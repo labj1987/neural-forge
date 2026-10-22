@@ -209,7 +209,15 @@ fn a_larger_build_after_a_smaller_one_on_one_network() {
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
         d.cmd_fill_buffer(cmd, large.features, 0, vk::WHOLE_SIZE, 0);
         let to_compute = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-        d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute], &[], &[]);
+        d.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[to_compute],
+            &[],
+            &[],
+        );
         d.cmd_execute_commands(cmd, &[net.graph_commands()]);
         d.end_command_buffer(cmd).unwrap();
         d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
@@ -254,11 +262,29 @@ fn two_sizes_built_together_each_give_the_head_of_their_size_alone() {
                 let values: Vec<f32> = (0..frame.features_bytes / 4).map(|i| ((i * 2654435761 % 1000) as f32 / 1000.0 - 0.5) * 0.25).collect();
                 std::ptr::copy_nonoverlapping(values.as_ptr().cast::<u8>(), src_ptr, values.len() * 4);
                 let (dst, dst_mem, dst_ptr) = g.host_buffer(frame.head_bytes, usage);
-                let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+                let all = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
                 d.cmd_copy_buffer(cmd, src, frame.features, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: frame.features_bytes }]);
-                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[all], &[], &[]);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[all],
+                    &[],
+                    &[],
+                );
                 d.cmd_execute_commands(cmd, &[*graph]);
-                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[all], &[], &[]);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[all],
+                    &[],
+                    &[],
+                );
                 d.cmd_copy_buffer(cmd, frame.head, dst, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: frame.head_bytes }]);
                 staging.push((src, src_mem, dst, dst_mem, dst_ptr, frame.head_bytes));
             }
@@ -335,9 +361,7 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
     unsafe {
         let queue = d.get_device_queue(g.family, 0);
         let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(g.family), None).unwrap();
-        let cmd = d
-            .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1))
-            .unwrap()[0];
+        let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];
         let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
         let queries = d.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2), None).unwrap();
         let period = g.instance.get_physical_device_properties(g.physical).limits.timestamp_period as f64;
@@ -346,13 +370,29 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
             d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
             d.cmd_copy_buffer(cmd, up, frame.features, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: features.len() as u64 }]);
             let to_compute = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute], &[], &[]);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[to_compute],
+                &[],
+                &[],
+            );
             d.cmd_reset_query_pool(cmd, queries, 0, 2);
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, queries, 0);
             d.cmd_execute_commands(cmd, &[net.graph_commands()]);
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, queries, 1);
             let to_copy = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_copy], &[], &[]);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[to_copy],
+                &[],
+                &[],
+            );
             d.cmd_copy_buffer(cmd, frame.head, down, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: head_bytes }]);
             d.end_command_buffer(cmd).unwrap();
             d.reset_fences(&[fence]).unwrap();
@@ -364,35 +404,45 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
             eprintln!("run {run}: graph {:.3} ms GPU", (stamps[1] - stamps[0]) as f64 * period / 1e6);
             let got = std::slice::from_raw_parts(down_ptr, head_bytes as usize);
             let differing = got.as_chunks::<4>().0.iter().zip(expected.as_chunks::<4>().0.iter()).filter(|(a, b)| a != b).count();
-            eprintln!("run {run}: {:?} incl. copies, {differing} of {} head values differ, chain timeouts {:?}", t.elapsed(), expected.len() / 4, net.chain_timeouts());
+            eprintln!(
+                "run {run}: {:?} incl. copies, {differing} of {} head values differ, chain timeouts {:?}",
+                t.elapsed(),
+                expected.len() / 4,
+                net.chain_timeouts()
+            );
             assert_eq!(differing, 0, "the head differs from dlss5vk's");
             assert_eq!(net.chain_timeouts().0, 0);
         }
         // Back to back, the graph alone (the GPU at its working clocks, as dlss5vk bench measures).
         for primary in [false, true] {
-        let mut times = Vec::new();
-        for _ in 0..40 {
-            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
-            d.cmd_reset_query_pool(cmd, queries, 0, 2);
-            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, queries, 0);
-            if primary {
-                // SAFETY: `cmd` is a primary of the frame family being recorded here; the previous run's
-                // submit was waited on.
-                net.record_graph(cmd).unwrap();
-            } else {
-                d.cmd_execute_commands(cmd, &[net.graph_commands()]);
+            let mut times = Vec::new();
+            for _ in 0..40 {
+                d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+                d.cmd_reset_query_pool(cmd, queries, 0, 2);
+                d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, queries, 0);
+                if primary {
+                    // SAFETY: `cmd` is a primary of the frame family being recorded here; the previous run's
+                    // submit was waited on.
+                    net.record_graph(cmd).unwrap();
+                } else {
+                    d.cmd_execute_commands(cmd, &[net.graph_commands()]);
+                }
+                d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, queries, 1);
+                d.end_command_buffer(cmd).unwrap();
+                d.reset_fences(&[fence]).unwrap();
+                d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
+                d.wait_for_fences(&[fence], true, 5_000_000_000).unwrap();
+                let mut stamps = [0u64; 2];
+                d.get_query_pool_results(queries, 0, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT).unwrap();
+                times.push((stamps[1] - stamps[0]) as f64 * period / 1e6);
             }
-            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, queries, 1);
-            d.end_command_buffer(cmd).unwrap();
-            d.reset_fences(&[fence]).unwrap();
-            d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
-            d.wait_for_fences(&[fence], true, 5_000_000_000).unwrap();
-            let mut stamps = [0u64; 2];
-            d.get_query_pool_results(queries, 0, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT).unwrap();
-            times.push((stamps[1] - stamps[0]) as f64 * period / 1e6);
-        }
-        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        eprintln!("graph back to back ({}), 40 runs: min {:.3} ms, median {:.3} ms", if primary { "recorded into the primary" } else { "secondary" }, times[0], times[20]);
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "graph back to back ({}), 40 runs: min {:.3} ms, median {:.3} ms",
+                if primary { "recorded into the primary" } else { "secondary" },
+                times[0],
+                times[20]
+            );
         }
         assert_eq!(net.chain_timeouts().0, 0);
         d.destroy_query_pool(queries, None);
@@ -482,10 +532,26 @@ fn the_heads_at_the_layers_sizes_match_a_saved_run() {
             d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
             d.cmd_copy_buffer(cmd, up, frame.features, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: features.len() as u64 }]);
             let to_compute = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute], &[], &[]);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[to_compute],
+                &[],
+                &[],
+            );
             d.cmd_execute_commands(cmd, &[net.graph_commands()]);
             let to_copy = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_copy], &[], &[]);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[to_copy],
+                &[],
+                &[],
+            );
             d.cmd_copy_buffer(cmd, frame.head, down, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: head_bytes }]);
             d.end_command_buffer(cmd).unwrap();
             d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
@@ -504,7 +570,12 @@ fn the_heads_at_the_layers_sizes_match_a_saved_run() {
         match std::fs::read(&saved) {
             Ok(expected) => {
                 let differing = got.as_chunks::<4>().0.iter().zip(expected.as_chunks::<4>().0.iter()).filter(|(a, b)| a != b).count();
-                eprintln!("{width}x{height} (field {fw}x{fh}, chained {}): {differing} of {} head values differ from {}", frame.chained, got.len() / 4, saved.display());
+                eprintln!(
+                    "{width}x{height} (field {fw}x{fh}, chained {}): {differing} of {} head values differ from {}",
+                    frame.chained,
+                    got.len() / 4,
+                    saved.display()
+                );
                 if differing != 0 || expected.len() != got.len() {
                     mismatches.push(format!("{width}x{height}"));
                 }
@@ -608,11 +679,13 @@ fn device_extend_keeps_the_loaders_nodes_and_unknown_ones() {
         function: u32,
         u: *const std::ffi::c_void,
     }
-    let loader = LoaderNode { s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::from_ref(&unknown).cast(), function: 0, u: 0x1234 as *const _ };
+    let loader =
+        LoaderNode { s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::from_ref(&unknown).cast(), function: 0, u: 0x1234 as *const _ };
     let mut v12 = vk::PhysicalDeviceVulkan12Features { p_next: std::ptr::from_ref(&loader).cast_mut().cast(), ..Default::default() };
     let info = vk::DeviceCreateInfo { p_next: std::ptr::from_mut(&mut v12).cast(), ..vk::DeviceCreateInfo::default().queue_create_infos(&queues) };
     // SAFETY: valid create info, outliving the extension; the chain is only read.
-    let extension = unsafe { device_extend(gipa, g.instance.handle(), vk::API_VERSION_1_3, g.physical, &info) }.expect("the loader's node and an unknown one do not stop the additions");
+    let extension = unsafe { device_extend(gipa, g.instance.handle(), vk::API_VERSION_1_3, g.physical, &info) }
+        .expect("the loader's node and an unknown one do not stop the additions");
     let (mut copied_loader, mut tail, mut v12_set) = (None, None, false);
     // SAFETY: the extended chain is valid while `extension` lives.
     unsafe {
@@ -620,7 +693,9 @@ fn device_extend_keeps_the_loaders_nodes_and_unknown_ones() {
         while !node.is_null() {
             match (*node).s_type {
                 vk::StructureType::LOADER_DEVICE_CREATE_INFO => copied_loader = Some(node),
-                vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => v12_set = (*node.cast::<vk::PhysicalDeviceVulkan12Features>()).buffer_device_address == 1,
+                vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => {
+                    v12_set = (*node.cast::<vk::PhysicalDeviceVulkan12Features>()).buffer_device_address == 1
+                }
                 t if t == unknown.s_type => tail = Some(node),
                 _ => {}
             }
@@ -671,7 +746,9 @@ unsafe fn run_head(g: &Gpu, queue: vk::Queue, cmd: vk::CommandBuffer, frame: &Fr
     unsafe {
         std::ptr::copy_nonoverlapping(features.as_ptr(), up_ptr, features.len());
         let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
-        let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        let all = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         let stages = vk::PipelineStageFlags::ALL_COMMANDS;
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
         d.cmd_copy_buffer(cmd, up, frame.features, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: frame.features_bytes }]);

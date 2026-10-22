@@ -58,7 +58,9 @@ impl Cube {
         let mut out = [0f32; 3];
         for (corner, w) in (0..8).map(|k| {
             let (dr, dg, db) = (k & 1, (k >> 1) & 1, (k >> 2) & 1);
-            let w = (if dr == 1 { frac[0] } else { 1.0 - frac[0] }) * (if dg == 1 { frac[1] } else { 1.0 - frac[1] }) * (if db == 1 { frac[2] } else { 1.0 - frac[2] });
+            let w = (if dr == 1 { frac[0] } else { 1.0 - frac[0] })
+                * (if dg == 1 { frac[1] } else { 1.0 - frac[1] })
+                * (if db == 1 { frac[2] } else { 1.0 - frac[2] });
             (at(base[0] + dr, base[1] + dg, base[2] + db), w)
         }) {
             for c in 0..3 {

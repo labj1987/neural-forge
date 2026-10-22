@@ -262,9 +262,7 @@ fn open_locked(fd: BorrowedFd<'_>) -> Result<(*mut ShmHeader, bool), OpenError> 
     // many bytes is always in-bounds. The mapping is intentionally never unmapped
     // (see `Mapping::header`'s doc comment), so the returned pointer stays valid for
     // as long as anything derived from it is used.
-    let map = unsafe {
-        libc::mmap(std::ptr::null_mut(), HEADER_BYTES, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0)
-    };
+    let map = unsafe { libc::mmap(std::ptr::null_mut(), HEADER_BYTES, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
     if map == libc::MAP_FAILED {
         return Err(OpenError::Unavailable);
     }
@@ -294,7 +292,11 @@ mod tests {
     fn scratch_path() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("{}/mapping-{}-{n}/shm.bin", std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/test-scratch").display(), std::process::id())
+        format!(
+            "{}/mapping-{}-{n}/shm.bin",
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/test-scratch").display(),
+            std::process::id()
+        )
     }
 
     fn cleanup(path: &str) {

@@ -166,7 +166,12 @@ pub fn write_private_file_atomic(path: &str, content: &[u8]) -> std::io::Result<
     }
     // SAFETY: as above.
     let raw = unsafe {
-        libc::openat(dir_fd.as_raw_fd(), c_staged.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600 as libc::c_uint)
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c_staged.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
     };
     if raw < 0 {
         return Err(std::io::Error::last_os_error());

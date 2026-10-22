@@ -104,9 +104,7 @@ pub fn probe_system(proc_root: &Path, nvidia_smi: Option<&str>) -> SystemInfo {
         .collect();
     gpus.sort();
     let driver = std::fs::read_to_string(nvidia.join("version")).ok().and_then(|v| driver_version(&v)).unwrap_or_default();
-    let compute = nvidia_smi
-        .map(|out| out.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(", "))
-        .unwrap_or_default();
+    let compute = nvidia_smi.map(|out| out.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
     SystemInfo { gpu: gpus.join(", "), driver, compute_capability: compute }
 }
 
@@ -332,7 +330,11 @@ pub struct Member {
 }
 
 fn or_unknown(s: &str) -> &str {
-    if s.trim().is_empty() { "unknown" } else { s.trim() }
+    if s.trim().is_empty() {
+        "unknown"
+    } else {
+        s.trim()
+    }
 }
 
 /// `summary.txt`, before redaction.
@@ -866,7 +868,10 @@ mod tests {
         // The last 25 bytes start inside "line 0997"; the first whole line is 0998.
         assert_eq!(tail, format!("[... first {} bytes left out ...]\nline 0998\nline 0999\n", body.len() - 20));
         // A cap that ends the omitted part on a line break keeps the whole first line.
-        assert_eq!(String::from_utf8(log_tail(&path, 20).unwrap()).unwrap(), format!("[... first {} bytes left out ...]\nline 0998\nline 0999\n", body.len() - 20));
+        assert_eq!(
+            String::from_utf8(log_tail(&path, 20).unwrap()).unwrap(),
+            format!("[... first {} bytes left out ...]\nline 0998\nline 0999\n", body.len() - 20)
+        );
         write(&path, b"no newline at all, longer than the cap");
         assert_eq!(String::from_utf8(log_tail(&path, 8).unwrap()).unwrap(), "[... first 30 bytes left out ...]\n the cap", "one line is cut, not dropped");
         assert!(log_tail(&root.join("absent.log"), 8).is_none());
@@ -886,7 +891,10 @@ mod tests {
         assert_eq!(desktop_dir(&config, &home), home, "nothing configured, no ~/Desktop");
         std::fs::create_dir_all(home.join("Desktop")).unwrap();
         assert_eq!(desktop_dir(&config, &home), home.join("Desktop"));
-        write(&config.join("user-dirs.dirs"), "# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"$HOME/Schreibtisch\"\nXDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n");
+        write(
+            &config.join("user-dirs.dirs"),
+            "# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"$HOME/Schreibtisch\"\nXDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n",
+        );
         assert_eq!(desktop_dir(&config, &home), home.join("Desktop"), "a configured directory that does not exist is skipped");
         std::fs::create_dir_all(home.join("Schreibtisch")).unwrap();
         assert_eq!(desktop_dir(&config, &home), home.join("Schreibtisch"));

@@ -12,8 +12,8 @@ use vulkan_layer::{DeviceHooks, DeviceInfo, LayerResult, LayerVulkanCommand as V
 
 use crate::capture;
 use crate::shm::ShmClient;
-use neural_forge_protocol::Slot;
 use crate::swapchain::{self, SwapchainState};
+use neural_forge_protocol::Slot;
 
 /// The one swapchain (across every device in this process) allowed to drive the
 /// shared-memory channel. A process can present more than one swapchain -- the game
@@ -92,7 +92,8 @@ fn shares_memory(info: &vk::ImageCreateInfo) -> bool {
 /// shared. `None`: created as asked. Also what a memory-requirements query for such an image is
 /// answered from (`vkGetDeviceImage*MemoryRequirements`), so memory placed by those numbers fits.
 fn copyable_create_info<'a>(info: &vk::ImageCreateInfo<'a>) -> Option<vk::ImageCreateInfo<'a>> {
-    (crate::preupscale::wants_copyable(info) && !shares_memory(info)).then(|| vk::ImageCreateInfo { usage: info.usage | vk::ImageUsageFlags::TRANSFER_SRC, ..*info })
+    (crate::preupscale::wants_copyable(info) && !shares_memory(info))
+        .then(|| vk::ImageCreateInfo { usage: info.usage | vk::ImageUsageFlags::TRANSFER_SRC, ..*info })
 }
 
 /// Whether the pre-upscaler dump (`NEURAL_FORGE_PREUPSCALE=dump`) serves one-shot capture requests:
@@ -542,10 +543,7 @@ impl TapTracker {
     }
 
     fn record_image(&mut self, image: vk::Image, info: &vk::ImageCreateInfo) {
-        if info.image_type == vk::ImageType::TYPE_2D
-            && info.samples == vk::SampleCountFlags::TYPE_1
-            && info.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
-        {
+        if info.image_type == vk::ImageType::TYPE_2D && info.samples == vk::SampleCountFlags::TYPE_1 && info.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
             self.image_info.insert(image, ImageInfo { width: info.extent.width, height: info.extent.height, format: info.format });
         }
     }
@@ -557,9 +555,7 @@ impl TapTracker {
     }
 
     /// Returns `true` the first time a given swapchain image is seen as a destination.
-    fn observe_write(
-        &mut self, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout, dst: vk::Image,
-    ) -> Option<bool> {
+    fn observe_write(&mut self, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout, dst: vk::Image) -> Option<bool> {
         if !self.swapchain_images.contains(&dst) {
             return None;
         }
@@ -734,8 +730,7 @@ fn try_hold(hold: &Mutex<HoldState>) -> Option<std::sync::MutexGuard<'_, HoldSta
 }
 
 type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>, Arc<Mutex<HoldState>>);
-static CLEANUP: std::sync::LazyLock<Mutex<HashMap<vk::Device, CleanupState>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static CLEANUP: std::sync::LazyLock<Mutex<HashMap<vk::Device, CleanupState>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Called only from vkDestroyDevice, before downstream device destruction.
 /// Vulkan requires the caller to externally synchronize this device AND all its
@@ -764,25 +759,45 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         let mut hold = hold.lock().unwrap_or_else(|e| e.into_inner());
         let mut idle = true;
-        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || !state.present_tickets.is_empty() || state.series.has_stranded() || hold.preupscale.has_res() || hold.preupscale.native.is_some() {
+        if state.capture_pipeline.is_some()
+            || state.direct_capture.iter().any(Option::is_some)
+            || state.gpu_compose.is_some()
+            || !state.relay_semaphores.is_empty()
+            || !state.present_tickets.is_empty()
+            || state.series.has_stranded()
+            || hold.preupscale.has_res()
+            || hold.preupscale.native.is_some()
+        {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
                     // Idle: nothing uses the network any more.
                     hold.preupscale.close_native();
-                    unsafe { capture::destroy_pipeline(state.capture_pipeline.take(), &device); }
+                    unsafe {
+                        capture::destroy_pipeline(state.capture_pipeline.take(), &device);
+                    }
                     for slot in &mut state.direct_capture {
-                        unsafe { capture::destroy_direct_capture(slot.take(), &device); }
+                        unsafe {
+                            capture::destroy_direct_capture(slot.take(), &device);
+                        }
                     }
                     if let Some(compose) = state.gpu_compose.take() {
-                        unsafe { compose.destroy(&device); }
+                        unsafe {
+                            compose.destroy(&device);
+                        }
                     }
                     // SAFETY: device is idle (or lost) and the application's swapchains are
                     // gone, so no present still waits on a relay semaphore.
-                    unsafe { state.relay_semaphores.destroy(&device); }
+                    unsafe {
+                        state.relay_semaphores.destroy(&device);
+                    }
                     // SAFETY: as above: no present or batch still uses a fence.
-                    unsafe { state.present_tickets.destroy(&device); }
+                    unsafe {
+                        state.present_tickets.destroy(&device);
+                    }
                     // SAFETY: the device is idle (or lost): no hold's submission is pending.
-                    unsafe { hold.preupscale.destroy(&device); }
+                    unsafe {
+                        hold.preupscale.destroy(&device);
+                    }
                 }
                 Err(error) => {
                     idle = false;
@@ -797,10 +812,14 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
         // SAFETY: a series leaves no GPU work pending once a present returns (it waits on its own
         // fences) except a stalled readback's, which the idle wait above covered when `idle`; this
         // also finishes writing its files.
-        unsafe { state.series.destroy(&device, idle); }
+        unsafe {
+            state.series.destroy(&device, idle);
+        }
         state.swapchains.clear();
         let mut primary = PRIMARY.lock().unwrap();
-        if primary.as_ref().is_some_and(|p| p.device == handle) { *primary = None; }
+        if primary.as_ref().is_some_and(|p| p.device == handle) {
+            *primary = None;
+        }
         crate::log!("[layer] private device teardown complete {:?}", handle);
         crate::logging::flush();
     }
@@ -869,8 +888,13 @@ fn inline_chain_kept() -> bool {
 /// whose buffers ran left is applied first (`Session::harvest`).
 #[allow(clippy::too_many_arguments)]
 fn record_inline_hold(
-    device: &Arc<ash::Device>, instance: &Arc<ash::Instance>, physical_device: vk::PhysicalDevice, hold_state: &Arc<Mutex<HoldState>>,
-    inline: &crate::preupscale::inline::Inline, jitter: Option<[f32; 2]>, ctx: &mut crate::preupscale::inline::Ctx,
+    device: &Arc<ash::Device>,
+    instance: &Arc<ash::Instance>,
+    physical_device: vk::PhysicalDevice,
+    hold_state: &Arc<Mutex<HoldState>>,
+    inline: &crate::preupscale::inline::Inline,
+    jitter: Option<[f32; 2]>,
+    ctx: &mut crate::preupscale::inline::Ctx,
 ) -> Result<crate::preupscale::inline::Meta, crate::preupscale::inline::Recorded> {
     use crate::preupscale::inline::Recorded;
     use crate::preupscale::Mode;
@@ -956,7 +980,21 @@ fn record_inline_hold(
     // SAFETY: `res` was built on this device for this extent and the graphics family DLSS's buffer runs on;
     // the buffer is being recorded on this thread.
     let mut hold = unsafe {
-        crate::preupscale::run_native(device, instance, physical_device, res, &target, &loader, jitter, inline_chain_kept(), shm, arm, seen, point.hold, crate::preupscale::Sink::Buffer(ctx))
+        crate::preupscale::run_native(
+            device,
+            instance,
+            physical_device,
+            res,
+            &target,
+            &loader,
+            jitter,
+            inline_chain_kept(),
+            shm,
+            arm,
+            seen,
+            point.hold,
+            crate::preupscale::Sink::Buffer(ctx),
+        )
     };
     session.note_native(shm, &hold);
     session.cache_dump_after(arm, &mut hold);
@@ -1057,12 +1095,7 @@ fn note_present_rate(composited: bool) {
     let elapsed = now.duration_since(*start);
     if elapsed >= WINDOW {
         let secs = elapsed.as_secs_f64();
-        crate::log!(
-            "[present] {:.1} fps ({:.1}/s composited by the effect) over {:.1}s",
-            f64::from(*presents) / secs,
-            f64::from(*composed) / secs,
-            secs
-        );
+        crate::log!("[present] {:.1} fps ({:.1}/s composited by the effect) over {:.1}s", f64::from(*presents) / secs, f64::from(*composed) / secs, secs);
         crate::logging::flush();
         *rate = Some((now, 0, 0));
     }
@@ -1185,14 +1218,9 @@ unsafe fn relay_app_waits(
     image: vk::Image,
     app_waits: &[vk::Semaphore],
 ) -> Option<vk::Semaphore> {
-    let relay = relay_semaphores.get(image, || unsafe {
-        device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
-    })?;
+    let relay = relay_semaphores.get(image, || unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok() })?;
     let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; app_waits.len()];
-    let submit = vk::SubmitInfo::default()
-        .wait_semaphores(app_waits)
-        .wait_dst_stage_mask(&stages)
-        .signal_semaphores(std::slice::from_ref(&relay));
+    let submit = vk::SubmitInfo::default().wait_semaphores(app_waits).wait_dst_stage_mask(&stages).signal_semaphores(std::slice::from_ref(&relay));
     // SAFETY: the batch references only live handles; `stages` and `app_waits` outlive
     // the call.
     unsafe { device.queue_submit(queue, &[submit], vk::Fence::null()) }.ok()?;
@@ -1214,26 +1242,10 @@ impl NeuralForgeDeviceInfo {
         // device; each name below matches the `PFN_vk*` type requested.
         let (create, destroy, present, get_images, get_queue, get_queue2) = unsafe {
             (
-                resolve::<vk::PFN_vkCreateSwapchainKHR>(
-                    next_get_device_proc_addr,
-                    handle,
-                    c"vkCreateSwapchainKHR",
-                ),
-                resolve::<vk::PFN_vkDestroySwapchainKHR>(
-                    next_get_device_proc_addr,
-                    handle,
-                    c"vkDestroySwapchainKHR",
-                ),
-                resolve::<vk::PFN_vkQueuePresentKHR>(
-                    next_get_device_proc_addr,
-                    handle,
-                    c"vkQueuePresentKHR",
-                ),
-                resolve::<vk::PFN_vkGetSwapchainImagesKHR>(
-                    next_get_device_proc_addr,
-                    handle,
-                    c"vkGetSwapchainImagesKHR",
-                ),
+                resolve::<vk::PFN_vkCreateSwapchainKHR>(next_get_device_proc_addr, handle, c"vkCreateSwapchainKHR"),
+                resolve::<vk::PFN_vkDestroySwapchainKHR>(next_get_device_proc_addr, handle, c"vkDestroySwapchainKHR"),
+                resolve::<vk::PFN_vkQueuePresentKHR>(next_get_device_proc_addr, handle, c"vkQueuePresentKHR"),
+                resolve::<vk::PFN_vkGetSwapchainImagesKHR>(next_get_device_proc_addr, handle, c"vkGetSwapchainImagesKHR"),
                 resolve::<vk::PFN_vkGetDeviceQueue>(next_get_device_proc_addr, handle, c"vkGetDeviceQueue"),
                 resolve::<vk::PFN_vkGetDeviceQueue2>(next_get_device_proc_addr, handle, c"vkGetDeviceQueue2"),
             )
@@ -1444,8 +1456,15 @@ impl NeuralForgeDeviceInfo {
     /// (see [`TapTracker`]).
     #[allow(clippy::too_many_arguments)]
     fn observe_swapchain_write(
-        &self, kind: &str, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout,
-        dst: vk::Image, dst_layout: vk::ImageLayout, region_count: usize, shape: TapWrite,
+        &self,
+        kind: &str,
+        command_buffer: vk::CommandBuffer,
+        src: vk::Image,
+        src_layout: vk::ImageLayout,
+        dst: vk::Image,
+        dst_layout: vk::ImageLayout,
+        region_count: usize,
+        shape: TapWrite,
     ) {
         let first = {
             let mut tracker = self.tracker.lock().unwrap();
@@ -1455,8 +1474,15 @@ impl NeuralForgeDeviceInfo {
             first
         };
         if first == Some(true) {
-            crate::log!("[layer] observed game {} into swapchain: src={:?} {:?} dst={:?} {:?} regions={}",
-                kind, src, src_layout, dst, dst_layout, region_count);
+            crate::log!(
+                "[layer] observed game {} into swapchain: src={:?} {:?} dst={:?} {:?} regions={}",
+                kind,
+                src,
+                src_layout,
+                dst,
+                dst_layout,
+                region_count
+            );
             crate::logging::flush();
         }
     }
@@ -1528,7 +1554,10 @@ impl NeuralForgeDeviceInfo {
 
     /// [`record_inline_hold`] with this device's state.
     fn record_hold(
-        &self, inline: &crate::preupscale::inline::Inline, jitter: Option<[f32; 2]>, ctx: &mut crate::preupscale::inline::Ctx,
+        &self,
+        inline: &crate::preupscale::inline::Inline,
+        jitter: Option<[f32; 2]>,
+        ctx: &mut crate::preupscale::inline::Ctx,
     ) -> Result<crate::preupscale::inline::Meta, crate::preupscale::inline::Recorded> {
         let Some(instance) = self.instance.as_ref() else { return Err(crate::preupscale::inline::Recorded::Refused) };
         record_inline_hold(&self.device, instance, self.physical_device, &self.hold, inline, jitter, ctx)
@@ -1543,8 +1572,13 @@ impl NeuralForgeDeviceInfo {
     /// application gets back; with it come the application's command buffers of the parts the next
     /// layer accepted (`preupscale::submit_around`), for the caller to commit.
     fn preupscale_submit<B: crate::preupscale::SplitBatch>(
-        &self, tracking: &crate::preupscale::Tracking, queue: vk::Queue, cbs: &[Vec<vk::CommandBuffer>],
-        parse: impl FnOnce() -> Result<Vec<B>, &'static str>, fence: vk::Fence, submit: &dyn Fn(&[B], vk::Fence) -> vk::Result,
+        &self,
+        tracking: &crate::preupscale::Tracking,
+        queue: vk::Queue,
+        cbs: &[Vec<vk::CommandBuffer>],
+        parse: impl FnOnce() -> Result<Vec<B>, &'static str>,
+        fence: vk::Fence,
+        submit: &dyn Fn(&[B], vk::Fence) -> vk::Result,
     ) -> Option<(vk::Result, Vec<vk::CommandBuffer>)> {
         use crate::preupscale::{Mode, Which};
         let scan = tracking.scan(cbs)?;
@@ -1608,7 +1642,9 @@ impl NeuralForgeDeviceInfo {
         // The last ownership transfer of the colour input the application submitted, if it ever
         // made one, must have left it with the family of the queue the hold runs on.
         if scan.colour_owner.is_some_and(|owner| owner != queue_family) {
-            session.say_once("the colour input was last transferred to another queue family than the DLSS submit's queue; not holding, frames go to DLSS untouched");
+            session.say_once(
+                "the colour input was last transferred to another queue family than the DLSS submit's queue; not holding, frames go to DLSS untouched",
+            );
             return None;
         }
         if !shm.open() {
@@ -1642,7 +1678,19 @@ impl NeuralForgeDeviceInfo {
             }
         };
         // SAFETY: the SHM mapping is never unmapped once open.
-        if !unsafe { session.ensure(&self.device, instance, self.physical_device, queue_family, colour.width, colour.height, shm, *external_memory_host, crate::preupscale::placement::Stage::Before) } {
+        if !unsafe {
+            session.ensure(
+                &self.device,
+                instance,
+                self.physical_device,
+                queue_family,
+                colour.width,
+                colour.height,
+                shm,
+                *external_memory_host,
+                crate::preupscale::placement::Stage::Before,
+            )
+        } {
             if mode == Mode::Model {
                 session.note(shm, &crate::preupscale::HoldResult::local("the hold's resources could not be built"), std::time::Duration::ZERO, extent);
             }
@@ -1671,7 +1719,8 @@ impl NeuralForgeDeviceInfo {
                 .map(|a| crate::preupscale::Aux { readable: a.readable && a.layout.is_some_and(|l| crate::preupscale::depth_copy_layout(a.format, l)), ..a }),
             depth_buffer: None,
             // The dump's buffer and file are RG16F (4 bytes a texel): RG32F motion vectors are not read.
-            mvec: Some(aux(inputs.mvec, scan.mvec_layout)).map(|a| crate::preupscale::Aux { readable: a.readable && a.format == vk::Format::R16G16_SFLOAT, ..a }),
+            mvec: Some(aux(inputs.mvec, scan.mvec_layout))
+                .map(|a| crate::preupscale::Aux { readable: a.readable && a.format == vk::Format::R16G16_SFLOAT, ..a }),
             // Read only at the colour input's extent (`aux`): in its pixels.
             mvec_scale: [1.0, 1.0],
             // The 1x1 candidates: read in their committed layout, or as GENERAL (assumed, flagged in
@@ -1701,28 +1750,48 @@ impl NeuralForgeDeviceInfo {
         let res = session.res.as_mut()?;
         let mut held: Option<(crate::preupscale::HoldResult, std::time::Duration)> = None;
         let mut accepted: Vec<vk::CommandBuffer> = Vec::new();
-        let result = crate::preupscale::submit_around(plan, fence, submit, |moved| {
-            let started = std::time::Instant::now();
-            let mut layer_submit = |which: Which, cmd: vk::CommandBuffer, own_fence: vk::Fence| {
-                let waits = if which == Which::Capture { moved.to_vec() } else { Vec::new() };
-                submit(std::slice::from_ref(&B::own(waits, cmd)), own_fence).result()
-            };
-            // SAFETY: `res` was built on this device for this extent; the colour input is live and
-            // in GENERAL; `layer_submit` submits on the application's queue, which it holds for the
-            // duration of its call.
-            let hold = match loader {
-                // SAFETY: as below; the loader belongs to this device and `res` to the queue's family.
-                Some(loader) => unsafe {
-                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, arm, seen, at, crate::preupscale::Sink::Queue(&mut layer_submit))
-                },
-                None => unsafe {
-                    crate::preupscale::run_hold(&self.device, instance, self.physical_device, res, &target, mode, dump, scan.evaluation, &mut layer_submit)
-                },
-            };
-            let consumed = hold.waits_consumed;
-            held = Some((hold, started.elapsed()));
-            consumed
-        }, &mut |part| accepted.extend(part));
+        let result = crate::preupscale::submit_around(
+            plan,
+            fence,
+            submit,
+            |moved| {
+                let started = std::time::Instant::now();
+                let mut layer_submit = |which: Which, cmd: vk::CommandBuffer, own_fence: vk::Fence| {
+                    let waits = if which == Which::Capture { moved.to_vec() } else { Vec::new() };
+                    submit(std::slice::from_ref(&B::own(waits, cmd)), own_fence).result()
+                };
+                // SAFETY: `res` was built on this device for this extent; the colour input is live and
+                // in GENERAL; `layer_submit` submits on the application's queue, which it holds for the
+                // duration of its call.
+                let hold = match loader {
+                    // SAFETY: as below; the loader belongs to this device and `res` to the queue's family.
+                    Some(loader) => unsafe {
+                        crate::preupscale::run_native(
+                            &self.device,
+                            instance,
+                            self.physical_device,
+                            res,
+                            &target,
+                            loader,
+                            jitter,
+                            true,
+                            shm,
+                            arm,
+                            seen,
+                            at,
+                            crate::preupscale::Sink::Queue(&mut layer_submit),
+                        )
+                    },
+                    None => unsafe {
+                        crate::preupscale::run_hold(&self.device, instance, self.physical_device, res, &target, mode, dump, scan.evaluation, &mut layer_submit)
+                    },
+                };
+                let consumed = hold.waits_consumed;
+                held = Some((hold, started.elapsed()));
+                consumed
+            },
+            &mut |part| accepted.extend(part),
+        );
         if let Some((mut hold, cpu)) = held {
             if hold.native {
                 session.note_native(shm, &hold);
@@ -1788,20 +1857,26 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next_create) = self.next_create_swapchain_khr else {
             return LayerResult::Unhandled;
         };
-        if crate::layer_enabled() && !crate::ownership::eligible()
+        if crate::layer_enabled()
+            && !crate::ownership::eligible()
             && swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height)
         {
             crate::ownership::note_excluded_swapchain(create_info.image_extent.width, create_info.image_extent.height);
         }
-        let eligible = crate::layer_enabled() && self.nvidia && crate::ownership::eligible()
+        let eligible = crate::layer_enabled()
+            && self.nvidia
+            && crate::ownership::eligible()
             && swapchain::is_supported_format(create_info.image_format)
             && create_info.image_extent.width <= neural_forge_protocol::MAX_W
             && create_info.image_extent.height <= neural_forge_protocol::MAX_H
             && swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height);
         let adjusted = if eligible {
-            self.instance.as_deref().and_then(|instance|
-                self.surface_caps.and_then(|query| crate::surface_usage::prepare(instance, query, self.physical_device, create_info)))
-        } else { None };
+            self.instance
+                .as_deref()
+                .and_then(|instance| self.surface_caps.and_then(|query| crate::surface_usage::prepare(instance, query, self.physical_device, create_info)))
+        } else {
+            None
+        };
         let pass_through = adjusted.is_none();
         if pass_through && eligible {
             // Distinguishes *why* `prepare` returned `None`: `!candidate` means the
@@ -1913,7 +1988,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // unchanged.
         unsafe { next(self.device.handle(), queue_family_index, queue_index, &mut queue) };
         if self.queue_families.write().unwrap_or_else(|e| e.into_inner()).insert(queue, queue_family_index).is_none() {
-            crate::log!("[queues] device {:#x}: the application took queue {queue_index} of family {queue_family_index} ({queue:?})", vk::Handle::as_raw(self.device.handle()));
+            crate::log!(
+                "[queues] device {:#x}: the application took queue {queue_index} of family {queue_family_index} ({queue:?})",
+                vk::Handle::as_raw(self.device.handle())
+            );
         }
         LayerResult::Handled(queue)
     }
@@ -1937,8 +2015,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_copy_image(
-        &self, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout,
-        dst: vk::Image, dst_layout: vk::ImageLayout, regions: &[vk::ImageCopy],
+        &self,
+        command_buffer: vk::CommandBuffer,
+        src: vk::Image,
+        src_layout: vk::ImageLayout,
+        dst: vk::Image,
+        dst_layout: vk::ImageLayout,
+        regions: &[vk::ImageCopy],
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_transfer(command_buffer, "copy", Some((src, src_layout)), Some((dst, dst_layout)));
         self.observe_swapchain_write("copy", command_buffer, src, src_layout, dst, dst_layout, regions.len(), TapWrite::from_copy(regions));
@@ -1946,8 +2029,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_blit_image(
-        &self, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout,
-        dst: vk::Image, dst_layout: vk::ImageLayout, regions: &[vk::ImageBlit], _filter: vk::Filter,
+        &self,
+        command_buffer: vk::CommandBuffer,
+        src: vk::Image,
+        src_layout: vk::ImageLayout,
+        dst: vk::Image,
+        dst_layout: vk::ImageLayout,
+        regions: &[vk::ImageBlit],
+        _filter: vk::Filter,
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_transfer(command_buffer, "blit", Some((src, src_layout)), Some((dst, dst_layout)));
         self.observe_swapchain_write("blit", command_buffer, src, src_layout, dst, dst_layout, regions.len(), TapWrite::from_blit(regions));
@@ -1955,9 +2044,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_pipeline_barrier(
-        &self, command_buffer: vk::CommandBuffer, src_stage: vk::PipelineStageFlags,
-        dst_stage: vk::PipelineStageFlags, _dependency: vk::DependencyFlags,
-        memory: &[vk::MemoryBarrier], buffers: &[vk::BufferMemoryBarrier],
+        &self,
+        command_buffer: vk::CommandBuffer,
+        src_stage: vk::PipelineStageFlags,
+        dst_stage: vk::PipelineStageFlags,
+        _dependency: vk::DependencyFlags,
+        memory: &[vk::MemoryBarrier],
+        buffers: &[vk::BufferMemoryBarrier],
         images: &[vk::ImageMemoryBarrier],
     ) -> LayerResult<()> {
         if crate::probe_ngx::enabled() {
@@ -1979,7 +2072,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             );
         }
         if let Some(t) = self.preupscale.as_ref().filter(|t| t.watching()) {
-            let global = memory.iter().any(|m| crate::probe_seq::is_write(u64::from(m.src_access_mask.as_raw()))).then_some(crate::preupscale::Hazard::MemoryBarrier);
+            let global =
+                memory.iter().any(|m| crate::probe_seq::is_write(u64::from(m.src_access_mask.as_raw()))).then_some(crate::preupscale::Hazard::MemoryBarrier);
             t.barriers(command_buffer, images.iter().map(|b| crate::preupscale::ImageSync::from_barrier(b, src_stage, dst_stage)), global);
         }
         // No logging here: this fires for every barrier the game records, from every
@@ -1994,9 +2088,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
-    fn cmd_pipeline_barrier2(
-        &self, command_buffer: vk::CommandBuffer, info: &vk::DependencyInfo,
-    ) -> LayerResult<()> {
+    fn cmd_pipeline_barrier2(&self, command_buffer: vk::CommandBuffer, info: &vk::DependencyInfo) -> LayerResult<()> {
         // A buffer-only or memory-only barrier legally passes a zero count with a null
         // pointer, and `slice::from_raw_parts` must never see a null pointer even for an
         // empty slice (with debug assertions that is an immediate abort).
@@ -2037,9 +2129,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
-    fn begin_command_buffer(
-        &self, command_buffer: vk::CommandBuffer, begin_info: &vk::CommandBufferBeginInfo,
-    ) -> LayerResult<ash::prelude::VkResult<()>> {
+    fn begin_command_buffer(&self, command_buffer: vk::CommandBuffer, begin_info: &vk::CommandBufferBeginInfo) -> LayerResult<ash::prelude::VkResult<()>> {
         crate::probe_ngx::on_begin_command_buffer(command_buffer, begin_info.flags);
         if let Some(t) = &self.preupscale {
             t.begin(command_buffer);
@@ -2051,9 +2141,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
-    fn free_command_buffers(
-        &self, command_pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer],
-    ) -> LayerResult<()> {
+    fn free_command_buffers(&self, command_pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer]) -> LayerResult<()> {
         crate::probe_ngx::on_free_command_buffers(command_pool, command_buffers);
         if let Some(t) = &self.preupscale {
             t.free(command_buffers);
@@ -2068,7 +2156,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     /// Created here (through the next layer) only to learn the pool's queue family, for the hold inside
     /// DLSS's buffer ([`crate::preupscale::inline::Inline::record_outcome`]); without it, untouched.
     fn create_command_pool(
-        &self, create_info: &vk::CommandPoolCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
+        &self,
+        create_info: &vk::CommandPoolCreateInfo,
+        allocator: Option<&vk::AllocationCallbacks>,
     ) -> LayerResult<ash::prelude::VkResult<vk::CommandPool>> {
         let Some(i) = &self.inline else { return LayerResult::Unhandled };
         // SAFETY: the application's own create info and allocator, forwarded unchanged to the next layer.
@@ -2083,9 +2173,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     /// or destroyed resets or frees its buffers without naming them, for the render tap's recorded
     /// layouts, the hold inside DLSS's buffer ([`crate::preupscale::inline::Inline::reset_pool`]) and
     /// the pre-upscaler tracking ([`crate::preupscale::Tracking::reset_pool`]).
-    fn allocate_command_buffers(
-        &self, allocate_info: &vk::CommandBufferAllocateInfo,
-    ) -> LayerResult<ash::prelude::VkResult<Vec<vk::CommandBuffer>>> {
+    fn allocate_command_buffers(&self, allocate_info: &vk::CommandBufferAllocateInfo) -> LayerResult<ash::prelude::VkResult<Vec<vk::CommandBuffer>>> {
         // SAFETY: the application's own allocate info, forwarded unchanged to the next layer.
         let result = unsafe { self.device.allocate_command_buffers(allocate_info) };
         if let Ok(cbs) = &result {
@@ -2101,9 +2189,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Handled(result)
     }
 
-    fn reset_command_buffer(
-        &self, command_buffer: vk::CommandBuffer, _flags: vk::CommandBufferResetFlags,
-    ) -> LayerResult<ash::prelude::VkResult<()>> {
+    fn reset_command_buffer(&self, command_buffer: vk::CommandBuffer, _flags: vk::CommandBufferResetFlags) -> LayerResult<ash::prelude::VkResult<()>> {
         if let Some(i) = &self.inline {
             i.reset(command_buffer);
         }
@@ -2113,9 +2199,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
-    fn reset_command_pool(
-        &self, command_pool: vk::CommandPool, _flags: vk::CommandPoolResetFlags,
-    ) -> LayerResult<ash::prelude::VkResult<()>> {
+    fn reset_command_pool(&self, command_pool: vk::CommandPool, _flags: vk::CommandPoolResetFlags) -> LayerResult<ash::prelude::VkResult<()>> {
         if let Some(i) = &self.inline {
             i.reset_pool(command_pool, false);
         }
@@ -2127,9 +2211,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
-    fn destroy_command_pool(
-        &self, command_pool: vk::CommandPool, _allocator: Option<&vk::AllocationCallbacks>,
-    ) -> LayerResult<()> {
+    fn destroy_command_pool(&self, command_pool: vk::CommandPool, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
         if let Some(i) = &self.inline {
             i.reset_pool(command_pool, true);
         }
@@ -2141,9 +2223,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
-    fn cmd_execute_commands(
-        &self, command_buffer: vk::CommandBuffer, secondaries: &[vk::CommandBuffer],
-    ) -> LayerResult<()> {
+    fn cmd_execute_commands(&self, command_buffer: vk::CommandBuffer, secondaries: &[vk::CommandBuffer]) -> LayerResult<()> {
         crate::probe_ngx::on_execute_commands(command_buffer, secondaries);
         if let Some(t) = &self.preupscale {
             t.execute(command_buffer, secondaries);
@@ -2166,7 +2246,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_bind_descriptor_sets(
-        &self, command_buffer: vk::CommandBuffer, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout, first_set: u32, sets: &[vk::DescriptorSet],
+        &self,
+        command_buffer: vk::CommandBuffer,
+        bind_point: vk::PipelineBindPoint,
+        layout: vk::PipelineLayout,
+        first_set: u32,
+        sets: &[vk::DescriptorSet],
         dynamic_offsets: &[u32],
     ) -> LayerResult<()> {
         if let Some(i) = self.inline.as_ref().filter(|i| bind_point == vk::PipelineBindPoint::COMPUTE && i.restore.active()) {
@@ -2176,7 +2261,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
-    fn cmd_push_constants(&self, command_buffer: vk::CommandBuffer, layout: vk::PipelineLayout, stages: vk::ShaderStageFlags, offset: u32, values: &[u8]) -> LayerResult<()> {
+    fn cmd_push_constants(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        layout: vk::PipelineLayout,
+        stages: vk::ShaderStageFlags,
+        offset: u32,
+        values: &[u8],
+    ) -> LayerResult<()> {
         if let Some(i) = self.inline.as_ref().filter(|i| stages.contains(vk::ShaderStageFlags::COMPUTE) && i.restore.active()) {
             i.restore.with(command_buffer, |s| s.push(layout, stages, offset, values));
         }
@@ -2184,7 +2276,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_push_descriptor_set_khr(
-        &self, command_buffer: vk::CommandBuffer, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, writes: &[vk::WriteDescriptorSet],
+        &self,
+        command_buffer: vk::CommandBuffer,
+        bind_point: vk::PipelineBindPoint,
+        layout: vk::PipelineLayout,
+        set: u32,
+        writes: &[vk::WriteDescriptorSet],
     ) -> LayerResult<()> {
         if let Some(i) = self.inline.as_ref().filter(|i| bind_point == vk::PipelineBindPoint::COMPUTE && i.restore.active()) {
             // SAFETY: the application's writes, valid for this call.
@@ -2194,7 +2291,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_push_descriptor_set_with_template_khr(
-        &self, command_buffer: vk::CommandBuffer, template: vk::DescriptorUpdateTemplate, layout: vk::PipelineLayout, set: u32, data: *const std::ffi::c_void,
+        &self,
+        command_buffer: vk::CommandBuffer,
+        template: vk::DescriptorUpdateTemplate,
+        layout: vk::PipelineLayout,
+        set: u32,
+        data: *const std::ffi::c_void,
     ) -> LayerResult<()> {
         if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
             // SAFETY: the application's data, valid for this call and of the template's size.
@@ -2204,11 +2306,17 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_set_descriptor_buffer_offsets_ext(
-        &self, command_buffer: vk::CommandBuffer, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout, first_set: u32, buffer_indices: &[u32],
+        &self,
+        command_buffer: vk::CommandBuffer,
+        bind_point: vk::PipelineBindPoint,
+        layout: vk::PipelineLayout,
+        first_set: u32,
+        buffer_indices: &[u32],
         offsets: &[vk::DeviceSize],
     ) -> LayerResult<()> {
         if let Some(i) = self.inline.as_ref().filter(|i| bind_point == vk::PipelineBindPoint::COMPUTE && i.restore.active()) {
-            let binding = crate::preupscale::restore::Binding::Offsets { layout, first: first_set, indices: buffer_indices.to_vec(), offsets: offsets.to_vec() };
+            let binding =
+                crate::preupscale::restore::Binding::Offsets { layout, first: first_set, indices: buffer_indices.to_vec(), offsets: offsets.to_vec() };
             i.restore.with(command_buffer, |s| s.bind(binding));
         }
         LayerResult::Unhandled
@@ -2223,7 +2331,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_bind_descriptor_buffer_embedded_samplers_ext(
-        &self, command_buffer: vk::CommandBuffer, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32,
+        &self,
+        command_buffer: vk::CommandBuffer,
+        bind_point: vk::PipelineBindPoint,
+        layout: vk::PipelineLayout,
+        set: u32,
     ) -> LayerResult<()> {
         if let Some(i) = self.inline.as_ref().filter(|i| bind_point == vk::PipelineBindPoint::COMPUTE && i.restore.active()) {
             i.restore.with(command_buffer, |s| s.bind(crate::preupscale::restore::Binding::Embedded { layout, set }));
@@ -2233,7 +2345,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
 
     /// Created here (through the next layer) to learn a push-descriptor template's data size.
     fn create_descriptor_update_template(
-        &self, create_info: &vk::DescriptorUpdateTemplateCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
+        &self,
+        create_info: &vk::DescriptorUpdateTemplateCreateInfo,
+        allocator: Option<&vk::AllocationCallbacks>,
     ) -> LayerResult<ash::prelude::VkResult<vk::DescriptorUpdateTemplate>> {
         let Some(i) = &self.inline else { return LayerResult::Unhandled };
         // SAFETY: the application's own create info and allocator, forwarded unchanged to the next layer.
@@ -2265,15 +2379,18 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
-    fn queue_submit(
-        &self, queue: vk::Queue, submits: &[vk::SubmitInfo], fence: vk::Fence,
-    ) -> LayerResult<ash::prelude::VkResult<()>> {
+    fn queue_submit(&self, queue: vk::Queue, submits: &[vk::SubmitInfo], fence: vk::Fence) -> LayerResult<ash::prelude::VkResult<()>> {
         if crate::probe_ngx::enabled() {
-            crate::probe_ngx::on_submit(queue, submits.iter().flat_map(|submit| {
-                if submit.command_buffer_count == 0 || submit.p_command_buffers.is_null() { return [].iter().copied(); }
-                // SAFETY: as below.
-                unsafe { std::slice::from_raw_parts(submit.p_command_buffers, submit.command_buffer_count as usize) }.iter().copied()
-            }));
+            crate::probe_ngx::on_submit(
+                queue,
+                submits.iter().flat_map(|submit| {
+                    if submit.command_buffer_count == 0 || submit.p_command_buffers.is_null() {
+                        return [].iter().copied();
+                    }
+                    // SAFETY: as below.
+                    unsafe { std::slice::from_raw_parts(submit.p_command_buffers, submit.command_buffer_count as usize) }.iter().copied()
+                }),
+            );
         }
         // SAFETY: `p_command_buffers` is valid for `command_buffer_count` elements for the
         // duration of the application's own `vkQueueSubmit` call.
@@ -2310,15 +2427,18 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Handled(result.result())
     }
 
-    fn queue_submit2(
-        &self, queue: vk::Queue, submits: &[vk::SubmitInfo2], fence: vk::Fence,
-    ) -> LayerResult<ash::prelude::VkResult<()>> {
+    fn queue_submit2(&self, queue: vk::Queue, submits: &[vk::SubmitInfo2], fence: vk::Fence) -> LayerResult<ash::prelude::VkResult<()>> {
         if crate::probe_ngx::enabled() {
-            crate::probe_ngx::on_submit(queue, submits.iter().flat_map(|submit| {
-                if submit.command_buffer_info_count == 0 || submit.p_command_buffer_infos.is_null() { return [].iter().map(cb_of); }
-                // SAFETY: as below.
-                unsafe { std::slice::from_raw_parts(submit.p_command_buffer_infos, submit.command_buffer_info_count as usize) }.iter().map(cb_of)
-            }));
+            crate::probe_ngx::on_submit(
+                queue,
+                submits.iter().flat_map(|submit| {
+                    if submit.command_buffer_info_count == 0 || submit.p_command_buffer_infos.is_null() {
+                        return [].iter().map(cb_of);
+                    }
+                    // SAFETY: as below.
+                    unsafe { std::slice::from_raw_parts(submit.p_command_buffer_infos, submit.command_buffer_info_count as usize) }.iter().map(cb_of)
+                }),
+            );
         }
         // SAFETY: `p_command_buffer_infos` is valid for `command_buffer_info_count` elements for
         // the duration of the application's own `vkQueueSubmit2` call.
@@ -2366,11 +2486,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Handled(result.result())
     }
 
-    fn destroy_swapchain_khr(
-        &self,
-        swapchain: vk::SwapchainKHR,
-        allocator: Option<&vk::AllocationCallbacks>,
-    ) -> LayerResult<()> {
+    fn destroy_swapchain_khr(&self, swapchain: vk::SwapchainKHR, allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
         let Some(next_destroy) = self.next_destroy_swapchain_khr else {
             return LayerResult::Unhandled;
         };
@@ -2403,7 +2519,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     }
                     self.note_tap_sources(&tracker);
                 }
-                if let Some(gpu) = &mut state.gpu_compose { gpu.retire_present_images(&old.images); }
+                if let Some(gpu) = &mut state.gpu_compose {
+                    gpu.retire_present_images(&old.images);
+                }
                 state.relay_semaphores.retire(&old.images);
                 let (freed, left) = state.reclaim_present_semaphores(&self.device);
                 if freed + left > 0 {
@@ -2436,7 +2554,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     /// An image `create_image` adds `TRANSFER_SRC` to is queried with it too (placed resources are
     /// sized by these numbers before the image exists).
     fn get_device_image_memory_requirements(
-        &self, info: &vk::DeviceImageMemoryRequirements, requirements: &mut std::mem::MaybeUninit<vk::MemoryRequirements2>,
+        &self,
+        info: &vk::DeviceImageMemoryRequirements,
+        requirements: &mut std::mem::MaybeUninit<vk::MemoryRequirements2>,
     ) -> LayerResult<()> {
         let Some(next) = self.next_image_requirements.filter(|_| self.preupscale.is_some()) else { return LayerResult::Unhandled };
         // SAFETY: the application's query: a valid create info.
@@ -2448,7 +2568,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn get_device_image_sparse_memory_requirements(
-        &self, info: &vk::DeviceImageMemoryRequirements, count: &mut std::mem::MaybeUninit<u32>,
+        &self,
+        info: &vk::DeviceImageMemoryRequirements,
+        count: &mut std::mem::MaybeUninit<u32>,
         requirements: Option<&mut [std::mem::MaybeUninit<vk::SparseImageMemoryRequirements2>]>,
     ) -> LayerResult<()> {
         let Some(next) = self.next_image_sparse_requirements.filter(|_| self.preupscale.is_some()) else { return LayerResult::Unhandled };
@@ -2461,9 +2583,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Handled(())
     }
 
-    fn create_image(
-        &self, create_info: &vk::ImageCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
-    ) -> LayerResult<ash::prelude::VkResult<vk::Image>> {
+    fn create_image(&self, create_info: &vk::ImageCreateInfo, allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<ash::prelude::VkResult<vk::Image>> {
         let Some(next) = self.next_create_image else { return LayerResult::Unhandled };
         let mut image = vk::Image::null();
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
@@ -2520,7 +2640,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     // forwards the application's call unchanged and returns the next layer's own result.
 
     fn create_image_view(
-        &self, create_info: &vk::ImageViewCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
+        &self,
+        create_info: &vk::ImageViewCreateInfo,
+        allocator: Option<&vk::AllocationCallbacks>,
     ) -> LayerResult<ash::prelude::VkResult<vk::ImageView>> {
         let Some(next) = self.probe_next.as_ref().and_then(|n| n.create_image_view) else { return LayerResult::Unhandled };
         let mut view = vk::ImageView::null();
@@ -2564,7 +2686,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn get_image_view_address_nvx(
-        &self, view: vk::ImageView, properties: &mut std::mem::MaybeUninit<vk::ImageViewAddressPropertiesNVX>,
+        &self,
+        view: vk::ImageView,
+        properties: &mut std::mem::MaybeUninit<vk::ImageViewAddressPropertiesNVX>,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         let Some(next) = self.probe_next.as_ref().and_then(|n| n.get_image_view_address_nvx) else { return LayerResult::Unhandled };
         // SAFETY: the next layer's own `vkGetImageViewAddressNVX`, writing into the
@@ -2590,7 +2714,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn create_cu_module_nvx(
-        &self, create_info: &vk::CuModuleCreateInfoNVX, allocator: Option<&vk::AllocationCallbacks>,
+        &self,
+        create_info: &vk::CuModuleCreateInfoNVX,
+        allocator: Option<&vk::AllocationCallbacks>,
     ) -> LayerResult<ash::prelude::VkResult<vk::CuModuleNVX>> {
         let Some(next) = self.probe_next.as_ref().and_then(|n| n.create_cu_module_nvx) else { return LayerResult::Unhandled };
         let mut module = vk::CuModuleNVX::null();
@@ -2604,7 +2730,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn create_cu_function_nvx(
-        &self, create_info: &vk::CuFunctionCreateInfoNVX, allocator: Option<&vk::AllocationCallbacks>,
+        &self,
+        create_info: &vk::CuFunctionCreateInfoNVX,
+        allocator: Option<&vk::AllocationCallbacks>,
     ) -> LayerResult<ash::prelude::VkResult<vk::CuFunctionNVX>> {
         let Some(next) = self.probe_next.as_ref().and_then(|n| n.create_cu_function_nvx) else { return LayerResult::Unhandled };
         let mut function = vk::CuFunctionNVX::null();
@@ -2701,7 +2829,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn create_framebuffer(
-        &self, create_info: &vk::FramebufferCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
+        &self,
+        create_info: &vk::FramebufferCreateInfo,
+        allocator: Option<&vk::AllocationCallbacks>,
     ) -> LayerResult<ash::prelude::VkResult<vk::Framebuffer>> {
         let Some(next) = self.probe_next.as_ref().and_then(|n| n.create_framebuffer) else { return LayerResult::Unhandled };
         let mut framebuffer = vk::Framebuffer::null();
@@ -2748,14 +2878,28 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_draw_indirect_count(
-        &self, command_buffer: vk::CommandBuffer, _: vk::Buffer, _: vk::DeviceSize, _: vk::Buffer, _: vk::DeviceSize, _: u32, _: u32,
+        &self,
+        command_buffer: vk::CommandBuffer,
+        _: vk::Buffer,
+        _: vk::DeviceSize,
+        _: vk::Buffer,
+        _: vk::DeviceSize,
+        _: u32,
+        _: u32,
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_draw(command_buffer);
         LayerResult::Unhandled
     }
 
     fn cmd_draw_indexed_indirect_count(
-        &self, command_buffer: vk::CommandBuffer, _: vk::Buffer, _: vk::DeviceSize, _: vk::Buffer, _: vk::DeviceSize, _: u32, _: u32,
+        &self,
+        command_buffer: vk::CommandBuffer,
+        _: vk::Buffer,
+        _: vk::DeviceSize,
+        _: vk::Buffer,
+        _: vk::DeviceSize,
+        _: u32,
+        _: u32,
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_draw(command_buffer);
         LayerResult::Unhandled
@@ -2767,7 +2911,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_draw_multi_indexed_ext(
-        &self, command_buffer: vk::CommandBuffer, _: &[vk::MultiDrawIndexedInfoEXT], _: u32, _: u32, _: u32, _: Option<&i32>,
+        &self,
+        command_buffer: vk::CommandBuffer,
+        _: &[vk::MultiDrawIndexedInfoEXT],
+        _: u32,
+        _: u32,
+        _: u32,
+        _: Option<&i32>,
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_draw(command_buffer);
         LayerResult::Unhandled
@@ -2784,7 +2934,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_draw_mesh_tasks_indirect_count_ext(
-        &self, command_buffer: vk::CommandBuffer, _: vk::Buffer, _: vk::DeviceSize, _: vk::Buffer, _: vk::DeviceSize, _: u32, _: u32,
+        &self,
+        command_buffer: vk::CommandBuffer,
+        _: vk::Buffer,
+        _: vk::DeviceSize,
+        _: vk::Buffer,
+        _: vk::DeviceSize,
+        _: u32,
+        _: u32,
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_draw(command_buffer);
         LayerResult::Unhandled
@@ -2811,17 +2968,32 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_copy_image2(&self, command_buffer: vk::CommandBuffer, info: &vk::CopyImageInfo2) -> LayerResult<()> {
-        crate::probe_ngx::on_cmd_transfer(command_buffer, "copy2", Some((info.src_image, info.src_image_layout)), Some((info.dst_image, info.dst_image_layout)));
+        crate::probe_ngx::on_cmd_transfer(
+            command_buffer,
+            "copy2",
+            Some((info.src_image, info.src_image_layout)),
+            Some((info.dst_image, info.dst_image_layout)),
+        );
         LayerResult::Unhandled
     }
 
     fn cmd_blit_image2(&self, command_buffer: vk::CommandBuffer, info: &vk::BlitImageInfo2) -> LayerResult<()> {
-        crate::probe_ngx::on_cmd_transfer(command_buffer, "blit2", Some((info.src_image, info.src_image_layout)), Some((info.dst_image, info.dst_image_layout)));
+        crate::probe_ngx::on_cmd_transfer(
+            command_buffer,
+            "blit2",
+            Some((info.src_image, info.src_image_layout)),
+            Some((info.dst_image, info.dst_image_layout)),
+        );
         LayerResult::Unhandled
     }
 
     fn cmd_copy_buffer_to_image(
-        &self, command_buffer: vk::CommandBuffer, _: vk::Buffer, dst: vk::Image, dst_layout: vk::ImageLayout, _: &[vk::BufferImageCopy],
+        &self,
+        command_buffer: vk::CommandBuffer,
+        _: vk::Buffer,
+        dst: vk::Image,
+        dst_layout: vk::ImageLayout,
+        _: &[vk::BufferImageCopy],
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_transfer(command_buffer, "copy-buffer-to-image", None, Some((dst, dst_layout)));
         LayerResult::Unhandled
@@ -2833,14 +3005,24 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_clear_color_image(
-        &self, command_buffer: vk::CommandBuffer, image: vk::Image, layout: vk::ImageLayout, _: &vk::ClearColorValue, _: &[vk::ImageSubresourceRange],
+        &self,
+        command_buffer: vk::CommandBuffer,
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        _: &vk::ClearColorValue,
+        _: &[vk::ImageSubresourceRange],
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_transfer(command_buffer, "clear-color", None, Some((image, layout)));
         LayerResult::Unhandled
     }
 
     fn cmd_clear_depth_stencil_image(
-        &self, command_buffer: vk::CommandBuffer, image: vk::Image, layout: vk::ImageLayout, _: &vk::ClearDepthStencilValue, _: &[vk::ImageSubresourceRange],
+        &self,
+        command_buffer: vk::CommandBuffer,
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        _: &vk::ClearDepthStencilValue,
+        _: &[vk::ImageSubresourceRange],
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_transfer(command_buffer, "clear-depth", None, Some((image, layout)));
         LayerResult::Unhandled
@@ -2852,14 +3034,25 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_resolve_image(
-        &self, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout, dst: vk::Image, dst_layout: vk::ImageLayout, _: &[vk::ImageResolve],
+        &self,
+        command_buffer: vk::CommandBuffer,
+        src: vk::Image,
+        src_layout: vk::ImageLayout,
+        dst: vk::Image,
+        dst_layout: vk::ImageLayout,
+        _: &[vk::ImageResolve],
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_transfer(command_buffer, "resolve", Some((src, src_layout)), Some((dst, dst_layout)));
         LayerResult::Unhandled
     }
 
     fn cmd_resolve_image2(&self, command_buffer: vk::CommandBuffer, info: &vk::ResolveImageInfo2) -> LayerResult<()> {
-        crate::probe_ngx::on_cmd_transfer(command_buffer, "resolve2", Some((info.src_image, info.src_image_layout)), Some((info.dst_image, info.dst_image_layout)));
+        crate::probe_ngx::on_cmd_transfer(
+            command_buffer,
+            "resolve2",
+            Some((info.src_image, info.src_image_layout)),
+            Some((info.dst_image, info.dst_image_layout)),
+        );
         LayerResult::Unhandled
     }
 
@@ -2892,8 +3085,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_wait_events(
-        &self, command_buffer: vk::CommandBuffer, _: &[vk::Event], src_stage: vk::PipelineStageFlags, dst_stage: vk::PipelineStageFlags,
-        _: &[vk::MemoryBarrier], _: &[vk::BufferMemoryBarrier], images: &[vk::ImageMemoryBarrier],
+        &self,
+        command_buffer: vk::CommandBuffer,
+        _: &[vk::Event],
+        src_stage: vk::PipelineStageFlags,
+        dst_stage: vk::PipelineStageFlags,
+        _: &[vk::MemoryBarrier],
+        _: &[vk::BufferMemoryBarrier],
+        images: &[vk::ImageMemoryBarrier],
     ) -> LayerResult<()> {
         if let Some(t) = self.preupscale.as_ref().filter(|t| t.watching()) {
             t.barriers(
@@ -2965,11 +3164,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
-    fn queue_present_khr(
-        &self,
-        queue: vk::Queue,
-        present_info: &vk::PresentInfoKHR,
-    ) -> LayerResult<ash::prelude::VkResult<()>> {
+    fn queue_present_khr(&self, queue: vk::Queue, present_info: &vk::PresentInfoKHR) -> LayerResult<ash::prelude::VkResult<()>> {
         crate::probe_ngx::on_present(queue);
         let Some(next_present) = self.next_queue_present_khr else {
             return LayerResult::Unhandled;
@@ -2996,8 +3191,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // The channel's lease follows presenting (`ownership`): an atomic store.
             crate::ownership::note_present();
         }
-        if crate::layer_enabled() && self.nvidia && !crate::device_lost(self.device.handle())
-            && present_info.swapchain_count > 0 && !present_info.p_swapchains.is_null() && !present_info.p_image_indices.is_null()
+        if crate::layer_enabled()
+            && self.nvidia
+            && !crate::device_lost(self.device.handle())
+            && present_info.swapchain_count > 0
+            && !present_info.p_swapchains.is_null()
+            && !present_info.p_image_indices.is_null()
         {
             // SAFETY: `p_swapchains`/`p_image_indices`/`swapchain_count` are a valid,
             // parallel pair of slices for the duration of this call -- part of the
@@ -3089,7 +3288,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // without TRANSFER_SRC would be undefined behaviour on the GPU.
                     continue;
                 }
-                if !sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && state.shm.capture_requested() && would_be_primary(self.device.handle(), sc, sw.width, sw.height) {
+                if !sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+                    && state.shm.capture_requested()
+                    && would_be_primary(self.device.handle(), sc, sw.width, sw.height)
+                {
                     // A swapchain the layer could not admit cannot be read back: a capture of it is
                     // refused (said), never left waiting for a frame that cannot come.
                     crate::series::refuse_waiting(&state.shm, dump_owns_one_shot(), neural_forge_protocol::capture::reason::UNREADABLE);
@@ -3101,8 +3303,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // often lacks it; writing anyway is undefined behaviour on the GPU.
                     static SAID_USAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !SAID_USAGE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        crate::log!("[layer] present skipped: swapchain is pass_through and was not created with TRANSFER_DST usage ({:?}) \
-                                     -- the layer cannot legally write into it", sw.image_usage);
+                        crate::log!(
+                            "[layer] present skipped: swapchain is pass_through and was not created with TRANSFER_DST usage ({:?}) \
+                                     -- the layer cannot legally write into it",
+                            sw.image_usage
+                        );
                         crate::logging::flush();
                     }
                     continue;
@@ -3193,7 +3398,27 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     Some(source) if sw.pass_through => source,
                     _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),
                 };
-                let State { shm, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, last_answer_encoded, relay_semaphores, engaged_swapchains, series, .. } = &mut *state;
+                let State {
+                    shm,
+                    capture_pipeline,
+                    direct_capture,
+                    external_memory_host,
+                    gpu_compose,
+                    original_scratch,
+                    model_scratch,
+                    inflight,
+                    bootstrap_complete,
+                    answer_scratch,
+                    raw_answer_base,
+                    raw_answer_generation,
+                    last_answer,
+                    last_answer_dims,
+                    last_answer_encoded,
+                    relay_semaphores,
+                    engaged_swapchains,
+                    series,
+                    ..
+                } = &mut *state;
                 // The hold's state, for the hand-back, its captures and the model server: let go
                 // before the post path's synchronous wait below. Busy, a hold runs on another thread
                 // right now (DLSS runs, the model is applied before the upscaler): this present goes
@@ -3239,8 +3464,20 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             // duration; nothing of the layer's was submitted for it yet.
                             unsafe {
                                 capture_untouched(
-                                    &self.device, instance, self.physical_device, queue, queue_family, image, (width, height, bgr_order), readable,
-                                    series, relay_semaphores, present_info, &mut relay_semaphore, &mut series_wait, neural_forge_protocol::capture::reason::BEFORE_UPSCALER,
+                                    &self.device,
+                                    instance,
+                                    self.physical_device,
+                                    queue,
+                                    queue_family,
+                                    image,
+                                    (width, height, bgr_order),
+                                    readable,
+                                    series,
+                                    relay_semaphores,
+                                    present_info,
+                                    &mut relay_semaphore,
+                                    &mut series_wait,
+                                    neural_forge_protocol::capture::reason::BEFORE_UPSCALER,
                                 );
                             }
                         }
@@ -3272,8 +3509,20 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         // SAFETY: as for the held path above.
                         unsafe {
                             capture_untouched(
-                                &self.device, instance, self.physical_device, queue, queue_family, image, (width, height, bgr_order), readable,
-                                series, relay_semaphores, present_info, &mut relay_semaphore, &mut series_wait, neural_forge_protocol::capture::reason::MODEL_UNAVAILABLE,
+                                &self.device,
+                                instance,
+                                self.physical_device,
+                                queue,
+                                queue_family,
+                                image,
+                                (width, height, bgr_order),
+                                readable,
+                                series,
+                                relay_semaphores,
+                                present_info,
+                                &mut relay_semaphore,
+                                &mut series_wait,
+                                neural_forge_protocol::capture::reason::MODEL_UNAVAILABLE,
                             );
                         }
                     }
@@ -3334,8 +3583,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         None => {
                             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                crate::log!("[layer] present skipped: could not relay the application's present wait semaphores, \
-                                             so no layer work can safely read the swapchain image");
+                                crate::log!(
+                                    "[layer] present skipped: could not relay the application's present wait semaphores, \
+                                             so no layer work can safely read the swapchain image"
+                                );
                                 crate::logging::flush();
                             }
                             break;
@@ -3441,9 +3692,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // SAFETY: `p_wait_semaphores` is a valid slice of `wait_semaphore_count`
                     // elements per `present_info`'s own contract, valid for this call's
                     // duration.
-                    combined.extend_from_slice(unsafe {
-                        std::slice::from_raw_parts(present_info.p_wait_semaphores, present_info.wait_semaphore_count as usize)
-                    });
+                    combined
+                        .extend_from_slice(unsafe { std::slice::from_raw_parts(present_info.p_wait_semaphores, present_info.wait_semaphore_count as usize) });
                 }
                 None => {}
             }
@@ -3785,8 +4035,12 @@ mod submit_order_tests {
     }
     use ash::vk::Handle;
 
-    fn image(raw: u64) -> vk::Image { vk::Image::from_raw(raw) }
-    fn cb(raw: u64) -> vk::CommandBuffer { vk::CommandBuffer::from_raw(raw) }
+    fn image(raw: u64) -> vk::Image {
+        vk::Image::from_raw(raw)
+    }
+    fn cb(raw: u64) -> vk::CommandBuffer {
+        vk::CommandBuffer::from_raw(raw)
+    }
 
     fn tracker_with_swapchain() -> TapTracker {
         let mut t = TapTracker::default();
@@ -3887,7 +4141,13 @@ mod submit_order_tests {
         assert!(t.tapped_source_layouts.is_empty());
     }
 
-    fn color_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, width: u32, height: u32, format: vk::Format) -> (vk::Image, vk::DeviceMemory, vk::ImageCreateInfo<'static>) {
+    fn color_image(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> (vk::Image, vk::DeviceMemory, vk::ImageCreateInfo<'static>) {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -3902,9 +4162,12 @@ mod submit_order_tests {
         let image = unsafe { device.create_image(&info, None) }.unwrap();
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let type_index = (0..mem_props.memory_type_count)
-            .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+            .find(|&i| {
+                reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })
             .unwrap();
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let memory =
+            unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
         (image, memory, info)
     }
@@ -3918,7 +4181,13 @@ mod submit_order_tests {
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image)
-            .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
     }
 
     /// The render tap on a real (lavapipe) device, recorded through the same tracker calls the
@@ -3948,7 +4217,12 @@ mod submit_order_tests {
         }
 
         let pool = unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None) }.unwrap();
-        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+        let cmd = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+            )
+        }
+        .unwrap()[0];
         let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
         let whole = |x: u32, y: u32| [vk::Offset3D::default(), vk::Offset3D { x: x as i32, y: y as i32, z: 1 }];
         // Records `write` (the game's command) into a fresh command buffer, submits it, and tells
@@ -3959,22 +4233,50 @@ mod submit_order_tests {
                 device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty()).unwrap();
                 device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
                 t.begin_recording(cmd);
-                let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[
-                    layout_barrier(source, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
-                    layout_barrier(swap, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
-                ]);
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[
+                        layout_barrier(source, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                        layout_barrier(swap, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                    ],
+                );
                 device.cmd_clear_color_image(cmd, source, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: fill }, &[range]);
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[
-                    layout_barrier(source, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
-                ]);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[layout_barrier(source, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)],
+                );
                 let shape = write(cmd);
                 t.observe_write(cmd, source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, swap);
                 t.note_write_shape(swap, shape);
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[
-                    layout_barrier(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::GENERAL),
-                    layout_barrier(swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR),
-                ]);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[
+                        layout_barrier(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::GENERAL),
+                        layout_barrier(swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR),
+                    ],
+                );
                 t.record_barrier(cmd, source, vk::ImageLayout::GENERAL);
                 device.end_command_buffer(cmd).unwrap();
                 device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], vk::Fence::null()).unwrap();
@@ -3987,7 +4289,9 @@ mod submit_order_tests {
         // A render target at half size, blitted (scaled) up into the swapchain.
         game_frame(&mut t, small, &|cmd| {
             let blit = [vk::ImageBlit { src_subresource: layers, src_offsets: whole(w / 2, h / 2), dst_subresource: layers, dst_offsets: whole(w, h) }];
-            unsafe { device.cmd_blit_image(cmd, small, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &blit, vk::Filter::LINEAR) };
+            unsafe {
+                device.cmd_blit_image(cmd, small, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &blit, vk::Filter::LINEAR)
+            };
             TapWrite::from_blit(&blit)
         });
         assert!(t.tap_matches(swap, w, h, swapchain_format).is_err(), "a scaled-up source must not be tapped");
@@ -3995,14 +4299,22 @@ mod submit_order_tests {
         // A full-size render target in another channel order, blitted 1:1 (the blit converts).
         game_frame(&mut t, rgba, &|cmd| {
             let blit = [vk::ImageBlit { src_subresource: layers, src_offsets: whole(w, h), dst_subresource: layers, dst_offsets: whole(w, h) }];
-            unsafe { device.cmd_blit_image(cmd, rgba, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &blit, vk::Filter::NEAREST) };
+            unsafe {
+                device.cmd_blit_image(cmd, rgba, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &blit, vk::Filter::NEAREST)
+            };
             TapWrite::from_blit(&blit)
         });
         assert_eq!(t.tap_matches(swap, w, h, swapchain_format), Err("the render source's format differs from the swapchain's"));
 
         // A same-format, full-size target copied 1:1: tapped, and captured as it is.
         game_frame(&mut t, good, &|cmd| {
-            let copy = [vk::ImageCopy { src_subresource: layers, src_offset: vk::Offset3D::default(), dst_subresource: layers, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: w, height: h, depth: 1 } }];
+            let copy = [vk::ImageCopy {
+                src_subresource: layers,
+                src_offset: vk::Offset3D::default(),
+                dst_subresource: layers,
+                dst_offset: vk::Offset3D::default(),
+                extent: vk::Extent3D { width: w, height: h, depth: 1 },
+            }];
             unsafe { device.cmd_copy_image(cmd, good, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &copy) };
             TapWrite::from_copy(&copy)
         });
@@ -4032,12 +4344,22 @@ mod submit_order_tests {
         let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
         let at = |x: i32, y: i32| vk::Offset3D { x, y, z: 0 };
         let end = |x: i32, y: i32| vk::Offset3D { x, y, z: 1 };
-        let blit = |src: [vk::Offset3D; 2], dst: [vk::Offset3D; 2]| TapWrite::from_blit(&[vk::ImageBlit { src_subresource: layers, src_offsets: src, dst_subresource: layers, dst_offsets: dst }]);
+        let blit = |src: [vk::Offset3D; 2], dst: [vk::Offset3D; 2]| {
+            TapWrite::from_blit(&[vk::ImageBlit { src_subresource: layers, src_offsets: src, dst_subresource: layers, dst_offsets: dst }])
+        };
         assert_eq!(blit([at(0, 0), end(64, 32)], [at(0, 0), end(64, 32)]).unscaled_extent, Some((64, 32)));
         assert_eq!(blit([at(0, 0), end(32, 16)], [at(0, 0), end(64, 32)]).unscaled_extent, None, "scaled");
         assert_eq!(blit([at(0, 32), end(64, 0)], [at(0, 0), end(64, 32)]).unscaled_extent, None, "flipped");
         assert_eq!(blit([at(8, 0), end(72, 32)], [at(8, 0), end(72, 32)]).unscaled_extent, None, "offset");
-        let copy = |offset: vk::Offset3D, mip: u32| TapWrite::from_copy(&[vk::ImageCopy { src_subresource: vk::ImageSubresourceLayers { mip_level: mip, ..layers }, src_offset: offset, dst_subresource: layers, dst_offset: offset, extent: vk::Extent3D { width: 64, height: 32, depth: 1 } }]);
+        let copy = |offset: vk::Offset3D, mip: u32| {
+            TapWrite::from_copy(&[vk::ImageCopy {
+                src_subresource: vk::ImageSubresourceLayers { mip_level: mip, ..layers },
+                src_offset: offset,
+                dst_subresource: layers,
+                dst_offset: offset,
+                extent: vk::Extent3D { width: 64, height: 32, depth: 1 },
+            }])
+        };
         assert_eq!(copy(at(0, 0), 0), TapWrite { unscaled_extent: Some((64, 32)), copy: true });
         assert_eq!(copy(at(4, 0), 0).unscaled_extent, None, "offset");
         assert_eq!(copy(at(0, 0), 1).unscaled_extent, None, "another mip level");

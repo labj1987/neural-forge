@@ -25,8 +25,7 @@ fn chain_is_understood(info: &vk::SwapchainCreateInfoKHR) -> bool {
         match base.s_type {
             // Multi-device layouts and exclusive full-screen control change how the
             // images are owned and presented. Not admitted.
-            vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR
-            | vk::StructureType::SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT => return false,
+            vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR | vk::StructureType::SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT => return false,
             _ => {}
         }
         next = base.p_next.cast();
@@ -65,15 +64,16 @@ pub fn candidate(info: &vk::SwapchainCreateInfoKHR) -> bool {
     // listed format supports the enlarged usage. Unknown bits are allowed: this module
     // rewrites only `image_usage`, and the surface-capability and image-format-properties
     // checks below still have to pass for the enlarged usage.
-    let unsupported_flags = vk::SwapchainCreateFlagsKHR::PROTECTED
-        | vk::SwapchainCreateFlagsKHR::SPLIT_INSTANCE_BIND_REGIONS;
+    let unsupported_flags = vk::SwapchainCreateFlagsKHR::PROTECTED | vk::SwapchainCreateFlagsKHR::SPLIT_INSTANCE_BIND_REGIONS;
     let mutable_ok = !info.flags.contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT) || view_formats(info).is_some();
     !info.flags.intersects(unsupported_flags)
         && mutable_ok
         && chain_is_understood(info)
         && info.image_array_layers == 1
-        && matches!(info.present_mode, vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
-            | vk::PresentModeKHR::IMMEDIATE | vk::PresentModeKHR::MAILBOX)
+        && matches!(
+            info.present_mode,
+            vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED | vk::PresentModeKHR::IMMEDIATE | vk::PresentModeKHR::MAILBOX
+        )
 }
 
 pub fn requested_usage(original: vk::ImageUsageFlags, supported: vk::ImageUsageFlags) -> Option<vk::ImageUsageFlags> {
@@ -83,10 +83,15 @@ pub fn requested_usage(original: vk::ImageUsageFlags, supported: vk::ImageUsageF
 
 /// Returns a private copy; the caller's create info and extension chain are never modified.
 /// Unsupported or unqueryable surfaces use the original creation path without capture.
-pub fn prepare<'a>(instance: &ash::Instance, query: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR, physical: vk::PhysicalDevice, info: &vk::SwapchainCreateInfoKHR<'a>)
-    -> Option<vk::SwapchainCreateInfoKHR<'a>>
-{
-    if !candidate(info) { return None; }
+pub fn prepare<'a>(
+    instance: &ash::Instance,
+    query: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
+    physical: vk::PhysicalDevice,
+    info: &vk::SwapchainCreateInfoKHR<'a>,
+) -> Option<vk::SwapchainCreateInfoKHR<'a>> {
+    if !candidate(info) {
+        return None;
+    }
     // SAFETY: query was resolved through the same next-layer instance dispatch
     // chain as physical. Never send that handle through the loader trampoline.
     let mut caps = vk::SurfaceCapabilitiesKHR::default();
@@ -104,14 +109,17 @@ pub fn prepare<'a>(instance: &ash::Instance, query: vk::PFN_vkGetPhysicalDeviceS
     }
     for format in formats {
         // SAFETY: plain query on the same physical device the swapchain is created for.
-        let props = unsafe { instance.get_physical_device_image_format_properties(
-            physical, format, vk::ImageType::TYPE_2D, vk::ImageTiling::OPTIMAL,
-            usage, create_flags,
-        ) }.ok()?;
+        let props = unsafe {
+            instance.get_physical_device_image_format_properties(physical, format, vk::ImageType::TYPE_2D, vk::ImageTiling::OPTIMAL, usage, create_flags)
+        }
+        .ok()?;
         if info.image_extent.width > props.max_extent.width
             || info.image_extent.height > props.max_extent.height
-            || props.max_array_layers < 1 || !props.sample_counts.contains(vk::SampleCountFlags::TYPE_1)
-        { return None; }
+            || props.max_array_layers < 1
+            || !props.sample_counts.contains(vk::SampleCountFlags::TYPE_1)
+        {
+            return None;
+        }
     }
     let mut adjusted = *info;
     adjusted.image_usage = usage;
@@ -158,7 +166,9 @@ mod tests {
         let list = vk::ImageFormatListCreateInfo::default().view_formats(&formats);
         let reflex = vk::BaseInStructure {
             s_type: vk::StructureType::from_raw(1_000_505_007),
-            p_next: std::ptr::from_ref(&list).cast(), _marker: std::marker::PhantomData };
+            p_next: std::ptr::from_ref(&list).cast(),
+            _marker: std::marker::PhantomData,
+        };
         let mut info = vk::SwapchainCreateInfoKHR::default()
             .image_array_layers(1)
             .present_mode(vk::PresentModeKHR::IMMEDIATE)
@@ -191,10 +201,7 @@ mod tests {
     #[test]
     fn structures_that_change_what_the_images_are_still_disqualify_the_chain() {
         let mut info = vk::SwapchainCreateInfoKHR::default().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO);
-        for s_type in [
-            vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR,
-            vk::StructureType::SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT,
-        ] {
+        for s_type in [vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR, vk::StructureType::SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT] {
             let refused = vk::BaseInStructure { s_type, p_next: std::ptr::null(), _marker: std::marker::PhantomData };
             info.p_next = std::ptr::from_ref(&refused).cast();
             assert!(!candidate(&info), "{s_type:?} should not be admitted");
@@ -205,8 +212,13 @@ mod tests {
     fn the_whole_chain_is_walked_not_just_its_first_link() {
         // A refused struct hiding behind an allowed one still has to be found.
         let mut info = vk::SwapchainCreateInfoKHR::default().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO);
-        let deep = vk::BaseInStructure { s_type: vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR, p_next: std::ptr::null(), _marker: std::marker::PhantomData };
-        let shallow = vk::BaseInStructure { s_type: vk::StructureType::from_raw(1_000_505_007), p_next: std::ptr::from_ref(&deep), _marker: std::marker::PhantomData };
+        let deep = vk::BaseInStructure {
+            s_type: vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR,
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        let shallow =
+            vk::BaseInStructure { s_type: vk::StructureType::from_raw(1_000_505_007), p_next: std::ptr::from_ref(&deep), _marker: std::marker::PhantomData };
         info.p_next = std::ptr::from_ref(&shallow).cast();
         assert!(!candidate(&info), "a refused struct deeper in the chain was missed");
     }

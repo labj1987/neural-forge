@@ -172,12 +172,7 @@ fn create_storage_image(
         return None;
     }
     let view_info = vk::ImageViewCreateInfo::default().image(image).view_type(vk::ImageViewType::TYPE_2D).format(FORMAT).subresource_range(
-        vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .base_mip_level(0)
-            .level_count(1)
-            .base_array_layer(0)
-            .layer_count(1),
+        vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).base_mip_level(0).level_count(1).base_array_layer(0).layer_count(1),
     );
     // SAFETY: `image` is bound to memory; `view_info` matches it.
     let view = match unsafe { device.create_image_view(&view_info, None) } {
@@ -199,24 +194,13 @@ fn image_copy_region(width: u32, height: u32, offset: u64) -> vk::BufferImageCop
         .buffer_offset(offset)
         .buffer_row_length(0)
         .buffer_image_height(0)
-        .image_subresource(
-            vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(0)
-                .base_array_layer(0)
-                .layer_count(1),
-        )
+        .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
         .image_offset(vk::Offset3D::default())
         .image_extent(vk::Extent3D { width, height, depth: 1 })
 }
 
 fn full_subresource() -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .base_mip_level(0)
-        .level_count(1)
-        .base_array_layer(0)
-        .layer_count(1)
+    vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).base_mip_level(0).level_count(1).base_array_layer(0).layer_count(1)
 }
 
 fn image_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier<'static> {
@@ -253,7 +237,10 @@ struct DeviceBuffer {
 
 impl DeviceBuffer {
     fn new(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, bytes: u64) -> Option<Self> {
-        let info = vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let info = vk::BufferCreateInfo::default()
+            .size(bytes)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: `info` is valid.
         let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
         // SAFETY: `buffer` was just created, not yet bound to memory.
@@ -441,7 +428,6 @@ fn wait_armed(device: &ash::Device, fences: &[Option<vk::Fence>], site: &'static
 }
 
 impl ComposeSlot {
-
     /// (Re)builds this slot's own images/staging buffer if `width`/`height` changed
     /// (or this is the first use). Never touches any *other* slot's resources.
     fn ensure_sized(&mut self, device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, width: u32, height: u32) -> bool {
@@ -620,7 +606,10 @@ impl ComposeSlot {
                 return None;
             };
             if unsafe { device.bind_buffer_memory(current_buffer, current_memory, 0) }.is_err() {
-                unsafe { device.free_memory(current_memory, None); device.destroy_buffer(current_buffer, None) };
+                unsafe {
+                    device.free_memory(current_memory, None);
+                    device.destroy_buffer(current_buffer, None)
+                };
                 return None;
             }
             Some((current_buffer, current_memory))
@@ -656,7 +645,22 @@ impl ComposeSlot {
         // least as long as `self.sized` holds its owning `Image`.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-        self.sized = Some(Sized_ { width, height, original, model_answer, proxy, output, staging_buffer, staging_memory, staging_ptr: staging_ptr.cast(), staging_capacity, cached_buffer, cached_memory, current_buffer, current_memory });
+        self.sized = Some(Sized_ {
+            width,
+            height,
+            original,
+            model_answer,
+            proxy,
+            output,
+            staging_buffer,
+            staging_memory,
+            staging_ptr: staging_ptr.cast(),
+            staging_capacity,
+            cached_buffer,
+            cached_memory,
+            current_buffer,
+            current_memory,
+        });
         true
     }
 
@@ -741,7 +745,26 @@ impl ComposeSlot {
     /// `Some([(capture_target, gen_base), (imported_answer, gen_answer)])`, first copies the
     /// new zero-copy pair into `gen_*` (`frame_bytes` each).
     #[allow(clippy::too_many_arguments)]
-    unsafe fn record_temporal_delta_into_image(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, answer_width: u32, answer_height: u32, frame_bytes: u64, update_cache: bool, small_proxy: bool, held: bool, bgr_order: bool, target_image: vk::Image, compose: ComposeParams, update_src: (vk::Buffer, u64, vk::Buffer, u64), fresh_copy: Option<[(vk::Buffer, vk::Buffer); 2]>, timer: Option<&crate::gpu_timer::GpuTimer>) {
+    unsafe fn record_temporal_delta_into_image(
+        &self,
+        device: &ash::Device,
+        pipeline: vk::Pipeline,
+        pipeline_layout: vk::PipelineLayout,
+        width: u32,
+        height: u32,
+        answer_width: u32,
+        answer_height: u32,
+        frame_bytes: u64,
+        update_cache: bool,
+        small_proxy: bool,
+        held: bool,
+        bgr_order: bool,
+        target_image: vk::Image,
+        compose: ComposeParams,
+        update_src: (vk::Buffer, u64, vk::Buffer, u64),
+        fresh_copy: Option<[(vk::Buffer, vk::Buffer); 2]>,
+        timer: Option<&crate::gpu_timer::GpuTimer>,
+    ) {
         let s = self.sized.as_ref().expect("caller already ensured this");
         let cached_before = self.cached_generation != 0;
         let scaled_answer = answer_width != width || answer_height != height;
@@ -749,8 +772,22 @@ impl ComposeSlot {
         unsafe {
             // Its `ALL_COMMANDS` first scope is also what orders the fresh copy below after every
             // earlier read of `gen_*` on this queue (the other slot's carried compose).
-            let target_to_src = image_barrier(target_image, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ);
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[target_to_src]);
+            let target_to_src = image_barrier(
+                target_image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_READ,
+            );
+            device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[target_to_src],
+            );
             // The timed span starts here, after the barrier that waits for the queue's earlier
             // work (see `crate::gpu_timer`); the caller records the end. SAFETY: `self.cmd` is
             // recording outside a render pass, and the caller waited this slot's fence, so the
@@ -758,9 +795,30 @@ impl ComposeSlot {
             if let Some(timer) = timer {
                 timer.record_start(device, self.cmd);
             }
-            device.cmd_copy_image_to_buffer(self.cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.current_buffer, &[image_copy_region(width, height, 0)]);
-            let current_ready = vk::BufferMemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(s.current_buffer).offset(0).size(frame_bytes);
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[current_ready], &[]);
+            device.cmd_copy_image_to_buffer(
+                self.cmd,
+                target_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                s.current_buffer,
+                &[image_copy_region(width, height, 0)],
+            );
+            let current_ready = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(s.current_buffer)
+                .offset(0)
+                .size(frame_bytes);
+            device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[current_ready],
+                &[],
+            );
 
             if let Some(copies) = fresh_copy {
                 // The capture's own closing barrier made the capture target's write visible to
@@ -772,37 +830,118 @@ impl ComposeSlot {
                     device.cmd_copy_buffer(self.cmd, src, dst, &[copy]);
                 }
                 let ready = copies.map(|(_, dst)| {
-                    vk::BufferMemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(dst).offset(0).size(frame_bytes)
+                    vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(dst)
+                        .offset(0)
+                        .size(frame_bytes)
                 });
-                device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &ready, &[]);
+                device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &ready,
+                    &[],
+                );
             }
 
             if update_cache {
                 let old = if cached_before { vk::ImageLayout::GENERAL } else { vk::ImageLayout::UNDEFINED };
                 let to_dst = [
                     image_barrier(s.proxy.image, old, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE),
-                    image_barrier(s.model_answer.image, old, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE),
+                    image_barrier(
+                        s.model_answer.image,
+                        old,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::SHADER_READ,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    ),
                 ];
-                device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_dst);
+                device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_dst,
+                );
                 if small_proxy {
                     // The proxy the model was shown, at its own (smaller) size, is at the start of
                     // the staging buffer in place of the full frame: blit it up into `proxy` with
                     // the same filter the answer gets below, so `answer - proxy` is the model's
                     // edit and not the enlargement's blur.
                     let (sp, _, _) = self.small_proxy.as_ref().expect("caller already ensured this");
-                    let sp_to_dst = image_barrier(sp.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
-                    device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[sp_to_dst]);
-                    device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, sp.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(answer_width, answer_height, 0)]);
-                    let sp_to_src = image_barrier(sp.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ);
-                    device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[sp_to_src]);
+                    let sp_to_dst = image_barrier(
+                        sp.image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    );
+                    device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[sp_to_dst],
+                    );
+                    device.cmd_copy_buffer_to_image(
+                        self.cmd,
+                        s.staging_buffer,
+                        sp.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[image_copy_region(answer_width, answer_height, 0)],
+                    );
+                    let sp_to_src = image_barrier(
+                        sp.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
+                    );
+                    device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[sp_to_src],
+                    );
                     let blit = vk::ImageBlit::default()
-                        .src_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
+                        .src_subresource(
+                            vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1),
+                        )
                         .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: answer_width as i32, y: answer_height as i32, z: 1 }])
-                        .dst_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
+                        .dst_subresource(
+                            vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1),
+                        )
                         .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }]);
-                    device.cmd_blit_image(self.cmd, sp.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
+                    device.cmd_blit_image(
+                        self.cmd,
+                        sp.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        s.proxy.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[blit],
+                        vk::Filter::LINEAR,
+                    );
                 } else {
-                    device.cmd_copy_buffer_to_image(self.cmd, base_src, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, base_offset)]);
+                    device.cmd_copy_buffer_to_image(
+                        self.cmd,
+                        base_src,
+                        s.proxy.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[image_copy_region(width, height, base_offset)],
+                    );
                 }
                 if scaled_answer {
                     // `self.small_answer` was already ensured sized to
@@ -810,44 +949,150 @@ impl ComposeSlot {
                     // before this call -- required precondition, matching every other
                     // `self.sized.as_ref().expect(...)` in this file.
                     let (small, _, _) = self.small_answer.as_ref().expect("caller already ensured this");
-                    let small_to_dst = image_barrier(small.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
-                    device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[small_to_dst]);
-                    device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, small.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(answer_width, answer_height, frame_bytes)]);
-                    let small_to_src = image_barrier(small.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ);
-                    device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[small_to_src]);
+                    let small_to_dst = image_barrier(
+                        small.image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    );
+                    device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[small_to_dst],
+                    );
+                    device.cmd_copy_buffer_to_image(
+                        self.cmd,
+                        s.staging_buffer,
+                        small.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[image_copy_region(answer_width, answer_height, frame_bytes)],
+                    );
+                    let small_to_src = image_barrier(
+                        small.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
+                    );
+                    device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[small_to_src],
+                    );
                     let blit = vk::ImageBlit::default()
-                        .src_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
+                        .src_subresource(
+                            vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1),
+                        )
                         .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: answer_width as i32, y: answer_height as i32, z: 1 }])
-                        .dst_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
+                        .dst_subresource(
+                            vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1),
+                        )
                         .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }]);
                     // `s.model_answer.image` was already transitioned to
                     // `TRANSFER_DST_OPTIMAL` in `to_dst` above -- the blit target here
                     // is the same layout the direct-copy branch below would have used.
-                    device.cmd_blit_image(self.cmd, small.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
+                    device.cmd_blit_image(
+                        self.cmd,
+                        small.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        s.model_answer.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[blit],
+                        vk::Filter::LINEAR,
+                    );
                 } else {
-                    device.cmd_copy_buffer_to_image(self.cmd, answer_src, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, answer_offset)]);
+                    device.cmd_copy_buffer_to_image(
+                        self.cmd,
+                        answer_src,
+                        s.model_answer.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[image_copy_region(width, height, answer_offset)],
+                    );
                 }
                 let to_general = [
-                    image_barrier(s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
-                    image_barrier(s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
+                    image_barrier(
+                        s.proxy.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::GENERAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ,
+                    ),
+                    image_barrier(
+                        s.model_answer.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::GENERAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ,
+                    ),
                 ];
-                device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &to_general);
+                device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_general,
+                );
             }
             let current_old = if cached_before { vk::ImageLayout::GENERAL } else { vk::ImageLayout::UNDEFINED };
             let output_old = if cached_before { vk::ImageLayout::TRANSFER_SRC_OPTIMAL } else { vk::ImageLayout::UNDEFINED };
             let to_compute = [
-                image_barrier(s.original.image, current_old, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE),
+                image_barrier(
+                    s.original.image,
+                    current_old,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                ),
                 image_barrier(s.output.image, output_old, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_WRITE),
             ];
             // This batch prepares both the upload destination and the compute
             // output. SHADER_WRITE needs COMPUTE_SHADER in the destination scope.
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &to_compute);
+            device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_compute,
+            );
             // Frame hold: the composition works on the held frame (third staging segment) rather
             // than whatever the game has drawn since, and the result replaces the live image.
             let (original_src, original_offset) = if held { (s.staging_buffer, frame_bytes * 2) } else { (s.current_buffer, 0) };
-            device.cmd_copy_buffer_to_image(self.cmd, original_src, s.original.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, original_offset)]);
-            let original_general = image_barrier(s.original.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ);
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &[original_general]);
+            device.cmd_copy_buffer_to_image(
+                self.cmd,
+                original_src,
+                s.original.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[image_copy_region(width, height, original_offset)],
+            );
+            let original_general = image_barrier(
+                s.original.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+            );
+            device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[original_general],
+            );
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
             // Mode 2 when the capture leg encoded the proxy, mode 1 when it could not
@@ -885,16 +1130,85 @@ impl ComposeSlot {
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
-            let output_src = image_barrier(s.output.image, vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::TRANSFER_READ);
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[output_src]);
-            device.cmd_copy_image_to_buffer(self.cmd, s.output.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.cached_buffer, &[image_copy_region(width, height, 0)]);
-            let output_ready = vk::BufferMemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(s.cached_buffer).offset(0).size(frame_bytes);
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[output_ready], &[]);
-            let target_to_dst = image_barrier(target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[target_to_dst]);
-            device.cmd_copy_buffer_to_image(self.cmd, s.cached_buffer, target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
-            let to_present = image_barrier(target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            let output_src = image_barrier(
+                s.output.image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+            );
+            device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[output_src],
+            );
+            device.cmd_copy_image_to_buffer(
+                self.cmd,
+                s.output.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                s.cached_buffer,
+                &[image_copy_region(width, height, 0)],
+            );
+            let output_ready = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(s.cached_buffer)
+                .offset(0)
+                .size(frame_bytes);
+            device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[output_ready],
+                &[],
+            );
+            let target_to_dst = image_barrier(
+                target_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::AccessFlags::TRANSFER_WRITE,
+            );
+            device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[target_to_dst],
+            );
+            device.cmd_copy_buffer_to_image(
+                self.cmd,
+                s.cached_buffer,
+                target_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[image_copy_region(width, height, 0)],
+            );
+            let to_present = image_barrier(
+                target_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            );
+            device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
         }
     }
 
@@ -986,10 +1300,8 @@ impl GpuCompose {
         // SAFETY: `layout_info` is valid.
         let descriptor_set_layout = unsafe { device.create_descriptor_set_layout(&layout_info, None) }.ok()?;
 
-        let push_constant_range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(std::mem::size_of::<PushConstants>() as u32);
+        let push_constant_range =
+            vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(std::mem::size_of::<PushConstants>() as u32);
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&push_constant_range));
@@ -1029,10 +1341,7 @@ impl GpuCompose {
             }
         };
         let entry_point = c"main";
-        let stage_info = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader_module)
-            .name(entry_point);
+        let stage_info = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(shader_module).name(entry_point);
         let pipeline_info = vk::ComputePipelineCreateInfo::default().stage(stage_info).layout(pipeline_layout);
         // SAFETY: `pipeline_info` is valid; `shader_module`/`pipeline_layout` were
         // just created above and outlive this call.
@@ -1149,8 +1458,20 @@ impl GpuCompose {
     /// the present that received the answer.
     #[allow(clippy::too_many_arguments)]
     pub fn present_temporal_delta_async(
-        &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue,
-        width: u32, height: u32, answer_width: u32, answer_height: u32, inputs: ComposeInputs, generation: u64, bgr_order: bool, target_image: vk::Image, compose: ComposeParams,
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue: vk::Queue,
+        width: u32,
+        height: u32,
+        answer_width: u32,
+        answer_height: u32,
+        inputs: ComposeInputs,
+        generation: u64,
+        bgr_order: bool,
+        target_image: vk::Image,
+        compose: ComposeParams,
     ) -> Option<vk::Semaphore> {
         let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
         let answer_bytes = (u64::from(answer_width) * u64::from(answer_height) * 4) as usize;
@@ -1180,33 +1501,51 @@ impl GpuCompose {
             }
             ComposeInputs::Cpu { .. } => None,
         };
-        let semaphore = self.present_semaphores.get(target_image, || unsafe {
-            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
-        })?;
+        let semaphore = self.present_semaphores.get(target_image, || unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok() })?;
         if !self.timers_built {
             self.timers_built = true;
             for s in &mut self.async_slots {
                 s.timer = crate::gpu_timer::GpuTimer::new(device, instance, physical_device, self.queue_family);
             }
         }
-        let idx = self.next_async_slot; self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
+        let idx = self.next_async_slot;
+        self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let slot = &mut self.async_slots[idx];
-        if !wait_armed(device, &[slot.slot.armed_fence()], "gpu::present_temporal_delta_async slot reuse") { return None; }
-        if self.zc.answer_reader == Some(slot.slot.fence) { self.zc.answer_reader = None; }
+        if !wait_armed(device, &[slot.slot.armed_fence()], "gpu::present_temporal_delta_async slot reuse") {
+            return None;
+        }
+        if self.zc.answer_reader == Some(slot.slot.fence) {
+            self.zc.answer_reader = None;
+        }
         // The reuse wait just above (which this path always had) is what makes the slot's last
         // timestamps readable; no wait of its own.
-        if let Some(ms) = slot.timer.as_mut().and_then(|t| { t.read_if_pending(device); t.take_reading() }) { self.compose_gpu_ms = Some(ms); }
-        if generation == 0 || answer_bytes > bytes { return None; }
+        if let Some(ms) = slot.timer.as_mut().and_then(|t| {
+            t.read_if_pending(device);
+            t.take_reading()
+        }) {
+            self.compose_gpu_ms = Some(ms);
+        }
+        if generation == 0 || answer_bytes > bytes {
+            return None;
+        }
         let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let (update_src, fresh_copy, small_proxy, held) = match inputs {
             ComposeInputs::Cpu { base, answer, proxy_small, held_original } => {
-                if base.len() < bytes || answer.len() < answer_bytes { return None; }
-                if !slot.slot.ensure_sized(device, &props, width, height) { return None; }
+                if base.len() < bytes || answer.len() < answer_bytes {
+                    return None;
+                }
+                if !slot.slot.ensure_sized(device, &props, width, height) {
+                    return None;
+                }
                 let scaled_answer = answer_width != width || answer_height != height;
-                if scaled_answer && !slot.slot.ensure_small_answer(device, &props, answer_width, answer_height) { return None; }
+                if scaled_answer && !slot.slot.ensure_small_answer(device, &props, answer_width, answer_height) {
+                    return None;
+                }
                 // The small proxy stands in for the full frame in the proxy input only when the model ran
                 // small and the caller has it (the synchronous present does; the pipelined one does not).
-                let small_proxy = scaled_answer && proxy_small.is_some_and(|p| p.len() >= answer_bytes) && slot.slot.ensure_small_proxy(device, &props, answer_width, answer_height);
+                let small_proxy = scaled_answer
+                    && proxy_small.is_some_and(|p| p.len() >= answer_bytes)
+                    && slot.slot.ensure_small_proxy(device, &props, answer_width, answer_height);
                 let s = slot.slot.sized.as_ref().expect("ensured");
                 if slot.slot.cached_generation != generation {
                     unsafe {
@@ -1226,31 +1565,65 @@ impl GpuCompose {
             }
             ComposeInputs::Gpu { .. } => {
                 let (capture_target, gen_base, gen_answer, fresh_source) = zero_copy.expect("resolved above");
-                if !slot.slot.ensure_sized(device, &props, width, height) { return None; }
+                if !slot.slot.ensure_sized(device, &props, width, height) {
+                    return None;
+                }
                 ((gen_base, 0, gen_answer, 0), fresh_source.map(|answer| [(capture_target, gen_base), (answer, gen_answer)]), false, false)
             }
         };
         let update = slot.slot.cached_generation != generation;
         let compose = ComposeParams { model_small: small_proxy, ..compose };
-        if unsafe { device.reset_command_buffer(slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() { return None; }
+        if unsafe { device.reset_command_buffer(slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
+            return None;
+        }
         let begin = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        if unsafe { device.begin_command_buffer(slot.slot.cmd, &begin) }.is_err() { return None; }
+        if unsafe { device.begin_command_buffer(slot.slot.cmd, &begin) }.is_err() {
+            return None;
+        }
         // Timed span: from just after the opening `ALL_COMMANDS -> TRANSFER` barrier on the
         // target image (so not the wait for the queue's earlier work) to the end of the buffer.
         // That covers the copy of the target out, the zero-copy `gen_*` copies, the uploads and
         // the upscale blits of a cache update, the compute dispatch, and the copy back into the
         // target image -- everything this submission does. See `crate::gpu_timer`.
-        unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, answer_width, answer_height, bytes as u64, update, small_proxy, held, bgr_order, target_image, compose, update_src, fresh_copy, slot.timer.as_ref()); }
+        unsafe {
+            slot.slot.record_temporal_delta_into_image(
+                device,
+                self.pipeline,
+                self.pipeline_layout,
+                width,
+                height,
+                answer_width,
+                answer_height,
+                bytes as u64,
+                update,
+                small_proxy,
+                held,
+                bgr_order,
+                target_image,
+                compose,
+                update_src,
+                fresh_copy,
+                slot.timer.as_ref(),
+            );
+        }
         if let Some(timer) = &slot.timer {
             // SAFETY: `slot.slot.cmd` is recording and `record_start` went into it above.
             unsafe { timer.record_end(device, slot.slot.cmd) };
         }
-        if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || !slot.slot.reset(device) { return None; }
+        if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || !slot.slot.reset(device) {
+            return None;
+        }
         let cmd = slot.slot.cmd;
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd)).signal_semaphores(std::slice::from_ref(&semaphore));
-        if !slot.slot.submit(device, queue, submit) { return None; }
-        if let Some(timer) = slot.timer.as_mut() { timer.mark_submitted(); }
-        if update { slot.slot.cached_generation = generation; }
+        if !slot.slot.submit(device, queue, submit) {
+            return None;
+        }
+        if let Some(timer) = slot.timer.as_mut() {
+            timer.mark_submitted();
+        }
+        if update {
+            slot.slot.cached_generation = generation;
+        }
         if zero_copy.is_some() {
             self.zc.last_queue = Some(queue);
             if fresh_copy.is_some() {
@@ -1273,7 +1646,14 @@ impl GpuCompose {
     /// existing import already covers it. `false` when it cannot be imported: that present, and
     /// every later one with the same region, takes the CPU path. A replaced import is only freed
     /// once every async slot is done with it (never unmapped: the mapping is `ShmClient`'s).
-    pub fn ensure_answer_import(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, host_ptr: *mut u8, bytes: u64) -> bool {
+    pub fn ensure_answer_import(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        host_ptr: *mut u8,
+        bytes: u64,
+    ) -> bool {
         if self.zc.answer_import.as_ref().is_some_and(|a| a.ptr == host_ptr && a.bytes == bytes) {
             return true;
         }
@@ -1321,7 +1701,15 @@ impl GpuCompose {
     /// compose's, every async slot is waited first: the capture about to be submitted is not
     /// ordered against that compose's read of the target.
     #[allow(clippy::too_many_arguments)]
-    pub fn zero_copy_capture_target(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue, frame_bytes: u64, capture_idle: bool) -> Option<vk::Buffer> {
+    pub fn zero_copy_capture_target(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue: vk::Queue,
+        frame_bytes: u64,
+        capture_idle: bool,
+    ) -> Option<vk::Buffer> {
         if self.zc.last_queue.is_some_and(|q| q != queue) {
             if !self.wait_async_slots(device) {
                 return None;
@@ -1507,7 +1895,12 @@ pub(crate) fn test_instance(entry: &ash::Entry) -> Option<(ash::Instance, bool)>
 /// a layout that exists only with that extension enabled, as it is on every device the layer sees a
 /// present on.
 #[cfg(test)]
-pub(crate) fn test_device_extensions(instance: &ash::Instance, physical_device: vk::PhysicalDevice, surface: bool, extra: &[&'static std::ffi::CStr]) -> Vec<*const std::ffi::c_char> {
+pub(crate) fn test_device_extensions(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    surface: bool,
+    extra: &[&'static std::ffi::CStr],
+) -> Vec<*const std::ffi::c_char> {
     let swapchain = ash::khr::swapchain::NAME;
     // SAFETY: `physical_device` is the instance's own; each name is a NUL-terminated array.
     let offered = surface
@@ -1584,11 +1977,14 @@ mod tests {
     /// uploading test fixture content into an image via `cmd_copy_buffer_to_image`.
     /// Caller destroys/frees both returned handles once the upload's fence signals.
     fn build_upload_staging(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, bytes: &[u8]) -> (vk::Buffer, vk::DeviceMemory) {
-        let buf_info = vk::BufferCreateInfo::default().size(bytes.len() as u64).usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buf_info =
+            vk::BufferCreateInfo::default().size(bytes.len() as u64).usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { device.create_buffer(&buf_info, None) }.unwrap();
         let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let type_index = find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).unwrap();
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let type_index =
+            find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).unwrap();
+        let memory =
+            unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_buffer_memory(buffer, memory, 0).unwrap() };
         let ptr = unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.unwrap().cast::<u8>();
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
@@ -1606,13 +2002,34 @@ mod tests {
     /// [`compose_once`] with the model's answer at `answer_dims`, and optionally the small proxy it
     /// was shown (which puts the transfer modes in play).
     #[allow(clippy::too_many_arguments)]
-    fn compose_once_scaled(width: u32, height: u32, current: &[u8], proxy: &[u8], answer: &[u8], answer_dims: (u32, u32), proxy_small: Option<&[u8]>, held: Option<&[u8]>, params: ComposeParams) -> Option<Vec<u8>> {
+    fn compose_once_scaled(
+        width: u32,
+        height: u32,
+        current: &[u8],
+        proxy: &[u8],
+        answer: &[u8],
+        answer_dims: (u32, u32),
+        proxy_small: Option<&[u8]>,
+        held: Option<&[u8]>,
+        params: ComposeParams,
+    ) -> Option<Vec<u8>> {
         compose_once_ordered(width, height, current, proxy, answer, answer_dims, proxy_small, held, params, false)
     }
 
     /// [`compose_once_scaled`] with the frame's channel order: `bgr_order` for a `B8G8R8A8` swapchain.
     #[allow(clippy::too_many_arguments)]
-    fn compose_once_ordered(width: u32, height: u32, current: &[u8], proxy: &[u8], answer: &[u8], answer_dims: (u32, u32), proxy_small: Option<&[u8]>, held: Option<&[u8]>, params: ComposeParams, bgr_order: bool) -> Option<Vec<u8>> {
+    fn compose_once_ordered(
+        width: u32,
+        height: u32,
+        current: &[u8],
+        proxy: &[u8],
+        answer: &[u8],
+        answer_dims: (u32, u32),
+        proxy_small: Option<&[u8]>,
+        held: Option<&[u8]>,
+        params: ComposeParams,
+        bgr_order: bool,
+    ) -> Option<Vec<u8>> {
         let (_entry, instance, physical_device, device, queue, queue_family) = test_device()?;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -1620,15 +2037,48 @@ mod tests {
         let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
         let target = make_target_image(&device, &mem_props, width, height);
         let staging = build_upload_staging(&device, &mem_props, current);
-        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+        let cmd = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+            )
+        }
+        .unwrap()[0];
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
         unsafe {
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
-            let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            let to_dst = image_barrier(
+                target.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
             device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
-            let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            let to_present = image_barrier(
+                target.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
             device.end_command_buffer(cmd).unwrap();
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
@@ -1636,12 +2086,32 @@ mod tests {
             device.free_memory(staging.1, None);
         }
         let sem = gpu
-            .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_dims.0, answer_dims.1, ComposeInputs::Cpu { base: proxy, answer, proxy_small, held_original: held }, 1, bgr_order, target.image, params)
+            .present_temporal_delta_async(
+                &device,
+                &instance,
+                physical_device,
+                queue,
+                width,
+                height,
+                answer_dims.0,
+                answer_dims.1,
+                ComposeInputs::Cpu { base: proxy, answer, proxy_small, held_original: held },
+                1,
+                bgr_order,
+                target.image,
+                params,
+            )
             .expect("compose");
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
         let stage = vk::PipelineStageFlags::ALL_COMMANDS;
         unsafe {
-            device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
+            device
+                .queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                    wait_fence,
+                )
+                .unwrap();
             device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
             device.destroy_fence(wait_fence, None);
         }
@@ -1664,15 +2134,41 @@ mod tests {
     fn bgr_order_composes_the_same_true_colours_as_rgb_order() {
         let (width, height) = (8u32, 8u32);
         let n = (width * height) as usize;
-        let frame: Vec<u8> = (0..n).flat_map(|i| { let t = (i * 37 % 256) as u8; [t, t.wrapping_add(64), t.wrapping_add(128), 255] }).collect();
-        let answer: Vec<u8> = (0..n).flat_map(|i| { let t = (i * 53 % 256) as u8; [t.wrapping_add(20), t, t.wrapping_add(200), 255] }).collect();
+        let frame: Vec<u8> = (0..n)
+            .flat_map(|i| {
+                let t = (i * 37 % 256) as u8;
+                [t, t.wrapping_add(64), t.wrapping_add(128), 255]
+            })
+            .collect();
+        let answer: Vec<u8> = (0..n)
+            .flat_map(|i| {
+                let t = (i * 53 % 256) as u8;
+                [t.wrapping_add(20), t, t.wrapping_add(200), 255]
+            })
+            .collect();
         let swap = |v: &[u8]| v.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], p[3]]).collect::<Vec<u8>>();
-        let params = ComposeParams { colour_strength: 0.7, transfer_strength: 0.8, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 1.0, transfer: 1, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let params = ComposeParams {
+            colour_strength: 0.7,
+            transfer_strength: 0.8,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 1.0,
+            transfer: 1,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         let Some(rgb) = compose_once_ordered(width, height, &frame, &frame, &answer, (width, height), None, None, params, false) else {
             eprintln!("bgr_order_composes_the_same_true_colours_as_rgb_order: no Vulkan device, skipping");
             return;
         };
-        let bgr = compose_once_ordered(width, height, &swap(&frame), &swap(&frame), &swap(&answer), (width, height), None, None, params, true).expect("compose");
+        let bgr =
+            compose_once_ordered(width, height, &swap(&frame), &swap(&frame), &swap(&answer), (width, height), None, None, params, true).expect("compose");
         assert_ne!(rgb, frame, "the answer must change the frame for this to test anything");
         assert_eq!(swap(&bgr), rgb, "the BGRA run's true colours differ from the RGBA run's");
     }
@@ -1686,7 +2182,22 @@ mod tests {
         let mut speckle = grey.clone();
         let centre = ((8 * w + 8) * 4) as usize;
         speckle[centre..centre + 3].copy_from_slice(&[200, 200, 200]);
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let base = ComposeParams {
+            colour_strength: 0.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         let Some(sharp) = compose_once(w, h, &grey, &grey, &speckle, base) else {
             eprintln!("ratio smoothing test: no Vulkan device, skipping");
             return;
@@ -1723,7 +2234,22 @@ mod tests {
         let blue: Vec<u8> = (0..w * h).flat_map(|_| [100u8, 120, 160, 255]).collect();
         let red: Vec<u8> = (0..w * h).flat_map(|_| [170u8, 110, 100, 255]).collect();
         let centre = ((8 * w + 8) * 4) as usize;
-        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 0.5, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let base = ComposeParams {
+            colour_strength: 1.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 0.5,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
 
         let Some(normal) = compose_once(w, h, &blue, &blue, &red, base) else {
             eprintln!("debug_views test: no Vulkan device, skipping");
@@ -1737,10 +2263,16 @@ mod tests {
 
         let px = |out: &[u8]| (out[centre], out[centre + 1], out[centre + 2]);
         let (ob, og, obl) = px(&original);
-        assert!((i32::from(ob) - 100).abs() <= 2 && (i32::from(og) - 120).abs() <= 2 && (i32::from(obl) - 160).abs() <= 2, "view 1 is the original frame: got ({ob},{og},{obl})");
+        assert!(
+            (i32::from(ob) - 100).abs() <= 2 && (i32::from(og) - 120).abs() <= 2 && (i32::from(obl) - 160).abs() <= 2,
+            "view 1 is the original frame: got ({ob},{og},{obl})"
+        );
 
         let (rr, rg, rb) = px(&raw_answer);
-        assert!((i32::from(rr) - 170).abs() <= 2 && (i32::from(rg) - 110).abs() <= 2 && (i32::from(rb) - 100).abs() <= 2, "view 2 is the model's raw answer: got ({rr},{rg},{rb})");
+        assert!(
+            (i32::from(rr) - 170).abs() <= 2 && (i32::from(rg) - 110).abs() <= 2 && (i32::from(rb) - 100).abs() <= 2,
+            "view 2 is the model's raw answer: got ({rr},{rg},{rb})"
+        );
 
         // View 3 is 0.5 + (normal - original) * 4: it must actually move away from mid-gray here
         // (there is a real composited edit to show), and in the direction the real edit moved.
@@ -1791,7 +2323,22 @@ mod tests {
         let frame: Vec<u8> = (0..w * h).flat_map(|_| [60u8, 60, 60, 255]).collect();
         let small_proxy: Vec<u8> = (0..sw * sh).flat_map(|_| [100u8, 100, 100, 255]).collect();
         let answer: Vec<u8> = (0..sw * sh).flat_map(|_| [85u8, 85, 85, 255]).collect();
-        let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 1, model_small: false, white_point: 1.0, debug_view: 2, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let params = ComposeParams {
+            colour_strength: 0.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 1,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 2,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         let Some(out) = compose_once_scaled(w, h, &frame, &frame, &answer, (sw, sh), Some(&small_proxy), None, params) else {
             eprintln!("debug view 2 test: no Vulkan device, skipping");
             return;
@@ -1806,7 +2353,22 @@ mod tests {
         let (w, h) = (8u32, 8u32);
         let frame: Vec<u8> = (0..w * h).flat_map(|_| [100u8, 120, 160, 77]).collect();
         let answer: Vec<u8> = (0..w * h).flat_map(|_| [170u8, 110, 100, 255]).collect();
-        let params = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 1, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let params = ComposeParams {
+            colour_strength: 1.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 1,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         let Some(out) = compose_once(w, h, &frame, &frame, &answer, params) else { return };
         assert_ne!(out[..3], frame[..3], "the answer changed the colour");
         assert!(out.chunks(4).all(|p| p[3] == 77), "alpha {:?}", &out[..4]);
@@ -1823,7 +2385,22 @@ mod tests {
         let frame: Vec<u8> = (0..w * h).flat_map(|i| if i % w < 16 { [60u8, 60, 60, 255] } else { [180u8, 180, 180, 255] }).collect();
         let small: Vec<u8> = (0..sw * sh).flat_map(|i| if i % sw < 8 { [60u8, 60, 60, 255] } else { [180u8, 180, 180, 255] }).collect();
         let brighter: Vec<u8> = small.chunks(4).flat_map(|p| [p[0] + 25, p[1] + 25, p[2] + 25, 255]).collect();
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let base = ComposeParams {
+            colour_strength: 0.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         let px = |out: &[u8], x: u32| i32::from(out[((4 * w + x) * 4) as usize]);
         for transfer in [0u32, 1, 2] {
             let Some(out) = compose_once_scaled(w, h, &frame, &frame, &small, (sw, sh), Some(&small), None, ComposeParams { transfer, ..base }) else {
@@ -1856,11 +2433,37 @@ mod tests {
     /// dim every highlight.
     #[test]
     fn no_edit_is_identity_across_white_points_and_highlights() {
-        let srgb_to_lin = |c: u8| { let c = f32::from(c) / 255.0; if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) } };
-        let lin_to_srgb = |l: f32| { let l = l.clamp(0.0, 1.0); let c = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }; (c * 255.0).round() as u8 };
+        let srgb_to_lin = |c: u8| {
+            let c = f32::from(c) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let lin_to_srgb = |l: f32| {
+            let l = l.clamp(0.0, 1.0);
+            let c = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+            (c * 255.0).round() as u8
+        };
         let knee = |l: f32| if l > 0.75 { 0.75 + 0.25 * (1.0 - (-(l - 0.75) / 0.25).exp()) } else { l };
         let (w, h) = (16u32, 16u32);
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let base = ComposeParams {
+            colour_strength: 0.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         // Also with ratio smoothing and the ghost guard on: their neighbourhood taps of the proxy go
         // through the same encode as the centre's.
         for (smooth, ghost) in [(0.0f32, 0.0f32), (1.0, 1.0)] {
@@ -1874,7 +2477,10 @@ mod tests {
                     return;
                 };
                 let got = out[((8 * w + 8) * 4) as usize];
-                assert!((i32::from(got) - i32::from(value)).abs() <= 2, "frame {value} at white point {wp} (smoothing {smooth}, ghost guard {ghost}): expected ~{value}, got {got}");
+                assert!(
+                    (i32::from(got) - i32::from(value)).abs() <= 2,
+                    "frame {value} at white point {wp} (smoothing {smooth}, ghost guard {ghost}): expected ~{value}, got {got}"
+                );
             }
         }
     }
@@ -1887,26 +2493,59 @@ mod tests {
     fn no_edit_is_identity_for_every_encode_curve() {
         use neural_forge_protocol::enums::reversible_mode;
         let (w, h) = (16u32, 16u32);
-        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let base = ComposeParams {
+            colour_strength: 1.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         let colours: [[u8; 3]; 4] = [[250, 60, 20], [30, 90, 245], [200, 200, 200], [120, 140, 60]];
-        let frame: Vec<u8> = (0..w * h).flat_map(|i| { let c = colours[(i % 4) as usize]; [c[0], c[1], c[2], 255] }).collect();
-        for (mode, wp, smooth) in [reversible_mode::KNEE, reversible_mode::NEUTWO, reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID, reversible_mode::HYBRID_REPLACE]
-            .into_iter()
-            .flat_map(|m| [1.0f32, 0.8].into_iter().flat_map(move |wp| [0.0f32, 1.0].map(|s| (m, wp, s))))
+        let frame: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let c = colours[(i % 4) as usize];
+                [c[0], c[1], c[2], 255]
+            })
+            .collect();
+        for (mode, wp, smooth) in
+            [reversible_mode::KNEE, reversible_mode::NEUTWO, reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID, reversible_mode::HYBRID_REPLACE]
+                .into_iter()
+                .flat_map(|m| [1.0f32, 0.8].into_iter().flat_map(move |wp| [0.0f32, 1.0].map(|s| (m, wp, s))))
         {
             {
-                let answer: Vec<u8> = frame.as_chunks::<4>().0.iter().flat_map(|p| crate::composition::encode::reference_encode_pixel([p[0], p[1], p[2], p[3]], false, wp, mode)).collect();
+                let answer: Vec<u8> = frame
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|p| crate::composition::encode::reference_encode_pixel([p[0], p[1], p[2], p[3]], false, wp, mode))
+                    .collect();
                 // Ratio smoothing and the ghost guard on as well (`smooth`): their taps are encoded too.
                 let params = ComposeParams { white_point: wp, reversible_mode: mode, ratio_smooth: smooth, ghost_guard: smooth, ..base };
                 let Some(out) = compose_once(w, h, &frame, &frame, &answer, params) else {
                     eprintln!("encode curve test: no Vulkan device, skipping");
                     return;
                 };
-                let worst = out.as_chunks::<4>().0.iter().zip(frame.as_chunks::<4>().0.iter())
+                let worst = out
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(frame.as_chunks::<4>().0.iter())
                     .flat_map(|(o, f)| (0..3).map(move |c| (i32::from(o[c]) - i32::from(f[c])).abs()))
                     .max()
                     .unwrap_or(0);
-                assert!(worst <= 3, "curve {mode} at white point {wp} (smoothing and ghost guard {smooth}): an unedited answer moved the frame by up to {worst}");
+                assert!(
+                    worst <= 3,
+                    "curve {mode} at white point {wp} (smoothing and ghost guard {smooth}): an unedited answer moved the frame by up to {worst}"
+                );
             }
         }
     }
@@ -1937,9 +2576,27 @@ mod tests {
         let frame: Vec<u8> = (0..w * h).flat_map(|_| [original[0], original[1], original[2], 255]).collect();
         // A brighter answer of another hue: an edit of both light and colour.
         let answer: Vec<u8> = (0..w * h).flat_map(|_| [160u8, 120, 90, 255]).collect();
-        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let base = ComposeParams {
+            colour_strength: 1.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         let centre = ((8 * w + 8) * 4) as usize;
-        let at = |strength: f32| compose_once(w, h, &frame, &frame, &answer, ComposeParams { transfer_strength: strength, ..base }).map(|o| [o[centre], o[centre + 1], o[centre + 2]]);
+        let at = |strength: f32| {
+            compose_once(w, h, &frame, &frame, &answer, ComposeParams { transfer_strength: strength, ..base })
+                .map(|o| [o[centre], o[centre + 1], o[centre + 2]])
+        };
         let Some(none) = at(0.0) else {
             eprintln!("detail strength test: no Vulkan device, skipping");
             return;
@@ -1963,10 +2620,26 @@ mod tests {
         use neural_forge_protocol::enums::reversible_mode;
         let (w, h) = (16u32, 16u32);
         let frame: Vec<u8> = (0..w * h).flat_map(|_| [60u8, 60, 60, 255]).collect();
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let base = ComposeParams {
+            colour_strength: 0.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         let centre = ((8 * w + 8) * 4) as usize;
         for (replace, composed) in [(reversible_mode::NEUTWO_REPLACE, reversible_mode::NEUTWO), (reversible_mode::HYBRID_REPLACE, reversible_mode::HYBRID)] {
-            let answer: Vec<u8> = (0..w * h).flat_map(|_| crate::composition::encode::reference_encode_pixel([200, 200, 200, 255], false, 1.0, replace)).collect();
+            let answer: Vec<u8> =
+                (0..w * h).flat_map(|_| crate::composition::encode::reference_encode_pixel([200, 200, 200, 255], false, 1.0, replace)).collect();
             let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { reversible_mode: replace, ..base }) else {
                 eprintln!("replace mode test: no Vulkan device, skipping");
                 return;
@@ -1989,7 +2662,22 @@ mod tests {
         let frame: Vec<u8> = (0..w * h).flat_map(|_| [60u8, 60, 60, 255]).collect();
         let hue = [255u8, 160, 60];
         let answer: Vec<u8> = (0..w * h).flat_map(|_| [hue[0], hue[1], hue[2], 255]).collect();
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let base = ComposeParams {
+            colour_strength: 0.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         let centre = ((8 * w + 8) * 4) as usize;
         for replace in [reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID_REPLACE] {
             let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { reversible_mode: replace, ..base }) else {
@@ -1997,7 +2685,10 @@ mod tests {
                 return;
             };
             let got = [out[centre], out[centre + 1], out[centre + 2]];
-            assert!(got.iter().zip(hue).all(|(&g, a)| (i32::from(g) - i32::from(a)).abs() <= 1), "replace mode {replace}: {got:?}, the answer's hue is {hue:?}");
+            assert!(
+                got.iter().zip(hue).all(|(&g, a)| (i32::from(g) - i32::from(a)).abs() <= 1),
+                "replace mode {replace}: {got:?}, the answer's hue is {hue:?}"
+            );
         }
     }
 
@@ -2008,7 +2699,22 @@ mod tests {
         let (w, h) = (16u32, 16u32);
         let live: Vec<u8> = (0..w * h).flat_map(|_| [30u8, 30, 30, 255]).collect();
         let held: Vec<u8> = (0..w * h).flat_map(|_| [140u8, 140, 140, 255]).collect();
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let base = ComposeParams {
+            colour_strength: 0.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+        };
         // No edit: the answer is the held frame's own proxy.
         let Some(out) = compose_once_scaled(w, h, &live, &held, &held, (w, h), None, Some(&held), base) else {
             eprintln!("frame hold test: no Vulkan device, skipping");
@@ -2038,29 +2744,97 @@ mod tests {
             let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
             let target = make_target_image(&device, &mem_props, width, height);
             let staging = build_upload_staging(&device, &mem_props, &frame);
-            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+            let cmd = unsafe {
+                device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+                )
+            }
+            .unwrap()[0];
             let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             unsafe {
                 device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
-                let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+                let to_dst = image_barrier(
+                    target.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                );
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_dst],
+                );
                 device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
-                let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+                let to_present = image_barrier(
+                    target.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::empty(),
+                );
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_present],
+                );
                 device.end_command_buffer(cmd).unwrap();
                 device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
                 device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
             }
-            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+            let params = ComposeParams {
+                colour_strength: 0.0,
+                transfer_strength: 1.0,
+                max_ratio: 2.0,
+                ghost_guard: 0.0,
+                compare,
+                colour_trust: 2.0,
+                ratio_smooth: 0.0,
+                transfer: 0,
+                model_small: false,
+                white_point: 1.0,
+                debug_view: 0,
+                debug_scale: 1.0,
+                proxy_encoded: true,
+                reversible_mode: 0,
+            };
             let sem = gpu
-                .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Cpu { base: &frame, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, params)
+                .present_temporal_delta_async(
+                    &device,
+                    &instance,
+                    physical_device,
+                    queue,
+                    width,
+                    height,
+                    width,
+                    height,
+                    ComposeInputs::Cpu { base: &frame, answer: &answer, proxy_small: None, held_original: None },
+                    1,
+                    false,
+                    target.image,
+                    params,
+                )
                 .expect("compose");
             let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
+                device
+                    .queue_submit(
+                        queue,
+                        &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                        wait_fence,
+                    )
+                    .unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -2139,29 +2913,97 @@ mod tests {
             let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
             let target = make_target_image(&device, &mem_props, width, height);
             let staging = build_upload_staging(&device, &mem_props, current);
-            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+            let cmd = unsafe {
+                device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+                )
+            }
+            .unwrap()[0];
             let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             unsafe {
                 device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
-                let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+                let to_dst = image_barrier(
+                    target.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                );
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_dst],
+                );
                 device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
-                let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+                let to_present = image_barrier(
+                    target.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::empty(),
+                );
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_present],
+                );
                 device.end_command_buffer(cmd).unwrap();
                 device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
                 device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
             }
-            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+            let params = ComposeParams {
+                colour_strength: 0.0,
+                transfer_strength: 1.0,
+                max_ratio: 2.0,
+                ghost_guard: guard,
+                compare: Default::default(),
+                colour_trust: 2.0,
+                ratio_smooth: 0.0,
+                transfer: 0,
+                model_small: false,
+                white_point: 1.0,
+                debug_view: 0,
+                debug_scale: 1.0,
+                proxy_encoded: true,
+                reversible_mode: 0,
+            };
             let sem = gpu
-                .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Cpu { base: &proxy, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, params)
+                .present_temporal_delta_async(
+                    &device,
+                    &instance,
+                    physical_device,
+                    queue,
+                    width,
+                    height,
+                    width,
+                    height,
+                    ComposeInputs::Cpu { base: &proxy, answer: &answer, proxy_small: None, held_original: None },
+                    1,
+                    false,
+                    target.image,
+                    params,
+                )
                 .expect("compose");
             let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
+                device
+                    .queue_submit(
+                        queue,
+                        &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                        wait_fence,
+                    )
+                    .unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -2215,7 +3057,10 @@ mod tests {
         };
         let Some(mut gpu) = GpuCompose::new(&device, queue_family) else {
             eprintln!("present_temporal_delta_async_upscales_a_smaller_answer_and_rejects_an_oversized_one: GpuCompose::new failed, skipping");
-            unsafe { device.destroy_device(None); instance.destroy_instance(None) };
+            unsafe {
+                device.destroy_device(None);
+                instance.destroy_instance(None)
+            };
             return;
         };
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -2236,15 +3081,48 @@ mod tests {
         // starting content -- a stable/motionless frame, exactly the case
         // `stability` should hold near its maximum for.
         let staging = build_upload_staging(&device, &mem_props, &base);
-        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+        let cmd = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+            )
+        }
+        .unwrap()[0];
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
         unsafe {
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
-            let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            let to_dst = image_barrier(
+                target.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
             device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
-            let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            let to_present = image_barrier(
+                target.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
             device.end_command_buffer(cmd).unwrap();
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
@@ -2253,13 +3131,48 @@ mod tests {
         }
 
         // (1) A smaller answer must still be accepted and actually change the output.
-        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, ComposeInputs::Cpu { base: &base, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false, reversible_mode: 0 });
+        let sem = gpu.present_temporal_delta_async(
+            &device,
+            &instance,
+            physical_device,
+            queue,
+            width,
+            height,
+            answer_width,
+            answer_height,
+            ComposeInputs::Cpu { base: &base, answer: &answer, proxy_small: None, held_original: None },
+            1,
+            false,
+            target.image,
+            crate::composition::gpu::ComposeParams {
+                colour_strength: 1.0,
+                transfer_strength: 1.0,
+                max_ratio: 2.0,
+                ghost_guard: 0.0,
+                compare: Default::default(),
+                colour_trust: 2.0,
+                ratio_smooth: 0.0,
+                transfer: 0,
+                model_small: false,
+                white_point: 1.0,
+                debug_view: 0,
+                debug_scale: 1.0,
+                proxy_encoded: false,
+                reversible_mode: 0,
+            },
+        );
         assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
         let sem = sem.unwrap();
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
         let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
         unsafe {
-            device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage))], wait_fence).unwrap();
+            device
+                .queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage))],
+                    wait_fence,
+                )
+                .unwrap();
             device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
             device.destroy_fence(wait_fence, None);
         }
@@ -2279,7 +3192,36 @@ mod tests {
         // for this function -- see its own doc comment) must be rejected, not
         // overflow the shared staging buffer.
         let big_answer = vec![200u8; ((width + 8) * (height + 8) * 4) as usize];
-        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, ComposeInputs::Cpu { base: &base, answer: &big_answer, proxy_small: None, held_original: None }, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false, reversible_mode: 0 });
+        let oversized = gpu.present_temporal_delta_async(
+            &device,
+            &instance,
+            physical_device,
+            queue,
+            width,
+            height,
+            width + 8,
+            height + 8,
+            ComposeInputs::Cpu { base: &base, answer: &big_answer, proxy_small: None, held_original: None },
+            2,
+            false,
+            target.image,
+            crate::composition::gpu::ComposeParams {
+                colour_strength: 1.0,
+                transfer_strength: 1.0,
+                max_ratio: 2.0,
+                ghost_guard: 0.0,
+                compare: Default::default(),
+                colour_trust: 2.0,
+                ratio_smooth: 0.0,
+                transfer: 0,
+                model_small: false,
+                white_point: 1.0,
+                debug_view: 0,
+                debug_scale: 1.0,
+                proxy_encoded: false,
+                reversible_mode: 0,
+            },
+        );
         assert!(oversized.is_none(), "an answer larger than the frame must be safely rejected, not overflow the staging buffer");
 
         unsafe {
@@ -2306,16 +3248,48 @@ mod tests {
         };
         let (width, height) = (16u32, 16u32);
         let frame_bytes = u64::from(width * height * 4);
-        let current: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 29 % 200) as u8; [t + 20, t + 10, 200 - t, 255] }).collect();
-        let base: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 37 % 200) as u8; [t + 30, 220 - t, t + 5, 255] }).collect();
-        let answer: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 53 % 200) as u8; [t + 40, t, 180 - t / 2, 255] }).collect();
-        let params = ComposeParams { colour_strength: 0.8, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.5, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false, reversible_mode: 0 };
+        let current: Vec<u8> = (0..width * height)
+            .flat_map(|i| {
+                let t = (i * 29 % 200) as u8;
+                [t + 20, t + 10, 200 - t, 255]
+            })
+            .collect();
+        let base: Vec<u8> = (0..width * height)
+            .flat_map(|i| {
+                let t = (i * 37 % 200) as u8;
+                [t + 30, 220 - t, t + 5, 255]
+            })
+            .collect();
+        let answer: Vec<u8> = (0..width * height)
+            .flat_map(|i| {
+                let t = (i * 53 % 200) as u8;
+                [t + 40, t, 180 - t / 2, 255]
+            })
+            .collect();
+        let params = ComposeParams {
+            colour_strength: 0.8,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.5,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: false,
+            reversible_mode: 0,
+        };
         let expected = compose_once(width, height, &current, &base, &answer, params).expect("the CPU reference composes");
 
         let alignment = crate::capture::min_imported_host_pointer_alignment(&instance, physical_device).expect("alignment query");
         let region_len = frame_bytes.div_ceil(alignment) * alignment;
         // SAFETY: a plain anonymous mapping standing in for the answer region, unmapped at the end.
-        let region = unsafe { libc::mmap(std::ptr::null_mut(), region_len as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        let region = unsafe {
+            libc::mmap(std::ptr::null_mut(), region_len as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
         assert_ne!(region, libc::MAP_FAILED);
         let region = region.cast::<u8>();
         unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
@@ -2332,20 +3306,74 @@ mod tests {
         // does), or into the target image (the live frame the compose reads).
         let upload = |bytes: &[u8], into_image: bool| {
             let staging = build_upload_staging(&device, &mem_props, bytes);
-            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+            let cmd = unsafe {
+                device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+                )
+            }
+            .unwrap()[0];
             let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             unsafe {
                 device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
                 if into_image {
-                    let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
-                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
-                    device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
-                    let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
-                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+                    let to_dst = image_barrier(
+                        target.image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    );
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_dst],
+                    );
+                    device.cmd_copy_buffer_to_image(
+                        cmd,
+                        staging.0,
+                        target.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[image_copy_region(width, height, 0)],
+                    );
+                    let to_present = image_barrier(
+                        target.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::PRESENT_SRC_KHR,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::empty(),
+                    );
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_present],
+                    );
                 } else {
                     device.cmd_copy_buffer(cmd, staging.0, capture_target, &[vk::BufferCopy::default().size(frame_bytes)]);
-                    let ready = vk::BufferMemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(capture_target).offset(0).size(frame_bytes);
-                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[ready], &[]);
+                    let ready = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(capture_target)
+                        .offset(0)
+                        .size(frame_bytes);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[ready],
+                        &[],
+                    );
                 }
                 device.end_command_buffer(cmd).unwrap();
                 device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
@@ -2357,11 +3385,31 @@ mod tests {
             }
         };
         let present = |gpu: &mut GpuCompose, fresh: bool, generation: u64| -> Option<Vec<u8>> {
-            let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Gpu { fresh }, generation, false, target.image, params)?;
+            let sem = gpu.present_temporal_delta_async(
+                &device,
+                &instance,
+                physical_device,
+                queue,
+                width,
+                height,
+                width,
+                height,
+                ComposeInputs::Gpu { fresh },
+                generation,
+                false,
+                target.image,
+                params,
+            )?;
             let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
+                device
+                    .queue_submit(
+                        queue,
+                        &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                        wait_fence,
+                    )
+                    .unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -2408,7 +3456,15 @@ mod tests {
     /// away afterward) back into a fresh CPU buffer, blocking until done -- test-only
     /// verification plumbing; production code never needs to read the real swapchain
     /// image back.
-    fn read_back_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image, width: u32, height: u32) -> Vec<u8> {
+    fn read_back_image(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        pool: vk::CommandPool,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
         let frame_bytes = (width * height * 4) as u64;
         let alloc_info = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
         let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
@@ -2417,16 +3473,32 @@ mod tests {
         let buf_info = vk::BufferCreateInfo::default().size(frame_bytes).usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { device.create_buffer(&buf_info, None) }.unwrap();
         let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let type_index = find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).unwrap();
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let type_index =
+            find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).unwrap();
+        let memory =
+            unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_buffer_memory(buffer, memory, 0) }.unwrap();
         let ptr = unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.unwrap().cast::<u8>();
 
         let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
             device.begin_command_buffer(cmd, &begin_info).unwrap();
-            let to_src = image_barrier(image, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_src]);
+            let to_src = image_barrier(
+                image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_READ,
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_src],
+            );
             device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[image_copy_region(width, height, 0)]);
             device.end_command_buffer(cmd).unwrap();
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();

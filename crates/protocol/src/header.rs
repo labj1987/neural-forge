@@ -82,7 +82,14 @@ pub struct PassTunings {
 impl PassTunings {
     /// One pass with `tuning`, at full size.
     pub fn single(tuning: Tuning) -> Self {
-        Self { count: 1, tunings: [tuning; crate::MAX_PASSES], feedback: 1.0, scales: [1.0; crate::MAX_PASSES], colour: ColourSettings::DEFAULT, placements: [crate::enums::placement::AUTO; crate::MAX_PASSES] }
+        Self {
+            count: 1,
+            tunings: [tuning; crate::MAX_PASSES],
+            feedback: 1.0,
+            scales: [1.0; crate::MAX_PASSES],
+            colour: ColourSettings::DEFAULT,
+            placements: [crate::enums::placement::AUTO; crate::MAX_PASSES],
+        }
     }
 
     pub fn passes(&self) -> &[Tuning] {
@@ -147,7 +154,8 @@ pub struct ColourSettings {
 
 impl ColourSettings {
     /// Every control at its default: the edit as the network made it.
-    pub const DEFAULT: Self = Self { each: [EditColour::NEUTRAL; crate::MAX_PASSES], gamut_guard: true, dither: false, lut_strength: 0.0, lut_adapt: 0.05, lut_seq: 0 };
+    pub const DEFAULT: Self =
+        Self { each: [EditColour::NEUTRAL; crate::MAX_PASSES], gamut_guard: true, dither: false, lut_strength: 0.0, lut_adapt: 0.05, lut_seq: 0 };
 }
 
 /// The control mask's rules ([`ShmHeader::mask_settings`]), as plain values.
@@ -199,14 +207,7 @@ pub struct Tuning {
 
 impl Default for Tuning {
     fn default() -> Self {
-        Self {
-            intensity: 1.0,
-            local_tone: 1.0,
-            local_structure: 1.0,
-            skin_structure: -1.0,
-            style: 0,
-            auto_mask: 1,
-        }
+        Self { intensity: 1.0, local_tone: 1.0, local_structure: 1.0, skin_structure: -1.0, style: 0, auto_mask: 1 }
     }
 }
 
@@ -993,7 +994,11 @@ pub fn pass_setting(pass: usize, field: &str) -> Option<&'static str> {
 /// [`crate::enums::model_scale::MIN`] and 1, and 1 for anything that is not a number.
 pub fn resolved_scale(bits: u32) -> f32 {
     let s = f32::from_bits(bits);
-    if s.is_finite() { s.clamp(crate::enums::model_scale::MIN, 1.0) } else { 1.0 }
+    if s.is_finite() {
+        s.clamp(crate::enums::model_scale::MIN, 1.0)
+    } else {
+        1.0
+    }
 }
 
 /// `(min, max)` for a persisted setting, from [`SETTING_BOUNDS`].
@@ -1547,7 +1552,11 @@ impl ShmHeader {
         let f = |a: &AtomicU32, name: &str, default: f32| {
             let (lo, hi) = setting_bounds(name).expect("a colour setting");
             let v = f32::from_bits(a.load(Ordering::Relaxed));
-            if v.is_finite() { v.clamp(lo, hi) } else { default }
+            if v.is_finite() {
+                v.clamp(lo, hi)
+            } else {
+                default
+            }
         };
         let global = EditColour {
             saturation: f(&self.edit_saturation_bits, "edit_saturation", 1.0),
@@ -1583,8 +1592,22 @@ impl ShmHeader {
         let kept: Vec<HudRegion> = regions.iter().filter_map(|r| r.clamped()).take(MAX_HUD_REGIONS).collect();
         let mut stores = Vec::with_capacity(MAX_HUD_REGIONS * 6 + 1);
         for (k, w) in self.hud_region.iter().enumerate() {
-            let r = kept.get(k).copied().unwrap_or(HudRegion { x: 0.0, y: 0.0, w: 0.0, h: 0.0, mode: crate::enums::hud_mode::KEEP, strength: HudRegion::DEFAULT_STRENGTH });
-            stores.extend([(&w.x_bits, r.x.to_bits()), (&w.y_bits, r.y.to_bits()), (&w.w_bits, r.w.to_bits()), (&w.h_bits, r.h.to_bits()), (&w.mode, r.mode), (&w.strength_bits, r.strength.to_bits())]);
+            let r = kept.get(k).copied().unwrap_or(HudRegion {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+                mode: crate::enums::hud_mode::KEEP,
+                strength: HudRegion::DEFAULT_STRENGTH,
+            });
+            stores.extend([
+                (&w.x_bits, r.x.to_bits()),
+                (&w.y_bits, r.y.to_bits()),
+                (&w.w_bits, r.w.to_bits()),
+                (&w.h_bits, r.h.to_bits()),
+                (&w.mode, r.mode),
+                (&w.strength_bits, r.strength.to_bits()),
+            ]);
         }
         stores.push((&self.hud_region_count, kept.len() as u32));
         stores
@@ -1598,7 +1621,17 @@ impl ShmHeader {
             let f = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed));
             let regions = self.hud_region[..n]
                 .iter()
-                .filter_map(|w| HudRegion { x: f(&w.x_bits), y: f(&w.y_bits), w: f(&w.w_bits), h: f(&w.h_bits), mode: w.mode.load(Ordering::Relaxed), strength: f(&w.strength_bits) }.clamped())
+                .filter_map(|w| {
+                    HudRegion {
+                        x: f(&w.x_bits),
+                        y: f(&w.y_bits),
+                        w: f(&w.w_bits),
+                        h: f(&w.h_bits),
+                        mode: w.mode.load(Ordering::Relaxed),
+                        strength: f(&w.strength_bits),
+                    }
+                    .clamped()
+                })
                 .collect();
             HudSettings { detect: self.hud_detect.load(Ordering::Relaxed) != 0, regions }
         })
@@ -1626,7 +1659,11 @@ impl ShmHeader {
     /// The Network setting ([`crate::enums::network`]); a value out of range is the full network.
     pub fn network_choice(&self) -> u32 {
         let v = self.network.load(Ordering::Relaxed);
-        if v < crate::enums::network::COUNT { v } else { crate::enums::network::FULL }
+        if v < crate::enums::network::COUNT {
+            v
+        } else {
+            crate::enums::network::FULL
+        }
     }
 
     /// The control mask's rules, each value clamped to its range.
@@ -1634,7 +1671,11 @@ impl ShmHeader {
         let f = |a: &AtomicU32, name: &str| {
             let (lo, hi) = setting_bounds(name).expect("a mask setting");
             let v = f32::from_bits(a.load(Ordering::Relaxed));
-            if v.is_finite() { v.clamp(lo, hi) } else { lo }
+            if v.is_finite() {
+                v.clamp(lo, hi)
+            } else {
+                lo
+            }
         };
         let on = |a: &AtomicU32| a.load(Ordering::Relaxed) != 0;
         self.read_settings(|| MaskSettings {
@@ -2415,7 +2456,13 @@ mod tests {
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.placements(), (1, [placement::AUTO; crate::MAX_PASSES]), "auto for every pass by default");
-        assert!(h.write_settings(&[("passes", 3), ("placement", placement::BEFORE), ("pass2_placement", placement::UPSCALED), ("pass3_placement", placement::PRESENT), ("pass2_overrides", pass_override::PLACEMENT)]));
+        assert!(h.write_settings(&[
+            ("passes", 3),
+            ("placement", placement::BEFORE),
+            ("pass2_placement", placement::UPSCALED),
+            ("pass3_placement", placement::PRESENT),
+            ("pass2_overrides", pass_override::PLACEMENT)
+        ]));
         let (count, p) = h.placements();
         assert_eq!((count, &p[..3]), (3, &[placement::BEFORE, placement::UPSCALED, placement::BEFORE][..]), "pass 3 does not override its placement");
         assert_eq!(h.pass_tunings().placements, p);

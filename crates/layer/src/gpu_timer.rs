@@ -54,7 +54,11 @@ impl GpuTimer {
     }
 
     fn mask(bits: u32) -> u64 {
-        if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }
+        if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        }
     }
 
     /// Resets both queries and writes the start timestamp at the `TRANSFER` stage. Call right

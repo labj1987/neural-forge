@@ -312,13 +312,8 @@ impl PresentFences {
         let mut fences = vec![vk::Fence::null(); swapchain_count as usize];
         fences[slot] = fence;
         let mut this = Box::new(Self { fences, info: vk::SwapchainPresentFenceInfoEXT::default() });
-        this.info = vk::SwapchainPresentFenceInfoEXT {
-            s_type: PRESENT_FENCE_INFO,
-            p_next,
-            swapchain_count,
-            p_fences: this.fences.as_ptr(),
-            ..Default::default()
-        };
+        this.info =
+            vk::SwapchainPresentFenceInfoEXT { s_type: PRESENT_FENCE_INFO, p_next, swapchain_count, p_fences: this.fences.as_ptr(), ..Default::default() };
         this
     }
 }
@@ -356,7 +351,12 @@ mod tests {
         let mut sems = PresentSemaphores::default();
         let mut next = 10;
         for image in [2, 0, 1, 2, 0, 1, 2, 0] {
-            let sem = sems.get(vk::Image::from_raw(image + 1), || { next += 1; Some(vk::Semaphore::from_raw(next)) }).unwrap();
+            let sem = sems
+                .get(vk::Image::from_raw(image + 1), || {
+                    next += 1;
+                    Some(vk::Semaphore::from_raw(next))
+                })
+                .unwrap();
             assert_eq!(sem.as_raw(), [12, 13, 11][image as usize]);
         }
         assert_eq!(next, 13);
@@ -417,7 +417,13 @@ mod tests {
 
     #[test]
     fn a_present_fence_counts_where_its_queue_operations_were_enqueued() {
-        for result in [vk::Result::SUCCESS, vk::Result::SUBOPTIMAL_KHR, vk::Result::ERROR_OUT_OF_DATE_KHR, vk::Result::ERROR_SURFACE_LOST_KHR, vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT] {
+        for result in [
+            vk::Result::SUCCESS,
+            vk::Result::SUBOPTIMAL_KHR,
+            vk::Result::ERROR_OUT_OF_DATE_KHR,
+            vk::Result::ERROR_SURFACE_LOST_KHR,
+            vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT,
+        ] {
             assert!(present_fence_signals(result, false), "{result:?}");
         }
         for result in [vk::Result::ERROR_OUT_OF_HOST_MEMORY, vk::Result::ERROR_OUT_OF_DEVICE_MEMORY, vk::Result::ERROR_DEVICE_LOST] {
@@ -589,7 +595,9 @@ mod tests {
             let surface = ash::khr::xlib_surface::Instance::new(&entry, &instance)
                 .create_xlib_surface(&vk::XlibSurfaceCreateInfoKHR::default().dpy(x11.display.cast()).window(x11.window), None)
                 .unwrap();
-            if !has(&device_offered, c"VK_EXT_swapchain_maintenance1") || !surface_fns.get_physical_device_surface_support(physical, 0, surface).unwrap_or(false) {
+            if !has(&device_offered, c"VK_EXT_swapchain_maintenance1")
+                || !surface_fns.get_physical_device_surface_support(physical, 0, surface).unwrap_or(false)
+            {
                 eprintln!("present fence WSI test: no VK_EXT_swapchain_maintenance1 or no presenting family 0, skipping");
                 surface_fns.destroy_surface(surface, None);
                 instance.destroy_instance(None);
@@ -599,7 +607,11 @@ mod tests {
             let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default().swapchain_maintenance1(true);
             let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&[1.0])];
             let device = instance
-                .create_device(physical, &vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&device_names).push_next(&mut maintenance), None)
+                .create_device(
+                    physical,
+                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&device_names).push_next(&mut maintenance),
+                    None,
+                )
                 .unwrap();
             {
                 use std::io::Write;
@@ -609,10 +621,15 @@ mod tests {
             let caps = surface_fns.get_physical_device_surface_capabilities(physical, surface).unwrap();
             let format = surface_fns.get_physical_device_surface_formats(physical, surface).unwrap()[0];
             let extent = if caps.current_extent.width == u32::MAX { vk::Extent2D { width: 64, height: 64 } } else { caps.current_extent };
-            let alpha = [vk::CompositeAlphaFlagsKHR::OPAQUE, vk::CompositeAlphaFlagsKHR::INHERIT, vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED, vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED]
-                .into_iter()
-                .find(|a| caps.supported_composite_alpha.contains(*a))
-                .unwrap();
+            let alpha = [
+                vk::CompositeAlphaFlagsKHR::OPAQUE,
+                vk::CompositeAlphaFlagsKHR::INHERIT,
+                vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+                vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+            ]
+            .into_iter()
+            .find(|a| caps.supported_composite_alpha.contains(*a))
+            .unwrap();
             // Each swapchain command resolved by itself: ash's loader also asks the device for
             // `vkGetPhysicalDevicePresentRectanglesKHR`, an instance command (a validation warning).
             let resolve = |name: &CStr| (instance.fp_v1_0().get_device_proc_addr)(device.handle(), name.as_ptr()).unwrap();
@@ -623,22 +640,22 @@ mod tests {
             let queue_present: vk::PFN_vkQueuePresentKHR = std::mem::transmute(resolve(c"vkQueuePresentKHR"));
             let mut swapchain = vk::SwapchainKHR::null();
             let created = create_swapchain(
-                    device.handle(),
-                    &vk::SwapchainCreateInfoKHR::default()
-                        .surface(surface)
-                        .min_image_count(caps.min_image_count.max(2))
-                        .image_format(format.format)
-                        .image_color_space(format.color_space)
-                        .image_extent(extent)
-                        .image_array_layers(1)
-                        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                        .pre_transform(caps.current_transform)
-                        .composite_alpha(alpha)
-                        .present_mode(vk::PresentModeKHR::FIFO)
-                        .clipped(true),
-                    std::ptr::null(),
-                    &mut swapchain,
-                );
+                device.handle(),
+                &vk::SwapchainCreateInfoKHR::default()
+                    .surface(surface)
+                    .min_image_count(caps.min_image_count.max(2))
+                    .image_format(format.format)
+                    .image_color_space(format.color_space)
+                    .image_extent(extent)
+                    .image_array_layers(1)
+                    .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                    .pre_transform(caps.current_transform)
+                    .composite_alpha(alpha)
+                    .present_mode(vk::PresentModeKHR::FIFO)
+                    .clipped(true),
+                std::ptr::null(),
+                &mut swapchain,
+            );
             assert_eq!(created, vk::Result::SUCCESS);
             let mut count = 0;
             assert_eq!(get_images(device.handle(), swapchain, &mut count, std::ptr::null_mut()), vk::Result::SUCCESS);
@@ -658,8 +675,22 @@ mod tests {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(image)
-                    .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 });
-                device.cmd_pipeline_barrier(buffer, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &[barrier]);
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                device.cmd_pipeline_barrier(
+                    buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
                 device.end_command_buffer(buffer).unwrap();
                 app_semaphores.push(device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap());
             }
@@ -679,7 +710,10 @@ mod tests {
                 device.queue_submit(queue, &[render], vk::Fence::null()).unwrap();
                 // The relay batch (`device::relay_app_waits`): the present waits on the layer's semaphore.
                 let relay = relays.get(image, || device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()).unwrap();
-                let relay_batch = vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&app)).wait_dst_stage_mask(&stage).signal_semaphores(std::slice::from_ref(&relay));
+                let relay_batch = vk::SubmitInfo::default()
+                    .wait_semaphores(std::slice::from_ref(&app))
+                    .wait_dst_stage_mask(&stage)
+                    .signal_semaphores(std::slice::from_ref(&relay));
                 device.queue_submit(queue, &[relay_batch], vk::Fence::null()).unwrap();
                 let fence = tickets.take(&device).unwrap();
                 let fences = PresentFences::new(1, 0, fence, std::ptr::null());

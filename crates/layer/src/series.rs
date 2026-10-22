@@ -215,9 +215,7 @@ impl Progress {
             Close::Complete if self.failed > 0 || self.written == 0 => (state::FAILED, reason::WRITE_FAILED),
             Close::Complete if self.held => (state::WRITTEN, reason::BEFORE_UPSCALER),
             Close::Complete if self.composed == self.written => (state::WRITTEN, reason::NONE),
-            Close::Complete if self.composed == 0 => {
-                (state::WRITTEN, if self.untouched == reason::NONE { reason::NOT_COMPOSED } else { self.untouched })
-            }
+            Close::Complete if self.composed == 0 => (state::WRITTEN, if self.untouched == reason::NONE { reason::NOT_COMPOSED } else { self.untouched }),
             Close::Complete => (state::WRITTEN, reason::PARTLY_COMPOSED),
         };
     }
@@ -374,7 +372,12 @@ impl Series {
     ) {
         let Some(active) = self.active.as_mut() else { return };
         active.original_pending = false;
-        let cancelled = active.report.channel.as_ref().and_then(crate::shm::Channel::header).is_some_and(|hdr| neural_forge_protocol::capture::cancel_requested(hdr, active.request.id));
+        let cancelled = active
+            .report
+            .channel
+            .as_ref()
+            .and_then(crate::shm::Channel::header)
+            .is_some_and(|hdr| neural_forge_protocol::capture::cancel_requested(hdr, active.request.id));
         if cancelled {
             crate::log!("[capture] capture {} cancelled after {} frames", active.request.id, active.seq);
             self.finish(Close::Cancelled);
@@ -638,12 +641,7 @@ fn write_job(target: &Target, job: &Job, fast: bool) -> bool {
     a.is_ok() && b.is_ok()
 }
 
-unsafe fn create_readback(
-    device: &ash::Device,
-    mem_props: &vk::PhysicalDeviceMemoryProperties,
-    pool: vk::CommandPool,
-    bytes: u64,
-) -> Option<Readback> {
+unsafe fn create_readback(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, pool: vk::CommandPool, bytes: u64) -> Option<Readback> {
     let info = vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
     let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
@@ -651,7 +649,9 @@ unsafe fn create_readback(
         (0..mem_props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(wanted))
     };
     // Cached host memory first: reading uncached memory back on the CPU is slow.
-    let Some(type_index) = find(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED).or_else(|| find(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)) else {
+    let Some(type_index) = find(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED)
+        .or_else(|| find(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT))
+    else {
         unsafe { device.destroy_buffer(buffer, None) };
         return None;
     };
@@ -769,18 +769,31 @@ unsafe fn submit_copy(device: &ash::Device, queue: vk::Queue, r: &Readback, imag
         if device.reset_command_buffer(r.cmd, vk::CommandBufferResetFlags::empty()).is_err() || device.begin_command_buffer(r.cmd, &begin).is_err() {
             return false;
         }
-        device.cmd_pipeline_barrier(r.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_src]);
+        device.cmd_pipeline_barrier(
+            r.cmd,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_src],
+        );
         device.cmd_copy_image_to_buffer(r.cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, r.buffer, &[region]);
-        device.cmd_pipeline_barrier(r.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[], &[to_host], &[to_present]);
+        device.cmd_pipeline_barrier(
+            r.cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE | vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[to_host],
+            &[to_present],
+        );
         if device.end_command_buffer(r.cmd).is_err() {
             return false;
         }
         let stage = [vk::PipelineStageFlags::TRANSFER];
         let waits: Vec<vk::Semaphore> = wait.into_iter().collect();
-        let submit = vk::SubmitInfo::default()
-            .wait_semaphores(&waits)
-            .wait_dst_stage_mask(&stage[..waits.len()])
-            .command_buffers(std::slice::from_ref(&r.cmd));
+        let submit = vk::SubmitInfo::default().wait_semaphores(&waits).wait_dst_stage_mask(&stage[..waits.len()]).command_buffers(std::slice::from_ref(&r.cmd));
         device.queue_submit(queue, &[submit], r.fence).is_ok()
     }
 }
@@ -839,7 +852,8 @@ mod tests {
     use neural_forge_protocol::capture::{self as protocol, MAX_FRAMES};
 
     fn clear(device: &ash::Device, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image, from: vk::ImageLayout, colour: [f32; 4]) {
-        let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+        let range =
+            vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
         let barrier = |old, new, src, dst| {
             vk::ImageMemoryBarrier::default()
                 .old_layout(old)
@@ -852,11 +866,36 @@ mod tests {
                 .subresource_range(range)
         };
         unsafe {
-            let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).unwrap()[0];
+            let cmd = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+                )
+                .unwrap()[0];
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[barrier(from, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::MEMORY_READ, vk::AccessFlags::TRANSFER_WRITE)]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(from, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::MEMORY_READ, vk::AccessFlags::TRANSFER_WRITE)],
+            );
             device.cmd_clear_color_image(cmd, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: colour }, &[range]);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[barrier(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::MEMORY_READ)]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::MEMORY_READ,
+                )],
+            );
             device.end_command_buffer(cmd).unwrap();
             // No fence: queue order alone has to keep the series' readbacks around this.
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], vk::Fence::null()).unwrap();

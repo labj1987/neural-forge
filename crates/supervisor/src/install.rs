@@ -423,10 +423,7 @@ pub fn uninstall() -> std::io::Result<Vec<PathBuf>> {
 /// Removes `path`'s parent directories while they are empty, stopping at the XDG base
 /// directories themselves (never removes `~/.local/share` and the like).
 fn remove_empty_parents(path: &Path) {
-    let stops: Vec<PathBuf> = [crate::paths::data_home(), crate::paths::config_home(), crate::paths::home()]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
+    let stops: Vec<PathBuf> = [crate::paths::data_home(), crate::paths::config_home(), crate::paths::home()].into_iter().map(PathBuf::from).collect();
     let mut dir = path.parent();
     while let Some(d) = dir {
         if stops.iter().any(|s| s == d) || std::fs::remove_dir(d).is_err() {
@@ -459,10 +456,7 @@ pub fn purge() -> std::io::Result<Vec<PathBuf>> {
     let runtime = neural_forge_protocol::shm_runtime_dir();
     for dir in [crate::paths::config_dir(), crate::paths::data_dir(), crate::paths::state_dir(), runtime] {
         let dir = PathBuf::from(dir);
-        let ours = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n == "neural-forge" || n.starts_with("neural-forge-"));
+        let ours = dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == "neural-forge" || n.starts_with("neural-forge-"));
         if !ours || !dir.is_dir() || dir.is_symlink() {
             continue;
         }
@@ -563,7 +557,9 @@ mod tests {
         assert_eq!(manifest["layer"]["library_path"], root.join("lib/neural-forge/libneural_forge_layer.so").to_string_lossy().into_owned());
 
         let data_home = PathBuf::from(paths::data_home());
-        for integration in [format!("applications/{APP_ID}.desktop"), "icons/hicolor/scalable/apps/neural-forge.svg".into(), format!("metainfo/{APP_ID}.appdata.xml")] {
+        for integration in
+            [format!("applications/{APP_ID}.desktop"), "icons/hicolor/scalable/apps/neural-forge.svg".into(), format!("metainfo/{APP_ID}.appdata.xml")]
+        {
             assert!(!data_home.join(&integration).exists(), "{integration}: menu integration belongs to the AppImage, not the install");
         }
 

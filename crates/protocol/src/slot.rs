@@ -84,7 +84,12 @@ mod tests {
         assert_eq!(next_request(u32::MAX - 1), u32::MAX);
         assert_eq!(next_request(u32::MAX), 1, "0 means no request and is skipped");
         let mut seq = u32::MAX - 2;
-        let issued: Vec<u32> = (0..5).map(|_| { seq = next_request(seq); seq }).collect();
+        let issued: Vec<u32> = (0..5)
+            .map(|_| {
+                seq = next_request(seq);
+                seq
+            })
+            .collect();
         assert_eq!(issued, [u32::MAX - 1, u32::MAX, 1, 2, 3]);
     }
 }

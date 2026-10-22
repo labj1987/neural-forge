@@ -132,12 +132,14 @@ mod tests {
         let app = |api| vk::ApplicationInfo { api_version: api, ..Default::default() };
         let (v10, v11, v13) = (app(vk::API_VERSION_1_0), app(vk::API_VERSION_1_1), app(vk::API_VERSION_1_3));
         let khr = [c"VK_KHR_get_physical_device_properties2".as_ptr()];
-        let info = |a: Option<&vk::ApplicationInfo>, ext: &[*const std::ffi::c_char]| -> vk::InstanceCreateInfo<'static> { vk::InstanceCreateInfo {
-            p_application_info: a.map_or(std::ptr::null(), |a| std::ptr::from_ref(a).cast()),
-            enabled_extension_count: ext.len() as u32,
-            pp_enabled_extension_names: if ext.is_empty() { std::ptr::null() } else { ext.as_ptr() },
-            ..Default::default()
-        } };
+        let info = |a: Option<&vk::ApplicationInfo>, ext: &[*const std::ffi::c_char]| -> vk::InstanceCreateInfo<'static> {
+            vk::InstanceCreateInfo {
+                p_application_info: a.map_or(std::ptr::null(), |a| std::ptr::from_ref(a).cast()),
+                enabled_extension_count: ext.len() as u32,
+                pp_enabled_extension_names: if ext.is_empty() { std::ptr::null() } else { ext.as_ptr() },
+                ..Default::default()
+            }
+        };
         assert_eq!(Properties2::of(&info(None, &[])), Properties2::None, "no application info: 1.0");
         assert_eq!(Properties2::of(&info(Some(&app(0)), &[])), Properties2::None, "0 is 1.0");
         assert_eq!(Properties2::of(&info(Some(&v10), &[])), Properties2::None);

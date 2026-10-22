@@ -111,13 +111,7 @@ pub fn is_plausible_game_size(width: u32, height: u32) -> bool {
 /// Widen this list only together with the matching compose path (the tracked follow-up:
 /// the float16 proxy, PQ10 transfer and half-float compose fallback).
 pub fn is_supported_format(format: vk::Format) -> bool {
-    matches!(
-        format,
-        vk::Format::B8G8R8A8_UNORM
-            | vk::Format::B8G8R8A8_SRGB
-            | vk::Format::R8G8B8A8_UNORM
-            | vk::Format::R8G8B8A8_SRGB
-    )
+    matches!(format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB)
 }
 
 /// The `neural_forge_protocol::enums::proxy_format` this swapchain's raw
@@ -148,10 +142,7 @@ pub fn detect_hdr_kind(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u3
     if format == vk::Format::R16G16B16A16_SFLOAT {
         return hdr_kind::LINEAR_FP16;
     }
-    let ten_bit = matches!(
-        format,
-        vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32
-    );
+    let ten_bit = matches!(format, vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32);
     let pq = color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT;
     if ten_bit && pq {
         hdr_kind::PQ10
@@ -241,12 +232,12 @@ mod format_tests {
     }
     #[test]
     fn raw_formats_preserve_channel_order_and_size() {
-        for f in [vk::Format::B8G8R8A8_UNORM,vk::Format::B8G8R8A8_SRGB] {
-            assert_eq!(proxy_format_for(f),proxy_format::BGRA8);
-            assert_eq!(proxy_format::bytes_per_pixel(proxy_format_for(f)),4);
+        for f in [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB] {
+            assert_eq!(proxy_format_for(f), proxy_format::BGRA8);
+            assert_eq!(proxy_format::bytes_per_pixel(proxy_format_for(f)), 4);
             assert!(proxy_format::is_8bit(proxy_format_for(f)));
         }
-        assert_eq!(proxy_format_for(vk::Format::R8G8B8A8_UNORM),proxy_format::RGBA8);
+        assert_eq!(proxy_format_for(vk::Format::R8G8B8A8_UNORM), proxy_format::RGBA8);
         assert!(!proxy_format::is_8bit(proxy_format::RGBA16F));
     }
 }

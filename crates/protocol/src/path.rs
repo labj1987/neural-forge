@@ -40,7 +40,9 @@ pub fn isolated_path(path: &str) -> bool {
 mod tests {
     #[test]
     fn upstream_overrides_are_refused() {
-        for path in ["/tmp/dlssnr-1000/shm.bin", "/home/a/.config/dlssnr/config.ini", "Z:\\tmp\\dlssnr-1000\\shm.bin", "/tmp/neural-forge-1000/../dlssnr-1000/shm.bin"] {
+        for path in
+            ["/tmp/dlssnr-1000/shm.bin", "/home/a/.config/dlssnr/config.ini", "Z:\\tmp\\dlssnr-1000\\shm.bin", "/tmp/neural-forge-1000/../dlssnr-1000/shm.bin"]
+        {
             assert!(!super::isolated_path(path));
         }
         assert!(super::isolated_path("/tmp/neural-forge-1000/shm.bin"));

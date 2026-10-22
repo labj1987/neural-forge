@@ -166,7 +166,11 @@ pub unsafe fn app_feature(info: &vk::DeviceCreateInfo) -> Option<bool> {
 /// # Safety
 /// `gipa` and `instance` are the next layer's for `physical`; `extensions` is its extension list.
 pub unsafe fn offered(
-    gipa: vk::PFN_vkGetInstanceProcAddr, instance: vk::Instance, physical: vk::PhysicalDevice, properties2: crate::vram::Properties2, extensions: &[&CStr],
+    gipa: vk::PFN_vkGetInstanceProcAddr,
+    instance: vk::Instance,
+    physical: vk::PhysicalDevice,
+    properties2: crate::vram::Properties2,
+    extensions: &[&CStr],
 ) -> Offered {
     let khr = extensions.contains(&KHR_SWAPCHAIN);
     let ext = extensions.contains(&EXT_SWAPCHAIN);
@@ -179,7 +183,8 @@ pub unsafe fn offered(
         return Offered::default();
     }
     // SAFETY: the name's signature.
-    let features2 = unsafe { gipa(instance, name.as_ptr()) }.map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceFeatures2>(f) });
+    let features2 = unsafe { gipa(instance, name.as_ptr()) }
+        .map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceFeatures2>(f) });
     let Some(features2) = features2 else { return Offered { khr, ext, feature: false } };
     let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
     let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut maintenance);
@@ -248,7 +253,11 @@ mod tests {
         let app = [SWAPCHAIN];
         assert_eq!(plan(&app, None, ALL, BOTH, true), Plan::Add { extension: Some(KHR_SWAPCHAIN) }, "KHR first");
         assert_eq!(plan(&app, None, Offered { khr: false, ..ALL }, BOTH, true), Plan::Add { extension: Some(EXT_SWAPCHAIN) });
-        assert_eq!(plan(&app, None, ALL, InstanceSupport { khr: false, ext: true }, true), Plan::Add { extension: Some(EXT_SWAPCHAIN) }, "the instance's dependency decides");
+        assert_eq!(
+            plan(&app, None, ALL, InstanceSupport { khr: false, ext: true }, true),
+            Plan::Add { extension: Some(EXT_SWAPCHAIN) },
+            "the instance's dependency decides"
+        );
         assert!(matches!(plan(&app, None, ALL, InstanceSupport::default(), true), Plan::AsIs(Err(_))));
         assert!(matches!(plan(&app, None, Offered { feature: false, ..ALL }, BOTH, true), Plan::AsIs(Err(_))));
         assert!(matches!(plan(&app, None, ALL, BOTH, false), Plan::AsIs(Err(_))), "Vulkan 1.0 without properties2");

@@ -75,7 +75,10 @@ pub type Command = Box<dyn Fn(&[&str]) -> CommandOutput>;
 pub enum LaunchOptionState {
     Present,
     /// Missing for the named game; `option` is the launch option to set for it.
-    Missing { game: String, option: String },
+    Missing {
+        game: String,
+        option: String,
+    },
     /// No installed Steam game has it.
     NoneEnabled,
 }
@@ -417,13 +420,27 @@ fn check_manifest(roots: &Roots) -> Finding {
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Finding::new(CHECK, Severity::Failure, "the Vulkan layer is not installed: no game can load it", format!("{shown} does not exist"), install());
+            return Finding::new(
+                CHECK,
+                Severity::Failure,
+                "the Vulkan layer is not installed: no game can load it",
+                format!("{shown} does not exist"),
+                install(),
+            );
         }
         Err(e) => return Finding::new(CHECK, Severity::Failure, format!("the layer manifest cannot be read: {e}"), shown, install()),
     };
     let json: serde_json::Value = match serde_json::from_str(&text) {
         Ok(json) => json,
-        Err(e) => return Finding::new(CHECK, Severity::Failure, "the layer manifest is not valid JSON: the Vulkan loader ignores it", format!("{shown}: {e}"), install()),
+        Err(e) => {
+            return Finding::new(
+                CHECK,
+                Severity::Failure,
+                "the layer manifest is not valid JSON: the Vulkan loader ignores it",
+                format!("{shown}: {e}"),
+                install(),
+            )
+        }
     };
     let Some(library) = json["layer"]["library_path"].as_str() else {
         return Finding::new(CHECK, Severity::Failure, "the layer manifest names no library", format!("{shown}: no layer.library_path"), install());
@@ -480,7 +497,12 @@ fn check_gpu(roots: &Roots) -> Vec<Finding> {
         )];
     }
     let names = models.iter().map(|(_, m)| m.as_str()).collect::<Vec<_>>().join(", ");
-    let evidence = models.iter().map(|(p, m)| format!("{}: Model: {m}", p.display())).chain([format!("{}: {version}", version_file.display())]).collect::<Vec<_>>().join("\n");
+    let evidence = models
+        .iter()
+        .map(|(p, m)| format!("{}: Model: {m}", p.display()))
+        .chain([format!("{}: {version}", version_file.display())])
+        .collect::<Vec<_>>()
+        .join("\n");
     vec![Finding::new("gpu", Severity::Ok, format!("{names}, driver {version}"), evidence, None)]
 }
 
@@ -558,7 +580,13 @@ fn check_compute_capability(gpus: &Gpus) -> Vec<Finding> {
     let shown = |c: u32| format!("{}.{}", c / 10, c % 10);
     let able: Vec<&Gpu> = list.iter().filter(|g| g.compute.is_some_and(|c| c >= MIN_COMPUTE_CAPABILITY)).collect();
     if let Some(gpu) = able.first() {
-        return vec![Finding::new(CHECK, Severity::Ok, format!("{} has compute capability {}", gpu.name, shown(gpu.compute.unwrap_or_default())), evidence, None)];
+        return vec![Finding::new(
+            CHECK,
+            Severity::Ok,
+            format!("{} has compute capability {}", gpu.name, shown(gpu.compute.unwrap_or_default())),
+            evidence,
+            None,
+        )];
     }
     match list.iter().find(|g| g.compute.is_some()) {
         Some(gpu) => vec![Finding::new(
@@ -607,7 +635,10 @@ fn check_vram(gpus: &Gpus, hdr: Option<&neural_forge_protocol::ShmHeader>) -> Ve
         return vec![Finding::new(
             CHECK,
             Severity::Info,
-            format!("{free} MiB of {total} MiB VRAM free; the network needs about {}-{} MiB depending on the game's resolution", NETWORK_VRAM_MIB[0].2, NETWORK_VRAM_MIB[3].2),
+            format!(
+                "{free} MiB of {total} MiB VRAM free; the network needs about {}-{} MiB depending on the game's resolution",
+                NETWORK_VRAM_MIB[0].2, NETWORK_VRAM_MIB[3].2
+            ),
             evidence,
             None,
         )];
@@ -667,7 +698,13 @@ fn check_never_attached(roots: &Roots, manifest_ok: bool, evidence: String) -> F
         Some(LaunchOptionState::NoneEnabled) => format!("Switch the game on in the Setup tab's Steam games list (or `neural-forge-cli enable GAME`) with Steam closed, then start it. By hand: `{GENERIC_OPTION}`."),
         _ => format!("Check the game's launch options for `{GENERIC_OPTION}`, then start the game again (a running game keeps the layer it started with)."),
     };
-    Finding::new(CHECK, Severity::Warning, "no game's layer has attached since the channel was created (this boot)", format!("{evidence}\nlikely causes:\n{numbered}"), Some(fix))
+    Finding::new(
+        CHECK,
+        Severity::Warning,
+        "no game's layer has attached since the channel was created (this boot)",
+        format!("{evidence}\nlikely causes:\n{numbered}"),
+        Some(fix),
+    )
 }
 
 // ---- Steam: which games launch with Neural Forge ---------------------------------------------------
@@ -694,7 +731,13 @@ fn check_steam(roots: &Roots) -> Vec<Finding> {
     const CHECK: &str = "steam";
     let steam = &roots.steam_roots;
     if steam.is_empty() {
-        return vec![Finding::new(CHECK, Severity::Info, "no Steam installation found", "no steamapps/ under ~/.local/share/Steam, ~/.steam/steam, the Flatpak or the Snap root", None)];
+        return vec![Finding::new(
+            CHECK,
+            Severity::Info,
+            "no Steam installation found",
+            "no steamapps/ under ~/.local/share/Steam, ~/.steam/steam, the Flatpak or the Snap root",
+            None,
+        )];
     }
     let mut out = Vec::new();
     let root_list = steam.iter().map(|r| format!("{}{}", r.path.display(), if r.flatpak { " (Flatpak)" } else { "" })).collect::<Vec<_>>().join("\n");
@@ -736,7 +779,8 @@ fn check_steam(roots: &Roots) -> Vec<Finding> {
         out.push(Finding::new(CHECK, Severity::Ok, format!("{on} of {usable_games} installed Steam games launch with Neural Forge"), evidence.clone(), None));
     }
     // Switched on in the Flatpak Steam: it cannot work there, whatever the native Steam does.
-    let flatpak_on: Vec<String> = games.iter().zip(&options).filter(|(g, o)| !usable(g) && o.is_some()).map(|(g, _)| format!("{} ({})", g.name, g.appid)).collect();
+    let flatpak_on: Vec<String> =
+        games.iter().zip(&options).filter(|(g, o)| !usable(g) && o.is_some()).map(|(g, _)| format!("{} ({})", g.name, g.appid)).collect();
     if !flatpak_on.is_empty() && !crate::steam::only_flatpak(steam) {
         out.push(Finding::new(
             "steam-flatpak-games",
@@ -819,7 +863,8 @@ fn check_device_lost(hdr: Option<&neural_forge_protocol::ShmHeader>, session: Op
     }
     if evidence.is_empty() {
         // Only what was actually read is evidence: with neither the channel nor a session, nothing is known.
-        let read: Vec<&str> = [hdr.map(|_| "channel: device_lost_at=0"), session.map(|_| "state log: no device-lost line in the last session")].into_iter().flatten().collect();
+        let read: Vec<&str> =
+            [hdr.map(|_| "channel: device_lost_at=0"), session.map(|_| "state log: no device-lost line in the last session")].into_iter().flatten().collect();
         if read.is_empty() {
             return Vec::new();
         }
@@ -929,7 +974,11 @@ pub fn xid_lines(roots: &Roots) -> String {
     match (roots.journalctl)(&JOURNAL_ARGS) {
         CommandOutput::Ran(text) => {
             let lines: Vec<String> = text.lines().filter_map(parse_xid).map(|x| x.line).collect();
-            if lines.is_empty() { format!("{command}: no NVRM: Xid line this boot\n") } else { format!("{command}:\n{}\n", lines.join("\n")) }
+            if lines.is_empty() {
+                format!("{command}: no NVRM: Xid line this boot\n")
+            } else {
+                format!("{command}:\n{}\n", lines.join("\n"))
+            }
         }
         CommandOutput::Failed(why) => format!("{command}: could not be read: {why}\n"),
         CommandOutput::Missing => format!("{command}: journalctl is not installed\n"),
@@ -1025,7 +1074,12 @@ fn check_input_group(roots: &Roots) -> Vec<Finding> {
         })
     });
     let (Some(groups), Some(gid)) = (groups, input_gid) else { return Vec::new() };
-    let evidence = format!("{}: Groups: {}; {}: input is gid {gid}", status_file.display(), groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "), roots.group_file.display());
+    let evidence = format!(
+        "{}: Groups: {}; {}: input is gid {gid}",
+        status_file.display(),
+        groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),
+        roots.group_file.display()
+    );
     if groups.contains(&gid) {
         return vec![Finding::new(CHECK, Severity::Ok, "you are in the input group: the toggle key works everywhere", evidence, None)];
     }
@@ -1086,7 +1140,13 @@ fn check_session_log(roots: &Roots, events: Result<&[state_log::Event], std::io:
     let shown = file.display().to_string();
     match events {
         Err(std::io::ErrorKind::NotFound) => {
-            return vec![Finding::new(CHECK, Severity::Info, "no game has run with this version's layer yet (no state log)", format!("{shown} does not exist"), None)]
+            return vec![Finding::new(
+                CHECK,
+                Severity::Info,
+                "no game has run with this version's layer yet (no state log)",
+                format!("{shown} does not exist"),
+                None,
+            )]
         }
         Err(kind) => return vec![Finding::new(CHECK, Severity::Info, format!("the layer's state log cannot be read: {kind}"), shown, None)],
         Ok(_) => {}
@@ -1162,7 +1222,8 @@ mod tests {
 
     fn fixture(smi: CommandOutput, journal: CommandOutput) -> Fixture {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("neural-forge-doctor-{}-{}", std::process::id(), COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let dir =
+            std::env::temp_dir().join(format!("neural-forge-doctor-{}-{}", std::process::id(), COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&dir);
         // The channel's directory must be private, as the real runtime dir is.
         std::fs::create_dir_all(dir.join("run")).unwrap();
@@ -1213,7 +1274,10 @@ mod tests {
     }
 
     fn manifest(f: &Fixture, library: &Path) {
-        write(&f.roots.data_home.join("vulkan/implicit_layer.d/neural_forge_layer.json"), &format!(r#"{{"layer": {{"name": "VK_LAYER_neuralforge_neural", "library_path": "{}"}}}}"#, library.display()));
+        write(
+            &f.roots.data_home.join("vulkan/implicit_layer.d/neural_forge_layer.json"),
+            &format!(r#"{{"layer": {{"name": "VK_LAYER_neuralforge_neural", "library_path": "{}"}}}}"#, library.display()),
+        );
     }
 
     #[test]
@@ -1238,7 +1302,10 @@ mod tests {
             Finding::new("gpu", Severity::Ok, "RTX 5070", "/proc/x", None),
         ];
         let text = render_text(&v);
-        assert!(text.starts_with("[FAILURE] model: the model is missing\n    line one\n    line two\n    fix: extract it\n[ok] gpu: RTX 5070\n    /proc/x\n"), "{text}");
+        assert!(
+            text.starts_with("[FAILURE] model: the model is missing\n    line one\n    line two\n    fix: extract it\n[ok] gpu: RTX 5070\n    /proc/x\n"),
+            "{text}"
+        );
         assert!(text.ends_with("1 failure(s), 0 warning(s), 0 note(s), 1 ok\n"), "{text}");
     }
 
@@ -1391,7 +1458,11 @@ mod tests {
         let v = check_attached(&f.roots, mapping.header(), false);
         assert_eq!(v.severity, Severity::Warning);
         assert!(v.evidence.contains("NEURAL_FORGE_TARGET_EXE=<the game's .exe>"), "the advice names the target: {}", v.evidence);
-        let (launch, restart, manifest) = (v.evidence.find("1. the game's Steam launch options may lack").unwrap(), v.evidence.find("2. the game was already running").unwrap(), v.evidence.find("3. the layer manifest").unwrap());
+        let (launch, restart, manifest) = (
+            v.evidence.find("1. the game's Steam launch options may lack").unwrap(),
+            v.evidence.find("2. the game was already running").unwrap(),
+            v.evidence.find("3. the layer manifest").unwrap(),
+        );
         assert!(launch < restart && restart < manifest);
         // Known missing for a game: named, first, and the fix says where.
         let option = "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe %command%".to_string();
@@ -1417,7 +1488,10 @@ mod tests {
         write(&root.join("steamapps/libraryfolders.vdf"), &format!("\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{lib}\"\n\t}}\n}}\n"));
         let mut apps = String::new();
         for (appid, name, options) in games {
-            write(&root.join(format!("steamapps/appmanifest_{appid}.acf")), &format!("\"AppState\"\n{{\n\t\"appid\"\t\t\"{appid}\"\n\t\"name\"\t\t\"{name}\"\n\t\"installdir\"\t\t\"{name}\"\n}}\n"));
+            write(
+                &root.join(format!("steamapps/appmanifest_{appid}.acf")),
+                &format!("\"AppState\"\n{{\n\t\"appid\"\t\t\"{appid}\"\n\t\"name\"\t\t\"{name}\"\n\t\"installdir\"\t\t\"{name}\"\n}}\n"),
+            );
             if let Some(options) = options {
                 apps.push_str(&format!("\t\t\t\t\t\"{appid}\"\n\t\t\t\t\t{{\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"{options}\"\n\t\t\t\t\t}}\n"));
             }
@@ -1429,7 +1503,16 @@ mod tests {
     #[test]
     fn steam_games_are_listed_with_their_state() {
         let mut f = quiet();
-        steam(&mut f, "steam", false, &[("3240220", "Grand Theft Auto V Enhanced", Some("MANGOHUD=1 NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%")), ("990080", "Hogwarts Legacy", None), ("1493710", "Proton Experimental", None)]);
+        steam(
+            &mut f,
+            "steam",
+            false,
+            &[
+                ("3240220", "Grand Theft Auto V Enhanced", Some("MANGOHUD=1 NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%")),
+                ("990080", "Hogwarts Legacy", None),
+                ("1493710", "Proton Experimental", None),
+            ],
+        );
         let v = check_steam(&f.roots);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].severity, Severity::Ok);
@@ -1482,7 +1565,11 @@ mod tests {
         let v = check_steam(&f.roots);
         let w = one(&v, "steam-target");
         assert_eq!(w.severity, Severity::Warning);
-        assert!(w.evidence.contains("Grand Theft Auto V Enhanced: NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command% --launcher-skip"), "{}", w.evidence);
+        assert!(
+            w.evidence.contains("Grand Theft Auto V Enhanced: NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command% --launcher-skip"),
+            "{}",
+            w.evidence
+        );
     }
 
     #[test]
@@ -1593,7 +1680,10 @@ mod tests {
         assert!(v[0].summary.starts_with("the GPU device was lost during the last game session"));
         assert!(v[0].evidence.contains("device_lost_at=1760119200 (2025-10-10 18:00:00 UTC)"), "{}", v[0].evidence);
         // From the log alone (the channel is gone after a reboot).
-        let session: Vec<_> = [event(1, 7, state_log::ATTACH, "engaged"), event(2, 7, state_log::DEVICE_LOST, "VK_ERROR_DEVICE_LOST")].iter().filter_map(|l| state_log::parse_line(l)).collect();
+        let session: Vec<_> = [event(1, 7, state_log::ATTACH, "engaged"), event(2, 7, state_log::DEVICE_LOST, "VK_ERROR_DEVICE_LOST")]
+            .iter()
+            .filter_map(|l| state_log::parse_line(l))
+            .collect();
         let v = check_device_lost(None, Some(&session));
         assert_eq!(v[0].severity, Severity::Failure);
         assert!(v[0].evidence.contains("state log: 1970-01-01 00:00:02 UTC Game.exe (pid 7) device-lost"));
@@ -1612,16 +1702,28 @@ mod tests {
         // Another status line that merely mentions the words is not this.
         hdr.set_layer_reason("native network: the device cannot run the network: later");
         assert!(check_cannot_run(Some(hdr), None).is_empty());
-        let session: Vec<_> = [event(1, 7, state_log::NATIVE_UNAVAILABLE, "device cannot run the network: shaderInt64")].iter().filter_map(|l| state_log::parse_line(l)).collect();
-        assert_eq!(check_cannot_run(None, Some(&session))[0].summary, "the GPU cannot run the network: it lacks shaderInt64");
-        // The application's instance version is that program's, not the GPU's: a warning naming it, no driver advice.
-        let old: Vec<_> = [event(1, 7, state_log::NATIVE_UNAVAILABLE, "device cannot run the network: the application's instance asks for Vulkan 1.1; the network needs an instance for Vulkan 1.3")]
+        let session: Vec<_> = [event(1, 7, state_log::NATIVE_UNAVAILABLE, "device cannot run the network: shaderInt64")]
             .iter()
             .filter_map(|l| state_log::parse_line(l))
             .collect();
+        assert_eq!(check_cannot_run(None, Some(&session))[0].summary, "the GPU cannot run the network: it lacks shaderInt64");
+        // The application's instance version is that program's, not the GPU's: a warning naming it, no driver advice.
+        let old: Vec<_> = [event(
+            1,
+            7,
+            state_log::NATIVE_UNAVAILABLE,
+            "device cannot run the network: the application's instance asks for Vulkan 1.1; the network needs an instance for Vulkan 1.3",
+        )]
+        .iter()
+        .filter_map(|l| state_log::parse_line(l))
+        .collect();
         let v = check_cannot_run(None, Some(&old));
         assert_eq!(v[0].severity, Severity::Warning);
-        assert!(v[0].summary.ends_with("ran without the model: the application's instance asks for Vulkan 1.1; the network needs an instance for Vulkan 1.3"), "{}", v[0].summary);
+        assert!(
+            v[0].summary.ends_with("ran without the model: the application's instance asks for Vulkan 1.1; the network needs an instance for Vulkan 1.3"),
+            "{}",
+            v[0].summary
+        );
         assert!(!v[0].fix.as_deref().unwrap_or("").contains("Update the NVIDIA driver"), "{:?}", v[0].fix);
     }
 
@@ -1746,7 +1848,10 @@ mod tests {
     #[test]
     fn run_reads_the_session_through_to_the_device_loss_and_fails() {
         let f = quiet();
-        write(&f.roots.state_dir.join(state_log::FILE_NAME), &[event(1, 9, state_log::ATTACH, "engaged"), event(2, 9, state_log::DEVICE_LOST, "VK_ERROR_DEVICE_LOST")].concat());
+        write(
+            &f.roots.state_dir.join(state_log::FILE_NAME),
+            &[event(1, 9, state_log::ATTACH, "engaged"), event(2, 9, state_log::DEVICE_LOST, "VK_ERROR_DEVICE_LOST")].concat(),
+        );
         let v = run(&f.roots);
         assert_eq!(one(&v, "device-lost").severity, Severity::Failure);
         assert_eq!(one(&v, "last-session").summary, "the last session engaged; its errors are reported above");

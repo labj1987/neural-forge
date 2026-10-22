@@ -32,11 +32,7 @@ pub fn luminance(rgb: [f32; 3]) -> f32 {
 }
 
 fn mat3_mul(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
-    [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-    ]
+    [m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2], m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2], m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2]]
 }
 
 fn cbrt3(v: [f32; 3]) -> [f32; 3] {
@@ -49,26 +45,13 @@ fn cube3(v: [f32; 3]) -> [f32; 3] {
 
 // Björn Ottosson's published constants (see module doc comment) -- also present,
 // unmodified, in RenoDX's own MIT-licensed `oklab.hlsl`.
-const LINEAR_SRGB_TO_OKLAB_LMS: [[f32; 3]; 3] = [
-    [0.4122214708, 0.5363325363, 0.0514459929],
-    [0.2119034982, 0.6806995451, 0.1073969566],
-    [0.0883024619, 0.2817188376, 0.6299787005],
-];
-const OKLAB_LMS_TO_OKLAB: [[f32; 3]; 3] = [
-    [0.2104542553, 0.7936177850, -0.0040720468],
-    [1.9779984951, -2.4285922050, 0.4505937099],
-    [0.0259040371, 0.7827717662, -0.8086757660],
-];
-const OKLAB_TO_OKLAB_LMS: [[f32; 3]; 3] = [
-    [1.0, 0.3963377774, 0.2158037573],
-    [1.0, -0.1055613458, -0.0638541728],
-    [1.0, -0.0894841775, -1.2914855480],
-];
-const OKLAB_LMS_TO_LINEAR_SRGB: [[f32; 3]; 3] = [
-    [4.0767416621, -3.3077115913, 0.2309699292],
-    [-1.2684380046, 2.6097574011, -0.3413193965],
-    [-0.0041960863, -0.7034186147, 1.7076147010],
-];
+const LINEAR_SRGB_TO_OKLAB_LMS: [[f32; 3]; 3] =
+    [[0.4122214708, 0.5363325363, 0.0514459929], [0.2119034982, 0.6806995451, 0.1073969566], [0.0883024619, 0.2817188376, 0.6299787005]];
+const OKLAB_LMS_TO_OKLAB: [[f32; 3]; 3] =
+    [[0.2104542553, 0.7936177850, -0.0040720468], [1.9779984951, -2.4285922050, 0.4505937099], [0.0259040371, 0.7827717662, -0.8086757660]];
+const OKLAB_TO_OKLAB_LMS: [[f32; 3]; 3] = [[1.0, 0.3963377774, 0.2158037573], [1.0, -0.1055613458, -0.0638541728], [1.0, -0.0894841775, -1.2914855480]];
+const OKLAB_LMS_TO_LINEAR_SRGB: [[f32; 3]; 3] =
+    [[4.0767416621, -3.3077115913, 0.2309699292], [-1.2684380046, 2.6097574011, -0.3413193965], [-0.0041960863, -0.7034186147, 1.7076147010]];
 
 pub fn oklab_from_linear_srgb(rgb: [f32; 3]) -> [f32; 3] {
     let lms = mat3_mul(&LINEAR_SRGB_TO_OKLAB_LMS, rgb);
@@ -85,18 +68,9 @@ pub fn linear_srgb_from_oklab(oklab: [f32; 3]) -> [f32; 3] {
 // e.g. Fairchild, *Color Appearance Models*) -- none of this is RenoDX's; it's the
 // same "specific to nobody" category upstream's own attribution file puts the AP1/PQ
 // transforms in.
-const LINEAR_SRGB_TO_XYZ: [[f32; 3]; 3] = [
-    [0.4124564, 0.3575761, 0.1804375],
-    [0.2126729, 0.7151522, 0.0721750],
-    [0.0193339, 0.1191920, 0.9503041],
-];
-const XYZ_TO_HPE_LMS: [[f32; 3]; 3] =
-    [[0.38971, 0.68898, -0.07868], [-0.22981, 1.18340, 0.04641], [0.0, 0.0, 1.0]];
-const HPE_LMS_TO_XYZ: [[f32; 3]; 3] = [
-    [1.9102329169, -1.1121299780, 0.2019182498],
-    [0.3709500882, 0.6290542715, 0.0000000000],
-    [0.0, 0.0, 1.0],
-];
+const LINEAR_SRGB_TO_XYZ: [[f32; 3]; 3] = [[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]];
+const XYZ_TO_HPE_LMS: [[f32; 3]; 3] = [[0.38971, 0.68898, -0.07868], [-0.22981, 1.18340, 0.04641], [0.0, 0.0, 1.0]];
+const HPE_LMS_TO_XYZ: [[f32; 3]; 3] = [[1.9102329169, -1.1121299780, 0.2019182498], [0.3709500882, 0.6290542715, 0.0000000000], [0.0, 0.0, 1.0]];
 /// The D65 white point's XYZ, normalized so `Y = 1` — used to build "a neutral color
 /// of the same luminance as X" by scaling this along the white point's own ray.
 const D65_WHITE_XYZ: [f32; 3] = [0.95047, 1.0, 1.08883];
@@ -107,11 +81,7 @@ fn linear_srgb_to_hpe_lms(rgb: [f32; 3]) -> [f32; 3] {
 
 fn hpe_lms_to_linear_srgb(lms: [f32; 3]) -> [f32; 3] {
     // XYZ -> linear sRGB is the matrix inverse of LINEAR_SRGB_TO_XYZ.
-    const XYZ_TO_LINEAR_SRGB: [[f32; 3]; 3] = [
-        [3.2404542, -1.5371385, -0.4985314],
-        [-0.9692660, 1.8760108, 0.0415560],
-        [0.0556434, -0.2040259, 1.0572252],
-    ];
+    const XYZ_TO_LINEAR_SRGB: [[f32; 3]; 3] = [[3.2404542, -1.5371385, -0.4985314], [-0.9692660, 1.8760108, 0.0415560], [0.0556434, -0.2040259, 1.0572252]];
     mat3_mul(&XYZ_TO_LINEAR_SRGB, mat3_mul(&HPE_LMS_TO_XYZ, lms))
 }
 
@@ -138,11 +108,7 @@ pub fn upgrade_tone_map(original: [f32; 3], proxy: [f32; 3], model: [f32; 3], co
     // had; treat that clipped-away difference as headroom and hand it back on top of
     // whatever the model answered, rather than trying to make the model responsible
     // for light it was never shown.
-    let target_luminance = if original_luminance <= proxy_luminance {
-        original_luminance
-    } else {
-        model_luminance + (original_luminance - proxy_luminance)
-    };
+    let target_luminance = if original_luminance <= proxy_luminance { original_luminance } else { model_luminance + (original_luminance - proxy_luminance) };
 
     let ratio = target_luminance / model_luminance;
     let rescaled = [model[0] * ratio, model[1] * ratio, model[2] * ratio];
@@ -163,8 +129,7 @@ pub fn upgrade_tone_map(original: [f32; 3], proxy: [f32; 3], model: [f32; 3], co
     // the luminance-preserving rescale answers how far.
     let model_oklab = oklab_from_linear_srgb(model);
     let model_chroma = (model_oklab[1] * model_oklab[1] + model_oklab[2] * model_oklab[2]).sqrt();
-    let (chroma_dir_a, chroma_dir_b) =
-        if model_chroma > 1e-6 { (model_oklab[1] / model_chroma, model_oklab[2] / model_chroma) } else { (0.0, 0.0) };
+    let (chroma_dir_a, chroma_dir_b) = if model_chroma > 1e-6 { (model_oklab[1] / model_chroma, model_oklab[2] / model_chroma) } else { (0.0, 0.0) };
 
     let rescaled_oklab = oklab_from_linear_srgb(rescaled);
     let rescaled_chroma = (rescaled_oklab[1] * rescaled_oklab[1] + rescaled_oklab[2] * rescaled_oklab[2]).sqrt();

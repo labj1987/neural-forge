@@ -35,19 +35,22 @@ pub mod cache_dump;
 pub mod capture;
 pub mod cube;
 pub mod enums;
-mod header;
-pub mod mapping;
 pub mod env;
+mod header;
 pub mod history;
-pub mod rebuild;
+pub mod mapping;
 mod path;
 pub mod persist;
 pub mod private_dir;
 pub mod processes;
+pub mod rebuild;
 mod slot;
 pub mod state_log;
 
-pub use header::{load64, pass_setting, resolved_scale, setting_bounds, store64, ColourSettings, EditColour, HudRegion, HudRegionWords, HudSettings, MaskSettings, PassColour, PassControl, PassTunings, ShmHeader, Tuning, MAX_HUD_REGIONS, SETTING_BOUNDS};
+pub use header::{
+    load64, pass_setting, resolved_scale, setting_bounds, store64, ColourSettings, EditColour, HudRegion, HudRegionWords, HudSettings, MaskSettings,
+    PassColour, PassControl, PassTunings, ShmHeader, Tuning, MAX_HUD_REGIONS, SETTING_BOUNDS,
+};
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub use slot::{next_request, Slot};
 
@@ -137,10 +140,14 @@ pub const fn answer_offset() -> usize {
 
 /// Byte offset of slot 1's proxy region — the second, independent in-flight request
 /// v3 adds. See `docs/PROTOCOL_V3_DESIGN.md`.
-pub const fn proxy_b_offset() -> usize { HEADER_BYTES + MAX_FRAME * 2 }
+pub const fn proxy_b_offset() -> usize {
+    HEADER_BYTES + MAX_FRAME * 2
+}
 
 /// Byte offset of slot 1's answer region.
-pub const fn answer_b_offset() -> usize { HEADER_BYTES + MAX_FRAME * 3 }
+pub const fn answer_b_offset() -> usize {
+    HEADER_BYTES + MAX_FRAME * 3
+}
 
 /// The slot's proxy region: `proxy_offset()` or `proxy_b_offset()`.
 pub const fn proxy_offset_slot(slot: Slot) -> usize {

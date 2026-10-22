@@ -182,7 +182,9 @@ fn build_model_scratch(
     let image_reqs = unsafe { device.get_image_memory_requirements(image) };
     let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
     let image_type = (0..mem_props.memory_type_count)
-        .find(|&i| image_reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+        .find(|&i| {
+            image_reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        })
         .or_else(|| (0..mem_props.memory_type_count).find(|&i| image_reqs.memory_type_bits & (1 << i) != 0));
     let Some(image_type) = image_type else {
         // SAFETY: `image` has no memory bound; nothing else references it.
@@ -207,7 +209,10 @@ fn build_model_scratch(
     }
 
     let bytes = vk::DeviceSize::from(width) * vk::DeviceSize::from(height) * 4;
-    let buf_info = vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buf_info = vk::BufferCreateInfo::default()
+        .size(bytes)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
     // SAFETY: `buf_info` is valid.
     let Ok(buffer) = (unsafe { device.create_buffer(&buf_info, None) }) else {
         // SAFETY: `image`/`image_memory` are bound to each other, own nothing else yet.
@@ -268,11 +273,8 @@ fn build_model_scratch(
     // perfectly usable for the blit/download it existed for before the encode, so the
     // proxy simply crosses unencoded rather than the whole capture failing.
     let (encode_view, encode_set) = if want_encode {
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .subresource_range(
+        let view_info =
+            vk::ImageViewCreateInfo::default().image(image).view_type(vk::ImageViewType::TYPE_2D).format(vk::Format::R8G8B8A8_UNORM).subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
                     .base_mip_level(0)
@@ -298,19 +300,7 @@ fn build_model_scratch(
         (None, None)
     };
 
-    Some(ModelScratch {
-        image,
-        image_memory,
-        buffer,
-        buffer_memory,
-        ptr: ptr.cast(),
-        width,
-        height,
-        format,
-        capacity: buf_reqs.size,
-        encode_view,
-        encode_set,
-    })
+    Some(ModelScratch { image, image_memory, buffer, buffer_memory, ptr: ptr.cast(), width, height, format, capacity: buf_reqs.size, encode_view, encode_set })
 }
 
 /// Picks the best `HOST_VISIBLE` memory type for a buffer the GPU writes and the CPU
@@ -333,16 +323,18 @@ fn pick_readback_memory_type(reqs: vk::MemoryRequirements, mem_props: &vk::Physi
     pick(&|f| f.contains(host_visible | cached | coherent) && !f.contains(device_local)).or_else(|| pick(&|f| f.contains(host_visible | coherent)))
 }
 
-fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32, bytes: vk::DeviceSize) -> Option<CaptureBuffer> {
-    let pool_info =
-        vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+fn build_capture_buffer(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue_family: u32,
+    bytes: vk::DeviceSize,
+) -> Option<CaptureBuffer> {
+    let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     // SAFETY: `device` is the live device this capture serves; `pool_info` is valid.
     let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else { return None };
 
-    let alloc_info = vk::CommandBufferAllocateInfo::default()
-        .command_pool(pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
+    let alloc_info = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
     // SAFETY: `pool` was just created above.
     let cmd = match unsafe { crate::loader_data::allocate_commands(device, &alloc_info) } {
         Ok(bufs) => bufs[0],
@@ -454,12 +446,7 @@ fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical
 /// failure -- every caller treats that as "skip capture this frame, present
 /// unmodified", never a reason to stop trying on a later frame.
 fn subresource() -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .base_mip_level(0)
-        .level_count(1)
-        .base_array_layer(0)
-        .layer_count(1)
+    vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).base_mip_level(0).level_count(1).base_array_layer(0).layer_count(1)
 }
 
 fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier<'static> {
@@ -516,8 +503,7 @@ pub struct Inflight {
     answer_proxy: Vec<u8>,
 }
 
-impl Inflight {
-}
+impl Inflight {}
 
 /// Whether the zero-copy capture of wire slot `slot` still has a GPU write into that slot's
 /// proxy region in flight. The pre-upscaler path (`crate::preupscale`) writes the same region and
@@ -750,9 +736,7 @@ fn poll_or_submit_capture(
         let import_bytes = min_imported_host_pointer_alignment(instance, physical_device)
             .map_or(capacity as u64, |alignment| frame_bytes.div_ceil(alignment) * alignment)
             .min(capacity as u64);
-        if !unsafe {
-            ensure_direct_capture(&mut direct[slot.index()], device, instance, physical_device, queue_family, host_ptr, import_bytes)
-        } {
+        if !unsafe { ensure_direct_capture(&mut direct[slot.index()], device, instance, physical_device, queue_family, host_ptr, import_bytes) } {
             note_setup_failure();
             *external_memory_host = false;
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -774,7 +758,13 @@ fn poll_or_submit_capture(
                     // reads, so there is nothing to copy out here.
                     original_scratch.clear();
                     shm.set_frame_info(slot, width, height, proxy_format);
-                    return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: true, copy_out: std::time::Duration::ZERO, encoded: false, from_model_scratch: false });
+                    return CaptureStep::Captured(Captured {
+                        sent: (width, height),
+                        gpu_original: true,
+                        copy_out: std::time::Duration::ZERO,
+                        encoded: false,
+                        from_model_scratch: false,
+                    });
                 }
                 let t_copy = std::time::Instant::now();
                 let n = capacity.min(frame_bytes as usize);
@@ -786,7 +776,13 @@ fn poll_or_submit_capture(
                 // imported or not).
                 original_scratch.extend_from_slice(unsafe { std::slice::from_raw_parts(host_ptr, n) });
                 shm.set_frame_info(slot, width, height, proxy_format);
-                return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: false, copy_out: t_copy.elapsed(), encoded: false, from_model_scratch: false });
+                return CaptureStep::Captured(Captured {
+                    sent: (width, height),
+                    gpu_original: false,
+                    copy_out: t_copy.elapsed(),
+                    encoded: false,
+                    from_model_scratch: false,
+                });
             }
             // A capture of another frame size, or of an earlier frame: dropped, and a fresh
             // one submitted below in its place.
@@ -844,7 +840,13 @@ fn poll_or_submit_capture(
             }
             shm.set_frame_info(slot, width, height, proxy_format);
             shm.write_proxy(slot, original_scratch);
-            return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: false, copy_out: t_copy.elapsed(), encoded: false, from_model_scratch: false });
+            return CaptureStep::Captured(Captured {
+                sent: (width, height),
+                gpu_original: false,
+                copy_out: t_copy.elapsed(),
+                encoded: false,
+                from_model_scratch: false,
+            });
         }
         // Nothing completed, or what completed was of another frame size or an earlier frame
         // (dropped: its slot is free again and a fresh capture goes in below).
@@ -935,7 +937,11 @@ fn meter_white(frame: &[u8], width: u32, height: u32, bgr: bool) -> Option<f32> 
     static LUT: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| {
         std::array::from_fn(|i| {
             let c = i as f32 / 255.0;
-            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
         })
     });
     if width < GRID || height < GRID || frame.len() < (width * height * 4) as usize {
@@ -1203,14 +1209,33 @@ pub unsafe fn run(
         // only helps avoid the VRAM-full failure mode, it does not need to guess the
         // eventual real resolution correctly to do that.
         if let CaptureStep::Captured(_) = poll_or_submit_capture(
-            SLOT, use_direct, external_memory_host, pipeline, direct, device, instance, physical_device, queue, queue_family,
-            capture_image, capture_layout, width, height, proxy_format, frame_bytes, None,
+            SLOT,
+            use_direct,
+            external_memory_host,
+            pipeline,
+            direct,
+            device,
+            instance,
+            physical_device,
+            queue,
+            queue_family,
+            capture_image,
+            capture_layout,
+            width,
+            height,
+            proxy_format,
+            frame_bytes,
+            None,
             crate::composition::encode_pass::EncodePush {
                 white_point: settings.white_point,
                 bgr_order: u32::from(bgr_order),
                 reversible_mode: settings.reversible_mode,
             },
-            shm, original_scratch, model_scratch, None, None,
+            shm,
+            original_scratch,
+            model_scratch,
+            None,
+            None,
         ) {
             if answer_region_free(gpu_compose, device) && shm.begin_async_request(SLOT) {
                 inflight[SLOT.index()].dims = Some((width, height, proxy_format));
@@ -1324,14 +1349,33 @@ pub unsafe fn run(
             // started.
             if !shm.has_pending_request(slot) {
                 if let CaptureStep::Captured(captured) = poll_or_submit_capture(
-                    slot, use_direct, external_memory_host, pipeline, direct, device, instance, physical_device, queue, queue_family,
-                    capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request,
+                    slot,
+                    use_direct,
+                    external_memory_host,
+                    pipeline,
+                    direct,
+                    device,
+                    instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    capture_image,
+                    capture_layout,
+                    width,
+                    height,
+                    proxy_format,
+                    frame_bytes,
+                    model_request,
                     crate::composition::encode_pass::EncodePush {
                         white_point: settings.white_point,
                         bgr_order: u32::from(bgr_order),
                         reversible_mode: settings.reversible_mode,
                     },
-                    shm, original_scratch, model_scratch, None, None,
+                    shm,
+                    original_scratch,
+                    model_scratch,
+                    None,
+                    None,
                 ) {
                     let (sent_w, sent_h) = captured.sent;
                     if answer_region_free(gpu_compose, device) && shm.begin_async_request(slot) {
@@ -1348,7 +1392,10 @@ pub unsafe fn run(
                 }
             }
 
-            if have_answer && inflight[slot.index()].dims == Some((width, height, proxy_format)) && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+            if have_answer
+                && inflight[slot.index()].dims == Some((width, height, proxy_format))
+                && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format)
+            {
                 // Retain the model's raw answer for continuous re-presentation below --
                 // deliberately *not* run through `composition::gpu`/`composition::apply`'s
                 // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
@@ -1491,9 +1538,29 @@ pub unsafe fn run(
             };
             while sent.is_none() {
                 match poll_or_submit_capture(
-                    SLOT, use_direct, external_memory_host, pipeline, direct, device, instance, physical_device, queue, queue_family,
-                    capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request,
-                    encode_push, shm, original_scratch, model_scratch, zc_target, Some(t_start),
+                    SLOT,
+                    use_direct,
+                    external_memory_host,
+                    pipeline,
+                    direct,
+                    device,
+                    instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    capture_image,
+                    capture_layout,
+                    width,
+                    height,
+                    proxy_format,
+                    frame_bytes,
+                    model_request,
+                    encode_push,
+                    shm,
+                    original_scratch,
+                    model_scratch,
+                    zc_target,
+                    Some(t_start),
                 ) {
                     CaptureStep::Captured(captured) => {
                         sent = Some(captured.sent);
@@ -1524,7 +1591,8 @@ pub unsafe fn run(
                 // shared memory or the scratch could not be built.
                 let t_copy = std::time::Instant::now();
                 let proxy = if from_model_scratch { model_scratch.clone() } else { original_scratch.clone() };
-                *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some(HeldFrame { width, height, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h), encoded });
+                *HELD.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(HeldFrame { width, height, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h), encoded });
                 copy_out += t_copy.elapsed();
             }
             let t_captured = std::time::Instant::now();
@@ -1770,11 +1838,7 @@ fn record_capture_commands(
     width: u32,
     height: u32,
     model: Option<(vk::Image, vk::Buffer, u32, u32)>,
-    encode: Option<(
-        &crate::composition::encode_pass::EncodePass,
-        vk::DescriptorSet,
-        crate::composition::encode_pass::EncodePush,
-    )>,
+    encode: Option<(&crate::composition::encode_pass::EncodePass, vk::DescriptorSet, crate::composition::encode_pass::EncodePush)>,
     timer: Option<&crate::gpu_timer::GpuTimer>,
 ) -> bool {
     // SAFETY: `cmd` was allocated from a pool created with `RESET_COMMAND_BUFFER`.
@@ -1794,13 +1858,7 @@ fn record_capture_commands(
     // A swapchain image is presented in PRESENT_SRC_KHR, which a copy cannot read, so it goes
     // to TRANSFER_SRC_OPTIMAL and back.
     let read_layout = if initial_layout == vk::ImageLayout::GENERAL { vk::ImageLayout::GENERAL } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
-    let to_transfer_src = barrier(
-        image,
-        initial_layout,
-        read_layout,
-        vk::AccessFlags::empty(),
-        vk::AccessFlags::TRANSFER_READ,
-    );
+    let to_transfer_src = barrier(image, initial_layout, read_layout, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ);
     // SAFETY: `cmd` is in the recording state; `image` is the caller's own, currently
     // `initial_layout` per every caller's own contract on the image it passes in.
     unsafe {
@@ -1825,13 +1883,7 @@ fn record_capture_commands(
         .buffer_offset(0)
         .buffer_row_length(0)
         .buffer_image_height(0)
-        .image_subresource(
-            vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(0)
-                .base_array_layer(0)
-                .layer_count(1),
-        )
+        .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
         .image_offset(vk::Offset3D::default())
         .image_extent(vk::Extent3D { width, height, depth: 1 });
     // SAFETY: `image` is in `read_layout` after the barrier above; `buffer` is sized to
@@ -1857,7 +1909,15 @@ fn record_capture_commands(
         // `width*height*4` bytes by whoever handed it over.
         unsafe {
             device.cmd_copy_image_to_buffer(cmd, image, read_layout, extra_dst, &[region]);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[extra_ready], &[]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[extra_ready],
+                &[],
+            );
         }
     }
     if let Some((scratch_image, scratch_buffer, model_width, model_height)) = model {
@@ -1867,9 +1927,25 @@ fn record_capture_commands(
         // the whole image, so there is never any prior content worth preserving, and
         // `UNDEFINED` as `oldLayout` is valid regardless of the image's actual current
         // layout (the exact property that lets this skip tracking it across frames).
-        let scratch_to_dst = barrier(scratch_image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+        let scratch_to_dst = barrier(
+            scratch_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::TRANSFER_WRITE,
+        );
         // SAFETY: `cmd` is recording; `scratch_image` is this slot's own, not aliased.
-        unsafe { device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[scratch_to_dst]) };
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[scratch_to_dst],
+            )
+        };
         let blit = vk::ImageBlit::default()
             .src_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
             .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }])
@@ -1934,9 +2010,25 @@ fn record_capture_commands(
                 );
             }
         } else {
-            let scratch_to_src = barrier(scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ);
+            let scratch_to_src = barrier(
+                scratch_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+            );
             // SAFETY: `cmd` is recording; `scratch_image` was just written by the blit above.
-            unsafe { device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[scratch_to_src]) };
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[scratch_to_src],
+                )
+            };
         }
         let scratch_region = vk::BufferImageCopy::default()
             .buffer_offset(0)
@@ -1954,13 +2046,7 @@ fn record_capture_commands(
     // `TRANSFER_DST_OPTIMAL` (a layout only valid mid-way through an image<->buffer
     // round trip) would be a real bug the moment the real present call, or the game's
     // own next use of a render-tap source, ran against it instead.
-    let to_present = barrier(
-        image,
-        read_layout,
-        initial_layout,
-        vk::AccessFlags::TRANSFER_READ,
-        vk::AccessFlags::empty(),
-    );
+    let to_present = barrier(image, read_layout, initial_layout, vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::empty());
     // The CPU reads `buffer` (the staging buffer, or the imported proxy region) and the model
     // scratch's buffer once the fence signals. A fence signal makes nothing available to the host
     // by itself: the copies' writes are made available to host reads here.
@@ -2123,10 +2209,7 @@ fn build_pipeline(
     let timer = || crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family);
     *existing = Some(CapturePipeline {
         queue_family,
-        slots: [
-            PipelineSlot { buf: a, model: None, pending: None, timer: timer() },
-            PipelineSlot { buf: b, model: None, pending: None, timer: timer() },
-        ],
+        slots: [PipelineSlot { buf: a, model: None, pending: None, timer: timer() }, PipelineSlot { buf: b, model: None, pending: None, timer: timer() }],
         // Fail-open: `None` just means no encode, and the composition is told.
         encode: crate::composition::encode_pass::EncodePass::new(device),
     });
@@ -2267,11 +2350,8 @@ fn submit_pipeline_capture(
     };
     // The encode runs only when this submission actually has a scratch with a set on
     // it; `encode_dispatch` is `None` otherwise and the proxy crosses unencoded.
-    let encode_dispatch = slot
-        .model
-        .as_ref()
-        .filter(|_| model_dims.is_some())
-        .and_then(|m| m.encode_set.map(|set| (set, encode.expect("a set only exists when the pass does"))));
+    let encode_dispatch =
+        slot.model.as_ref().filter(|_| model_dims.is_some()).and_then(|m| m.encode_set.map(|set| (set, encode.expect("a set only exists when the pass does"))));
     if !record_capture_commands(
         device,
         slot.buf.cmd,
@@ -2338,8 +2418,15 @@ pub fn wait_in_flight(pipeline: Option<&CapturePipeline>, direct: &[Option<Direc
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn test_capture_once(
-    device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue, queue_family: u32,
-    image: vk::Image, layout: vk::ImageLayout, width: u32, height: u32,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue: vk::Queue,
+    queue_family: u32,
+    image: vk::Image,
+    layout: vk::ImageLayout,
+    width: u32,
+    height: u32,
 ) -> Option<Vec<u8>> {
     let bytes = u64::from(width) * u64::from(height) * 4;
     let mut pipeline = None;
@@ -2348,7 +2435,21 @@ pub(crate) fn test_capture_once(
     }
     let p = pipeline.as_mut()?;
     let push = crate::composition::encode_pass::EncodePush { white_point: 1.0, bgr_order: 0, reversible_mode: 0 };
-    let submitted = submit_pipeline_capture(p, Slot::Primary, device, instance, physical_device, queue, image, layout, width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None, push);
+    let submitted = submit_pipeline_capture(
+        p,
+        Slot::Primary,
+        device,
+        instance,
+        physical_device,
+        queue,
+        image,
+        layout,
+        width,
+        height,
+        neural_forge_protocol::enums::proxy_format::RGBA8,
+        None,
+        push,
+    );
     // SAFETY: `queue` is the test's own; waiting for it idle completes the capture.
     unsafe { device.queue_wait_idle(queue) }.ok()?;
     let (mut out, mut model) = (Vec::new(), Vec::new());
@@ -2525,7 +2626,19 @@ fn submit_direct_capture(
     }
     // `working_scale` is not wired into the dma-buf path -- see `poll_or_submit_capture`'s
     // own doc comment on why.
-    if !record_capture_commands(device, direct.buf.cmd, image, initial_layout, direct.buf.buffer, original_dst, width, height, None, None, direct.timer.as_ref()) {
+    if !record_capture_commands(
+        device,
+        direct.buf.cmd,
+        image,
+        initial_layout,
+        direct.buf.buffer,
+        original_dst,
+        width,
+        height,
+        None,
+        None,
+        direct.timer.as_ref(),
+    ) {
         return false;
     }
     // SAFETY: `direct.buf.fence` is `pending: None` here -- either never used yet
@@ -2584,14 +2697,10 @@ unsafe fn build_imported_capture_buffer(
     host_ptr: *mut u8,
     bytes: vk::DeviceSize,
 ) -> Option<CaptureBuffer> {
-    let pool_info =
-        vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     // SAFETY: `device` is the live device this capture serves; `pool_info` is valid.
     let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else { return None };
-    let alloc_info = vk::CommandBufferAllocateInfo::default()
-        .command_pool(pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
+    let alloc_info = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
     // SAFETY: `pool` was just created above.
     let cmd = match unsafe { crate::loader_data::allocate_commands(device, &alloc_info) } {
         Ok(bufs) => bufs[0],
@@ -2659,9 +2768,7 @@ pub(crate) unsafe fn import_host_buffer(
     // context, and this whole module's fail-open discipline requires that to be a
     // normal "don't import" outcome, not an abort).
     // SAFETY: `device` is live; `name` is a valid, NUL-terminated C string.
-    let get_memory_host_pointer_properties_ext = unsafe {
-        instance.get_device_proc_addr(device.handle(), c"vkGetMemoryHostPointerPropertiesEXT".as_ptr())
-    };
+    let get_memory_host_pointer_properties_ext = unsafe { instance.get_device_proc_addr(device.handle(), c"vkGetMemoryHostPointerPropertiesEXT".as_ptr()) };
     let get_memory_host_pointer_properties_ext = get_memory_host_pointer_properties_ext?;
     // SAFETY: a non-null `vkGetDeviceProcAddr(device, "vkGetMemoryHostPointerPropertiesEXT")`
     // result is guaranteed by the Vulkan spec to have this exact signature.
@@ -2671,12 +2778,7 @@ pub(crate) unsafe fn import_host_buffer(
     // SAFETY: `device` is live; `host_ptr` is valid for `bytes` bytes per this
     // function's own contract.
     let query_result = unsafe {
-        get_memory_host_pointer_properties_ext(
-            device.handle(),
-            vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
-            host_ptr.cast(),
-            &mut host_props,
-        )
+        get_memory_host_pointer_properties_ext(device.handle(), vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT, host_ptr.cast(), &mut host_props)
     };
     if query_result != vk::Result::SUCCESS {
         return None;
@@ -2705,8 +2807,8 @@ pub(crate) unsafe fn import_host_buffer(
     // Only a memory type both the buffer itself (`reqs`) and the imported pointer
     // (`host_props`) agree on is actually usable here.
     let compatible = reqs.memory_type_bits & host_props.memory_type_bits;
-    let Some(type_index) = (0..mem_props.memory_type_count)
-        .find(|&i| (compatible & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(wanted))
+    let Some(type_index) =
+        (0..mem_props.memory_type_count).find(|&i| (compatible & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(wanted))
     else {
         // SAFETY: `buffer` has no memory bound yet.
         unsafe { device.destroy_buffer(buffer, None) };
@@ -2761,7 +2863,14 @@ mod tests {
     /// `PRESENT_SRC_KHR` -- what `run`'s own contract requires of `image` on entry,
     /// same as any image `vkQueuePresentKHR`'s own precondition hasn't been violated
     /// on.
-    fn make_present_src_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, width: u32, height: u32) -> (vk::Image, vk::DeviceMemory) {
+    fn make_present_src_image(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        pool: vk::CommandPool,
+        width: u32,
+        height: u32,
+    ) -> (vk::Image, vk::DeviceMemory) {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
@@ -2776,9 +2885,12 @@ mod tests {
         let image = unsafe { device.create_image(&info, None) }.expect("failed to create the test's own target image");
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let type_index = (0..mem_props.memory_type_count)
-            .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+            .find(|&i| {
+                reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })
             .expect("no suitable memory type for the test's own target image");
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let memory =
+            unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
 
         let alloc_info = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
@@ -2788,7 +2900,15 @@ mod tests {
         unsafe {
             device.begin_command_buffer(cmd, &begin_info).unwrap();
             let to_present = barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::empty(), vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
             device.end_command_buffer(cmd).unwrap();
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
@@ -2801,7 +2921,11 @@ mod tests {
     fn scratch_path(tag: &str) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        format!("{}/capture-{}-{tag}-{n}/shm.bin", std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/test-scratch").display(), std::process::id())
+        format!(
+            "{}/capture-{}-{tag}-{n}/shm.bin",
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/test-scratch").display(),
+            std::process::id()
+        )
     }
 
     /// Same shape as `test_device`, except the device is created with
@@ -2825,7 +2949,12 @@ mod tests {
         });
         let queue_family = 0;
         let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&[1.0])];
-        let extension_names = crate::composition::gpu::test_device_extensions(&instance, physical_device, surface, if supported { &[EXTERNAL_MEMORY_HOST_EXTENSION] } else { &[] });
+        let extension_names = crate::composition::gpu::test_device_extensions(
+            &instance,
+            physical_device,
+            surface,
+            if supported { &[EXTERNAL_MEMORY_HOST_EXTENSION] } else { &[] },
+        );
         let device_create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -2838,7 +2967,15 @@ mod tests {
     /// *that* a copy happened, not *what* it copied. This test needs the latter: the
     /// whole point is confirming the imported-memory capture lands the *right* bytes,
     /// not just *some* bytes.
-    fn make_filled_present_src_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, width: u32, height: u32, color: [f32; 4]) -> (vk::Image, vk::DeviceMemory) {
+    fn make_filled_present_src_image(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        pool: vk::CommandPool,
+        width: u32,
+        height: u32,
+        color: [f32; 4],
+    ) -> (vk::Image, vk::DeviceMemory) {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
@@ -2853,9 +2990,12 @@ mod tests {
         let image = unsafe { device.create_image(&info, None) }.expect("failed to create the test's own target image");
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let type_index = (0..mem_props.memory_type_count)
-            .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+            .find(|&i| {
+                reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })
             .expect("no suitable memory type for the test's own target image");
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let memory =
+            unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
 
         let alloc_info = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
@@ -2864,11 +3004,34 @@ mod tests {
         let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
             device.begin_command_buffer(cmd, &begin_info).unwrap();
-            let to_dst = barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            let to_dst =
+                barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
             device.cmd_clear_color_image(cmd, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: color }, &[subresource()]);
-            let to_present = barrier(image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            let to_present = barrier(
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
             device.end_command_buffer(cmd).unwrap();
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
@@ -2895,12 +3058,18 @@ mod tests {
         };
         if !supported {
             eprintln!("direct_capture_writes_straight_into_imported_host_memory: VK_EXT_external_memory_host not supported here, skipping");
-            unsafe { device.destroy_device(None); instance.destroy_instance(None); }
+            unsafe {
+                device.destroy_device(None);
+                instance.destroy_instance(None);
+            }
             return;
         }
         let Some(alignment) = min_imported_host_pointer_alignment(&instance, physical_device) else {
             eprintln!("direct_capture_writes_straight_into_imported_host_memory: alignment query failed, skipping");
-            unsafe { device.destroy_device(None); instance.destroy_instance(None); }
+            unsafe {
+                device.destroy_device(None);
+                instance.destroy_instance(None);
+            }
             return;
         };
 
@@ -2914,9 +3083,8 @@ mod tests {
         // SAFETY: a plain anonymous mapping, valid for the rest of this test; never
         // shared with another process, matching every other precondition
         // `ensure_direct_capture`'s own safety contract asks for.
-        let host_ptr = unsafe {
-            libc::mmap(std::ptr::null_mut(), region_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
-        };
+        let host_ptr =
+            unsafe { libc::mmap(std::ptr::null_mut(), region_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
         assert_ne!(host_ptr, libc::MAP_FAILED, "mmap for the test's own host region failed");
         let host_ptr = host_ptr.cast::<u8>();
         assert_eq!(host_ptr as usize % alignment as usize, 0, "mmap must hand back at least page-aligned memory");
@@ -2942,14 +3110,27 @@ mod tests {
             "ensure_direct_capture should succeed with a supported, correctly aligned host pointer"
         );
         let d = direct.as_mut().unwrap();
-        assert!(submit_direct_capture(d, &device, queue, image, vk::ImageLayout::PRESENT_SRC_KHR, width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None));
+        assert!(submit_direct_capture(
+            d,
+            &device,
+            queue,
+            image,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            width,
+            height,
+            neural_forge_protocol::enums::proxy_format::RGBA8,
+            None
+        ));
         // A real wait (not `poll_direct_capture`'s own non-blocking check) is correct
         // here: this test cares whether the capture is *correct*, not whether `run`'s
         // own present-hook discipline of never blocking holds -- that's
         // `run_never_blocks_on_a_slow_server_and_eventually_composites`'s job, not
         // this test's.
         crate::note_vk(device.handle(), unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }).expect("capture fence wait failed");
-        assert_eq!(poll_direct_capture(d, &device).map(|(w, h, f, t, _)| (w, h, f, t)), Some((width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None)));
+        assert_eq!(
+            poll_direct_capture(d, &device).map(|(w, h, f, t, _)| (w, h, f, t)),
+            Some((width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None))
+        );
 
         // SAFETY: the fence wait above confirms the GPU's writes to `host_ptr` are
         // complete and visible to the CPU (host-coherent memory).
@@ -2958,7 +3139,8 @@ mod tests {
         // `vkCmdClearColorImage`/the copy actually perform rounds to nearest (found
         // live: 0.25 * 255 = 63.75, which truncation would wrongly expect as 63
         // against the real, correct 64).
-        let expected: [u8; 4] = [(color[0] * 255.0).round() as u8, (color[1] * 255.0).round() as u8, (color[2] * 255.0).round() as u8, (color[3] * 255.0).round() as u8];
+        let expected: [u8; 4] =
+            [(color[0] * 255.0).round() as u8, (color[1] * 255.0).round() as u8, (color[2] * 255.0).round() as u8, (color[3] * 255.0).round() as u8];
         for pixel in captured.as_chunks::<4>().0.iter() {
             assert_eq!(*pixel, expected, "every captured pixel must match the source image's own fill color, read straight out of the imported host pointer");
         }
@@ -2994,7 +3176,9 @@ mod tests {
         // A live model server (matters for `poll_async_request`'s timeout budget: the long
         // "steady state" one, not the short "nobody's listening" one, since this test
         // deliberately answers slower than that short budget).
-        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
+        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }
+            .server_state
+            .store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
 
         // A fake model server that only answers `SERVER_DELAY` after it sees a new request --
         // long enough that if `run` ever blocked waiting for it, a handful of calls
@@ -3088,7 +3272,8 @@ mod tests {
                     &mut raw_answer_base,
                     &mut raw_answer_generation,
                     &mut last_answer,
-                    &mut last_answer_dims, &mut last_answer_encoded,
+                    &mut last_answer_dims,
+                    &mut last_answer_encoded,
                 )
             };
             let call_time = call_start.elapsed();
@@ -3145,10 +3330,33 @@ mod tests {
             let before = hdr_now.seq_req.load(AtomicOrdering::Relaxed);
             let sem = unsafe {
                 run(
-                    &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
-                    width, height, proxy_format, false, &mut pipeline, &mut direct, &mut false, &mut gpu_compose,
-                    &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
-                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded,
+                    &device,
+                    &instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    image,
+                    width,
+                    height,
+                    proxy_format,
+                    false,
+                    &mut pipeline,
+                    &mut direct,
+                    &mut false,
+                    &mut gpu_compose,
+                    &mut shm,
+                    &mut original_scratch,
+                    &mut model_scratch,
+                    &mut inflight,
+                    &mut bootstrap_complete,
+                    &mut answer_scratch,
+                    &mut raw_answer_base,
+                    &mut raw_answer_generation,
+                    &mut last_answer,
+                    &mut last_answer_dims,
+                    &mut last_answer_encoded,
                 )
             };
             assert!(sem.is_some(), "every present is composited, carried or not");
@@ -3156,7 +3364,13 @@ mod tests {
             let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
+                device
+                    .queue_submit(
+                        queue,
+                        &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                        wait_fence,
+                    )
+                    .unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -3196,15 +3410,47 @@ mod tests {
     }
     /// Copies `bytes` into `image` (any layout, contents discarded) and leaves it `PRESENT_SRC_KHR`.
     #[allow(clippy::too_many_arguments)]
-    fn upload_present_src(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image, width: u32, height: u32, bytes: &[u8]) {
+    fn upload_present_src(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        pool: vk::CommandPool,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+    ) {
         let (buffer, memory, ptr) = host_buffer(device, mem_props, bytes.len() as u64);
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
         one_shot(device, queue, pool, |cmd| unsafe {
-            let to_dst = barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            let to_dst =
+                barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
             device.cmd_copy_buffer_to_image(cmd, buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[full_region(width, height)]);
-            let to_present = barrier(image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            let to_present = barrier(
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
         });
         unsafe {
             device.destroy_buffer(buffer, None);
@@ -3213,15 +3459,51 @@ mod tests {
     }
 
     /// Reads a `PRESENT_SRC_KHR` image back (leaving it `PRESENT_SRC_KHR`).
-    fn read_back_present_src(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image, width: u32, height: u32) -> Vec<u8> {
+    fn read_back_present_src(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        pool: vk::CommandPool,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
         let bytes = u64::from(width * height * 4);
         let (buffer, memory, ptr) = host_buffer(device, mem_props, bytes);
         one_shot(device, queue, pool, |cmd| unsafe {
-            let to_src = barrier(image, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_src]);
+            let to_src = barrier(
+                image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_READ,
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_src],
+            );
             device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[full_region(width, height)]);
-            let back = barrier(image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[], &[], &[back]);
+            let back = barrier(
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::AccessFlags::empty(),
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[back],
+            );
         });
         let out = unsafe { std::slice::from_raw_parts(ptr, bytes as usize) }.to_vec();
         unsafe {
@@ -3242,8 +3524,11 @@ mod tests {
         let buffer = unsafe { device.create_buffer(&info, None) }.unwrap();
         let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
         let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let type_index = (0..mem_props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(wanted)).unwrap();
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let type_index = (0..mem_props.memory_type_count)
+            .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(wanted))
+            .unwrap();
+        let memory =
+            unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_buffer_memory(buffer, memory, 0) }.unwrap();
         let ptr = unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.unwrap().cast::<u8>();
         (buffer, memory, ptr)
@@ -3275,7 +3560,12 @@ mod tests {
     }
 
     fn test_game_frame(width: u32, height: u32) -> Vec<u8> {
-        (0..width * height).flat_map(|i| { let t = (i * 37 % 200) as u8; [t + 30, 220 - t, t / 2 + 40, 255] }).collect()
+        (0..width * height)
+            .flat_map(|i| {
+                let t = (i * 37 % 200) as u8;
+                [t + 30, 220 - t, t / 2 + 40, 255]
+            })
+            .collect()
     }
 
     /// Everything `run` keeps per device between presents.
@@ -3357,8 +3647,25 @@ mod tests {
             let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("the test's own command pool");
             let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
             Some(Self {
-                _entry: entry, instance, physical_device, device, queue, queue_family, mem_props, pool, image, image_memory, width, height,
-                shm, hdr_ptr, answering, stop, server: Some(server), state: RunState::default(), _cleanup: cleanup,
+                _entry: entry,
+                instance,
+                physical_device,
+                device,
+                queue,
+                queue_family,
+                mem_props,
+                pool,
+                image,
+                image_memory,
+                width,
+                height,
+                shm,
+                hdr_ptr,
+                answering,
+                stop,
+                server: Some(server),
+                state: RunState::default(),
+                _cleanup: cleanup,
             })
         }
 
@@ -3382,12 +3689,33 @@ mod tests {
             // thread only, as `run`'s contract asks of the present hook.
             let sem = unsafe {
                 run(
-                    &self.device, &self.instance, self.physical_device, self.queue, self.queue_family, self.image,
-                    vk::ImageLayout::PRESENT_SRC_KHR, self.image, self.width, self.height,
-                    neural_forge_protocol::enums::proxy_format::RGBA8, false, &mut s.pipeline, &mut s.direct, &mut false,
-                    &mut s.gpu_compose, &mut self.shm, &mut s.original_scratch, &mut s.model_scratch, &mut s.inflight,
-                    &mut s.bootstrap_complete, &mut s.answer_scratch, &mut s.raw_answer_base, &mut s.raw_answer_generation,
-                    &mut s.last_answer, &mut s.last_answer_dims, &mut s.last_answer_encoded,
+                    &self.device,
+                    &self.instance,
+                    self.physical_device,
+                    self.queue,
+                    self.queue_family,
+                    self.image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    self.image,
+                    self.width,
+                    self.height,
+                    neural_forge_protocol::enums::proxy_format::RGBA8,
+                    false,
+                    &mut s.pipeline,
+                    &mut s.direct,
+                    &mut false,
+                    &mut s.gpu_compose,
+                    &mut self.shm,
+                    &mut s.original_scratch,
+                    &mut s.model_scratch,
+                    &mut s.inflight,
+                    &mut s.bootstrap_complete,
+                    &mut s.answer_scratch,
+                    &mut s.raw_answer_base,
+                    &mut s.raw_answer_generation,
+                    &mut s.last_answer,
+                    &mut s.last_answer_dims,
+                    &mut s.last_answer_encoded,
                 )
             };
             let Some(sem) = sem else { return false };
@@ -3466,7 +3794,21 @@ mod tests {
         }
         let push = crate::composition::encode_pass::EncodePush { white_point: 1.0, bgr_order: 0, reversible_mode: 0 };
         let mut capture = |format: vk::Format, proxy_format: u32| -> Vec<u8> {
-            assert!(submit_pipeline_capture(p, Slot::Primary, &device, &instance, physical_device, queue, image, vk::ImageLayout::PRESENT_SRC_KHR, width, height, proxy_format, Some((4, 4, format)), push));
+            assert!(submit_pipeline_capture(
+                p,
+                Slot::Primary,
+                &device,
+                &instance,
+                physical_device,
+                queue,
+                image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                width,
+                height,
+                proxy_format,
+                Some((4, 4, format)),
+                push
+            ));
             unsafe { device.queue_wait_idle(queue) }.unwrap();
             let (mut full, mut model) = (Vec::new(), Vec::new());
             let (done, dims) = poll_pipeline_capture(p, Slot::Primary, &device, &mut full, &mut model);
@@ -3600,7 +3942,10 @@ mod tests {
     fn direct_present_sequence(path: &str, zero_copy: bool, model_interval: u32, presents: usize, scribble: bool, hold: bool) -> Option<Vec<Presented>> {
         let (_entry, instance, physical_device, device, queue, queue_family, supported) = test_device_with_external_memory_host()?;
         if !supported {
-            unsafe { device.destroy_device(None); instance.destroy_instance(None); }
+            unsafe {
+                device.destroy_device(None);
+                instance.destroy_instance(None);
+            }
             return None;
         }
         TEST_NO_ZERO_COPY.store(!zero_copy, AtomicOrdering::Relaxed);
@@ -3703,10 +4048,33 @@ mod tests {
             // SAFETY: `image` is this test's own, currently `PRESENT_SRC_KHR`; one thread.
             let sem = unsafe {
                 run(
-                    &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
-                    width, height, proxy_format, false, &mut pipeline, &mut direct, &mut true, &mut gpu_compose,
-                    &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
-                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded,
+                    &device,
+                    &instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    image,
+                    width,
+                    height,
+                    proxy_format,
+                    false,
+                    &mut pipeline,
+                    &mut direct,
+                    &mut true,
+                    &mut gpu_compose,
+                    &mut shm,
+                    &mut original_scratch,
+                    &mut model_scratch,
+                    &mut inflight,
+                    &mut bootstrap_complete,
+                    &mut answer_scratch,
+                    &mut raw_answer_base,
+                    &mut raw_answer_generation,
+                    &mut last_answer,
+                    &mut last_answer_dims,
+                    &mut last_answer_encoded,
                 )
             };
             let Some(sem) = sem else {
@@ -3717,7 +4085,13 @@ mod tests {
             let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
+                device
+                    .queue_submit(
+                        queue,
+                        &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                        wait_fence,
+                    )
+                    .unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -3737,7 +4111,10 @@ mod tests {
             "the direct capture imports the frame's own bytes, not the whole region"
         );
         if hold {
-            assert!(HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|h| h.original.len() == frame_bytes), "frame hold holds the frame on the CPU");
+            assert!(
+                HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|h| h.original.len() == frame_bytes),
+                "frame hold holds the frame on the CPU"
+            );
             assert!(!last_answer.is_empty() && !raw_answer_base.is_empty(), "frame hold composes the CPU pair");
             assert!(!gpu_compose.as_ref().unwrap().holds_generation(raw_answer_generation), "frame hold never takes the zero-copy path");
         }
@@ -3817,8 +4194,14 @@ mod tests {
     /// down everything it built, but not the device.
     #[allow(clippy::too_many_arguments)]
     fn published_gpu_ms_after_presents(
-        instance: &ash::Instance, physical_device: vk::PhysicalDevice, device: &ash::Device, queue: vk::Queue, queue_family: u32,
-        direct_capture: bool, composes: usize, tag: &str,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
+        queue: vk::Queue,
+        queue_family: u32,
+        direct_capture: bool,
+        composes: usize,
+        tag: &str,
     ) -> (f32, f32) {
         let path = scratch_path(tag);
         let _cleanup = RemoveScratch(path.clone());
@@ -3877,10 +4260,33 @@ mod tests {
             // SAFETY: `image` is this test's own, currently `PRESENT_SRC_KHR`; one thread.
             let sem = unsafe {
                 run(
-                    device, instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
-                    width, height, proxy_format, false, &mut pipeline, &mut direct, &mut external_memory_host,
-                    &mut gpu_compose, &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete,
-                    &mut answer_scratch, &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded,
+                    device,
+                    instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    image,
+                    width,
+                    height,
+                    proxy_format,
+                    false,
+                    &mut pipeline,
+                    &mut direct,
+                    &mut external_memory_host,
+                    &mut gpu_compose,
+                    &mut shm,
+                    &mut original_scratch,
+                    &mut model_scratch,
+                    &mut inflight,
+                    &mut bootstrap_complete,
+                    &mut answer_scratch,
+                    &mut raw_answer_base,
+                    &mut raw_answer_generation,
+                    &mut last_answer,
+                    &mut last_answer_dims,
+                    &mut last_answer_encoded,
                 )
             };
             let Some(sem) = sem else {
@@ -3891,7 +4297,13 @@ mod tests {
             let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
+                device
+                    .queue_submit(
+                        queue,
+                        &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                        wait_fence,
+                    )
+                    .unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -3943,7 +4355,8 @@ mod tests {
             return;
         }
         let composes = 4;
-        let (capture_ms, compose_ms) = published_gpu_ms_after_presents(&instance, physical_device, &device, queue, queue_family, false, composes, "gpu-ms-pipeline");
+        let (capture_ms, compose_ms) =
+            published_gpu_ms_after_presents(&instance, physical_device, &device, queue, queue_family, false, composes, "gpu-ms-pipeline");
         unsafe {
             device.destroy_device(None);
             instance.destroy_instance(None);
@@ -3954,7 +4367,8 @@ mod tests {
 
         let Some((_entry, instance, physical_device, device, queue, queue_family, supported)) = test_device_with_external_memory_host() else { return };
         if supported {
-            let (capture_ms, compose_ms) = published_gpu_ms_after_presents(&instance, physical_device, &device, queue, queue_family, true, composes, "gpu-ms-direct");
+            let (capture_ms, compose_ms) =
+                published_gpu_ms_after_presents(&instance, physical_device, &device, queue, queue_family, true, composes, "gpu-ms-direct");
             assert!(capture_ms.is_finite() && capture_ms > 0.0, "direct capture GPU ms: {capture_ms}");
             assert!(compose_ms.is_finite() && compose_ms > 0.0, "zero-copy compose GPU ms: {compose_ms}");
         } else {
@@ -3991,10 +4405,29 @@ mod tests {
         let (mut original, mut model) = (Vec::new(), Vec::new());
         let mut step = |w: u32, h: u32, after: Option<Instant>| {
             let step = poll_or_submit_capture(
-                Slot::Primary, false, &mut false, &mut pipeline, &mut direct, &device, &instance, physical_device, queue, queue_family,
-                image, vk::ImageLayout::PRESENT_SRC_KHR, w, h, proxy_format, frame_bytes, None,
+                Slot::Primary,
+                false,
+                &mut false,
+                &mut pipeline,
+                &mut direct,
+                &device,
+                &instance,
+                physical_device,
+                queue,
+                queue_family,
+                image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                w,
+                h,
+                proxy_format,
+                frame_bytes,
+                None,
                 crate::composition::encode_pass::EncodePush { white_point: 1.0, bgr_order: 0, reversible_mode: 0 },
-                &mut shm, &mut original, &mut model, None, after,
+                &mut shm,
+                &mut original,
+                &mut model,
+                None,
+                after,
             );
             unsafe { device.queue_wait_idle(queue) }.unwrap();
             match step {
@@ -4034,7 +4467,10 @@ mod tests {
         };
         if !supported {
             eprintln!("a_failed_capture_setup_presents_at_once_and_falls_back_to_the_pipeline: VK_EXT_external_memory_host not supported here, skipping");
-            unsafe { device.destroy_device(None); instance.destroy_instance(None); }
+            unsafe {
+                device.destroy_device(None);
+                instance.destroy_instance(None);
+            }
             return;
         }
         struct Reset;
@@ -4082,7 +4518,8 @@ mod tests {
         let mut pipeline: Option<CapturePipeline> = None;
         let mut direct: [Option<DirectCapture>; 2] = [None, None];
         let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
-        let (mut original_scratch, mut model_scratch, mut answer_scratch, mut raw_answer_base, mut last_answer) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut original_scratch, mut model_scratch, mut answer_scratch, mut raw_answer_base, mut last_answer) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut raw_answer_generation = 0u64;
         let mut last_answer_dims = (0u32, 0u32);
         let mut last_answer_encoded = false;
@@ -4092,10 +4529,33 @@ mod tests {
 
         let mut present = |external_memory_host: &mut bool| unsafe {
             run(
-                &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
-                width, height, proxy_format, false, &mut pipeline, &mut direct, external_memory_host, &mut gpu_compose,
-                &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
-                &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded,
+                &device,
+                &instance,
+                physical_device,
+                queue,
+                queue_family,
+                image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                image,
+                width,
+                height,
+                proxy_format,
+                false,
+                &mut pipeline,
+                &mut direct,
+                external_memory_host,
+                &mut gpu_compose,
+                &mut shm,
+                &mut original_scratch,
+                &mut model_scratch,
+                &mut inflight,
+                &mut bootstrap_complete,
+                &mut answer_scratch,
+                &mut raw_answer_base,
+                &mut raw_answer_generation,
+                &mut last_answer,
+                &mut last_answer_dims,
+                &mut last_answer_encoded,
             )
         };
         // Presents before the fake model server's first heartbeat go out untouched without trying
@@ -4133,7 +4593,13 @@ mod tests {
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
         let stage = vk::PipelineStageFlags::ALL_COMMANDS;
         unsafe {
-            device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
+            device
+                .queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                    wait_fence,
+                )
+                .unwrap();
             device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
             device.destroy_fence(wait_fence, None);
         }
@@ -4188,7 +4654,9 @@ mod tests {
         // A live model server (matters for `poll_async_request`'s timeout budget: the long
         // "steady state" one, not the short "nobody's listening" one, since this test
         // deliberately answers slower than that short budget).
-        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
+        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }
+            .server_state
+            .store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
 
         // A fake model server that only answers `SERVER_DELAY` after it sees a new request --
         // long enough that if `run` ever blocked waiting for it, a handful of calls
@@ -4277,7 +4745,8 @@ mod tests {
                     &mut raw_answer_base,
                     &mut raw_answer_generation,
                     &mut last_answer,
-                    &mut last_answer_dims, &mut last_answer_encoded,
+                    &mut last_answer_dims,
+                    &mut last_answer_encoded,
                 )
             };
             let call_time = call_start.elapsed();
@@ -4447,10 +4916,33 @@ mod tests {
             // is used from this one thread only, exactly like `run`'s own contract.
             let sem = unsafe {
                 run(
-                    &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image, width, height,
-                    proxy_format, false, &mut pipeline, &mut direct, &mut false, &mut gpu_compose, &mut shm, &mut original_scratch,
-                    &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch, &mut raw_answer_base, &mut raw_answer_generation,
-                    &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded,
+                    &device,
+                    &instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    image,
+                    width,
+                    height,
+                    proxy_format,
+                    false,
+                    &mut pipeline,
+                    &mut direct,
+                    &mut false,
+                    &mut gpu_compose,
+                    &mut shm,
+                    &mut original_scratch,
+                    &mut model_scratch,
+                    &mut inflight,
+                    &mut bootstrap_complete,
+                    &mut answer_scratch,
+                    &mut raw_answer_base,
+                    &mut raw_answer_generation,
+                    &mut last_answer,
+                    &mut last_answer_dims,
+                    &mut last_answer_encoded,
                 )
             };
             if let Some(sem) = sem {
@@ -4464,7 +4956,10 @@ mod tests {
                 }
                 composited = true;
             }
-            assert!(!sent_wrong_size.load(AtomicOrdering::Relaxed), "the model server observed a proxy request at the wrong resolution -- working_scale did not shrink it");
+            assert!(
+                !sent_wrong_size.load(AtomicOrdering::Relaxed),
+                "the model server observed a proxy request at the wrong resolution -- working_scale did not shrink it"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(composited, "the scaled pipeline must eventually composite a real answer within 5s, same as the unscaled path already does");
@@ -4528,7 +5023,9 @@ mod tests {
         let mut shm = ShmClient::default();
         assert!(shm.test_open_at(&path));
         let hdr_ptr = shm.test_header_ptr();
-        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
+        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }
+            .server_state
+            .store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
 
         // A fake model server that answers as fast as it can see the request -- the real
         // steady state, where the layer has a fresh answer nearly every present and so
@@ -4590,11 +5087,35 @@ mod tests {
             // SAFETY: `image` is this harness's own, treated as `PRESENT_SRC_KHR`;
             // `queue` is used from this one thread only, exactly `run`'s contract.
             let sem = unsafe {
-                run(&device, &instance, physical_device, queue, queue_family, image,
-                    vk::ImageLayout::PRESENT_SRC_KHR, image, width, height, proxy_format, false,
-                    &mut pipeline, &mut direct, &mut false, &mut gpu_compose, &mut shm,
-                    &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
-                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded)
+                run(
+                    &device,
+                    &instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    image,
+                    width,
+                    height,
+                    proxy_format,
+                    false,
+                    &mut pipeline,
+                    &mut direct,
+                    &mut false,
+                    &mut gpu_compose,
+                    &mut shm,
+                    &mut original_scratch,
+                    &mut model_scratch,
+                    &mut inflight,
+                    &mut bootstrap_complete,
+                    &mut answer_scratch,
+                    &mut raw_answer_base,
+                    &mut raw_answer_generation,
+                    &mut last_answer,
+                    &mut last_answer_dims,
+                    &mut last_answer_encoded,
+                )
             };
             let cpu_cost = c.elapsed();
             if sem.is_some() {
@@ -4616,10 +5137,7 @@ mod tests {
         let report = |label: &str, v: &mut Vec<Duration>| {
             v.sort_unstable();
             let mean = v.iter().sum::<Duration>() / v.len() as u32;
-            println!(
-                "  {label}: mean={mean:?} p50={:?} p95={:?} max={:?}",
-                v[v.len() / 2], v[v.len() * 95 / 100], *v.last().unwrap()
-            );
+            println!("  {label}: mean={mean:?} p50={:?} p95={:?} max={:?}", v[v.len() / 2], v[v.len() * 95 / 100], *v.last().unwrap());
         };
         println!("capture_hot_path_cost_per_present @ {width}x{height} ({} samples, {submitted} composited a fresh answer):", cpu.len());
         report("cpu (run() on present thread)", &mut cpu);
@@ -4673,7 +5191,12 @@ mod model_size_tests {
     }
 
     fn frame_of(w: u32, h: u32, f: impl Fn(u32, u32) -> u8) -> Vec<u8> {
-        (0..w * h).flat_map(|i| { let v = f(i % w, i / w); [v, v, v, 255] }).collect()
+        (0..w * h)
+            .flat_map(|i| {
+                let v = f(i % w, i / w);
+                [v, v, v, 255]
+            })
+            .collect()
     }
 
     #[test]

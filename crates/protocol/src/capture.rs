@@ -150,16 +150,10 @@ pub fn request(hdr: &ShmHeader, frames: u32) -> Result<u32, RequestError> {
     if hdr.capture_request.load(Ordering::Acquire) != 0 {
         return Err(RequestError::Pending);
     }
-    let previous = hdr
-        .capture_next_id
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n % MAX_ID + 1))
-        .unwrap_or_default();
+    let previous = hdr.capture_next_id.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n % MAX_ID + 1)).unwrap_or_default();
     let id = previous % MAX_ID + 1;
     // Release: a cancel of an earlier id written before this request is seen before it.
-    hdr.capture_request
-        .compare_exchange(0, encode_request(id, frames), Ordering::Release, Ordering::Relaxed)
-        .map(|_| id)
-        .map_err(|_| RequestError::Pending)
+    hdr.capture_request.compare_exchange(0, encode_request(id, frames), Ordering::Release, Ordering::Relaxed).map(|_| id).map_err(|_| RequestError::Pending)
 }
 
 /// The request waiting for the layer, if any (not taken).
@@ -362,7 +356,15 @@ mod tests {
     fn an_outcome_round_trips_and_long_paths_are_cut_on_a_character() {
         let h = ShmHeader::default();
         assert_eq!(result(&h), None);
-        let outcome = Outcome { id: 9, state: state::WRITTEN, reason: reason::NO_ANSWER, done: 1, total: 1, composed: 0, paths: "/a/1-original.png\n/a/1-composited.png".into() };
+        let outcome = Outcome {
+            id: 9,
+            state: state::WRITTEN,
+            reason: reason::NO_ANSWER,
+            done: 1,
+            total: 1,
+            composed: 0,
+            paths: "/a/1-original.png\n/a/1-composited.png".into(),
+        };
         publish(&h, &outcome);
         let read = result(&h).unwrap();
         assert_eq!(read, outcome);

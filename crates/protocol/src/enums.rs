@@ -34,7 +34,11 @@ pub mod network {
     /// The network's directory name under the model directory, and its name on the command line.
     /// A value out of range is the full network.
     pub fn name(network: u32) -> &'static str {
-        if network == SMALL { "small" } else { "full" }
+        if network == SMALL {
+            "small"
+        } else {
+            "full"
+        }
     }
 }
 
@@ -131,7 +135,6 @@ pub mod proxy_format {
         }
     }
 }
-
 
 /// The bits of a pass's `overrides` setting (`pass<N>_overrides`): each names a Model-tab value the
 /// pass takes from its own field instead. A pass with none follows the Model tab.

@@ -231,7 +231,12 @@ fn result_wait(frames: u32) -> std::time::Duration {
 
 /// Waits for capture `id`'s outcome: withdraws the request when no game took it within `take_wait`,
 /// gives up after `result_wait`. Prints a series' progress as it goes.
-fn wait_for_capture(header: &ShmHeader, id: u32, take_wait: std::time::Duration, result_wait: std::time::Duration) -> Result<neural_forge_protocol::capture::Outcome, String> {
+fn wait_for_capture(
+    header: &ShmHeader,
+    id: u32,
+    take_wait: std::time::Duration,
+    result_wait: std::time::Duration,
+) -> Result<neural_forge_protocol::capture::Outcome, String> {
     use neural_forge_protocol::capture;
     let start = std::time::Instant::now();
     let mut said = 0;
@@ -323,7 +328,9 @@ fn cmd_dump_cache(header: &ShmHeader, args: &[String]) -> bool {
     match dump_cache_holds(args) {
         Ok(k) => {
             header.preupscale_dump_request.store(k, Ordering::Relaxed);
-            println!("preupscale_dump_request={k} -- the game's next {k} model-mode holds go to a new $XDG_DATA_HOME/neural-forge/captures/preupscale-cache-<ms>/");
+            println!(
+                "preupscale_dump_request={k} -- the game's next {k} model-mode holds go to a new $XDG_DATA_HOME/neural-forge/captures/preupscale-cache-<ms>/"
+            );
             true
         }
         Err(e) => {
@@ -550,7 +557,18 @@ mod tests {
                 };
                 capture::publish(&header, &capture::Outcome { id: request.id + 1, state: capture::state::WRITTEN, ..Default::default() });
                 std::thread::sleep(std::time::Duration::from_millis(30));
-                capture::publish(&header, &capture::Outcome { id: request.id, state: capture::state::WRITTEN, done: 2, total: 2, composed: 2, paths: "/c/series-1".into(), ..Default::default() });
+                capture::publish(
+                    &header,
+                    &capture::Outcome {
+                        id: request.id,
+                        state: capture::state::WRITTEN,
+                        done: 2,
+                        total: 2,
+                        composed: 2,
+                        paths: "/c/series-1".into(),
+                        ..Default::default()
+                    },
+                );
             })
         };
         let outcome = wait_for_capture(&header, id, std::time::Duration::from_secs(5), std::time::Duration::from_secs(10)).unwrap();

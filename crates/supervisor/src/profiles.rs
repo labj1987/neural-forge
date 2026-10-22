@@ -38,7 +38,10 @@ fn load_for_update() -> std::io::Result<BTreeMap<String, ProfileSettings>> {
         Ok(text) => Ok(parse(&text)),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("{file} is not UTF-8 (byte {}); not replacing it, which would change the profiles it holds: fix that line by hand", e.utf8_error().valid_up_to()),
+            format!(
+                "{file} is not UTF-8 (byte {}); not replacing it, which would change the profiles it holds: fix that line by hand",
+                e.utf8_error().valid_up_to()
+            ),
         )),
     }
 }

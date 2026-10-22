@@ -152,7 +152,15 @@ impl PostServer {
     /// Starts the server's worker, which takes the channel ([`Owner`]), checks that nothing outside the
     /// process answers it (its heartbeat stands still), builds its pipelines and serves. Nothing here waits:
     /// this is called from the present. `None` only when the thread could not be spawned.
-    pub(crate) fn start(device: ash::Device, instance: ash::Instance, physical: vk::PhysicalDevice, setup: Setup, import: bool, loader: Arc<Loader>, view: ShmView) -> Option<Self> {
+    pub(crate) fn start(
+        device: ash::Device,
+        instance: ash::Instance,
+        physical: vk::PhysicalDevice,
+        setup: Setup,
+        import: bool,
+        loader: Arc<Loader>,
+        view: ShmView,
+    ) -> Option<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let status = Arc::new(AtomicU8::new(Status::Starting as u8));
         let (q, st) = (quit.clone(), status.clone());
@@ -394,14 +402,27 @@ impl Gpu {
             step(0)?;
             g.gpu.queue = device.get_device_queue(setup.family, setup.post_index);
             crate::loader_data::initialize_queue(device.handle(), g.gpu.queue).ok()?;
-            let binding = |n: u32| vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
+            let binding = |n: u32| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(n)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            };
             let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..BINDINGS).map(binding).collect();
             step(1)?;
             g.gpu.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
             let set_layout = g.gpu.set_layout;
             let layout = |bytes: usize| {
                 let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(bytes as u32);
-                device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None).ok()
+                device
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .set_layouts(std::slice::from_ref(&set_layout))
+                            .push_constant_ranges(std::slice::from_ref(&push)),
+                        None,
+                    )
+                    .ok()
             };
             step(2)?;
             g.gpu.layouts[0] = layout(std::mem::size_of::<PreprocessPush>())?;
@@ -420,10 +441,17 @@ impl Gpu {
             g.gpu.sets.copy_from_slice(&sets);
             step(8)?;
             g.gpu.command_pool = device
-                .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(setup.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(setup.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
                 .ok()?;
             step(9)?;
-            g.gpu.cmd = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::default().command_pool(g.gpu.command_pool).command_buffer_count(1)).ok()?[0];
+            g.gpu.cmd = crate::loader_data::allocate_commands(
+                device,
+                &vk::CommandBufferAllocateInfo::default().command_pool(g.gpu.command_pool).command_buffer_count(1),
+            )
+            .ok()?[0];
             step(10)?;
             g.gpu.fence = device.create_fence(&vk::FenceCreateInfo::default(), None).ok()?;
         }
@@ -438,7 +466,16 @@ impl Gpu {
     #[cfg(test)]
     fn live(&self) -> usize {
         use ash::vk::Handle;
-        let handles = [self.set_layout.as_raw(), self.layouts[0].as_raw(), self.layouts[1].as_raw(), self.pipelines[0].as_raw(), self.pipelines[1].as_raw(), self.pool.as_raw(), self.command_pool.as_raw(), self.fence.as_raw()];
+        let handles = [
+            self.set_layout.as_raw(),
+            self.layouts[0].as_raw(),
+            self.layouts[1].as_raw(),
+            self.pipelines[0].as_raw(),
+            self.pipelines[1].as_raw(),
+            self.pool.as_raw(),
+            self.command_pool.as_raw(),
+            self.fence.as_raw(),
+        ];
         handles.iter().filter(|&&h| h != 0).count()
     }
 
@@ -533,7 +570,16 @@ fn first_seen(hdr: &neural_forge_protocol::ShmHeader) -> [u32; Slot::COUNT] {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, import: bool, loader: &Loader, view: ShmView, quit: &AtomicBool, gpu: &mut Gpu) {
+fn serve(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    import: bool,
+    loader: &Loader,
+    view: ShmView,
+    quit: &AtomicBool,
+    gpu: &mut Gpu,
+) {
     let hdr = view.header();
     // A request the layer posted before this thread started (it posts in the present that starts the
     // server) is still unanswered: `seq_resp` behind `seq_req`. Starting from `seq_resp` serves it.
@@ -575,8 +621,16 @@ fn serve(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalD
 
 #[allow(clippy::too_many_arguments)]
 fn process(
-    device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, import: bool, loader: &Loader, view: ShmView, gpu: &mut Gpu, slot: Slot,
-    seq: u32, frames: &mut u64,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    import: bool,
+    loader: &Loader,
+    view: ShmView,
+    gpu: &mut Gpu,
+    slot: Slot,
+    seq: u32,
+    frames: &mut u64,
 ) {
     let hdr = view.header();
     let t = Instant::now();
@@ -612,7 +666,27 @@ fn process(
         // was waited for (`evaluate` waits for each) and the other path is kept off by the claim.
         let ok = loader.ready(width, height, hdr.network_choice()).is_some_and(|built| {
             // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
-            unsafe { evaluate(device, instance, physical, import, Some(loader), (view.regions(slot).0, view.regions(slot).1, view.capacity()), gpu, slot, &built, width, height, format == proxy_format::BGRA8, &passes, feedback, &colour, lut.as_ref(), &hud) }
+            unsafe {
+                evaluate(
+                    device,
+                    instance,
+                    physical,
+                    import,
+                    Some(loader),
+                    (view.regions(slot).0, view.regions(slot).1, view.capacity()),
+                    gpu,
+                    slot,
+                    &built,
+                    width,
+                    height,
+                    format == proxy_format::BGRA8,
+                    &passes,
+                    feedback,
+                    &colour,
+                    lut.as_ref(),
+                    &hud,
+                )
+            }
         });
         if gpu.stalled {
             loader.post_stalled(device, gpu.fence);
@@ -706,9 +780,23 @@ unsafe fn upload_lut(device: &ash::Device, instance: &ash::Instance, physical: v
 /// The regions are live; nothing of `gpu`'s is pending.
 #[allow(clippy::too_many_arguments)]
 unsafe fn evaluate(
-    device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, import: bool, loader: Option<&Loader>, regions: (*mut u8, *mut u8, usize), gpu: &mut Gpu, slot: Slot,
-    built: &Built, width: u32, height: u32, bgra: bool, passes: &[Conditioning], feedback: f32, colour: &neural_forge_protocol::ColourSettings,
-    lut: Option<&Arc<super::colour::Lut>>, hud: &neural_forge_protocol::HudSettings,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    import: bool,
+    loader: Option<&Loader>,
+    regions: (*mut u8, *mut u8, usize),
+    gpu: &mut Gpu,
+    slot: Slot,
+    built: &Built,
+    width: u32,
+    height: u32,
+    bgra: bool,
+    passes: &[Conditioning],
+    feedback: f32,
+    colour: &neural_forge_protocol::ColourSettings,
+    lut: Option<&Arc<super::colour::Lut>>,
+    hud: &neural_forge_protocol::HudSettings,
 ) -> bool {
     let s = slot.index();
     let bytes = u64::from(width) * u64::from(height) * 4;
@@ -722,7 +810,10 @@ unsafe fn evaluate(
         // SAFETY: the regions are mapped for the process's life with room for `bytes`.
         let buffers = unsafe {
             let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
-            (region_buffer(device, instance, physical, import, proxy_region, capacity, bytes, storage), region_buffer(device, instance, physical, import, answer_region, capacity, bytes, storage))
+            (
+                region_buffer(device, instance, physical, import, proxy_region, capacity, bytes, storage),
+                region_buffer(device, instance, physical, import, answer_region, capacity, bytes, storage),
+            )
         };
         let (proxy, answer) = match buffers {
             (Some(proxy), Some(answer)) => (proxy, answer),
@@ -753,15 +844,16 @@ unsafe fn evaluate(
         let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(8);
         // SAFETY: valid create infos; the layout is destroyed again if the pipeline fails.
         let built = unsafe {
-            device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[gpu.set_layout]).push_constant_ranges(&[push]), None).ok().and_then(|layout| {
-                match super::hdr::compute_pipeline(device, layout, FEEDBACK_SPV) {
+            device
+                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[gpu.set_layout]).push_constant_ranges(&[push]), None)
+                .ok()
+                .and_then(|layout| match super::hdr::compute_pipeline(device, layout, FEEDBACK_SPV) {
                     Some(pipeline) => Some((layout, pipeline)),
                     None => {
                         device.destroy_pipeline_layout(layout, None);
                         None
                     }
-                }
-            })
+                })
         };
         let Some(built) = built else { return false };
         gpu.feedback = Some(built);
@@ -777,10 +869,11 @@ unsafe fn evaluate(
     // The HUD (module docs): its buffers, and whether the scene moves as a whole since the last frame (the
     // detection runs only then; a still frame holds every confidence).
     // SAFETY: nothing of the slot's is pending.
-    let hud_on = (hud.detect || !hud.regions.is_empty()) && (unsafe { ensure_hud(device, instance, physical, gpu, s, width, height) } || {
-        note_hud_off();
-        false
-    });
+    let hud_on = (hud.detect || !hud.regions.is_empty())
+        && (unsafe { ensure_hud(device, instance, physical, gpu, s, width, height) } || {
+            note_hud_off();
+            false
+        });
     let hud_moving = match gpu.slots[s].as_mut().and_then(|b| b.hud.as_mut()) {
         Some(h) if hud_on && hud.detect => {
             // SAFETY: the proxy region holds the frame's `bytes`, written before the request was posted.
@@ -882,8 +975,26 @@ unsafe fn evaluate(
             // Every pass after the first reads the previous pass's answer from the scratch.
             let input = if k == 0 { &proxy_i } else { &scratch_i };
             let (pre, post) = (gpu.sets[2 * k], gpu.sets[2 * k + 1]);
-            writes.extend([w(pre, 0, input), w(pre, 1, &feat_i), w(pre, 3, history_k), w(pre, 4, &reproj_i), w(pre, 5, &proxy_i), w(pre, 6, &previous_i), w(pre, 7, &flow_i), w(pre, 9, &hud_i)]);
-            writes.extend([w(post, 0, input), w(post, 1, &head_i), w(post, 2, &ans_i), w(post, 3, history_k), w(post, 4, &reproj_i), w(post, 5, &proxy_i), w(post, 8, &lut_i), w(post, 9, &hud_i)]);
+            writes.extend([
+                w(pre, 0, input),
+                w(pre, 1, &feat_i),
+                w(pre, 3, history_k),
+                w(pre, 4, &reproj_i),
+                w(pre, 5, &proxy_i),
+                w(pre, 6, &previous_i),
+                w(pre, 7, &flow_i),
+                w(pre, 9, &hud_i),
+            ]);
+            writes.extend([
+                w(post, 0, input),
+                w(post, 1, &head_i),
+                w(post, 2, &ans_i),
+                w(post, 3, history_k),
+                w(post, 4, &reproj_i),
+                w(post, 5, &proxy_i),
+                w(post, 8, &lut_i),
+                w(post, 9, &hud_i),
+            ]);
         }
         if scratch.is_some() {
             // Pass feedback: from the frame (pass 2) and from the scratch in place (after), into the scratch.
@@ -914,7 +1025,9 @@ unsafe fn evaluate(
             let writes: Vec<vk::WriteDescriptorSet> = infos
                 .iter()
                 .enumerate()
-                .map(|(n, i)| vk::WriteDescriptorSet::default().dst_set(pipe.set).dst_binding(n as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i))
+                .map(|(n, i)| {
+                    vk::WriteDescriptorSet::default().dst_set(pipe.set).dst_binding(n as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i)
+                })
                 .collect();
             // SAFETY: the set is not in use (every frame waits for its own work); the buffers are live.
             unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -956,36 +1069,96 @@ unsafe fn evaluate(
         (|| {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &barrier(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE),
+                &[],
+                &[],
+            );
             if let Some((layout, pipeline, set, push, fresh, confidence, _)) = hud_rec {
                 // The HUD's scale of the edit, before every pass (the preprocess and the last composite read it).
                 if fresh {
                     // A new confidence starts at 0 everywhere: nothing is HUD before the detection saw it.
-                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE), &[], &[]);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &barrier(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE),
+                        &[],
+                        &[],
+                    );
                     device.cmd_fill_buffer(cmd, confidence, 0, vk::WHOLE_SIZE, 0);
-                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &barrier(vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE),
+                        &[],
+                        &[],
+                    );
                 }
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
                 let groups = (width.div_ceil(8), height.div_ceil(8));
                 if hud_moving {
-                    device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<HudPush>()));
+                    device.cmd_push_constants(
+                        cmd,
+                        layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<HudPush>()),
+                    );
                     device.cmd_dispatch(cmd, groups.0, groups.1, 1);
-                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ), &[], &[]);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ),
+                        &[],
+                        &[],
+                    );
                 }
                 // Phase 1 (the detection's rows) with the detection on, then phase 2 (the scale).
                 for phase in if push.flags[0] != 0 { 1..3 } else { 2..3 } {
                     let at = HudPush { dims: [push.dims[0], push.dims[1], phase, push.dims[3]], ..push };
-                    device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&at).cast::<u8>(), std::mem::size_of::<HudPush>()));
+                    device.cmd_push_constants(
+                        cmd,
+                        layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        std::slice::from_raw_parts(std::ptr::from_ref(&at).cast::<u8>(), std::mem::size_of::<HudPush>()),
+                    );
                     device.cmd_dispatch(cmd, groups.0, groups.1, 1);
-                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE),
+                        &[],
+                        &[],
+                    );
                 }
             }
             if let (Some(session), Some(out)) = (session, flow_buffer) {
                 if flow_frame {
                     // The frame waits for the flow's semaphore at the transfer stage.
                     session.record_readback(device, cmd, out);
-                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ), &[], &[]);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &barrier(vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
+                        &[],
+                        &[],
+                    );
                 } else {
                     // No flow on this frame (no pass has a history): its proxy still becomes the next frame's
                     // reference, and the next flow starts without the previous one's hints.
@@ -996,7 +1169,10 @@ unsafe fn evaluate(
             }
             for (k, c) in passes.iter().enumerate() {
                 let (pre, post) = push(c, decision.passes[k]);
-                let post = CompositePush { hud: [if hud_rec.is_some() && k + 1 == runs { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0], ..post.with_colour(super::colour::PassColour::of(colour, k, k + 1 == runs, lut, true)) };
+                let post = CompositePush {
+                    hud: [if hud_rec.is_some() && k + 1 == runs { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+                    ..post.with_colour(super::colour::PassColour::of(colour, k, k + 1 == runs, lut, true))
+                };
                 // Every pass after the first reads the previous one's answer: copied into `scratch`, after the
                 // composite wrote it and before this pass's shaders read it (and the next composite rewrites it).
                 if k > 0 {
@@ -1004,48 +1180,148 @@ unsafe fn evaluate(
                     match gpu.feedback.filter(|_| blend) {
                         // Feedback below 1: the scratch is the pass's input moved toward its answer.
                         Some((layout, pipeline)) => {
-                            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                            device.cmd_pipeline_barrier(
+                                cmd,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::DependencyFlags::empty(),
+                                &barrier(
+                                    vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
+                                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                                ),
+                                &[],
+                                &[],
+                            );
                             let push: [u32; 2] = [width * height, feedback.to_bits()];
                             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-                            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[if k == 1 { gpu.sets[SETS - 2] } else { gpu.sets[SETS - 1] }], &[]);
+                            device.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                0,
+                                &[if k == 1 { gpu.sets[SETS - 2] } else { gpu.sets[SETS - 1] }],
+                                &[],
+                            );
                             device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 8));
                             device.cmd_dispatch(cmd, (width * height).div_ceil(64), 1, 1);
-                            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                            device.cmd_pipeline_barrier(
+                                cmd,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::DependencyFlags::empty(),
+                                &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE),
+                                &[],
+                                &[],
+                            );
                         }
                         None => {
-                            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE), &[], &[]);
+                            device.cmd_pipeline_barrier(
+                                cmd,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::DependencyFlags::empty(),
+                                &barrier(
+                                    vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
+                                    vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+                                ),
+                                &[],
+                                &[],
+                            );
                             device.cmd_copy_buffer(cmd, b.answer.buffer, scratch, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
-                            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                            device.cmd_pipeline_barrier(
+                                cmd,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::DependencyFlags::empty(),
+                                &barrier(
+                                    vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ,
+                                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                                ),
+                                &[],
+                                &[],
+                            );
                         }
                     }
                 }
                 let (pre_set, post_set) = (gpu.sets[2 * k], gpu.sets[2 * k + 1]);
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, gpu.pipelines[0]);
                 device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, gpu.layouts[0], 0, &[pre_set], &[]);
-                device.cmd_push_constants(cmd, gpu.layouts[0], vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&pre).cast::<u8>(), std::mem::size_of::<PreprocessPush>()));
+                device.cmd_push_constants(
+                    cmd,
+                    gpu.layouts[0],
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    std::slice::from_raw_parts(std::ptr::from_ref(&pre).cast::<u8>(), std::mem::size_of::<PreprocessPush>()),
+                );
                 device.cmd_dispatch(cmd, f.field_width.div_ceil(8), f.field_height.div_ceil(8), 1);
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE),
+                    &[],
+                    &[],
+                );
                 device.cmd_execute_commands(cmd, &[built.graph_own]);
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ), &[], &[]);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ),
+                    &[],
+                    &[],
+                );
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, gpu.pipelines[1]);
                 device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, gpu.layouts[1], 0, &[post_set], &[]);
-                device.cmd_push_constants(cmd, gpu.layouts[1], vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&post).cast::<u8>(), std::mem::size_of::<CompositePush>()));
+                device.cmd_push_constants(
+                    cmd,
+                    gpu.layouts[1],
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    std::slice::from_raw_parts(std::ptr::from_ref(&post).cast::<u8>(), std::mem::size_of::<CompositePush>()),
+                );
                 device.cmd_dispatch(cmd, width.div_ceil(8), height.div_ceil(8), 1);
             }
             let mut last = vk::PipelineStageFlags::COMPUTE_SHADER;
             if let Some(h) = hist {
                 // The frame's proxy is the next frame's previous one, copied once every pass read this one.
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE), &[], &[]);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &barrier(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE),
+                    &[],
+                    &[],
+                );
                 device.cmd_copy_buffer(cmd, b.proxy.buffer, h.previous.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
                 last |= vk::PipelineStageFlags::TRANSFER;
             }
             if let Some((.., Some(previous))) = hud_rec {
                 // The HUD's own previous proxy (no history keeps one), for the next frame's detection.
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE), &[], &[]);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &barrier(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE),
+                    &[],
+                    &[],
+                );
                 device.cmd_copy_buffer(cmd, b.proxy.buffer, previous, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
                 last |= vk::PipelineStageFlags::TRANSFER;
             }
-            device.cmd_pipeline_barrier(cmd, last, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::HOST_READ), &[], &[]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                last,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::HOST_READ),
+                &[],
+                &[],
+            );
             device.end_command_buffer(cmd)
         })()
     };
@@ -1117,9 +1393,21 @@ unsafe fn flow_submits(device: &ash::Device, gpu: &Gpu, s: usize) -> Result<vk::
     // SAFETY: the caller's contract; the buffers are the device's own and idle.
     unsafe {
         device.reset_command_buffer(fd.upload, vk::CommandBufferResetFlags::empty()).map_err(|e| format!("{e:?}"))?;
-        device.begin_command_buffer(fd.upload, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("{e:?}"))?;
-        let host = [vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-        device.cmd_pipeline_barrier(fd.upload, vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &host, &[], &[]);
+        device
+            .begin_command_buffer(fd.upload, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+            .map_err(|e| format!("{e:?}"))?;
+        let host = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+        device.cmd_pipeline_barrier(
+            fd.upload,
+            vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &host,
+            &[],
+            &[],
+        );
         session.record_upload(device, fd.upload, b.proxy.buffer);
         device.end_command_buffer(fd.upload).map_err(|e| format!("{e:?}"))?;
         session.record_flow(device, fd)?;
@@ -1144,7 +1432,16 @@ unsafe fn flow_submits(device: &ash::Device, gpu: &Gpu, s: usize) -> Result<vk::
 /// # Safety
 /// Nothing of the slot's is pending.
 #[allow(clippy::too_many_arguments)]
-unsafe fn ensure_history(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, gpu: &mut Gpu, s: usize, width: u32, height: u32, passes: usize) -> bool {
+unsafe fn ensure_history(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    gpu: &mut Gpu,
+    s: usize,
+    width: u32,
+    height: u32,
+    passes: usize,
+) -> bool {
     let pixels = u64::from(width) * u64::from(height);
     let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
     let Some(b) = gpu.slots[s].as_mut() else { return false };
@@ -1157,7 +1454,9 @@ unsafe fn ensure_history(device: &ash::Device, instance: &ash::Instance, physica
             )
         };
         match made {
-            (Some(previous), Some(reproj)) => b.hist = Some(HistBuffers { previous, reproj, passes: Vec::new(), flow: None, session: None, flow_failed: false }),
+            (Some(previous), Some(reproj)) => {
+                b.hist = Some(HistBuffers { previous, reproj, passes: Vec::new(), flow: None, session: None, flow_failed: false })
+            }
             (previous, reproj) => {
                 // SAFETY: never used.
                 unsafe {
@@ -1209,7 +1508,12 @@ unsafe fn ensure_history(device: &ash::Device, instance: &ash::Instance, physica
                 let cells = u64::from(session.cells.0) * u64::from(session.cells.1);
                 match super::own_host_buffer_with(device, instance, physical, cells * 4, storage | vk::BufferUsageFlags::TRANSFER_DST) {
                     Some(out) => {
-                        crate::log!("[native] after the upscaler: optical flow at {width}x{height}, a {0}x{0} grid ({1}x{2} vectors)", session.grid, session.cells.0, session.cells.1);
+                        crate::log!(
+                            "[native] after the upscaler: optical flow at {width}x{height}, a {0}x{0} grid ({1}x{2} vectors)",
+                            session.grid,
+                            session.cells.0,
+                            session.cells.1
+                        );
                         h.session = Some(session);
                         h.flow = Some(out);
                         gpu.bound = None;
@@ -1293,19 +1597,34 @@ impl HudPipeline {
     /// # Safety
     /// `device` is live.
     unsafe fn build(device: &ash::Device) -> Option<Self> {
-        let mut h = Self { set_layout: vk::DescriptorSetLayout::null(), layout: vk::PipelineLayout::null(), pipeline: vk::Pipeline::null(), pool: vk::DescriptorPool::null(), set: vk::DescriptorSet::null() };
+        let mut h = Self {
+            set_layout: vk::DescriptorSetLayout::null(),
+            layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            pool: vk::DescriptorPool::null(),
+            set: vk::DescriptorSet::null(),
+        };
         // SAFETY: valid create infos; on a failure what was made is destroyed (null handles are ignored).
         let built = unsafe {
             (|| {
-                let binding = |n: u32| vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
+                let binding = |n: u32| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(n)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                };
                 let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..6).map(binding).collect();
                 h.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
                 let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(std::mem::size_of::<HudPush>() as u32);
-                h.layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[h.set_layout]).push_constant_ranges(&[push]), None).ok()?;
+                h.layout = device
+                    .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[h.set_layout]).push_constant_ranges(&[push]), None)
+                    .ok()?;
                 h.pipeline = super::hdr::compute_pipeline(device, h.layout, HUD_SPV)?;
                 let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 6 }];
                 h.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).ok()?;
-                h.set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(h.pool).set_layouts(&[h.set_layout])).ok()?[0];
+                h.set =
+                    device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(h.pool).set_layouts(&[h.set_layout])).ok()?[0];
                 Some(())
             })()
         };
@@ -1453,7 +1772,17 @@ mod tests {
         unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
             None
         }
-        let setup = Setup { gipa, instance: vk::Instance::null(), physical, frame_family: family, family, index: 0, post_index: 0, properties2: crate::vram::Properties2::None, flow: None };
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical,
+            frame_family: family,
+            family,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+        };
         // Objects that exist when each step fails (the sets and the command buffer go with their pools).
         let before = [0, 0, 1, 2, 3, 4, 5, 6, 6, 7, 7];
         for (step, &created) in before.iter().enumerate() {
@@ -1484,14 +1813,25 @@ mod tests {
         unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
             None
         }
-        let setup = Setup { gipa, instance: vk::Instance::null(), physical, frame_family: family, family, index: 0, post_index: 0, properties2: crate::vram::Properties2::None, flow: None };
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical,
+            frame_family: family,
+            family,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+        };
         const W: u32 = 16;
         const H: u32 = 16;
         // SAFETY: a live test device whose queue 0 of `family` exists; every object is waited for.
         unsafe {
             let mut gpu = Gpu::new(&device, setup).expect("builds");
             let host = |bytes: u64| super::super::own_host_buffer_with(&device, instance, physical, bytes, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
-            let (proxy, head, answer, lut, history) = (host(u64::from(W * H) * 4), host(u64::from(W * H) * 16), host(u64::from(W * H) * 4), host(64), host(u64::from(W * H) * 8));
+            let (proxy, head, answer, lut, history) =
+                (host(u64::from(W * H) * 4), host(u64::from(W * H) * 16), host(u64::from(W * H) * 4), host(64), host(u64::from(W * H) * 8));
             let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
             let (pi, hi, ai, li, si) = (info(proxy.buffer), info(head.buffer), info(answer.buffer), info(lut.buffer), info(history.buffer));
             let set = gpu.sets[1];
@@ -1515,10 +1855,24 @@ mod tests {
                 device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, gpu.pipelines[1]);
                 device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, gpu.layouts[1], 0, &[gpu.sets[1]], &[]);
-                device.cmd_push_constants(cmd, gpu.layouts[1], vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<CompositePush>()));
+                device.cmd_push_constants(
+                    cmd,
+                    gpu.layouts[1],
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<CompositePush>()),
+                );
                 device.cmd_dispatch(cmd, W.div_ceil(8), H.div_ceil(8), 1);
                 let to_host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[to_host], &[], &[]);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[to_host],
+                    &[],
+                    &[],
+                );
                 device.end_command_buffer(cmd).unwrap();
                 device.reset_fences(&[gpu.fence]).unwrap();
                 device.queue_submit(gpu.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], gpu.fence).unwrap();
@@ -1541,13 +1895,21 @@ mod tests {
                     assert!((d[0] - d[1]).abs() <= 1 && (d[1] - d[2]).abs() <= 1, "saturation 0 leaves a grey change at {x},{y}: {d:?}");
                 }
             }
-            assert!((0..W).any(|x| (0..3).map(|c| i32::from(at(&plain, x, 0, c)) - i32::from(proxy_of(x, 0, c))).collect::<Vec<_>>().windows(2).any(|w| (w[0] - w[1]).abs() > 2)), "the test's edit has chroma");
+            assert!(
+                (0..W).any(|x| (0..3)
+                    .map(|c| i32::from(at(&plain, x, 0, c)) - i32::from(proxy_of(x, 0, c)))
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|w| (w[0] - w[1]).abs() > 2)),
+                "the test's edit has chroma"
+            );
 
             // The detail step's 3x3 low-pass of the change, across the 8x8 groups' edges and the frame's: bit for
             // bit what the shader gave when it worked out all nine neighbours per pixel (pinned from it).
             use super::super::colour::DETAIL;
             let digest = |a: &[u8]| a.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
-            let detailed: Vec<u64> = [0.0f32, 0.5, 2.0].iter().map(|&d| digest(&run(PassColour { colour: [1.0, 1.0, d, 0.0], ..flags(STEP | GUARD | DETAIL) }))).collect();
+            let detailed: Vec<u64> =
+                [0.0f32, 0.5, 2.0].iter().map(|&d| digest(&run(PassColour { colour: [1.0, 1.0, d, 0.0], ..flags(STEP | GUARD | DETAIL) }))).collect();
             assert_eq!(detailed, DETAIL_PINNED, "the detail step moved");
             assert_ne!(detailed[0], digest(&plain), "detail 0 changes the answer");
 
@@ -1585,14 +1947,25 @@ mod tests {
         unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
             None
         }
-        let setup = Setup { gipa, instance: vk::Instance::null(), physical, frame_family: family, family, index: 0, post_index: 0, properties2: crate::vram::Properties2::None, flow: None };
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical,
+            frame_family: family,
+            family,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+        };
         let table = |generation: u64, size: usize| Arc::new(super::super::colour::Lut { generation, cube: neural_forge_protocol::cube::Cube::identity(size) });
         // SAFETY: a live test device whose queue 0 of `family` exists; nothing is submitted.
         unsafe {
             let mut gpu = Gpu::new(&device, setup).expect("builds");
             upload_lut(&device, &instance, physical, &mut gpu, Some(&table(1, 3)));
             let first = gpu.lut.as_ref().map(|l| l.buffer.buffer).expect("a buffer for the table");
-            let key = Bound { slot: 0, width: 4, height: 4, generation: 1, scratch: false, passes: 1, history: 0, flow: false, lut: first, hud: vk::Buffer::null() };
+            let key =
+                Bound { slot: 0, width: 4, height: 4, generation: 1, scratch: false, passes: 1, history: 0, flow: false, lut: first, hud: vk::Buffer::null() };
             gpu.bound = Some(key);
             upload_lut(&device, &instance, physical, &mut gpu, Some(&table(2, 3)));
             assert_eq!(gpu.lut.as_ref().map(|l| l.buffer.buffer), Some(first), "the same size: the same buffer");
@@ -1654,7 +2027,17 @@ mod tests {
             unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
                 None
             }
-            let setup = Setup { gipa, instance: vk::Instance::null(), physical, frame_family: family, family, index: 0, post_index: 0, properties2: crate::vram::Properties2::None, flow: None };
+            let setup = Setup {
+                gipa,
+                instance: vk::Instance::null(),
+                physical,
+                frame_family: family,
+                family,
+                index: 0,
+                post_index: 0,
+                properties2: crate::vram::Properties2::None,
+                flow: None,
+            };
             // SAFETY: a live test device; every object below is destroyed in Drop after the device idles.
             unsafe {
                 let gpu = Gpu::new(&device, setup).expect("the server's objects build");
@@ -1662,9 +2045,18 @@ mod tests {
                 let features = super::super::own_host_buffer_with(&device, &instance, physical, u64::from(FW * FH) * 64, usage).unwrap();
                 let head = super::super::own_host_buffer_with(&device, &instance, physical, u64::from(FW * FH) * 16, usage).unwrap();
                 let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
-                let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+                let graph = device
+                    .allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1),
+                    )
+                    .unwrap()[0];
                 let inheritance = vk::CommandBufferInheritanceInfo::default();
-                device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+                device
+                    .begin_command_buffer(
+                        graph,
+                        &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance),
+                    )
+                    .unwrap();
                 device.end_command_buffer(graph).unwrap();
                 let frame = neural_forge_native::Frame {
                     field_width: FW,
@@ -1679,7 +2071,20 @@ mod tests {
                 let built = Built { width: W, height: H, frame, graph, graph_own: graph, generation: 1, network: neural_forge_protocol::enums::network::FULL };
                 let bytes = (W * H * 4) as usize;
                 let hud = neural_forge_protocol::HudSettings { detect: true, regions: Vec::new() };
-                Some(Self { device, instance, physical, gpu, features, head, graph_pool, built, proxy: vec![0; bytes], answer: vec![0; bytes], hud, _entry: entry })
+                Some(Self {
+                    device,
+                    instance,
+                    physical,
+                    gpu,
+                    features,
+                    head,
+                    graph_pool,
+                    built,
+                    proxy: vec![0; bytes],
+                    answer: vec![0; bytes],
+                    hud,
+                    _entry: entry,
+                })
             }
         }
 
@@ -1697,7 +2102,27 @@ mod tests {
             }
             let regions = (self.proxy.as_mut_ptr(), self.answer.as_mut_ptr(), self.proxy.len());
             // SAFETY: the regions live as long as the rig; nothing of the rig's is pending.
-            let ok = unsafe { evaluate(&self.device, &self.instance, self.physical, false, None, regions, &mut self.gpu, Slot::Primary, &self.built, W, H, false, passes, 1.0, &neural_forge_protocol::ColourSettings::DEFAULT, None, &self.hud) };
+            let ok = unsafe {
+                evaluate(
+                    &self.device,
+                    &self.instance,
+                    self.physical,
+                    false,
+                    None,
+                    regions,
+                    &mut self.gpu,
+                    Slot::Primary,
+                    &self.built,
+                    W,
+                    H,
+                    false,
+                    passes,
+                    1.0,
+                    &neural_forge_protocol::ColourSettings::DEFAULT,
+                    None,
+                    &self.hud,
+                )
+            };
             assert!(ok, "the frame was answered");
             self.answer.as_chunks::<4>().0.iter().map(|&c| u32::from_le_bytes(c)).collect()
         }
@@ -1791,7 +2216,8 @@ mod tests {
     }
 
     /// [`the_shipped_frame_stays_bit_for_bit`]'s digests, from 3.7.0's shaders (commit 140c7a2).
-    const SHIPPED: [u64; 6] = [0xafea_81f1_9746_c790, 0xbaf4_583a_665d_da89, 0xb04e_20c6_c636_d0f5, 0x1d9c_9395_0c08_6565, 0x80ee_55d5_8453_dfd5, 0x1756_013e_f379_6ca2];
+    const SHIPPED: [u64; 6] =
+        [0xafea_81f1_9746_c790, 0xbaf4_583a_665d_da89, 0xb04e_20c6_c636_d0f5, 0x1d9c_9395_0c08_6565, 0x80ee_55d5_8453_dfd5, 0x1756_013e_f379_6ca2];
 
     impl Rig {
         /// A rig whose frames keep a history (`motion`), with the default rejection.
@@ -2023,8 +2449,23 @@ mod tests {
     fn the_flow_reprojects_the_history() {
         let one = [Conditioning::default()];
         // Strong horizontal structure, so a 3-pixel shift changes every pixel by far more than 0.12.
-        let p: Vec<u32> = (0..W * H).map(|i| { let (x, y) = (i % W, i / W); let v = (x * 50 + y * 3) % 256; v | ((255 - v) << 8) | (((x * 13) % 256) << 16) | (0xff << 24) }).collect();
-        let pan: Vec<u32> = (0..W * H).map(|i| { let (x, y) = (i % W, i / W); if x >= 3 { p[(y * W + x - 3) as usize] } else { p[(y * W) as usize] } }).collect();
+        let p: Vec<u32> = (0..W * H)
+            .map(|i| {
+                let (x, y) = (i % W, i / W);
+                let v = (x * 50 + y * 3) % 256;
+                v | ((255 - v) << 8) | (((x * 13) % 256) << 16) | (0xff << 24)
+            })
+            .collect();
+        let pan: Vec<u32> = (0..W * H)
+            .map(|i| {
+                let (x, y) = (i % W, i / W);
+                if x >= 3 {
+                    p[(y * W + x - 3) as usize]
+                } else {
+                    p[(y * W) as usize]
+                }
+            })
+            .collect();
         let grid = 4;
         let cells = W.div_ceil(grid) * H.div_ceil(grid);
         let Some(mut flow) = Rig::with(Motion::Flow) else { return };
@@ -2087,7 +2528,14 @@ mod tests {
     fn hud(detect: bool, regions: &[(u32, u32, u32, u32, u32, f32)]) -> neural_forge_protocol::HudSettings {
         let regions = regions
             .iter()
-            .map(|&(x, y, w, h, mode, strength)| neural_forge_protocol::HudRegion { x: x as f32 / W as f32, y: y as f32 / H as f32, w: w as f32 / W as f32, h: h as f32 / H as f32, mode, strength })
+            .map(|&(x, y, w, h, mode, strength)| neural_forge_protocol::HudRegion {
+                x: x as f32 / W as f32,
+                y: y as f32 / H as f32,
+                w: w as f32 / W as f32,
+                h: h as f32 / H as f32,
+                mode,
+                strength,
+            })
             .collect();
         neural_forge_protocol::HudSettings { detect, regions }
     }
@@ -2115,7 +2563,13 @@ mod tests {
         let plain = rig.frame(&p, &one);
         let keep = (8, 6, 8, 6);
         let soften = (26, 12, 8, 8);
-        rig.hud = hud(false, &[(keep.0, keep.1, keep.2, keep.3, neural_forge_protocol::enums::hud_mode::KEEP, 0.0), (soften.0, soften.1, soften.2, soften.3, neural_forge_protocol::enums::hud_mode::SOFTEN, 0.5)]);
+        rig.hud = hud(
+            false,
+            &[
+                (keep.0, keep.1, keep.2, keep.3, neural_forge_protocol::enums::hud_mode::KEEP, 0.0),
+                (soften.0, soften.1, soften.2, soften.3, neural_forge_protocol::enums::hud_mode::SOFTEN, 0.5),
+            ],
+        );
         let a = rig.frame(&p, &one);
         let feather = Hud::region_feather(H);
         let (mut edited, mut kept, mut softened) = (0, 0, 0);

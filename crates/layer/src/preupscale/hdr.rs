@@ -96,7 +96,13 @@ pub(crate) struct AutoState {
 impl AutoState {
     /// The state from its five words as the resolve writes them.
     pub(crate) fn from_words(raw: [u32; 5]) -> Self {
-        AutoState { log2_e: f32::from_bits(raw[0]), valid: raw[1] != 0, target_log2_e: f32::from_bits(raw[2]), mean_log2: f32::from_bits(raw[3]), samples: raw[4] }
+        AutoState {
+            log2_e: f32::from_bits(raw[0]),
+            valid: raw[1] != 0,
+            target_log2_e: f32::from_bits(raw[2]),
+            mean_log2: f32::from_bits(raw[3]),
+            samples: raw[4],
+        }
     }
 }
 
@@ -209,8 +215,8 @@ pub(crate) fn parse_paper_white(value: Option<&str>) -> Result<f32, String> {
 /// The paper white for this process ([`PAPER_WHITE_ENV`], default [`DEFAULT_PAPER_WHITE`]).
 /// Cached; an unusable value is logged once and the default used.
 pub(crate) fn paper_white() -> f32 {
-    static WHITE: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
-        match parse_paper_white(neural_forge_protocol::env::var(PAPER_WHITE_ENV).as_deref()) {
+    static WHITE: std::sync::LazyLock<f32> =
+        std::sync::LazyLock::new(|| match parse_paper_white(neural_forge_protocol::env::var(PAPER_WHITE_ENV).as_deref()) {
             Ok(w) => {
                 crate::log!("[preupscale] HDR encode: paper white {w} (exposure multiplied in, shoulder above 0.75, sRGB)");
                 w
@@ -219,8 +225,7 @@ pub(crate) fn paper_white() -> f32 {
                 crate::log!("[preupscale] {PAPER_WHITE_ENV}={other:?} is not a positive number; using {DEFAULT_PAPER_WHITE}");
                 DEFAULT_PAPER_WHITE
             }
-        }
-    });
+        });
     *WHITE
 }
 
@@ -240,7 +245,14 @@ pub(super) struct OwnImage {
 impl OwnImage {
     /// # Safety
     /// `device` is live.
-    pub(super) unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32, usage: vk::ImageUsageFlags) -> Option<Self> {
+    pub(super) unsafe fn new(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        width: u32,
+        height: u32,
+        usage: vk::ImageUsageFlags,
+    ) -> Option<Self> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R16G16B16A16_SFLOAT)
@@ -395,9 +407,15 @@ impl AutoExposure {
         let built = unsafe {
             (|| -> Option<vk::DescriptorSet> {
                 set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
-                let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(std::mem::size_of::<ExposurePush>() as u32);
+                let push =
+                    vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(std::mem::size_of::<ExposurePush>() as u32);
                 pipeline_layout = device
-                    .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None)
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .set_layouts(std::slice::from_ref(&set_layout))
+                            .push_constant_ranges(std::slice::from_ref(&push)),
+                        None,
+                    )
                     .ok()?;
                 pipeline = compute_pipeline(device, pipeline_layout, EXPOSURE_SPV)?;
                 let sizes = [
@@ -456,8 +474,12 @@ impl AutoExposure {
     /// # Safety
     /// `cmd` is recording; binding 0 holds a live view of the colour input.
     unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, width: u32, height: u32) {
-        let filled = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-        let counted = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+        let filled = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+        let counted = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         let push = |pass: u32| ExposurePush { width, height, key: AUTO_KEY, rate: AUTO_RATE, pass };
         let bytes = |p: &ExposurePush| {
             // SAFETY: `ExposurePush` is `repr(C)`, plain data; read as bytes for its own size.
@@ -466,12 +488,28 @@ impl AutoExposure {
         // SAFETY: forwarded; every handle is the pass's own and live.
         unsafe {
             device.cmd_fill_buffer(cmd, self.histogram.buffer, 0, HISTOGRAM_BYTES, 0);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[filled], &[], &[]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[filled],
+                &[],
+                &[],
+            );
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, std::slice::from_ref(&self.set), &[]);
             device.cmd_push_constants(cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes(&push(0)));
             device.cmd_dispatch(cmd, width.div_ceil(AUTO_TILE), height.div_ceil(AUTO_TILE), 1);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[counted], &[], &[]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[counted],
+                &[],
+                &[],
+            );
             device.cmd_push_constants(cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes(&push(1)));
             device.cmd_dispatch(cmd, 1, 1, 1);
         }
@@ -497,11 +535,9 @@ impl AutoExposure {
 /// # Safety
 /// `image` is a live, plain 2D RGBA16F image of `device`.
 unsafe fn colour_view(device: &ash::Device, image: vk::Image) -> Option<vk::ImageView> {
-    let info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(vk::Format::R16G16B16A16_SFLOAT)
-        .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 });
+    let info = vk::ImageViewCreateInfo::default().image(image).view_type(vk::ImageViewType::TYPE_2D).format(vk::Format::R16G16B16A16_SFLOAT).subresource_range(
+        vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 },
+    );
     // SAFETY: forwarded.
     unsafe { device.create_image_view(&info, None) }.ok()
 }
@@ -575,7 +611,10 @@ impl HdrPass {
             p.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
             let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(std::mem::size_of::<HdrPush>() as u32);
             p.pipeline_layout = device
-                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&p.set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None)
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&p.set_layout)).push_constant_ranges(std::slice::from_ref(&push)),
+                    None,
+                )
                 .ok()?;
             p.encode = compute_pipeline(device, p.pipeline_layout, ENCODE_SPV)?;
             p.decode = compute_pipeline(device, p.pipeline_layout, DECODE_SPV)?;
@@ -589,7 +628,14 @@ impl HdrPass {
                 .ok()?
                 .first()
                 .copied()?;
-            p.encoded = Some(OwnImage::new(device, instance, physical_device, padded_width, padded_height, vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)?);
+            p.encoded = Some(OwnImage::new(
+                device,
+                instance,
+                physical_device,
+                padded_width,
+                padded_height,
+                vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+            )?);
             p.answer = Some(OwnImage::new(device, instance, physical_device, padded_width, padded_height, vk::ImageUsageFlags::TRANSFER_DST)?);
             p.exposure = Some(super::own_host_buffer_with(
                 device,
@@ -602,7 +648,8 @@ impl HdrPass {
         let (encoded, answer, exposure) = (p.encoded.take()?, p.answer.take()?, p.exposure.take()?);
         // SAFETY: the mapping covers EXPOSURE_BYTES; a defined starting value (0: "no exposure").
         unsafe { std::ptr::write_bytes(exposure.ptr, 0, EXPOSURE_BYTES as usize) };
-        let image_info = |view: vk::ImageView| [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }];
+        let image_info =
+            |view: vk::ImageView| [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }];
         let (enc_info, ans_info) = (image_info(encoded.view), image_info(answer.view));
         let buf_info = [vk::DescriptorBufferInfo { buffer: exposure.buffer, offset: 0, range: EXPOSURE_BYTES }];
         let writes = [
@@ -871,7 +918,15 @@ impl HdrPass {
             );
             self.dispatch(device, cmd, self.encode, paper_white, self.padded_width, self.padded_height);
             if let Some(proxy) = proxy {
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[encoded_out], &[], &[]);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[encoded_out],
+                    &[],
+                    &[],
+                );
                 device.cmd_copy_image_to_buffer(cmd, self.encoded.image, vk::ImageLayout::GENERAL, proxy, &[region]);
             }
         }
@@ -888,7 +943,14 @@ impl HdrPass {
     /// # Safety
     /// `cmd` is recording, the answer image is in `GENERAL` (the caller's opening barrier), the
     /// encoded image still holds this hold's capture, [`Self::bind_colour`] was called for it.
-    pub(crate) unsafe fn record_decode(&self, device: &ash::Device, cmd: vk::CommandBuffer, source: vk::Buffer, paper_white: f32, before: Option<&dyn Fn(vk::CommandBuffer)>) {
+    pub(crate) unsafe fn record_decode(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        source: vk::Buffer,
+        paper_white: f32,
+        before: Option<&dyn Fn(vk::CommandBuffer)>,
+    ) {
         let region = vk::BufferImageCopy {
             buffer_offset: 0,
             buffer_row_length: self.padded_width,
@@ -901,7 +963,15 @@ impl HdrPass {
         // SAFETY: forwarded; every handle is live.
         unsafe {
             device.cmd_copy_buffer_to_image(cmd, source, self.answer.image, vk::ImageLayout::GENERAL, &[region]);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[answer_in], &[], &[]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[answer_in],
+                &[],
+                &[],
+            );
             if let Some(before) = before {
                 before(cmd);
             }
@@ -968,7 +1038,13 @@ fn to_general(image: vk::Image, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier<
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
-        .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
 }
 
 /// A compute pipeline from embedded SPIR-V (`scripts/check_shaders.py` ties it to its source).
@@ -984,7 +1060,12 @@ pub(super) unsafe fn compute_pipeline(device: &ash::Device, layout: vk::Pipeline
 ///
 /// # Safety
 /// As [`compute_pipeline`]; `spec` matches the shader's constants.
-pub(super) unsafe fn compute_pipeline_with(device: &ash::Device, layout: vk::PipelineLayout, spv: &[u8], spec: Option<&vk::SpecializationInfo>) -> Option<vk::Pipeline> {
+pub(super) unsafe fn compute_pipeline_with(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    spv: &[u8],
+    spec: Option<&vk::SpecializationInfo>,
+) -> Option<vk::Pipeline> {
     let code = ash::util::read_spv(&mut std::io::Cursor::new(spv)).ok()?;
     // SAFETY: valid SPIR-V, compiled by `glslangValidator -V` and checked by spirv-val.
     let module = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) }.ok()?;
@@ -1086,5 +1167,4 @@ mod tests {
         }
         assert!(exposure_ok(0.128) && !exposure_ok(0.0) && !exposure_ok(f32::NAN) && !exposure_ok(f32::INFINITY) && !exposure_ok(-1.0));
     }
-
 }

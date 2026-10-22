@@ -38,12 +38,23 @@ mod ffi {
         pub fn nf_native_asset_count(kind: *const c_char) -> u32;
         pub fn nf_native_hold_slots() -> u32;
         pub fn nf_native_device_supported(
-            gipa: vk::PFN_vkGetInstanceProcAddr, instance: vk::Instance, instance_api_version: u32, physical: vk::PhysicalDevice,
-            missing: *mut c_char, len: usize,
+            gipa: vk::PFN_vkGetInstanceProcAddr,
+            instance: vk::Instance,
+            instance_api_version: u32,
+            physical: vk::PhysicalDevice,
+            missing: *mut c_char,
+            len: usize,
         ) -> u32;
         pub fn nf_native_device_extend(
-            gipa: vk::PFN_vkGetInstanceProcAddr, instance: vk::Instance, instance_api_version: u32, physical: vk::PhysicalDevice,
-            input: *const vk::DeviceCreateInfo, out: *mut vk::DeviceCreateInfo, state: *mut *mut c_void, err: *mut c_char, len: usize,
+            gipa: vk::PFN_vkGetInstanceProcAddr,
+            instance: vk::Instance,
+            instance_api_version: u32,
+            physical: vk::PhysicalDevice,
+            input: *const vk::DeviceCreateInfo,
+            out: *mut vk::DeviceCreateInfo,
+            state: *mut *mut c_void,
+            err: *mut c_char,
+            len: usize,
         ) -> u32;
         pub fn nf_native_device_restore(state: *mut c_void);
         pub fn nf_native_open(open: *const Open, stalled: *mut u32, err: *mut c_char, len: usize) -> *mut c_void;
@@ -122,7 +133,10 @@ pub fn asset_count(kind: AssetKind) -> u32 {
 /// # Safety
 /// `gipa` is a valid `vkGetInstanceProcAddr` for `instance`, which owns `physical`.
 pub unsafe fn device_supported(
-    gipa: vk::PFN_vkGetInstanceProcAddr, instance: vk::Instance, instance_api_version: u32, physical: vk::PhysicalDevice,
+    gipa: vk::PFN_vkGetInstanceProcAddr,
+    instance: vk::Instance,
+    instance_api_version: u32,
+    physical: vk::PhysicalDevice,
 ) -> Result<(), String> {
     let mut missing = [0 as c_char; MESSAGE];
     // SAFETY: forwarded from this function's contract; the buffer is MESSAGE bytes.
@@ -155,7 +169,10 @@ impl Drop for DeviceExtension {
 /// # Safety
 /// As [`device_supported`]; `info` is a valid create info whose pointers outlive the result.
 pub unsafe fn device_extend(
-    gipa: vk::PFN_vkGetInstanceProcAddr, instance: vk::Instance, instance_api_version: u32, physical: vk::PhysicalDevice,
+    gipa: vk::PFN_vkGetInstanceProcAddr,
+    instance: vk::Instance,
+    instance_api_version: u32,
+    physical: vk::PhysicalDevice,
     info: &vk::DeviceCreateInfo,
 ) -> Result<DeviceExtension, String> {
     let mut out = vk::DeviceCreateInfo::default();

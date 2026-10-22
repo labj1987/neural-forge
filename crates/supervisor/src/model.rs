@@ -109,7 +109,11 @@ impl Network {
 
     /// The network a Network setting value names (out of range: the full one, as the layer reads it).
     pub fn from_setting(value: u32) -> Network {
-        if value == neural_forge_protocol::enums::network::SMALL { Network::Small } else { Network::Full }
+        if value == neural_forge_protocol::enums::network::SMALL {
+            Network::Small
+        } else {
+            Network::Full
+        }
     }
 
     /// The DLL resource holding its weights.
@@ -203,7 +207,7 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
 struct Resources<'a> {
     image: &'a [u8],
     sections: Vec<(u32, u32, u32, u32)>, // virtual address, virtual size, raw offset, raw size
-    root: usize,                    // file offset of the resource directory
+    root: usize,                         // file offset of the resource directory
 }
 
 #[derive(Clone, Copy)]
@@ -275,10 +279,7 @@ impl<'a> Resources<'a> {
             let hit = match key {
                 None => true,
                 Some(Key::Id(id)) => name & 0x8000_0000 == 0 && name == id,
-                Some(Key::Name(n)) => {
-                    name & 0x8000_0000 != 0
-                        && self.name_at(self.root + (name & 0x7fff_ffff) as usize).as_deref() == Some(n)
-                }
+                Some(Key::Name(n)) => name & 0x8000_0000 != 0 && self.name_at(self.root + (name & 0x7fff_ffff) as usize).as_deref() == Some(n),
             };
             hit.then_some(target)
         })
@@ -406,10 +407,8 @@ pub fn check_shape(tensors: &[Tensor], expected: &[(&str, u64)]) -> Result<(), M
         }
     }
     let missing: Vec<String> = expected.iter().filter(|(n, _)| !found.contains_key(n)).map(|(n, _)| n.to_string()).collect();
-    let differing: Vec<String> = expected
-        .iter()
-        .filter_map(|(n, want)| found.get(n).filter(|got| *got != want).map(|got| format!("{n}: found {got}, expected {want}")))
-        .collect();
+    let differing: Vec<String> =
+        expected.iter().filter_map(|(n, want)| found.get(n).filter(|got| *got != want).map(|got| format!("{n}: found {got}, expected {want}"))).collect();
     if missing.is_empty() && unexpected.is_empty() && differing.is_empty() {
         return Ok(());
     }
@@ -1189,10 +1188,7 @@ mod tests {
         assert_eq!(rows[rows.len() - 2], ("block30.layer0.blend_scale", 2));
         // Every small block has the shape of a full-network block: the graph runs it with the same kernels.
         let shape_of = |table: &[(&str, u64)], block: u32| -> Vec<(u32, String, u64)> {
-            let mut v: Vec<_> = table
-                .iter()
-                .filter_map(|(n, len)| parse_name(n).filter(|p| p.0 == block).map(|(_, l, p)| (l, p, *len)))
-                .collect();
+            let mut v: Vec<_> = table.iter().filter_map(|(n, len)| parse_name(n).filter(|p| p.0 == block).map(|(_, l, p)| (l, p, *len))).collect();
             v.sort();
             v
         };

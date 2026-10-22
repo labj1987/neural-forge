@@ -240,7 +240,11 @@ fn cmd_status() -> ExitCode {
 fn cmd_doctor() -> ExitCode {
     let findings = neural_forge_supervisor::doctor::run(&neural_forge_supervisor::doctor::Roots::system());
     print!("{}", neural_forge_supervisor::doctor::render_text(&findings));
-    if neural_forge_supervisor::doctor::any_failure(&findings) { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+    if neural_forge_supervisor::doctor::any_failure(&findings) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn cmd_install(appdir: &str) -> ExitCode {
@@ -324,7 +328,8 @@ fn cmd_extract_model(source: &str, network: Option<Network>) -> ExitCode {
             for done in &all.networks {
                 println!("extracted the {} of build {} ({} tensors, {} bytes) to {}", done.network, done.build, done.tensors, done.bytes, done.dir.display());
                 if !done.verified {
-                    let verified: Vec<String> = model::VERIFIED.iter().filter(|(n, _)| *n == done.network).map(|(_, v)| format!("{}.{}.{}", v[0], v[1], v[2])).collect();
+                    let verified: Vec<String> =
+                        model::VERIFIED.iter().filter(|(n, _)| *n == done.network).map(|(_, v)| format!("{}.{}.{}", v[0], v[1], v[2])).collect();
                     println!(
                         "The {} of build {} has not been compared with NVIDIA's runtime (verified builds: {}).",
                         done.network,
@@ -410,7 +415,9 @@ fn target_for_enable(game: &neural_forge_supervisor::steam::Game, chosen: &str) 
         return Ok(chosen.to_string());
     }
     match steam::target_for(&cfg, game) {
-        t if t.is_empty() => Err(format!("{}'s executable was not found in {}; name it with --target-exe (the .exe the game runs)", game.name, game.dir().display())),
+        t if t.is_empty() => {
+            Err(format!("{}'s executable was not found in {}; name it with --target-exe (the .exe the game runs)", game.name, game.dir().display()))
+        }
         t => Ok(t),
     }
 }
@@ -490,13 +497,21 @@ enum Command {
     Config,
     ImportBinaries(String),
     /// `network` None extracts every network the DLL carries ([`neural_forge_supervisor::model::extract_all`]).
-    ExtractModel { source: String, network: Option<Network> },
+    ExtractModel {
+        source: String,
+        network: Option<Network>,
+    },
     Install(String),
-    Uninstall { purge: bool },
+    Uninstall {
+        purge: bool,
+    },
     Shmctl(Vec<String>),
     Profile(Vec<String>),
     Games,
-    Enable { game: String, target_exe: String },
+    Enable {
+        game: String,
+        target_exe: String,
+    },
     Disable(String),
     /// The Steam app id, when given.
     Report(Option<String>),
@@ -589,7 +604,11 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
                 ["save" | "load" | "delete", name] => !name.starts_with('-'),
                 _ => false,
             };
-            if ok { Ok(Command::Profile(args[1..].to_vec())) } else { Err(err(format!("unexpected arguments: {}", rest.join(" ")))) }
+            if ok {
+                Ok(Command::Profile(args[1..].to_vec()))
+            } else {
+                Err(err(format!("unexpected arguments: {}", rest.join(" "))))
+            }
         }
         "games" => none(Command::Games),
         "enable" | "disable" => {
@@ -781,7 +800,10 @@ mod tests {
         assert_eq!(parse_str("games"), Ok(Command::Games));
         assert!(parse_str("games now").is_err());
         assert_eq!(parse_str("enable 3240220"), Ok(Command::Enable { game: "3240220".into(), target_exe: String::new() }));
-        assert_eq!(parse_str("enable grand theft auto --target-exe GTA5_Enhanced.exe"), Ok(Command::Enable { game: "grand theft auto".into(), target_exe: "GTA5_Enhanced.exe".into() }));
+        assert_eq!(
+            parse_str("enable grand theft auto --target-exe GTA5_Enhanced.exe"),
+            Ok(Command::Enable { game: "grand theft auto".into(), target_exe: "GTA5_Enhanced.exe".into() })
+        );
         assert_eq!(parse_str("disable Hogwarts Legacy"), Ok(Command::Disable("Hogwarts Legacy".into())));
         assert!(parse_str("enable").is_err());
         assert!(parse_str("enable gta --target-exe").is_err());

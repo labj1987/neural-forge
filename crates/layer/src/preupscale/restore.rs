@@ -72,12 +72,34 @@ pub(crate) struct OwnedWrite {
 #[derive(Clone, Debug)]
 pub(crate) enum Binding {
     /// `vkCmdBindDescriptorSets`: sets `first..first + sets.len()`.
-    Sets { layout: vk::PipelineLayout, first: u32, sets: Vec<vk::DescriptorSet>, dynamic: Vec<u32> },
-    Push { layout: vk::PipelineLayout, set: u32, writes: Vec<OwnedWrite> },
-    PushTemplate { template: vk::DescriptorUpdateTemplate, layout: vk::PipelineLayout, set: u32, data: Vec<u8> },
+    Sets {
+        layout: vk::PipelineLayout,
+        first: u32,
+        sets: Vec<vk::DescriptorSet>,
+        dynamic: Vec<u32>,
+    },
+    Push {
+        layout: vk::PipelineLayout,
+        set: u32,
+        writes: Vec<OwnedWrite>,
+    },
+    PushTemplate {
+        template: vk::DescriptorUpdateTemplate,
+        layout: vk::PipelineLayout,
+        set: u32,
+        data: Vec<u8>,
+    },
     /// `vkCmdSetDescriptorBufferOffsetsEXT`: sets `first..first + indices.len()`.
-    Offsets { layout: vk::PipelineLayout, first: u32, indices: Vec<u32>, offsets: Vec<vk::DeviceSize> },
-    Embedded { layout: vk::PipelineLayout, set: u32 },
+    Offsets {
+        layout: vk::PipelineLayout,
+        first: u32,
+        indices: Vec<u32>,
+        offsets: Vec<vk::DeviceSize>,
+    },
+    Embedded {
+        layout: vk::PipelineLayout,
+        set: u32,
+    },
 }
 
 impl Binding {
@@ -260,8 +282,10 @@ impl State {
                     }
                     Item::Buffers(buffers) => {
                         let Some(bind) = fns.bind_descriptor_buffers else { continue };
-                        let handles: Vec<vk::DescriptorBufferBindingPushDescriptorBufferHandleEXT> =
-                            buffers.iter().map(|(_, _, b)| vk::DescriptorBufferBindingPushDescriptorBufferHandleEXT { buffer: b.unwrap_or_default(), ..Default::default() }).collect();
+                        let handles: Vec<vk::DescriptorBufferBindingPushDescriptorBufferHandleEXT> = buffers
+                            .iter()
+                            .map(|(_, _, b)| vk::DescriptorBufferBindingPushDescriptorBufferHandleEXT { buffer: b.unwrap_or_default(), ..Default::default() })
+                            .collect();
                         let infos: Vec<vk::DescriptorBufferBindingInfoEXT> = buffers
                             .iter()
                             .zip(&handles)
@@ -274,7 +298,9 @@ impl State {
                             .collect();
                         bind(cb, infos.len() as u32, infos.as_ptr());
                     }
-                    Item::Binding(Binding::Sets { layout, first, sets, dynamic }) => device.cmd_bind_descriptor_sets(cb, compute, *layout, *first, sets, dynamic),
+                    Item::Binding(Binding::Sets { layout, first, sets, dynamic }) => {
+                        device.cmd_bind_descriptor_sets(cb, compute, *layout, *first, sets, dynamic)
+                    }
                     Item::Binding(Binding::Push { layout, set, writes }) => {
                         let Some(push) = fns.push_descriptor_set else { continue };
                         let mut inline: Vec<vk::WriteDescriptorSetInlineUniformBlock> = Vec::with_capacity(writes.len());
@@ -298,7 +324,11 @@ impl State {
                                 v.p_texel_buffer_view = w.texel_views.as_ptr();
                             }
                             if let Some(bytes) = &w.inline {
-                                inline.push(vk::WriteDescriptorSetInlineUniformBlock { data_size: bytes.len() as u32, p_data: bytes.as_ptr().cast(), ..Default::default() });
+                                inline.push(vk::WriteDescriptorSetInlineUniformBlock {
+                                    data_size: bytes.len() as u32,
+                                    p_data: bytes.as_ptr().cast(),
+                                    ..Default::default()
+                                });
                                 v.p_next = std::ptr::from_ref(inline.last().expect("pushed")).cast();
                             } else if let Some(handles) = &w.accel {
                                 accel.push(vk::WriteDescriptorSetAccelerationStructureKHR {
@@ -401,7 +431,10 @@ pub(crate) unsafe fn own_writes(writes: &[vk::WriteDescriptorSet]) -> Result<Vec
                     }
                     own.images = std::slice::from_raw_parts(w.p_image_info, n).to_vec();
                 }
-                vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
+                vk::DescriptorType::UNIFORM_BUFFER
+                | vk::DescriptorType::STORAGE_BUFFER
+                | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
                     if n > 0 && w.p_buffer_info.is_null() {
                         return Err("a pushed buffer descriptor without its buffer infos");
                     }
@@ -450,12 +483,15 @@ pub(crate) fn template_bytes(entries: &[vk::DescriptorUpdateTemplateEntry]) -> O
             continue;
         }
         let size = match e.descriptor_type {
-            vk::DescriptorType::SAMPLER | vk::DescriptorType::COMBINED_IMAGE_SAMPLER | vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::STORAGE_IMAGE | vk::DescriptorType::INPUT_ATTACHMENT => {
-                std::mem::size_of::<vk::DescriptorImageInfo>()
-            }
-            vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
-                std::mem::size_of::<vk::DescriptorBufferInfo>()
-            }
+            vk::DescriptorType::SAMPLER
+            | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+            | vk::DescriptorType::SAMPLED_IMAGE
+            | vk::DescriptorType::STORAGE_IMAGE
+            | vk::DescriptorType::INPUT_ATTACHMENT => std::mem::size_of::<vk::DescriptorImageInfo>(),
+            vk::DescriptorType::UNIFORM_BUFFER
+            | vk::DescriptorType::STORAGE_BUFFER
+            | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+            | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => std::mem::size_of::<vk::DescriptorBufferInfo>(),
             vk::DescriptorType::UNIFORM_TEXEL_BUFFER | vk::DescriptorType::STORAGE_TEXEL_BUFFER => std::mem::size_of::<vk::BufferView>(),
             vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => std::mem::size_of::<vk::AccelerationStructureKHR>(),
             // The count is in bytes, at the offset; no stride.
@@ -566,7 +602,10 @@ impl Tracker {
         if info.template_type != vk::DescriptorUpdateTemplateType::PUSH_DESCRIPTORS_KHR {
             return;
         }
-        let size = if info.pipeline_bind_point != vk::PipelineBindPoint::COMPUTE || info.descriptor_update_entry_count == 0 || info.p_descriptor_update_entries.is_null() {
+        let size = if info.pipeline_bind_point != vk::PipelineBindPoint::COMPUTE
+            || info.descriptor_update_entry_count == 0
+            || info.p_descriptor_update_entries.is_null()
+        {
             Some(0)
         } else {
             // SAFETY: the application's create info, valid for this call.
@@ -583,7 +622,14 @@ impl Tracker {
     ///
     /// # Safety
     /// `data` holds the template's data.
-    pub(crate) unsafe fn push_template(&self, cb: vk::CommandBuffer, template: vk::DescriptorUpdateTemplate, layout: vk::PipelineLayout, set: u32, data: *const std::ffi::c_void) {
+    pub(crate) unsafe fn push_template(
+        &self,
+        cb: vk::CommandBuffer,
+        template: vk::DescriptorUpdateTemplate,
+        layout: vk::PipelineLayout,
+        set: u32,
+        data: *const std::ffi::c_void,
+    ) {
         if !self.active() {
             return;
         }
@@ -785,7 +831,8 @@ pub(crate) unsafe fn intercept(device: vk::Device, name: &[u8], original: vk::PF
                 wrap(set_descriptor_buffer_offsets2 as *const ())
             }
             b"vkCmdBindDescriptorBufferEmbeddedSamplers2EXT" => {
-                n.bind_descriptor_buffer_embedded_samplers2 = Some(std::mem::transmute::<unsafe extern "system" fn(), Pfn2<BindDescriptorBufferEmbeddedSamplersInfo>>(next));
+                n.bind_descriptor_buffer_embedded_samplers2 =
+                    Some(std::mem::transmute::<unsafe extern "system" fn(), Pfn2<BindDescriptorBufferEmbeddedSamplersInfo>>(next));
                 wrap(bind_descriptor_buffer_embedded_samplers2 as *const ())
             }
             // The core 1.4 names of the push-descriptor commands (the framework hooks only the KHR ones).
@@ -922,7 +969,14 @@ unsafe extern "system" fn bind_descriptor_buffer_embedded_samplers2(cb: vk::Comm
     }
 }
 
-unsafe extern "system" fn push_descriptor_set(cb: vk::CommandBuffer, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, count: u32, writes: *const vk::WriteDescriptorSet) {
+unsafe extern "system" fn push_descriptor_set(
+    cb: vk::CommandBuffer,
+    bind_point: vk::PipelineBindPoint,
+    layout: vk::PipelineLayout,
+    set: u32,
+    count: u32,
+    writes: *const vk::WriteDescriptorSet,
+) {
     // SAFETY: as above.
     unsafe {
         let Some((w, next)) = next_of(cb, |n| n.push_descriptor_set) else { return };
@@ -933,7 +987,13 @@ unsafe extern "system" fn push_descriptor_set(cb: vk::CommandBuffer, bind_point:
     }
 }
 
-unsafe extern "system" fn push_descriptor_set_with_template(cb: vk::CommandBuffer, template: vk::DescriptorUpdateTemplate, layout: vk::PipelineLayout, set: u32, data: *const std::ffi::c_void) {
+unsafe extern "system" fn push_descriptor_set_with_template(
+    cb: vk::CommandBuffer,
+    template: vk::DescriptorUpdateTemplate,
+    layout: vk::PipelineLayout,
+    set: u32,
+    data: *const std::ffi::c_void,
+) {
     // SAFETY: as above.
     unsafe {
         let Some((w, next)) = next_of(cb, |n| n.push_descriptor_set_with_template) else { return };
@@ -1064,7 +1124,14 @@ mod tests {
 
     #[test]
     fn a_template_spans_its_furthest_element() {
-        let e = |ty, offset, count, stride| vk::DescriptorUpdateTemplateEntry { dst_binding: 0, dst_array_element: 0, descriptor_count: count, descriptor_type: ty, offset, stride };
+        let e = |ty, offset, count, stride| vk::DescriptorUpdateTemplateEntry {
+            dst_binding: 0,
+            dst_array_element: 0,
+            descriptor_count: count,
+            descriptor_type: ty,
+            offset,
+            stride,
+        };
         let b = std::mem::size_of::<vk::DescriptorBufferInfo>();
         assert_eq!(template_bytes(&[e(vk::DescriptorType::STORAGE_BUFFER, 8, 3, 32)]), Some(8 + 2 * 32 + b));
         assert_eq!(template_bytes(&[e(vk::DescriptorType::INLINE_UNIFORM_BLOCK, 100, 12, 0), e(vk::DescriptorType::UNIFORM_TEXEL_BUFFER, 0, 1, 0)]), Some(112));

@@ -183,11 +183,7 @@ fn main() {
         }
     }
     // The fetch script's stamps; a tools directory filled some other way has none, so the files themselves.
-    for (stamp, file) in [
-        ("glslang", &glslang),
-        ("Vulkan-Headers", &headers.join("vulkan/vulkan_core.h")),
-        ("volk", &volk.join("volk.c")),
-    ] {
+    for (stamp, file) in [("glslang", &glslang), ("Vulkan-Headers", &headers.join("vulkan/vulkan_core.h")), ("volk", &volk.join("volk.c"))] {
         let fetched = tools.join(stamp).join(".fetched-sha256");
         rerun_if_changed(if fetched.exists() { &fetched } else { file });
     }
@@ -202,7 +198,13 @@ fn main() {
         .unwrap_or_else(|| panic!("neural-forge-native: cannot run {} (set NEURAL_FORGE_PYTHON to a Python 3)", python.to_string_lossy()));
     let parsed: Vec<u32> = version.trim().split('.').filter_map(|v| v.parse().ok()).collect();
     if parsed.len() != 2 || (parsed[0], parsed[1]) < MIN_PYTHON {
-        panic!("neural-forge-native: {} is Python {}; the PTX generators need {}.{} or later", python.to_string_lossy(), version.trim(), MIN_PYTHON.0, MIN_PYTHON.1);
+        panic!(
+            "neural-forge-native: {} is Python {}; the PTX generators need {}.{} or later",
+            python.to_string_lossy(),
+            version.trim(),
+            MIN_PYTHON.0,
+            MIN_PYTHON.1
+        );
     }
 
     // Kernels: SPIR-V with the same glslang flags as upstream, PTX with the same generator invocations.
@@ -235,7 +237,11 @@ fn main() {
         let mut cmd = Command::new(&python);
         cmd.arg("-I").arg(manifest.join("run_ptx.py")).arg(ptx_scripts.join(script));
         for a in &args {
-            if a == "@" { cmd.arg(&ptx); } else { cmd.arg(a); }
+            if a == "@" {
+                cmd.arg(&ptx);
+            } else {
+                cmd.arg(a);
+            }
         }
         jobs.push((format!("{script} {}", args.join(" ")), cmd));
         assets.push(("ptx", stem, ptx));
@@ -260,11 +266,7 @@ fn main() {
     }
     src.push_str("\"  .popsection\\n\");\n\nextern \"C\" {\n");
     for i in 0..assets.len() {
-        writeln!(
-            src,
-            "__attribute__((visibility(\"hidden\"))) extern const uint8_t nf_native_asset_{i}[], nf_native_asset_{i}_end[];"
-        )
-        .unwrap();
+        writeln!(src, "__attribute__((visibility(\"hidden\"))) extern const uint8_t nf_native_asset_{i}[], nf_native_asset_{i}_end[];").unwrap();
     }
     src.push_str(
         "}\n\nnamespace nf_native {\nnamespace {\nstruct Asset { const char* kind; const char* name; const uint8_t* begin; const uint8_t* end; };\n\

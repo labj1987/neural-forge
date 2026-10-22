@@ -26,9 +26,7 @@ fn main() {
 
     // SAFETY: `instance` was just created above and is destroyed at the end of main.
     let physical_devices = unsafe { instance.enumerate_physical_devices() }.expect("enumerate_physical_devices failed");
-    let physical_device = *physical_devices
-        .first()
-        .expect("no Vulkan physical devices -- is a software ICD (lavapipe) installed?");
+    let physical_device = *physical_devices.first().expect("no Vulkan physical devices -- is a software ICD (lavapipe) installed?");
     // SAFETY: `physical_device` is one of the handles just enumerated above.
     let props = unsafe { instance.get_physical_device_properties(physical_device) };
     let name = unsafe { std::ffi::CStr::from_ptr(props.device_name.as_ptr()) };
@@ -48,8 +46,7 @@ fn main() {
     }
     // SAFETY: `device_create_info` is valid; queue family 0 exists on every physical
     // device (the Vulkan spec guarantees at least one queue family).
-    let device =
-        unsafe { instance.create_device(physical_device, &device_create_info, None) }.expect("vkCreateDevice failed");
+    let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.expect("vkCreateDevice failed");
     println!("smoke: device created -- if the layer is enabled, NeuralForgeDeviceInfo::new ran without panicking");
 
     // The image, view and submit paths the `NEURAL_FORGE_PROBE_NGX` probe hooks (it is off
@@ -73,11 +70,10 @@ fn main() {
             .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(requirements.size).memory_type_index(memory_type), None)
             .expect("vkAllocateMemory failed");
         device.bind_image_memory(image, memory, 0).expect("vkBindImageMemory failed");
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() });
+        let view_info =
+            vk::ImageViewCreateInfo::default().image(image).view_type(vk::ImageViewType::TYPE_2D).format(vk::Format::R8G8B8A8_UNORM).subresource_range(
+                vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() },
+            );
         let view = device.create_image_view(&view_info, None).expect("vkCreateImageView failed");
         for name in [c"vkGetImageViewHandleNVX", c"vkGetImageViewAddressNVX", c"vkCmdCuLaunchKernelNVX", c"vkCreateCuFunctionNVX"] {
             let p = (instance.fp_v1_0().get_device_proc_addr)(device.handle(), name.as_ptr());
@@ -90,7 +86,9 @@ fn main() {
         // layer issues the application's submits to the next layer itself (to see their result
         // before its tracking advances), so the fence must signal and the result come back.
         let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(0), None).expect("vkCreateCommandPool failed");
-        let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("vkAllocateCommandBuffers failed")[0];
+        let cmd = device
+            .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1))
+            .expect("vkAllocateCommandBuffers failed")[0];
         let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).expect("vkCreateFence failed");
         let record = || {
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).expect("vkBeginCommandBuffer failed");
@@ -101,8 +99,21 @@ fn main() {
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() });
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[barrier]);
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    level_count: 1,
+                    layer_count: 1,
+                    ..Default::default()
+                });
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
             device.end_command_buffer(cmd).expect("vkEndCommandBuffer failed");
         };
         record();

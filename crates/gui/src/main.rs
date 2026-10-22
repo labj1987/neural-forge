@@ -13,10 +13,7 @@ fn main() {
     glib::set_prgname(Some(APP_ID));
     glib::set_application_name("Neural Forge");
 
-    let app = libadwaita::Application::builder()
-        .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::FLAGS_NONE)
-        .build();
+    let app = libadwaita::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::FLAGS_NONE).build();
 
     // Keep the persistent layer copy (what Steam games load) in step with this
     // AppImage on every launch, so an updated AppImage never runs against a stale layer.

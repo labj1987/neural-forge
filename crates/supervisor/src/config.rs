@@ -62,7 +62,13 @@ impl Config {
             }
             map.insert(k, v);
         }
-        let mut cfg = Self { binaries: map.remove("binaries").unwrap_or_default(), shm: map.remove("shm").unwrap_or_default(), settings: map, read_error: None, raw_lines };
+        let mut cfg = Self {
+            binaries: map.remove("binaries").unwrap_or_default(),
+            shm: map.remove("shm").unwrap_or_default(),
+            settings: map,
+            read_error: None,
+            raw_lines,
+        };
         if !neural_forge_protocol::isolated_path(&cfg.shm) {
             cfg.shm.clear();
         }

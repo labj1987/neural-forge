@@ -381,11 +381,7 @@ impl Layout {
             prefix.iter().all(|&c| c == b' ' || c == b'\t').then(|| String::from_utf8_lossy(prefix).into_owned())
         };
         let close_indent = leading(close);
-        let indent = block
-            .0
-            .first()
-            .and_then(|e| leading(e.key_span.start))
-            .unwrap_or_else(|| format!("{}\t", close_indent.clone().unwrap_or_default()));
+        let indent = block.0.first().and_then(|e| leading(e.key_span.start)).unwrap_or_else(|| format!("{}\t", close_indent.clone().unwrap_or_default()));
         let separator = block
             .0
             .iter()
@@ -554,7 +550,10 @@ mod tests {
             assert!(verify_edit(crlf.as_bytes(), &out, &path(appid), "Z %command%"));
         }
         let (out, _) = set_string(crlf.as_bytes(), &path("1091500"), "W").unwrap();
-        assert_eq!(out.len() as isize - crlf.len() as isize, "\"W\"".len() as isize - "\"MANGOHUD=1 WINEDLLOVERRIDES=\\\"dxgi=n,b\\\" %command%\"".len() as isize);
+        assert_eq!(
+            out.len() as isize - crlf.len() as isize,
+            "\"W\"".len() as isize - "\"MANGOHUD=1 WINEDLLOVERRIDES=\\\"dxgi=n,b\\\" %command%\"".len() as isize
+        );
     }
 
     #[test]

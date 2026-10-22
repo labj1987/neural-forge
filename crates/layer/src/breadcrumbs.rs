@@ -62,8 +62,7 @@ pub fn mark(stage: &'static str) {
 pub fn dump(reason: &str) {
     let Ok(ring) = RING.lock() else { return };
     let now = Instant::now();
-    let lines: Vec<String> =
-        ring.newest_first().map(|(stage, at)| format!("  -{:>9.3}ms  {stage}", now.duration_since(at).as_secs_f64() * 1000.0)).collect();
+    let lines: Vec<String> = ring.newest_first().map(|(stage, at)| format!("  -{:>9.3}ms  {stage}", now.duration_since(at).as_secs_f64() * 1000.0)).collect();
     drop(ring);
     crate::log!("[breadcrumbs] {reason} -- last {} stage marker(s), newest first:", lines.len());
     for line in lines {

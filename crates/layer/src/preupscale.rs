@@ -94,9 +94,9 @@ use neural_forge_protocol::Slot;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod cache;
+pub(crate) mod cache_dump;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod colour;
-pub(crate) mod cache_dump;
 pub(crate) mod hdr;
 pub(crate) mod inline;
 #[cfg(target_arch = "x86_64")]
@@ -104,11 +104,11 @@ pub(crate) mod native;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native_post;
 pub(crate) mod placement;
-pub(crate) mod restore;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_flow;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_history;
+pub(crate) mod restore;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod scene_cut;
 
@@ -155,8 +155,18 @@ pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
 // The `return` is needless only where the other targets' lines below are compiled out.
 #[allow(clippy::too_many_arguments, clippy::needless_return)]
 pub(crate) unsafe fn run_native(
-    device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target,
-    loader: &NativeLoader, jitter: Option<[f32; 2]>, chain_ok: bool, shm: &ShmClient, arm: Option<cache_dump::Arm>, hold: u64, at: placement::Hold,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    res: &mut Resources,
+    target: &Target,
+    loader: &NativeLoader,
+    jitter: Option<[f32; 2]>,
+    chain_ok: bool,
+    shm: &ShmClient,
+    arm: Option<cache_dump::Arm>,
+    hold: u64,
+    at: placement::Hold,
     sink: Sink,
 ) -> HoldResult {
     #[cfg(target_arch = "x86_64")]
@@ -182,7 +192,25 @@ pub(crate) unsafe fn run_native(
         let choice = shm.network_choice().unwrap_or(neural_forge_protocol::enums::network::FULL);
         // The colour of the edit's look-up table (read from config.ini's `edit_lut` in the background).
         let lut = colour::current(&passes.colour);
-        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, passes, &sizes, arm, ask, choice, lut.as_ref(), sink) };
+        return unsafe {
+            native::run_native_hold(
+                device,
+                instance,
+                physical_device,
+                res,
+                target,
+                loader,
+                jitter,
+                chain_ok,
+                passes,
+                &sizes,
+                arm,
+                ask,
+                choice,
+                lut.as_ref(),
+                sink,
+            )
+        };
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, arm, hold, at, sink);
@@ -455,7 +483,11 @@ pub(crate) const SR_RECENT: u64 = 64;
 
 /// [`COMMANDS`] when `on`, nothing otherwise.
 pub(crate) fn commands(on: bool) -> &'static [VulkanCommand] {
-    if on { COMMANDS } else { &[] }
+    if on {
+        COMMANDS
+    } else {
+        &[]
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -586,7 +618,6 @@ pub(crate) enum Rule {
     Size,
 }
 
-
 /// DLSS's motion-vector formats: RG16F (GTA V) or RG32F. RG16F first where both are at an extent.
 const MVEC_FORMATS: [vk::Format; 2] = [vk::Format::R16G16_SFLOAT, vk::Format::R32G32_SFLOAT];
 
@@ -627,9 +658,7 @@ fn smaller(w: u32, h: u32, (ow, oh): (u32, u32)) -> bool {
 /// The registered image at `(w, h)` with the first format of `formats` present there (lowest
 /// handle).
 fn at(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, formats: &[vk::Format], w: u32, h: u32) -> Option<(vk::Image, ImageDesc)> {
-    formats
-        .iter()
-        .find_map(|&f| registered.values().find(|(_, d)| d.plain && d.format == f && (d.width, d.height) == (w, h)).copied())
+    formats.iter().find_map(|&f| registered.values().find(|(_, d)| d.plain && d.format == f && (d.width, d.height) == (w, h)).copied())
 }
 
 /// The colour candidates: every registered RGBA16F storage image smaller than the output (the
@@ -686,9 +715,9 @@ fn size_candidates(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, output: (
 /// The registered 1x1 float images (DLSS's exposure input among them), lowest handles first.
 fn exposure_images(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>) -> [Option<(vk::Image, ImageDesc)>; MAX_EXPOSURE] {
     let mut exposure = [None; MAX_EXPOSURE];
-    for (slot, found) in exposure.iter_mut().zip(
-        registered.values().filter(|(_, d)| d.plain && (d.width, d.height) == (1, 1) && exposure_texel_bytes(d.format).is_some()),
-    ) {
+    for (slot, found) in
+        exposure.iter_mut().zip(registered.values().filter(|(_, d)| d.plain && (d.width, d.height) == (1, 1) && exposure_texel_bytes(d.format).is_some()))
+    {
         *slot = Some(*found);
     }
     exposure
@@ -763,7 +792,8 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
     if depths.is_empty() && !mvecs.is_empty() {
         // Depth handed over as a colour image (Streamline's copy): one at a motion-vector or colour
         // candidate's extent.
-        let extents: Vec<(u32, u32)> = mvecs.iter().map(|(_, d)| (d.width, d.height)).chain(of(colour_candidate).iter().map(|(_, d)| (d.width, d.height))).collect();
+        let extents: Vec<(u32, u32)> =
+            mvecs.iter().map(|(_, d)| (d.width, d.height)).chain(of(colour_candidate).iter().map(|(_, d)| (d.width, d.height))).collect();
         depths = of(|d| d.plain && DEPTH_AS_COLOUR.contains(&d.format)).into_iter().filter(|(_, d)| extents.contains(&(d.width, d.height))).collect();
     }
     if depths.is_empty() || mvecs.is_empty() {
@@ -784,10 +814,8 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
     if colours.is_empty() {
         colours = at_extent(sampled_colour);
     }
-    let mvec = mvecs
-        .iter()
-        .min_by_key(|(i, d)| ((d.width, d.height) != extent, MVEC_FORMATS.iter().position(|f| *f == d.format), i.as_raw()))
-        .map(|(i, _)| *i)?;
+    let mvec =
+        mvecs.iter().min_by_key(|(i, d)| ((d.width, d.height) != extent, MVEC_FORMATS.iter().position(|f| *f == d.format), i.as_raw())).map(|(i, _)| *i)?;
     Some(match colours[..] {
         [] => InputLaunch::Unusable,
         [(colour, _)] => InputLaunch::Inputs { colour, depth, mvec },
@@ -811,7 +839,8 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
 fn rr_input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], known: &[vk::Image]) -> Option<InputLaunch> {
     let desc = |i: &vk::Image| images.get(i).copied();
     let candidates: Vec<vk::Image> = named.iter().copied().filter(|i| desc(i).is_some_and(|d| colour_candidate(&d))).collect();
-    let attachments: Vec<vk::Image> = candidates.iter().copied().filter(|i| desc(i).is_some_and(|d| d.usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT))).collect();
+    let attachments: Vec<vk::Image> =
+        candidates.iter().copied().filter(|i| desc(i).is_some_and(|d| d.usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT))).collect();
     let rgba: Vec<vk::Image> = attachments.iter().copied().filter(|i| desc(i).is_some_and(|d| d.format == vk::Format::R16G16B16A16_SFLOAT)).collect();
     let only = |list: &[vk::Image]| match list {
         [one] => Some(*one),
@@ -828,7 +857,11 @@ fn rr_input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], 
     let depth = named
         .iter()
         .copied()
-        .find(|i| desc(i).is_some_and(|d| d.plain && (DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format)) && (d.width, d.height) == (md.width, md.height)))
+        .find(|i| {
+            desc(i).is_some_and(|d| {
+                d.plain && (DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format)) && (d.width, d.height) == (md.width, md.height)
+            })
+        })
         .unwrap_or(vk::Image::null());
     Some(InputLaunch::Inputs { colour, depth, mvec })
 }
@@ -889,11 +922,8 @@ const MAX_NAMED: usize = 4;
 fn by_params(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, n: Named, swapchain: Option<(u32, u32)>, size: Option<&Inputs>) -> Option<Inputs> {
     let get = |i: vk::Image| registered.get(&i.as_raw()).copied();
     let colour = get(n.colour)?;
-    let rest: Vec<(vk::Image, ImageDesc)> = size
-        .into_iter()
-        .flat_map(|s| std::iter::once(s.colour).chain(s.others.iter().flatten().copied()))
-        .filter(|o| o.0 != n.colour)
-        .collect();
+    let rest: Vec<(vk::Image, ImageDesc)> =
+        size.into_iter().flat_map(|s| std::iter::once(s.colour).chain(s.others.iter().flatten().copied())).filter(|o| o.0 != n.colour).collect();
     let mut others = [None; MAX_OTHERS];
     for (slot, other) in others.iter_mut().zip(&rest) {
         *slot = Some(*other);
@@ -934,7 +964,11 @@ fn usage_short(usage: vk::ImageUsageFlags) -> String {
         (vk::ImageUsageFlags::TRANSFER_DST, "dst"),
     ];
     let list: Vec<&str> = names.iter().filter(|(bit, _)| usage.contains(*bit)).map(|(_, n)| *n).collect();
-    if list.is_empty() { "-".to_string() } else { list.join("+") }
+    if list.is_empty() {
+        "-".to_string()
+    } else {
+        list.join("+")
+    }
 }
 
 /// The longest [`diagnose`] text.
@@ -982,10 +1016,8 @@ pub(crate) fn diagnose(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapc
         (None, Some(o)) => format!("output: no swapchain known, largest RGBA16F/R11G11B10 storage image {}x{}", o.0, o.1),
         (None, None) => "output: no swapchain known and no RGBA16F/R11G11B10 storage image to compare with".to_string(),
     };
-    let mut line = format!(
-        "{output_text}; RGBA16F storage extents: {}; registered: ",
-        if reasons.is_empty() { "none".to_string() } else { reasons.join(", ") }
-    );
+    let mut line =
+        format!("{output_text}; RGBA16F storage extents: {}; registered: ", if reasons.is_empty() { "none".to_string() } else { reasons.join(", ") });
     let total = kinds.len();
     for (k, (&(_, w, h, format, usage, plain), n)) in kinds.iter().enumerate() {
         let item = format!(
@@ -1550,12 +1582,8 @@ pub(crate) fn depth_copy_layout(format: vk::Format, layout: vk::ImageLayout) -> 
     }
 }
 
-pub(crate) const MVEC_COPY_LAYOUTS: [vk::ImageLayout; 4] = [
-    vk::ImageLayout::GENERAL,
-    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-];
+pub(crate) const MVEC_COPY_LAYOUTS: [vk::ImageLayout; 4] =
+    [vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL];
 
 /// What a command buffer held at the point a launch was recorded into it: how many of its
 /// barriers on watched images come before the launch ([`Tracker`]'s `pending` list is in recording
@@ -1807,10 +1835,7 @@ impl Tracker {
     /// launch ([`input_launch`]), with whether its kernel is SR's input kernel ([`Kernel`]).
     pub(crate) fn launch_kernel(&mut self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) {
         let kernel = self.functions.get(&function).map(|(k, _)| *k);
-        let before = Before {
-            barriers: self.pending.get(&command_buffer).map_or(0, Vec::len),
-            global: self.global_sync.get(&command_buffer).copied(),
-        };
+        let before = Before { barriers: self.pending.get(&command_buffer).map_or(0, Vec::len), global: self.global_sync.get(&command_buffer).copied() };
         {
             let refs = self.launch.entry(command_buffer).or_default();
             refs.before_first.get_or_insert(before);
@@ -1872,7 +1897,11 @@ impl Tracker {
             }
         }
         if let Some(o) = self.launch.get(&command_buffer).and_then(|r| r.output) {
-            probe_rr_state(command_buffer, self.functions.get(&function).map(|(_, n)| n.as_str()), &format!("output {:?} swapchain {:?}", o, self.swapchain_extent()));
+            probe_rr_state(
+                command_buffer,
+                self.functions.get(&function).map(|(_, n)| n.as_str()),
+                &format!("output {:?} swapchain {:?}", o, self.swapchain_extent()),
+            );
         }
         // This buffer's own output (image, inputs), when this launch is the learnt output kernel writing an
         // output of the learnt kind ([`same_output`]).
@@ -1898,9 +1927,8 @@ impl Tracker {
             // A later launch naming the colour input with another candidate of its extent.
             let extent = self.images.get(&colour).map(|d| (d.width, d.height));
             if !refs.output_pair && named.contains(&colour) {
-                refs.output_pair = named
-                    .iter()
-                    .any(|i| *i != colour && self.images.get(i).is_some_and(|d| colour_candidate(d) && Some((d.width, d.height)) == extent));
+                refs.output_pair =
+                    named.iter().any(|i| *i != colour && self.images.get(i).is_some_and(|d| colour_candidate(d) && Some((d.width, d.height)) == extent));
             }
         } else if refs.input.is_none() {
             fresh_input = true;
@@ -1923,7 +1951,11 @@ impl Tracker {
                 refs.input_sr = kernel.map(|k| k == Kernel::SrInput);
                 refs.input_rr = kernel == Some(Kernel::RayReconstruction);
             }
-            probe_rr_state(command_buffer, self.functions.get(&function).map(|(_, n)| n.as_str()), &format!("input {:?} rr {} known {}", refs.input, refs.input_rr, known.len()));
+            probe_rr_state(
+                command_buffer,
+                self.functions.get(&function).map(|(_, n)| n.as_str()),
+                &format!("input {:?} rr {} known {}", refs.input, refs.input_rr, known.len()),
+            );
             // DLSS Super Resolution's input kernel by name, but not read as an input launch: say once
             // what it named, so a new engine's input form shows in the log.
             let read_as = refs.input.clone();
@@ -1936,13 +1968,8 @@ impl Tracker {
                         None => "unregistered".into(),
                     })
                     .collect();
-                let words: Vec<String> = bytes
-                    .as_chunks::<8>().0.iter()
-                    .map(|w| u64::from_le_bytes(*w))
-                    .filter(|&v| v != 0)
-                    .take(64)
-                    .map(|v| format!("{v:#x}"))
-                    .collect();
+                let words: Vec<String> =
+                    bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).filter(|&v| v != 0).take(64).map(|v| format!("{v:#x}")).collect();
                 let mut keys: Vec<u64> = self.keys.iter().map(|k| k.0).collect();
                 keys.sort_unstable();
                 keys.dedup();
@@ -2004,11 +2031,8 @@ impl Tracker {
         // DLSS Frame Generation's by its kernel's name (`main_kernel` in Wukong's frame-generation
         // buffers, which took every staging slot) and not an input launch naming that image.
         let sr_kernel = !self.functions.get(&function).is_some_and(|(_, n)| fg_kernel_name(n));
-        let first_colour = if had_colour {
-            None
-        } else {
-            named.iter().copied().find(candidate).filter(|c| input_colour == Some(*c) || sr_kernel).or(own_colour)
-        };
+        let first_colour =
+            if had_colour { None } else { named.iter().copied().find(candidate).filter(|c| input_colour == Some(*c) || sr_kernel).or(own_colour) };
         for image in named {
             if !refs.images.contains(&image) {
                 refs.images.push(image);
@@ -2032,7 +2056,9 @@ impl Tracker {
             return;
         }
         let words: Vec<String> = bytes
-            .as_chunks::<8>().0.iter()
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|w| u64::from_le_bytes(*w))
             .enumerate()
             .map(|(i, value)| format!("{i}={}", self.describe_word(value, colour)))
@@ -2183,7 +2209,18 @@ impl Tracker {
                 && layout.is_some_and(|l| depth_copy_layout(d.format, l));
             Aux { image, format: d.format, layout, readable }
         });
-        Some(InlinePoint { colour, desc, layout, exposure_input, mvec_input, mvec_extent, depth_input, identification: self.generation, hazard, hold: placement::Hold::ALL_BEFORE })
+        Some(InlinePoint {
+            colour,
+            desc,
+            layout,
+            exposure_input,
+            mvec_input,
+            mvec_extent,
+            depth_input,
+            identification: self.generation,
+            hazard,
+            hold: placement::Hold::ALL_BEFORE,
+        })
     }
 
     /// A hold inside DLSS's buffer was recorded at a point of identification `identification`.
@@ -2377,10 +2414,7 @@ impl Tracker {
                 self.recorded_watched.remove(&primary);
             }
             // Where the secondary's recording starts in the primary's.
-            let base = Before {
-                barriers: self.pending.get(&primary).map_or(0, Vec::len),
-                global: self.global_sync.get(&primary).copied(),
-            };
+            let base = Before { barriers: self.pending.get(&primary).map_or(0, Vec::len), global: self.global_sync.get(&primary).copied() };
             let shift = |b: Before| Before { barriers: base.barriers + b.barriers, global: base.global.or(b.global) };
             if let Some(c) = self.launch.get(secondary).cloned() {
                 let refs = self.launch.entry(primary).or_default();
@@ -2519,9 +2553,7 @@ impl Tracker {
         }
         // Unknown inputs: every watched image counts as read by every hold.
         let held = |image: vk::Image| inputs.is_none_or(|i| i.colour.0 == image || i.exposure_input.is_some_and(|e| e.0 == image));
-        let dumped = |image: vk::Image| {
-            inputs.is_some_and(|i| i.depth.0 == image || i.mvec.0 == image || i.exposure.iter().flatten().any(|e| e.0 == image))
-        };
+        let dumped = |image: vk::Image| inputs.is_some_and(|i| i.depth.0 == image || i.mvec.0 == image || i.exposure.iter().flatten().any(|e| e.0 == image));
         let Some(recorded) = self.pending.get(&cb) else { return (None, None, None) };
         let before = &recorded[..before.barriers.min(recorded.len())];
         (
@@ -2575,9 +2607,7 @@ impl Tracker {
         // more, so a dump cannot read it, and a hold never reads depth.
         let depth_gap = |old: &Inputs| {
             let alive = |image: vk::Image| registered.contains_key(&image.as_raw());
-            gate && alive(old.colour.0)
-                && alive(old.mvec.0)
-                && at(&registered, &DEPTH_FORMATS, old.colour.1.width, old.colour.1.height).is_none()
+            gate && alive(old.colour.0) && alive(old.mvec.0) && at(&registered, &DEPTH_FORMATS, old.colour.1.width, old.colour.1.height).is_none()
         };
         let gap_open = self.depth_gap.is_none_or(|since| self.launch_submits.saturating_sub(since) < SR_RECENT);
         if inputs.is_none() && gap_open && self.inputs.is_some_and(|old| depth_gap(&old)) {
@@ -2660,15 +2690,10 @@ impl Tracker {
                     Rule::Size => "identified by size",
                 }
             ),
-            None if !gate => format!(
-                "no DLSS input: DLSS Ray Reconstruction runs ({}); its input is not held, the model runs after the upscaler",
-                self.rr_names.join(", ")
-            ),
-            None => format!(
-                "no DLSS input among {} registered views (swapchain {:?}); waiting",
-                registered.len(),
-                self.swapchain_extent()
-            ),
+            None if !gate => {
+                format!("no DLSS input: DLSS Ray Reconstruction runs ({}); its input is not held, the model runs after the upscaler", self.rr_names.join(", "))
+            }
+            None => format!("no DLSS input among {} registered views (swapchain {:?}); waiting", registered.len(), self.swapchain_extent()),
         };
         // A failed identification says why, with the registered set ([`diagnose`]), once per change
         // of it, for the first [`MAX_DIAGNOSES`] changes; after those only the short line, once per
@@ -2898,8 +2923,7 @@ impl Tracker {
         }
         let first = with.iter().min_by_key(|n| n.colour.as_raw())?;
         let extent = |n: &Named| self.images.get(&n.colour).map(|d| (d.width, d.height));
-        (with.len() > 1 && extent(first).is_some() && with.iter().all(|n| n.exposure == first.exposure && extent(n) == extent(first)))
-            .then_some(*first)
+        (with.len() > 1 && extent(first).is_some() && with.iter().all(|n| n.exposure == first.exposure && extent(n) == extent(first))).then_some(*first)
     }
 
     /// Whether `image` is one of the size rule's colour candidates ([`Self::candidates`]).
@@ -2909,11 +2933,7 @@ impl Tracker {
 
     /// The registered images with their descriptions, keyed by raw handle (what [`identify`] reads).
     fn registered_set(&self) -> BTreeMap<u64, (vk::Image, ImageDesc)> {
-        self.registered
-            .values()
-            .chain(&self.kept)
-            .filter_map(|&image| self.images.get(&image).map(|d| (image.as_raw(), (image, *d))))
-            .collect()
+        self.registered.values().chain(&self.kept).filter_map(|&image| self.images.get(&image).map(|d| (image.as_raw(), (image, *d)))).collect()
     }
 
     /// The evidence to identify by. An entry whose colour input is smaller than the output (the
@@ -2941,9 +2961,8 @@ impl Tracker {
             list.join(", ")
         };
         let output = self.swapchain_extent().or_else(|| output_candidate(&self.registered_set()));
-        let (mut counted, output_size): (Vec<Named>, Vec<Named>) = self.named.iter().partition(|n| {
-            n.exposure.is_some() || self.images.get(&n.colour).zip(output).is_some_and(|(d, o)| smaller(d.width, d.height, o))
-        });
+        let (mut counted, output_size): (Vec<Named>, Vec<Named>) =
+            self.named.iter().partition(|n| n.exposure.is_some() || self.images.get(&n.colour).zip(output).is_some_and(|(d, o)| smaller(d.width, d.height, o)));
         // Output-size entries without an exposure image: SR's shape (DLAA, no exposure given to
         // DLSS), counted when it is the only one; the rest (FG's frame) not used.
         let (sr_like, refused): (Vec<Named>, Vec<Named>) = output_size.iter().partition(|n| n.sr_without_exposure());
@@ -2958,10 +2977,8 @@ impl Tracker {
             }
         } else if sr_like.len() > 1 && self.said_named & 32 == 0 {
             self.said_named |= 32;
-            lines.push(format!(
-                "several output-size colour images have SR's shape without a 1x1 R16_SFLOAT exposure ({}): none used",
-                describe(self, &sr_like)
-            ));
+            lines
+                .push(format!("several output-size colour images have SR's shape without a 1x1 R16_SFLOAT exposure ({}): none used", describe(self, &sr_like)));
         }
         let refused: Vec<Named> = if sr_like.len() > 1 { output_size.clone() } else { refused };
         if !refused.is_empty() && self.said_named & 8 == 0 {
@@ -3196,7 +3213,8 @@ impl Tracker {
     /// 4. else the identified one.
     fn hold_depth(&self, cb: vk::CommandBuffer, identified: (vk::Image, ImageDesc), before: Option<usize>, inside: bool) -> (vk::Image, ImageDesc) {
         let extent = (identified.1.width, identified.1.height);
-        let depth = |image: vk::Image| self.images.get(&image).filter(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == extent).map(|d| (image, *d));
+        let depth =
+            |image: vk::Image| self.images.get(&image).filter(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == extent).map(|d| (image, *d));
         let recorded = self.pending.get(&cb).map_or(&[][..], Vec::as_slice);
         let recorded = &recorded[..before.unwrap_or(recorded.len()).min(recorded.len())];
         let named = match self.launch.get(&cb).and_then(|r| r.input.as_ref()) {
@@ -3393,7 +3411,12 @@ impl Tracking {
 
     /// [`Self::launch`], and the hold right after this launch when it is DLSS's output kernel and the
     /// model runs after DLSS ([`Tracker::after_point`]).
-    pub(crate) fn launch_with_after(&self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) -> (Option<InlinePoint>, Option<InlinePoint>) {
+    pub(crate) fn launch_with_after(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        function: vk::CuFunctionNVX,
+        params: Option<&[u8]>,
+    ) -> (Option<InlinePoint>, Option<InlinePoint>) {
         let mut t = self.lock();
         t.launch_kernel(command_buffer, function, params);
         self.rearm(&t);
@@ -3409,9 +3432,12 @@ impl Tracking {
             return None;
         }
         let output = t.output_extent();
-        let point = t.inline_point(cb, colour).map(|p| InlinePoint { hold: placement::Hold::of(&plan, placement::Stage::Before, (p.desc.width, p.desc.height), output), ..p });
+        let point = t
+            .inline_point(cb, colour)
+            .map(|p| InlinePoint { hold: placement::Hold::of(&plan, placement::Stage::Before, (p.desc.width, p.desc.height), output), ..p });
         if point.is_none() && !t.said_layout_miss && t.images.contains_key(&colour) && t.recorded_watched.contains(&cb) {
-            let own = t.pending.get(&cb).is_some_and(|p| p.iter().any(|s| s.image == colour)) || t.attached.get(&cb).is_some_and(|a| a.iter().any(|(i, _)| *i == colour));
+            let own = t.pending.get(&cb).is_some_and(|p| p.iter().any(|s| s.image == colour))
+                || t.attached.get(&cb).is_some_and(|a| a.iter().any(|(i, _)| *i == colour));
             if !own && !t.committed.contains_key(&colour) {
                 t.said_layout_miss = true;
                 crate::log!(
@@ -3779,7 +3805,10 @@ pub(crate) fn plan<B: SplitBatch>(mut batches: Vec<B>, batch: usize, index: usiz
 /// reported as `VK_ERROR_DEVICE_LOST`. A tail that failed with `VK_ERROR_DEVICE_LOST` is returned
 /// as it is.
 pub(crate) fn submit_around<B: SplitBatch>(
-    mut plan: Plan<B>, fence: vk::Fence, submit: &dyn Fn(&[B], vk::Fence) -> vk::Result, hold: impl FnOnce(&[B::Wait]) -> bool,
+    mut plan: Plan<B>,
+    fence: vk::Fence,
+    submit: &dyn Fn(&[B], vk::Fence) -> vk::Result,
+    hold: impl FnOnce(&[B::Wait]) -> bool,
     accepted: &mut dyn FnMut(Vec<vk::CommandBuffer>),
 ) -> vk::Result {
     let buffers = |part: &[B]| part.iter().flat_map(B::command_buffers).collect::<Vec<_>>();
@@ -3881,12 +3910,7 @@ pub(crate) unsafe fn parse1(submits: &[vk::SubmitInfo]) -> Result<Vec<Batch1>, &
             return Err("wait semaphores without stage masks");
         }
         out.push(Batch1 {
-            waits: waits
-                .iter()
-                .zip(stages)
-                .enumerate()
-                .map(|(i, (&semaphore, &stage))| Wait1 { semaphore, stage, value: wait_values.map(|v| v[i]) })
-                .collect(),
+            waits: waits.iter().zip(stages).enumerate().map(|(i, (&semaphore, &stage))| Wait1 { semaphore, stage, value: wait_values.map(|v| v[i]) }).collect(),
             cbs: cbs.to_vec(),
             signals: signals.iter().enumerate().map(|(i, &semaphore)| Signal1 { semaphore, value: signal_values.map(|v| v[i]) }).collect(),
         });
@@ -4114,7 +4138,13 @@ fn own_host_buffer(device: &ash::Device, instance: &ash::Instance, physical_devi
 }
 
 /// [`own_host_buffer`] with the given usage.
-fn own_host_buffer_with(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, bytes: u64, usage: vk::BufferUsageFlags) -> Option<HostBuffer> {
+fn own_host_buffer_with(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    bytes: u64,
+    usage: vk::BufferUsageFlags,
+) -> Option<HostBuffer> {
     let info = vk::BufferCreateInfo::default().size(bytes).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
     // SAFETY: `info` is valid.
     let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
@@ -4139,11 +4169,8 @@ fn own_host_buffer_with(device: &ash::Device, instance: &ash::Instance, physical
         return None;
     };
     // SAFETY: freshly created, sized for each other; mapping a host-visible allocation.
-    let mapped = unsafe {
-        device
-            .bind_buffer_memory(buffer, memory, 0)
-            .and_then(|()| device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()))
-    };
+    let mapped =
+        unsafe { device.bind_buffer_memory(buffer, memory, 0).and_then(|()| device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())) };
     match mapped {
         Ok(ptr) => Some(HostBuffer { buffer, memory, ptr: ptr.cast(), staged: true }),
         Err(_) => {
@@ -4165,8 +4192,14 @@ fn own_host_buffer_with(device: &ash::Device, instance: &ash::Instance, physical
 /// `region` must be valid for `capacity` bytes for the life of the result.
 #[allow(clippy::too_many_arguments)]
 unsafe fn region_buffer(
-    device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, import: bool,
-    region: *mut u8, capacity: usize, bytes: u64, usage: vk::BufferUsageFlags,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    import: bool,
+    region: *mut u8,
+    capacity: usize,
+    bytes: u64,
+    usage: vk::BufferUsageFlags,
 ) -> Option<HostBuffer> {
     if import {
         if let Some(alignment) = crate::capture::min_imported_host_pointer_alignment(instance, physical_device) {
@@ -4331,8 +4364,14 @@ impl Resources {
     /// mapping is never unmapped.
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn build(
-        device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
-        width: u32, height: u32, shm: &ShmClient, import: bool,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue_family: u32,
+        width: u32,
+        height: u32,
+        shm: &ShmClient,
+        import: bool,
     ) -> Option<Self> {
         let (pw, ph) = padded(width, height);
         let bytes = u64::from(pw) * u64::from(ph) * TEXEL;
@@ -4351,7 +4390,14 @@ impl Resources {
     ///
     /// # Safety
     /// `device` is live.
-    pub(crate) unsafe fn build_inline(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32, width: u32, height: u32) -> Option<Self> {
+    pub(crate) unsafe fn build_inline(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue_family: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
         let (pw, ph) = padded(width, height);
         let proxy = own_host_buffer(device, instance, physical_device, u64::from(pw) * u64::from(ph) * TEXEL)?;
         let region = proxy.ptr;
@@ -4363,8 +4409,15 @@ impl Resources {
     /// `device` is live; `proxy_region` stays valid for the result's life.
     #[allow(clippy::too_many_arguments)]
     unsafe fn build_with(
-        device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32, width: u32, height: u32, proxy: HostBuffer,
-        proxy_region: *mut u8, inline: bool,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue_family: u32,
+        width: u32,
+        height: u32,
+        proxy: HostBuffer,
+        proxy_region: *mut u8,
+        inline: bool,
     ) -> Option<Self> {
         let cleanup = |pool: Option<vk::CommandPool>, fences: &[vk::Fence]| {
             // SAFETY: none of these was ever submitted.
@@ -4471,7 +4524,11 @@ impl Resources {
     ///
     /// # Safety
     /// The write-back fence is idle (not pending, waited on); `submit` submits on the hold's queue.
-    pub(crate) unsafe fn fence_submitted(&mut self, device: &ash::Device, submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>) {
+    pub(crate) unsafe fn fence_submitted(
+        &mut self,
+        device: &ash::Device,
+        submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
+    ) {
         // SAFETY: the fence is idle (contract); the empty buffer is idle with it.
         let reset = unsafe { device.reset_fences(&[self.writeback_fence]) };
         if reset.is_ok() && crate::note_vk(device.handle(), submit(Which::WriteBack, self.fence_cmd, self.writeback_fence)).is_ok() {
@@ -4764,7 +4821,6 @@ impl HoldResult {
     pub(crate) fn local(why: &'static str) -> Self {
         Self { miss: Some(why), ..Default::default() }
     }
-
 }
 
 /// Wall-clock phases of one hold, for the periodic `[preupscale]` line. `None` for a phase the
@@ -4817,11 +4873,21 @@ fn aux_copy_layout(layout: Option<vk::ImageLayout>) -> Option<(vk::ImageLayout, 
 
 pub(crate) fn aux_range(format: vk::Format) -> vk::ImageSubresourceRange {
     let aspect = if DEPTH_FORMATS.contains(&format) {
-        if has_stencil(format) { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH }
+        if has_stencil(format) {
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        } else {
+            vk::ImageAspectFlags::DEPTH
+        }
     } else {
         vk::ImageAspectFlags::COLOR
     };
-    vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS }
+    vk::ImageSubresourceRange {
+        aspect_mask: aspect,
+        base_mip_level: 0,
+        level_count: vk::REMAINING_MIP_LEVELS,
+        base_array_layer: 0,
+        layer_count: vk::REMAINING_ARRAY_LAYERS,
+    }
 }
 
 /// What a dump reads besides colour.
@@ -4856,7 +4922,11 @@ struct DumpRead {
 /// encode (`exposure_buffer`), the exposure input. Each readable one in a layout it can be copied
 /// from (see [`aux_copy_layout`]).
 fn capture_reads(
-    target: &Target, bufs: Option<&DumpBuffers>, exposure_buffer: Option<vk::Buffer>, native_mvec: Option<vk::Buffer>, native_depth: Option<vk::Buffer>,
+    target: &Target,
+    bufs: Option<&DumpBuffers>,
+    exposure_buffer: Option<vk::Buffer>,
+    native_mvec: Option<vk::Buffer>,
+    native_depth: Option<vk::Buffer>,
 ) -> Vec<DumpRead> {
     let full = (target.width, target.height);
     let mut parts = Vec::new();
@@ -4906,9 +4976,17 @@ fn capture_reads(
 /// `target.colour` and, for [`ExposureSource::Auto`], its auto-exposure is built.
 #[allow(clippy::too_many_arguments)]
 unsafe fn record_capture(
-    device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>, hdr: Option<&hdr::HdrPass>, proxy: Option<vk::Buffer>,
-    native_mvec: Option<vk::Buffer>, native_depth: Option<(vk::Buffer, Option<&crate::gpu_timer::GpuTimer>)>, colour_before: Option<vk::Buffer>,
-    extra: Option<&dyn Fn(vk::CommandBuffer)>, into: Option<vk::CommandBuffer>,
+    device: &ash::Device,
+    res: &Resources,
+    target: &Target,
+    dump: Option<&DumpBuffers>,
+    hdr: Option<&hdr::HdrPass>,
+    proxy: Option<vk::Buffer>,
+    native_mvec: Option<vk::Buffer>,
+    native_depth: Option<(vk::Buffer, Option<&crate::gpu_timer::GpuTimer>)>,
+    colour_before: Option<vk::Buffer>,
+    extra: Option<&dyn Fn(vk::CommandBuffer)>,
+    into: Option<vk::CommandBuffer>,
 ) -> ash::prelude::VkResult<()> {
     let auto = hdr.is_some() && ExposureSource::of(target) == ExposureSource::Auto;
     // Into DLSS's buffer (`into`, being recorded), or the layer's own capture buffer.
@@ -5069,8 +5147,14 @@ unsafe fn record_capture(
 /// capture and its colour view is bound to `target.colour`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn record_writeback(
-    device: &ash::Device, res: &Resources, target: &Target, source: vk::Buffer, hdr: Option<&hdr::HdrPass>, cache: Option<&CacheCopies>,
-    edit_capture: Option<&dyn Fn(vk::CommandBuffer)>, into: Option<vk::CommandBuffer>,
+    device: &ash::Device,
+    res: &Resources,
+    target: &Target,
+    source: vk::Buffer,
+    hdr: Option<&hdr::HdrPass>,
+    cache: Option<&CacheCopies>,
+    edit_capture: Option<&dyn Fn(vk::CommandBuffer)>,
+    into: Option<vk::CommandBuffer>,
 ) -> ash::prelude::VkResult<()> {
     // Into DLSS's buffer (`into`, being recorded), or the layer's own write-back buffer.
     let cmd = into.unwrap_or(res.writeback_cmd);
@@ -5083,7 +5167,12 @@ unsafe fn record_writeback(
             vk::AccessFlags::SHADER_WRITE,
         )
     } else {
-        (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE, vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
+        (
+            vk::PipelineStageFlags::TRANSFER,
+            vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::AccessFlags::TRANSFER_WRITE,
+        )
     };
     let open = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE).dst_access_mask(dst_access);
     // The dump's copies read what the decode wrote, and the host reads them after the fence.
@@ -5146,25 +5235,48 @@ unsafe fn record_writeback(
 /// # Safety
 /// `res`'s write-back command buffer must not be pending.
 #[cfg(target_arch = "x86_64")]
-unsafe fn record_cached_writeback(device: &ash::Device, res: &Resources, apply: &dyn Fn(vk::CommandBuffer), into: Option<vk::CommandBuffer>) -> ash::prelude::VkResult<()> {
+unsafe fn record_cached_writeback(
+    device: &ash::Device,
+    res: &Resources,
+    apply: &dyn Fn(vk::CommandBuffer),
+    into: Option<vk::CommandBuffer>,
+) -> ash::prelude::VkResult<()> {
     let cmd = into.unwrap_or(res.writeback_cmd);
     let writeback_timer = res.writeback_timer.as_ref().filter(|_| into.is_none());
     let open = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
         .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-    let close = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+    let close = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
     // SAFETY: the layer's own buffer, not pending, or DLSS's being recorded; every handle is live.
     unsafe {
         if into.is_none() {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         }
-        device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[open], &[], &[]);
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[open],
+            &[],
+            &[],
+        );
         if let Some(timer) = writeback_timer {
             timer.record_start(device, cmd);
         }
         apply(cmd);
-        device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[close], &[], &[]);
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[close],
+            &[],
+            &[],
+        );
         if let Some(timer) = writeback_timer {
             timer.record_end(device, cmd);
         }
@@ -5192,8 +5304,14 @@ unsafe fn record_cached_writeback(device: &ash::Device, res: &Resources, apply: 
 /// for, which the caller holds.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_hold(
-    device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target, mode: Mode,
-    dump: bool, frame: u64,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    res: &mut Resources,
+    target: &Target,
+    mode: Mode,
+    dump: bool,
+    frame: u64,
     submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> HoldResult {
     let mut result = HoldResult::default();
@@ -5387,7 +5505,11 @@ pub(crate) fn f16_to_f32(h: u16) -> f32 {
     match exp {
         0 => sign * mant * 2f32.powi(-24),
         0x1f => {
-            if mant == 0.0 { sign * f32::INFINITY } else { f32::NAN }
+            if mant == 0.0 {
+                sign * f32::INFINITY
+            } else {
+                f32::NAN
+            }
         }
         e => sign * (1.0 + mant / 1024.0) * 2f32.powi(i32::from(e) - 15),
     }
@@ -5546,17 +5668,17 @@ struct Stats {
 /// Holds per second over a summary window of `holds` holds that took `elapsed`.
 fn per_second(holds: u64, elapsed: Duration) -> f32 {
     let secs = elapsed.as_secs_f32();
-    if secs > 0.0 { holds as f32 / secs } else { 0.0 }
+    if secs > 0.0 {
+        holds as f32 / secs
+    } else {
+        0.0
+    }
 }
 
 impl Stats {
     fn book(&mut self, t: &HoldTiming) {
         let ms = |d: Duration| d.as_secs_f32() * 1000.0;
-        let pairs = [
-            (&mut self.prep_ms, t.prep),
-            (&mut self.capture_wait_ms, t.capture_wait),
-            (&mut self.writeback_cpu_ms, t.writeback),
-        ];
+        let pairs = [(&mut self.prep_ms, t.prep), (&mut self.capture_wait_ms, t.capture_wait), (&mut self.writeback_cpu_ms, t.writeback)];
         for (v, d) in pairs {
             if let Some(d) = d {
                 v.push(ms(d));
@@ -5702,7 +5824,9 @@ fn probe_params(bytes: &[u8]) {
         return;
     }
     let words: Vec<String> = bytes
-        .as_chunks::<8>().0.iter()
+        .as_chunks::<8>()
+        .0
+        .iter()
         .enumerate()
         .map(|(i, w)| {
             let v = u64::from_le_bytes(*w);
@@ -5723,7 +5847,9 @@ fn probe_kernel(name: &str, bytes: &[u8]) {
         return;
     }
     let words: Vec<String> = bytes
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|w| {
             let v = u32::from_le_bytes(*w);
             format!("{v:08x}:{}", f32::from_bits(v))
@@ -5736,8 +5862,9 @@ fn probe_kernel(name: &str, bytes: &[u8]) {
 /// every launch whose kernel name contains one of the comma-separated parts (`1`: every launch), for the
 /// first 4000 such launches: how a DLSS engine spreads its inputs and output over its launches.
 fn probe_rr(cb: vk::CommandBuffer, name: Option<&str>, named: &[vk::Image], images: &HashMap<vk::Image, ImageDesc>) {
-    static PARTS: LazyLock<Option<Vec<String>>> =
-        LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_PROBE_RR").filter(|v| !v.is_empty()).map(|v| v.split(',').map(str::to_string).collect()));
+    static PARTS: LazyLock<Option<Vec<String>>> = LazyLock::new(|| {
+        neural_forge_protocol::env::var("NEURAL_FORGE_PROBE_RR").filter(|v| !v.is_empty()).map(|v| v.split(',').map(str::to_string).collect())
+    });
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let Some(parts) = PARTS.as_deref() else { return };
     let wanted = parts.iter().any(|p| p == "1" || name.is_some_and(|n| n.contains(p.as_str())));
@@ -5756,8 +5883,9 @@ fn probe_rr(cb: vk::CommandBuffer, name: Option<&str>, named: &[vk::Image], imag
 
 /// With `NEURAL_FORGE_PROBE_RR` set: what a matching launch left in its buffer's tracking (`state`).
 fn probe_rr_state(cb: vk::CommandBuffer, name: Option<&str>, state: &str) {
-    static PARTS: LazyLock<Option<Vec<String>>> =
-        LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_PROBE_RR").filter(|v| !v.is_empty()).map(|v| v.split(',').map(str::to_string).collect()));
+    static PARTS: LazyLock<Option<Vec<String>>> = LazyLock::new(|| {
+        neural_forge_protocol::env::var("NEURAL_FORGE_PROBE_RR").filter(|v| !v.is_empty()).map(|v| v.split(',').map(str::to_string).collect())
+    });
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let Some(parts) = PARTS.as_deref() else { return };
     let wanted = parts.iter().any(|p| p == "1" || name.is_some_and(|n| n.contains(p.as_str())));
@@ -5805,9 +5933,8 @@ const CAPTURE_GAP: Duration = Duration::from_secs(3);
 /// `NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES`: how many consecutive DLSS frames each dump takes (default
 /// 1). Two or more give frame pairs for checking the motion vectors' convention.
 pub(crate) fn dump_frames() -> u32 {
-    static FRAMES: LazyLock<u32> = LazyLock::new(|| {
-        neural_forge_protocol::env::var("NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES").and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(1)
-    });
+    static FRAMES: LazyLock<u32> =
+        LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES").and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(1));
     *FRAMES
 }
 
@@ -5949,8 +6076,15 @@ impl Session {
     /// `device` is live.
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn ensure_inline(
-        &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32, width: u32, height: u32,
-        stage: placement::Stage, outstanding: usize,
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue_family: u32,
+        width: u32,
+        height: u32,
+        stage: placement::Stage,
+        outstanding: usize,
     ) -> Result<(), &'static str> {
         let slot = self.res_inline(stage);
         if slot.as_ref().is_some_and(|r| r.inline && r.matches(queue_family, width, height)) {
@@ -6045,8 +6179,16 @@ impl Session {
     /// As [`Resources::build`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn ensure(
-        &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
-        width: u32, height: u32, shm: &ShmClient, import: bool, stage: placement::Stage,
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue_family: u32,
+        width: u32,
+        height: u32,
+        shm: &ShmClient,
+        import: bool,
+        stage: placement::Stage,
     ) -> bool {
         if stage != placement::Stage::Before {
             return false;
@@ -6066,8 +6208,16 @@ impl Session {
     /// As [`Resources::build`].
     #[allow(clippy::too_many_arguments)]
     unsafe fn ensure_in(
-        &mut self, res: &mut Option<Resources>, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
-        width: u32, height: u32, shm: &ShmClient, import: bool,
+        &mut self,
+        res: &mut Option<Resources>,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue_family: u32,
+        width: u32,
+        height: u32,
+        shm: &ShmClient,
+        import: bool,
     ) -> bool {
         // A staged set serves either way; an imported one only where imports are wanted.
         if res.as_ref().is_some_and(|r| r.matches(queue_family, width, height) && (import || !r.imported())) {
@@ -6244,7 +6394,11 @@ impl Session {
         if let Some(why) = result.miss {
             s.unlogged_misses += 1;
             if s.last_miss_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
-                crate::log!("[preupscale] frame went to DLSS untouched: {why} ({} such since the last line, {} answers over budget or echoed in total)", s.unlogged_misses, s.misses);
+                crate::log!(
+                    "[preupscale] frame went to DLSS untouched: {why} ({} such since the last line, {} answers over budget or echoed in total)",
+                    s.unlogged_misses,
+                    s.misses
+                );
                 crate::logging::flush();
                 s.last_miss_log = Some(Instant::now());
                 s.unlogged_misses = 0;
@@ -6332,7 +6486,14 @@ impl Session {
 
     /// Starts the native backend's after-the-upscaler server once the shared memory is open (once per
     /// device), on a device with the native network.
-    pub(crate) fn ensure_post_server(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, import: bool, shm: &ShmClient) {
+    pub(crate) fn ensure_post_server(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        import: bool,
+        shm: &ShmClient,
+    ) {
         #[cfg(target_arch = "x86_64")]
         if !self.post_stalled && native_on(self.native.as_ref()) {
             use native_post::Status;
@@ -6402,9 +6563,10 @@ impl Session {
     }
 
     fn capture_at_due_for(&mut self, entries: &[CaptureAt]) -> Option<u32> {
-        let (i, at) = entries.iter().enumerate().find(|&(i, at)| {
-            self.captured_at & (1 << i) == 0 && self.resumes == at.resume && self.resumed_at.is_some_and(|t| t.elapsed() >= at.after)
-        })?;
+        let (i, at) = entries
+            .iter()
+            .enumerate()
+            .find(|&(i, at)| self.captured_at & (1 << i) == 0 && self.resumes == at.resume && self.resumed_at.is_some_and(|t| t.elapsed() >= at.after))?;
         self.captured_at |= 1 << i;
         crate::log!("[preupscale] NEURAL_FORGE_CAPTURE_AT: capturing {} frames {} ms after resume {}", at.frames, at.after.as_millis(), at.resume);
         Some(at.frames)
@@ -6520,7 +6682,11 @@ fn hold_state_of(before: bool, after: bool) -> u32 {
 /// holds are being recorded (within [`RAY_RECONSTRUCTION_HAND_BACK`]), so a game whose hold after DLSS
 /// cannot be recorded keeps the post path, as Ray Reconstruction did before the placements.
 pub(crate) fn post_serves(now: Instant) -> bool {
-    post_serves_for(placement::settings(), ray_reconstruction_running(now), lock(&AFTER_DLSS_AT).is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK))
+    post_serves_for(
+        placement::settings(),
+        ray_reconstruction_running(now),
+        lock(&AFTER_DLSS_AT).is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK),
+    )
 }
 
 /// [`post_serves`] for the passes' `settings` (count, placements), Ray Reconstruction running (`rr`) and holds
@@ -6583,7 +6749,14 @@ pub(crate) fn write_dump_async(frame: DumpFrame, capture: Option<(neural_forge_p
     let spawned = std::thread::Builder::new().name("nf-preupscale-dump".into()).spawn(move || {
         let written = match frame.write(&dir) {
             Ok(files) => {
-                crate::log!("[preupscale] dump of the DLSS input ({}x{}, frame {}) written to {}: {}", frame.width, frame.height, frame.frame, dir.display(), files.join(", "));
+                crate::log!(
+                    "[preupscale] dump of the DLSS input ({}x{}, frame {}) written to {}: {}",
+                    frame.width,
+                    frame.height,
+                    frame.frame,
+                    dir.display(),
+                    files.join(", ")
+                );
                 true
             }
             Err(e) => {
@@ -6745,11 +6918,7 @@ mod tests {
 
     #[test]
     fn a_launch_buffer_first_in_its_batch_moves_the_waits_to_the_capture() {
-        let batches = vec![
-            batch1(&[(1, None)], &[10], &[(2, None)]),
-            batch1(&[(3, Some(7)), (4, None)], &[20, 21], &[(5, Some(8))]),
-            batch1(&[], &[30], &[]),
-        ];
+        let batches = vec![batch1(&[(1, None)], &[10], &[(2, None)]), batch1(&[(3, Some(7)), (4, None)], &[20, 21], &[(5, Some(8))]), batch1(&[], &[30], &[])];
         let p = plan(batches.clone(), 1, 0);
         assert_eq!(p.head, vec![batches[0].clone()], "earlier batches go first, unchanged");
         assert_eq!(p.capture_waits, batches[1].waits, "the launch batch's waits, values and all");
@@ -6862,17 +7031,27 @@ mod tests {
         let batches = vec![batch1(&[(1, None)], &[10], &[(2, None)]), batch1(&[(3, Some(5))], &[20], &[(4, Some(6))]), batch1(&[], &[30], &[(8, None)])];
         let p = plan(batches.clone(), 1, 0);
         let mut accepted: Vec<Vec<vk::CommandBuffer>> = Vec::new();
-        let result = submit_around(p, game_fence, &submit, |waits| {
-            let _ = submit(&[Batch1::own(waits.to_vec(), cb(100))], own_fence);
-            let _ = submit(&[Batch1::own(Vec::new(), cb(101))], own_fence);
-            true
-        }, &mut |part| accepted.push(part));
+        let result = submit_around(
+            p,
+            game_fence,
+            &submit,
+            |waits| {
+                let _ = submit(&[Batch1::own(waits.to_vec(), cb(100))], own_fence);
+                let _ = submit(&[Batch1::own(Vec::new(), cb(101))], own_fence);
+                true
+            },
+            &mut |part| accepted.push(part),
+        );
         assert_eq!(result, vk::Result::SUCCESS);
         assert_eq!(accepted, vec![vec![cb(10)], vec![cb(20), cb(30)]], "the application's buffers of each accepted part, never the layer's own");
         let calls = calls.into_inner();
         assert_eq!(calls.len(), 4);
         assert_eq!(calls[0], (vec![batches[0].clone()], vk::Fence::null()), "head: the earlier batch, no fence");
-        assert_eq!(calls[1].0[0].waits, vec![Wait1 { semaphore: sem(3), stage: vk::PipelineStageFlags::ALL_COMMANDS, value: Some(5) }], "the capture waits for what the launch batch waited for");
+        assert_eq!(
+            calls[1].0[0].waits,
+            vec![Wait1 { semaphore: sem(3), stage: vk::PipelineStageFlags::ALL_COMMANDS, value: Some(5) }],
+            "the capture waits for what the launch batch waited for"
+        );
         assert_eq!(calls[2].0[0].cbs, vec![cb(101)]);
         assert!(calls[2].0[0].waits.is_empty());
         assert_eq!(calls[3].1, game_fence, "the application's fence is on the last call");
@@ -6896,7 +7075,19 @@ mod tests {
         // A failing head is returned at once.
         let failing = |_: &[Batch1], _: vk::Fence| vk::Result::ERROR_DEVICE_LOST;
         let (mut held, mut reported) = (false, false);
-        assert_eq!(submit_around(plan(batches.clone(), 1, 0), game_fence, &failing, |_| { held = true; true }, &mut |_| reported = true), vk::Result::ERROR_DEVICE_LOST);
+        assert_eq!(
+            submit_around(
+                plan(batches.clone(), 1, 0),
+                game_fence,
+                &failing,
+                |_| {
+                    held = true;
+                    true
+                },
+                &mut |_| reported = true
+            ),
+            vk::Result::ERROR_DEVICE_LOST
+        );
         assert!(!held);
         assert!(!reported, "a refused head reports nothing as accepted");
     }
@@ -6960,7 +7151,15 @@ mod tests {
             p_signal_semaphore_infos: signals.as_ptr(),
             ..Default::default()
         };
-        let other = vk::SubmitInfo2 { p_next: std::ptr::null(), flags: vk::SubmitFlags::empty(), command_buffer_info_count: 1, p_command_buffer_infos: &cbs[0], wait_semaphore_info_count: 0, signal_semaphore_info_count: 0, ..info };
+        let other = vk::SubmitInfo2 {
+            p_next: std::ptr::null(),
+            flags: vk::SubmitFlags::empty(),
+            command_buffer_info_count: 1,
+            p_command_buffer_infos: &cbs[0],
+            wait_semaphore_info_count: 0,
+            signal_semaphore_info_count: 0,
+            ..info
+        };
         let parsed = unsafe { parse2(&[other, info, other]) }.unwrap();
         // Launch buffer is the second of the second batch: split.
         let p = plan(parsed.clone(), 1, 1);
@@ -6981,14 +7180,18 @@ mod tests {
         // Launch buffer first: the waits move, widened to ALL_COMMANDS, values kept.
         let p = plan(parsed, 1, 0);
         let own = Batch2::own(p.capture_waits.clone(), cb(99));
-        assert_eq!(own.waits.iter().map(|w| (w.semaphore, w.value, w.stage_mask)).collect::<Vec<_>>(), vec![
-            (sem(1), 41, vk::PipelineStageFlags2::ALL_COMMANDS),
-            (sem(2), 42, vk::PipelineStageFlags2::ALL_COMMANDS)
-        ]);
+        assert_eq!(
+            own.waits.iter().map(|w| (w.semaphore, w.value, w.stage_mask)).collect::<Vec<_>>(),
+            vec![(sem(1), 41, vk::PipelineStageFlags2::ALL_COMMANDS), (sem(2), 42, vk::PipelineStageFlags2::ALL_COMMANDS)]
+        );
         assert!(own.p_next.is_null() && own.flags.is_empty(), "the layer's own batch carries nothing of the game's");
         assert!(p.tail[0].waits.is_empty());
         // An unknown chain is refused.
-        let keyed = vk::BaseInStructure { s_type: vk::StructureType::WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR, p_next: std::ptr::null(), _marker: std::marker::PhantomData };
+        let keyed = vk::BaseInStructure {
+            s_type: vk::StructureType::WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR,
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
         assert!(unsafe { parse2(&[vk::SubmitInfo2 { p_next: std::ptr::from_ref(&keyed).cast(), ..info }]) }.is_err());
     }
 
@@ -7048,7 +7251,10 @@ mod tests {
         two.insert(0x51, (vk::Image::from_raw(0x51), desc(1490, 838, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)));
         two.insert(0x52, (vk::Image::from_raw(0x52), desc(1490, 838, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT)));
         let found = identify(&two, Some((2560, 1440))).unwrap();
-        assert_eq!((found.colour.0, found.depth.0, found.mvec.0, found.candidates), (vk::Image::from_raw(0x50), vk::Image::from_raw(0x51), vk::Image::from_raw(0x52), 2));
+        assert_eq!(
+            (found.colour.0, found.depth.0, found.mvec.0, found.candidates),
+            (vk::Image::from_raw(0x50), vk::Image::from_raw(0x51), vk::Image::from_raw(0x52), 2)
+        );
     }
 
     /// A tracker with `set` registered (view `raw + 1`, kernel handle `raw + 0x1000`) and, when
@@ -7156,7 +7362,9 @@ mod tests {
     #[test]
     fn without_a_swapchain_the_largest_output_like_image_is_the_comparison() {
         let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
-        let mk = |list: &[(u64, ImageDesc)]| -> BTreeMap<u64, (vk::Image, ImageDesc)> { list.iter().map(|&(raw, d)| (raw, (vk::Image::from_raw(raw), d))).collect() };
+        let mk = |list: &[(u64, ImageDesc)]| -> BTreeMap<u64, (vk::Image, ImageDesc)> {
+            list.iter().map(|&(raw, d)| (raw, (vk::Image::from_raw(raw), d))).collect()
+        };
         let inputs = [
             (0x100, desc(1708, 960, vk::Format::R16G16B16A16_SFLOAT, storage)),
             (0x200, desc(1708, 960, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)),
@@ -7170,7 +7378,10 @@ mod tests {
         let line = t.refresh().expect("identified");
         assert!(line.starts_with("colour input: image 0x100 (1708x960 R16G16B16A16_SFLOAT"), "{line}");
         assert!(line.contains("depth 0x200 D32_SFLOAT, motion vectors 0x300 R32G32_SFLOAT"), "{line}");
-        assert!(line.ends_with("swapchain None, compared with the largest registered RGBA16F/R11G11B10 storage image (2560x1440); identified by size"), "{line}");
+        assert!(
+            line.ends_with("swapchain None, compared with the largest registered RGBA16F/R11G11B10 storage image (2560x1440); identified by size"),
+            "{line}"
+        );
         assert_eq!(t.inputs.map(|i| (i.output, i.output_from_swapchain, i.exposure_input.map(|e| e.0.as_raw()))), Some(((2560, 1440), false, Some(0x400))));
         // An RGBA16F output does as well; a swapchain, once known, is what counts.
         let mut rgba_out = inputs.to_vec();
@@ -7208,19 +7419,33 @@ mod tests {
         let mut t = tracker_with(&set, None);
         let line = t.refresh().expect("the failure is logged");
         assert!(line.starts_with("no DLSS input among 6 registered views (swapchain None); waiting. output: no swapchain known, largest RGBA16F/R11G11B10 storage image 2560x1440"), "{line}");
-        assert!(line.contains("RGBA16F storage extents: 2560x1440 not smaller than the output, 1708x960 no R16G16/R32G32_SFLOAT motion vectors at this extent"), "{line}");
+        assert!(
+            line.contains("RGBA16F storage extents: 2560x1440 not smaller than the output, 1708x960 no R16G16/R32G32_SFLOAT motion vectors at this extent"),
+            "{line}"
+        );
         assert!(line.contains("registered: 2560x1440 R16G16B16A16_SFLOAT storage x2, "), "{line}");
         assert!(line.contains("1708x960 R16G16B16A16_SFLOAT sampled+colour x1") && line.contains("1708x960 D32_SFLOAT depth x1"), "{line}");
         assert!(t.refresh().is_none(), "nothing changed");
         // A change of the set (same count) is logged again.
         t.forget_image(vk::Image::from_raw(0x300));
-        t.record_image(vk::Image::from_raw(0x310), &vk::ImageCreateInfo { image_type: vk::ImageType::TYPE_2D, extent: vk::Extent3D { width: 1708, height: 960, depth: 1 }, format: vk::Format::R16G16_SNORM, usage: storage, samples: vk::SampleCountFlags::TYPE_1, ..Default::default() });
+        t.record_image(
+            vk::Image::from_raw(0x310),
+            &vk::ImageCreateInfo {
+                image_type: vk::ImageType::TYPE_2D,
+                extent: vk::Extent3D { width: 1708, height: 960, depth: 1 },
+                format: vk::Format::R16G16_SNORM,
+                usage: storage,
+                samples: vk::SampleCountFlags::TYPE_1,
+                ..Default::default()
+            },
+        );
         t.record_view(vk::ImageView::from_raw(0x311), vk::Image::from_raw(0x310));
         t.register(vk::ImageView::from_raw(0x311), None);
         let again = t.refresh().expect("a changed set is logged again");
         assert!(again.contains("R16G16_SNORM") && !again.contains("R16G16_UNORM"), "{again}");
         // Long sets are cut at the cap.
-        let many: BTreeMap<u64, (vk::Image, ImageDesc)> = (0..400u64).map(|k| (0x1000 + k, (vk::Image::from_raw(0x1000 + k), desc(100 + k as u32, 50, rgba, storage)))).collect();
+        let many: BTreeMap<u64, (vk::Image, ImageDesc)> =
+            (0..400u64).map(|k| (0x1000 + k, (vk::Image::from_raw(0x1000 + k), desc(100 + k as u32, 50, rgba, storage)))).collect();
         let long = diagnose(&many, None);
         assert!(long.len() <= DIAGNOSE_MAX && long.ends_with(" more)"), "{} bytes: ...{}", long.len(), &long[long.len().saturating_sub(40)..]);
         // After MAX_DIAGNOSES detailed lines, only the short one (once per change of it).
@@ -7286,7 +7511,11 @@ mod tests {
             ..Default::default()
         };
         let storage = vk::ImageUsageFlags::STORAGE;
-        for (raw, w, h, format) in [(0x100, 1707, 960, vk::Format::R16G16B16A16_SFLOAT), (0x200, 1707, 960, vk::Format::D32_SFLOAT_S8_UINT), (0x300, 1707, 960, vk::Format::R16G16_SFLOAT)] {
+        for (raw, w, h, format) in [
+            (0x100, 1707, 960, vk::Format::R16G16B16A16_SFLOAT),
+            (0x200, 1707, 960, vk::Format::D32_SFLOAT_S8_UINT),
+            (0x300, 1707, 960, vk::Format::R16G16_SFLOAT),
+        ] {
             t.record_image(vk::Image::from_raw(raw), &info(w, h, format, storage));
             t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
             t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
@@ -7341,7 +7570,9 @@ mod tests {
         };
         let register = |base: u64| {
             let mut tr = t.lock();
-            for (raw, format) in [(base, vk::Format::R16G16B16A16_SFLOAT), (base + 0x100, vk::Format::D32_SFLOAT_S8_UINT), (base + 0x200, vk::Format::R16G16_SFLOAT)] {
+            for (raw, format) in
+                [(base, vk::Format::R16G16B16A16_SFLOAT), (base + 0x100, vk::Format::D32_SFLOAT_S8_UINT), (base + 0x200, vk::Format::R16G16_SFLOAT)]
+            {
                 tr.record_image(vk::Image::from_raw(raw), &info(1707, 960, format));
                 tr.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
                 tr.register(vk::ImageView::from_raw(raw + 1), None);
@@ -7480,7 +7711,8 @@ mod tests {
     #[test]
     fn a_frame_boundary_submit_is_refused_and_forwarded_untouched() {
         let boundary = vk::BaseInStructure { s_type: FRAME_BOUNDARY_EXT, p_next: std::ptr::null(), _marker: std::marker::PhantomData };
-        let latency = vk::BaseInStructure { s_type: LATENCY_SUBMISSION_PRESENT_ID_NV, p_next: std::ptr::from_ref(&boundary), _marker: std::marker::PhantomData };
+        let latency =
+            vk::BaseInStructure { s_type: LATENCY_SUBMISSION_PRESENT_ID_NV, p_next: std::ptr::from_ref(&boundary), _marker: std::marker::PhantomData };
         let cbs = [cb2(10), cb2(11)];
         let plain = vk::SubmitInfo2 { command_buffer_info_count: 2, p_command_buffer_infos: cbs.as_ptr(), ..Default::default() };
         for chain in [std::ptr::from_ref(&boundary), std::ptr::from_ref(&latency)] {
@@ -7567,7 +7799,11 @@ mod tests {
         let cases: [(&str, &dyn Fn(&mut Tracker), Hazard); 5] = [
             ("GENERAL -> GENERAL on the colour input", &|t| t.barrier(cb(2), general_to_general(colour())), Hazard::SameLayoutBarrier),
             ("a queue-family ownership transfer", &|t| t.barrier(cb(2), transfer), Hazard::QueueFamilyTransfer),
-            ("a layout transition", &|t| t.barrier(cb(2), ImageSync { old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, ..ImageSync::to(colour(), GENERAL) }), Hazard::LayoutTransition),
+            (
+                "a layout transition",
+                &|t| t.barrier(cb(2), ImageSync { old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, ..ImageSync::to(colour(), GENERAL) }),
+                Hazard::LayoutTransition,
+            ),
             ("a global memory barrier", &|t| t.global(cb(2), Hazard::MemoryBarrier), Hazard::MemoryBarrier),
             ("an event wait", &|t| t.global(cb(2), Hazard::EventWait), Hazard::EventWait),
         ];
@@ -7886,7 +8122,8 @@ mod tests {
         assert!(colour_candidate(&rgba(vk::ImageUsageFlags::STORAGE)));
 
         let mut t = Tracker::default();
-        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let usage =
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
         for (raw, format, usage) in [
             (0x100, vk::Format::B10G11R11_UFLOAT_PACK32, usage),
             (0x200, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
@@ -7914,7 +8151,13 @@ mod tests {
         }
         let inputs = t.inputs.expect("identified");
         assert_eq!((inputs.colour.0, inputs.colour.1.format), (vk::Image::from_raw(0x100), vk::Format::B10G11R11_UFLOAT_PACK32));
-        t.barrier(cb(2), ImageSync { old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, ..ImageSync::to(vk::Image::from_raw(0x100), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) });
+        t.barrier(
+            cb(2),
+            ImageSync {
+                old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                ..ImageSync::to(vk::Image::from_raw(0x100), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            },
+        );
         let _ = submit(&mut t, &[vec![cb(2)]]);
         t.begin(cb(2));
         t.launch(cb(2), Some(&params));
@@ -8233,7 +8476,11 @@ mod tests {
             let calls = std::cell::Cell::new(0);
             let submit = |_: &[Batch1], _: vk::Fence| {
                 calls.set(calls.get() + 1);
-                if fail.contains(&calls.get()) { vk::Result::ERROR_OUT_OF_DEVICE_MEMORY } else { vk::Result::SUCCESS }
+                if fail.contains(&calls.get()) {
+                    vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                } else {
+                    vk::Result::SUCCESS
+                }
             };
             let mut accepted = Vec::new();
             let result = submit_around(plan(batches.clone(), scan.batch, scan.index), vk::Fence::null(), &submit, |_| false, &mut |part| accepted.extend(part));
@@ -8422,7 +8669,18 @@ mod tests {
         let huge_size = [ptr(1), block.as_ptr().cast(), ptr(2), std::ptr::from_ref(&huge).cast(), ptr(0)];
         assert_eq!(unsafe { launch_params(huge_size.as_ptr(), 1) }, None);
         // No terminator within four pairs: refused, nothing past the ninth entry is read.
-        let endless = [ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast()];
+        let endless = [
+            ptr(1),
+            block.as_ptr().cast(),
+            ptr(1),
+            block.as_ptr().cast(),
+            ptr(1),
+            block.as_ptr().cast(),
+            ptr(1),
+            block.as_ptr().cast(),
+            ptr(1),
+            block.as_ptr().cast(),
+        ];
         assert_eq!(unsafe { launch_params(endless.as_ptr(), 1) }, None);
         // An explicit count that ends between a key and its value: the value is not read (only three
         // entries exist), and the list is refused. Four entries without the terminator are the list.
@@ -8442,7 +8700,15 @@ mod tests {
         for read in [A::TRANSFORM_FEEDBACK_COUNTER_READ_EXT, A::SHADER_STORAGE_READ, A::VIDEO_ENCODE_READ_KHR, A::SHADER_READ | A::TRANSFER_READ] {
             assert!(!after(read).may_follow_a_write(), "{read:?}");
         }
-        for write in [A::SHADER_STORAGE_WRITE, A::VIDEO_DECODE_WRITE_KHR, A::VIDEO_ENCODE_WRITE_KHR, A::OPTICAL_FLOW_WRITE_NV, A::MICROMAP_WRITE_EXT, A::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT, A::MEMORY_WRITE] {
+        for write in [
+            A::SHADER_STORAGE_WRITE,
+            A::VIDEO_DECODE_WRITE_KHR,
+            A::VIDEO_ENCODE_WRITE_KHR,
+            A::OPTICAL_FLOW_WRITE_NV,
+            A::MICROMAP_WRITE_EXT,
+            A::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT,
+            A::MEMORY_WRITE,
+        ] {
             assert!(after(write).may_follow_a_write(), "{write:?}");
         }
     }
@@ -8578,13 +8844,25 @@ mod tests {
             }
         }
         assert_eq!((t.colour_submits, t.foreign_submits, t.evaluations), (40, 80, 40));
-        assert_eq!(t.named, vec![Named::new(img(0x100), img(0x200), img(0x300), Some(img(0x610)))], "the output kernel names the larger output: no same-extent output pair (that is DLAA's)");
+        assert_eq!(
+            t.named,
+            vec![Named::new(img(0x100), img(0x200), img(0x300), Some(img(0x610)))],
+            "the output kernel names the larger output: no same-extent output pair (that is DLAA's)"
+        );
         let ids = identification_lines(&lines);
         assert_eq!(ids.len(), 2, "{lines:#?}");
-        assert!(ids[0].starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT") && ids[0].ends_with("exposure input 0x610; swapchain Some((2560, 1440)); identified by size"), "{}", ids[0]);
+        assert!(
+            ids[0].starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT")
+                && ids[0].ends_with("exposure input 0x610; swapchain Some((2560, 1440)); identified by size"),
+            "{}",
+            ids[0]
+        );
         assert!(ids[1].starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT") && !ids[1].contains("candidates"), "{}", ids[1]);
         assert!(ids[1].ends_with("exposure input 0x610 (named by the same command buffer); swapchain Some((2560, 1440)); identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{}", ids[1]);
-        assert!(lines.iter().all(|l| !l.contains("output-size colour image") && !l.contains("different colour inputs") && !l.contains("several colour candidates")), "{lines:#?}");
+        assert!(
+            lines.iter().all(|l| !l.contains("output-size colour image") && !l.contains("different colour inputs") && !l.contains("several colour candidates")),
+            "{lines:#?}"
+        );
 
         // fg_tracker's own data: FG's first launch is not evidence, its buffers stay forwarded.
         let (mut t, [colour, sr_out, fg_colour, depth, mvec]) = fg_tracker();
@@ -8674,7 +8952,11 @@ mod tests {
         t.launch(cb(2), Some(&param_block(&[h(0x500), h(0x200), h(0x300)])));
         t.launch(cb(2), Some(&param_block(&[h(0x400)])));
         t.launch(cb(3), Some(&param_block(&[h(0x500), h(0x400), h(0x700)])));
-        assert_eq!(t.launch[&cb(2)].input, Some(InputLaunch::Inputs { colour: img(0x500), depth: img(0x200), mvec: img(0x300) }), "FG's launch has SR's shape under DLAA");
+        assert_eq!(
+            t.launch[&cb(2)].input,
+            Some(InputLaunch::Inputs { colour: img(0x500), depth: img(0x200), mvec: img(0x300) }),
+            "FG's launch has SR's shape under DLAA"
+        );
         let mut lines = Vec::new();
         let mut first_held = None;
         for frame in 0..40 {
@@ -8684,7 +8966,10 @@ mod tests {
             match sr.inputs {
                 None => assert!(first_held.is_none(), "frame {frame}: never un-identified"),
                 Some(i) => {
-                    assert_eq!((i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw(), i.rule, i.exposure_input.map(|e| e.0.as_raw())), (0x100, 0x200, 0x300, Rule::Params, Some(0x610)));
+                    assert_eq!(
+                        (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw(), i.rule, i.exposure_input.map(|e| e.0.as_raw())),
+                        (0x100, 0x200, 0x300, Rule::Params, Some(0x610))
+                    );
                     if sr.identified_now {
                         assert!(first_held.is_none());
                     } else {
@@ -8705,7 +8990,11 @@ mod tests {
         assert_eq!(t.colour_submits, 40 - 6, "SR submits reading the colour input from the identifying one on");
         let ids = identification_lines(&lines);
         assert_eq!(ids.len(), 2, "{lines:#?}");
-        assert!(ids[0].starts_with("no DLSS input among 8 registered views (swapchain Some((2560, 1440))); waiting. output: swapchain 2560x1440"), "{}", ids[0]);
+        assert!(
+            ids[0].starts_with("no DLSS input among 8 registered views (swapchain Some((2560, 1440))); waiting. output: swapchain 2560x1440"),
+            "{}",
+            ids[0]
+        );
         assert!(ids[0].contains("2560x1440 not smaller than the output"), "{}", ids[0]);
         assert!(ids[1].starts_with("colour input: image 0x100 (2560x1440 R16G16B16A16_SFLOAT"), "{}", ids[1]);
         assert!(ids[1].ends_with("exposure input 0x610 (named by the same command buffer); swapchain Some((2560, 1440)); identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{}", ids[1]);
@@ -8878,7 +9167,11 @@ mod tests {
         let ids = identification_lines(&lines);
         assert_eq!(ids.len(), 2, "{lines:#?}");
         assert!(ids[0].contains("(first of 2 candidates; others 0x110 1516x852)") && ids[0].ends_with("identified by size"), "{}", ids[0]);
-        assert!(ids[1].starts_with("colour input: image 0x100 (1516x852") && ids[1].contains("(the size rule's other candidates: 0x110 1516x852)"), "{}", ids[1]);
+        assert!(
+            ids[1].starts_with("colour input: image 0x100 (1516x852") && ids[1].contains("(the size rule's other candidates: 0x110 1516x852)"),
+            "{}",
+            ids[1]
+        );
         assert!(ids[1].ends_with("identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{}", ids[1]);
         // A buffer naming only the other candidate is still forwarded and counted.
         t.launch(cb(5), Some(&param_block(&[h(0x110), h(0x400)])));
@@ -8929,7 +9222,10 @@ mod tests {
         for (named, stale) in [(0x110, 0x120), (0x120, 0x110)] {
             let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
             let line = t.refresh().expect("identified by size");
-            assert!(line.starts_with("colour input: image 0x100 (1516x852") && line.contains("(first of 3 candidates; others 0x110 1516x852, 0x120 1516x852)"), "{line}");
+            assert!(
+                line.starts_with("colour input: image 0x100 (1516x852") && line.contains("(first of 3 candidates; others 0x110 1516x852, 0x120 1516x852)"),
+                "{line}"
+            );
             assert!(t.inputs.unwrap().others.iter().flatten().any(|o| o.0 == img(named)));
             // The stale input launch (one frame, a loading screen), then the steady state.
             crimson_frame(&mut t, cb(1), stale);
@@ -8953,13 +9249,19 @@ mod tests {
             }
             let switch = format!("colour input switched to {} (DLSS's input kernel reads it; the size rule had picked 0x100)", hex(img(named)));
             assert_eq!(lines.iter().filter(|l| **l == switch).count(), 1, "{lines:#?}");
-            assert!(lines.iter().any(|l| l.contains("different colour inputs") && l.contains("none chosen")), "the settled evidence alone chooses nothing here: {lines:#?}");
+            assert!(
+                lines.iter().any(|l| l.contains("different colour inputs") && l.contains("none chosen")),
+                "the settled evidence alone chooses nothing here: {lines:#?}"
+            );
             assert_eq!(identified_at, vec![SWITCH_AFTER as usize - 1], "re-identified once, at the switch (that one submit goes to DLSS untouched)");
             let i = t.inputs.unwrap();
             assert_eq!((i.colour.0.as_raw(), i.rule, i.exposure_input.map(|e| e.0.as_raw()), i.exposure_named), (named, Rule::Params, Some(0x610), true));
             let ids = identification_lines(&lines);
             assert!(ids.last().unwrap().starts_with(&format!("colour input: image {} (1516x852", hex(img(named)))), "{ids:#?}");
-            assert!(ids.last().unwrap().ends_with("identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{ids:#?}");
+            assert!(
+                ids.last().unwrap().ends_with("identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"),
+                "{ids:#?}"
+            );
             assert_eq!((t.colour_submits, t.retargeted_submits, t.other_candidate_buffers), (41, 1 + SWITCH_AFTER as u64 - 1, 0));
             assert!(t.alternation.is_none());
         }
@@ -9115,7 +9417,11 @@ mod tests {
         }
         let ids = identification_lines(&lines);
         assert_eq!(ids.len(), 1, "{ids:#?}");
-        assert!(ids[0].starts_with("colour input: image 0x110 (1516x852") && ids[0].contains("(the size rule's other candidates: 0x100 1516x852, 0x120 1516x852)"), "{}", ids[0]);
+        assert!(
+            ids[0].starts_with("colour input: image 0x110 (1516x852") && ids[0].contains("(the size rule's other candidates: 0x100 1516x852, 0x120 1516x852)"),
+            "{}",
+            ids[0]
+        );
         assert!(lines.iter().all(|l| !l.contains("switched")), "{lines:#?}");
         assert_eq!((t.colour_submits, t.retargeted_submits), (20, 0));
     }
@@ -9474,7 +9780,12 @@ mod tests {
     /// `rr2_*` never stop a hold.
     #[test]
     fn super_resolution_is_held_whatever_its_kernels_are_called() {
-        for input in ["hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", "cuda_engine_input_kernel_rel_hdr_mvdiff_mvlo", "rrlite_enc0_4x4_mvlo_hdr_folded", "some_future_input_kernel"] {
+        for input in [
+            "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel",
+            "cuda_engine_input_kernel_rel_hdr_mvdiff_mvlo",
+            "rrlite_enc0_4x4_mvlo_hdr_folded",
+            "some_future_input_kernel",
+        ] {
             let mut t = gta_with(input);
             let (first_held, lines) = run_frames(&mut t, 20);
             assert_eq!(first_held, Some(1), "{input}: held from the frame after the identification");
@@ -9520,7 +9831,11 @@ mod tests {
 
     #[test]
     fn a_dump_writes_raw_files_a_sidecar_and_a_preview() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(format!("target/test-scratch/preupscale-dump-{}", std::process::id()));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .join(format!("target/test-scratch/preupscale-dump-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (w, h) = (3u32, 1u32);
         let colour = vec![0u8; (4 * 2 * TEXEL) as usize];
@@ -9537,13 +9852,27 @@ mod tests {
         let files = frame.write(&dir).unwrap();
         assert_eq!(files, vec!["colour.rgba16f", "depth.r32f", "mvec.rg16f", "colour-preview.png", "meta.json"], "no exposure.json without candidates");
         let meta = std::fs::read_to_string(dir.join("meta.json")).unwrap();
-        for needle in ["\"width\": 3", "\"height\": 1", "\"padded_width\": 4", "\"padded_height\": 2", "\"frame\": 42", "D32_SFLOAT_S8_UINT", "\"mvec_scale\": [0.5, 0.75]"] {
+        for needle in [
+            "\"width\": 3",
+            "\"height\": 1",
+            "\"padded_width\": 4",
+            "\"padded_height\": 2",
+            "\"frame\": 42",
+            "D32_SFLOAT_S8_UINT",
+            "\"mvec_scale\": [0.5, 0.75]",
+        ] {
             assert!(meta.contains(needle), "{needle} in {meta}");
         }
         let rgba32: Vec<u8> = [0.5f32, 2.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
         frame.exposure = vec![
             ExposureValue { image: 0x600, format: vk::Format::R32G32B32A32_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), assumed: true, bytes: Some(rgba32) },
-            ExposureValue { image: 0x610, format: vk::Format::R16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), assumed: false, bytes: Some(vec![0x00, 0x3c]) },
+            ExposureValue {
+                image: 0x610,
+                format: vk::Format::R16_SFLOAT,
+                layout: Some(vk::ImageLayout::GENERAL),
+                assumed: false,
+                bytes: Some(vec![0x00, 0x3c]),
+            },
             ExposureValue { image: 0x620, format: vk::Format::R16_SFLOAT, layout: None, assumed: false, bytes: None },
         ];
         let files = frame.write(&dir).unwrap();
@@ -9578,17 +9907,21 @@ mod tests {
         fn supports(&self, format: vk::Format, usage: vk::ImageUsageFlags) -> bool {
             // SAFETY: a plain property query on this instance's physical device.
             unsafe {
-                self.instance.get_physical_device_image_format_properties(self.physical, format, vk::ImageType::TYPE_2D, vk::ImageTiling::OPTIMAL, usage, vk::ImageCreateFlags::empty())
+                self.instance.get_physical_device_image_format_properties(
+                    self.physical,
+                    format,
+                    vk::ImageType::TYPE_2D,
+                    vk::ImageTiling::OPTIMAL,
+                    usage,
+                    vk::ImageCreateFlags::empty(),
+                )
             }
             .is_ok()
         }
 
         fn open(import: bool) -> Option<Self> {
-            let (entry, instance, physical, device, queue, family) = if import {
-                crate::composition::gpu::test_device_with_external_memory_host()?
-            } else {
-                crate::composition::gpu::test_device()?
-            };
+            let (entry, instance, physical, device, queue, family) =
+                if import { crate::composition::gpu::test_device_with_external_memory_host()? } else { crate::composition::gpu::test_device()? };
             let info = vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
             let pool = unsafe { device.create_command_pool(&info, None) }.unwrap();
             Some(Self { instance, physical, device, queue, family, pool, _entry: entry })
@@ -9624,7 +9957,9 @@ mod tests {
             let reqs = unsafe { d.get_image_memory_requirements(image) };
             let props = unsafe { self.instance.get_physical_device_memory_properties(self.physical) };
             let index = (0..props.memory_type_count)
-                .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+                .find(|&i| {
+                    reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                })
                 .unwrap();
             let memory = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None) }.unwrap();
             unsafe { d.bind_image_memory(image, memory, 0) }.unwrap();
@@ -9640,8 +9975,24 @@ mod tests {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
-                .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 });
-            unsafe { d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[b]) };
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[b],
+                )
+            };
         }
 
         /// Uploads `bytes` (tightly packed RGBA16F) and leaves the image in GENERAL, like DLSS's input.
@@ -9651,7 +10002,8 @@ mod tests {
             let d = &self.device;
             self.one_shot(|cmd| {
                 Self::barrier(cmd, d, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-                let region = vk::BufferImageCopy { image_subresource: colour_layers(), image_extent: vk::Extent3D { width, height, depth: 1 }, ..Default::default() };
+                let region =
+                    vk::BufferImageCopy { image_subresource: colour_layers(), image_extent: vk::Extent3D { width, height, depth: 1 }, ..Default::default() };
                 unsafe { d.cmd_copy_buffer_to_image(cmd, staging.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]) };
                 Self::barrier(cmd, d, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL);
             });
@@ -9664,11 +10016,32 @@ mod tests {
             let d = &self.device;
             self.one_shot(|cmd| {
                 let open = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-                unsafe { d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[open], &[], &[]) };
-                let region = vk::BufferImageCopy { image_subresource: colour_layers(), image_extent: vk::Extent3D { width, height, depth: 1 }, ..Default::default() };
+                unsafe {
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[open],
+                        &[],
+                        &[],
+                    )
+                };
+                let region =
+                    vk::BufferImageCopy { image_subresource: colour_layers(), image_extent: vk::Extent3D { width, height, depth: 1 }, ..Default::default() };
                 unsafe { d.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, staging.buffer, &[region]) };
                 let to_host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
-                unsafe { d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[to_host], &[], &[]) };
+                unsafe {
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &[to_host],
+                        &[],
+                        &[],
+                    )
+                };
             });
             let out = unsafe { std::slice::from_raw_parts(staging.ptr, n) }.to_vec();
             unsafe { staging.destroy(d) };
@@ -9787,11 +10160,11 @@ mod tests {
 
     fn scratch_shm(tag: &str) -> ScratchShm {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .unwrap()
-            .join(format!("target/test-scratch/preupscale-{}-{tag}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(format!(
+            "target/test-scratch/preupscale-{}-{tag}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut shm = ShmClient::default();
         assert!(shm.test_open_at(&dir.join("shm.bin").display().to_string()));
         ScratchShm { shm, dir }
@@ -9891,12 +10264,20 @@ mod tests {
 
         fn srgb_oetf(c: f64) -> f64 {
             let c = c.clamp(0.0, 1.0);
-            if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+            if c <= 0.0031308 {
+                12.92 * c
+            } else {
+                1.055 * c.powf(1.0 / 2.4) - 0.055
+            }
         }
 
         fn srgb_eotf(s: f64) -> f64 {
             let s = s.clamp(0.0, 1.0);
-            if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
         }
 
         /// scene-linear -> model domain: `max(scene, 0) * e / w`, the shoulder above 0.75, sRGB.
@@ -10013,7 +10394,8 @@ mod tests {
         let index = (0..32).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
         let memory = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None) }.unwrap();
         unsafe { d.bind_image_memory(image, memory, 0) }.unwrap();
-        let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+        let range =
+            vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
         gpu.one_shot(|cmd| unsafe {
             Gpu::barrier(cmd, d, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL);
             d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [value, 0.0, 0.0, 0.0] }, &[range]);
@@ -10065,7 +10447,19 @@ mod tests {
             let shm = scratch_shm(if import { "rt-import" } else { "rt-staged" });
             let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, import) }.expect("resources");
             let white = 2.5;
-            let target = Target { colour: image, width: w, height: h, depth: None, depth_buffer: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
+            let target = Target {
+                colour: image,
+                width: w,
+                height: h,
+                depth: None,
+                depth_buffer: None,
+                mvec: None,
+                mvec_scale: [1.0, 1.0],
+                exposure: [None; MAX_EXPOSURE],
+                exposure_input: exposure_aux(exposure),
+                paper_white: white,
+                identification: 1,
+            };
             let (device, queue) = (&gpu.device, gpu.queue);
             let mut submits = Vec::new();
             let mut submit = |which: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
@@ -10162,7 +10556,19 @@ mod tests {
             submits.push(which);
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
         };
-        let base = Target { colour: image, width: w, height: h, depth: None, depth_buffer: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification: 1 };
+        let base = Target {
+            colour: image,
+            width: w,
+            height: h,
+            depth: None,
+            depth_buffer: None,
+            mvec: None,
+            mvec_scale: [1.0, 1.0],
+            exposure: [None; MAX_EXPOSURE],
+            exposure_input: None,
+            paper_white: hdr::DEFAULT_PAPER_WHITE,
+            identification: 1,
+        };
         {
             let target = Target { exposure_input: exposure_aux(zero), ..base };
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut submit) };
@@ -10220,10 +10626,28 @@ mod tests {
             gpu.one_shot(|cmd| unsafe {
                 d.cmd_fill_buffer(cmd, pass.exposure_buffer(), 0, 4, u32::from(f32_to_f16(e)));
                 let open = [pass.encoded_to_general(), pass.answer_to_general()];
-                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &open);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &open,
+                );
                 pass.record_encode(d, cmd, None, white);
-                let encoded = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[encoded], &[], &[]);
+                let encoded = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[encoded],
+                    &[],
+                    &[],
+                );
                 pass.record_decode(d, cmd, source.buffer, white, None);
             });
             (gpu.read(image, w, h), gpu.read(pass.encoded_image(), pw, ph))
@@ -10415,7 +10839,19 @@ mod tests {
 
     /// Runs one auto-exposure hold (roundtrip mode, no exposure image) on `texels` and returns it.
     fn auto_hold(gpu: &Gpu, res: &mut Resources, image: vk::Image, w: u32, h: u32, identification: u64) -> HoldResult {
-        let target = Target { colour: image, width: w, height: h, depth: None, depth_buffer: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification };
+        let target = Target {
+            colour: image,
+            width: w,
+            height: h,
+            depth: None,
+            depth_buffer: None,
+            mvec: None,
+            mvec_scale: [1.0, 1.0],
+            exposure: [None; MAX_EXPOSURE],
+            exposure_input: None,
+            paper_white: hdr::DEFAULT_PAPER_WHITE,
+            identification,
+        };
         let (device, queue) = (&gpu.device, gpu.queue);
         let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
@@ -10506,11 +10942,16 @@ mod tests {
         for scale in [1.0f32, 8.0] {
             let original: Vec<u8> = {
                 let base = hdr_pattern(w, h);
-                base.as_chunks::<2>().0.iter().enumerate().flat_map(|(i, b)| {
-                    let v = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
-                    let v = if i % 4 == 3 { v } else { v * scale };
-                    f32_to_f16(v).to_le_bytes()
-                }).collect()
+                base.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, b)| {
+                        let v = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                        let v = if i % 4 == 3 { v } else { v * scale };
+                        f32_to_f16(v).to_le_bytes()
+                    })
+                    .collect()
             };
             gpu.upload(image, w, h, &original);
             let result = auto_hold(&gpu, &mut res, image, w, h, 1);
@@ -10656,15 +11097,38 @@ mod tests {
         };
         let all = vk::PipelineStageFlags::ALL_COMMANDS;
         gpu.one_shot(|cmd| unsafe {
-            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL)]);
-            d.cmd_clear_depth_stencil_image(cmd, depth, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearDepthStencilValue { depth: 0.75, stencil: 3 }, &[ds_range]);
-            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)]);
+            d.cmd_pipeline_barrier(
+                cmd,
+                all,
+                all,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to(vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL)],
+            );
+            d.cmd_clear_depth_stencil_image(
+                cmd,
+                depth,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearDepthStencilValue { depth: 0.75, stencil: 3 },
+                &[ds_range],
+            );
+            d.cmd_pipeline_barrier(
+                cmd,
+                all,
+                all,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)],
+            );
         });
         let shm = scratch_shm("depth-copy");
         let mut res = unsafe { Resources::build(d, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
         let texels = (w * h) as usize;
         let host = |bytes: usize| own_host_buffer(d, &gpu.instance, gpu.physical, bytes as u64).expect("host buffer");
-        let (depth_copy, before, after, mvec_src, mvec_back, depth_back) = (host(texels * 4), host(texels * 8), host(texels * 8), host(texels * 4), host(texels * 4), host(texels * 4));
+        let (depth_copy, before, after, mvec_src, mvec_back, depth_back) =
+            (host(texels * 4), host(texels * 8), host(texels * 8), host(texels * 4), host(texels * 4), host(texels * 4));
         let fill = |b: &HostBuffer, bytes: usize, v: u8| unsafe { std::ptr::write_bytes(b.ptr, v, bytes) };
         let read = |b: &HostBuffer, bytes: usize| unsafe { std::slice::from_raw_parts(b.ptr, bytes) }.to_vec();
         fill(&depth_copy, texels * 4, 0xaa);
@@ -10683,7 +11147,8 @@ mod tests {
             identification: 1,
         };
         let run = |res: &Resources, target: &Target, cache: Option<&CacheCopies>| unsafe {
-            record_capture(d, res, target, None, None, Some(res.proxy.buffer), None, Some((depth_copy.buffer, None)), cache.map(|c| c.colour), None, None).unwrap();
+            record_capture(d, res, target, None, None, Some(res.proxy.buffer), None, Some((depth_copy.buffer, None)), cache.map(|c| c.colour), None, None)
+                .unwrap();
             record_writeback(d, res, target, res.proxy.buffer, None, cache, None, None).unwrap();
             let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
             d.queue_submit(gpu.queue, &[vk::SubmitInfo::default().command_buffers(&[res.capture_cmd, res.writeback_cmd])], fence).unwrap();
@@ -10693,7 +11158,12 @@ mod tests {
         // Not readable: the depth copy is left alone.
         run(&res, &Target { depth: Some(Aux { readable: false, ..readable.depth.unwrap() }), ..readable }, None);
         assert!(read(&depth_copy, texels * 4).iter().all(|&b| b == 0xaa), "an unreadable depth is copied");
-        let cache = CacheCopies { colour: before.buffer, answer: after.buffer, mvec: Some((mvec_src.buffer, mvec_back.buffer)), depth: Some((depth_copy.buffer, depth_back.buffer)) };
+        let cache = CacheCopies {
+            colour: before.buffer,
+            answer: after.buffer,
+            mvec: Some((mvec_src.buffer, mvec_back.buffer)),
+            depth: Some((depth_copy.buffer, depth_back.buffer)),
+        };
         run(&res, &readable, Some(&cache));
         let quarter: Vec<u8> = (0..texels).flat_map(|_| 0.75f32.to_le_bytes()).collect();
         assert_eq!(read(&depth_copy, texels * 4), quarter, "the depth aspect as float32");
@@ -10704,7 +11174,15 @@ mod tests {
         assert_eq!(read(&depth_back, texels * 4), quarter);
         // The depth is back in its layout (validation checks this use).
         gpu.one_shot(|cmd| unsafe {
-            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::GENERAL)]);
+            d.cmd_pipeline_barrier(
+                cmd,
+                all,
+                all,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::GENERAL)],
+            );
         });
         let mut gpu_ms = None;
         assert!(res.wait_idle(d, &mut gpu_ms));
@@ -10763,7 +11241,8 @@ mod tests {
         let make = |format: vk::Format, usage: vk::ImageUsageFlags| make_sized(format, usage, (w, h));
         let (exp32, exp32_mem) = make_sized(vk::Format::R32G32B32A32_SFLOAT, vk::ImageUsageFlags::STORAGE, (1, 1)).expect("1x1 RGBA32F image");
         let (exp16, exp16_mem) = make_sized(vk::Format::R16_SFLOAT, vk::ImageUsageFlags::SAMPLED, (1, 1)).expect("1x1 R16F image");
-        let (depth, depth_mem) = make(depth_format, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT).expect("a D32_SFLOAT_S8_UINT image, which the device supports");
+        let (depth, depth_mem) =
+            make(depth_format, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT).expect("a D32_SFLOAT_S8_UINT image, which the device supports");
         let (mvec, mvec_mem) = make(vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT).expect("RG16F image");
         let ds_range = aux_range(depth_format);
         let colour_range = aux_range(vk::Format::R16G16_SFLOAT);
@@ -10780,20 +11259,42 @@ mod tests {
         };
         let all = vk::PipelineStageFlags::ALL_COMMANDS;
         gpu.one_shot(|cmd| unsafe {
-            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[
-                to(depth, ds_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
-                to(mvec, colour_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL),
-                to(exp32, colour_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL),
-                to(exp16, colour_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
-            ]);
+            d.cmd_pipeline_barrier(
+                cmd,
+                all,
+                all,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[
+                    to(depth, ds_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                    to(mvec, colour_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL),
+                    to(exp32, colour_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL),
+                    to(exp16, colour_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                ],
+            );
             d.cmd_clear_color_image(cmd, exp32, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [0.5, 2.0, 0.0, 1.0] }, &[colour_range]);
             d.cmd_clear_color_image(cmd, exp16, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: [3.0, 0.0, 0.0, 0.0] }, &[colour_range]);
-            d.cmd_clear_depth_stencil_image(cmd, depth, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearDepthStencilValue { depth: 0.25, stencil: 7 }, &[ds_range]);
+            d.cmd_clear_depth_stencil_image(
+                cmd,
+                depth,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearDepthStencilValue { depth: 0.25, stencil: 7 },
+                &[ds_range],
+            );
             d.cmd_clear_color_image(cmd, mvec, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [1.0, -2.0, 0.0, 0.0] }, &[colour_range]);
-            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[
-                to(depth, ds_range, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
-                to(exp16, colour_range, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            ]);
+            d.cmd_pipeline_barrier(
+                cmd,
+                all,
+                all,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[
+                    to(depth, ds_range, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+                    to(exp16, colour_range, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                ],
+            );
         });
         let shm = scratch_shm("dump");
         let mut res = unsafe { Resources::build(d, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
@@ -10836,17 +11337,34 @@ mod tests {
         assert!(mv.as_chunks::<4>().0.iter().all(|v| *v == [0x00, 0x3c, 0x00, 0xc0]), "RG16F (1, -2)");
         assert_eq!(frame.exposure.len(), 3, "one entry per candidate");
         let rgba32: Vec<u8> = [0.5f32, 2.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
-        assert_eq!(frame.exposure[0], ExposureValue { image: exp32.as_raw(), format: vk::Format::R32G32B32A32_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), assumed: true, bytes: Some(rgba32) });
+        assert_eq!(
+            frame.exposure[0],
+            ExposureValue {
+                image: exp32.as_raw(),
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                layout: Some(vk::ImageLayout::GENERAL),
+                assumed: true,
+                bytes: Some(rgba32)
+            }
+        );
         assert_eq!(frame.exposure[1].bytes.as_deref(), Some(&[0x00, 0x42][..]), "R16F 3.0, read through a transition");
         assert_eq!(frame.exposure[1].layout, Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
         assert_eq!((frame.exposure[2].layout, frame.exposure[2].bytes.as_ref()), (None, None), "no layout known, not read");
         assert_eq!(gpu.read(image, w, h), original, "the colour input is untouched");
         // The depth and R16F images are back in their layouts (validation checks this use).
         gpu.one_shot(|cmd| unsafe {
-            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[
-                to(depth, ds_range, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::GENERAL),
-                to(exp16, colour_range, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::GENERAL),
-            ]);
+            d.cmd_pipeline_barrier(
+                cmd,
+                all,
+                all,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[
+                    to(depth, ds_range, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::GENERAL),
+                    to(exp16, colour_range, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::GENERAL),
+                ],
+            );
         });
         let mut gpu_ms = None;
         assert!(res.wait_idle(d, &mut gpu_ms));

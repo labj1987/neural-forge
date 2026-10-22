@@ -123,15 +123,18 @@ mod tests {
         let header = ShmHeader::default();
         header.init_defaults();
         let id = neural_forge_protocol::capture::request(&header, 1).unwrap();
-        neural_forge_protocol::capture::publish(&header, &neural_forge_protocol::capture::Outcome {
-            id: 9,
-            state: neural_forge_protocol::capture::state::WRITTEN,
-            done: 1,
-            total: 1,
-            composed: 1,
-            paths: "/c/1-original.png\n/c/1-composited.png".into(),
-            ..Default::default()
-        });
+        neural_forge_protocol::capture::publish(
+            &header,
+            &neural_forge_protocol::capture::Outcome {
+                id: 9,
+                state: neural_forge_protocol::capture::state::WRITTEN,
+                done: 1,
+                total: 1,
+                composed: 1,
+                paths: "/c/1-original.png\n/c/1-composited.png".into(),
+                ..Default::default()
+            },
+        );
         header.preupscale_dump_request.store(16, Ordering::Relaxed);
         header.cache_refresh_holds.store(30, Ordering::Relaxed);
         header.cache_cached_holds.store(29, Ordering::Relaxed);

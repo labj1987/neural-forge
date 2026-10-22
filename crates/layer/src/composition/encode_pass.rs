@@ -58,10 +58,7 @@ impl EncodePass {
         // SAFETY: `layout_info` is valid.
         let descriptor_set_layout = unsafe { device.create_descriptor_set_layout(&layout_info, None) }.ok()?;
 
-        let push_range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(std::mem::size_of::<EncodePush>() as u32);
+        let push_range = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(std::mem::size_of::<EncodePush>() as u32);
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&push_range));
@@ -98,10 +95,7 @@ impl EncodePass {
             }
         };
         let entry = std::ffi::CString::new("main").unwrap();
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
-            .name(&entry);
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(&entry);
         let pipeline_info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout);
         // SAFETY: `pipeline_info` is valid; `module`/`pipeline_layout` outlive the call.
         let pipeline = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&pipeline_info), None) };
@@ -141,9 +135,8 @@ impl EncodePass {
     /// image (see [`EncodePush::bgr_order`] for why the view's format is fixed even
     /// when the image's is BGRA).
     pub fn allocate_set(&self, device: &ash::Device, view: vk::ImageView) -> Option<vk::DescriptorSet> {
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
+        let alloc_info =
+            vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.descriptor_pool).set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
         // SAFETY: `alloc_info` names this pass's own pool and layout.
         let set = unsafe { device.allocate_descriptor_sets(&alloc_info) }.ok()?.first().copied()?;
         let image_info = vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL);
@@ -172,15 +165,7 @@ impl EncodePass {
     /// # Safety
     /// `cmd` is recording; `set` is this pass's own and points at an image of exactly
     /// `width`x`height`.
-    pub unsafe fn record(
-        &self,
-        device: &ash::Device,
-        cmd: vk::CommandBuffer,
-        set: vk::DescriptorSet,
-        width: u32,
-        height: u32,
-        push: EncodePush,
-    ) {
+    pub unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, set: vk::DescriptorSet, width: u32, height: u32, push: EncodePush) {
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
         device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, std::slice::from_ref(&set), &[]);
         let bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<EncodePush>());

@@ -68,7 +68,11 @@ pub(crate) fn motion() -> Motion {
     static MOTION: LazyLock<Motion> = LazyLock::new(|| match parse_motion(neural_forge_protocol::env::var(MOTION_ENV).as_deref()) {
         Ok(Motion::None) => Motion::None,
         Ok(m) => {
-            crate::log!("[native] after the upscaler: history with {} ({MOTION_ENV}), rejection above {} ({REJECT_ENV})", if m == Motion::Zero { "zero motion" } else { "the optical flow" }, reject());
+            crate::log!(
+                "[native] after the upscaler: history with {} ({MOTION_ENV}), rejection above {} ({REJECT_ENV})",
+                if m == Motion::Zero { "zero motion" } else { "the optical flow" },
+                reject()
+            );
             m
         }
         Err(other) => {
@@ -211,10 +215,14 @@ impl SlotHistory {
 /// Logs a reset of the after-the-upscaler history.
 pub(crate) fn note_reset(reset: Reset) {
     match reset {
-        Reset::Stale(Stale::Skipped) => crate::log!("[native] after the upscaler: resetting the history (requests went unanswered by the network since the last frame)"),
+        Reset::Stale(Stale::Skipped) => {
+            crate::log!("[native] after the upscaler: resetting the history (requests went unanswered by the network since the last frame)")
+        }
         Reset::Stale(Stale::Idle(gap)) => crate::log!("[native] after the upscaler: resetting the history ({} ms since the last frame)", gap.as_millis()),
         Reset::Stale(Stale::FormatChanged) => crate::log!("[native] after the upscaler: resetting the history (another size or format)"),
-        Reset::Stale(Stale::SceneCut(mean)) => crate::log!("[native] after the upscaler: resetting the history (scene cut: the picture's luma changed by {mean} of 255 on average)"),
+        Reset::Stale(Stale::SceneCut(mean)) => {
+            crate::log!("[native] after the upscaler: resetting the history (scene cut: the picture's luma changed by {mean} of 255 on average)")
+        }
         Reset::Network => crate::log!("[native] after the upscaler: resetting the history (the network was built again)"),
     }
 }

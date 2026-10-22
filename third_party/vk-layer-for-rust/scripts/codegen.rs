@@ -39,9 +39,16 @@ fn toolchain() -> String {
         .args(["show", "active-toolchain"])
         .output()
         .expect("Could not spawn `rustup` command");
-    assert!(output.status.success(), "`rustup show active-toolchain` failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "`rustup show active-toolchain` failed: {:?}",
+        output
+    );
     let line = String::from_utf8(output.stdout).expect("rustup's output is not valid `utf-8`");
-    line.split_whitespace().next().expect("rustup named no toolchain").to_owned()
+    line.split_whitespace()
+        .next()
+        .expect("rustup named no toolchain")
+        .to_owned()
 }
 
 fn create_file_all(path: impl AsRef<Path>) -> io::Result<File> {

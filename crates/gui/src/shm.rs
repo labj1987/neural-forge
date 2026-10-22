@@ -11,8 +11,8 @@
 //! against upstream DLSS5VKLayer's real, installed `config.ini` on 2026-09-10, which
 //! persists the equivalent of every one of these fields.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use neural_forge_protocol::mapping::Mapping;
 

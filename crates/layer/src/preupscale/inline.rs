@@ -325,7 +325,12 @@ impl Inline {
     /// The hold inside DLSS's buffers on `device`, whose buffers run on `app_family`; `outstanding` counts the
     /// holds recorded and not yet released (shared with the network's loader).
     pub(crate) fn new(
-        device: Arc<ash::Device>, instance: &ash::Instance, physical_device: vk::PhysicalDevice, app_family: u32, outstanding: Arc<AtomicUsize>, restore: super::restore::Fns,
+        device: Arc<ash::Device>,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        app_family: u32,
+        outstanding: Arc<AtomicUsize>,
+        restore: super::restore::Fns,
     ) -> Arc<Self> {
         // SAFETY: `physical_device` is the device's own.
         let memory = unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -360,7 +365,9 @@ impl Inline {
             restore: Arc::new(super::restore::Tracker::new(restore)),
         });
         lock(&INLINES).insert(device.handle(), inline.clone());
-        crate::log!("[preupscale] hold inside DLSS's command buffer available: recorded into it, on family {app_family} (NEURAL_FORGE_INLINE=off turns it off)");
+        crate::log!(
+            "[preupscale] hold inside DLSS's command buffer available: recorded into it, on family {app_family} (NEURAL_FORGE_INLINE=off turns it off)"
+        );
         crate::logging::flush();
         inline
     }
@@ -664,7 +671,8 @@ impl Inline {
             if !self.restore.with(cb, |s| s.complete()) {
                 return Recorded::Skipped;
             }
-            let unrestorable = self.restore.with(cb, |s| s.unrestorable().or(s.needs_missing(&self.restore.fns).then_some("a binding command the layer cannot repeat")));
+            let unrestorable =
+                self.restore.with(cb, |s| s.unrestorable().or(s.needs_missing(&self.restore.fns).then_some("a binding command the layer cannot repeat")));
             if let Some(why) = unrestorable {
                 self.say_once(format!("a DLSS buffer is not held inside: its compute state cannot be put back after the hold ({why})"));
                 return Recorded::Skipped;
@@ -715,7 +723,9 @@ impl Inline {
         // What is copied beside the colour input, from where it can be read.
         let exposure = point
             .exposure_input
-            .filter(|a| a.readable && a.format == vk::Format::R16_SFLOAT && matches!(a.layout, Some(vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL)))
+            .filter(|a| {
+                a.readable && a.format == vk::Format::R16_SFLOAT && matches!(a.layout, Some(vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL))
+            })
             .map(|a| (a.image, a.layout.unwrap_or(vk::ImageLayout::GENERAL)));
         let mvec = point
             .mvec_input
@@ -725,7 +735,12 @@ impl Inline {
         let held = InlinePoint {
             colour: staging.colour,
             layout: vk::ImageLayout::GENERAL,
-            exposure_input: exposure.map(|_| Aux { image: staging.exposure, format: vk::Format::R16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
+            exposure_input: exposure.map(|_| Aux {
+                image: staging.exposure,
+                format: vk::Format::R16_SFLOAT,
+                layout: Some(vk::ImageLayout::GENERAL),
+                readable: true,
+            }),
             // The copy is at the colour input's extent; the source's extent stays (the vectors' unit,
             // `InlinePoint::mvec_scale`).
             mvec_input: mvec.map(|_| Aux { image: staging.mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
@@ -777,7 +792,13 @@ impl Inline {
                 self.say_once(format!(
                     "holding inside DLSS's command buffer, {} ({:?} in {:?}{}; why not the split: {:?}; motion vectors {})",
                     match stage {
-                        Stage::Upscaled => format!("right after its output kernel, on its {}x{} output (passes {}-{})", extent.0, extent.1, point.hold.upscaled.0 + 1, point.hold.upscaled.1),
+                        Stage::Upscaled => format!(
+                            "right after its output kernel, on its {}x{} output (passes {}-{})",
+                            extent.0,
+                            extent.1,
+                            point.hold.upscaled.0 + 1,
+                            point.hold.upscaled.1
+                        ),
                         _ => "right before its first launch that reads the colour input".to_string(),
                     },
                     point.desc.format,
@@ -911,8 +932,10 @@ impl Inline {
                 let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
                 let index = (0..self.memory.memory_type_count)
                     .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.memory.memory_types[i as usize].property_flags.contains(host));
-                let memory = index.and_then(|i| d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(i), None).ok());
-                let ptr = memory.and_then(|m| d.bind_buffer_memory(buffer, m, 0).and_then(|()| d.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())).ok());
+                let memory =
+                    index.and_then(|i| d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(i), None).ok());
+                let ptr =
+                    memory.and_then(|m| d.bind_buffer_memory(buffer, m, 0).and_then(|()| d.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())).ok());
                 match (memory, ptr) {
                     (Some(m), Some(p)) => {
                         std::ptr::write_bytes(p.cast::<u8>(), 0, READBACK_BYTES as usize);
@@ -1011,15 +1034,20 @@ impl Inline {
             return None;
         }
         let d = &self.device;
-        let info = vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let info = vk::BufferCreateInfo::default()
+            .size(bytes)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: valid create info on a live device.
         let buffer = unsafe { d.create_buffer(&info, None) }.ok()?;
         // SAFETY: just created.
         let reqs = unsafe { d.get_buffer_memory_requirements(buffer) };
-        let index = (0..self.memory.memory_type_count)
-            .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.memory.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL));
+        let index = (0..self.memory.memory_type_count).find(|&i| {
+            reqs.memory_type_bits & (1 << i) != 0 && self.memory.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        });
         // SAFETY: valid allocate info.
-        let memory = index.and_then(|index| unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None) }.ok());
+        let memory = index
+            .and_then(|index| unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None) }.ok());
         // SAFETY: a fresh buffer and an allocation of its required size and type.
         match memory.filter(|&m| unsafe { d.bind_buffer_memory(buffer, m, 0) }.is_ok()) {
             Some(memory) => Some((buffer, memory)),
@@ -1075,7 +1103,11 @@ impl Inline {
             .or_else(|| (0..self.memory.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0));
         let alloc = index.map(|index| vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index));
         // SAFETY: valid allocate info.
-        let memory = alloc.and_then(|a| unsafe { d.allocate_memory(&a, None) }.inspect_err(|e| crate::log!("[preupscale] staging image: vkAllocateMemory of {} bytes failed ({e:?})", reqs.size)).ok());
+        let memory = alloc.and_then(|a| {
+            unsafe { d.allocate_memory(&a, None) }
+                .inspect_err(|e| crate::log!("[preupscale] staging image: vkAllocateMemory of {} bytes failed ({e:?})", reqs.size))
+                .ok()
+        });
         // SAFETY: a fresh image and an allocation of its required size and type.
         match memory.filter(|&m| unsafe { d.bind_image_memory(image, m, 0) }.is_ok()) {
             Some(memory) => Some((image, memory)),
@@ -1115,7 +1147,14 @@ impl Meta {
 }
 
 /// The barrier of `range` of `image` from `old` to `new`.
-fn image_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags, range: vk::ImageSubresourceRange) -> vk::ImageMemoryBarrier<'static> {
+fn image_barrier(
+    image: vk::Image,
+    old: vk::ImageLayout,
+    new: vk::ImageLayout,
+    src: vk::AccessFlags,
+    dst: vk::AccessFlags,
+    range: vk::ImageSubresourceRange,
+) -> vk::ImageMemoryBarrier<'static> {
     vk::ImageMemoryBarrier::default()
         .old_layout(old)
         .new_layout(new)
@@ -1127,8 +1166,10 @@ fn image_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, s
         .subresource_range(range)
 }
 
-const COLOUR_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
-const COLOUR_LAYERS: vk::ImageSubresourceLayers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+const COLOUR_RANGE: vk::ImageSubresourceRange =
+    vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+const COLOUR_LAYERS: vk::ImageSubresourceLayers =
+    vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
 
 /// The copies recorded into the application's buffer at the start of a hold: the colour input (`colour`: the
 /// image, its layout there, and whether it is converted (blitted) rather than copied: an R11G11B10 colour
@@ -1143,8 +1184,13 @@ const COLOUR_LAYERS: vk::ImageSubresourceLayers = vk::ImageSubresourceLayers { a
 /// and has the usage its transfers need; `staging` is RGBA16F of the colour input's extent.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn record_copy_in(
-    d: &ash::Device, cb: vk::CommandBuffer, (colour, layout, convert): (vk::Image, vk::ImageLayout, bool), staging: vk::Image, extent: (u32, u32),
-    exposure: Option<(vk::Image, vk::ImageLayout, vk::Image)>, mvec: Option<(vk::Image, vk::ImageLayout, vk::Image, (u32, u32))>,
+    d: &ash::Device,
+    cb: vk::CommandBuffer,
+    (colour, layout, convert): (vk::Image, vk::ImageLayout, bool),
+    staging: vk::Image,
+    extent: (u32, u32),
+    exposure: Option<(vk::Image, vk::ImageLayout, vk::Image)>,
+    mvec: Option<(vk::Image, vk::ImageLayout, vk::Image, (u32, u32))>,
     depth: Option<(vk::Image, vk::ImageLayout, vk::Format, vk::Buffer)>,
 ) {
     let region = vk::ImageCopy {
@@ -1155,13 +1201,22 @@ pub(crate) unsafe fn record_copy_in(
         extent: vk::Extent3D { width: extent.0, height: extent.1, depth: 1 },
     };
     let far = vk::Offset3D { x: extent.0 as i32, y: extent.1 as i32, z: 1 };
-    let blit = vk::ImageBlit { src_subresource: COLOUR_LAYERS, src_offsets: [vk::Offset3D::default(), far], dst_subresource: COLOUR_LAYERS, dst_offsets: [vk::Offset3D::default(), far] };
+    let blit = vk::ImageBlit {
+        src_subresource: COLOUR_LAYERS,
+        src_offsets: [vk::Offset3D::default(), far],
+        dst_subresource: COLOUR_LAYERS,
+        dst_offsets: [vk::Offset3D::default(), far],
+    };
     let general = layout == vk::ImageLayout::GENERAL;
     let read_layout = if general { vk::ImageLayout::GENERAL } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
     // Everything the buffer wrote before this point (the frame, rendered in this same buffer) is visible to
     // the copies; the staging images' old contents are not needed.
-    let open = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
-    let fresh = |image| image_barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE, COLOUR_RANGE);
+    let open = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+    let fresh = |image| {
+        image_barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE, COLOUR_RANGE)
+    };
     let mut to_read = vec![fresh(staging)];
     to_read.extend(exposure.map(|(_, _, own)| fresh(own)));
     if !general {
@@ -1172,23 +1227,53 @@ pub(crate) unsafe fn record_copy_in(
     // takes one of the vectors it covers, never an average across an edge.
     let mvec_moved = mvec.filter(|(_, l, _, _)| !matches!(*l, vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
     to_read.extend(mvec.map(|(_, _, own, _)| fresh(own)));
-    to_read.extend(mvec_moved.map(|(source, l, _, _)| image_barrier(source, l, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::TRANSFER_READ, COLOUR_RANGE)));
+    to_read.extend(mvec_moved.map(|(source, l, _, _)| {
+        image_barrier(source, l, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::TRANSFER_READ, COLOUR_RANGE)
+    }));
     let mut back: Vec<vk::ImageMemoryBarrier> = mvec_moved
-        .map(|(source, l, _, _)| image_barrier(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, l, vk::AccessFlags::empty(), vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE, COLOUR_RANGE))
+        .map(|(source, l, _, _)| {
+            image_barrier(
+                source,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                l,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                COLOUR_RANGE,
+            )
+        })
         .into_iter()
         .collect();
     // DLSS's depth aspect, read in place in GENERAL or TRANSFER_SRC_OPTIMAL, else moved there and back.
     let depth_moved = depth.filter(|(_, l, _, _)| !matches!(*l, vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
-    to_read.extend(depth_moved.map(|(source, l, f, _)| image_barrier(source, l, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::TRANSFER_READ, super::aux_range(f))));
+    to_read.extend(depth_moved.map(|(source, l, f, _)| {
+        image_barrier(source, l, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::TRANSFER_READ, super::aux_range(f))
+    }));
     back.extend(depth_moved.map(|(source, l, f, _)| {
-        image_barrier(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, l, vk::AccessFlags::empty(), vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE, super::aux_range(f))
+        image_barrier(
+            source,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            l,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            super::aux_range(f),
+        )
     }));
     let exposure_region = vk::ImageCopy { extent: vk::Extent3D { width: 1, height: 1, depth: 1 }, ..region };
     // The copies visible to the hold's commands (transfers and shaders), the sources back where they were.
-    let copied = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+    let copied = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
     // SAFETY: the contract; every command is legal outside a render pass instance, where a CUDA launch is.
     unsafe {
-        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[open], &[], &to_read);
+        d.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[open],
+            &[],
+            &to_read,
+        );
         if convert {
             d.cmd_blit_image(cb, colour, read_layout, staging, vk::ImageLayout::GENERAL, &[blit], vk::Filter::NEAREST);
         } else {
@@ -1235,7 +1320,13 @@ pub(crate) unsafe fn record_copy_in(
 ///
 /// # Safety
 /// As [`record_copy_in`], recorded before it in the same buffer.
-pub(crate) unsafe fn record_copy_back(d: &ash::Device, cb: vk::CommandBuffer, (colour, layout, convert): (vk::Image, vk::ImageLayout, bool), staging: vk::Image, extent: (u32, u32)) {
+pub(crate) unsafe fn record_copy_back(
+    d: &ash::Device,
+    cb: vk::CommandBuffer,
+    (colour, layout, convert): (vk::Image, vk::ImageLayout, bool),
+    staging: vk::Image,
+    extent: (u32, u32),
+) {
     let region = vk::ImageCopy {
         src_subresource: COLOUR_LAYERS,
         src_offset: vk::Offset3D::default(),
@@ -1244,24 +1335,52 @@ pub(crate) unsafe fn record_copy_back(d: &ash::Device, cb: vk::CommandBuffer, (c
         extent: vk::Extent3D { width: extent.0, height: extent.1, depth: 1 },
     };
     let far = vk::Offset3D { x: extent.0 as i32, y: extent.1 as i32, z: 1 };
-    let blit = vk::ImageBlit { src_subresource: COLOUR_LAYERS, src_offsets: [vk::Offset3D::default(), far], dst_subresource: COLOUR_LAYERS, dst_offsets: [vk::Offset3D::default(), far] };
+    let blit = vk::ImageBlit {
+        src_subresource: COLOUR_LAYERS,
+        src_offsets: [vk::Offset3D::default(), far],
+        dst_subresource: COLOUR_LAYERS,
+        dst_offsets: [vk::Offset3D::default(), far],
+    };
     let general = layout == vk::ImageLayout::GENERAL;
     let write_layout = if general { vk::ImageLayout::GENERAL } else { vk::ImageLayout::TRANSFER_DST_OPTIMAL };
     // The hold's writes of the staging image (shaders or transfers) visible to the copy; outside GENERAL the
     // colour input went to TRANSFER_SRC_OPTIMAL for the copy in, and now to the write layout.
-    let open = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+    let open = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
     let to_write: Vec<vk::ImageMemoryBarrier> = (!general)
-        .then(|| image_barrier(colour, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, write_layout, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE, COLOUR_RANGE))
+        .then(|| {
+            image_barrier(colour, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, write_layout, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE, COLOUR_RANGE)
+        })
         .into_iter()
         .collect();
-    let close = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+    let close = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
     let back: Vec<vk::ImageMemoryBarrier> = (!general)
-        .then(|| image_barrier(colour, write_layout, layout, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE, COLOUR_RANGE))
+        .then(|| {
+            image_barrier(
+                colour,
+                write_layout,
+                layout,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                COLOUR_RANGE,
+            )
+        })
         .into_iter()
         .collect();
     // SAFETY: the contract.
     unsafe {
-        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[open], &[], &to_write);
+        d.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[open],
+            &[],
+            &to_write,
+        );
         if convert {
             d.cmd_blit_image(cb, staging, vk::ImageLayout::GENERAL, colour, write_layout, &[blit], vk::Filter::NEAREST);
         } else {
@@ -1402,11 +1521,25 @@ mod tests {
             // SAFETY: test-only objects on a live device; everything is destroyed in `drop`.
             unsafe {
                 let props = instance.get_physical_device_memory_properties(physical);
-                let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+                let pool = device
+                    .create_command_pool(
+                        &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                        None,
+                    )
+                    .unwrap();
                 let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
-                let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+                let graph = device
+                    .allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1),
+                    )
+                    .unwrap()[0];
                 let inheritance = vk::CommandBufferInheritanceInfo::default();
-                device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+                device
+                    .begin_command_buffer(
+                        graph,
+                        &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance),
+                    )
+                    .unwrap();
                 device.end_command_buffer(graph).unwrap();
                 let holds = Arc::new(AtomicUsize::new(0));
                 // The replay's functions, as `device.rs` resolves them below the layer.
@@ -1442,7 +1575,15 @@ mod tests {
                     exposure: vk::Image::null(),
                     head: 0,
                     head_bytes: Vec::new(),
-                    built: Built { width: W, height: H, frame: neural_forge_native::Frame::default(), graph, graph_own: graph, generation: 1, network: neural_forge_protocol::enums::network::FULL },
+                    built: Built {
+                        width: W,
+                        height: H,
+                        frame: neural_forge_native::Frame::default(),
+                        graph,
+                        graph_own: graph,
+                        generation: 1,
+                        network: neural_forge_protocol::enums::network::FULL,
+                    },
                     loader: None,
                     inline,
                     session: Session::default(),
@@ -1503,8 +1644,23 @@ mod tests {
                 self.images.push((image, memory));
                 // Into GENERAL, the layout the game keeps DLSS's inputs in.
                 self.one_shot(|cmd| {
-                    let b = image_barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE, RANGE);
-                    d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[b]);
+                    let b = image_barrier(
+                        image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::GENERAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                        RANGE,
+                    );
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[b],
+                    );
                 });
                 image
             }
@@ -1518,7 +1674,9 @@ mod tests {
                 let buffer = d.create_buffer(&vk::BufferCreateInfo::default().size(bytes).usage(usage), None).unwrap();
                 let reqs = d.get_buffer_memory_requirements(buffer);
                 let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-                let index = (0..self.props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.props.memory_types[i as usize].property_flags.contains(host)).unwrap();
+                let index = (0..self.props.memory_type_count)
+                    .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.props.memory_types[i as usize].property_flags.contains(host))
+                    .unwrap();
                 let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
                 let mut info = vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index);
                 if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
@@ -1557,7 +1715,10 @@ mod tests {
 
         /// Frame `f`'s colour input and motion vectors, as bytes for `upload`.
         fn frame_bytes(f: u32) -> (Vec<u8>, Vec<u8>) {
-            let colour: Vec<u8> = (0..H).flat_map(|y| (0..W).flat_map(move |x| [half(colour_at(x, y, 0, f)), half(colour_at(x, y, 1, f)), half(colour_at(x, y, 2, f)), half(1.0)])).flat_map(u16::to_le_bytes).collect();
+            let colour: Vec<u8> = (0..H)
+                .flat_map(|y| (0..W).flat_map(move |x| [half(colour_at(x, y, 0, f)), half(colour_at(x, y, 1, f)), half(colour_at(x, y, 2, f)), half(1.0)]))
+                .flat_map(u16::to_le_bytes)
+                .collect();
             let v = vector_of(f);
             let mvec: Vec<u8> = (0..W * H).flat_map(|_| [half(v[0]), half(v[1])]).flat_map(u16::to_le_bytes).collect();
             (colour, mvec)
@@ -1580,12 +1741,20 @@ mod tests {
             let d = &self.device;
             let colour_bytes = u64::from(W * H) * 8;
             let all = vk::PipelineStageFlags::ALL_COMMANDS;
-            let written = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            let written = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             // SAFETY: recording the test's buffer.
             unsafe {
                 d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[written], &[], &[]);
                 d.cmd_copy_buffer_to_image(cmd, self.hosts[k].buffer, self.colour, vk::ImageLayout::GENERAL, &[whole(W, H)]);
-                d.cmd_copy_buffer_to_image(cmd, self.hosts[k].buffer, self.mvec, vk::ImageLayout::GENERAL, &[vk::BufferImageCopy { buffer_offset: colour_bytes, ..whole(W, H) }]);
+                d.cmd_copy_buffer_to_image(
+                    cmd,
+                    self.hosts[k].buffer,
+                    self.mvec,
+                    vk::ImageLayout::GENERAL,
+                    &[vk::BufferImageCopy { buffer_offset: colour_bytes, ..whole(W, H) }],
+                );
                 d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[written], &[], &[]);
             }
         }
@@ -1649,11 +1818,29 @@ mod tests {
                 paper_white: 2.5,
                 identification: 1,
             };
-            let mut submit = |_: crate::preupscale::Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe { device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence) };
+            let mut submit = |_: crate::preupscale::Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
+                device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
+            };
             let jitter = Some([0.25 * (f % 4) as f32 - 0.375, 0.125]);
             // SAFETY: the resources are this device's, at this extent; the colour input is in GENERAL.
             let result = unsafe {
-                native::run_native_hold(&device, &instance, physical, res, &target, self.loader.as_ref().expect("loader"), jitter, true, Passes::default(), &[(W, H)], None, Self::ask(hold), neural_forge_protocol::enums::network::FULL, None, Sink::Queue(&mut submit))
+                native::run_native_hold(
+                    &device,
+                    &instance,
+                    physical,
+                    res,
+                    &target,
+                    self.loader.as_ref().expect("loader"),
+                    jitter,
+                    true,
+                    Passes::default(),
+                    &[(W, H)],
+                    None,
+                    Self::ask(hold),
+                    neural_forge_protocol::enums::network::FULL,
+                    None,
+                    Sink::Queue(&mut submit),
+                )
             };
             assert!(result.wrote_back, "the split hold of frame {f}: {result:?}");
             // SAFETY: the test's queue.
@@ -1666,7 +1853,8 @@ mod tests {
         /// A primary command buffer of the test's pool, known to the hold.
         pub(crate) fn buffer(&self) -> vk::CommandBuffer {
             // SAFETY: the test's pool.
-            let cb = unsafe { self.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(1)) }.unwrap()[0];
+            let cb = unsafe { self.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(1)) }
+                .unwrap()[0];
             self.inline.allocated(self.pool, vk::CommandBufferLevel::PRIMARY, &[cb]);
             cb
         }
@@ -1676,7 +1864,13 @@ mod tests {
             let aux = |image, format| Some(Aux { image, format, layout: Some(vk::ImageLayout::GENERAL), readable: true });
             InlinePoint {
                 colour: self.colour,
-                desc: ImageDesc { width: W, height: H, format: vk::Format::R16G16B16A16_SFLOAT, usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE, plain: true },
+                desc: ImageDesc {
+                    width: W,
+                    height: H,
+                    format: vk::Format::R16G16B16A16_SFLOAT,
+                    usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE,
+                    plain: true,
+                },
                 layout: vk::ImageLayout::GENERAL,
                 exposure_input: aux(self.exposure, vk::Format::R16_SFLOAT),
                 mvec_input: aux(self.mvec, vk::Format::R16G16_SFLOAT),
@@ -1701,7 +1895,8 @@ mod tests {
             let jitter = Some([0.25 * (f % 4) as f32 - 0.375, 0.125]);
             inline.record_outcome(cb, point, |ctx| {
                 // SAFETY: the device is live.
-                unsafe { session.ensure_inline(&device, &instance, physical, family, W, H, crate::preupscale::placement::Stage::Before, ctx.outstanding) }.map_err(|_| Recorded::Skipped)?;
+                unsafe { session.ensure_inline(&device, &instance, physical, family, W, H, crate::preupscale::placement::Stage::Before, ctx.outstanding) }
+                    .map_err(|_| Recorded::Skipped)?;
                 let target = Target {
                     colour: ctx.point.colour,
                     width: W,
@@ -1718,7 +1913,23 @@ mod tests {
                 let res = session.res_inline(crate::preupscale::placement::Stage::Before).as_mut().expect("ensured");
                 // SAFETY: `cb` is being recorded on this thread; the resources are this device's.
                 let mut result = unsafe {
-                    native::run_native_hold(&device, &instance, physical, res, &target, loader, jitter, false, Passes::default(), &[(W, H)], None, Self::ask(hold), neural_forge_protocol::enums::network::FULL, None, Sink::Buffer(ctx))
+                    native::run_native_hold(
+                        &device,
+                        &instance,
+                        physical,
+                        res,
+                        &target,
+                        loader,
+                        jitter,
+                        false,
+                        Passes::default(),
+                        &[(W, H)],
+                        None,
+                        Self::ask(hold),
+                        neural_forge_protocol::enums::network::FULL,
+                        None,
+                        Sink::Buffer(ctx),
+                    )
                 };
                 result.meta.take().ok_or(Recorded::Skipped)
             })
@@ -1805,7 +2016,11 @@ mod tests {
             let readback = rig.record_held(cb, f, u64::from(f) + 1);
             rig.submit(&[cb]);
             let got = rig.read(readback);
-            assert!(got == expected[f as usize], "frame {f}: the hold inside the buffer differs from the split hold (first difference {:?})", first_difference(&got, &expected[f as usize]));
+            assert!(
+                got == expected[f as usize],
+                "frame {f}: the hold inside the buffer differs from the split hold (first difference {:?})",
+                first_difference(&got, &expected[f as usize])
+            );
         }
     }
 
@@ -1818,7 +2033,8 @@ mod tests {
     #[test]
     fn buffers_recorded_before_any_runs_keep_each_hold_s_parameters_and_history() {
         let Some(mut rig) = Rig::open(false) else { return };
-        let split: Vec<Vec<u16>> = [(0, 1, false), (1, 2, false), (2, 3, false), (4, 5, true), (5, 6, false)].into_iter().map(|(f, h, reset)| rig.split_frame(f, h, reset)).collect();
+        let split: Vec<Vec<u16>> =
+            [(0, 1, false), (1, 2, false), (2, 3, false), (4, 5, true), (5, 6, false)].into_iter().map(|(f, h, reset)| rig.split_frame(f, h, reset)).collect();
         rig.clear_head();
         let cbs: Vec<vk::CommandBuffer> = (0..3).map(|_| rig.buffer()).collect();
         let reads: Vec<usize> = (0..3).map(|i| rig.record_held(cbs[i], i as u32, i as u64 + 1)).collect();
@@ -1834,7 +2050,11 @@ mod tests {
         let read = rig.record_held(b, 4, 5);
         rig.submit(&[b]);
         let got = rig.read(read);
-        assert!(got == split[3], "the network frame after a hold that never ran differs from one after a reset (first difference {:?})", first_difference(&got, &split[3]));
+        assert!(
+            got == split[3],
+            "the network frame after a hold that never ran differs from one after a reset (first difference {:?})",
+            first_difference(&got, &split[3])
+        );
         let read = rig.record_held(b, 5, 6);
         rig.submit(&[b]);
         let got = rig.read(read);
@@ -1844,7 +2064,11 @@ mod tests {
         let read = rig.record_held(b, 7, 8);
         rig.submit(&[b]);
         let got = rig.read(read);
-        assert!(got == Rig::input(7), "a cached hold applied the edit of a refresh that never ran (first difference {:?})", first_difference(&got, &Rig::input(7)));
+        assert!(
+            got == Rig::input(7),
+            "a cached hold applied the edit of a refresh that never ran (first difference {:?})",
+            first_difference(&got, &Rig::input(7))
+        );
     }
 
     const PROBE_SPV: &[u8] = include_bytes!("../../shaders/test_restore_probe.spv");
@@ -1880,19 +2104,29 @@ mod tests {
         let db = descriptor_buffer.then(|| ash::ext::descriptor_buffer::Device::new(&rig.instance, &d));
         // SAFETY: test-only objects on the rig's device, destroyed at the end.
         unsafe {
-            let binding = |n: u32, ty| vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
+            let binding = |n: u32, ty| {
+                vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)
+            };
             // Classic sets: the input through a dynamic offset (64 bytes in).
             let in_type = if descriptor_buffer { vk::DescriptorType::STORAGE_BUFFER } else { vk::DescriptorType::STORAGE_BUFFER_DYNAMIC };
             let bindings = [binding(0, in_type), binding(1, vk::DescriptorType::STORAGE_BUFFER)];
             let flags = if descriptor_buffer { vk::DescriptorSetLayoutCreateFlags::DESCRIPTOR_BUFFER_EXT } else { vk::DescriptorSetLayoutCreateFlags::empty() };
             let set_layout = d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None).unwrap();
             let push_range = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(8);
-            let layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&[push_range]), None).unwrap();
+            let layout = d
+                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&[push_range]), None)
+                .unwrap();
             let code: Vec<u32> = PROBE_SPV.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
             let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).unwrap();
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let pflags = if descriptor_buffer { vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT } else { vk::PipelineCreateFlags::empty() };
-            let pipeline = d.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().flags(pflags).stage(stage).layout(layout)], None).unwrap()[0];
+            let pipeline = d
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default().flags(pflags).stage(stage).layout(layout)],
+                    None,
+                )
+                .unwrap()[0];
             d.destroy_shader_module(module, None);
             let mut pool = vk::DescriptorPool::null();
             let mut set = vk::DescriptorSet::null();
@@ -1909,7 +2143,11 @@ mod tests {
                     let o = [vk::DescriptorBufferInfo { buffer: rig.hosts[output].buffer, offset: 0, range: vk::WHOLE_SIZE }];
                     d.update_descriptor_sets(
                         &[
-                            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC).buffer_info(&i),
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(set)
+                                .dst_binding(0)
+                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
+                                .buffer_info(&i),
                             vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&o),
                         ],
                         &[],
@@ -1924,7 +2162,8 @@ mod tests {
                     let addr = |b: vk::Buffer| d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b));
                     for (n, (buffer, at, range)) in [(rig.hosts[input].buffer, 64u64, 16u64), (rig.hosts[output].buffer, 0, 16)].into_iter().enumerate() {
                         let info = vk::DescriptorAddressInfoEXT::default().address(addr(buffer) + at).range(range);
-                        let get = vk::DescriptorGetInfoEXT::default().ty(vk::DescriptorType::STORAGE_BUFFER).data(vk::DescriptorDataEXT { p_storage_buffer: &info });
+                        let get =
+                            vk::DescriptorGetInfoEXT::default().ty(vk::DescriptorType::STORAGE_BUFFER).data(vk::DescriptorDataEXT { p_storage_buffer: &info });
                         let offset = db.get_descriptor_set_layout_binding_offset(set_layout, n as u32) as usize;
                         let mut bytes = vec![0u8; props.storage_buffer_descriptor_size];
                         db.get_descriptor(&get, &mut bytes);
@@ -1965,7 +2204,11 @@ mod tests {
             rig.end(cb);
             rig.submit(&[cb]);
             let out = std::slice::from_raw_parts(rig.hosts[output].ptr.cast::<u32>(), 4).to_vec();
-            assert_eq!(out, vec![0xa11ce, 0x1234_5678, 0xb0b, 0x600d_beef], "the game's dispatch after the hold did not see its own pipeline, descriptors and push constants");
+            assert_eq!(
+                out,
+                vec![0xa11ce, 0x1234_5678, 0xb0b, 0x600d_beef],
+                "the game's dispatch after the hold did not see its own pipeline, descriptors and push constants"
+            );
             d.device_wait_idle().unwrap();
             d.destroy_pipeline(pipeline, None);
             d.destroy_pipeline_layout(layout, None);
@@ -1999,7 +2242,9 @@ mod tests {
         inline.allocated(pool, vk::CommandBufferLevel::SECONDARY, &[cb(10)]);
         inline.allocated(other_pool, vk::CommandBufferLevel::PRIMARY, &[cb(11)]);
         inline.allocated(unseen, vk::CommandBufferLevel::PRIMARY, &[cb(12)]);
-        for (c, why) in [(cb(10), "a secondary"), (cb(11), "another family's pool"), (cb(12), "a pool never seen created"), (cb(13), "a buffer never seen allocated")] {
+        for (c, why) in
+            [(cb(10), "a secondary"), (cb(11), "another family's pool"), (cb(12), "a pool never seen created"), (cb(13), "a buffer never seen allocated")]
+        {
             assert_eq!(inline.record_outcome(c, rig.point(), |_| unreachable!("{why}: nothing is recorded")), Recorded::Refused, "{why} is not held inside");
             assert!(!inline.owns(c));
         }
@@ -2080,8 +2325,13 @@ mod tests {
     fn staging_images_are_built_again_only_when_no_hold_may_run() {
         let Some(mut rig) = Rig::open(false) else { return };
         let small = rig.point();
-        let big_image = rig.image(vk::Format::R16G16B16A16_SFLOAT, (2 * W, 2 * H), vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE);
-        let big = InlinePoint { colour: big_image, desc: ImageDesc { width: 2 * W, height: 2 * H, ..small.desc }, mvec_input: None, exposure_input: None, ..small };
+        let big_image = rig.image(
+            vk::Format::R16G16B16A16_SFLOAT,
+            (2 * W, 2 * H),
+            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE,
+        );
+        let big =
+            InlinePoint { colour: big_image, desc: ImageDesc { width: 2 * W, height: 2 * H, ..small.desc }, mvec_input: None, exposure_input: None, ..small };
         let (a, b) = (rig.buffer(), rig.buffer());
         let staging = |rig: &Rig| lock(&rig.inline.slots).staging[0].map(|s| s.extent);
         FAIL_IMAGES.set(true);
@@ -2122,13 +2372,19 @@ mod tests {
             let mvec = rig.image(vk::Format::R16G16_SFLOAT, (mw, mh), usage);
             // Each texel holds the position of the colour input's pixel it covers (constant over each block of
             // `scale` x `scale` texels: which of them NEAREST takes at a block's centre is the device's choice).
-            let bytes: Vec<u8> = (0..mh).flat_map(|y| (0..mw).flat_map(move |x| [half((x / scale) as f32), half((y / scale) as f32)])).flat_map(u16::to_le_bytes).collect();
+            let bytes: Vec<u8> =
+                (0..mh).flat_map(|y| (0..mw).flat_map(move |x| [half((x / scale) as f32), half((y / scale) as f32)])).flat_map(u16::to_le_bytes).collect();
             rig.upload_image(mvec, (mw, mh), &bytes);
             let k = rig.host(bytes.len() as u64, vk::BufferUsageFlags::TRANSFER_DST);
             let all = vk::PipelineStageFlags::ALL_COMMANDS;
             let to = |old, new| image_barrier(mvec, old, new, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::MEMORY_READ, RANGE);
             let point = InlinePoint {
-                mvec_input: Some(Aux { image: mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL), readable: true }),
+                mvec_input: Some(Aux {
+                    image: mvec,
+                    format: vk::Format::R16G16_SFLOAT,
+                    layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                    readable: true,
+                }),
                 mvec_extent: (mw, mh),
                 ..rig.point()
             };
@@ -2136,9 +2392,25 @@ mod tests {
             rig.begin(cb);
             // SAFETY: recording the test's buffer.
             unsafe {
-                rig.device.cmd_pipeline_barrier(cb, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]);
+                rig.device.cmd_pipeline_barrier(
+                    cb,
+                    all,
+                    all,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to(vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
+                );
                 assert_eq!(rig.inline.record_outcome(cb, point, copies_only), Recorded::Held);
-                rig.device.cmd_pipeline_barrier(cb, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::GENERAL)]);
+                rig.device.cmd_pipeline_barrier(
+                    cb,
+                    all,
+                    all,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::GENERAL)],
+                );
                 rig.device.cmd_copy_image_to_buffer(cb, mvec, vk::ImageLayout::GENERAL, rig.hosts[k].buffer, &[whole(mw, mh)]);
             }
             rig.end(cb);
@@ -2173,13 +2445,36 @@ mod tests {
         let run = |rig: &mut Rig, with_hold: bool| -> Vec<u8> {
             let cb = rig.buffer();
             let all = vk::PipelineStageFlags::ALL_COMMANDS;
-            let to = |old, new| image_barrier(colour, old, new, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE, RANGE);
+            let to =
+                |old, new| image_barrier(colour, old, new, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE, RANGE);
             rig.begin(cb);
             // SAFETY: recording the test's buffer.
             unsafe {
-                rig.device.cmd_pipeline_barrier(cb, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL)]);
-                rig.device.cmd_clear_color_image(cb, colour, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: [1.75, 0.3125, 6.5, 1.0] }, &[RANGE]);
-                rig.device.cmd_pipeline_barrier(cb, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]);
+                rig.device.cmd_pipeline_barrier(
+                    cb,
+                    all,
+                    all,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to(vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL)],
+                );
+                rig.device.cmd_clear_color_image(
+                    cb,
+                    colour,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue { float32: [1.75, 0.3125, 6.5, 1.0] },
+                    &[RANGE],
+                );
+                rig.device.cmd_pipeline_barrier(
+                    cb,
+                    all,
+                    all,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
+                );
                 if with_hold {
                     let point = InlinePoint {
                         colour,
@@ -2192,9 +2487,25 @@ mod tests {
                     };
                     assert_eq!(rig.inline.record_outcome(cb, point, copies_only), Recorded::Held);
                 }
-                rig.device.cmd_pipeline_barrier(cb, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)]);
+                rig.device.cmd_pipeline_barrier(
+                    cb,
+                    all,
+                    all,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)],
+                );
                 rig.device.cmd_copy_image_to_buffer(cb, colour, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, rig.hosts[k].buffer, &[whole(W, H)]);
-                rig.device.cmd_pipeline_barrier(cb, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::GENERAL)]);
+                rig.device.cmd_pipeline_barrier(
+                    cb,
+                    all,
+                    all,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to(vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::GENERAL)],
+                );
             }
             rig.end(cb);
             rig.submit(&[cb]);

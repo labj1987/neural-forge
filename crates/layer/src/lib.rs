@@ -20,22 +20,22 @@ mod breadcrumbs;
 mod capture;
 mod composition;
 mod device;
-mod ownership;
-mod loader_data;
 mod dump;
-mod series;
-mod gpu_timer;
-mod logging;
-mod hotkey;
-mod shm;
-mod swapchain;
-mod surface_usage;
 mod entry_points;
+mod gpu_timer;
+mod hotkey;
+mod loader_data;
+mod logging;
+mod ownership;
 mod present_sync;
-mod swapchain_maintenance;
+mod preupscale;
 mod probe_ngx;
 mod probe_seq;
-mod preupscale;
+mod series;
+mod shm;
+mod surface_usage;
+mod swapchain;
+mod swapchain_maintenance;
 mod vram;
 
 // The native backend (crates/native), linked into the 64-bit layer (`preupscale::native`).
@@ -51,8 +51,8 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 use std::sync::LazyLock;
 use vulkan_layer::{
-    auto_globalhooksinfo_impl, declare_introspection_queries, Global, GlobalHooks, InstanceHooks, InstanceInfo,
-    Layer, LayerManifest, LayerResult, LayerVulkanCommand, VkLayerDeviceLink, VkLayerInstanceLink,
+    auto_globalhooksinfo_impl, declare_introspection_queries, Global, GlobalHooks, InstanceHooks, InstanceInfo, Layer, LayerManifest, LayerResult,
+    LayerVulkanCommand, VkLayerDeviceLink, VkLayerInstanceLink,
 };
 
 use device::NeuralForgeDeviceInfo;
@@ -81,8 +81,7 @@ struct InstanceContext {
 /// calls first, and dropped with the instance (see `NeuralForgeInstanceHooks`'s `Drop`):
 /// a launcher that creates a probe instance after the real one, or destroys one, never
 /// has a device resolved through someone else's (or a dead) instance.
-static PHYSICAL_DEVICE_INSTANCES: LazyLock<Mutex<HashMap<vk::PhysicalDevice, InstanceContext>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PHYSICAL_DEVICE_INSTANCES: LazyLock<Mutex<HashMap<vk::PhysicalDevice, InstanceContext>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub const LAYER_NAME: &str = "VK_LAYER_neuralforge_neural";
 
@@ -91,9 +90,7 @@ pub const LAYER_NAME: &str = "VK_LAYER_neuralforge_neural";
 /// options — checked once and cached, same as upstream, since it can't change for the
 /// life of the process.
 pub(crate) fn layer_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        env_flag("NEURAL_FORGE_ENABLE") && !env_flag("NEURAL_FORGE_DISABLE") && !duplicate_copy()
-    });
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag("NEURAL_FORGE_ENABLE") && !env_flag("NEURAL_FORGE_DISABLE") && !duplicate_copy());
     *ENABLED
 }
 
@@ -349,9 +346,7 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
         // next-layer-supplied chained `vkGetInstanceProcAddr`, valid for the duration of
         // this call; `VK_NULL_HANDLE` + a global-command name is the spec-mandated way
         // to query it before an instance exists.
-        let create_instance = unsafe {
-            (layer_instance_link.pfnNextGetInstanceProcAddr)(vk::Instance::null(), c"vkCreateInstance".as_ptr())
-        };
+        let create_instance = unsafe { (layer_instance_link.pfnNextGetInstanceProcAddr)(vk::Instance::null(), c"vkCreateInstance".as_ptr()) };
         let create_instance: vk::PFN_vkCreateInstance = match create_instance {
             // SAFETY: a non-null `vkGetInstanceProcAddr(NULL, "vkCreateInstance")` result
             // is guaranteed by the Vulkan spec to have this exact signature.
@@ -567,7 +562,11 @@ fn extra_queues<'a>(families: &[vk::QueueFamilyProperties], infos: &[vk::DeviceQ
 /// `gipa` is the next layer's for `instance`, which `physical_device` belongs to.
 #[cfg(target_arch = "x86_64")]
 unsafe fn flow_family(
-    instance: &InstanceContext, gipa: vk::PFN_vkGetInstanceProcAddr, physical_device: vk::PhysicalDevice, families: &[vk::QueueFamilyProperties], queues: &[vk::DeviceQueueCreateInfo],
+    instance: &InstanceContext,
+    gipa: vk::PFN_vkGetInstanceProcAddr,
+    physical_device: vk::PhysicalDevice,
+    families: &[vk::QueueFamilyProperties],
+    queues: &[vk::DeviceQueueCreateInfo],
 ) -> Result<u32, String> {
     // SAFETY: `physical_device` belongs to the instance.
     let extension = unsafe { instance.instance.enumerate_device_extension_properties(physical_device) }.is_ok_and(|list| {
@@ -582,7 +581,11 @@ unsafe fn flow_family(
 }
 
 /// `create_info`'s queue requests, and the physical device's families.
-fn queue_requests<'a>(instance: &ash::Instance, physical_device: vk::PhysicalDevice, create_info: &'a vk::DeviceCreateInfo<'_>) -> (&'a [vk::DeviceQueueCreateInfo<'a>], Vec<vk::QueueFamilyProperties>) {
+fn queue_requests<'a>(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    create_info: &'a vk::DeviceCreateInfo<'_>,
+) -> (&'a [vk::DeviceQueueCreateInfo<'a>], Vec<vk::QueueFamilyProperties>) {
     let infos = if create_info.queue_create_info_count == 0 || create_info.p_queue_create_infos.is_null() {
         &[][..]
     } else {
@@ -646,8 +649,12 @@ impl DeviceLink {
 /// # Safety
 /// As `vkCreateDevice`; `link` was found in `info`'s chain.
 unsafe fn call_next_create_device(
-    next: vk::PFN_vkCreateDevice, link: Option<&DeviceLink>, physical_device: vk::PhysicalDevice, info: &vk::DeviceCreateInfo,
-    allocator: *const vk::AllocationCallbacks, p_device: &mut std::mem::MaybeUninit<vk::Device>,
+    next: vk::PFN_vkCreateDevice,
+    link: Option<&DeviceLink>,
+    physical_device: vk::PhysicalDevice,
+    info: &vk::DeviceCreateInfo,
+    allocator: *const vk::AllocationCallbacks,
+    p_device: &mut std::mem::MaybeUninit<vk::Device>,
 ) -> vk::Result {
     if let Some(link) = link {
         link.restore();
@@ -735,7 +742,13 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                 let list = instance.instance.enumerate_device_extension_properties(physical_device).unwrap_or_default();
                 let extensions: Vec<&CStr> = list.iter().map(|e| CStr::from_ptr(e.extension_name.as_ptr())).collect();
                 let offered = swapchain_maintenance::offered(gipa, instance.instance.handle(), physical_device, instance.properties2, &extensions);
-                Some(swapchain_maintenance::plan(&requested, app_feature, offered, instance.surface_maintenance, instance.properties2 != vram::Properties2::None))
+                Some(swapchain_maintenance::plan(
+                    &requested,
+                    app_feature,
+                    offered,
+                    instance.surface_maintenance,
+                    instance.properties2 != vram::Properties2::None,
+                ))
             }
         };
         let created = |result: &LayerResult<ash::prelude::VkResult<()>>| matches!(result, LayerResult::Handled(Ok(())));
@@ -812,14 +825,13 @@ impl NeuralForgeInstanceHooks {
         // path resolves it (see `vulkan_layer::Global::create_device`) -- the next
         // layer/driver's real `vkCreateDevice`, through the instance this physical
         // device belongs to.
-        let next_create_device: vk::PFN_vkCreateDevice = match unsafe {
-            (layer_device_link.pfnNextGetInstanceProcAddr)(instance.instance.handle(), c"vkCreateDevice".as_ptr())
-        } {
-            // SAFETY: a non-null `vkGetInstanceProcAddr(instance, "vkCreateDevice")`
-            // result is guaranteed by the Vulkan spec to have this exact signature.
-            Some(f) => unsafe { std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateDevice>(f) },
-            None => return LayerResult::Unhandled,
-        };
+        let next_create_device: vk::PFN_vkCreateDevice =
+            match unsafe { (layer_device_link.pfnNextGetInstanceProcAddr)(instance.instance.handle(), c"vkCreateDevice".as_ptr()) } {
+                // SAFETY: a non-null `vkGetInstanceProcAddr(instance, "vkCreateDevice")`
+                // result is guaranteed by the Vulkan spec to have this exact signature.
+                Some(f) => unsafe { std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateDevice>(f) },
+                None => return LayerResult::Unhandled,
+            };
         let allocator_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
         // SAFETY: the framework's copy of the request, whose chain is the loader's.
         let link = unsafe { DeviceLink::find(create_info) };
@@ -946,15 +958,14 @@ impl NeuralForgeInstanceHooks {
         // SAFETY: `physical_device` is the one this exact `vkCreateDevice` call is
         // for; `instance.instance` is its owning instance (these are this instance's
         // own hooks).
-        let supported = unsafe { instance.instance.enumerate_device_extension_properties(physical_device) }
-            .is_ok_and(|extensions| {
-                extensions.iter().any(|extension| {
-                    // SAFETY: `extension_name` is a NUL-terminated, driver-supplied C
-                    // string per the Vulkan spec's own contract on this struct.
-                    let name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
-                    name == EXTERNAL_MEMORY_HOST_EXTENSION
-                })
-            });
+        let supported = unsafe { instance.instance.enumerate_device_extension_properties(physical_device) }.is_ok_and(|extensions| {
+            extensions.iter().any(|extension| {
+                // SAFETY: `extension_name` is a NUL-terminated, driver-supplied C
+                // string per the Vulkan spec's own contract on this struct.
+                let name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
+                name == EXTERNAL_MEMORY_HOST_EXTENSION
+            })
+        });
         // VK_EXT_external_memory_host requires VK_KHR_external_memory, core in Vulkan 1.1: below that
         // effective version (the lower of the application's instance version, 0 meaning 1.0, and the
         // device's) it may only be added beside an application that enables VK_KHR_external_memory itself
@@ -997,7 +1008,9 @@ impl NeuralForgeInstanceHooks {
         // device creation that would otherwise have succeeded now fails.
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            crate::log!("[layer] adding {EXTERNAL_MEMORY_HOST_EXTENSION:?} was refused ({result:?}); creating the device as requested, without zero-copy capture");
+            crate::log!(
+                "[layer] adding {EXTERNAL_MEMORY_HOST_EXTENSION:?} was refused ({result:?}); creating the device as requested, without zero-copy capture"
+            );
         }
         // Same as the call above, with `create_info` (the original request) this time.
         let result = create(create_info, p_device);
@@ -1070,7 +1083,6 @@ impl Layer for NeuralForgeLayer {
         instance: Arc<ash::Instance>,
         next_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
     ) -> Self::InstanceInfoContainer {
-        
         // Resolve below this layer: the physical-device handle supplied by the
         // framework belongs to that chain, not the loader's outer trampoline.
         let surface_caps = unsafe {
@@ -1080,7 +1092,9 @@ impl Layer for NeuralForgeLayer {
         // SAFETY: the application's create info, valid for the call; its application info is null or valid.
         let api_version = unsafe { create_info.p_application_info.as_ref() }.map_or(0, |app| app.api_version);
         let surface_maintenance = swapchain_maintenance::take_instance(instance.handle());
-        NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance, surface_caps, properties2: vram::Properties2::of(create_info), api_version, surface_maintenance }) }
+        NeuralForgeInstanceHooks {
+            ctx: Some(InstanceContext { instance, surface_caps, properties2: vram::Properties2::of(create_info), api_version, surface_maintenance }),
+        }
     }
 
     fn create_device_info(
@@ -1096,7 +1110,14 @@ impl Layer for NeuralForgeLayer {
         // instance from before this layer was loaded, which never happens for an implicit
         // layer, and then capture is simply skipped.
         let instance = PHYSICAL_DEVICE_INSTANCES.lock().unwrap().get(&physical_device).cloned();
-        NeuralForgeDeviceInfo::new(instance.as_ref().map(|ctx| ctx.instance.clone()), instance.and_then(|ctx| ctx.surface_caps), physical_device, device, next_get_device_proc_addr, create_info)
+        NeuralForgeDeviceInfo::new(
+            instance.as_ref().map(|ctx| ctx.instance.clone()),
+            instance.and_then(|ctx| ctx.surface_caps),
+            physical_device,
+            device,
+            next_get_device_proc_addr,
+            create_info,
+        )
     }
 }
 
@@ -1216,7 +1237,15 @@ mod instance_table_tests {
             eprintln!("instance table test: no Vulkan ICD, skipping");
             return;
         };
-        let hooks = |instance: &Arc<ash::Instance>| NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None, properties2: vram::Properties2::None, api_version: 0, surface_maintenance: Default::default() }) };
+        let hooks = |instance: &Arc<ash::Instance>| NeuralForgeInstanceHooks {
+            ctx: Some(InstanceContext {
+                instance: instance.clone(),
+                surface_caps: None,
+                properties2: vram::Properties2::None,
+                api_version: 0,
+                surface_maintenance: Default::default(),
+            }),
+        };
         // Stand-in handles: the table is keyed by whatever the framework hands over.
         let (real_gpu, probe_gpu) = (vk::PhysicalDevice::from_raw(0x5100), vk::PhysicalDevice::from_raw(0x5200));
         let real_hooks = hooks(&real);
@@ -1336,7 +1365,10 @@ mod device_link_tests {
     /// The layer below, as a real one behaves: it takes its link and advances `pLayerInfo` in place
     /// for the layer under it, then refuses the first `REFUSE` requests.
     unsafe extern "system" fn next_layer(
-        _: vk::PhysicalDevice, info: *const vk::DeviceCreateInfo, _: *const vk::AllocationCallbacks, _: *mut vk::Device,
+        _: vk::PhysicalDevice,
+        info: *const vk::DeviceCreateInfo,
+        _: *const vk::AllocationCallbacks,
+        _: *mut vk::Device,
     ) -> vk::Result {
         CALLED.set(CALLED.get() + 1);
         // SAFETY: the test's own request. Without a link node (a request the hook made itself, in
@@ -1412,7 +1444,8 @@ mod device_link_tests {
         // The retry copies the chain now, link node and its advanced `pLayerInfo` included.
         // SAFETY: the node above, written by the layer below through the request.
         let advanced = unsafe { (*link.node).layer_info };
-        let mut copied = LoaderDeviceCreateInfo { s_type: LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::null(), function: LAYER_LINK_INFO, layer_info: advanced };
+        let mut copied =
+            LoaderDeviceCreateInfo { s_type: LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::null(), function: LAYER_LINK_INFO, layer_info: advanced };
         assert_ne!(copied.layer_info, original, "the layer below advanced the application's node");
         let retry = vk::DeviceCreateInfo { p_next: std::ptr::from_mut(&mut copied).cast(), ..Default::default() };
         // SAFETY: as above, with the copied chain.
@@ -1449,7 +1482,15 @@ mod device_link_tests {
         let priorities = [1.0];
         let queue = vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&priorities);
         let info = vk::DeviceCreateInfo::default().queue_create_infos(std::slice::from_ref(&queue));
-        let hooks = NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None, properties2: vram::Properties2::None, api_version: 0, surface_maintenance: Default::default() }) };
+        let hooks = NeuralForgeInstanceHooks {
+            ctx: Some(InstanceContext {
+                instance: instance.clone(),
+                surface_caps: None,
+                properties2: vram::Properties2::None,
+                api_version: 0,
+                surface_maintenance: Default::default(),
+            }),
+        };
         let mut p_device = std::mem::MaybeUninit::uninit();
         CALLED.set(0);
         let result = hooks.create_device(physical, &info, &link, None, &mut p_device);
@@ -1468,7 +1509,8 @@ mod extra_queue_tests {
         vk::QueueFamilyProperties { queue_flags: flags, queue_count, ..Default::default() }
     }
 
-    const GRAPHICS: vk::QueueFlags = vk::QueueFlags::from_raw(vk::QueueFlags::GRAPHICS.as_raw() | vk::QueueFlags::COMPUTE.as_raw() | vk::QueueFlags::TRANSFER.as_raw());
+    const GRAPHICS: vk::QueueFlags =
+        vk::QueueFlags::from_raw(vk::QueueFlags::GRAPHICS.as_raw() | vk::QueueFlags::COMPUTE.as_raw() | vk::QueueFlags::TRANSFER.as_raw());
     const COMPUTE: vk::QueueFlags = vk::QueueFlags::from_raw(vk::QueueFlags::COMPUTE.as_raw() | vk::QueueFlags::TRANSFER.as_raw());
 
     /// The first compute-only family is full (the application asks for all its queues): the next one with room

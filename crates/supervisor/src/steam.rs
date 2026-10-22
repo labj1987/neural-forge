@@ -215,7 +215,22 @@ use neural_forge_protocol::processes::{game_helper as helper_exe, launcher_like}
 
 fn helper_dir(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    ["redist", "_commonredist", "redistributables", "installers", "__installer", "directx", "vcredist", "battleye", "easyanticheat", "engine", "support", "crashreporter", "crashpad"].contains(&n.as_str())
+    [
+        "redist",
+        "_commonredist",
+        "redistributables",
+        "installers",
+        "__installer",
+        "directx",
+        "vcredist",
+        "battleye",
+        "easyanticheat",
+        "engine",
+        "support",
+        "crashreporter",
+        "crashpad",
+    ]
+    .contains(&n.as_str())
 }
 
 /// The `.exe` files directly in `dir` (case kept), sorted.
@@ -255,7 +270,10 @@ fn elf_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let Ok(meta) = std::fs::metadata(path) else { return false };
     let mut magic = [0u8; 4];
-    meta.is_file() && meta.permissions().mode() & 0o111 != 0 && std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && magic == *b"\x7fELF"
+    meta.is_file()
+        && meta.permissions().mode() & 0o111 != 0
+        && std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok()
+        && magic == *b"\x7fELF"
 }
 
 /// How deep [`TargetFinder`] searches a game's folder for executables.
@@ -356,7 +374,8 @@ impl TargetFinder {
             launched = true;
             if name.to_ascii_lowercase().ends_with(".sh") {
                 let Ok(entries) = std::fs::read_dir(&beside) else { continue };
-                let mut elves: Vec<String> = entries.flatten().filter(|e| elf_executable(&e.path())).filter_map(|e| e.file_name().to_str().map(str::to_string)).collect();
+                let mut elves: Vec<String> =
+                    entries.flatten().filter(|e| elf_executable(&e.path())).filter_map(|e| e.file_name().to_str().map(str::to_string)).collect();
                 elves.sort();
                 for elf in elves {
                     add(&elf, &mut out);
@@ -408,7 +427,9 @@ impl TargetFinder {
 fn relative_inside(path: &str) -> bool {
     use std::path::Component;
     let path = Path::new(path);
-    path.components().next().is_some() && path.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir)) && path.components().any(|c| matches!(c, Component::Normal(_)))
+    path.components().next().is_some()
+        && path.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+        && path.components().any(|c| matches!(c, Component::Normal(_)))
 }
 
 fn file_name(path: &str) -> &str {
@@ -481,9 +502,9 @@ pub fn games_for_exe<'a>(games: &'a [Game], exe: &str) -> Vec<&'a Game> {
 /// `comm` is `steam` or `steamwebhelper` (`comm` is cut at 15 characters; both names are shorter).
 pub fn steam_running(proc_root: &Path) -> bool {
     let Ok(dir) = std::fs::read_dir(proc_root) else { return false };
-    dir.flatten().filter(|e| e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))).any(|e| {
-        std::fs::read_to_string(e.path().join("comm")).is_ok_and(|comm| matches!(comm.trim_end_matches('\n'), "steam" | "steamwebhelper"))
-    })
+    dir.flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())))
+        .any(|e| std::fs::read_to_string(e.path().join("comm")).is_ok_and(|comm| matches!(comm.trim_end_matches('\n'), "steam" | "steamwebhelper")))
 }
 
 /// Every account's `localconfig.vdf` under `root`, sorted.
@@ -563,7 +584,9 @@ pub fn chosen_target(cfg: &crate::Config, appid: &str) -> Option<String> {
 pub enum Action {
     /// Turn Neural Forge on for the target executable(s) (comma-separated; never empty: [`apply`]
     /// refuses an empty one, since without it a store launcher could take the channel).
-    Enable { target_exe: String },
+    Enable {
+        target_exe: String,
+    },
     Disable,
 }
 
@@ -595,9 +618,14 @@ pub enum Outcome {
     /// Every account that has the game already had it this way.
     Unchanged,
     /// Steam is running: it would overwrite the edit when it exits.
-    SteamRunning { manual: String },
+    SteamRunning {
+        manual: String,
+    },
     /// Something prevented a safe edit; nothing was written (or, for a write error, see `reason`).
-    Failed { reason: String, manual: String },
+    Failed {
+        reason: String,
+        manual: String,
+    },
 }
 
 /// [`apply`] against the real `/proc`.
@@ -652,7 +680,8 @@ pub fn apply(root: &Path, appid: &str, action: &Action, steam_running: bool) -> 
         if after == before {
             continue;
         }
-        let refuse = |why: String| Outcome::Failed { reason: format!("{}: {why}; the file was left as it was", account.file.display()), manual: manual.clone() };
+        let refuse =
+            |why: String| Outcome::Failed { reason: format!("{}: {why}; the file was left as it was", account.file.display()), manual: manual.clone() };
         let old = match std::fs::read(&account.file) {
             Ok(old) => old,
             Err(e) => return refuse(e.to_string()),
@@ -738,7 +767,14 @@ mod tests {
     #[test]
     fn a_running_exe_names_its_game() {
         let s = Scratch::new("exe");
-        let game = |appid: &str, name: &str| Game { appid: appid.into(), name: name.into(), installdir: name.into(), library: s.0.clone(), root: Root { path: s.0.clone(), flatpak: false }, branch: String::new() };
+        let game = |appid: &str, name: &str| Game {
+            appid: appid.into(),
+            name: name.into(),
+            installdir: name.into(),
+            library: s.0.clone(),
+            root: Root { path: s.0.clone(), flatpak: false },
+            branch: String::new(),
+        };
         let games = vec![game("1", "Alpha"), game("2", "Remnant2"), game("3", "Deep"), game("4", "Bundle"), game("5", "Twin")];
         write(&s.0.join("steamapps/common/Alpha/alpha.exe"), "");
         write(&s.0.join("steamapps/common/Remnant2/Remnant2/Binaries/Win64/Remnant2-Win64-Shipping.exe"), "");
@@ -763,14 +799,31 @@ mod tests {
     fn the_target_is_the_executable_the_game_really_runs() {
         let s = Scratch::new("targets");
         let root = Root { path: s.0.clone(), flatpak: false };
-        let game = |appid: &str, dir: &str, branch: &str| Game { appid: appid.into(), name: dir.into(), installdir: dir.into(), library: s.0.clone(), root: root.clone(), branch: branch.into() };
+        let game = |appid: &str, dir: &str, branch: &str| Game {
+            appid: appid.into(),
+            name: dir.into(),
+            installdir: dir.into(),
+            library: s.0.clone(),
+            root: root.clone(),
+            branch: branch.into(),
+        };
         let files = |dir: &str, names: &[&str]| {
             for name in names {
                 write(&s.0.join("steamapps/common").join(dir).join(name), "");
             }
         };
         // A store bootstrapper starting the game beside it; the store's own launcher lives elsewhere.
-        files("Grand Theft Auto V Enhanced", &["PlayGTAV.exe", "GTA5_Enhanced.exe", "GTA5_Enhanced_BE.exe", "BattlEye/BEService_x64.exe", "Redistributables/Rockstar-Games-Launcher.exe", "Redistributables/Social-Club-Setup.exe"]);
+        files(
+            "Grand Theft Auto V Enhanced",
+            &[
+                "PlayGTAV.exe",
+                "GTA5_Enhanced.exe",
+                "GTA5_Enhanced_BE.exe",
+                "BattlEye/BEService_x64.exe",
+                "Redistributables/Rockstar-Games-Launcher.exe",
+                "Redistributables/Social-Club-Setup.exe",
+            ],
+        );
         // Unreal: a stub in the folder starts <Project>/Binaries/Win64/<Name>-Win64-Shipping.exe.
         files("Remnant2", &["Remnant2.exe", "Remnant2/Binaries/Win64/Remnant2-Win64-Shipping.exe", "Engine/Binaries/Win64/CrashReportClient.exe"]);
         // Launch entries per beta branch.
@@ -840,7 +893,13 @@ mod tests {
         let names: Vec<(String, bool)> = finder.candidates(&eso).into_iter().map(|c| (c.name, c.chosen)).collect();
         assert_eq!(
             names,
-            [("eso64.exe".into(), true), ("eso.exe".into(), true), ("tools.exe".into(), false), ("Bethesda.net_Launcher.exe".into(), false), ("BethesdaNetUpdater.exe".into(), false)],
+            [
+                ("eso64.exe".into(), true),
+                ("eso.exe".into(), true),
+                ("tools.exe".into(), false),
+                ("Bethesda.net_Launcher.exe".into(), false),
+                ("BethesdaNetUpdater.exe".into(), false)
+            ],
             "the found target first, the rest by size, launchers last"
         );
         // A target chosen by hand wins, and survives switching off and on (it lives in config.ini).
@@ -932,7 +991,9 @@ mod tests {
     fn an_install_folder_or_launch_entry_outside_the_library_is_ignored() {
         let home = Scratch::new("traversal");
         let root = home.0.join("Steam");
-        let manifest_with = |appid: &str, installdir: &str| format!("\"AppState\"\n{{\n\t\"appid\"\t\t\"{appid}\"\n\t\"name\"\t\t\"Game {appid}\"\n\t\"installdir\"\t\t{}\n}}\n", vdf::quote(installdir));
+        let manifest_with = |appid: &str, installdir: &str| {
+            format!("\"AppState\"\n{{\n\t\"appid\"\t\t\"{appid}\"\n\t\"name\"\t\t\"Game {appid}\"\n\t\"installdir\"\t\t{}\n}}\n", vdf::quote(installdir))
+        };
         for (appid, installdir) in [("1", "/"), ("2", ".."), ("3", "../../.."), ("4", "a/../../b"), ("5", ""), ("6", "Real Game"), ("7", "sub/dir")] {
             write(&root.join(format!("steamapps/appmanifest_{appid}.acf")), &manifest_with(appid, installdir));
         }
@@ -976,12 +1037,25 @@ mod tests {
     }
 
     fn game(appid: &str, name: &str) -> Game {
-        Game { appid: appid.into(), name: name.into(), installdir: name.into(), library: PathBuf::new(), root: Root { path: PathBuf::new(), flatpak: false }, branch: String::new() }
+        Game {
+            appid: appid.into(),
+            name: name.into(),
+            installdir: name.into(),
+            library: PathBuf::new(),
+            root: Root { path: PathBuf::new(), flatpak: false },
+            branch: String::new(),
+        }
     }
 
     #[test]
     fn games_are_found_by_appid_exact_name_or_unique_substring() {
-        let games = [game("3240220", "Grand Theft Auto V Enhanced"), game("1547000", "Grand Theft Auto: San Andreas - The Definitive Edition"), game("990080", "Hogwarts Legacy"), game("1", "Remnant"), game("2", "Remnant II")];
+        let games = [
+            game("3240220", "Grand Theft Auto V Enhanced"),
+            game("1547000", "Grand Theft Auto: San Andreas - The Definitive Edition"),
+            game("990080", "Hogwarts Legacy"),
+            game("1", "Remnant"),
+            game("2", "Remnant II"),
+        ];
         assert_eq!(find(&games, "3240220").unwrap().appid, "3240220");
         assert_eq!(find(&games, "hogwarts").unwrap().appid, "990080");
         assert_eq!(find(&games, "GRAND THEFT AUTO V ENHANCED").unwrap().appid, "3240220");
@@ -1019,7 +1093,11 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].after, "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe MANGOHUD=1 PROTON_ENABLE_WAYLAND=1 %command% -dx12 -skipintro");
         let after = std::fs::read_to_string(&lc).unwrap();
-        assert_eq!(after, original.replace("\"MANGOHUD=1", "\"NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe MANGOHUD=1"), "byte-identical except the one value");
+        assert_eq!(
+            after,
+            original.replace("\"MANGOHUD=1", "\"NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe MANGOHUD=1"),
+            "byte-identical except the one value"
+        );
         assert!(enabled(&home.0, "3240220") && !enabled(&home.0, "990080"));
         assert_eq!(apply(&home.0, "3240220", &enable(), false), Outcome::Unchanged);
         assert!(matches!(apply(&home.0, "3240220", &Action::Disable, false), Outcome::Changed(_)));
@@ -1045,7 +1123,8 @@ mod tests {
         apply(&home.0, "3240220", &Action::Disable, false);
         assert_eq!(std::fs::read_to_string(&orig).unwrap(), original, ".orig is taken once");
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), enabled_text, ".bak is the state before the last edit");
-        let leftovers: Vec<_> = std::fs::read_dir(lc.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).filter(|n| n.to_string_lossy().ends_with(".tmp")).collect();
+        let leftovers: Vec<_> =
+            std::fs::read_dir(lc.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).filter(|n| n.to_string_lossy().ends_with(".tmp")).collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
@@ -1055,7 +1134,10 @@ mod tests {
         let lc = home.0.join("userdata/1/config/localconfig.vdf");
         let original = localconfig(&[("3240220", Some("gamemoderun %command% -x"))]);
         write(&lc, &original);
-        assert_eq!(apply(&home.0, "3240220", &enable(), true), Outcome::SteamRunning { manual: "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe gamemoderun %command% -x".into() });
+        assert_eq!(
+            apply(&home.0, "3240220", &enable(), true),
+            Outcome::SteamRunning { manual: "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe gamemoderun %command% -x".into() }
+        );
         assert_eq!(std::fs::read_to_string(&lc).unwrap(), original);
         assert!(!home.0.join("userdata/1/config/localconfig.vdf.neural-forge.bak").exists());
     }
@@ -1070,7 +1152,10 @@ mod tests {
         assert_eq!(options_in(&lc, "990080").as_deref(), Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=HogwartsLegacy.exe %command%"));
         let text = std::fs::read_to_string(&lc).unwrap();
         assert!(text.contains("\t\t\t\t\t\t\"Playtime\"\t\t\"6916\"\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"NEURAL_FORGE_ENABLE=1"), "{text}");
-        assert_eq!(text.len(), original.len() + "\t\t\t\t\t\t\"LaunchOptions\"\t\t\"NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=HogwartsLegacy.exe %command%\"\n".len());
+        assert_eq!(
+            text.len(),
+            original.len() + "\t\t\t\t\t\t\"LaunchOptions\"\t\t\"NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=HogwartsLegacy.exe %command%\"\n".len()
+        );
         // Disabling leaves the inserted key, empty: Steam's own "no launch options".
         apply(&home.0, "990080", &Action::Disable, false);
         assert_eq!(options_in(&lc, "990080").as_deref(), Some(""));
@@ -1083,7 +1168,9 @@ mod tests {
         let newer = home.0.join("userdata/222/config/localconfig.vdf");
         write(&older, &localconfig(&[("3240220", Some("%command%"))]));
         write(&newer, &localconfig(&[("990080", None)]));
-        let set_mtime = |p: &Path, secs: u64| std::fs::File::options().write(true).open(p).unwrap().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap();
+        let set_mtime = |p: &Path, secs: u64| {
+            std::fs::File::options().write(true).open(p).unwrap().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap()
+        };
         set_mtime(&older, 1_000);
         set_mtime(&newer, 2_000);
         // Only the older account has GTA: its file changes, and the account signed in last (the
@@ -1115,7 +1202,10 @@ mod tests {
         let original = localconfig(&[("3240220", Some("PROTON_LOG=1 %command%")), ("990080", None)]).replace('\n', "\r\n");
         write(&lc, &original);
         apply(&home.0, "3240220", &enable(), false);
-        assert_eq!(std::fs::read_to_string(&lc).unwrap(), original.replace("\"PROTON_LOG=1", "\"NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe PROTON_LOG=1"));
+        assert_eq!(
+            std::fs::read_to_string(&lc).unwrap(),
+            original.replace("\"PROTON_LOG=1", "\"NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe PROTON_LOG=1")
+        );
         apply(&home.0, "990080", &enable(), false);
         apply(&home.0, "1593500", &enable(), false);
         let text = std::fs::read_to_string(&lc).unwrap();

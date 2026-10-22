@@ -42,9 +42,12 @@ fn allowed(args: &[String], exe_path: &str, target: Option<&str>) -> bool {
 
 /// This process's arguments and executable path.
 fn this_process() -> (Vec<String>, String) {
-    let args = std::fs::read("/proc/self/cmdline").unwrap_or_default()
-        .split(|b| *b == 0).filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned()).collect::<Vec<_>>();
+    let args = std::fs::read("/proc/self/cmdline")
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect::<Vec<_>>();
     let exe = std::fs::read_link("/proc/self/exe").map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     (args, exe)
 }
@@ -53,11 +56,15 @@ static ELIGIBLE: LazyLock<bool> = LazyLock::new(|| {
     let (args, exe) = this_process();
     let target = neural_forge_protocol::env::var("NEURAL_FORGE_TARGET_EXE");
     let ok = allowed(&args, &exe, target.as_deref());
-    if !ok { crate::log!("[ownership] process excluded from NeuralForge session"); }
+    if !ok {
+        crate::log!("[ownership] process excluded from NeuralForge session");
+    }
     ok
 });
 
-pub fn eligible() -> bool { *ELIGIBLE }
+pub fn eligible() -> bool {
+    *ELIGIBLE
+}
 
 /// A process the layer is enabled in but the target excludes made a game-sized swapchain: it is
 /// showing a picture, and unless it is a launcher or helper (`processes::launcher_like`,
@@ -86,8 +93,7 @@ pub fn process_name() -> &'static str {
 }
 
 fn acquire(path: &str) -> std::io::Result<File> {
-    let file = OpenOptions::new().read(true).write(true).create(true)
-        .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;
+    let file = OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;
     let meta = file.metadata()?;
     use std::os::unix::fs::MetadataExt;
     if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } || meta.mode() & 0o077 != 0 {
@@ -158,7 +164,9 @@ pub fn note_present() {
 /// Takes (or keeps) the lease on `shm_path`'s channel. Cheap while held; a process that does not hold
 /// it tries the lock at most once per [`RETRY_EVERY`].
 pub fn claim(shm_path: &str) -> bool {
-    if !eligible() { return false; }
+    if !eligible() {
+        return false;
+    }
     if held() {
         return LEASE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|l| l.path == shm_path);
     }
@@ -169,7 +177,9 @@ pub fn claim(shm_path: &str) -> bool {
     }
     LAST_ATTEMPT_MS.store(now, Ordering::Relaxed);
     let mut lease = LEASE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(l) = &*lease { return l.path == shm_path; }
+    if let Some(l) = &*lease {
+        return l.path == shm_path;
+    }
     match acquire(&format!("{shm_path}.owner")) {
         Ok(file) => {
             crate::log!("[ownership] pid {} owns {}", std::process::id(), shm_path);
@@ -254,7 +264,15 @@ mod tests {
     static LEASE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
     fn launchers_cannot_claim_unless_explicitly_targeted() {
-        for exe in ["explorer.exe", "Xalia.exe", "Launcher.exe", "SocialClubHelper.exe", "RockstarService.exe", "Rockstar Games Launcher.exe", "Social Club Helper.exe"] {
+        for exe in [
+            "explorer.exe",
+            "Xalia.exe",
+            "Launcher.exe",
+            "SocialClubHelper.exe",
+            "RockstarService.exe",
+            "Rockstar Games Launcher.exe",
+            "Social Club Helper.exe",
+        ] {
             let args = vec!["wine64-preloader".into(), format!("C:\\Rockstar Games\\{exe}")];
             assert!(!allowed(&args, "/usr/bin/wine64-preloader", None));
             assert!(!allowed(&args, "/usr/bin/wine64-preloader", Some("GTA5_Enhanced.exe")), "{exe}: another game is the target");
@@ -296,10 +314,25 @@ mod tests {
     fn store_launchers_and_their_helpers_never_claim() {
         let wine = "/usr/bin/wine64-preloader";
         for exe in [
-            "upc.exe", "UbisoftConnect.exe", "UplayWebCore.exe", "EADesktop.exe", "EALauncher.exe", "EABackgroundService.exe",
-            "Battle.net.exe", "Agent.exe", "Battle.net Launcher.exe", "EpicGamesLauncher.exe", "EpicWebHelper.exe",
-            "EOSOverlayRenderer-Win64-Shipping.exe", "GalaxyClient.exe", "GalaxyClient Helper.exe", "RiotClientServices.exe",
-            "CrashReportClient.exe", "UnityCrashHandler64.exe", "QtWebEngineProcess.exe", "steamerrorreporter.exe",
+            "upc.exe",
+            "UbisoftConnect.exe",
+            "UplayWebCore.exe",
+            "EADesktop.exe",
+            "EALauncher.exe",
+            "EABackgroundService.exe",
+            "Battle.net.exe",
+            "Agent.exe",
+            "Battle.net Launcher.exe",
+            "EpicGamesLauncher.exe",
+            "EpicWebHelper.exe",
+            "EOSOverlayRenderer-Win64-Shipping.exe",
+            "GalaxyClient.exe",
+            "GalaxyClient Helper.exe",
+            "RiotClientServices.exe",
+            "CrashReportClient.exe",
+            "UnityCrashHandler64.exe",
+            "QtWebEngineProcess.exe",
+            "steamerrorreporter.exe",
         ] {
             let args = vec![wine.to_string(), format!("C:\\Program Files\\{exe}")];
             assert!(!allowed(&args, wine, None), "{exe}");
@@ -378,9 +411,12 @@ mod tests {
         // Create with the same private permissions as production, then let an
         // independent process acquire the actual kernel lock.
         drop(acquire(path.to_str().unwrap()).unwrap());
-        let mut child = Command::new("python3").args(["-c",
-            "import fcntl,sys,time; f=open(sys.argv[1], 'r+'); fcntl.flock(f, fcntl.LOCK_EX); print('ready', flush=True); time.sleep(30)"])
-            .arg(&path).stdout(Stdio::piped()).spawn().unwrap();
+        let mut child = Command::new("python3")
+            .args(["-c", "import fcntl,sys,time; f=open(sys.argv[1], 'r+'); fcntl.flock(f, fcntl.LOCK_EX); print('ready', flush=True); time.sleep(30)"])
+            .arg(&path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
         let mut ready = String::new();
         BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
         let excluded = acquire(path.to_str().unwrap()).is_err();

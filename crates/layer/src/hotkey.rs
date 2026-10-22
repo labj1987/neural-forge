@@ -37,16 +37,64 @@ use std::time::{Duration, Instant};
 /// The keys anyone would plausibly bind. Not the whole table: a name that is not here simply
 /// does not resolve, which is better than accepting something nobody can type.
 const KEYS: &[(&str, u32)] = &[
-    ("F1", 59), ("F2", 60), ("F3", 61), ("F4", 62), ("F5", 63), ("F6", 64),
-    ("F7", 65), ("F8", 66), ("F9", 67), ("F10", 68), ("F11", 87), ("F12", 88),
-    ("HOME", 102), ("END", 107), ("INSERT", 110), ("DELETE", 111),
-    ("PAGEUP", 104), ("PAGEDOWN", 109), ("PAUSE", 119), ("SCROLLLOCK", 70),
-    ("SYSRQ", 99), ("GRAVE", 41),
-    ("A", 30), ("B", 48), ("C", 46), ("D", 32), ("E", 18), ("F", 33), ("G", 34),
-    ("H", 35), ("I", 23), ("J", 36), ("K", 37), ("L", 38), ("M", 50), ("N", 49),
-    ("O", 24), ("P", 25), ("Q", 16), ("R", 19), ("S", 31), ("T", 20), ("U", 22),
-    ("V", 47), ("W", 17), ("X", 45), ("Y", 21), ("Z", 44),
-    ("0", 11), ("1", 2), ("2", 3), ("3", 4), ("4", 5), ("5", 6), ("6", 7), ("7", 8), ("8", 9), ("9", 10),
+    ("F1", 59),
+    ("F2", 60),
+    ("F3", 61),
+    ("F4", 62),
+    ("F5", 63),
+    ("F6", 64),
+    ("F7", 65),
+    ("F8", 66),
+    ("F9", 67),
+    ("F10", 68),
+    ("F11", 87),
+    ("F12", 88),
+    ("HOME", 102),
+    ("END", 107),
+    ("INSERT", 110),
+    ("DELETE", 111),
+    ("PAGEUP", 104),
+    ("PAGEDOWN", 109),
+    ("PAUSE", 119),
+    ("SCROLLLOCK", 70),
+    ("SYSRQ", 99),
+    ("GRAVE", 41),
+    ("A", 30),
+    ("B", 48),
+    ("C", 46),
+    ("D", 32),
+    ("E", 18),
+    ("F", 33),
+    ("G", 34),
+    ("H", 35),
+    ("I", 23),
+    ("J", 36),
+    ("K", 37),
+    ("L", 38),
+    ("M", 50),
+    ("N", 49),
+    ("O", 24),
+    ("P", 25),
+    ("Q", 16),
+    ("R", 19),
+    ("S", 31),
+    ("T", 20),
+    ("U", 22),
+    ("V", 47),
+    ("W", 17),
+    ("X", 45),
+    ("Y", 21),
+    ("Z", 44),
+    ("0", 11),
+    ("1", 2),
+    ("2", 3),
+    ("3", 4),
+    ("4", 5),
+    ("5", 6),
+    ("6", 7),
+    ("7", 8),
+    ("8", 9),
+    ("9", 10),
 ];
 
 /// A Linux key code from a name (`F10`, `Home`, `KEY_N`, case-insensitive) or a bare number, or 0.
@@ -341,14 +389,12 @@ impl X11 {
                 let default_root: unsafe extern "C" fn(*mut c_void) -> c_ulong = sym(x11, "XDefaultRootWindow")?;
                 let flush: unsafe extern "C" fn(*mut c_void) -> c_int = sym(x11, "XFlush")?;
                 let query_version: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) -> c_int = sym(xi, "XIQueryVersion")?;
-                let select_events: unsafe extern "C" fn(*mut c_void, c_ulong, *mut XiEventMask, c_int) -> c_int =
-                    sym(xi, "XISelectEvents")?;
+                let select_events: unsafe extern "C" fn(*mut c_void, c_ulong, *mut XiEventMask, c_int) -> c_int = sym(xi, "XISelectEvents")?;
                 let close_display = sym(x11, "XCloseDisplay")?;
                 // Needed to survive the connection's death (libX11 1.7 and later): without it, Xlib's
                 // I/O error path ends the process, so the backend is not used at all.
                 let set_io_error_handler: SetIoErrorHandler = sym(x11, "XSetIOErrorHandler")?;
-                let set_io_error_exit_handler: unsafe extern "C" fn(*mut c_void, Option<IoErrorExitHandler>, *mut c_void) =
-                    sym(x11, "XSetIOErrorExitHandler")?;
+                let set_io_error_exit_handler: unsafe extern "C" fn(*mut c_void, Option<IoErrorExitHandler>, *mut c_void) = sym(x11, "XSetIOErrorExitHandler")?;
                 let pending = sym(x11, "XPending")?;
                 let next_event = sym(x11, "XNextEvent")?;
                 let get_event_data = sym(x11, "XGetEventData")?;

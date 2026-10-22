@@ -113,7 +113,11 @@ pub(crate) const PROBE_COMMANDS: &[VulkanCommand] = &[
 
 /// [`PROBE_COMMANDS`] when `probe` is on, nothing otherwise.
 pub(crate) fn probe_commands(probe: bool) -> &'static [VulkanCommand] {
-    if probe { PROBE_COMMANDS } else { &[] }
+    if probe {
+        PROBE_COMMANDS
+    } else {
+        &[]
+    }
 }
 
 /// `vkGetImageViewHandle64NVX` (`VK_NVX_image_view_handle` revision 3). Newer than the
@@ -182,14 +186,7 @@ struct ViewDesc {
 
 impl std::fmt::Display for ViewDesc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}x{} {:?} {:?}",
-            self.width,
-            self.height,
-            vk::Format::from_raw(self.format),
-            vk::ImageUsageFlags::from_raw(self.usage)
-        )
+        write!(f, "{}x{} {:?} {:?}", self.width, self.height, vk::Format::from_raw(self.format), vk::ImageUsageFlags::from_raw(self.usage))
     }
 }
 
@@ -213,8 +210,7 @@ impl std::fmt::Display for LaunchShape {
         write!(
             f,
             "{} grid={}x{}x{} block={}x{}x{} smem={} params={} extras={}",
-            self.function, self.grid.0, self.grid.1, self.grid.2, self.block.0, self.block.1, self.block.2,
-            self.shared_mem, self.params, self.extras
+            self.function, self.grid.0, self.grid.1, self.grid.2, self.block.0, self.block.1, self.block.2, self.shared_mem, self.params, self.extras
         )
     }
 }
@@ -307,11 +303,8 @@ fn identify_colour(interest: &BTreeMap<vk::Image, ViewDesc>) -> (Option<vk::Imag
         vk::Format::D24_UNORM_S8_UINT,
         vk::Format::D32_SFLOAT_S8_UINT,
     ];
-    let depth_extents: BTreeSet<(u32, u32)> = interest
-        .values()
-        .filter(|d| DEPTH.contains(&vk::Format::from_raw(d.format)))
-        .map(|d| (d.width, d.height))
-        .collect();
+    let depth_extents: BTreeSet<(u32, u32)> =
+        interest.values().filter(|d| DEPTH.contains(&vk::Format::from_raw(d.format))).map(|d| (d.width, d.height)).collect();
     let candidates: Vec<vk::Image> = interest
         .iter()
         .filter(|(_, d)| {
@@ -326,10 +319,7 @@ fn identify_colour(interest: &BTreeMap<vk::Image, ViewDesc>) -> (Option<vk::Imag
 
 impl State {
     fn record_image(&mut self, image: vk::Image, info: &vk::ImageCreateInfo) {
-        self.images.insert(
-            image,
-            ImageDesc { width: info.extent.width, height: info.extent.height, format: info.format, usage: info.usage },
-        );
+        self.images.insert(image, ImageDesc { width: info.extent.width, height: info.extent.height, format: info.format, usage: info.usage });
     }
 
     fn forget_image(&mut self, image: vk::Image) {
@@ -377,7 +367,11 @@ impl State {
 
     /// A pool reset (`destroyed`: destroyed) resets (frees) every buffer of it.
     fn reset_pool(&mut self, pool: vk::CommandPool, destroyed: bool) {
-        let members: Vec<vk::CommandBuffer> = if destroyed { self.pools.remove(&pool).map(|m| m.into_iter().collect()).unwrap_or_default() } else { self.pools.get(&pool).map(|m| m.iter().copied().collect()).unwrap_or_default() };
+        let members: Vec<vk::CommandBuffer> = if destroyed {
+            self.pools.remove(&pool).map(|m| m.into_iter().collect()).unwrap_or_default()
+        } else {
+            self.pools.get(&pool).map(|m| m.iter().copied().collect()).unwrap_or_default()
+        };
         self.free(&members);
     }
 
@@ -454,8 +448,11 @@ impl State {
     }
 
     fn cmd_transfer(
-        &mut self, command_buffer: vk::CommandBuffer, kind: &'static str,
-        src: Option<(vk::Image, vk::ImageLayout)>, dst: Option<(vk::Image, vk::ImageLayout)>,
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        kind: &'static str,
+        src: Option<(vk::Image, vk::ImageLayout)>,
+        dst: Option<(vk::Image, vk::ImageLayout)>,
     ) {
         let interesting = src.is_some_and(|(i, _)| self.interesting(i)) || dst.is_some_and(|(i, _)| self.interesting(i));
         self.rec(command_buffer).transfer(kind, src, dst, interesting);
@@ -466,9 +463,7 @@ impl State {
     fn cmd_begin_render(&mut self, command_buffer: vk::CommandBuffer, kind: &'static str, views: &[RenderView]) {
         let attachments: Vec<Attachment> = views
             .iter()
-            .filter_map(|&(view, layout, load, depth)| {
-                self.view_images.get(&view).map(|&image| Attachment { image, layout, load, depth })
-            })
+            .filter_map(|&(view, layout, load, depth)| self.view_images.get(&view).map(|&image| Attachment { image, layout, load, depth }))
             .collect();
         let interesting = attachments.iter().any(|a| self.interesting(a.image));
         self.rec(command_buffer).begin_render(kind, attachments, interesting);
@@ -485,8 +480,11 @@ impl State {
     }
 
     fn cmd_barriers(
-        &mut self, command_buffer: vk::CommandBuffer, images: impl Iterator<Item = ImageBarrier>,
-        memory: impl Iterator<Item = (u64, u64, u64, u64)>, buffers: u32,
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        images: impl Iterator<Item = ImageBarrier>,
+        memory: impl Iterator<Item = (u64, u64, u64, u64)>,
+        buffers: u32,
     ) {
         for (src_stage, src_access, dst_stage, dst_access) in memory {
             self.rec(command_buffer).memory_barrier(src_stage, src_access, dst_stage, dst_access);
@@ -494,10 +492,8 @@ impl State {
         self.rec(command_buffer).buffer_barriers(buffers);
         for barrier in images {
             if Some(barrier.image) == self.colour {
-                self.colour_last_barrier = Some((
-                    command_buffer,
-                    format!("{:?}->{:?} in cmdbuf {} (frame {})", barrier.old, barrier.new, hex(command_buffer), self.frames),
-                ));
+                self.colour_last_barrier =
+                    Some((command_buffer, format!("{:?}->{:?} in cmdbuf {} (frame {})", barrier.old, barrier.new, hex(command_buffer), self.frames)));
             }
             let interesting = self.interesting(barrier.image);
             self.rec(command_buffer).image_barrier(barrier, interesting);
@@ -662,8 +658,7 @@ impl State {
         if self.launch_cmdbufs.is_empty() {
             return Vec::new();
         }
-        let bearing: Vec<(vk::CommandBuffer, u32)> =
-            command_buffers.filter_map(|cb| self.launch_cmdbufs.get(&cb).map(|n| (cb, *n))).collect();
+        let bearing: Vec<(vk::CommandBuffer, u32)> = command_buffers.filter_map(|cb| self.launch_cmdbufs.get(&cb).map(|n| (cb, *n))).collect();
         let carried: u32 = bearing.iter().map(|(_, n)| n).sum();
         if carried == 0 {
             return Vec::new();
@@ -839,8 +834,10 @@ pub(crate) fn on_cmd_clear_attachments(command_buffer: vk::CommandBuffer) {
 }
 
 pub(crate) fn on_cmd_transfer(
-    command_buffer: vk::CommandBuffer, kind: &'static str,
-    src: Option<(vk::Image, vk::ImageLayout)>, dst: Option<(vk::Image, vk::ImageLayout)>,
+    command_buffer: vk::CommandBuffer,
+    kind: &'static str,
+    src: Option<(vk::Image, vk::ImageLayout)>,
+    dst: Option<(vk::Image, vk::ImageLayout)>,
 ) {
     if enabled() {
         state().cmd_transfer(command_buffer, kind, src, dst);
@@ -868,8 +865,10 @@ pub(crate) fn on_cmd_end_render(command_buffer: vk::CommandBuffer) {
 /// Image barriers, memory barriers as `(src stage, src access, dst stage, dst access)`, and
 /// the number of buffer barriers, all widened to sync2's 64-bit masks.
 pub(crate) fn on_cmd_barriers(
-    command_buffer: vk::CommandBuffer, images: impl Iterator<Item = ImageBarrier>,
-    memory: impl Iterator<Item = (u64, u64, u64, u64)>, buffers: u32,
+    command_buffer: vk::CommandBuffer,
+    images: impl Iterator<Item = ImageBarrier>,
+    memory: impl Iterator<Item = (u64, u64, u64, u64)>,
+    buffers: u32,
 ) {
     if enabled() {
         state().cmd_barriers(command_buffer, images, memory, buffers);
@@ -930,17 +929,15 @@ pub(crate) fn on_present(queue: vk::Queue) {
 mod tests {
     use super::*;
 
-    fn cb(raw: u64) -> vk::CommandBuffer { vk::CommandBuffer::from_raw(raw) }
-    fn queue(raw: u64) -> vk::Queue { vk::Queue::from_raw(raw) }
+    fn cb(raw: u64) -> vk::CommandBuffer {
+        vk::CommandBuffer::from_raw(raw)
+    }
+    fn queue(raw: u64) -> vk::Queue {
+        vk::Queue::from_raw(raw)
+    }
 
     fn image_info(width: u32, height: u32, format: vk::Format, usage: vk::ImageUsageFlags) -> vk::ImageCreateInfo<'static> {
-        vk::ImageCreateInfo {
-            image_type: vk::ImageType::TYPE_2D,
-            extent: vk::Extent3D { width, height, depth: 1 },
-            format,
-            usage,
-            ..Default::default()
-        }
+        vk::ImageCreateInfo { image_type: vk::ImageType::TYPE_2D, extent: vk::Extent3D { width, height, depth: 1 }, format, usage, ..Default::default() }
     }
 
     fn view_info(image: vk::Image, format: vk::Format, mip: u32) -> vk::ImageViewCreateInfo<'static> {
@@ -982,7 +979,8 @@ mod tests {
         let output = vk::Image::from_raw(0x200);
         s.record_image(render, &image_info(1707, 960, vk::Format::R16G16B16A16_SFLOAT, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT));
         s.record_image(output, &image_info(2560, 1440, vk::Format::R16G16B16A16_SFLOAT, vk::ImageUsageFlags::STORAGE));
-        let (rv, ov, mipv, unknown) = (vk::ImageView::from_raw(0x10), vk::ImageView::from_raw(0x20), vk::ImageView::from_raw(0x30), vk::ImageView::from_raw(0x40));
+        let (rv, ov, mipv, unknown) =
+            (vk::ImageView::from_raw(0x10), vk::ImageView::from_raw(0x20), vk::ImageView::from_raw(0x30), vk::ImageView::from_raw(0x40));
         s.record_view(rv, &view_info(render, vk::Format::UNDEFINED, 0));
         s.record_view(ov, &view_info(output, vk::Format::R16G16B16A16_SFLOAT, 0));
         s.record_view(mipv, &view_info(output, vk::Format::R16G16B16A16_SFLOAT, 1));

@@ -15,16 +15,15 @@ pub const HUD_REGIONS: &str = "hud_regions";
 /// merge into whatever else `config.ini` is about to write out (the HUD regions as their text).
 pub fn snapshot(header: &ShmHeader) -> BTreeMap<String, String> {
     let fmt = |is_float: bool, bits: u32| if is_float { f32::from_bits(bits).to_string() } else { bits.to_string() };
-    let mut all: BTreeMap<String, String> = header.persisted_settings().into_iter().map(|(name, is_float, bits)| (format!("set_{name}"), fmt(is_float, bits))).collect();
+    let mut all: BTreeMap<String, String> =
+        header.persisted_settings().into_iter().map(|(name, is_float, bits)| (format!("set_{name}"), fmt(is_float, bits))).collect();
     all.insert(format!("set_{HUD_REGIONS}"), crate::HudRegion::list_text(&header.hud_settings().regions));
     all
 }
 
 /// `config.ini`: `$XDG_CONFIG_HOME/neural-forge/config.ini`, or `~/.config/neural-forge/config.ini`.
 pub fn config_file() -> String {
-    let base = crate::env::var("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
+    let base = crate::env::var("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).unwrap_or_else(|| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
     format!("{base}/neural-forge/config.ini")
 }
 
@@ -120,7 +119,11 @@ mod tests {
             let (min, max) = crate::setting_bounds(name).expect(name);
             if is_float {
                 let v = min + (max - min) * (0.1 + 0.8 * i as f32 / defaults.len() as f32);
-                if v.to_bits() == default_bits { ((v + max) / 2.0).to_bits() } else { v.to_bits() }
+                if v.to_bits() == default_bits {
+                    ((v + max) / 2.0).to_bits()
+                } else {
+                    v.to_bits()
+                }
             } else if default_bits == max as u32 {
                 min as u32
             } else {
@@ -234,8 +237,16 @@ mod tests {
                 apply_if_unconfigured(&h, &saved)
             });
             assert_eq!(intensity(), 0.5, "the live write was overwritten by the saved settings");
-            if applied { saved_first += 1 } else { live_first += 1 }
-            assert_eq!(f32::from_bits(h.local_tone_bits.load(std::sync::atomic::Ordering::Relaxed)), if applied { 2.0 } else { 1.0 }, "applied whole or not at all");
+            if applied {
+                saved_first += 1
+            } else {
+                live_first += 1
+            }
+            assert_eq!(
+                f32::from_bits(h.local_tone_bits.load(std::sync::atomic::Ordering::Relaxed)),
+                if applied { 2.0 } else { 1.0 },
+                "applied whole or not at all"
+            );
         }
         assert!(saved_first + live_first == 2000);
         assert!(!apply_if_unconfigured(&h, &saved), "configured: not applied again");

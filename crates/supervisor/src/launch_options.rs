@@ -217,9 +217,15 @@ mod tests {
     #[test]
     fn merge_keeps_real_world_options_and_strip_restores_them() {
         for (existing, merged) in [
-            ("MANGOHUD=1 PROTON_ENABLE_WAYLAND=1 %command% -dx12 -skipintro", "NEURAL_FORGE_ENABLE=1 MANGOHUD=1 PROTON_ENABLE_WAYLAND=1 %command% -dx12 -skipintro"),
+            (
+                "MANGOHUD=1 PROTON_ENABLE_WAYLAND=1 %command% -dx12 -skipintro",
+                "NEURAL_FORGE_ENABLE=1 MANGOHUD=1 PROTON_ENABLE_WAYLAND=1 %command% -dx12 -skipintro",
+            ),
             ("gamemoderun %command%", "NEURAL_FORGE_ENABLE=1 gamemoderun %command%"),
-            ("WINEDLLOVERRIDES=\"dxgi=n,b;winmm=n,b\" DXVK_CONFIG_FILE='/home/a/My Games/dxvk.conf' %command% --launcher-skip", "NEURAL_FORGE_ENABLE=1 WINEDLLOVERRIDES=\"dxgi=n,b;winmm=n,b\" DXVK_CONFIG_FILE='/home/a/My Games/dxvk.conf' %command% --launcher-skip"),
+            (
+                "WINEDLLOVERRIDES=\"dxgi=n,b;winmm=n,b\" DXVK_CONFIG_FILE='/home/a/My Games/dxvk.conf' %command% --launcher-skip",
+                "NEURAL_FORGE_ENABLE=1 WINEDLLOVERRIDES=\"dxgi=n,b;winmm=n,b\" DXVK_CONFIG_FILE='/home/a/My Games/dxvk.conf' %command% --launcher-skip",
+            ),
             ("gamescope -W 2560 -H 1440 -- %command%", "NEURAL_FORGE_ENABLE=1 gamescope -W 2560 -H 1440 -- %command%"),
             ("%command% -DLSSFG", "NEURAL_FORGE_ENABLE=1 %command% -DLSSFG"),
             ("", "NEURAL_FORGE_ENABLE=1 %command%"),
@@ -270,7 +276,10 @@ mod tests {
     #[test]
     fn a_misplaced_or_disabled_variable_of_ours_is_replaced() {
         assert_eq!(merge("gamemoderun NEURAL_FORGE_ENABLE=0 %command%", ""), "NEURAL_FORGE_ENABLE=1 gamemoderun %command%");
-        assert_eq!(merge("gamemoderun NEURAL_FORGE_TARGET_EXE=x.exe %command%", ""), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=x.exe gamemoderun %command%");
+        assert_eq!(
+            merge("gamemoderun NEURAL_FORGE_TARGET_EXE=x.exe %command%", ""),
+            "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=x.exe gamemoderun %command%"
+        );
         assert_eq!(strip("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='My Game.exe' MANGOHUD=1 %command%"), "MANGOHUD=1 %command%");
     }
 

@@ -19,7 +19,8 @@
 //! APIs.
 
 pub use crate::{
-    global_simple_intercept::ApiVersion, lazy_collection::LazyCollection, vk_utils::IsCommandEnabled,
+    global_simple_intercept::ApiVersion, lazy_collection::LazyCollection,
+    vk_utils::IsCommandEnabled,
 };
 // Used only outside the crate (the integration tests), so exported only where this module is public.
 #[cfg(feature = "unstable")]

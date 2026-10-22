@@ -10,13 +10,22 @@ impl EntryPoints {
     pub unsafe extern "system" fn enumerate_instance_layer_properties(count: *mut u32, props: *mut vk::LayerProperties) -> vk::Result {
         unsafe { Framework::enumerate_instance_layer_properties(count, props) }
     }
-    pub unsafe extern "system" fn enumerate_instance_extension_properties(name: *const c_char, count: *mut u32, props: *mut vk::ExtensionProperties) -> vk::Result {
+    pub unsafe extern "system" fn enumerate_instance_extension_properties(
+        name: *const c_char,
+        count: *mut u32,
+        props: *mut vk::ExtensionProperties,
+    ) -> vk::Result {
         unsafe { Framework::enumerate_instance_extension_properties(name, count, props) }
     }
     pub unsafe extern "system" fn enumerate_device_layer_properties(pd: vk::PhysicalDevice, count: *mut u32, props: *mut vk::LayerProperties) -> vk::Result {
         unsafe { Framework::enumerate_device_layer_properties(pd, count, props) }
     }
-    pub unsafe extern "system" fn enumerate_device_extension_properties(pd: vk::PhysicalDevice, name: *const c_char, count: *mut u32, props: *mut vk::ExtensionProperties) -> vk::Result {
+    pub unsafe extern "system" fn enumerate_device_extension_properties(
+        pd: vk::PhysicalDevice,
+        name: *const c_char,
+        count: *mut u32,
+        props: *mut vk::ExtensionProperties,
+    ) -> vk::Result {
         unsafe { Framework::enumerate_device_extension_properties(pd, name, count, props) }
     }
     pub unsafe extern "system" fn get_instance_proc_addr(instance: vk::Instance, name: *const c_char) -> vk::PFN_vkVoidFunction {
@@ -46,7 +55,9 @@ impl EntryPoints {
         }
         // SAFETY: a non-null `vkGetDeviceProcAddr(device, "vkGetImageViewHandle64NVX")` has
         // this signature.
-        crate::probe_ngx::remember_handle64(device, unsafe { std::mem::transmute::<unsafe extern "system" fn(), crate::probe_ngx::PfnGetImageViewHandle64Nvx>(next) });
+        crate::probe_ngx::remember_handle64(device, unsafe {
+            std::mem::transmute::<unsafe extern "system" fn(), crate::probe_ngx::PfnGetImageViewHandle64Nvx>(next)
+        });
         Some(unsafe { std::mem::transmute::<crate::probe_ngx::PfnGetImageViewHandle64Nvx, unsafe extern "system" fn()>(Self::get_image_view_handle64_nvx) })
     }
     unsafe extern "system" fn get_image_view_handle64_nvx(device: vk::Device, info: *const vk::ImageViewHandleInfoNVX) -> u64 {
@@ -88,22 +99,36 @@ impl EntryPoints {
         original?;
         match unsafe { CStr::from_ptr(name) }.to_bytes() {
             b"vkDestroyDevice" => Some(unsafe { std::mem::transmute::<vk::PFN_vkDestroyDevice, unsafe extern "system" fn()>(Self::destroy_device) }),
-            b"vkGetInstanceProcAddr" => Some(unsafe { std::mem::transmute::<vk::PFN_vkGetInstanceProcAddr, unsafe extern "system" fn()>(Self::get_instance_proc_addr) }),
-            b"vkGetDeviceProcAddr" => Some(unsafe { std::mem::transmute::<vk::PFN_vkGetDeviceProcAddr, unsafe extern "system" fn()>(Self::get_device_proc_addr) }),
+            b"vkGetInstanceProcAddr" => {
+                Some(unsafe { std::mem::transmute::<vk::PFN_vkGetInstanceProcAddr, unsafe extern "system" fn()>(Self::get_instance_proc_addr) })
+            }
+            b"vkGetDeviceProcAddr" => {
+                Some(unsafe { std::mem::transmute::<vk::PFN_vkGetDeviceProcAddr, unsafe extern "system" fn()>(Self::get_device_proc_addr) })
+            }
             _ => original,
         }
     }
     unsafe extern "system" fn destroy_device(device: vk::Device, allocator: *const vk::AllocationCallbacks) {
-        if device == vk::Device::null() { return; }
+        if device == vk::Device::null() {
+            return;
+        }
         // Ask the framework directly, bypassing this adapter. Its original function
         // must still remove device dispatch bookkeeping and forward the allocator.
         let original = unsafe { Framework::get_device_proc_addr(device, c"vkDestroyDevice".as_ptr()) };
         if let Some(original) = original {
-            unsafe { crate::device::destroy_private_resources(device); }
-            if crate::probe_ngx::enabled() || crate::preupscale::active() { crate::probe_ngx::forget_device(device); }
-            if crate::preupscale::active() { crate::preupscale::forget_device(device); }
+            unsafe {
+                crate::device::destroy_private_resources(device);
+            }
+            if crate::probe_ngx::enabled() || crate::preupscale::active() {
+                crate::probe_ngx::forget_device(device);
+            }
+            if crate::preupscale::active() {
+                crate::preupscale::forget_device(device);
+            }
             let destroy: vk::PFN_vkDestroyDevice = unsafe { std::mem::transmute(original) };
-            unsafe { destroy(device, allocator); }
+            unsafe {
+                destroy(device, allocator);
+            }
             // A later device may be given the same handle: it starts with no device-lost latch.
             crate::forget_lost_device(device);
         }

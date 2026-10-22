@@ -5,10 +5,10 @@
 
 use std::sync::atomic::Ordering;
 
-use neural_forge_protocol::enums::{colour_mode, reversible_mode};
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use neural_forge_protocol::enums::{colour_mode, reversible_mode};
 use neural_forge_supervisor::model::Network;
 
 use crate::shm::{bind_bool, bind_float, bind_u32, Shm};
@@ -348,8 +348,10 @@ fn format_key_label(code: u32, name: Option<&str>) -> String {
 
 fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
     let reader = crate::shm::take_pending_reader();
-    let row = adw::ActionRow::builder().title("Toggle key")
-        .subtitle("Toggles Neural Forge inside a running game. Needs read access to /dev/input (the 'input' group) or an X11/XWayland session.").build();
+    let row = adw::ActionRow::builder()
+        .title("Toggle key")
+        .subtitle("Toggles Neural Forge inside a running game. Needs read access to /dev/input (the 'input' group) or an X11/XWayland session.")
+        .build();
     let label = key_label;
     let button = gtk4::Button::with_label(&label(initial));
     button.set_valign(gtk4::Align::Center);
@@ -374,7 +376,9 @@ fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
         let value = value.clone();
         let setter = setter.clone();
         controller.connect_key_pressed(move |_, key, hardware, _| {
-            if !capturing.get() { return glib::Propagation::Proceed; }
+            if !capturing.get() {
+                return glib::Propagation::Proceed;
+            }
             if let Some(button) = button.upgrade() {
                 if key != gtk4::gdk::Key::Escape {
                     if let Some(code) = evdev_keycode(hardware) {
@@ -509,12 +513,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     // The control mask (before the upscaler): the sky rule, and the optional dark and motion rules.
     let (mask_sky, set_mask_sky) = bind_bool(&shm, Some("mask_sky"), |h| &h.mask_sky);
-    model_group.add(&switch_row(
-        "Keep the game's sky",
-        "No edit where the game draws its sky (from the depth, before the upscaler)",
-        mask_sky,
-        set_mask_sky,
-    ));
+    model_group.add(&switch_row("Keep the game's sky", "No edit where the game draws its sky (from the depth, before the upscaler)", mask_sky, set_mask_sky));
     let mask_more = adw::ExpanderRow::new();
     mask_more.set_title("More mask rules");
     mask_more.set_subtitle("Edit less in dark or fast-moving parts of the picture (before the upscaler)");
@@ -555,10 +554,24 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     comp_group.set_title("Composition");
 
     let (transfer_strength, set_transfer_strength) = bind_float(&shm, Some("transfer_strength"), |h| &h.transfer_strength_bits);
-    comp_group.add(&spin_row("Detail strength", "How much of the model's edit reaches the frame; above 1 amplifies it", transfer_strength, "transfer_strength", 0.05, set_transfer_strength));
+    comp_group.add(&spin_row(
+        "Detail strength",
+        "How much of the model's edit reaches the frame; above 1 amplifies it",
+        transfer_strength,
+        "transfer_strength",
+        0.05,
+        set_transfer_strength,
+    ));
 
     let (colour_strength, set_colour_strength) = bind_float(&shm, Some("colour_strength"), |h| &h.colour_strength_bits);
-    comp_group.add(&spin_row("Colour strength", "How much of the transfer is allowed to be colour, not just luminance", colour_strength, "colour_strength", 0.05, set_colour_strength));
+    comp_group.add(&spin_row(
+        "Colour strength",
+        "How much of the transfer is allowed to be colour, not just luminance",
+        colour_strength,
+        "colour_strength",
+        0.05,
+        set_colour_strength,
+    ));
 
     let (max_ratio, set_max_ratio) = bind_float(&shm, Some("max_ratio"), |h| &h.max_ratio_bits);
     comp_group.add(&spin_row("Highlight guard", "The most the pass may brighten or darken a pixel by (x)", max_ratio, "max_ratio", 0.1, set_max_ratio));
@@ -575,14 +588,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     );
     comp_group.add(&working_scale_row);
 
-
     let (reversible, set_reversible) = bind_u32(&shm, Some("reversible_mode"), |h| &h.reversible_mode);
-    comp_group.add(&combo_row(
-        "Reversible mode",
-        &["Knee", "Neutwo", "Neutwo replace", "Hybrid", "Hybrid replace"],
-        reversible,
-        set_reversible,
-    ));
+    comp_group.add(&combo_row("Reversible mode", &["Knee", "Neutwo", "Neutwo replace", "Hybrid", "Hybrid replace"], reversible, set_reversible));
     debug_assert_eq!(reversible_mode::KNEE, 0);
 
     let (hdr_mode, set_hdr_mode) = bind_u32(&shm, Some("hdr_mode"), |h| &h.hdr_mode);
@@ -652,7 +659,12 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     ));
 
     let (apply_model, set_apply_model) = bind_bool(&shm, Some("apply_model"), |h| &h.apply_model);
-    comp_group.add(&switch_row("Apply model edit", "Off presents the clean frame — capture/transport/round-trip still run, for an honest A/B", apply_model, set_apply_model));
+    comp_group.add(&switch_row(
+        "Apply model edit",
+        "Off presents the clean frame — capture/transport/round-trip still run, for an honest A/B",
+        apply_model,
+        set_apply_model,
+    ));
 
     let (hold_frame, set_hold_frame) = bind_bool(&shm, Some("hold_frame"), |h| &h.hold_frame);
     comp_group.add(&switch_row("Hold frame", "Freeze the frame the pass works on, to re-run composition over the same picture", hold_frame, set_hold_frame));
@@ -886,13 +898,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // instance appears here within a second instead of needing an app restart.
     every(&toasts, SECOND, |_| refresh_all_rows());
 
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Neural Forge")
-        .default_width(620)
-        .default_height(700)
-        .content(&toasts)
-        .build();
+    let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").default_width(620).default_height(700).content(&toasts).build();
 
     {
         let toasts = toasts.clone();
@@ -924,10 +930,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // `switcher_bar` are otherwise different libadwaita types.
     let narrow = adw::BreakpointCondition::new_length(adw::BreakpointConditionLengthType::MaxWidth, 1400.0, adw::LengthUnit::Sp);
     let breakpoint = adw::Breakpoint::new(narrow);
-    breakpoint.add_setters(&[
-        (switcher.upcast_ref::<gtk4::Widget>(), "visible", false),
-        (switcher_bar.upcast_ref::<gtk4::Widget>(), "reveal", true),
-    ]);
+    breakpoint.add_setters(&[(switcher.upcast_ref::<gtk4::Widget>(), "visible", false), (switcher_bar.upcast_ref::<gtk4::Widget>(), "reveal", true)]);
     window.add_breakpoint(breakpoint);
 
     {
@@ -954,10 +957,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
                     "Dagherbou and cdozdil (OptiScaler) — the DLSS-NR shader lineage",
                 ],
             );
-            dialog.add_credit_section(
-                Some("Built with"),
-                &["Claude Code (Anthropic)", "Codex (OpenAI)"],
-            );
+            dialog.add_credit_section(Some("Built with"), &["Claude Code (Anthropic)", "Codex (OpenAI)"]);
             dialog.present(Some(&window));
         });
     }
@@ -973,15 +973,46 @@ fn build_colour_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     group.set_title("Colour");
     group.set_description(Some("Shapes the model's change to the frame, not the frame: 1 leaves the change as the model made it"));
     let (v, set) = bind_float(shm, Some("edit_saturation"), |h| &h.edit_saturation_bits);
-    group.add(&spin_row("Saturation of the change", "Scales how much the model changes colour: 0 keeps the frame's colours, above 1 adds to the model's", v, "edit_saturation", 0.05, set));
+    group.add(&spin_row(
+        "Saturation of the change",
+        "Scales how much the model changes colour: 0 keeps the frame's colours, above 1 adds to the model's",
+        v,
+        "edit_saturation",
+        0.05,
+        set,
+    ));
     let (v, set) = bind_float(shm, Some("edit_contrast"), |h| &h.edit_contrast_bits);
-    group.add(&spin_row("Contrast of the change", "Scales how much the model brightens or darkens: 0 keeps the frame's brightness", v, "edit_contrast", 0.05, set));
+    group.add(&spin_row(
+        "Contrast of the change",
+        "Scales how much the model brightens or darkens: 0 keeps the frame's brightness",
+        v,
+        "edit_contrast",
+        0.05,
+        set,
+    ));
     let (v, set) = bind_float(shm, Some("edit_detail"), |h| &h.edit_detail_bits);
-    group.add(&spin_row("Detail of the change", "Scales the fine part of the change against its broad part: 0 keeps only the broad change", v, "edit_detail", 0.05, set));
+    group.add(&spin_row(
+        "Detail of the change",
+        "Scales the fine part of the change against its broad part: 0 keeps only the broad change",
+        v,
+        "edit_detail",
+        0.05,
+        set,
+    ));
     let (v, set) = bind_bool(shm, Some("edit_gamut_guard"), |h| &h.edit_gamut_guard);
-    group.add(&switch_row("Gamut guard", "Where a change would push a colour past what the frame can hold, shorten the change instead of clipping a channel (keeps the hue)", v, set));
+    group.add(&switch_row(
+        "Gamut guard",
+        "Where a change would push a colour past what the frame can hold, shorten the change instead of clipping a channel (keeps the hue)",
+        v,
+        set,
+    ));
     let (v, set) = bind_bool(shm, Some("edit_dither"), |h| &h.edit_dither);
-    group.add(&switch_row("Dither", "Against banding in smooth gradients after the upscaler: a fixed pattern of half a step before the 8-bit answer is rounded", v, set));
+    group.add(&switch_row(
+        "Dither",
+        "Against banding in smooth gradients after the upscaler: a fixed pattern of half a step before the 8-bit answer is rounded",
+        v,
+        set,
+    ));
 
     let lut_row = adw::ActionRow::new();
     lut_row.set_title("Look-up table");
@@ -1048,9 +1079,23 @@ fn build_colour_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     }
     clear.connect_clicked(move |_| set_lut(None));
     let (v, set) = bind_float(shm, Some("edit_lut_strength"), |h| &h.edit_lut_strength_bits);
-    group.add(&spin_row("Look-up table strength", "0 is off. Applied where the model changed the picture, on its last pass", v, "edit_lut_strength", 0.05, set));
+    group.add(&spin_row(
+        "Look-up table strength",
+        "0 is off. Applied where the model changed the picture, on its last pass",
+        v,
+        "edit_lut_strength",
+        0.05,
+        set,
+    ));
     let (v, set) = bind_float(shm, Some("edit_lut_adapt"), |h| &h.edit_lut_adapt_bits);
-    group.add(&spin_row("Look-up table full at", "How large a change gets the table's full strength (0-1 of the picture's range); smaller changes get less, an unchanged pixel none", v, "edit_lut_adapt", 0.01, set));
+    group.add(&spin_row(
+        "Look-up table full at",
+        "How large a change gets the table's full strength (0-1 of the picture's range); smaller changes get less, an unchanged pixel none",
+        v,
+        "edit_lut_adapt",
+        0.01,
+        set,
+    ));
     group
 }
 
@@ -1082,9 +1127,7 @@ fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>
     use std::rc::Rc;
     let group = adw::PreferencesGroup::new();
     group.set_title("HUD on the finished frame");
-    group.set_description(Some(
-        "Only where the model runs on the presented frame, HUD included. Before the upscaler and after DLSS the HUD is not drawn yet",
-    ));
+    group.set_description(Some("Only where the model runs on the presented frame, HUD included. Before the upscaler and after DLSS the HUD is not drawn yet"));
     let (v, set) = bind_bool(shm, Some("hud_detect"), |h| &h.hud_detect);
     group.add(&switch_row("Find the HUD", "Keep the edit off what stays still and sharp while the picture moves (text, icons, the minimap)", v, set));
     let list = gtk4::ListBox::new();
@@ -1114,7 +1157,8 @@ fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>
     let rebuild: Rc<std::cell::RefCell<Option<Rebuild>>> = Rc::new(std::cell::RefCell::new(None));
     let shown: Rc<std::cell::RefCell<Vec<HudRegion>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
     {
-        let (shm, list, write, rebuild_ref, shown, add) = (std::sync::Arc::clone(shm), list.clone(), Rc::clone(&write), Rc::clone(&rebuild), Rc::clone(&shown), add.clone());
+        let (shm, list, write, rebuild_ref, shown, add) =
+            (std::sync::Arc::clone(shm), list.clone(), Rc::clone(&write), Rc::clone(&rebuild), Rc::clone(&shown), add.clone());
         let f: Rebuild = Rc::new(move || {
             while let Some(child) = list.first_child() {
                 list.remove(&child);
@@ -1232,7 +1276,9 @@ struct PassField {
 }
 
 enum PassFieldKind {
-    Float { step: f64 },
+    Float {
+        step: f64,
+    },
     Choice(&'static [&'static str]),
     Toggle,
     /// A model resolution preset (`enums::model_scale::PRESETS`), stored as its scale.
@@ -1247,17 +1293,71 @@ fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
     use std::cell::Cell;
     use std::rc::Rc;
     const FIELDS: &[PassField] = &[
-        PassField { title: "Intensity", field: "intensity", bit: po::INTENSITY, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass[k].intensity_bits },
-        PassField { title: "Local tone", field: "local_tone", bit: po::LOCAL_TONE, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass[k].local_tone_bits },
-        PassField { title: "Local structure", field: "local_structure", bit: po::LOCAL_STRUCTURE, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass[k].local_structure_bits },
-        PassField { title: "Skin structure", field: "skin_structure", bit: po::SKIN_STRUCTURE, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass[k].skin_structure_bits },
-        PassField { title: "Style", field: "style", bit: po::STYLE, kind: PassFieldKind::Choice(&["Default", "Natural", "Cinematic"]), get: |h, k| &h.pass[k].style },
+        PassField {
+            title: "Intensity",
+            field: "intensity",
+            bit: po::INTENSITY,
+            kind: PassFieldKind::Float { step: 0.05 },
+            get: |h, k| &h.pass[k].intensity_bits,
+        },
+        PassField {
+            title: "Local tone",
+            field: "local_tone",
+            bit: po::LOCAL_TONE,
+            kind: PassFieldKind::Float { step: 0.05 },
+            get: |h, k| &h.pass[k].local_tone_bits,
+        },
+        PassField {
+            title: "Local structure",
+            field: "local_structure",
+            bit: po::LOCAL_STRUCTURE,
+            kind: PassFieldKind::Float { step: 0.05 },
+            get: |h, k| &h.pass[k].local_structure_bits,
+        },
+        PassField {
+            title: "Skin structure",
+            field: "skin_structure",
+            bit: po::SKIN_STRUCTURE,
+            kind: PassFieldKind::Float { step: 0.05 },
+            get: |h, k| &h.pass[k].skin_structure_bits,
+        },
+        PassField {
+            title: "Style",
+            field: "style",
+            bit: po::STYLE,
+            kind: PassFieldKind::Choice(&["Default", "Natural", "Cinematic"]),
+            get: |h, k| &h.pass[k].style,
+        },
         PassField { title: "Auto mask", field: "auto_mask", bit: po::AUTO_MASK, kind: PassFieldKind::Toggle, get: |h, k| &h.pass[k].auto_mask },
         PassField { title: "Model resolution", field: "scale", bit: po::SCALE, kind: PassFieldKind::Scale, get: |h, k| &h.pass_scale_bits[k] },
-        PassField { title: "Edit saturation", field: "edit_saturation", bit: po::EDIT_SATURATION, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass_colour[k].saturation_bits },
-        PassField { title: "Edit contrast", field: "edit_contrast", bit: po::EDIT_CONTRAST, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass_colour[k].contrast_bits },
-        PassField { title: "Edit detail", field: "edit_detail", bit: po::EDIT_DETAIL, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass_colour[k].detail_bits },
-        PassField { title: "Placement", field: "placement", bit: po::PLACEMENT, kind: PassFieldKind::Choice(&PLACEMENT_NAMES), get: |h, k| &h.pass_placement[k] },
+        PassField {
+            title: "Edit saturation",
+            field: "edit_saturation",
+            bit: po::EDIT_SATURATION,
+            kind: PassFieldKind::Float { step: 0.05 },
+            get: |h, k| &h.pass_colour[k].saturation_bits,
+        },
+        PassField {
+            title: "Edit contrast",
+            field: "edit_contrast",
+            bit: po::EDIT_CONTRAST,
+            kind: PassFieldKind::Float { step: 0.05 },
+            get: |h, k| &h.pass_colour[k].contrast_bits,
+        },
+        PassField {
+            title: "Edit detail",
+            field: "edit_detail",
+            bit: po::EDIT_DETAIL,
+            kind: PassFieldKind::Float { step: 0.05 },
+            get: |h, k| &h.pass_colour[k].detail_bits,
+        },
+        PassField {
+            title: "Placement",
+            field: "placement",
+            bit: po::PLACEMENT,
+            kind: PassFieldKind::Choice(&PLACEMENT_NAMES),
+            get: |h, k| &h.pass_placement[k],
+        },
     ];
     let max = neural_forge_protocol::MAX_PASSES;
 
@@ -1552,7 +1652,9 @@ async fn extract_model(path: std::path::PathBuf, rows: ModelRows) {
             let networks: Vec<String> = all
                 .networks
                 .iter()
-                .map(|done| format!("the {} of build {}{}", done.network, done.build, if done.verified { "" } else { " (not verified against NVIDIA's runtime)" }))
+                .map(|done| {
+                    format!("the {} of build {}{}", done.network, done.build, if done.verified { "" } else { " (not verified against NVIDIA's runtime)" })
+                })
                 .collect();
             for (network, why) in &all.refused {
                 eprintln!("neural-forge: the DLL's {network} was not extracted: {why}");
@@ -1581,9 +1683,7 @@ async fn extract_model(path: std::path::PathBuf, rows: ModelRows) {
 fn build_model_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Neural rendering model");
-    group.set_description(Some(
-        "Taken from your own nvngx_dlssnr.dll -- this project doesn't and can't ship it",
-    ));
+    group.set_description(Some("Taken from your own nvngx_dlssnr.dll -- this project doesn't and can't ship it"));
     let (text, present) = model_status();
     let status_row = adw::ActionRow::new();
     status_row.set_title("Model");
@@ -1771,16 +1871,21 @@ fn target_editor(
             // A game whose executable was just named can be switched on now, without a refresh.
             switch.set_sensitive(switch_usable(&game, &new, switch.is_active(), running.get()));
             if !switch.is_active() || new.is_empty() {
-                toasts.add_toast(toast(&format!("{}'s target is {}; it is used when the game is switched on", game.name, if new.is_empty() { "not found" } else { &new })));
+                toasts.add_toast(toast(&format!(
+                    "{}'s target is {}; it is used when the game is switched on",
+                    game.name,
+                    if new.is_empty() { "not found" } else { &new }
+                )));
                 return;
             }
             let (root, appid, action) = (game.root.path.clone(), game.appid.clone(), steam::Action::Enable { target_exe: new.clone() });
             match gio::spawn_blocking(move || steam::apply_now(&root, &appid, &action)).await {
                 Ok(steam::Outcome::Changed(_) | steam::Outcome::Unchanged) => toasts.add_toast(toast(&format!("{} now targets {new}", game.name))),
-                Ok(steam::Outcome::SteamRunning { manual }) => {
-                    toasts.add_toast(manual_toast("Saved, but Steam is running: close it and switch the game off and on, or set the launch options by hand", manual))
+                Ok(steam::Outcome::SteamRunning { manual }) => toasts
+                    .add_toast(manual_toast("Saved, but Steam is running: close it and switch the game off and on, or set the launch options by hand", manual)),
+                Ok(steam::Outcome::Failed { reason, manual }) => {
+                    toasts.add_toast(manual_toast(&format!("Saved, but the launch options could not be changed safely: {reason}"), manual))
                 }
-                Ok(steam::Outcome::Failed { reason, manual }) => toasts.add_toast(manual_toast(&format!("Saved, but the launch options could not be changed safely: {reason}"), manual)),
                 Err(_) => toasts.add_toast(toast("Saved, but changing the launch options stopped")),
             }
         });
@@ -2212,8 +2317,10 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             let parent = button.root().and_downcast::<gtk4::Window>();
             let dialog = adw::AlertDialog::builder()
                 .heading("Reset all settings?")
-                .body("Every tuning value returns to its default. The running layer \
-                       session (frame counters, transport state) is not affected.")
+                .body(
+                    "Every tuning value returns to its default. The running layer \
+                       session (frame counters, transport state) is not affected.",
+                )
                 .default_response("cancel")
                 .close_response("cancel")
                 .build();
@@ -2221,7 +2328,9 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             dialog.add_response("reset", "Reset");
             dialog.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
             dialog.choose(parent.as_ref(), None::<&gio::Cancellable>, move |response| {
-                if response != "reset" { return; }
+                if response != "reset" {
+                    return;
+                }
                 // Reset the live mapping the running layer is already
                 // attached to, then overwrite config.ini with the same defaults so a
                 // restart doesn't just reload the values this just cleared -- the
@@ -2557,11 +2666,8 @@ fn connect_save_report(button: &gtk4::Button, shm: &std::sync::Arc<neural_forge_
                 Ok(Ok(path)) => {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     let dir = path.parent().map(|d| d.display().to_string()).unwrap_or_default();
-                    let toast = adw::Toast::builder()
-                        .title(glib::markup_escape_text(&format!("Saved {name} to {dir}")))
-                        .button_label("Show")
-                        .timeout(10)
-                        .build();
+                    let toast =
+                        adw::Toast::builder().title(glib::markup_escape_text(&format!("Saved {name} to {dir}"))).button_label("Show").timeout(10).build();
                     let parent = button.root().and_downcast::<gtk4::Window>();
                     toast.connect_button_clicked(move |_| {
                         gtk4::FileLauncher::new(Some(&gio::File::for_path(&path))).open_containing_folder(parent.as_ref(), None::<&gio::Cancellable>, |_| {});
@@ -2628,10 +2734,7 @@ fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::map
                 neural_forge_protocol::SHM_VERSION
             ),
         ),
-        OpenError::Unavailable => (
-            "Couldn't open the shared-memory mapping",
-            "neural-forge-cli doctor may help.".to_string(),
-        ),
+        OpenError::Unavailable => ("Couldn't open the shared-memory mapping", "neural-forge-cli doctor may help.".to_string()),
         OpenError::Foreign => (
             "The shared-memory path names another file",
             "The configured channel path (shm= in config.ini, or NEURAL_FORGE_SHM) points at an existing file that is not a \
@@ -2704,16 +2807,19 @@ mod capture_tests {
     }
 }
 
-#[cfg(test)] mod hotkey_tests {
+#[cfg(test)]
+mod hotkey_tests {
     use super::*;
-    #[test] fn hardware_codes_are_converted_without_underflow() {
-        assert_eq!(evdev_keycode(95),Some(87)); // F11: XKB -> Linux evdev.
-        assert_eq!(evdev_keycode(38),Some(30)); // physical A key on evdev.
-        assert_eq!(evdev_keycode(0),None);
-        assert_eq!(evdev_keycode(8),None);
-        assert_eq!(evdev_keycode(u32::MAX),None);
+    #[test]
+    fn hardware_codes_are_converted_without_underflow() {
+        assert_eq!(evdev_keycode(95), Some(87)); // F11: XKB -> Linux evdev.
+        assert_eq!(evdev_keycode(38), Some(30)); // physical A key on evdev.
+        assert_eq!(evdev_keycode(0), None);
+        assert_eq!(evdev_keycode(8), None);
+        assert_eq!(evdev_keycode(u32::MAX), None);
     }
-    #[test] fn key_labels_use_the_key_name_and_fall_back_to_the_code() {
+    #[test]
+    fn key_labels_use_the_key_name_and_fall_back_to_the_code() {
         assert_eq!(format_key_label(87, Some("F11")), "F11");
         assert_eq!(format_key_label(30, Some("a")), "A");
         assert_eq!(format_key_label(70, Some("Scroll_Lock")), "Scroll_Lock");

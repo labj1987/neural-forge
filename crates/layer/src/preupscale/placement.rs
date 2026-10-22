@@ -115,7 +115,8 @@ impl Plan {
         }
         // The present stage does not share a frame with the holds (module docs).
         if stages[0] != Stage::Present {
-            let held = if frame.output { Stage::Upscaled } else { stages[..count].iter().copied().filter(|s| *s != Stage::Present).max().unwrap_or(Stage::Before) };
+            let held =
+                if frame.output { Stage::Upscaled } else { stages[..count].iter().copied().filter(|s| *s != Stage::Present).max().unwrap_or(Stage::Before) };
             for (k, stage) in stages.iter_mut().enumerate().take(count) {
                 if *stage == Stage::Present {
                     notes.push(format!(

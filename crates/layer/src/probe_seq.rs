@@ -33,7 +33,11 @@ fn stages(raw: u64) -> String {
 }
 
 fn access(raw: u64) -> String {
-    if raw == 0 { "NONE".into() } else { format!("{:?}", vk::AccessFlags2::from_raw(raw)) }
+    if raw == 0 {
+        "NONE".into()
+    } else {
+        format!("{:?}", vk::AccessFlags2::from_raw(raw))
+    }
 }
 
 /// Uninteresting commands between two kept entries.
@@ -87,7 +91,11 @@ impl std::fmt::Display for Gap {
                 access(self.mem_dst_access)
             ));
         }
-        if parts.is_empty() { f.write_str("(nothing)") } else { f.write_str(&parts.join(", ")) }
+        if parts.is_empty() {
+            f.write_str("(nothing)")
+        } else {
+            f.write_str(&parts.join(", "))
+        }
     }
 }
 
@@ -117,15 +125,30 @@ pub(crate) struct ImageBarrier {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
     Gap(Gap),
-    Launch { ordinal: u32, kernel: String },
+    Launch {
+        ordinal: u32,
+        kernel: String,
+    },
     /// A copy/blit/clear/resolve with an image of interest as source or destination.
-    Transfer { kind: &'static str, src: Option<(vk::Image, vk::ImageLayout)>, dst: Option<(vk::Image, vk::ImageLayout)> },
+    Transfer {
+        kind: &'static str,
+        src: Option<(vk::Image, vk::ImageLayout)>,
+        dst: Option<(vk::Image, vk::ImageLayout)>,
+    },
     /// A render pass or rendering with an image of interest attached, and the draws and
     /// `vkCmdClearAttachments` recorded inside it.
-    Render { kind: &'static str, attachments: Vec<Attachment>, draws: u32, clears: u32 },
+    Render {
+        kind: &'static str,
+        attachments: Vec<Attachment>,
+        draws: u32,
+        clears: u32,
+    },
     Barrier(ImageBarrier),
     /// `vkCmdExecuteCommands` whose secondaries carry launches.
-    Execute { buffers: u32, launches: u32 },
+    Execute {
+        buffers: u32,
+        launches: u32,
+    },
 }
 
 /// The recorded sequence of one command buffer since its last `vkBeginCommandBuffer`.
@@ -264,8 +287,7 @@ impl Recording {
 
     /// Launches this buffer carries, its own plus its secondaries'.
     pub fn total_launches(&self) -> u32 {
-        self.launches
-            + self.ops.iter().map(|op| if let Op::Execute { launches, .. } = op { *launches } else { 0 }).sum::<u32>()
+        self.launches + self.ops.iter().map(|op| if let Op::Execute { launches, .. } = op { *launches } else { 0 }).sum::<u32>()
     }
 
     /// What the commands before the first launch did to `colour`.
@@ -438,7 +460,9 @@ pub(crate) fn hex<H: Handle>(handle: H) -> String {
 mod tests {
     use super::*;
 
-    fn img(raw: u64) -> vk::Image { vk::Image::from_raw(raw) }
+    fn img(raw: u64) -> vk::Image {
+        vk::Image::from_raw(raw)
+    }
 
     fn barrier(image: u64, old: vk::ImageLayout, new: vk::ImageLayout, src_access: vk::AccessFlags2) -> ImageBarrier {
         ImageBarrier {
@@ -470,7 +494,10 @@ mod tests {
         r.buffer_barriers(3);
         assert_eq!(r.ops.len(), 1, "{:?}", r.ops);
         let Op::Gap(gap) = &r.ops[0] else { panic!() };
-        assert_eq!((gap.draws, gap.dispatches, gap.memory_barriers, gap.image_barriers, gap.transfers, gap.renderings, gap.buffer_barriers), (301, 2, 2, 1, 1, 1, 3));
+        assert_eq!(
+            (gap.draws, gap.dispatches, gap.memory_barriers, gap.image_barriers, gap.transfers, gap.renderings, gap.buffer_barriers),
+            (301, 2, 2, 1, 1, 1, 3)
+        );
         assert_eq!(gap.mem_src_access, vk::AccessFlags2::SHADER_WRITE.as_raw());
         r.launch("k1".into());
         r.launch("k2".into());
@@ -478,7 +505,13 @@ mod tests {
         assert_eq!(r.ops.len(), 4);
         assert_eq!(r.total_launches(), 2);
         let lines = r.lines(&|i| hex(i));
-        assert!(lines[0].starts_with("[0] ... 301 draws, 2 dispatches, 1 transfers(other), 1 renderings(other), 1 img-barriers(other), 3 buf-barriers, 2 mem-barriers(src "), "{}", lines[0]);
+        assert!(
+            lines[0].starts_with(
+                "[0] ... 301 draws, 2 dispatches, 1 transfers(other), 1 renderings(other), 1 img-barriers(other), 3 buf-barriers, 2 mem-barriers(src "
+            ),
+            "{}",
+            lines[0]
+        );
         assert!(lines[0].contains("SHADER_WRITE"), "{}", lines[0]);
         assert_eq!(lines[1], "[1] LAUNCH #1 k1");
         assert_eq!(lines[3], "[3] ... 1 dispatches");
@@ -494,7 +527,11 @@ mod tests {
         let colour = img(0xc0);
         let mut r = Recording::default();
         r.draw();
-        r.begin_render("rendering", vec![Attachment { image: colour, layout: Some(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL), load: Some(vk::AttachmentLoadOp::LOAD), depth: false }], true);
+        r.begin_render(
+            "rendering",
+            vec![Attachment { image: colour, layout: Some(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL), load: Some(vk::AttachmentLoadOp::LOAD), depth: false }],
+            true,
+        );
         r.draw();
         r.draw();
         r.clear_attachments();
@@ -518,7 +555,11 @@ mod tests {
         assert_eq!(r.analyse(None).class(), "untouched");
         let lines = r.lines(&|i| if i == colour { "C".into() } else { hex(i) });
         assert_eq!(lines[1], "[1] rendering [C COLOR_ATTACHMENT_OPTIMAL load=LOAD] draws=2 clear-attachments=1");
-        assert!(lines[3].starts_with("[3] barrier C COLOR_ATTACHMENT_OPTIMAL->GENERAL src COMPUTE_SHADER:COLOR_ATTACHMENT_WRITE dst ALL_COMMANDS:SHADER_READ"), "{}", lines[3]);
+        assert!(
+            lines[3].starts_with("[3] barrier C COLOR_ATTACHMENT_OPTIMAL->GENERAL src COMPUTE_SHADER:COLOR_ATTACHMENT_WRITE dst ALL_COMMANDS:SHADER_READ"),
+            "{}",
+            lines[3]
+        );
     }
 
     #[test]
@@ -542,7 +583,18 @@ mod tests {
     fn launches_in_secondaries_past_the_cap_are_counted() {
         let mut r = Recording::new(vk::CommandBufferUsageFlags::empty(), 0);
         for _ in 0..MAX_OPS + 10 {
-            r.image_barrier(ImageBarrier { image: vk::Image::null(), old: vk::ImageLayout::GENERAL, new: vk::ImageLayout::GENERAL, src_stage: 0, src_access: 0, dst_stage: 0, dst_access: 0 }, true);
+            r.image_barrier(
+                ImageBarrier {
+                    image: vk::Image::null(),
+                    old: vk::ImageLayout::GENERAL,
+                    new: vk::ImageLayout::GENERAL,
+                    src_stage: 0,
+                    src_access: 0,
+                    dst_stage: 0,
+                    dst_access: 0,
+                },
+                true,
+            );
         }
         r.execute(1, 3);
         r.execute(2, 0);

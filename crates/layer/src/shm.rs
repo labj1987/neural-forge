@@ -480,7 +480,11 @@ impl ShmClient {
                     && measured_white.is_finite()
                     && measured_white > 1e-4;
                 let combined = if measured { measured_white * trim } else { manual } * scale;
-                if combined.is_finite() && combined > 1e-4 { combined } else { 1.0 }
+                if combined.is_finite() && combined > 1e-4 {
+                    combined
+                } else {
+                    1.0
+                }
             },
             reversible_mode: hdr.reversible_mode.load(Ordering::Relaxed),
         })
@@ -500,7 +504,11 @@ impl ShmClient {
     /// The mapping for another thread of this process, once open.
     #[cfg(target_arch = "x86_64")]
     pub fn view(&self) -> Option<ShmView> {
-        (!self.header.is_null() && self.regions.iter().all(|r| !r.is_null())).then_some(ShmView { header: self.header, regions: self.regions, leased: self.leased })
+        (!self.header.is_null() && self.regions.iter().all(|r| !r.is_null())).then_some(ShmView {
+            header: self.header,
+            regions: self.regions,
+            leased: self.leased,
+        })
     }
 
     /// The control mask's rules.
@@ -571,10 +579,7 @@ impl ShmClient {
     /// through the GUI or CLI without adding I/O to the game's present path.
     pub fn publish_frame_timing(&self, total: Duration, composition_up: bool) {
         let Some(hdr) = self.header() else { return };
-        hdr.layer_ms_bits.store(
-            (total.as_secs_f64().mul_add(1_000.0, 0.0) as f32).to_bits(),
-            Ordering::Relaxed,
-        );
+        hdr.layer_ms_bits.store((total.as_secs_f64().mul_add(1_000.0, 0.0) as f32).to_bits(), Ordering::Relaxed);
         hdr.layer_composition_up.store(u32::from(composition_up), Ordering::Relaxed);
     }
 
@@ -660,10 +665,7 @@ impl ShmClient {
     /// before the first reading (or before the mapping is open).
     pub fn published_gpu_ms(&self) -> (f32, f32) {
         let Some(hdr) = self.header() else { return (0.0, 0.0) };
-        (
-            f32::from_bits(hdr.layer_capture_gpu_ms_bits.load(Ordering::Relaxed)),
-            f32::from_bits(hdr.layer_compose_gpu_ms_bits.load(Ordering::Relaxed)),
-        )
+        (f32::from_bits(hdr.layer_capture_gpu_ms_bits.load(Ordering::Relaxed)), f32::from_bits(hdr.layer_compose_gpu_ms_bits.load(Ordering::Relaxed)))
     }
 
     /// Writes `bytes` (truncated to `MAX_FRAME`, same discipline as the free-text
@@ -687,11 +689,7 @@ impl ShmClient {
         // in bounds for any `n <= MAX_FRAME` and `slot < 2` by that region's own
         // definition.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                dst,
-                n,
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
         }
     }
 
@@ -708,11 +706,7 @@ impl ShmClient {
         let n = out.len().min(cap);
         // SAFETY: same reasoning as `write_proxy`, mirrored for the answer region.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                src,
-                out.as_mut_ptr(),
-                n,
-            );
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
         }
         n
     }
@@ -789,7 +783,11 @@ impl ShmClient {
         let Some(hdr) = self.header() else { return 0.0 };
         let ms = |bits: &std::sync::atomic::AtomicU32| f32::from_bits(bits.load(Ordering::Relaxed));
         let total = ms(&hdr.server_upload_ms_bits) + ms(&hdr.server_eval_ms_bits) + ms(&hdr.server_readback_ms_bits);
-        if total.is_finite() && total > 0.0 { total } else { 0.0 }
+        if total.is_finite() && total > 0.0 {
+            total
+        } else {
+            0.0
+        }
     }
 
     /// Opens (or creates) the mapping if not already attached, and takes (or keeps) this process's
@@ -812,9 +810,7 @@ impl ShmClient {
             }
             return true;
         }
-        let path = neural_forge_protocol::env::var("NEURAL_FORGE_SHM")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(shm_default_path);
+        let path = neural_forge_protocol::env::var("NEURAL_FORGE_SHM").filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
         // A mapping refused once is refused for good: no claim for a channel this client can never use.
         if self.map_refused || !neural_forge_protocol::isolated_path(&path) || !ensure_private_parent_dir(&path) {
             return false;
@@ -900,12 +896,7 @@ impl ShmClient {
         self.last_control_seq = hdr.control_seq.load(Ordering::Relaxed);
         self.header = header;
         self.path = path.to_string();
-        crate::log!(
-            "[shm] attached {} seq_req={} seq_resp={}",
-            self.path,
-            hdr.seq_req.load(Ordering::Relaxed),
-            hdr.seq_resp.load(Ordering::Relaxed)
-        );
+        crate::log!("[shm] attached {} seq_req={} seq_resp={}", self.path, hdr.seq_req.load(Ordering::Relaxed), hdr.seq_resp.load(Ordering::Relaxed));
         true
     }
 

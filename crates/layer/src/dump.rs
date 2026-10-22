@@ -117,7 +117,11 @@ mod tests {
     fn only_absolute_base_directories_are_used() {
         let unused = || -> Option<String> { panic!("the runtime directory is only asked for without a home") };
         assert_eq!(captures_dir_from(Some("/x/data"), Some("/home/u"), unused), PathBuf::from("/x/data/neural-forge/captures"));
-        assert_eq!(captures_dir_from(Some("rel/data"), Some("/home/u"), unused), PathBuf::from("/home/u/.local/share/neural-forge/captures"), "a relative XDG_DATA_HOME is ignored");
+        assert_eq!(
+            captures_dir_from(Some("rel/data"), Some("/home/u"), unused),
+            PathBuf::from("/home/u/.local/share/neural-forge/captures"),
+            "a relative XDG_DATA_HOME is ignored"
+        );
         assert_eq!(captures_dir_from(None, Some("/home/u"), unused), PathBuf::from("/home/u/.local/share/neural-forge/captures"));
     }
 

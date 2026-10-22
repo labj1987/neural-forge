@@ -214,7 +214,10 @@ mod tests {
         assert_eq!(line.matches('\t').count(), 4);
         assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
         let e = parse_line(&line).unwrap();
-        assert_eq!((e.time, e.pid, e.process.as_str(), e.kind.as_str(), e.message.as_str()), (1_760_000_000, 4242, "Hogwarts Legacy.exe", DEVICE_LOST, "lost at submit"));
+        assert_eq!(
+            (e.time, e.pid, e.process.as_str(), e.kind.as_str(), e.message.as_str()),
+            (1_760_000_000, 4242, "Hogwarts Legacy.exe", DEVICE_LOST, "lost at submit")
+        );
     }
 
     #[test]

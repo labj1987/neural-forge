@@ -68,7 +68,18 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { width: 1280, height: 720, px_per_frame: 2.0, grain: 0.0, contrast: 1.0, frames: 0, present_mode: vk::PresentModeKHR::FIFO, save: None, capture_at: None, capture_frames: 120 };
+    let mut a = Args {
+        width: 1280,
+        height: 720,
+        px_per_frame: 2.0,
+        grain: 0.0,
+        contrast: 1.0,
+        frames: 0,
+        present_mode: vk::PresentModeKHR::FIFO,
+        save: None,
+        capture_at: None,
+        capture_frames: 120,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         if flag == "-h" || flag == "--help" {
@@ -88,7 +99,9 @@ fn parse_args() -> Args {
             "--frames" => a.frames = value.parse().unwrap_or_else(|_| bad()),
             "--save" => a.save = Some(value.into()),
             "--capture-at" => a.capture_at = Some(value.parse().unwrap_or_else(|_| bad())),
-            "--capture-frames" => a.capture_frames = value.parse::<u32>().ok().filter(|&n| n > 1 && n <= neural_forge_protocol::capture::MAX_FRAMES).unwrap_or_else(|| bad()),
+            "--capture-frames" => {
+                a.capture_frames = value.parse::<u32>().ok().filter(|&n| n > 1 && n <= neural_forge_protocol::capture::MAX_FRAMES).unwrap_or_else(|| bad())
+            }
             "--present-mode" => {
                 a.present_mode = match value.as_str() {
                     "fifo" => vk::PresentModeKHR::FIFO,
@@ -203,7 +216,11 @@ fn texel(x: usize, y: usize) -> [f32; 3] {
                 let (gx, gy) = ((px % cw) / s, (py % ch) / s);
                 let glyph = hash3(cx * 64 + col, cy * 64 + row, 4);
                 let on = !glyph.is_multiple_of(6) && gx < 5 && gy < 7 && (hash(glyph) >> (gy * 5 + gx) as u32) & 1 == 1;
-                if on { [ink; 3] } else { [ground; 3] }
+                if on {
+                    [ink; 3]
+                } else {
+                    [ground; 3]
+                }
             }
         }
         // Smooth gradient: the flat, low-detail areas.
@@ -233,7 +250,11 @@ fn texel(x: usize, y: usize) -> [f32; 3] {
         7 => {
             let period = 2 + (hash(h) % 4) as usize;
             let on = if hash(h ^ 5) & 1 == 0 { (lx / period + ly / period).is_multiple_of(2) } else { (lx / period).is_multiple_of(2) };
-            if on { palette(hash(h ^ 6)) } else { [235.0, 235.0, 235.0] }
+            if on {
+                palette(hash(h ^ 6))
+            } else {
+                [235.0, 235.0, 235.0]
+            }
         }
         // Flat fill.
         _ => palette(hash(h ^ 8)),
@@ -426,7 +447,11 @@ impl Xcb {
             }
             let sym = |name: &CStr| -> Result<*mut c_void, String> {
                 let p = libc::dlsym(lib, name.as_ptr());
-                if p.is_null() { Err(format!("libxcb has no {name:?}")) } else { Ok(p) }
+                if p.is_null() {
+                    Err(format!("libxcb has no {name:?}"))
+                } else {
+                    Ok(p)
+                }
             };
             let connect: unsafe extern "C" fn(*const c_char, *mut c_int) -> *mut c_void = std::mem::transmute(sym(c"xcb_connect")?);
             let has_error: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(sym(c"xcb_connection_has_error")?);
@@ -462,7 +487,21 @@ impl Xcb {
             const EVENT_MASK_KEY_PRESS: u32 = 0x1;
             const EVENT_MASK_STRUCTURE_NOTIFY: u32 = 0x20000;
             let values = [screen.black_pixel, EVENT_MASK_KEY_PRESS | EVENT_MASK_STRUCTURE_NOTIFY];
-            create_window(conn, 0, window, screen.root, 0, 0, width as u16, height as u16, 0, 1, screen.root_visual, CW_BACK_PIXEL | CW_EVENT_MASK, values.as_ptr());
+            create_window(
+                conn,
+                0,
+                window,
+                screen.root,
+                0,
+                0,
+                width as u16,
+                height as u16,
+                0,
+                1,
+                screen.root_visual,
+                CW_BACK_PIXEL | CW_EVENT_MASK,
+                values.as_ptr(),
+            );
             let atom = |name: &str, only_if_exists: u8| {
                 let cookie = intern_atom(conn, only_if_exists, name.len() as u16, name.as_ptr().cast());
                 let reply = intern_atom_reply(conn, cookie, std::ptr::null_mut());
@@ -691,10 +730,15 @@ impl Gpu {
         if caps.max_image_count != 0 {
             count = count.min(caps.max_image_count);
         }
-        let alpha = [vk::CompositeAlphaFlagsKHR::OPAQUE, vk::CompositeAlphaFlagsKHR::INHERIT, vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED, vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED]
-            .into_iter()
-            .find(|a| caps.supported_composite_alpha.contains(*a))
-            .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
+        let alpha = [
+            vk::CompositeAlphaFlagsKHR::OPAQUE,
+            vk::CompositeAlphaFlagsKHR::INHERIT,
+            vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+            vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+        ]
+        .into_iter()
+        .find(|a| caps.supported_composite_alpha.contains(*a))
+        .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(count)
@@ -711,7 +755,8 @@ impl Gpu {
             .old_swapchain(old);
         let handle = check(unsafe { self.swapchain_fn.create_swapchain(&info, None) }, "vkCreateSwapchainKHR");
         let images = check(unsafe { self.swapchain_fn.get_swapchain_images(handle) }, "vkGetSwapchainImagesKHR");
-        let copied = images.iter().map(|_| check(unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }, "vkCreateSemaphore")).collect();
+        let copied =
+            images.iter().map(|_| check(unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }, "vkCreateSemaphore")).collect();
         Swapchain { handle, images, extent, copied }
     }
 
@@ -733,7 +778,10 @@ impl Gpu {
         let type_index = (0..self.mem_props.memory_type_count)
             .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.mem_props.memory_types[i as usize].property_flags.contains(wanted))
             .expect("no host-visible coherent memory");
-        let memory = check(unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }, "vkAllocateMemory");
+        let memory = check(
+            unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) },
+            "vkAllocateMemory",
+        );
         check(unsafe { d.bind_buffer_memory(buffer, memory, 0) }, "vkBindBufferMemory");
         let ptr = check(unsafe { d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }, "vkMapMemory").cast();
         let alloc = vk::CommandBufferAllocateInfo::default().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
@@ -756,7 +804,8 @@ impl Gpu {
     /// Records "staging buffer -> `image`, then ready to present".
     fn record_copy(&self, s: &Staging, image: vk::Image, extent: vk::Extent2D) {
         let d = &self.device;
-        let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+        let range =
+            vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
         let to_dst = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -781,11 +830,30 @@ impl Gpu {
         // SAFETY: `s.cmd` is not in use (its fence was waited on); all handles are live.
         unsafe {
             check(d.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()), "vkResetCommandBuffer");
-            check(d.begin_command_buffer(s.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)), "vkBeginCommandBuffer");
+            check(
+                d.begin_command_buffer(s.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)),
+                "vkBeginCommandBuffer",
+            );
             // The acquire semaphore is waited on at TRANSFER; this barrier's first scope chains to it.
-            d.cmd_pipeline_barrier(s.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            d.cmd_pipeline_barrier(
+                s.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
             d.cmd_copy_buffer_to_image(s.cmd, s.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
-            d.cmd_pipeline_barrier(s.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            d.cmd_pipeline_barrier(
+                s.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
             check(d.end_command_buffer(s.cmd), "vkEndCommandBuffer");
         }
     }
@@ -884,15 +952,13 @@ fn main() {
         check(unsafe { d.queue_submit(gpu.queue, &[submit], s.fence) }, "vkQueueSubmit");
         if args.capture_at == Some(frame) {
             match neural_forge_protocol::mapping::open() {
-                Ok(mapping) => {
-                    match neural_forge_protocol::capture::request(mapping.header(), args.capture_frames) {
-                        Ok(id) => {
-                            eprintln!("pan: requested a {}-frame capture (id {id}) at frame {frame}", args.capture_frames);
-                            capture = Some((mapping, id));
-                        }
-                        Err(e) => eprintln!("pan: the capture request was refused: {e}"),
+                Ok(mapping) => match neural_forge_protocol::capture::request(mapping.header(), args.capture_frames) {
+                    Ok(id) => {
+                        eprintln!("pan: requested a {}-frame capture (id {id}) at frame {frame}", args.capture_frames);
+                        capture = Some((mapping, id));
                     }
-                }
+                    Err(e) => eprintln!("pan: the capture request was refused: {e}"),
+                },
                 Err(e) => eprintln!("pan: cannot open the layer's shared memory for --capture-at: {e}"),
             }
         }

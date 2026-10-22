@@ -354,7 +354,11 @@ fn unix_ms() -> u64 {
 
 /// A JSON number, or `null` for a value JSON cannot hold.
 fn number(v: f32) -> String {
-    if v.is_finite() { format!("{v}") } else { "null".into() }
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "null".into()
+    }
 }
 
 /// `s` as a JSON string literal: quotes, backslashes and every control character escaped.
@@ -449,7 +453,8 @@ pub(crate) fn write_frames(dir: &std::path::Path, rx: &mpsc::Receiver<Frame>) {
         let head = first.get_or_insert(Frame { colour: Vec::new(), answer: Vec::new(), mvec: Vec::new(), depth: None, ..frame });
         let text = manifest(head, depth_format, &entries);
         let tmp = dir.join("manifest.json.tmp");
-        let written = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(text.as_bytes())).and_then(|()| std::fs::rename(&tmp, dir.join("manifest.json")));
+        let written =
+            std::fs::File::create(&tmp).and_then(|mut f| f.write_all(text.as_bytes())).and_then(|()| std::fs::rename(&tmp, dir.join("manifest.json")));
         if let Err(e) = written {
             crate::log!("[preupscale] cache dump manifest in {} failed: {e}", dir.display());
             crate::logging::flush();
@@ -501,7 +506,12 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/test-scratch").join(format!("cache-dump-{name}-{}", std::process::id()));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .join("target/test-scratch")
+            .join(format!("cache-dump-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -529,7 +539,14 @@ mod tests {
         drop(tx);
         write_frames(&dir, &rx);
         let text = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
-        for want in ["\"holds\": 3", "\"width\": 6, \"height\": 4", "\"path\": \"split\"", "\"depth_format\": \"D32_SFLOAT_S8_UINT\"", "\"hold\": 12", "\"jitter\": [0.25, -0.125]"] {
+        for want in [
+            "\"holds\": 3",
+            "\"width\": 6, \"height\": 4",
+            "\"path\": \"split\"",
+            "\"depth_format\": \"D32_SFLOAT_S8_UINT\"",
+            "\"hold\": 12",
+            "\"jitter\": [0.25, -0.125]",
+        ] {
             assert!(text.contains(want), "{want} missing from {text}");
         }
         let size = |name: &str| std::fs::metadata(dir.join(name)).unwrap().len();
@@ -593,7 +610,11 @@ mod tests {
     #[test]
     fn a_gap_or_a_miss_ends_the_dump() {
         let (tx, rx) = mpsc::sync_channel(QUEUED_FRAMES);
-        let mut d = CacheDump { run: Some(Run { id: 1, want: 4, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx }), runs: 1, ..Default::default() };
+        let mut d = CacheDump {
+            run: Some(Run { id: 1, want: 4, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx }),
+            runs: 1,
+            ..Default::default()
+        };
         let a = d.arm(10, false).unwrap();
         d.after_hold(Some(a), true, None);
         let b = d.arm(11, false).unwrap();
@@ -614,7 +635,11 @@ mod tests {
     #[test]
     fn the_dump_ends_after_k_holds() {
         let (tx, rx) = mpsc::sync_channel(QUEUED_FRAMES);
-        let mut d = CacheDump { run: Some(Run { id: 1, want: 2, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx }), runs: 1, ..Default::default() };
+        let mut d = CacheDump {
+            run: Some(Run { id: 1, want: 2, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx }),
+            runs: 1,
+            ..Default::default()
+        };
         let a = d.arm(1, false).unwrap();
         d.after_hold(Some(a), true, None);
         let b = d.arm(2, false).unwrap();
@@ -631,7 +656,11 @@ mod tests {
     fn a_writer_that_falls_behind_ends_the_dump() {
         let (tx, rx) = mpsc::sync_channel(QUEUED_FRAMES);
         let want = QUEUED_FRAMES as u32 + 4;
-        let mut d = CacheDump { run: Some(Run { id: 1, want, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx }), runs: 1, ..Default::default() };
+        let mut d = CacheDump {
+            run: Some(Run { id: 1, want, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx }),
+            runs: 1,
+            ..Default::default()
+        };
         for hold in 0..=QUEUED_FRAMES as u64 {
             let a = d.arm(hold, false).unwrap();
             d.after_hold(Some(a), true, Some(frame(hold, 1, 1, None)));
