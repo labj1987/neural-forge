@@ -1339,6 +1339,42 @@ directly. GPU from nvidia-smi each second, CPU per thread from `top -H` each sec
   and the docs still called it "the after-the-upscaler path everywhere"; they now say what it does, the
   layer logs it once, and the comparison with the model on the finished frame is `placement=present`.
 
+## October 22: ideas from the other DLSS-NR projects
+
+A survey of the other projects running DLSS 5's NR network (AMDNR by 3zwr1, lmxxf/Kien's and mochizuki0323's AMD
+runtimes, TheAutomatic's and wilsjo2's OptiScaler forks, the SAOG0721 Magpie fork) and the tools around them (RenoDX,
+ReShade, dlssg-to-fsr3, the FSR 4 overrides, HelixSR), read for what Neural Forge could use. What came of it:
+
+- **Taken: activations placed by lifetime** (mochizuki0323's idea). About half the network's video memory
+  (NATIVE_BACKEND.md, "Activation memory").
+- **Already here:** the Natural/Cinematic grade after the network (mochizuki's `nr_style_grade.glsl`; ours matches NGX
+  within a half step, NATIVE_BACKEND.md 2.2), an auto-exposure for games that hand DLSS none, motion accumulated over
+  the frames the edit cache carries (AMDNR's `MotionAccumulateShader`), the sky from depth, counter chaining between
+  launches (mochizuki's `NR_TCHAIN`), NaN from the head read as 0 in every composite (AMDNR's black-output guard), and a
+  build that returns its memory when rebuilt for another size (AMDNR measured another runtime keeping 75-350 MB per
+  size; the rig's `rebuilds_at_other_sizes_return_their_memory` holds ours flat).
+- **Not taken, the noise lanes computed once** (mochizuki's `NR_NOISE_FIELD`): the noise is seeded per frame, and NGX's
+  answer is reproduced bit for bit only with that seed. Computing it once gives up exactness for a negligible cost.
+- **Not taken, the network one frame behind** (AMDNR's non-blocking lmxxf backend: frame N gets N-1's correction,
+  reprojected, while N runs on another queue). Before the upscaler the hold already waits for nothing on the host
+  (October 21, above): the network runs in line on the game's queue and the GPU takes it into the game's idle time.
+  Moving it to another queue could only overlap it with the game's own work at a frame of latency, and TheAutomatic's
+  A/B (`docs/decisions.md`, 09-21) found the previous frame's colour with the current frame's vectors blurred the whole
+  picture.
+- **Not taken, programmatic dependent launch** (`griddepcontrol`, lmxxf's home-made PDL): the launches go through
+  `vkCmdCudaLaunchKernelNV`, which takes no CUDA launch attributes, and counter chaining already overlaps them.
+- **Not taken, skipping the ViT when the picture has not changed** (lmxxf's `DLSS5_VIT_ADAPTIVE`, 5-6% in motion):
+  TheAutomatic found it flickers badly with the network's history on, and ours is always on.
+- **Not needed yet, pre-SR inputs smaller than their image** (wilsjo2's padded pre-SR): every game held so far (GTA V
+  Enhanced, Crimson Desert, Cyberpunk 2077, Black Myth: Wukong, GTA San Andreas DE, Hogwarts Legacy) renders into an
+  image of its render size. A game with dynamic resolution into a larger image would need it.
+- **Left for later:** the game's reactive mask in the edit cache (AMDNR's `reactiveAt`; GTA's is R-only), the frame
+  generation HUD-less image as an exact HUD mask (dlssg-to-fsr3 reads `DLSSG.HUDLess`; a Vulkan layer under Proton sees
+  only images, not NGX's parameters), a low-band temporal filter of the correction (SAOG's Magpie, lmxxf's
+  `DLSS5_TEMPORAL_MODE`; DLSS5VKLayer measured an answer carried into newer frames as a dead end twice, ATTRIBUTION.md
+  "The composition strategy", which argues against it unless the band split changes that), and HDR on the after-the-upscaler path (RenoDX's resource upgrade; HDR
+  swapchains pass through untouched today).
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
