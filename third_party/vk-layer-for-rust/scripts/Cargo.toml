@@ -18,6 +18,7 @@
 edition = "2021"
 name = "vulkan-layer-scripts"
 version = "0.1.0"
+publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

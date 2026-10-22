@@ -47,8 +47,13 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   never edit its generated files by hand (`bash scripts/vk-layer-codegen.sh`). Its `UPSTREAM.md` has the checks.
 - CI (`.github/workflows/check.yml`, run by ci.yml on every push and pull request and by release.yml
   on a tag) runs the tests, the layer's tests again under the Khronos validation layer (which must
-  report nothing, with nothing filtered), clippy, every script's
-  self-test, the shader check, the AppImage build and its installed-layer smoke test. A new script with a self-test is added there. The weekly pin check
+  report nothing, with nothing filtered), clippy, `cargo fmt --check`, every script's
+  self-test, the shader check, the dependency check, the AppImage build and its installed-layer smoke test. A new script with a self-test is added there.
+- Formatting: `cargo fmt --all` before committing (rustfmt.toml: 160 columns), and in
+  `third_party/vk-layer-for-rust` too, which keeps its own 100-column config.
+- Dependencies: `bash scripts/cargo-deny.sh` (deny.toml) checks RustSec advisories, licences and sources. A
+  new advisory fails CI: update the crate, or add an `ignore` entry in deny.toml with the reason it does not
+  apply. A new licence must be added to the allow-list on purpose, after checking it is AGPL-compatible. The weekly pin check
   (`scripts/check_pins.py`, pin-check.yml) keeps one issue about pins behind upstream; it must never
   comment or open more than that one (each notification is an email).
 - `cargo test` and `cargo build --release` build every crate (x86_64 Linux only; there is no

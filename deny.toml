@@ -1,0 +1,43 @@
+# cargo-deny (CI's "Dependency advisories, licences and sources" step): what the shipped binaries link,
+# checked against the RustSec advisory database, an allow-list of licences compatible with this project's
+# AGPL-3.0-or-later, and crates.io as the only source. `bash scripts/cargo-deny.sh` runs the pinned cargo-deny.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+# Dev-dependencies never ship; build-dependencies and proc macros run only in the compiler but are
+# still checked for advisories and licences.
+exclude-dev = true
+
+[advisories]
+# Every advisory fails, unmaintained and unsound ones included: each needs a decision written down
+# here (an `ignore` entry with its reason) or an update.
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+# The licences found in the dependency graph, each compatible with AGPL-3.0-or-later.
+allow = [
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of one crate are reported, not refused: they come from dependencies' own requirements
+# (png's miniz_oxide 0.8, the GTK -sys crates' two system-deps, syn 2 and 3 in different proc macros).
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

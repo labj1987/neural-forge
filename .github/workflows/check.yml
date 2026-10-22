@@ -65,11 +65,11 @@ jobs:
       - name: Set up Rust Toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.99.0
+          toolchain: 1.99.1
           components: clippy, rustfmt
 
       - name: Toolchain matches rust-toolchain.toml
-        run: grep -q '^channel = "1.99.0"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.99\.0 '
+        run: grep -q '^channel = "1.99.1"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.99\.1 '
 
       # libgtk-4-dev/libadwaita-1-dev for the gui crate; a software Vulkan ICD (lavapipe) so the
       # layer's real-device tests run (NEURAL_FORGE_REQUIRE_VULKAN makes that an assertion);
@@ -179,6 +179,12 @@ jobs:
       - name: Clippy (warnings are errors)
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # rustfmt.toml for the workspace; the layer framework keeps its own config.
+      - name: Formatting
+        run: |
+          cargo fmt --all --check
+          (cd third_party/vk-layer-for-rust && cargo fmt --all --check)
+
       # The layer framework is its own workspace (third_party/vk-layer-for-rust/UPSTREAM.md): clippy
       # with and without its features, and its tests, one at a time (several share mock expectations
       # held in statics). Its build output goes to the workspace's target directory, which is cached.
@@ -218,6 +224,10 @@ jobs:
 
       - name: AppStream releases match the changelog
         run: python3 scripts/sync_appdata_releases.py --check
+
+      # RustSec advisories (the database fetched fresh), licences and sources: deny.toml.
+      - name: Dependency advisories, licences and sources
+        run: bash scripts/cargo-deny.sh
 
       - name: Third-party crate listing is current
         run: python3 scripts/gen_third_party_crates.py --check

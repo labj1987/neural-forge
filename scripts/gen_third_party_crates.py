@@ -28,13 +28,6 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "THIRD_PARTY_CRATES.md"
 TARGET = "x86_64-unknown-linux-gnu"
 
-# Crates whose manifest names its licence by file (`license-file`) instead of an SPDX `license`: the layer
-# framework in third_party/vk-layer-for-rust, whose LICENSE is the Apache-2.0 text.
-LICENSE_OVERRIDES = {
-    "vulkan-layer": "Apache-2.0",
-    "vulkan-layer-macros": "Apache-2.0",
-}
-
 # A crate's licence and notice files, by name.
 LICENCE_FILE = re.compile(r"^(licen[cs]e|copying|notice|copyright|unlicense)([-_.].*)?$", re.I)
 
@@ -83,7 +76,7 @@ def linked(meta):
 
 
 def licence_of(pkg):
-    return pkg.get("license") or LICENSE_OVERRIDES.get(pkg["name"], "see crate")
+    return pkg.get("license") or "see crate"
 
 
 def listing(meta):

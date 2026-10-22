@@ -50,8 +50,9 @@ this project's own code: upstream is no longer tracked.
 
 1. **Workspace.** The members are `vulkan-layer`, `vulkan-layer-macros` and `scripts`; `Cargo.lock` is upstream's
    with the entries of what was left out removed, every other version as upstream had it.
-2. **Manifests.** `vulkan-layer` and `vulkan-layer-macros` name their licence file (`license-file = "../LICENSE"`)
-   and upstream as their `repository`, so the licence listing finds both.
+2. **Manifests.** `vulkan-layer` and `vulkan-layer-macros` declare `license = "Apache-2.0"` and upstream as their
+   `repository`, with a copy of `LICENSE` in each crate's directory, so the licence listing and cargo-deny find
+   both. All three crates are `publish = false`.
 3. **Warnings under Rust 1.99** (CI's `-D warnings`; as a git dependency its warnings were not shown):
    `LazyCollection::get` returns `Cow<'_, T>`; the tests compare function pointers by address (`as usize`), as
    upstream's other tests already did; `unstable_api` re-exports `Feature` and `CheckEmpty` only with the

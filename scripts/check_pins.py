@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Reports the pinned versions Dependabot cannot see that are behind their upstream.
 
-The pins: the native toolchain in scripts/fetch-native-tools.sh, appimagetool and the
+The pins: the native toolchain in scripts/fetch-native-tools.sh, cargo-deny in scripts/cargo-deny.sh,
+appimagetool and the
 AppImage runtime in build-appimage.sh, and the Rust toolchain in rust-toolchain.toml. (GitHub Actions
 are pinned by SHA and updated by Dependabot; Cargo crates by Dependabot.) Each is compared with
 upstream's newest release or tag through the GitHub API ($GITHUB_TOKEN raises its rate limit).
@@ -28,7 +29,7 @@ def read(rel):
     return (ROOT / rel).read_text()
 
 
-def pins(fetch_text, build_text, toolchain_text):
+def pins(fetch_text, build_text, toolchain_text, deny_text):
     """[(name, pinned, kind, repo)]: kind is release or tag:<prefix>."""
     out = []
     m = re.search(r"glslang/releases/download/([^/]+)/", fetch_text)
@@ -37,6 +38,8 @@ def pins(fetch_text, build_text, toolchain_text):
     out.append(("Vulkan-Headers", m.group(1), "tag:v1.", "KhronosGroup/Vulkan-Headers"))
     m = re.search(r"volk/archive/refs/tags/(vulkan-sdk-[0-9.]+)\.tar", fetch_text)
     out.append(("volk", m.group(1), "tag:vulkan-sdk-", "zeux/volk"))
+    m = re.search(r'^CARGO_DENY_VERSION="([^"]+)"', deny_text, re.M)
+    out.append(("cargo-deny", m.group(1), "release", "EmbarkStudios/cargo-deny"))
     m = re.search(r'^APPIMAGETOOL_VERSION="([^"]+)"', build_text, re.M)
     out.append(("appimagetool", m.group(1), "release", "AppImage/appimagetool"))
     m = re.search(r'^RUNTIME_VERSION="([^"]+)"', build_text, re.M)
@@ -97,8 +100,8 @@ def report(rows):
 
 
 def self_test():
-    rows = pins(read("scripts/fetch-native-tools.sh"), read("build-appimage.sh"), read("rust-toolchain.toml"))
-    assert [r[0] for r in rows] == ["glslang", "Vulkan-Headers", "volk", "appimagetool", "AppImage type2-runtime", "Rust toolchain"], rows
+    rows = pins(read("scripts/fetch-native-tools.sh"), read("build-appimage.sh"), read("rust-toolchain.toml"), read("scripts/cargo-deny.sh"))
+    assert [r[0] for r in rows] == ["glslang", "Vulkan-Headers", "volk", "cargo-deny", "appimagetool", "AppImage type2-runtime", "Rust toolchain"], rows
     assert all(r[1] for r in rows)
     assert version_key("vulkan-sdk-1.4.357.0") < version_key("vulkan-sdk-1.4.360.0")
     assert newest(["v1.4.363", "v1.4.370", "v1.4.99", "v1.5.0-rc1", "continuous"]) == "v1.4.370"
@@ -126,7 +129,7 @@ def main():
     if sys.argv[1:] == ["--self-test"]:
         return self_test()
     rows, failed = [], []
-    for name, pinned, kind, repo in pins(read("scripts/fetch-native-tools.sh"), read("build-appimage.sh"), read("rust-toolchain.toml")):
+    for name, pinned, kind, repo in pins(read("scripts/fetch-native-tools.sh"), read("build-appimage.sh"), read("rust-toolchain.toml"), read("scripts/cargo-deny.sh")):
         try:
             upstream = latest(kind, repo)
             if upstream is None:

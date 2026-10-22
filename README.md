@@ -558,7 +558,7 @@ cargo build --release
 bash build-appimage.sh
 ```
 
-Every build uses Rust 1.99.0, pinned in `rust-toolchain.toml`. The first command fetches what the native backend (`crates/native`) builds with: the pinned glslang,
+Every build uses Rust 1.99.1, pinned in `rust-toolchain.toml`. The first command fetches what the native backend (`crates/native`) builds with: the pinned glslang,
 Vulkan-Headers and volk; the network's own source is in `third_party/opendlss-nr`. The second builds everything (protocol, layer, native,
 GUI, CLI, supervisor). The third packs it into an AppImage (see `build-appimage.sh` for the package
 list). CI runs the same build, the checks below, clippy and the AppImage's installed-layer smoke

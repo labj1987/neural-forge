@@ -17,6 +17,7 @@ version = "3.8.6"
 edition = "2021"
 authors = ["Linnard Alex Brown Jr."]
 license = "AGPL-3.0-or-later"
+publish = false
 
 # Workspace-wide because Cargo profiles (other than a few per-package-overridable
 # knobs, and `panic` isn't one of them) apply to the whole build, not one member.

@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Modified for Neural Forge (2026): license-file and repository added; ash 0.38 (UPSTREAM.md).
+# Modified for Neural Forge (2026): licence and repository added; ash 0.38 (UPSTREAM.md).
 
 [package]
 edition = "2021"
 name = "vulkan-layer-macros"
 version = "0.1.0"
-license-file = "../LICENSE"
+publish = false
+license = "Apache-2.0"
 repository = "https://github.com/google/vk-layer-for-rust"
 
 [lib]
