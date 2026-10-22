@@ -1956,11 +1956,13 @@ impl Tracker {
                 self.functions.get(&function).map(|(_, n)| n.as_str()),
                 &format!("input {:?} rr {} known {}", refs.input, refs.input_rr, known.len()),
             );
-            // DLSS Super Resolution's input kernel by name, but not read as an input launch: say once
-            // what it named, so a new engine's input form shows in the log.
+            // DLSS Super Resolution's input kernel by name: say once what it named, read as an input launch
+            // or not, so a new engine's input form (and every image beside the three used, a reactive or
+            // transparency mask among them) shows in the log.
             let read_as = refs.input.clone();
-            if kernel == Some(Kernel::SrInput) && !matches!(read_as, Some(InputLaunch::Inputs { .. })) && self.said_named & 4 == 0 {
-                self.said_named |= 4;
+            let bit = if matches!(read_as, Some(InputLaunch::Inputs { .. })) { 64 } else { 4 };
+            if kernel == Some(Kernel::SrInput) && self.said_named & bit == 0 {
+                self.said_named |= bit;
                 let list: Vec<String> = named
                     .iter()
                     .map(|i| match self.images.get(i) {

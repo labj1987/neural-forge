@@ -607,10 +607,10 @@ fn check_compute_capability(gpus: &Gpus) -> Vec<Finding> {
 
 // ---- VRAM ----------------------------------------------------------------------------------------
 
-/// What the network needs at a size: `(width, height, MiB)`, from `dlss5vk bench`'s peak VRAM over the
-/// idle desktop in docs/NATIVE_BACKEND.md, "0.5 Network time on the test machine" (weights,
-/// activations, staging). The README's "about 1.5 GB" at 4K DLSS Balanced is the 2228x1253 row.
-const NETWORK_VRAM_MIB: [(u32, u32, u64); 4] = [(1485, 836, 945), (2228, 1253, 1511), (2560, 1440, 1810), (3840, 2160, 3474)];
+/// What the network needs at a size: `(width, height, MiB)`, the device-local memory the full network's open and
+/// build at that size take on the test machine (weights and activations, the activations shared by lifetime:
+/// docs/NATIVE_BACKEND.md, "Activation memory"; the small network takes about 45 MiB less).
+const NETWORK_VRAM_MIB: [(u32, u32, u64); 4] = [(1485, 836, 377), (2228, 1253, 607), (2560, 1440, 729), (3840, 2160, 1415)];
 
 /// The network's need at `width` x `height`: the smallest measured size that covers it, or the largest.
 fn network_need_mib(width: u32, height: u32) -> (u32, u32, u64) {
@@ -1431,10 +1431,10 @@ mod tests {
 
     #[test]
     fn vram_below_the_networks_need_at_the_games_size_warns() {
-        assert_eq!(network_need_mib(1485, 836).2, 945);
-        assert_eq!(network_need_mib(1920, 1080).2, 1511);
-        assert_eq!(network_need_mib(2560, 1440).2, 1810);
-        assert_eq!(network_need_mib(7680, 4320).2, 3474);
+        assert_eq!(network_need_mib(1485, 836).2, 377);
+        assert_eq!(network_need_mib(1920, 1080).2, 607);
+        assert_eq!(network_need_mib(2560, 1440).2, 729);
+        assert_eq!(network_need_mib(7680, 4320).2, 1415);
         let gpus = |free: u64| Gpus::Listed(vec![parse_gpu_line(&format!("NVIDIA GeForce RTX 5070, 12.0, 12227, {free}"))]);
         let hdr = neural_forge_protocol::ShmHeader::default();
         hdr.init_defaults();
@@ -1442,9 +1442,9 @@ mod tests {
         assert_eq!(check_vram(&gpus(500), Some(&hdr))[0].severity, Severity::Info);
         hdr.preupscale_width.store(2228, Ordering::Relaxed);
         hdr.preupscale_height.store(1253, Ordering::Relaxed);
-        let low = check_vram(&gpus(1200), Some(&hdr));
+        let low = check_vram(&gpus(500), Some(&hdr));
         assert_eq!(low[0].severity, Severity::Warning);
-        assert!(low[0].summary.contains("below the 1511 MiB the network needs at 2228x1253"), "{}", low[0].summary);
+        assert!(low[0].summary.contains("below the 607 MiB the network needs at 2228x1253"), "{}", low[0].summary);
         assert_eq!(check_vram(&gpus(4000), Some(&hdr))[0].severity, Severity::Ok);
         // Running: the network is already in what is used.
         hdr.native_running.store(1, Ordering::Relaxed);
