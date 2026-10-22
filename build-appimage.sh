@@ -60,8 +60,8 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
 rustup run "$TOOLCHAIN" rustc --version >/dev/null 2>&1 || rustup toolchain install "$TOOLCHAIN"
-# The pinned glslang, Vulkan-Headers, volk and patched OpenDLSS-NR that crates/native builds with
-# (SHA-256-checked, skipped when already in tools/native/).
+# The pinned glslang, Vulkan-Headers and volk that crates/native builds with (SHA-256-checked,
+# skipped when already in tools/native/).
 bash scripts/fetch-native-tools.sh
 # ── Release build ─────────────────────────────────────────────────────
 echo "==> cargo build --release (protocol/layer/native/gui/cli)"
@@ -91,15 +91,18 @@ cp data/io.github.labj1987.NeuralForge.appdata.xml       "$APPDIR/usr/share/meta
 
 # Licence notices that must ship with any build: this project's own AGPL text, the GPL-3.0 text
 # and RenoDX MIT notice for the OptiScaler-derived shader lineage (third_party/optiscaler), the
-# OpenDLSS-NR patches and their reasons, the statically linked crates' listing (regenerated here so
-# it cannot drift from Cargo.lock), and the full licence and notice texts of every linked crate and
-# of OpenDLSS-NR, volk and the Vulkan-Headers compiled into the layer, collected from their sources.
+# network's MIT licence, notice and origin from OpenDLSS-NR (third_party/opendlss-nr, without its
+# source), the statically linked crates' listing (regenerated here so it cannot drift from
+# Cargo.lock), and the full licence and notice texts of every linked crate and of the network, volk
+# and the Vulkan-Headers compiled into the layer, collected from their sources.
 DOCDIR="$APPDIR/usr/share/doc/$NAME"
 mkdir -p "$DOCDIR"
 python3 scripts/gen_third_party_crates.py
 python3 scripts/gen_third_party_crates.py --licences "$DOCDIR/THIRD_PARTY_LICENSES.txt"
 cp LICENSE ATTRIBUTION.md THIRD_PARTY_CRATES.md "$DOCDIR/"
-cp -r third_party "$DOCDIR/"
+mkdir -p "$DOCDIR/third_party/opendlss-nr"
+cp -r third_party/optiscaler "$DOCDIR/third_party/"
+cp third_party/opendlss-nr/{LICENSE,NOTICE,UPSTREAM.md} "$DOCDIR/third_party/opendlss-nr/"
 
 # Top-level AppImage requirements
 cp data/io.github.labj1987.NeuralForge.desktop "$APPDIR/"

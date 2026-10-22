@@ -4,7 +4,8 @@
 The crates: every crate the workspace members (layer, native backend, supervisor, GUI, CLI, protocol) link,
 walking normal (non-dev, non-build) dependencies only and leaving out proc-macro crates (they run in the
 compiler and are not linked), nor anything reached only through one. The C and C++ code compiled into
-the layer: OpenDLSS-NR, volk and the Vulkan-Headers, from tools/native (scripts/fetch-native-tools.sh).
+the layer: the network from OpenDLSS-NR (third_party/opendlss-nr), and volk and the Vulkan-Headers from
+tools/native (scripts/fetch-native-tools.sh).
 
   gen_third_party_crates.py                  rewrite THIRD_PARTY_CRATES.md (the crate listing)
   gen_third_party_crates.py --check          exit 1, with a diff, if THIRD_PARTY_CRATES.md is out of date
@@ -37,11 +38,12 @@ LICENSE_OVERRIDES = {
 # A crate's licence and notice files, by name.
 LICENCE_FILE = re.compile(r"^(licen[cs]e|copying|notice|copyright|unlicense)([-_.].*)?$", re.I)
 
-# The native code compiled into the layer: (name, licence, files under tools/native).
+# The native code compiled into the layer: (name, licence, files), the files under the repository ("repo")
+# or tools/native ("tools").
 NATIVE = [
-    ("OpenDLSS-NR", "MIT", ["OpenDLSS-NR/LICENSE", "OpenDLSS-NR/NOTICE"]),
-    ("volk", "MIT", ["volk/LICENSE.md"]),
-    ("Vulkan-Headers", "Apache-2.0 OR MIT", ["Vulkan-Headers/LICENSE.md", "Vulkan-Headers/LICENSES/Apache-2.0.txt", "Vulkan-Headers/LICENSES/MIT.txt"]),
+    ("OpenDLSS-NR", "MIT", "repo", ["third_party/opendlss-nr/LICENSE", "third_party/opendlss-nr/NOTICE"]),
+    ("volk", "MIT", "tools", ["volk/LICENSE.md"]),
+    ("Vulkan-Headers", "Apache-2.0 OR MIT", "tools", ["Vulkan-Headers/LICENSE.md", "Vulkan-Headers/LICENSES/Apache-2.0.txt", "Vulkan-Headers/LICENSES/MIT.txt"]),
 ]
 
 
@@ -143,11 +145,12 @@ def licences(meta, out_path):
         "scripts/gen_third_party_crates.py at build time; ATTRIBUTION.md says what each project contributed.\n\n"
     ]
     missing = []
-    for name, lic, rel in NATIVE:
-        files = [tools / r for r in rel]
+    for name, lic, base, rel in NATIVE:
+        files = [(ROOT if base == "repo" else tools) / r for r in rel]
         absent = [str(f) for f in files if not f.is_file()]
         if absent:
-            missing.append(f"{name}: {', '.join(absent)} (run scripts/fetch-native-tools.sh)")
+            hint = "" if base == "repo" else " (run scripts/fetch-native-tools.sh)"
+            missing.append(f"{name}: {', '.join(absent)}{hint}")
             continue
         parts.append(section(f"{name} ({lic}), compiled into the Vulkan layer", files))
     for pkg in sorted(linked(meta), key=lambda p: (p["name"], p["version"])):

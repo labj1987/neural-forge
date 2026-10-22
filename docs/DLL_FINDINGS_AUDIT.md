@@ -232,7 +232,7 @@ per-pass overrides of the passes built earlier would be lost (section 4, test 3)
   - Lane 10 is style/128 and lane 11 is tone.
   - Auto-mask on: lane 12 = 1, lane 13 = skin (structure when skin < 0), lane 14 = structure.
   - Auto-mask off: lane 12 = structure, lanes 13 and 14 = -1. These are the sentinels.
-  - OpenDLSS-NR (at the pinned commit 9d08f41, fetched into `tools/native/OpenDLSS-NR`) uses the same lanes (`shaders/preprocess.comp:83-88`;
+  - OpenDLSS-NR (commit 9d08f41, now `third_party/opendlss-nr`) uses the same lanes (`shaders/preprocess.comp:83-88`;
     the `autoMask ? 1 : -1` push constant in `src/kernels.cpp:520-522` means the same under its `> 0` test).
 - **Composite.** Style 1 and 2 apply the `nrStyle` operator scaled by tone, then blend by intensity
   (`native-backend:crates/layer/shaders/native_composite.comp:88-92,171-178`).

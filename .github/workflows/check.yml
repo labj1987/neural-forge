@@ -120,18 +120,17 @@ jobs:
             target
           key: ${{ steps.cargo-key.outputs.key }}
 
-      # The pinned glslang, Vulkan-Headers, volk and OpenDLSS-NR (with its patches applied) that
-      # crates/native builds with, cached by their pins and patches: the build itself is offline.
-      # The key covers everything that decides the tree (the pins, what is kept of OpenDLSS-NR and the
-      # patches are all in the script or the patch files), and the script re-checks each tool's stamp
-      # (its archive's and the patches' SHA-256) and fetches again on a mismatch.
-      - name: Cache the native backend's sources and tools
+      # The pinned glslang, Vulkan-Headers and volk that crates/native builds with, cached by their
+      # pins: the build itself is offline. The key covers everything that decides the tree (the pins
+      # are all in the script), and the script re-checks each tool's stamp (its archive's SHA-256) and
+      # fetches again on a mismatch.
+      - name: Cache the native backend's tools
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tools/native
-          key: native-tools-${{ hashFiles('scripts/fetch-native-tools.sh', 'third_party/opendlss-nr/patches/*.patch') }}
+          key: native-tools-${{ hashFiles('scripts/fetch-native-tools.sh') }}
 
-      - name: Fetch the native backend's sources and tools
+      - name: Fetch the native backend's tools
         run: bash scripts/fetch-native-tools.sh
 
       - name: cargo test
@@ -197,7 +196,6 @@ jobs:
           python3 scripts/test_cache_replay.py
           python3 scripts/gen_third_party_crates.py --self-test
           python3 scripts/check_pins.py --self-test
-          bash scripts/fetch-native-tools.sh --self-test
 
       - name: Shader sources match committed SPIR-V
         run: python3 scripts/check_shaders.py

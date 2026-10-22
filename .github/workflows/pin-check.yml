@@ -1,6 +1,6 @@
 name: Pin check
 
-# Weekly: are the pins Dependabot cannot see (the native toolchain, OpenDLSS-NR, appimagetool, the
+# Weekly: are the pins Dependabot cannot see (the native toolchain, appimagetool, the
 # AppImage runtime, the Rust toolchain) behind upstream? The answer lives in one standing issue
 # (label pin-check), so this sends as few notifications as possible: it is opened the first time a
 # pin falls behind and reopened (never a second issue) when one falls behind again, its body is

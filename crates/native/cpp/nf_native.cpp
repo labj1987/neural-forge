@@ -423,7 +423,7 @@ struct NfNative {
         throw std::runtime_error("the warm-up run (with barriers) reports a counter-chain timeout at " + t.counter);
       }
       // The warm-up built every matrix the graph uses and has completed: the records' raw buffers now keep only the
-      // bytes the kernels read through them (OpenDLSS-NR patch 0008). The recordings below use those.
+      // bytes the kernels read through them (`Model::compactAux`). The recordings below use those.
       model->compactAux();
     }
     // The frame recordings (one per queue family they run on), every size's: descriptor pool 1 stays reserved

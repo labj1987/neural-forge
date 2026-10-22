@@ -1,9 +1,9 @@
 //! Builds the native backend: compiles OpenDLSS-NR's GLSL kernels (glslang) and generates its PTX kernels
-//! (the upstream Python generators), embeds both into a generated C++ source, and compiles that with the
+//! (its Python generators, `scripts/ptx`), embeds both into a generated C++ source, and compiles that with the
 //! OpenDLSS-NR host code, volk (as C++, in namespace volk) and `cpp/*.cpp` into a static library. libstdc++ is linked statically so the
 //! layer does not depend on the C++ runtime of whatever container a game runs in.
 //!
-//! Tools, and OpenDLSS-NR's source at its pinned commit with this project's patches applied, come from
+//! The network's source (from OpenDLSS-NR, now kept here) is `third_party/opendlss-nr`. The tools come from
 //! `NEURAL_FORGE_NATIVE_TOOLS` or `<workspace>/tools/native` (`scripts/fetch-native-tools.sh`);
 //! Python (3.10 or later) from `NEURAL_FORGE_PYTHON` or `python3` on PATH. The Vulkan-Headers' registry also
 //! gives the size of every structure a device create info may chain (`nf_native_device_extend` copies the
@@ -166,14 +166,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NEURAL_FORGE_NATIVE_TOOLS");
     println!("cargo:rerun-if-env-changed=NEURAL_FORGE_PYTHON");
     let tools = env::var_os("NEURAL_FORGE_NATIVE_TOOLS").map(PathBuf::from).unwrap_or_else(|| root.join("tools/native"));
-    let vendor = tools.join("OpenDLSS-NR");
+    let vendor = root.join("third_party/opendlss-nr");
     let shaders = vendor.join("shaders");
     let ptx_scripts = vendor.join("scripts/ptx");
     let cpp = manifest.join("cpp");
     let glslang = tools.join("glslang/bin/glslang");
     let headers = tools.join("Vulkan-Headers/include");
     let volk = tools.join("volk");
-    for need in [&glslang, &headers.join("vulkan/vulkan_core.h"), &volk.join("volk.c"), &vendor.join("src/vk_context.cpp")] {
+    for need in [&glslang, &headers.join("vulkan/vulkan_core.h"), &volk.join("volk.c")] {
         if !need.exists() {
             panic!(
                 "\n\nneural-forge-native: {} is missing.\nRun `bash scripts/fetch-native-tools.sh` once in the workspace root \
@@ -187,7 +187,6 @@ fn main() {
         ("glslang", &glslang),
         ("Vulkan-Headers", &headers.join("vulkan/vulkan_core.h")),
         ("volk", &volk.join("volk.c")),
-        ("OpenDLSS-NR", &vendor.join("src/vk_context.cpp")),
     ] {
         let fetched = tools.join(stamp).join(".fetched-sha256");
         rerun_if_changed(if fetched.exists() { &fetched } else { file });
@@ -331,8 +330,8 @@ fn main() {
             .cpp_link_stdlib(None);
         b
     };
-    // This project's glue (cpp/ and the generated embedding) with the compiler's warnings; the vendored host
-    // code and volk, which are kept as upstream has them, without. Glue first: it calls into the vendored code
+    // This project's glue (cpp/ and the generated embedding) with the compiler's warnings; the network's host
+    // code (third_party/opendlss-nr) and volk without. Glue first: it calls into the vendored code
     // (the static link resolves left to right).
     let (glue, vendored): (Vec<PathBuf>, Vec<PathBuf>) = sources.into_iter().partition(|s| s.starts_with(&cpp));
     let mut glue_build = build();

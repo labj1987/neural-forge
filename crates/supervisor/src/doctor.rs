@@ -532,7 +532,7 @@ fn parse_gpu_line(line: &str) -> Gpu {
 }
 
 /// The lowest compute capability the network runs on: its kernels are PTX for `sm_89`
-/// (OpenDLSS-NR's `scripts/ptx/ptxgen.py`, `target="sm_89"`) using FP8 (e4m3) tensor-core
+/// (`third_party/opendlss-nr/scripts/ptx/ptxgen.py`, `target="sm_89"`) using FP8 (e4m3) tensor-core
 /// instructions (`mma.sync...e4m3`, e.g. `mlp_e4m3.py`), and the device needs `VK_EXT_shader_float8`
 /// (`crates/native/cpp/nf_native.cpp`). PTX for sm_89 is only compiled by the driver for 8.9 and newer,
 /// and FP8 tensor cores start with Ada (RTX 40): an RTX 20 (7.5) or 30 (8.6) cannot run it at all.

@@ -4,6 +4,11 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## Unreleased
+
+- The network's source, which came from OpenDLSS-NR (MIT), is now part of Neural Forge and developed here
+  rather than downloaded and patched at build time. The network itself is unchanged: same picture, same speed.
+
 ## 3.8.6 — 2026-10-21
 
 - The Network choice in the Model tab describes each network without quoting one game's frame rates.

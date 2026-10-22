@@ -31,7 +31,7 @@ flowchart LR
 | Part | Crate | What it does |
 |---|---|---|
 | Vulkan layer, inside the game | `crates/layer` | Hooks device creation, command recording, `vkQueueSubmit` and `vkQueuePresentKHR`. Holds DLSS's input and runs the network on it before the upscaler; after the upscaler, captures frames, answers them with the network on a thread of its own (`preupscale/native_post.rs`) and composites the answer back. x86_64 only. |
-| Network | `crates/native` | OpenDLSS-NR's implementation of the DLSS 5 Neural Rendering network (C++, GLSL and PTX kernels fetched at a pinned commit and patched, `third_party/opendlss-nr/UPSTREAM.md`), built into the layer: loads the extracted weights, records the network's graph, runs it on the game's device. |
+| Network | `crates/native` | OpenDLSS-NR's implementation of the DLSS 5 Neural Rendering network (C++, GLSL and PTX kernels, taken in and developed in `third_party/opendlss-nr`), built into the layer: loads the extracted weights, records the network's graph, runs it on the game's device. |
 | GUI | `crates/gui` | GTK4/libadwaita settings app. Reads and writes live settings in shared memory, shows status, extracts the model. |
 | CLI | `crates/cli` | `neural-forge-cli`: install, model extraction, `doctor`, profiles, and `shmctl` for live settings. |
 | Supervisor | `crates/supervisor` | Library shared by GUI and CLI: paths, config, the channel's path, the model's extraction, installs the layer. |
@@ -763,7 +763,7 @@ With `NEURAL_FORGE_PREUPSCALE=dump` the one-shot is the pre-upscaler dump's.
 
 ## 6. The network
 
-`crates/native` (OpenDLSS-NR's C++ at its pinned commit, patched, `cpp/nf_native.cpp` glue, kernels built and embedded
+`crates/native` (the network's C++ from OpenDLSS-NR, in `third_party/opendlss-nr`, `cpp/nf_native.cpp` glue, kernels built and embedded
 by `build.rs`), `crates/layer/src/preupscale/native.rs` (the loader, the per-device state, the hold).
 
 - **Device setup** (`create_device`): on an NVIDIA device with the pre-upscaler path on, the layer

@@ -1,0 +1,89 @@
+#version 460
+// Input feature generation. Sixteen f32 lanes per padded pixel:
+// three Box-Muller Gaussian lanes evaluated with the GPU's approximate f32
+// transcendentals, constant 1, the centered proxy
+// color twice (the second copy is the history when temporal input is valid),
+// and the five conditioning lanes.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Push {
+  uint fullWidth;
+  uint fullHeight;
+  uint validWidth;
+  uint validHeight;
+  uint sourceWidth;
+  uint sourceHeight;
+  uint seed;
+  float autoMask;        // > 0 enables the auto-mask lane pair
+  float localTone;
+  float localStructure;
+  float skinStructure;
+  float style;
+} pc;
+
+layout(std430, binding = 0) readonly buffer Source { vec4 proxy[]; };   // RGBA f32 proxy code values
+layout(std430, binding = 7) writeonly buffer Features { float features[]; };
+
+float hashUniform(uint value) {
+  uint mixed = value;
+  mixed = (mixed >> ((mixed >> 28u) + 4u)) ^ mixed;
+  mixed *= 0x108ef2d9u;
+  uint integer = ((mixed >> 30u) ^ (mixed >> 8u)) + 1u;
+  return float(integer) * uintBitsToFloat(0x33800000u);
+}
+
+// Scalar form of the network's Box-Muller sequence (instruction order preserved:
+// the approximate transcendentals make it order dependent).
+vec3 gaussian3(uint x, uint y, uint seed) {
+  uint base = (x * 0x8da6b343u) ^ (seed * 0x9e3779b9u) ^ (y * 0xd8163841u) ^ 0x243f6a88u;
+  base = (base >> ((base >> 28u) + 4u)) ^ base;
+  base *= 0x108ef2d9u;
+  base = (base >> 22u) ^ base;
+  float u0 = hashUniform(base * 0x2c9277b5u + 0xac564b05u);
+  float u1 = hashUniform(base * 0xfa6dc5f9u + 0x4712a88eu);
+  float u2 = hashUniform(base * 0xcaa5b80du + 0x21dd796bu);
+  float u3 = hashUniform(base * 0x83232c31u + 0x3463e0acu);
+  float radius0 = sqrt(log2(u0) * uintBitsToFloat(0x3f317218u) * -2.0);
+  float radius1 = sqrt(log2(u2) * uintBitsToFloat(0x3f317218u) * -2.0);
+  float angle0 = u1 * uintBitsToFloat(0x40c90fdbu);
+  float angle1 = u3 * uintBitsToFloat(0x40c90fdbu);
+  return vec3(roundF16(radius0 * cos(angle0)), roundF16(radius0 * sin(angle0)), roundF16(radius1 * cos(angle1)));
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.fullWidth || id.y >= pc.fullHeight) return;
+  // Coordinates outside the valid image are mirrored, while the noise channels still hash the original
+  // padded coordinate.
+  uint sourceX = id.x < pc.validWidth ? id.x : 2u * pc.validWidth - id.x - 2u;
+  uint sourceY = id.y < pc.validHeight ? id.y : 2u * pc.validHeight - id.y - 2u;
+  uint imageX = ((2u * sourceX + 1u) * pc.sourceWidth) / (2u * pc.validWidth);
+  uint imageY = ((2u * sourceY + 1u) * pc.sourceHeight) / (2u * pc.validHeight);
+  vec4 rgba = proxy[imageY * pc.sourceWidth + imageX];
+  // Native: texture sample -> cvt.rn.f16, sub.f16(0.5), mul.f16(0.125).
+  float r = roundF16(roundF16(roundF16(rgba.r) - 0.5) * 0.125);
+  float g = roundF16(roundF16(roundF16(rgba.g) - 0.5) * 0.125);
+  float b = roundF16(roundF16(roundF16(rgba.b) - 0.5) * 0.125);
+  vec3 noise = gaussian3(id.x, id.y, pc.seed);
+  uint base = (id.y * pc.fullWidth + id.x) * 16u;
+  features[base + 0u] = noise.x;
+  features[base + 1u] = noise.y;
+  features[base + 2u] = noise.z;
+  features[base + 3u] = 1.0;
+  features[base + 4u] = r;
+  features[base + 5u] = g;
+  features[base + 6u] = b;
+  features[base + 7u] = r;
+  features[base + 8u] = g;
+  features[base + 9u] = b;
+  features[base + 10u] = pc.style / 128.0;
+  features[base + 11u] = roundF16(pc.localTone);
+  features[base + 12u] = roundF16(pc.autoMask > 0.0 ? 1.0 : pc.localStructure);
+  features[base + 13u] = roundF16(pc.autoMask > 0.0 ? (pc.skinStructure < 0.0 ? pc.localStructure : pc.skinStructure) : -1.0);
+  features[base + 14u] = roundF16(pc.autoMask > 0.0 ? pc.localStructure : -1.0);
+  features[base + 15u] = 0.0;
+}

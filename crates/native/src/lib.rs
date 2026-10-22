@@ -1,4 +1,4 @@
-//! Native backend: OpenDLSS-NR's host code (fetched at a pinned commit and patched, `third_party/opendlss-nr/UPSTREAM.md`), with its SPIR-V and
+//! Native backend: the network's host code (from OpenDLSS-NR, in `third_party/opendlss-nr`), with its SPIR-V and
 //! PTX kernels embedded at build time, behind a small C API (`cpp/nf_native.h`).
 //!
 //! `build.rs` compiles the kernels with the pinned toolchain from `scripts/fetch-native-tools.sh`, embeds

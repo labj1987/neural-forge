@@ -559,7 +559,7 @@ bash build-appimage.sh
 ```
 
 Every build uses Rust 1.99.0, pinned in `rust-toolchain.toml`. The first command fetches what the native backend (`crates/native`) builds with: the pinned glslang,
-Vulkan-Headers and volk, and OpenDLSS-NR's C++ source at its pinned commit with this project's patches applied. The second builds everything (protocol, layer, native,
+Vulkan-Headers and volk; the network's own source is in `third_party/opendlss-nr`. The second builds everything (protocol, layer, native,
 GUI, CLI, supervisor). The third packs it into an AppImage (see `build-appimage.sh` for the package
 list). CI runs the same build, the checks below, clippy and the AppImage's installed-layer smoke
 test on every push. Checks:
@@ -608,8 +608,8 @@ well: a requirement for the adapted code, not just a preference.
 This project's own code is licensed under the **GNU Affero General Public License v3.0 or later
 (AGPL-3.0-or-later)**; see [LICENSE](LICENSE). It links against and depends on NVIDIA's
 proprietary model weights at run time (extracted by the user from NVIDIA's DLL), which are not
-covered by that license and are not redistributed here. The OpenDLSS-NR sources keep their
-MIT licence; its source is fetched at a pinned commit and patched at build time
+covered by that license and are not redistributed here. The network's source in
+`third_party/opendlss-nr`, taken from OpenDLSS-NR, keeps its MIT licence
 (`third_party/opendlss-nr/UPSTREAM.md`). Statically linked Rust crates and their licences are listed in
 [THIRD_PARTY_CRATES.md](THIRD_PARTY_CRATES.md).
 
@@ -618,8 +618,7 @@ MIT licence; its source is fetched at a pinned commit and patched at build time
 - [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) (bmitch87): the architecture, the
   composition strategy and many ported functions ([ATTRIBUTION.md](ATTRIBUTION.md)).
 - [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (maan): the network implementation the
-  layer runs (fetched at a pinned commit with this project's patches, `third_party/opendlss-nr`, and
-  built by `crates/native`), the history reset rule, and the documented proxy encode the HDR encode
+  layer runs (taken into `third_party/opendlss-nr` and developed there, built by `crates/native`), the history reset rule, and the documented proxy encode the HDR encode
   before the upscaler follows.
 - [OptiScaler](https://github.com/cdozdil/OptiScaler) and
   [OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR): the idea of running the model

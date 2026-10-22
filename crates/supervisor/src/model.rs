@@ -60,7 +60,7 @@ const STAGES: [(&str, u32, u32); 11] = [
 ];
 
 /// The small network's stages: the same eleven, two blocks per resolution stage where the full one
-/// has four to nine (the ViT keeps its eight). The graph's `Topology` (patches/0009) mirrors these.
+/// has four to nine (the ViT keeps its eight). The graph's `nr::Topology` (`third_party/opendlss-nr/src/nr_graph.h`) mirrors these.
 const STAGES_SMALL: [(&str, u32, u32); 11] = [
     ("encoder32", 0, 2),
     ("encoder64", 3, 4),
