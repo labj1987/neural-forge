@@ -1379,6 +1379,22 @@ ReShade, dlssg-to-fsr3, the FSR 4 overrides, HelixSR), read for what Neural Forg
   "The composition strategy", which argues against it unless the band split changes that), and HDR on the after-the-upscaler path (RenoDX's resource upgrade; HDR
   swapchains pass through untouched today).
 
+## October 23: Metro Last Light Redux, NVIDIA's own NR as the reference
+
+Metro Last Light Redux ships the same `nvngx_dlssnr.dll` the network is extracted from, run by NVIDIA's integration.
+Three things it showed (NATIVE_BACKEND.md, "Metro Last Light Redux and NVIDIA's own NR"):
+
+- **A game can break three assumptions at once:** four-channel motion vectors, several Vulkan devices with the network
+  open on the wrong one, and an exposure image that is always 0. Each made the model silently do nothing; only the log
+  and a within-frame dump showed it. A screenshot against the model off looked like a change because the scene moved.
+- **Compare within one frame, not across launches.** A title scene that looks still differed by 5.5 of 255 between two
+  shots, as much as the model's edit; numbers from separate launches contradicted each other (an edit correlation of
+  0.89 and of -0.46 for the same setting). The probe's input and output of one frame, against our dump of a hold a few
+  seconds later in the same session, gave stable numbers.
+- **NVIDIA runs NR after DLSS on the game's tone-mapped image, linear.** Ours (before the upscaler, sRGB-encoded,
+  exposure and shoulder) pulls the brighter half of the picture down where NVIDIA's does not, and adds less detail at
+  the default brightness; about half the cost at the default placement, about twice NVIDIA's at the same one.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

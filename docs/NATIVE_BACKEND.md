@@ -1394,6 +1394,82 @@ of the budget in both: the headroom is the game's.
 The idea of placing activations by lifetime is mochizuki0323's DLSSNR-AMD ("Arena reuse, by lifetime", MIT); the code
 is this project's.
 
+## Metro Last Light Redux and NVIDIA's own NR (3.8.11, 2026-10-23)
+
+Metro Last Light Redux (Steam 287390, 4A Engine, DX12 through vkd3d-proton, NGX 310.9.16) ships NVIDIA's DLSS 5 NR
+itself: `nvngx_dlssnr.dll` is the very file the extracted network comes from (SHA-256 `2BC19BC0...789F`, the model
+manifest's source), and `user.cfg` (Steam cloud, `userdata/<id>/287390/remote/`) switches it with `r_dlss_nr`, next to
+`r_nr_preset 0` (the small network), `r_nr_style`, `r_nr_automask` and `r_nr_tonemap`. It is the first reference for
+what NVIDIA's integration hands the network.
+
+**What the game needed** (all three found here, all fixed):
+
+- **Its inputs.** DLSS's input kernel (`hiluma_engine_input_depthreg_mvlo_hdr_v2_rel`) names the colour as an RGBA16F
+  render target without storage use, the motion vectors as an RGBA16F storage image (x and y in the first two
+  channels; NVIDIA's NR reads the same image) and the depth as R32F. No two-channel motion vectors, so nothing was
+  identified. `four_channel_inputs` reads exactly that shape (one such render target, one such storage image, one
+  depth-like image at one extent), and the hold inside DLSS's buffer blits motion vectors of another format than
+  RG16F into its staging image (`MVEC_HOLD_FORMATS`: RGBA16F and RG32F; Vulkan requires those blits).
+- **Its devices.** The game creates three Vulkan devices. The after-the-upscaler path opened the network for the intro
+  video on the one that presents, and DLSS ran on another, whose loader was refused it for good (one network per
+  process). A refused loader now asks the owner to lend it (`Loader::lend`): the owner closes its network when
+  neither of its paths uses it (no hold in DLSS's buffers may run, nothing in flight, neither path ran for a path
+  switch), and opens it again only when one of its paths asks for a build. In the game it moved within 4 s.
+- **Its exposure.** The 1x1 R16F the game names for DLSS holds 0 on every frame. The encode had no usable exposure,
+  so the decode wrote nothing back: before the upscaler the model never showed. After 8 such holds in a row
+  (`EXPOSURE_UNUSABLE_HOLDS`) the exposure is measured from the frame, as for an implausible one.
+- The status read "waiting for DLSS input" while the model ran (the presenting device published its own state); the
+  process's latest hold is published by a device that does not hold.
+
+**Where NVIDIA runs it.** `NEURAL_FORGE_PROBE_RR=1` shows the order in one buffer: SR's input kernel, SR's transformer
+(`dltss_pwin_*`), SR's output kernel, `cuda_copy_exposure_kernel`, then NR's kernels (`cc_tinlayout_fused_*`,
+`cc_split_swin_*`, `cc_vit_1d_*`, the FP8 PTX this backend ports) and `cg2r_copy_kernel`, split over two command
+buffers. NR runs after DLSS, at 2560x1440, on an image the game prepares between the two (with `r_nr_tonemap 1`, its
+tone mapping): `NEURAL_FORGE_PROBE_IMAGE` caught SR's output (luma median 0.071, p99 0.60, max 1.72), NR's input
+(0.077, 0.67, max 0.90: linear, the highlights compressed) and NR's output (0.081, 0.63, max 0.86). NGX reads float
+input as given (the 0.6 parity was on float proxies encoded as the layer does, bit-exact), so NVIDIA's network sees
+linear display values, ours the sRGB-encoded ones the HDR encode makes. With `r_nr_tonemap 0` NR's input is the
+untonemapped frame (p99 1.05, max 1.93) and its output is clamped at 1.0.
+
+**Speed** (the title screen's 3D scene, 2560x1440, small network both, the game's frame generation off as found):
+
+| | fps | network GPU ms |
+|---|---|---|
+| no NR | 97-118 | - |
+| NVIDIA's NR (after DLSS, 2560x1440) | 60-67 | - |
+| ours after DLSS (2560x1440) | 46-48 | 8.1 |
+| ours before the upscaler (1485x835, the default) | 64-72 | 3.4 |
+
+At the same place NVIDIA's NR costs about 6 ms a frame and ours about 12 (8.1 the network, the rest the capture,
+encode, history and copies): the gap to close.
+
+**The picture.** Screenshot A/Bs across launches were noise here (the scene's fog and figure move, and the title falls
+back to its intro video; two shots of one state differed by 5.5 of 255), so each comparison is within one session:
+NVIDIA's NR captured by the probe (its input and output of one frame), then ours switched on after DLSS and its holds
+dumped seconds later (`shmctl dump-cache --holds 1`; longer dumps end at the first DLSS frame held only before the
+upscaler). Each image is normalised to its input's median (0.18) and sRGB-encoded; the change per decile of input
+brightness and the high-frequency energy (detail) out over in:
+
+| | darkest decile | middle | brightest three | detail | mean |
+|---|---|---|---|---|---|
+| NVIDIA (8 sessions) | +6 to +9 | -5 to +5 | -4 to +3 | x1.13-1.29 | -1.0 to +3.0 |
+| ours, sRGB, brightness 1 (default) | +3 | -0.5 to -4.6 | -7 to -9 | x1.12 | -2.0 |
+| ours, sRGB, brightness 0.4 | +4 | +1.8 to +3.7 | -4 to -8 | x1.27 | -0.35 |
+| ours, sRGB, brightness 0.25-0.3 | +4 | +1.5 to +3.9 | -5 to -10 | x1.29 | -0.5 to -0.9 |
+| ours, local tone and structure 0.8 | +2 to +3.5 | -0.4 to +3.1 | -4 to -8 | x1.09-1.22 | -0.3 to -1.9 |
+| ours, linear (`NEURAL_FORGE_PREUPSCALE_TRANSFER=linear`), brightness 0.3-0.4 | +11 to +12 | +0.1 to +9 | -3 to -6.5 | x1.07 | +2.8 to +4.0 |
+| ours without history (`NEURAL_FORGE_NATIVE_NO_HISTORY=1`), brightness 1 | +3 | -2.8 to +3.5 | -6 to -7 | x1.13 | -0.6 |
+| ours with the edit cache off (before the upscaler) | +4.6 | -1.1 to +1.8 | -3.4 to -7.4 | x1.10 | -0.6 |
+
+NVIDIA's network lifts the shadows, leaves the middle and the highlights roughly alone and adds a quarter more
+detail. Ours, as it is, lifts the shadows less and pulls the brighter half down: the darkening seen in Crimson Desert
+happens here too and not with NVIDIA's own integration. A lower brightness (0.3-0.4, an input median like NVIDIA's,
+about 0.08 linear) brings the detail to NVIDIA's and most of the middle back; the brighter half stays darker. Neither
+the transfer (linear is worse overall), the history, the edit cache nor the local tone and structure explain it. In
+each network's own domain the inputs are spread alike, so what remains is how the game's tone mapping shapes NVIDIA's
+input against our exposure, shoulder and sRGB curve. The defaults are unchanged; the Model brightness scale at 0.4 is
+the setting to compare in a game.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

@@ -30,8 +30,10 @@ layout(push_constant) uniform Params {
   uvec2 size;        // the colour input's extent
   uvec2 padded;      // the proxy's extent (even)
   float paper_white; // exposed units that map to 1.0 before the shoulder
-  uint flags;        // bit 0: keep clamped highlights (decode only)
+  uint flags;        // bit 0: keep clamped highlights (decode only); bit 1: linear (no sRGB OETF)
 } p;
+
+const uint LINEAR = 2u;
 
 const float KNEE = 0.75;
 const float K = 5.770780;
@@ -55,7 +57,8 @@ float srgb_oetf(float c) {
 // unusable exposure (scale 0) every value is 0: +Inf * 0 would be a NaN, and clamp() of one is undefined.
 float encode(float scene, float scale) {
   float x = scene >= 0.0 ? scene : 0.0;
-  return srgb_oetf(shoulder(scale > 0.0 ? x * scale : 0.0));
+  float v = shoulder(scale > 0.0 ? x * scale : 0.0);
+  return (p.flags & LINEAR) != 0u ? v : srgb_oetf(v);
 }
 
 void main() {

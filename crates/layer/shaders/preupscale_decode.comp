@@ -32,13 +32,14 @@ layout(push_constant) uniform Params {
   uvec2 size;        // the colour input's extent
   uvec2 padded;      // the proxy's extent (even)
   float paper_white; // exposed units that map to 1.0 before the shoulder
-  uint flags;        // bit 0: keep clamped highlights
+  uint flags;        // bit 0: keep clamped highlights; bit 1: linear (no sRGB EOTF)
 } p;
 
 const float KNEE = 0.75;
 const float K = 5.770780;
 const float CLAMPED = 0.999;
 const uint KEEP_CLAMPED = 1u;
+const uint LINEAR = 2u;
 const float HALF_MAX = 65504.0; // the largest finite half: the most a write-back stores
 
 bool exposure_ok(float e) {
@@ -58,7 +59,8 @@ float shoulder_inverse(float y) {
 
 // model domain -> scene-linear, within the finite half range the colour input stores.
 float decode(float answer, float inv_scale) {
-  return min(shoulder_inverse(srgb_eotf(answer)) * inv_scale, HALF_MAX);
+  float v = (p.flags & LINEAR) != 0u ? (isnan(answer) ? 0.0 : clamp(answer, 0.0, 1.0)) : srgb_eotf(answer);
+  return min(shoulder_inverse(v) * inv_scale, HALF_MAX);
 }
 
 void main() {

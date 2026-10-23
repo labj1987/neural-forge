@@ -190,6 +190,29 @@ pub(crate) const DEFAULT_PAPER_WHITE: f32 = 3.0;
 /// the shoulder's top (>= 0.999), where the inverse cannot bring it back.
 pub(crate) const KEEP_CLAMPED: u32 = 1;
 
+/// [`HdrPush::flags`] bit: the encode leaves out the sRGB OETF (and the decode its inverse), so the network sees
+/// linear values in [0, 1] (`NEURAL_FORGE_PREUPSCALE_TRANSFER=linear`, [`transfer_flags`]).
+pub(crate) const LINEAR: u32 = 2;
+
+/// The variable that chooses the encode's transfer: `srgb` (the default) or `linear`.
+pub(crate) const TRANSFER_ENV: &str = "NEURAL_FORGE_PREUPSCALE_TRANSFER";
+
+/// The [`HdrPush::flags`] bits [`TRANSFER_ENV`] asks for, read once.
+pub(crate) fn transfer_flags() -> u32 {
+    static FLAGS: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| match neural_forge_protocol::env::var(TRANSFER_ENV).as_deref() {
+        None | Some("" | "srgb") => 0,
+        Some("linear") => {
+            crate::log!("[preupscale] {TRANSFER_ENV}=linear: the network sees linear values (no sRGB curve)");
+            LINEAR
+        }
+        Some(other) => {
+            crate::log!("[preupscale] {TRANSFER_ENV}={other:?} is not srgb or linear; using srgb");
+            0
+        }
+    });
+    *FLAGS
+}
+
 /// The encoded value at and above which a channel counts as clamped (the decode keeps it).
 #[cfg(test)]
 pub(crate) const CLAMPED: f32 = 0.999;
@@ -893,7 +916,14 @@ impl HdrPass {
     }
 
     fn push(&self, paper_white: f32) -> HdrPush {
-        HdrPush { width: self.width, height: self.height, padded_width: self.padded_width, padded_height: self.padded_height, paper_white, flags: KEEP_CLAMPED }
+        HdrPush {
+            width: self.width,
+            height: self.height,
+            padded_width: self.padded_width,
+            padded_height: self.padded_height,
+            paper_white,
+            flags: KEEP_CLAMPED | transfer_flags(),
+        }
     }
 
     /// A barrier taking the encoded image from anything (its contents are rewritten) to `GENERAL`

@@ -199,6 +199,9 @@ struct LoaderState {
     /// The graph was switched to barriers ([`Loader::fall_back`]): a network opened after a switch of
     /// the Network setting is switched too.
     barriers: bool,
+    /// Another device's loader asked for the network, and this one's paths are not using it ([`Loader::lend`]):
+    /// the worker closes it. It is opened again when a path here asks for a build.
+    lend: bool,
 }
 
 impl LoaderState {
@@ -342,6 +345,31 @@ const PATH_SWITCH_MS: u64 = 1000;
 
 /// The next [`Built::generation`] (process-wide).
 static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `NEURAL_FORGE_NATIVE_NO_HISTORY=1` (diagnostics): every network frame runs without history, as after a reset,
+/// to tell what the history adds to the picture from what one frame does.
+fn no_history() -> bool {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let off = neural_forge_protocol::env::var("NEURAL_FORGE_NATIVE_NO_HISTORY").as_deref() == Some("1");
+        if off {
+            crate::log!("[native] NEURAL_FORGE_NATIVE_NO_HISTORY=1: every frame without history");
+        }
+        off
+    });
+    *OFF
+}
+
+/// The device whose loader opened the network last ([`Loader::work`]). One network can be open in a process (its
+/// Vulkan function table is process-wide), and a game may create several devices: Metro Last Light Redux's
+/// after-the-upscaler path opened it on the device that presents the intro, and DLSS then ran on another, whose
+/// holds were refused it for good (2026-10-23).
+static NETWORK_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The words of `nf_native_open`'s refusal while another network is open in the process (crates/native/cpp/nf_native.cpp).
+const OPEN_ELSEWHERE: &str = "another network is open in this process";
+
+/// This process's loaders by device ([`Loader::register`]), for [`Loader::lend`].
+static LOADERS: Mutex<Vec<(u64, std::sync::Weak<Loader>)>> = Mutex::new(Vec::new());
 
 /// `1485x836`, or `1485x836 and 743x418` for a build of several sizes.
 fn sizes_text(sizes: &[(u32, u32)]) -> String {
@@ -512,6 +540,58 @@ impl Loader {
         !self.post_busy.load(SeqCst) && (last_post == 0 || epoch_ms().saturating_sub(last_post) >= PATH_SWITCH_MS)
     }
 
+    /// Notes this loader as `device`'s, so a loader of another device of the process can ask it to lend the
+    /// network ([`Self::lend`]).
+    pub(crate) fn register(self: &Arc<Self>, device: vk::Device) {
+        let mut loaders = LOADERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loaders.retain(|(d, l)| l.strong_count() > 0 && *d != device.as_raw());
+        loaders.push((device.as_raw(), Arc::downgrade(self)));
+    }
+
+    /// Another device's loader could not open the network because this one has it: when neither path here uses
+    /// it (no hold recorded into DLSS's buffers may run, no hold's or after-the-upscaler frame's work is in
+    /// flight, neither path ran for [`PATH_SWITCH_MS`]), the worker closes it, the after-the-upscaler path kept
+    /// off it meanwhile. `false` when it is in use: the other loader tries again on its schedule.
+    fn lend(&self) -> bool {
+        if !self.unused() {
+            return false;
+        }
+        // The after-the-upscaler path checks the last hold before it takes the network: it waits now.
+        self.last_pre.store(epoch_ms(), std::sync::atomic::Ordering::SeqCst);
+        let (lock, wake) = &*self.shared;
+        let mut st = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if st.network.is_none() || self.holds_out() {
+            return false;
+        }
+        st.lend = true;
+        drop(st);
+        wake.notify_all();
+        true
+    }
+
+    /// Neither path uses the network ([`Self::lend`]'s condition).
+    fn unused(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.post_finished();
+        let now = epoch_ms();
+        let quiet = |at: &std::sync::atomic::AtomicU64| now.saturating_sub(at.load(SeqCst)) >= PATH_SWITCH_MS;
+        let stalled = self.post_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some();
+        !(self.holds_out() || self.pre_running() || self.post_busy.load(SeqCst) || stalled || now < self.pre_unfenced_until.load(SeqCst))
+            && quiet(&self.last_pre)
+            && quiet(&self.last_post)
+    }
+
+    /// Asks the loader of the device that has the network, if it is another than `device`'s, to lend it
+    /// ([`Self::lend`]). Whether it will.
+    fn ask_owner(device: vk::Device) -> Option<bool> {
+        let owner = NETWORK_OWNER.load(std::sync::atomic::Ordering::SeqCst);
+        if owner == 0 || owner == device.as_raw() {
+            return None;
+        }
+        let loader = LOADERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(|(d, _)| *d == owner).and_then(|(_, l)| l.upgrade())?;
+        Some(loader.lend())
+    }
+
     /// Starts the loading thread the first time.
     fn spawn(&self) {
         let Some((device, setup)) = self.pending.lock().unwrap().take() else { return };
@@ -579,6 +659,21 @@ impl Loader {
         }
         let mut state = lock.lock().unwrap();
         loop {
+            // Lent to another device's loader ([`Loader::lend`]): closed, its builds gone, and nothing asked
+            // for until a path here asks again. SAFETY of the close: `lend` asked only with nothing of it in use.
+            if std::mem::take(&mut state.lend) {
+                if let Some(network) = state.network.take() {
+                    state.built = Vec::new();
+                    state.wanted = None;
+                    state.failed = Some("lent to another device of the game, which runs the model".into());
+                    drop(state);
+                    drop(network);
+                    crate::log!("[native] the network is closed on this device: another device of the game asked for it (one network per process)");
+                    crate::logging::flush();
+                    state = lock.lock().unwrap();
+                }
+                continue;
+            }
             // Work is wanted when the network is not open yet, another network is chosen, a size is
             // wanted that is not built, or the graph is to fall back to barriers
             // ([`LoaderState::wants_work`]); it is due when the retry schedule says so.
@@ -665,6 +760,12 @@ impl Loader {
                     }
                 }
             });
+            if opened.is_some() && result.is_ok() {
+                NETWORK_OWNER.store(device.as_raw(), std::sync::atomic::Ordering::SeqCst);
+            }
+            // Refused because another device's loader has the network: that one is asked to lend it.
+            let refused = matches!(&result, Err(why) if why.contains(OPEN_ELSEWHERE));
+            let asked = (refused && opened.is_none() && !open_stalled && network.is_none()).then(|| Loader::ask_owner(device)).flatten();
             let vram_after = vram.as_ref().filter(|_| matches!(result, Ok((_, Some(_))))).map(crate::vram::reading);
             let stalled = result.is_err() && (open_stalled || network.as_ref().is_some_and(nn::Network::stalled));
             // The state log, written before the loader's lock is taken again: holds take it on the game's thread.
@@ -756,6 +857,13 @@ impl Loader {
                 }
                 Err(why) => {
                     let wait = retry.failed(Instant::now());
+                    match asked {
+                        Some(true) => {
+                            lines.push("[native] the network is open on another device of the game, which is not using it: it is asked to close it".into())
+                        }
+                        Some(false) => lines.push("[native] the network is open on another device of the game, which is using it".into()),
+                        None => {}
+                    }
                     lines.push(format!("[native] {why}; frames go to DLSS untouched, trying again in {} ms", wait.as_millis()));
                     state.failed = Some(why);
                     state.network = network;
@@ -4126,7 +4234,7 @@ pub(crate) unsafe fn run_native_hold(
         } else {
             let stale = native.gap.begin(hold_now());
             note_network_reset(native.frames, stale, &mut result.scene_cut);
-            let history = native.frames > 0 && stale.is_none() && mvec.is_some();
+            let history = native.frames > 0 && stale.is_none() && mvec.is_some() && !no_history();
             (history, Some(native.frame_plan(&graphs, history, jitter, target.mvec_scale, &passes)))
         };
         let seq = res.seq + 1;
@@ -4392,7 +4500,7 @@ pub(crate) unsafe fn run_native_hold(
     } else {
         let stale = native.gap.begin(hold_now());
         note_network_reset(native.frames, stale, &mut result.scene_cut);
-        let history = native.frames > 0 && stale.is_none() && mvec.is_some();
+        let history = native.frames > 0 && stale.is_none() && mvec.is_some() && !no_history();
         let (cmds, later) = native.frame_graphs(&graphs, history, jitter, target.mvec_scale, &passes);
         (history, cmds, if more { later } else { Vec::new() })
     };
@@ -4594,6 +4702,46 @@ mod tests {
         loader.pre_unfenced_until.store(epoch_ms().saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
         assert!(loader.claim_post(), "once a frame can no longer be running");
         loader.release_post();
+    }
+
+    /// The network is lent to another device only while neither path here uses it: not with a hold recorded into
+    /// DLSS's buffers that may run, not while an after-the-upscaler frame runs, not within a path switch of either
+    /// path's last frame; and a loader with no network open has none to lend.
+    #[test]
+    fn the_network_is_lent_only_while_neither_path_uses_it() {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical: vk::PhysicalDevice::null(),
+            frame_family: 0,
+            family: 0,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+        };
+        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader = Loader::start(vk::Device::null(), setup, holds.clone());
+        use std::sync::atomic::Ordering::SeqCst;
+        let _ = epoch_ms();
+        std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
+        assert!(loader.unused(), "nothing ran");
+        holds.store(1, SeqCst);
+        assert!(!loader.unused(), "a hold in DLSS's buffers may still run");
+        holds.store(0, SeqCst);
+        loader.post_busy.store(true, SeqCst);
+        assert!(!loader.unused(), "an after-the-upscaler frame runs");
+        loader.release_post();
+        assert!(!loader.unused(), "within a path switch of it");
+        loader.last_post.store(0, SeqCst);
+        loader.last_pre.store(epoch_ms(), SeqCst);
+        assert!(!loader.unused(), "within a path switch of a hold");
+        loader.last_pre.store(0, SeqCst);
+        assert!(loader.unused());
+        assert!(!loader.lend(), "no network open here: nothing to lend");
     }
 
     fn built(size: (u32, u32), generation: u64, network: u32) -> Built {

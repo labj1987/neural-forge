@@ -108,6 +108,7 @@ pub(crate) mod placement;
 pub(crate) mod post_flow;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_history;
+pub(crate) mod probe_image;
 pub(crate) mod restore;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod scene_cut;
@@ -251,6 +252,12 @@ pub(crate) const EXPOSURE_JUMP_MAX: f32 = 32.0;
 /// one there and back, is a cut that resets the game's adaptation (Crimson Desert: 0.0069 to 0.91
 /// once, at its menus, 2026-10-09); Hogwarts Legacy's runaway jumps on most holds.
 pub(crate) const EXPOSURE_JUMPS: u32 = 3;
+
+/// Holds in a row whose game exposure read 0, negative or not a number after which it is not trusted
+/// ([`Session::check_exposure`]): Metro Last Light Redux names a 1x1 R16F for DLSS that holds 0 on every frame
+/// (2026-10-23), and the encode then had no usable exposure, so the decode wrote nothing back and the model
+/// before the upscaler never showed. A few, so a frame whose copy came too early does not decide it.
+pub(crate) const EXPOSURE_UNUSABLE_HOLDS: u32 = 8;
 /// See [`EXPOSURE_JUMPS`]: the count starts over after this many holds without a jump.
 pub(crate) const EXPOSURE_JUMP_WINDOW: u32 = 120;
 
@@ -621,6 +628,31 @@ pub(crate) enum Rule {
 /// DLSS's motion-vector formats: RG16F (GTA V) or RG32F. RG16F first where both are at an extent.
 const MVEC_FORMATS: [vk::Format; 2] = [vk::Format::R16G16_SFLOAT, vk::Format::R32G32_SFLOAT];
 
+/// The motion-vector formats the hold inside DLSS's buffer copies into its RG16F staging image: RG16F as it is,
+/// the others blitted (which converts; Vulkan requires blits from RGBA16F and RG32F and into RG16F with optimal
+/// tiling). RGBA16F is Metro Last Light Redux's ([`four_channel_inputs`]).
+pub(crate) const MVEC_HOLD_FORMATS: [vk::Format; 3] = [vk::Format::R16G16_SFLOAT, vk::Format::R16G16B16A16_SFLOAT, vk::Format::R32G32_SFLOAT];
+
+/// DLSS's inputs where its input launch names no two-channel motion vectors: Metro Last Light Redux (310.9.16,
+/// `hiluma_engine_input_depthreg_*`, 2026-10-23) hands DLSS its colour as an RGBA16F render target without storage
+/// use, its motion vectors as an RGBA16F storage image (x and y in the first two channels; NVIDIA's own NR reads
+/// that image too) and its depth as R32F, all at the render size. Read so only when the launch names exactly one
+/// such render target, one such storage image and one depth-like image at one extent; anything else stays
+/// unread.
+fn four_channel_inputs(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<InputLaunch> {
+    let with = |keep: &dyn Fn(&ImageDesc) -> bool| -> Vec<(vk::Image, ImageDesc)> {
+        named.iter().filter_map(|i| images.get(i).filter(|d| d.plain && keep(d)).map(|d| (*i, *d))).collect()
+    };
+    let rgba = |d: &ImageDesc| d.format == vk::Format::R16G16B16A16_SFLOAT && d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC);
+    let attachment = |d: &ImageDesc| d.usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT);
+    let storage = |d: &ImageDesc| d.usage.contains(vk::ImageUsageFlags::STORAGE);
+    let [(colour, c)] = with(&|d| rgba(d) && attachment(d) && !storage(d))[..] else { return None };
+    let extent = |d: &ImageDesc| (d.width, d.height) == (c.width, c.height);
+    let [(mvec, _)] = with(&|d| rgba(d) && storage(d) && !attachment(d) && extent(d))[..] else { return None };
+    let [(depth, _)] = with(&|d| (DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format)) && extent(d))[..] else { return None };
+    Some(InputLaunch::Inputs { colour, depth, mvec })
+}
+
 /// The formats of an image DLSS Super Resolution writes (its output, NGX's output-size scratch).
 const OUTPUT_FORMATS: [vk::Format; 2] = [vk::Format::R16G16B16A16_SFLOAT, vk::Format::B10G11R11_UFLOAT_PACK32];
 
@@ -788,6 +820,11 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
         list
     };
     let mvecs = of(|d| d.plain && MVEC_FORMATS.contains(&d.format));
+    if mvecs.is_empty() {
+        if let Some(inputs) = four_channel_inputs(images, named) {
+            return Some(inputs);
+        }
+    }
     let mut depths = of(|d| d.plain && DEPTH_FORMATS.contains(&d.format));
     if depths.is_empty() && !mvecs.is_empty() {
         // Depth handed over as a colour image (Streamline's copy): one at a motion-vector or colour
@@ -1407,6 +1444,9 @@ pub(crate) struct Tracker {
     colour_barriers: u64,
     last_colour_layout: Option<vk::ImageLayout>,
     said_layout_miss: bool,
+    /// The last launch's kernel name and the registered images it named, kept only for
+    /// `NEURAL_FORGE_PROBE_IMAGE` ([`probe_image`]).
+    last_launch: Option<(String, Vec<vk::Image>)>,
     /// The camera jitter's sequence as the launches that carry it showed it ([`Self::jitter_for_hold`]): each
     /// jitter and the one seen after it, and the last one seen.
     jitter_next: HashMap<u64, u64>,
@@ -1907,6 +1947,9 @@ impl Tracker {
             }
         }
         probe_rr(command_buffer, self.functions.get(&function).map(|(_, n)| n.as_str()), &named, &self.images);
+        if probe_image::enabled() {
+            self.last_launch = self.functions.get(&function).map(|(_, n)| (n.clone(), named.clone()));
+        }
         // DLSS's output: after the buffer's input launch, a launch naming a colour candidate larger than
         // the input (the upscaled frame); the last such launch of the buffer is its output kernel.
         if let Some(InputLaunch::Inputs { colour, .. }) = self.launch.get(&command_buffer).and_then(|r| r.input.clone()) {
@@ -2215,7 +2258,7 @@ impl Tracker {
                 .or_else(|| self.committed.get(&image).copied())
                 .or(d.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL));
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
-                && d.format == vk::Format::R16G16_SFLOAT
+                && MVEC_HOLD_FORMATS.contains(&d.format)
                 && d.width >= desc.width
                 && d.height >= desc.height
                 && layout.is_some_and(|l| MVEC_COPY_LAYOUTS.contains(&l));
@@ -2406,7 +2449,7 @@ impl Tracker {
         let mvec_input = mvec.map(|d| {
             let layout = layout_of(o.mvec, &d);
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
-                && d.format == vk::Format::R16G16_SFLOAT
+                && MVEC_HOLD_FORMATS.contains(&d.format)
                 && layout.is_some_and(|l| MVEC_COPY_LAYOUTS.contains(&l));
             Aux { image: o.mvec, format: d.format, layout, readable }
         });
@@ -3492,6 +3535,13 @@ impl Tracking {
 
     /// [`Self::launch`], and the hold right after this launch when it is DLSS's output kernel and the
     /// model runs after DLSS ([`Tracker::after_point`]).
+    /// The last launch's kernel name and named images with their descriptions ([`probe_image`]).
+    pub(crate) fn last_launch(&self) -> Option<(String, Vec<(vk::Image, ImageDesc)>)> {
+        let t = self.lock();
+        let (name, named) = t.last_launch.clone()?;
+        Some((name, named.iter().filter_map(|i| t.images.get(i).map(|d| (*i, *d))).collect()))
+    }
+
     pub(crate) fn launch_with_after(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -5860,6 +5910,8 @@ pub(crate) struct Session {
     /// Jumps of the game's exposure in the identification of [`Self::last_game_exposure`], and the
     /// holds since the last one ([`EXPOSURE_JUMPS`]).
     exposure_jumps: (u32, u32),
+    /// The identification and the holds in a row its game exposure read unusable ([`EXPOSURE_UNUSABLE_HOLDS`]).
+    exposure_unusable: (u64, u32),
     /// The native backend's network on this device, when it was created for it.
     pub(crate) native: Option<NativeLoader>,
     /// The native backend's after-the-upscaler server (`native_post`), once the mapping is open.
@@ -6377,7 +6429,22 @@ impl Session {
         if result.exposure_source != Some(ExposureSource::Game) || self.exposure_untrusted == Some(identification) {
             return;
         }
-        let Some(e) = result.game_exposure.or(result.exposure).or(result.previous_exposure).filter(|e| e.is_finite() && *e > 0.0) else { return };
+        let Some(read) = result.game_exposure.or(result.exposure).or(result.previous_exposure) else { return };
+        if !(read.is_finite() && read > 0.0) {
+            let (id, holds) = &mut self.exposure_unusable;
+            *holds = if *id == identification { *holds + 1 } else { 1 };
+            *id = identification;
+            if *holds >= EXPOSURE_UNUSABLE_HOLDS {
+                self.exposure_untrusted = Some(identification);
+                crate::log!(
+                    "[preupscale] the game's exposure image read {read} on {EXPOSURE_UNUSABLE_HOLDS} holds in a row: not an exposure; measuring it from the frame for this identification"
+                );
+                crate::logging::flush();
+            }
+            return;
+        }
+        self.exposure_unusable = (identification, 0);
+        let e = read;
         let previous = self.last_game_exposure.filter(|(id, _)| *id == identification).map(|(_, p)| p);
         if previous.is_none() {
             self.exposure_jumps = (0, 0);
@@ -6542,6 +6609,9 @@ impl Session {
             }
         }
         shm.publish_preupscale_state(hold_state(holding), self.last_hold_native, extent.0, extent.1);
+        if holding {
+            *lock(&LAST_HELD) = Some((now, hold_state(true), self.last_hold_native, self.last_hold_extent.unwrap_or(extent)));
+        }
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {
             let (pw, ph) = padded(extent.0, extent.1);
             // The window's rate: frames the model ran on before the upscaler (the post path's
@@ -6727,6 +6797,12 @@ impl Session {
     /// last hold (after DLSS: its output; with Ray Reconstruction there are no Super Resolution inputs, and the
     /// inputs' `extent` is none), else `extent`.
     pub(crate) fn publish_status(&self, shm: &ShmClient, extent: Option<(u32, u32)>) {
+        if !self.holding() {
+            if let Some((_, state, native, (w, h))) = (*lock(&LAST_HELD)).filter(|(at, ..)| at.elapsed() < RECENT) {
+                shm.publish_preupscale_state(state, native, w, h);
+                return;
+            }
+        }
         let (w, h) = self.last_hold_extent.filter(|_| self.holding()).or(extent).unwrap_or((0, 0));
         shm.publish_preupscale_state(hold_state(self.holding()), self.last_hold_native, w, h);
     }
@@ -6773,6 +6849,13 @@ static NATIVE_POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
     (lock(&POST_OFF_UNTIL).values().any(|&until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)) && !post_serves(now)
 }
+
+/// The process's latest hold, from whichever device made it ([`Session::note`]): when, its header state, whether
+/// the native backend ran it, and its extent. A device that does not hold publishes it while it is recent
+/// ([`Session::publish_status`]): Metro Last Light Redux presents on another device than DLSS runs on, and its
+/// status read "waiting for DLSS input" while the model ran (2026-10-23).
+type Held = (Instant, u32, bool, (u32, u32));
+static LAST_HELD: Mutex<Option<Held>> = Mutex::new(None);
 
 /// When a device of the process last saw DLSS Ray Reconstruction running ([`Tracker::rr_running`]).
 static RAY_RECONSTRUCTION_AT: Mutex<Option<Instant>> = Mutex::new(None);
@@ -7402,6 +7485,35 @@ mod tests {
 
     fn desc(w: u32, h: u32, format: vk::Format, usage: vk::ImageUsageFlags) -> ImageDesc {
         ImageDesc { width: w, height: h, format, usage, plain: true }
+    }
+
+    /// Metro Last Light Redux's input launch (2026-10-23): the colour as an RGBA16F render target, the motion
+    /// vectors as an RGBA16F storage image, the depth as R32F, DLSS's output and two more storage images. Read as
+    /// such; with a second storage image at the render size, or the colour a storage image too, not read.
+    #[test]
+    fn four_channel_motion_vectors_beside_a_render_target_colour_are_read() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let transfer = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
+        let (rt, storage) = (transfer | vk::ImageUsageFlags::COLOR_ATTACHMENT, transfer | vk::ImageUsageFlags::STORAGE);
+        let mut images: HashMap<vk::Image, ImageDesc> = [
+            (0x100, desc(1485, 835, rgba, rt)),
+            (0x400, desc(2560, 1440, rgba, storage)),
+            (0x300, desc(1485, 835, rgba, storage)),
+            (0x200, desc(1485, 835, vk::Format::R32_SFLOAT, storage)),
+            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
+            (0x500, desc(640, 384, rgba, storage)),
+        ]
+        .into_iter()
+        .map(|(raw, d)| (img(raw), d))
+        .collect();
+        let named: Vec<vk::Image> = [0x100, 0x400, 0x300, 0x200, 0x610, 0x500].map(img).to_vec();
+        assert_eq!(input_launch(&images, &named), Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
+        let mut second = images.clone();
+        second.insert(img(0x310), desc(1485, 835, rgba, storage));
+        assert_eq!(input_launch(&second, &[named.clone(), vec![img(0x310)]].concat()), None, "two storage images: which is the motion?");
+        images.insert(img(0x100), desc(1485, 835, rgba, rt | vk::ImageUsageFlags::STORAGE));
+        assert_eq!(input_launch(&images, &named), None, "a storage colour: the usual rules, which want RG motion vectors");
+        assert!(MVEC_HOLD_FORMATS.contains(&rgba) && MVEC_HOLD_FORMATS[0] == vk::Format::R16G16_SFLOAT);
     }
 
     fn gta_registered() -> BTreeMap<u64, (vk::Image, ImageDesc)> {
@@ -8262,6 +8374,30 @@ mod tests {
     /// untouched: 0.0027-0.0034; a fast scene change, 16x), a cut there and back (Crimson Desert's
     /// menus: 0.0069 to 0.91), cuts far apart and a jump across identifications do not; the native
     /// hold's value, read a hold late, counts the same.
+    /// Metro Last Light Redux's exposure image holds 0: after [`EXPOSURE_UNUSABLE_HOLDS`] such holds in a row the
+    /// exposure is measured from the frame. Fewer, or a usable value between them, or another identification's,
+    /// do not; a NaN counts as unusable too; the native hold's value, read a hold late, counts the same.
+    #[test]
+    fn a_game_exposure_that_keeps_reading_zero_switches_to_the_measured_one() {
+        let game = |e| HoldResult { exposure_source: Some(ExposureSource::Game), exposure: Some(e), ..HoldResult::default() };
+        let native = |e| HoldResult { exposure_source: Some(ExposureSource::Game), previous_exposure: Some(e), ..HoldResult::default() };
+        let mut session = Session::default();
+        for _ in 1..EXPOSURE_UNUSABLE_HOLDS {
+            session.check_exposure(3, &game(0.0));
+        }
+        session.check_exposure(3, &game(0.5));
+        session.check_exposure(3, &game(0.0));
+        session.check_exposure(4, &game(0.0));
+        assert!(session.game_exposure_trusted(3) && session.game_exposure_trusted(4), "interrupted, and another identification");
+        for _ in 0..EXPOSURE_UNUSABLE_HOLDS - 1 {
+            session.check_exposure(5, &native(0.0));
+        }
+        assert!(session.game_exposure_trusted(5));
+        session.check_exposure(5, &native(f32::NAN));
+        assert!(!session.game_exposure_trusted(5), "{EXPOSURE_UNUSABLE_HOLDS} unusable in a row");
+        assert!(session.game_exposure_trusted(3));
+    }
+
     #[test]
     fn a_game_exposure_that_keeps_jumping_switches_to_the_measured_one() {
         let mut session = Session::default();

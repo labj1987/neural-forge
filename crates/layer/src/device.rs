@@ -1352,7 +1352,9 @@ impl NeuralForgeDeviceInfo {
             // uses the network too (`preupscale::native_post`). Nothing loads until a path asks.
             if nvidia && active {
                 frame_family = Some(setup.frame_family);
-                hold.lock().unwrap().preupscale.native = Some(std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup, holds.clone())));
+                let loader = std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup, holds.clone()));
+                loader.register(handle);
+                hold.lock().unwrap().preupscale.native = Some(loader);
             }
         }
         // The hold inside DLSS's command buffer: recorded into the application's buffers on the game's
@@ -2781,6 +2783,28 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // SAFETY: `p_extras` is the application's own launch-parameter list, valid for this call.
             let params = unsafe { crate::preupscale::launch_params(launch_info.p_extras, launch_info.extra_count) };
             let (before, after) = t.launch_with_after(command_buffer, launch_info.function, params);
+            // `NEURAL_FORGE_PROBE_IMAGE` (diagnostics): the images this launch names, before it or after it.
+            if crate::preupscale::probe_image::enabled() {
+                if let (Some((name, images)), Some(instance), Some(next)) =
+                    (t.last_launch(), self.instance.as_ref(), self.probe_next.as_ref().and_then(|n| n.cmd_cu_launch_kernel_nvx))
+                {
+                    let (pre, post) = (crate::preupscale::probe_image::due(&name, false), crate::preupscale::probe_image::due(&name, true));
+                    if pre || post {
+                        // SAFETY: the application's buffer is recording here (a launch is); NGX's images are storage
+                        // images in GENERAL. The launch is forwarded here, between the copies.
+                        unsafe {
+                            if pre {
+                                crate::preupscale::probe_image::record(&self.device, instance, self.physical_device, command_buffer, &name, false, &images);
+                            }
+                            next(command_buffer, launch_info);
+                            if post {
+                                crate::preupscale::probe_image::record(&self.device, instance, self.physical_device, command_buffer, &name, true, &images);
+                            }
+                        }
+                        return LayerResult::Handled(());
+                    }
+                }
+            }
             let inline = self.inline.as_ref().filter(|_| crate::preupscale::mode().holds_inline());
             if let (Some(point), Some(inline)) = (before, inline) {
                 // DLSS's buffer renders its own input before this launch: the hold is recorded here, inside

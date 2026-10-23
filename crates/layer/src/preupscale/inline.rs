@@ -228,7 +228,8 @@ pub(crate) struct Ctx<'a> {
     pub outstanding: usize,
     convert: bool,
     exposure: Option<(vk::Image, vk::ImageLayout)>,
-    mvec: Option<(vk::Image, vk::ImageLayout, (u32, u32))>,
+    /// DLSS's motion vectors: the image, its layout, its extent and its format.
+    mvec: Option<(vk::Image, vk::ImageLayout, (u32, u32), vk::Format)>,
     depth_source: Option<(vk::Image, vk::ImageLayout, vk::Format)>,
     device: &'a ash::Device,
     opened: bool,
@@ -255,7 +256,7 @@ impl Ctx<'_> {
                 s.colour,
                 s.extent,
                 self.exposure.map(|(image, layout)| (image, layout, s.exposure)),
-                self.mvec.map(|(image, layout, extent)| (image, layout, s.mvec, extent)),
+                self.mvec.map(|(image, layout, extent, format)| (image, layout, s.mvec, extent, format)),
                 self.depth_source.map(|(image, layout, format)| (image, layout, format, s.depth)),
             );
             if self.queries != vk::QueryPool::null() {
@@ -730,7 +731,7 @@ impl Inline {
         let mvec = point
             .mvec_input
             .filter(|a| a.readable && point.mvec_extent.0 > 0 && point.mvec_extent.1 > 0)
-            .and_then(|a| a.layout.map(|layout| (a.image, layout, point.mvec_extent)));
+            .and_then(|a| a.layout.map(|layout| (a.image, layout, point.mvec_extent, a.format)));
         let depth_source = point.depth_input.filter(|a| a.readable && super::edit_cache_on()).and_then(|a| a.layout.map(|layout| (a.image, layout, a.format)));
         let held = InlinePoint {
             colour: staging.colour,
@@ -806,8 +807,9 @@ impl Inline {
                     if convert { ", blitted to and from RGBA16F" } else { "" },
                     point.hazard,
                     match (mvec, point.mvec_input) {
-                        (Some((_, layout, e)), _) if e == extent => format!("copied from {layout:?}"),
-                        (Some((_, layout, e)), _) => format!("resampled from {}x{} in {layout:?}", e.0, e.1),
+                        (Some((_, layout, e, vk::Format::R16G16_SFLOAT)), _) if e == extent => format!("copied from {layout:?}"),
+                        (Some((_, layout, e, format)), _) if e == extent => format!("blitted from {format:?} in {layout:?}"),
+                        (Some((_, layout, e, format)), _) => format!("resampled from {}x{} {format:?} in {layout:?}", e.0, e.1),
                         (None, Some(a)) => format!("not copied ({:?} in {:?}, readable {})", a.format, a.layout, a.readable),
                         (None, None) => "not known".to_string(),
                     }
@@ -1182,6 +1184,10 @@ const COLOUR_LAYERS: vk::ImageSubresourceLayers =
 /// # Safety
 /// `cb` is being recorded on this thread; every image is in the given layout at this point of the buffer
 /// and has the usage its transfers need; `staging` is RGBA16F of the colour input's extent.
+/// DLSS's motion vectors as [`record_copy_in`] copies them: the source, its layout, the staging image, the source's
+/// extent and its format.
+pub(crate) type MvecCopy = (vk::Image, vk::ImageLayout, vk::Image, (u32, u32), vk::Format);
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn record_copy_in(
     d: &ash::Device,
@@ -1190,7 +1196,7 @@ pub(crate) unsafe fn record_copy_in(
     staging: vk::Image,
     extent: (u32, u32),
     exposure: Option<(vk::Image, vk::ImageLayout, vk::Image)>,
-    mvec: Option<(vk::Image, vk::ImageLayout, vk::Image, (u32, u32))>,
+    mvec: Option<MvecCopy>,
     depth: Option<(vk::Image, vk::ImageLayout, vk::Format, vk::Buffer)>,
 ) {
     let region = vk::ImageCopy {
@@ -1224,14 +1230,15 @@ pub(crate) unsafe fn record_copy_in(
     }
     // DLSS's motion vectors, read in place when readable there, else moved to TRANSFER_SRC_OPTIMAL and back.
     // High-resolution ones (larger than the colour input) are blitted down to it, NEAREST: each render pixel
-    // takes one of the vectors it covers, never an average across an edge.
-    let mvec_moved = mvec.filter(|(_, l, _, _)| !matches!(*l, vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
-    to_read.extend(mvec.map(|(_, _, own, _)| fresh(own)));
-    to_read.extend(mvec_moved.map(|(source, l, _, _)| {
+    // takes one of the vectors it covers, never an average across an edge. Motion vectors in another format than
+    // the staging image's RG16F (Metro Last Light Redux's RGBA16F) are blitted too, which converts them.
+    let mvec_moved = mvec.filter(|(_, l, _, _, _)| !matches!(*l, vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
+    to_read.extend(mvec.map(|(_, _, own, _, _)| fresh(own)));
+    to_read.extend(mvec_moved.map(|(source, l, _, _, _)| {
         image_barrier(source, l, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::TRANSFER_READ, COLOUR_RANGE)
     }));
     let mut back: Vec<vk::ImageMemoryBarrier> = mvec_moved
-        .map(|(source, l, _, _)| {
+        .map(|(source, l, _, _, _)| {
             image_barrier(
                 source,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -1282,9 +1289,9 @@ pub(crate) unsafe fn record_copy_in(
         if let Some((source, source_layout, own)) = exposure {
             d.cmd_copy_image(cb, source, source_layout, own, vk::ImageLayout::GENERAL, &[exposure_region]);
         }
-        if let Some((source, source_layout, own, (sw, sh))) = mvec {
+        if let Some((source, source_layout, own, (sw, sh), format)) = mvec {
             let from = if mvec_moved.is_some() { vk::ImageLayout::TRANSFER_SRC_OPTIMAL } else { source_layout };
-            if (sw, sh) == extent {
+            if (sw, sh) == extent && format == vk::Format::R16G16_SFLOAT {
                 d.cmd_copy_image(cb, source, from, own, vk::ImageLayout::GENERAL, &[region]);
             } else {
                 let down = vk::ImageBlit {
@@ -2361,32 +2368,36 @@ mod tests {
     }
 
     /// The copies into the staging images, with the hold writing nothing: DLSS's motion vectors (in
-    /// `SHADER_READ_ONLY_OPTIMAL`, at the colour input's extent or twice it, resampled to it) land in the
-    /// stage's motion-vector image, DLSS's images are left as they were and in their layouts, and an
+    /// `SHADER_READ_ONLY_OPTIMAL`, at the colour input's extent or twice it, resampled to it; RG16F, and RGBA16F
+    /// and RG32F blitted, x and y of each) land in the stage's RG16F motion-vector image, DLSS's images are left as they were and in their layouts, and an
     /// R11G11B10 colour input (Unreal Engine 5's, sampled) comes back byte for byte through the RGBA16F staging
     /// image.
     #[test]
     fn the_copies_in_and_back_leave_dlss_s_inputs_as_they_were() {
         let Some(mut rig) = Rig::open(false) else { return };
-        for scale in [1u32, 2] {
+        let (rg, rgba, rg32) = (vk::Format::R16G16_SFLOAT, vk::Format::R16G16B16A16_SFLOAT, vk::Format::R32G32_SFLOAT);
+        for (format, scale) in [(rg, 1u32), (rg, 2), (rgba, 1), (rgba, 2), (rg32, 1)] {
             let (mw, mh) = (W * scale, H * scale);
             let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
-            let mvec = rig.image(vk::Format::R16G16_SFLOAT, (mw, mh), usage);
+            let mvec = rig.image(format, (mw, mh), usage);
             // Each texel holds the position of the colour input's pixel it covers (constant over each block of
-            // `scale` x `scale` texels: which of them NEAREST takes at a block's centre is the device's choice).
-            let bytes: Vec<u8> =
-                (0..mh).flat_map(|y| (0..mw).flat_map(move |x| [half((x / scale) as f32), half((y / scale) as f32)])).flat_map(u16::to_le_bytes).collect();
+            // `scale` x `scale` texels: which of them NEAREST takes at a block's centre is the device's choice); an
+            // RGBA16F one 7 and 9 in its last two channels.
+            let texel = move |x: u32, y: u32| -> Vec<u8> {
+                let (x, y) = ((x / scale) as f32, (y / scale) as f32);
+                match format {
+                    vk::Format::R32G32_SFLOAT => [x, y].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                    vk::Format::R16G16B16A16_SFLOAT => [half(x), half(y), half(7.0), half(9.0)].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                    _ => [half(x), half(y)].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                }
+            };
+            let bytes: Vec<u8> = (0..mh).flat_map(|y| (0..mw).flat_map(move |x| texel(x, y))).collect();
             rig.upload_image(mvec, (mw, mh), &bytes);
             let k = rig.host(bytes.len() as u64, vk::BufferUsageFlags::TRANSFER_DST);
             let all = vk::PipelineStageFlags::ALL_COMMANDS;
             let to = |old, new| image_barrier(mvec, old, new, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::MEMORY_READ, RANGE);
             let point = InlinePoint {
-                mvec_input: Some(Aux {
-                    image: mvec,
-                    format: vk::Format::R16G16_SFLOAT,
-                    layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                    readable: true,
-                }),
+                mvec_input: Some(Aux { image: mvec, format, layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL), readable: true }),
                 mvec_extent: (mw, mh),
                 ..rig.point()
             };
@@ -2418,11 +2429,8 @@ mod tests {
             rig.end(cb);
             rig.submit(&[cb]);
             // SAFETY: mapped; the copy finished.
-            let source: Vec<u16> = unsafe { std::slice::from_raw_parts(rig.hosts[k].ptr.cast::<u16>(), (mw * mh * 2) as usize) }.to_vec();
-            for (i, t) in source.as_chunks::<2>().0.iter().enumerate() {
-                let (x, y) = ((i as u32 % mw / scale) as f32, (i as u32 / mw / scale) as f32);
-                assert_eq!([f16_to_f32(t[0]), f16_to_f32(t[1])], [x, y], "DLSS's motion vectors after the hold");
-            }
+            let source = unsafe { std::slice::from_raw_parts(rig.hosts[k].ptr, bytes.len()) };
+            assert!(source == bytes.as_slice(), "DLSS's {format:?} motion vectors after the hold");
             let staged = lock(&rig.inline.slots).staging[0].expect("built").mvec;
             let k2 = rig.host(u64::from(W * H) * 4, vk::BufferUsageFlags::TRANSFER_DST);
             rig.one_shot(|cmd| unsafe { rig.device.cmd_copy_image_to_buffer(cmd, staged, vk::ImageLayout::GENERAL, rig.hosts[k2].buffer, &[whole(W, H)]) });
@@ -2430,7 +2438,7 @@ mod tests {
             let copy: Vec<u16> = unsafe { std::slice::from_raw_parts(rig.hosts[k2].ptr.cast::<u16>(), (W * H * 2) as usize) }.to_vec();
             for (i, t) in copy.as_chunks::<2>().0.iter().enumerate() {
                 let (x, y) = ((i as u32 % W) as f32, (i as u32 / W) as f32);
-                assert_eq!([f16_to_f32(t[0]), f16_to_f32(t[1])], [x, y], "the staging copy at ({x}, {y}), scale {scale}");
+                assert_eq!([f16_to_f32(t[0]), f16_to_f32(t[1])], [x, y], "the staging copy at ({x}, {y}), {format:?} at scale {scale}");
             }
         }
         // An R11G11B10 colour input in SHADER_READ_ONLY_OPTIMAL.

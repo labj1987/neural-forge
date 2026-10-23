@@ -4,6 +4,16 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.11 — 2026-10-23
+
+- Metro Last Light Redux works: the model runs before the upscaler, inside DLSS's buffer. Turn the game's own DLSS 5
+  NR off in its settings so the picture does not get the network twice.
+- Games that create several graphics devices (Metro Last Light Redux) no longer leave the model off: the device the
+  game's DLSS runs on gets the network from the one that used it for the intro.
+- Games whose exposure for DLSS is always 0 now get the model: Neural Forge measures the exposure from the frame.
+- The Status tab says where the model runs in games that present on another device than DLSS runs on, instead of
+  "waiting for DLSS input".
+
 ## 3.8.10 — 2026-10-22
 
 - Opening a menu or a fade no longer makes the picture flicker with the model on. The model started afresh on
