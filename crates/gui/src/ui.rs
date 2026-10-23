@@ -498,6 +498,22 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         scale,
         set_scale,
     ));
+    // What the model sees before the upscaler: the picture's brightness for it alone (the game's is kept).
+    let (exposure, set_exposure) = bind_u32(&shm, Some("preupscale_exposure"), |h| &h.preupscale_exposure);
+    let exposure_row = combo_row("Model brightness", &["Game", "Auto"], exposure, set_exposure);
+    exposure_row.set_subtitle(
+        "How bright the picture the model works on is (the game's own brightness is kept). Game: the game's exposure. Auto: measured from the frame (within half to 16 times the game's), for games whose picture makes the model darken it",
+    );
+    model_group.add(&exposure_row);
+    let (brightness, set_brightness) = bind_float(&shm, Some("preupscale_brightness"), |h| &h.preupscale_brightness_bits);
+    model_group.add(&spin_row(
+        "Model brightness scale",
+        "On top of the above: above 1 the model sees a brighter picture, below 1 a darker one",
+        brightness,
+        "preupscale_brightness",
+        0.05,
+        set_brightness,
+    ));
     let pass_row = adw::ActionRow::new();
     pass_row.set_title("Per-pass settings");
     pass_row.set_subtitle("Give individual passes their own values");
@@ -2069,61 +2085,89 @@ fn build_setup_page(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
     page
 }
 
-/// One sample of the two timing series the sparkline plots, both already published by the layer for
-/// `neural-forge-cli shmctl status` -- this just samples them on a faster timer than the
-/// once-a-second status labels need, and keeps the last few seconds for the drawing area to plot.
+/// One sample of the graph's two series: how long a frame took and how much of it the model's network took on
+/// the GPU, sampled from the header on a faster timer than the once-a-second status labels need. The last few
+/// seconds are kept for the drawing area.
 #[derive(Clone, Copy)]
 struct TelemetrySample {
-    /// After the upscaler: capture and compose.
-    layer_ms: f32,
-    /// Before the upscaler: how long the last hold took.
-    hold_ms: f32,
+    /// Milliseconds per presented frame over the sample's interval (`None`: no frames, or no game).
+    frame_ms: Option<f32>,
+    /// The network's GPU milliseconds on its last hold (`preupscale_network_gpu_ms`); `None` while it does not run.
+    model_ms: Option<f32>,
 }
 
 const TELEMETRY_INTERVAL_MS: u32 = 200;
-const TELEMETRY_WINDOW_SECS: u32 = 5;
+const TELEMETRY_WINDOW_SECS: u32 = 10;
 const TELEMETRY_SAMPLES: usize = (TELEMETRY_WINDOW_SECS * 1000 / TELEMETRY_INTERVAL_MS) as usize;
+const FRAME_RGB: (f64, f64, f64) = (0.596, 0.478, 0.953);
+const MODEL_RGB: (f64, f64, f64) = (0.204, 0.780, 0.678);
 
-fn draw_telemetry_sparkline(cr: &gtk4::cairo::Context, width: i32, height: i32, history: &std::collections::VecDeque<TelemetrySample>) {
+/// The graph's top in milliseconds: the smallest of 5, 10, 20, 40 and 80 above every sample, so a line's height
+/// means the same while the frame rate holds and the scale only moves for a real change.
+fn telemetry_ceiling(history: &std::collections::VecDeque<TelemetrySample>) -> f32 {
+    let top = history.iter().flat_map(|s| [s.frame_ms, s.model_ms]).flatten().fold(0.0f32, f32::max);
+    [5.0, 10.0, 20.0, 40.0].into_iter().find(|&c| top <= c * 0.95).unwrap_or(80.0)
+}
+
+fn draw_telemetry_graph(cr: &gtk4::cairo::Context, width: i32, height: i32, history: &std::collections::VecDeque<TelemetrySample>) {
     let (width, height) = (f64::from(width), f64::from(height));
     let _ = cr.save();
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
-    let _ = cr.paint();
-
-    if history.len() < 2 {
-        let _ = cr.restore();
-        return;
+    let ceiling = telemetry_ceiling(history);
+    // The scale: a line at the top, the middle and the bottom, each labelled, in the text colour at low alpha.
+    let fg = (0.5, 0.5, 0.5);
+    cr.set_font_size(10.0);
+    let label_w = 34.0;
+    for (frac, value) in [(0.0, ceiling), (0.5, ceiling / 2.0), (1.0, 0.0)] {
+        let y = (height - 1.0) * frac + 0.5;
+        cr.set_source_rgba(fg.0, fg.1, fg.2, 0.25);
+        cr.set_line_width(1.0);
+        cr.move_to(label_w, y);
+        cr.line_to(width, y);
+        let _ = cr.stroke();
+        cr.set_source_rgba(fg.0, fg.1, fg.2, 0.9);
+        let text = format!("{value} ms");
+        let baseline = if frac == 0.0 {
+            y + 9.0
+        } else if frac == 1.0 {
+            y - 2.0
+        } else {
+            y + 3.5
+        };
+        cr.move_to(0.0, baseline);
+        let _ = cr.show_text(&text);
     }
-
-    // A fixed ceiling (not the window's own max) so the line's height means the same
-    // thing frame to frame instead of visually flattening every series out whenever
-    // one of them briefly spikes -- 20ms is comfortably above a healthy per-stage
-    // budget at the frame rates this project targets, without being so tall that
-    // ordinary sub-millisecond noise disappears into the bottom pixel row.
-    const CEILING_MS: f32 = 20.0;
-    let plot = |cr: &gtk4::cairo::Context, pick: fn(&TelemetrySample) -> f32| {
+    let plot_w = width - label_w;
+    let n = TELEMETRY_SAMPLES.max(2);
+    // The newest sample at the right edge; a gap where a series has no value.
+    let plot = |pick: fn(&TelemetrySample) -> Option<f32>| {
+        let mut drawing = false;
+        let start = n - history.len();
         for (i, sample) in history.iter().enumerate() {
-            let x = width * (i as f64) / ((history.len() - 1) as f64);
-            let y = height * (1.0 - f64::from(pick(sample).min(CEILING_MS) / CEILING_MS));
-            if i == 0 {
-                cr.move_to(x, y);
-            } else {
-                cr.line_to(x, y);
+            let x = label_w + plot_w * ((start + i) as f64) / ((n - 1) as f64);
+            match pick(sample) {
+                Some(v) => {
+                    let y = (height - 1.0) * (1.0 - f64::from(v.min(ceiling) / ceiling)) + 0.5;
+                    if drawing {
+                        cr.line_to(x, y);
+                    } else {
+                        cr.move_to(x, y);
+                    }
+                    drawing = true;
+                }
+                None => drawing = false,
             }
         }
         let _ = cr.stroke();
     };
-
     cr.set_line_width(1.6);
-    cr.set_source_rgb(0.204, 0.780, 0.678); // hold before the upscaler -- teal
-    plot(cr, |s| s.hold_ms);
-    cr.set_source_rgb(0.596, 0.478, 0.953); // layer (capture+compose) -- violet, matches the app's own accent
-    plot(cr, |s| s.layer_ms);
-
+    cr.set_source_rgb(FRAME_RGB.0, FRAME_RGB.1, FRAME_RGB.2);
+    plot(|s| s.frame_ms);
+    cr.set_source_rgb(MODEL_RGB.0, MODEL_RGB.1, MODEL_RGB.2);
+    plot(|s| s.model_ms);
     let _ = cr.restore();
 }
 
-fn legend_label(text: &str, rgb: (f64, f64, f64)) -> gtk4::Box {
+fn legend_label(text: &str, rgb: (f64, f64, f64)) -> (gtk4::Box, gtk4::Label) {
     let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     let swatch = gtk4::DrawingArea::new();
     swatch.set_content_width(10);
@@ -2135,8 +2179,9 @@ fn legend_label(text: &str, rgb: (f64, f64, f64)) -> gtk4::Box {
         let _ = cr.fill();
     });
     row.append(&swatch);
-    row.append(&gtk4::Label::new(Some(text)));
-    row
+    let label = gtk4::Label::new(Some(text));
+    row.append(&label);
+    (row, label)
 }
 
 fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
@@ -2158,14 +2203,16 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     legend.set_margin_top(10);
     legend.set_margin_start(10);
     legend.set_margin_end(10);
-    legend.append(&legend_label("Hold (before the upscaler)", (0.204, 0.780, 0.678)));
-    legend.append(&legend_label("Layer (after the upscaler)", (0.596, 0.478, 0.953)));
+    let (frame_key, frame_label) = legend_label("Frame time", FRAME_RGB);
+    let (model_key, model_label) = legend_label("Model (GPU)", MODEL_RGB);
+    legend.append(&frame_key);
+    legend.append(&model_key);
 
     let sparkline = gtk4::DrawingArea::new();
     // A minimum, not a ceiling: `AdwPreferencesGroup` still stretches this row taller
     // than 80px on a short page with room to spare (confirmed visually; `vexpand`
     // false the whole way down this box's ancestor chain didn't stop it either).
-    // Harmless -- `draw_telemetry_sparkline` normalizes against whatever height it's
+    // Harmless -- `draw_telemetry_graph` normalizes against whatever height it's
     // actually given each draw, so the plot still reads correctly at any size.
     sparkline.set_size_request(-1, 80);
     sparkline.set_hexpand(true);
@@ -2195,7 +2242,7 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     let history = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::<TelemetrySample>::with_capacity(TELEMETRY_SAMPLES)));
     {
         let history = std::rc::Rc::clone(&history);
-        sparkline.set_draw_func(move |_, cr, width, height| draw_telemetry_sparkline(cr, width, height, &history.borrow()));
+        sparkline.set_draw_func(move |_, cr, width, height| draw_telemetry_graph(cr, width, height, &history.borrow()));
     }
 
     let shm_for_timer = std::sync::Arc::clone(shm);
@@ -2228,10 +2275,14 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
             _ => fps_row.set_subtitle("—"),
         }
 
+        let model = f32::from_bits(hdr.preupscale_network_gpu_ms_bits.load(Ordering::Relaxed));
         let sample = TelemetrySample {
-            layer_ms: f32::from_bits(hdr.layer_ms_bits.load(Ordering::Relaxed)),
-            hold_ms: f32::from_bits(hdr.preupscale_hold_ms_bits.load(Ordering::Relaxed)),
+            frame_ms: layer_fps.filter(|&f| active && f > 0.5).map(|f| (1000.0 / f) as f32),
+            model_ms: (active && hdr.native_running.load(Ordering::Relaxed) != 0 && model.is_finite() && model > 0.0).then_some(model),
         };
+        let ms = |v: Option<f32>| v.map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"));
+        frame_label.set_text(&format!("Frame time {}", ms(sample.frame_ms)));
+        model_label.set_text(&format!("Model (GPU) {}", ms(sample.model_ms)));
         {
             let mut history = history.borrow_mut();
             if history.len() == TELEMETRY_SAMPLES {
@@ -2842,5 +2893,21 @@ mod games_note_tests {
         assert!(games_note(std::slice::from_ref(&native), 3, false).starts_with("Turns Neural Forge on"));
         assert!(games_note(std::slice::from_ref(&flatpak), 1, false).starts_with("Steam is the Flatpak build"));
         assert!(!games_note(&[native, flatpak], 1, false).contains("Flatpak"), "a native Steam is there too");
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::{telemetry_ceiling, TelemetrySample};
+
+    #[test]
+    fn the_graph_s_top_is_the_smallest_step_above_every_sample_and_ignores_gaps() {
+        let s = |frame_ms: Option<f32>, model_ms: Option<f32>| TelemetrySample { frame_ms, model_ms };
+        assert_eq!(telemetry_ceiling(&[].into()), 5.0, "empty");
+        assert_eq!(telemetry_ceiling(&[s(Some(3.5), Some(1.2)), s(None, None)].into()), 5.0, "a 288 Hz frame");
+        assert_eq!(telemetry_ceiling(&[s(Some(5.5), Some(3.1))].into()), 10.0, "180 fps");
+        assert_eq!(telemetry_ceiling(&[s(Some(16.7), None)].into()), 20.0, "60 fps");
+        assert_eq!(telemetry_ceiling(&[s(Some(19.5), None)].into()), 40.0, "close to a step goes to the next");
+        assert_eq!(telemetry_ceiling(&[s(Some(250.0), None)].into()), 80.0, "a stall is capped");
     }
 }

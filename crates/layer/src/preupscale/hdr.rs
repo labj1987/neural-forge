@@ -77,6 +77,23 @@ pub(crate) struct ExposurePush {
     pub rate: f32,
     /// `uint pass`: 0 the histogram, 1 the resolve.
     pub pass: u32,
+    /// `uint relative`: 1 keeps the e within [`LIFT_LO`]..[`LIFT_HI`] of the game's in the exposure buffer.
+    pub relative: u32,
+}
+
+/// With the Model brightness setting's Auto where the game gives an exposure, the measured e is kept within
+/// this factor of the game's: down to half of it, up to 16 times it. Crimson Desert's daytime picture needs 13x
+/// to reach the brightness the network was tuned on; a night scene would take 255x and the network would see
+/// day, its noise amplified (2026-10-22: the scene-cut detector then cut about once a second).
+pub(crate) const LIFT_LO: f32 = 0.5;
+pub(crate) const LIFT_HI: f32 = 16.0;
+
+/// The exposure buffer's first word as the encode reads it (the low half) and the game's own exposure: the
+/// high half where the auto-exposure lifted the game's (relative), else the same value.
+pub(crate) fn exposure_word(bytes: [u8; 4]) -> (f32, f32) {
+    let used = super::f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+    let game = u16::from_le_bytes([bytes[2], bytes[3]]);
+    (used, if game == 0 { used } else { super::f16_to_f32(game) })
 }
 
 /// What the auto-exposure resolve left in its state buffer (read after the capture's fence).
@@ -473,14 +490,14 @@ impl AutoExposure {
 
     /// # Safety
     /// `cmd` is recording; binding 0 holds a live view of the colour input.
-    unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, width: u32, height: u32) {
+    unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, width: u32, height: u32, relative: bool) {
         let filled = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         let counted = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-        let push = |pass: u32| ExposurePush { width, height, key: AUTO_KEY, rate: AUTO_RATE, pass };
+        let push = |pass: u32| ExposurePush { width, height, key: AUTO_KEY, rate: AUTO_RATE, pass, relative: u32::from(relative) };
         let bytes = |p: &ExposurePush| {
             // SAFETY: `ExposurePush` is `repr(C)`, plain data; read as bytes for its own size.
             unsafe { std::slice::from_raw_parts(std::ptr::from_ref(p).cast::<u8>(), std::mem::size_of::<ExposurePush>()) }.to_vec()
@@ -741,10 +758,14 @@ impl HdrPass {
 
     /// The exposure value the last capture read (call after its fence).
     pub(crate) fn exposure_value(&self) -> f32 {
+        self.exposure_values().0
+    }
+
+    /// The exposure value the last capture used and the game's own ([`exposure_word`]; call after its fence).
+    pub(crate) fn exposure_values(&self) -> (f32, f32) {
         // SAFETY: the mapping covers EXPOSURE_BYTES and is host-coherent; the capture's fence was
         // waited on and its closing barrier made the transfer write available to the host.
-        let bits = unsafe { std::ptr::read_volatile(self.exposure.ptr.cast::<[u8; 2]>()) };
-        super::f16_to_f32(u16::from_le_bytes(bits))
+        exposure_word(unsafe { std::ptr::read_volatile(self.exposure.ptr.cast::<[u8; 4]>()) })
     }
 
     /// Clears the exposure buffer to 0 (so a capture that did not read the exposure image leaves
@@ -829,15 +850,17 @@ impl HdrPass {
     }
 
     /// Records the auto-exposure (histogram, then resolve into the exposure buffer) for the colour
-    /// input; [`Self::record_encode`]'s opening barrier makes its write visible to the encode.
+    /// input; [`Self::record_encode`]'s opening barrier makes its write visible to the encode. `relative`:
+    /// the game's texel was copied into the exposure buffer before (the fill barrier at the start makes it
+    /// visible), and the e written is kept within [`LIFT_LO`]..[`LIFT_HI`] of it.
     /// Returns `false` (nothing recorded) when the pass is not built.
     ///
     /// # Safety
     /// `cmd` is recording; [`Self::bind_colour`] was called for this hold.
-    pub(crate) unsafe fn record_auto_exposure(&self, device: &ash::Device, cmd: vk::CommandBuffer) -> bool {
+    pub(crate) unsafe fn record_auto_exposure(&self, device: &ash::Device, cmd: vk::CommandBuffer, relative: bool) -> bool {
         let Some(auto) = &self.auto else { return false };
         // SAFETY: forwarded.
-        unsafe { auto.record(device, cmd, self.width, self.height) };
+        unsafe { auto.record(device, cmd, self.width, self.height, relative) };
         true
     }
 
@@ -1147,11 +1170,12 @@ mod tests {
         assert_eq!(std::mem::offset_of!(HdrPush, padded_width), 8);
         assert_eq!(std::mem::offset_of!(HdrPush, paper_white), 16);
         assert_eq!(std::mem::offset_of!(HdrPush, flags), 20);
-        // preupscale_exposure.comp: uvec2 size, float key, float rate, uint pass: 20 bytes.
-        assert_eq!(std::mem::size_of::<ExposurePush>(), 20);
+        // preupscale_exposure.comp: uvec2 size, float key, float rate, uint pass, uint relative: 24 bytes.
+        assert_eq!(std::mem::size_of::<ExposurePush>(), 24);
         assert_eq!(std::mem::offset_of!(ExposurePush, key), 8);
         assert_eq!(std::mem::offset_of!(ExposurePush, rate), 12);
         assert_eq!(std::mem::offset_of!(ExposurePush, pass), 16);
+        assert_eq!(std::mem::offset_of!(ExposurePush, relative), 20);
         for spv in [ENCODE_SPV, DECODE_SPV, EXPOSURE_SPV] {
             assert!(spv.len() > 20 && spv.len().is_multiple_of(4), "embedded SPIR-V");
         }

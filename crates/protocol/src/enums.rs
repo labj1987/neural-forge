@@ -178,6 +178,22 @@ pub mod placement {
     }
 }
 
+/// Where the HDR encode's exposure comes from before the upscaler (`preupscale_exposure`).
+pub mod exposure_source {
+    /// The game's exposure for DLSS where it gives a readable one, else measured from the frame.
+    pub const GAME: u32 = 0;
+    /// Measured from the frame always (the auto-exposure).
+    pub const AUTO: u32 = 1;
+    pub const COUNT: u32 = 2;
+    /// The names `shmctl` and `config.ini` comments use, by value.
+    pub const NAMES: [&str; 2] = ["game", "auto"];
+
+    /// The value `name` names (`NAMES`), or a number below [`COUNT`].
+    pub fn parse(name: &str) -> Option<u32> {
+        NAMES.iter().position(|n| *n == name).map(|i| i as u32).or_else(|| name.parse().ok().filter(|v| *v < COUNT))
+    }
+}
+
 /// How a HUD region (`hud_regions`) treats the edit inside it.
 pub mod hud_mode {
     /// No edit inside the region (a feathered edge outside it).

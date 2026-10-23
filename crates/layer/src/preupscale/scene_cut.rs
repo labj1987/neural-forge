@@ -5,8 +5,9 @@
 //! there or not.
 //!
 //! It is the 1.x helper's detector (`scene.rs`, removed with the helper in 3.0.0) moved onto the GPU: a
-//! luma thumbnail of the encoded capture on an [`STEP`]-pixel step (each channel clamped to [0, 1] and
-//! rounded to 8 bits, the three averaged), compared with the previous hold's; a cut when the mean
+//! luma thumbnail of the encoded capture, one value per [`STEP`]x[`STEP`] block (each channel clamped to [0, 1]
+//! and rounded to 8 bits, the three channels of the block's pixels averaged; the helper took one pixel per
+//! block, which a noisy picture made flicker over the threshold), compared with the previous hold's; a cut when the mean
 //! absolute difference is at least [`THRESHOLD`] of 255 and the comparison before it was under it (a fade or an
 //! animated menu, over it from every hold to the next, cuts on its first hold only: resetting on each made the
 //! picture flicker, Crimson Desert 2026-10-22). `shaders/preupscale_scene_cut.comp` takes the
@@ -26,7 +27,8 @@ use super::HostBuffer;
 
 const SPV: &[u8] = include_bytes!("../../shaders/preupscale_scene_cut.spv");
 
-/// Every `STEP`th pixel on each axis goes into the thumbnail (the shader's `STEP`).
+/// The thumbnail's blocks are `STEP` pixels on a side (the shader's `STEP`); the last row and column of blocks
+/// hold what is left of the frame.
 pub(crate) const STEP: u32 = 8;
 
 /// A cut is a mean absolute difference of the two thumbnails of at least this, on 0-255: the 8-bit value
@@ -532,14 +534,22 @@ mod tests {
         }
     }
 
-    /// The 1.x helper's `luma_thumbnail_rgba16f` and `is_scene_cut`, on the CPU: the shader's reference.
+    /// The thumbnail on the CPU, the shader's reference: per block, the integer mean of the quantised channels
+    /// of its pixels within the frame.
     fn cpu_thumbnail(frame: &[[f32; 3]], width: u32, height: u32) -> Vec<u32> {
         let q = |v: f32| if v.is_nan() { 0 } else { (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32 };
         let mut out = Vec::new();
-        for y in (0..height).step_by(STEP as usize) {
-            for x in (0..width).step_by(STEP as usize) {
-                let [r, g, b] = frame[(y * width + x) as usize];
-                out.push((q(r) + q(g) + q(b)) / 3);
+        for by in (0..height).step_by(STEP as usize) {
+            for bx in (0..width).step_by(STEP as usize) {
+                let (ex, ey) = ((bx + STEP).min(width), (by + STEP).min(height));
+                let mut s = 0;
+                for y in by..ey {
+                    for x in bx..ex {
+                        let [r, g, b] = frame[(y * width + x) as usize];
+                        s += q(r) + q(g) + q(b);
+                    }
+                }
+                out.push(s / (3 * (ex - bx) * (ey - by)));
             }
         }
         out

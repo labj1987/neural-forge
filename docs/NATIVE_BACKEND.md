@@ -937,7 +937,8 @@ grew) starts afresh. What gets no history:
   previous position is off screen. The idea is uzbekunknown/dlss-nr-on-intel's (Apache-2.0,
   `notes/phase72-preset-b.md` "Flicker", the daemon's `History` with `STALE = 0.12`; ideas only).
 - **The whole frame** (`post_history::SlotHistory`): a scene cut (the pre-upscaler detector's rule on the
-  CPU: a luma thumbnail of the proxy on an 8-pixel step, a cut at a mean difference of 40 of 255;
+  CPU: a luma thumbnail of the proxy in 8-pixel blocks, a cut at a mean difference of 40 of 255 after a
+  frame under it;
   `NEURAL_FORGE_SCENE_CUT` applies here too), another size or format, a request that did not reach the
   network (the effect off, the model not ready, a failed frame), more than 500 ms since the previous frame,
   another network build. Each reset is logged (`[native] after the upscaler: resetting the history (...)`).
@@ -1064,6 +1065,57 @@ GPU) checks two sizes built together against one built alone.
   detail.
 
 Full stays the default.
+
+## Brightness before the upscaler (3.8.10, 2026-10-22)
+
+The network treats its input as a display-referred 0-1 picture, so the HDR encode (`preupscale_encode.comp`)
+multiplies DLSS's scene-linear colour by an exposure and divides it by the paper white (3) before the shoulder
+and the sRGB curve. The paper white was tuned on GTA V, whose own exposure puts the exposed median at 0.47-0.76.
+Crimson Desert's daytime exposure puts it at 0.05: its encoded luma has a median of 0.135 (p10 0.065, p90 0.197;
+holds 0, 8 and 15 of a 16-hold dump at 1516x852, game exposure 47.1). The network darkens such a picture further
+where it lifts GTA V's: in the dump it took the darkest quarter down by 16%, where it lifts GTA V's by 33-40%.
+Alex saw the whole picture get darker with the model on, worst with the full network.
+
+Two Model tab settings (SHM v22, live) change what the network sees and nothing else, because the decode is the
+encode's exact inverse:
+
+- **Model brightness** (`preupscale_exposure`, `enums::exposure_source`): `game` (0, the default) the game's
+  exposure for DLSS; `auto` (1) the auto-exposure (`preupscale_exposure.comp`, key 0.6) measured from the frame,
+  kept within 0.5x-16x of the game's exposure where the game gives one (`hdr::LIFT_LO`, `hdr::LIFT_HI`; the
+  `relative` resolve: the capture copies the game's texel in as usual, the resolve bounds the adapted e by it and
+  keeps the game's own e in the exposure word's high half for `Session::check_exposure`). A game without an
+  exposure gets the auto-exposure as before.
+  - Without the bound, the first try took a night scene in Crimson Desert (encoded median 0.012 with the game's
+    exposure) to e 12,008, 255x the game's 47.1: the network saw day, and the noise the lift amplified moved
+    the scene-cut detector's point-sampled thumbnail by 28-34 of 255 between holds of a still scene, so it cut
+    about once a second (39 history resets in a minute). Bounded at 16x the same frames differ by 9-11 point-
+    sampled and 3-5 in the block means the detector takes since (above).
+  - In daytime (the dump above) the auto-exposure asks for 13.2x (e 622-625): encoded median 0.503 (p10 0.295,
+    p90 0.684), 4.2% of pixels on the shoulder and 1.72% clamped (the decode keeps the game's value there),
+    against E1b's target of an exposed median at 0.16-0.25 of the paper white with under 1% clamped.
+- **Model brightness scale** (`preupscale_brightness`, 0.25-4, default 1): the paper white is divided by it
+  (the exposure multiplied), on top of either. On the daytime dump, `auto` at 0.5 gives a median of 0.363 with
+  0.08% clamped.
+
+What the network then does with the picture's brightness, as the decoded answer over the colour input (scene-
+linear luma, 8-hold dumps of one spot in Crimson Desert, the full network):
+
+| Dump | e | Whole frame | Darkest quarter | Brightest quarter |
+|---|---|---|---|---|
+| Day, `game` | 47 | +1.6% | -16% | +8% |
+| Night, `game` | 47 | -0.3% | +63% | -2% |
+| Night, `auto` (16x, the bound) | 754 | +7% | -24% | +13% |
+
+So the brightness the network sees moves how it treats the shadows, but not in one direction: at night `auto`
+gives more contrast where `game` lifted the shadows, and in GTA V, whose encoded median is like `auto`'s, the
+network lifts the darkest quarter by 33-40%. The default stays `game` until the setting has been compared in
+the game in daylight, where the darkening was seen.
+
+`Session::view` reads both for each hold and logs a change (`what the network sees: brightness ...`). The
+defaults leave the frame bit for bit as before (`the_auto_brightness_lifts_the_game_s_exposure_within_its_bounds`
+checks the bound on the GPU: e 16 for a dark frame, 0.5 for a bright one, the measured e between). The status's
+`swapchain_hdr` line says whether the game presents HDR (`hdr_detected`, written by the layer at each present
+since 3.8.10; nothing wrote it before).
 
 ## The colour of the edit (3.8.0, 2026-10-19)
 

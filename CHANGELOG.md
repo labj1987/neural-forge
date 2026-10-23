@@ -4,6 +4,23 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.10 — 2026-10-22
+
+- Opening a menu or a fade no longer makes the picture flicker with the model on. The model started afresh on
+  every frame of such a change (35 times in 10 seconds in Crimson Desert); it now starts afresh once per change.
+- New in the Model tab: **Model brightness**. **Auto** measures the brightness of the picture the model works on
+  from the frame (within half to 16 times the game's, so night stays night) instead of taking the game's, for
+  games that give it a very dark picture (Crimson Desert); the game's own brightness is kept. **Model brightness
+  scale** brightens or darkens what the model sees on top. Both change how the model treats shadows; try them
+  where the model makes a game darker.
+- The model no longer starts afresh by mistake in noisy, dark scenes: the check for a new scene compares the
+  picture's 8x8 blocks instead of single pixels.
+- The Status tab's graph shows something useful: the time per frame and the model's GPU time per frame, with a
+  scale and the current values. It plotted two timings that sit at zero while the model runs inside DLSS.
+- With Ray Reconstruction on, the Status tab says the size of DLSS's output the model runs on instead of 0x0.
+- `neural-forge-cli shmctl status` says whether the game presents HDR (`swapchain_hdr`) and the model's GPU time
+  (`preupscale_network_gpu_ms`).
+
 ## 3.8.9 — 2026-10-22
 
 - GTA San Andreas - The Definitive Edition runs the model before the upscaler again. Its newer DXVK makes a call

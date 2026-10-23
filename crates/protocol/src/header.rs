@@ -623,6 +623,20 @@ pub struct ShmHeader {
     pub hud_region_count: AtomicU32,
     /// The user's HUD regions at present, in the output's 0-1 coordinates ([`HudRegion`]).
     pub hud_region: [HudRegionWords; MAX_HUD_REGIONS],
+
+    // --- v22 -----------------------------------------------------------------------------
+    /// f32 bits: how bright the picture the network sees before the upscaler is (docs/NATIVE_BACKEND.md,
+    /// "Brightness before the upscaler"), 0.25 to 4: the HDR encode's exposure is multiplied by it (its paper
+    /// white divided). The decode is the encode's exact inverse, so the game's brightness is kept; only what
+    /// the network works on changes. Default 1.
+    pub preupscale_brightness_bits: AtomicU32,
+    /// Where the HDR encode's exposure comes from ([`crate::enums::exposure_source`]): `game` (0, the default)
+    /// the game's exposure for DLSS where it gives one, `auto` measured from the frame always, which puts the
+    /// picture's middle grey where the network was tuned whatever the game's exposure.
+    pub preupscale_exposure: AtomicU32,
+    /// f32 bits: the network's GPU milliseconds on the last hold that ran it (before the upscaler or after
+    /// DLSS), for the Status tab's graph. 0 before the first.
+    pub preupscale_network_gpu_ms_bits: AtomicU32,
 }
 
 /// The most HUD regions (`hud_regions`).
@@ -742,12 +756,15 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2524, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2536, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, placement) == 2280, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_placement) == 2284, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hud_detect) == 2324, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hud_region_count) == 2328, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hud_region) == 2332, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_brightness_bits) == 2524, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_exposure) == 2528, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_network_gpu_ms_bits) == 2532, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_saturation_bits) == 2128, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_lut_seq) == 2156, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_colour) == 2160, "layout changed -- bump SHM_VERSION");
@@ -792,7 +809,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 176] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 178] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -981,6 +998,10 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 176] = [
     ("pass10_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
     // The HUD at present: its detection.
     ("hud_detect", 0.0, 1.0),
+    // What the network sees before the upscaler: its brightness, and where the exposure comes from
+    // (`enums::exposure_source`).
+    ("preupscale_brightness", 0.25, 4.0),
+    ("preupscale_exposure", 0.0, (crate::enums::exposure_source::COUNT - 1) as f32),
 ];
 
 /// The persisted name of pass `pass`'s (0 is pass 1) `field` (`overrides`, `intensity`, `local_tone`,
@@ -1098,6 +1119,8 @@ impl ShmHeader {
         }
         self.hud_detect.store(1, Ordering::Relaxed);
         self.store_hud_regions(&[]);
+        self.preupscale_brightness_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.preupscale_exposure.store(crate::enums::exposure_source::GAME, Ordering::Relaxed);
 
         self.server_state.store(crate::enums::server_state::STOPPED, Ordering::Relaxed);
         self.model_up.store(0, Ordering::Relaxed);
@@ -1286,13 +1309,13 @@ impl ShmHeader {
     /// under `/tmp` and does not). Add to [`Self::setting_slots`] (and [`SETTING_BOUNDS`]), not just
     /// to the GUI, whenever a new tunable needs to survive a restart -- that is the one list that
     /// decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 176] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 178] {
         self.setting_slots().map(|(name, kind, field)| (name, kind == Kind::Float, field.load(Ordering::Relaxed)))
     }
 
     /// Every persisted setting's name, kind and field, in [`SETTING_BOUNDS`]'s order (a test holds
     /// the two lists to the same names at the same places). Only addresses: nothing is loaded.
-    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 176] {
+    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 178] {
         [
             ("white_point", Kind::Float, &self.white_point_bits),
             ("white_point_scale", Kind::Float, &self.white_point_scale_bits),
@@ -1472,6 +1495,8 @@ impl ShmHeader {
             ("pass9_placement", Kind::Whole, &self.pass_placement[8]),
             ("pass10_placement", Kind::Whole, &self.pass_placement[9]),
             ("hud_detect", Kind::Whole, &self.hud_detect),
+            ("preupscale_brightness", Kind::Float, &self.preupscale_brightness_bits),
+            ("preupscale_exposure", Kind::Whole, &self.preupscale_exposure),
         ]
     }
 
@@ -1479,7 +1504,7 @@ impl ShmHeader {
     /// clamped to the setting's range in [`SETTING_BOUNDS`] (`None` for one that is not finite), a
     /// whole number clamped to it, and an override mask with the bits that name no override cleared.
     /// `None` for a name that is no setting.
-    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 176], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
+    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 178], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
         let at = SETTING_BOUNDS.iter().position(|(n, ..)| *n == name)?;
         let (_, min, max) = SETTING_BOUNDS[at];
         let (slot_name, kind, field) = slots[at];
@@ -1635,6 +1660,15 @@ impl ShmHeader {
                 .collect();
             HudSettings { detect: self.hud_detect.load(Ordering::Relaxed) != 0, regions }
         })
+    }
+
+    /// What the network sees before the upscaler: the brightness (within its bounds; 1 for anything that is
+    /// not a number) and whether the exposure is measured from the frame even where the game gives one.
+    pub fn preupscale_view(&self) -> (f32, bool) {
+        let b = f32::from_bits(self.preupscale_brightness_bits.load(Ordering::Relaxed));
+        let (_, lo, hi) = SETTING_BOUNDS.iter().find(|(n, ..)| *n == "preupscale_brightness").copied().expect("bounded");
+        let brightness = if b.is_finite() { b.clamp(lo, hi) } else { 1.0 };
+        (brightness, self.preupscale_exposure.load(Ordering::Relaxed) == crate::enums::exposure_source::AUTO)
     }
 
     /// The pass count and each pass's placement ([`crate::enums::placement`]: `placement`, or the pass's own
@@ -2258,7 +2292,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_sky), std::mem::offset_of!(ShmHeader, network) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_motion_structure_bits) + 4, std::mem::offset_of!(ShmHeader, pass_feedback_bits));
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4, std::mem::offset_of!(ShmHeader, scene_cuts));
-        assert_eq!(crate::SHM_VERSION, 21);
+        assert_eq!(crate::SHM_VERSION, 22);
         let h = ShmHeader::default();
         h.init_defaults();
         let m = h.mask_settings();
@@ -2282,7 +2316,7 @@ mod tests {
         // v20 appends the Network setting: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, network), std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28);
         assert_eq!(std::mem::offset_of!(ShmHeader, network) + 4, std::mem::offset_of!(ShmHeader, mask_sky));
-        assert_eq!(crate::SHM_VERSION, 21);
+        assert_eq!(crate::SHM_VERSION, 22);
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.network.load(Ordering::Relaxed), crate::enums::network::FULL, "the full network is the default");
@@ -2293,7 +2327,7 @@ mod tests {
         // v20's last word: every earlier field keeps its offset, and v21's fields follow it.
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts), std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts) + 4, std::mem::offset_of!(ShmHeader, preupscale_scale_bits));
-        assert_eq!(crate::SHM_VERSION, 21);
+        assert_eq!(crate::SHM_VERSION, 22);
         let h = ShmHeader::default();
         h.scene_cuts.store(5, Ordering::Relaxed);
         h.init_defaults();
@@ -2308,7 +2342,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<PassColour>(), 12);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour), std::mem::offset_of!(ShmHeader, edit_lut_seq) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour) + crate::MAX_PASSES * 12, std::mem::offset_of!(ShmHeader, placement));
-        assert_eq!(crate::SHM_VERSION, 21);
+        assert_eq!(crate::SHM_VERSION, 22);
         let h = ShmHeader::default();
         h.edit_lut_seq.store(9, Ordering::Relaxed);
         h.init_defaults();
@@ -2445,6 +2479,23 @@ mod tests {
     }
 
     #[test]
+    fn what_the_network_sees_is_appended_after_the_hud_and_defaults_to_the_game_s_own() {
+        use crate::enums::exposure_source;
+        assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_brightness_bits), std::mem::offset_of!(ShmHeader, hud_region) + MAX_HUD_REGIONS * 24);
+        assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_network_gpu_ms_bits), std::mem::offset_of!(ShmHeader, preupscale_exposure) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_network_gpu_ms_bits) + 4, std::mem::size_of::<ShmHeader>());
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(h.preupscale_view(), (1.0, false), "the game's exposure, unchanged");
+        assert!(h.write_settings(&[("preupscale_brightness", 2.0f32.to_bits()), ("preupscale_exposure", exposure_source::AUTO)]));
+        assert_eq!(h.preupscale_view(), (2.0, true));
+        assert!(h.write_settings(&[("preupscale_brightness", 9.0f32.to_bits()), ("preupscale_exposure", 7)]));
+        assert_eq!(h.preupscale_view(), (4.0, true), "clamped to the bounds");
+        h.preupscale_brightness_bits.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        assert_eq!(h.preupscale_view().0, 1.0);
+    }
+
+    #[test]
     fn the_placement_and_the_hud_are_appended_after_the_colour_of_the_edit() {
         use crate::enums::{pass_override, placement};
         assert_eq!(std::mem::offset_of!(ShmHeader, placement), std::mem::offset_of!(ShmHeader, pass_colour) + crate::MAX_PASSES * 12);
@@ -2452,7 +2503,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, hud_detect), std::mem::offset_of!(ShmHeader, pass_placement) + crate::MAX_PASSES * 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, hud_region_count), std::mem::offset_of!(ShmHeader, hud_detect) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, hud_region), std::mem::offset_of!(ShmHeader, hud_region_count) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, hud_region) + MAX_HUD_REGIONS * 24, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, hud_region) + MAX_HUD_REGIONS * 24, std::mem::offset_of!(ShmHeader, preupscale_brightness_bits));
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.placements(), (1, [placement::AUTO; crate::MAX_PASSES]), "auto for every pass by default");
@@ -2501,7 +2552,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_scale_bits), std::mem::offset_of!(ShmHeader, scene_cuts) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits), std::mem::offset_of!(ShmHeader, preupscale_scale_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits) + crate::MAX_PASSES * 4, std::mem::offset_of!(ShmHeader, edit_saturation_bits));
-        assert_eq!(crate::SHM_VERSION, 21);
+        assert_eq!(crate::SHM_VERSION, 22);
         let h = ShmHeader::default();
         h.preupscale_scale_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
         h.pass_scale_bits[2].store(0.5f32.to_bits(), Ordering::Relaxed);

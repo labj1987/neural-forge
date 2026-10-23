@@ -631,6 +631,12 @@ impl ShmClient {
         }
     }
 
+    /// The network's GPU milliseconds on the last hold that ran it (`ShmHeader::preupscale_network_gpu_ms_bits`).
+    pub fn publish_network_gpu_ms(&self, ms: f32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.preupscale_network_gpu_ms_bits.store(ms.to_bits(), Ordering::Relaxed);
+    }
+
     /// History resets for a scene cut before the upscaler since the layer opened the channel
     /// (`ShmHeader::scene_cuts`).
     pub fn publish_scene_cuts(&self, cuts: u32) {
@@ -646,6 +652,18 @@ impl ShmClient {
             return None;
         }
         Some(hdr.preupscale_dump_request.swap(0, Ordering::Relaxed)).filter(|&k| k > 0)
+    }
+
+    /// What the network sees before the upscaler (`ShmHeader::preupscale_view`): the brightness and whether
+    /// the exposure is measured from the frame always. The defaults (1, the game's) before the mapping is open.
+    pub fn preupscale_view(&self) -> (f32, bool) {
+        self.header().map_or((1.0, false), |h| h.preupscale_view())
+    }
+
+    /// The swapchain's HDR kind as the layer read it (`ShmHeader::hdr_detected`, `enums::hdr_kind`).
+    pub fn publish_hdr_detected(&self, kind: u32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.hdr_detected.store(kind, Ordering::Relaxed);
     }
 
     /// The channel's path once it is open (empty before).

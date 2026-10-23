@@ -1,9 +1,12 @@
 #version 450
 // The scene-cut detector (`preupscale::scene_cut`, docs/DLSSNR_PARAMETERS.md, "History reset"): a luma
-// thumbnail of the encoded capture on an 8-pixel step, compared with the previous hold's, in the capture
-// (`C`) of every native hold, right after the encode. The 1.x helper's detector on the CPU (`scene.rs`),
-// moved onto the GPU: each sampled channel of the encoded proxy (display-referred, [0, 1]) clamped (NaN
-// to 0) and rounded to 8 bits, the three averaged (integer division); a cut when the mean absolute
+// thumbnail of the encoded capture, one value per 8x8 block, compared with the previous hold's, in the
+// capture (`C`) of every native hold, right after the encode. The 1.x helper's detector on the CPU
+// (`scene.rs`), moved onto the GPU: each channel of the encoded proxy (display-referred, [0, 1]) clamped
+// (NaN to 0) and rounded to 8 bits, the three channels of every pixel of the block (within the frame)
+// averaged (one integer division). The helper took one pixel per block; a noisy picture (Crimson Desert at
+// night, brightened for the network) then differed by the threshold from frame to frame while the scene
+// stood still (2026-10-22), where the blocks' means differ by about a third of that. A cut when the mean absolute
 // difference of the two thumbnails is at least the threshold (40 of 255 by default), in integers, and the
 // comparison before it was not: a fade or an animated menu changes the picture that much from every hold to
 // the next, and resetting the history on each of them made the picture flicker (Crimson Desert, 35 resets in
@@ -21,7 +24,7 @@ layout(constant_id = 0) const bool DECIDE = false;
 
 // The encoded proxy (padded extent; the valid part is read), GENERAL.
 layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_encoded;
-// The thumbnail: one 8-bit luma value a word, row-major over ceil(width / 8) x ceil(height / 8).
+// The thumbnail: one 8-bit luma value (a block's mean) a word, row-major over ceil(width / 8) x ceil(height / 8).
 layout(set = 0, binding = 1, std430) buffer Thumb { uint luma[]; } u_thumb;
 // One partial sum of absolute differences per first-dispatch workgroup.
 layout(set = 0, binding = 2, std430) buffer Partial { uint sum[]; } u_partial;
@@ -65,9 +68,16 @@ void main() {
     uint i = gl_GlobalInvocationID.x;
     uint d = 0u;
     if (i < n) {
-      ivec2 at = ivec2(int((i % t.x) * STEP), int((i / t.x) * STEP));
-      vec3 c = imageLoad(u_encoded, at).rgb;
-      uint q = (quantise(c.r) + quantise(c.g) + quantise(c.b)) / 3u;
+      uvec2 base = uvec2((i % t.x) * STEP, (i / t.x) * STEP);
+      uvec2 end = min(base + uvec2(STEP), p.size);
+      uint s = 0u;
+      for (uint y = base.y; y < end.y; y++) {
+        for (uint x = base.x; x < end.x; x++) {
+          vec3 c = imageLoad(u_encoded, ivec2(x, y)).rgb;
+          s += quantise(c.r) + quantise(c.g) + quantise(c.b);
+        }
+      }
+      uint q = s / (3u * (end.x - base.x) * (end.y - base.y));
       uint previous = u_thumb.luma[i];
       u_thumb.luma[i] = q;
       if (p.compare != 0u) d = q > previous ? q - previous : previous - q;

@@ -105,17 +105,25 @@ pub(crate) fn reject() -> f32 {
 }
 
 /// The scene-cut thumbnail of an 8-bit proxy (`width` x `height` texels of four bytes, rows of `width`):
-/// every [`super::scene_cut::STEP`]th pixel on each axis, the integer mean of its three colour channels
-/// (the channel order does not matter), as the pre-upscaler detector's thumbnail of its encoded capture.
+/// per [`super::scene_cut::STEP`]-pixel block, the integer mean of the three colour channels of its pixels
+/// within the frame (the channel order does not matter), as the pre-upscaler detector's thumbnail of its
+/// encoded capture.
 pub(crate) fn thumbnail(proxy: &[u8], width: u32, height: u32) -> Vec<u8> {
     let step = super::scene_cut::STEP as usize;
     let (w, h) = (width as usize, height as usize);
     let mut out = Vec::with_capacity(w.div_ceil(step) * h.div_ceil(step));
-    for y in (0..h).step_by(step) {
-        for x in (0..w).step_by(step) {
-            let at = (y * w + x) * 4;
-            let t = proxy.get(at..at + 3).unwrap_or(&[0, 0, 0]);
-            out.push(((u32::from(t[0]) + u32::from(t[1]) + u32::from(t[2])) / 3) as u8);
+    for by in (0..h).step_by(step) {
+        for bx in (0..w).step_by(step) {
+            let (ex, ey) = ((bx + step).min(w), (by + step).min(h));
+            let mut s = 0u32;
+            for y in by..ey {
+                for x in bx..ex {
+                    let at = (y * w + x) * 4;
+                    let t = proxy.get(at..at + 3).unwrap_or(&[0, 0, 0]);
+                    s += u32::from(t[0]) + u32::from(t[1]) + u32::from(t[2]);
+                }
+            }
+            out.push((s / (3 * ((ex - bx) * (ey - by)) as u32)) as u8);
         }
     }
     out
@@ -256,14 +264,26 @@ mod tests {
         assert_eq!((Motion::None.shader_mode(), Motion::Zero.shader_mode(), Motion::Flow.shader_mode()), (0, 1, 2));
     }
 
-    /// The thumbnail and the cut rule are the pre-upscaler detector's: an 8-pixel step, the three channels'
-    /// integer mean, a cut at a mean difference of 40.
+    /// The thumbnail and the cut rule are the pre-upscaler detector's: 8-pixel blocks, the integer mean of their
+    /// pixels' three channels, a cut at a mean difference of 40.
     #[test]
     fn the_cut_test_is_the_scene_cut_detectors_rule() {
         let (w, h) = (20, 10);
         let frame = |v: [u8; 4]| -> Vec<u8> { (0..w * h).flat_map(|_| v).collect() };
         let a = thumbnail(&frame([10, 20, 30, 255]), w, h);
-        assert_eq!(a, vec![20; 3 * 2], "every 8th pixel of 20 x 10: 3 x 2, the mean of r, g and b");
+        assert_eq!(a, vec![20; 3 * 2], "20 x 10 in 8-pixel blocks: 3 x 2, the mean of r, g and b");
+        // A block's mean, not one of its pixels: a single bright pixel moves its block by 1/64 of its step.
+        let mut speck = frame([0, 0, 0, 0]);
+        speck[(w * 3 + 3) as usize * 4..][..3].copy_from_slice(&[255, 255, 255]);
+        assert_eq!(thumbnail(&speck, w, h)[0], 3, "255 over the 64 pixels of the first block, rounded down");
+        // The last column of blocks is 4 pixels wide here: its mean is over those.
+        let mut edge = frame([0, 0, 0, 0]);
+        for y in 0..8 {
+            for x in 16..20 {
+                edge[(y * w + x) as usize * 4..][..3].copy_from_slice(&[90, 90, 90]);
+            }
+        }
+        assert_eq!(thumbnail(&edge, w, h)[2], 90, "the 4 x 8 pixels of the last block");
         let b = thumbnail(&frame([50, 60, 70, 0]), w, h);
         assert_eq!(mean_difference(&a, &b), Some(40));
         assert!(is_cut(40, 40));

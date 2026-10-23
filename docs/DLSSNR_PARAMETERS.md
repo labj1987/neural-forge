@@ -170,10 +170,11 @@ Findings:
   runs. Taking the thumbnail regardless would close it at the cost of a CPU pass over every 64th pixel.
 - **The native backend's detector (3.7.0)** is the helper's rule on the GPU, independent of the motion
   vectors: in the capture (`C`) of every native hold, after the encode,
-  `shaders/preupscale_scene_cut.comp` takes the thumbnail of the encoded capture (every 8th pixel on
-  each axis; each channel clamped to [0, 1], NaN to 0, rounded to 8 bits, the three averaged) and
-  compares it with the previous hold's; a cut when the integer mean absolute difference is at least
-  40 of 255 (`scene_cut::THRESHOLD`). The encoded capture is the same display-referred [0, 1] value the
+  `shaders/preupscale_scene_cut.comp` takes the thumbnail of the encoded capture (each channel clamped
+  to [0, 1], NaN to 0, rounded to 8 bits; since 3.8.10 the integer mean of the three channels over each
+  8x8 block, before that the helper's one pixel per block) and compares it with the previous hold's; a
+  cut when the integer mean absolute difference is at least 40 of 255 (`scene_cut::THRESHOLD`) and the
+  comparison before it was under 40 (since 3.8.10: a fade cuts on its first hold only). The encoded capture is the same display-referred [0, 1] value the
   helper quantised (`ebad222`), so 40 means what it meant there. The decision is written into the native
   pass's state buffer (`State.cut`), which `native_preprocess.comp` and `native_composite.comp` read as
   "no history" (seed 0, no blend) on the same frame, for every pass; the host reads the result at the

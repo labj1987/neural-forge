@@ -961,6 +961,7 @@ fn record_inline_hold(
     // A cache dump: armed holds read the colour input as it is (the staging image can always be copied from).
     let arm = session.cache_dump_arm(shm, true, true);
     let seen = session.seen();
+    let (brightness, measure) = session.view(shm);
     let target = crate::preupscale::Target {
         colour: point.colour,
         width: extent.0,
@@ -973,7 +974,8 @@ fn record_inline_hold(
         mvec_scale: point.mvec_scale(),
         exposure: [None; crate::preupscale::MAX_EXPOSURE],
         exposure_input: point.exposure_input.filter(|_| session.game_exposure_trusted(point.identification)),
-        paper_white: crate::preupscale::hdr::paper_white(),
+        paper_white: crate::preupscale::hdr::paper_white() / brightness,
+        lift_exposure: measure,
         identification: point.identification,
     };
     let res = session.res_inline(stage).as_mut().expect("ensured above");
@@ -1705,6 +1707,7 @@ impl NeuralForgeDeviceInfo {
         };
         // A cache dump's armed hold also copies the colour input as it is (TRANSFER_SRC).
         let arm = if native { session.cache_dump_arm(shm, false, colour.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)) } else { None };
+        let (brightness, measure) = session.view(shm);
         let target = crate::preupscale::Target {
             colour: inputs.colour.0,
             width: colour.width,
@@ -1740,8 +1743,9 @@ impl NeuralForgeDeviceInfo {
                 let readable = desc.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (desc.width, desc.height) == (1, 1);
                 crate::preupscale::Aux { image, format: desc.format, layout, readable }
             }),
-            // Only the modes that encode read (and so log) the paper white.
-            paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
+            // Only the modes that encode read (and so log) the paper white; the brightness divides it.
+            paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() / brightness } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
+            lift_exposure: measure,
             identification: scan.identification,
         };
         let loader = session.native.as_ref().filter(|_| native);
@@ -3254,6 +3258,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     shm.poll_toggle_hotkey(hotkey);
                 }
                 let Some(sw) = state.swapchains.get(&sc) else { continue };
+                // What the status shows as the game's output (HDR or SDR), whatever is done with it below.
+                state.shm.publish_hdr_detected(sw.hdr_kind);
                 let Some(&image) = sw.images.get(image_index as usize) else { continue };
                 if !swapchain::is_supported_format(sw.format) {
                     // Not merely `pass_through`: a pass-through swapchain can still be composed

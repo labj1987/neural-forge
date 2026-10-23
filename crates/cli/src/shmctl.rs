@@ -80,21 +80,29 @@ fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
             }
         };
     }
-    // A placement by name (`enums::placement`).
+    // A placement (`enums::placement`) or an exposure source (`enums::exposure_source`) by name.
+    use neural_forge_protocol::enums::{exposure_source, placement};
+    type Names = (fn(&str) -> Option<u32>, &'static [&'static str]);
+    let names: Option<Names> = if name == "placement" || (name.starts_with("pass") && name.ends_with("_placement")) {
+        Some((placement::parse, &placement::NAMES))
+    } else if name == "preupscale_exposure" {
+        Some((exposure_source::parse, &exposure_source::NAMES))
+    } else {
+        None
+    };
     let named;
-    let value = if name == "placement" || (name.starts_with("pass") && name.ends_with("_placement")) {
-        match neural_forge_protocol::enums::placement::parse(value) {
+    let value = match names {
+        Some((parse, names)) => match parse(value) {
             Some(v) => {
                 named = v.to_string();
                 named.as_str()
             }
             None => {
-                eprintln!("shmctl set: {name} takes one of {}, got {value:?}", neural_forge_protocol::enums::placement::NAMES.join(", "));
+                eprintln!("shmctl set: {name} takes one of {}, got {value:?}", names.join(", "));
                 return false;
             }
-        }
-    } else {
-        value
+        },
+        None => value,
     };
     let Some((is_float, _)) = resolve(header, name) else {
         eprintln!("shmctl set: unknown setting {name:?}");
@@ -441,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn set_takes_placements_by_name_and_hud_regions_as_text() {
+    fn set_takes_placements_and_exposure_sources_by_name_and_hud_regions_as_text() {
         let header = ShmHeader::default();
         header.init_defaults();
         assert!(cmd_set(&header, "placement", "upscaled"));
@@ -450,6 +458,12 @@ mod tests {
         assert_eq!(header.pass_placement[1].load(Ordering::Relaxed), neural_forge_protocol::enums::placement::PRESENT);
         assert!(cmd_set(&header, "placement", "0"));
         assert!(!cmd_set(&header, "placement", "sideways"));
+        assert!(cmd_set(&header, "preupscale_exposure", "auto"));
+        assert_eq!(header.preupscale_view(), (1.0, true));
+        assert!(!cmd_set(&header, "preupscale_exposure", "bright"));
+        assert!(cmd_set(&header, "preupscale_exposure", "game"));
+        assert!(cmd_set(&header, "preupscale_brightness", "1.5"));
+        assert_eq!(header.preupscale_view(), (1.5, false));
         assert!(cmd_set(&header, "hud_regions", "0.1,0.8,0.3,0.2;0.7,0,0.3,0.1,soften,0.4"));
         assert_eq!(header.hud_settings().regions.len(), 2);
         assert!(!cmd_set(&header, "hud_regions", "0.1,0.8"));

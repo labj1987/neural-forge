@@ -107,8 +107,11 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   `enums::placement`: 0 auto, 1 before, 2 upscaled, 3 present), `pass_placement[10]` (2284, each pass's own,
   used where its `overrides` has `pass_override::PLACEMENT`, 1024), `hud_detect` (2324, default 1),
   `hud_region_count` (2328) and `hud_region[8]` (2332, 24 bytes each: f32 bits of x, y, w, h in 0-1 of the
-  frame, `mode` (`enums::hud_mode`: 0 keep, 1 soften), f32 bits of the soften strength); the header ends at
-  2524. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
+  frame, `mode` (`enums::hud_mode`: 0 keep, 1 soften), f32 bits of the soften strength), then what the network
+  sees before the upscaler (v22): `preupscale_brightness` (2524, f32 bits, 0.25-4, default 1) and
+  `preupscale_exposure` (2528, `enums::exposure_source`: 0 game, 1 auto; NATIVE_BACKEND.md, "Brightness before
+  the upscaler"), and the network's GPU milliseconds on its last hold (`preupscale_network_gpu_ms_bits`,
+  2532, f32 bits, written by the layer for the Status tab's graph); the header ends at 2536. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
   `persist::HUD_REGIONS`), the one setting that is not a number. NATIVE_BACKEND.md, "Where the model runs"
   and "The HUD at present".
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
@@ -178,6 +181,7 @@ be private.
 | 19 | `passes` and `pass[10]` (each pass's overrides of the Model tab's values: `overrides` bits and their values) appended | 3.6.0 |
 | 20 | `network` (which extracted network the layer runs) and the control mask's rules (`mask_sky`, `mask_sky_margin`, `mask_dark*`, `mask_motion*`) appended | 3.7.0 |
 | 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended; then the colour of the edit (`edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`, `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`) and `pass_colour[10]` (override bits `EDIT_SATURATION` 128, `EDIT_CONTRAST` 256, `EDIT_DETAIL` 512); then `placement`, `pass_placement[10]` (override bit `PLACEMENT` 1024), `hud_detect`, `hud_region_count` and `hud_region[8]` | 3.8.0 |
+| 22 | `preupscale_brightness` and `preupscale_exposure` (what the network sees before the upscaler: its brightness and where the exposure comes from) and `preupscale_network_gpu_ms` (the network's GPU time on its last hold) appended | 3.8.10 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.
@@ -357,9 +361,9 @@ sequenceDiagram
    shader reads the colour input through a storage view and writes the layer's padded `RGBA16F`
    image; DLSS's motion vectors are copied beside it for the history. An odd width or height is
    padded by repeating the last column or row. After the encode the scene-cut detector
-   (`preupscale/scene_cut.rs`) takes a luma thumbnail of the encoded image (every 8th pixel on each
-   axis) and compares it with the previous hold's; a mean absolute difference of 40 of 255 or more
-   marks the frame as a cut in the native pass's state buffer.
+   (`preupscale/scene_cut.rs`) takes a luma thumbnail of the encoded image (the mean of each 8x8 block)
+   and compares it with the previous hold's; a mean absolute difference of 40 of 255 or more after a
+   comparison under it marks the frame as a cut in the native pass's state buffer.
 3. **The network** (`N`, `preupscale/native.rs`): `native_preprocess.comp` builds the network's input
    lanes from the encoded frame, the previous answer reprojected with the motion vectors and the
    camera jitter (read from DLSS's input-kernel parameters), and the Model tab's settings; the graph

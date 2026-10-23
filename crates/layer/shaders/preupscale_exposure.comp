@@ -20,6 +20,12 @@
 //    refuses). e is written as a half into the exposure buffer the encode and the decode read (low
 //    16 bits), the same slot the game's 1x1 R16_SFLOAT texel is copied into otherwise. No samples (a black frame)
 //    keeps the previous e, or 1 when there is none.
+//    With `relative` (the Model brightness setting's Auto where the game gives an exposure: the capture
+//    copied the game's texel into the exposure buffer before this pass), the e written is the adapted one
+//    kept within LIFT_LO_LOG2 and LIFT_HI_LOG2 of the game's (log2: 0.5x to 16x), and the game's own e
+//    goes into the high 16 bits for the CPU's plausibility check; an unusable game e leaves the adapted
+//    one as it is. The state keeps the adapted e unbounded either way, so the bound does not slow the
+//    adaptation.
 //
 // The CPU reference is `preupscale::hdr::auto_exposure_reference`; constants must match.
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -30,6 +36,8 @@ const float LOG2_HI = 16.0;
 const float TRIM = 0.01;
 const float MIN_LOG2_E = -14.0;
 const float MAX_LOG2_E = 15.0;
+const float LIFT_LO_LOG2 = -1.0;
+const float LIFT_HI_LOG2 = 4.0;
 
 // The game's colour input, in GENERAL. Only read.
 layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_colour;
@@ -59,6 +67,7 @@ layout(push_constant) uniform Params {
   float key;   // the exposed luma the log-average maps to
   float rate;  // per-frame adaptation towards the target, in log2 space
   uint pass;   // 0 histogram, 1 resolve
+  uint relative; // 1: within LIFT_LO_LOG2..LIFT_HI_LOG2 of the game's e in the exposure buffer
 } p;
 
 shared uint s_count[BINS];
@@ -152,7 +161,17 @@ void resolve() {
   u_state.log2_e = log2_e;
   u_state.valid = 1u;
   u_state.samples = total;
-  u_exposure.bits = packHalf2x16(vec2(exp2(log2_e), 0.0));
+  if (p.relative != 0u) {
+    float game = unpackHalf2x16(u_exposure.bits).x;
+    float used = log2_e;
+    if (game > 1e-6 && game < 65504.0) {
+      used = clamp(log2_e, log2(game) + LIFT_LO_LOG2, log2(game) + LIFT_HI_LOG2);
+      used = clamp(used, MIN_LOG2_E, MAX_LOG2_E);
+    }
+    u_exposure.bits = packHalf2x16(vec2(exp2(used), game));
+  } else {
+    u_exposure.bits = packHalf2x16(vec2(exp2(log2_e), 0.0));
+  }
 }
 
 void main() {

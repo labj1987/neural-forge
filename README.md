@@ -17,7 +17,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab, scrolled to the middle: Placement (Auto), Model resolution (Full), Per-pass settings, Keep the game's sky, More mask rules, the toggle key, and the start of the Colour group with saturation and contrast of the change; above are the switch, style, strength and passes, below the rest of the Colour group and the HUD on the finished frame](screenshots/settings.png) | ![Setup tab: the model present (the full and the small network of build 310.9.16.0), the Network choice, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: telemetry (model, game, frame rate and the graph of the hold's and the layer's time), then the layer state, the Model placement line and the model (the full and the small network of build 310.9.16.0)](screenshots/status.png) |
+| ![Model tab, scrolled to the middle: Placement (Auto), Model resolution (Full), Per-pass settings, Keep the game's sky, More mask rules, the toggle key, and the start of the Colour group with saturation and contrast of the change; above are the switch, style, strength and passes, below the rest of the Colour group and the HUD on the finished frame](screenshots/settings.png) | ![Setup tab: the model present (the full and the small network of build 310.9.16.0), the Network choice, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: telemetry (model, game, frame rate and the graph of the frame time and the model's GPU time), then the layer state, the Model placement line and the model (the full and the small network of build 310.9.16.0)](screenshots/status.png) |
 
 The screenshots show default settings with no game running.
 
@@ -360,6 +360,16 @@ most of it for about 30 fps more (see [Measured results](#measured-results)). Fu
 without the setting. Each pass can have its own model resolution in the per-pass settings: a pass works
 on the previous pass's full-size picture at its own size. Changing it starts the model's history afresh
 and shows a moment of untouched frames while the model is prepared for the new size.
+
+**Model brightness** (Model tab) sets how bright the picture the model works on is, before the upscaler and
+after DLSS; the game's own brightness is kept either way, because the picture is brought back exactly
+afterwards. **Game** (the default) uses the exposure the game gives DLSS. **Auto** measures it from the frame, within half
+to 16 times the game's own so night stays night, for games that give the model a very dark picture: in daytime
+Crimson Desert's has a median brightness of 0.14 of white with Game and 0.50 with Auto. How the model treats the
+shadows changes with it, so compare the two in the game. **Model
+brightness scale** (0.25 to 4, default 1) brightens (above 1) or darkens (below 1) what the model sees on top
+of either. `neural-forge-cli shmctl set preupscale_exposure game|auto` and `shmctl set preupscale_brightness
+1.5` do the same from a terminal.
 
 **Colour** (Model tab) shapes the model's change to the frame instead of the frame, before and after the
 upscaler. **Saturation**, **contrast** and **detail of the change** (0 to 4, default 1) scale how much the

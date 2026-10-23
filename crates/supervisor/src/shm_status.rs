@@ -67,10 +67,21 @@ pub fn status_text(header: &ShmHeader) -> String {
     }));
     line(format_args!("layer_reason={}", header.layer_reason()));
     line(format_args!("native_running={}", header.native_running.load(Ordering::Relaxed)));
+    let hdr = header.hdr_detected.load(Ordering::Relaxed);
+    line(format_args!("swapchain_hdr={hdr} ({})", {
+        use neural_forge_protocol::enums::hdr_kind::*;
+        match hdr {
+            NONE => "SDR, or no game yet",
+            LINEAR_FP16 => "HDR, linear FP16",
+            PQ10 => "HDR10, PQ",
+            _ => "unknown",
+        }
+    }));
     line(format_args!("device_lost_at={}", header.device_lost_at.load(Ordering::Relaxed)));
     line(format_args!("preupscale_extent={}x{}", header.preupscale_width.load(Ordering::Relaxed), header.preupscale_height.load(Ordering::Relaxed)));
     line(format_args!("preupscale_hold_ms={}", f32::from_bits(header.preupscale_hold_ms_bits.load(Ordering::Relaxed))));
     line(format_args!("preupscale_misses={}", header.preupscale_misses.load(Ordering::Relaxed)));
+    line(format_args!("preupscale_network_gpu_ms={}", f32::from_bits(header.preupscale_network_gpu_ms_bits.load(Ordering::Relaxed))));
     line(format_args!("layer_measured_white={}", f32::from_bits(header.layer_measured_white_bits.load(Ordering::Relaxed))));
     line(format_args!("layer_composition_up={}", header.layer_composition_up.load(Ordering::Relaxed)));
     match neural_forge_protocol::capture::pending(header) {
@@ -141,6 +152,7 @@ mod tests {
         header.cache_rejected.store(1234, Ordering::Relaxed);
         header.cache_gpu_ms_bits.store(0.25f32.to_bits(), Ordering::Relaxed);
         header.scene_cuts.store(3, Ordering::Relaxed);
+        header.hdr_detected.store(neural_forge_protocol::enums::hdr_kind::PQ10, Ordering::Relaxed);
         let text = status_text(&header);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "# live status");
@@ -150,6 +162,7 @@ mod tests {
         assert!(lines.contains(&"preupscale_dump_request=16"), "{text}");
         assert!(lines.contains(&"edit_cache: refresh_holds=30 cached_holds=29 rejected=12.34% gpu_ms=0.250"), "{text}");
         assert!(lines.contains(&"scene_cuts=3"), "{text}");
+        assert!(lines.contains(&"swapchain_hdr=2 (HDR10, PQ)"), "{text}");
         assert!(lines.contains(&"intensity=1"), "{text}");
         assert!(lines.contains(&"skin_structure=-1"), "{text}");
         let settings_at = lines.iter().position(|l| l.starts_with("# settings")).expect("a settings section");
