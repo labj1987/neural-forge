@@ -121,6 +121,7 @@ const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const float KNEE = 0.75;
 const float K = 5.770780;
 const float CLAMPED = 0.999;
+const float FADE = 0.954; // preupscale_decode.comp's FADE_SRGB (the cache follows the sRGB encode)
 const float HALF_MAX = 65504.0; // the largest finite half: the most a write-back stores
 
 uint index_of(uvec2 xy) { return xy.y * p.size.x + xy.x; }
@@ -266,8 +267,14 @@ void main() {
   for (int c = 0; c < 3; c++) {
     result[c] = (p.flags & F_SCENE_ANSWER) != 0u ? answer[c] : stored(decode(answer[c], inv_scale));
   }
-  // The decode's rule: the whole pixel kept where the encoded peak channel clamped.
-  if (keep && max(encoded.r, max(encoded.g, encoded.b)) >= CLAMPED) result = original;
+  // The decode's rule: the whole pixel kept where the encoded peak channel clamped, and faded into the
+  // original from the shoulder's 0.9 (FADE) up: the edit carried to the cached holds is the one written.
+  float peak = max(encoded.r, max(encoded.g, encoded.b));
+  if (keep && peak >= CLAMPED) {
+    result = original;
+  } else if (keep) {
+    result = mix(result, original, smoothstep(FADE, CLAMPED, peak));
+  }
   float scale = e / p.paper_white;
   vec3 vc = to_v(original, scale);
   vec3 va = to_v(result, scale);

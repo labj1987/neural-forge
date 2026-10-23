@@ -8,7 +8,11 @@
 // * paper_white / e, at most 65504 (the largest finite half: at a low exposure the shoulder's inverse
 // reaches past it, and an infinity in DLSS's colour input spreads through its history). Where the encoded input's peak channel was >= 0.999 (a blown highlight: sky,
 // sun; the inverse cannot bring it back) and flags bit 0 is set, the original pixel is kept, all
-// three channels: keeping only the clamped one beside the model's other two would turn its hue.
+// three channels: keeping only the clamped one beside the model's other two would turn its hue. Below it,
+// from an encoded peak of FADE (the shoulder's 0.9, where its inverse turns a step of the answer into 1.7 of
+// the scene, up to 17 at 0.99), the result fades from the model's to the original: on the shoulder's top
+// the inverse turned the network's small changes into flat bright patches (Hogwarts Legacy, a lit forehead
+// in a dark cave after DLSS with Ray Reconstruction, the exposure measured from the frame; 2026-10-23).
 // Alpha is always the original. With an unusable exposure value nothing is written.
 //
 // In place: every invocation reads its own pixel of the colour input before writing it, and no
@@ -38,6 +42,9 @@ layout(push_constant) uniform Params {
 const float KNEE = 0.75;
 const float K = 5.770780;
 const float CLAMPED = 0.999;
+// The shoulder's 0.9, encoded: sRGB (0.954) or as it is (linear).
+const float FADE_SRGB = 0.954;
+const float FADE_LINEAR = 0.9;
 const uint KEEP_CLAMPED = 1u;
 const uint LINEAR = 2u;
 const float HALF_MAX = 65504.0; // the largest finite half: the most a write-back stores
@@ -79,6 +86,12 @@ void main() {
   vec3 answer = imageLoad(u_answer, at).rgb;
   bool keep = (p.flags & KEEP_CLAMPED) != 0u;
   vec3 result = vec3(decode(answer.r, inv_scale), decode(answer.g, inv_scale), decode(answer.b, inv_scale));
-  if (keep && max(encoded.r, max(encoded.g, encoded.b)) >= CLAMPED) result = original.rgb;
+  float peak = max(encoded.r, max(encoded.g, encoded.b));
+  if (keep && peak >= CLAMPED) {
+    result = original.rgb;
+  } else if (keep) {
+    float fade = (p.flags & LINEAR) != 0u ? FADE_LINEAR : FADE_SRGB;
+    result = mix(result, original.rgb, smoothstep(fade, CLAMPED, peak));
+  }
   imageStore(u_colour, at, vec4(result, original.a));
 }

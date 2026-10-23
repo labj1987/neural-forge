@@ -202,6 +202,9 @@ struct LoaderState {
     /// Another device's loader asked for the network, and this one's paths are not using it ([`Loader::lend`]):
     /// the worker closes it. It is opened again when a path here asks for a build.
     lend: bool,
+    /// The network is opened without counter chaining ([`Loader::start`]'s `chain` false): the holds run inside
+    /// DLSS's buffer, which needs barriers between its launches, so a chained build would be built again at once.
+    barriers_from_start: bool,
 }
 
 impl LoaderState {
@@ -365,6 +368,9 @@ fn no_history() -> bool {
 /// holds were refused it for good (2026-10-23).
 static NETWORK_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The longest a build waits for the game to stop loading ([`Loader::work`]).
+const LOADING_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The words of `nf_native_open`'s refusal while another network is open in the process (crates/native/cpp/nf_native.cpp).
 const OPEN_ELSEWHERE: &str = "another network is open in this process";
 
@@ -384,9 +390,13 @@ unsafe extern "C" fn init_dispatchable(_user: *mut std::ffi::c_void, device: vk:
 impl Loader {
     /// The network's loader for `device`; `holds` counts the holds recorded into DLSS's buffers that may
     /// still run (shared with `super::inline::Inline`).
-    pub(crate) fn start(device: vk::Device, setup: Setup, holds: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    /// The loader of `device`'s network, opened with counter chaining when `chain` (and `NEURAL_FORGE_NATIVE_CHAIN`
+    /// allows it): `false` where the holds run inside DLSS's buffer, which needs barriers.
+    pub(crate) fn start(device: vk::Device, setup: Setup, holds: Arc<std::sync::atomic::AtomicUsize>, chain: bool) -> Self {
+        let shared: Arc<(Mutex<LoaderState>, Condvar)> = Arc::default();
+        shared.0.lock().unwrap().barriers_from_start = !chain;
         Self {
-            shared: Arc::default(),
+            shared,
             worker: Mutex::new(None),
             pending: Mutex::new(Some((device, setup))),
             setup,
@@ -406,7 +416,7 @@ impl Loader {
     /// buffer in the graph's place.
     #[cfg(test)]
     pub(crate) fn for_test(setup: Setup, built: Vec<Built>, holds: Arc<std::sync::atomic::AtomicUsize>, graph: TestGraph) -> Self {
-        let mut loader = Self::start(vk::Device::null(), setup, holds);
+        let mut loader = Self::start(vk::Device::null(), setup, holds, true);
         *loader.pending.get_mut().unwrap() = None;
         loader.test_graph = Some(graph);
         {
@@ -607,7 +617,7 @@ impl Loader {
 
     /// Opens the network the Network setting `choice` names ([`network_to_load`]); returns it with
     /// which network it is.
-    fn open(device: vk::Device, setup: Setup, choice: u32) -> Result<(nn::Network, u32), nn::OpenError> {
+    fn open(device: vk::Device, setup: Setup, choice: u32, chain: bool) -> Result<(nn::Network, u32), nn::OpenError> {
         let Some(running) = network_to_load(choice, network_present) else {
             let message = format!("no model at {}: extract it in the Setup tab (neural-forge-cli extract-model)", network_dir(choice).display());
             return Err(nn::OpenError { message, stalled: false });
@@ -629,7 +639,7 @@ impl Loader {
             queue_index: setup.index,
             frame_family: setup.frame_family,
             model_dir: &dir,
-            chain: chain_wanted(),
+            chain: chain_wanted() && chain,
             fence_timeout_ms: crate::FENCE_WAIT_TIMEOUT.as_millis() as u32,
             init_dispatchable: Some(init_dispatchable),
         };
@@ -657,6 +667,7 @@ impl Loader {
         if let Some(f) = inject {
             crate::log!("[native] {}: the next {} network builds will fail on purpose", FailInject::ENV, f.remaining());
         }
+        let (mut loading_since, mut said_loading, mut said_waited): (Option<Instant>, bool, bool) = (None, false, false);
         let mut state = lock.lock().unwrap();
         loop {
             // Lent to another device's loader ([`Loader::lend`]): closed, its builds gone, and nothing asked
@@ -684,6 +695,28 @@ impl Loader {
                 state = wake.wait(state).unwrap();
                 continue;
             }
+            // While the game loads, no build: each runs the network once on this queue, which a game's loading work
+            // could not make room for (`crate::swapchain::loading_now`). At most a minute, for a game that renders
+            // below 15 fps all along.
+            if crate::swapchain::loading_now() {
+                let since = *loading_since.get_or_insert_with(Instant::now);
+                if since.elapsed() < LOADING_WAIT_MAX {
+                    if !said_loading {
+                        said_loading = true;
+                        crate::log!("[native] the game is loading (frames under 15 fps or none): the network is built once it renders steadily");
+                        crate::logging::flush();
+                    }
+                    state = wake.wait_timeout(state, std::time::Duration::from_millis(250)).unwrap().0;
+                    continue;
+                }
+                if !said_waited {
+                    said_waited = true;
+                    crate::log!("[native] the game has not rendered steadily for a minute: building the network anyway");
+                    crate::logging::flush();
+                }
+            } else {
+                loading_since = None;
+            }
             let step = retry.step(Instant::now());
             if let Step::Wait(d) = step {
                 state = wake.wait_timeout(state, d).unwrap().0;
@@ -694,6 +727,7 @@ impl Loader {
             let fall_back = std::mem::take(&mut state.fall_back) || (switching && state.barriers);
             let sizes = state.wanted.clone().or_else(|| (!state.built.is_empty()).then(|| state.built_sizes()));
             let choice = state.choice;
+            let barriers_from_start = state.barriers_from_start;
             state.built = Vec::new();
             drop(state);
             if step == Step::ReinitThenBuild && network.take().is_some() {
@@ -714,7 +748,7 @@ impl Loader {
             let mut loaded = None;
             let result = match network.take() {
                 Some(n) => Ok(n),
-                None => Self::open(device, setup, choice)
+                None => Self::open(device, setup, choice, !barriers_from_start)
                     .map(|(n, running)| {
                         opened = Some((t.elapsed(), vram.as_ref().map(crate::vram::reading)));
                         loaded = Some(running);
@@ -4689,7 +4723,7 @@ mod tests {
             properties2: crate::vram::Properties2::None,
             flow: None,
         };
-        let loader = Loader::start(vk::Device::null(), setup, Arc::default());
+        let loader = Loader::start(vk::Device::null(), setup, Arc::default(), true);
         // No hold for longer than the path switch: the post path may claim.
         loader.last_pre.store(0, std::sync::atomic::Ordering::SeqCst);
         let _ = epoch_ms();
@@ -4724,7 +4758,7 @@ mod tests {
             flow: None,
         };
         let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let loader = Loader::start(vk::Device::null(), setup, holds.clone());
+        let loader = Loader::start(vk::Device::null(), setup, holds.clone(), true);
         use std::sync::atomic::Ordering::SeqCst;
         let _ = epoch_ms();
         std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));

@@ -1479,6 +1479,41 @@ each network's own domain the inputs are spread alike, so what remains is how th
 input against our exposure, shoulder and sRGB curve. The defaults are unchanged; the Model brightness scale at 0.4 is
 the setting to compare in a game.
 
+## Hogwarts Legacy with ray tracing: a GPU fault while loading, patches on the shoulder (3.8.13, 2026-10-23)
+
+**The fault.** With ray tracing on (Ray Reconstruction on), loading the save from the menu killed the game: Xid 109
+(`CTX SWITCH TIMEOUT`, the game's channel) in the same second as `building the network for 1708x964 failed: a submit
+on the network's queue did not finish in time`, twice in two runs, never in a run with `NEURAL_FORGE_DISABLE=1`.
+Every build runs the network once on the layer's own queue and waits for it (`buildGraphs`' warm-up); this load
+(12 fps, just after the game's shader compile) brought two: the first build, then the rebuild with barriers the
+hold inside DLSS's buffer asks for. The GPU could not switch away from the game's loading work in time.
+- **No build while the game loads** (`swapchain::loading_now`, `Loader::work`): a process that has presented waits
+  while its frames are over 66 ms (under about 15 fps), have been shorter for under 2 s, or stopped for a second.
+  At most a minute, for a game that renders that slowly all along; logged when it waits and when it gives up.
+- **Barriers from the start** where the holds run inside DLSS's buffer (`Loader::start`'s `chain`): no chained build
+  to be built again. In the game: `the game is loading`, then one build (`chained false`) once it rendered, no
+  rebuild, no fault, the model on every frame (12,000 holds, no miss).
+
+**The patches.** After DLSS (Ray Reconstruction on), the exposure measured from a dark cave put a lit forehead on the
+shoulder's top: flat, brighter patches in 4 of 6 screenshots, in the dumped answer itself. There the shoulder's inverse
+turns a step of the answer into 17 of the scene (at 0.99; 1.7 at 0.9), and the network's answer saturated. The decode
+now fades its result into the original pixel from the shoulder's 0.9 (encoded 0.954) up to the clamped 0.999
+(`preupscale_decode.comp`, smoothstep), and the edit cache's capture, which decodes for itself to carry the edit to the
+cached holds, does the same (`preupscale_cache_capture.comp`): with only the decode changed the dumped holds were
+clean and the screenshots were not. With both, 0 of 6.
+
+**What the model does with Ray Reconstruction here**, the same spot of the same save (full network, the game's settings
+otherwise as Alex has them, HDR on): before the upscaler (RR off) a change of 7.6-9.2 of 255, shadows +7 to +11, the
+brightest quarter -8 to -17, detail x0.8-1.06; after DLSS (RR on) 11-13 of 255, the middle +6 to +13, the brightest
+quarter -4 to -8, detail x1.28-1.31, 15.5 ms on the GPU at 2560x1440 (145 fps shown with frame generation 4x). Not
+Crimson Desert's weak change after DLSS (7 of 255, NATIVE_BACKEND's Crimson Desert notes).
+
+**HDR under Proton.** The game rewrites `bUseHDRDisplayOutput=False` at every start under Proton-GE (with
+`PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`); its menu switch works while it runs. `Engine.ini`'s `[SystemSettings]`
+`r.HDR.EnableHDROutput=1`, `r.HDR.Display.OutputDevice=4` (ST 2084, 2000 nits, the game's own `HDRDisplayOutputNits`)
+and `r.HDR.Display.ColorGamut=2` start it in HDR10; against the menu's HDR the picture differs by less than two
+screenshots of one state do.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

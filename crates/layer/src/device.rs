@@ -1352,7 +1352,10 @@ impl NeuralForgeDeviceInfo {
             // uses the network too (`preupscale::native_post`). Nothing loads until a path asks.
             if nvidia && active {
                 frame_family = Some(setup.frame_family);
-                let loader = std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup, holds.clone()));
+                // Holds inside DLSS's buffer (below) run the network with barriers: opened so from the start, not
+                // chained and then built again (each build runs the network once on the layer's queue).
+                let inline_holds = preupscale.is_some() && instance.is_some() && crate::preupscale::inline::enabled() && !inline_chain_kept();
+                let loader = std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup, holds.clone(), !inline_holds));
                 loader.register(handle);
                 hold.lock().unwrap().preupscale.native = Some(loader);
             }

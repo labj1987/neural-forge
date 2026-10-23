@@ -10702,8 +10702,8 @@ mod tests {
     }
 
     /// The write-back: the whole original pixel where the encoded input's (`proxy`'s) peak channel
-    /// reached 0.999, else per channel the CPU inverse of the answer (`answer`) within relative 2e-3; alpha
-    /// the original's.
+    /// reached 0.999, else per channel the CPU inverse of the answer (`answer`) within relative 2e-3, faded into
+    /// the original from a peak of [`hdr::FADE_SRGB`] (smoothstep); alpha the original's.
     #[allow(clippy::too_many_arguments)]
     fn check_decode(after: &[u8], original: &[u8], proxy: &[u8], answer: &[u8], w: u32, h: u32, e: f32, white: f32) {
         let (pw, _) = padded(w, h);
@@ -10717,7 +10717,10 @@ mod tests {
                         assert_eq!(got, orig, "a clamped highlight keeps its whole original pixel at {x},{y} channel {c} (encoded peak {peak})");
                         continue;
                     }
-                    let want = hdr_ref::decode(f16_to_f32(half_at(answer, pw, x, y, c)), e, white);
+                    let decoded = hdr_ref::decode(f16_to_f32(half_at(answer, pw, x, y, c)), e, white);
+                    let t = f64::from(((peak - hdr::FADE_SRGB) / (hdr::CLAMPED - hdr::FADE_SRGB)).clamp(0.0, 1.0));
+                    let t = t * t * (3.0 - 2.0 * t);
+                    let want = decoded * (1.0 - t) + f64::from(f16_to_f32(orig)) * t;
                     let got = f64::from(f16_to_f32(got));
                     assert!((got - want).abs() <= 2e-3 * want.abs() + 1e-5, "decode at {x},{y} channel {c}: {got}, the CPU reference says {want}");
                 }

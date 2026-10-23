@@ -213,6 +213,11 @@ pub(crate) fn transfer_flags() -> u32 {
     *FLAGS
 }
 
+/// The encoded peak from which the decode fades the model's result into the original pixel, up to
+/// [`CLAMPED`] (`preupscale_decode.comp`): the shoulder's 0.9, sRGB-encoded.
+#[cfg(test)]
+pub(crate) const FADE_SRGB: f32 = 0.954;
+
 /// The encoded value at and above which a channel counts as clamped (the decode keeps it).
 #[cfg(test)]
 pub(crate) const CLAMPED: f32 = 0.999;

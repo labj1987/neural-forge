@@ -68,6 +68,7 @@ impl Warmup {
         let game_frame = self.last_present.map(|last| now.saturating_duration_since(last).saturating_sub(layer_time_last));
         self.last_present = Some(now);
         let Some(game_frame) = game_frame else { return false };
+        note_game_frame(now, game_frame);
         if self.engaged {
             if game_frame > Self::LOADING_FRAME {
                 self.long_frames += 1;
@@ -92,6 +93,66 @@ impl Warmup {
         }
         self.engaged = self.steady_since.is_some_and(|t| now.saturating_duration_since(t) >= Self::hold());
         self.engaged
+    }
+}
+
+/// The process's presents, for [`loading_now`]: ms since [`present_clock`]'s start plus one (0: none yet), of the
+/// last present and of the start of the current run of frames shorter than [`Warmup::STEADY_FRAME`] (0: none).
+static LAST_PRESENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STEADY_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn present_clock(at: std::time::Instant) -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+    at.saturating_duration_since(*START).as_millis() as u64 + 1
+}
+
+/// How long frames must have been short before the game counts as rendering steadily ([`loading_now`]), and how long
+/// without a present counts as loading.
+const STEADY_FOR_MS: u64 = 2000;
+const NO_PRESENT_MS: u64 = 1000;
+
+/// One game frame of any swapchain of the process ([`Warmup::on_present`]).
+fn note_game_frame(now: std::time::Instant, game_frame: std::time::Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let t = present_clock(now);
+    LAST_PRESENT.store(t, Relaxed);
+    if game_frame > Warmup::STEADY_FRAME {
+        STEADY_SINCE.store(0, Relaxed);
+    } else {
+        let _ = STEADY_SINCE.compare_exchange(0, t, Relaxed, Relaxed);
+    }
+}
+
+/// Whether the game is loading rather than rendering steadily: it has presented, and either it has not for
+/// [`NO_PRESENT_MS`] or its frames have not been shorter than [`Warmup::STEADY_FRAME`] (about 15 fps) for
+/// [`STEADY_FOR_MS`]. The network's builds wait while it is (`preupscale::native::Loader`): each runs the network once
+/// on the layer's own queue, and Hogwarts Legacy with ray tracing, loading at 12 fps, lost its GPU context to a
+/// build's warm-up (Xid 109, CTX SWITCH TIMEOUT, twice in two runs, never without Neural Forge; 2026-10-23).
+pub fn loading_now() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    loading_at(present_clock(std::time::Instant::now()), LAST_PRESENT.load(Relaxed), STEADY_SINCE.load(Relaxed))
+}
+
+fn loading_at(now: u64, last_present: u64, steady_since: u64) -> bool {
+    if last_present == 0 {
+        return false;
+    }
+    now.saturating_sub(last_present) > NO_PRESENT_MS || steady_since == 0 || now.saturating_sub(steady_since) < STEADY_FOR_MS
+}
+
+#[cfg(test)]
+mod loading_tests {
+    use super::loading_at;
+
+    /// Nothing presented: not loading (a process that never presents builds at once). Frames short for 2 s: steady;
+    /// for less, or a long frame since (0), or no present for a second: loading.
+    #[test]
+    fn the_game_loads_until_its_frames_have_been_short_for_two_seconds() {
+        assert!(!loading_at(10_000, 0, 0), "never presented");
+        assert!(!loading_at(10_000, 9_990, 7_000), "short frames for 3 s");
+        assert!(loading_at(10_000, 9_990, 8_500), "for 1.5 s");
+        assert!(loading_at(10_000, 9_990, 0), "a long frame just now");
+        assert!(loading_at(10_000, 8_500, 2_000), "no present for 1.5 s");
     }
 }
 

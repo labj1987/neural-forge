@@ -4,6 +4,14 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.13 — 2026-10-23
+
+- Hogwarts Legacy with ray tracing no longer crashes while the save loads. Neural Forge prepared the model while the
+  game was still loading, and the graphics card gave up on the game (a GPU fault). It now waits until the game
+  renders steadily, and prepares the model once instead of twice.
+- No more flat, bright patches on brightly lit skin and other highlights in dark scenes, seen in Hogwarts Legacy with
+  Ray Reconstruction on. The model's change now fades out toward the brightest values instead of being blown up there.
+
 ## 3.8.12 — 2026-10-23
 
 - GTA San Andreas - The Definitive Edition: the model gets the camera's sub-pixel movement, which it lines its previous
