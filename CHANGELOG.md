@@ -13,6 +13,8 @@ first shipped them; their phase is kept as a subheading.
   games that give it a very dark picture (Crimson Desert); the game's own brightness is kept. **Model brightness
   scale** brightens or darkens what the model sees on top. Both change how the model treats shadows; try them
   where the model makes a game darker.
+- Crimson Desert (with Ray Reconstruction off): the model gets the camera's sub-pixel movement again, which it
+  lines its previous frames up with; recent versions gave it none in this game.
 - The model no longer starts afresh by mistake in noisy, dark scenes: the check for a new scene compares the
   picture's 8x8 blocks instead of single pixels.
 - The Status tab's graph shows something useful: the time per frame and the model's GPU time per frame, with a

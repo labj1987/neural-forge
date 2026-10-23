@@ -1407,6 +1407,15 @@ pub(crate) struct Tracker {
     colour_barriers: u64,
     last_colour_layout: Option<vk::ImageLayout>,
     said_layout_miss: bool,
+    /// The camera jitter's sequence as the launches that carry it showed it ([`Self::jitter_for_hold`]): each
+    /// jitter and the one seen after it, and the last one seen.
+    jitter_next: HashMap<u64, u64>,
+    jitter_last: Option<u64>,
+    /// Predicted jitters checked against the one the same buffer's launch carried after the hold: right, wrong;
+    /// and whether prediction stopped for this device (too many wrong, [`JITTER_WRONG_MAX`]).
+    jitter_checks: (u64, u64),
+    jitter_stopped: bool,
+    jitter_said: bool,
     /// The identification ([`Self::generation`]) a hold inside DLSS's buffer was recorded for: from
     /// then on [`Self::inline_point`] answers for the buffers the split could take too
     /// ([`Hazard::HeldInside`]).
@@ -1533,6 +1542,21 @@ pub(crate) struct LaunchRefs {
     /// `hiluma_engine_input*` kernel's parameters, x in its low and y in its high 32 bits, render
     /// pixels (docs/NATIVE_BACKEND.md, "Motion vectors"). `None` for other kernels.
     pub jitter: Option<u64>,
+    /// The jitter a hold recorded before the launch carrying it was given ([`Tracker::jitter_for_hold`]), until
+    /// that launch checks it.
+    pub predicted: Option<u64>,
+}
+
+/// Wrong predictions of the camera jitter ([`Tracker::jitter_for_hold`]) after which, with more than one in nine
+/// wrong, a device's holds go without a jitter again.
+const JITTER_WRONG_MAX: u64 = 8;
+
+/// The most jitters of a sequence kept ([`Tracker::jitter_next`]); DLSS's are 8 to a few dozen long.
+const JITTER_SEQUENCE_MAX: usize = 1024;
+
+/// A jitter word as render pixels, x and y.
+fn jitter_px(v: u64) -> [f32; 2] {
+    [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)]
 }
 
 /// The word of a 310.x SR input kernel's parameters that holds the camera jitter ([`LaunchRefs::jitter`]).
@@ -1857,7 +1881,11 @@ impl Tracker {
         // (SR's input kernels).
         let at = self.functions.get(&function).and_then(|(_, name)| jitter_word(name));
         if let Some(value) = at.and_then(|at| bytes.as_chunks::<8>().0.get(at)).map(|w| u64::from_le_bytes(*w)).filter(|&v| jitter_plausible(v)) {
-            self.launch.entry(command_buffer).or_default().jitter.get_or_insert(value);
+            let refs = self.launch.entry(command_buffer).or_default();
+            if refs.jitter.is_none() {
+                refs.jitter = Some(value);
+                self.learn_jitter(command_buffer, value);
+            }
         }
         let mut named: Vec<vk::Image> = Vec::new();
         for word in bytes.as_chunks::<8>().0.iter() {
@@ -2231,6 +2259,57 @@ impl Tracker {
     }
 
     /// Takes the mark [`Self::launch_kernel`] left for the launch just recorded.
+    /// A buffer's camera jitter seen in a launch (`cb`'s first): checks the jitter predicted for a hold recorded
+    /// before it, and learns the sequence (the jitter seen before it is followed by this one).
+    fn learn_jitter(&mut self, cb: vk::CommandBuffer, value: u64) {
+        if let Some(p) = self.launch.get_mut(&cb).and_then(|r| r.predicted.take()) {
+            let (right, wrong) = &mut self.jitter_checks;
+            if p == value {
+                *right += 1;
+            } else {
+                *wrong += 1;
+            }
+            let (right, wrong) = (*right, *wrong);
+            if !self.jitter_stopped && wrong >= JITTER_WRONG_MAX && wrong * 8 > right {
+                self.jitter_stopped = true;
+                crate::log!("[preupscale] the predicted camera jitter was wrong {wrong} times in {}: the holds go without the jitter again", right + wrong);
+                crate::logging::flush();
+            } else if right + wrong == 1000 {
+                crate::log!("[preupscale] the predicted camera jitter was right {right} times in 1000");
+                crate::logging::flush();
+            }
+        }
+        if let Some(last) = self.jitter_last.filter(|&l| l != value) {
+            if self.jitter_next.len() >= JITTER_SEQUENCE_MAX && !self.jitter_next.contains_key(&last) {
+                self.jitter_next.clear();
+            }
+            self.jitter_next.insert(last, value);
+        }
+        self.jitter_last = Some(value);
+    }
+
+    /// The camera jitter for a hold recorded into `cb` now: the jitter a launch of `cb` already carried, or,
+    /// where the hold comes before that launch (Crimson Desert: NGX's `cuda_dldn_engine_luma_convert_kernel`
+    /// reads the colour input five launches before `rrlite_enc0_*` carries the jitter), the one that followed
+    /// the last jitter seen when the sequence went round before. The launch checks a predicted jitter when it
+    /// comes ([`Self::learn_jitter`]); `None` before the sequence went round once, and after too many wrong.
+    pub(crate) fn jitter_for_hold(&mut self, cb: vk::CommandBuffer) -> Option<u64> {
+        if let Some(v) = self.launch.get(&cb).and_then(|r| r.jitter) {
+            return Some(v);
+        }
+        if self.jitter_stopped {
+            return None;
+        }
+        let next = *self.jitter_next.get(&self.jitter_last?)?;
+        if !self.jitter_said {
+            self.jitter_said = true;
+            crate::log!("[preupscale] the hold comes before the launch that carries the camera jitter: predicted from the sequence seen, checked when that launch comes");
+            crate::logging::flush();
+        }
+        self.launch.entry(cb).or_default().predicted = Some(next);
+        Some(next)
+    }
+
     pub(crate) fn take_inline_at(&mut self) -> Option<(vk::CommandBuffer, vk::Image)> {
         self.inline_at.take()
     }
@@ -3370,9 +3449,9 @@ impl Tracking {
         plan.has(placement::Stage::Before).then(|| placement::Hold::of(&plan, placement::Stage::Before, render, t.output_extent()))
     }
 
+    /// The camera jitter for a hold recorded into `cb` now ([`Tracker::jitter_for_hold`]).
     pub(crate) fn jitter_px_of(&self, cb: vk::CommandBuffer) -> Option<[f32; 2]> {
-        let v = self.lock().launch.get(&cb).and_then(|r| r.jitter)?;
-        Some([f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
+        self.lock().jitter_for_hold(cb).map(jitter_px)
     }
 
     /// Whether `cb` has CUDA launches recorded (diagnostics: `NEURAL_FORGE_LOG_LAUNCH_QUEUES`).
@@ -6845,6 +6924,78 @@ mod jitter_tests {
         assert_eq!(jitter_word("rr2_enc0_kernel"), None, "Ray Reconstruction is never held");
         assert_eq!(jitter_word("rr2_enc1_kernel"), None);
         assert_eq!(jitter_word("main_kernel"), None);
+    }
+
+    /// Crimson Desert's buffer: the hold is recorded at NGX's luma kernel, before `rrlite_enc0_*` carries the
+    /// frame's jitter. Once the jitter sequence went round, each hold gets the jitter that followed the last one
+    /// seen, and the launch after it confirms it. Another cycle costs one wrong prediction and is learnt the same
+    /// way; jitters in no fixed order make the predictions wrong, and after enough of them the holds go without
+    /// the jitter again.
+    #[test]
+    fn a_hold_before_the_jitter_s_launch_gets_the_jitter_that_follows_and_stops_when_wrong() {
+        let mut t = Tracker::default();
+        let (luma, enc0) = (vk::CuFunctionNVX::from_raw(0x9101), vk::CuFunctionNVX::from_raw(0x9102));
+        t.record_function(luma, "cuda_dldn_engine_luma_convert_kernel");
+        t.record_function(enc0, "rrlite_enc0_4x4_mvlo_hdr");
+        let halton = |i: u32, base: u32| {
+            let (mut f, mut r, mut i) = (1.0f32, 0.0f32, i);
+            while i > 0 {
+                f /= base as f32;
+                r += f * (i % base) as f32;
+                i /= base;
+            }
+            r - 0.5
+        };
+        let sequence: Vec<u64> = (1..=8).map(|i| word(halton(i, 2), halton(i, 3))).collect();
+        // The parameters as 8-byte words: the jitter at word 21.
+        let params = |words: &[u64]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let enc0_params = |j: u64| {
+            let mut words = vec![0u64; 22];
+            words[21] = j;
+            params(&words)
+        };
+        // One frame: the hold at the luma kernel (its jitter as the hold would get it), then enc0 with the frame's.
+        let frame = |t: &mut Tracker, n: u64, j: u64| {
+            let buffer = vk::CommandBuffer::from_raw(0x5000 + n);
+            t.launch_kernel(buffer, luma, Some(&params(&[0; 4])));
+            let held = t.jitter_for_hold(buffer);
+            t.launch_kernel(buffer, enc0, Some(&enc0_params(j)));
+            held
+        };
+        let mut n = 0;
+        // The last jitter's successor is the first, seen when the sequence comes round: predictions from frame 9.
+        for k in 0..9 {
+            assert_eq!(frame(&mut t, n, sequence[k % 8]), None, "frame {k}: the sequence has not gone round yet");
+            n += 1;
+        }
+        for k in 9..33 {
+            assert_eq!(frame(&mut t, n, sequence[k % 8]), Some(sequence[k % 8]), "frame {k}: the jitter that followed");
+            n += 1;
+        }
+        assert_eq!(t.jitter_checks, (24, 0));
+        // A buffer whose launch carries the jitter before the hold: its own, as before.
+        let own = vk::CommandBuffer::from_raw(0x6000);
+        t.launch_kernel(own, enc0, Some(&enc0_params(sequence[3])));
+        assert_eq!(t.jitter_for_hold(own), Some(sequence[3]));
+        // Another cycle (the game's upscaling changed): one wrong prediction, then it is learnt.
+        let other: Vec<u64> = (1..=5).map(|i| word(halton(i + 20, 2), halton(i + 20, 3))).collect();
+        for k in 0..12 {
+            let held = frame(&mut t, n, other[k % 5]);
+            if k >= 6 {
+                assert_eq!(held, Some(other[k % 5]), "frame {k} of the new cycle");
+            }
+            n += 1;
+        }
+        assert_eq!(t.jitter_checks, (24 + 6, 1), "the change of cycle alone was wrong");
+        // Jitters in no fixed order: wrong predictions, then none.
+        let mut lcg = 12345u32;
+        for _ in 0..200 {
+            lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            frame(&mut t, n, sequence[(lcg >> 16) as usize % 8]);
+            n += 1;
+        }
+        assert!(t.jitter_stopped && t.jitter_checks.1 >= JITTER_WRONG_MAX, "{:?}", t.jitter_checks);
+        assert_eq!(frame(&mut t, n, sequence[0]), None, "stopped");
     }
 
     /// A Halton jitter passes; a handle, an address or a NaN in that word does not.

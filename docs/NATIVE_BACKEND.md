@@ -699,6 +699,17 @@ is out of scope).
   With Ray Reconstruction off, Crimson Desert's Super Resolution (`rrlite_*`) keeps it in
   `rrlite_enc0_*`'s bytes 168-175 (the previous frame's in 176-183), the same encoding (3000
   launches probed, 2026-10-09).
+  - **Read too late since the hold moved inside DLSS's buffer (found 2026-10-22, fixed in 3.8.10).** The hold
+    goes right before the buffer's first launch that reads the colour input, which in Crimson Desert is NGX's
+    `cuda_dldn_engine_luma_convert_kernel` (then three `_reduce_sum_`, `_auto_exposure_copy_`), five launches
+    before `rrlite_enc0_4x4_mvlo_hdr` carries the frame's jitter (`NEURAL_FORGE_PROBE_RR=1`). Every hold there
+    logged "held without the jitter" (in every log kept, 3.8.2 to 3.8.9), so the network's history was blended as if the camera
+    never moved by a fraction of a pixel. `Tracker::jitter_for_hold` now predicts it: every launch that carries a
+    jitter teaches the sequence (the jitter seen before is followed by this one), a hold before that launch gets
+    the jitter that followed the last one seen, and the launch checks it when it comes. A new cycle costs one
+    wrong frame and is learnt as it goes round; with 8 wrong and more than one in nine wrong
+    (`JITTER_WRONG_MAX`) the device's holds go without again. The log says when prediction starts, after 1000
+    checks how many were right, and when it stops.
 - **Fixed on the way:**
   - The after-the-upscaler path kept its claim on the network when the network was not built at its size,
     so the paths fought over the build. The claim is now always released.
