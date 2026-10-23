@@ -710,6 +710,15 @@ is out of scope).
     wrong frame and is learnt as it goes round; with 8 wrong and more than one in nine wrong
     (`JITTER_WRONG_MAX`) the device's holds go without again. The log says when prediction starts, after 1000
     checks how many were right, and when it stops.
+  - **GTA San Andreas - The Definitive Edition (fixed in 3.8.12, 2026-10-23).** Unreal Engine 4's DLSS plugin launches
+    plain `cuda_engine_input_kernel`, which keeps the jitter in bytes 72-79 (bytes 80-87, the family's word for
+    Wukong's `cuda_engine_input_kernel_rel_*`, hold 0). Read there, every hold got a jitter of 0, and on every other
+    frame, where NGX's `cuda_luma_convert_kernel` reads the colour input first, none: a constant 0 gives the prediction
+    no sequence to learn. With word 9 for the plain name: every hold with the jitter, predicted right 1000 times in
+    1000. The game did not switch its output to HDR under Proton-GE with `PROTON_ENABLE_WAYLAND=1` and
+    `PROTON_ENABLE_HDR=1` (its HDR option on, `bUseHDRDisplayOutput=True`, the desktop in bt2100): the swapchain stays
+    A2B10G10R10 in the sRGB colour space. The layer does not touch surface formats; the model before the upscaler is
+    the same with 8-bit and 10-bit output (a change of 12 of 255, detail x1.14).
 - **Fixed on the way:**
   - The after-the-upscaler path kept its claim on the network when the network was not built at its size,
     so the paths fought over the build. The claim is now always released.

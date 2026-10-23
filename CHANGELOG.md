@@ -4,6 +4,11 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.12 — 2026-10-23
+
+- GTA San Andreas - The Definitive Edition: the model gets the camera's sub-pixel movement, which it lines its previous
+  frames up with. It got none on every other frame and a wrong one on the others.
+
 ## 3.8.11 — 2026-10-23
 
 - Metro Last Light Redux works: the model runs before the upscaler, inside DLSS's buffer. Turn the game's own DLSS 5

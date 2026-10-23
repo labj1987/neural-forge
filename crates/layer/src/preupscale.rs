@@ -1602,7 +1602,12 @@ fn jitter_px(v: u64) -> [f32; 2] {
 /// The word of a 310.x SR input kernel's parameters that holds the camera jitter ([`LaunchRefs::jitter`]).
 const HILUMA_JITTER_WORD: usize = 3;
 
-/// The same in the `cuda_engine_input_kernel*` family (Black Myth: Wukong's DLSS): bytes 80-87, a
+/// The same in plain `cuda_engine_input_kernel` (GTA San Andreas - The Definitive Edition, Unreal Engine 4's DLSS
+/// plugin): bytes 72-79, Halton(2,3) minus 0.5 in render pixels; bytes 80-87 hold 0 (`NEURAL_FORGE_PROBE_KERNEL`,
+/// 3000 launches, 2026-10-23). Read as the family's word 10 before, every hold had a jitter of 0.
+const CUDA_ENGINE_PLAIN_JITTER_WORD: usize = 9;
+
+/// The same in the `cuda_engine_input_kernel_*` family (Black Myth: Wukong's DLSS): bytes 80-87, a
 /// Halton(2,3) sequence minus 0.5 in render pixels, 24 frames long (`NEURAL_FORGE_PROBE_KERNEL`, 2026-10-07).
 const CUDA_ENGINE_JITTER_WORD: usize = 10;
 
@@ -1615,7 +1620,9 @@ const RRLITE_ENC0_JITTER_WORD: usize = 21;
 fn jitter_word(name: &str) -> Option<usize> {
     if name.starts_with("hiluma_engine_input") {
         Some(HILUMA_JITTER_WORD)
-    } else if name.starts_with("cuda_engine_input_kernel") {
+    } else if name == "cuda_engine_input_kernel" {
+        Some(CUDA_ENGINE_PLAIN_JITTER_WORD)
+    } else if name.starts_with("cuda_engine_input_kernel_") {
         Some(CUDA_ENGINE_JITTER_WORD)
     } else if name.starts_with("rrlite_enc0_") {
         Some(RRLITE_ENC0_JITTER_WORD)
@@ -7002,6 +7009,8 @@ mod jitter_tests {
     fn the_jitter_word_follows_the_kernel() {
         assert_eq!(jitter_word("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel"), Some(3));
         assert_eq!(jitter_word("cuda_engine_input_kernel_rel_hdr_mvdiff_mvhi"), Some(10));
+        assert_eq!(jitter_word("cuda_engine_input_kernel"), Some(9), "San Andreas's plain kernel");
+        assert_eq!(jitter_word("cuda_engine_input_kernelx"), None);
         assert_eq!(jitter_word("rrlite_enc0_4x4_mvlo_hdr_folded"), Some(21));
         assert_eq!(jitter_word("rrlite_enc1_4x4"), None);
         assert_eq!(jitter_word("rr2_enc0_kernel"), None, "Ray Reconstruction is never held");
