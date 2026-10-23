@@ -130,7 +130,9 @@ pub(crate) fn mean_difference(a: &[u8], b: &[u8]) -> Option<u32> {
     Some((sum / a.len() as u64) as u32)
 }
 
-/// A cut: the mean difference reaches `threshold` (0 never cuts), the pre-upscaler detector's rule.
+/// Over the cut threshold: the mean difference reaches `threshold` (0 never does), the pre-upscaler detector's
+/// rule. A cut is such a frame after one that was not ([`SlotHistory::begin`]): a fade changes the picture that
+/// much from every frame to the next, and resetting on each flickered.
 pub(crate) fn is_cut(mean: u32, threshold: u32) -> bool {
     threshold > 0 && mean >= threshold
 }
@@ -167,6 +169,8 @@ pub(crate) struct Decision {
 pub(crate) struct SlotHistory {
     gap: HistoryGap<(u32, u32, u32)>,
     thumb: Option<Vec<u8>>,
+    /// The last comparison was over the cut threshold: the next one over it is part of the same change, no cut.
+    changing: bool,
     network: Option<(u32, u64)>,
     passes: Vec<PassState>,
 }
@@ -191,7 +195,9 @@ impl SlotHistory {
     /// (else [`Self::skipped`]).
     pub(crate) fn begin(&mut self, now: Instant, thumb: Vec<u8>, threshold: u32, network: (u32, u64), passes: usize) -> Decision {
         let stale = self.gap.begin(now);
-        let cut = self.thumb.as_deref().and_then(|last| mean_difference(last, &thumb)).filter(|&m| is_cut(m, threshold));
+        let over = self.thumb.as_deref().and_then(|last| mean_difference(last, &thumb)).filter(|&m| is_cut(m, threshold));
+        let cut = over.filter(|_| !self.changing);
+        self.changing = over.is_some();
         self.thumb = Some(thumb);
         let switched = self.network.is_some_and(|n| n != network);
         self.network = Some(network);
@@ -264,6 +270,24 @@ mod tests {
         assert!(!is_cut(39, 40));
         assert!(!is_cut(255, 0), "0 is off");
         assert_eq!(mean_difference(&a, &a[1..]), None);
+    }
+
+    #[test]
+    fn a_change_over_the_threshold_on_every_frame_cuts_once_until_the_picture_settles() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let (dark, bright) = (vec![20u8; 12], vec![200u8; 12]);
+        let mut h = SlotHistory::default();
+        let net = (1, 1);
+        let cut = |d: Decision| matches!(d.reset, Some(Reset::Stale(Stale::SceneCut(_))));
+        assert!(!cut(h.begin(ms(0), dark.clone(), 40, net, 1)));
+        assert!(!cut(h.begin(ms(16), dark.clone(), 40, net, 1)), "still");
+        assert!(cut(h.begin(ms(33), bright.clone(), 40, net, 1)), "the change's first frame cuts");
+        for (i, frame) in [&dark, &bright, &dark].into_iter().enumerate() {
+            assert!(!cut(h.begin(ms(50 + 16 * i as u64), frame.clone(), 40, net, 1)), "frame {} of the change", i + 2);
+        }
+        assert!(!cut(h.begin(ms(110), dark.clone(), 40, net, 1)), "settled");
+        assert!(cut(h.begin(ms(126), bright.clone(), 40, net, 1)), "a cut again once settled");
     }
 
     #[test]

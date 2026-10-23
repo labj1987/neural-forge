@@ -4,7 +4,10 @@
 // (`C`) of every native hold, right after the encode. The 1.x helper's detector on the CPU (`scene.rs`),
 // moved onto the GPU: each sampled channel of the encoded proxy (display-referred, [0, 1]) clamped (NaN
 // to 0) and rounded to 8 bits, the three averaged (integer division); a cut when the mean absolute
-// difference of the two thumbnails is at least the threshold (40 of 255 by default), in integers.
+// difference of the two thumbnails is at least the threshold (40 of 255 by default), in integers, and the
+// comparison before it was not: a fade or an animated menu changes the picture that much from every hold to
+// the next, and resetting the history on each of them made the picture flicker (Crimson Desert, 35 resets in
+// 10 s, 2026-10-22). Its first such hold still cuts; the next cut needs a settled picture first.
 //
 // Two dispatches of this shader (DECIDE false, then true, with a barrier between): the first writes the
 // thumbnail in place (each sample's word belongs to one invocation, which reads the previous hold's value
@@ -24,8 +27,10 @@ layout(set = 0, binding = 1, std430) buffer Thumb { uint luma[]; } u_thumb;
 layout(set = 0, binding = 2, std430) buffer Partial { uint sum[]; } u_partial;
 // Host-visible: compared (0 on the first hold), cut, the sum of absolute differences, the sample count.
 layout(set = 0, binding = 3, std430) writeonly buffer Result { uint words[4]; } u_result;
-// The native pass's state (native_preprocess.comp's `State`): `cut` is this shader's.
-layout(set = 0, binding = 4, std430) buffer State { uint ok[2]; uint cut; } u_state;
+// The native pass's state (native_preprocess.comp's `State`): `cut` is this shader's, and so is `changing` (the
+// last comparison was over the threshold; zeroed with the rest at the pass's initialisation). `last` is the
+// inline hold guard's (preupscale_hold_guard.comp).
+layout(set = 0, binding = 4, std430) buffer State { uint ok[2]; uint cut; uint last; uint changing; } u_state;
 
 layout(push_constant) uniform Params {
   uvec2 size;       // the render extent
@@ -79,8 +84,10 @@ void main() {
     if (local == 0u) {
       uint sum = p.compare != 0u ? s_sum[0] : 0u;
       // floor(sum / n) >= threshold, without the division (n * 255 fits 32 bits up to 8K).
-      bool cut = p.compare != 0u && p.threshold > 0u && n > 0u && sum >= p.threshold * n;
+      bool over = p.compare != 0u && p.threshold > 0u && n > 0u && sum >= p.threshold * n;
+      bool cut = over && u_state.changing == 0u;
       u_state.cut = cut ? 1u : 0u;
+      u_state.changing = over ? 1u : 0u;
       u_result.words[0] = p.compare;
       u_result.words[1] = cut ? 1u : 0u;
       u_result.words[2] = sum;

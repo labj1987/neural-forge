@@ -7,7 +7,9 @@
 //! It is the 1.x helper's detector (`scene.rs`, removed with the helper in 3.0.0) moved onto the GPU: a
 //! luma thumbnail of the encoded capture on an [`STEP`]-pixel step (each channel clamped to [0, 1] and
 //! rounded to 8 bits, the three averaged), compared with the previous hold's; a cut when the mean
-//! absolute difference is at least [`THRESHOLD`] of 255. `shaders/preupscale_scene_cut.comp` takes the
+//! absolute difference is at least [`THRESHOLD`] of 255 and the comparison before it was under it (a fade or an
+//! animated menu, over it from every hold to the next, cuts on its first hold only: resetting on each made the
+//! picture flicker, Crimson Desert 2026-10-22). `shaders/preupscale_scene_cut.comp` takes the
 //! thumbnail and decides in the capture (`C`) of every hold, after the encode, and writes the decision
 //! into the native pass's state buffer, where the frame shaders read it as "no history" on the same frame
 //! (seed 0, no blend, for every pass). Nothing waits for it: the host reads the few result words at the
@@ -494,7 +496,7 @@ mod tests {
                 );
                 device.cmd_clear_color_image(cmd, encoded.image, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [0.5; 4] }, &[range]);
             });
-            let [state, elsewhere] = [(); 2].map(|()| own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap());
+            let [state, elsewhere] = [(); 2].map(|()| own_host_buffer_with(device, instance, physical, 32, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap());
             let mut pass = ScenePass::build(device, instance, physical, W, H).expect("the scene-cut pass builds");
             // The state word each hold writes (`cut`), set beforehand in both buffers: which one the hold wrote.
             let written = |pass: &mut ScenePass| -> [bool; 2] {
@@ -558,7 +560,8 @@ mod tests {
 
     /// The detector on lavapipe over a sequence of frames, against the helper's CPU detector: a still frame
     /// never trips it, a small change does not, a different picture trips it once (and the frame after it,
-    /// the same picture again, does not), the decision reaches the native pass's state word, the first hold
+    /// the same picture again, does not), a picture changing past the threshold on every hold cuts on the
+    /// first only and again once it settled, the decision reaches the native pass's state word, the first hold
     /// compares with nothing, and the threshold is the one passed.
     #[test]
     fn a_still_frame_never_cuts_and_a_new_picture_cuts_once() {
@@ -585,7 +588,7 @@ mod tests {
             let (pw, ph) = (W + 1, H + 1);
             let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
             let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC).unwrap();
-            let state = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let state = own_host_buffer_with(device, instance, physical, 32, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let range =
                 vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
             one_shot(&|cmd| {
@@ -685,6 +688,17 @@ mod tests {
             // A threshold above the difference keeps the history; one at it cuts.
             assert!(!hold(&mut pass, &a, mean_ab + 1).cut, "under the threshold");
             assert!(hold(&mut pass, &b, mean_ab).cut, "at the threshold");
+            // A fade or an animated menu: the picture changes past the threshold on every hold. It cuts on the
+            // first only; the history then runs through the change (resetting on each hold flickered).
+            assert!(!hold(&mut pass, &b, THRESHOLD).cut, "settled");
+            assert!(hold(&mut pass, &a, THRESHOLD).cut, "the change's first hold cuts");
+            for (i, frame) in [&b, &a, &b, &a].into_iter().enumerate() {
+                let r = hold(&mut pass, frame, THRESHOLD);
+                assert!(r.mean >= THRESHOLD && !r.cut, "hold {} of the change: over the threshold ({}) but no cut", i + 2, r.mean);
+            }
+            // Settled again (the same picture twice), a new picture cuts again.
+            assert!(!hold(&mut pass, &a, THRESHOLD).cut);
+            assert!(hold(&mut pass, &b, THRESHOLD).cut, "a cut after the picture settled");
 
             pass.destroy(device);
             encoded.destroy(device);

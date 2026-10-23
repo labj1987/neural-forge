@@ -1758,7 +1758,7 @@ impl NativePass {
             )?));
             step()?;
             p.state =
-                Some(made(OwnBuffer::new(device, instance, physical_device, 16, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER)?));
+                Some(made(OwnBuffer::new(device, instance, physical_device, 32, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER)?));
             for _ in 0..2 {
                 step()?;
                 // TRANSFER_DST: inside DLSS's buffer the hold writes them there (`vkCmdUpdateBuffer`).
@@ -1936,7 +1936,7 @@ impl NativePass {
     }
 
     /// The frame shaders' state buffer (binding 5: `ok[2]`, then `cut`, which the scene-cut detector writes
-    /// in the capture).
+    /// in the capture; then the inline hold guard's `last` and the detector's `changing`).
     pub(crate) fn state_buffer(&self) -> vk::Buffer {
         self.state.buffer
     }
