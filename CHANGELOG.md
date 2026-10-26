@@ -4,6 +4,12 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.14 — 2026-10-26
+
+- New strength preset in the Model tab: **Remix**, the strengths RTX Remix uses with NVIDIA's neural rendering
+  (intensity 1, local tone 0.3, local structure 0.7, skin structure 0.5): less change to the picture's tone than
+  Reference. The README lists what each preset matches. The default stays Reference.
+
 ## 3.8.13 — 2026-10-23
 
 - Hogwarts Legacy with ray tracing no longer crashes while the save loads. Neural Forge prepared the model while the
