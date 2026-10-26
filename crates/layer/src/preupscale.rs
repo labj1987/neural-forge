@@ -10957,6 +10957,133 @@ mod tests {
     /// value, not the NaN of +Inf x 0, and nothing is written back. (Lavapipe's float-to-half conversion
     /// rounds toward zero, so an overflow lands on 65504 there anyway, and its clamp() returns 0 for a NaN:
     /// this pins the result every driver must give, NVIDIA's round-to-nearest one included.)
+    /// The ACES transfer on the GPU against its CPU reference (`hdr::aces`): the encode of every texel, the
+    /// decode of an edited answer (a tenth darker, linear), and the decode of the answer left as it was sent
+    /// (the frame back), at the game's exposure and the default paper white.
+    #[test]
+    fn the_aces_transfer_matches_its_cpu_reference() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("preupscale ACES test: no Vulkan device, skipping");
+            return;
+        };
+        let (w, h) = (6u32, 3u32);
+        let (pw, ph) = padded(w, h);
+        let d = &gpu.device;
+        let (image, memory) = gpu.image(w, h);
+        let colours = [
+            [0.0, 0.0, 0.0],
+            [0.002, 0.003, 0.004],
+            [0.05, 0.1, 0.2],
+            [0.3, 0.3, 0.3],
+            [0.9, 0.5, 0.1],
+            [2.0, 1.5, 1.0],
+            [4.0, 0.2, 0.05],
+            [0.1, 0.2, 6.0],
+            [12.0, 10.0, 9.0],
+            [1000.0, 800.0, 30000.0],
+            [f32::NAN, 0.5, 0.5],
+            [-1.0, 0.5, 2.0],
+        ];
+        let colour = |x: u32, y: u32| colours[((y * w + x) as usize) % colours.len()];
+        let scene = frame(w, h, colour);
+        let white = hdr::DEFAULT_PAPER_WHITE;
+        let e = f16_to_f32(f32_to_f16(0.6));
+        let exposure = e * hdr::ACES_WHITE / white;
+        let original = |x: u32, y: u32, c: usize| f16_to_f32(half_at(&scene, w, x, y, c));
+        let mut pass = unsafe { hdr::HdrPass::build(d, &gpu.instance, gpu.physical, w, h) }.expect("the HDR pass builds");
+        pass.set_transfer(hdr::ACES);
+        assert!(unsafe { pass.bind_colour(d, image) });
+        let source = own_host_buffer_with(d, &gpu.instance, gpu.physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC).unwrap();
+        // One hold with `answer` (padded, RGBA16F halves) as the network's: the frame after it and the encoded picture.
+        let hold = |answer: &[u16]| {
+            unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr().cast::<u8>(), source.ptr, answer.len() * 2) };
+            gpu.upload(image, w, h, &scene);
+            gpu.one_shot(|cmd| unsafe {
+                d.cmd_fill_buffer(cmd, pass.exposure_buffer(), 0, 4, u32::from(f32_to_f16(e)));
+                let open = [pass.encoded_to_general(), pass.answer_to_general()];
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &open,
+                );
+                pass.record_encode(d, cmd, None, white);
+                let encoded = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[encoded],
+                    &[],
+                    &[],
+                );
+                pass.record_decode(d, cmd, source.buffer, white, None);
+            });
+            (gpu.read(image, w, h), gpu.read(pass.encoded_image(), pw, ph))
+        };
+
+        // The encode, and an answer a tenth darker in linear light (the padding's texels as sent).
+        let (_, encoded) = hold(&vec![0u16; (pw * ph * 4) as usize]);
+        let mut edited = Vec::with_capacity((pw * ph * 4) as usize);
+        for y in 0..ph {
+            for x in 0..pw {
+                let (sx, sy) = (x.min(w - 1), y.min(h - 1));
+                for c in 0..3 {
+                    let want = hdr::aces::encode(original(sx, sy, c), exposure);
+                    let got = f16_to_f32(half_at(&encoded, pw, x, y, c));
+                    assert!((got - want).abs() <= 1e-3, "encode at {x},{y} channel {c}: {} -> {got}, the CPU reference says {want}", original(sx, sy, c));
+                    edited.push(f32_to_f16(hdr::aces::srgb_oetf(hdr::aces::srgb_eotf(got) * 0.9)));
+                }
+                edited.push(0x3c00);
+            }
+        }
+        let check = |after: &[u8], answer: &dyn Fn(u32, u32, usize) -> f32, what: &str| {
+            for y in 0..h {
+                for x in 0..w {
+                    let px = [0, 1, 2].map(|c| original(x, y, c));
+                    let want = hdr::aces::decode(px, [0, 1, 2].map(|c| answer(x, y, c)), exposure, true);
+                    for (c, want) in want.into_iter().enumerate() {
+                        let got = f16_to_f32(half_at(after, w, x, y, c));
+                        if want.is_nan() {
+                            assert!(got.is_nan(), "{what} at {x},{y} channel {c}: {got}, the original's NaN kept");
+                        } else {
+                            assert!((got - want).abs() <= 2e-3 * want.abs() + 1e-5, "{what} at {x},{y} channel {c}: {got}, the CPU reference says {want}");
+                        }
+                    }
+                    assert_eq!(half_at(after, w, x, y, 3), half_at(&scene, w, x, y, 3), "alpha is kept at {x},{y}");
+                }
+            }
+        };
+        let (after, _) = hold(&edited);
+        check(&after, &|x, y, c| f16_to_f32(edited[((y * pw + x) * 4) as usize + c]), "the edited answer");
+        // No edit: the frame back, as the CPU reference has it (the original within the halves' rounding).
+        let sent: Vec<u16> = encoded.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+        let (after, _) = hold(&sent);
+        check(&after, &|x, y, c| f16_to_f32(half_at(&encoded, pw, x, y, c)), "the answer as sent");
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    let (o, got) = (original(x, y, c), f16_to_f32(half_at(&after, w, x, y, c)));
+                    if o.is_finite() && o * exposure > 1e-3 {
+                        assert!((got - o).abs() <= 4e-3 * o, "no edit at {x},{y} channel {c}: {o} -> {got}");
+                    }
+                }
+            }
+        }
+        unsafe {
+            pass.destroy(d);
+            source.destroy(d);
+            d.destroy_image(image, None);
+            d.free_memory(memory, None);
+        }
+    }
+
     #[test]
     fn the_decode_stores_finite_halves_at_a_low_exposure_and_an_infinity_encodes_to_0_without_one() {
         let Some(gpu) = Gpu::open(false) else {

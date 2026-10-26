@@ -25,8 +25,9 @@ otherwise. "History" means [history/development-before-neuralforge.md](history/d
 7. [October 11: the edit cache (3.3)](#october-11-the-edit-cache-33)
 8. [October 13: the network's weights were on the GPU twice (3.4.1)](#october-13-the-networks-weights-were-on-the-gpu-twice-341)
 9. [October 16: skipping the network's work on the padding (tried, not done)](#october-16-skipping-the-networks-work-on-the-padding-tried-not-done)
-10. [Deliberately not done, or left open](#deliberately-not-done-or-left-open)
-11. [Working practices that came out of all this](#working-practices-that-came-out-of-all-this)
+10. [October 26: RTX Remix's transfer before the upscaler (tried, not the default)](#october-26-rtx-remixs-transfer-before-the-upscaler-tried-not-the-default)
+11. [Deliberately not done, or left open](#deliberately-not-done-or-left-open)
+12. [Working practices that came out of all this](#working-practices-that-came-out-of-all-this)
 
 ## September 9-12: getting a model answer at all
 
@@ -1395,6 +1396,45 @@ Three things it showed (NATIVE_BACKEND.md, "Metro Last Light Redux and NVIDIA's 
   exposure and shoulder) pulls the brighter half of the picture down where NVIDIA's does not, and adds less detail at
   the default brightness; about half the cost at the default placement, about twice NVIDIA's at the same one.
 
+## October 26: RTX Remix's transfer before the upscaler (tried, not the default)
+
+RTX Remix (NVIDIA, MIT, `dxvk-remix` at `bbd74a1`) feeds an HDR picture to the same network with Narkowicz's ACES fit
+and sRGB, and writes the answer back with a ratio inverse: the answer's linear value times the original pixel's own
+`x / ACES(x)`, so a small change on the shoulder is scaled by that pixel's ratio instead of the curve's steep inverse.
+It also has a highlight recovery that blends back to the original where a pixel is both very bright and on the
+shoulder. Built exactly as Remix has it (`NEURAL_FORGE_PREUPSCALE_TRANSFER=aces`, with the edit cache's capture
+decoding the same way) and compared with the current encode. Each number is one held frame's own before and after
+(`shmctl dump-cache` or `NEURAL_FORGE_CACHE_DUMP_AT`), never screenshots from different launches. Upper and lower
+are the mean display luma change of the pixels above and below 0.5. Detail is the log-luma Laplacian energy, on
+over off (GTA: the fixed facade box at the still shot). Patches are the share of exposed-bright pixels the model
+made 25% brighter or more.
+
+| Game (network, Model brightness) | Transfer | Upper | Lower | Detail | Patches |
+|---|---|---|---|---|---|
+| GTA V Enhanced 1440p FG 4x (full, 0.3) | current, 2 runs | -3.0% | +7.7 / +7.9% | x1.28 / x1.25 | 9.9 / 13.4 per mille |
+| | ACES, 3 runs | -4.0 to -4.3% | +9.1 to +9.8% | x1.14 to x1.24 | 1.6 to 3.7 |
+| GTA (full, 1.0: Remix's exact exposure) | current | -3.2% | +6.9% | x1.24 | 8.3 |
+| | ACES | -2.4% | +4.0% | x1.16 | 0.1 |
+| GTA (small, 0.3) | current | -1.6% | +4.8% | x1.42 | 12.2 |
+| | ACES | -2.7% | +6.0% | x1.42 | 0.4 |
+| Hogwarts Legacy, RR on, the 3.8.13 cave (full, 0.3) | current | -2.2% | +6.3% | x1.42 | 75.8 |
+| | ACES | -3.7% | +4.2% | x1.24 | 8.1 |
+| Crimson Desert at night, RR off (full, 0.3) | current | 0.0% | -4.9% | x0.53 | 0 |
+| | ACES | -1.9% | +3.2% | x0.46 | 0 |
+
+- **No cost.** Real fps equal within the runs' spread (GTA pass 4: 64.1-65.1 full, 71.7/71.8 small; Hogwarts
+  147-148 shown; Crimson Desert 211.5/213.5 shown), the network's GPU time the same (6.99/7.00 ms full, 3.99 small).
+- **Less detail.** In Hogwarts the face gets clearly less skin detail (x1.24 against x1.42), and the shadowed jaw takes
+  a grey-green cast: ACES works per channel, and its ratio scales each channel by its own factor. In GTA it ties on
+  the small network and is behind on the full one at the default brightness. It brightens highlights far less, but
+  with the 3.8.13 fade the current encode shows no flat patches in these frames either.
+- **Patches without any highlight protection** (`NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS=off`, both transfers): none in
+  the dumped frames or the screenshots of this cave spot. There the forehead sat lower on the curve than in the 3.8.13
+  frames, so the ratio inverse's own resistance to patches is not shown either way.
+
+Kept as a testing mode; the default and the 3.8.13 fade stay. The Remix strength preset (its defaults: structure 0.7,
+tone 0.3, character structure 0.5) is in the Model tab.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
@@ -1413,6 +1453,17 @@ Three things it showed (NATIVE_BACKEND.md, "Metro Last Light Redux and NVIDIA's 
 - **DMA-BUF and a native Linux helper:** closed (above).
 - **Queue priority:** refused by the driver without privileges.
 - **Building a frame generator into Neural Forge:** out of scope; the game's own works.
+- **Ending the game's conditional rendering around the hold** (as AMD-NR does with D3D12 predication): no game
+  has needed it. Across 710 launch logs on the test machine (every game tested since the hold inside DLSS's buffer),
+  the hold was never refused for conditional rendering (2026-10-26).
+- **A despeckle of the network's input** (Skynizz's median-of-8, gated on motion and flat depth): the network does
+  not amplify dark noise. In Crimson Desert at night (RR off) the dark pixels' isolated outliers went from 66-68 to 65
+  per mille, and their change from hold to hold fell by a third. In the Hogwarts cave after Ray Reconstruction the
+  input has few outliers to remove (4 per mille). Measured within held frames, 2026-10-26.
+- **Running the model less often in fast motion** (Skynizz's one-in-eight while its motion fade removes the edit):
+  the motion mask rule here fades the edit toward 0.5 intensity and structure, not to nothing, and is off by
+  default. A longer interval carries that half of the edit and grows the trails the moving interval of 2 was chosen
+  to avoid (October 11).
 - **Skipping the network's work on the padding:** at most 0.054 ms of 6.1 at 1486x836, because the
   ViT attends over the padded tokens and the encoder must run over the whole field (October 16, above).
 - **A before/after capture while the model runs before the upscaler.** The capture request (`shmctl

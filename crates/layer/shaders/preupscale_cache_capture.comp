@@ -97,6 +97,7 @@ const uint F_KEEP_CLAMPED = 64u; // the decode's rule: keep the original where t
 const uint F_SCENE_ANSWER = 128u; // (tests) the capture's answer image holds the decoded answer
 const uint F_COUNT_DEPTH = 256u; // the prep pass counts the depth for telling reversed-Z (until decided)
 const uint F_NO_MVEC = 512u;     // the hold has no motion vectors: the field is NaN (no history), none counted
+const uint F_ACES = 1024u;       // the decode is the ACES transfer's (preupscale_decode.comp's flags bit 2)
 
 const uint STAT_Z0 = 0u;         // depth texels at exactly 0 / 1
 const uint STAT_Z1 = 1u;
@@ -239,6 +240,50 @@ float decode(float answer, float inv_scale) {
   return min(shoulder_inverse(srgb_eotf(answer)) * inv_scale, HALF_MAX);
 }
 
+// preupscale_decode.comp's ACES transfer, the same functions.
+const float ACES_WHITE = 3.0;
+
+float aces(float x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+vec3 aces3(vec3 x) {
+  return vec3(aces(x.r), aces(x.g), aces(x.b));
+}
+
+float srgb_oetf(float c) {
+  c = clamp(c, 0.0, 1.0);
+  return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+bool finite3(vec3 v) {
+  return !any(isnan(v)) && !any(isinf(v));
+}
+
+vec3 sanitized(vec3 v) {
+  return mix(clamp(v, vec3(0.0), vec3(HALF_MAX)), vec3(0.0), bvec3(isnan(v.r) || isinf(v.r), isnan(v.g) || isinf(v.g), isnan(v.b) || isinf(v.b)));
+}
+
+vec3 aces_decode(vec3 original, vec3 answer, float exposure, bool recover) {
+  if (!finite3(original) || !finite3(answer)) {
+    return original;
+  }
+  vec3 hdr = sanitized(original);
+  vec3 x = hdr * exposure;
+  vec3 curve = aces3(x);
+  vec3 ratio = x / max(curve, vec3(1e-6));
+  if (!finite3(ratio) || any(lessThan(ratio, vec3(0.0)))) {
+    return hdr;
+  }
+  vec3 result = vec3(srgb_eotf(answer.r), srgb_eotf(answer.g), srgb_eotf(answer.b)) * ratio / exposure;
+  if (recover) {
+    float preserve = smoothstep(1.0, 8.0, max(x.r, max(x.g, x.b)));
+    float shoulder = smoothstep(0.75, 0.99, max(srgb_oetf(curve.r), max(srgb_oetf(curve.g), srgb_oetf(curve.b))));
+    result = mix(result, hdr, preserve * shoulder);
+  }
+  return finite3(result) ? clamp(result, vec3(0.0), vec3(HALF_MAX)) : original;
+}
+
 // The value an RGBA16F store keeps.
 float stored(float v) {
   return unpackHalf2x16(packHalf2x16(vec2(v, 0.0))).x;
@@ -264,16 +309,22 @@ void main() {
   bool keep = (p.flags & F_KEEP_CLAMPED) != 0u;
   float inv_scale = p.paper_white / e;
   vec3 result;
-  for (int c = 0; c < 3; c++) {
-    result[c] = (p.flags & F_SCENE_ANSWER) != 0u ? answer[c] : stored(decode(answer[c], inv_scale));
-  }
-  // The decode's rule: the whole pixel kept where the encoded peak channel clamped, and faded into the
-  // original from the shoulder's 0.9 (FADE) up: the edit carried to the cached holds is the one written.
-  float peak = max(encoded.r, max(encoded.g, encoded.b));
-  if (keep && peak >= CLAMPED) {
-    result = original;
-  } else if (keep) {
-    result = mix(result, original, smoothstep(FADE, CLAMPED, peak));
+  if ((p.flags & (F_ACES | F_SCENE_ANSWER)) == F_ACES) {
+    // The ACES decode, its own highlight recovery included: the edit carried to the cached holds is the one written.
+    vec3 d = aces_decode(original, answer, e * ACES_WHITE / p.paper_white, keep);
+    result = vec3(stored(d.r), stored(d.g), stored(d.b));
+  } else {
+    for (int c = 0; c < 3; c++) {
+      result[c] = (p.flags & F_SCENE_ANSWER) != 0u ? answer[c] : stored(decode(answer[c], inv_scale));
+    }
+    // The decode's rule: the whole pixel kept where the encoded peak channel clamped, and faded into the
+    // original from the shoulder's 0.9 (FADE) up: the edit carried to the cached holds is the one written.
+    float peak = max(encoded.r, max(encoded.g, encoded.b));
+    if (keep && peak >= CLAMPED) {
+      result = original;
+    } else if (keep) {
+      result = mix(result, original, smoothstep(FADE, CLAMPED, peak));
+    }
   }
   float scale = e / p.paper_white;
   vec3 vc = to_v(original, scale);

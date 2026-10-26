@@ -61,6 +61,8 @@ pub(crate) const F_COUNT_DEPTH: u32 = 256;
 /// The hold has no motion vectors (none copied: the motion buffer holds an older hold's): the motion
 /// pass writes a field of NaN (no history) and counts nothing for the cadence.
 pub(crate) const F_NO_MVEC: u32 = 512;
+/// The capture decodes with the ACES transfer (`hdr::ACES`), its highlight recovery included.
+pub(crate) const F_ACES: u32 = 1024;
 /// Tests: the capture's answer image holds the decoded answer (the replay tool's dumps store it so).
 #[cfg(test)]
 const F_SCENE_ANSWER: u32 = 128;
@@ -489,7 +491,8 @@ impl State {
         // The hold before went through on this chain, and this one can read the refresh's edit.
         let continues = chained && had && consecutive && h.jitter.is_some() && h.mvec && h.depth == self.refresh_depth && h.history_ok && !h.armed;
         let cached = continues && self.since_refresh + 1 < self.regime.interval(h.interval);
-        let mut flags = F_KEEP_CLAMPED;
+        let mut flags = if super::hdr::highlight_flags() != 0 { F_KEEP_CLAMPED } else { 0 }
+            | if super::hdr::transfer_flags() & super::hdr::ACES != 0 { F_ACES } else { 0 };
         if chained {
             flags |= F_CHAINED;
             if !chain_live {

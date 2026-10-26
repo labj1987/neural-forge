@@ -312,7 +312,7 @@ this version re-creates the shared memory.
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
+| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
@@ -325,6 +325,16 @@ to the next (a cut in a cutscene, a respawn, a camera switch), the model starts 
 in the previous scene. The model's answer is written straight back (there is no
 composition step), so "Model every Nth frame" and the Composition tab only change the after-the-upscaler
 path. The Model tab's tuning and the switch apply to both.
+
+**Strength presets** set intensity, local tone, local structure and skin structure together:
+
+| Preset | Intensity | Local tone | Local structure | Skin structure | What it matches |
+|---|---|---|---|---|---|
+| Light | 0.45 | 0.55 | 0.25 | 0.15 | A light touch. |
+| Moderate | 0.70 | 0.80 | 0.55 | 0.40 | In between. |
+| Reference | 1.00 | 1.00 | 1.00 | follows local structure | NVIDIA's own defaults for the network; Neural Forge's default. |
+| Overdrive | 1.30 | 1.25 | 1.45 | 1.20 | Stronger than NVIDIA's defaults. |
+| Remix | 1.00 | 0.30 | 0.70 | 0.50 | RTX Remix's defaults for its DLSS neural rendering. |
 
 **Keep the game's sky** (on by default) leaves the sky untouched before the upscaler: no edit where the
 game's depth is at the far plane, fading in over the distance just in front of it. **More mask rules** can
@@ -490,7 +500,8 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_NATIVE_CHAIN=0`, `NEURAL_FORGE_NATIVE_INLINE_CHAIN=1` | layer | Testing aids: barriers between the network's launches instead of counter chaining (before the upscaler), or counter chaining inside DLSS's buffer (where barriers are the default). |
 | `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1` | layer | Testing aid: record everything but the network's launches. |
 | `NEURAL_FORGE_NATIVE_NO_HISTORY=1` | layer | Testing aid: every network frame without history, as after a reset. |
-| `NEURAL_FORGE_PREUPSCALE_TRANSFER=linear` | layer | Testing aid: the HDR encode without its sRGB curve (the network sees linear values); `srgb` is the default. The edit cache assumes sRGB: use it with `NEURAL_FORGE_EDIT_CACHE=off`. |
+| `NEURAL_FORGE_PREUPSCALE_TRANSFER=aces\|linear` | layer | Testing aids: `aces` encodes the picture before the upscaler with RTX Remix's transfer (an ACES curve, and on the way back the model's change scaled by each pixel's own ratio, with Remix's highlight recovery); `linear` leaves out the sRGB curve (the network sees linear values; the edit cache assumes sRGB, so use it with `NEURAL_FORGE_EDIT_CACHE=off`). `srgb` is the default. |
+| `NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS=off` | layer | Testing aid: before the upscaler, apply the model's change to the brightest highlights too, instead of keeping the game's own values there. |
 | `NEURAL_FORGE_PROBE_IMAGE=<kernel>[+],...` | layer | Testing aid: copy the images a named CUDA launch reads, before it (or after it with `+`), once, into `captures/probe-<ms>/`. |
 | `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` | layer | Gives every network activation its own allocation again instead of sharing memory by lifetime (more video memory, same result). |
 | `NEURAL_FORGE_POST_MOTION=none\|zero\|flow`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | Testing aids: after the upscaler, give the model a history: its previous output at the same pixel (`zero`) or where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; `zero` elsewhere), not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and dropped on a scene cut. Default `none`: no history (measured, neither is steadier than none). |

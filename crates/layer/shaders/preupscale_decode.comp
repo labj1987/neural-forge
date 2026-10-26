@@ -13,6 +13,13 @@
 // the scene, up to 17 at 0.99), the result fades from the model's to the original: on the shoulder's top
 // the inverse turned the network's small changes into flat bright patches (Hogwarts Legacy, a lit forehead
 // in a dark cave after DLSS with Ray Reconstruction, the exposure measured from the frame; 2026-10-23).
+// With flags bit 2 (ACES, RTX Remix's transfer; tonemapping_inverse_tonemapping.comp.slang, MIT, see ATTRIBUTION.md)
+// instead, per pixel: x = sanitised original * the encode's exposure; the answer's sRGB EOTF times the original's
+// own ratio x / max(ACES(x), 1e-6), divided by the exposure (a small change on the shoulder is scaled by the
+// pixel's ratio instead of the curve's steep inverse); with bit 0, faded into the original by
+// smoothstep(1, 8, peak x) * smoothstep(0.75, 0.99, peak encoded original) (the highlight recovery: very bright
+// and on the curve's shoulder); a NaN or infinite answer, original or result gives the original back; within
+// [0, 65504]. Neither the clamped rule nor the fade above applies.
 // Alpha is always the original. With an unusable exposure value nothing is written.
 //
 // In place: every invocation reads its own pixel of the colour input before writing it, and no
@@ -36,7 +43,7 @@ layout(push_constant) uniform Params {
   uvec2 size;        // the colour input's extent
   uvec2 padded;      // the proxy's extent (even)
   float paper_white; // exposed units that map to 1.0 before the shoulder
-  uint flags;        // bit 0: keep clamped highlights; bit 1: linear (no sRGB EOTF)
+  uint flags;        // bit 0: keep clamped highlights; bit 1: linear (no sRGB EOTF); bit 2: ACES
 } p;
 
 const float KNEE = 0.75;
@@ -47,6 +54,8 @@ const float FADE_SRGB = 0.954;
 const float FADE_LINEAR = 0.9;
 const uint KEEP_CLAMPED = 1u;
 const uint LINEAR = 2u;
+const uint ACES = 4u;
+const float ACES_WHITE = 3.0; // preupscale_encode.comp's
 const float HALF_MAX = 65504.0; // the largest finite half: the most a write-back stores
 
 bool exposure_ok(float e) {
@@ -70,6 +79,51 @@ float decode(float answer, float inv_scale) {
   return min(shoulder_inverse(v) * inv_scale, HALF_MAX);
 }
 
+// ---- The ACES transfer's decode (preupscale::hdr::aces::decode; the same functions in
+// preupscale_cache_capture.comp). ----
+
+float aces(float x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+vec3 aces3(vec3 x) {
+  return vec3(aces(x.r), aces(x.g), aces(x.b));
+}
+
+float srgb_oetf(float c) {
+  c = clamp(c, 0.0, 1.0);
+  return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+bool finite3(vec3 v) {
+  return !any(isnan(v)) && !any(isinf(v));
+}
+
+// Remix's sanitizeRadiance: NaN and infinities 0, else within [0, 65504].
+vec3 sanitized(vec3 v) {
+  return mix(clamp(v, vec3(0.0), vec3(HALF_MAX)), vec3(0.0), bvec3(isnan(v.r) || isinf(v.r), isnan(v.g) || isinf(v.g), isnan(v.b) || isinf(v.b)));
+}
+
+vec3 aces_decode(vec3 original, vec3 answer, float exposure, bool recover) {
+  if (!finite3(original) || !finite3(answer)) {
+    return original;
+  }
+  vec3 hdr = sanitized(original);
+  vec3 x = hdr * exposure;
+  vec3 curve = aces3(x);
+  vec3 ratio = x / max(curve, vec3(1e-6));
+  if (!finite3(ratio) || any(lessThan(ratio, vec3(0.0)))) {
+    return hdr;
+  }
+  vec3 result = vec3(srgb_eotf(answer.r), srgb_eotf(answer.g), srgb_eotf(answer.b)) * ratio / exposure;
+  if (recover) {
+    float preserve = smoothstep(1.0, 8.0, max(x.r, max(x.g, x.b)));
+    float shoulder = smoothstep(0.75, 0.99, max(srgb_oetf(curve.r), max(srgb_oetf(curve.g), srgb_oetf(curve.b))));
+    result = mix(result, hdr, preserve * shoulder);
+  }
+  return finite3(result) ? clamp(result, vec3(0.0), vec3(HALF_MAX)) : original;
+}
+
 void main() {
   uvec2 xy = gl_GlobalInvocationID.xy;
   if (any(greaterThanEqual(xy, p.size))) {
@@ -85,6 +139,10 @@ void main() {
   vec3 encoded = imageLoad(u_encoded, at).rgb;
   vec3 answer = imageLoad(u_answer, at).rgb;
   bool keep = (p.flags & KEEP_CLAMPED) != 0u;
+  if ((p.flags & ACES) != 0u) {
+    imageStore(u_colour, at, vec4(aces_decode(original.rgb, answer, e * ACES_WHITE / p.paper_white, keep), original.a));
+    return;
+  }
   vec3 result = vec3(decode(answer.r, inv_scale), decode(answer.g, inv_scale), decode(answer.b, inv_scale));
   float peak = max(encoded.r, max(encoded.g, encoded.b));
   if (keep && peak >= CLAMPED) {

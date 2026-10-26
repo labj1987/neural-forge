@@ -5,7 +5,9 @@
 //
 // Per channel: v = max(scene, 0) * e / paper_white (e: the game's 1x1 R16_SFLOAT exposure value,
 // multiplied in); above 0.75 the shoulder 0.75 + 0.25 * (1 - exp(-K * (v - 0.75))); then the sRGB
-// OETF. Alpha is 1. Padding: an invocation outside the real extent reads the nearest edge texel, so
+// OETF. With flags bit 2 (ACES, RTX Remix's transfer) instead: x = min(max(scene, 0), 65504) * e * ACES_WHITE /
+// paper_white, Narkowicz's ACES fit of x saturated, then the sRGB OETF (Remix's tonemapping_fast_tonemapping.comp.slang,
+// MIT, see ATTRIBUTION.md). Alpha is 1. Padding: an invocation outside the real extent reads the nearest edge texel, so
 // the padding column/row duplicates the last column/row (as the raw copy's regions do).
 //
 // The descriptor set layout and the push constants are shared with preupscale_decode.comp and must
@@ -30,10 +32,15 @@ layout(push_constant) uniform Params {
   uvec2 size;        // the colour input's extent
   uvec2 padded;      // the proxy's extent (even)
   float paper_white; // exposed units that map to 1.0 before the shoulder
-  uint flags;        // bit 0: keep clamped highlights (decode only); bit 1: linear (no sRGB OETF)
+  uint flags;        // bit 0: keep clamped highlights (decode only); bit 1: linear (no sRGB OETF); bit 2: ACES
 } p;
 
 const uint LINEAR = 2u;
+const uint ACES = 4u;
+// The ACES transfer's exposure is e * ACES_WHITE / paper_white: Remix's x = hdr * exposure at the default paper
+// white (preupscale::hdr::ACES_WHITE).
+const float ACES_WHITE = 3.0;
+const float HALF_MAX = 65504.0;
 
 const float KNEE = 0.75;
 const float K = 5.770780;
@@ -53,9 +60,24 @@ float srgb_oetf(float c) {
   return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 
+// Narkowicz's ACES fit (Remix's ACESFilmApproximation), saturated.
+float aces(float x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+// The ACES transfer: Remix's sanitizeRadiance (NaN and infinities 0, within [0, 65504]), the exposure, the curve,
+// sRGB. An unusable exposure (scale 0) encodes 0.
+float aces_encode(float scene, float scale) {
+  float x = isnan(scene) || isinf(scene) ? 0.0 : clamp(scene, 0.0, HALF_MAX);
+  return srgb_oetf(scale > 0.0 ? aces(x * scale * ACES_WHITE) : 0.0);
+}
+
 // scene-linear -> model domain. NaN and negatives are 0; +Inf ends on the shoulder's top (1.0). With an
 // unusable exposure (scale 0) every value is 0: +Inf * 0 would be a NaN, and clamp() of one is undefined.
 float encode(float scene, float scale) {
+  if ((p.flags & ACES) != 0u) {
+    return aces_encode(scene, scale);
+  }
   float x = scene >= 0.0 ? scene : 0.0;
   float v = shoulder(scale > 0.0 ? x * scale : 0.0);
   return (p.flags & LINEAR) != 0u ? v : srgb_oetf(v);

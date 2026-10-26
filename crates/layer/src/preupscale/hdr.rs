@@ -190,27 +190,160 @@ pub(crate) const DEFAULT_PAPER_WHITE: f32 = 3.0;
 /// the shoulder's top (>= 0.999), where the inverse cannot bring it back.
 pub(crate) const KEEP_CLAMPED: u32 = 1;
 
+/// The variable that turns the decode's highlight protection off (`off`): [`KEEP_CLAMPED`] cleared, so the
+/// shoulder's inverse (or the ACES transfer's ratio) applies everywhere. A testing aid.
+pub(crate) const HIGHLIGHTS_ENV: &str = "NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS";
+
+/// [`KEEP_CLAMPED`] unless [`HIGHLIGHTS_ENV`] is `off`, read once.
+pub(crate) fn highlight_flags() -> u32 {
+    static FLAGS: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| match neural_forge_protocol::env::var(HIGHLIGHTS_ENV).as_deref().map(str::trim) {
+        Some("off") => {
+            crate::log!("[preupscale] {HIGHLIGHTS_ENV}=off: the decode keeps no highlights (no clamped rule, fade or recovery)");
+            0
+        }
+        None | Some("" | "on") => KEEP_CLAMPED,
+        Some(other) => {
+            crate::log!("[preupscale] {HIGHLIGHTS_ENV}={other:?} is not on or off; keeping highlights");
+            KEEP_CLAMPED
+        }
+    });
+    *FLAGS
+}
+
 /// [`HdrPush::flags`] bit: the encode leaves out the sRGB OETF (and the decode its inverse), so the network sees
 /// linear values in [0, 1] (`NEURAL_FORGE_PREUPSCALE_TRANSFER=linear`, [`transfer_flags`]).
 pub(crate) const LINEAR: u32 = 2;
 
-/// The variable that chooses the encode's transfer: `srgb` (the default) or `linear`.
+/// [`HdrPush::flags`] bit: RTX Remix's transfer (`NEURAL_FORGE_PREUPSCALE_TRANSFER=aces`, [`transfer_flags`]):
+/// the encode is the Narkowicz ACES fit ([`aces`]) of the exposed value, then sRGB; the decode scales the
+/// answer by the original pixel's own ratio `x / ACES(x)` instead of inverting the curve, and fades into
+/// the original where the pixel was both very bright and on the curve's shoulder (with [`KEEP_CLAMPED`]).
+/// The [`LINEAR`] bit means nothing with it.
+pub(crate) const ACES: u32 = 4;
+
+/// The ACES transfer's exposure is `e * ACES_WHITE / paper white`: Remix's `x = hdr * exposure` at the
+/// default paper white, scaled by the Model brightness setting (and [`PAPER_WHITE_ENV`]) as the shoulder's is.
+#[cfg(test)]
+pub(crate) const ACES_WHITE: f32 = DEFAULT_PAPER_WHITE;
+
+/// The variable that chooses the encode's transfer: `srgb` (the default), `linear` or `aces`.
 pub(crate) const TRANSFER_ENV: &str = "NEURAL_FORGE_PREUPSCALE_TRANSFER";
+
+/// The [`HdrPush::flags`] bits a [`TRANSFER_ENV`] value asks for, or `None` for one that is none of them.
+pub(crate) fn parse_transfer(value: Option<&str>) -> Option<u32> {
+    match value.map(str::trim) {
+        None | Some("" | "srgb") => Some(0),
+        Some("linear") => Some(LINEAR),
+        Some("aces") => Some(ACES),
+        Some(_) => None,
+    }
+}
 
 /// The [`HdrPush::flags`] bits [`TRANSFER_ENV`] asks for, read once.
 pub(crate) fn transfer_flags() -> u32 {
-    static FLAGS: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| match neural_forge_protocol::env::var(TRANSFER_ENV).as_deref() {
-        None | Some("" | "srgb") => 0,
-        Some("linear") => {
-            crate::log!("[preupscale] {TRANSFER_ENV}=linear: the network sees linear values (no sRGB curve)");
-            LINEAR
-        }
-        Some(other) => {
-            crate::log!("[preupscale] {TRANSFER_ENV}={other:?} is not srgb or linear; using srgb");
-            0
+    static FLAGS: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        let value = neural_forge_protocol::env::var(TRANSFER_ENV);
+        match parse_transfer(value.as_deref()) {
+            Some(LINEAR) => {
+                crate::log!("[preupscale] {TRANSFER_ENV}=linear: the network sees linear values (no sRGB curve)");
+                LINEAR
+            }
+            Some(ACES) => {
+                crate::log!("[preupscale] {TRANSFER_ENV}=aces: RTX Remix's transfer (ACES fit, ratio decode, highlight recovery)");
+                ACES
+            }
+            Some(flags) => flags,
+            None => {
+                crate::log!("[preupscale] {TRANSFER_ENV}={:?} is not srgb, linear or aces; using srgb", value.unwrap_or_default());
+                0
+            }
         }
     });
     *FLAGS
+}
+
+/// The ACES transfer's CPU reference, in the shaders' f32 arithmetic (`preupscale_encode.comp`'s
+/// `aces_encode`, `preupscale_decode.comp`'s and `preupscale_cache_capture.comp`'s `aces_decode`).
+///
+/// Ported from RTX Remix (NVIDIA, MIT; https://github.com/NVIDIAGameWorks/dxvk-remix, commit bbd74a1):
+/// `tonemapping_fast_tonemapping.comp.slang` (the encode), `tonemapping_inverse_tonemapping.comp.slang`
+/// (the ratio decode and the highlight recovery) and `tonemapping.slangh` (`ACESFilmApproximation`); see
+/// ATTRIBUTION.md.
+#[cfg(test)]
+pub(crate) mod aces {
+    /// The largest finite half: what the colour input stores at most.
+    const HALF_MAX: f32 = 65504.0;
+    /// The highlight recovery's gates (Remix's `highlightRecoveryThresholds` defaults): the exposed
+    /// peak channel from 1 to 8, and the encoded peak channel from 0.75 to 0.99.
+    pub(crate) const PRESERVE: (f32, f32) = (1.0, 8.0);
+    pub(crate) const SHOULDER: (f32, f32) = (0.75, 0.99);
+
+    /// Narkowicz's ACES fit (Remix's `ACESFilmApproximation`), saturated.
+    pub(crate) fn curve(x: f32) -> f32 {
+        ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
+    }
+
+    pub(crate) fn srgb_oetf(c: f32) -> f32 {
+        let c = c.clamp(0.0, 1.0);
+        if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+    }
+
+    pub(crate) fn srgb_eotf(s: f32) -> f32 {
+        let s = if s.is_nan() { 0.0 } else { s.clamp(0.0, 1.0) };
+        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    }
+
+    /// Remix's `sanitizeRadiance`: NaN and infinities 0, else within [0, 65504].
+    pub(crate) fn sanitized(v: f32) -> f32 {
+        if v.is_finite() { v.clamp(0.0, HALF_MAX) } else { 0.0 }
+    }
+
+    fn smoothstep(lo: f32, hi: f32, v: f32) -> f32 {
+        let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// One channel, scene-linear -> model domain: sRGB(ACES(sanitized(scene) * exposure)); 0 with an
+    /// unusable exposure (`exposure` 0).
+    pub(crate) fn encode(scene: f32, exposure: f32) -> f32 {
+        srgb_oetf(if exposure > 0.0 { curve(sanitized(scene) * exposure) } else { 0.0 })
+    }
+
+    /// How much of the original the highlight recovery keeps for a pixel whose exposed value is `x`:
+    /// very bright (`PRESERVE`) times on the curve's shoulder once encoded (`SHOULDER`).
+    pub(crate) fn recovery(x: [f32; 3]) -> f32 {
+        let peak = x[0].max(x[1]).max(x[2]);
+        let encoded = x.map(|v| srgb_oetf(curve(v)));
+        let shoulder = encoded[0].max(encoded[1]).max(encoded[2]);
+        smoothstep(PRESERVE.0, PRESERVE.1, peak) * smoothstep(SHOULDER.0, SHOULDER.1, shoulder)
+    }
+
+    /// The write-back of one pixel: the answer (model domain) scaled by the original's ratio `x / ACES(x)`
+    /// per channel and divided by the exposure, faded into the original by [`recovery`] when `recover`
+    /// is set, within [0, 65504]. An answer or original that is not finite, or a result that is not,
+    /// gives the original back.
+    pub(crate) fn decode(original: [f32; 3], answer: [f32; 3], exposure: f32, recover: bool) -> [f32; 3] {
+        if !original.iter().chain(&answer).all(|v| v.is_finite()) {
+            return original;
+        }
+        let hdr = original.map(sanitized);
+        let x = hdr.map(|v| v * exposure);
+        let ratio = x.map(|v| v / curve(v).max(1e-6));
+        if !ratio.iter().all(|r| r.is_finite() && *r >= 0.0) {
+            return hdr;
+        }
+        let mut out = [0.0; 3];
+        for c in 0..3 {
+            out[c] = srgb_eotf(answer[c]) * ratio[c] / exposure;
+        }
+        if recover {
+            let m = recovery(x);
+            for c in 0..3 {
+                out[c] += (hdr[c] - out[c]) * m;
+            }
+        }
+        if out.iter().all(|v| v.is_finite()) { out.map(|v| v.clamp(0.0, HALF_MAX)) } else { original }
+    }
 }
 
 /// The encoded peak from which the decode fades the model's result into the original pixel, up to
@@ -626,6 +759,8 @@ pub(crate) struct HdrPass {
     id: u64,
     /// The auto-exposure, built on the first hold without a readable exposure image.
     auto: Option<AutoExposure>,
+    /// The transfer's [`HdrPush::flags`] bits ([`transfer_flags`]).
+    transfer: u32,
 }
 
 // SAFETY: plain handles and the layer's own mapped allocation, only used behind the device's
@@ -724,8 +859,15 @@ impl HdrPass {
             colour_bindings: 0,
             id: NEXT_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             auto: None,
+            transfer: transfer_flags(),
         };
         Some(pass)
+    }
+
+    /// Encode and decode with the transfer `flags` ([`LINEAR`], [`ACES`]) instead of [`transfer_flags`]'s.
+    #[cfg(test)]
+    pub(crate) fn set_transfer(&mut self, flags: u32) {
+        self.transfer = flags;
     }
 
     /// The encoded picture (the network's later passes copy the previous answer into it).
@@ -927,7 +1069,7 @@ impl HdrPass {
             padded_width: self.padded_width,
             padded_height: self.padded_height,
             paper_white,
-            flags: KEEP_CLAMPED | transfer_flags(),
+            flags: highlight_flags() | self.transfer,
         }
     }
 
@@ -1225,5 +1367,145 @@ mod tests {
             assert!(parse_paper_white(Some(bad)).is_err(), "{bad}");
         }
         assert!(exposure_ok(0.128) && !exposure_ok(0.0) && !exposure_ok(f32::NAN) && !exposure_ok(f32::INFINITY) && !exposure_ok(-1.0));
+    }
+
+    #[test]
+    fn the_transfer_parses_and_refuses_nonsense() {
+        assert_eq!(parse_transfer(None), Some(0));
+        assert_eq!(parse_transfer(Some(" ")), Some(0));
+        assert_eq!(parse_transfer(Some("srgb")), Some(0));
+        assert_eq!(parse_transfer(Some("linear")), Some(LINEAR));
+        assert_eq!(parse_transfer(Some(" aces ")), Some(ACES));
+        assert_eq!(parse_transfer(Some("ACES-remix")), None);
+    }
+
+    // ---- The ACES transfer (RTX Remix's), on the CPU reference. ----
+
+    /// Pixels across the range the colour input holds: black, near-black, mid-tones, the shoulder, past the
+    /// curve's saturation (x above 7.24), saturated colours and a sun.
+    const ACES_PIXELS: [[f32; 3]; 10] = [
+        [0.0, 0.0, 0.0],
+        [0.002, 0.003, 0.004],
+        [0.05, 0.1, 0.2],
+        [0.3, 0.3, 0.3],
+        [0.9, 0.5, 0.1],
+        [2.0, 1.5, 1.0],
+        [4.0, 0.2, 0.05],
+        [0.1, 0.2, 6.0],
+        [12.0, 10.0, 9.0],
+        [1000.0, 800.0, 30000.0],
+    ];
+
+    fn rel_close(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol * b.abs().max(a.abs()) + 1e-9
+    }
+
+    #[test]
+    fn the_aces_encode_is_monotonic_and_stays_within_0_and_1() {
+        for e in [0.05f32, 0.5, 1.0, 3.0] {
+            let mut last = -1.0f32;
+            for i in 0..4000 {
+                let scene = 1e-4 * 1.005f32.powi(i);
+                let y = aces::encode(scene, e);
+                assert!((0.0..=1.0).contains(&y), "encode({scene}, {e}) = {y}");
+                assert!(y >= last, "not monotonic at {scene} (e {e}): {last} then {y}");
+                last = y;
+            }
+            assert!(aces::encode(1e6, e) > 0.99999, "the curve saturates");
+        }
+        // Remix's numbers: ACES(1) = 2.54 / 3.16, the curve meets 1 at x = 7.24.
+        assert!(rel_close(aces::curve(1.0), 2.54 / 3.16, 1e-6));
+        assert!(aces::curve(7.2) < 1.0 && aces::curve(7.3) == 1.0);
+    }
+
+    #[test]
+    fn no_edit_is_identity_through_the_aces_ratio_decode() {
+        for e in [0.05f32, 0.6, 1.0, 3.0] {
+            for recover in [false, true] {
+                for px in ACES_PIXELS {
+                    let answer = px.map(|v| aces::encode(v, e));
+                    let back = aces::decode(px, answer, e, recover);
+                    for c in 0..3 {
+                        // Below an ACES value of 1e-6 the ratio's floor takes over (x under 4.7e-6).
+                        let tol = if px[c] * e < 5e-6 { 1.0 } else { 1e-4 };
+                        assert!(rel_close(back[c], px[c], tol) || (px[c] * e < 5e-6 && back[c] <= px[c]), "{px:?} at e {e} (recover {recover}): {back:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_change_of_the_answer_on_the_shoulder_is_scaled_by_the_pixels_ratio_not_the_curves_inverse() {
+        // An exposed 3.0 sits on the shoulder (ACES 0.954, encoded 0.980), below the recovery's full strength.
+        let (e, px) = (1.0f32, [3.0f32, 3.0, 3.0]);
+        let enc = aces::encode(px[0], e);
+        let answer = [enc + 1.0 / 255.0; 3];
+        let out = aces::decode(px, answer, e, false);
+        // The result moves by the answer's own linear change, relatively: about 1%.
+        let step = aces::srgb_eotf(answer[0]) / aces::srgb_eotf(enc);
+        assert!(rel_close(out[0] / px[0], step, 1e-4), "{out:?}, the answer's step {step}");
+        assert!(out[0] < px[0] * 1.015, "{out:?}");
+        // The curve's inverse would have taken the same step more than ten times as far.
+        let (mut lo, mut hi) = (0.0f32, 7.3f32);
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if aces::curve(mid) < aces::srgb_eotf(answer[0]) { lo = mid } else { hi = mid }
+        }
+        assert!(lo > px[0] * 1.1, "the inverse lands at {lo}");
+    }
+
+    #[test]
+    fn the_aces_decode_keeps_hue_where_the_answer_keeps_it() {
+        // An answer that scales the linear values of every channel by one factor scales the result alike:
+        // its channel ratios are the original's.
+        for px in ACES_PIXELS.into_iter().filter(|p| p.iter().all(|v| *v > 0.01)) {
+            let e = 0.6;
+            let answer = px.map(|v| aces::srgb_oetf(aces::curve(v * e) * 0.9));
+            let out = aces::decode(px, answer, e, false);
+            for c in 0..3 {
+                assert!(rel_close(out[c] / out[1], px[c] / px[1], 1e-3), "{px:?} -> {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_highlight_recovery_needs_both_gates_and_keeps_the_whole_original_at_full_strength() {
+        // Very bright and on the shoulder: the whole original, whatever the answer, its hue included.
+        let sun = [1000.0f32, 800.0, 30000.0];
+        assert_eq!(aces::recovery(sun.map(|v| v * 0.6)), 1.0);
+        assert_eq!(aces::decode(sun, [0.2, 0.9, 0.0], 0.6, true), sun);
+        // A dim pixel is under both.
+        assert_eq!(aces::recovery([0.5, 0.4, 0.3]), 0.0);
+        // On the shoulder (encoded above 0.75) but under an exposed 1.0: the first gate keeps it at 0.
+        let x = [0.95f32, 0.2, 0.1];
+        assert!(aces::srgb_oetf(aces::curve(0.95)) > 0.75);
+        assert_eq!(aces::recovery(x), 0.0);
+        // In between, a blend: the result lies between the model's and the original.
+        let px = [3.0f32, 2.0, 1.0];
+        let m = aces::recovery(px);
+        assert!(m > 0.0 && m < 1.0, "{m}");
+        let answer = px.map(|v| aces::encode(v, 1.0) * 0.9);
+        let (free, kept) = (aces::decode(px, answer, 1.0, false), aces::decode(px, answer, 1.0, true));
+        for c in 0..3 {
+            assert!(rel_close(kept[c], free[c] + (px[c] - free[c]) * m, 1e-5), "{kept:?} {free:?} {m}");
+        }
+    }
+
+    #[test]
+    fn the_aces_decode_gives_the_original_back_for_values_it_cannot_use() {
+        let px = [0.4f32, 0.5, 0.6];
+        let back = |v: [f32; 3]| v.map(f32::to_bits);
+        assert_eq!(back(aces::decode(px, [f32::NAN, 0.5, 0.5], 1.0, true)), back(px), "a NaN answer");
+        assert_eq!(back(aces::decode(px, [0.5, f32::INFINITY, 0.5], 1.0, true)), back(px), "an infinite answer");
+        let odd = [f32::NAN, 0.5, f32::INFINITY];
+        assert_eq!(back(aces::decode(odd, [0.5; 3], 1.0, true)), back(odd), "a pixel the game left NaN and infinite");
+        // The encode reads NaN, an infinity and a negative as 0 (Remix's sanitizeRadiance).
+        assert_eq!(aces::encode(f32::NAN, 1.0), 0.0);
+        assert_eq!(aces::encode(-2.0, 1.0), 0.0);
+        assert_eq!(aces::encode(f32::INFINITY, 1.0), 0.0);
+        assert_eq!(aces::encode(5.0, 0.0), 0.0, "no exposure: 0");
+        // A negative channel comes back as 0, as Remix's sanitised original.
+        assert_eq!(aces::decode([-1.0, 0.5, 0.5], [0.0, 0.7, 0.7], 1.0, false)[0], 0.0);
     }
 }

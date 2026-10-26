@@ -53,11 +53,14 @@ const fn knobs(intensity: f32, local_tone: f32, local_structure: f32, skin_struc
 }
 
 /// Reference is the defaults (`ShmHeader::init_defaults`): a skin structure of -1 follows local structure.
-pub const PRESETS: [Preset; 4] = [
+/// Remix is RTX Remix's defaults for NVIDIA's neural rendering (`rtx_dlss_neural_rendering.h`: intensity 1,
+/// structure 0.7, tone 0.3, character structure 0.5 with its auto mask on).
+pub const PRESETS: [Preset; 5] = [
     Preset { name: "Light", knobs: knobs(0.45, 0.55, 0.25, 0.15) },
     Preset { name: "Moderate", knobs: knobs(0.70, 0.80, 0.55, 0.40) },
     Preset { name: "Reference", knobs: knobs(1.00, 1.00, 1.00, -1.00) },
     Preset { name: "Overdrive", knobs: knobs(1.30, 1.25, 1.45, 1.20) },
+    Preset { name: "Remix", knobs: knobs(1.00, 0.30, 0.70, 0.50) },
 ];
 
 /// The preset `values` are, if any (to within the spin rows' 0.01 resolution).
@@ -91,6 +94,13 @@ mod tests {
         header.init_defaults();
         assert_eq!(Knobs::from_header(&header), PRESETS[2].knobs);
         assert_eq!(matching(&Knobs::from_header(&header)), Some(2));
+    }
+
+    #[test]
+    fn remix_is_rtx_remixs_defaults() {
+        let remix = PRESETS.iter().find(|p| p.name == "Remix").expect("a Remix preset");
+        assert_eq!(remix.knobs, knobs(1.0, 0.3, 0.7, 0.5));
+        assert_eq!(PRESETS.iter().position(|p| p.name == "Reference"), Some(2), "the default preset stays Reference");
     }
 
     #[test]
