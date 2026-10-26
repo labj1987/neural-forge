@@ -491,8 +491,8 @@ impl State {
         // The hold before went through on this chain, and this one can read the refresh's edit.
         let continues = chained && had && consecutive && h.jitter.is_some() && h.mvec && h.depth == self.refresh_depth && h.history_ok && !h.armed;
         let cached = continues && self.since_refresh + 1 < self.regime.interval(h.interval);
-        let mut flags = if super::hdr::highlight_flags() != 0 { F_KEEP_CLAMPED } else { 0 }
-            | if super::hdr::transfer_flags() & super::hdr::ACES != 0 { F_ACES } else { 0 };
+        let mut flags =
+            if super::hdr::highlight_flags() != 0 { F_KEEP_CLAMPED } else { 0 } | if super::hdr::transfer_flags() & super::hdr::ACES != 0 { F_ACES } else { 0 };
         if chained {
             flags |= F_CHAINED;
             if !chain_live {

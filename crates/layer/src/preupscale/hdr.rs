@@ -285,17 +285,29 @@ pub(crate) mod aces {
 
     pub(crate) fn srgb_oetf(c: f32) -> f32 {
         let c = c.clamp(0.0, 1.0);
-        if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+        if c <= 0.0031308 {
+            12.92 * c
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        }
     }
 
     pub(crate) fn srgb_eotf(s: f32) -> f32 {
         let s = if s.is_nan() { 0.0 } else { s.clamp(0.0, 1.0) };
-        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
     }
 
     /// Remix's `sanitizeRadiance`: NaN and infinities 0, else within [0, 65504].
     pub(crate) fn sanitized(v: f32) -> f32 {
-        if v.is_finite() { v.clamp(0.0, HALF_MAX) } else { 0.0 }
+        if v.is_finite() {
+            v.clamp(0.0, HALF_MAX)
+        } else {
+            0.0
+        }
     }
 
     fn smoothstep(lo: f32, hi: f32, v: f32) -> f32 {
@@ -342,7 +354,11 @@ pub(crate) mod aces {
                 out[c] += (hdr[c] - out[c]) * m;
             }
         }
-        if out.iter().all(|v| v.is_finite()) { out.map(|v| v.clamp(0.0, HALF_MAX)) } else { original }
+        if out.iter().all(|v| v.is_finite()) {
+            out.map(|v| v.clamp(0.0, HALF_MAX))
+        } else {
+            original
+        }
     }
 }
 
@@ -1450,7 +1466,11 @@ mod tests {
         let (mut lo, mut hi) = (0.0f32, 7.3f32);
         for _ in 0..60 {
             let mid = 0.5 * (lo + hi);
-            if aces::curve(mid) < aces::srgb_eotf(answer[0]) { lo = mid } else { hi = mid }
+            if aces::curve(mid) < aces::srgb_eotf(answer[0]) {
+                lo = mid
+            } else {
+                hi = mid
+            }
         }
         assert!(lo > px[0] * 1.1, "the inverse lands at {lo}");
     }
