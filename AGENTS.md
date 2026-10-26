@@ -201,3 +201,10 @@ composition changes.
 - **Tested on lavapipe, and the test fails without the change.** Every composition behaviour has
   a GPU test (`composition::gpu::tests::compose_once` makes one short); run it once with the
   change reverted to see it fail.
+
+## Shared memory
+
+The owner's Claude sessions (local, cloud and chat) share notes in the Google Drive folder "Claude Memory", one doc per topic; this repo's doc is "app: neural-forge". If you have the Google Drive connector:
+
+- Before starting work, read that doc and the "prefs:" docs for decisions, things already tried or ruled out, and the release state.
+- After meaningful work (a release, a decision, a failed attempt worth not repeating, an open issue), update the doc. The connector can't edit a doc's text: create a replacement doc with the same title in that folder, then trash the old one. The folder's "README - how this folder works" doc has the conventions.
