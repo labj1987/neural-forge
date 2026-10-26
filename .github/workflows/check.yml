@@ -37,8 +37,8 @@ jobs:
       # incremental state would only be written, never reused.
       CARGO_INCREMENTAL: "0"
     steps:
-      # Actions are pinned to full commit SHAs (a tag can be moved); Dependabot proposes the
-      # updates (.github/dependabot.yml). The trailing comment is the release the SHA is.
+      # Actions are pinned to full commit SHAs (a tag can be moved); the weekly maintenance
+      # round updates them (see .github/dependabot.yml). The trailing comment is the release the SHA is.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
