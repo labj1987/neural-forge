@@ -23,10 +23,10 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bindgen = "0.69.4"
+bindgen = "0.73.2"
 clap = { version = "4.5.8", features = ["derive"] }
 env_logger = "0.11.3"
-imara-diff = "0.1.6"
+imara-diff = "0.2.0"
 log = "0.4.22"
 tempfile = "3.10.1"
 

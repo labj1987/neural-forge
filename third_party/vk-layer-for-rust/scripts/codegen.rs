@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): the pinned toolchain's rustfmt, a fixed copyright year (UPSTREAM.md).
+// Modified for Neural Forge (2026): the pinned toolchain's rustfmt, a fixed copyright year, imara-diff 0.2
+// (UPSTREAM.md).
 
-use imara_diff::{intern::InternedInput, Sink as _, UnifiedDiffBuilder};
+use imara_diff::{Algorithm, BasicLineDiffPrinter, Diff, InternedInput, UnifiedDiffConfig};
 use log::{debug, info};
 use std::{
     env,
@@ -448,18 +449,19 @@ fn main() -> ExitCode {
                             "".to_owned()
                         };
                         let input = InternedInput::new(before.as_str(), after.as_str());
-                        let diff_builder = UnifiedDiffBuilder::new(&input).with_counter();
-                        let diff_result = imara_diff::diff(
-                            imara_diff::Algorithm::Histogram,
-                            &input,
-                            diff_builder,
-                        );
-                        let diff_message = if diff_result.total() == 0 {
+                        let mut diff = Diff::compute(Algorithm::Histogram, &input);
+                        diff.postprocess_lines(&input);
+                        let diff_message = if diff.count_additions() + diff.count_removals() == 0 {
                             None
                         } else {
                             let mut message = completed_file.to_string_lossy().into_owned();
                             message.push('\n');
-                            message.push_str(&diff_result.wrapped);
+                            let printer = BasicLineDiffPrinter(&input.interner);
+                            message.push_str(
+                                &diff
+                                    .unified_diff(&printer, UnifiedDiffConfig::default(), &input)
+                                    .to_string(),
+                            );
                             Some(message)
                         };
                         diff_message_tx.send(diff_message).unwrap_or_else(|e| {

@@ -74,3 +74,8 @@ this project's own code: upstream is no longer tracked.
    loader structures hold raw pointers), the builders' `::builder()`/`.build()` are `::default()` and gone, the
    core function tables are `ash::DeviceFnV1_0` and the others, and the tests' mocks name every lifetime the
    trait elides.
+2. **Newer dependencies** (2026-10-26). `Cargo.lock` follows the weekly dependency round like the root one.
+   thiserror 2, mockall 0.15, parking_lot 0.13, syn 3, bindgen 0.73 (with prettyplease 0.3) and imara-diff 0.2
+   needed no change to the hand-written code except the generator's diff printer (imara-diff 0.2's
+   `Diff::compute` and `unified_diff`). bindgen 0.73 writes the bindings' layout checks as compile-time
+   assertions in place of `#[test]` functions; regenerated, nothing else in the generated files changed.
