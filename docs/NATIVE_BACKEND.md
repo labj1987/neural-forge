@@ -1382,8 +1382,13 @@ tracker); the untouched ones get a 16-byte buffer; the used ones are placed in o
 offset clear of every placed one whose interval overlaps theirs. A barrier orders every launch before it against
 every one after it, chained or not, so two activations share bytes only across one. Every size built together shares
 the same block, as they share the split-K scratch: they never run at the same time. The features and the head stay
-their own (the layer writes and reads them outside the graph). The block starts zeroed, as the activations did.
-`NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` keeps one allocation per activation.
+their own (the layer writes and reads them outside the graph), and so do a graph's captures (the copies of its
+outputs a test asks for, `nf_native_set_captures`), read after the run. A recording uses buffers only through
+`vk::Context`, transfers included (`cmdCopyBuffer`, `cmdFillZero`), so the tracker sees every use: a capture's copy
+keeps its source alive until it has read it, and a use the tracker did not see would leave its buffer taken for
+unused (16 bytes) or for dead too early (2026-10-27; the rig's `captures_with_shared_activations_match_own_allocations`
+compares the captures and the head with and without sharing, byte for byte). The block starts zeroed, as the
+activations did. `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` keeps one allocation per activation.
 
 **Measured** (rig, `shared_activations_take_less_memory`, device-local use of the build):
 

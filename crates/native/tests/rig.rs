@@ -7,8 +7,8 @@
 //! 1486x836 frame); `NEURAL_FORGE_NATIVE_MODEL` overrides the model directory (default: the full
 //! network's directory in the user data dir, `neural-forge/model/full`). The same variable runs the rebuild test (a small build, then a large one
 //! on the same network), the fallback to barriers, the chain watchdog's count across builds, sizes that
-//! cannot be built, the graph recorded into the application's buffer (`record_graph_at`) and the
-//! device-creation tests. Each network drains the device before it closes ([`Drained`]). With
+//! cannot be built, the graph recorded into the application's buffer (`record_graph_at`), the
+//! graph's captures with shared activations and the device-creation tests. Each network drains the device before it closes ([`Drained`]). With
 //! `NEURAL_FORGE_NATIVE_HEADS=<dir>` too, the heads at every size the layer builds are compared with a
 //! saved run there (or saved, the first time): run once on a known-good build, then on the change.
 //!
@@ -924,6 +924,61 @@ impl Drop for SharedActivations {
     fn drop(&mut self) {
         // SAFETY: as in `set`.
         unsafe { std::env::remove_var("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS") };
+    }
+}
+
+/// The graph's captures (the copies of every block's and transition's output, and of the tensors inside each block)
+/// with the activations sharing memory by lifetime are, byte for byte, what they are with each activation in its own
+/// allocation, and so is the head. Each capture is copied into a buffer of its full size (checked before anything
+/// runs), and a copy's source lives until the copy has read it: the copies are uses the lifetimes see.
+#[test]
+fn captures_with_shared_activations_match_own_allocations() {
+    if std::env::var_os("NEURAL_FORGE_NATIVE_RIG").is_none() {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
+        return;
+    }
+    let _one = one_at_a_time();
+    let g = gpu();
+    let mut net = open_network(&g, &model_dir(), chain_wanted());
+    let d = &g.device;
+    // SAFETY: live device and handles; every submit completes (run_head waits) before the captures are read and
+    // before the next build drops what it used.
+    unsafe {
+        let queue = d.get_device_queue(g.family, 0);
+        let reset = vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER;
+        let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(g.family).flags(reset), None).unwrap();
+        let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+        for intermediates in [false, true] {
+            net.set_captures(true, intermediates);
+            let mut runs = Vec::new();
+            for shared in [false, true] {
+                let _shared = SharedActivations::set(shared);
+                let frame = net.build(640, 360).expect("build");
+                let captures = net.captures(0);
+                assert!(captures.iter().any(|c| c.name == "block-0") && captures.len() > 30, "a capture of every block at least: {}", captures.len());
+                for c in &captures {
+                    assert!(c.buffer_bytes >= c.bytes, "shared {shared}: {} is copied into a buffer of {} bytes, not its {}", c.name, c.buffer_bytes, c.bytes);
+                }
+                let graph = net.graph_commands();
+                let head = run_head(&g, queue, cmd, &frame, &pattern(frame.features_bytes), |cmd| d.cmd_execute_commands(cmd, &[graph]));
+                assert_eq!(net.chain_timeouts().0, 0, "no counter wait gave up");
+                let copies: Vec<(String, Vec<u8>)> = captures.iter().map(|c| (c.name.clone(), net.capture(0, &c.name).expect("read back"))).collect();
+                runs.push((head, copies));
+            }
+            let ((own_head, own), (shared_head, shared)) = (&runs[0], &runs[1]);
+            let what = if intermediates { "with the tensors inside the blocks" } else { "the blocks' outputs" };
+            eprintln!("{what}: {} captures, {} head values", own.len(), own_head.len() / 4);
+            assert_eq!(differing(shared_head, own_head), 0, "{what}: the head differs with shared activations");
+            assert_eq!(own.iter().map(|c| &c.0).collect::<Vec<_>>(), shared.iter().map(|c| &c.0).collect::<Vec<_>>());
+            for ((name, a), (_, b)) in own.iter().zip(shared) {
+                assert_eq!(differing(b, a), 0, "{what}: capture {name} differs with shared activations");
+            }
+        }
+        net.set_captures(false, false);
+        drop(net);
+        d.destroy_command_pool(pool, None);
+        d.destroy_device(None);
+        g.instance.destroy_instance(None);
     }
 }
 

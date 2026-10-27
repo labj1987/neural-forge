@@ -75,6 +75,9 @@ mod ffi {
         pub fn nf_native_fall_back_to_barriers(n: *mut c_void);
         pub fn nf_native_forget_fall_back();
         pub fn nf_native_fake_chain_timeout(n: *mut c_void, in_warm_up: u32);
+        pub fn nf_native_set_captures(n: *mut c_void, boundaries: u32, intermediates: u32);
+        pub fn nf_native_captures(n: *const c_void, slot: u32, out: *mut c_char, len: usize) -> u32;
+        pub fn nf_native_capture(n: *mut c_void, slot: u32, name: *const c_char, out: *mut c_void, out_len: usize, err: *mut c_char, len: usize) -> u32;
         pub fn nf_native_stalled(n: *const c_void) -> u32;
         pub fn nf_native_weight_bytes(n: *const c_void, raw_loaded: *mut u64, raw: *mut u64, matrices: *mut u64);
         pub fn nf_native_close(n: *mut c_void);
@@ -212,6 +215,17 @@ pub struct WeightBytes {
     pub raw_loaded: u64,
     pub raw: u64,
     pub matrices: u64,
+}
+
+/// One of a graph's captures ([`Network::captures`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Capture {
+    /// The block, transition or tensor inside a block it copies (`block-3`, `block-3/qkv`, ...).
+    pub name: String,
+    /// What a run copies into it.
+    pub bytes: u64,
+    /// The size of the buffer it is copied into.
+    pub buffer_bytes: u64,
 }
 
 /// Where the network runs.
@@ -476,6 +490,48 @@ impl Network {
     pub fn fake_chain_timeout(&mut self, in_warm_up: bool) {
         // SAFETY: `raw` is live; only host-side counters change.
         unsafe { ffi::nf_native_fake_chain_timeout(self.raw, u32::from(in_warm_up)) }
+    }
+
+    /// For tests of the graph's captures: the graphs of the next builds copy every block's and transition's
+    /// output as they run (`boundaries`), and with `intermediates` (and `boundaries`) the tensors inside each
+    /// block too, which runs the blocks unfused. Takes effect at the next [`Self::build`].
+    #[doc(hidden)]
+    pub fn set_captures(&mut self, boundaries: bool, intermediates: bool) {
+        // SAFETY: `raw` is live; only the options of later builds change.
+        unsafe { ffi::nf_native_set_captures(self.raw, u32::from(boundaries), u32::from(intermediates)) }
+    }
+
+    /// Slot `slot`'s captures ([`Self::set_captures`]), by name.
+    #[doc(hidden)]
+    pub fn captures(&self, slot: u32) -> Vec<Capture> {
+        let mut out = vec![0 as c_char; 1 << 20];
+        // SAFETY: `raw` is live; `out` holds its length.
+        unsafe { ffi::nf_native_captures(self.raw, slot, out.as_mut_ptr(), out.len()) };
+        message(&out)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split('\t');
+                Some(Capture { name: f.next()?.to_string(), bytes: f.next()?.parse().ok()?, buffer_bytes: f.next()?.parse().ok()? })
+            })
+            .collect()
+    }
+
+    /// Capture `name` of slot `slot`, as the last run of the slot's graph left it.
+    ///
+    /// # Safety
+    /// That run has completed, and nothing recorded with this build is pending (the read waits on the
+    /// network's own queue).
+    #[doc(hidden)]
+    pub unsafe fn capture(&mut self, slot: u32, name: &str) -> Result<Vec<u8>, String> {
+        let bytes = self.captures(slot).into_iter().find(|c| c.name == name).ok_or_else(|| format!("no capture named {name}"))?.bytes;
+        let mut out = vec![0u8; bytes as usize];
+        let name = CString::new(name).map_err(|e| e.to_string())?;
+        let mut err = [0 as c_char; MESSAGE];
+        // SAFETY: `raw` is live; `out` holds `bytes`; nothing that writes the capture is pending (contract).
+        match unsafe { ffi::nf_native_capture(self.raw, slot, name.as_ptr(), out.as_mut_ptr().cast(), out.len(), err.as_mut_ptr(), MESSAGE) } {
+            1 => Ok(out),
+            _ => Err(message(&err)),
+        }
     }
 
     /// Switches to barriers between launches (for the rest of the process) and drops the graph recorded

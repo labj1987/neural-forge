@@ -191,6 +191,9 @@ Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t ch
   return activations_.back().get();
 }
 
+// The lifetimes are only as complete as the reports: every use the recording makes of a buffer, transfers (the
+// captures' copies, fills) included, must reach the use tracker (vk::Context::cmdCopyBuffer, cmdFillZero,
+// allocateSet, deviceAddress), or shareActivations takes that buffer for unused or for dead too early.
 void Graph::trackLifetimes(bool on) {
   if (!on) {
     context_.setUseTracker(nullptr);
@@ -246,7 +249,10 @@ void Graph::capture(VkCommandBuffer commands, const std::string& name, const Act
   Activation* copy = allocate("boundary " + name, source.rows, source.channels, source.format);
   VkBufferCopy region{0, 0, source.validBytes()};
   context_.transferBarrier(commands);
-  vkCmdCopyBuffer(commands, source.buffer.buffer, copy->buffer.buffer, 1, &region);
+  // Through the context, so the lifetimes see the copy: the source is still read here, after its last kernel, and
+  // the capture is written here. It is read only after the run, outside the graph, like the head: memory shared by
+  // lifetime keeps both out (boundaries()).
+  context_.cmdCopyBuffer(commands, source.buffer, copy->buffer, region);
   context_.transferBarrier(commands);
   boundaries_[name] = copy;
 }

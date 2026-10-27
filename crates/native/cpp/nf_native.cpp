@@ -324,6 +324,8 @@ struct NfNative {
   float blendScale = 1.0f;
   uint64_t rawLoaded = 0;
   uint64_t fenceTimeoutNs = 5'000'000'000ull;
+  // The graphs' options for the next builds: captures only for tests (nf_native_set_captures).
+  nr::Graph::Options graphOptions{};
 
   bool stalled() const { return context && context->stalled(); }
 
@@ -409,7 +411,7 @@ struct NfNative {
     for (uint32_t i : order) {
       NfSlot& slot = slots[i];
       slot.geometry = nr::Geometry::fromValid(sizes[2 * i], sizes[2 * i + 1]);
-      slot.graph = std::make_unique<nr::Graph>(*context, *model, *kernels, slot.geometry, nr::Graph::Options{});
+      slot.graph = std::make_unique<nr::Graph>(*context, *model, *kernels, slot.geometry, graphOptions);
       slot.features = slot.graph->allocate("input features", slot.geometry.fullWidth * slot.geometry.fullHeight, 16, nr::Format::F32);
       context->fillZero(slot.features->buffer);
       // The first recording uploads the weights' re-laid matrices (each its own bounded submit) and
@@ -453,7 +455,9 @@ struct NfNative {
   // placed first fit, largest first, so that two overlap only when their barrier intervals do not (a barrier orders
   // every launch before it against every one after, chained or not). The slots share the block as they share the
   // split-K scratch: they never run at the same time. The features and the head stay their own: the layer
-  // writes and reads them outside the graph. The block starts zeroed, as the activations did.
+  // writes and reads them outside the graph. So do a graph's captures (nf_native_set_captures), read after a run
+  // (nf_native_capture); their copies' sources are placed like any activation, alive until the copy (a use the
+  // warm-up reported). The block starts zeroed, as the activations did.
   void shareActivations() {
     if (const char* off = getenv("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS"); off && std::string(off) == "0") return;
     struct Placement {
@@ -468,13 +472,19 @@ struct NfNative {
     for (NfSlot& slot : slots) {
       std::vector<nr::Activation*> unused;
       std::vector<nr::Graph::Lifetime> used = slot.graph->lifetimes(unused);
+      const auto& captures = slot.graph->boundaries();
+      auto own = [&](const nr::Activation* a) {
+        return a == slot.features || a == &slot.graph->head() ||
+               std::any_of(captures.begin(), captures.end(), [a](const auto& c) { return c.second == a; });
+      };
       for (nr::Activation* a : unused) {
+        if (own(a)) continue;
         before += a->buffer.size;
         slot.graph->rebind(*a, context->createBuffer(16, false, a->label.c_str()));
       }
       std::vector<Placement> mine;
       for (const nr::Graph::Lifetime& l : used) {
-        if (l.activation == slot.features || l.activation == &slot.graph->head()) continue;
+        if (own(l.activation)) continue;
         const VkMemoryRequirements r = context->bufferRequirements(l.activation->buffer.size);
         alignment = std::max(alignment, r.alignment);
         types &= r.memoryTypeBits;
@@ -900,6 +910,58 @@ void nf_native_fall_back_to_barriers(NfNative* n) {
 }
 
 void nf_native_forget_fall_back(void) { g_fellBack.store(false); }
+
+void nf_native_set_captures(NfNative* n, uint32_t boundaries, uint32_t intermediates) {
+  n->graphOptions.captureBoundaries = boundaries != 0;
+  n->graphOptions.captureIntermediates = intermediates != 0;
+}
+
+uint32_t nf_native_captures(const NfNative* n, uint32_t slot, char* out, size_t out_len) {
+  if (out_len) out[0] = 0;
+  if (slot >= n->slots.size() || !n->slots[slot].graph) return 0;
+  try {
+    const auto& captures = n->slots[slot].graph->boundaries();
+    std::string text;
+    for (const auto& [name, activation] : captures)
+      text += name + "\t" + std::to_string(activation->validBytes()) + "\t" + std::to_string(activation->buffer.size) + "\n";
+    say(out, out_len, text);
+    return static_cast<uint32_t>(captures.size());
+  } catch (...) {
+    return 0;
+  }
+}
+
+uint32_t nf_native_capture(NfNative* n, uint32_t slot, const char* name, void* out, size_t out_len, char* err,
+                           size_t err_len) {
+  if (n->stalled()) {
+    say(err, err_len, "the network's queue stalled earlier; it takes no more work");
+    return 0;
+  }
+  if (slot >= n->slots.size() || !n->slots[slot].graph) {
+    say(err, err_len, "no such slot");
+    return 0;
+  }
+  try {
+    const auto& captures = n->slots[slot].graph->boundaries();
+    const auto found = captures.find(name);
+    if (found == captures.end()) {
+      say(err, err_len, std::string("no capture named ") + name);
+      return 0;
+    }
+    const nr::Activation& capture = *found->second;
+    if (out_len != capture.validBytes()) {
+      say(err, err_len, "capture " + found->first + " holds " + std::to_string(capture.validBytes()) + " bytes, not " +
+                            std::to_string(out_len));
+      return 0;
+    }
+    const std::vector<uint8_t> bytes = n->context->download(capture.buffer, out_len);
+    std::memcpy(out, bytes.data(), out_len);
+    return 1;
+  } catch (const std::exception& e) {
+    say(err, err_len, e.what());
+    return 0;
+  }
+}
 
 void nf_native_fake_chain_timeout(NfNative* n, uint32_t in_warm_up) {
   if (in_warm_up)
