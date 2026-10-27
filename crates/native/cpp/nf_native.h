@@ -159,6 +159,21 @@ void nf_native_fall_back_to_barriers(NfNative* n);
 // test of the fall back that shares its process with other tests.
 void nf_native_forget_fall_back(void);
 
+// For tests of the graph's captures (OpenDLSS-NR's parity copies): the graphs of the next builds copy every block's
+// and transition's output as they run (`boundaries`), and with `intermediates` (and `boundaries`) the tensors inside
+// each block too, which runs the blocks unfused. Both 0 (no captures) until set. Takes effect at the next build.
+void nf_native_set_captures(NfNative* n, uint32_t boundaries, uint32_t intermediates);
+
+// Slot `slot`'s captures, one "name\tbytes\tbuffer_bytes\n" line each (`bytes` what a run copies into it,
+// `buffer_bytes` the size of the buffer it is copied into), written into `out` (truncated to `out_len`,
+// NUL-terminated). Returns how many there are (0 past the last slot).
+uint32_t nf_native_captures(const NfNative* n, uint32_t slot, char* out, size_t out_len);
+
+// Reads capture `name` of slot `slot` back into `out`: exactly its `bytes` (`out_len`), as the last run of the slot's
+// graph left them. Only once that run has completed. Waits for the network's queue (a download on it).
+uint32_t nf_native_capture(NfNative* n, uint32_t slot, const char* name, void* out, size_t out_len, char* err,
+                           size_t err_len);
+
 // For tests of the watchdog: as if a counter wait gave up, in the graph's last frame (`in_warm_up` 0: the
 // count nf_native_chain_timeouts reads) or in the next build's first warm-up (1). Cleared as a real one is.
 void nf_native_fake_chain_timeout(NfNative* n, uint32_t in_warm_up);

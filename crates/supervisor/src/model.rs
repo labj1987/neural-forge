@@ -640,7 +640,7 @@ fn extract_shaped(source: &Path, root: &Path, network: Network, expected: &[(&st
     let tensors = shaped(&resources, version, network, expected)?;
     let dir = network_dir(root, network);
     let files = build_model(&tensors, network, version, &dll.sha256())?;
-    replace_tree(&dir, &files)?;
+    replace_tree(root, &dir, &files)?;
     Ok(extracted(dir, network, version, &tensors))
 }
 
@@ -677,7 +677,7 @@ fn extract_all_with<'t>(source: &Path, root: &Path, expected: &dyn Fn(Network) -
     if networks.is_empty() {
         return Err(first_error.unwrap_or_else(|| w_err("the DLL carries no network")));
     }
-    replace_tree(root, &files)?;
+    replace_tree(root, root, &files)?;
     Ok(ExtractedAll { networks, refused })
 }
 
@@ -720,25 +720,48 @@ fn extracted(dir: PathBuf, network: Network, version: [u16; 4], tensors: &[Tenso
     }
 }
 
+/// `path`'s parent directory (`.` for a bare name) and its own name.
+fn parent_and_name(path: &Path) -> Result<(&Path, String), ModelError> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| ModelError::Io(path.to_path_buf(), std::io::Error::new(std::io::ErrorKind::InvalidInput, "no directory name")))?
+        .to_string_lossy()
+        .into_owned();
+    Ok((parent, name))
+}
+
+/// Takes the model directory `root` for one writer at a time: an exclusive `flock` on `.<name>.lock`
+/// beside it (created if missing, never removed: removing it would let a writer lock a file another
+/// one has already replaced), held until the returned file is dropped. The lock belongs to the file
+/// opened here, so it serialises the CLI against the GUI, any two processes, and two calls in one
+/// process alike (each opens its own). Waits for a writer holding it.
+fn lock_model_dir(root: &Path) -> Result<std::fs::File, ModelError> {
+    let (parent, name) = parent_and_name(root)?;
+    std::fs::create_dir_all(parent).map_err(|e| ModelError::Io(parent.to_path_buf(), e))?;
+    let path = parent.join(format!(".{name}.lock"));
+    let file = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&path).map_err(|e| ModelError::Io(path.clone(), e))?;
+    file.lock().map_err(|e| ModelError::Io(path, e))?;
+    Ok(file)
+}
+
 /// Makes `out` hold exactly `files` (relative path, content): the whole tree is built in a sibling
 /// temporary directory and synced, then swapped in by rename, so a reader sees the old directory or
 /// the new one and never a mix. The temporary directory is removed on any error, leaving `out` as
-/// it was. One call at a time in a process: the temporary directories are named by the process, and
-/// the GUI can start a second extraction while one is still writing. What a process that died left
-/// behind is cleaned up first ([`recover_leftovers`]).
-fn replace_tree(out: &Path, files: &[(String, Vec<u8>)]) -> Result<(), ModelError> {
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+/// it was. `out` is the model directory `root` or a network's directory in it, and the whole of
+/// `root` is held for this call ([`lock_model_dir`]): another process or thread extracting at the
+/// same time (the CLI and the GUI, or the GUI twice) waits for this one, then makes its own
+/// replacement after it, so neither result is lost and no two runs swap directories under each
+/// other. What a process that died left behind is cleaned up first, under the same lock
+/// ([`recover_leftovers`]).
+fn replace_tree(root: &Path, out: &Path, files: &[(String, Vec<u8>)]) -> Result<(), ModelError> {
+    debug_assert!(out.starts_with(root), "{} is not in the model directory {}", out.display(), root.display());
+    let _held = lock_model_dir(root)?;
     let io = |path: &Path| {
         let path = path.to_path_buf();
         move |e| ModelError::Io(path, e)
     };
-    let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let name = out
-        .file_name()
-        .ok_or_else(|| ModelError::Io(out.to_path_buf(), std::io::Error::new(std::io::ErrorKind::InvalidInput, "no directory name")))?
-        .to_string_lossy()
-        .into_owned();
+    let (parent, name) = parent_and_name(out)?;
     std::fs::create_dir_all(parent).map_err(io(parent))?;
     let staging = parent.join(format!(".{name}.partial-{}", std::process::id()));
     let previous = parent.join(format!(".{name}.previous-{}", std::process::id()));
@@ -794,7 +817,8 @@ fn replace_tree(out: &Path, files: &[(String, Vec<u8>)]) -> Result<(), ModelErro
     Ok(())
 }
 
-/// Cleans up after [`replace_tree`] runs of processes that are gone (killed, crashed): their
+/// Cleans up after [`replace_tree`] runs of processes that are gone (killed, crashed), under its
+/// lock on the model directory ([`lock_model_dir`]), so no other run is moving directories meanwhile: their
 /// `.<name>.partial-<pid>` staging directories are removed, and when `out` is missing because the
 /// run died between moving it aside and moving the new tree in, its `.<name>.previous-<pid>` is
 /// put back (the newest, if several), so the layer finds the model again; the rest are removed.
@@ -874,18 +898,19 @@ mod tests {
 
         // "a" as a file and as a directory: the build fails partway, after "a" is written.
         let bad = vec![("a".to_string(), b"x".to_vec()), ("a/b".to_string(), b"y".to_vec())];
-        assert!(replace_tree(&out, &bad).is_err());
+        assert!(replace_tree(&out, &out, &bad).is_err());
         assert_eq!(std::fs::read_to_string(out.join("manifest.json")).unwrap(), "old", "a failed build leaves the live tree alone");
         let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         names.sort();
-        assert_eq!(names, ["model"], "the temporary directory is removed on error");
+        assert_eq!(names, [".model.lock", "model"], "the temporary directory is removed on error");
 
         let good = vec![("manifest.json".to_string(), b"new".to_vec()), ("model/vit.e4m3".to_string(), b"w".to_vec())];
-        replace_tree(&out, &good).unwrap();
+        replace_tree(&out, &out, &good).unwrap();
         assert_eq!(std::fs::read_to_string(out.join("manifest.json")).unwrap(), "new");
         assert!(!out.join("model/stale.e4m3").exists(), "the new tree replaces the old one as a whole");
-        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(names, ["model"]);
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, [".model.lock", "model"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1055,9 +1080,48 @@ mod tests {
         assert_eq!(left, [live.file_name().unwrap().to_string_lossy().into_owned(), "model".to_string()]);
         // With `model` in place, a dead run's previous copy is only removed.
         std::fs::create_dir_all(&previous).unwrap();
-        replace_tree(&out, &[("full/weights.bin".to_string(), b"new".to_vec())]).unwrap();
+        replace_tree(&out, &out, &[("full/weights.bin".to_string(), b"new".to_vec())]).unwrap();
         assert_eq!(std::fs::read_to_string(out.join("full/weights.bin")).unwrap(), "new");
         assert!(!previous.exists() && live.exists());
+    }
+
+    /// A writer holding the model directory (another process: its own open of the lock file) keeps
+    /// every replacement of it, or of a network in it, waiting; each then runs whole, one after the
+    /// other, so neither result is lost and no run's temporary directory is left.
+    #[test]
+    fn replacing_waits_for_another_writer_of_the_model_directory() {
+        let dir = scratch("lock");
+        let root = dir.join("model");
+        let both = |v: &str| vec![("full/weights.bin".to_string(), v.as_bytes().to_vec()), ("small/weights.bin".to_string(), v.as_bytes().to_vec())];
+        replace_tree(&root, &root, &both("old")).unwrap();
+        let held = lock_model_dir(&root).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let writes = [(root.clone(), both("all")), (root.join("full"), vec![("weights.bin".to_string(), b"one".to_vec())])];
+            for (out, files) in writes {
+                let (root, done) = (&root, done.clone());
+                s.spawn(move || {
+                    replace_tree(root, &out, &files).unwrap();
+                    done.send(()).unwrap();
+                });
+            }
+            assert!(finished.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "a replacement ran while another writer held the directory");
+            assert_eq!(std::fs::read_to_string(root.join("full/weights.bin")).unwrap(), "old");
+            drop(held);
+            for _ in 0..2 {
+                finished.recv_timeout(std::time::Duration::from_secs(10)).expect("each replacement runs once the lock is free");
+            }
+        });
+        let read = |f: &str| std::fs::read_to_string(root.join(f)).unwrap();
+        let end = (read("full/weights.bin"), read("small/weights.bin"));
+        assert!(end == ("one".into(), "all".into()) || end == ("all".into(), "all".into()), "not the two writes one after the other: {end:?}");
+        let names = |d: &Path| {
+            let mut n: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            n.sort();
+            n
+        };
+        assert_eq!(names(&dir), [".model.lock", "model"]);
+        assert_eq!(names(&root), ["full", "small"], "one lock, the model directory's, for a network's replacement too");
     }
 
     #[test]
@@ -1371,7 +1435,8 @@ mod tests {
         }
         assert!(!installed_all(&root).is_empty());
         for d in [&*dir, root.as_path()] {
-            let leftovers: Vec<_> = std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with('.')).collect();
+            let leftovers: Vec<_> =
+                std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with('.') && n != ".model.lock").collect();
             assert!(leftovers.is_empty(), "{leftovers:?}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1482,7 +1547,9 @@ mod tests {
         assert_eq!(installed(&out).as_deref(), Some("310.8.0.3"));
         assert_eq!(installed_verified(&out), Some(true));
         assert_eq!((installed(&dir.join("nowhere")), installed_verified(&dir.join("nowhere"))), (None, None));
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "only the DLL and the model directory");
+        let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, [".model.lock", "model", DLL_NAME], "only the DLL, the model directory and its lock");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "only the full network's directory");
         std::fs::remove_dir_all(&dir).unwrap();
     }

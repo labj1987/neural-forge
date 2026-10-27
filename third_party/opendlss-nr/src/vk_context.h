@@ -122,9 +122,15 @@ class Context {
   // A device-local buffer bound to `memory` at `offset` (aligned as bufferRequirements says). The memory stays the
   // caller's: destroyBuffer destroys the buffer only.
   Buffer createBufferAt(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, const char* label);
-  // While set, every buffer a recording binds (allocateSet) or takes the address of (deviceAddress) is reported with
-  // the number of barriers recorded so far: what Graph::trackLifetimes reads lifetimes from.
+  // While set, every buffer a recording binds (allocateSet), takes the address of (deviceAddress), copies from or to
+  // (cmdCopyBuffer) or fills (cmdFillZero) is reported with the number of barriers recorded so far: what
+  // Graph::trackLifetimes reads lifetimes from. A recording uses buffers only through these: a transfer command
+  // recorded straight (vkCmdCopyBuffer, vkCmdFillBuffer) would go unreported.
   void setUseTracker(std::function<void(VkBuffer, uint32_t)> tracker) { useTracker_ = std::move(tracker); }
+  // Records a copy of `region` from `source` to `target` into `commands`, reporting both to the use tracker.
+  void cmdCopyBuffer(VkCommandBuffer commands, const Buffer& source, const Buffer& target, const VkBufferCopy& region);
+  // Records zeroing the whole of `target` into `commands`, reporting it to the use tracker.
+  void cmdFillZero(VkCommandBuffer commands, const Buffer& target);
   // Upload through a staging buffer and wait for completion.
   void upload(const Buffer& target, const void* data, VkDeviceSize size, VkDeviceSize offset = 0);
   void fillZero(const Buffer& target);

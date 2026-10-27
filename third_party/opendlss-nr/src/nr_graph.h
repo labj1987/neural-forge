@@ -63,6 +63,8 @@ class Graph {
   void record(VkCommandBuffer commands, const Activation& inputFeatures);
 
   const Activation& head() const { return *head_; }  // f32 [full rows][4]
+  // The captures (Options::captureBoundaries), by name. Read after a run, outside the graph: like the head, they
+  // keep their own buffers when the activations share memory by lifetime.
   const std::map<std::string, Activation*>& boundaries() const { return boundaries_; }
   const Geometry& geometry() const { return geometry_; }
   // Whether consecutive launches are linked by device counters instead of barriers (docs/execution.md).
@@ -76,7 +78,11 @@ class Graph {
 
   // Lifetimes: between trackLifetimes(true) and (false) (the warm-up's recording), every use of an activation's buffer
   // is noted with the barrier interval it falls in. A barrier orders everything before it against everything after,
-  // so two activations whose intervals do not overlap can share memory.
+  // so two activations whose intervals do not overlap can share memory. Every use counts, the transfers included
+  // (the captures' copies): the recording reports each through the context's use tracker (vk::Context::setUseTracker),
+  // so it binds, takes addresses, copies and fills only through the context. An activation whose use goes
+  // unreported is taken for unused (and rebound to a minimal buffer) or for dead before that use (and its memory
+  // given to another).
   void trackLifetimes(bool on);
   struct Lifetime {
     Activation* activation;

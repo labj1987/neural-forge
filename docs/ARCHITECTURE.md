@@ -93,8 +93,13 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
 - **Liveness:** `server_heartbeat`, `layer_heartbeat`, `quit`.
 - **Change counters:** `control_seq` (any setting changed), `tuning_seq`: the settings' sequence
   lock. A preset, a profile, Reset or a saved setting is written as one unit
-  (`ShmHeader::write_settings`: `tuning_seq` odd while the values change, even after), so
-  `global_tuning` never reads half of one; 0 means nothing has configured the header yet.
+  (`ShmHeader::write_settings`: `tuning_seq` odd while the values change, even after), so no
+  reader sees half of one; 0 means nothing has configured the header yet. The GUI and the CLI
+  wait for a writer (`global_tuning`, `hud_settings`; one left odd for 50 ms has died, and the
+  values are read as they stand). The game's threads never wait (`pass_tunings`, `mask_settings`,
+  `placements`, `hud_settings_for_frame`): a read that finds no whole copy within about a
+  millisecond uses the last whole one its process read of that header, the settings before the
+  write (the defaults when it has none).
 - **Model settings:** `enabled`, `style`, `auto_mask`, intensity, local tone, local structure,
   skin structure, `model_interval` (v6), `passes` and `pass[10]` (v19), `network` (v20,
   `enums::network`: 0 the full network, 1 the small one), `preupscale_scale` and `pass_scale[10]` (v21:

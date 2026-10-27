@@ -1047,6 +1047,7 @@ impl ShmHeader {
         self.control_seq.store(0, Ordering::Relaxed);
         self.tuning_seq.store(0, Ordering::Relaxed);
         self.forget_dead_writer();
+        self.forget_frame_copy();
 
         self.enabled.store(1, Ordering::Relaxed);
         self.style.store(0, Ordering::Relaxed);
@@ -1144,6 +1145,7 @@ impl ShmHeader {
         self.preupscale_width.store(0, Ordering::Relaxed);
         self.preupscale_height.store(0, Ordering::Relaxed);
         self.preupscale_hold_ms_bits.store(0, Ordering::Relaxed);
+        self.preupscale_network_gpu_ms_bits.store(0, Ordering::Relaxed);
         self.preupscale_misses.store(0, Ordering::Relaxed);
         self.server_busy_us.store(0, Ordering::Relaxed);
         self.seq_eval.store(0, Ordering::Relaxed);
@@ -1161,6 +1163,10 @@ impl ShmHeader {
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 
+        // From 0 like the capture result's, so a sequence another layout left (odd, or anywhere) does
+        // not carry into the new session.
+        self.layer_reason_seq.store(0, Ordering::Relaxed);
+        self.game_name_seq.store(0, Ordering::Relaxed);
         self.set_layer_reason("");
         self.set_game_name("");
 
@@ -1541,34 +1547,38 @@ impl ShmHeader {
         self.enabled.load(Ordering::Relaxed) != 0
     }
 
-    /// The Model tab's settings, as the network uses them.
+    /// The Model tab's settings, as the network uses them, for the GUI and the CLI.
     /// Read under `tuning_seq` ([`Self::write_settings`]): a preset or profile being written is seen
-    /// whole, before or after. A writer that died mid-write (the sequence left on one odd value) is
-    /// recognised after a few thousand looks and the values are read as they stand.
+    /// whole, before or after, waiting for the writer ([`Self::read_settings`]). A writer that died
+    /// mid-write (the sequence left on one odd value for [`STUCK_FOR`]) is recognised after that wait
+    /// and the values are read as they stand. Never on the game's threads: they read with
+    /// [`Self::read_settings_for_frame`].
     pub fn global_tuning(&self) -> Tuning {
-        self.read_settings(|| self.global_tuning_now())
+        self.read_settings(Self::global_tuning_now)
     }
 
     /// The pass count ([`Self::resolved_passes`]) and each pass's settings, read as one unit under
-    /// `tuning_seq` like [`Self::global_tuning`].
+    /// `tuning_seq` for the game's threads: never waits for a writer ([`Self::read_settings_for_frame`]).
     pub fn pass_tunings(&self) -> PassTunings {
-        self.read_settings(|| {
-            let global = self.global_tuning_now();
-            let mut tunings = [global; crate::MAX_PASSES];
-            for (t, p) in tunings.iter_mut().zip(&self.pass) {
-                *t = p.apply(global);
+        self.read_settings_for_frame(Self::pass_tunings_now)
+    }
+
+    fn pass_tunings_now(&self) -> PassTunings {
+        let global = self.global_tuning_now();
+        let mut tunings = [global; crate::MAX_PASSES];
+        for (t, p) in tunings.iter_mut().zip(&self.pass) {
+            *t = p.apply(global);
+        }
+        let feedback = f32::from_bits(self.pass_feedback_bits.load(Ordering::Relaxed));
+        let feedback = if feedback.is_finite() { feedback.clamp(0.0, 1.0) } else { 1.0 };
+        let global_scale = resolved_scale(self.preupscale_scale_bits.load(Ordering::Relaxed));
+        let mut scales = [global_scale; crate::MAX_PASSES];
+        for (k, s) in scales.iter_mut().enumerate() {
+            if self.pass[k].overrides.load(Ordering::Relaxed) & crate::enums::pass_override::SCALE != 0 {
+                *s = resolved_scale(self.pass_scale_bits[k].load(Ordering::Relaxed));
             }
-            let feedback = f32::from_bits(self.pass_feedback_bits.load(Ordering::Relaxed));
-            let feedback = if feedback.is_finite() { feedback.clamp(0.0, 1.0) } else { 1.0 };
-            let global_scale = resolved_scale(self.preupscale_scale_bits.load(Ordering::Relaxed));
-            let mut scales = [global_scale; crate::MAX_PASSES];
-            for (k, s) in scales.iter_mut().enumerate() {
-                if self.pass[k].overrides.load(Ordering::Relaxed) & crate::enums::pass_override::SCALE != 0 {
-                    *s = resolved_scale(self.pass_scale_bits[k].load(Ordering::Relaxed));
-                }
-            }
-            PassTunings { count: self.resolved_passes() as usize, tunings, feedback, scales, colour: self.colour_now(), placements: self.placements_now() }
-        })
+        }
+        PassTunings { count: self.resolved_passes() as usize, tunings, feedback, scales, colour: self.colour_now(), placements: self.placements_now() }
     }
 
     /// The colour of the edit ([`ColourSettings`]), each value clamped to its range (a non-finite one is
@@ -1639,27 +1649,35 @@ impl ShmHeader {
     }
 
     /// The HUD settings at present: the detection switch and the regions in use (each clamped; one that is not
-    /// a valid rectangle is left out), read as one unit like [`Self::global_tuning`].
+    /// a valid rectangle is left out), read as one unit like [`Self::global_tuning`], waiting for a writer: for
+    /// the GUI and the CLI, which edit them. The game's threads read [`Self::hud_settings_for_frame`].
     pub fn hud_settings(&self) -> HudSettings {
-        self.read_settings(|| {
-            let n = (self.hud_region_count.load(Ordering::Relaxed) as usize).min(MAX_HUD_REGIONS);
-            let f = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed));
-            let regions = self.hud_region[..n]
-                .iter()
-                .filter_map(|w| {
-                    HudRegion {
-                        x: f(&w.x_bits),
-                        y: f(&w.y_bits),
-                        w: f(&w.w_bits),
-                        h: f(&w.h_bits),
-                        mode: w.mode.load(Ordering::Relaxed),
-                        strength: f(&w.strength_bits),
-                    }
-                    .clamped()
-                })
-                .collect();
-            HudSettings { detect: self.hud_detect.load(Ordering::Relaxed) != 0, regions }
-        })
+        self.read_settings(Self::hud_settings_now)
+    }
+
+    /// [`Self::hud_settings`] for the game's threads: never waits for a writer ([`Self::read_settings_for_frame`]).
+    pub fn hud_settings_for_frame(&self) -> HudSettings {
+        self.read_settings_for_frame(Self::hud_settings_now)
+    }
+
+    fn hud_settings_now(&self) -> HudSettings {
+        let n = (self.hud_region_count.load(Ordering::Relaxed) as usize).min(MAX_HUD_REGIONS);
+        let f = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed));
+        let regions = self.hud_region[..n]
+            .iter()
+            .filter_map(|w| {
+                HudRegion {
+                    x: f(&w.x_bits),
+                    y: f(&w.y_bits),
+                    w: f(&w.w_bits),
+                    h: f(&w.h_bits),
+                    mode: w.mode.load(Ordering::Relaxed),
+                    strength: f(&w.strength_bits),
+                }
+                .clamped()
+            })
+            .collect();
+        HudSettings { detect: self.hud_detect.load(Ordering::Relaxed) != 0, regions }
     }
 
     /// What the network sees before the upscaler: the brightness (within its bounds; 1 for anything that is
@@ -1673,9 +1691,9 @@ impl ShmHeader {
 
     /// The pass count and each pass's placement ([`crate::enums::placement`]: `placement`, or the pass's own
     /// where its `overrides` has [`crate::enums::pass_override::PLACEMENT`]; a value out of range is `auto`),
-    /// read as one unit like [`Self::pass_tunings`].
+    /// read as one unit like [`Self::pass_tunings`], for the game's threads (never waits for a writer).
     pub fn placements(&self) -> (usize, [u32; crate::MAX_PASSES]) {
-        self.read_settings(|| (self.resolved_passes() as usize, self.placements_now()))
+        self.read_settings_for_frame(|h| (h.resolved_passes() as usize, h.placements_now()))
     }
 
     fn placements_now(&self) -> [u32; crate::MAX_PASSES] {
@@ -1700,8 +1718,13 @@ impl ShmHeader {
         }
     }
 
-    /// The control mask's rules, each value clamped to its range.
+    /// The control mask's rules, each value clamped to its range, read as one unit like
+    /// [`Self::pass_tunings`], for the game's threads (never waits for a writer).
     pub fn mask_settings(&self) -> MaskSettings {
+        self.read_settings_for_frame(Self::mask_settings_now)
+    }
+
+    fn mask_settings_now(&self) -> MaskSettings {
         let f = |a: &AtomicU32, name: &str| {
             let (lo, hi) = setting_bounds(name).expect("a mask setting");
             let v = f32::from_bits(a.load(Ordering::Relaxed));
@@ -1712,7 +1735,7 @@ impl ShmHeader {
             }
         };
         let on = |a: &AtomicU32| a.load(Ordering::Relaxed) != 0;
-        self.read_settings(|| MaskSettings {
+        MaskSettings {
             sky: on(&self.mask_sky),
             sky_margin: f(&self.mask_sky_margin_bits, "mask_sky_margin"),
             dark: on(&self.mask_dark),
@@ -1723,7 +1746,7 @@ impl ShmHeader {
             motion_threshold: f(&self.mask_motion_threshold_bits, "mask_motion_threshold"),
             motion_intensity: f(&self.mask_motion_intensity_bits, "mask_motion_intensity"),
             motion_structure: f(&self.mask_motion_structure_bits, "mask_motion_structure"),
-        })
+        }
     }
 
     /// The Passes setting, clamped to 1 to [`crate::MAX_PASSES`].
@@ -1743,9 +1766,10 @@ impl ShmHeader {
         .validated()
     }
 
-    /// `read` under `tuning_seq` ([`Self::write_settings`]): a preset or profile being written is seen
-    /// whole, before or after.
-    fn read_settings<T>(&self, read: impl Fn() -> T) -> T {
+    /// `read` under `tuning_seq` ([`Self::write_settings`]), waiting for a writer: a preset or profile
+    /// being written is seen whole, before or after. For the GUI and the CLI, which may wait: the game's
+    /// threads read with [`Self::read_settings_for_frame`], which never does.
+    fn read_settings<T>(&self, read: impl Fn(&ShmHeader) -> T) -> T {
         // A live writer moves the sequence on within microseconds; one that stays on the same odd
         // value for STUCK_FOR has died mid-write. That value is remembered (per process and header),
         // so later reads do not wait for it again; the next write takes it over.
@@ -1753,10 +1777,10 @@ impl ShmHeader {
         loop {
             let before = self.tuning_seq.load(Ordering::Acquire);
             if self.dead_writer_at(before) {
-                return read();
+                return read(self);
             }
             if before & 1 == 0 {
-                let tuning = read();
+                let tuning = read(self);
                 std::sync::atomic::fence(Ordering::Acquire);
                 if self.tuning_seq.load(Ordering::Relaxed) == before {
                     return tuning;
@@ -1764,7 +1788,7 @@ impl ShmHeader {
             } else if let Some((value, at)) = stuck.filter(|(v, _)| *v == before) {
                 if at.elapsed() >= STUCK_FOR {
                     self.note_dead_writer(value);
-                    return read();
+                    return read(self);
                 }
                 std::thread::yield_now();
                 continue;
@@ -1773,6 +1797,98 @@ impl ShmHeader {
             }
             std::hint::spin_loop();
         }
+    }
+
+    /// `read` on the settings as one unit under `tuning_seq`, for the game's threads (the hold, the
+    /// recording of a frame, the post path): never waits for a writer, whether it is writing, stopped
+    /// inside its section, dead, or keeps the sequence odd while it moves.
+    ///
+    /// It tries [`FRAME_READ_TRIES`] times, for at most [`FRAME_READ_FOR`], to copy the whole header
+    /// under an unchanged even sequence. A copy taken is read, and kept as this process's last
+    /// consistent copy of this header ([`FRAME_COPIES`]). When none is taken in time, the last one
+    /// kept is read instead: the settings as they were before the write in progress, never part of
+    /// it. With none kept (none taken yet, or the header was re-initialised since: its sequence went
+    /// back), the defaults ([`Self::init_defaults`]) are read, which is what a fresh header holds.
+    /// The next read after the writer finishes sees its write.
+    fn read_settings_for_frame<T>(&self, read: impl Fn(&ShmHeader) -> T) -> T {
+        let copy = ShmHeader::default();
+        let start = std::time::Instant::now();
+        let mut seq = 0;
+        for attempt in 0..FRAME_READ_TRIES {
+            if attempt % 16 == 15 && start.elapsed() >= FRAME_READ_FOR {
+                break;
+            }
+            seq = self.tuning_seq.load(Ordering::Acquire);
+            if seq & 1 == 0 {
+                copy.copy_words_from(self);
+                std::sync::atomic::fence(Ordering::Acquire);
+                if self.tuning_seq.load(Ordering::Relaxed) == seq {
+                    self.keep_frame_copy(seq, &copy);
+                    return read(&copy);
+                }
+            }
+            std::hint::spin_loop();
+        }
+        if !self.last_frame_copy(seq, &copy) {
+            copy.init_defaults();
+        }
+        read(&copy)
+    }
+
+    /// The header as words: every field is an `AtomicU32` or an array of them, in `repr(C)` structs.
+    fn words(&self) -> &[AtomicU32; HEADER_WORDS] {
+        // SAFETY: `ShmHeader` and the structs in it are `repr(C)` and hold only `AtomicU32`s (and
+        // arrays of them; `Default` relies on the same), so the header is exactly HEADER_WORDS
+        // `AtomicU32`s with no padding (both checked below).
+        unsafe { &*std::ptr::from_ref(self).cast::<[AtomicU32; HEADER_WORDS]>() }
+    }
+
+    /// Stores every word of `from` here (each word on its own: a copy is consistent only under
+    /// `from`'s sequence lock).
+    fn copy_words_from(&self, from: &ShmHeader) {
+        for (to, from) in self.words().iter().zip(from.words()) {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    /// Keeps `copy`, read whole at the even `seq`, as this process's last consistent copy of this
+    /// header. Skipped while another thread holds the copies: that thread is keeping one as recent, or
+    /// reading one, and this read does not wait for it.
+    fn keep_frame_copy(&self, seq: u32, copy: &ShmHeader) {
+        let me = std::ptr::from_ref(self) as usize;
+        let mut kept = match FRAME_COPIES.try_lock() {
+            Ok(kept) => kept,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        if let Some(k) = kept.iter_mut().find(|k| k.header == me) {
+            k.seq = seq;
+            k.words.copy_words_from(copy);
+            return;
+        }
+        if kept.len() >= MAX_FRAME_COPIES {
+            kept.remove(0);
+        }
+        let words = Box::new(ShmHeader::default());
+        words.copy_words_from(copy);
+        kept.push(FrameCopy { header: me, seq, words });
+    }
+
+    /// Puts this process's last consistent copy of this header in `into`, if it was taken before the
+    /// sequence's present value `seq` (`seq` behind it means the header was re-initialised since, and
+    /// the copy is another session's). Returns whether it did.
+    fn last_frame_copy(&self, seq: u32, into: &ShmHeader) -> bool {
+        let me = std::ptr::from_ref(self) as usize;
+        let kept = FRAME_COPIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(k) = kept.iter().find(|k| k.header == me && seq.wrapping_sub(k.seq) <= i32::MAX as u32) else { return false };
+        into.copy_words_from(&k.words);
+        true
+    }
+
+    /// Forgets this process's copy of this header: it is being initialised.
+    fn forget_frame_copy(&self) {
+        let me = std::ptr::from_ref(self) as usize;
+        FRAME_COPIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|k| k.header != me);
     }
 
     pub fn set_layer_reason(&self, s: &str) {
@@ -1851,6 +1967,29 @@ static DEAD_WRITERS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new
 const MAX_DEAD_WRITERS: usize = 8;
 /// Whether [`DEAD_WRITERS`] holds anything: the read path's only cost while it does not.
 static ANY_DEAD_WRITER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How many times a read for the game's threads tries to copy the header whole
+/// ([`ShmHeader::read_settings_for_frame`]): a live writer's section lasts microseconds, and a
+/// try costs a few hundred nanoseconds (a full copy) or a few (a look at an odd sequence).
+const FRAME_READ_TRIES: u32 = 256;
+/// The longest a read for the game's threads tries for, should it be preempted while trying.
+const FRAME_READ_FOR: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The header's size in words ([`ShmHeader::words`]).
+const HEADER_WORDS: usize = std::mem::size_of::<ShmHeader>() / 4;
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == HEADER_WORDS * 4 && std::mem::align_of::<ShmHeader>() == 4);
+
+/// This process's last consistent copy of one header, read whole at the even `tuning_seq` `seq`.
+struct FrameCopy {
+    header: usize,
+    seq: u32,
+    words: Box<ShmHeader>,
+}
+
+/// The copies the game's reads fall back on ([`ShmHeader::read_settings_for_frame`]), one per header
+/// by its address. A few headers' worth (a process maps one channel; tests make many).
+static FRAME_COPIES: std::sync::Mutex<Vec<FrameCopy>> = std::sync::Mutex::new(Vec::new());
+const MAX_FRAME_COPIES: usize = 8;
 
 /// How a writer enters a sequence lock's write section ([`write_unit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2231,6 +2370,150 @@ mod tests {
         assert!(a.dead_writer_at(9));
         assert!(!a.dead_writer_at(10), "seen elsewhere: forgotten");
         assert!(!a.dead_writer_at(9));
+    }
+
+    /// Every game-side read of the settings, timed.
+    fn frame_reads(h: &ShmHeader) -> (f32, MaskSettings, (usize, [u32; crate::MAX_PASSES]), HudSettings, std::time::Duration) {
+        let start = std::time::Instant::now();
+        let t = h.pass_tunings();
+        let read = (t.tunings[0].intensity, h.mask_settings(), h.placements(), h.hud_settings_for_frame());
+        (read.0, read.1, read.2, read.3, start.elapsed())
+    }
+
+    /// Well under the 50 ms a waiting read gives a stopped writer, well over the reads' own 1 ms
+    /// bound each.
+    const FRAME_BOUND: std::time::Duration = std::time::Duration::from_millis(25);
+
+    fn region(x: f32) -> HudRegion {
+        HudRegion { x, y: 0.1, w: 0.2, h: 0.2, mode: crate::enums::hud_mode::KEEP, strength: HudRegion::DEFAULT_STRENGTH }
+    }
+
+    /// A writer stopped inside its section (the sequence odd, half of its values stored) never holds up
+    /// the game's reads: they return at once with the settings as they were before that write, never
+    /// the half stored, and see the write once a writer finishes one.
+    #[test]
+    fn frame_reads_never_wait_for_a_stopped_writer() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert!(
+            h.write_settings_and_hud(&[("intensity", 0.5f32.to_bits()), ("mask_motion_threshold", 32.0f32.to_bits()), ("placement", 1)], Some(&[region(0.25)]))
+        );
+        let (intensity, mask, placements, hud, _) = frame_reads(&h);
+        assert_eq!((intensity, mask.motion_threshold, placements.1[0], hud.regions.clone()), (0.5, 32.0, 1, vec![region(0.25)]));
+
+        // Stopped half way: the sequence odd, two of its stores made.
+        let seq = h.tuning_seq.load(Ordering::Relaxed);
+        h.tuning_seq.store(seq + 1, Ordering::Relaxed);
+        h.intensity_bits.store(1.5f32.to_bits(), Ordering::Relaxed);
+        h.hud_region[0].x_bits.store(0.75f32.to_bits(), Ordering::Relaxed);
+        for _ in 0..20 {
+            let (i, m, p, r, took) = frame_reads(&h);
+            assert!(took < FRAME_BOUND, "a read waited {took:?} for a stopped writer");
+            assert_eq!((i, m, p, r), (intensity, mask, placements, hud.clone()), "the settings before the write, not half of it");
+        }
+        // The next write takes the section over (after the wait the writers give a dead one), and is seen.
+        assert!(h.write_settings(&[("intensity", 0.25f32.to_bits())]));
+        assert_eq!(frame_reads(&h).0, 0.25);
+
+        // A header with no copy kept (none read yet, or re-initialised since: the sequence went back)
+        // reads as a fresh one, never as the half-made write.
+        let defaults = ShmHeader::default();
+        defaults.init_defaults();
+        let (di, dm, dp, dr, _) = frame_reads(&defaults);
+        assert_eq!(di, 1.0);
+        let fresh = ShmHeader::default();
+        fresh.init_defaults();
+        fresh.tuning_seq.store(1, Ordering::Relaxed);
+        fresh.intensity_bits.store(1.5f32.to_bits(), Ordering::Relaxed);
+        let (i, ..) = frame_reads(&fresh);
+        assert_eq!(i, di, "nothing kept: the defaults");
+        assert!(h.tuning_seq.load(Ordering::Relaxed) > 4);
+        h.tuning_seq.store(3, Ordering::Relaxed);
+        let (i, m, p, r, _) = frame_reads(&h);
+        assert_eq!((i, m, p, r), (di, dm, dp, dr), "re-initialised elsewhere: the defaults, not the copy of the session before");
+    }
+
+    /// A writer that keeps the sequence odd but moving (and its values changing) never holds up the
+    /// game's reads either, and they never read its values; with a live writer finishing its writes as
+    /// fast as it can, each read is one write whole.
+    #[test]
+    fn frame_reads_never_wait_for_a_churning_writer() {
+        let h = std::sync::Arc::new(ShmHeader::default());
+        h.init_defaults();
+        assert!(h.write_settings(&[("intensity", 0.5f32.to_bits()), ("local_tone", 0.5f32.to_bits())]));
+        let _ = frame_reads(&h);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = {
+            let (h, stop) = (h.clone(), stop.clone());
+            std::thread::spawn(move || {
+                h.tuning_seq.fetch_add(1, Ordering::Relaxed);
+                let mut v = 2.0f32;
+                while !stop.load(Ordering::Relaxed) {
+                    h.tuning_seq.fetch_add(2, Ordering::Relaxed);
+                    h.intensity_bits.store(v.to_bits(), Ordering::Relaxed);
+                    v += 1.0;
+                }
+                // Even again, its last values whole.
+                h.local_tone_bits.store(h.intensity_bits.load(Ordering::Relaxed), Ordering::Relaxed);
+                h.tuning_seq.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        // The reads on a thread of their own: a read that never returns fails the test rather than hanging it.
+        let (done, outcome) = std::sync::mpsc::channel();
+        {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                let mut slowest = std::time::Duration::ZERO;
+                for _ in 0..200 {
+                    let (i, _, _, _, took) = frame_reads(&h);
+                    slowest = slowest.max(took);
+                    if i != 0.5 {
+                        let _ = done.send(Err(format!("read the churning writer's {i}")));
+                        return;
+                    }
+                }
+                let _ = done.send(Ok(slowest));
+            });
+        }
+        let slowest = outcome.recv_timeout(std::time::Duration::from_secs(10)).expect("the reads returned").expect("the settings before the writes");
+        assert!(slowest < FRAME_BOUND, "a read waited {slowest:?}");
+        stop.store(true, Ordering::Relaxed);
+        churn.join().unwrap();
+        let t = h.pass_tunings().tunings[0];
+        assert!(t.intensity > 0.5 && t.intensity == t.local_tone, "the writer's last values once it finished: {t:?}");
+
+        let one = 1.0f32.to_bits();
+        assert!(h.write_settings(&[("intensity", one), ("local_tone", one), ("local_structure", one)]));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let v = if i.is_multiple_of(2) { 0.5f32 } else { 2.0 };
+                    h.write_settings(&[("intensity", v.to_bits()), ("local_tone", v.to_bits()), ("local_structure", v.to_bits())]);
+                    i += 1;
+                }
+            });
+            let torn = (0..2_000).map(|_| h.pass_tunings().tunings[0]).find(|t| !(t.intensity == t.local_tone && t.local_tone == t.local_structure));
+            stop.store(true, Ordering::Relaxed);
+            assert_eq!(torn, None, "a torn read");
+        });
+    }
+
+    /// `init_defaults` resets every word of the header: on one holding anything at all (every bit set)
+    /// it leaves exactly what it leaves on a fresh one, so a field added without a reset fails here.
+    #[test]
+    fn init_defaults_resets_every_field() {
+        let dirty = ShmHeader::default();
+        for w in dirty.words() {
+            w.store(u32::MAX, Ordering::Relaxed);
+        }
+        dirty.init_defaults();
+        let fresh = ShmHeader::default();
+        fresh.init_defaults();
+        let left: Vec<usize> =
+            (0..HEADER_WORDS).filter(|&i| dirty.words()[i].load(Ordering::Relaxed) != fresh.words()[i].load(Ordering::Relaxed)).map(|i| i * 4).collect();
+        assert!(left.is_empty(), "init_defaults leaves the words at these byte offsets as they were: {left:?}");
     }
 
     #[test]

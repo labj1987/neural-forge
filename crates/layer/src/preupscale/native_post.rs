@@ -656,7 +656,7 @@ fn process(
     let colour = tunings.colour;
     let lut = super::colour::current(&colour);
     // The HUD's regions and detection (the presented frame carries the game's HUD).
-    let hud = hdr.hud_settings();
+    let hud = hdr.hud_settings_for_frame();
     // The claim is released whatever happens after it (a claim held while the network is not built at
     // this size would keep the pre-upscaler path off it for good), except after a frame that did not
     // finish in time: its work may still use the network, so the claim stays until its fence signals
