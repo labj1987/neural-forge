@@ -27,6 +27,10 @@ first shipped them; their phase is kept as a subheading.
   card is done with them, instead of at exit.
 - Starting a game whose driver refuses the feature Neural Forge adds for its present fences works: the retry
   without it could reach the wrong Vulkan layer.
+- Changing settings in the app or the CLI while a game runs can no longer stall the game for a moment (or hang
+  it, if the writer stopped halfway): the game keeps the settings it had until the change is complete.
+- Extracting the model from the CLI and the app at the same time no longer loses one of the results: the second
+  extraction waits for the first.
 - An internal error on one of Neural Forge's threads no longer takes down the game's own threads with it.
 - The diagnostic modes (`NEURAL_FORGE_PREUPSCALE=dump`, `identity`, `roundtrip`) no longer freeze the game for up
   to 5 seconds on a submit that waits for something signalled later.
