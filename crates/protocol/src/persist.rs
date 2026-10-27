@@ -44,14 +44,17 @@ pub fn read_config(path: &str) -> BTreeMap<String, String> {
 
 /// Applies the saved settings in [`config_file`] to `header` if nothing has since it was last
 /// initialised (`tuning_seq` still 0): the layer does this when it finds a fresh mapping, since no
-/// other process is running to do it. Returns whether it applied them.
-pub fn apply_saved(header: &ShmHeader) -> bool {
-    // Not configured yet is decided again as the write is entered ([`apply_if_unconfigured`]); this
-    // only spares reading the file when it is plainly too late.
+/// other process is running to do it. Never waits for another writer of the settings (it runs on the
+/// game's thread): what it cannot write at once this process's writer thread writes. Returns whether it
+/// applied them (or handed them over).
+pub fn apply_saved(header: &'static ShmHeader) -> bool {
+    // Not configured yet is decided again as the write is entered; this only spares reading the file
+    // when it is plainly too late.
     if header.tuning_seq.load(std::sync::atomic::Ordering::Relaxed) != 0 {
         return false;
     }
-    apply_if_unconfigured(header, &read_config(&config_file()))
+    let (settings, regions) = parse(header, &read_config(&config_file()));
+    header.write_settings_if_unconfigured_without_waiting(settings, regions)
 }
 
 /// [`apply`], only if nothing has written settings to `header` since it was initialised: decided as

@@ -99,7 +99,11 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   values are read as they stand). The game's threads never wait (`pass_tunings`, `mask_settings`,
   `placements`, `hud_settings_for_frame`): a read that finds no whole copy within about a
   millisecond uses the last whole one its process read of that header, the settings before the
-  write (the defaults when it has none).
+  write (the defaults when it has none). Nor do they wait to write: the saved settings a layer applies
+  to a fresh header (`persist::apply_saved`) and a capture's outcome (`capture::publish_without_waiting`,
+  under `capture_result_seq`) are written at once when the section is free within about a millisecond,
+  and otherwise by the process's writer thread (`deferred`), in the order they were handed to it; only
+  that thread waits for a writer, and takes over one left odd for 50 ms.
 - **Model settings:** `enabled`, `style`, `auto_mask`, intensity, local tone, local structure,
   skin structure, `model_interval` (v6), `passes` and `pass[10]` (v19), `network` (v20,
   `enums::network`: 0 the full network, 1 the small one), `preupscale_scale` and `pass_scale[10]` (v21:

@@ -34,6 +34,7 @@
 pub mod cache_dump;
 pub mod capture;
 pub mod cube;
+mod deferred;
 pub mod enums;
 pub mod env;
 mod header;

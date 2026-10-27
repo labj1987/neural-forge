@@ -246,6 +246,18 @@ impl Outcome {
 /// number may publish at once (a capture's writer threads, a new game's [`reset_session`], another
 /// process's layer still finishing its capture): a reader sees one whole outcome or another.
 pub fn publish(hdr: &ShmHeader, outcome: &Outcome) {
+    hdr.set_capture_result_words(&words_of(outcome));
+}
+
+/// [`publish`] for the game's threads (the layer's present and its capture writers): never waits for
+/// another writer of the result block, live or dead. An outcome it cannot write at once is written by this
+/// process's writer thread, after the ones handed there before.
+pub fn publish_without_waiting(hdr: &'static ShmHeader, outcome: &Outcome) {
+    hdr.set_capture_result_words_without_waiting(words_of(outcome));
+}
+
+/// The result block's words for `outcome`.
+fn words_of(outcome: &Outcome) -> [u32; RESULT_WORDS] {
     let mut words = [0u32; RESULT_WORDS];
     words[..6].copy_from_slice(&[outcome.id, outcome.state, outcome.reason, outcome.done, outcome.total, outcome.composed]);
     let bytes = outcome.paths.as_bytes();
@@ -259,7 +271,7 @@ pub fn publish(hdr: &ShmHeader, outcome: &Outcome) {
         word[..chunk.len()].copy_from_slice(chunk);
         words[6 + i] = u32::from_le_bytes(word);
     }
-    hdr.set_capture_result_words(&words);
+    words
 }
 
 /// The latest published outcome, `None` when none was ever published (or a write kept racing).
@@ -283,14 +295,15 @@ pub fn result(hdr: &ShmHeader) -> Option<Outcome> {
 /// is running now (it would fire, unasked, at this game's first frame), and an outcome left running
 /// is a game that went away mid-capture. The same holds for a cache-dump request
 /// (`shmctl dump-cache`) that no pre-upscaler hold has taken yet.
-pub fn reset_session(hdr: &ShmHeader) {
+pub fn reset_session(hdr: &'static ShmHeader) {
     hdr.capture_request.store(0, Ordering::Release);
     hdr.preupscale_dump_request.store(0, Ordering::Relaxed);
     hdr.capture_cancel.store(0, Ordering::Relaxed);
     if let Some(mut stale) = result(hdr).filter(|o| o.state == state::RUNNING) {
         stale.state = state::FAILED;
         stale.reason = reason::GAME_ENDED;
-        publish(hdr, &stale);
+        // On the game's thread (the layer's channel opening): never waits for another writer.
+        publish_without_waiting(hdr, &stale);
     }
 }
 
@@ -298,13 +311,45 @@ pub fn reset_session(hdr: &ShmHeader) {
 mod tests {
     use super::*;
 
+    /// A header for the life of the test process, as the layer's mapping is (the writes for the game's
+    /// threads may finish on the writer thread).
+    fn leaked() -> &'static ShmHeader {
+        Box::leak(Box::new(ShmHeader::default()))
+    }
+
+    /// A writer of another process left the result block's section open (it died inside it, the sequence
+    /// stays odd): a publish from the game's threads returns at once, well inside the 50 ms a waiting
+    /// writer gives it, and the outcome is published once the writer thread has taken the dead section
+    /// over. Publishes after it, while it waits, land after it, in their order.
+    #[test]
+    fn a_game_thread_publish_never_waits_for_a_dead_writer() {
+        let h = leaked();
+        h.init_defaults();
+        let first = Outcome { id: 7, state: state::RUNNING, total: 3, ..Outcome::default() };
+        let last = Outcome { id: 7, state: state::WRITTEN, done: 3, total: 3, ..Outcome::default() };
+        let odd = h.capture_result_seq.load(Ordering::Relaxed) | 1;
+        h.capture_result_seq.store(odd, Ordering::Release);
+        let start = std::time::Instant::now();
+        publish_without_waiting(h, &first);
+        publish_without_waiting(h, &last);
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_millis(10), "the game's thread waited {took:?}");
+        assert!(crate::deferred::settle(std::time::Duration::from_secs(2)), "the writer thread took the dead section over");
+        assert_eq!(result(h), Some(last), "both published, the later one last");
+        // A section nobody holds: written at once, on the game's thread.
+        publish_without_waiting(h, &first);
+        assert!(crate::deferred::settle(std::time::Duration::from_secs(2)));
+        assert_eq!(result(h), Some(first));
+    }
+
     #[test]
     fn a_new_session_drops_requests_left_for_an_earlier_game() {
-        let h = ShmHeader::default();
+        let h = leaked();
         h.init_defaults();
         h.preupscale_dump_request.store(32, Ordering::Relaxed);
         h.capture_request.store(5, Ordering::Relaxed);
-        reset_session(&h);
+        reset_session(h);
+        assert!(crate::deferred::settle(std::time::Duration::from_secs(2)));
         assert_eq!(h.preupscale_dump_request.load(Ordering::Relaxed), 0);
         assert_eq!(h.capture_request.load(Ordering::Relaxed), 0);
     }
@@ -379,20 +424,22 @@ mod tests {
 
     #[test]
     fn a_new_session_drops_a_waiting_request_and_ends_a_running_capture() {
-        let h = ShmHeader::default();
-        publish(&h, &Outcome { id: 3, state: state::RUNNING, total: 10, done: 4, ..Outcome::default() });
-        request(&h, 1).unwrap();
+        let h = leaked();
+        publish(h, &Outcome { id: 3, state: state::RUNNING, total: 10, done: 4, ..Outcome::default() });
+        request(h, 1).unwrap();
         h.capture_cancel.store(3, Ordering::Relaxed);
-        reset_session(&h);
-        assert_eq!(pending(&h), None, "a request from before this game never fires on it");
-        assert!(!cancel_requested(&h, 3));
-        let ended = result(&h).unwrap();
+        reset_session(h);
+        assert!(crate::deferred::settle(std::time::Duration::from_secs(2)));
+        assert_eq!(pending(h), None, "a request from before this game never fires on it");
+        assert!(!cancel_requested(h, 3));
+        let ended = result(h).unwrap();
         assert_eq!((ended.state, ended.reason, ended.done), (state::FAILED, reason::GAME_ENDED, 4));
         // A finished outcome is left as it was.
         let written = Outcome { id: 4, state: state::WRITTEN, done: 1, total: 1, composed: 1, ..Outcome::default() };
-        publish(&h, &written);
-        reset_session(&h);
-        assert_eq!(result(&h), Some(written));
+        publish(h, &written);
+        reset_session(h);
+        assert!(crate::deferred::settle(std::time::Duration::from_secs(2)));
+        assert_eq!(result(h), Some(written));
     }
 
     /// Two publishers at once (a game's capture writer finishing while the next game's layer resets the

@@ -192,12 +192,14 @@ impl Report {
 }
 
 /// Publishes `outcome` on the channel. The result block is a sequence-locked unit with one writer at
-/// a time; this lock is that one writer, whichever capture or thread publishes.
+/// a time; this lock is that one writer, whichever capture or thread publishes. Called on the game's
+/// threads (the present, the capture's writers): never waits for a writer of another process, live or
+/// dead (`capture::publish_without_waiting`).
 pub(crate) fn publish(channel: Option<&crate::shm::Channel>, outcome: &Outcome) {
     static PUBLISHING: Mutex<()> = Mutex::new(());
     if let Some(hdr) = channel.and_then(crate::shm::Channel::header) {
         let _one = PUBLISHING.lock().unwrap_or_else(|e| e.into_inner());
-        neural_forge_protocol::capture::publish(hdr, outcome);
+        neural_forge_protocol::capture::publish_without_waiting(hdr, outcome);
     }
 }
 

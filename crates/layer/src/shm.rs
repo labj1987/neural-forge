@@ -166,7 +166,7 @@ fn note_channel_open(hdr: &neural_forge_protocol::ShmHeader, lost: bool, cannot_
 /// capture the first one is running), regaining the lease after another process held it is.
 static SESSION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn start_session(hdr: &neural_forge_protocol::ShmHeader) {
+fn start_session(hdr: &'static neural_forge_protocol::ShmHeader) {
     let generation = crate::ownership::generation();
     if SESSION_GENERATION.swap(generation, Ordering::AcqRel) != generation && !own_session_continues(hdr) {
         neural_forge_protocol::capture::reset_session(hdr);
@@ -196,7 +196,7 @@ unsafe impl Sync for Channel {}
 
 impl Channel {
     /// `None` once this process no longer holds the channel's lease (`ownership::held`).
-    pub(crate) fn header(&self) -> Option<&neural_forge_protocol::ShmHeader> {
+    pub(crate) fn header(&self) -> Option<&'static neural_forge_protocol::ShmHeader> {
         // SAFETY: see the type's doc comment.
         (!self.leased || crate::ownership::held()).then(|| unsafe { &*self.header })
     }
@@ -364,7 +364,7 @@ impl ShmClient {
         Self { header: std::ptr::from_ref(header).cast_mut(), reserved: [REGION_CAP as u64; Slot::COUNT], ..Self::default() }
     }
 
-    fn header(&self) -> Option<&neural_forge_protocol::ShmHeader> {
+    fn header(&self) -> Option<&'static neural_forge_protocol::ShmHeader> {
         // SAFETY: non-null only after a successful `open()`, which mmaps
         // `neural_forge_protocol::shm_total_bytes()` at this address and never unmaps it for
         // the lifetime of the process. The real channel is this process's only while it holds the

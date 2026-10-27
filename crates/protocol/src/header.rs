@@ -1246,11 +1246,42 @@ impl ShmHeader {
         self.write_settings_unit(settings, regions, Entry::First).is_some()
     }
 
+    /// [`Self::write_settings_if_unconfigured`] for the game's threads: never waits for another writer. A
+    /// write it cannot finish at once (its section taken over, and the section busy when it would write it
+    /// again) goes to this process's writer thread ([`crate::deferred`]) and counts as written. Returns
+    /// whether they were (or will be) written.
+    pub fn write_settings_if_unconfigured_without_waiting(&'static self, settings: Vec<(&'static str, u32)>, regions: Option<Vec<HudRegion>>) -> bool {
+        if crate::deferred::pending() {
+            crate::deferred::hand_over(Box::new(move || {
+                self.write_settings_if_unconfigured(&settings, regions.as_deref());
+            }));
+            return true;
+        }
+        match self.write_settings_unit_as(&settings, regions.as_deref(), Entry::First, Wait::Briefly).0 {
+            Unit::Written => true,
+            Unit::Skipped => false,
+            Unit::Busy => {
+                // Entered first and then taken over: the whole write again, after the writer that took over.
+                crate::deferred::hand_over(Box::new(move || {
+                    self.write_settings_and_hud(&settings, regions.as_deref());
+                }));
+                true
+            }
+        }
+    }
+
     /// The settings' and regions' stores, made one unit under `tuning_seq` ([`write_unit`]); `None`
     /// when `entry` skipped them, else whether every name was a setting. Each name is resolved to its
     /// field and value before the section is entered, so the section holds only the stores the
     /// readers wait for.
     fn write_settings_unit(&self, settings: &[(&str, u32)], regions: Option<&[HudRegion]>, entry: Entry) -> Option<bool> {
+        let (unit, all) = self.write_settings_unit_as(settings, regions, entry, Wait::AsLongAsItTakes);
+        (unit == Unit::Written).then_some(all)
+    }
+
+    /// [`Self::write_settings_unit`] with the writer's [`Wait`]: what it did, and whether every name was a
+    /// setting.
+    fn write_settings_unit_as(&self, settings: &[(&str, u32)], regions: Option<&[HudRegion]>, entry: Entry, wait: Wait) -> (Unit, bool) {
         let slots = self.setting_slots();
         let mut all = true;
         let mut stores: Vec<(&AtomicU32, u32)> = Vec::with_capacity(settings.len() + regions.map_or(0, |_| MAX_HUD_REGIONS * 6 + 1));
@@ -1263,11 +1294,11 @@ impl ShmHeader {
         if let Some(regions) = regions {
             stores.extend(self.hud_region_stores(regions));
         }
-        if !write_unit(&self.tuning_seq, entry, stores.len(), |i| stores[i].0.store(stores[i].1, Ordering::Relaxed)) {
-            return None;
+        let unit = write_unit_as(&self.tuning_seq, entry, stores.len(), |i| stores[i].0.store(stores[i].1, Ordering::Relaxed), wait);
+        if unit == Unit::Written {
+            self.control_seq.fetch_add(1, Ordering::Relaxed);
         }
-        self.control_seq.fetch_add(1, Ordering::Relaxed);
-        Some(all)
+        (unit, all)
     }
 
     /// Whether this mapping is one of ours and laid out the way this build expects.
@@ -1910,6 +1941,17 @@ impl ShmHeader {
         write_unit(&self.capture_result_seq, Entry::Any, words.len(), |i| self.capture_result[i].store(words[i], Ordering::Relaxed));
     }
 
+    /// [`Self::set_capture_result_words`] for the game's threads: never waits for another writer (one that
+    /// is writing, or died inside the section and is not taken over yet). What it cannot write at once
+    /// goes to this process's writer thread ([`crate::deferred`]), in order behind anything handed there
+    /// before.
+    pub(crate) fn set_capture_result_words_without_waiting(&'static self, words: [u32; crate::capture::RESULT_WORDS]) {
+        let store = |i: usize| self.capture_result[i].store(words[i], Ordering::Relaxed);
+        if crate::deferred::pending() || write_unit_as(&self.capture_result_seq, Entry::Any, words.len(), store, Wait::Briefly) == Unit::Busy {
+            crate::deferred::hand_over(Box::new(move || self.set_capture_result_words(&words)));
+        }
+    }
+
     /// Whether `seq` is the odd `tuning_seq` this process found left on this header by a writer that
     /// died. Seeing the sequence anywhere else (taken over, re-initialised) forgets the record, so a
     /// live writer passing through the same value later is waited for again.
@@ -2025,6 +2067,24 @@ fn enter_write(seq: &AtomicU32) -> u32 {
     }
 }
 
+/// [`enter_write`] for the game's threads: from an even value only, within [`FRAME_READ_TRIES`] tries and
+/// [`FRAME_READ_FOR`]. `None` while another writer holds the section (live, or dead and not yet taken
+/// over: that is left to a writer that may wait for [`STUCK_FOR`]).
+fn enter_write_briefly(seq: &AtomicU32) -> Option<u32> {
+    let start = std::time::Instant::now();
+    for attempt in 0..FRAME_READ_TRIES {
+        if attempt % 16 == 15 && start.elapsed() >= FRAME_READ_FOR {
+            break;
+        }
+        let s = seq.load(Ordering::Relaxed);
+        if s & 1 == 0 && seq.compare_exchange_weak(s, s.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return Some(s.wrapping_add(1));
+        }
+        std::hint::spin_loop();
+    }
+    None
+}
+
 /// Ends the write section entered at `odd`, only if this writer still owns it: one taken over as
 /// dead while it was merely slow must not move the sequence back under the writer that took over.
 /// Returns whether it still owned it.
@@ -2048,13 +2108,45 @@ fn finish_write(seq: &AtomicU32, odd: u32) -> bool {
 /// header could close that too, but it needs a word naming the writer (and a way to tell it is alive
 /// across the game's container), which this layout does not have.
 fn write_unit(seq: &AtomicU32, entry: Entry, count: usize, store: impl Fn(usize)) -> bool {
+    write_unit_as(seq, entry, count, store, Wait::AsLongAsItTakes) == Unit::Written
+}
+
+/// How long a writer waits to enter a sequence lock's write section ([`write_unit_as`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    /// Until the writer before finished, or (left odd for [`STUCK_FOR`]) died and is taken over: the GUI,
+    /// the CLI, and the layer's own writer thread ([`crate::deferred`]).
+    AsLongAsItTakes,
+    /// [`FRAME_READ_TRIES`] tries for at most [`FRAME_READ_FOR`], never taking a writer over: the game's
+    /// threads, which hand a write they could not make to the writer thread.
+    Briefly,
+}
+
+/// What [`write_unit_as`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    /// Every store made, as one unit.
+    Written,
+    /// [`Entry::First`] after something else had entered: nothing stored.
+    Skipped,
+    /// [`Wait::Briefly`] could not enter in time: the whole unit is still to be written (any stores made
+    /// in a section taken over meanwhile are to be made again, as [`write_unit`] does).
+    Busy,
+}
+
+/// [`write_unit`] with the writer's [`Wait`].
+fn write_unit_as(seq: &AtomicU32, entry: Entry, count: usize, store: impl Fn(usize), wait: Wait) -> Unit {
     let mut entry = entry;
     loop {
         let odd = match entry {
+            Entry::Any if wait == Wait::Briefly => match enter_write_briefly(seq) {
+                Some(odd) => odd,
+                None => return Unit::Busy,
+            },
             Entry::Any => enter_write(seq),
             Entry::First => {
                 if seq.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                    return false;
+                    return Unit::Skipped;
                 }
                 1
             }
@@ -2071,7 +2163,7 @@ fn write_unit(seq: &AtomicU32, entry: Entry, count: usize, store: impl Fn(usize)
             store(i);
         }
         if finish_write(seq, odd) && owned {
-            return true;
+            return Unit::Written;
         }
         // Taken over: the whole unit again, after the writer that took over. A first write has
         // already started applying, so it finishes like any other.
@@ -2502,6 +2594,38 @@ mod tests {
 
     /// `init_defaults` resets every word of the header: on one holding anything at all (every bit set)
     /// it leaves exactly what it leaves on a fresh one, so a field added without a reset fails here.
+    /// A write from the game's threads whose section was taken over (it was slow) by a writer that then died
+    /// there: it does not wait the 50 ms a dead writer is given before it would write again, it says so
+    /// (`Busy`), and the settings it was applying go to the writer thread, which takes the section over
+    /// and writes them whole. A writer that may wait takes those 50 ms.
+    #[test]
+    fn a_write_taken_over_on_the_game_s_threads_never_waits_to_write_again() {
+        // The first store finds its section taken over (once) by a writer that dies in it.
+        fn taken_over_by_a_dead_writer(seq: &AtomicU32) -> impl Fn(usize) + '_ {
+            let done = std::cell::Cell::new(false);
+            move |i: usize| {
+                if i == 0 && !done.replace(true) {
+                    seq.store(3, Ordering::Relaxed);
+                }
+            }
+        }
+        let seq = AtomicU32::new(0);
+        let start = std::time::Instant::now();
+        assert_eq!(write_unit_as(&seq, Entry::First, 2, taken_over_by_a_dead_writer(&seq), Wait::Briefly), Unit::Busy);
+        assert!(start.elapsed() < std::time::Duration::from_millis(10), "waited {:?}", start.elapsed());
+        let seq = AtomicU32::new(0);
+        let start = std::time::Instant::now();
+        assert_eq!(write_unit_as(&seq, Entry::First, 2, taken_over_by_a_dead_writer(&seq), Wait::AsLongAsItTakes), Unit::Written);
+        assert!(start.elapsed() >= STUCK_FOR, "a writer that may wait gives the dead one its time");
+        // The saved settings on a fresh header from the game's thread: written, and nothing left behind.
+        let h: &'static ShmHeader = Box::leak(Box::new(ShmHeader::default()));
+        h.init_defaults();
+        assert!(h.write_settings_if_unconfigured_without_waiting(vec![("intensity", 0.5f32.to_bits())], None));
+        assert!(crate::deferred::settle(std::time::Duration::from_secs(2)));
+        assert_eq!(h.pass_tunings().tunings[0].intensity, 0.5);
+        assert!(!h.write_settings_if_unconfigured_without_waiting(vec![("intensity", 0.25f32.to_bits())], None), "configured: not again");
+    }
+
     #[test]
     fn init_defaults_resets_every_field() {
         let dirty = ShmHeader::default();

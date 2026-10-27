@@ -4,6 +4,12 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.9.1 — 2026-10-27
+
+- A game no longer stalls for a moment at start or when a capture's progress is reported, after an earlier
+  game's Neural Forge crashed in the middle of reporting a capture (or of applying the saved settings): the
+  report is written in the background instead.
+
 ## 3.9.0 — 2026-10-27
 
 - Less ghosting after a frame the model missed (the network still loading, a switch of the Network setting, a
