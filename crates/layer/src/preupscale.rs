@@ -488,13 +488,38 @@ pub(crate) fn fg_kernel_name(name: &str) -> bool {
 /// about 10 real frames: switching Ray Reconstruction off in a game's settings takes effect within it.
 pub(crate) const SR_RECENT: u64 = 64;
 
-/// [`COMMANDS`] when `on`, nothing otherwise.
-pub(crate) fn commands(on: bool) -> &'static [VulkanCommand] {
-    if on {
-        COMMANDS
-    } else {
-        &[]
-    }
+/// What the diagnostic modes' split hold (`dump`, `identity`, `roundtrip`) hooks besides [`COMMANDS`]: the
+/// semaphores' creation, so the hold knows which are timeline semaphores (whose waits it checks before it
+/// waits on the host: [`waits_reached`]).
+pub(crate) const DIAGNOSTIC_COMMANDS: &[VulkanCommand] = &[VulkanCommand::CreateSemaphore, VulkanCommand::DestroySemaphore];
+
+/// Whether the mode is one of the diagnostics the split hold runs with a wait on the host ([`run_hold`]).
+pub(crate) fn diagnostic(mode: Mode) -> bool {
+    matches!(mode, Mode::Dump | Mode::Identity | Mode::Roundtrip)
+}
+
+/// [`COMMANDS`] (and in a diagnostic mode [`DIAGNOSTIC_COMMANDS`]) when `on`, nothing otherwise.
+pub(crate) fn commands(on: bool) -> impl Iterator<Item = &'static VulkanCommand> {
+    let extra = if diagnostic(mode()) { DIAGNOSTIC_COMMANDS } else { &[] };
+    COMMANDS.iter().chain(extra).filter(move |_| on)
+}
+
+/// Whether every wait in `waits` on a timeline semaphore (`timeline` tells which are) is already reached:
+/// the split hold of a diagnostic mode waits on the host for its capture, which runs after them, inside the
+/// application's submit. A value only the host signals later (after the submit returns) would hold that wait
+/// to its timeout; one the GPU has not reached yet would too, for as long as the GPU takes.
+///
+/// # Safety
+/// Every semaphore `timeline` accepts is a live timeline semaphore of `device`.
+pub(crate) unsafe fn waits_reached(
+    device: &ash::Device,
+    waits: impl IntoIterator<Item = (vk::Semaphore, u64)>,
+    timeline: impl Fn(vk::Semaphore) -> bool,
+) -> bool {
+    waits.into_iter().filter(|(s, _)| timeline(*s)).all(|(semaphore, value)| {
+        // SAFETY: per this function's contract.
+        unsafe { device.get_semaphore_counter_value(semaphore) }.is_ok_and(|reached| reached >= value)
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1370,6 +1395,9 @@ pub(crate) struct Tracker {
     /// The first global synchronization recorded into each command buffer while an input was
     /// watched ([`Hazard::MemoryBarrier`], [`Hazard::EventWait`]).
     global_sync: HashMap<vk::CommandBuffer, Hazard>,
+    /// The command buffers that wait on an event (`vkCmdWaitEvents*`) while an input was watched, whatever
+    /// synchronization came first in them: an event the host sets after the submission returns.
+    event_waits: HashSet<vk::CommandBuffer>,
     /// The launch just recorded was the first of its command buffer to name a colour candidate:
     /// the buffer and that image ([`Self::inline_point`] decides on a hold inside the buffer there).
     inline_at: Option<(vk::CommandBuffer, vk::Image)>,
@@ -1688,6 +1716,22 @@ pub(crate) struct InlinePoint {
     pub hazard: Hazard,
     /// The stage this hold runs at and which passes ([`placement::Hold`]).
     pub hold: placement::Hold,
+    /// The inputs whose layout at the hold is a guess, not something this buffer set: checked when the
+    /// buffer is submitted ([`Tracker::layout_when_run`], `inline::Inline::check`).
+    pub guessed: Guessed,
+}
+
+/// The layouts [`Tracker::inline_point`] took for the hold's inputs without this buffer setting them (no barrier
+/// on the image and no attachment use in it before the hold): from the layouts the buffers submitted before it
+/// left (as known when this one is recorded), or `GENERAL` for a storage image never seen in a barrier.
+/// vkd3d-proton records several command lists in parallel and submits them later, so a buffer submitted in
+/// between can leave another layout. Each `Some` is the layout guessed for that input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Guessed {
+    pub colour: Option<vk::ImageLayout>,
+    pub exposure: Option<vk::ImageLayout>,
+    pub mvec: Option<vk::ImageLayout>,
+    pub depth: Option<vk::ImageLayout>,
 }
 
 impl InlinePoint {
@@ -2223,13 +2267,11 @@ impl Tracker {
             return None;
         }
         let rgba16f = desc.format == vk::Format::R16G16B16A16_SFLOAT;
-        let layout = self
-            .pending
-            .get(&cb)
-            .and_then(|p| p.iter().rev().find(|s| s.image == colour).map(|s| s.new_layout))
-            .or_else(|| self.attached.get(&cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == colour).map(|(_, l)| *l)))
-            .or_else(|| self.committed.get(&colour).copied())
-            .or((rgba16f && desc.usage.contains(vk::ImageUsageFlags::STORAGE)).then_some(vk::ImageLayout::GENERAL))?;
+        let mut guessed = Guessed::default();
+        let (layout, set) = self.layout_in(cb, colour, true, rgba16f && desc.usage.contains(vk::ImageUsageFlags::STORAGE))?;
+        if !set {
+            guessed.colour = Some(layout);
+        }
         if !INLINE_LAYOUTS.contains(&layout) {
             return None;
         }
@@ -2243,13 +2285,14 @@ impl Tracker {
         // The inputs are refreshed on the next submit, not when an image is destroyed: an exposure
         // input or motion vectors destroyed since are not copied from.
         let exposure_input = inputs.exposure_input.and_then(|(image, _)| self.images.get(&image).map(|d| (image, *d))).map(|(image, d)| {
-            let layout = self
-                .pending
-                .get(&cb)
-                .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
-                .or_else(|| self.committed.get(&image).copied())
-                .or(d.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL));
-            Aux { image, format: d.format, layout, readable: d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (d.width, d.height) == (1, 1) }
+            let known = self.layout_in(cb, image, false, d.usage.contains(vk::ImageUsageFlags::STORAGE));
+            guessed.exposure = known.filter(|(_, set)| !set).map(|(l, _)| l);
+            Aux {
+                image,
+                format: d.format,
+                layout: known.map(|(l, _)| l),
+                readable: d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (d.width, d.height) == (1, 1),
+            }
         });
         // DLSS's motion vectors, copied beside the colour input for the native backend's history: RG16F
         // at the colour input's extent or larger (high-resolution motion vectors, resampled to it), in
@@ -2257,13 +2300,9 @@ impl Tracker {
         let live_mvec = self.images.get(&inputs.mvec.0).copied().filter(|_| self.current_mvec == Some(inputs.mvec.0));
         let mvec_input = live_mvec.map(|d| {
             let image = inputs.mvec.0;
-            let layout = self
-                .pending
-                .get(&cb)
-                .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
-                .or_else(|| self.attached.get(&cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
-                .or_else(|| self.committed.get(&image).copied())
-                .or(d.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL));
+            let known = self.layout_in(cb, image, true, d.usage.contains(vk::ImageUsageFlags::STORAGE));
+            guessed.mvec = known.filter(|(_, set)| !set).map(|(l, _)| l);
+            let layout = known.map(|(l, _)| l);
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
                 && MVEC_HOLD_FORMATS.contains(&d.format)
                 && d.width >= desc.width
@@ -2278,12 +2317,9 @@ impl Tracker {
         let (named, _) = self.hold_depth(cb, inputs.depth, None, true);
         let depth_input = self.images.get(&named).copied().map(|d| {
             let image = named;
-            let layout = self
-                .pending
-                .get(&cb)
-                .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
-                .or_else(|| self.attached.get(&cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
-                .or_else(|| self.committed.get(&image).copied());
+            let known = self.layout_in(cb, image, true, false);
+            guessed.depth = known.filter(|(_, set)| !set).map(|(l, _)| l);
+            let layout = known.map(|(l, _)| l);
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
                 && (d.width, d.height) == (desc.width, desc.height)
                 && layout.is_some_and(|l| depth_copy_layout(d.format, l));
@@ -2300,7 +2336,38 @@ impl Tracker {
             identification: self.generation,
             hazard,
             hold: placement::Hold::ALL_BEFORE,
+            guessed,
         })
+    }
+
+    /// `image`'s layout at this point of `cb` and whether `cb` set it: the buffer's own last barrier on it,
+    /// else (`attachments`) its last use as an attachment in `cb`; else what the buffers submitted so far left
+    /// ([`Self::commit_submitted`]), else `GENERAL` when `storage_general` (a storage image no barrier was seen
+    /// on), both guesses (`false`). `None` when nothing is known.
+    fn layout_in(&self, cb: vk::CommandBuffer, image: vk::Image, attachments: bool, storage_general: bool) -> Option<(vk::ImageLayout, bool)> {
+        let set = self
+            .pending
+            .get(&cb)
+            .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
+            .or_else(|| attachments.then(|| self.attached.get(&cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l))).flatten());
+        set.map(|l| (l, true)).or_else(|| self.committed.get(&image).map(|l| (*l, false))).or(storage_general.then_some((vk::ImageLayout::GENERAL, false)))
+    }
+
+    /// `image`'s layout when a buffer submitted right after `earlier` (the buffers in front of it in the same
+    /// submission, in order) starts: what the last of them to set it left, else what the buffers submitted
+    /// before left. `None` when nothing is known (an image not watched, or never seen in a barrier).
+    pub(crate) fn layout_when_run(&self, earlier: &[vk::CommandBuffer], image: vk::Image) -> Option<vk::ImageLayout> {
+        earlier
+            .iter()
+            .rev()
+            .find_map(|cb| {
+                // A buffer's barriers follow its attachments ([`Self::commit_submitted`]).
+                self.pending
+                    .get(cb)
+                    .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
+                    .or_else(|| self.attached.get(cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
+            })
+            .or_else(|| self.committed.get(&image).copied())
     }
 
     /// A hold inside DLSS's buffer was recorded at a point of identification `identification`.
@@ -2440,21 +2507,20 @@ impl Tracker {
         if self.rendering.get(&cb).is_some_and(|r| r.last_suspending || r.open_resume) {
             return None;
         }
-        let layout_of = |image: vk::Image, d: &ImageDesc| {
-            self.pending
-                .get(&cb)
-                .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
-                .or_else(|| self.attached.get(&cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
-                .or_else(|| self.committed.get(&image).copied())
-                .or(d.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL))
-        };
-        let layout = layout_of(o.image, &desc)?;
+        let layout_of = |image: vk::Image, d: &ImageDesc| self.layout_in(cb, image, true, d.usage.contains(vk::ImageUsageFlags::STORAGE));
+        let mut guessed = Guessed::default();
+        let (layout, set) = layout_of(o.image, &desc)?;
+        if !set {
+            guessed.colour = Some(layout);
+        }
         if !INLINE_LAYOUTS.contains(&layout) {
             return None;
         }
         let mvec = self.images.get(&o.mvec).copied();
         let mvec_input = mvec.map(|d| {
-            let layout = layout_of(o.mvec, &d);
+            let known = layout_of(o.mvec, &d);
+            guessed.mvec = known.filter(|(_, set)| !set).map(|(l, _)| l);
+            let layout = known.map(|(l, _)| l);
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
                 && MVEC_HOLD_FORMATS.contains(&d.format)
                 && layout.is_some_and(|l| MVEC_COPY_LAYOUTS.contains(&l));
@@ -2472,6 +2538,7 @@ impl Tracker {
             identification: o.image.as_raw() | (1 << 63),
             hazard: Hazard::NotSplittable,
             hold: placement::Hold::of(plan, placement::Stage::Upscaled, render, (desc.width, desc.height)),
+            guessed,
         })
     }
 
@@ -2499,6 +2566,7 @@ impl Tracker {
             self.launch.remove(cb);
             self.pending.remove(cb);
             self.global_sync.remove(cb);
+            self.event_waits.remove(cb);
             self.rendering.remove(cb);
             self.attached.remove(cb);
             self.recorded_watched.remove(cb);
@@ -2524,6 +2592,14 @@ impl Tracker {
     /// source access, an event wait); the first one is kept.
     pub(crate) fn global(&mut self, command_buffer: vk::CommandBuffer, hazard: Hazard) {
         self.global_sync.entry(command_buffer).or_insert(hazard);
+        if hazard == Hazard::EventWait {
+            self.event_waits.insert(command_buffer);
+        }
+    }
+
+    /// Whether any of `cbs` waits on an event ([`Self::event_waits`]).
+    pub(crate) fn waits_on_event(&self, cbs: &[vk::CommandBuffer]) -> bool {
+        cbs.iter().any(|cb| self.event_waits.contains(cb))
     }
 
     /// `vkCmdBeginRendering` with `VK_RENDERING_SUSPENDING_BIT` or `VK_RENDERING_RESUMING_BIT`. A
@@ -2588,6 +2664,9 @@ impl Tracker {
             }
             if let Some(hazard) = self.global_sync.get(secondary).copied() {
                 self.global(primary, hazard);
+            }
+            if self.event_waits.contains(secondary) {
+                self.event_waits.insert(primary);
             }
             if let Some(inherited) = self.attached.get(secondary).filter(|a| !a.is_empty()).cloned() {
                 self.attached.entry(primary).or_default().extend(inherited);
@@ -3471,6 +3550,11 @@ pub(crate) struct Tracking {
 static TRACKING: LazyLock<Mutex<HashMap<vk::Device, Arc<Tracking>>>> = LazyLock::new(Default::default);
 
 impl Tracking {
+    /// [`Tracker::waits_on_event`].
+    pub(crate) fn waits_on_event(&self, cbs: &[vk::CommandBuffer]) -> bool {
+        self.lock().waits_on_event(cbs)
+    }
+
     /// A new tracker for `device`, also reachable through [`tracking_for`] (the
     /// `vkGetImageViewHandle64NVX` wrapper has only the device handle).
     pub(crate) fn new_for(device: vk::Device) -> Arc<Self> {
@@ -3829,6 +3913,10 @@ pub(crate) trait SplitBatch: Sized {
     fn own(waits: Vec<Self::Wait>, command_buffer: vk::CommandBuffer) -> Self;
     /// The batch's command buffers, in order.
     fn command_buffers(&self) -> Vec<vk::CommandBuffer>;
+    /// A wait's semaphore and the value it waits for (a timeline semaphore's; ignored for a binary one).
+    fn wait_value(wait: &Self::Wait) -> (vk::Semaphore, u64);
+    /// The batch's own waits.
+    fn waits(&self) -> &[Self::Wait];
 }
 
 impl SplitBatch for Batch1 {
@@ -3850,6 +3938,12 @@ impl SplitBatch for Batch1 {
     }
     fn command_buffers(&self) -> Vec<vk::CommandBuffer> {
         self.cbs.clone()
+    }
+    fn wait_value(wait: &Wait1) -> (vk::Semaphore, u64) {
+        (wait.semaphore, wait.value.unwrap_or(0))
+    }
+    fn waits(&self) -> &[Wait1] {
+        &self.waits
     }
 }
 
@@ -3873,6 +3967,12 @@ impl<'a> SplitBatch for Batch2<'a> {
     }
     fn command_buffers(&self) -> Vec<vk::CommandBuffer> {
         self.cbs.iter().map(|c| c.command_buffer).collect()
+    }
+    fn wait_value(wait: &vk::SemaphoreSubmitInfo<'a>) -> (vk::Semaphore, u64) {
+        (wait.semaphore, wait.value)
+    }
+    fn waits(&self) -> &[vk::SemaphoreSubmitInfo<'a>] {
+        &self.waits
     }
 }
 
@@ -4490,6 +4590,11 @@ pub(crate) struct Resources {
     pub(crate) writeback_pending: bool,
     /// A hold's work went to the queue and no fence could be put after it: nothing here is reused.
     unfenced: bool,
+    /// The queue the holds' work goes to ([`Self::on_queue`]), and how many waits on their fences saw them
+    /// signalled: such a fence's signal covers everything submitted on its queue before it, so resources left
+    /// behind there ([`Session::recover_unfenced`]) are free once a later one was seen ([`Session::bury`]).
+    queue: Option<vk::Queue>,
+    fences_seen: u64,
 }
 
 // SAFETY: the raw pointers are the SHM mapping (process-lifetime) or the layer's own mapped
@@ -4640,7 +4745,14 @@ impl Resources {
             capture_pending: false,
             writeback_pending: false,
             unfenced: false,
+            queue: None,
+            fences_seen: 0,
         })
+    }
+
+    /// The next hold's work goes to `queue` (the application's DLSS submit's).
+    pub(crate) fn on_queue(&mut self, queue: vk::Queue) {
+        self.queue = Some(queue);
     }
 
     pub(crate) fn matches(&self, queue_family: u32, width: u32, height: u32) -> bool {
@@ -4703,6 +4815,7 @@ impl Resources {
         if crate::note_fence_wait(device.handle(), wait, "preupscale::wait_idle").is_err() {
             return false;
         }
+        self.fences_seen += 1;
         self.idle();
         if std::mem::take(&mut self.writeback_pending) {
             if let Some(timer) = self.writeback_timer.as_mut() {
@@ -5897,6 +6010,9 @@ pub(crate) struct Session {
     /// Until when the after-the-upscaler path keeps off slot 0: hold resources were left behind
     /// without a fence ([`Self::recover_unfenced`]), and their write-back may still read it.
     post_held_off_until: Option<Instant>,
+    /// Split-hold resources left without a fence for their last work, until a later fence on their queue
+    /// signals ([`Self::bury`]) or the device is torn down.
+    left_behind: Vec<Resources>,
     /// The last launch-bearing submit with DLSS's inputs identified (held or not).
     last_dlss: Option<Instant>,
     /// A model-mode hold on this device ran the network: the pre-upscaler path works here, so the
@@ -6189,23 +6305,45 @@ impl Session {
     }
 
     /// Hold resources that a failed submit left without a fence ([`Resources::fence_submitted`]) are
-    /// let go of on a device that is not lost: leaked, not destroyed (what went to the queue may still
+    /// let go of on a device that is not lost: set aside, not destroyed (what went to the queue may still
     /// use them), so the next hold builds new ones and the after-the-upscaler path is not kept waiting
-    /// on them. On a lost device they stay, and nothing holds there again. Only the split hold's
-    /// [`Self::res`] has fences: the holds recorded into DLSS's buffers ([`Self::res_inline`],
-    /// [`Self::res_after`]) have no work of their own.
+    /// on them. They are destroyed once a fence submitted after them on their queue was seen signalled
+    /// ([`Self::bury`]), or at device teardown. On a lost device they stay, and nothing holds there again.
+    /// Only the split hold's [`Self::res`] has fences: the holds recorded into DLSS's buffers
+    /// ([`Self::res_inline`], [`Self::res_after`]) have no work of their own.
     pub(crate) fn recover_unfenced(&mut self, device: &ash::Device) {
+        self.bury(device);
         if !self.res.as_ref().is_some_and(|r| r.unfenced) || crate::device_lost(device.handle()) {
             return;
         }
-        crate::log!("[preupscale] hold resources without a fence for their last work are left behind (leaked) and built again");
+        crate::log!(
+            "[preupscale] hold resources without a fence for their last work are set aside until a later fence on their queue signals, and built again"
+        );
         if let Some(old) = self.res.take() {
-            std::mem::forget(old);
+            self.left_behind.push(old);
         }
         // What they went to the queue with may still read slot 0, which the after-the-upscaler
         // path writes: it keeps off as long as any wait of the layer's is bounded (on the native
         // path the network's loader holds it off the same way, `Loader::pre_unfenced`).
         self.post_held_off_until = Some(Instant::now() + crate::FENCE_WAIT_TIMEOUT);
+    }
+
+    /// Destroys the resources left behind ([`Self::recover_unfenced`]) on the queue the split hold's current
+    /// ones work on, once one of their fences was seen signalled: those resources were built after the left
+    /// ones were set aside, so that fence was submitted after the left ones' last work, and a fence's signal
+    /// covers everything submitted on its queue before it (`vkQueueSubmit`'s fence signal operation).
+    pub(crate) fn bury(&mut self, device: &ash::Device) {
+        let Some(after) = self.res.as_ref().filter(|r| r.fences_seen > 0 && !r.unfenced).and_then(|r| r.queue) else { return };
+        let mut k = 0;
+        while k < self.left_behind.len() {
+            if self.left_behind[k].queue == Some(after) {
+                let old = self.left_behind.swap_remove(k);
+                // SAFETY: everything submitted with it on its queue completed (above).
+                unsafe { old.destroy(device) };
+            } else {
+                k += 1;
+            }
+        }
     }
 
     /// Whether the after-the-upscaler path must leave slot 0 alone this present (see
@@ -6296,9 +6434,14 @@ impl Session {
         if let Some(n) = res.native.as_mut().filter(|n| h.meta.fresh.0 == n.id()) {
             n.inline_ran(h.meta.fresh.1);
         }
+        if !h.sound {
+            // A guessed input layout was wrong when the buffer ran (`inline::Inline::check`): the guard reset
+            // what it carries; what it measured from those inputs is not used either.
+            return;
+        }
         if let (true, Some(kind), Some(edit)) = (h.meta.stats, h.meta.kind, res.edit.as_mut()) {
             let counters: [u32; cache::STAT_WORDS] = std::array::from_fn(|k| word(inline::READ_STATS, k));
-            if let Some(rejected) = edit.after_counters(kind, &counters).rejected {
+            if let Some(rejected) = edit.after_counters(kind, h.meta.refresh, &counters).rejected {
                 res.readings.cache_rejected = Some(rejected);
             }
         }
@@ -6325,7 +6468,8 @@ impl Session {
     /// # Safety
     /// The device must be idle (teardown).
     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {
-        for res in [self.res.take(), self.res_inline.take(), self.res_after.take()].into_iter().flatten() {
+        let left = std::mem::take(&mut self.left_behind);
+        for res in [self.res.take(), self.res_inline.take(), self.res_after.take()].into_iter().flatten().chain(left) {
             // SAFETY: forwarded.
             unsafe { res.destroy(device) };
         }
@@ -6743,6 +6887,8 @@ impl Session {
         drop(self.post_server.take());
         #[cfg(target_arch = "x86_64")]
         if let Some(loader) = &self.native {
+            // First: no other device's loader can reach it once this returns.
+            loader.retire();
             loader.stop_worker();
         }
     }
@@ -7179,8 +7325,10 @@ mod tests {
         assert_eq!(Mode::parse(Some("roundtrip")), Ok(Mode::Roundtrip));
         assert!(Mode::parse(Some("on")).is_err());
         assert!(Mode::Model.hdr() && Mode::Roundtrip.hdr() && !Mode::Identity.hdr() && !Mode::Dump.hdr(), "identity stays the raw copy-through");
-        assert!(commands(false).is_empty());
-        assert!(commands(true).contains(&VulkanCommand::CmdCuLaunchKernelNvx));
+        assert_eq!(commands(false).count(), 0);
+        assert!(commands(true).any(|c| *c == VulkanCommand::CmdCuLaunchKernelNvx));
+        assert!(diagnostic(Mode::Dump) && diagnostic(Mode::Identity) && diagnostic(Mode::Roundtrip) && !diagnostic(Mode::Model) && !diagnostic(Mode::Off));
+        assert!(!commands(true).any(|c| DIAGNOSTIC_COMMANDS.contains(c)), "outside the diagnostic modes the semaphores are not hooked");
         // The test process does not set NEURAL_FORGE_ENABLE: off, and nothing extra is hooked.
         assert_eq!(mode(), Mode::Off);
     }
@@ -8276,6 +8424,75 @@ mod tests {
         assert_eq!(t.take_inline_at(), None);
     }
 
+    /// The diagnostic modes' split hold waits on the host behind what is submitted in front of its capture:
+    /// only behind timeline values already reached (a binary semaphore's wait is never checked), and never
+    /// behind a buffer that waits on an event, whatever synchronization came first in it.
+    #[test]
+    fn diagnostic_holds_wait_only_behind_what_needs_no_later_host_signal() {
+        let (mut t, _) = held_tracker();
+        t.global(cb(5), Hazard::MemoryBarrier);
+        t.global(cb(5), Hazard::EventWait);
+        assert_eq!(t.global_sync.get(&cb(5)), Some(&Hazard::MemoryBarrier), "the first synchronization stays the hazard");
+        assert!(t.waits_on_event(&[cb(4), cb(5)]));
+        assert!(!t.waits_on_event(&[cb(4)]));
+        t.begin(cb(5));
+        assert!(!t.waits_on_event(&[cb(5)]), "begun again");
+        // SAFETY: a test device of its own, everything destroyed below.
+        unsafe {
+            let Ok(entry) = ash::Entry::load() else { return };
+            let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+            let Ok(instance) = entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) else { return };
+            let Some(&physical) = instance.enumerate_physical_devices().ok().as_ref().and_then(|d| d.first()) else {
+                instance.destroy_instance(None);
+                return;
+            };
+            let mut v12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
+            let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&[1.0])];
+            let device = instance.create_device(physical, &vk::DeviceCreateInfo::default().queue_create_infos(&queues).push_next(&mut v12), None).unwrap();
+            let mut ty = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(3);
+            let timeline = device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ty), None).unwrap();
+            let binary = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
+            let is_timeline = |s| s == timeline;
+            assert!(waits_reached(&device, [(timeline, 3), (binary, 99)], is_timeline), "reached, and a binary semaphore's value ignored");
+            assert!(!waits_reached(&device, [(timeline, 2), (timeline, 4)], is_timeline), "a value the host signals only later");
+            device.signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(timeline).value(4)).unwrap();
+            assert!(waits_reached(&device, [(timeline, 4)], is_timeline));
+            device.destroy_semaphore(timeline, None);
+            device.destroy_semaphore(binary, None);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    /// A layout the buffer set before the hold point (its own barrier) is no guess; one taken from what the
+    /// buffers submitted before left, or `GENERAL` for a storage image never seen in a barrier, is. When a
+    /// buffer runs, an image's layout is what the last buffer in front of it in the submission set, else what
+    /// the submitted ones left.
+    #[test]
+    fn layouts_the_buffer_did_not_set_are_guesses_checked_against_the_buffers_before() {
+        use vk::ImageLayout as L;
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, params) = held_tracker_with(copyable);
+        t.global(cb(2), Hazard::MemoryBarrier);
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        let point = t.inline_point(b, c).expect("held inside the buffer");
+        assert_eq!(point.guessed.colour, Some(L::GENERAL), "a storage image no barrier was seen on");
+        let (mut t, params) = held_tracker_with(copyable);
+        t.barrier(cb(2), ImageSync { old_layout: L::GENERAL, ..ImageSync::to(colour(), L::SHADER_READ_ONLY_OPTIMAL) });
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        let point = t.inline_point(b, c).expect("held inside the buffer");
+        assert_eq!((point.layout, point.guessed.colour), (L::SHADER_READ_ONLY_OPTIMAL, None), "set by the buffer's own barrier");
+        // When a buffer runs.
+        t.barrier(cb(7), ImageSync { old_layout: L::SHADER_READ_ONLY_OPTIMAL, ..ImageSync::to(colour(), L::GENERAL) });
+        assert_eq!(t.layout_when_run(&[cb(7)], colour()), Some(L::GENERAL), "the buffer in front set it");
+        t.commit_submitted([cb(2)]);
+        assert_eq!(t.layout_when_run(&[], colour()), Some(L::SHADER_READ_ONLY_OPTIMAL), "what the submitted ones left");
+        assert_eq!(t.layout_when_run(&[cb(2), cb(7)], colour()), Some(L::GENERAL), "the last in front wins");
+        assert_eq!(t.layout_when_run(&[cb(8)], colour()), Some(L::SHADER_READ_ONLY_OPTIMAL), "a buffer that does not set it");
+    }
+
     /// Once a hold inside DLSS's buffer was recorded for an identification, a buffer the split
     /// could take is held inside too (Hogwarts Legacy refuses the split for some of its DLSS
     /// buffers only): the two holds alternating rebuilt the hold's resources, and the network's
@@ -8320,6 +8537,7 @@ mod tests {
             identification: 1,
             hazard: Hazard::MemoryBarrier,
             hold: placement::Hold::ALL_BEFORE,
+            guessed: Guessed::default(),
         };
         assert_eq!(point((1708, 964)).mvec_scale(), [1.0, 1.0]);
         assert_eq!(point((2560, 1440)).mvec_scale(), [1708.0 / 2560.0, 964.0 / 1440.0]);
@@ -10461,25 +10679,31 @@ mod tests {
         let mut session = Session::default();
         // SAFETY: a fresh device; nothing of the resources is ever submitted.
         assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false, placement::Stage::Before) });
+        session.res.as_mut().unwrap().on_queue(gpu.queue);
         session.res.as_mut().unwrap().unfenced = true;
         assert!(session.res.as_ref().unwrap().pending());
-        // The resources the layer lets go of: kept here so the test can destroy them before the device
-        // (the layer forgets its own copy, `recover_unfenced`, so this one is the only one dropped).
-        // SAFETY: a bitwise copy of a value that is `mem::forget`-ten, never dropped, below.
-        let left_behind = unsafe { std::ptr::read(session.res.as_ref().unwrap()) };
         // SAFETY: as above.
         assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false, placement::Stage::Before) }, "built again");
         assert!(!session.res.as_ref().unwrap().pending(), "fresh resources");
+        assert_eq!(session.left_behind.len(), 1, "the old ones set aside, not leaked");
+        // The new ones' first fence on the same queue, seen signalled: the old ones' work is done.
+        let res = session.res.as_mut().unwrap();
+        res.on_queue(gpu.queue);
+        // SAFETY: the resources' own idle fence, submitted once with nothing.
+        unsafe { d.queue_submit(gpu.queue, &[], res.capture_fence) }.unwrap();
+        res.capture_pending = true;
+        session.bury(d);
+        assert_eq!(session.left_behind.len(), 1, "no fence of the new ones seen yet");
+        assert!(session.res.as_mut().unwrap().wait_idle(d, &mut None));
+        session.bury(d);
+        assert!(session.left_behind.is_empty(), "destroyed once a later fence on their queue signalled");
         // The split holds run before the upscaler only: no fenced resources are ever built into the
         // slot of the hold after DLSS's output, which `ensure_inline` destroys without a wait.
         // SAFETY: as above.
         assert!(!unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 32, 16, &shm, false, placement::Stage::Upscaled) });
         assert!(session.res_after.is_none() && session.res.as_ref().unwrap().matches(gpu.family, 16, 8), "nothing built, the split's left alone");
-        // SAFETY: nothing submitted.
-        unsafe {
-            session.destroy(d);
-            left_behind.destroy(d);
-        }
+        // SAFETY: everything submitted was waited on.
+        unsafe { session.destroy(d) };
     }
 
     /// A channel over a scratch file, which goes (with its directory) when the test is done with it.

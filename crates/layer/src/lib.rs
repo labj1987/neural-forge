@@ -296,7 +296,7 @@ fn cannot_run_line(why: &str) -> String {
 
 fn note_native_unavailable(why: &str) {
     let line = cannot_run_line(why);
-    let mut said = NATIVE_UNAVAILABLE.lock().unwrap();
+    let mut said = NATIVE_UNAVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // A launcher can create several devices on the same GPU: one line per different reason.
     if said.as_deref() != Some(line.as_str()) {
         crate::event!(neural_forge_protocol::state_log::NATIVE_UNAVAILABLE, "{line}");
@@ -306,7 +306,7 @@ fn note_native_unavailable(why: &str) {
 
 /// The status line for a device that cannot run the network, if this process created one.
 pub(crate) fn native_unavailable() -> Option<String> {
-    NATIVE_UNAVAILABLE.lock().unwrap().clone()
+    NATIVE_UNAVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 fn env_flag(name: &str) -> bool {
@@ -477,7 +477,7 @@ fn external_memory_host_allowed(instance_api_version: u32, device_api_version: u
 }
 
 pub(crate) fn take_external_memory_host_enabled(device: vk::Device) -> bool {
-    EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().as_mut().is_some_and(|set| set.remove(&device))
+    EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut().is_some_and(|set| set.remove(&device))
 }
 
 /// Devices created with the native backend's additions (`preupscale::native`): its extensions and
@@ -489,7 +489,7 @@ static NATIVE_DEVICES: Mutex<Option<HashMap<vk::Device, preupscale::native::Setu
 /// Checks and clears the native backend's setup for `device`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn take_native(device: vk::Device) -> Option<preupscale::native::Setup> {
-    NATIVE_DEVICES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
+    NATIVE_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut().and_then(|map| map.remove(&device))
 }
 
 /// The application's queue requests `infos` with `n` more queues for the layer, in a compute family without
@@ -683,7 +683,7 @@ impl NeuralForgeInstanceHooks {
     /// Records `physical_device` as belonging to this instance, for `create_device_info`.
     fn remember(&self, physical_device: vk::PhysicalDevice) {
         if let Some(ctx) = &self.ctx {
-            PHYSICAL_DEVICE_INSTANCES.lock().unwrap().insert(physical_device, ctx.clone());
+            PHYSICAL_DEVICE_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(physical_device, ctx.clone());
         }
     }
 }
@@ -693,7 +693,7 @@ impl Drop for NeuralForgeInstanceHooks {
         if let Some(ctx) = &self.ctx {
             let handle = ctx.instance.handle();
 
-            PHYSICAL_DEVICE_INSTANCES.lock().unwrap().retain(|_, owner| owner.instance.handle() != handle);
+            PHYSICAL_DEVICE_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|_, owner| owner.instance.handle() != handle);
         }
     }
 }
@@ -751,12 +751,18 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                 ))
             }
         };
+        // The framework's link, found once before any attempt: an attempt the layer below refuses has
+        // advanced it in place, so a later search would find the link for the layer under that one.
+        // Every attempt, the retry without `swapchainMaintenance1` included, starts from this.
+        // SAFETY: the framework's copy of the request, whose chain is the loader's.
+        let link = unsafe { DeviceLink::find(create_info) };
+        let link = link.as_ref();
         let created = |result: &LayerResult<ash::prelude::VkResult<()>>| matches!(result, LayerResult::Handled(Ok(())));
         match plan {
             Some(swapchain_maintenance::Plan::Add { extension }) => {
                 // SAFETY: the framework's request, valid for this call; `addition` outlives it.
                 let addition = unsafe { swapchain_maintenance::Addition::new(create_info, extension) };
-                let result = Self::create_device_with(&instance, physical_device, &addition.info, layer_device_link, allocator, p_device, true);
+                let result = Self::create_device_with(&instance, physical_device, &addition.info, layer_device_link, link, allocator, p_device, true);
                 if created(&result) {
                     // SAFETY: written by the successful call.
                     swapchain_maintenance::note_enabled(unsafe { p_device.assume_init() });
@@ -771,10 +777,10 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                     _ => return result,
                 };
                 log!("[present] creating the device with swapchainMaintenance1 was refused ({refused:?}); creating it without");
-                Self::create_device_with(&instance, physical_device, create_info, layer_device_link, allocator, p_device, false)
+                Self::create_device_with(&instance, physical_device, create_info, layer_device_link, link, allocator, p_device, false)
             }
             Some(swapchain_maintenance::Plan::AsIs(Ok(()))) => {
-                let result = Self::create_device_with(&instance, physical_device, create_info, layer_device_link, allocator, p_device, true);
+                let result = Self::create_device_with(&instance, physical_device, create_info, layer_device_link, link, allocator, p_device, true);
                 if created(&result) {
                     // SAFETY: written by the successful call.
                     swapchain_maintenance::note_enabled(unsafe { p_device.assume_init() });
@@ -786,7 +792,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                 if let Some(swapchain_maintenance::Plan::AsIs(Err(why))) = plan {
                     log!("[present] no swapchainMaintenance1 on the device ({why}): present semaphores of destroyed swapchains are kept until the device is destroyed");
                 }
-                Self::create_device_with(&instance, physical_device, create_info, layer_device_link, allocator, p_device, false)
+                Self::create_device_with(&instance, physical_device, create_info, layer_device_link, link, allocator, p_device, false)
             }
         }
     }
@@ -796,11 +802,15 @@ impl NeuralForgeInstanceHooks {
     /// The rest of `create_device`, for `create_info` (the application's request, or it with
     /// `swapchainMaintenance1` added). `handled`: the device is created here even where nothing else
     /// is added (never [`LayerResult::Unhandled`] for that reason), so the caller learns its handle.
+    /// `link`: the request's link node as the framework left it, found before the first attempt
+    /// (`create_device`).
+    #[allow(clippy::too_many_arguments)]
     fn create_device_with(
         instance: &InstanceContext,
         physical_device: vk::PhysicalDevice,
         create_info: &vk::DeviceCreateInfo,
         layer_device_link: &VkLayerDeviceLink,
+        link: Option<&DeviceLink>,
         allocator: Option<&vk::AllocationCallbacks>,
         p_device: &mut std::mem::MaybeUninit<vk::Device>,
         handled: bool,
@@ -833,12 +843,10 @@ impl NeuralForgeInstanceHooks {
                 None => return LayerResult::Unhandled,
             };
         let allocator_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
-        // SAFETY: the framework's copy of the request, whose chain is the loader's.
-        let link = unsafe { DeviceLink::find(create_info) };
         // SAFETY: `vkCreateDevice` for this call's physical device, with the request each attempt
         // passes and the framework's out-parameter.
         let next_create_device = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| unsafe {
-            call_next_create_device(next_create_device, link.as_ref(), physical_device, info, allocator_ptr, p_device)
+            call_next_create_device(next_create_device, link, physical_device, info, allocator_ptr, p_device)
         };
         // SAFETY: `physical_device` belongs to this instance.
         let nvidia = unsafe { instance.instance.get_physical_device_properties(physical_device) }.vendor_id == 0x10DE;
@@ -927,7 +935,7 @@ impl NeuralForgeInstanceHooks {
                                         properties2: instance.properties2,
                                         flow,
                                     };
-                                    NATIVE_DEVICES.lock().unwrap().get_or_insert_default().insert(device, setup);
+                                    NATIVE_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().insert(device, setup);
                                     log!("[native] device created with the network's extensions and features, loading queue {index} of family {family}");
                                     return result;
                                 }
@@ -951,7 +959,7 @@ impl NeuralForgeInstanceHooks {
             if result.result().is_ok() {
                 // SAFETY: `p_device` was just written by the successful call above.
                 let device = unsafe { p_device.assume_init() };
-                EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().get_or_insert_default().insert(device);
+                EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().insert(device);
             }
             return LayerResult::Handled(result.result());
         }
@@ -999,7 +1007,7 @@ impl NeuralForgeInstanceHooks {
         if result.result().is_ok() {
             // SAFETY: `p_device` was just written by the successful call above.
             let device = unsafe { p_device.assume_init() };
-            EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().get_or_insert_default().insert(device);
+            EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().insert(device);
             return LayerResult::Handled(Ok(()));
         }
         // The driver refused device creation with the extra extension for some reason
@@ -1109,7 +1117,7 @@ impl Layer for NeuralForgeLayer {
         // this is always `Some` in practice; `None` only for a device created against an
         // instance from before this layer was loaded, which never happens for an implicit
         // layer, and then capture is simply skipped.
-        let instance = PHYSICAL_DEVICE_INSTANCES.lock().unwrap().get(&physical_device).cloned();
+        let instance = PHYSICAL_DEVICE_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&physical_device).cloned();
         NeuralForgeDeviceInfo::new(
             instance.as_ref().map(|ctx| ctx.instance.clone()),
             instance.and_then(|ctx| ctx.surface_caps),
@@ -1452,6 +1460,83 @@ mod device_link_tests {
         let second = unsafe { call_next_create_device(next_layer, Some(&link), vk::PhysicalDevice::null(), &retry, std::ptr::null(), &mut p_device) };
         assert_eq!(second, vk::Result::SUCCESS);
         SEEN.with_borrow(|seen| assert_eq!(seen.as_slice(), [original, original], "an attempt saw an advanced link"));
+    }
+
+    /// The retry without `swapchainMaintenance1` (`create_device`'s `Plan::Add` refused): the request
+    /// with the addition, then the application's own, each through every attempt `create_device_with`
+    /// makes, reach the layer below with the link the framework left, although the refused attempts
+    /// advanced it.
+    #[test]
+    fn the_retry_without_the_addition_sees_the_original_link() {
+        let Some(entry) = (unsafe { ash::Entry::load() }).ok() else {
+            eprintln!("device link retry test: no Vulkan loader, skipping");
+            return;
+        };
+        let Some(instance) = (unsafe { entry.create_instance(&vk::InstanceCreateInfo::default(), None) }).ok().map(Arc::new) else {
+            eprintln!("device link retry test: no Vulkan ICD, skipping");
+            return;
+        };
+        let Some(&physical) = unsafe { instance.enumerate_physical_devices() }.ok().as_ref().and_then(|d| d.first()) else {
+            eprintln!("device link retry test: no physical device, skipping");
+            unsafe { instance.destroy_instance(None) };
+            return;
+        };
+        unsafe extern "system" fn gipa_next(_: vk::Instance, name: *const c_char) -> vk::PFN_vkVoidFunction {
+            // SAFETY: a NUL-terminated name from the hook.
+            (unsafe { CStr::from_ptr(name) } == c"vkCreateDevice")
+                // SAFETY: the same signature as `vkCreateDevice`, which the caller transmutes back.
+                .then(|| unsafe { std::mem::transmute::<vk::PFN_vkCreateDevice, unsafe extern "system" fn()>(next_layer) })
+        }
+        let mut lower = VkLayerDeviceLink { pNext: std::ptr::null_mut(), pfnNextGetInstanceProcAddr: gipa_next, pfnNextGetDeviceProcAddr: gdpa };
+        let mut below = VkLayerDeviceLink { pNext: &mut lower, pfnNextGetInstanceProcAddr: gipa_next, pfnNextGetDeviceProcAddr: gdpa };
+        let original: *mut VkLayerDeviceLink = &mut below;
+        let mut node = LoaderDeviceCreateInfo { s_type: LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::null(), function: LAYER_LINK_INFO, layer_info: original };
+        let priorities = [1.0];
+        let queue = vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&priorities);
+        let names = [c"VK_KHR_swapchain".as_ptr()];
+        let info = vk::DeviceCreateInfo { p_next: std::ptr::from_mut(&mut node).cast(), ..Default::default() }
+            .queue_create_infos(std::slice::from_ref(&queue))
+            .enabled_extension_names(&names);
+        let ctx = InstanceContext {
+            instance: instance.clone(),
+            surface_caps: None,
+            properties2: vram::Properties2::None,
+            api_version: 0,
+            surface_maintenance: Default::default(),
+        };
+        // As `create_device` does: the link found once, before the first attempt.
+        // SAFETY: the chain above.
+        let link = unsafe { DeviceLink::find(&info) };
+        // SAFETY: the request above, valid for the call; `addition` outlives it.
+        let addition = unsafe { swapchain_maintenance::Addition::new(&info, Some(c"VK_KHR_swapchain_maintenance1")) };
+        SEEN.with_borrow_mut(Vec::clear);
+        REFUSE.set(u32::MAX);
+        let mut p_device = std::mem::MaybeUninit::uninit();
+        let with = NeuralForgeInstanceHooks::create_device_with(&ctx, physical, &addition.info, &below, link.as_ref(), None, &mut p_device, true);
+        assert!(matches!(with, LayerResult::Handled(Err(_))), "refused");
+        let tried = SEEN.with_borrow(Vec::len);
+        assert!(tried > 0);
+        // SAFETY: the node above, written by the layer below through the request.
+        assert_ne!(unsafe { node_info(&info) }, original, "the refused attempts advanced the link");
+        let without = NeuralForgeInstanceHooks::create_device_with(&ctx, physical, &info, &below, link.as_ref(), None, &mut p_device, true);
+        assert!(matches!(without, LayerResult::Handled(Err(_))));
+        REFUSE.set(0);
+        SEEN.with_borrow(|seen| {
+            assert!(seen.len() > tried, "the retry reached the layer below");
+            assert!(seen.iter().all(|&l| l == original), "an attempt saw an advanced link: {seen:?} (original {original:?})");
+        });
+        drop(addition);
+        drop(ctx);
+        unsafe { instance.destroy_instance(None) };
+    }
+
+    /// The `pLayerInfo` in `info`'s link node now.
+    ///
+    /// # Safety
+    /// `info`'s chain is valid and has a link node.
+    unsafe fn node_info(info: &vk::DeviceCreateInfo) -> *mut VkLayerDeviceLink {
+        // SAFETY: per this function's contract.
+        unsafe { (*DeviceLink::find(info).unwrap().node).layer_info }
     }
 
     /// In a process the layer is off in (`NEURAL_FORGE_ENABLE` is unset in tests), the hook hands the

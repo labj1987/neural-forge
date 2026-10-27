@@ -162,14 +162,38 @@ impl Tickets {
     /// An unsignalled fence for one present: a spare one, or a new one. Given to a call, it becomes a
     /// [`Ticket`] ([`Self::submitted`], [`Self::stranded`]); given to none, it goes back ([`Self::unused`]).
     ///
+    /// With no spare, the pending fences are looked at first ([`Self::poll`]), whether or not anything
+    /// is waiting to be freed: a present's fence signals a few frames later, so the fences of earlier
+    /// presents come back as spares and a running swapchain needs only a handful. `None` (the present
+    /// goes untracked) once [`Self::MAX_PENDING`] are still pending: a device that signals none of them
+    /// never makes a fence per present.
+    ///
     /// # Safety
     /// `device` is the one every fence here belongs to.
     pub unsafe fn take(&mut self, device: &ash::Device) -> Option<vk::Fence> {
-        match self.spare.pop() {
-            Some(fence) => Some(fence),
-            // SAFETY: plain creation.
-            None => unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.ok(),
+        if self.spare.is_empty() {
+            // SAFETY: per this function's contract.
+            unsafe { self.poll(device) };
         }
+        if let Some(fence) = self.spare.pop() {
+            return Some(fence);
+        }
+        if self.pending.len() >= Self::MAX_PENDING {
+            return None;
+        }
+        // SAFETY: plain creation.
+        unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.ok()
+    }
+
+    /// The most present fences waited for at once. A present's fence signals once its queue operations
+    /// are done, a few frames after it was made; this many outstanding means the device is not
+    /// signalling them.
+    pub const MAX_PENDING: usize = 16;
+
+    /// Fences made and not yet destroyed (pending, stranded and spare).
+    #[cfg(test)]
+    pub fn fences(&self) -> usize {
+        self.pending.len() + self.stranded.len() + self.spare.len()
     }
 
     fn ticket(&mut self) -> Ticket {
@@ -452,13 +476,15 @@ mod tests {
             // present fence or the layer's own batch would be).
             let waited = sems.get(vk::Image::from_raw(1), new_semaphore).unwrap();
             let first_fence = tickets.take(&device).unwrap();
+            // Taken before the first is submitted: a later take could hand the first one back once
+            // it signalled.
+            let second_fence = tickets.take(&device).unwrap();
             device.queue_submit(queue, &[vk::SubmitInfo::default().signal_semaphores(&[waited])], vk::Fence::null()).unwrap();
             device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(&[waited]).wait_dst_stage_mask(&stage)], first_fence).unwrap();
             let first = tickets.submitted(first_fence);
             sems.note(waited, LastUse::Ticket(first));
             // Image 2: a ticket whose fence nothing has signalled yet (a present still queued).
             let queued = sems.get(vk::Image::from_raw(2), new_semaphore).unwrap();
-            let second_fence = tickets.take(&device).unwrap();
             let second = tickets.submitted(second_fence);
             sems.note(queued, LastUse::Ticket(second));
             // Image 3: waited on by a present without a fence.
@@ -506,6 +532,50 @@ mod tests {
             device.queue_wait_idle(queue).unwrap();
             sems.destroy(&device);
             tickets.destroy(&device);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    /// Presents with nothing retired (a running swapchain): the fences come back once signalled, so
+    /// hundreds of presents use a handful; a device that signals none never gets more than
+    /// `MAX_PENDING`, and the presents past that go untracked.
+    #[test]
+    fn presents_without_retirement_keep_the_fence_count_bounded() {
+        let Some((_entry, instance, _physical, device, queue, _family)) = crate::composition::gpu::test_device() else {
+            eprintln!("present_sync test: no Vulkan loader/ICD in this environment, skipping");
+            return;
+        };
+        let mut tickets = Tickets::default();
+        unsafe {
+            for present in 0..300 {
+                let fence = tickets.take(&device).expect("a fence for every present while they signal");
+                // The present's queue operations: the fence signals once they are done.
+                device.queue_submit(queue, &[], fence).unwrap();
+                tickets.submitted(fence);
+                if present % 3 == 2 {
+                    // Three presents in flight, as a swapchain of three images allows.
+                    device.queue_wait_idle(queue).unwrap();
+                }
+                assert!(tickets.fences() <= 4, "present {present}: {} fences", tickets.fences());
+            }
+            device.queue_wait_idle(queue).unwrap();
+            tickets.destroy(&device);
+
+            // Fences the device never signals (a present stuck in the presentation engine).
+            let mut stuck = Tickets::default();
+            let mut untracked = 0;
+            for _ in 0..100 {
+                match stuck.take(&device) {
+                    Some(fence) => {
+                        stuck.submitted(fence);
+                    }
+                    None => untracked += 1,
+                }
+            }
+            assert_eq!(stuck.fences(), Tickets::MAX_PENDING);
+            assert_eq!(untracked, 100 - Tickets::MAX_PENDING);
+            stuck.destroy(&device);
             device.destroy_device(None);
             instance.destroy_instance(None);
         }

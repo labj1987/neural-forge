@@ -38,7 +38,7 @@
 //! uncontended lock.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
 use ash::vk;
 
@@ -512,16 +512,19 @@ pub(crate) struct Tracker {
     id: u64,
     /// Noting at all ([`Self::activate`]).
     active: std::sync::atomic::AtomicBool,
-    /// Never removed (a buffer freed and a new one with the same handle start over at their
-    /// `vkBeginCommandBuffer`): a thread's cached entry stays the buffer's.
+    /// Removed when the buffer is freed ([`Self::forget`]); a new one with the same handle starts over.
     states: Mutex<HashMap<vk::CommandBuffer, Arc<Mutex<State>>>>,
+    /// Buffers forgotten so far: a thread's cached state ([`LAST`]) is used only while this is what it
+    /// was when cached, so none outlives its buffer's entry.
+    forgotten: std::sync::atomic::AtomicU64,
     /// Each push-descriptor template's data size, compute bind point only (`None`: not sizable).
     templates: Mutex<HashMap<vk::DescriptorUpdateTemplate, Option<usize>>>,
     pub(crate) fns: Fns,
 }
 
-/// A thread's last state: its tracker ([`Tracker::id`]), command buffer and state.
-type Last = (u64, vk::CommandBuffer, Arc<Mutex<State>>);
+/// A thread's last state: its tracker ([`Tracker::id`]), the tracker's [`Tracker::forgotten`] then, the
+/// command buffer and its state.
+type Last = (u64, u64, vk::CommandBuffer, Arc<Mutex<State>>);
 
 thread_local! {
     /// The state this thread used last: its tracker, command buffer and state.
@@ -537,6 +540,7 @@ impl Tracker {
             id: NEXT_TRACKER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             active: std::sync::atomic::AtomicBool::new(false),
             states: Mutex::default(),
+            forgotten: std::sync::atomic::AtomicU64::new(0),
             templates: Mutex::default(),
             fns,
         }
@@ -556,13 +560,17 @@ impl Tracker {
         let me = self.id;
         LAST.with(|last| {
             let mut last = last.borrow_mut();
-            if let Some((t, c, s)) = last.as_ref() {
-                if *t == me && *c == cb {
+            if let Some((t, g, c, s)) = last.as_ref() {
+                if *t == me && *c == cb && *g == self.forgotten.load(std::sync::atomic::Ordering::Acquire) {
                     return s.clone();
                 }
             }
-            let s = lock(&self.states).entry(cb).or_default().clone();
-            *last = Some((me, cb, s.clone()));
+            let mut states = lock(&self.states);
+            // Read under the lock `forget` changes it under: the entry and the count agree.
+            let generation = self.forgotten.load(std::sync::atomic::Ordering::Acquire);
+            let s = states.entry(cb).or_default().clone();
+            drop(states);
+            *last = Some((me, generation, cb, s.clone()));
             s
         })
     }
@@ -592,8 +600,10 @@ impl Tracker {
     /// `vkFreeCommandBuffers` or a pool destroyed: nothing is bound in `cb` any more, and nothing is noted
     /// until it begins again.
     pub(crate) fn forget(&self, cb: vk::CommandBuffer) {
-        if let Some(s) = lock(&self.states).get(&cb).cloned() {
-            *lock(&s) = State::default();
+        let mut states = lock(&self.states);
+        if states.remove(&cb).is_some() {
+            // Every thread's cached state is looked up again: the one for `cb` is gone.
+            self.forgotten.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -725,28 +735,31 @@ type Pfn2<T> = unsafe extern "system" fn(vk::CommandBuffer, *const T);
 type PfnPushDescriptorSet = vk::PFN_vkCmdPushDescriptorSetKHR;
 type PfnPushDescriptorSetWithTemplate = vk::PFN_vkCmdPushDescriptorSetWithTemplateKHR;
 
-/// The next layer's pointers for the wrapped commands of one device, as handed out.
+/// The next layer's pointers for the wrapped commands of one device, as handed out: each set once, when
+/// the application first asks for it ([`intercept`]), and read without a lock on every call after.
 #[derive(Default)]
 struct Next {
-    bind_descriptor_sets2: Option<Pfn2<BindDescriptorSetsInfo>>,
-    push_constants2: Option<Pfn2<PushConstantsInfo>>,
-    push_descriptor_set2: Option<Pfn2<PushDescriptorSetInfo>>,
-    push_descriptor_set_with_template2: Option<Pfn2<PushDescriptorSetWithTemplateInfo>>,
-    set_descriptor_buffer_offsets2: Option<Pfn2<SetDescriptorBufferOffsetsInfo>>,
-    bind_descriptor_buffer_embedded_samplers2: Option<Pfn2<BindDescriptorBufferEmbeddedSamplersInfo>>,
-    push_descriptor_set: Option<PfnPushDescriptorSet>,
-    push_descriptor_set_with_template: Option<PfnPushDescriptorSetWithTemplate>,
-    bind_shaders: Option<PfnCmdBindShadersEXT>,
+    bind_descriptor_sets2: OnceLock<Pfn2<BindDescriptorSetsInfo>>,
+    push_constants2: OnceLock<Pfn2<PushConstantsInfo>>,
+    push_descriptor_set2: OnceLock<Pfn2<PushDescriptorSetInfo>>,
+    push_descriptor_set_with_template2: OnceLock<Pfn2<PushDescriptorSetWithTemplateInfo>>,
+    set_descriptor_buffer_offsets2: OnceLock<Pfn2<SetDescriptorBufferOffsetsInfo>>,
+    bind_descriptor_buffer_embedded_samplers2: OnceLock<Pfn2<BindDescriptorBufferEmbeddedSamplersInfo>>,
+    push_descriptor_set: OnceLock<PfnPushDescriptorSet>,
+    push_descriptor_set_with_template: OnceLock<PfnPushDescriptorSetWithTemplate>,
+    bind_shaders: OnceLock<PfnCmdBindShadersEXT>,
 }
 
 struct Wrapped {
     key: usize,
     tracker: Arc<Tracker>,
-    next: Mutex<Next>,
+    next: Next,
 }
 
 /// The devices whose tracking is on, by the loader's dispatch key (a command buffer's is its device's).
-static WRAPPED: Mutex<Vec<Arc<Wrapped>>> = Mutex::new(Vec::new());
+/// Written only when a device's tracking starts or ends; every wrapped command reads it, from any thread,
+/// so readers share the lock.
+static WRAPPED: RwLock<Vec<Arc<Wrapped>>> = RwLock::new(Vec::new());
 
 /// The loader's dispatch key of a dispatchable handle: its first pointer-sized word.
 ///
@@ -765,9 +778,9 @@ pub(crate) unsafe fn register(device: vk::Device, tracker: Arc<Tracker>) {
     use ash::vk::Handle;
     // SAFETY: forwarded.
     let key = unsafe { key(device.as_raw()) };
-    let mut w = lock(&WRAPPED);
+    let mut w = WRAPPED.write().unwrap_or_else(PoisonError::into_inner);
     w.retain(|e| e.key != key);
-    w.push(Arc::new(Wrapped { key, tracker, next: Mutex::new(Next::default()) }));
+    w.push(Arc::new(Wrapped { key, tracker, next: Next::default() }));
 }
 
 /// Stops wrapping for `device` (its destruction).
@@ -778,11 +791,11 @@ pub(crate) unsafe fn unregister(device: vk::Device) {
     use ash::vk::Handle;
     // SAFETY: forwarded.
     let key = unsafe { key(device.as_raw()) };
-    lock(&WRAPPED).retain(|e| e.key != key);
+    WRAPPED.write().unwrap_or_else(PoisonError::into_inner).retain(|e| e.key != key);
 }
 
 fn wrapped_for(key: usize) -> Option<Arc<Wrapped>> {
-    lock(&WRAPPED).iter().find(|e| e.key == key).cloned()
+    WRAPPED.read().unwrap_or_else(PoisonError::into_inner).iter().find(|e| e.key == key).cloned()
 }
 
 /// The device's entry for command buffer `cb`.
@@ -805,47 +818,48 @@ pub(crate) unsafe fn intercept(device: vk::Device, name: &[u8], original: vk::PF
     let next = original?;
     // SAFETY: forwarded.
     let Some(w) = wrapped_for(unsafe { key(device.as_raw()) }) else { return original };
-    let mut n = lock(&w.next);
+    let n = &w.next;
     // SAFETY (each arm): the next layer's pointer for that command name, which has that signature.
     unsafe {
         let wrap = |f: *const ()| Some(std::mem::transmute::<*const (), unsafe extern "system" fn()>(f));
         match name {
             b"vkCmdBindDescriptorSets2" | b"vkCmdBindDescriptorSets2KHR" => {
-                n.bind_descriptor_sets2 = Some(std::mem::transmute::<unsafe extern "system" fn(), Pfn2<BindDescriptorSetsInfo>>(next));
+                n.bind_descriptor_sets2.get_or_init(|| std::mem::transmute::<unsafe extern "system" fn(), Pfn2<BindDescriptorSetsInfo>>(next));
                 wrap(bind_descriptor_sets2 as *const ())
             }
             b"vkCmdPushConstants2" | b"vkCmdPushConstants2KHR" => {
-                n.push_constants2 = Some(std::mem::transmute::<unsafe extern "system" fn(), Pfn2<PushConstantsInfo>>(next));
+                n.push_constants2.get_or_init(|| std::mem::transmute::<unsafe extern "system" fn(), Pfn2<PushConstantsInfo>>(next));
                 wrap(push_constants2 as *const ())
             }
             b"vkCmdPushDescriptorSet2" | b"vkCmdPushDescriptorSet2KHR" => {
-                n.push_descriptor_set2 = Some(std::mem::transmute::<unsafe extern "system" fn(), Pfn2<PushDescriptorSetInfo>>(next));
+                n.push_descriptor_set2.get_or_init(|| std::mem::transmute::<unsafe extern "system" fn(), Pfn2<PushDescriptorSetInfo>>(next));
                 wrap(push_descriptor_set2 as *const ())
             }
             b"vkCmdPushDescriptorSetWithTemplate2" | b"vkCmdPushDescriptorSetWithTemplate2KHR" => {
-                n.push_descriptor_set_with_template2 = Some(std::mem::transmute::<unsafe extern "system" fn(), Pfn2<PushDescriptorSetWithTemplateInfo>>(next));
+                n.push_descriptor_set_with_template2
+                    .get_or_init(|| std::mem::transmute::<unsafe extern "system" fn(), Pfn2<PushDescriptorSetWithTemplateInfo>>(next));
                 wrap(push_descriptor_set_with_template2 as *const ())
             }
             b"vkCmdSetDescriptorBufferOffsets2EXT" => {
-                n.set_descriptor_buffer_offsets2 = Some(std::mem::transmute::<unsafe extern "system" fn(), Pfn2<SetDescriptorBufferOffsetsInfo>>(next));
+                n.set_descriptor_buffer_offsets2.get_or_init(|| std::mem::transmute::<unsafe extern "system" fn(), Pfn2<SetDescriptorBufferOffsetsInfo>>(next));
                 wrap(set_descriptor_buffer_offsets2 as *const ())
             }
             b"vkCmdBindDescriptorBufferEmbeddedSamplers2EXT" => {
-                n.bind_descriptor_buffer_embedded_samplers2 =
-                    Some(std::mem::transmute::<unsafe extern "system" fn(), Pfn2<BindDescriptorBufferEmbeddedSamplersInfo>>(next));
+                n.bind_descriptor_buffer_embedded_samplers2
+                    .get_or_init(|| std::mem::transmute::<unsafe extern "system" fn(), Pfn2<BindDescriptorBufferEmbeddedSamplersInfo>>(next));
                 wrap(bind_descriptor_buffer_embedded_samplers2 as *const ())
             }
             // The core 1.4 names of the push-descriptor commands (the framework hooks only the KHR ones).
             b"vkCmdPushDescriptorSet" => {
-                n.push_descriptor_set = Some(std::mem::transmute::<unsafe extern "system" fn(), PfnPushDescriptorSet>(next));
+                n.push_descriptor_set.get_or_init(|| std::mem::transmute::<unsafe extern "system" fn(), PfnPushDescriptorSet>(next));
                 wrap(push_descriptor_set as *const ())
             }
             b"vkCmdPushDescriptorSetWithTemplate" => {
-                n.push_descriptor_set_with_template = Some(std::mem::transmute::<unsafe extern "system" fn(), PfnPushDescriptorSetWithTemplate>(next));
+                n.push_descriptor_set_with_template.get_or_init(|| std::mem::transmute::<unsafe extern "system" fn(), PfnPushDescriptorSetWithTemplate>(next));
                 wrap(push_descriptor_set_with_template as *const ())
             }
             b"vkCmdBindShadersEXT" => {
-                n.bind_shaders = Some(std::mem::transmute::<unsafe extern "system" fn(), PfnCmdBindShadersEXT>(next));
+                n.bind_shaders.get_or_init(|| std::mem::transmute::<unsafe extern "system" fn(), PfnCmdBindShadersEXT>(next));
                 wrap(bind_shaders as *const ())
             }
             _ => original,
@@ -855,10 +869,10 @@ pub(crate) unsafe fn intercept(device: vk::Device, name: &[u8], original: vk::PF
 
 /// The wrapper's device entry and its next pointer for one command; `None` (nothing called) only when the
 /// device is gone, which the application may not do while recording.
-unsafe fn next_of<T: Copy>(cb: vk::CommandBuffer, pick: impl Fn(&Next) -> Option<T>) -> Option<(Arc<Wrapped>, T)> {
+unsafe fn next_of<T: Copy>(cb: vk::CommandBuffer, pick: impl Fn(&Next) -> &OnceLock<T>) -> Option<(Arc<Wrapped>, T)> {
     // SAFETY: forwarded.
     let w = unsafe { of(cb) }?;
-    let f = pick(&lock(&w.next))?;
+    let f = *pick(&w.next).get()?;
     Some((w, f))
 }
 
@@ -898,7 +912,7 @@ fn say_chained(command: &str, layout_null: bool, types: &[i32]) {
 unsafe extern "system" fn bind_descriptor_sets2(cb: vk::CommandBuffer, info: *const BindDescriptorSetsInfo) {
     // SAFETY: the application's call: `cb` is recording and `info` valid.
     unsafe {
-        let Some((w, next)) = next_of(cb, |n| n.bind_descriptor_sets2) else { return };
+        let Some((w, next)) = next_of(cb, |n| &n.bind_descriptor_sets2) else { return };
         // A call that binds no set binds nothing to put back (GTA San Andreas DE's DXVK binds 0 sets with a null
         // layout and no chain, 2026-10-22): not noted.
         if let Some(i) = info.as_ref().filter(|i| binds_compute_sets(i)) {
@@ -927,7 +941,7 @@ unsafe extern "system" fn bind_descriptor_sets2(cb: vk::CommandBuffer, info: *co
 unsafe extern "system" fn push_constants2(cb: vk::CommandBuffer, info: *const PushConstantsInfo) {
     // SAFETY: as above.
     unsafe {
-        let Some((w, next)) = next_of(cb, |n| n.push_constants2) else { return };
+        let Some((w, next)) = next_of(cb, |n| &n.push_constants2) else { return };
         // Nothing pushed is nothing to put back.
         if let Some(i) = info.as_ref().filter(|i| pushes_compute_constants(i)) {
             w.tracker.note(cb, |s| {
@@ -945,7 +959,7 @@ unsafe extern "system" fn push_constants2(cb: vk::CommandBuffer, info: *const Pu
 unsafe extern "system" fn push_descriptor_set2(cb: vk::CommandBuffer, info: *const PushDescriptorSetInfo) {
     // SAFETY: as above.
     unsafe {
-        let Some((w, next)) = next_of(cb, |n| n.push_descriptor_set2) else { return };
+        let Some((w, next)) = next_of(cb, |n| &n.push_descriptor_set2) else { return };
         // No write is nothing to put back.
         if let Some(i) = info.as_ref().filter(|i| i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE) && i.descriptor_write_count > 0) {
             w.tracker.note(cb, |s| {
@@ -966,7 +980,7 @@ unsafe extern "system" fn push_descriptor_set2(cb: vk::CommandBuffer, info: *con
 unsafe extern "system" fn push_descriptor_set_with_template2(cb: vk::CommandBuffer, info: *const PushDescriptorSetWithTemplateInfo) {
     // SAFETY: as above.
     unsafe {
-        let Some((w, next)) = next_of(cb, |n| n.push_descriptor_set_with_template2) else { return };
+        let Some((w, next)) = next_of(cb, |n| &n.push_descriptor_set_with_template2) else { return };
         if let Some(i) = info.as_ref() {
             if !i.p_next.is_null() || i.layout == vk::PipelineLayout::null() {
                 w.tracker.note(cb, |s| s.refuse("vkCmdPushDescriptorSetWithTemplate2 with a chained structure"));
@@ -981,7 +995,7 @@ unsafe extern "system" fn push_descriptor_set_with_template2(cb: vk::CommandBuff
 unsafe extern "system" fn set_descriptor_buffer_offsets2(cb: vk::CommandBuffer, info: *const SetDescriptorBufferOffsetsInfo) {
     // SAFETY: as above.
     unsafe {
-        let Some((w, next)) = next_of(cb, |n| n.set_descriptor_buffer_offsets2) else { return };
+        let Some((w, next)) = next_of(cb, |n| &n.set_descriptor_buffer_offsets2) else { return };
         // No set is nothing to put back.
         if let Some(i) = info.as_ref().filter(|i| i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE) && i.set_count > 0) {
             w.tracker.note(cb, |s| {
@@ -1001,7 +1015,7 @@ unsafe extern "system" fn set_descriptor_buffer_offsets2(cb: vk::CommandBuffer, 
 unsafe extern "system" fn bind_descriptor_buffer_embedded_samplers2(cb: vk::CommandBuffer, info: *const BindDescriptorBufferEmbeddedSamplersInfo) {
     // SAFETY: as above.
     unsafe {
-        let Some((w, next)) = next_of(cb, |n| n.bind_descriptor_buffer_embedded_samplers2) else { return };
+        let Some((w, next)) = next_of(cb, |n| &n.bind_descriptor_buffer_embedded_samplers2) else { return };
         if let Some(i) = info.as_ref().filter(|i| i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE)) {
             w.tracker.note(cb, |s| {
                 if !i.p_next.is_null() || i.layout == vk::PipelineLayout::null() {
@@ -1025,7 +1039,7 @@ unsafe extern "system" fn push_descriptor_set(
 ) {
     // SAFETY: as above.
     unsafe {
-        let Some((w, next)) = next_of(cb, |n| n.push_descriptor_set) else { return };
+        let Some((w, next)) = next_of(cb, |n| &n.push_descriptor_set) else { return };
         if bind_point == vk::PipelineBindPoint::COMPUTE {
             w.tracker.note_push_descriptor_set(cb, layout, set, slice(writes, count));
         }
@@ -1042,7 +1056,7 @@ unsafe extern "system" fn push_descriptor_set_with_template(
 ) {
     // SAFETY: as above.
     unsafe {
-        let Some((w, next)) = next_of(cb, |n| n.push_descriptor_set_with_template) else { return };
+        let Some((w, next)) = next_of(cb, |n| &n.push_descriptor_set_with_template) else { return };
         w.tracker.push_template(cb, template, layout, set, data);
         next(cb, template, layout, set, data);
     }
@@ -1051,7 +1065,7 @@ unsafe extern "system" fn push_descriptor_set_with_template(
 unsafe extern "system" fn bind_shaders(cb: vk::CommandBuffer, count: u32, stages: *const vk::ShaderStageFlags, shaders: *const u64) {
     // SAFETY: as above.
     unsafe {
-        let Some((w, next)) = next_of(cb, |n| n.bind_shaders) else { return };
+        let Some((w, next)) = next_of(cb, |n| &n.bind_shaders) else { return };
         let st = slice(stages, count);
         if let Some(k) = st.iter().position(|s| *s == vk::ShaderStageFlags::COMPUTE) {
             let shader = if shaders.is_null() { 0 } else { *shaders.add(k) };
@@ -1165,7 +1179,14 @@ mod tests {
         assert!(!t.with(early, |s| s.complete()), "began before: its earlier binds were not noted");
         assert!(t.with(late, |s| s.complete() && s.compute.is_some()));
         t.forget(late);
+        assert!(!lock(&t.states).contains_key(&late), "freed: its entry goes");
         assert!(!t.with(late, |s| s.complete()), "freed: nothing noted until it begins again");
+        // A new buffer with the same handle: this thread's cached state is not the freed buffer's.
+        t.forget(late);
+        t.clear(late);
+        t.note(late, |s| s.bind_compute(Compute::Pipeline(vk::Pipeline::from_raw(6))));
+        assert!(lock(&lock(&t.states)[&late]).complete(), "noted in the new buffer's entry");
+        assert!(t.with(late, |s| s.complete()));
     }
 
     #[test]

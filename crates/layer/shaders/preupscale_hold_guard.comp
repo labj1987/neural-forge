@@ -7,7 +7,9 @@
 // is not (the first hold, a hold that never ran, holds run out of the order they were recorded in, or the
 // initialisation run again), nothing carried from the holds before is used: the network's history is not
 // (both frames' `ok` flags cleared, as for a reset) and the edit cache applies no stored edit
-// (STAT_EDIT_STORED cleared) until its next refresh.
+// (STAT_EDIT_STORED cleared) until its next refresh. The same where the host found, as the buffer was
+// submitted, that an input layout the hold guessed was wrong (its verdict, preupscale::inline::Verdicts): the
+// hold may have read its inputs wrongly, so it also leaves `last` at 0 and the next hold starts afresh too.
 layout(local_size_x = 1) in;
 
 // The native pass's state buffer (preupscale::native::NativePass::state): the frame shaders read `ok` and
@@ -15,19 +17,25 @@ layout(local_size_x = 1) in;
 layout(set = 0, binding = 0, std430) buffer State { uint ok[2]; uint cut; uint last; } u_state;
 // The edit cache's counters (preupscale::cache), or a stand-in while the cache is off.
 layout(set = 0, binding = 1, std430) buffer Stats { uint v[16]; } u_stats;
+// One word per slot of the hold inside DLSS's buffer: non-zero when the hold's guessed layouts were wrong.
+layout(set = 0, binding = 2, std430) readonly buffer Verdicts { uint v[]; } u_verdicts;
 
 layout(push_constant) uniform Push {
   uint seq;   // this hold's sequence number (1, 2, ... in recording order)
+  uint slot;  // its word in u_verdicts, or NO_VERDICT for none
 } p;
+
+const uint NO_VERDICT = 0xffffffffu;
 
 const uint STAT_EDIT_STORED = 14u;
 
 void main() {
-  bool follows = u_state.last != 0u && u_state.last + 1u == p.seq;
+  bool sound = p.slot == NO_VERDICT || u_verdicts.v[p.slot] == 0u;
+  bool follows = sound && u_state.last != 0u && u_state.last + 1u == p.seq;
   if (!follows) {
     u_state.ok[0] = 0u;
     u_state.ok[1] = 0u;
     u_stats.v[STAT_EDIT_STORED] = 0u;
   }
-  u_state.last = p.seq;
+  u_state.last = sound ? p.seq : 0u;
 }

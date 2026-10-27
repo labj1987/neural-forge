@@ -4,6 +4,34 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.9.0 — 2026-10-27
+
+- Less ghosting after a frame the model missed (the network still loading, a switch of the Network setting, a
+  busy moment): the next frame starts its history afresh instead of blending in one a frame older than its
+  motion vectors.
+- Games that record DLSS's work ahead on several threads (Crimson Desert, Hogwarts Legacy and other vkd3d-proton
+  games): where one of DLSS's inputs changed layout between recording and running, the model no longer builds
+  later frames on what it may have read wrongly from it; the following frames start afresh.
+- The edit cache no longer throws away a fresh edit because of a late reading from an older frame.
+- With more than one pass, a frame whose later passes could not be prepared no longer gives them a history
+  they never wrote.
+- Games with several graphics devices (Metro Last Light Redux): handing the network from one device to the
+  other can no longer close it while the other path is still using it, and quitting the game while that
+  happens is safe.
+- A look-up table that is removed or cannot be read stops being applied after the upscaler too, as before it.
+- After the upscaler with optical flow: a frame that did not reach the graphics card no longer leaves the flow
+  comparing the next frame with the wrong one.
+- Long sessions no longer gather Vulkan objects: a fence on every presented frame (reused now), and an entry
+  for every command buffer the game ever freed.
+- Hold resources left behind by a failed submit (hundreds of MB of video memory) are freed once the graphics
+  card is done with them, instead of at exit.
+- Starting a game whose driver refuses the feature Neural Forge adds for its present fences works: the retry
+  without it could reach the wrong Vulkan layer.
+- An internal error on one of Neural Forge's threads no longer takes down the game's own threads with it.
+- The diagnostic modes (`NEURAL_FORGE_PREUPSCALE=dump`, `identity`, `roundtrip`) no longer freeze the game for up
+  to 5 seconds on a submit that waits for something signalled later.
+- A little less CPU work per frame on the game's render threads.
+
 ## 3.8.14 — 2026-10-26
 
 - New strength preset in the Model tab: **Remix**, the strengths RTX Remix uses with NVIDIA's neural rendering

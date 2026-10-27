@@ -483,7 +483,20 @@ carry from the holds before: the network's history (both frames' `ok` flags: the
 run without history, as after a reset) and the edit cache's stored edit (`STAT_EDIT_STORED`, which a
 refresh's capture sets and a cached hold's apply requires; without it the cached hold writes nothing).
 That costs the history for a frame, never a frame built on a history, an edit or a motion chain that
-did not run. The alternative, copying the history back into one image at the end of every hold so no
+did not run.
+
+**Layouts the buffer did not set.** The copies in name each input's layout at the hold point. Where the
+buffer itself set it before that point (a barrier on the image, or its use as an attachment), that is what
+it is. Otherwise it is taken from what the buffers submitted so far left, or `GENERAL` for a storage image
+never seen in a barrier (`Tracker::inline_point`, `Guessed`): a guess, since vkd3d-proton records several
+command lists in parallel and submits them later, and a buffer submitted in between can leave another
+layout. Each guess is checked when the buffer is submitted, against what the buffers in front of it in
+that submission and the ones submitted before leave (`Tracker::layout_when_run`, `Inline::check`). A
+wrong guess cannot be taken back (the commands are in the application's buffer), so its hold is made
+harmless instead: the host writes the slot's verdict word before the submission, and the guard, reading
+it, clears what the hold carries from the holds before and leaves `last` at 0, so the next hold starts
+afresh too; the hold's readings (the edit cache's counters, the scene cut, the exposure) are not used.
+A device without the verdicts' buffer reads no input in a guessed layout. The alternative, copying the history back into one image at the end of every hold so no
 parity is needed, would cost a copy every frame and still not cover the edit cache's chain or the seed.
 The native pass's initialisation (its state cleared, its history images to `GENERAL`) is not recorded
 into the buffers: it is submitted once, on the same queue, in front of the first submission that

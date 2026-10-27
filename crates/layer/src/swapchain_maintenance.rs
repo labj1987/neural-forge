@@ -72,22 +72,22 @@ impl InstanceSupport {
 static INSTANCES: Mutex<Option<HashMap<vk::Instance, InstanceSupport>>> = Mutex::new(None);
 
 pub fn note_instance(instance: vk::Instance, support: InstanceSupport) {
-    INSTANCES.lock().unwrap().get_or_insert_default().insert(instance, support);
+    INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().insert(instance, support);
 }
 
 pub fn take_instance(instance: vk::Instance) -> InstanceSupport {
-    INSTANCES.lock().unwrap().as_mut().and_then(|map| map.remove(&instance)).unwrap_or_default()
+    INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut().and_then(|map| map.remove(&instance)).unwrap_or_default()
 }
 
 /// Devices created with `swapchainMaintenance1` enabled: taken by `NeuralForgeDeviceInfo::new`.
 static DEVICES: Mutex<Option<std::collections::HashSet<vk::Device>>> = Mutex::new(None);
 
 pub fn note_enabled(device: vk::Device) {
-    DEVICES.lock().unwrap().get_or_insert_default().insert(device);
+    DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().insert(device);
 }
 
 pub fn take_enabled(device: vk::Device) -> bool {
-    DEVICES.lock().unwrap().as_mut().is_some_and(|set| set.remove(&device))
+    DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut().is_some_and(|set| set.remove(&device))
 }
 
 /// What the device offers.
@@ -110,6 +110,11 @@ pub enum Plan {
     Add { extension: Option<&'static CStr> },
 }
 
+/// Why a request that enables the feature in its own structure, but neither extension, goes as it is.
+const FEATURE_WITHOUT_EXTENSION: &str = "the application enables the feature in its own structure but not its extension";
+/// Why a request that chains the feature's structure with the feature off goes as it is.
+const CHAINED_NOT_ENABLED: &str = "the application chains the feature's structure without enabling it";
+
 /// The plan for a request on an NVIDIA device: `requested`, its extensions; `app_feature`, the
 /// `swapchainMaintenance1` of the features structure it chains, if any; `properties2`, whether the
 /// instance allows the device extension's other dependency (Vulkan 1.1, or
@@ -119,7 +124,8 @@ pub fn plan(requested: &[&CStr], app_feature: Option<bool>, offered: Offered, in
     match app_feature {
         // Its own structure is the application's to set: never written, never given twice.
         Some(true) if app_extension => return Plan::AsIs(Ok(())),
-        Some(_) => return Plan::AsIs(Err("the application chains the feature's structure without enabling it")),
+        Some(true) => return Plan::AsIs(Err(FEATURE_WITHOUT_EXTENSION)),
+        Some(false) => return Plan::AsIs(Err(CHAINED_NOT_ENABLED)),
         None => {}
     }
     if !requested.contains(&SWAPCHAIN) {
@@ -265,7 +271,8 @@ mod tests {
         // The application enables it all itself (DXVK, vkd3d-proton): as it is.
         assert_eq!(plan(&[SWAPCHAIN, EXT_SWAPCHAIN], Some(true), ALL, BOTH, true), Plan::AsIs(Ok(())));
         // Its own structure, set to false: never written over, never given twice.
-        assert!(matches!(plan(&[SWAPCHAIN, KHR_SWAPCHAIN], Some(false), ALL, BOTH, true), Plan::AsIs(Err(_))));
+        assert_eq!(plan(&[SWAPCHAIN, KHR_SWAPCHAIN], Some(false), ALL, BOTH, true), Plan::AsIs(Err(CHAINED_NOT_ENABLED)));
+        assert_eq!(plan(&[SWAPCHAIN], Some(true), ALL, BOTH, true), Plan::AsIs(Err(FEATURE_WITHOUT_EXTENSION)), "enabled, extension missing");
         // The extension without the structure: only the structure is added.
         assert_eq!(plan(&[SWAPCHAIN, KHR_SWAPCHAIN], None, ALL, BOTH, true), Plan::Add { extension: None });
     }

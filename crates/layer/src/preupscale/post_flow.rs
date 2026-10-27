@@ -561,7 +561,9 @@ impl Session {
     }
 
     /// Records the upload of `proxy` (the frame's texels, `width` x `height`) into the frame's input image,
-    /// with the images' first layout change on the first frame.
+    /// with the images' first layout change on the first frame. Nothing of the session's state moves until the
+    /// submission carrying it was made ([`Self::uploaded`]): a recording that never goes to the queue leaves the
+    /// images where they were.
     ///
     /// # Safety
     /// `cmd` is recording on the compute family; nothing pending uses the frame's input image.
@@ -607,11 +609,11 @@ impl Session {
             };
             device.cmd_copy_buffer_to_image(cmd, proxy, target, vk::ImageLayout::GENERAL, &[region]);
         }
-        self.fresh.set(false);
     }
 
     /// Binds the frame's input, the previous frame's (the reference) and the flow image, and records the flow
-    /// into `cmd` (the optical-flow family's). Then the next frame goes into the other input image.
+    /// into `cmd` (the optical-flow family's). The next flow takes this one's hints once it was submitted
+    /// ([`Self::flowed`]).
     ///
     /// # Safety
     /// Nothing pending uses the session; `cmd` is not pending.
@@ -640,13 +642,19 @@ impl Session {
             (fd.fns.execute)(fd.cmd, self.session, &info);
             device.end_command_buffer(fd.cmd).map_err(|e| format!("{e:?}"))?;
         }
-        self.hinted.set(true);
         Ok(())
     }
 
-    /// The upload went in: the next frame's goes into the other image.
-    pub(crate) fn advance(&self) {
+    /// The submission carrying the upload ([`Self::record_upload`]) was made: the images are out of `UNDEFINED`,
+    /// and the next frame's upload goes into the other image.
+    pub(crate) fn uploaded(&self) {
+        self.fresh.set(false);
         self.parity.set(1 - self.parity.get());
+    }
+
+    /// The flow ([`Self::record_flow`]) was submitted: the next one may use its hints.
+    pub(crate) fn flowed(&self) {
+        self.hinted.set(true);
     }
 
     /// Records the copy of the flow vectors into `out` (cells x 4 bytes), after the flow (the frame waits for

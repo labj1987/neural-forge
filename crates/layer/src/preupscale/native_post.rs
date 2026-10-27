@@ -767,6 +767,14 @@ unsafe fn upload_lut(device: &ash::Device, instance: &ash::Instance, physical: v
     }
 }
 
+/// The table this frame's colour applies: the one `colour::current` gave now, once it is in [`Gpu::lut`]. None
+/// when it gave none (the strength at 0, no table named, or one that could not be read): the table still in the
+/// buffer is not applied then, as the holds before the upscaler apply none.
+fn applied_lut<'a>(uploaded: Option<&'a PostLut>, now: Option<&Arc<super::colour::Lut>>) -> Option<&'a super::colour::Lut> {
+    let now = now?;
+    uploaded.filter(|g| g.lut.generation == now.generation).map(|g| &*g.lut)
+}
+
 /// One frame through the network, once per entry of `passes` (each pass's settings, at least one). `false`
 /// (and the caller echoes) on anything short of a written answer. `regions` are the slot's proxy and answer
 /// regions and their size; `loader` (`None` in tests) is told about counter-chain timeouts.
@@ -874,13 +882,16 @@ unsafe fn evaluate(
             note_hud_off();
             false
         });
+    // The frame's thumbnail, made once for the HUD's detection and the history's cut test.
+    let detect = hud_on && hud.detect && gpu.slots[s].as_ref().is_some_and(|b| b.hud.is_some());
+    // SAFETY: the proxy region holds the frame's `bytes`, written before the request was posted.
+    let thumb = (detect || history).then(|| post_history::thumbnail(unsafe { std::slice::from_raw_parts(proxy_region, bytes as usize) }, width, height));
     let hud_moving = match gpu.slots[s].as_mut().and_then(|b| b.hud.as_mut()) {
-        Some(h) if hud_on && hud.detect => {
-            // SAFETY: the proxy region holds the frame's `bytes`, written before the request was posted.
-            let thumb = post_history::thumbnail(unsafe { std::slice::from_raw_parts(proxy_region, bytes as usize) }, width, height);
+        Some(h) if detect => {
+            let thumb = thumb.as_ref().expect("made for the detection");
             // The previous proxy is the history's while it keeps one, else the HUD's own: a switch has none yet.
-            let moving = h.from_history == history && h.thumb.as_deref().is_some_and(|last| Hud::moving(last, &thumb));
-            h.thumb = Some(thumb);
+            let moving = h.from_history == history && h.thumb.as_deref().is_some_and(|last| Hud::moving(last, thumb));
+            h.thumb = Some(thumb.clone());
             h.from_history = history;
             let words = Hud::region_words(&hud.regions, width, height);
             // SAFETY: host-coherent, sized for every region; not in use (contract).
@@ -897,9 +908,10 @@ unsafe fn evaluate(
         }
         None => false,
     };
+    let lut = lut.filter(|_| colour.lut_strength > 0.0);
     // SAFETY: nothing of `gpu`'s is pending (contract).
-    unsafe { upload_lut(device, instance, physical, gpu, lut.filter(|_| colour.lut_strength > 0.0)) };
-    let lut = gpu.lut.as_ref().filter(|_| colour.lut_strength > 0.0).map(|l| &*l.lut);
+    unsafe { upload_lut(device, instance, physical, gpu, lut) };
+    let lut = applied_lut(gpu.lut.as_ref(), lut);
     let lut_buffer = gpu.lut.as_ref().map_or(vk::Buffer::null(), |l| l.buffer.buffer);
     let Some(b) = gpu.slots[s].as_ref() else { return false };
     let hist = b.hist.as_ref().filter(|_| history);
@@ -920,8 +932,7 @@ unsafe fn evaluate(
     // The history's decision for this frame: the cut test on the frame's thumbnail, the reset rules, each
     // pass's seed.
     let decision = if history {
-        // SAFETY: the proxy region holds the frame's `bytes`, written before the request was posted.
-        let thumb = post_history::thumbnail(unsafe { std::slice::from_raw_parts(proxy_region, bytes as usize) }, width, height);
+        let thumb = thumb.expect("made for the history");
         #[cfg(not(test))]
         let now = Instant::now();
         #[cfg(test)]
@@ -1064,6 +1075,9 @@ unsafe fn evaluate(
     // (the next frame's reference): in its own submit before the flow, else in the frame's.
     let flow_frame = mode == Motion::Flow && session_live && any_history;
     let cmd = gpu.cmd;
+    // The frame's buffer carries the proxy's upload into the session (a frame without a flow): the session moves
+    // on once it was submitted (`FlowSession::uploaded`).
+    let mut uploaded_in_frame = false;
     // SAFETY: the layer's own buffer, not pending; every handle is live.
     let recorded: ash::prelude::VkResult<()> = unsafe {
         (|| {
@@ -1164,7 +1178,7 @@ unsafe fn evaluate(
                     // reference, and the next flow starts without the previous one's hints.
                     session.restart();
                     session.record_upload(device, cmd, b.proxy.buffer);
-                    session.advance();
+                    uploaded_in_frame = true;
                 }
             }
             for (k, c) in passes.iter().enumerate() {
@@ -1355,6 +1369,12 @@ unsafe fn evaluate(
         }
         return false;
     }
+    if uploaded_in_frame {
+        // The frame's own upload into the session (a frame without a flow) went to the queue with it.
+        if let Some(session) = gpu.slots[s].as_ref().and_then(|b| b.hist.as_ref()).and_then(|h| h.session.as_ref()) {
+            session.uploaded();
+        }
+    }
     // SAFETY: the fence was just submitted.
     let waited = unsafe { device.wait_for_fences(&[gpu.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
     if crate::note_fence_wait(device.handle(), waited, "native::post").is_err() {
@@ -1364,7 +1384,7 @@ unsafe fn evaluate(
     }
     if let Some((loader, (waits, at))) = loader.and_then(|l| l.chain_timeouts().filter(|(n, _)| *n > 0).map(|t| (l, t))) {
         crate::log!("[native] {waits} counter-chain wait(s) gave up ({at}); rebuilding the network with barriers between its launches");
-        loader.fall_back();
+        loader.fall_back(0);
         return false;
     }
     if b.answer.staged {
@@ -1413,7 +1433,7 @@ unsafe fn flow_submits(device: &ash::Device, gpu: &Gpu, s: usize) -> Result<vk::
         session.record_flow(device, fd)?;
         let upload = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&fd.upload)).signal_semaphores(std::slice::from_ref(&fd.uploaded));
         device.queue_submit(gpu.queue, &[upload], vk::Fence::null()).map_err(|e| format!("the upload's submit: {e:?}"))?;
-        session.advance();
+        session.uploaded();
         let stage = [vk::PipelineStageFlags::ALL_COMMANDS];
         let flow = vk::SubmitInfo::default()
             .command_buffers(std::slice::from_ref(&fd.cmd))
@@ -1421,6 +1441,7 @@ unsafe fn flow_submits(device: &ash::Device, gpu: &Gpu, s: usize) -> Result<vk::
             .wait_dst_stage_mask(&stage)
             .signal_semaphores(std::slice::from_ref(&fd.flowed));
         device.queue_submit(fd.queue, &[flow], vk::Fence::null()).map_err(|e| format!("the flow's submit: {e:?}"))?;
+        session.flowed();
     }
     Ok(fd.flowed)
 }
@@ -1970,9 +1991,17 @@ mod tests {
             upload_lut(&device, &instance, physical, &mut gpu, Some(&table(2, 3)));
             assert_eq!(gpu.lut.as_ref().map(|l| l.buffer.buffer), Some(first), "the same size: the same buffer");
             assert_eq!(gpu.bound, Some(key), "and the sets stay as they are");
-            upload_lut(&device, &instance, physical, &mut gpu, Some(&table(3, 5)));
+            let five = table(3, 5);
+            upload_lut(&device, &instance, physical, &mut gpu, Some(&five));
             assert_eq!(gpu.lut.as_ref().map(|l| l.entries), Some(125), "a new buffer for 5 points a side");
             assert_eq!(gpu.bound, None, "the sets are written again, whatever handle the new buffer has");
+            // The table the frame applies is the one there now: none once it is removed or unreadable (nothing
+            // uploaded, the old one still in the buffer), as before the upscaler.
+            assert_eq!(applied_lut(gpu.lut.as_ref(), Some(&five)).map(|l| l.generation), Some(3));
+            upload_lut(&device, &instance, physical, &mut gpu, None);
+            assert!(gpu.lut.is_some(), "the buffer stays for when a table comes back");
+            assert!(applied_lut(gpu.lut.as_ref(), None).is_none(), "no table now: none applied");
+            assert!(applied_lut(gpu.lut.as_ref(), Some(&table(4, 5))).is_none(), "a newer table not uploaded yet is not the one in the buffer");
             gpu.destroy(&device);
             device.destroy_device(None);
         }

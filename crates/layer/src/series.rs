@@ -50,6 +50,9 @@ pub enum PresentWait {
     /// The readback waited on the composition's semaphore and was seen complete: the present must
     /// not wait on that semaphore again (a binary semaphore is consumed by one wait).
     Consumed,
+    /// The readback waited on the composition's semaphore, was not seen complete, and the present
+    /// could not be ordered after it: as [`Self::Consumed`], but that wait's completion is unknown.
+    ConsumedUnordered,
     /// A readback was not seen complete (its bounded wait failed): the present waits on this, signalled
     /// once everything the layer submitted for it has run, in place of the composition's semaphore.
     Instead(vk::Semaphore),
@@ -452,7 +455,11 @@ impl Series {
                 }
                 None => {
                     crate::log!("[capture] could not order the present after the stalled readback");
-                    consumed
+                    if submitted {
+                        PresentWait::ConsumedUnordered
+                    } else {
+                        consumed
+                    }
                 }
             };
         }

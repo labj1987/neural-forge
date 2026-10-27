@@ -431,8 +431,10 @@ pub(crate) struct State {
     /// agreed (`infer_reverse_z`); the streak so far.
     reverse_z: Option<bool>,
     reverse_z_streak: (Option<bool>, u32),
-    /// The kind of the last submitted hold whose counters are still to be read.
-    pending: Option<Kind>,
+    /// The kind and [`Plan::refresh`] of the last submitted hold whose counters are still to be read.
+    pending: Option<(Kind, u64)>,
+    /// Refreshes that went through so far: the number of the one whose edit is stored ([`Plan::refresh`]).
+    refresh_seq: u64,
     /// The adaptive cadence, from the counts of the holds before.
     pub(crate) regime: Regime,
 }
@@ -463,6 +465,10 @@ pub(crate) struct Hold {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Plan {
     pub kind: Kind,
+    /// The refresh whose edit the hold stores (a refresh: the next number) or carries (a cached hold),
+    /// counted by [`State::went_through`]: counters read back late ([`CachePass::after_counters`]) act on
+    /// the stored edit only while it is still that refresh's.
+    pub refresh: u64,
     /// The push constants' flags and jitters for this hold's passes ([`CachePass::push`]).
     pub flags: u32,
     pub step_jitter: [f32; 2],
@@ -476,12 +482,12 @@ impl State {
         self.chain_live = false;
     }
 
-    /// Whether this hold is cached or refreshes, and its passes' flags. Takes the stored edit out.
     /// The depth's convention once decided ([`infer_reverse_z`]): `Some(true)` for reversed-Z.
     pub(crate) fn reverse_z(&self) -> Option<bool> {
         self.reverse_z
     }
 
+    /// Whether this hold is cached or refreshes, and its passes' flags. Takes the stored edit out.
     pub(crate) fn plan(&mut self, h: &Hold) -> Plan {
         let consecutive = self.last_seen.is_some_and(|s| s.wrapping_add(1) == h.hold) && self.generation == h.generation;
         let had = std::mem::take(&mut self.valid);
@@ -514,6 +520,7 @@ impl State {
         let delta = |a: [f32; 2]| [a[0] - jitter[0], a[1] - jitter[1]];
         Plan {
             kind: if cached { Kind::Cached } else { Kind::Refresh },
+            refresh: if cached { self.refresh_seq } else { self.refresh_seq + 1 },
             flags,
             step_jitter: if consecutive { delta(self.prev_jitter) } else { [0.0; 2] },
             refresh_jitter: delta(self.refresh_jitter),
@@ -526,7 +533,8 @@ impl State {
         self.generation = h.generation;
         self.prev_jitter = h.jitter.unwrap_or_default();
         let chained = h.interval > 1;
-        self.pending = chained.then_some(plan.kind);
+        self.pending = chained.then_some((plan.kind, plan.refresh));
+        self.refresh_seq = plan.refresh;
         match plan.kind {
             Kind::Refresh => {
                 self.valid = chained && h.jitter.is_some();
@@ -581,6 +589,40 @@ pub(crate) fn infer_reverse_z(counts: &[u32; STAT_WORDS]) -> Option<bool> {
 }
 
 impl State {
+    /// [`CachePass::after_counters`] over `texels` texels.
+    pub(crate) fn read_counters(&mut self, kind: Kind, refresh: u64, c: &[u32; STAT_WORDS], texels: u64) -> Outcome {
+        let decided = self.reverse_z.is_some();
+        let mut out = Outcome::default();
+        self.regime.observe(c[STAT_STILL], c[STAT_MOTION_N]);
+        if !decided && self.vote_reverse_z(infer_reverse_z(c)) {
+            let rev = self.reverse_z == Some(true);
+            crate::log!(
+                "[preupscale] edit cache: depth is {} ({REVERSE_Z_HOLDS} holds agreeing; the last: {} of {} texels at 0, {} at 1)",
+                if rev { "reversed-Z" } else { "forward" },
+                c[STAT_Z0],
+                c[STAT_DEPTH_N],
+                c[STAT_Z1]
+            );
+            // The stored edit's depth was read with the assumed convention.
+            self.drop_edit();
+        }
+        let current = refresh == self.refresh_seq;
+        match kind {
+            Kind::Refresh => {
+                if c[STAT_EDIT_OK] == 0 && current {
+                    self.drop_edit();
+                }
+            }
+            Kind::Cached => {
+                if c[STAT_APPLY_BAD] != 0 && current {
+                    self.drop_edit();
+                }
+                out.rejected = Some((f64::from(c[STAT_REJECTED]) / texels.max(1) as f64) as f32);
+            }
+        }
+        out
+    }
+
     /// One hold's verdict on the depth's convention ([`infer_reverse_z`]); decides it once
     /// [`REVERSE_Z_HOLDS`] conclusive holds in a row agree. Inconclusive holds neither count nor break
     /// the streak. `true` when this hold decided it.
@@ -1063,44 +1105,17 @@ impl CachePass {
     /// edit is dropped when the refresh's exposure was unusable or a cached hold could not apply,
     /// the motion's counts go to the [`Regime`], and the depth's convention is decided once.
     pub(crate) fn after_fence(&mut self) -> Outcome {
-        let Some(kind) = self.state.pending.take() else { return Outcome::default() };
+        let Some((kind, refresh)) = self.state.pending.take() else { return Outcome::default() };
         let c = self.counters();
-        self.after_counters(kind, &c)
+        self.after_counters(kind, refresh, &c)
     }
 
-    /// [`Self::after_fence`] for counters `c` of a hold planned as `kind` (inside DLSS's buffer, read back
-    /// once its buffer ran).
-    pub(crate) fn after_counters(&mut self, kind: Kind, c: &[u32; STAT_WORDS]) -> Outcome {
-        let decided = self.state.reverse_z.is_some();
-        let mut out = Outcome::default();
-        self.state.regime.observe(c[STAT_STILL], c[STAT_MOTION_N]);
-        if !decided && self.state.vote_reverse_z(infer_reverse_z(c)) {
-            let rev = self.state.reverse_z == Some(true);
-            crate::log!(
-                "[preupscale] edit cache: depth is {} ({REVERSE_Z_HOLDS} holds agreeing; the last: {} of {} texels at 0, {} at 1)",
-                if rev { "reversed-Z" } else { "forward" },
-                c[STAT_Z0],
-                c[STAT_DEPTH_N],
-                c[STAT_Z1]
-            );
-            // The stored edit's depth was read with the assumed convention.
-            self.state.drop_edit();
-        }
-        match kind {
-            Kind::Refresh => {
-                if c[STAT_EDIT_OK] == 0 {
-                    self.state.drop_edit();
-                }
-            }
-            Kind::Cached => {
-                if c[STAT_APPLY_BAD] != 0 {
-                    self.state.drop_edit();
-                }
-                let n = u64::from(self.width) * u64::from(self.height);
-                out.rejected = Some((f64::from(c[STAT_REJECTED]) / n.max(1) as f64) as f32);
-            }
-        }
-        out
+    /// [`Self::after_fence`] for counters `c` of a hold planned as `kind` for refresh `refresh`
+    /// ([`Plan::refresh`]; inside DLSS's buffer, read back once its buffer ran, which can be after later
+    /// holds went through). The stored edit is dropped for them only while it is still that refresh's:
+    /// a later refresh's edit is not the one they measured.
+    pub(crate) fn after_counters(&mut self, kind: Kind, refresh: u64, c: &[u32; STAT_WORDS]) -> Outcome {
+        self.state.read_counters(kind, refresh, c, u64::from(self.width) * u64::from(self.height))
     }
 
     /// # Safety
@@ -1231,6 +1246,34 @@ mod tests {
                 plan.kind
             })
             .collect()
+    }
+
+    /// Counters of a hold inside DLSS's buffer read back after later holds went through: a refresh's
+    /// "edit unusable" drops the stored edit only while it is still that refresh's, not a newer one's.
+    #[test]
+    fn late_counters_do_not_drop_a_newer_refresh() {
+        let mut s = State::default();
+        let plans: Vec<Plan> = (1..=3)
+            .map(|n| {
+                let plan = s.plan(&hold(n));
+                s.went_through(&hold(n), &plan);
+                plan
+            })
+            .collect();
+        assert_eq!(plans.iter().map(|p| p.kind).collect::<Vec<_>>(), [Kind::Refresh, Kind::Cached, Kind::Refresh]);
+        assert_eq!(plans.iter().map(|p| p.refresh).collect::<Vec<_>>(), [1, 1, 2], "a cached hold carries its refresh's number");
+        let unusable = [0u32; STAT_WORDS];
+        // The first refresh's counters, late: its edit is no longer the stored one.
+        s.read_counters(Kind::Refresh, plans[0].refresh, &unusable, 64);
+        let mut c = [0u32; STAT_WORDS];
+        c[STAT_APPLY_BAD] = 1;
+        s.read_counters(Kind::Cached, plans[1].refresh, &c, 64);
+        let plan = s.plan(&hold(4));
+        assert_eq!(plan.kind, Kind::Cached, "the newer refresh's edit is carried");
+        s.went_through(&hold(4), &plan);
+        // The current refresh's own counters still drop it.
+        s.read_counters(Kind::Refresh, plans[2].refresh, &unusable, 64);
+        assert_eq!(s.plan(&hold(5)).kind, Kind::Refresh);
     }
 
     /// The interval's rhythm, and every reset forcing a refresh: a DLSS frame that was not held, the

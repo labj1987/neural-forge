@@ -91,6 +91,75 @@ pub(crate) struct Staging {
     pub id: u64,
 }
 
+/// A host-visible, host-coherent buffer of `bytes`, zeroed and mapped for its whole size.
+///
+/// # Safety
+/// `d` is live; `memory` is its physical device's.
+unsafe fn host_buffer(
+    d: &ash::Device,
+    memory: &vk::PhysicalDeviceMemoryProperties,
+    bytes: u64,
+    usage: vk::BufferUsageFlags,
+) -> Option<(vk::Buffer, vk::DeviceMemory, *mut u8)> {
+    // SAFETY: valid create infos on a live device; each object is destroyed on a later failure.
+    unsafe {
+        let info = vk::BufferCreateInfo::default().size(bytes).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = d.create_buffer(&info, None).ok()?;
+        let reqs = d.get_buffer_memory_requirements(buffer);
+        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let index =
+            (0..memory.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0 && memory.memory_types[i as usize].property_flags.contains(host));
+        let mem = index.and_then(|i| d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(i), None).ok());
+        let ptr = mem.and_then(|m| d.bind_buffer_memory(buffer, m, 0).and_then(|()| d.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())).ok());
+        match (mem, ptr) {
+            (Some(m), Some(p)) => {
+                std::ptr::write_bytes(p.cast::<u8>(), 0, bytes as usize);
+                Some((buffer, m, p.cast::<u8>()))
+            }
+            (m, _) => {
+                d.destroy_buffer(buffer, None);
+                if let Some(m) = m {
+                    d.free_memory(m, None);
+                }
+                None
+            }
+        }
+    }
+}
+
+/// The input layouts a hold guessed ([`Slot::guesses`]).
+type Guesses = Vec<(vk::Image, vk::ImageLayout)>;
+
+/// An input found in another layout than guessed: the image, the guess and the layout.
+type Wrong = (vk::Image, vk::ImageLayout, vk::ImageLayout);
+
+/// One word per slot that the hold guard (`preupscale_hold_guard.comp`) reads before the hold runs: non-zero
+/// when an input layout the hold guessed ([`super::Guessed`]) was found wrong as its buffer was submitted
+/// ([`Inline::check`]). The guard then drops what the hold would carry from the holds before (the network's
+/// history, the edit cache's stored edit) and what it leaves for the next (its sequence number), so the inputs
+/// it may have read wrongly reach no later frame. Written from the host before the submission that runs the
+/// hold, and only while the slot's buffer is not pending (a buffer is never pending twice: no hold is recorded
+/// into one for simultaneous use).
+struct Verdicts {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    words: *mut u32,
+}
+
+// SAFETY: a buffer and the layer's own mapping, written only under `Inline::slots`.
+unsafe impl Send for Verdicts {}
+unsafe impl Sync for Verdicts {}
+
+impl Verdicts {
+    const BYTES: u64 = 4 * MAX_SLOTS as u64;
+
+    /// Slot `slot`'s word.
+    fn set(&self, slot: usize, sound: bool) {
+        // SAFETY: mapped for MAX_SLOTS words; host-coherent.
+        unsafe { self.words.add(slot).write_volatile(u32::from(!sound)) };
+    }
+}
+
 /// The next [`Staging::id`].
 static NEXT_STAGING: AtomicU64 = AtomicU64::new(1);
 
@@ -110,6 +179,12 @@ struct Slot {
     /// A cache dump's readbacks for an armed hold (`super::cache_dump`), built when one is armed.
     cache_dump: Option<super::cache_dump::Buffers>,
     meta: Option<Meta>,
+    /// The input layouts the hold was recorded with that its buffer did not set (`super::Guessed`): checked
+    /// when the buffer is submitted ([`Inline::check`]).
+    guesses: Guesses,
+    /// Whether every guess held at its last submission: otherwise the guard dropped what the hold carries
+    /// ([`Verdicts`]) and its readings are not used.
+    sound: bool,
 }
 
 // SAFETY: plain handles and the layer's own mapping, only used behind `Inline::slots`.
@@ -126,8 +201,9 @@ pub(crate) struct Meta {
     pub stats: bool,
     pub scene: Option<super::scene_cut::Recorded>,
     pub auto: bool,
-    /// The edit cache's plan for the hold.
+    /// The edit cache's plan for the hold, and the refresh it stores or carries (`cache::Plan::refresh`).
     pub kind: Option<super::cache::Kind>,
+    pub refresh: u64,
     /// The native pass (its id) the hold needs initialised, and the command buffer that does (submitted once,
     /// in front of the first buffer that runs a hold of the pass: [`Inline::prologue`]).
     pub init: Option<(u64, vk::CommandBuffer)>,
@@ -143,6 +219,8 @@ pub(crate) struct Meta {
 /// A slot's hold, read back after its buffer ran.
 pub(crate) struct Harvest {
     pub meta: Meta,
+    /// Every input layout the hold guessed held when its buffer ran ([`Inline::check`]).
+    pub sound: bool,
     /// How many times the buffer ran the hold.
     pub runs: u32,
     /// GPU milliseconds: the capture, the network (with the copies between its passes), the write-back.
@@ -217,8 +295,11 @@ pub(crate) struct Ctx<'a> {
     pub staging: Staging,
     /// The depth format copied into the staging buffer, if one is.
     pub depth: Option<vk::Format>,
-    /// The slot's index: the network's descriptor pool for this buffer (`nn::HOLD_SLOTS`).
+    /// The slot's index: the network's descriptor pool for this buffer (`nn::HOLD_SLOTS`), and the guard's word
+    /// in [`Self::verdicts`].
     pub slot: u32,
+    /// The guard's verdicts ([`Verdicts`]).
+    pub verdicts: vk::Buffer,
     pub queries: vk::QueryPool,
     pub readback: vk::Buffer,
     /// A cache dump's readbacks, for a hold armed for one (built by [`Self::cache_dump_buffers`]).
@@ -305,6 +386,9 @@ pub(crate) struct Inline {
     /// The timestamps' tick in nanoseconds and valid bits (`None`: the family writes none).
     ticks: Option<(f64, u64)>,
     slots: Mutex<Slots>,
+    /// The guard's word per slot ([`Verdicts`]); `None` when it could not be made: then no hold reads an input
+    /// in a guessed layout.
+    verdicts: Option<Verdicts>,
     harvest: Mutex<Vec<Harvest>>,
     /// Holds recorded and not yet released, on every stage: the network's loader rebuilds nothing they use
     /// while there are any (`native::Loader`).
@@ -351,9 +435,19 @@ impl Inline {
             .map(|f| f.timestamp_valid_bits)
             .filter(|&bits| bits > 0 && period.is_finite() && period > 0.0)
             .map(|bits| (f64::from(period), if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }));
+        // SAFETY: the device is live; `memory` is its physical device's.
+        let verdicts = unsafe { host_buffer(&device, &memory, Verdicts::BYTES, vk::BufferUsageFlags::STORAGE_BUFFER) }.map(|(buffer, memory, ptr)| Verdicts {
+            buffer,
+            memory,
+            words: ptr.cast(),
+        });
+        if verdicts.is_none() {
+            crate::log!("[preupscale] the hold guard's verdicts could not be made: inputs whose layout is not set in DLSS's buffer are not read there");
+        }
         let inline = Arc::new(Self {
             device: device.clone(),
             memory,
+            verdicts,
             app_family,
             blit_r11g11b10,
             ticks,
@@ -617,6 +711,52 @@ impl Inline {
         }
     }
 
+    /// Before a submission of `cbs` (in order) on the hold's queue: checks each layout a hold in them guessed
+    /// ([`super::Guessed`]) against `actual`, the layout the image will have when the buffer runs (given the
+    /// buffers in front of it in this submission; `None` when unknown, which keeps the guess), and writes each
+    /// slot's verdict for the guard ([`Verdicts`]). A hold whose guess was wrong still runs (its commands are
+    /// in the application's buffer), but the guard drops what it carries from the holds before and leaves the
+    /// next hold to start afresh, and its readings are not used ([`Harvest::sound`]).
+    pub(crate) fn check(&self, cbs: &[vk::CommandBuffer], actual: impl Fn(&[vk::CommandBuffer], vk::Image) -> Option<vk::ImageLayout>) {
+        let Some(verdicts) = &self.verdicts else { return };
+        // What is to be checked, then the checks without the slots' lock (`actual` takes the tracking's, which
+        // a launch hook holds while it records a hold): the buffers are the application's submission, which it
+        // may not record or free meanwhile.
+        let guessed: Vec<(usize, usize, Guesses)> = {
+            let s = lock(&self.slots);
+            if s.by_cb.is_empty() {
+                return;
+            }
+            cbs.iter()
+                .enumerate()
+                .flat_map(|(at, cb)| s.by_cb.get(cb).into_iter().flatten().map(move |&i| (at, i)))
+                .filter(|&(_, i)| s.slots[i].meta.is_some() && !s.slots[i].guesses.is_empty())
+                .map(|(at, i)| (at, i, s.slots[i].guesses.clone()))
+                .collect()
+        };
+        if guessed.is_empty() {
+            return;
+        }
+        // Each slot, and its first input found in another layout than guessed (the image, the guess, the layout).
+        let found: Vec<(usize, Option<Wrong>)> = guessed
+            .into_iter()
+            .map(|(at, i, guesses)| {
+                (i, guesses.into_iter().find_map(|(image, guess)| actual(&cbs[..at], image).filter(|&l| l != guess).map(|l| (image, guess, l))))
+            })
+            .collect();
+        let mut s = lock(&self.slots);
+        for (i, wrong) in found {
+            s.slots[i].sound = wrong.is_none();
+            verdicts.set(i, wrong.is_none());
+            if let Some((image, guess, layout)) = wrong {
+                self.say_once(format!(
+                    "an input of a hold inside DLSS's buffer was read as {guess:?}, its layout before this buffer was recorded, but it is {layout:?} when the buffer runs (image {}): that hold carries nothing to the next",
+                    super::hex(image)
+                ));
+            }
+        }
+    }
+
     /// Records a hold into `cb` right before the launch being recorded (or right after DLSS's output kernel):
     /// the copies in, what `hold` records, the copy back and the application's compute state. `hold` decides
     /// (on what it can know: the device's state, the network) whether to hold; it records nothing until it
@@ -629,6 +769,10 @@ impl Inline {
         }
         if self.stopped.load(Ordering::Relaxed) {
             return Recorded::Refused;
+        }
+        if point.guessed.colour.is_some() && self.verdicts.is_none() {
+            // Its layout could not be checked when the buffer is submitted.
+            return Recorded::Skipped;
         }
         let stage = if point.hold.stage == Stage::Upscaled { Stage::Upscaled } else { Stage::Before };
         let extent = (point.desc.width, point.desc.height);
@@ -733,6 +877,22 @@ impl Inline {
             .filter(|a| a.readable && point.mvec_extent.0 > 0 && point.mvec_extent.1 > 0)
             .and_then(|a| a.layout.map(|layout| (a.image, layout, point.mvec_extent, a.format)));
         let depth_source = point.depth_input.filter(|a| a.readable && super::edit_cache_on()).and_then(|a| a.layout.map(|layout| (a.image, layout, a.format)));
+        // An input whose layout this buffer did not set is read in the layout guessed for it only where that
+        // guess is checked when the buffer is submitted ([`Self::check`]).
+        let checked = self.verdicts.is_some();
+        let g = point.guessed;
+        let exposure = exposure.filter(|_| checked || g.exposure.is_none());
+        let mvec = mvec.filter(|_| checked || g.mvec.is_none());
+        let depth_source = depth_source.filter(|_| checked || g.depth.is_none());
+        let guesses: Guesses = [
+            g.colour.map(|l| (point.colour, l)),
+            exposure.and(g.exposure).zip(exposure).map(|(l, (image, _))| (image, l)),
+            mvec.and(g.mvec).zip(mvec).map(|(l, (image, ..))| (image, l)),
+            depth_source.and(g.depth).zip(depth_source).map(|(l, (image, ..))| (image, l)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let held = InlinePoint {
             colour: staging.colour,
             layout: vk::ImageLayout::GENERAL,
@@ -746,6 +906,8 @@ impl Inline {
             // `InlinePoint::mvec_scale`).
             mvec_input: mvec.map(|_| Aux { image: staging.mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
             depth_input: None,
+            // The staging images, in `GENERAL` (set by the copies in).
+            guessed: super::Guessed::default(),
             ..point
         };
         let mut ctx = Ctx {
@@ -755,6 +917,7 @@ impl Inline {
             staging,
             depth: depth_source.map(|(_, _, f)| f),
             slot: index as u32,
+            verdicts: self.verdicts.as_ref().map_or(vk::Buffer::null(), |v| v.buffer),
             queries,
             readback,
             cache_dump: &mut cache_dump,
@@ -767,8 +930,15 @@ impl Inline {
             opened: false,
             closed: false,
         };
+        // Counted among the holds that may still run from before it asks for the network: nothing rebuilds the
+        // network or lends it to another device while it is being recorded (`native::Loader::ready_sizes`).
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
         let outcome = hold(&mut ctx);
         let opened = ctx.opened;
+        if !opened {
+            // Nothing recorded: nothing of it can run.
+            self.outstanding.fetch_sub(1, Ordering::SeqCst);
+        }
         if opened {
             // SAFETY: recording into the application's buffer on this thread (the launch hook).
             unsafe {
@@ -781,6 +951,14 @@ impl Inline {
         let slot = &mut s.slots[index];
         slot.reserved = false;
         slot.cache_dump = cache_dump;
+        if opened {
+            slot.guesses = guesses;
+            slot.sound = true;
+            if let Some(v) = &self.verdicts {
+                // Not pending: the buffer is being recorded.
+                v.set(index, true);
+            }
+        }
         match outcome {
             // Something was recorded: the slot is the buffer's until it can no longer run, whatever the hold
             // decided after opening (its readings are then dropped).
@@ -788,7 +966,6 @@ impl Inline {
                 slot.meta = Some(meta);
                 slot.recorded = Some(Instant::now());
                 s.by_cb.entry(cb).or_default().push(index);
-                self.outstanding.fetch_add(1, Ordering::SeqCst);
                 drop(s);
                 self.say_once(format!(
                     "holding inside DLSS's command buffer, {} ({:?} in {:?}{}; why not the split: {:?}; motion vectors {})",
@@ -823,7 +1000,6 @@ impl Inline {
                     let stage = slot.stage;
                     slot.meta = Some(Meta::empty(stage));
                     s.by_cb.entry(cb).or_default().push(index);
-                    self.outstanding.fetch_add(1, Ordering::SeqCst);
                     return Recorded::Held;
                 }
                 slot.owner = None;
@@ -913,7 +1089,7 @@ impl Inline {
             b.pending = Some(pending);
             b.take(exposure)
         });
-        Harvest { meta, runs: slot.submits, gpu_ms, readback, cache_frame }
+        Harvest { meta, sound: slot.sound, runs: slot.submits, gpu_ms, readback, cache_frame }
     }
 
     /// A new slot: its timestamp pool (none where the family writes no timestamps) and its readback buffer.
@@ -928,31 +1104,8 @@ impl Inline {
                 Some(_) => d.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(TIMESTAMPS), None).ok()?,
                 None => vk::QueryPool::null(),
             };
-            let info = vk::BufferCreateInfo::default().size(READBACK_BYTES).usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let made = d.create_buffer(&info, None).ok().and_then(|buffer| {
-                let reqs = d.get_buffer_memory_requirements(buffer);
-                let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-                let index = (0..self.memory.memory_type_count)
-                    .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.memory.memory_types[i as usize].property_flags.contains(host));
-                let memory =
-                    index.and_then(|i| d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(i), None).ok());
-                let ptr =
-                    memory.and_then(|m| d.bind_buffer_memory(buffer, m, 0).and_then(|()| d.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())).ok());
-                match (memory, ptr) {
-                    (Some(m), Some(p)) => {
-                        std::ptr::write_bytes(p.cast::<u8>(), 0, READBACK_BYTES as usize);
-                        Some((buffer, m, p.cast::<u8>().cast_const()))
-                    }
-                    (m, _) => {
-                        d.destroy_buffer(buffer, None);
-                        if let Some(m) = m {
-                            d.free_memory(m, None);
-                        }
-                        None
-                    }
-                }
-            });
-            let Some((readback, readback_memory, readback_ptr)) = made else {
+            let made = host_buffer(d, &self.memory, READBACK_BYTES, vk::BufferUsageFlags::TRANSFER_DST);
+            let Some((readback, readback_memory, readback_ptr)) = made.map(|(b, m, p)| (b, m, p.cast_const())) else {
                 d.destroy_query_pool(queries, None);
                 return None;
             };
@@ -968,6 +1121,8 @@ impl Inline {
                 readback_ptr,
                 cache_dump: None,
                 meta: None,
+                guesses: Vec::new(),
+                sound: true,
             })
         }
     }
@@ -1139,6 +1294,7 @@ impl Meta {
             scene: None,
             auto: false,
             kind: None,
+            refresh: 0,
             init: None,
             fresh: (0, 0),
             exposure_source: None,
@@ -1433,6 +1589,13 @@ pub(crate) unsafe fn destroy(device: vk::Device) {
                 // SAFETY: as above.
                 unsafe { inline.free_staging(&staging) };
             }
+            if let Some(v) = &inline.verdicts {
+                // SAFETY: as above; the guard's set that names it is the device's resources', not used again.
+                unsafe {
+                    d.destroy_buffer(v.buffer, None);
+                    d.free_memory(v.memory, None);
+                }
+            }
             let mut fences: Vec<vk::Fence> = s.drain.take().map(|(_, f)| f).into_iter().collect();
             fences.append(&mut s.spare);
             fences.append(&mut s.retired);
@@ -1516,6 +1679,8 @@ mod tests {
         pub inline: Arc<Inline>,
         session: Session,
         split: Option<Resources>,
+        /// The layouts the next holds take as guessed ([`InlinePoint::guessed`]).
+        pub guessed: crate::preupscale::Guessed,
     }
 
     impl Rig {
@@ -1580,6 +1745,7 @@ mod tests {
                     colour: vk::Image::null(),
                     mvec: vk::Image::null(),
                     exposure: vk::Image::null(),
+                    guessed: crate::preupscale::Guessed::default(),
                     head: 0,
                     head_bytes: Vec::new(),
                     built: Built {
@@ -1887,12 +2053,18 @@ mod tests {
                 identification: 1,
                 hazard: Hazard::MemoryBarrier,
                 hold: crate::preupscale::placement::Hold::ALL_BEFORE,
+                guessed: self.guessed,
             }
         }
 
         /// The hold recorded into `cb` (being recorded) as `device.rs` records it: what earlier buffers left
         /// applied, the inline resources ensured, and the native hold recorded through the buffer sink.
         pub(crate) fn hold_into(&mut self, cb: vk::CommandBuffer, f: u32, hold: u64) -> Recorded {
+            self.hold_into_sizes(cb, f, hold, &[(W, H)])
+        }
+
+        /// [`Self::hold_into`] with the network's sizes `sizes` (without the hold's own, it misses).
+        pub(crate) fn hold_into_sizes(&mut self, cb: vk::CommandBuffer, f: u32, hold: u64, sizes: &[(u32, u32)]) -> Recorded {
             let point = self.point();
             let Self { inline, session, loader, device, instance, physical, family, .. } = self;
             let loader = loader.as_ref().expect("loader");
@@ -1932,7 +2104,7 @@ mod tests {
                         jitter,
                         false,
                         Passes::default(),
-                        &[(W, H)],
+                        sizes,
                         None,
                         Self::ask(hold),
                         neural_forge_protocol::enums::network::FULL,
@@ -1960,6 +2132,13 @@ mod tests {
                 self.inline.submitted(self.queue, cbs.iter().copied());
                 d.queue_wait_idle(self.queue).unwrap();
             }
+        }
+
+        /// [`Self::submit`], the holds' guessed layouts checked first against `actual` as `device.rs` checks them
+        /// against the tracking's.
+        pub(crate) fn submit_checked(&self, cbs: &[vk::CommandBuffer], actual: impl Fn(&[vk::CommandBuffer], vk::Image) -> Option<vk::ImageLayout>) {
+            self.inline.check(cbs, actual);
+            self.submit(cbs);
         }
 
         /// Begins `cb` again (the hold's slot in it, if any, is free and read back).
@@ -2078,6 +2257,88 @@ mod tests {
             "a cached hold applied the edit of a refresh that never ran (first difference {:?})",
             first_difference(&got, &Rig::input(7))
         );
+    }
+
+    /// A hold counts among the holds that may still run (what keeps the network from being rebuilt or lent) from
+    /// before it asks for the network, while it is recorded; one that recorded nothing stops counting at once.
+    #[test]
+    fn a_hold_counts_as_outstanding_while_it_is_recorded() {
+        let Some(rig) = Rig::open(false) else { return };
+        let cb = rig.buffer();
+        rig.begin(cb);
+        let seen = std::cell::Cell::new(usize::MAX);
+        let outcome = rig.inline.record_outcome(cb, rig.point(), |_| {
+            seen.set(rig.inline.outstanding.load(Ordering::SeqCst));
+            Err(Recorded::Skipped)
+        });
+        assert_eq!(outcome, Recorded::Skipped);
+        assert_eq!(seen.get(), 1, "counted while it is recorded");
+        assert_eq!(rig.inline.outstanding.load(Ordering::SeqCst), 0, "nothing recorded: no longer counted");
+        rig.end(cb);
+    }
+
+    /// A hold that misses once the network ran (here: the network's sizes do not include the hold's): the frame
+    /// goes to DLSS untouched, and the next network frame starts afresh, as the split hold's after a reset,
+    /// instead of reprojecting a history a frame older than its motion vectors.
+    #[test]
+    fn a_missed_hold_resets_the_history_of_the_next_network_frame() {
+        let Some(mut rig) = Rig::open(false) else { return };
+        let split: Vec<Vec<u16>> = [(0, 1, false), (1, 2, false), (3, 4, true)].into_iter().map(|(f, h, reset)| rig.split_frame(f, h, reset)).collect();
+        rig.clear_head();
+        let cb = rig.buffer();
+        for f in 0..2 {
+            let readback = rig.record_held(cb, f, u64::from(f) + 1);
+            rig.submit(&[cb]);
+            let got = rig.read(readback);
+            assert!(got == split[f as usize], "frame {f} (first difference {:?})", first_difference(&got, &split[f as usize]));
+        }
+        let k = rig.upload_of(2);
+        rig.begin(cb);
+        rig.record_frame(cb, k);
+        assert_eq!(rig.hold_into_sizes(cb, 2, 3, &[]), Recorded::Skipped, "frame 2's hold misses");
+        rig.end(cb);
+        rig.submit(&[cb]);
+        let readback = rig.record_held(cb, 3, 4);
+        rig.submit(&[cb]);
+        let got = rig.read(readback);
+        assert!(got == split[2], "the network frame after a missed hold reprojected its history (first difference {:?})", first_difference(&got, &split[2]));
+    }
+
+    /// A hold recorded with its motion vectors in a guessed layout (not set in its buffer: vkd3d-proton records
+    /// in parallel and submits later), found wrong when the buffer is submitted: the hold still runs, but as a
+    /// network frame without history (as the split hold after a reset), and the hold after it starts afresh too
+    /// (a cached hold applies no edit). A guess found right changes nothing.
+    #[test]
+    fn a_hold_whose_guessed_layout_was_wrong_carries_nothing_to_the_next() {
+        let Some(mut rig) = Rig::open(false) else { return };
+        let split: Vec<Vec<u16>> =
+            [(0, 1, false), (1, 2, false), (2, 3, false), (3, 4, false), (4, 5, true)].into_iter().map(|(f, h, reset)| rig.split_frame(f, h, reset)).collect();
+        rig.clear_head();
+        let cb = rig.buffer();
+        let mvec = rig.mvec;
+        // Guessed GENERAL, and GENERAL when the buffer runs: as if set in the buffer.
+        rig.guessed.mvec = Some(vk::ImageLayout::GENERAL);
+        for f in 0..4 {
+            let readback = rig.record_held(cb, f, u64::from(f) + 1);
+            rig.submit_checked(&[cb], |_, image| (image == mvec).then_some(vk::ImageLayout::GENERAL));
+            let got = rig.read(readback);
+            assert!(
+                got == split[f as usize],
+                "frame {f}: a guess that held changed the hold (first difference {:?})",
+                first_difference(&got, &split[f as usize])
+            );
+        }
+        // Frame 4 (hold 5, a network frame): the motion vectors are in another layout when its buffer runs.
+        let readback = rig.record_held(cb, 4, 5);
+        rig.submit_checked(&[cb], |_, image| (image == mvec).then_some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
+        let got = rig.read(readback);
+        assert!(got == split[4], "the hold whose guess was wrong used its history (first difference {:?})", first_difference(&got, &split[4]));
+        // Frame 5 (hold 6, planned as cached on hold 5's refresh): nothing carried over.
+        rig.guessed = crate::preupscale::Guessed::default();
+        let readback = rig.record_held(cb, 5, 6);
+        rig.submit(&[cb]);
+        let got = rig.read(readback);
+        assert!(got == Rig::input(5), "the hold after it applied an edit carried from it (first difference {:?})", first_difference(&got, &Rig::input(5)));
     }
 
     const PROBE_SPV: &[u8] = include_bytes!("../../shaders/test_restore_probe.spv");

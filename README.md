@@ -394,8 +394,8 @@ colour past what the frame can hold instead of clipping one channel, so the hue 
 breaks up banding in smooth gradients after the upscaler. **Look-up table** applies a 3D `.cube` file (17 to
 65 points; the Choose button or `neural-forge-cli shmctl lut FILE`) to the last pass's result where the model
 changed the picture: its strength (0, off) grows with the size of the change and is full at **Look-up table
-full at**, so a pixel the model left alone keeps its colour. At their defaults the picture is exactly the
-model's.
+full at**, so a pixel the model left alone keeps its colour. A table that is removed or cannot be read stops
+applying, before and after the upscaler alike. At their defaults the picture is exactly the model's.
 
 **Placement** (Model tab) sets where the model runs in the frame: **Auto** (the default; see
 [How it works](#how-it-works)), **Before the upscaler** (with Ray Reconstruction on, the finished
@@ -484,7 +484,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_DISABLE=1` | layer (manifest) | Forces it off, overriding `ENABLE`. |
 | `NEURAL_FORGE_TARGET_EXE=a.exe,b.exe` | layer | Only these executables (case-insensitive basenames) may use the layer, even one whose name is on the built-in list of launchers and helpers (a game whose executable is `Launcher.exe`). Switching a game on sets it to the game's own executables. Without it, the first process not on that list to present steadily takes the layer. |
 | `NEURAL_FORGE_PREUPSCALE=off` | layer | Rollback: the network is not loaded, so no frame is changed (the layer log says so once). The model on the finished frame is the Placement setting's Finished frame instead. Unset (or `model`) is the default. An unknown value is logged and treated as `off`. |
-| `NEURAL_FORGE_PREUPSCALE=dump\|identity\|roundtrip` | layer | Diagnostics: write DLSS's input to `captures/`, hold without the model (raw copy back), or run the HDR encode and decode with no model. See [docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md). |
+| `NEURAL_FORGE_PREUPSCALE=dump\|identity\|roundtrip` | layer | Diagnostics: write DLSS's input to `captures/`, hold without the model (raw copy back), or run the HDR encode and decode with no model. They wait for their own work inside the game's submit, so a submit that waits on an event or on a timeline value not reached yet goes to DLSS untouched. See [docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md). |
 | `NEURAL_FORGE_EDIT_CACHE=off` | layer | Before the upscaler, run the network on every frame instead of the edit cache's cadence (every frame while the camera is still, every second frame while it moves), with none of the cache at all (the game's depth is neither made copyable nor copied). For A/B comparisons, benchmarks and rollback; unset (or `on`) is the default. An unknown value is logged and the cache stays on. |
 | `NEURAL_FORGE_SCENE_CUT=off\|N` | layer | Before the upscaler, how different two frames must be for the model to start afresh: the mean change of brightness, 1 to 255 (default 40), or `off` to never start afresh on a cut. For testing; an unknown value is logged and the default stays. |
 | `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=3` | layer | The HDR encode's paper white (default 3; a positive number up to 1000). Tuning only. |

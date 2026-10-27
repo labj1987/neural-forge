@@ -18,9 +18,7 @@
 //! Each move is logged once. Each stage then runs one contiguous group of passes with their own settings and
 //! its own histories (a hold's resources per stage: `Session::res` and `Session::res_after`).
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use neural_forge_protocol::enums::placement;
 use neural_forge_protocol::MAX_PASSES;
@@ -76,13 +74,67 @@ pub(crate) fn stage_of(setting: u32, frame: Frame) -> (Stage, bool) {
     }
 }
 
+/// A fallback or a move [`Plan::of`] made to keep the plan sound, for the log (once each). Plain values: a
+/// plan is made for every hold, and its notes are only formatted the first time one is logged ([`Plan::say`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Note {
+    /// Pass `pass` (0-based) asked for after DLSS, whose output is not known: it runs at `to`, as auto does.
+    FellBack { pass: usize, to: Stage },
+    /// Pass `pass` asked for `asked`, earlier than the pass before it, which runs at `runs`: it runs there too.
+    Order { pass: usize, asked: Stage, runs: Stage },
+    /// Pass `pass` at present follows passes held in the game's frame: it runs at `to`.
+    PresentAfterHold { pass: usize, to: Stage },
+}
+
+impl Note {
+    /// A number of its own for each note (below [`NOTE_KINDS`]).
+    fn index(self) -> usize {
+        let (kind, pass, a, b) = match self {
+            Note::FellBack { pass, to } => (0, pass, to, Stage::Before),
+            Note::Order { pass, asked, runs } => (1, pass, asked, runs),
+            Note::PresentAfterHold { pass, to } => (2, pass, to, Stage::Before),
+        };
+        ((kind * MAX_PASSES + pass) * 3 + a as usize) * 3 + b as usize
+    }
+
+    fn line(self) -> String {
+        match self {
+            Note::FellBack { pass, to } => format!(
+                "pass {}: DLSS's output is not known in this game (or not yet), so the placement after DLSS runs {} instead, as auto does",
+                pass + 1,
+                to.name()
+            ),
+            Note::Order { pass, asked, runs } => format!(
+                "pass {}: asked for {}, but pass {} runs {} and the passes run in order; it runs {} too",
+                pass + 1,
+                asked.name(),
+                pass,
+                runs.name(),
+                runs.name()
+            ),
+            Note::PresentAfterHold { pass, to } => format!(
+                "pass {}: at present cannot follow passes held in the game's frame (the network serves one path at a time); it runs {}",
+                pass + 1,
+                to.name()
+            ),
+        }
+    }
+}
+
+/// How many different [`Note`]s there are.
+const NOTE_KINDS: usize = 3 * MAX_PASSES * 3 * 3;
+
+/// The notes a plan can carry: a fallback, a move for the order and one for the present stage per pass.
+const MAX_NOTES: usize = 3 * MAX_PASSES;
+
 /// Every pass's stage for one frame ([`Plan::of`]), and what had to move.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Plan {
     pub count: usize,
     pub stages: [Stage; MAX_PASSES],
-    /// Lines for the log (once each): a fallback or a move made to keep the plan sound.
-    pub notes: Vec<String>,
+    /// The fallbacks and moves made to keep the plan sound, the first `note_count` of them.
+    notes: [Option<Note>; MAX_NOTES],
+    note_count: usize,
 }
 
 impl Plan {
@@ -90,26 +142,15 @@ impl Plan {
     pub(crate) fn of(count: usize, settings: &[u32; MAX_PASSES], frame: Frame) -> Self {
         let count = count.clamp(1, MAX_PASSES);
         let mut stages = [Stage::Present; MAX_PASSES];
-        let mut notes = Vec::new();
+        let mut plan = Self { count, stages, notes: [None; MAX_NOTES], note_count: 0 };
         for k in 0..count {
             let (stage, fell_back) = stage_of(settings[k], frame);
             if fell_back {
-                notes.push(format!(
-                    "pass {}: DLSS's output is not known in this game (or not yet), so the placement after DLSS runs {} instead, as auto does",
-                    k + 1,
-                    stage.name()
-                ));
+                plan.note(Note::FellBack { pass: k, to: stage });
             }
             stages[k] = stage;
             if k > 0 && stages[k] < stages[k - 1] {
-                notes.push(format!(
-                    "pass {}: asked for {}, but pass {} runs {} and the passes run in order; it runs {} too",
-                    k + 1,
-                    stage.name(),
-                    k,
-                    stages[k - 1].name(),
-                    stages[k - 1].name()
-                ));
+                plan.note(Note::Order { pass: k, asked: stage, runs: stages[k - 1] });
                 stages[k] = stages[k - 1];
             }
         }
@@ -119,16 +160,23 @@ impl Plan {
                 if frame.output { Stage::Upscaled } else { stages[..count].iter().copied().filter(|s| *s != Stage::Present).max().unwrap_or(Stage::Before) };
             for (k, stage) in stages.iter_mut().enumerate().take(count) {
                 if *stage == Stage::Present {
-                    notes.push(format!(
-                        "pass {}: at present cannot follow passes held in the game's frame (the network serves one path at a time); it runs {}",
-                        k + 1,
-                        held.name()
-                    ));
+                    plan.note(Note::PresentAfterHold { pass: k, to: held });
                     *stage = held;
                 }
             }
         }
-        Self { count, stages, notes }
+        plan.stages = stages;
+        plan
+    }
+
+    fn note(&mut self, note: Note) {
+        self.notes[self.note_count] = Some(note);
+        self.note_count += 1;
+    }
+
+    /// The fallbacks and moves made.
+    pub(crate) fn notes(&self) -> impl Iterator<Item = Note> + '_ {
+        self.notes[..self.note_count].iter().flatten().copied()
     }
 
     /// The passes `stage` runs, as `first..end` (empty when none).
@@ -149,12 +197,13 @@ impl Plan {
         !self.has(Stage::Before) && !self.has(Stage::Upscaled)
     }
 
-    /// Logs the notes not logged before.
+    /// Logs the notes not logged before: one atomic load per note once it was, nothing formatted.
     pub(crate) fn say(&self) {
-        static SAID: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
-        for note in &self.notes {
-            if super::lock(&SAID).insert(note.clone()) {
-                crate::log!("[placement] {note}");
+        static SAID: [AtomicBool; NOTE_KINDS] = [const { AtomicBool::new(false) }; NOTE_KINDS];
+        for note in self.notes() {
+            let said = &SAID[note.index()];
+            if !said.load(Ordering::Relaxed) && !said.swap(true, Ordering::Relaxed) {
+                crate::log!("[placement] {}", note.line());
                 crate::logging::flush();
             }
         }
@@ -255,7 +304,7 @@ mod tests {
             // One pass: the plan is the stage itself, the fallback noted.
             let plan = Plan::of(1, &[setting; MAX_PASSES], frame);
             assert_eq!(plan.stages[0], stage);
-            assert_eq!(plan.notes.len(), usize::from(fell_back), "{:?}", plan.notes);
+            assert_eq!(plan.notes().count(), usize::from(fell_back), "{plan:?}");
             assert_eq!(plan.all_present(), stage == Present);
         }
         // No hook before the upscaler and no output (no DLSS, no NVX): everything at present.
@@ -264,6 +313,25 @@ mod tests {
         }
         // A value out of range is auto.
         assert_eq!(stage_of(17, Frame { rr: true, output: true, hook: false }), (Upscaled, false));
+    }
+
+    /// Every note has a number of its own, so each is logged once and none hides another.
+    #[test]
+    fn each_note_has_its_own_number() {
+        let stages = [Stage::Before, Stage::Upscaled, Stage::Present];
+        let mut seen = std::collections::HashSet::new();
+        for pass in 0..MAX_PASSES {
+            for a in stages {
+                for b in stages {
+                    for note in [Note::FellBack { pass, to: a }, Note::Order { pass, asked: a, runs: b }, Note::PresentAfterHold { pass, to: a }] {
+                        assert!(note.index() < NOTE_KINDS);
+                        if matches!(note, Note::Order { .. }) || b == Stage::Before {
+                            assert!(seen.insert(note.index()), "{note:?}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -275,7 +343,7 @@ mod tests {
         s[1] = UPSCALED;
         let plan = Plan::of(2, &s, sr);
         assert_eq!(&plan.stages[..2], &[Before, Upscaled]);
-        assert!(plan.notes.is_empty());
+        assert_eq!(plan.notes().count(), 0);
         assert_eq!((plan.range(Before), plan.range(Upscaled), plan.range(Present)), ((0, 1), (1, 2), (0, 0)));
         let hold = Hold::of(&plan, Upscaled, (1707, 960), (2560, 1440));
         assert_eq!(hold.passes(), (1, 2));
@@ -285,14 +353,14 @@ mod tests {
         s[1] = BEFORE;
         let plan = Plan::of(2, &s, sr);
         assert_eq!(&plan.stages[..2], &[Upscaled, Upscaled]);
-        assert_eq!(plan.notes.len(), 1, "{:?}", plan.notes);
+        assert_eq!(plan.notes().collect::<Vec<_>>(), [Note::Order { pass: 1, asked: Before, runs: Upscaled }]);
         // At present after a hold: to the hold after DLSS where the output is learnt, else before the upscaler.
         s[0] = BEFORE;
         s[1] = PRESENT;
         s[2] = PRESENT;
         let plan = Plan::of(3, &s, sr);
         assert_eq!(&plan.stages[..3], &[Before, Upscaled, Upscaled]);
-        assert_eq!(plan.notes.len(), 2);
+        assert_eq!(plan.notes().count(), 2);
         let plan = Plan::of(3, &s, Frame { output: false, ..sr });
         assert_eq!(&plan.stages[..3], &[Before, Before, Before]);
         // Pass 1 at present: every later pass follows it there (the holds stand down).
