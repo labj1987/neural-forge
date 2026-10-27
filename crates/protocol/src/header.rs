@@ -1145,6 +1145,7 @@ impl ShmHeader {
         self.preupscale_width.store(0, Ordering::Relaxed);
         self.preupscale_height.store(0, Ordering::Relaxed);
         self.preupscale_hold_ms_bits.store(0, Ordering::Relaxed);
+        self.preupscale_network_gpu_ms_bits.store(0, Ordering::Relaxed);
         self.preupscale_misses.store(0, Ordering::Relaxed);
         self.server_busy_us.store(0, Ordering::Relaxed);
         self.seq_eval.store(0, Ordering::Relaxed);
@@ -1162,6 +1163,10 @@ impl ShmHeader {
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 
+        // From 0 like the capture result's, so a sequence another layout left (odd, or anywhere) does
+        // not carry into the new session.
+        self.layer_reason_seq.store(0, Ordering::Relaxed);
+        self.game_name_seq.store(0, Ordering::Relaxed);
         self.set_layer_reason("");
         self.set_game_name("");
 
@@ -2493,6 +2498,22 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
             assert_eq!(torn, None, "a torn read");
         });
+    }
+
+    /// `init_defaults` resets every word of the header: on one holding anything at all (every bit set)
+    /// it leaves exactly what it leaves on a fresh one, so a field added without a reset fails here.
+    #[test]
+    fn init_defaults_resets_every_field() {
+        let dirty = ShmHeader::default();
+        for w in dirty.words() {
+            w.store(u32::MAX, Ordering::Relaxed);
+        }
+        dirty.init_defaults();
+        let fresh = ShmHeader::default();
+        fresh.init_defaults();
+        let left: Vec<usize> =
+            (0..HEADER_WORDS).filter(|&i| dirty.words()[i].load(Ordering::Relaxed) != fresh.words()[i].load(Ordering::Relaxed)).map(|i| i * 4).collect();
+        assert!(left.is_empty(), "init_defaults leaves the words at these byte offsets as they were: {left:?}");
     }
 
     #[test]
