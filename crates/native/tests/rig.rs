@@ -894,8 +894,7 @@ fn shared_activations_take_less_memory() {
     for sizes in [&[(2560, 1440), (1708, 960)][..], &[(3840, 2160), (2560, 1440)][..]] {
         let mut taken = [0u64; 2];
         for (i, shared) in [false, true].into_iter().enumerate() {
-            // SAFETY: the variable is read by the build below on this thread only; no other test runs (`ONE`).
-            unsafe { std::env::set_var("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS", if shared { "1" } else { "0" }) };
+            let _shared = SharedActivations::set(shared);
             // SAFETY: no graph of the previous build was submitted. A tiny build first returns the last one's memory.
             unsafe { net.build(64, 64) }.expect("the small build");
             let base = device_local_usage(&g);
@@ -906,8 +905,26 @@ fn shared_activations_take_less_memory() {
         eprintln!("{sizes:?}: own allocations {} MiB, shared {} MiB", mib(taken[0]), mib(taken[1]));
         assert!(taken[1] <= taken[0]);
     }
-    // SAFETY: as above.
-    unsafe { std::env::remove_var("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS") };
+}
+
+/// `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS` set for the builds while this lives, and removed when it is dropped on
+/// any path (a failed assertion's unwinding included): the tests after one that sets it build as by default.
+struct SharedActivations;
+
+impl SharedActivations {
+    fn set(shared: bool) -> Self {
+        // SAFETY: the variable is read by the builds of the test holding [`ONE`] (as every test here does), on its
+        // thread; no other test runs meanwhile.
+        unsafe { std::env::set_var("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS", if shared { "1" } else { "0" }) };
+        SharedActivations
+    }
+}
+
+impl Drop for SharedActivations {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`.
+        unsafe { std::env::remove_var("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS") };
+    }
 }
 
 /// How many 4-byte values of `got` differ from `expected` (all of them when the lengths differ).
