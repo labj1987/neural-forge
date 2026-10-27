@@ -93,9 +93,10 @@ jobs:
 
       # Cargo's downloads and the third-party crates' build output, so a run does not download and
       # compile the whole dependency graph again. Only what cannot go stale is kept. The key is the
-      # exact lockfile, manifests (profiles, features), toolchain, runner image and the system packages
-      # the -sys crates' build scripts and the C/C++ builds read, with no fallback to an older key:
-      # any change is a cold build, never a partial restore. And the workspace's own crates are
+      # exact lockfiles, manifests (profiles, features; the workspace's and the layer framework's),
+      # toolchain, runner image and the system packages the -sys crates' build scripts and the C/C++
+      # builds read, with no fallback to an older key: any change is a cold build, never a partial
+      # restore. And the checkout's own crates (the workspace's and the layer framework's) are
       # removed before the cache is saved (the last steps), so every run compiles and tests this
       # checkout's code from scratch, its build scripts included (crates/native's reads tools/native).
       # A release builds everything from nothing and leaves the cache alone.
@@ -106,7 +107,7 @@ jobs:
           sys="$( { echo "${ImageOS:-} ${ImageVersion:-}"; rustc -vV
                     dpkg-query -W -f '${Package}=${Version}\n' gcc g++ binutils libc6-dev pkg-config \
                       libgtk-4-dev libadwaita-1-dev libglib2.0-dev libvulkan1; } | sha256sum | cut -c1-16)"
-          echo "key=cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'rust-toolchain.toml') }}-$sys" >> "$GITHUB_OUTPUT"
+          echo "key=cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'rust-toolchain.toml', 'third_party/vk-layer-for-rust/Cargo.lock', 'third_party/vk-layer-for-rust/Cargo.toml', 'third_party/vk-layer-for-rust/*/Cargo.toml') }}-$sys" >> "$GITHUB_OUTPUT"
 
       - name: Restore the Cargo cache
         if: ${{ !inputs.release }}
@@ -120,15 +121,18 @@ jobs:
             target
           key: ${{ steps.cargo-key.outputs.key }}
 
-      # The pinned glslang, Vulkan-Headers and volk that crates/native builds with, cached by their
-      # pins: the build itself is offline. The key covers everything that decides the tree (the pins
-      # are all in the script), and the script re-checks each tool's stamp (its archive's SHA-256) and
-      # fetches again on a mismatch.
-      - name: Cache the native backend's tools
+      # The pinned tools in tools/native, cached by their pins: glslang, Vulkan-Headers and volk that
+      # crates/native builds with (fetch-native-tools.sh), cargo-deny (cargo-deny.sh) and the layer
+      # framework's generator headers (vk-layer-codegen.sh). The key covers every script that fetches
+      # into the tree (the pins are in them), and each re-checks its tools' stamps (the archives'
+      # SHA-256) and fetches again on a mismatch. A release fetches everything fresh, as it builds
+      # everything from nothing.
+      - name: Cache the pinned tools
+        if: ${{ !inputs.release }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tools/native
-          key: native-tools-${{ hashFiles('scripts/fetch-native-tools.sh') }}
+          key: native-tools-${{ hashFiles('scripts/fetch-native-tools.sh', 'scripts/cargo-deny.sh', 'scripts/vk-layer-codegen.sh') }}
 
       - name: Fetch the native backend's tools
         run: bash scripts/fetch-native-tools.sh
@@ -303,21 +307,30 @@ jobs:
           if-no-files-found: error
 
       # Only a run that found no cache under its key and passed everything saves one, and without
-      # the workspace's own crates (see the restore step): the downloads and the dependencies'
-      # build output are all that is kept.
-      - name: Drop the workspace's own build output from the Cargo cache
+      # the checkout's own crates (see the restore step): the downloads and the dependencies'
+      # build output are all that is kept. The checkout's own are the workspace's and the layer
+      # framework's (third_party/vk-layer-for-rust, its own workspace, built into target/ as
+      # crates/layer's dependency and by its clippy, tests and generator steps).
+      - name: Drop the checkout's own build output from the Cargo cache
         if: success() && !inputs.release && steps.cargo-cache.outputs.cache-hit != 'true'
         run: |
-          packages="$(cargo metadata --locked --no-deps --format-version 1 |
-            python3 -c 'import json, sys; print(" ".join(p["name"] for p in json.load(sys.stdin)["packages"]))')"
-          test -n "$packages"
+          names='import json, sys; print(" ".join(p["name"] for p in json.load(sys.stdin)["packages"]))'
+          packages="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c "$names")"
+          framework="$(cd third_party/vk-layer-for-rust && cargo metadata --locked --no-deps --format-version 1 | python3 -c "$names")"
+          test -n "$packages" && test -n "$framework"
           for package in $packages; do
               cargo clean --locked -p "$package"
               cargo clean --locked --release -p "$package"
           done
+          for package in $framework; do
+              (cd third_party/vk-layer-for-rust &&
+                  CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked -p "$package" &&
+                  CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked --release -p "$package")
+          done
           rm -rf target/debug/incremental target/release/incremental
-          if find target -maxdepth 3 \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \) | grep .; then
-              echo "error: the workspace's build output is still in target/" >&2
+          if find target -maxdepth 3 \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \
+                  -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' \) | grep .; then
+              echo "error: the checkout's own build output is still in target/" >&2
               exit 1
           fi
 
