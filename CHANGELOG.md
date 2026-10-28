@@ -4,6 +4,21 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.9.2 — 2026-10-28
+
+- Pressing the toggle key in a game running under X11 could crash the game: checking which window had the
+  focus read past the end of the window list. It now reads only the list.
+- A game that asks Vulkan for its device groups no longer crashes at start.
+- Switching two games on (or off) in quick succession, or changing a game in the terminal while the window
+  is open, no longer loses one of the changes to the Steam launch options while the window shows it as made.
+- Games where the model runs inside DLSS's own work (Crimson Desert and other vkd3d-proton games): a game that
+  sets drawing constants for all its shaders and then for its drawing shaders alone no longer gets the older
+  values back after the model ran, so its HUD and post-processing after DLSS draw as the game meant.
+- With another Vulkan layer installed below Neural Forge, starting a game on an NVIDIA card with
+  `NEURAL_FORGE_PREUPSCALE=off` could skip that layer.
+- A game that uses a Vulkan 1.2 extension command (such as the KHR names of the synchronization2 and dynamic
+  rendering commands) no longer aborts when the driver or a layer below answers only to the extension's name.
+
 ## 3.9.1 — 2026-10-27
 
 - A game no longer stalls for a moment at start or when a capture's progress is reported, after an earlier
