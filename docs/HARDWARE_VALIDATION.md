@@ -1502,6 +1502,7 @@ MangoHud's per presented frame over 50 s.
 35.0-36.1; one of the three pairs goes each way and one is even), and the costs it could change are the same:
 hold CPU time, network time and frame pacing. No fence timeout, no refused hold, no Xid. Not slower.
 
-**GTA V Enhanced** (one 3.9.1 run, frame generation engaged at once): pass 4 63.6 real / 256.2 shown fps (4.0x),
-hold 0.10 ms, network 6.92 ms, 0 misses, frame time p1 9.90 / p99 21.30 ms; the 3.8.14 run of the same
-afternoon 63.4 / 255.8 (4.0x), 0.10 ms, 6.87 ms, 9.97 / 21.16 ms.
+**GTA V Enhanced** (3.9.1, frame generation engaged in both launches): pass 4 64.7 real / 261.1 shown fps (4.0x),
+hold 0.10 ms, network 6.89 ms, 0 misses, frame time p1 10.49 / p99 21.23 ms; the 3.8.14 run of the same
+afternoon 63.4 / 255.8 (4.0x), 0.10 ms, 6.87 ms, 9.97 / 21.16 ms. A first 3.9.1 launch (63.6 / 256.2) is left
+out: GPU tests ran on the machine for 12 s during its start.

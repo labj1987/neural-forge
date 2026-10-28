@@ -2029,9 +2029,11 @@ struct FrameCopy {
 }
 
 /// The copies the game's reads fall back on ([`ShmHeader::read_settings_for_frame`]), one per header
-/// by its address. A few headers' worth (a process maps one channel; tests make many).
+/// by its address. A few headers' worth (a process maps one channel); the tests, which run in one
+/// process and make a header or more each, keep far more, so that one test's copy is never pushed out
+/// by the others' while it counts on it.
 static FRAME_COPIES: std::sync::Mutex<Vec<FrameCopy>> = std::sync::Mutex::new(Vec::new());
-const MAX_FRAME_COPIES: usize = 8;
+const MAX_FRAME_COPIES: usize = if cfg!(test) { 4096 } else { 8 };
 
 /// How a writer enters a sequence lock's write section ([`write_unit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2472,6 +2474,22 @@ mod tests {
         (read.0, read.1, read.2, read.3, start.elapsed())
     }
 
+    /// [`frame_reads`] until this process keeps its copy of `h` at the present sequence: a read skips
+    /// keeping its copy while another thread (another test's read, in the same process) holds the
+    /// copies, and a test that then counts on that copy would read an older one.
+    fn frame_reads_kept(h: &ShmHeader) -> (f32, MaskSettings, (usize, [u32; crate::MAX_PASSES]), HudSettings, std::time::Duration) {
+        let me = std::ptr::from_ref(h) as usize;
+        loop {
+            let read = frame_reads(h);
+            let seq = h.tuning_seq.load(Ordering::Relaxed);
+            let kept = FRAME_COPIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|k| k.header == me && k.seq == seq);
+            if kept {
+                return read;
+            }
+            std::thread::yield_now();
+        }
+    }
+
     /// Well under the 50 ms a waiting read gives a stopped writer, well over the reads' own 1 ms
     /// bound each.
     const FRAME_BOUND: std::time::Duration = std::time::Duration::from_millis(25);
@@ -2490,7 +2508,7 @@ mod tests {
         assert!(
             h.write_settings_and_hud(&[("intensity", 0.5f32.to_bits()), ("mask_motion_threshold", 32.0f32.to_bits()), ("placement", 1)], Some(&[region(0.25)]))
         );
-        let (intensity, mask, placements, hud, _) = frame_reads(&h);
+        let (intensity, mask, placements, hud, _) = frame_reads_kept(&h);
         assert_eq!((intensity, mask.motion_threshold, placements.1[0], hud.regions.clone()), (0.5, 32.0, 1, vec![region(0.25)]));
 
         // Stopped half way: the sequence odd, two of its stores made.
@@ -2505,7 +2523,7 @@ mod tests {
         }
         // The next write takes the section over (after the wait the writers give a dead one), and is seen.
         assert!(h.write_settings(&[("intensity", 0.25f32.to_bits())]));
-        assert_eq!(frame_reads(&h).0, 0.25);
+        assert_eq!(frame_reads_kept(&h).0, 0.25);
 
         // A header with no copy kept (none read yet, or re-initialised since: the sequence went back)
         // reads as a fresh one, never as the half-made write.
@@ -2533,7 +2551,7 @@ mod tests {
         let h = std::sync::Arc::new(ShmHeader::default());
         h.init_defaults();
         assert!(h.write_settings(&[("intensity", 0.5f32.to_bits()), ("local_tone", 0.5f32.to_bits())]));
-        let _ = frame_reads(&h);
+        let _ = frame_reads_kept(&h);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let churn = {
             let (h, stop) = (h.clone(), stop.clone());
@@ -2576,6 +2594,9 @@ mod tests {
 
         let one = 1.0f32.to_bits();
         assert!(h.write_settings(&[("intensity", one), ("local_tone", one), ("local_structure", one)]));
+        // A read that finds no quiet moment falls back on the copy kept last: let that be this write's,
+        // not the churning writer's last values (whole, but no write of the three below).
+        let _ = frame_reads_kept(&h);
         let stop = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|s| {
             s.spawn(|| {
