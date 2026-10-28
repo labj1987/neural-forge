@@ -175,7 +175,9 @@ class CacheReplayTests(unittest.TestCase):
         r = cr.replay(dump, [2], cc.Params(), True)["results"][2]
         self.assertGreater(r["cache"]["kept"], 99.9)
         self.assertLess(r["cache"]["err"], 1e-3)
-        self.assertLess(r["none"]["kept"], 1e-6)
+        # No edit keeps nothing. pic and base are the same float64 mean of the same pixels (cc.picture_error), so
+        # this is 0 on every numpy and SIMD level; checked on both sides.
+        self.assertLess(abs(r["none"]["kept"]), 1e-6)
 
     def test_history_read_keeps_a_pixel_scale_edit(self):
         # A checkerboard edit read at a sub-pixel offset: the strongest tap's own edit comes through
