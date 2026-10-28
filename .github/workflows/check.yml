@@ -147,11 +147,11 @@ jobs:
       # The layer's GPU tests (the only crate with tests that run on lavapipe) again, under the Khronos
       # validation layer, which must report nothing. Its settings come from a settings file, which
       # every version reads (Ubuntu 24.04's 1.3.275 ignores the VK_KHRONOS_VALIDATION_* variables):
-      # errors and warnings, every one (no per-message limit), and the information-level status line
+      # errors, warnings and performance warnings, every one (no per-message limit), and the information-level status line
       # it prints into each instance, which shows it was loaded at all (the loader skips a
       # VK_INSTANCE_LAYERS entry it cannot find, and the run would pass with nothing checked).
       # The layer writes its messages to stdout itself, past libtest's capture, so the log holds
-      # every one; the step fails on any "Validation Error" or "Validation Warning" line, after
+      # every one; the step fails on any "Validation Error", "Validation Warning" or "Validation Performance Warning" line, after
       # printing them all (aborting on the first error would hide the rest and lose the test's
       # output).
       - name: cargo test under the Vulkan validation layer
@@ -160,7 +160,7 @@ jobs:
         run: |
           settings="$RUNNER_TEMP/vk_layer_settings.txt"
           printf '%s\n' \
-            'khronos_validation.report_flags = error,warn,info' \
+            'khronos_validation.report_flags = error,warn,perf,info' \
             'khronos_validation.debug_action = VK_DBG_LAYER_ACTION_LOG_MSG' \
             'khronos_validation.enable_message_limit = false' > "$settings"
           export VK_LAYER_SETTINGS_PATH="$settings"
