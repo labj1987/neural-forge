@@ -402,7 +402,9 @@ output kernel for the passes placed after DLSS): the colour input (and its motio
 depth) copied to staging images, the same `C`/`N`/`W` as the split hold with the network's graph
 recorded straight into the buffer, the staging image copied back, and the application's compute
 state (pipeline, descriptor sets or descriptor-buffer offsets, push constants) bound again
-(`preupscale/restore.rs`), since vkd3d-proton does not bind it again itself. Nothing waits on the host
+(`preupscale/restore.rs`), since vkd3d-proton does not bind it again itself. A push for graphics stages
+only that came after a kept push reaching those stages over the same bytes is replayed after it, so a
+draw after DLSS reads the application's newer values. Nothing waits on the host
 and nothing runs on another queue; DLSS continues on the enhanced input in the same buffer. Per-hold
 data the split hold writes from the host is written in the buffer; a guard dispatch checks on the GPU
 that the hold recorded before ran right before, and otherwise drops the history and the edit cache's
