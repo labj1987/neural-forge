@@ -1473,3 +1473,35 @@ RTX 5070, 2560x1440@288 VRR, desktop HDR as set, frame generation on as found.
   same edge detail as Full (23.9 / 23.9 on a fixed crop), Ultra Performance 159.4 and a little softer (23.2).
 - **Native network, 1486x836, idle GPU** (back-to-back graph time, median of 40): full 5.41 ms (5.60 before
   the 64-register cap on the 128-channel FFN kernels), small 2.90 ms (2.96); heads bit-exact.
+
+
+## 2026-10-27: 3.9.1 against 3.8.14 with frame generation on
+
+RTX 5070, 2560x1440@288 VRR, desktop HDR as set, DLSS Frame Generation on with Preset C, Ray Reconstruction off.
+The 3.9.0 check had only a frame-generation-off GTA run (the game turned it off at about 125 s), so this one
+compares the release layers with frame generation engaged.
+
+**Crimson Desert** (the hold inside DLSS's buffer, before the upscaler; the game's dynamic multi frame
+generation, about 6x). Same save, same spot at night, 60 s measured standing still; the layer swapped between
+the released 3.8.14 (`3bef0706…`) and 3.9.1 (`c12fa611…`) for each launch, alternating A/B/A/B/A/B. Real fps
+is holds per second (every rendered frame held); shown fps the layer's present rate; frame times are
+MangoHud's per presented frame over 50 s.
+
+| Run | Real fps | Shown fps | FG | Hold CPU ms | Network GPU ms | Misses | Frame time p1 / p99 ms |
+|---|---|---|---|---|---|---|---|
+| 3.8.14 #1 | 35.6 | 212.8 | 5.98x | 0.63 | 6.51 | 0 | 1.23 / 11.31 |
+| 3.9.1 #1 | 36.1 | 216.0 | 5.98x | 0.63 | 6.52 | 0 | 1.19 / 10.73 |
+| 3.8.14 #2 | 36.6 | 219.0 | 5.98x | 0.63 | 6.52 | 0 | 1.17 / 11.04 |
+| 3.9.1 #2 | 35.0 | 209.1 | 5.97x | 0.63 | 6.52 | 0 | 1.19 / 11.35 |
+| 3.8.14 #3 | 35.6 | 212.5 | 5.98x | 0.63 | 6.51 | 0 | 1.18 / 11.34 |
+| 3.9.1 #3 | 35.4 | 211.7 | 5.97x | 0.64 | 6.53 | 0 | 1.19 / 11.30 |
+| **3.8.14 mean** | **35.9** | **214.8** | | 0.63 | 6.51 | 0 | 1.19 / 11.23 |
+| **3.9.1 mean** | **35.5** | **212.3** | | 0.63 | 6.52 | 0 | 1.19 / 11.13 |
+
+3.9.1 is 1.2% lower on the means, inside the run-to-run spread of either build (3.8.14 35.6-36.6, 3.9.1
+35.0-36.1; one of the three pairs goes each way and one is even), and the costs it could change are the same:
+hold CPU time, network time and frame pacing. No fence timeout, no refused hold, no Xid. Not slower.
+
+**GTA V Enhanced** (one 3.9.1 run, frame generation engaged at once): pass 4 63.6 real / 256.2 shown fps (4.0x),
+hold 0.10 ms, network 6.92 ms, 0 misses, frame time p1 9.90 / p99 21.30 ms; the 3.8.14 run of the same
+afternoon 63.4 / 255.8 (4.0x), 0.10 ms, 6.87 ms, 9.97 / 21.16 ms.
