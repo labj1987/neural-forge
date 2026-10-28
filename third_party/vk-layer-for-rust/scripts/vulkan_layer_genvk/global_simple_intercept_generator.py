@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
+# Modified for Neural Forge (2026): ported to ash 0.38; the command alias table (UPSTREAM.md).
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
@@ -656,6 +656,38 @@ class GlobalSimpleInterceptGenerator(OutputGenerator):
             )
         )
         self.newline()
+        self.newline()
+
+        # An aliased command is dispatched through its representative's table entry, which is loaded
+        # under the representative's name only. Below a layer or driver that resolves that name to
+        # NULL (a core name on a device of an older version that enabled the extension), the
+        # loaders try these names next.
+        alias_groups: dict[str, list[str]] = {}
+        for name in aliased_commands:
+            alias_groups.setdefault(all_commands[name].vk_xml_command.name, []).append(name)
+        self.outFile.write(
+            "\n".join(
+                [
+                    "/// The other names of a command (its aliases in the registry, the extension names",
+                    "/// of a promoted command), NUL-terminated, tried in this order when the next layer",
+                    "/// resolves its name to NULL.",
+                    "pub(crate) fn command_aliases(name: &CStr) -> &'static [&'static [u8]] {",
+                    "    match name.to_bytes() {",
+                ]
+                + [
+                    f'        b"{represent}" => &['
+                    + ", ".join(
+                        f'b"{alias}\\0"'
+                        for alias in sorted(
+                            aliases, key=lambda alias: (not alias.endswith("KHR"), alias)
+                        )
+                    )
+                    + "],"
+                    for represent, aliases in sorted(alias_groups.items())
+                ]
+                + ["        _ => &[],", "    }", "}", ""]
+            )
+        )
         self.newline()
 
         self.outFile.write(generate_unhandled_command_comments(self.unhandled_commands.values()))

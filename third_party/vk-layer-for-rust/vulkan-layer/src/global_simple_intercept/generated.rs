@@ -1742,6 +1742,123 @@ impl InstanceDispatchTable {
     }
 }
 
+/// The other names of a command (its aliases in the registry, the extension names
+/// of a promoted command), NUL-terminated, tried in this order when the next layer
+/// resolves its name to NULL.
+pub(crate) fn command_aliases(name: &CStr) -> &'static [&'static [u8]] {
+    match name.to_bytes() {
+        b"vkBindBufferMemory2" => &[b"vkBindBufferMemory2KHR\0"],
+        b"vkBindImageMemory2" => &[b"vkBindImageMemory2KHR\0"],
+        b"vkCmdBeginRenderPass2" => &[b"vkCmdBeginRenderPass2KHR\0"],
+        b"vkCmdBeginRendering" => &[b"vkCmdBeginRenderingKHR\0"],
+        b"vkCmdBindVertexBuffers2" => &[b"vkCmdBindVertexBuffers2EXT\0"],
+        b"vkCmdBlitImage2" => &[b"vkCmdBlitImage2KHR\0"],
+        b"vkCmdCopyBuffer2" => &[b"vkCmdCopyBuffer2KHR\0"],
+        b"vkCmdCopyBufferToImage2" => &[b"vkCmdCopyBufferToImage2KHR\0"],
+        b"vkCmdCopyImage2" => &[b"vkCmdCopyImage2KHR\0"],
+        b"vkCmdCopyImageToBuffer2" => &[b"vkCmdCopyImageToBuffer2KHR\0"],
+        b"vkCmdDispatchBase" => &[b"vkCmdDispatchBaseKHR\0"],
+        b"vkCmdDrawIndexedIndirectCount" => &[
+            b"vkCmdDrawIndexedIndirectCountKHR\0",
+            b"vkCmdDrawIndexedIndirectCountAMD\0",
+        ],
+        b"vkCmdDrawIndirectCount" => &[
+            b"vkCmdDrawIndirectCountKHR\0",
+            b"vkCmdDrawIndirectCountAMD\0",
+        ],
+        b"vkCmdEndRenderPass2" => &[b"vkCmdEndRenderPass2KHR\0"],
+        b"vkCmdEndRendering" => &[b"vkCmdEndRenderingKHR\0"],
+        b"vkCmdNextSubpass2" => &[b"vkCmdNextSubpass2KHR\0"],
+        b"vkCmdPipelineBarrier2" => &[b"vkCmdPipelineBarrier2KHR\0"],
+        b"vkCmdResetEvent2" => &[b"vkCmdResetEvent2KHR\0"],
+        b"vkCmdResolveImage2" => &[b"vkCmdResolveImage2KHR\0"],
+        b"vkCmdSetCullMode" => &[b"vkCmdSetCullModeEXT\0"],
+        b"vkCmdSetDepthBiasEnable" => &[b"vkCmdSetDepthBiasEnableEXT\0"],
+        b"vkCmdSetDepthBoundsTestEnable" => &[b"vkCmdSetDepthBoundsTestEnableEXT\0"],
+        b"vkCmdSetDepthCompareOp" => &[b"vkCmdSetDepthCompareOpEXT\0"],
+        b"vkCmdSetDepthTestEnable" => &[b"vkCmdSetDepthTestEnableEXT\0"],
+        b"vkCmdSetDepthWriteEnable" => &[b"vkCmdSetDepthWriteEnableEXT\0"],
+        b"vkCmdSetDeviceMask" => &[b"vkCmdSetDeviceMaskKHR\0"],
+        b"vkCmdSetEvent2" => &[b"vkCmdSetEvent2KHR\0"],
+        b"vkCmdSetFrontFace" => &[b"vkCmdSetFrontFaceEXT\0"],
+        b"vkCmdSetLineStippleKHR" => &[b"vkCmdSetLineStippleEXT\0"],
+        b"vkCmdSetPrimitiveRestartEnable" => &[b"vkCmdSetPrimitiveRestartEnableEXT\0"],
+        b"vkCmdSetPrimitiveTopology" => &[b"vkCmdSetPrimitiveTopologyEXT\0"],
+        b"vkCmdSetRasterizerDiscardEnable" => &[b"vkCmdSetRasterizerDiscardEnableEXT\0"],
+        b"vkCmdSetScissorWithCount" => &[b"vkCmdSetScissorWithCountEXT\0"],
+        b"vkCmdSetStencilOp" => &[b"vkCmdSetStencilOpEXT\0"],
+        b"vkCmdSetStencilTestEnable" => &[b"vkCmdSetStencilTestEnableEXT\0"],
+        b"vkCmdSetViewportWithCount" => &[b"vkCmdSetViewportWithCountEXT\0"],
+        b"vkCmdWaitEvents2" => &[b"vkCmdWaitEvents2KHR\0"],
+        b"vkCmdWriteTimestamp2" => &[b"vkCmdWriteTimestamp2KHR\0"],
+        b"vkCreateDescriptorUpdateTemplate" => &[b"vkCreateDescriptorUpdateTemplateKHR\0"],
+        b"vkCreatePrivateDataSlot" => &[b"vkCreatePrivateDataSlotEXT\0"],
+        b"vkCreateRenderPass2" => &[b"vkCreateRenderPass2KHR\0"],
+        b"vkCreateSamplerYcbcrConversion" => &[b"vkCreateSamplerYcbcrConversionKHR\0"],
+        b"vkDestroyDescriptorUpdateTemplate" => &[b"vkDestroyDescriptorUpdateTemplateKHR\0"],
+        b"vkDestroyPrivateDataSlot" => &[b"vkDestroyPrivateDataSlotEXT\0"],
+        b"vkDestroySamplerYcbcrConversion" => &[b"vkDestroySamplerYcbcrConversionKHR\0"],
+        b"vkEnumeratePhysicalDeviceGroups" => &[b"vkEnumeratePhysicalDeviceGroupsKHR\0"],
+        b"vkGetBufferDeviceAddress" => &[
+            b"vkGetBufferDeviceAddressKHR\0",
+            b"vkGetBufferDeviceAddressEXT\0",
+        ],
+        b"vkGetBufferMemoryRequirements2" => &[b"vkGetBufferMemoryRequirements2KHR\0"],
+        b"vkGetBufferOpaqueCaptureAddress" => &[b"vkGetBufferOpaqueCaptureAddressKHR\0"],
+        b"vkGetCalibratedTimestampsKHR" => &[b"vkGetCalibratedTimestampsEXT\0"],
+        b"vkGetDescriptorSetLayoutSupport" => &[b"vkGetDescriptorSetLayoutSupportKHR\0"],
+        b"vkGetDeviceBufferMemoryRequirements" => &[b"vkGetDeviceBufferMemoryRequirementsKHR\0"],
+        b"vkGetDeviceGroupPeerMemoryFeatures" => &[b"vkGetDeviceGroupPeerMemoryFeaturesKHR\0"],
+        b"vkGetDeviceImageMemoryRequirements" => &[b"vkGetDeviceImageMemoryRequirementsKHR\0"],
+        b"vkGetDeviceImageSparseMemoryRequirements" => {
+            &[b"vkGetDeviceImageSparseMemoryRequirementsKHR\0"]
+        }
+        b"vkGetDeviceMemoryOpaqueCaptureAddress" => {
+            &[b"vkGetDeviceMemoryOpaqueCaptureAddressKHR\0"]
+        }
+        b"vkGetImageMemoryRequirements2" => &[b"vkGetImageMemoryRequirements2KHR\0"],
+        b"vkGetImageSparseMemoryRequirements2" => &[b"vkGetImageSparseMemoryRequirements2KHR\0"],
+        b"vkGetImageSubresourceLayout2KHR" => &[b"vkGetImageSubresourceLayout2EXT\0"],
+        b"vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" => {
+            &[b"vkGetPhysicalDeviceCalibrateableTimeDomainsEXT\0"]
+        }
+        b"vkGetPhysicalDeviceExternalBufferProperties" => {
+            &[b"vkGetPhysicalDeviceExternalBufferPropertiesKHR\0"]
+        }
+        b"vkGetPhysicalDeviceExternalFenceProperties" => {
+            &[b"vkGetPhysicalDeviceExternalFencePropertiesKHR\0"]
+        }
+        b"vkGetPhysicalDeviceExternalSemaphoreProperties" => {
+            &[b"vkGetPhysicalDeviceExternalSemaphorePropertiesKHR\0"]
+        }
+        b"vkGetPhysicalDeviceFeatures2" => &[b"vkGetPhysicalDeviceFeatures2KHR\0"],
+        b"vkGetPhysicalDeviceFormatProperties2" => &[b"vkGetPhysicalDeviceFormatProperties2KHR\0"],
+        b"vkGetPhysicalDeviceImageFormatProperties2" => {
+            &[b"vkGetPhysicalDeviceImageFormatProperties2KHR\0"]
+        }
+        b"vkGetPhysicalDeviceMemoryProperties2" => &[b"vkGetPhysicalDeviceMemoryProperties2KHR\0"],
+        b"vkGetPhysicalDeviceProperties2" => &[b"vkGetPhysicalDeviceProperties2KHR\0"],
+        b"vkGetPhysicalDeviceQueueFamilyProperties2" => {
+            &[b"vkGetPhysicalDeviceQueueFamilyProperties2KHR\0"]
+        }
+        b"vkGetPhysicalDeviceSparseImageFormatProperties2" => {
+            &[b"vkGetPhysicalDeviceSparseImageFormatProperties2KHR\0"]
+        }
+        b"vkGetPhysicalDeviceToolProperties" => &[b"vkGetPhysicalDeviceToolPropertiesEXT\0"],
+        b"vkGetPrivateData" => &[b"vkGetPrivateDataEXT\0"],
+        b"vkGetRayTracingShaderGroupHandlesKHR" => &[b"vkGetRayTracingShaderGroupHandlesNV\0"],
+        b"vkGetSemaphoreCounterValue" => &[b"vkGetSemaphoreCounterValueKHR\0"],
+        b"vkQueueSubmit2" => &[b"vkQueueSubmit2KHR\0"],
+        b"vkResetQueryPool" => &[b"vkResetQueryPoolEXT\0"],
+        b"vkSetPrivateData" => &[b"vkSetPrivateDataEXT\0"],
+        b"vkSignalSemaphore" => &[b"vkSignalSemaphoreKHR\0"],
+        b"vkTrimCommandPool" => &[b"vkTrimCommandPoolKHR\0"],
+        b"vkUpdateDescriptorSetWithTemplate" => &[b"vkUpdateDescriptorSetWithTemplateKHR\0"],
+        b"vkWaitSemaphores" => &[b"vkWaitSemaphoresKHR\0"],
+        _ => &[],
+    }
+}
+
 // Unhandled commands:
 // * vkMapMemory2KHR: The ash Rust binding doesn't have proper bindings yet.
 // * vkUnmapMemory2KHR: The ash Rust binding doesn't have proper bindings yet.
