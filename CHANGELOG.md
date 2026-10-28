@@ -4,6 +4,13 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## Unreleased
+
+- A damaged or wrong network model is refused with an error that names the file at fault. Before, a misspelt
+  true, false or null in the model's manifest could be read as a value, a directory where a model file
+  belongs failed with only "std::bad_alloc", and a manifest that named a tensor twice was accepted and kept
+  GPU memory for the first copy allocated until the game quit.
+
 ## 3.9.2 — 2026-10-28
 
 - Pressing the toggle key in a game running under X11 could crash the game: checking which window had the
