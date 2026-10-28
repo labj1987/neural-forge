@@ -1506,3 +1506,26 @@ hold CPU time, network time and frame pacing. No fence timeout, no refused hold,
 hold 0.10 ms, network 6.89 ms, 0 misses, frame time p1 10.49 / p99 21.23 ms; the 3.8.14 run of the same
 afternoon 63.4 / 255.8 (4.0x), 0.10 ms, 6.87 ms, 9.97 / 21.16 ms. A first 3.9.1 launch (63.6 / 256.2) is left
 out: GPU tests ran on the machine for 12 s during its start.
+
+
+## 2026-10-28: 3.9.2's graphics-push tracking, what it costs in the installed games
+
+3.9.2 also keeps a graphics-only push constant that overlaps a kept push after a hold inside DLSS's buffer
+(`preupscale/restore.rs`, `Tracker::note_push` and `State::keeps`). A graphics push is examined only once
+two things have happened: the tracker is active (the device reached its first hold point inside DLSS's
+buffer), and the device has seen a push reaching compute and other stages. From then on, every graphics push
+takes the command buffer's state lock. Before that it costs one atomic load. Which games reach that slow
+path was checked rather than timed: a development build logged the first such push (the log line of #31).
+Each game was run in play at 2560x1440@288 VRR, with the desktop's HDR as set, frame generation as found
+and Ray Reconstruction off. The installed 3.9.2 layer was restored and hash-checked after the runs.
+
+| Game | Tracker active | Push mixing compute and other stages |
+|---|---|---|
+| Crimson Desert (Proton-GE) | yes, held inside DLSS's buffer | none |
+| Hogwarts Legacy (Proton 11.0; 50 real / 201 shown fps) | yes, held inside DLSS's buffer | none |
+| GTA San Andreas DE (Proton-GE) | yes, held inside DLSS's buffer | none |
+| GTA V Enhanced | never: the split hold (no `noting the application's compute state` line in the 3.9.x bench logs) | not looked at |
+
+So no installed game takes the slow path. Graphics pushes cost what they did before 3.9.2, and no frame-time
+A/B was needed. A game that does take it says so in its log with #31's line; that game would be the one to
+time, against a build with the graphics-push tracking off.
