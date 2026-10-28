@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 
 namespace vk {
@@ -30,7 +31,16 @@ uint32_t Context::validationErrors() { return g_validationErrors.load(); }
 
 Context::Context() {
   if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("vulkan-1.dll unavailable");
+  // A throw destroys what was made so far: the instance, the messenger, the device and what is on it.
+  try {
+    create();
+  } catch (...) {
+    release();
+    throw;
+  }
+}
 
+void Context::create() {
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
   app.pApplicationName = "dlss5-vulkan";
   app.apiVersion = VK_API_VERSION_1_3;
@@ -317,30 +327,41 @@ void Context::initCommon() {
 Context::~Context() { release(); }
 
 void Context::release() {
-  if (!device_) return;
-  // Stalled: the GPU may still use any of it. Leaked, never destroyed.
-  if (stalled_) return;
-  // An adopted device is the application's: only this object's own queue is waited for.
-  if (owned_) vkDeviceWaitIdle(device_);
-  else if (queue_) {
-    try { waitIdle(); } catch (...) {}   // a destructor must not throw; the caller already drained it
+  // Also reached from a constructor that threw part way, so every step allows for what was never made (the
+  // vkDestroy* calls take VK_NULL_HANDLE). An adopted instance and device belong to the application.
+  if (device_) {
+    // Stalled: the GPU may still use any of it. Leaked, never destroyed (the instance with it).
+    if (stalled_) return;
+    // An adopted device is the application's: only this object's own queue is waited for.
+    if (owned_) vkDeviceWaitIdle(device_);
+    else if (queue_) {
+      try { waitIdle(); } catch (...) {}   // a destructor must not throw; the caller already drained it
+    }
+    // The wait just made may have timed out and latched it: then nothing is destroyed either.
+    if (stalled_) return;
+    if (waitFence_) vkDestroyFence(device_, waitFence_, nullptr);
+    waitFence_ = VK_NULL_HANDLE;
+    for (VkShaderModule module : modules_) vkDestroyShaderModule(device_, module, nullptr);
+    modules_.clear();
+    destroyBuffer(dummy_);
+    destroyBuffer(staging_);
+    for (VkDescriptorPool& pool : descriptorPools_) { vkDestroyDescriptorPool(device_, pool, nullptr); pool = VK_NULL_HANDLE; }
+    descriptorPool_ = VK_NULL_HANDLE;
+    vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
+    vkDestroyDescriptorSetLayout(device_, setLayout_, nullptr);
+    vkDestroyCommandPool(device_, commandPool_, nullptr);
+    pipelineLayout_ = VK_NULL_HANDLE;
+    setLayout_ = VK_NULL_HANDLE;
+    commandPool_ = VK_NULL_HANDLE;
+    if (owned_) vkDestroyDevice(device_, nullptr);
+    device_ = VK_NULL_HANDLE;
   }
-  // The wait just made may have timed out and latched it: then nothing is destroyed either.
-  if (stalled_) return;
-  if (waitFence_) vkDestroyFence(device_, waitFence_, nullptr);
-  for (VkShaderModule module : modules_) vkDestroyShaderModule(device_, module, nullptr);
-  destroyBuffer(dummy_);
-  destroyBuffer(staging_);
-  for (VkDescriptorPool pool : descriptorPools_) vkDestroyDescriptorPool(device_, pool, nullptr);
-  vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
-  vkDestroyDescriptorSetLayout(device_, setLayout_, nullptr);
-  vkDestroyCommandPool(device_, commandPool_, nullptr);
-  if (owned_) {
-    vkDestroyDevice(device_, nullptr);
+  if (owned_ && instance_) {
     if (messenger_) vkDestroyDebugUtilsMessengerEXT(instance_, messenger_, nullptr);
     vkDestroyInstance(instance_, nullptr);
+    messenger_ = VK_NULL_HANDLE;
+    instance_ = VK_NULL_HANDLE;
   }
-  device_ = VK_NULL_HANDLE;
 }
 
 uint32_t Context::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required) {
@@ -496,13 +517,19 @@ VkShaderModule Context::loadShaderModule(const std::string& spvPath) {
     words.resize((size + 3) / 4);
     memcpy(words.data(), data, size);
   } else {
+    // A directory opens, and sizes as the largest offset there is: only a regular file is a module.
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(spvPath, error)) throw std::runtime_error("missing shader " + spvPath);
     std::ifstream file(spvPath, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error("missing shader " + spvPath);
-    size = (size_t)file.tellg();
-    file.seekg(0);
+    const std::streamsize length = file.tellg();   // -1 when the size cannot be known
+    if (length < 0 || !file.seekg(0)) throw std::runtime_error("cannot size shader " + spvPath);
+    size = (size_t)length;
     words.resize((size + 3) / 4);
-    file.read(reinterpret_cast<char*>(words.data()), size);
+    if (!file.read(reinterpret_cast<char*>(words.data()), length)) throw std::runtime_error("cannot read shader " + spvPath);
   }
+  // SPIR-V is a sequence of 32-bit words; a size that is not a whole number of them is a truncated module.
+  if (size == 0 || size % 4) throw std::runtime_error("not a SPIR-V module (size " + std::to_string(size) + "): " + spvPath);
   VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
   info.codeSize = size;
   info.pCode = words.data();

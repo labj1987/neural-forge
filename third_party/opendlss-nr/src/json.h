@@ -1,6 +1,7 @@
 // Tiny read-only JSON parser: enough for the NR/SR manifests and fixtures.
 #pragma once
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -47,6 +48,13 @@ class Parser {
   void skipSpace() { while (position_ < text_.size() && isspace((unsigned char)text_[position_])) ++position_; }
   char peek() { skipSpace(); return position_ < text_.size() ? text_[position_] : '\0'; }
   void expect(char c) { if (peek() != c) fail("unexpected character"); ++position_; }
+  // The whole word, not just its first letter: "tru", "nul" or "fals" at the end of the text are refused, and
+  // so is anything else that starts with t, f or n. What follows the word is the caller's to check.
+  void literal(const char* word) {
+    const size_t length = strlen(word);
+    if (text_.compare(position_, length, word) != 0) fail("bad literal");
+    position_ += length;
+  }
   Value parseValue() {
     char c = peek();
     Value value;
@@ -80,9 +88,9 @@ class Parser {
     } else if (c == 't' || c == 'f') {
       value.kind = Value::Bool;
       value.boolean = c == 't';
-      position_ += value.boolean ? 4 : 5;
+      literal(value.boolean ? "true" : "false");
     } else if (c == 'n') {
-      position_ += 4;
+      literal("null");
     } else {
       value.kind = Value::Number;
       const char* start = text_.c_str() + position_;
