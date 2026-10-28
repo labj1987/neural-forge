@@ -222,6 +222,7 @@ jobs:
           python3 scripts/test_cache_replay.py
           python3 scripts/gen_third_party_crates.py --self-test
           python3 scripts/check_pins.py --self-test
+          bash scripts/gta-bench.sh --self-test
 
       - name: Shader sources match committed SPIR-V
         run: python3 scripts/check_shaders.py

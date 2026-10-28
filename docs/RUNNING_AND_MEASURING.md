@@ -42,6 +42,7 @@ for t in release_notes.py bench-iq.py bench-report.py agreement.py gen_third_par
     python3 scripts/$t --self-test
 done
 python3 scripts/hdr_encode.py selftest && python3 scripts/test_cache_replay.py
+bash scripts/gta-bench.sh --self-test
 python3 scripts/check_shaders.py && python3 scripts/sync_appdata_releases.py --check
 python3 scripts/gen_third_party_crates.py --check && python3 scripts/check_namespace.py
 cargo fmt --all --check && (cd third_party/vk-layer-for-rust && cargo fmt --all --check)
