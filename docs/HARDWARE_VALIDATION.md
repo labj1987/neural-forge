@@ -1529,3 +1529,40 @@ and Ray Reconstruction off. The installed 3.9.2 layer was restored and hash-chec
 So no installed game takes the slow path. Graphics pushes cost what they did before 3.9.2, and no frame-time
 A/B was needed. A game that does take it says so in its log with #31's line; that game would be the one to
 time, against a build with the graphics-push tracking off.
+
+
+## 2026-10-28: 3.9.3, the README's measurements again
+
+RTX 5070, 2560x1440@288 VRR, desktop HDR as set, the installed 3.9.3 layer (`eed5dc82…`), GTA V Enhanced's
+built-in benchmark through `scripts/gta-bench.sh` with DLSS Balanced, Frame Generation 4x with Preset C (the
+two `DXVK_NVAPI_DRS_NGX_DLSS_FG_OVERRIDE*` variables passed), ray tracing on, script mods off, Neural Forge's
+settings as found, pass 4. One run per configuration; a run where GTA turned frame generation off (at about
+120-125 s, its own Reflex quirk) is kept as a frame-generation-off run and not repeated. Another session ran
+single-threaded CPU jobs on the machine during some of these runs (each run started only at a load under 3).
+
+| Run | Real fps | Shown fps | FG | Network ms per network frame | Misses |
+|---|---|---|---|---|---|
+| Full network | 62.1 | 249.4 | 4.0x | 6.65-6.91 | 0 |
+| Full network, 2 passes | 50.7 | 203.4 | 4.0x | 13.56 | 0 |
+| Small network, 2 passes | 60.4 | 243.6 | 4.0x | 7.76 | 0 |
+| Small network, 3 passes | 52.8 | 211.5 | 4.0x | 11.37 | 0 |
+| Off (no Neural Forge layer) | 88.0 | 88.7 | off | | |
+| Small network | 76.9 | 78.2 | off | 3.41 | 0 |
+| Full network (second run) | 75.1 | 76.2 | off | 6.12 | 0 |
+
+Against the README's earlier frame-generation-on numbers (full 65.2 over three runs on 2026-10-19, 3.9.1 64.7
+and 63.6 on 2026-10-27; 2 passes small 64.0, 3 passes 58.1, full 51.2) these are 1-9% lower, the largest on
+the configurations with the most network work; with frame generation off, off and full are 2-3% below the
+3.8.0 runs (90.3 and 77.1). Network times per pass are unchanged. No Xid, no fence timeout.
+
+**The network on its own** (`crates/native/tests/rig.rs` on frame d1's dump, 1486x836, idle GPU): the full
+network back to back 5.347 ms median of 40 (5.362 recorded into a primary), heads bit-exact; the per-kernel
+profile totals (median of 20, with a timestamp after every dispatch) full 5.907 ms over 249 dispatches and
+small 3.149 ms over 125, so the small network back to back is about 2.85 ms. 3.8.1 gave 5.41 and 2.90.
+
+Not re-run: the model-resolution runs before the upscaler (frame generation off, `settings.xml` changed for
+the run, facade captures), and the Crimson Desert and Hogwarts Legacy tables after DLSS, whose runs need the
+game driven to gameplay through its menus with a virtual pad and Ray Reconstruction switched on in a menu.
+
+The README's GUI screenshots were retaken from the 3.9.3 AppImage (Xvfb, own D-Bus session, default
+settings, dark theme, 1240x1400); only the Setup tab's content changed (the Network row's subtitle).
