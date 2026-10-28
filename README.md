@@ -157,8 +157,9 @@ shown with the model after DLSS (25 on the finished frame), 15.2 ms network GPU 
 
 ### The network on its own
 
-The network's time per frame on its own, run back to back on an idle GPU at 1486x836 (DLSS's input in
-GTA V at 1440p, DLSS Balanced; `crates/native/tests/rig.rs`): full 5.35 ms, small 2.85 ms. In the game it
+The network's time per frame on its own on an idle GPU at 1486x836 (DLSS's input in GTA V at 1440p, DLSS
+Balanced; `crates/native/tests/rig.rs`): full 5.35 ms run back to back, small about 2.85 ms (scaled from
+the per-kernel profile, which has no back-to-back run for the small network). In the game it
 also waits for the game's own GPU work. Games
 are tested at 2560x1440 only (see [Known issues](#known-issues) for 4K). Details and the record of
 every measurement: [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) and
