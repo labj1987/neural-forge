@@ -439,7 +439,7 @@ def prepare(hold: Hold, dump_white: float, reverse_z: bool, p: Params) -> Frame:
                  has_depth=hold.depth is not None, jitter=hold.jitter, v_colour=vc, edit=edit_of(vc, va, p),
                  lin=lin, log_luma=prt3[..., 0].copy(), prt=prt3,
                  prt_lo=nb.min(axis=0), prt_hi=nb.max(axis=0), mv=mv.astype(F32), disp_answer=da,
-                 base=float(np.abs(display(vc) - da).mean()))
+                 base=picture_error(display(vc), da))
 
 
 # --------------------------------------------------------------------------------------------------
@@ -676,19 +676,29 @@ def carry(src: Frame, dst: Frame, pos: np.ndarray, on: np.ndarray, p: Params) ->
 # Metrics (the reference's measure_ghosting.score and measure_reprojection's kept)
 # --------------------------------------------------------------------------------------------------
 
+def picture_error(disp: np.ndarray, disp_answer: np.ndarray, mask: np.ndarray | None = None) -> float:
+    """mean |disp - disp_answer| over the pixels (in `mask`) of each pixel's channel mean: pic and base
+    (kept = 100 * (1 - pic / base)). Both are taken by this one function, in float64: float32 means taken
+    in different orders differ by a rounding that depends on numpy's SIMD reduction kernels (+-7.6e-6 in
+    kept for an edit of zero on AVX-512, 0 on AVX2), and the same order in float64 makes an unchanged
+    picture's kept exactly 0 everywhere."""
+    d = np.abs(disp - disp_answer).mean(axis=-1, dtype=np.float64)
+    return float(d[mask].mean() if mask is not None else d.mean())
+
+
 def pair_metrics(shown: np.ndarray, dst: Frame, p: Params, mask: np.ndarray | None = None) -> dict:
     """One hold's numbers for one shown edit. err/p99.5 in stops of luma against the model's edit for
     this hold; worse = share of area where the shown edit is worse than no edit by over 0.15 stop;
-    pic = mean |display(shown) - display(model)| (kept is computed over holds from pic and base)."""
+    pic = mean |display(shown) - display(model)| (kept is computed over holds from pic and base). The
+    means are taken in float64."""
     e = np.abs((shown - dst.edit) @ LUMA)
     excess = np.maximum(0, e - np.abs(dst.edit @ LUMA))
-    d = np.abs(display(apply_edit(dst.v_colour, shown, p)) - dst.disp_answer).mean(axis=-1)
+    pic = picture_error(display(apply_edit(dst.v_colour, shown, p)), dst.disp_answer, mask)
     if mask is not None:
-        e, excess, d = e[mask], excess[mask], d[mask]
-    return dict(err=float(e.mean()), p995=float(np.percentile(e, 99.5)), worse=float((excess > 0.15).mean()),
-                harm=float(excess.mean()), pic=float(d.mean()))
+        e, excess = e[mask], excess[mask]
+    return dict(err=float(e.mean(dtype=np.float64)), p995=float(np.percentile(e, 99.5)), worse=float((excess > 0.15).mean()),
+                harm=float(excess.mean(dtype=np.float64)), pic=pic)
 
 
 def base_metric(dst: Frame, mask: np.ndarray | None = None) -> float:
-    d = np.abs(display(dst.v_colour) - dst.disp_answer).mean(axis=-1)
-    return float(d[mask].mean()) if mask is not None else float(d.mean())
+    return picture_error(display(dst.v_colour), dst.disp_answer, mask)
