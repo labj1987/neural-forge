@@ -418,9 +418,16 @@ struct NfNative {
       // its run makes the driver compile every PTX module.
       context->resetDescriptorPool(0);
       VkCommandBuffer warm = context->beginCommands();
-      slot.graph->trackLifetimes(true);
-      slot.graph->record(warm, *slot.features);
-      slot.graph->trackLifetimes(false);
+      {
+        // The context's use tracker points into this graph: switched off on every way out of the recording, so
+        // a recording that throws (and the graph freed after it) never leaves it to the next use of a buffer.
+        struct Untrack {
+          nr::Graph& graph;
+          ~Untrack() { graph.trackLifetimes(false); }
+        } untrack{*slot.graph};
+        slot.graph->trackLifetimes(true);
+        slot.graph->record(warm, *slot.features);
+      }
       slot.sets = kernels->dispatchCount();
       // This warm-up's count alone: nothing else of the network runs (the previous warm-up was waited on, and
       // the caller drained every frame of the previous build).
