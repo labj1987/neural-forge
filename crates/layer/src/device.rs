@@ -2320,8 +2320,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         offset: u32,
         values: &[u8],
     ) -> LayerResult<()> {
-        if let Some(i) = self.inline.as_ref().filter(|i| stages.contains(vk::ShaderStageFlags::COMPUTE) && i.restore.active()) {
-            i.restore.with(command_buffer, |s| s.push(layout, stages, offset, values));
+        if let Some(i) = self.inline.as_ref() {
+            i.restore.note_push(command_buffer, stages, |s| s.push(layout, stages, offset, values));
         }
         LayerResult::Unhandled
     }

@@ -22,8 +22,10 @@
 //!   across `vkCmdBindDescriptorSets`, but the validation layer takes binding descriptor sets to unbind them,
 //!   so they are bound again before the offsets that use them;
 //! - the push constants of every push that includes the compute stage, with the layout it was made with
-//!   (values are per stage, and the hold's pushes are compute ones; a push for graphics stages only is left
-//!   alone by the hold). A later push covering an earlier one's stages and bytes replaces it.
+//!   (values are per stage, and the hold's pushes are compute ones). A push for graphics stages only is left
+//!   alone by the hold, but one over bytes of a kept push that reached its stages too (stages ALL, then
+//!   VERTEX | FRAGMENT) is kept as well: replaying the earlier push alone would put its old values back for
+//!   those stages. A later push covering an earlier one's stages and bytes replaces it.
 //!
 //! The `2` forms of the binding commands (VK_KHR_maintenance6) are taken as the same calls when they name a
 //! layout and carry nothing else; `vkCmdExecuteCommands` leaves everything undefined, so tracking starts over.
@@ -218,8 +220,16 @@ impl State {
         self.buffers = Some((s, out));
     }
 
+    /// Whether a push for `stages` over `offset..offset + size` is kept: one reaching the compute stage, or one
+    /// for other stages only over bytes of a kept push that reached them too. The hold leaves those stages
+    /// alone, but the replay of the earlier push would undo the later one, so it is replayed after it.
+    fn keeps(&self, stages: vk::ShaderStageFlags, offset: u32, size: u32) -> bool {
+        stages.contains(vk::ShaderStageFlags::COMPUTE)
+            || self.pushes.iter().any(|(_, p)| p.stages.intersects(stages) && p.offset < offset + size && offset < p.offset + p.bytes.len() as u32)
+    }
+
     pub(crate) fn push(&mut self, layout: vk::PipelineLayout, stages: vk::ShaderStageFlags, offset: u32, bytes: &[u8]) {
-        if !stages.contains(vk::ShaderStageFlags::COMPUTE) {
+        if !self.keeps(stages, offset, bytes.len() as u32) {
             return;
         }
         let s = self.next();
@@ -517,6 +527,9 @@ pub(crate) struct Tracker {
     /// Buffers forgotten so far: a thread's cached state ([`LAST`]) is used only while this is what it
     /// was when cached, so none outlives its buffer's entry.
     forgotten: std::sync::atomic::AtomicU64,
+    /// A push reaching the compute stage and other stages was noted: pushes for other stages only are noted
+    /// from then on ([`Self::note_push`]).
+    mixed: std::sync::atomic::AtomicBool,
     /// Each push-descriptor template's data size, compute bind point only (`None`: not sizable).
     templates: Mutex<HashMap<vk::DescriptorUpdateTemplate, Option<usize>>>,
     pub(crate) fns: Fns,
@@ -541,6 +554,7 @@ impl Tracker {
             active: std::sync::atomic::AtomicBool::new(false),
             states: Mutex::default(),
             forgotten: std::sync::atomic::AtomicU64::new(0),
+            mixed: std::sync::atomic::AtomicBool::new(false),
             templates: Mutex::default(),
             fns,
         }
@@ -573,6 +587,24 @@ impl Tracker {
             *last = Some((me, generation, cb, s.clone()));
             s
         })
+    }
+
+    /// `vkCmdPushConstants` and its `2` form: `f` runs on `cb`'s state for a push reaching the compute stage,
+    /// and for one for other stages only once a push reaching compute and other stages was noted on the device
+    /// (before that, no kept push can share stages with it: [`State::keeps`]). So most graphics pushes, every
+    /// one of a game whose compute pushes are for compute only (vkd3d-proton), cost one atomic load.
+    pub(crate) fn note_push(&self, cb: vk::CommandBuffer, stages: vk::ShaderStageFlags, f: impl FnOnce(&mut State)) {
+        if !self.active() {
+            return;
+        }
+        if stages.contains(vk::ShaderStageFlags::COMPUTE) {
+            if stages != vk::ShaderStageFlags::COMPUTE {
+                self.mixed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else if !self.mixed.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        self.with(cb, f);
     }
 
     /// Runs `f` on `cb`'s state while noting is on ([`Self::active`]).
@@ -883,9 +915,9 @@ fn binds_compute_sets(i: &BindDescriptorSetsInfo) -> bool {
     i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE) && i.descriptor_set_count > 0
 }
 
-/// Whether a `vkCmdPushConstants2` call changes the compute state: it reaches the compute stage and pushes bytes.
-fn pushes_compute_constants(i: &PushConstantsInfo) -> bool {
-    i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE) && i.size > 0
+/// Whether a `vkCmdPushConstants2` call pushes bytes (which of them are kept: [`State::keeps`]).
+fn pushes_constants(i: &PushConstantsInfo) -> bool {
+    i.size > 0
 }
 
 /// The structure types chained from `p_next`, for the once-only line that says why a `2` binding command made
@@ -943,10 +975,12 @@ unsafe extern "system" fn push_constants2(cb: vk::CommandBuffer, info: *const Pu
     unsafe {
         let Some((w, next)) = next_of(cb, |n| &n.push_constants2) else { return };
         // Nothing pushed is nothing to put back.
-        if let Some(i) = info.as_ref().filter(|i| pushes_compute_constants(i)) {
-            w.tracker.note(cb, |s| {
+        if let Some(i) = info.as_ref().filter(|i| pushes_constants(i)) {
+            w.tracker.note_push(cb, i.stage_flags, |s| {
                 if !i.p_next.is_null() || i.layout == vk::PipelineLayout::null() {
-                    s.refuse("vkCmdPushConstants2 with a chained structure");
+                    if s.keeps(i.stage_flags, i.offset, i.size) {
+                        s.refuse("vkCmdPushConstants2 with a chained structure");
+                    }
                 } else {
                     s.push(i.layout, i.stage_flags, i.offset, slice(i.p_values.cast::<u8>(), i.size));
                 }
@@ -1164,6 +1198,50 @@ mod tests {
         assert!(s.unrestorable().is_some());
     }
 
+    /// A push for graphics stages only over bytes an earlier kept push also wrote for those stages is kept after
+    /// it: the replay would otherwise put the earlier push's values back for the graphics stages, and a draw after
+    /// the hold would read them.
+    #[test]
+    fn a_graphics_push_over_a_kept_push_is_replayed_after_it() {
+        let gfx = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT;
+        let mut s = State::default();
+        s.push(layout(1), vk::ShaderStageFlags::ALL, 0, &[1; 16]);
+        s.push(layout(2), gfx, 4, &[2; 8]);
+        s.push(layout(2), vk::ShaderStageFlags::FRAGMENT, 32, &[3; 4]);
+        let kept: Vec<_> = s.pushes.iter().map(|(seq, p)| (*seq, p.layout, p.stages, p.offset, p.bytes.clone())).collect();
+        assert_eq!(kept.len(), 2, "the ALL push and the graphics push over its bytes, not the one over no kept bytes: {kept:?}");
+        assert!(kept[0].0 < kept[1].0, "replayed in the application's order");
+        assert_eq!((kept[1].1, kept[1].2, kept[1].3, kept[1].4.as_slice()), (layout(2), gfx, 4, &[2u8; 8][..]), "the graphics push, after the ALL push");
+        // Again over the same bytes: the newer one replaces it.
+        s.push(layout(2), gfx, 4, &[4; 8]);
+        assert_eq!(s.pushes.len(), 2);
+        assert_eq!(s.pushes[1].1.bytes, [4; 8]);
+        // A push for a stage the kept push did not reach is not kept.
+        let mut t = State::default();
+        t.push(layout(1), vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::FRAGMENT, 0, &[1; 16]);
+        t.push(layout(2), vk::ShaderStageFlags::VERTEX, 0, &[2; 16]);
+        assert_eq!(t.pushes.len(), 1, "the vertex stage was never pushed by a kept push");
+        // A later push covering it with the compute stage replaces the graphics push too.
+        s.push(layout(1), vk::ShaderStageFlags::ALL, 0, &[7; 16]);
+        assert!(s.pushes.iter().all(|(_, p)| p.stages.contains(vk::ShaderStageFlags::COMPUTE)), "{:?}", s.pushes);
+    }
+
+    /// Graphics pushes are noted only once the device saw a push reaching compute and other stages.
+    #[test]
+    fn graphics_pushes_are_noted_once_a_mixed_push_was() {
+        let t = Tracker::new(Fns::default());
+        t.activate();
+        let cb = vk::CommandBuffer::from_raw(3);
+        t.clear(cb);
+        let noted = std::cell::Cell::new(0);
+        t.note_push(cb, vk::ShaderStageFlags::COMPUTE, |_| noted.set(noted.get() + 1));
+        t.note_push(cb, vk::ShaderStageFlags::FRAGMENT, |_| noted.set(noted.get() + 10));
+        assert_eq!(noted.get(), 1, "compute pushes only so far: a graphics push is not looked at");
+        t.note_push(cb, vk::ShaderStageFlags::ALL, |_| noted.set(noted.get() + 100));
+        t.note_push(cb, vk::ShaderStageFlags::FRAGMENT, |_| noted.set(noted.get() + 1000));
+        assert_eq!(noted.get(), 1101);
+    }
+
     /// Nothing is noted before the device's first hold point, and a buffer begun before it is never taken
     /// for complete; one begun after is.
     #[test]
@@ -1215,8 +1293,8 @@ mod tests {
             size,
             p_values: std::ptr::null(),
         };
-        assert!(!pushes_compute_constants(&push(0)));
-        assert!(pushes_compute_constants(&push(4)));
+        assert!(!pushes_constants(&push(0)));
+        assert!(pushes_constants(&push(4)));
     }
 
     #[test]

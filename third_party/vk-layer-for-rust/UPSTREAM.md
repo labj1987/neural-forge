@@ -79,3 +79,9 @@ this project's own code: upstream is no longer tracked.
    needed no change to the hand-written code except the generator's diff printer (imara-diff 0.2's
    `Diff::compute` and `unified_diff`). bindgen 0.73 writes the bindings' layout checks as compile-time
    assertions in place of `#[test]` functions; regenerated, nothing else in the generated files changed.
+3. **Fixes from the 2026-10-28 review.** `vkEnumeratePhysicalDeviceGroups` reads the groups only when the caller
+   passed an array for them: a count query (the array NULL, as an application asks how many there are) read
+   through the NULL pointer. The mock driver enumerates one group per physical device, and a test makes both
+   queries. With a create-device hook that returns `Unhandled`, the extension list the next `vkCreateDevice` was
+   given (the application's, without the layer's own) is kept until `create_device_info` has read the same create
+   info: it pointed at a list already freed.

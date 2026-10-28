@@ -777,7 +777,9 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                     _ => return result,
                 };
                 log!("[present] creating the device with swapchainMaintenance1 was refused ({refused:?}); creating it without");
-                Self::create_device_with(&instance, physical_device, create_info, layer_device_link, link, allocator, p_device, false)
+                // Handled here, never left to the framework: the refused attempt advanced the link
+                // in place, and only an attempt made here puts it back first.
+                Self::create_device_with(&instance, physical_device, create_info, layer_device_link, link, allocator, p_device, true)
             }
             Some(swapchain_maintenance::Plan::AsIs(Ok(()))) => {
                 let result = Self::create_device_with(&instance, physical_device, create_info, layer_device_link, link, allocator, p_device, true);

@@ -402,7 +402,9 @@ output kernel for the passes placed after DLSS): the colour input (and its motio
 depth) copied to staging images, the same `C`/`N`/`W` as the split hold with the network's graph
 recorded straight into the buffer, the staging image copied back, and the application's compute
 state (pipeline, descriptor sets or descriptor-buffer offsets, push constants) bound again
-(`preupscale/restore.rs`), since vkd3d-proton does not bind it again itself. Nothing waits on the host
+(`preupscale/restore.rs`), since vkd3d-proton does not bind it again itself. A push for graphics stages
+only that came after a kept push reaching those stages over the same bytes is replayed after it, so a
+draw after DLSS reads the application's newer values. Nothing waits on the host
 and nothing runs on another queue; DLSS continues on the enhanced input in the same buffer. Per-hold
 data the split hold writes from the host is written in the buffer; a guard dispatch checks on the GPU
 that the hold recorded before ran right before, and otherwise drops the history and the edit cache's
@@ -875,7 +877,8 @@ file: it splices the one quoted value (or inserts the missing key or app block w
 layout and line endings), re-parses the result and requires the tree to equal the original plus
 exactly that change. It refuses while a `steam` or `steamwebhelper` process runs (Steam rewrites the
 file on exit), backs up to `.neural-forge.orig` once ever and `.neural-forge.bak` before each edit,
-and replaces the file atomically with its mode kept (a symlinked file is written through, and the
+holds `.neural-forge.lock` from reading the file to replacing it (two edits at once, the GUI's
+switches for two games or the CLI beside the GUI, run one after the other), and replaces the file atomically with its mode kept (a symlinked file is written through, and the
 directory is fsynced). Every account that has the game is edited, and switching on also the most
 recently modified account (the one signed in), which gets the game's block if it lacks it. Refused
 or failed edits return the string to paste instead. An appid listed in two libraries or roots is one

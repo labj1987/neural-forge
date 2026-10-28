@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
+// Modified for Neural Forge (2026): ported to ash 0.38; the mock driver enumerates device groups
+// (UPSTREAM.md).
 
 use ash::{
     prelude::VkResult,
@@ -449,11 +450,34 @@ static VULKAN_COMMANDS: Lazy<BTreeMap<VulkanCommandName, VulkanCommand>> = Lazy:
             VulkanCommand {
                 proc: {
                     extern "system" fn enumerate_physical_device_groups(
-                        _: vk::Instance,
-                        _physical_device_group_count: *mut u32,
-                        _physical_device_group_properties: *mut vk::PhysicalDeviceGroupProperties,
+                        instance: vk::Instance,
+                        physical_device_group_count: *mut u32,
+                        physical_device_group_properties: *mut vk::PhysicalDeviceGroupProperties,
                     ) -> vk::Result {
-                        unimplemented!()
+                        // One group of its own for each physical device.
+                        let all_groups = unsafe { InstanceData::from_handle(instance) }
+                            .physical_devices
+                            .iter()
+                            .map(|physical_device_data| {
+                                let mut physical_devices =
+                                    [vk::PhysicalDevice::null(); vk::MAX_DEVICE_GROUP_SIZE];
+                                physical_devices[0] = **physical_device_data;
+                                vk::PhysicalDeviceGroupProperties {
+                                    physical_device_count: 1,
+                                    physical_devices,
+                                    ..Default::default()
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let physical_device_group_count =
+                            NonNull::new(physical_device_group_count).unwrap();
+                        unsafe {
+                            fill_vk_out_array(
+                                &all_groups,
+                                physical_device_group_count,
+                                physical_device_group_properties,
+                            )
+                        }
                     }
                     unsafe {
                         std::mem::transmute::<

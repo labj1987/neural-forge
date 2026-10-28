@@ -887,8 +887,10 @@ impl<T: Layer> Global<T> {
                 p_physical_device_group_properties,
             )
         };
+        // A count query (`pPhysicalDeviceGroupProperties` NULL) returns no groups to read.
         if (res == vk::Result::SUCCESS || res == vk::Result::INCOMPLETE)
             && !p_physical_device_group_count.is_null()
+            && !p_physical_device_group_properties.is_null()
         {
             let physical_device_group_count =
                 *unsafe { p_physical_device_group_count.as_ref() }.unwrap();
@@ -995,11 +997,15 @@ impl<T: Layer> Global<T> {
             LayerResult::Unhandled
         };
         let layer_manifest = T::manifest();
+        // The extension list `create_info` points at once the layer's own extensions are taken out:
+        // kept until `create_device_info` below has read `create_info`.
+        let enabled_extension_names: Vec<CString>;
+        let enabled_extension_ptrs: Vec<*const c_char>;
         match create_device_res {
             LayerResult::Handled(Ok(())) => {}
             LayerResult::Handled(Err(e)) => return e,
             LayerResult::Unhandled => {
-                let enabled_extensions = requested_extensions
+                enabled_extension_names = requested_extensions
                     .iter()
                     .filter_map(|extension_name| {
                         let extension_name_cstring = CString::new(extension_name.clone())
@@ -1021,15 +1027,16 @@ impl<T: Layer> Global<T> {
                         }
                     })
                     .collect::<Vec<_>>();
-                let enabled_extensions = enabled_extensions
+                enabled_extension_ptrs = enabled_extension_names
                     .iter()
                     .map(|extension_name| extension_name.as_ptr())
                     .collect::<Vec<_>>();
-                create_info.enabled_extension_count = enabled_extensions.len().try_into().unwrap();
-                create_info.pp_enabled_extension_names = if enabled_extensions.is_empty() {
+                create_info.enabled_extension_count =
+                    enabled_extension_ptrs.len().try_into().unwrap();
+                create_info.pp_enabled_extension_names = if enabled_extension_ptrs.is_empty() {
                     null()
                 } else {
-                    enabled_extensions.as_ptr()
+                    enabled_extension_ptrs.as_ptr()
                 };
                 let res = unsafe {
                     next_create_device(physical_device, &create_info, p_allocator, p_device)

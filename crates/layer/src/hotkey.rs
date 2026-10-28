@@ -703,7 +703,7 @@ impl Focus {
             if reply.is_null() {
                 return None;
             }
-            let value = ((self.value_length)(reply) >= 1).then(|| *(self.value)(reply).cast::<u32>());
+            let value = items32(reply, (self.value_length)(reply)).filter(|&n| n >= 1).map(|_| *(self.value)(reply).cast::<u32>());
             libc::free(reply);
             value
         }
@@ -718,17 +718,16 @@ impl Focus {
     /// Every 32-bit value of `property` on `window` (a list such as `_NET_CLIENT_LIST`), `None` without
     /// it (or on any error).
     fn property_list(&self, window: u32, property: u32, kind: u32) -> Option<Vec<u32>> {
-        // SAFETY: as `property`; the reply's value holds `value_length` 32-bit items.
+        // SAFETY: as `property`; the reply's value holds `value_length` bytes, `items32` 32-bit items.
         unsafe {
             let cookie = (self.get_property)(self.conn, 0, window, property, kind, 0, 4096);
             let reply = (self.get_property_reply)(self.conn, cookie, std::ptr::null_mut());
             if reply.is_null() {
                 return None;
             }
-            let n = usize::try_from((self.value_length)(reply)).unwrap_or(0);
-            let list = std::slice::from_raw_parts((self.value)(reply).cast::<u32>(), n).to_vec();
+            let list = items32(reply, (self.value_length)(reply)).map(|n| std::slice::from_raw_parts((self.value)(reply).cast::<u32>(), n).to_vec());
             libc::free(reply);
-            Some(list)
+            list
         }
     }
 
@@ -750,6 +749,19 @@ impl Focus {
         }
         focus_of(window, active_pid, owns_x_window, ours)
     }
+}
+
+/// The number of 32-bit items in a `xcb_get_property_reply_t`'s value, from the reply and
+/// `xcb_get_property_value_length`, which counts bytes (`value_len * format / 8`), not items: `None`
+/// unless the value is in 32-bit format (a property that does not exist has format 0).
+///
+/// # Safety
+/// `reply` is a live property reply.
+unsafe fn items32(reply: *const c_void, value_bytes: c_int) -> Option<usize> {
+    // `xcb_get_property_reply_t`: response type, then the format.
+    // SAFETY: the reply's second byte, per the caller's contract.
+    let format = unsafe { *reply.cast::<u8>().add(1) };
+    (format == 32).then(|| usize::try_from(value_bytes).unwrap_or(0) / 4)
 }
 
 impl Drop for Focus {
@@ -1051,5 +1063,75 @@ mod tests {
         assert_eq!(focus_of(Some(8), None, Some(true), ours), None, "an active window without a PID");
         assert_eq!(focus_of(None, None, Some(true), ours), None, "no _NET_ACTIVE_WINDOW");
         assert!(press_acts(None, true));
+    }
+
+    // A `xcb_get_property_reply_t` as libxcb lays it out: response type, format, sequence, length,
+    // type, bytes after, value_len (in format units), 12 bytes of padding, then the value.
+    const FAKE_WINDOWS: [u32; 3] = [11, 22, 33];
+
+    thread_local! {
+        static FAKE_FORMAT: std::cell::Cell<u8> = const { std::cell::Cell::new(32) };
+    }
+
+    unsafe extern "C" fn fake_has_error(_: *mut c_void) -> c_int {
+        0
+    }
+    unsafe extern "C" fn fake_get_property(_: *mut c_void, _: u8, _: u32, _: u32, _: u32, _: u32, _: u32) -> u32 {
+        1
+    }
+    unsafe extern "C" fn fake_get_property_reply(_: *mut c_void, _: u32, _: *mut *mut c_void) -> *mut c_void {
+        let format = FAKE_FORMAT.with(|f| f.get());
+        let value_len = FAKE_WINDOWS.len() as u32 * 32 / u32::from(format.max(8));
+        // SAFETY: a fresh allocation the size of the header and the value, freed by the caller.
+        unsafe {
+            let reply = libc::calloc(1, 32 + std::mem::size_of_val(&FAKE_WINDOWS)).cast::<u8>();
+            *reply.add(1) = format;
+            reply.add(16).cast::<u32>().write(value_len);
+            std::ptr::copy_nonoverlapping(FAKE_WINDOWS.as_ptr(), reply.add(32).cast::<u32>(), FAKE_WINDOWS.len());
+            reply.cast()
+        }
+    }
+    unsafe extern "C" fn fake_value(reply: *const c_void) -> *mut c_void {
+        // SAFETY: the value follows the 32-byte header.
+        unsafe { reply.cast::<u8>().add(32).cast_mut().cast() }
+    }
+    unsafe extern "C" fn fake_value_length(reply: *const c_void) -> c_int {
+        // As libxcb: `value_len * (format / 8)`, a count of bytes.
+        // SAFETY: a reply from `fake_get_property_reply`.
+        unsafe { (*reply.cast::<u32>().add(4) * u32::from(*reply.cast::<u8>().add(1) / 8)) as c_int }
+    }
+    unsafe extern "C" fn fake_disconnect(_: *mut c_void) {}
+
+    fn fake_focus() -> std::mem::ManuallyDrop<Focus> {
+        // Never dropped: there is no connection or library to close.
+        std::mem::ManuallyDrop::new(Focus {
+            lib: std::ptr::null_mut(),
+            conn: std::ptr::null_mut(),
+            root: 1,
+            active: 2,
+            pid: 3,
+            client_list: 4,
+            has_error: fake_has_error,
+            get_property: fake_get_property,
+            get_property_reply: fake_get_property_reply,
+            value: fake_value,
+            value_length: fake_value_length,
+            disconnect: fake_disconnect,
+        })
+    }
+
+    #[test]
+    fn property_lists_count_32_bit_items_not_bytes() {
+        let focus = fake_focus();
+        FAKE_FORMAT.with(|f| f.set(32));
+        assert_eq!(focus.property_list(1, 4, XCB_ATOM_WINDOW), Some(FAKE_WINDOWS.to_vec()));
+        assert_eq!(focus.property(1, 4, XCB_ATOM_WINDOW), Some(11));
+        // A value in another format (or a property that does not exist, format 0) is no list of windows.
+        FAKE_FORMAT.with(|f| f.set(8));
+        assert_eq!(focus.property_list(1, 4, XCB_ATOM_WINDOW), None);
+        assert_eq!(focus.property(1, 4, XCB_ATOM_WINDOW), None);
+        FAKE_FORMAT.with(|f| f.set(0));
+        assert_eq!(focus.property_list(1, 4, XCB_ATOM_WINDOW), None);
+        assert_eq!(focus.property(1, 4, XCB_ATOM_WINDOW), None);
     }
 }
