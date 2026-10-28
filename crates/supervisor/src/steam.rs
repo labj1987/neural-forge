@@ -642,10 +642,11 @@ pub fn apply_now(root: &Path, appid: &str, action: &Action) -> Outcome {
 /// before any file is written, so a refusal leaves all of them untouched. For each file written:
 /// `localconfig.vdf.neural-forge.orig` is a copy of it as first found (taken once, never
 /// replaced), `localconfig.vdf.neural-forge.bak` a copy from just before this edit, and the new
-/// file replaces the old one atomically with the old one's permissions.
+/// file replaces the old one atomically with the old one's permissions. Each file is held from
+/// before it is read for the edit until it is replaced ([`lock_localconfigs`]): two edits at once (the GUI's
+/// switches for two games, or the CLI and the GUI) run one after the other, so neither is lost.
 pub fn apply(root: &Path, appid: &str, action: &Action, steam_running: bool) -> Outcome {
-    let accounts = launch_options(root, appid);
-    let current = accounts.iter().find(|a| a.has_app).and_then(|a| a.options.clone()).unwrap_or_default();
+    let current = launch_options(root, appid).iter().find(|a| a.has_app).and_then(|a| a.options.clone()).unwrap_or_default();
     let manual = action.apply_to(&current);
     if matches!(action, Action::Enable { target_exe } if target_exe.trim().is_empty()) {
         return Outcome::Failed { reason: "the game's executable is not known: name it (the .exe the game runs) as the target".into(), manual };
@@ -653,6 +654,9 @@ pub fn apply(root: &Path, appid: &str, action: &Action, steam_running: bool) -> 
     if steam_running {
         return Outcome::SteamRunning { manual };
     }
+    // Read again under the lock: what another edit wrote meanwhile is kept.
+    let _held = lock_localconfigs(&localconfigs(root));
+    let accounts = launch_options(root, appid);
     let files = localconfigs(root);
     if files.is_empty() {
         return Outcome::Failed { reason: format!("no Steam account found under {}", root.join("userdata").display()), manual };
@@ -715,6 +719,21 @@ fn sibling(file: &Path, suffix: &str) -> PathBuf {
     let mut name = file.file_name().unwrap_or_default().to_os_string();
     name.push(suffix);
     file.with_file_name(name)
+}
+
+/// Holds `files` for one [`apply`]: an exclusive lock on `localconfig.vdf.neural-forge.lock` next to
+/// each (beside its backups), taken in the files' sorted order so two holders never wait on each
+/// other. A lock that cannot be taken is skipped: its directory then cannot take the edit's
+/// temporary file either, and the write reports that.
+fn lock_localconfigs(files: &[PathBuf]) -> Vec<std::fs::File> {
+    files
+        .iter()
+        .filter_map(|file| {
+            let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(sibling(file, ".neural-forge.lock")).ok()?;
+            lock.lock().ok()?;
+            Some(lock)
+        })
+        .collect()
 }
 
 /// The backups and the atomic replace for one file, whose bytes read as `old` a moment ago.
@@ -1106,6 +1125,30 @@ mod tests {
     }
 
     #[test]
+    fn edits_at_the_same_time_are_all_kept() {
+        let home = Scratch::new("concurrent");
+        let lc = home.0.join("userdata/1/config/localconfig.vdf");
+        let apps: Vec<String> = (0..8).map(|n| format!("{}", 1000 + n)).collect();
+        let entries: Vec<(&str, Option<&str>)> = apps.iter().map(|a| (a.as_str(), Some("%command%"))).collect();
+        write(&lc, &localconfig(&entries));
+        // Each game's switch in the GUI applies on its own thread: all of them at once here.
+        let start = std::sync::Barrier::new(apps.len());
+        std::thread::scope(|scope| {
+            for app in &apps {
+                let (root, start) = (&home.0, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    let outcome = apply(root, app, &enable(), false);
+                    assert!(matches!(outcome, Outcome::Changed(_)), "{app}: {outcome:?}");
+                });
+            }
+        });
+        for app in &apps {
+            assert!(enabled(&home.0, app), "{app}'s launch options were lost");
+        }
+    }
+
+    #[test]
     fn backups_keep_the_first_original_and_the_last_state() {
         let home = Scratch::new("backups");
         let lc = home.0.join("userdata/1/config/localconfig.vdf");
@@ -1140,6 +1183,7 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&lc).unwrap(), original);
         assert!(!home.0.join("userdata/1/config/localconfig.vdf.neural-forge.bak").exists());
+        assert!(!home.0.join("userdata/1/config/localconfig.vdf.neural-forge.lock").exists(), "a refusal leaves nothing behind");
     }
 
     #[test]

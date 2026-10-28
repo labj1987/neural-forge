@@ -875,7 +875,8 @@ file: it splices the one quoted value (or inserts the missing key or app block w
 layout and line endings), re-parses the result and requires the tree to equal the original plus
 exactly that change. It refuses while a `steam` or `steamwebhelper` process runs (Steam rewrites the
 file on exit), backs up to `.neural-forge.orig` once ever and `.neural-forge.bak` before each edit,
-and replaces the file atomically with its mode kept (a symlinked file is written through, and the
+holds `.neural-forge.lock` from reading the file to replacing it (two edits at once, the GUI's
+switches for two games or the CLI beside the GUI, run one after the other), and replaces the file atomically with its mode kept (a symlinked file is written through, and the
 directory is fsynced). Every account that has the game is edited, and switching on also the most
 recently modified account (the one signed in), which gets the game's block if it lacks it. Refused
 or failed edits return the string to paste instead. An appid listed in two libraries or roots is one
