@@ -17,7 +17,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab, scrolled to the middle: Placement (Auto), Model resolution (Full), Model brightness (Game) and its scale, Per-pass settings, Keep the game's sky, More mask rules, the toggle key and the Colour heading; above are the switch, style, strength and passes, below the rest of the Colour group and the HUD on the finished frame](screenshots/settings.png) | ![Setup tab: the model present (the full and the small network of build 310.9.16.0), the Network choice, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: telemetry (model, game, frame rate and the graph of the frame time and the model's GPU time), then the layer state, the Model placement line and the model (the full and the small network of build 310.9.16.0)](screenshots/status.png) |
+| ![Model tab, scrolled to the middle: Placement (Auto), Model resolution (Full), Model brightness (Game) and its scale, Per-pass settings, Keep the game's sky, More mask rules, the toggle key and the Colour heading; above are the switch, style, strength and passes, below the rest of the Colour group and the HUD on the finished frame](screenshots/settings.png) | ![Setup tab: the model present (the full and the small network of build 310.9.16.0), the Network choice (Full network), Extract from DLL, then the Steam games with their switches, the executables they target and an edit button each; below them, the launch option to copy by hand](screenshots/setup.png) | ![Status tab: telemetry (model, game, frame rate and the graph of the frame time and the model's GPU time), then the layer state, the Model placement line and the model (the full and the small network of build 310.9.16.0)](screenshots/status.png) |
 
 The screenshots show default settings with no game running.
 
@@ -98,16 +98,20 @@ How it works, step by step: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ### GTA V Enhanced, before the upscaler
 
 GTA V Enhanced's built-in benchmark on the test machine: RTX 5070 (12 GB), 2560x1440, DLSS Balanced,
-DLSS Frame Generation 4x, ray tracing on, script mods off, pass 4 (about 117 s), three runs each (the
-off row: one run, 2026-10-16). Real fps is the game's own frames; shown fps counts the generated ones
-too. Measured 2026-10-19 with the default settings (keep the game's sky on, one pass); a run with 3.8.14
-on 2026-10-26 gave the same for the full network (65.1 real, 262.7 shown, 7.0 ms).
+DLSS Frame Generation 4x with Preset C, ray tracing on, script mods off, pass 4 (about 117 s), default
+settings (keep the game's sky on, one pass). Real fps is the game's own frames; shown fps counts the
+generated ones too. The full network: one run, 2026-10-28; the off row: one run, 2026-10-16; the small
+network: three runs, 2026-10-19 (the 2026-10-28 runs of those two are the frame-generation-off ones
+below: the game turned frame generation off in them).
 
 | Model | Real fps | Shown fps | Network GPU time on the frames it runs | Weights in video memory |
 |---|---|---|---|---|
 | Off (Neural Forge not loaded) | 76.8 | 309.0 | - | - |
-| Full network | 65.2 | 262.4 | 6.9 ms | 140 MB |
+| Full network | 62.1 | 249.4 | 6.8 ms | 140 MB |
 | Small network | 73.4 | 295.4 | 3.9 ms | 108 MB |
+
+With frame generation off (2026-10-28, one run each, real fps): off 88.0, small network 76.9 (3.4 ms),
+full network 75.1 (6.1 ms).
 
 The network runs on every frame while the camera is still and on every second frame while it moves (the
 edit cache carries it between), so about half the frames pay its time in this benchmark.
@@ -153,8 +157,9 @@ shown with the model after DLSS (25 on the finished frame), 15.2 ms network GPU 
 
 ### The network on its own
 
-The network's time per frame on its own (`dlss5vk bench`, 1707x960, the DLSS input of GTA V at DLSS
-Quality), measured with 3.5.0: full 7.03 ms, small 3.81 ms (slightly less since 3.8.1). In the game it also waits for the game's own GPU work. Games
+The network's time per frame on its own, run back to back on an idle GPU at 1486x836 (DLSS's input in
+GTA V at 1440p, DLSS Balanced; `crates/native/tests/rig.rs`): full 5.35 ms, small 2.85 ms. In the game it
+also waits for the game's own GPU work. Games
 are tested at 2560x1440 only (see [Known issues](#known-issues) for 4K). Details and the record of
 every measurement: [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) and
 [docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md).
@@ -348,12 +353,13 @@ GrimsVerk's runtime research).
 **Passes** (1 to 10, default 1) runs the model that many times over each frame, before or after the
 upscaler: every pass after the first works on the previous pass's picture. Each pass costs about as much
 GPU time as the first, and the effect builds up with every pass. In GTA V Enhanced at 1440p with frame
-generation 4x (real frames per second, pass 4 of the built-in benchmark):
+generation 4x (real frames per second, pass 4 of the built-in benchmark, one run each; the small
+network's one pass is from 2026-10-19, the rest from 2026-10-28):
 
 | Network | 1 pass | 2 passes | 3 passes |
 |---|---|---|---|
-| Small | 74.3 | 64.0 | 58.1 |
-| Full | 65.6 | 51.2 | |
+| Small | 74.3 | 60.4 | 52.8 |
+| Full | 62.1 | 50.7 | |
 
 Two passes of the small network cost about as much as one pass of the full network, and look
 over-processed: grittier stone and noisier roads. Each pass keeps its own history, so the passes do not
@@ -441,25 +447,23 @@ takes is withdrawn after 5 seconds.
 - **The game's DLSS Frame Generation does not always switch on.** In the benchmark runs the game
   generated frames in some launches and not in others with the same settings, with or without
   Neural Forge. The fps counter shows which happened.
-- **4K is at the memory limit on a 12 GB card, and is no longer tested.** Before 3.8.8 (which cut
-  the network's video memory by about 1.8 GB at 4K), one run of GTA V Enhanced at 3840x2160 with frame
-  generation 4x and the small network (texture quality one step down) ran steadily at 35.6 real fps
-  with the video memory at 11.9 of 12.2 GB, and the full network there collapsed to a few fps at the
-  limit; not repeated since. A network build that fails is retried on a schedule, and frames go to
-  DLSS untouched meanwhile.
+- **4K is not tested.** On a 12 GB card it is at the video memory limit: in the last 4K runs, of an
+  older build that used about 1.8 GB more video memory there, GTA V Enhanced at 3840x2160 with frame
+  generation 4x ran steadily with the small network (texture quality one step down, 11.9 of 12.2 GB in
+  use) and collapsed to a few fps with the full one. A network build that fails is retried on a
+  schedule, and frames go to DLSS untouched meanwhile.
 - **Unreal Engine 5 games are only partly tested.** Lords of the Fallen ran in game with frame
   generation, and Remnant II at its character select screen with frame generation, with no GPU fault
   in those measurements. The Black Myth: Wukong Benchmark Tool faulted the GPU
-  intermittently (`Xid 13` then `Xid 32`) in the first frames with frame generation on (measured
-  with 3.0; not retested since 3.8.1 changed how the model runs inside DLSS's work), and its
-  motion vectors cannot be copied, so the network runs there without history.
+  intermittently (`Xid 13` then `Xid 32`) in the first frames with frame generation on, in a test of
+  an older build that held DLSS's work differently (not retested since), and its motion vectors
+  cannot be copied, so the network runs there without history.
 - **NVIDIA `Xid 109` (`CTX_SWITCH_TIMEOUT`) or `Xid 119` GPU hangs.** This is a widely reported
   NVIDIA Linux driver bug under Proton, also seen in games with no DLSS or neural rendering at all
   ([nvidia forums thread 283722](https://forums.developer.nvidia.com/t/xid109-ctx-switch-timeout-driver-crashes-in-many-applications/283722),
   [NVIDIA/open-gpu-kernel-modules#1097](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1097)).
   Check `journalctl -k`
-  for an `Xid` line before blaming Neural Forge. Before 3.8.13, preparing the network while a game
-  loaded could cause an `Xid 109` too (Hogwarts Legacy with ray tracing): update first.
+  for an `Xid` line before blaming Neural Forge.
   [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) (2026-09-16) has the diagnosis and the
   workarounds other users report.
 - **The model after DLSS is tested in two games** (Crimson Desert and Hogwarts Legacy, with Ray
