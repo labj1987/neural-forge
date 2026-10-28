@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Modified for Neural Forge (2026): function pointers compared by address; ash 0.38; a device-group
-// enumeration test (UPSTREAM.md).
+// enumeration test; the destroy order tests (UPSTREAM.md).
 
 use ash::vk::{self};
 use mockall::predicate::{always, eq};
@@ -886,6 +886,40 @@ mod create_destroy_instance {
             // Calling vkDestroyInstance through RAII.
         }
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_destroy_instance_drops_the_instance_info_before_the_next_layer_destroys_it() {
+        static TEST_GLOBAL0: TestGlobal<Tag<0>> = TestGlobal::<Tag<0>>::builder().build();
+        static TEST_GLOBAL1: TestGlobal<Tag<1>> = TestGlobal::<Tag<1>>::builder().build();
+        let _ctx0 = TEST_GLOBAL0.create_context();
+        let _ctx1 = TEST_GLOBAL1.create_context();
+        let order: Arc<Mutex<Vec<&'static str>>> = Default::default();
+        let record = |name: &'static str| {
+            let order = Arc::clone(&order);
+            move || order.lock().push(name)
+        };
+        {
+            let ctx = vk::InstanceCreateInfo::default()
+                .default_instance::<(TestLayer<Tag<0>>, TestLayer<Tag<1>>)>();
+            let InstanceContext { instance, .. } = ctx.as_ref();
+            TestLayer::<Tag<0>>::global_instance()
+                .layer_info
+                .get_instance_info(instance.handle())
+                .unwrap()
+                .with_mock_drop(|d| {
+                    d.expect_drop().once().return_once(record("top"));
+                });
+            TestLayer::<Tag<1>>::global_instance()
+                .layer_info
+                .get_instance_info(instance.handle())
+                .unwrap()
+                .with_mock_drop(|d| {
+                    d.expect_drop().once().return_once(record("below"));
+                });
+            // Calling vkDestroyInstance through RAII.
+        }
+        assert_eq!(*order.lock(), ["top", "below"]);
     }
 
     // Requirements of Well-Behaved Layers number LLP_LAYER_21.
@@ -2010,6 +2044,44 @@ mod create_destroy_device {
             // Calling vkDestroyDevice through RAII.
         }
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_destroy_device_drops_the_device_info_before_the_next_layer_destroys_the_device() {
+        static TEST_GLOBAL0: TestGlobal<Tag<0>> = TestGlobal::<Tag<0>>::builder().build();
+        static TEST_GLOBAL1: TestGlobal<Tag<1>> = TestGlobal::<Tag<1>>::builder().build();
+        let _ctx0 = TEST_GLOBAL0.create_context();
+        let _ctx1 = TEST_GLOBAL1.create_context();
+        let order: Arc<Mutex<Vec<&'static str>>> = Default::default();
+        let record = |name: &'static str| {
+            let order = Arc::clone(&order);
+            move || order.lock().push(name)
+        };
+        {
+            let ctx = vk::InstanceCreateInfo::default()
+                .default_instance::<(TestLayer<Tag<0>>, TestLayer<Tag<1>>)>()
+                .default_device()
+                .unwrap();
+            let DeviceContext { device, .. } = ctx.as_ref();
+            // The layer below drops its device info in its vkDestroyDevice, the next one the layer
+            // on top calls: the layer on top's Drop may still use the device, so it comes first.
+            TestLayer::<Tag<0>>::global_instance()
+                .layer_info
+                .get_device_info(device.handle())
+                .unwrap()
+                .with_mock_drop(|d| {
+                    d.expect_drop().once().return_once(record("top"));
+                });
+            TestLayer::<Tag<1>>::global_instance()
+                .layer_info
+                .get_device_info(device.handle())
+                .unwrap()
+                .with_mock_drop(|d| {
+                    d.expect_drop().once().return_once(record("below"));
+                });
+            // Calling vkDestroyDevice through RAII.
+        }
+        assert_eq!(*order.lock(), ["top", "below"]);
     }
 
     #[test]

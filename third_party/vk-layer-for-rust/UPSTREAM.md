@@ -84,4 +84,6 @@ this project's own code: upstream is no longer tracked.
    through the NULL pointer. The mock driver enumerates one group per physical device, and a test makes both
    queries. With a create-device hook that returns `Unhandled`, the extension list the next `vkCreateDevice` was
    given (the application's, without the layer's own) is kept until `create_device_info` has read the same create
-   info: it pointed at a list already freed.
+   info: it pointed at a list already freed. `vkDestroyDevice` and `vkDestroyInstance` drop the layer's own
+   device and instance data before they call the next layer's: its Drop (how a layer sees the destroy) ran on a
+   device or instance already destroyed. Tests with two layers check the order.
