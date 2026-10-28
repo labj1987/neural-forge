@@ -4,7 +4,7 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
-## Unreleased
+## 3.9.3 — 2026-10-28
 
 - A damaged or wrong network model is refused with an error that names the file at fault. Before, a misspelt
   true, false or null in the model's manifest could be read as a value, a directory where a model file
