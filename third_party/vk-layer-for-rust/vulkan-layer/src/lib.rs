@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
+// Modified for Neural Forge (2026): ported to ash 0.38; review fixes, among them the layer's data
+// dropped before the next layer's destroy and the core tables' alias fallback (UPSTREAM.md).
 
 #![warn(missing_docs)]
 #![cfg_attr(all(doc, RUSTC_NIGHTLY), feature(doc_auto_cfg))]
@@ -726,10 +727,14 @@ impl<T: Layer> Global<T> {
         };
 
         let instance = *unsafe { p_instance.as_ref() }.unwrap();
+        // A core command's extension names are tried when the next layer resolves its name to
+        // NULL: the aliases of a core command are dispatched through this table.
         let ash_instance = unsafe {
-            ash::Instance::load(
-                &ash::StaticFn {
-                    get_instance_proc_addr,
+            ash::Instance::load_with(
+                |name| {
+                    global_simple_intercept::resolve_with_aliases(name, |name| {
+                        get_instance_proc_addr(instance, name.as_ptr())
+                    })
                 },
                 instance,
             )
@@ -835,9 +840,15 @@ impl<T: Layer> Global<T> {
             .unwrap()
             .get_mut_or_default()
             .retain(|_, physical_device_info| physical_device_info.owner_instance != instance);
-        unsafe {
-            (instance_info.dispatch_table.core.fp_v1_0().destroy_instance)(instance, allocator)
-        };
+        // As in destroy_device: the layer's own data goes before the next layer destroys the
+        // instance.
+        let InstanceInfoWrapper {
+            dispatch_table,
+            customized_info,
+            ..
+        } = instance_info;
+        drop(customized_info);
+        unsafe { (dispatch_table.core.fp_v1_0().destroy_instance)(instance, allocator) };
     }
 
     extern "system" fn enumerate_physical_devices(
@@ -1048,17 +1059,19 @@ impl<T: Layer> Global<T> {
         }
 
         let device = *unsafe { p_device.as_ref() }.unwrap();
-        let ash_instance = Arc::clone(&instance_info.dispatch_table.core);
         let ash_device = unsafe {
             // ash will also try to load instance-level dispatchable commands with
             // vkGetDeviceProcAddr. Although that won't end up with undefined behavior, and we
             // should always expect NULL returned according to the spec, we may see Android vulkan
             // loader complaining about internal vkGetDeviceProcAddr called for <function name>,
             // which should be benign.
-            ash::Device::load(
-                &ash::InstanceFnV1_0 {
-                    get_device_proc_addr,
-                    ..ash_instance.fp_v1_0().clone()
+            // The aliases of a core command are dispatched through this table: its extension names
+            // are tried when the next layer resolves the core name to NULL.
+            ash::Device::load_with(
+                |name| {
+                    global_simple_intercept::resolve_with_aliases(name, |name| {
+                        get_device_proc_addr(device, name.as_ptr())
+                    })
                 },
                 device,
             )
@@ -1129,12 +1142,15 @@ impl<T: Layer> Global<T> {
             Err(_) => panic!("This should be the sole owner of the device {:?}", device),
         };
         let allocation_callback = unsafe { p_allocator.as_ref() };
-        unsafe {
-            device_info
-                .dispatch_table
-                .core
-                .destroy_device(allocation_callback)
-        };
+        // The layer's own data goes first: its Drop is how a layer sees vkDestroyDevice, and it
+        // may still use the device, which the next layer destroys.
+        let DeviceInfoWrapper {
+            dispatch_table,
+            customized_info,
+            ..
+        } = device_info;
+        drop(customized_info);
+        unsafe { dispatch_table.core.destroy_device(allocation_callback) };
     }
 
     fn layer_properties() -> Vec<vk::LayerProperties> {

@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): the loaders try a command's aliases when its name resolves to
+// NULL (UPSTREAM.md).
 
 use std::{
     ffi::{c_void, CStr},
@@ -116,11 +119,9 @@ fn get_instance_proc_addr_loader(
     move |name| {
         // Safe because the VkInstance is valid, and a valid C string pointer is passed to the
         // `p_name` parameter.
-        let fp = unsafe { get_instance_proc_addr(instance.handle(), name.as_ptr()) };
-        if let Some(fp) = fp {
-            return fp as *const _;
-        }
-        std::ptr::null()
+        resolve_with_aliases(name, |name| unsafe {
+            get_instance_proc_addr(instance.handle(), name.as_ptr())
+        })
     }
 }
 
@@ -131,12 +132,28 @@ fn get_device_proc_addr_loader(
     move |name| {
         // Safe because the VkDevice is valid, and a valid C string pointer is passed to the
         // `p_name` parameter.
-        let fp = unsafe { get_device_proc_addr(device.handle(), name.as_ptr()) };
-        match fp {
-            Some(fp) => fp as *const _,
-            None => std::ptr::null(),
-        }
+        resolve_with_aliases(name, |name| unsafe {
+            get_device_proc_addr(device.handle(), name.as_ptr())
+        })
     }
+}
+
+/// `resolve(name)`, or when that is NULL the first of `name`'s aliases ([`command_aliases`]) that
+/// `resolve` finds. An aliased command is dispatched through the entry loaded under its
+/// representative's name, which a layer or driver below can resolve to NULL (a core name on a
+/// device of an older version that enabled the extension) where an extension name is found.
+pub(crate) fn resolve_with_aliases(
+    name: &CStr,
+    resolve: impl Fn(&CStr) -> vk::PFN_vkVoidFunction,
+) -> *const c_void {
+    std::iter::once(name)
+        .chain(
+            command_aliases(name)
+                .iter()
+                .filter_map(|alias| CStr::from_bytes_with_nul(alias).ok()),
+        )
+        .find_map(resolve)
+        .map_or(std::ptr::null(), |fp| fp as *const c_void)
 }
 
 /// Converts a raw pointer to a reference of a slice of maybe-uninit. In contrast to
@@ -276,6 +293,38 @@ unsafe fn bool_iterator_from_raw_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_core_name_resolved_to_null_falls_back_to_its_extension_name() {
+        unsafe extern "system" fn found() {}
+        // As the validation layer answers a 1.2 device that enabled VK_KHR_synchronization2: the
+        // core name is NULL, the extension's name is not.
+        let resolve = |name: &CStr| {
+            (name.to_bytes() == b"vkCmdPipelineBarrier2KHR")
+                .then_some(found as unsafe extern "system" fn())
+        };
+        assert_eq!(
+            resolve_with_aliases(c"vkCmdPipelineBarrier2", resolve),
+            found as *const c_void
+        );
+        assert_eq!(
+            resolve_with_aliases(c"vkCmdBeginRendering", |name| {
+                (name.to_bytes() == b"vkCmdBeginRenderingKHR")
+                    .then_some(found as unsafe extern "system" fn())
+            }),
+            found as *const c_void
+        );
+        // Found under its own name: no alias is asked for.
+        assert_eq!(
+            resolve_with_aliases(c"vkCmdPipelineBarrier2", |name| {
+                assert_eq!(name.to_bytes(), b"vkCmdPipelineBarrier2");
+                Some(found as unsafe extern "system" fn())
+            }),
+            found as *const c_void
+        );
+        assert!(resolve_with_aliases(c"vkCmdDraw", resolve).is_null());
+        assert!(command_aliases(c"vkCmdDraw").is_empty());
+    }
 
     #[test]
     fn bool_iterator_from_raw_parts_result_should_match() {

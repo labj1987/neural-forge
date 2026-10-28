@@ -84,4 +84,12 @@ this project's own code: upstream is no longer tracked.
    through the NULL pointer. The mock driver enumerates one group per physical device, and a test makes both
    queries. With a create-device hook that returns `Unhandled`, the extension list the next `vkCreateDevice` was
    given (the application's, without the layer's own) is kept until `create_device_info` has read the same create
-   info: it pointed at a list already freed.
+   info: it pointed at a list already freed. `vkDestroyDevice` and `vkDestroyInstance` drop the layer's own
+   device and instance data before they call the next layer's: its Drop (how a layer sees the destroy) ran on a
+   device or instance already destroyed. Tests with two layers check the order.
+4. **A command's aliases when its name resolves to NULL** (2026-10-28). An extension alias of a core command
+   (`vkCmdPipelineBarrier2KHR`, `vkCmdBeginRenderingKHR`) is dispatched through the core table, which was loaded
+   under the core name only. Below a layer that resolves that name to NULL (the validation layer does, on a 1.2
+   device that enabled the extension), an `Unhandled` call reached ash's panicking stub. The generator now emits
+   `command_aliases` from the registry's aliases, and the loaders (the core tables and the extensions') try them
+   in turn when a name resolves to NULL.
