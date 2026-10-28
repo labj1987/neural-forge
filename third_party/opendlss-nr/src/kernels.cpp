@@ -1,5 +1,6 @@
 #include "kernels.h"
 
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -53,9 +54,13 @@ std::string readPtx(const std::string& directory, const std::string& file) {
     if (!loader("ptx", file.substr(0, file.size() - 4).c_str(), &data, &size)) throw std::runtime_error("missing PTX kernel " + file);
     return std::string(reinterpret_cast<const char*>(data), size);
   }
+  std::error_code error;
+  if (!std::filesystem::is_regular_file(directory + "/" + file, error))
+    throw std::runtime_error("cannot read PTX kernel " + directory + "/" + file + " (not a file)");
   std::ifstream in(directory + "/" + file);
   if (!in) throw std::runtime_error("cannot read PTX kernel " + directory + "/" + file);
   std::stringstream buffer; buffer << in.rdbuf();
+  if (in.bad()) throw std::runtime_error("cannot read PTX kernel " + directory + "/" + file);
   return buffer.str();
 }
 }  // namespace

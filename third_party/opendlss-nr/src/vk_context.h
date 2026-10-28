@@ -212,8 +212,9 @@ class Context {
   void* initUser_ = nullptr;        // 0: unbounded waits (the tool); otherwise every wait is bounded
   VkFence waitFence_ = VK_NULL_HANDLE;
   bool stalled_ = false;
+  void create();   // the owning constructor's body: instance, device, then initCommon()
   void adopt();
-  void release();   // the destructor's cleanup (also an adopting constructor's that throws)
+  void release();   // the destructor's cleanup (also any constructor's that throws)
   std::string deviceName_;
   void initCommon();   // properties, memory types, command pool, layouts, pools, staging
   Buffer dummy_;
