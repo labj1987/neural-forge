@@ -69,8 +69,11 @@ jobs:
         run: |
           repo="$GITHUB_REPOSITORY"
           gh label create pin-check --repo "$repo" --color c5def5 --description "The weekly pin check's standing issue" 2>/dev/null || true
-          read -r number state <<<"$(gh issue list --repo "$repo" --state all --label pin-check --limit 1 \
+          # Its own assignment, so a failed lookup fails the step (inside the here-string its status is
+          # lost, and an empty answer would open a second issue).
+          found="$(gh issue list --repo "$repo" --state all --label pin-check --limit 1 \
             --json number,state --jq '.[0] | "\(.number // "") \(.state // "")"')"
+          read -r number state <<<"$found"
           if [ "$STATE" = behind ]; then
             if [ -z "$number" ]; then
               gh issue create --repo "$repo" --title "$TITLE" --label pin-check --body-file report.md
