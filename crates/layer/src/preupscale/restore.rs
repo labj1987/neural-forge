@@ -598,8 +598,12 @@ impl Tracker {
             return;
         }
         if stages.contains(vk::ShaderStageFlags::COMPUTE) {
-            if stages != vk::ShaderStageFlags::COMPUTE {
-                self.mixed.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Loaded first: a game making such pushes all the time writes the flag once, not on every push.
+            if stages != vk::ShaderStageFlags::COMPUTE
+                && !self.mixed.load(std::sync::atomic::Ordering::Relaxed)
+                && !self.mixed.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                crate::log!("[preupscale] a push for {stages:?}: graphics-only pushes are noted from here on, for the hold inside DLSS's buffer");
             }
         } else if !self.mixed.load(std::sync::atomic::Ordering::Relaxed) {
             return;
