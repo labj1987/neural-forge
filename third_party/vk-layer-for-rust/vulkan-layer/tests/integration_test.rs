@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): function pointers compared by address; ash 0.38 (UPSTREAM.md).
+// Modified for Neural Forge (2026): function pointers compared by address; ash 0.38; a device-group
+// enumeration test (UPSTREAM.md).
 
 use ash::vk::{self};
 use mockall::predicate::{always, eq};
@@ -663,6 +664,40 @@ mod get_instance_proc_addr {
     #[ignore]
     fn test_layer_hooked_device_commands_should_take_priority() {
         todo!()
+    }
+}
+
+mod enumerate_physical_device_groups {
+    use super::*;
+
+    #[test]
+    fn test_count_query_and_full_query() {
+        static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
+        let _ctx = TEST_GLOBAL.create_context();
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+        let ctx = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .default_instance::<(TestLayer,)>();
+        let InstanceContext { instance, .. } = ctx.as_ref();
+        let enumerate_physical_device_groups = instance.fp_v1_1().enumerate_physical_device_groups;
+        // The count query passes no array: the layer must not read one.
+        let mut count = 0;
+        let res =
+            unsafe { enumerate_physical_device_groups(instance.handle(), &mut count, null_mut()) };
+        assert_eq!(res, vk::Result::SUCCESS);
+        let physical_devices = unsafe { instance.enumerate_physical_devices() }.unwrap();
+        assert_eq!(count as usize, physical_devices.len());
+        let mut groups = vec![vk::PhysicalDeviceGroupProperties::default(); count as usize];
+        let res = unsafe {
+            enumerate_physical_device_groups(instance.handle(), &mut count, groups.as_mut_ptr())
+        };
+        assert_eq!(res, vk::Result::SUCCESS);
+        let grouped = groups
+            .iter()
+            .flat_map(|group| &group.physical_devices[..group.physical_device_count as usize])
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(grouped, physical_devices);
     }
 }
 

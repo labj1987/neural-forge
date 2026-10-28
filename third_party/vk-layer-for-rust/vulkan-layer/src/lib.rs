@@ -887,8 +887,10 @@ impl<T: Layer> Global<T> {
                 p_physical_device_group_properties,
             )
         };
+        // A count query (`pPhysicalDeviceGroupProperties` NULL) returns no groups to read.
         if (res == vk::Result::SUCCESS || res == vk::Result::INCOMPLETE)
             && !p_physical_device_group_count.is_null()
+            && !p_physical_device_group_properties.is_null()
         {
             let physical_device_group_count =
                 *unsafe { p_physical_device_group_count.as_ref() }.unwrap();
