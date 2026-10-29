@@ -773,7 +773,9 @@ unsafe fn run_head(g: &Gpu, queue: vk::Queue, cmd: vk::CommandBuffer, frame: &Fr
 /// recorded straight into a primary with a GPU timestamp after every dispatch, 20 times; prints each kernel's
 /// median time (per block and kernel, in recording order), each block's and the total. Timestamps after
 /// chained dispatches that overlap give each the time from the previous one's end to its own: run with
-/// `NEURAL_FORGE_NATIVE_CHAIN=0` too for each kernel alone.
+/// `NEURAL_FORGE_NATIVE_CHAIN=0` too for each kernel alone. `NEURAL_FORGE_NATIVE_PROFILE_SIZE=<w>x<h>` profiles
+/// another size on zero features (kernel times don't depend on the values), e.g. 2228x1253, the render size of
+/// 3840x2160 output with DLSS Balanced.
 #[test]
 fn the_graph_profiled_per_kernel() {
     let (Some(dump), true) = (std::env::var_os("NEURAL_FORGE_NATIVE_RIG").map(PathBuf::from), std::env::var_os("NEURAL_FORGE_NATIVE_PROFILE").is_some()) else {
@@ -781,11 +783,16 @@ fn the_graph_profiled_per_kernel() {
         return;
     };
     let _one = one_at_a_time();
-    let features = std::fs::read(dump.join("features.f32")).unwrap();
+    let size = std::env::var("NEURAL_FORGE_NATIVE_PROFILE_SIZE").ok().map(|s| {
+        let (w, h) = s.split_once('x').expect("NEURAL_FORGE_NATIVE_PROFILE_SIZE is <w>x<h>");
+        (w.parse::<u32>().expect("width"), h.parse::<u32>().expect("height"))
+    });
+    let (width, height) = size.unwrap_or((WIDTH, HEIGHT));
     let g = gpu();
     let mut net = open_network(&g, &model_dir(), chain_wanted());
     // SAFETY: nothing of a previous build exists.
-    let frame = unsafe { net.build(WIDTH, HEIGHT) }.expect("build");
+    let frame = unsafe { net.build(width, height) }.expect("build");
+    let features = if size.is_some() { vec![0u8; frame.features_bytes as usize] } else { std::fs::read(dump.join("features.f32")).unwrap() };
     let d = &g.device;
     const RUNS: usize = 20;
     let mut runs: Vec<Vec<(String, f64)>> = Vec::new();
@@ -829,7 +836,7 @@ fn the_graph_profiled_per_kernel() {
             _ => by_block.push((block, *ms)),
         }
     }
-    eprintln!("profile: {} dispatches, total {total:.3} ms (median of {RUNS}), chained {}", per_dispatch.len(), frame.chained);
+    eprintln!("profile {width}x{height}: {} dispatches, total {total:.3} ms (median of {RUNS}), chained {}", per_dispatch.len(), frame.chained);
     for (kernel, ms, n) in &by_kernel {
         eprintln!("kernel {ms:8.3} ms {:5.1}% x{n:<4} {kernel}", ms / total * 100.0);
     }
