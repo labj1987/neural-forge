@@ -244,7 +244,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
                 roots.shm_path.display().to_string(),
                 None,
             ));
-            out.extend(check_vram(&gpus, None));
+            out.extend(check_vram(&gpus, None, false));
             out.push(check_never_attached(roots, manifest_ok, "no channel file".to_string()));
             out.extend(check_device_lost(None, session.as_deref()));
             out.extend(check_cannot_run(None, session.as_deref()));
@@ -252,7 +252,8 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
         Ok(Some(mapping)) => {
             let hdr = mapping.header();
             out.push(Finding::new("channel", Severity::Ok, "the settings channel opens", roots.shm_path.display().to_string(), None));
-            out.extend(check_vram(&gpus, Some(hdr)));
+            let running = hdr.native_running.load(Ordering::Relaxed) != 0 && layer_alive(hdr);
+            out.extend(check_vram(&gpus, Some(hdr), running));
             out.push(check_attached(roots, hdr, manifest_ok));
             out.extend(check_device_lost(Some(hdr), session.as_deref()));
             out.extend(check_cannot_run(Some(hdr), session.as_deref()));
@@ -266,7 +267,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
                 roots.shm_path.display().to_string(),
                 Some("Close any game still running an older Neural Forge, then run the check again.".into()),
             ));
-            out.extend(check_vram(&gpus, None));
+            out.extend(check_vram(&gpus, None, false));
             out.extend(check_device_lost(None, session.as_deref()));
             out.extend(check_cannot_run(None, session.as_deref()));
         }
@@ -618,7 +619,22 @@ fn network_need_mib(width: u32, height: u32) -> (u32, u32, u64) {
     NETWORK_VRAM_MIB.iter().copied().find(|&(w, h, _)| u64::from(w) * u64::from(h) >= pixels).unwrap_or(NETWORK_VRAM_MIB[NETWORK_VRAM_MIB.len() - 1])
 }
 
-fn check_vram(gpus: &Gpus, hdr: Option<&neural_forge_protocol::ShmHeader>) -> Vec<Finding> {
+/// Whether a game's layer is presenting now: its heartbeat (one beat per present) moves within half a second. A
+/// closed game leaves its last values in the channel, `native_running` among them.
+fn layer_alive(hdr: &neural_forge_protocol::ShmHeader) -> bool {
+    let first = hdr.layer_heartbeat.load(Ordering::Relaxed);
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if hdr.layer_heartbeat.load(Ordering::Relaxed) != first {
+            return true;
+        }
+    }
+    false
+}
+
+/// `running`: the network is resident in a game that is running now (`native_running` and [`layer_alive`]).
+fn check_vram(gpus: &Gpus, hdr: Option<&neural_forge_protocol::ShmHeader>, running: bool) -> Vec<Finding> {
     const CHECK: &str = "vram";
     let Gpus::Listed(list) = gpus else { return Vec::new() };
     let Some(gpu) = list.iter().find(|g| g.compute.is_some_and(|c| c >= MIN_COMPUTE_CAPABILITY)).or(list.first()) else { return Vec::new() };
@@ -629,7 +645,6 @@ fn check_vram(gpus: &Gpus, hdr: Option<&neural_forge_protocol::ShmHeader>) -> Ve
         let post = (h.layer_width.load(Ordering::Relaxed), h.layer_height.load(Ordering::Relaxed));
         [pre, post].into_iter().find(|&(w, h)| w != 0 && h != 0)
     });
-    let running = hdr.is_some_and(|h| h.native_running.load(Ordering::Relaxed) != 0);
     let evidence = format!("nvidia-smi: {}: {free} MiB free of {total} MiB", gpu.name);
     let Some((w, h)) = size else {
         return vec![Finding::new(
@@ -1439,16 +1454,37 @@ mod tests {
         let hdr = neural_forge_protocol::ShmHeader::default();
         hdr.init_defaults();
         // No game size yet: a note.
-        assert_eq!(check_vram(&gpus(500), Some(&hdr))[0].severity, Severity::Info);
+        assert_eq!(check_vram(&gpus(500), Some(&hdr), false)[0].severity, Severity::Info);
         hdr.preupscale_width.store(2228, Ordering::Relaxed);
         hdr.preupscale_height.store(1253, Ordering::Relaxed);
-        let low = check_vram(&gpus(500), Some(&hdr));
+        let low = check_vram(&gpus(500), Some(&hdr), false);
         assert_eq!(low[0].severity, Severity::Warning);
         assert!(low[0].summary.contains("below the 607 MiB the network needs at 2228x1253"), "{}", low[0].summary);
-        assert_eq!(check_vram(&gpus(4000), Some(&hdr))[0].severity, Severity::Ok);
+        assert_eq!(check_vram(&gpus(4000), Some(&hdr), false)[0].severity, Severity::Ok);
         // Running: the network is already in what is used.
-        hdr.native_running.store(1, Ordering::Relaxed);
-        assert_eq!(check_vram(&gpus(300), Some(&hdr))[0].severity, Severity::Ok);
+        let running = check_vram(&gpus(300), Some(&hdr), true);
+        assert_eq!(running[0].severity, Severity::Ok);
+        assert!(running[0].summary.starts_with("the network is running at 2228x1253"), "{}", running[0].summary);
+    }
+
+    /// A closed game's channel keeps `native_running` set: only a moving heartbeat says the network is resident.
+    #[test]
+    fn a_closed_games_channel_is_not_a_running_network() {
+        let hdr = neural_forge_protocol::ShmHeader::default();
+        hdr.init_defaults();
+        hdr.layer_heartbeat.store(309419, Ordering::Relaxed);
+        assert!(!layer_alive(&hdr));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    hdr.layer_heartbeat.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            assert!(layer_alive(&hdr));
+            stop.store(true, Ordering::Relaxed);
+        });
     }
 
     #[test]

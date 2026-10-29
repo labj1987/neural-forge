@@ -4,6 +4,11 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.9.5 — 2026-10-29
+
+- `neural-forge-cli doctor` no longer reports the network as running after the game has closed, and it warns
+  again when there is too little VRAM free for the network at the last game's size.
+
 ## 3.9.4 — 2026-10-29
 
 - The network loads about a third of a second sooner: checking the model's files takes 0.17 s instead of 0.52 s
