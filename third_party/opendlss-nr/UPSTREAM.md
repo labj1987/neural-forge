@@ -24,7 +24,8 @@ both are generated at build time and embedded into the library.
 ## Included
 
 - `src/`: the host code: `kernels.cpp/.h`, `nr_graph.cpp/.h`, `nr_model.cpp/.h`, `vk_context.cpp/.h`,
-  `json.h`, `numeric.h`, `sha256.h`.
+  `numeric.h`. Upstream's `json.h` and `sha256.h` were removed in Neural Forge 3.9.4: the model directory is
+  read and checked by `crates/native/src/model_file.rs`, and `nr::Model` takes the tensor records it read.
 - `shaders/`: every GLSL compute shader (`*.comp`) and include (`*.glsl`).
 - `scripts/ptx/`: the PTX generators (`ptxgen.py`, `swin.py`, the `*_e4m3.py` kernels, `test_fast_divmod.py`).
 - `NOTICE`, `LICENSE`.

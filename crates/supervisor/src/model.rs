@@ -432,7 +432,7 @@ fn stage_of(network: Network, block: u32) -> Option<&'static str> {
     network.stages().iter().find(|(_, first, last)| (*first..=*last).contains(&block)).map(|s| s.0)
 }
 
-/// Upper case: `nr::Model` compares its own upper-case digest (`sha256.h`) as a string.
+/// Upper case, as every model directory has it (the native backend's loader takes either case).
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02X}")).collect()
 }

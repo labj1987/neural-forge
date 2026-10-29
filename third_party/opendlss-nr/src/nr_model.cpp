@@ -1,13 +1,8 @@
 #include "nr_model.h"
 
 #include <cassert>
-#include <filesystem>
-#include <fstream>
-#include <sstream>
-
-#include "json.h"
-#include "numeric.h"
-#include "sha256.h"
+#include <cstring>
+#include <stdexcept>
 
 namespace nr {
 
@@ -35,30 +30,6 @@ uint32_t packedWeightIndex(uint32_t k, uint32_t n, uint32_t outputChannels) {
 }
 
 namespace {
-std::string readText(const std::string& path) {
-  std::error_code error;
-  if (!std::filesystem::is_regular_file(path, error)) throw std::runtime_error("cannot read " + path + " (not a file)");
-  std::ifstream file(path, std::ios::binary);
-  if (!file) throw std::runtime_error("cannot read " + path);
-  std::stringstream stream;
-  stream << file.rdbuf();
-  if (file.bad()) throw std::runtime_error("cannot read " + path);
-  return stream.str();
-}
-
-std::vector<uint8_t> readBinary(const std::string& path) {
-  // A directory opens, and sizes as the largest offset there is: only a regular file is read.
-  std::error_code error;
-  if (!std::filesystem::is_regular_file(path, error)) throw std::runtime_error("cannot read " + path + " (not a file)");
-  std::ifstream file(path, std::ios::binary | std::ios::ate);
-  if (!file) throw std::runtime_error("cannot read " + path);
-  const std::streamsize size = file.tellg();   // -1 when the size cannot be known
-  if (size < 0 || !file.seekg(0)) throw std::runtime_error("cannot size " + path);
-  std::vector<uint8_t> bytes((size_t)size);
-  if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) throw std::runtime_error("cannot read " + path);
-  return bytes;
-}
-
 // Half index of an f16 weight inside a packed matrix: 16x16 tiles in (k, n) row-major order, each tile one
 // m16n8k16 B fragment pair - lane (n % 8) * 4 + (k % 8) / 2, four halves per lane per 8-column half.
 // The two f16 matrices of the network (the 16 -> 32 input adapter and the 32 -> 4 head) are the two ways this
@@ -90,42 +61,16 @@ uint32_t Tensor::auxOffset(uint32_t byteOffset, uint32_t bytes) const {
                            name + " overlaps bytes a matrix was built from (not in the compacted raw buffer)");
 }
 
-Model::Model(vk::Context& context, const std::string& directory, bool verifyHashes) : context_(context) {
+Model::Model(vk::Context& context, uint32_t blockCount, std::vector<Tensor> records)
+    : context_(context), blockCount_(blockCount) {
   // A throw destroys what was made so far (the destructor does not run for a constructor that throws).
   try {
-    json::Value manifest = json::parse(readText(directory + "/manifest.json"));
-    blockCount_ = (uint32_t)manifest["totals"]["blockCount"].integer();
-    for (const json::Value& stage : manifest["stages"].array) {
-      Stage loaded;
-      loaded.id = stage["id"].str();
-      loaded.bytes = readBinary(directory + "/model/" + stage["file"].str());
-      if (loaded.bytes.size() != (size_t)stage["packedByteLength"].integer())
-        throw std::runtime_error("stage size mismatch: " + loaded.id);
-      if (verifyHashes) {
-        std::string digest = sha256Hex(loaded.bytes.data(), loaded.bytes.size());
-        if (digest != stage["sha256"].str()) throw std::runtime_error("stage SHA-256 mismatch: " + loaded.id);
-      }
-      stages_.push_back(std::move(loaded));
-    }
-    for (const json::Value& entry : manifest["tensors"].array) {
-      Tensor tensor;
-      tensor.name = entry["name"].str();
-      tensor.block = (int)entry["block"].integer();
-      tensor.layer = (int)entry["layer"].integer();
-      tensor.parameter = entry["parameter"].str();
-      tensor.stage = entry["stage"].str();
-      tensor.stageOffset = (uint32_t)entry["stageOffset"].integer();
-      tensor.byteLength = (uint32_t)entry["byteLength"].integer();
-      const Stage* stage = nullptr;
-      for (const Stage& candidate : stages_) if (candidate.id == tensor.stage) stage = &candidate;
-      if (!stage) throw std::runtime_error("tensor references unknown stage " + tensor.stage);
-      if ((size_t)tensor.stageOffset + tensor.byteLength > stage->bytes.size())
-        throw std::runtime_error("tensor exceeds stage " + tensor.name);
-      tensor.bytes = stage->bytes.data() + tensor.stageOffset;
+    for (Tensor& tensor : records) {
+      if (tensor.byteLength && !tensor.bytes) throw std::runtime_error("tensor " + tensor.name + " has no bytes");
       // Raw bytes on the GPU for per-column aux vectors (padded to 4 bytes).
       size_t padded = (tensor.byteLength + 3) & ~3u;
       std::vector<uint8_t> paddedBytes(padded, 0);
-      memcpy(paddedBytes.data(), tensor.bytes, tensor.byteLength);
+      if (tensor.byteLength) memcpy(paddedBytes.data(), tensor.bytes, tensor.byteLength);
       // Owned by tensors_ before anything that can throw, so a failure releases it.
       const std::string name = tensor.name;
       // A second entry of the same name would replace the first and leak its buffer.

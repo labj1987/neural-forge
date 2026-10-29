@@ -1,5 +1,6 @@
-// Model loading: manifest, packed E4M3 stage files and the host-side re-layout of the MMA-fragment-ordered
-// weights into plain matrices that cooperative-matrix loads consume directly.
+// The model's weights on the GPU: the tensor records (read and checked from the manifest and the packed E4M3
+// stage files by the caller) and the host-side re-layout of the MMA-fragment-ordered weights into plain matrices
+// that cooperative-matrix loads consume directly.
 #pragma once
 #include <map>
 #include <memory>
@@ -18,7 +19,7 @@ struct Tensor {
   std::string stage;
   uint32_t stageOffset = 0;
   uint32_t byteLength = 0;
-  const uint8_t* bytes = nullptr;  // into the owning stage
+  const uint8_t* bytes = nullptr;  // into the stage's bytes, which the caller keeps for the Model's lifetime
   vk::Buffer raw;                  // raw packed bytes on the GPU (aux vectors, scales)
   // After Model::compactAux, raw holds only the record's bytes no matrix was built from: each run of them
   // [from, to) at raw offset `at`, which keeps the record offset's alignment modulo 16.
@@ -38,7 +39,9 @@ uint32_t packedWeightIndex(uint32_t k, uint32_t n, uint32_t outputChannels);
 
 class Model {
  public:
-  Model(vk::Context& context, const std::string& directory, bool verifyHashes = true);
+  // `records` as the model file lists them, each one's `byteLength` bytes at `bytes` inside its stage; the bytes
+  // stay valid and unchanged while the Model lives. Uploads each record's raw buffer.
+  Model(vk::Context& context, uint32_t blockCount, std::vector<Tensor> records);
   ~Model();
 
   const Tensor& tensor(int block, int layer = 0, const std::string& parameter = "layer") const;
@@ -77,12 +80,7 @@ class Model {
 
  private:
   void release();   // the destructor's cleanup (also a constructor's that throws)
-  struct Stage {
-    std::string id;
-    std::vector<uint8_t> bytes;
-  };
   vk::Context& context_;
-  std::vector<Stage> stages_;
   std::map<std::string, Tensor> tensors_;
   std::map<std::string, vk::Buffer> matrices_;
   // Until compactAux: per tensor, the record's bytes a matrix was built from.
