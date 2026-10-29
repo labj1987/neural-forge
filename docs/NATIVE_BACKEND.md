@@ -169,7 +169,7 @@ stages by resolution: `encoder32` (blocks 0-4), `encoder64` (5-8), `encoder128` 
 `encoder256` (15-22), `encoder512` (23-30), `vit` (31-38), `decoder512` (39-47), `decoder256`
 (48-55), `decoder128` (56-61), `decoder64` (62-65), `decoder32` (66-70); tensors 16-byte aligned
 in each file. The manifest also records the source DLL's build and SHA-256. Stage hashes are
-upper-case hex, because `nr::Model` compares its own upper-case digest as a string. The output
+upper-case hex (the loader, `crates/native/src/model_file.rs`, takes either case). The output
 directory is ignored in `.gitignore` (`/model/`, `*.e4m3`) in case it is ever written inside the
 tree. Extraction takes 0.26 s.
 

@@ -551,7 +551,7 @@ struct NfNative {
 
 extern "C" {
 
-uint32_t nf_native_abi_version(void) { return 5; }
+uint32_t nf_native_abi_version(void) { return 6; }
 
 uint32_t nf_native_hold_slots(void) { return kHoldPools; }
 
@@ -700,7 +700,21 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
     n->context = std::make_unique<vk::Context>(open->gipa, open->instance, open->physical, open->device, open->queue_family,
                                                open->queue_index, n->fenceTimeoutNs, open->init_dispatchable, open->init_user,
                                                open->frame_family);
-    n->model = std::make_unique<nr::Model>(*n->context, open->model_dir, true);
+    if (!open->model || (open->model->tensor_count && !open->model->tensors)) throw std::runtime_error("no model");
+    std::vector<nr::Tensor> records(open->model->tensor_count);
+    for (size_t i = 0; i < records.size(); ++i) {
+      const NfNativeTensor& from = open->model->tensors[i];
+      nr::Tensor& to = records[i];
+      to.name = from.name;
+      to.block = from.block;
+      to.layer = from.layer;
+      to.parameter = from.parameter;
+      to.stage = from.stage;
+      to.stageOffset = from.stage_offset;
+      to.byteLength = from.byte_length;
+      to.bytes = from.bytes;
+    }
+    n->model = std::make_unique<nr::Model>(*n->context, open->model->block_count, std::move(records));
     n->rawLoaded = n->model->rawBytes();
     n->kernels = std::make_unique<nr::Kernels>(*n->context, std::string());
     n->kernels->setSiluTable(ref::siluTable());

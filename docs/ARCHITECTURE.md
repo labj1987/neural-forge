@@ -780,7 +780,8 @@ With `NEURAL_FORGE_PREUPSCALE=dump` the one-shot is the pre-upscaler dump's.
 ## 6. The network
 
 `crates/native` (the network's C++ from OpenDLSS-NR, in `third_party/opendlss-nr`, `cpp/nf_native.cpp` glue, kernels built and embedded
-by `build.rs`), `crates/layer/src/preupscale/native.rs` (the loader, the per-device state, the hold).
+by `build.rs`; the model directory is read and checked in Rust, `src/model_file.rs`, and the C++ gets its tensor table),
+`crates/layer/src/preupscale/native.rs` (the loader, the per-device state, the hold).
 
 - **Device setup** (`create_device`): on an NVIDIA device with the pre-upscaler path on, the layer
   checks the network's requirements and adds `VK_NV_cuda_kernel_launch`,
@@ -788,7 +789,7 @@ by `build.rs`), `crates/layer/src/preupscale/native.rs` (the loader, the per-dev
   features to the game's device, and a queue in a compute family without graphics. A device that
   lacks one is created exactly as the game asked and the log names what was missing.
 - **Loading**, lazily on the first hold (or the first post-path request): the model directory (hash
-  checked, 0.53-0.66 s), the weights' device copies, the kernels, a first run so the driver compiles
+  checked, 0.17 s for the full network), the weights' device copies, the kernels, a first run so the driver compiles
   the PTX, and the graph's recording for the frame's extent (0.73-1.15 s at 1485x836), on a loader
   thread and the layer's compute queue, never the game's graphics queue (a graphics-family queue
   faulted the game's channel).

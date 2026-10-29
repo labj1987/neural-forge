@@ -51,6 +51,25 @@ void nf_native_device_restore(void* state);
 
 typedef struct NfNative NfNative;
 
+// One tensor record of the model, read and checked by the Rust side (crates/native/src/model_file.rs): `bytes`
+// is its `byte_length` bytes at `stage_offset` in stage `stage`'s file.
+typedef struct NfNativeTensor {
+  const char* name;
+  const char* parameter;
+  const char* stage;
+  int32_t block;
+  int32_t layer;
+  uint32_t stage_offset;
+  uint32_t byte_length;
+  const uint8_t* bytes;
+} NfNativeTensor;
+
+typedef struct NfNativeModel {
+  uint32_t block_count;             // the manifest's totals.blockCount
+  const NfNativeTensor* tensors;
+  size_t tensor_count;
+} NfNativeModel;
+
 typedef struct NfNativeOpen {
   PFN_vkGetInstanceProcAddr gipa;   // the next layer's
   VkInstance instance;
@@ -59,7 +78,9 @@ typedef struct NfNativeOpen {
   uint32_t queue_family;            // the family of a queue the layer added for the network (uploads, warm-up)
   uint32_t queue_index;             // that queue's index; nothing else may use it
   uint32_t frame_family;            // the family of the game's queue the recorded graph runs on
-  const char* model_dir;            // the extract-model output
+  // The extract-model output, loaded and verified (SHA-256): read during the call, and the records' strings and
+  // bytes stay valid and unchanged until nf_native_close (the weights are re-laid out from them on demand).
+  const NfNativeModel* model;
   uint32_t chain;                   // 1: counter chaining between PTX launches; 0: barriers
   uint32_t fence_timeout_ms;        // bound on every wait this side makes
   // Called on every dispatchable object this side gets from below the loader (its queue, its command
@@ -68,7 +89,7 @@ typedef struct NfNativeOpen {
   void* init_user;
 } NfNativeOpen;
 
-// Loads and verifies the model (SHA-256), builds the kernels. Slow (seconds): run off the game's
+// Uploads the model's records, builds the kernels. Slow (seconds): run off the game's
 // threads. Uses only `queue_index`, which nothing else may use while any nf_native call runs. On
 // failure `*stalled` (when not null) says whether a wait on the queue timed out (nf_native_stalled).
 // One network per process at a time (volk's function table is process-global): fails while another

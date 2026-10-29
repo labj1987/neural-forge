@@ -4,6 +4,14 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.9.4 — 2026-10-29
+
+- The network loads about a third of a second sooner: checking the model's files takes 0.17 s instead of 0.52 s
+  for the full network.
+- Checking the model's files is stricter, and its errors name the stage and file at fault: a negative or
+  fractional number in the manifest, a stage file named outside the model's folder, or a stage listed twice is
+  refused. Before, such a number was read as some other value, and of a stage listed twice only the last copy was used.
+
 ## 3.9.3 — 2026-10-28
 
 - A damaged or wrong network model is refused with an error that names the file at fault. Before, a misspelt

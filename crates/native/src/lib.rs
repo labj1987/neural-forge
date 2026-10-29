@@ -4,6 +4,8 @@
 //! `build.rs` compiles the kernels with the pinned toolchain from `scripts/fetch-native-tools.sh`, embeds
 //! them, and links the C++ (libstdc++ included, statically) into this rlib. x86_64 Linux only.
 //!
+//! The model directory is read and checked on this side ([`ModelFile`]); the C++ gets its tensor table.
+//!
 //! The layer drives it in three steps: [`device_extend`] at `vkCreateDevice` (the network's extensions
 //! and features), [`Network::open`] and [`Network::build`] off the game's threads (model, kernels, the
 //! graph for one size), then every frame it executes [`Network::graph_commands`] between its own
@@ -13,6 +15,10 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
 
 use ash::vk;
+
+mod model_file;
+
+pub use model_file::ModelFile;
 
 mod ffi {
     use super::*;
@@ -26,7 +32,7 @@ mod ffi {
         pub queue_family: u32,
         pub queue_index: u32,
         pub frame_family: u32,
-        pub model_dir: *const c_char,
+        pub model: *const crate::model_file::View,
         pub chain: u32,
         pub fence_timeout_ms: u32,
         pub init_dispatchable: Option<InitDispatchable>,
@@ -264,6 +270,8 @@ impl std::fmt::Display for OpenError {
 /// The network on one device.
 pub struct Network {
     raw: *mut c_void,
+    // The weights `raw` reads from (the C++ keeps pointers into them): dropped after `raw` is closed.
+    _model: ModelFile,
 }
 
 // SAFETY: the C++ object has no thread affinity, and every use goes through `&mut self` or is
@@ -273,7 +281,7 @@ pub struct Network {
 unsafe impl Send for Network {}
 
 impl Network {
-    /// Loads and verifies the model and builds the kernels. Seconds. One network per process at a time:
+    /// Loads and verifies the model ([`ModelFile::load`]) and builds the kernels. Seconds. One network per process at a time:
     /// fails while another is open.
     ///
     /// # Safety
@@ -286,8 +294,8 @@ impl Network {
     /// early return or a panic's unwinding included). The handles the safe accessors return carry the same
     /// obligation: submitting one is the caller's unsafe Vulkan call.
     pub unsafe fn open(info: &OpenInfo) -> Result<Self, OpenError> {
-        let dir = CString::new(info.model_dir.as_os_str().as_encoded_bytes())
-            .map_err(|_| OpenError { message: "a NUL in the model path".to_string(), stalled: false })?;
+        let model = ModelFile::load(info.model_dir).map_err(|message| OpenError { message, stalled: false })?;
+        let view = model.view();
         let open = ffi::Open {
             gipa: info.gipa,
             instance: info.instance,
@@ -296,7 +304,7 @@ impl Network {
             queue_family: info.queue_family,
             queue_index: info.queue_index,
             frame_family: info.frame_family,
-            model_dir: dir.as_ptr(),
+            model: &view,
             chain: u32::from(info.chain),
             fence_timeout_ms: info.fence_timeout_ms,
             init_dispatchable: info.init_dispatchable,
@@ -304,12 +312,13 @@ impl Network {
         };
         let mut err = [0 as c_char; MESSAGE];
         let mut stalled = 0;
-        // SAFETY: forwarded from this function's contract; the out-pointers are to locals.
+        // SAFETY: forwarded from this function's contract; the out-pointers are to locals; the table's bytes stay
+        // where they are while `model` lives, which the network keeps until after it is closed.
         let raw = unsafe { ffi::nf_native_open(&open, &mut stalled, err.as_mut_ptr(), MESSAGE) };
         if raw.is_null() {
             Err(OpenError { message: message(&err), stalled: stalled != 0 })
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _model: model })
         }
     }
 
@@ -566,8 +575,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn abi_version_is_5() {
-        assert_eq!(abi_version(), 5);
+    fn abi_version_is_6() {
+        assert_eq!(abi_version(), 6);
     }
 
     /// The layer's slot count and the C++ side's pool count are one number.
