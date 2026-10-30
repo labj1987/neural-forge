@@ -1362,6 +1362,16 @@ ReShade, dlssg-to-fsr3, the FSR 4 overrides, HelixSR), read for what Neural Forg
   Moving it to another queue could only overlap it with the game's own work at a frame of latency, and TheAutomatic's
   A/B (`docs/decisions.md`, 09-21) found the previous frame's colour with the current frame's vectors blurred the whole
   picture.
+- **Not taken, again (2026-10-30): an asynchronous network with a residual and displacement tracking**
+  (RedDukeDev/dlss5-nr-amd-custom, docs/DESIGN.md: the network on its own queue, slots, the residual composed through
+  a per-capture displacement map with gone-pixel fallbacks). Its answer to the blur above is what the edit cache
+  already does in line: the edit carried to the frames the network skips along the motion vectors, checked against
+  depth and colour, with a same-surface fill. What is left is speed, and at 4K on the RTX 5070 the GPU is 95% busy with
+  the model off (October 29): another queue adds no GPU time, so async gains only by evaluating the network less often,
+  which is the edit cache's interval. Measured in 3.3 (pan dump): every 2nd frame (shipped) trails p99.5 0.324 and keeps
+  69% of the effect; every 3rd 0.419 and 60%; every 4th 0.485 and 52%. From the 4K timings (network 12.9 ms on half the
+  frames) every 3rd frame would gain about 11% real fps, every 4th about 18%. Worth reopening only on a GPU with idle
+  time at the resolution played.
 - **Not taken, programmatic dependent launch** (`griddepcontrol`, lmxxf's home-made PDL): the launches go through
   `vkCmdCudaLaunchKernelNV`, which takes no CUDA launch attributes, and counter chaining already overlaps them.
 - **Not taken, skipping the ViT when the picture has not changed** (lmxxf's `DLSS5_VIT_ADAPTIVE`, 5-6% in motion):
