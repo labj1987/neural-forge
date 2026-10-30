@@ -4,6 +4,24 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.9.8 — 2026-10-30
+
+Fixes from a review of the whole code base:
+
+- A setting changed in the app is no longer lost when saving `config.ini` fails (a full disk, a folder that cannot
+  be written): it is saved with the next change or when the window closes.
+- A look-up table whose file is removed or cannot be read no longer stays applied before the upscaler while
+  another colour setting (saturation, contrast, detail) is in use.
+- A `.cube` file with more rows than its `LUT_3D_SIZE` is refused at the first row too many, instead of being read
+  whole into the game's memory first.
+- `NEURAL_FORGE_PREUPSCALE_TRANSFER=linear` now works with the edit cache on: before, the frames in between
+  the network's carried a slightly different change than the network's own, so brightness could pulse in motion.
+- After a GPU device loss, the layer reliably stops working on that device instead of repeating a failing
+  submission on some frames.
+- Neural Forge no longer reads DLSS5VKLayer's `DLSS5VK_*` environment variables. Set for that separate layer,
+  they changed how Neural Forge's network ran. The testing switches they named are now `NEURAL_FORGE_NR_*`.
+- A video memory leak when the auto-exposure pass could not be set up is fixed.
+
 ## 3.9.7 — 2026-10-30
 
 - Building the network takes no more video memory than it keeps: before, a build briefly held about twice that
