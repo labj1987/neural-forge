@@ -13,7 +13,8 @@
 // limitations under the License.
 //
 // Modified for Neural Forge (2026): ported to ash 0.38; review fixes, among them the layer's data
-// dropped before the next layer's destroy and the core tables' alias fallback (UPSTREAM.md).
+// dropped before the next layer's destroy, the core tables' alias fallback and the instance commands
+// of device extensions in vkGetInstanceProcAddr (UPSTREAM.md).
 
 #![warn(missing_docs)]
 #![cfg_attr(all(doc, RUSTC_NIGHTLY), feature(doc_auto_cfg))]
@@ -450,11 +451,12 @@ mod vk_utils;
 use bindings::vk_layer::{VkLayerDeviceCreateInfo, VkLayerFunction, VkLayerInstanceCreateInfo};
 pub use bindings::vk_layer::{VkLayerDeviceLink, VkLayerInstanceLink};
 pub use global_simple_intercept::Extension;
-use global_simple_intercept::{DeviceDispatchTable, InstanceDispatchTable, VulkanCommand};
+use global_simple_intercept::{DeviceDispatchTable, Feature, InstanceDispatchTable, VulkanCommand};
 pub use layer_trait::{
     DeviceHooks, DeviceInfo, ExtensionProperties, GlobalHooks, GlobalHooksInfo, InstanceHooks,
     InstanceInfo, Layer, LayerManifest, LayerResult, VulkanCommand as LayerVulkanCommand,
 };
+use smallvec::SmallVec;
 use unstable_api::{ApiVersion, IsCommandEnabled, LazyCollection};
 pub use vk_utils::{fill_vk_out_array, VulkanBaseInStructChain, VulkanBaseOutStructChain};
 use vk_utils::{ptr_as_uninit_mut, slice_from_raw_parts, slice_to_owned_strings};
@@ -1353,6 +1355,15 @@ impl<T: Layer> Global<T> {
         unsafe { fill_vk_out_array(&device_extensions, property_count, p_properties) }
     }
 
+    /// The device extensions the layer supports itself ([`LayerManifest::device_extensions`]).
+    fn layer_device_extensions() -> BTreeSet<Extension> {
+        T::manifest()
+            .device_extensions
+            .iter()
+            .map(|ExtensionProperties { name, .. }| name.clone())
+            .collect()
+    }
+
     /// The `vkGetInstanceProcAddr` entry point provided by the layer framework.
     ///
     /// The layer framework will make use of [`Layer::hooked_instance_commands`] and
@@ -1411,7 +1422,9 @@ impl<T: Layer> Global<T> {
     ///        regardless of whether the layer implementation wants to intercept the command or not,
     ///        and rely on the next layer to return `NULL`.
     ///
-    ///     1. For device extension dispatchable commands directly supported by the layer
+    ///     1. For device extension dispatchable commands (device commands, and physical-device
+    ///        commands of a device extension, e.g. `vkGetPhysicalDeviceFragmentShadingRatesKHR`,
+    ///        which no instance enables) directly supported by the layer
     ///        implementation according to [`LayerManifest::device_extensions`], always returns a
     ///        local function pointer if the layer implementation intercepts the command. Otherwise,
     ///        returns the function pointer of the next layer.
@@ -1520,10 +1533,30 @@ impl<T: Layer> Global<T> {
                 &instance_info.api_version,
                 &instance_info.enabled_extensions,
             );
-            if !enabled {
+            if enabled {
+                return instance_command.proc;
+            }
+            // A physical-device command of a device extension (vkGetPhysicalDeviceFragmentShadingRatesKHR):
+            // the instance enables no device extensions, so it is available, as a device command is,
+            // when the layer supports the extension or the next layer resolves the command.
+            let device_features: SmallVec<[Feature; 2]> = instance_command
+                .features
+                .iter()
+                .filter(|feature| matches!(feature, Feature::Extension(extension) if extension.is_device_extension()))
+                .cloned()
+                .collect();
+            if device_features.is_empty() {
                 return get_next_proc_addr();
             }
-            return instance_command.proc;
+            let next_proc_addr = get_next_proc_addr();
+            let available = device_features
+                .is_command_enabled(&instance_info.api_version, &Self::layer_device_extensions())
+                || next_proc_addr.is_some();
+            return if available {
+                instance_command.proc
+            } else {
+                next_proc_addr
+            };
         }
         let device_commands = &instance_info.device_commands;
         let device_command =
@@ -1536,16 +1569,11 @@ impl<T: Layer> Global<T> {
             if !device_command.hooked {
                 return next_proc_addr;
             }
-            let layer_device_extensions: BTreeSet<Extension> = T::manifest()
-                .device_extensions
-                .iter()
-                .map(|ExtensionProperties { name, .. }| name.clone())
-                .collect();
             // If the layer supports the command or the next proc addr can find it, this is an
             // available device command.
             let command_available = device_command
                 .features
-                .is_command_enabled(&instance_info.api_version, &layer_device_extensions)
+                .is_command_enabled(&instance_info.api_version, &Self::layer_device_extensions())
                 || next_proc_addr.is_some();
             if command_available {
                 return device_command.proc;

@@ -12,9 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
+// Modified for Neural Forge (2026): ported to ash 0.38; a doctest that a hook cannot keep the
+// application's arrays (UPSTREAM.md).
 
 //! This module includes all the traits that require the layer implementation to implement.
+//!
+//! The arrays a hook is given are the application's, valid only for the call. The iterator over a
+//! `VkBool32` array is no exception: a hook cannot ask for it as `'static` and keep it.
+//!
+//! ```compile_fail,E0276
+//! use ash::vk;
+//! use std::cell::RefCell;
+//! use vulkan_layer::{DeviceHooks, LayerResult};
+//!
+//! thread_local! {
+//!     static KEPT: RefCell<Option<Box<dyn Iterator<Item = bool>>>> = const { RefCell::new(None) };
+//! }
+//!
+//! struct Keeps;
+//!
+//! impl DeviceHooks for Keeps {
+//!     fn cmd_set_color_write_enable_ext<T: Iterator<Item = bool> + 'static>(
+//!         &self,
+//!         _command_buffer: vk::CommandBuffer,
+//!         p_color_write_enables: T,
+//!     ) -> LayerResult<()> {
+//!         KEPT.with(|k| *k.borrow_mut() = Some(Box::new(p_color_write_enables)));
+//!         LayerResult::Unhandled
+//!     }
+//! }
+//! ```
 
 use crate::{bindings::vk_layer::VkLayerInstanceLink, global_simple_intercept::Extension, Global};
 use ash::vk;

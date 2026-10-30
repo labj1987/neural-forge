@@ -4422,7 +4422,7 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
-    fn cmd_set_color_write_enable_ext<T: Iterator<Item = bool> + 'static>(
+    fn cmd_set_color_write_enable_ext<T: Iterator<Item = bool>>(
         &self,
         _command_buffer: vk::CommandBuffer,
         _p_color_write_enables: T,
@@ -4680,7 +4680,7 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
-    fn cmd_set_color_blend_enable_ext<T: Iterator<Item = bool> + 'static>(
+    fn cmd_set_color_blend_enable_ext<T: Iterator<Item = bool>>(
         &self,
         _command_buffer: vk::CommandBuffer,
         _first_attachment: u32,

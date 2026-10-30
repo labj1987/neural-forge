@@ -93,3 +93,12 @@ this project's own code: upstream is no longer tracked.
    device that enabled the extension), an `Unhandled` call reached ash's panicking stub. The generator now emits
    `command_aliases` from the registry's aliases, and the loaders (the core tables and the extensions') try them
    in turn when a name resolves to NULL.
+5. **Fixes from the 2026-10-30 review.** The hooks for a `VkBool32` array (`cmd_set_color_write_enable_ext`,
+   `cmd_set_color_blend_enable_ext`) took their iterator as `T: Iterator<Item = bool> + 'static`, though it reads
+   the application's array, valid only for the call: a hook could keep it and read freed memory from safe code.
+   The bound is gone (`vk_xml_util.py`), and a `compile_fail` doctest in `layer_trait.rs` holds it. And
+   `vkGetInstanceProcAddr` gated a physical-device command of a device extension
+   (`vkGetPhysicalDeviceFragmentShadingRatesKHR`, `vkGetPhysicalDeviceToolPropertiesEXT` below 1.3) on the
+   instance's enabled extensions, which never hold a device extension, so a hook on one was never returned. It is
+   now available as a device command is: when the layer supports the extension or the next layer resolves it. The
+   generator emits `Extension::is_device_extension` from the registry's `type="device"` for that.

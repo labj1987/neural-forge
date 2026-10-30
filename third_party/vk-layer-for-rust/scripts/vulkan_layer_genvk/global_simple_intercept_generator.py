@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Modified for Neural Forge (2026): ported to ash 0.38; the command alias table (UPSTREAM.md).
+# Modified for Neural Forge (2026): ported to ash 0.38; the command alias table; whether an extension is a
+# device one (UPSTREAM.md).
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
@@ -52,6 +53,8 @@ class CommandDispatchInfo:
     class ExtensionInfo(NamedTuple):
         vendor: str
         name: str
+        # The registry's type="device" (else "instance").
+        is_device: bool
 
     # Core commands only have core_info field. Extension commands only have extension_info field.
     core_info: Optional[CoreInfo]
@@ -77,8 +80,13 @@ class CommandDispatchInfo:
                 version_major=int(version_number[0]), version_minor=int(version_number[1])
             )
         else:
+            extension_type = feature.elem.get("type")
+            assert extension_type in (
+                "device",
+                "instance",
+            ), f"{feature.name} is neither a device nor an instance extension"
             extension_info = CommandDispatchInfo.ExtensionInfo(
-                vendor=feature.category, name=feature.name
+                vendor=feature.category, name=feature.name, is_device=extension_type == "device"
             )
         commands: set[str] = set()
         for command_elem in feature.elem.iterfind("require/command"):
@@ -138,6 +146,7 @@ class CommandDispatchInfo:
             "    fn from(value: Extension) -> &'static str {",
             "         match value {",
         ]
+        device_variants: list[str] = []
         for dispatch_info in dispatch_infos:
             if dispatch_info.core_info is not None:
                 pass
@@ -151,6 +160,8 @@ class CommandDispatchInfo:
                 str_from_extension_enum_lines.append(
                     f'            Extension::{variant_name} => "{extension_info.name}",'
                 )
+                if extension_info.is_device:
+                    device_variants.append(f"Extension::{variant_name}")
             else:
                 assert False, "A dispatch info should be either from an extension or from the core"
 
@@ -166,12 +177,22 @@ class CommandDispatchInfo:
             "    }",
             "}",
         ]
+        is_device_lines = [
+            "impl Extension {",
+            "    /// Whether this is a device extension (the registry's `type=\"device\"`), not an instance one.",
+            "    pub fn is_device_extension(&self) -> bool {",
+            f"        matches!(self, {' | '.join(device_variants)})",
+            "    }",
+            "}",
+        ]
         return (
             extension_enum_lines
             + ["\n"]
             + extension_enum_try_from_lines
             + ["\n"]
             + str_from_extension_enum_lines
+            + ["\n"]
+            + is_device_lines
             + ["\n"]
         )
 
