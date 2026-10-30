@@ -608,16 +608,8 @@ fn check_compute_capability(gpus: &Gpus) -> Vec<Finding> {
 
 // ---- VRAM ----------------------------------------------------------------------------------------
 
-/// What the network needs at a size: `(width, height, MiB)`, the device-local memory the full network's open and
-/// build at that size take on the test machine (weights and activations, the activations shared by lifetime:
-/// docs/NATIVE_BACKEND.md, "Activation memory"; the small network takes about 45 MiB less).
-const NETWORK_VRAM_MIB: [(u32, u32, u64); 4] = [(1485, 836, 377), (2228, 1253, 607), (2560, 1440, 729), (3840, 2160, 1415)];
-
-/// The network's need at `width` x `height`: the smallest measured size that covers it, or the largest.
-fn network_need_mib(width: u32, height: u32) -> (u32, u32, u64) {
-    let pixels = u64::from(width) * u64::from(height);
-    NETWORK_VRAM_MIB.iter().copied().find(|&(w, h, _)| u64::from(w) * u64::from(h) >= pixels).unwrap_or(NETWORK_VRAM_MIB[NETWORK_VRAM_MIB.len() - 1])
-}
+// What the network needs at a size (`NETWORK_VRAM_MIB`, measured; the small network takes about 45 MiB less).
+use neural_forge_protocol::vram_need::{network_need_mib, NETWORK_VRAM_MIB};
 
 /// Whether a game's layer is presenting now: its heartbeat (one beat per present) moves within half a second. A
 /// closed game leaves its last values in the channel, `native_running` among them.

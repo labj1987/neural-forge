@@ -47,6 +47,7 @@ pub mod processes;
 pub mod rebuild;
 mod slot;
 pub mod state_log;
+pub mod vram_need;
 
 pub use header::{
     load64, pass_setting, resolved_scale, setting_bounds, store64, ColourSettings, EditColour, HudRegion, HudRegionWords, HudSettings, MaskSettings,

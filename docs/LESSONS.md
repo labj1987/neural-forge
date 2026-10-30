@@ -1435,6 +1435,55 @@ made 25% brighter or more.
 Kept as a testing mode; the default and the 3.8.13 fade stay. The Remix strength preset (its defaults: structure 0.7,
 tone 0.3, character structure 0.5) is in the Model tab.
 
+## October 29: 4K, video memory and the guard
+
+GTA V Enhanced at 3840x2160 on the RTX 5070 (12 GB), three runs per configuration, on NVIDIA 615.78.08 stock and
+with the ogkm-experimental patch series (the same numbers within noise, and no NVRM or Xid line on either).
+
+### Frame generation in the benchmark
+
+- **Found:** the Reflex race above is lost when GTA presents many frames on a loading screen before Reflex is
+  back. Without Neural Forge its 4K loading screens run at 300-1,500 fps: frame generation stayed on in 0 of 6
+  launches, with Neural Forge (slower loading screens) in 3 of 8.
+- **Fix:** GTA's own `FrameLimit` 120 in settings.xml for runs with frame generation (gameplay renders under 120,
+  so pass 4 is untouched): frame generation stayed on in every launch since (22 of 22). Runs without frame
+  generation keep no limit.
+
+### The network's cost at 4K
+
+- The network alone (rig profile, per-dispatch timestamps): 5.86 ms at 1486x836 (1440p, DLSS Balanced),
+  10.89 ms at 2228x1253 (4K): 1.86 times for 2.25 times the pixels (the convolutions and FFNs scale with the
+  pixels, the ViT blocks and fixed costs less). In the game 12.9 against 10.9 ms (+19 %), the same ratio as
+  at 1440p (6.5 against 5.5): nothing 4K-specific.
+- The fps cost is larger at 4K (+9.7 ms a frame against +2.6 ms, frame generation off) because GTA leaves the
+  GPU 35 % idle at 1440p (CPU-bound, 94.5 fps with the model off), which absorbs most of the network; at 4K the
+  GPU is 95 % busy. The only lever, a smaller model resolution, is in the list below.
+
+### Video memory pressure, and the guard (3.9.6)
+
+- **Measured** with another process holding device-local memory and rewriting it every 100 ms
+  (frame generation 4x, full network): 1 GB held, the network stayed resident (12.4 ms) and the game ran at
+  30 real / 121 shown; 2 GB held, the driver moved the network to system memory: 290-396 ms a frame, about
+  17 shown fps, the benchmark never finished, and the ctxBufPoolReserve out-of-memory NVRM lines of the
+  October 4K floods appeared. The game alone under the same 2 GB ran at 55 / 222, with no NVRM line.
+- **The guard** (`preupscale/vram_guard.rs`): a build that ends with the device at its budget
+  (`VK_EXT_memory_budget`, within 128 MiB), or the network over four times its best time (or over 150 ms) for
+  2 s while at the budget, steps it down: full to small, small to paused (the network and the hold's frame
+  resources closed). Step up once the budget has room for the bigger network at the wanted size (its last
+  build, scaled by doctor's measured table) plus 512 MiB for 10 s, at least 30 s after the step down, doubling
+  when a step up is followed by a step down within 2 minutes. A tight budget alone (the 1 GB case) or a slow
+  GPU alone never steps. Steps are applied where a switch of the Network setting is.
+- **Result:** 2 GB held: the benchmark finishes at 18 / 74 (paused); the hold had built nothing, yet the game
+  alone with the layer loaded and the model off runs at 49 / 197 under the same pressure. The difference is the
+  driver: a 20 s spike of 1.5 GB on top of the 2 GB, with Neural Forge not loaded, left the game at 29 / 115 for
+  the rest of the run. Memory moved to system memory stays there while the pressure lasts, and returns once
+  it ends (memory freed at 120 s: back to the full network and 38 / 150).
+- **Late pressure** cannot push the network out: a program started while the game runs gets
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` past the game's budget (asked for 2.5 GB, got 1 GB) and the network stays
+  resident.
+- **Open:** whether building the network before the game fills its budget (rather than at the menus' 3840x2160
+  and again at DLSS's size) keeps the game out of system memory under pressure.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

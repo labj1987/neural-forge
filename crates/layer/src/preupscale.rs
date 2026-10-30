@@ -112,6 +112,8 @@ pub(crate) mod probe_image;
 pub(crate) mod restore;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod scene_cut;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod vram_guard;
 
 /// The native backend's per-device network ([`native::Loader`]); the native crate builds for x86_64 only.
 #[cfg(target_arch = "x86_64")]
@@ -4903,6 +4905,41 @@ impl Resources {
     ///
     /// # Safety
     /// Nothing submitted may still use them ([`Self::wait_idle`] returned true since the last hold).
+    /// Frees the native hold's frame resources (the native pass, the edit cache, the depth copy, the scene-cut
+    /// detector, the HDR pass) while the VRAM guard has the network paused, so the game gets all of Neural
+    /// Forge's memory back; each is built again on the first hold that runs the network. Returns whether there
+    /// was anything to free.
+    ///
+    /// # Safety
+    /// Nothing recorded with them may still run.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) unsafe fn release_native(&mut self, device: &ash::Device) -> bool {
+        let mut any = false;
+        // SAFETY (each destroy): nothing recorded with them may still run (this function's contract).
+        if let Some(n) = self.native.take() {
+            unsafe { n.destroy(device) };
+            any = true;
+        }
+        if let Some(e) = self.edit.take() {
+            unsafe { e.destroy(device) };
+            any = true;
+        }
+        if let Some(d) = self.depth.take() {
+            unsafe { d.destroy(device) };
+            any = true;
+        }
+        if let Some(s) = self.scene.take() {
+            unsafe { s.destroy(device) };
+            any = true;
+        }
+        if let Some(h) = self.hdr.take() {
+            unsafe { h.destroy(device) };
+            any = true;
+        }
+        self.game_exposure_read = None;
+        any
+    }
+
     pub(crate) unsafe fn free_cache(&mut self, device: &ash::Device) {
         if let Some(cache) = self.cache.take() {
             // SAFETY: forwarded.
@@ -6930,6 +6967,9 @@ impl Session {
     pub(crate) fn note_native(&mut self, shm: &ShmClient, result: &HoldResult) {
         #[cfg(target_arch = "x86_64")]
         if let Some(loader) = self.native.as_ref() {
+            if let Some(ms) = result.network_gpu_ms {
+                loader.note_gpu_ms(ms);
+            }
             let status = native::status(result, loader);
             if status != self.native_status {
                 shm.set_layer_reason(&status);

@@ -4,6 +4,15 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.9.6 — 2026-10-30
+
+- When the game and other programs leave too little video memory for the network, it now steps down to the small
+  network, and pauses (frames go to DLSS untouched) when even that does not fit. It comes back, one network at a
+  time, once there is room again. The Status tab says when the small network runs in place of the full one or the
+  network is paused. Before, the network kept running from system memory, many times slower: GTA V at 4K with 2 GB
+  of video memory held by another program ran at about 17 shown fps and its benchmark never finished; it now
+  finishes at 74, and is back at 150 with the full network once the memory is free.
+
 ## 3.9.5 — 2026-10-29
 
 - `neural-forge-cli doctor` no longer reports the network as running after the game has closed, and it warns

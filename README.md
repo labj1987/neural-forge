@@ -57,6 +57,13 @@ A game that is running switches to the chosen network at once: its next frames g
 while the network loads, and the network's history starts afresh. When the chosen network is not
 extracted (a DLL without the small one), the other one runs.
 
+When the game and other programs leave too little video memory for the network, the driver would move
+part of it to system memory, where it runs many times slower. Instead the full network gives way to the
+small one, and when that does not fit either, the network pauses and frames go to DLSS untouched. It
+steps back up, one network at a time, once the memory has had room for it for 10 s (and no sooner than
+30 s after the step down, longer when the steps repeat). The Status tab's Model placement line says when
+the small network runs in place of the full one, or that the network is paused.
+
 Each network's answer for an input frame is bit-exact with NGX's own
 ([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), 0.6 and "The small network").
 
@@ -129,6 +136,21 @@ edit cache carries it between), so about half the frames pay its time in this be
 
 At DLSS's input size the smaller model resolutions keep little of the detail the model adds: before the
 upscaler, use Full.
+
+### GTA V Enhanced at 4K
+
+The same benchmark at 3840x2160 (DLSS's input 2228x1253), 2026-10-29, three runs each (median), the
+game's frame rate limit at 120 for the frame generation runs:
+
+| Model | Frame generation 4x: real fps | Shown fps | Frame generation off: real fps | Video memory peak |
+|---|---|---|---|---|
+| Off (Neural Forge not loaded) | 62.6 | 251.9 | 84.3 | 10.4 GB |
+| Full network | 39.5 | 158.5 | 46.3 | 11.8 GB |
+
+The network takes 12.9 ms here against 6.5 ms at 1440p: about 1.9 times, for 2.25 times the pixels. It
+costs the game more at 4K than that because at 1440p the game leaves the GPU partly idle (65 % busy with
+the model off, frame generation off), and most of the network's time fits in that idle time; at 4K the
+GPU is already 95 % busy.
 
 ### Crimson Desert, after DLSS (Ray Reconstruction)
 
@@ -447,12 +469,18 @@ takes is withdrawn after 5 seconds.
   different ways, and several broke an assumption the first time. See [Tested games](#tested-games).
 - **The game's DLSS Frame Generation does not always switch on.** In the benchmark runs the game
   generated frames in some launches and not in others with the same settings, with or without
-  Neural Forge. The fps counter shows which happened.
-- **4K is not tested.** On a 12 GB card it is at the video memory limit: in the last 4K runs, of an
-  older build that used about 1.8 GB more video memory there, GTA V Enhanced at 3840x2160 with frame
-  generation 4x ran steadily with the small network (texture quality one step down, 11.9 of 12.2 GB in
-  use) and collapsed to a few fps with the full one. A network build that fails is retried on a
-  schedule, and frames go to DLSS untouched meanwhile.
+  Neural Forge. The fps counter shows which happened. In GTA V Enhanced it stays on with the game's
+  frame rate limit set (`FrameLimit` 120 in its settings.xml): without one its loading screens run at
+  hundreds of fps, and the game then drops frame generation at the next scene change.
+- **At 4K a 12 GB card is at its video memory limit.** GTA V Enhanced at 3840x2160 with frame
+  generation 4x uses up to 11.8 of 12.2 GB with the full network
+  ([Measured results](#gta-v-enhanced-at-4k)). When another program holds video memory the network
+  steps down or pauses ([How it works](#how-it-works)), but the game can stay slower while the memory
+  is short: the driver keeps in system memory what it moved there while the network was being built.
+  With 2 GB held by another program the benchmark ran at 18 real / 74 shown fps with the network
+  paused, against 55 / 222 without Neural Forge; with the memory free again the full network was back
+  and the game at 38 / 150. Close programs that hold video memory (browsers with hardware acceleration,
+  for one) before playing at 4K.
 - **Unreal Engine 5 games are only partly tested.** Lords of the Fallen ran in game with frame
   generation, and Remnant II at its character select screen with frame generation, with no GPU fault
   in those measurements. The Black Myth: Wukong Benchmark Tool faulted the GPU
@@ -519,7 +547,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_PROBE_IMAGE=<kernel>[+],...` | layer | Testing aid: copy the images a named CUDA launch reads, before it (or after it with `+`), once, into `captures/probe-<ms>/`. |
 | `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` | layer | Gives every network activation its own allocation again instead of sharing memory by lifetime (more video memory, same result). |
 | `NEURAL_FORGE_POST_MOTION=none\|zero\|flow`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | Testing aids: after the upscaler, give the model a history: its previous output at the same pixel (`zero`) or where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; `zero` elsewhere), not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and dropped on a scene cut. Default `none`: no history (measured, neither is steadier than none). |
-| `NEURAL_FORGE_FAIL_CREATE=N[@K]`, `NEURAL_FORGE_NATIVE_FAIL=chain` | layer | Testing aids: let K network builds through, then fail the next N; or report one counter-chain timeout. |
+| `NEURAL_FORGE_FAIL_CREATE=N[@K]`, `NEURAL_FORGE_NATIVE_FAIL=chain`, `NEURAL_FORGE_NATIVE_FAIL=vram` | layer | Testing aids: let K network builds through, then fail the next N; report one counter-chain timeout; or have the video memory guard step down at the 600th and 900th network frame, as if the network did not fit. |
 | `NEURAL_FORGE_GUI_OPEN=<tab>` | GUI | Testing aid: open a tab (`model`, `composition`, `debug`, `status`, `setup`, or `passes` for the per-pass dialog) at start, for screenshots. |
 | `NEURAL_FORGE_BENCH=1`, `NEURAL_FORGE_REQUIRE_VULKAN=1`, `NEURAL_FORGE_TEST_DISPLAY=:N` | layer tests | Testing aids: run the hot-path GPU benchmark; fail instead of skipping when no Vulkan device exists; run the present-fence test on a real swapchain in an X server (an Xvfb's display). |
 | `NEURAL_FORGE_CLI=/path` | `scripts/install.py`, `scripts/test_install.py` | The `neural-forge-cli` to use. |
