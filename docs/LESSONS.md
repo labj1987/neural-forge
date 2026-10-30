@@ -1481,8 +1481,21 @@ with the ogkm-experimental patch series (the same numbers within noise, and no N
 - **Late pressure** cannot push the network out: a program started while the game runs gets
   `VK_ERROR_OUT_OF_DEVICE_MEMORY` past the game's budget (asked for 2.5 GB, got 1 GB) and the network stays
   resident.
-- **Open:** whether building the network before the game fills its budget (rather than at the menus' 3840x2160
-  and again at DLSS's size) keeps the game out of system memory under pressure.
+- **Followed up (3.9.7), and what did not help.** A build used to hold every activation's own memory before placing
+  them (about twice what it keeps): now it does not (NATIVE_BACKEND.md, "Activation memory"); the game under 2 GB
+  stayed at the same 18-20 / 74-80. Freeing the after-the-upscaler path's 4K buffers while paused: same. A stricter
+  rule, pausing whenever the device is at its budget before a build (no build at all in game, kept as a patch, not
+  shipped): 2 GB the same, 1 GB 28 real on average against 30 (one run stayed paused). The fps are already down at the
+  first DLSS frames, and in every 2 GB run the driver logs its ctxBufPoolReserve failures ("trimming all pools") 26 s
+  after the pause, at a scene change of the benchmark, with nothing of Neural Forge built in game: the damage is done
+  while the menus run the network at 3840x2160 under that pressure. Not reproduced without Neural Forge: 1.5 GB held
+  by another process only during the menus and loading, then released, left the game at 56.5 / 228. The game's own
+  memory is what moved (GPU 93 % busy at 116 W against about 220 W: waiting on PCIe).
+- **Soak of 3.9.7:** 10 runs at 1440p (frame generation 4x, the full network): 64.8 / 261.1, first launch each, no
+  NVRM line; 6 under 2 GB at 4K, all finished; no Xid in any (one Xid 109 during GTA's loading in an earlier test of
+  the same build did not recur).
+- **Open:** keeping the menus' 3840x2160 network from running while the budget is tight (the menus are the only place
+  it runs in GTA).
 
 ## Deliberately not done, or left open
 

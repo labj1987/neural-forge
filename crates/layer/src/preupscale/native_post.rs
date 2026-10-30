@@ -609,6 +609,20 @@ fn serve(
             last_request = Instant::now();
             process(device, instance, physical, import, loader, view, gpu, slot, seq, &mut frames);
         }
+        // Paused by the VRAM guard: this path's buffers at the output size go too, so the game gets all of Neural
+        // Forge's memory back; built again by the first request after the resume.
+        if loader.paused() && gpu.slots.iter().any(Option::is_some) {
+            for s in 0..gpu.slots.len() {
+                if let Some(old) = gpu.slots[s].take() {
+                    // SAFETY: nothing pending (every request waits for its own work).
+                    unsafe { old.destroy(device, gpu.flow.device()) };
+                }
+                gpu.history[s].skipped();
+            }
+            gpu.bound = None;
+            crate::log!("[native] VRAM guard: the after-the-upscaler path's buffers are freed until the network resumes");
+            crate::logging::flush();
+        }
         hdr.server_heartbeat.fetch_add(1, Ordering::Relaxed);
         // The model server's idle policy, simplified: poll fast while requests come, slowly when none have for a while.
         if last_request.elapsed() < Duration::from_secs(1) {

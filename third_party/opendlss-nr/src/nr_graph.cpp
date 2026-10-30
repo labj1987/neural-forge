@@ -166,6 +166,7 @@ Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometr
 Graph::~Graph() {
   if (context_.stalled()) return;   // the GPU may still use the activations: leaked
   for (auto& activation : activations_) context_.destroyBuffer(activation->buffer);
+  for (VkDeviceMemory block : aliasBlocks_) context_.freeMemory(block);
 }
 
 Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t channels, Format format) {
@@ -184,8 +185,19 @@ Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t ch
   activation->allocRows = alignRows(rows);
   activation->label = label;
   VkDeviceSize bytes = (VkDeviceSize)activation->allocRows * channels * formatBytes(format);
-  activation->buffer = context_.createBuffer(bytes, false, activation->label.c_str());
-  context_.fillZero(activation->buffer);
+  if (aliasing_) {
+    const VkMemoryRequirements r = context_.bufferRequirements(bytes);
+    if (aliasBlocks_.empty() || aliasBytes_ < r.size) {
+      // Larger than every block so far: a new one (the old ones keep the buffers bound to them until setAliasing(false)).
+      aliasBlocks_.push_back(context_.allocateDeviceMemory(r.size, r.memoryTypeBits));
+      aliasBytes_ = r.size;
+    }
+    activation->buffer = context_.createBufferAt(aliasBlocks_.back(), 0, bytes, activation->label.c_str());
+    aliased_.insert(activation.get());
+  } else {
+    activation->buffer = context_.createBuffer(bytes, false, activation->label.c_str());
+    context_.fillZero(activation->buffer);
+  }
   activations_.push_back(std::move(activation));
   allocationsByKey_[key] = activations_.back().get();
   return activations_.back().get();
@@ -222,6 +234,25 @@ std::vector<Graph::Lifetime> Graph::lifetimes(std::vector<Activation*>& unused) 
 void Graph::rebind(Activation& activation, vk::Buffer buffer) {
   context_.destroyBuffer(activation.buffer);
   activation.buffer = buffer;
+  aliased_.erase(&activation);
+}
+
+void Graph::releaseScratch() {
+  for (VkDeviceMemory block : aliasBlocks_) context_.freeMemory(block);
+  aliasBlocks_.clear();
+  aliasBytes_ = 0;
+}
+
+void Graph::setAliasing(bool on) {
+  aliasing_ = on;
+  if (on) return;
+  for (auto& activation : activations_) {
+    if (!aliased_.count(activation.get())) continue;
+    vk::Buffer own = context_.createBuffer(activation->buffer.size, false, activation->label.c_str());
+    context_.fillZero(own);
+    rebind(*activation, own);
+  }
+  releaseScratch();
 }
 
 Topology Topology::forBlockCount(uint32_t blocks) {

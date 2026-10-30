@@ -914,6 +914,47 @@ fn shared_activations_take_less_memory() {
     }
 }
 
+/// A build never holds much more than it keeps: its activations are placed by lifetime before the warm-up runs, not
+/// allocated each on its own first (which took about twice the kept memory at the moment of the build, and when a game had
+/// filled its VRAM budget the driver moved the game's memory to system memory for good). Sampled every millisecond
+/// from another thread during builds at DLSS's render sizes of 1440p and 4K output: the peak above the starting use is at
+/// most what the build keeps plus 256 MiB (the scratch blocks the tracked recording aliases its activations in).
+#[test]
+fn a_build_holds_little_more_than_it_keeps() {
+    if std::env::var_os("NEURAL_FORGE_NATIVE_RIG").is_none() {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
+        return;
+    }
+    let _one = one_at_a_time();
+    let g = gpu();
+    let mut net = open_network(&g, &model_dir(), chain_wanted());
+    let mib = |b: u64| b >> 20;
+    for (w, h) in [(1486, 836), (2228, 1253), (3840, 2160)] {
+        // SAFETY: no graph of the previous build was submitted. A tiny build first returns the last one's memory.
+        unsafe { net.build(64, 64) }.expect("the small build");
+        let base = device_local_usage(&g);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let peak = std::thread::scope(|scope| {
+            let sampler = scope.spawn(|| {
+                let mut peak = 0;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    peak = peak.max(device_local_usage(&g));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                peak
+            });
+            // SAFETY: as above.
+            unsafe { net.build(w, h) }.expect("build");
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            sampler.join().unwrap()
+        });
+        let kept = device_local_usage(&g).saturating_sub(base);
+        let above = peak.max(base).saturating_sub(base);
+        eprintln!("{w}x{h}: keeps {} MiB, peak {} MiB above the start", mib(kept), mib(above));
+        assert!(above <= kept + (256 << 20), "{w}x{h}: peak {} MiB, kept {} MiB", mib(above), mib(kept));
+    }
+}
+
 /// `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS` set for the builds while this lives, and removed when it is dropped on
 /// any path (a failed assertion's unwinding included): the tests after one that sets it build as by default.
 struct SharedActivations;

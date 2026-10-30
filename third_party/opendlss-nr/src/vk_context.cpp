@@ -701,6 +701,11 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
   }
 }
 
+void Context::discardCommands(VkCommandBuffer commands) {
+  VK_CHECK(vkEndCommandBuffer(commands));
+  vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
+}
+
 void Context::waitIdle() {
   if (!waitTimeoutNs_) {
     VK_CHECK(vkQueueWaitIdle(queue_));

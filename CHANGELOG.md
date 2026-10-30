@@ -4,6 +4,13 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.9.7 — 2026-10-30
+
+- Building the network takes no more video memory than it keeps: before, a build briefly held about twice that
+  (at 1440p 472 MiB above what was in use before it, now 193; at 4K about 2.9 GB, now 1.3).
+- While the network is paused for lack of video memory it now holds none at all: the buffers of the model after
+  DLSS and on the finished frame are freed too, and built again when it resumes.
+
 ## 3.9.6 — 2026-10-30
 
 - When the game and other programs leave too little video memory for the network, it now steps down to the small

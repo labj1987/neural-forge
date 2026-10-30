@@ -1405,6 +1405,16 @@ build took 733 MiB (2924 to 3653) where 3.8.6's took 1,536 MiB, 65.9 real fps; a
 where 3.8.7's took 3,200 MiB, 37.2 real fps (149 shown) and 41.0 (165) with the small network. GTA fills what is left
 of the budget in both: the headroom is the game's.
 
+**Without the build's own peak (3.9.7, 2026-10-30).** Until then each activation still got its own allocation for the
+warm-up (the recording whose lifetimes were noted), so a build briefly held the unshared total. Now each size's graph
+is first recorded only to note the lifetimes, never run, with every activation bound to the start of a scratch block they
+all share (`nr::Graph::setAliasing`; a block per new largest size, not zeroed); the scratch blocks are freed
+(`releaseScratch`), the used activations placed in the shared block, the untouched ones given 16 bytes, the head and
+the captures their own buffers, and only then is the warm-up recorded and run on them. The rig's
+`a_build_holds_little_more_than_it_keeps` samples the device-local use every millisecond during a build: above the
+use before it, 1486x836 peaks at 193 MiB and keeps 178 (472 before), 2228x1253 417 and 408, 3840x2160 1,311 and 1,217.
+The heads and dlss5vk parity are unchanged (all rig tests, with counter chaining and with barriers).
+
 The idea of placing activations by lifetime is mochizuki0323's DLSSNR-AMD ("Arena reuse, by lifetime", MIT); the code
 is this project's.
 
