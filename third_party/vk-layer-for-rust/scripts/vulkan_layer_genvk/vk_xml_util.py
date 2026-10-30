@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Modified for Neural Forge (2026): comments wrapped here, a fixed copyright year; newer registries (UPSTREAM.md).
+# Modified for Neural Forge (2026): comments wrapped here, a fixed copyright year; newer registries; the
+# VkBool32 array hooks' iterator is not 'static (UPSTREAM.md).
 
 from __future__ import annotations
 from enum import Enum, IntEnum
@@ -937,7 +938,9 @@ class RustMethod(NamedTuple):
         def param_to_string(param: RustParam) -> str:
             if param.type.slice_of is not None and param.type.slice_of.name == "bool":
                 type_param = next(type_params)
-                type_params.send("Iterator<Item = bool> + 'static")
+                # Not 'static: the iterator reads the application's array, which lives only for the call, so
+                # a hook must not be able to keep it (a safe use after free).
+                type_params.send("Iterator<Item = bool>")
                 # Generic type for bool for efficient ABI breaking API.
                 return f"{param.name}: {type_param}"
             return param.to_string()

@@ -454,6 +454,50 @@ mod get_instance_proc_addr {
             }
         }
 
+        // Modified for Neural Forge (2026): a physical-device command of a device extension.
+        #[test]
+        fn test_should_return_fp_for_hooked_physical_device_command_of_device_extension() {
+            static TEST_GLOBAL: TestGlobal = TestGlobal::builder()
+                .set_layer_mock_builder(|| {
+                    let mut mock = MockTestLayer::default();
+                    mock.expect_hooked_instance_commands().return_const(vec![
+                        LayerVulkanCommand::GetPhysicalDeviceFragmentShadingRatesKhr,
+                    ]);
+                    mock.set_default_expectations();
+                    mock
+                })
+                .build();
+            let _ctx = TEST_GLOBAL.create_context();
+            let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
+            let InstanceContext {
+                instance,
+                entry,
+                icd_entry,
+                ..
+            } = ctx.as_ref();
+            let name = c"vkGetPhysicalDeviceFragmentShadingRatesKHR";
+            let instance_data = unsafe { InstanceData::from_handle(instance.handle()) };
+
+            // Neither the next layer nor the layer offers the device extension's command: NULL.
+            let next =
+                unsafe { icd_entry.get_instance_proc_addr(instance.handle(), name.as_ptr()) };
+            assert!(next.is_none());
+            let fp = unsafe { entry.get_instance_proc_addr(instance.handle(), name.as_ptr()) };
+            assert!(fp.is_none());
+
+            // The next layer resolves it (its device extension is supported), though no instance
+            // enables a device extension: the layer's own pointer.
+            extern "system" fn next_command() {}
+            instance_data.add_instance_command(name.to_str().unwrap(), Some(next_command));
+            let fp = unsafe { entry.get_instance_proc_addr(instance.handle(), name.as_ptr()) };
+            assert!(fp.is_some());
+            assert_ne!(
+                fp.map(|f| f as usize),
+                Some(next_command as extern "system" fn() as usize),
+                "the layer's own pointer, not the next layer's"
+            );
+        }
+
         mod icd_unavaiilable_device_dispatch_command {
             use super::*;
             #[test]
