@@ -1494,8 +1494,19 @@ with the ogkm-experimental patch series (the same numbers within noise, and no N
 - **Soak of 3.9.7:** 10 runs at 1440p (frame generation 4x, the full network): 64.8 / 261.1, first launch each, no
   NVRM line; 6 under 2 GB at 4K, all finished; no Xid in any (one Xid 109 during GTA's loading in an earlier test of
   the same build did not recur).
-- **Open:** keeping the menus' 3840x2160 network from running while the budget is tight (the menus are the only place
-  it runs in GTA).
+- **After 3.9.7, measured and not shipped (2026-10-30), 3 runs each, GTA V 4K FG 4x:**
+  - What hurts is memory still held when gameplay starts, not the network running: 1.4 GB held by another process
+    until 110 s (gameplay starts at about 60-70 s), Neural Forge not loaded, left the game at 28.7 / 115 with the same
+    driver lines; released at 75 s, 56.5 / 228.
+  - Closing the network while the game loads (`swapchain::loading_now` for 2 s, the lend's close): never fired.
+    GTA's menus and loading screens render at about 19 fps, which counts as steady.
+  - The menus' network capped at 1 MP (`NEURAL_FORGE_MAX_MODEL_PIXELS=1000000`, a 1332x750 build of 330 MB instead
+    of 1.35 GB at 3840x2160): 2 GB 20-21 / 81-86 (one run stuck), 1 GB 30.4-32.3 / 121-130 with the full network
+    and no NVRM line (3.9.6: 30.2 / 121).
+  - With 2 GB held, the game fills the whole budget by itself, so any build in game lands at the budget, and the
+    driver's move to system memory stays for the session. The game's own 55 / 222 is reachable only with no network
+    at all; the guard's pause gets 18-20 / 74-80. Every lever on Neural Forge's side tried here gave nothing at 2 GB,
+    and the stricter ones cost at 1 GB. Not pursued further.
 
 ## Deliberately not done, or left open
 
