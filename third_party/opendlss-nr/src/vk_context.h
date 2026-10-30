@@ -160,6 +160,8 @@ class Context {
   // Commands --------------------------------------------------------------------
   VkCommandBuffer beginCommands();
   void endAndSubmit(VkCommandBuffer commands, bool wait = true);
+  // Ends and frees a buffer from beginCommands without submitting it (a recording made only to be looked at).
+  void discardCommands(VkCommandBuffer commands);
   void waitIdle();
   // A bounded wait that timed out latches this: work of this object may still be running on the GPU, so it
   // submits nothing more (beginCommands/endAndSubmit/waitIdle throw) and destroys nothing (destroyBuffer,

@@ -408,17 +408,24 @@ struct NfNative {
     for (uint32_t i = 0; i < count; ++i) order[i] = i;
     auto area = [&](uint32_t i) { return uint64_t(sizes[2 * i]) * sizes[2 * i + 1]; };
     std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return area(a) > area(b); });
+    // With the activations sharing memory by lifetime (shareActivations), each size's graph is first recorded only to
+    // track the lifetimes, its activations aliased in one scratch block (nr::Graph::setAliasing) and never run; then
+    // they are placed in the shared block and the warm-ups run on it. So a build never holds every activation's own
+    // memory at once: that took about twice what the build keeps, briefly, and when the game had filled its VRAM
+    // budget the driver moved the game's memory to system memory for good (docs/LESSONS.md, October 29).
+    const bool share = sharingActivations();
     for (uint32_t i : order) {
       NfSlot& slot = slots[i];
       slot.geometry = nr::Geometry::fromValid(sizes[2 * i], sizes[2 * i + 1]);
       slot.graph = std::make_unique<nr::Graph>(*context, *model, *kernels, slot.geometry, graphOptions);
       slot.features = slot.graph->allocate("input features", slot.geometry.fullWidth * slot.geometry.fullHeight, 16, nr::Format::F32);
       context->fillZero(slot.features->buffer);
-      // The first recording uploads the weights' re-laid matrices (each its own bounded submit) and
-      // its run makes the driver compile every PTX module.
+      if (!share) continue;
+      // The first recording uploads the weights' re-laid matrices (each its own bounded submit).
+      slot.graph->setAliasing(true);
       context->resetDescriptorPool(0);
-      VkCommandBuffer warm = context->beginCommands();
-      {
+      VkCommandBuffer tracked = context->beginCommands();
+      try {
         // The context's use tracker points into this graph: switched off on every way out of the recording, so
         // a recording that throws (and the graph freed after it) never leaves it to the next use of a buffer.
         struct Untrack {
@@ -426,7 +433,30 @@ struct NfNative {
           ~Untrack() { graph.trackLifetimes(false); }
         } untrack{*slot.graph};
         slot.graph->trackLifetimes(true);
+        slot.graph->record(tracked, *slot.features);
+      } catch (...) {
+        context->discardCommands(tracked);
+        throw;
+      }
+      context->discardCommands(tracked);
+    }
+    if (share) {
+      // The scratch blocks go before the shared block is allocated (the aliased buffers stay until rebound below).
+      for (NfSlot& slot : slots) slot.graph->releaseScratch();
+      shareActivations();
+      for (NfSlot& slot : slots) slot.graph->setAliasing(false);
+    }
+    for (uint32_t i : order) {
+      NfSlot& slot = slots[i];
+      // The warm-up: its run makes the driver compile every PTX module (and, without sharing, its recording uploads the
+      // weights' re-laid matrices and tracks the lifetimes, unused then).
+      context->resetDescriptorPool(0);
+      VkCommandBuffer warm = context->beginCommands();
+      try {
         slot.graph->record(warm, *slot.features);
+      } catch (...) {
+        context->discardCommands(warm);
+        throw;
       }
       slot.sets = kernels->dispatchCount();
       // This warm-up's count alone: nothing else of the network runs (the previous warm-up was waited on, and
@@ -446,7 +476,6 @@ struct NfNative {
       // bytes the kernels read through them (`Model::compactAux`). The recordings below use those.
       model->compactAux();
     }
-    shareActivations();
     // The frame recordings (one per queue family they run on), every size's: descriptor pool 1 stays reserved
     // for them.
     context->resetDescriptorPool(1);
@@ -465,8 +494,12 @@ struct NfNative {
   // writes and reads them outside the graph. So do a graph's captures (nf_native_set_captures), read after a run
   // (nf_native_capture); their copies' sources are placed like any activation, alive until the copy (a use the
   // warm-up reported). The block starts zeroed, as the activations did.
+  static bool sharingActivations() {
+    const char* off = getenv("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS");
+    return !(off && std::string(off) == "0");
+  }
+
   void shareActivations() {
-    if (const char* off = getenv("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS"); off && std::string(off) == "0") return;
     struct Placement {
       nr::Graph* graph;
       nr::Activation* activation;

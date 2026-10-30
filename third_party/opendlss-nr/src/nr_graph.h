@@ -94,6 +94,17 @@ class Graph {
   // Points `activation` at `buffer`, destroying the one it had. Only between recordings: nothing recorded may still run.
   void rebind(Activation& activation, vk::Buffer buffer);
 
+  // Aliasing, for a recording that is never run (the tracked one of a build, before the activations are placed by
+  // lifetime): while on, every activation allocated is bound to the start of a scratch block they all share, sized by
+  // the largest so far, and is not zeroed, so the build never holds every activation's memory at once (about 2.9 GB at
+  // 3840x2160 against 1.4 GB placed). Off gives every activation still in a scratch block (those not rebound since: the
+  // head and the captures, which keep buffers of their own) its own zeroed buffer, and frees the scratch blocks.
+  void setAliasing(bool on);
+  // Frees the scratch blocks while aliasing, before the activations' own memory is allocated, so the two never coexist:
+  // the buffers still bound to them stay until they are rebound (rebind, or setAliasing(false) for the rest), and nothing
+  // may record or run with them in between. Only after the recording that tracked the lifetimes, which is never run.
+  void releaseScratch();
+
  private:
   // Window phases. Every resolution level runs its own four-phase cycle of half-window shifts; the phase advances
   // once per block at that level in visit order, and a decoder stage continues the count its encoder stage left.
@@ -166,6 +177,10 @@ class Graph {
   std::vector<std::unique_ptr<Activation>> activations_;
   std::map<std::string, Activation*> allocationsByKey_;
   std::set<std::string> usedThisRecord_;
+  bool aliasing_ = false;
+  std::vector<VkDeviceMemory> aliasBlocks_;
+  VkDeviceSize aliasBytes_ = 0;
+  std::set<const Activation*> aliased_;   // bound to a scratch block
   std::map<std::string, Activation*> boundaries_;
   Activation* head_ = nullptr;
   Activation* inputHalf_ = nullptr;

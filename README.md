@@ -61,7 +61,7 @@ When the game and other programs leave too little video memory for the network, 
 part of it to system memory, where it runs many times slower. Instead the full network gives way to the
 small one, and when that does not fit either, the network pauses and frames go to DLSS untouched. It
 steps back up, one network at a time, once the memory has had room for it for 10 s (and no sooner than
-30 s after the step down, longer when the steps repeat). The Status tab's Model placement line says when
+30 s after the step down, longer when the steps repeat). While paused, Neural Forge holds no video memory. The Status tab's Model placement line says when
 the small network runs in place of the full one, or that the network is paused.
 
 Each network's answer for an input frame is bit-exact with NGX's own
@@ -476,7 +476,8 @@ takes is withdrawn after 5 seconds.
   generation 4x uses up to 11.8 of 12.2 GB with the full network
   ([Measured results](#gta-v-enhanced-at-4k)). When another program holds video memory the network
   steps down or pauses ([How it works](#how-it-works)), but the game can stay slower while the memory
-  is short: the driver keeps in system memory what it moved there while the network was being built.
+  is short: once anything has gone past the budget during play, the driver keeps in system memory what it
+  moved there for as long as the game runs.
   With 2 GB held by another program the benchmark ran at 18 real / 74 shown fps with the network
   paused, against 55 / 222 without Neural Forge; with the memory free again the full network was back
   and the game at 38 / 150. Close programs that hold video memory (browsers with hardware acceleration,
