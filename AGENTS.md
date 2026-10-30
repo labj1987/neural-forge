@@ -61,7 +61,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - `bash build-appimage.sh` packages Neural Forge.
 - The layer's GPU tests run on lavapipe: set `VK_DRIVER_FILES` to the `lvp_icd*.json` manifests, as
   CI does. On a machine with an NVIDIA GPU, never run them without it. Under validation:
-  `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` (CI's step shows the settings); a test device
+  `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` and `--test-threads=1` (CI's step shows the settings;
+  validation layers before 1.4 crash when tests create and use devices in parallel); a test device
   enables what the code under test needs (`composition::gpu::test_device_extensions`), destroys what
   it created before the device, and records over real images, never stand-in handles.
 - Leave lavapipe's vector width and CPU features at their defaults. With `LP_NATIVE_VECTOR_WIDTH=128` on an
