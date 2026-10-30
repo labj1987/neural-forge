@@ -37,6 +37,8 @@ def generate(K, flags, max_regs=None, stagesWanted=STAGES, ksub=1, ws=False):
     assert outE4 or outF16
     name = f"gemm2_e4m3_K{K}_f{flags}" + (f"_s{ksub}" if ksub != 1 else "")
     RESS = stages * STAGE_BYTES            # residual E4 tile [64][64 B] (4 KB), then the E4 output tile
+    if outF16 and (outE4 or res):
+        RESS = max(RESS, BM * 128)         # past the f16 tile [64][128 B] the ring becomes (a one-stage ring at K=32 is smaller)
     shared_bytes = RESS + 4096
     NT = THREADS + 32 if ws else THREADS   # + the copy warp
     p = Ptx()

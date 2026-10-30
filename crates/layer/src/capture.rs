@@ -1028,6 +1028,8 @@ thread_local! {
     /// refused under VRAM pressure (the capture then sends the full-resolution frame). Per thread,
     /// so tests running alongside keep their scratches.
     static TEST_FAIL_MODEL_SCRATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The capture attempts (`poll_or_submit_capture` calls) the synchronous present made on this thread.
+    static TEST_CAPTURE_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn zero_copy_allowed() -> bool {
@@ -1537,6 +1539,8 @@ pub unsafe fn run(
                 held.is_some()
             };
             while sent.is_none() {
+                #[cfg(test)]
+                TEST_CAPTURE_ATTEMPTS.with(|n| n.set(n.get() + 1));
                 match poll_or_submit_capture(
                     SLOT,
                     use_direct,
@@ -4574,14 +4578,15 @@ mod tests {
         assert!(first.is_none(), "a present whose capture could not be set up goes out untouched");
         // That first attempt also paid one-time setup (the compose pipeline), which on a loaded
         // software rasterizer can itself take hundreds of milliseconds. A setup that keeps
-        // failing on later presents pays nothing but the failed attempt: each must come back
-        // well inside the budget rather than waiting it out.
+        // failing on later presents pays nothing but the failed attempt: each gives up after it
+        // rather than trying again until the budget runs out (counted, not timed, so a slow
+        // machine cannot fail it).
         let _ = took;
         for _ in 0..3 {
-            let started = Instant::now();
+            TEST_CAPTURE_ATTEMPTS.with(|n| n.set(0));
             assert!(present(&mut true).is_none());
-            let took = started.elapsed();
-            assert!(took < SYNC_BUDGET / 2, "a failed capture setup must not wait out the {SYNC_BUDGET:?} budget (took {took:?})");
+            let attempts = TEST_CAPTURE_ATTEMPTS.with(std::cell::Cell::get);
+            assert_eq!(attempts, 1, "a failed capture setup is given up at once, not retried until the {SYNC_BUDGET:?} budget runs out");
         }
 
         let deadline = Instant::now() + Duration::from_secs(5);

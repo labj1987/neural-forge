@@ -94,8 +94,8 @@ class Context {
   uint32_t queueFamily() const { return queueFamily_; }
   uint32_t queueIndex() const { return queueIndex_; }
   VkInstance instance() const { return instance_; }
-  // Instance diagnostics of the tool's own instance. DLSS5VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation and
-  // refuses to start without it; DLSS5VK_DEBUG=1 only installs a debug messenger for the driver's own messages
+  // Instance diagnostics of the tool's own instance. NEURAL_FORGE_NR_VALIDATION=1 enables VK_LAYER_KHRONOS_validation and
+  // refuses to start without it; NEURAL_FORGE_NR_DEBUG=1 only installs a debug messenger for the driver's own messages
   // (PTX compiler diagnostics among them), which checks nothing.
   bool validationEnabled() const { return validation_; }
   static uint32_t validationErrors();   // error-severity validation messages so far, over every Context
@@ -230,7 +230,7 @@ namespace nr {
 // Where SPIR-V and PTX come from. When a loader is set, every shader and PTX read goes through it instead of the
 // filesystem: kind is "spv" or "ptx", name is the file name without its extension (e.g. "gemm_fp8",
 // "gemmv_e4m3_K1024_f6_s1"). It returns false when it has no such asset; the bytes must stay valid for the
-// process lifetime. Unset (the default), shaderDir and DLSS5VK_PTX_DIR are read as before.
+// process lifetime. Unset (the default), shaderDir and NEURAL_FORGE_NR_PTX_DIR are read as before.
 using AssetLoader = bool (*)(const char* kind, const char* name, const uint8_t** data, size_t* size);
 void setAssetLoader(AssetLoader loader);
 AssetLoader assetLoader();

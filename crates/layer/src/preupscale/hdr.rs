@@ -505,6 +505,14 @@ impl OwnImage {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`DeviceBuffer`]s made and not destroyed on this thread.
+    static LIVE_DEVICE_BUFFERS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    /// Makes [`AutoExposure::build`] fail at its state buffer, after the histogram's.
+    static FAIL_AUTO_STATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A device-local storage buffer of the layer's own (the auto-exposure histogram: it takes
 /// atomics from every workgroup, which must not cross the bus to host memory).
 struct DeviceBuffer {
@@ -548,6 +556,8 @@ impl DeviceBuffer {
             }
             return None;
         }
+        #[cfg(test)]
+        LIVE_DEVICE_BUFFERS.with(|n| n.set(n.get() + 1));
         Some(Self { buffer, memory })
     }
 
@@ -559,6 +569,8 @@ impl DeviceBuffer {
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
         }
+        #[cfg(test)]
+        LIVE_DEVICE_BUFFERS.with(|n| n.set(n.get() - 1));
     }
 }
 
@@ -623,27 +635,35 @@ impl AutoExposure {
                     .first()
                     .copied()?;
                 histogram = Some(DeviceBuffer::new(device, instance, physical_device, HISTOGRAM_BYTES)?);
+                #[cfg(test)]
+                if FAIL_AUTO_STATE.with(std::cell::Cell::get) {
+                    return None;
+                }
                 // TRANSFER: inside DLSS's buffer the hold resets it and copies it out for the host itself.
                 let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
                 state = Some(super::own_host_buffer_with(device, instance, physical_device, STATE_BYTES, usage)?);
                 Some(set)
             })()
         };
-        let (Some(set), Some(histogram), Some(state)) = (built, histogram.take(), state.take()) else {
-            // SAFETY: nothing here was submitted; null handles are ignored.
-            unsafe {
-                if let Some(h) = histogram {
-                    h.destroy(device);
+        let (set, histogram, state) = match (built, histogram, state) {
+            (Some(set), Some(histogram), Some(state)) => (set, histogram, state),
+            // Whichever buffer was made before the failure is destroyed with the rest.
+            (_, histogram, state) => {
+                // SAFETY: nothing here was submitted; null handles are ignored.
+                unsafe {
+                    if let Some(h) = histogram {
+                        h.destroy(device);
+                    }
+                    if let Some(s) = state {
+                        s.destroy(device);
+                    }
+                    device.destroy_descriptor_pool(pool, None);
+                    device.destroy_pipeline(pipeline, None);
+                    device.destroy_pipeline_layout(pipeline_layout, None);
+                    device.destroy_descriptor_set_layout(set_layout, None);
                 }
-                if let Some(s) = state {
-                    s.destroy(device);
-                }
-                device.destroy_descriptor_pool(pool, None);
-                device.destroy_pipeline(pipeline, None);
-                device.destroy_pipeline_layout(pipeline_layout, None);
-                device.destroy_descriptor_set_layout(set_layout, None);
+                return None;
             }
-            return None;
         };
         // SAFETY: the mapping covers STATE_BYTES; all zero is "not valid".
         unsafe { std::ptr::write_bytes(state.ptr, 0, STATE_BYTES as usize) };
@@ -1371,6 +1391,30 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ExposurePush, relative), 20);
         for spv in [ENCODE_SPV, DECODE_SPV, EXPOSURE_SPV] {
             assert!(spv.len() > 20 && spv.len().is_multiple_of(4), "embedded SPIR-V");
+        }
+    }
+
+    /// A build that fails after its histogram buffer was made destroys that buffer too.
+    #[test]
+    fn a_failed_auto_exposure_build_leaves_no_buffer_behind() {
+        let Some((_entry, instance, physical_device, device, _queue, _family)) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device; skipping");
+            return;
+        };
+        // SAFETY: the device is live; nothing is submitted.
+        unsafe {
+            let exposure = DeviceBuffer::new(&device, &instance, physical_device, EXPOSURE_BYTES).expect("the exposure buffer");
+            let before = LIVE_DEVICE_BUFFERS.with(std::cell::Cell::get);
+            FAIL_AUTO_STATE.with(|f| f.set(true));
+            let built = AutoExposure::build(&device, &instance, physical_device, exposure.buffer);
+            FAIL_AUTO_STATE.with(|f| f.set(false));
+            assert!(built.is_none(), "the state buffer's failure fails the build");
+            assert_eq!(LIVE_DEVICE_BUFFERS.with(std::cell::Cell::get), before, "the histogram buffer made before it is destroyed");
+            let built = AutoExposure::build(&device, &instance, physical_device, exposure.buffer).expect("the build without the failure");
+            built.destroy(&device);
+            exposure.destroy(&device);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
         }
     }
 

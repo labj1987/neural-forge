@@ -104,6 +104,7 @@ const uint F_SCENE_ANSWER = 128u; // (tests) the capture's answer image holds th
 const uint F_COUNT_DEPTH = 256u; // the prep pass counts the depth for telling reversed-Z (until decided)
 const uint F_NO_MVEC = 512u;     // the hold has no motion vectors: the field is NaN (no history), none counted
 const uint F_ACES = 1024u;       // the decode is the ACES transfer's (preupscale_decode.comp's flags bit 2)
+const uint F_LINEAR = 2048u;     // the decode is the linear transfer's (preupscale_decode.comp's flags bit 1)
 
 const uint STAT_Z0 = 0u;         // depth texels at exactly 0 / 1
 const uint STAT_Z1 = 1u;

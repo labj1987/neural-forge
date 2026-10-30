@@ -98,6 +98,7 @@ const uint F_SCENE_ANSWER = 128u; // (tests) the capture's answer image holds th
 const uint F_COUNT_DEPTH = 256u; // the prep pass counts the depth for telling reversed-Z (until decided)
 const uint F_NO_MVEC = 512u;     // the hold has no motion vectors: the field is NaN (no history), none counted
 const uint F_ACES = 1024u;       // the decode is the ACES transfer's (preupscale_decode.comp's flags bit 2)
+const uint F_LINEAR = 2048u;     // the decode is the linear transfer's (preupscale_decode.comp's flags bit 1)
 
 const uint STAT_Z0 = 0u;         // depth texels at exactly 0 / 1
 const uint STAT_Z1 = 1u;
@@ -122,7 +123,8 @@ const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const float KNEE = 0.75;
 const float K = 5.770780;
 const float CLAMPED = 0.999;
-const float FADE = 0.954; // preupscale_decode.comp's FADE_SRGB (the cache follows the sRGB encode)
+const float FADE = 0.954; // preupscale_decode.comp's FADE_SRGB and FADE_LINEAR (with F_LINEAR)
+const float FADE_LINEAR = 0.9;
 const float HALF_MAX = 65504.0; // the largest finite half: the most a write-back stores
 
 uint index_of(uvec2 xy) { return xy.y * p.size.x + xy.x; }
@@ -237,7 +239,8 @@ float shoulder_inverse(float y) {
 }
 
 float decode(float answer, float inv_scale) {
-  return min(shoulder_inverse(srgb_eotf(answer)) * inv_scale, HALF_MAX);
+  float v = (p.flags & F_LINEAR) != 0u ? (isnan(answer) ? 0.0 : clamp(answer, 0.0, 1.0)) : srgb_eotf(answer);
+  return min(shoulder_inverse(v) * inv_scale, HALF_MAX);
 }
 
 // preupscale_decode.comp's ACES transfer, the same functions.
@@ -323,7 +326,7 @@ void main() {
     if (keep && peak >= CLAMPED) {
       result = original;
     } else if (keep) {
-      result = mix(result, original, smoothstep(FADE, CLAMPED, peak));
+      result = mix(result, original, smoothstep((p.flags & F_LINEAR) != 0u ? FADE_LINEAR : FADE, CLAMPED, peak));
     }
   }
   float scale = e / p.paper_white;

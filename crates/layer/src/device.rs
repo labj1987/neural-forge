@@ -1237,7 +1237,7 @@ unsafe fn relay_app_waits(
     let submit = vk::SubmitInfo::default().wait_semaphores(app_waits).wait_dst_stage_mask(&stages).signal_semaphores(std::slice::from_ref(&relay));
     // SAFETY: the batch references only live handles; `stages` and `app_waits` outlive
     // the call.
-    unsafe { device.queue_submit(queue, &[submit], vk::Fence::null()) }.ok()?;
+    crate::note_vk(device.handle(), unsafe { device.queue_submit(queue, &[submit], vk::Fence::null()) }).ok()?;
     Some(relay)
 }
 
@@ -1557,8 +1557,8 @@ impl NeuralForgeDeviceInfo {
         let info = vk::SubmitInfo::default().command_buffers(&cmds);
         // SAFETY: the layer's own recorded buffers of the queue's family, submitted once each; the queue is
         // externally synchronized by the application's call.
-        let result = unsafe { (self.device.fp_v1_0().queue_submit)(queue, 1, &info, vk::Fence::null()) };
-        if result != vk::Result::SUCCESS {
+        let result = crate::note_vk(self.device.handle(), unsafe { (self.device.fp_v1_0().queue_submit)(queue, 1, &info, vk::Fence::null()) }.result());
+        if let Err(result) = result {
             crate::log!("[preupscale] the initialisation for the hold inside DLSS's buffer could not be submitted ({result:?})");
             inline.prologue_failed(&inits);
         }
@@ -4083,6 +4083,7 @@ mod lock_structure_tests {
         let hold = Arc::new(Mutex::new(HoldState::default()));
         let families = std::sync::RwLock::new(HashMap::from([(queue, family)]));
         let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
         let present = {
             let (state, hold) = (state.clone(), hold.clone());
             std::thread::spawn(move || {
@@ -4090,17 +4091,18 @@ mod lock_structure_tests {
                 let _state = state.lock().unwrap();
                 drop(hold.lock().unwrap());
                 entered.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(400)); // the answer wait
+                // The answer wait, until the submit side is done: it ends on its own (and the test fails)
+                // only when the submit side is stuck behind it.
+                released.recv_timeout(std::time::Duration::from_secs(30)).is_ok()
             })
         };
         waiting.recv().unwrap();
-        let t = std::time::Instant::now();
         let held = hold.lock().unwrap();
         assert_eq!(family_of(&families, queue), Some(family));
         assert!(post_slot_busy(&state, &device), "a State held by the present is a post path at work");
         drop(held);
-        assert!(t.elapsed() < std::time::Duration::from_millis(100), "the submit side waited {:?} on the present", t.elapsed());
-        present.join().unwrap();
+        release.send(()).unwrap();
+        assert!(present.join().unwrap(), "the submit side waited on the present");
         assert!(!post_slot_busy(&state, &device), "free once the present is done");
         unsafe {
             device.destroy_device(None);

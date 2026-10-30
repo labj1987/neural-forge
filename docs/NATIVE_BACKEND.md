@@ -544,7 +544,7 @@ helper's runner stays in `config.ini` (and `neural-forge-cli`) for the A/B runs 
 `VK_KHR_buffer_device_address`, but **not `VK_NV_cuda_kernel_launch`** (checked with a 32-bit extension
 query on the RTX 5070), so none of the PTX kernels can launch. What it would take:
 
-- the GLSL route only (every `DLSS5VK_PTX_*` family off, no counter chaining): 7.56 ms at 1485x836 and
+- the GLSL route only (every `NEURAL_FORGE_NR_PTX_*` family off, no counter chaining): 7.56 ms at 1485x836 and
   19.7 ms at 2560x1440 on the idle GPU (+37% and +48% against PTX). The fully unfused reference route is
   77 ms and 220 ms: not usable;
 - an i686 build of the vendored C++ (the `cc` target, a 32-bit static libstdc++) and a requirement list

@@ -1792,6 +1792,9 @@ pub(crate) struct NativePass {
     colour_recorded: bool,
     /// The look-up table on the GPU (binding 13), the last pass's.
     lut: Option<LutBuffer>,
+    /// Whether this frame applies [`Self::lut`] ([`Self::prepare_colour`]): not once `colour::current` gives no
+    /// table (the strength at 0, none named, or one that could not be read), though the buffer stays.
+    lut_applies: bool,
 }
 
 /// [`NativePass::colour`].
@@ -2161,6 +2164,7 @@ impl NativePass {
                 colour_wanted: false,
                 colour_recorded: false,
                 lut: None,
+                lut_applies: false,
                 gap: HistoryGap::default(),
                 history_network: None,
             })
@@ -2452,6 +2456,7 @@ impl NativePass {
             }
         }
         let loaded = lut.is_some() && self.lut.is_some();
+        self.lut_applies = loaded;
         self.colour_wanted = super::colour::wanted(&passes.colour, passes.count, loaded);
     }
 
@@ -3302,7 +3307,7 @@ impl NativePass {
         let runs = 1 + self.more.as_ref().filter(|m| generation.is_some() && m.recorded == generation).map_or(0, |m| {
             (1..passes.count.min(neural_forge_protocol::MAX_PASSES)).take_while(|&k| m.history[k - 1].is_some() && m.recorded_pass[k - 1] == generation).count()
         });
-        let lut = self.lut.as_ref().map(|l| &*l.lut);
+        let lut = self.lut.as_ref().filter(|_| self.lut_applies).map(|l| &*l.lut);
         let recorded = self.colour_recorded;
         let colour = |k: usize| {
             if recorded {
@@ -6053,6 +6058,15 @@ mod tests {
                     }
                 }
             }
+            // The table gone (its file unreadable) with the strength still up and the stage recorded: the one
+            // still in the buffer is not applied.
+            let (gone, recorded) = run(neural_forge_protocol::ColourSettings { lut_strength: 1.0, lut_adapt: 0.01, ..neutral }, None, false, true);
+            assert!(recorded);
+            assert_eq!(
+                gone.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                none.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "no table now, none applied"
+            );
 
             pass.destroy(device);
             encoded.destroy(device);
