@@ -215,7 +215,9 @@ fn texel(x: usize, y: usize) -> [f32; 3] {
                 let (col, row) = ((px / cw) as u32, (py / ch) as u32);
                 let (gx, gy) = ((px % cw) / s, (py % ch) / s);
                 let glyph = hash3(cx * 64 + col, cy * 64 + row, 4);
-                let on = !glyph.is_multiple_of(6) && gx < 5 && gy < 7 && (hash(glyph) >> (gy * 5 + gx) as u32) & 1 == 1;
+                // 35 bits of a 32-bit hash: the shift wraps, as release builds always did (a debug build's
+                // overflow check would abort here).
+                let on = !glyph.is_multiple_of(6) && gx < 5 && gy < 7 && hash(glyph).wrapping_shr((gy * 5 + gx) as u32) & 1 == 1;
                 if on {
                     [ink; 3]
                 } else {

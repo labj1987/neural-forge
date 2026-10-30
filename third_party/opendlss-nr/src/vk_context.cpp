@@ -46,8 +46,8 @@ void Context::create() {
   app.apiVersion = VK_API_VERSION_1_3;
   VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
   instanceInfo.pApplicationInfo = &app;
-  validation_ = envFlag("DLSS5VK_VALIDATION");
-  const bool debug = envFlag("DLSS5VK_DEBUG");
+  validation_ = envFlag("NEURAL_FORGE_NR_VALIDATION");
+  const bool debug = envFlag("NEURAL_FORGE_NR_DEBUG");
   const char* instanceExtensions[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
   if (validation_ || debug) { instanceInfo.enabledExtensionCount = 1; instanceInfo.ppEnabledExtensionNames = instanceExtensions; }
   if (validation_) {
@@ -57,7 +57,7 @@ void Context::create() {
     VK_CHECK(vkEnumerateInstanceLayerProperties(&count, layers.data()));
     auto layer = std::find_if(layers.begin(), layers.end(), [](const VkLayerProperties& l) { return !strcmp(l.layerName, kValidationLayer); });
     if (layer == layers.end())
-      throw std::runtime_error(std::string("DLSS5VK_VALIDATION=1 but ") + kValidationLayer +
+      throw std::runtime_error(std::string("NEURAL_FORGE_NR_VALIDATION=1 but ") + kValidationLayer +
                                " is not installed (a Vulkan SDK, or VK_LAYER_PATH at a Vulkan-ValidationLayers build)");
     instanceInfo.enabledLayerCount = 1;
     instanceInfo.ppEnabledLayerNames = &kValidationLayer;
@@ -91,13 +91,13 @@ void Context::create() {
     for (const auto& extension : extensions) {
       if (!strcmp(extension.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) coop = true;
       if (!strcmp(extension.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) fp8 = true;
-      if (getenv("DLSS5VK_LIST_EXTENSIONS") && (strstr(extension.extensionName, "cooperative") || strstr(extension.extensionName, "NV_")))
+      if (getenv("NEURAL_FORGE_NR_LIST_EXTENSIONS") && (strstr(extension.extensionName, "cooperative") || strstr(extension.extensionName, "NV_")))
         printf("  device extension: %s (v%u)\n", extension.extensionName, extension.specVersion);
     }
     if (coop && fp8) { physical_ = candidate; break; }
   }
   if (!physical_) throw std::runtime_error("no device with VK_KHR_cooperative_matrix + VK_EXT_shader_float8");
-  if (getenv("DLSS5VK_LIST_EXTENSIONS")) {
+  if (getenv("NEURAL_FORGE_NR_LIST_EXTENSIONS")) {
     VkPhysicalDeviceCooperativeMatrix2FeaturesNV cm2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &cm2;

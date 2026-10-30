@@ -134,13 +134,18 @@ pub fn flush_settings() -> std::io::Result<()> {
     let Some(mapping) = mapping.filter(|_| !names.is_empty()) else { return Ok(()) };
     let snapshot = neural_forge_protocol::persist::snapshot(mapping.header());
     let mut cfg = neural_forge_supervisor::Config::load();
-    for name in names {
+    for name in &names {
         let key = format!("set_{name}");
         if let Some(value) = snapshot.get(&key) {
             cfg.settings.insert(key, value.clone());
         }
     }
-    cfg.save()
+    let saved = cfg.save();
+    if saved.is_err() {
+        // Still unsaved: the next change, or the flush on close, writes them again.
+        PENDING_SAVE.with(|p| p.borrow_mut().names.extend(names));
+    }
+    saved
 }
 
 /// Binds a GTK `Scale`/`SpinButton`-shaped float control to one `f32`-bits field:
@@ -238,6 +243,11 @@ mod tests {
             // Debounced: nothing is written until the timer fires or the window flushes.
             let early = std::fs::read_to_string(config_home.join("neural-forge/config.ini")).unwrap_or_default();
             assert!(!early.contains("set_intensity"), "a change is saved after a pause, not on every step:\n{early}");
+            // A save that fails (here: a directory where config.ini goes) keeps the change for the next one.
+            let blocker = config_home.join("neural-forge/config.ini");
+            std::fs::create_dir_all(&blocker).unwrap();
+            assert!(flush_settings().is_err(), "config.ini cannot be written over a directory");
+            std::fs::remove_dir(&blocker).unwrap();
             flush_settings().expect("save config.ini");
         }
 

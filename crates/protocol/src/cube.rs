@@ -111,7 +111,14 @@ pub fn parse(text: &str) -> Result<Cube, String> {
                 domain_min = [v[0]; 3];
                 domain_max = [v[1]; 3];
             }
-            _ if word.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+' || c == '.') => table.push(three(line, n)?),
+            _ if word.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+' || c == '.') => {
+                // Refused at the first row too many, before a file of rows holds the game's memory.
+                let most = size.map_or(MAX_SIZE * MAX_SIZE * MAX_SIZE, |s| s * s * s);
+                if table.len() == most {
+                    return Err(format!("line {n}: more than {most} entries"));
+                }
+                table.push(three(line, n)?);
+            }
             // Keywords of other tools (LUT_IN_VIDEO_RANGE, ...) are skipped.
             _ => {}
         }
@@ -179,6 +186,10 @@ mod tests {
         assert!(parse("LUT_3D_SIZE 66\n").unwrap_err().contains("outside"));
         assert!(parse("LUT_3D_SIZE 2\n0 0 0\n").unwrap_err().contains("needs 8"));
         assert!(parse("0 0 0\n").unwrap_err().contains("LUT_3D_SIZE"));
+        // Refused at the first entry past size^3 (line 12 here), not after reading the whole file.
+        let mut t = text(&Cube::identity(2));
+        t.push_str("0 0 0\n".repeat(1000).as_str());
+        assert_eq!(parse(&t).unwrap_err(), "line 12: more than 8 entries");
         let mut t = text(&Cube::identity(2));
         t.push_str("DOMAIN_MIN 1 0 0\nDOMAIN_MAX 1 1 1\n");
         assert!(parse(&t).unwrap_err().contains("DOMAIN"));

@@ -63,9 +63,16 @@ pub(crate) const F_COUNT_DEPTH: u32 = 256;
 pub(crate) const F_NO_MVEC: u32 = 512;
 /// The capture decodes with the ACES transfer (`hdr::ACES`), its highlight recovery included.
 pub(crate) const F_ACES: u32 = 1024;
+/// The capture decodes with the linear transfer (`hdr::LINEAR`): no sRGB curve, the linear fade.
+pub(crate) const F_LINEAR: u32 = 2048;
 /// Tests: the capture's answer image holds the decoded answer (the replay tool's dumps store it so).
 #[cfg(test)]
 const F_SCENE_ANSWER: u32 = 128;
+
+/// The cache's bits for the transfer [`super::hdr::transfer_flags`] names: the capture decodes as the hold does.
+fn transfer_bits(transfer: u32) -> u32 {
+    (if transfer & super::hdr::ACES != 0 { F_ACES } else { 0 }) | if transfer & super::hdr::LINEAR != 0 { F_LINEAR } else { 0 }
+}
 
 /// The shaders' `STAT_*` words of the host-visible counters.
 const STAT_Z0: usize = 0;
@@ -497,8 +504,7 @@ impl State {
         // The hold before went through on this chain, and this one can read the refresh's edit.
         let continues = chained && had && consecutive && h.jitter.is_some() && h.mvec && h.depth == self.refresh_depth && h.history_ok && !h.armed;
         let cached = continues && self.since_refresh + 1 < self.regime.interval(h.interval);
-        let mut flags =
-            if super::hdr::highlight_flags() != 0 { F_KEEP_CLAMPED } else { 0 } | if super::hdr::transfer_flags() & super::hdr::ACES != 0 { F_ACES } else { 0 };
+        let mut flags = if super::hdr::highlight_flags() != 0 { F_KEEP_CLAMPED } else { 0 } | transfer_bits(super::hdr::transfer_flags());
         if chained {
             flags |= F_CHAINED;
             if !chain_live {
@@ -2240,5 +2246,40 @@ mod tests {
         for (i, px) in colour.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(&px[..3], &[65504.0; 3], "the cached hold at texel {i} stores the largest finite half");
         }
+    }
+
+    /// Under the linear transfer the refresh's capture decodes the answer as the hold does (no sRGB curve):
+    /// an answer of 0.5 over a grey of 1.5 at exposure 1 and paper white 3 is the frame unchanged, so it
+    /// stores no edit; through the sRGB curve the same answer would be a darkening one.
+    #[test]
+    fn the_capture_decodes_with_the_linear_transfer_when_the_hold_does() {
+        assert_eq!(transfer_bits(super::super::hdr::LINEAR), F_LINEAR);
+        assert_eq!(transfer_bits(super::super::hdr::ACES), F_ACES);
+        assert_eq!(transfer_bits(0), 0);
+        let (w, h) = (8u32, 8u32);
+        let Some(rig) = Rig::new(w, h) else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let n = (w * h) as usize;
+        let half = crate::preupscale::tests::f32_to_f16;
+        let grey = |v: f32| -> Vec<u8> { (0..n).flat_map(|_| [v, v, v, 1.0]).flat_map(|c| half(c).to_le_bytes()).collect() };
+        Rig::write(&rig.exposure, &u32::from(half(1.0)).to_le_bytes());
+        Rig::write(&rig.depth, &vec![0u8; n * 4]);
+        Rig::write(&rig.mvec, &vec![0u8; n * 4]);
+        rig.upload_image(rig.colour.image, &grey(1.5));
+        rig.upload_image(rig.answer.image, &grey(0.5));
+        let d = &rig.gpu.3;
+        let capture = |flags: u32| {
+            let push = rig.pass.push(F_CHAINED | F_FRESH | flags, 0, [1.0, 1.0], 3.0);
+            // SAFETY (both): recording into the test's buffer; bound in `Rig::new`.
+            rig.one_shot(|cmd| unsafe { rig.pass.record_motion(d, cmd, &push, rig.acc.buffer) });
+            rig.one_shot(|cmd| unsafe { rig.pass.record_capture(d, cmd, &push) });
+            rig.read_edits(|l| l.src_edit).0
+        };
+        let linear = capture(F_LINEAR);
+        assert!(linear.iter().all(|e| e.abs() < 1e-3), "linear: the answer is the frame, no edit stored; got {:?}", &linear[..3]);
+        let srgb = capture(0);
+        assert!(srgb.iter().all(|&e| e < -0.1), "sRGB: the same answer is a darkening edit; got {:?}", &srgb[..3]);
     }
 }

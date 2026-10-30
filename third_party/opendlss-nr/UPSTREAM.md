@@ -54,7 +54,7 @@ Each was a patch, applied in this order on top of the commit, until 3.8.6.
    with `void setAssetLoader(AssetLoader)` and `AssetLoader assetLoader()`. When a loader is set, every
    SPIR-V read (`vk::Context::loadShaderModule`, kind `"spv"`) and every PTX probe and read in
    `src/kernels.cpp` (kind `"ptx"`) asks it, by file name without the extension, instead of opening
-   `<shaderDir>/<name>.spv` or `$DLSS5VK_PTX_DIR/<name>.ptx`. Unset, behaviour is unchanged. Reason: a
+   `<shaderDir>/<name>.spv` or `$NEURAL_FORGE_NR_PTX_DIR/<name>.ptx` (upstream's `DLSS5VK_PTX_DIR`). Unset, behaviour is unchanged. Reason: a
    Vulkan layer is a single `.so` loaded into a game process and cannot rely on a kernel directory next to
    it; neural-forge-native embeds the kernels and installs a loader (`nf_native::installAssetLoader`).
 4. **Layer adoption** (was `patches/0004-layer-adoption.patch`): a second adopting `vk::Context` constructor for use inside a Vulkan

@@ -77,8 +77,8 @@ class Kernels {
 
   void gemmFp8(VkCommandBuffer commands, const GemmFp8Args& args);
   void gemmF16(VkCommandBuffer commands, const GemmF16Args& args);
-  static bool ptxGemmEnabled();   // the gemm2 PTX route (DLSS5VK_PTX_GEMM, default on)
-  static bool ptxQkvEnabled();    // the fused QKV + window attention PTX route (DLSS5VK_PTX_QKV, default on)
+  static bool ptxGemmEnabled();   // the gemm2 PTX route (NEURAL_FORGE_NR_PTX_GEMM, default on)
+  static bool ptxQkvEnabled();    // the fused QKV + window attention PTX route (NEURAL_FORGE_NR_PTX_QKV, default on)
 
   struct PreprocessArgs {
     uint32_t fullWidth, fullHeight, validWidth, validHeight, sourceWidth, sourceHeight, seed;
@@ -138,7 +138,7 @@ class Kernels {
   // Whether these arguments take the PTX route (only PTX launches take part in counter chaining): the f16 skip and
   // raw-output variants of the block are GLSL only.
   static bool fusedBlock32IsPtx(const FusedBlock32Args& args);
-  static bool ptxGemmVEnabled();   // the ViT GEMM PTX route (DLSS5VK_PTX_GEMMV, default on; implies ptxGemmEnabled)
+  static bool ptxGemmVEnabled();   // the ViT GEMM PTX route (NEURAL_FORGE_NR_PTX_GEMMV, default on; implies ptxGemmEnabled)
   static uint32_t vitGemmTileRows(uint32_t rows);   // 192 or 96
   static uint32_t vitGemmSignals(uint32_t rows, uint32_t N);   // chain signals of a gemmv launch: one per published tile
   void fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& args);

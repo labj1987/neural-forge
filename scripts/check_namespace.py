@@ -65,6 +65,12 @@ for path in scanned:
         env = re.search(r'(?:var|var_os|set_var)\("(?:DLSSNR_|VKLayer_DLSS5)\w*', code)
         check(not env, f"{rel}: reads an old or upstream environment variable ({env.group(0) if env else ''})")
         check('NEURALFORGE.Color' not in code, f"{rel}: the old NEURALFORGE.Color name")
+# The network's C++ runs inside the layer: it reads NEURAL_FORGE_ variables only, never upstream's DLSS5VK_ ones
+# (set for DLSS5VKLayer, they would change this layer's network).
+for path in sorted((root / 'third_party/opendlss-nr/src').glob('*.[ch]*')) + sorted((root / 'crates/native/cpp').glob('*.[ch]*')):
+    for name in re.findall(r'getenv\(\s*"(\w+)"|envFlag\(\s*"(\w+)"', path.read_text()):
+        name = ''.join(name)
+        check(name.startswith('NEURAL_FORGE_'), f"{path.relative_to(root)}: reads {name} (only NEURAL_FORGE_ variables)")
 check(text('README.md').startswith('# Neural Forge\n'), "README.md does not start with the '# Neural Forge' heading")
 check('`dlssnr` is a from-scratch' not in text('ATTRIBUTION.md'), "ATTRIBUTION.md still describes the project as dlssnr")
 check('|labj1987|neural-forge|latest|' in text('build-appimage.sh'), "build-appimage.sh's update information does not name labj1987/neural-forge")
