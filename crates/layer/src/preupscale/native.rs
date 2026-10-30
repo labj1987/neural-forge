@@ -210,6 +210,10 @@ struct LoaderState {
     /// The network is opened without counter chaining ([`Loader::start`]'s `chain` false): the holds run inside
     /// DLSS's buffer, which needs barriers between its launches, so a chained build would be built again at once.
     barriers_from_start: bool,
+    /// Steps the network down when it no longer fits in VRAM, and back up ([`super::vram_guard`]).
+    guard: super::vram_guard::Guard,
+    /// The network frames the guard was told of ([`Loader::note_gpu_ms`]), for [`fake_vram_spill`].
+    guard_frames: u64,
 }
 
 impl LoaderState {
@@ -217,7 +221,21 @@ impl LoaderState {
     /// barriers, the network open is not the one the setting chooses, or a size is wanted that is not
     /// built.
     fn wants_work(&self) -> bool {
-        !self.dead && (!self.opened || self.fall_back || self.switching() || self.wanted.as_ref().is_some_and(|w| *w != self.built_sizes()))
+        !self.dead
+            && (self.pausing()
+                || self.target().is_some()
+                    && (!self.opened || self.fall_back || self.switching() || self.wanted.as_ref().is_some_and(|w| *w != self.built_sizes())))
+    }
+
+    /// The network to run: the one the Network setting chose, the small one in its place, or none while the
+    /// VRAM guard has it paused ([`super::vram_guard`]).
+    fn target(&self) -> Option<u32> {
+        self.guard.target(self.choice)
+    }
+
+    /// Paused by the VRAM guard with the network still open or built: the loader thread closes it.
+    fn pausing(&self) -> bool {
+        self.target().is_none() && (self.network.is_some() || !self.built.is_empty())
     }
 
     /// The sizes of what is built, in their order.
@@ -228,26 +246,43 @@ impl LoaderState {
     /// The network was last opened for another Network setting than the holds' now: it is closed (when
     /// open) and the chosen one opened.
     fn switching(&self) -> bool {
-        self.opened_for.is_some_and(|f| f != self.choice)
+        self.opened_for.is_some_and(|f| self.target().is_some_and(|t| t != f))
+    }
+
+    /// Whether the current build is what [`Self::want_sizes`] would serve for `sizes` and `choice` without
+    /// applying a step of the VRAM guard.
+    fn serves(&self, sizes: &[(u32, u32)], choice: u32) -> bool {
+        self.choice == choice && self.target().is_some_and(|t| self.opened_for == Some(t)) && !self.built.is_empty() && self.built_sizes() == sizes
     }
 
     /// The build the holds may use for `size` and the Network setting `choice`, after noting what they
     /// want (the caller wakes the loader thread when this returns `true` in its second field).
     #[cfg(test)]
     fn want(&mut self, size: (u32, u32), choice: u32) -> (Option<Built>, bool) {
-        let (built, wake) = self.want_sizes(&[size], choice);
+        let (built, wake) = self.want_sizes(&[size], choice, true);
         (built.map(|b| b[0]), wake)
     }
 
     /// [`Self::want`] for several sizes at once (one graph each, built together): the builds in `sizes`'
-    /// order once exactly those are built.
-    fn want_sizes(&mut self, sizes: &[(u32, u32)], choice: u32) -> (Option<Vec<Built>>, bool) {
+    /// order once exactly those are built. `may_step`: a step the VRAM guard decided is applied here (where
+    /// a switch of the setting is, after the frames that used the network were drained), unless holds
+    /// recorded with the current build may still run.
+    fn want_sizes(&mut self, sizes: &[(u32, u32)], choice: u32, may_step: bool) -> (Option<Vec<Built>>, bool) {
         let mut wake = false;
         if self.choice != choice {
             self.choice = choice;
+            // The user's choice wins: the guard starts afresh with it.
+            self.guard.reset();
             wake = true;
         }
-        if self.opened_for == Some(choice) && !self.built.is_empty() && self.built_sizes() == sizes {
+        if may_step && self.guard.apply().is_some() {
+            wake = true;
+        }
+        let Some(target) = self.target() else {
+            // Paused: nothing is served; the loader thread closes what is open.
+            return (None, wake);
+        };
+        if self.opened_for == Some(target) && !self.built.is_empty() && self.built_sizes() == sizes {
             return (Some(self.built.clone()), wake);
         }
         if self.wanted.as_deref() != Some(sizes) {
@@ -377,6 +412,9 @@ static NETWORK_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 
 /// The longest a build waits for the game to stop loading ([`Loader::work`]).
 const LOADING_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the loader thread checks the VRAM budget for the guard ([`super::vram_guard`]) while it has no other work.
+const GUARD_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The words of `nf_native_open`'s refusal while another network is open in the process (crates/native/cpp/nf_native.cpp).
 const OPEN_ELSEWHERE: &str = "another network is open in this process";
@@ -713,6 +751,7 @@ impl Loader {
             crate::log!("[native] {}: the next {} network builds will fail on purpose", FailInject::ENV, f.remaining());
         }
         let (mut loading_since, mut said_loading, mut said_waited): (Option<Instant>, bool, bool) = (None, false, false);
+        let mut last_tick = Instant::now();
         let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             // Lent to another device's loader ([`Loader::lend`]): closed, its builds gone, and nothing asked
@@ -743,7 +782,41 @@ impl Loader {
                 return;
             }
             if !state.wants_work() {
-                state = wake.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = wake.wait_timeout(state, GUARD_TICK).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+                if state.quit || last_tick.elapsed() < GUARD_TICK {
+                    continue;
+                }
+                last_tick = Instant::now();
+                // The VRAM guard's check: the reading taken with the lock let go (holds take it on the game's thread).
+                drop(state);
+                let reading = vram.as_ref().map(crate::vram::reading);
+                let small = network_present(network::SMALL);
+                state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let running = (!state.built.is_empty()).then_some(state.running);
+                let choice = state.choice;
+                let size = state.wanted.as_ref().and_then(|w| w.first().copied()).or_else(|| state.built.first().map(|b| (b.width, b.height)));
+                if let Some(line) = state.guard.tick(reading, running, size, choice, small, Instant::now()) {
+                    drop(state);
+                    crate::log!("{line}");
+                    crate::logging::flush();
+                    state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                continue;
+            }
+            // Paused by the VRAM guard: the network is closed, its memory given back to the game. SAFETY of the
+            // close: the pause is applied only where a switch of the setting is ([`LoaderState::want_sizes`]).
+            if state.pausing() {
+                let n = state.network.take();
+                state.built = Vec::new();
+                state.opened_for = None;
+                let why = state.guard.why().unwrap_or("paused: too little VRAM for the network").to_string();
+                note_failure(&why);
+                state.failed = Some(why);
+                drop(state);
+                drop(n);
+                crate::log!("[native] VRAM guard: the network is closed; frames go to DLSS untouched until there is room again");
+                crate::logging::flush();
+                state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 continue;
             }
             // While the game loads, no build: each runs the network once on this queue, which a game's loading work
@@ -777,7 +850,8 @@ impl Loader {
             let mut network = state.network.take();
             let fall_back = std::mem::take(&mut state.fall_back) || (switching && state.barriers);
             let sizes = state.wanted.clone().or_else(|| (!state.built.is_empty()).then(|| state.built_sizes()));
-            let choice = state.choice;
+            // `wants_work` is false while paused, so there is a network to run.
+            let choice = state.target().unwrap_or(state.choice);
             let barriers_from_start = state.barriers_from_start;
             state.built = Vec::new();
             drop(state);
@@ -865,7 +939,8 @@ impl Loader {
             state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.opened = true;
             if let Some(running) = loaded {
-                // The network now open (kept below whether its build succeeds) is the one for `choice`.
+                // The network now open (kept below whether its build succeeds) is the one for `choice` (the
+                // network to run: the setting's, or the VRAM guard's in its place).
                 state.opened_for = Some(choice);
                 state.running = running;
             }
@@ -929,6 +1004,18 @@ impl Loader {
                             lines.push(format!("[native] the network is up again after {streak} failed attempt(s)"));
                         }
                         state.failed = None;
+                        // What a fresh open and build took, and whether it already ended at the budget.
+                        let fresh_need = match (opened, vram_before, vram_after) {
+                            (Some(_), Some((before, _)), Some((after, _))) => Some(after.saturating_sub(before)),
+                            _ => None,
+                        };
+                        let (running, user_choice) = (state.running, state.choice);
+                        let size = (built[0].0, built[0].1);
+                        if let Some(line) =
+                            state.guard.built(running, fresh_need, size, vram_after, user_choice, network_present(network::SMALL), Instant::now())
+                        {
+                            lines.push(line);
+                        }
                     }
                     state.network = Some(n);
                 }
@@ -990,10 +1077,11 @@ impl Loader {
             // Being closed for another device ([`Self::lend`]): neither path takes it.
             return None;
         }
-        if self.holds_beyond(reserved) && !(st.opened_for == Some(choice) && !st.built.is_empty() && st.built_sizes() == sizes) {
+        let holds_out = self.holds_beyond(reserved);
+        if holds_out && !st.serves(sizes, choice) {
             return None;
         }
-        let (built, woken) = st.want_sizes(sizes, choice);
+        let (built, woken) = st.want_sizes(sizes, choice, !holds_out);
         if built.is_some() {
             st.uses += 1;
         }
@@ -1002,6 +1090,35 @@ impl Loader {
             wake.notify_all();
         }
         built
+    }
+
+    /// One hold's network GPU time, for the VRAM guard.
+    pub(crate) fn note_gpu_ms(&self, ms: f32) {
+        let now = Instant::now();
+        let mut st = self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.guard.gpu_ms(ms, now);
+        st.guard_frames += 1;
+        let line = if fake_vram_spill(st.guard_frames) {
+            let choice = st.choice;
+            st.guard.fake_spill(choice, network_present(network::SMALL), now)
+        } else {
+            None
+        };
+        drop(st);
+        if let Some(line) = line {
+            crate::log!("{line}");
+            crate::logging::flush();
+        }
+    }
+
+    /// Whether the VRAM guard has the network paused (no network to run).
+    pub(crate) fn paused(&self) -> bool {
+        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).target().is_none()
+    }
+
+    /// Why the VRAM guard has the network stepped down, while it has.
+    pub(crate) fn guard_note(&self) -> Option<String> {
+        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).guard.why().map(str::to_string)
     }
 
     /// Why the network is not usable right now, if a load or build failed.
@@ -3710,6 +3827,14 @@ pub(crate) struct Retries {
     pub(crate) scene: PassRetry,
 }
 
+/// `NEURAL_FORGE_NATIVE_FAIL=vram`: the VRAM guard steps down as if the network had spilled at the 600th network frame
+/// and again at the 900th (inside the backoff, so from the small network to the pause), to exercise the step to the small network, the pause (with the hold's resources freed)
+/// and the way back on the rig. Unset (the default) does nothing.
+fn fake_vram_spill(frames: u64) -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_NATIVE_FAIL").as_deref() == Some("vram"));
+    *ON && (frames == 600 || frames == 900)
+}
+
 /// `NEURAL_FORGE_NATIVE_FAIL=chain`: reports one counter-chain timeout at the 300th network frame, to
 /// exercise the fallback to barriers on the rig. Unset (the default) does nothing.
 fn fake_chain_timeout(frames: u64) -> Option<(u32, String)> {
@@ -3721,7 +3846,10 @@ fn fake_chain_timeout(frames: u64) -> Option<(u32, String)> {
 /// What the Status tab says about the native backend after a hold: running, or why not.
 pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     if result.evaluated {
-        return "native network running".to_string();
+        return match loader.guard_note() {
+            Some(why) => format!("native network running ({why})"),
+            None => "native network running".to_string(),
+        };
     }
     match (loader.failed(), result.miss) {
         (Some(why), _) => format!("native network not running: {why}"),
@@ -3922,7 +4050,8 @@ unsafe fn native_hold(
     let reserved = usize::from(inline);
     // Inside DLSS's buffer, while holds recorded with these resources may still run, nothing they use changes
     // (`super::may_rewrite`): a hold that would need a change records nothing until they are done.
-    let frozen = super::Frozen::new(ctx.as_ref().is_some_and(|c| c.outstanding > 0));
+    let others_outstanding = ctx.as_ref().is_some_and(|c| c.outstanding > 0);
+    let frozen = super::Frozen::new(others_outstanding);
     let mut previous_exposure = None;
     if inline {
         // What the holds whose buffers ran since the last hold left: their GPU times, the edit cache's
@@ -3998,7 +4127,16 @@ unsafe fn native_hold(
     // buffers keep it until they are done: `Loader::ready_sizes`), and the frames go to DLSS untouched until
     // the chosen network is built. So does another set of sizes.
     let Some(builts) = loader.ready_sizes(sizes, choice, reserved) else {
-        result.miss = Some(if loader.failed().is_some() {
+        // Paused by the VRAM guard: the hold's own frame resources go too. Idle: this path's last hold was waited
+        // for above, or no hold recorded into DLSS's buffers with them may still run; this hold records nothing.
+        // SAFETY: as just said.
+        if loader.paused() && !others_outstanding && unsafe { res.release_native(device) } {
+            crate::log!("[native] VRAM guard: the hold's frame resources are freed too until the network resumes");
+            crate::logging::flush();
+        }
+        result.miss = Some(if loader.paused() {
+            "the network is paused: too little VRAM for it (VRAM guard)"
+        } else if loader.failed().is_some() {
             "the native network could not be loaded or built"
         } else if loader.waiting_for_holds(reserved) {
             WAITING
@@ -4955,6 +5093,45 @@ mod tests {
         // A dead network is never switched.
         s.dead = true;
         assert!(!s.wants_work());
+    }
+
+    /// The VRAM guard's steps reach the loader the way a switch of the Network setting does: not while holds
+    /// recorded with the build may still run; then the build of the network stepped from is not served and the
+    /// loader switches; a pause serves nothing and has the loader close the network; a change of the setting
+    /// starts the guard afresh.
+    #[test]
+    fn the_vram_guard_steps_like_a_switch_of_the_setting() {
+        let now = Instant::now();
+        let mut s = LoaderState { opened: true, opened_for: Some(network::FULL), running: network::FULL, ..Default::default() };
+        s.built = vec![built((64, 32), 1, network::FULL)];
+        s.wanted = Some(vec![(64, 32)]);
+        assert!(s.guard.built(network::FULL, Some(1500), (64, 32), Some((8000, 8010)), network::FULL, true, now).is_some(), "a build at the budget");
+        // Holds may still run: nothing applied, the full build still served.
+        assert!(s.serves(&[(64, 32)], network::FULL));
+        assert_eq!(s.want_sizes(&[(64, 32)], network::FULL, false).0.map(|b| b[0].generation), Some(1));
+        // Applied: the loader switches to the small network.
+        let (b, wake) = s.want((64, 32), network::FULL);
+        assert!(b.is_none() && wake);
+        assert!(s.switching() && s.wants_work());
+        s.opened_for = Some(network::SMALL);
+        s.running = network::SMALL;
+        s.built = vec![built((64, 32), 2, network::SMALL)];
+        assert!(!s.switching() && !s.wants_work());
+        assert_eq!(s.want((64, 32), network::FULL).0.map(|b| b.network), Some(network::SMALL), "served for the full choice");
+        // The small network at the budget too: paused, the loader closes it.
+        s.guard.built(network::SMALL, Some(700), (64, 32), Some((8000, 8010)), network::FULL, true, now);
+        let (b, wake) = s.want((64, 32), network::FULL);
+        assert!(b.is_none() && wake);
+        assert!(s.pausing() && s.wants_work());
+        s.built = Vec::new();
+        s.opened_for = None;
+        assert!(!s.pausing() && !s.wants_work(), "closed: nothing to do while paused");
+        assert!(s.want((64, 32), network::FULL).0.is_none());
+        // The user picks the small network: the guard starts afresh and the loader opens it.
+        let (b, wake) = s.want((64, 32), network::SMALL);
+        assert!(b.is_none() && wake);
+        assert_eq!(s.target(), Some(network::SMALL));
+        assert!(s.wants_work());
     }
 
     /// The chosen network loads when it is extracted; when it is not, the other one does, and with
