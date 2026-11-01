@@ -39,12 +39,13 @@ fn usage_text() -> &'static str {
          \x20                     (see `profile help`)\n\
          \x20 games                list installed Steam games and whether Neural Forge\n\
          \x20                     is on in their launch options\n\
-         \x20 enable GAME [--target-exe EXE[,EXE...]|auto]\n\
+         \x20 enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]\n\
          \x20                     turn Neural Forge on in GAME's Steam launch options for\n\
          \x20                     the game's own executable (found from Steam's data;\n\
          \x20                     --target-exe names it, remembered for GAME; auto finds it\n\
          \x20                     again). GAME: appid, exact name, or a unique part of a\n\
-         \x20                     name; Steam must be closed, else the string to paste is shown\n\
+         \x20                     name; Steam must be closed, else the string to paste is shown.\n\
+         \x20                     A game that ships anti-cheat needs --anti-cheat-ok\n\
          \x20 disable GAME         take Neural Forge back out of GAME's launch options\n\
          \x20 report [--appid ID]  write a diagnostic report zip to the desktop (home, user\n\
          \x20                     and host names redacted; it lists your installed Steam\n\
@@ -391,7 +392,11 @@ fn cmd_games() -> ExitCode {
                 t => t,
             },
         };
-        println!("{:>8}  {:<3}  {}  ({})  {target}", game.appid, on, game.name, game.library.display());
+        let anti_cheat = match game.anti_cheat() {
+            found if found.is_empty() => String::new(),
+            found => format!("  [anti-cheat: {}]", neural_forge_supervisor::anti_cheat::list(&found)),
+        };
+        println!("{:>8}  {:<3}  {}  ({})  {target}{anti_cheat}", game.appid, on, game.name, game.library.display());
     }
     ExitCode::SUCCESS
 }
@@ -422,7 +427,8 @@ fn target_for_enable(game: &neural_forge_supervisor::steam::Game, chosen: &str) 
     }
 }
 
-fn cmd_set_game(query: &str, action: neural_forge_supervisor::steam::Action) -> ExitCode {
+/// `anti_cheat_ok`: switch on a game that ships anti-cheat (`enable --anti-cheat-ok`).
+fn cmd_set_game(query: &str, action: neural_forge_supervisor::steam::Action, anti_cheat_ok: bool) -> ExitCode {
     use neural_forge_supervisor::steam::{self, Action, FindError, Outcome};
     let roots = steam::roots();
     let games = steam::games(&roots);
@@ -444,6 +450,17 @@ fn cmd_set_game(query: &str, action: neural_forge_supervisor::steam::Action) -> 
     if let (Action::Enable { .. }, Some(why)) = (&action, game.unsupported()) {
         eprintln!("{} cannot be switched on: {why}. Install it in your distribution's Steam instead.", game.name);
         return ExitCode::FAILURE;
+    }
+    if matches!(action, Action::Enable { .. }) {
+        let anti_cheat = game.anti_cheat();
+        if !anti_cheat.is_empty() && !anti_cheat_ok {
+            eprintln!("{}: {}", game.name, neural_forge_supervisor::anti_cheat::warning(&anti_cheat));
+            eprintln!("Nothing was changed. To switch it on anyway: neural-forge-cli enable {} --anti-cheat-ok", game.appid);
+            return ExitCode::FAILURE;
+        }
+        if !anti_cheat.is_empty() {
+            println!("{} ships anti-cheat ({}): switching it on anyway (--anti-cheat-ok)", game.name, neural_forge_supervisor::anti_cheat::list(&anti_cheat));
+        }
     }
     let action = match action {
         Action::Enable { target_exe } => match target_for_enable(game, &target_exe) {
@@ -511,6 +528,8 @@ enum Command {
     Enable {
         game: String,
         target_exe: String,
+        /// `--anti-cheat-ok`: switch on a game that ships anti-cheat.
+        anti_cheat_ok: bool,
     },
     Disable(String),
     /// The Steam app id, when given.
@@ -614,6 +633,7 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
         "enable" | "disable" => {
             let mut words = Vec::new();
             let mut target_exe = String::new();
+            let mut anti_cheat_ok = false;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i] {
@@ -624,6 +644,7 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
                         }
                         None => return Err(err("--target-exe takes an executable name".into())),
                     },
+                    "--anti-cheat-ok" if command == "enable" => anti_cheat_ok = true,
                     option if option.starts_with('-') => return Err(err(format!("unknown option {option:?}"))),
                     word => words.push(word),
                 }
@@ -633,7 +654,7 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
                 return Err(err(format!("{command} takes a game: its appid or name")));
             }
             let game = words.join(" ");
-            Ok(if command == "enable" { Command::Enable { game, target_exe } } else { Command::Disable(game) })
+            Ok(if command == "enable" { Command::Enable { game, target_exe, anti_cheat_ok } } else { Command::Disable(game) })
         }
         "report" => match rest.as_slice() {
             [] => Ok(Command::Report(None)),
@@ -660,9 +681,9 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "uninstall" => {
             "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also removes config, data\n  (the DLL, the model), state and /tmp/neural-forge-$UID"
         }
-        "games" => "usage: neural-forge-cli games\n  list installed Steam games (appid, Neural Forge on/off, name, library, the executable\n  Neural Forge targets)",
+        "games" => "usage: neural-forge-cli games\n  list installed Steam games (appid, Neural Forge on/off, name, library, the executable\n  Neural Forge targets, and the anti-cheat the game's folder ships)",
         "enable" => {
-            "usage: neural-forge-cli enable GAME [--target-exe EXE[,EXE...]|auto]\n  turn Neural Forge on in GAME's Steam launch options, keeping the options already there,\n  with NEURAL_FORGE_TARGET_EXE set to the game's own executable, so no launcher or helper\n  can take the effect. The executable is found from Steam's data and the game's folder;\n  --target-exe names it instead and is remembered for GAME (also when the GUI switches it\n  on); --target-exe auto forgets it. GAME is an appid, an exact name or a unique part of a\n  name. Steam must be closed (it rewrites its settings on exit); otherwise the launch\n  options to paste are printed."
+            "usage: neural-forge-cli enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]\n  turn Neural Forge on in GAME's Steam launch options, keeping the options already there,\n  with NEURAL_FORGE_TARGET_EXE set to the game's own executable, so no launcher or helper\n  can take the effect. The executable is found from Steam's data and the game's folder;\n  --target-exe names it instead and is remembered for GAME (also when the GUI switches it\n  on); --target-exe auto forgets it. GAME is an appid, an exact name or a unique part of a\n  name. Steam must be closed (it rewrites its settings on exit); otherwise the launch\n  options to paste are printed. A game whose folder ships anti-cheat (Easy Anti-Cheat,\n  BattlEye and others) is only switched on with --anti-cheat-ok: Neural Forge does not hide\n  its layer, and the anti-cheat may refuse the game or ban the account."
         }
         "disable" => "usage: neural-forge-cli disable GAME\n  take Neural Forge back out of GAME's Steam launch options (see `enable --help`)",
         "report" => {
@@ -706,8 +727,10 @@ fn main() -> ExitCode {
         Command::Shmctl(args) => shmctl::run(&args),
         Command::Profile(args) => cmd_profile(&args),
         Command::Games => cmd_games(),
-        Command::Enable { game, target_exe } => cmd_set_game(&game, neural_forge_supervisor::steam::Action::Enable { target_exe }),
-        Command::Disable(game) => cmd_set_game(&game, neural_forge_supervisor::steam::Action::Disable),
+        Command::Enable { game, target_exe, anti_cheat_ok } => {
+            cmd_set_game(&game, neural_forge_supervisor::steam::Action::Enable { target_exe }, anti_cheat_ok)
+        }
+        Command::Disable(game) => cmd_set_game(&game, neural_forge_supervisor::steam::Action::Disable, false),
         Command::Report(appid) => cmd_report(appid.as_deref()),
         Command::Help(command) => {
             print_help(command.as_deref());
@@ -799,11 +822,16 @@ mod tests {
     fn game_commands_parse() {
         assert_eq!(parse_str("games"), Ok(Command::Games));
         assert!(parse_str("games now").is_err());
-        assert_eq!(parse_str("enable 3240220"), Ok(Command::Enable { game: "3240220".into(), target_exe: String::new() }));
+        assert_eq!(parse_str("enable 3240220"), Ok(Command::Enable { game: "3240220".into(), target_exe: String::new(), anti_cheat_ok: false }));
         assert_eq!(
             parse_str("enable grand theft auto --target-exe GTA5_Enhanced.exe"),
-            Ok(Command::Enable { game: "grand theft auto".into(), target_exe: "GTA5_Enhanced.exe".into() })
+            Ok(Command::Enable { game: "grand theft auto".into(), target_exe: "GTA5_Enhanced.exe".into(), anti_cheat_ok: false })
         );
+        assert_eq!(
+            parse_str("enable ark --anti-cheat-ok --target-exe ArkAscended.exe"),
+            Ok(Command::Enable { game: "ark".into(), target_exe: "ArkAscended.exe".into(), anti_cheat_ok: true })
+        );
+        assert!(parse_str("disable ark --anti-cheat-ok").is_err(), "disable needs no acknowledgement");
         assert_eq!(parse_str("disable Hogwarts Legacy"), Ok(Command::Disable("Hogwarts Legacy".into())));
         assert!(parse_str("enable").is_err());
         assert!(parse_str("enable gta --target-exe").is_err());

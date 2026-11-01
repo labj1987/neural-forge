@@ -4,6 +4,15 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.9.9 — 2026-11-01
+
+- A game whose folder ships anti-cheat (Easy Anti-Cheat, BattlEye, EA Javelin, RICOCHET, XIGNCODE3,
+  nProtect GameGuard, Anti-Cheat Expert and others) now says so in the Setup tab and in
+  `neural-forge-cli games`, and asks before Neural Forge is switched on for it: Neural Forge does not
+  hide its layer from anti-cheat, and the game may refuse to start or the account be banned, most of all
+  online. `neural-forge-cli enable` needs `--anti-cheat-ok` for such a game, and Diagnose warns about
+  one that is already on.
+
 ## 3.9.8 — 2026-10-30
 
 Fixes from a review of the whole code base:

@@ -1789,16 +1789,46 @@ struct ScannedGame {
     chosen: bool,
     /// The executables in its folder, best first (`TargetFinder::candidates`), for the target editor.
     candidates: Vec<neural_forge_supervisor::steam::Candidate>,
+    /// The anti-cheat its folder ships (`Game::anti_cheat`): switching it on asks first.
+    anti_cheat: Vec<&'static str>,
 }
 
-/// A game row's subtitle: its appid, library and target (or why it has none).
-fn game_subtitle(game: &neural_forge_supervisor::steam::Game, target: &str, chosen: bool) -> String {
+/// A game row's subtitle: its appid, library and target (or why it has none), and its anti-cheat.
+fn game_subtitle(game: &neural_forge_supervisor::steam::Game, target: &str, chosen: bool, anti_cheat: &[&str]) -> String {
     let detail = match (game.unsupported(), target.is_empty()) {
         (Some(why), _) => format!("cannot be switched on: {why}"),
         (None, true) => "its executable was not found: choose it with the edit button".to_string(),
         (None, false) => format!("runs {}{}", target.replace(',', ", "), if chosen { " (chosen)" } else { "" }),
     };
-    format!("{} · {} · {detail}", game.appid, game.library.display())
+    let anti_cheat = match anti_cheat {
+        [] => String::new(),
+        found => format!(" · anti-cheat: {}", neural_forge_supervisor::anti_cheat::list(found)),
+    };
+    format!("{} · {} · {detail}{anti_cheat}", game.appid, game.library.display())
+}
+
+/// Asks before switching on a game whose folder ships `anti_cheat`: "Switch On Anyway" runs
+/// `apply`, anything else turns the switch back off.
+fn confirm_anti_cheat(switch: &gtk4::Switch, game: &str, anti_cheat: &[&str], reverting: &std::rc::Rc<std::cell::Cell<bool>>, apply: impl FnOnce() + 'static) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(format!("{game} ships anti-cheat"))
+        .body(neural_forge_supervisor::anti_cheat::warning(anti_cheat))
+        .default_response("cancel")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("on", "Switch On Anyway");
+    dialog.set_response_appearance("on", adw::ResponseAppearance::Destructive);
+    let (switch_weak, reverting) = (switch.downgrade(), reverting.clone());
+    dialog.choose(switch.root().as_ref(), None::<&gio::Cancellable>, move |response| {
+        if response == "on" {
+            apply();
+        } else if let Some(switch) = switch_weak.upgrade() {
+            reverting.set(true);
+            switch.set_active(false);
+            reverting.set(false);
+        }
+    });
 }
 
 /// The per-game target editor: pick one of the executables found in the game's folder (best
@@ -1813,6 +1843,7 @@ fn target_editor(
     game: &neural_forge_supervisor::steam::Game,
     target: &std::rc::Rc<std::cell::RefCell<String>>,
     candidates: &[neural_forge_supervisor::steam::Candidate],
+    anti_cheat: &[&'static str],
     toasts: &adw::ToastOverlay,
     running: &std::rc::Rc<std::cell::Cell<bool>>,
 ) {
@@ -1850,6 +1881,7 @@ fn target_editor(
     dialog.add_response("save", "Save");
     dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
     let (row, switch, game, target, toasts, running) = (row.clone(), switch.clone(), game.clone(), target.clone(), toasts.clone(), running.clone());
+    let anti_cheat = anti_cheat.to_vec();
     dialog.choose(button.root().as_ref(), None::<&gio::Cancellable>, move |response| {
         let typed = entry.text().split(',').map(str::trim).filter(|n| !n.is_empty()).collect::<Vec<_>>().join(",");
         let mut cfg = neural_forge_supervisor::Config::load();
@@ -1872,6 +1904,7 @@ fn target_editor(
             return;
         }
         let (row, switch, game, target, toasts, running) = (row.clone(), switch.clone(), game.clone(), target.clone(), toasts.clone(), running.clone());
+        let anti_cheat = anti_cheat.clone();
         glib::spawn_future_local(async move {
             let worker_game = game.clone();
             let found = gio::spawn_blocking(move || {
@@ -1883,7 +1916,7 @@ fn target_editor(
             .await;
             let Ok((new, chosen)) = found else { return };
             *target.borrow_mut() = new.clone();
-            row.set_subtitle(&game_subtitle(&game, &new, chosen));
+            row.set_subtitle(&game_subtitle(&game, &new, chosen, &anti_cheat));
             // A game whose executable was just named can be switched on now, without a refresh.
             switch.set_sensitive(switch_usable(&game, &new, switch.is_active(), running.get()));
             if !switch.is_active() || new.is_empty() {
@@ -1930,7 +1963,8 @@ fn scan_steam() -> SteamScan {
             let target = if usable { steam::target_for_in(&cfg, &game, &finder) } else { String::new() };
             let candidates = if usable { finder.candidates(&game) } else { Vec::new() };
             let chosen = steam::chosen_target(&cfg, &game.appid).is_some();
-            ScannedGame { game, enabled, target, chosen, candidates }
+            let anti_cheat = if usable { game.anti_cheat() } else { Vec::new() };
+            ScannedGame { game, enabled, target, chosen, candidates, anti_cheat }
         })
         .collect();
     SteamScan { running: steam::steam_running(std::path::Path::new("/proc")), roots, games }
@@ -1967,7 +2001,7 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                 let row = adw::ActionRow::new();
                 row.set_use_markup(false);
                 row.set_title(&game.name);
-                row.set_subtitle(&game_subtitle(&game, &target.borrow(), scanned.chosen));
+                row.set_subtitle(&game_subtitle(&game, &target.borrow(), scanned.chosen, &scanned.anti_cheat));
                 let switch = gtk4::Switch::new();
                 switch.set_valign(gtk4::Align::Center);
                 switch.set_active(scanned.enabled);
@@ -1981,14 +2015,16 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                     row.add_suffix(&edit);
                     let (row_weak, switch_weak, game, target, toasts, candidates, running) =
                         (row.downgrade(), switch.downgrade(), game.clone(), target.clone(), toasts.clone(), scanned.candidates.clone(), running.clone());
+                    let anti_cheat = scanned.anti_cheat.clone();
                     edit.connect_clicked(move |button| {
                         let (Some(row), Some(switch)) = (row_weak.upgrade(), switch_weak.upgrade()) else { return };
-                        target_editor(button, &row, &switch, &game, &target, &candidates, &toasts, &running);
+                        target_editor(button, &row, &switch, &game, &target, &candidates, &anti_cheat, &toasts, &running);
                     });
                 }
                 // Switching off always works; switching on needs a usable game with a known executable.
                 switch.set_sensitive(switch_usable(&game, &target.borrow(), scanned.enabled, scan.running));
                 let reverting = std::rc::Rc::new(std::cell::Cell::new(false));
+                let anti_cheat = scanned.anti_cheat.clone();
                 // Weak: the list holds the rows, and each row's handler would otherwise hold the list.
                 let (group_for_row, rows_for_row, toasts, running) = (group.downgrade(), std::rc::Rc::downgrade(&rows), toasts.clone(), running.clone());
                 switch.connect_active_notify(move |row| {
@@ -1997,45 +2033,56 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                     }
                     let on = row.is_active();
                     let action = if on { steam::Action::Enable { target_exe: target.borrow().clone() } } else { steam::Action::Disable };
-                    row.set_sensitive(false);
-                    let (row, game, reverting, toasts) = (row.downgrade(), game.clone(), reverting.clone(), toasts.clone());
+                    let (row_weak, game_for_apply, reverting_for_apply, toasts) = (row.downgrade(), game.clone(), reverting.clone(), toasts.clone());
                     let (group_for_row, rows_for_row, running) = (group_for_row.clone(), rows_for_row.clone(), running.clone());
-                    glib::spawn_future_local(async move {
-                        let (root, appid) = (game.root.path.clone(), game.appid.clone());
-                        let outcome = gio::spawn_blocking(move || steam::apply_now(&root, &appid, &action)).await;
-                        let Some(row) = row.upgrade() else { return };
-                        row.set_sensitive(true);
-                        let revert = || {
-                            reverting.set(true);
-                            row.set_active(!on);
-                            reverting.set(false);
-                        };
-                        match outcome {
-                            Ok(steam::Outcome::Changed(_) | steam::Outcome::Unchanged) => {
-                                let state = if on { "on" } else { "off" };
-                                toasts.add_toast(toast(&format!("Neural Forge is {state} for {}", game.name)));
-                            }
-                            Ok(steam::Outcome::SteamRunning { manual }) => {
-                                revert();
-                                running.set(true);
-                                if let (Some(rows), Some(group)) = (rows_for_row.upgrade(), group_for_row.upgrade()) {
-                                    for (_, other) in rows.borrow().iter() {
-                                        other.set_sensitive(false);
-                                    }
-                                    group.set_description(Some(&games_note(&steam::roots(), rows.borrow().len(), true)));
-                                }
-                                toasts.add_toast(manual_toast("Steam is running: close it first, or set the launch options by hand", manual));
-                            }
-                            Ok(steam::Outcome::Failed { reason, manual }) => {
-                                revert();
-                                toasts.add_toast(manual_toast(&format!("Could not change the launch options safely: {reason}"), manual));
-                            }
-                            Err(_) => {
-                                revert();
-                                toasts.add_toast(toast("Could not change the launch options: the worker stopped"));
-                            }
+                    let apply = move || {
+                        let (row, game, reverting) = (row_weak, game_for_apply, reverting_for_apply);
+                        if let Some(switch) = row.upgrade() {
+                            switch.set_sensitive(false);
                         }
-                    });
+                        glib::spawn_future_local(async move {
+                            let (root, appid) = (game.root.path.clone(), game.appid.clone());
+                            let outcome = gio::spawn_blocking(move || steam::apply_now(&root, &appid, &action)).await;
+                            let Some(row) = row.upgrade() else { return };
+                            row.set_sensitive(true);
+                            let revert = || {
+                                reverting.set(true);
+                                row.set_active(!on);
+                                reverting.set(false);
+                            };
+                            match outcome {
+                                Ok(steam::Outcome::Changed(_) | steam::Outcome::Unchanged) => {
+                                    let state = if on { "on" } else { "off" };
+                                    toasts.add_toast(toast(&format!("Neural Forge is {state} for {}", game.name)));
+                                }
+                                Ok(steam::Outcome::SteamRunning { manual }) => {
+                                    revert();
+                                    running.set(true);
+                                    if let (Some(rows), Some(group)) = (rows_for_row.upgrade(), group_for_row.upgrade()) {
+                                        for (_, other) in rows.borrow().iter() {
+                                            other.set_sensitive(false);
+                                        }
+                                        group.set_description(Some(&games_note(&steam::roots(), rows.borrow().len(), true)));
+                                    }
+                                    toasts.add_toast(manual_toast("Steam is running: close it first, or set the launch options by hand", manual));
+                                }
+                                Ok(steam::Outcome::Failed { reason, manual }) => {
+                                    revert();
+                                    toasts.add_toast(manual_toast(&format!("Could not change the launch options safely: {reason}"), manual));
+                                }
+                                Err(_) => {
+                                    revert();
+                                    toasts.add_toast(toast("Could not change the launch options: the worker stopped"));
+                                }
+                            }
+                        });
+                    };
+                    // Switching on a game with anti-cheat asks first; switching off never does.
+                    if on && !anti_cheat.is_empty() {
+                        confirm_anti_cheat(row, &game.name, &anti_cheat, &reverting, apply);
+                    } else {
+                        apply();
+                    }
                 });
                 group.add(&row);
                 rows.borrow_mut().push((row, switch));

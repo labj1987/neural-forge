@@ -30,6 +30,7 @@ adapted, or taken from DLSS5VKLayer's real source, not just its documented behav
 | [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (maan), MIT: its documentation of the proxy transform read, **design only, no code** | **The pre-upscaler path's HDR encode** (2.0; `crates/layer/src/preupscale/hdr.rs`, `shaders/preupscale_encode.comp` and `preupscale_decode.comp`): the scene divided by a paper white, the per-channel shoulder above 0.75 (`0.75 + 0.25 (1 - exp(-5.770780 (v - 0.75)))`) and sRGB before the model, as OpenDLSS-NR documents its proxy; the inverse on write-back, the exposure multiply and the paper white of 3 are this project's own, chosen by measurement on GTA V Enhanced (`docs/PRE_UPSCALER_DESIGN.md`, "E1b"). |
 | [RTX Remix](https://github.com/NVIDIAGameWorks/dxvk-remix) (NVIDIA), MIT, commit `bbd74a1`: `src/dxvk/shaders/rtx/pass/tonemap/tonemapping_fast_tonemapping.comp.slang`, `tonemapping_inverse_tonemapping.comp.slang` and `tonemapping.slangh` (`ACESFilmApproximation`), and `src/dxvk/rtx_render/rtx_dlss_neural_rendering.h` read; **formulas ported** | **The ACES transfer before the upscaler** (`crates/layer/src/preupscale/hdr.rs`'s `ACES` and `aces`, `shaders/preupscale_encode.comp`, `preupscale_decode.comp` and `preupscale_cache_capture.comp`): the exposed value through Narkowicz's ACES fit (a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14, saturated, per channel) and sRGB before the model; the decode as the ratio inverse, the answer's linear value times the original pixel's `x / max(ACES(x), 1e-6)` divided by the exposure; the highlight recovery, `smoothstep(1, 8, peak exposed channel) * smoothstep(0.75, 0.99, peak encoded channel)` blending back to the original; and its sanitising of invalid values. The **Remix strength preset** (`crates/supervisor/src/presets.rs`) is Remix's defaults for its neural rendering (intensity 1, structure 0.7, tone 0.3, character structure 0.5). The exposure scale tied to the paper white and the brightness setting is this project's own. Remix's MIT notice is in the ported shaders' and module's comments. |
 | [DLSS5oneclick-forlinux](https://github.com/Mhsbrian/DLSS5oneclick-forlinux) (Copyright (c) 2026 Faisal Bahashwan), MIT, commit `b0f16ff`: `src/diagnose.rs` read, **technique only, no code** | **How `doctor` reads logs** (`crates/supervisor/src/doctor.rs`, `crates/protocol/src/state_log.rs`): every finding is driven by the component's own log grammar matched exactly, the newest matching line is the verdict, and the tests feed lines that only contain a match as substring traps. The checks, the state log and its grammar are this project's own. Its MIT license permits this use; the notice: "Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction ... The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software." |
+| [DLSS-5-Master](https://github.com/liongooder/DLSS-5-Master) (Copyright (c) 2026 Liongooder), MIT, commit `d3c3fd0`: `src/DLSS5Master/Core/Scanner.cs` (`AntiCheatOfFile`, `AntiCheatOfFolder`, `Scan`) and `tests/CoreTests/Program.cs` read, **adapted** | **Telling anti-cheat from the files and folders it leaves in a game's folder** (`crates/supervisor/src/anti_cheat.rs`): the file and folder name rules and the names they give, and the search that stops at an anti-cheat's own folder; the test names come from its tests. Rewritten here: a breadth-first search with its own depth and entry limits that does not follow symbolic links, and the warning text, the CLI's `--anti-cheat-ok`, the GUI's confirmation and the doctor's finding are this project's own. MIT notice below. |
 | [Dagherbou/OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR), GPL-3.0: **design only, no code** | **The idea of reading the game's exposure texture** to scale the HDR scene before the encode. Neural Forge reads DLSS's own 1x1 exposure input on the GPU at each hold (the image is found from DLSS's registered views, not from OptiScaler's code). |
 | [OptiScaler](https://github.com/cdozdil/OptiScaler), GPL-3.0: its pre-SR mod, **design only, no code** | **The inspiration for running the model before the upscaler** (on DLSS Super Resolution's render-resolution input rather than the upscaled frame). The mechanism here is different and this project's own: a Vulkan layer that recognises DLSS's input through `VK_NVX_image_view_handle` and holds the game's DLSS submit (`crates/layer/src/preupscale.rs`). |
 | [DLSS5oneclick-forlinux](https://github.com/Mhsbrian/DLSS5oneclick-forlinux) (Faisal Bahashwan), MIT, commit `b0f16ff`: `src/platform/vdf.rs`, `src/platform/launch_options.rs` and `src/platform/steam.rs` read, **adapted** | **Steam discovery and the guarded launch-option edit** in `crates/supervisor/src/vdf.rs`, `launch_options.rs` and `steam.rs`: the VDF reader with byte spans and the one-value splice that never re-serialises the file (`vdf::set_string`: replace the value, insert a missing key, or a missing parent block holding it, before the closing brace), the merge/strip pair for launch options (split respecting quotes, game arguments without `%command%` moved behind one, strip removing exactly what merge adds), the Steam root list with Flatpak and Snap, the library and app-manifest reading with Steam's own tools filtered out, and `apply_with`'s sequence, here `steam::apply` (refuse while Steam runs, splice, re-parse and compare, `.orig` once and `.bak` per edit, replace; the app block created in the most recently modified account). Rewritten for this project: byte-based parsing with `[$CONDITION]`s, the verification as "the original tree plus exactly this change", layout and CRLF copied from the file, the atomic write keeping the file's mode, `steamwebhelper` in the running check, the accounts that have the game edited along with the one signed in last, the game's own executable written as the target (from Steam's `appinfo.vdf`, `crates/supervisor/src/appinfo.rs`, this project's own), and a typed outcome carrying the string to paste instead of an error. The MIT notice is below. |
@@ -125,6 +126,32 @@ The Steam and report code adapted from DLSS5oneclick-forlinux (see above) is use
 MIT License
 
 Copyright (c) 2026 Faisal Bahashwan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+The anti-cheat name rules adapted from DLSS-5-Master (see above) are used under its MIT license:
+
+```
+MIT License
+
+Copyright (c) 2026 Liongooder
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

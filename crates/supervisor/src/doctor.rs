@@ -797,6 +797,24 @@ fn check_steam(roots: &Roots) -> Vec<Finding> {
             Some("Install those games in your distribution's Steam (not the Flatpak) and switch them on there.".into()),
         ));
     }
+    // On in a game that ships anti-cheat: the layer is not hidden from it.
+    let anti_cheat: Vec<(&crate::steam::Game, Vec<&'static str>)> =
+        games.iter().zip(&options).filter(|(g, o)| usable(g) && o.is_some()).map(|(g, _)| (g, g.anti_cheat())).filter(|(_, found)| !found.is_empty()).collect();
+    if !anti_cheat.is_empty() {
+        let names = anti_cheat.iter().map(|(g, found)| format!("{} ({})", g.name, crate::anti_cheat::list(found))).collect::<Vec<_>>().join(", ");
+        let detail = anti_cheat
+            .iter()
+            .map(|(g, found)| format!("{} ({}) in {}: {}", g.name, g.appid, g.dir().display(), crate::anti_cheat::list(found)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push(Finding::new(
+            "steam-anti-cheat",
+            Severity::Warning,
+            format!("on in games that ship anti-cheat: {names}"),
+            format!("{detail}\n{}", crate::anti_cheat::RISK),
+            Some("Play these offline or start them without the anti-cheat where the game offers it, or switch Neural Forge off for them in the Setup tab (or `neural-forge-cli disable GAME`).".into()),
+        ));
+    }
     // On without a target: a store launcher or helper that presents first can take the effect.
     let cfg = crate::Config::load_from(&roots.config_file.to_string_lossy());
     let finder = crate::steam::TargetFinder::new(&games);
@@ -1598,6 +1616,30 @@ mod tests {
             "{}",
             w.evidence
         );
+    }
+
+    #[test]
+    fn a_game_on_that_ships_anti_cheat_is_a_warning() {
+        let mut f = quiet();
+        steam(
+            &mut f,
+            "steam",
+            false,
+            &[
+                ("2399830", "ARK Survival Ascended", Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=ArkAscended.exe %command%")),
+                ("1172470", "Apex Legends", None),
+            ],
+        );
+        write(&f.dir.join("steam/steamapps/common/ARK Survival Ascended/ShooterGame/Binaries/Win64/BattlEye/BEClient_x64.dll"), "");
+        write(&f.dir.join("steam/steamapps/common/Apex Legends/EasyAntiCheat/Settings.json"), "");
+        let v = check_steam(&f.roots);
+        let w = one(&v, "steam-anti-cheat");
+        assert_eq!(w.severity, Severity::Warning);
+        assert_eq!(w.summary, "on in games that ship anti-cheat: ARK Survival Ascended (BattlEye)", "a game that is off is not named");
+        assert!(w.evidence.contains(crate::anti_cheat::RISK));
+        assert!(w.fix.as_deref().unwrap().contains("neural-forge-cli disable GAME"));
+        std::fs::remove_dir_all(f.dir.join("steam/steamapps/common/ARK Survival Ascended/ShooterGame")).unwrap();
+        assert!(check_steam(&f.roots).iter().all(|x| x.check != "steam-anti-cheat"));
     }
 
     #[test]
