@@ -74,7 +74,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
-| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another, and the launch option to copy by hand for a game you pick. |
+| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on), and the launch option to copy by hand for a game you pick. |
 
 Before the upscaler the network runs on every frame while the camera is still and on every second
 frame while it moves; the frame in between reuses its last result, moved with the game's motion and
@@ -281,12 +281,19 @@ The CLI is installed as `~/.local/share/neural-forge/bin/neural-forge-cli`; add 
 `PATH`, or call it by that path, for the commands in this guide.
 
 `neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID]`, `games`,
-`enable GAME [--target-exe EXE[,EXE...]|auto]`, `disable GAME`, `config`, `import-binaries DIR`,
+`enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]`, `disable GAME`, `config`, `import-binaries DIR`,
 `extract-model DIR [--network full|small]`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`, and
 `shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--view V]|capture --cancel|dump-cache [--holds K]|reset|lut FILE|none`
 for the live settings. `doctor`, `report` and `shmctl status` only look: they create and change nothing.
 `neural-forge-cli help [COMMAND]` (or `COMMAND --help`) has the details; an unknown or misspelt
 argument prints the usage and exits with status 2.
+
+`enable` switches on a game whose folder ships anti-cheat only with `--anti-cheat-ok`; `games` names
+the anti-cheat each game ships, and `doctor` warns about a game that is on with it. What is seen: Easy
+Anti-Cheat, BattlEye, EA Javelin, RICOCHET, XIGNCODE3, NetEase, HoYoverse, Denuvo Anti-Cheat, FACEIT,
+EQU8, nProtect GameGuard, Anti-Cheat Expert (ACE) and Nexon Game Security, by the files and folders
+they leave in the game's folder. Anti-cheat installed outside it (Riot Vanguard, FACEIT's client,
+Valve's VAC) cannot be seen.
 
 ## Files
 

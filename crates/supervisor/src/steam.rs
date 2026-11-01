@@ -104,6 +104,11 @@ impl Game {
     pub fn unsupported(&self) -> Option<&'static str> {
         self.root.flatpak.then_some("it belongs to the Flatpak Steam, whose games cannot load Neural Forge's layer")
     }
+
+    /// The anti-cheat its install folder ships ([`crate::anti_cheat::in_dir`]); reads the folder.
+    pub fn anti_cheat(&self) -> Vec<&'static str> {
+        crate::anti_cheat::in_dir(&self.dir())
+    }
 }
 
 /// Apps in `steamapps` that are Steam's own tools rather than games: Proton builds, the Steam Linux

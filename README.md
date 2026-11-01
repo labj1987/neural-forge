@@ -74,6 +74,10 @@ steps down to the small one, then pauses, and comes back when there is room.
 The game's HDR works with the model before the upscaler and after DLSS. On the finished frame, an HDR
 or 10-bit swapchain is presented untouched.
 
+A game whose folder ships anti-cheat (Easy Anti-Cheat, BattlEye and others) asks before it is switched
+on. Neural Forge does not hide its layer from anti-cheat: the game may refuse to start or go online
+with it, and the anti-cheat can ban the account, most of all in online play.
+
 After an update, restart the game: the layer and the app must be the same version.
 
 Every setting, the other placements and all environment variables: [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
