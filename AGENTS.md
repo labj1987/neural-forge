@@ -96,13 +96,17 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 
 ## README
 
-- The README describes the newest release only: what it does, how to install and use it, its
-  current measurements and known issues, all in the present tense. No version history ("since 3.0",
+- The README stays short: what it is, requirements, install, usage, the known issues and
+  troubleshooting a user will actually hit, then Legal, License and Acknowledgements. Every other
+  user-facing detail (settings, tested games, environment variables, CLI, files) goes in
+  docs/USER_GUIDE.md, and measurements in docs/MEASURED_RESULTS.md.
+- The README, the user guide and the measured results describe the newest release only, in the
+  present tense. No version history ("since 3.0",
   "3.4.1 drops ...", tables comparing releases, notes for settings made with an older version,
   screenshots captioned with an old version). Users run the latest release; history belongs in
   CHANGELOG.md and the docs.
-- Every release re-reads the whole README and updates or removes what the release changed, including
-  the screenshots and the measured results.
+- Every release re-reads all three and updates or removes what the release changed, including the
+  screenshots and the measured results. A new environment variable gets a row in the user guide's table.
 - Screenshots are always the dark theme, 1240x1400 (the window at 2x). A headless run (Xvfb) has no
   portal and falls back to light: set `ADW_DEBUG_COLOR_SCHEME=prefer-dark`, and look at every image
   before committing it.

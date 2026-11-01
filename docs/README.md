@@ -1,14 +1,21 @@
 # Neural Forge documentation
 
 Every document in this folder, one line each. New to the project: read
-[ARCHITECTURE.md](ARCHITECTURE.md), then [LESSONS.md](LESSONS.md). The user-facing guide is the
-top-level [README](../README.md).
+[ARCHITECTURE.md](ARCHITECTURE.md), then [LESSONS.md](LESSONS.md). Users start with the top-level
+[README](../README.md).
 
 Older documents are kept as they were written, with a dated note at the top where something in
 them is no longer true. Up to 2.0.10 the model ran in a Windows helper under Wine through NVIDIA's
 NGX runtime; 3.0 removed the helper, so what older documents say about it, the runners, the
 Wine prefix or NGX is history. When a document and the code disagree, the code wins; when two documents
 disagree, the more recent measurement wins.
+
+## For users
+
+- [USER_GUIDE.md](USER_GUIDE.md): how the model runs, every setting, the tested games and their setup
+  notes, every environment variable, the CLI, the files and uninstalling.
+- [MEASURED_RESULTS.md](MEASURED_RESULTS.md): the newest release's frame rates, GPU time and video
+  memory in GTA V Enhanced, Crimson Desert and Hogwarts Legacy, and the network on its own.
 
 ## How it works
 
