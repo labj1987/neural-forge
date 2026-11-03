@@ -17,7 +17,7 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/cfg-if |
 | const-oid | 0.10.2 | Apache-2.0 OR MIT | https://github.com/RustCrypto/formats |
 | cpufeatures | 0.3.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
-| crc32fast | 1.5.3 | MIT OR Apache-2.0 | https://github.com/srijs/rust-crc32fast |
+| crc32fast | 1.5.4 | MIT OR Apache-2.0 | https://github.com/srijs/rust-crc32fast |
 | crypto-common | 0.2.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
 | digest | 0.11.3 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 | https://github.com/image-rs/fdeflate |
@@ -50,7 +50,7 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | libadwaita-sys | 0.9.2 | MIT | https://gitlab.gnome.org/World/Rust/libadwaita-rs |
 | libc | 0.2.191 | MIT OR Apache-2.0 | https://github.com/rust-lang/libc |
 | libloading | 0.8.9 | ISC | https://github.com/nagisa/rust_libloading/ |
-| log | 0.4.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/log |
+| log | 0.4.35 | MIT OR Apache-2.0 | https://github.com/rust-lang/log |
 | memchr | 2.8.3 | Unlicense OR MIT | https://github.com/BurntSushi/memchr |
 | memoffset | 0.9.1 | MIT | https://github.com/Gilnaa/memoffset |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
