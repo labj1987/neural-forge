@@ -20,18 +20,6 @@ pub(crate) const DETAIL: u32 = 8;
 pub(crate) const DITHER: u32 = 16;
 /// The Oklab protections of the pass's result against its input (`protect`).
 pub(crate) const PROTECT: u32 = 32;
-/// Still-scene smoothing of the last pass's change (`still`).
-pub(crate) const STILL: u32 = 64;
-/// Still-scene smoothing: the most a pixel may move (render pixels, along the motion back to the network's
-/// previous frame) and the most its encoded input luma may change, and still count as the same observation.
-pub(crate) const STILL_PIXELS: f32 = 0.25;
-pub(crate) const STILL_LUMA: f32 = 0.06;
-
-/// The weight of this frame's change at still-scene smoothing `s` (0-1): 1 at 0 (off), 0.25 at 1 (the
-/// shown change is then three parts the previous one).
-pub(crate) fn still_weight(s: f32) -> f32 {
-    1.0 - 0.75 * s.clamp(0.0, 1.0)
-}
 
 /// A loaded table, numbered so a path's GPU copy knows when to upload it again.
 pub(crate) struct Lut {
@@ -57,8 +45,7 @@ impl Lut {
 
 /// One pass's shader parameters: `colour` (saturation, contrast, detail, 0), `flags` (steps, table size, 0,
 /// 0), `lut_scale` (grid scale, strength), `lut_offset` (grid offset, adapt) and `protect` (the hue, near-grey
-/// chroma, shadow and highlight protections, 0-1) and `still` (the still-scene smoothing's weight of this frame,
-/// pixels, luma tolerance, and its history valid: filled in by the frame's plan).
+/// chroma, shadow and highlight protections, 0-1).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct PassColour {
     pub colour: [f32; 4],
@@ -66,7 +53,6 @@ pub(crate) struct PassColour {
     pub lut_scale: [f32; 4],
     pub lut_offset: [f32; 4],
     pub protect: [f32; 4],
-    pub still: [f32; 4],
 }
 
 impl PassColour {
@@ -89,10 +75,6 @@ impl PassColour {
         if protect.iter().any(|&v| v > 0.0) {
             flags |= STEP | PROTECT;
         }
-        let still = last && s.still.is_finite() && s.still > 0.0;
-        if still {
-            flags |= STEP | STILL;
-        }
         if flags & STEP != 0 && s.gamut_guard {
             flags |= GUARD;
         }
@@ -106,7 +88,6 @@ impl PassColour {
             lut_scale: [scale[0], scale[1], scale[2], if lut.is_some() { s.lut_strength } else { 0.0 }],
             lut_offset: [offset[0], offset[1], offset[2], s.lut_adapt.max(1e-3)],
             protect,
-            still: if still { [still_weight(s.still), STILL_PIXELS, STILL_LUMA, 0.0] } else { [1.0, 0.0, 0.0, 0.0] },
         }
     }
 
@@ -119,10 +100,7 @@ impl PassColour {
 
 /// Whether any of the frame's first `count` passes reshapes its edit (or the table applies on the last).
 pub(crate) fn wanted(s: &ColourSettings, count: usize, lut: bool) -> bool {
-    s.each.iter().take(count.max(1)).any(|c| !EditColour::is_neutral(c))
-        || (lut && s.lut_strength > 0.0)
-        || s.protect.iter().any(|&v| v.is_finite() && v > 0.0)
-        || (s.still.is_finite() && s.still > 0.0)
+    s.each.iter().take(count.max(1)).any(|c| !EditColour::is_neutral(c)) || (lut && s.lut_strength > 0.0) || s.protect.iter().any(|&v| v.is_finite() && v > 0.0)
 }
 
 #[derive(Default)]
@@ -261,19 +239,5 @@ mod tests {
         assert_eq!(c.protect, [0.0, 1.0, 0.0, 0.0]);
         s.protect = [f32::NAN, 0.0, -1.0, 0.0];
         assert!(!PassColour::of(&s, 0, true, None, false).any() && !wanted(&s, 1, false), "nothing left to do");
-    }
-
-    /// Still-scene smoothing is the last pass's only, and its weight runs from 1 (off) to 0.25.
-    #[test]
-    fn still_smoothing_is_the_last_pass_s() {
-        let mut s = ColourSettings::DEFAULT;
-        s.still = 1.0;
-        assert!(wanted(&s, 1, false));
-        assert_eq!(PassColour::of(&s, 0, false, None, false).flags[0], 0, "not on an earlier pass");
-        let last = PassColour::of(&s, 1, true, None, false);
-        assert_eq!(last.flags[0], STEP | STILL | GUARD);
-        assert_eq!(last.still, [0.25, STILL_PIXELS, STILL_LUMA, 0.0]);
-        assert_eq!(still_weight(0.0), 1.0);
-        assert!((still_weight(2.0 / 3.0) - 0.5).abs() < 1e-6);
     }
 }

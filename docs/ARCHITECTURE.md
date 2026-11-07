@@ -123,8 +123,7 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   2532, f32 bits, written by the layer for the Status tab's graph), then the protections of each pass's result
   against its input (v23, f32 bits, 0-1, default 0): `edit_hue_protection` (2536), `edit_neutral_protection`
   (2540), `edit_shadow_protection` (2544) and `edit_highlight_protection` (2548; NATIVE_BACKEND.md, "The colour of
-  the edit"), and `edit_still_smoothing` (2552, f32 bits, 0-1, default 0; NATIVE_BACKEND.md, "Still-scene
-  smoothing"); the header ends at 2556. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
+  the edit"); the header ends at 2552. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
   `persist::HUD_REGIONS`), the one setting that is not a number. NATIVE_BACKEND.md, "Where the model runs"
   and "The HUD at present".
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
@@ -195,7 +194,7 @@ be private.
 | 20 | `network` (which extracted network the layer runs) and the control mask's rules (`mask_sky`, `mask_sky_margin`, `mask_dark*`, `mask_motion*`) appended | 3.7.0 |
 | 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended; then the colour of the edit (`edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`, `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`) and `pass_colour[10]` (override bits `EDIT_SATURATION` 128, `EDIT_CONTRAST` 256, `EDIT_DETAIL` 512); then `placement`, `pass_placement[10]` (override bit `PLACEMENT` 1024), `hud_detect`, `hud_region_count` and `hud_region[8]` | 3.8.0 |
 | 22 | `preupscale_brightness` and `preupscale_exposure` (what the network sees before the upscaler: its brightness and where the exposure comes from) and `preupscale_network_gpu_ms` (the network's GPU time on its last hold) appended | 3.8.10 |
-| 23 | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection` and `edit_highlight_protection` (the Oklab protections of each pass's result against its input) and `edit_still_smoothing` appended | 3.10.0 |
+| 23 | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection` and `edit_highlight_protection` (the Oklab protections of each pass's result against its input) appended | 3.10.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.

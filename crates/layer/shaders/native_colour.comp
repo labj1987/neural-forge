@@ -5,11 +5,6 @@
 //   detail      e = low + detail x (e - low), low the edit's 3x3 binomial blur (phase 0 writes it);
 //   saturation  and contrast: e = contrast x l + saturation x (e - l), l = the edit's BT.709 luma (a grey
 //               change), e - l its chroma (a change of no luma);
-//   still       first, on the last pass (p.colour_flags.x bit 64): where the pixel moved less than p.still.y
-//               render pixels since the network's previous frame and its input luma changed by at most
-//               p.still.z, the change is mixed with the one shown there then: e = mix(previous, e, p.still.x);
-//               the history (u_still) takes the change shown and the input's luma (docs/NATIVE_BACKEND.md,
-//               "Still-scene smoothing"; Magpie Experimental's static route, as Veyra-NRVideo carries it);
 //   protect     the result's Oklab hue turned toward the input's, a near-grey input's chroma kept, darkening of
 //               shadows and brightening of highlights held back (p.protect, 0-1 each; see protectResult);
 //   look-up     on the last pass, r = mix(r, LUT(r), strength x min(1, |e|max / adapt)): a pixel the
@@ -27,15 +22,7 @@
 // append only).
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(constant_id = 0) const bool MOTION_HALF = false;
 layout(constant_id = 1) const uint PHASE = 0u;
-// The motion back to the network's previous frame at the render extent (native_composite.comp's field; packed
-// halves with MOTION_HALF), in the vectors' units (times p.more.yz = the pass's pixels).
-layout(set = 0, binding = 13, std430) readonly buffer FullMotion { uint mv[]; } u_full_motion;
-// The frame's state (native_composite.comp's): a scene cut drops the still-scene history.
-layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; uint cut; } u_state;
-// Still-scene smoothing's history at the render extent: packHalf2x16(r, g), packHalf2x16(b, input luma).
-layout(set = 0, binding = 18, std430) buffer Still { uvec2 h[]; } u_still;
 // The pass's input at the render extent (padded), GENERAL.
 layout(set = 0, binding = 12, rgba16f) uniform readonly image2D u_encoded;
 layout(set = 0, binding = 4, std140) uniform Params {
@@ -55,7 +42,6 @@ layout(set = 0, binding = 4, std140) uniform Params {
   vec4 lut_scale;    // per channel (size - 1) / (domain max - min); strength
   vec4 lut_offset;   // per channel -domain min x scale; adapt (the edit size at full strength)
   vec4 protect;      // the protections: hue, near-grey chroma, shadow, highlight (0-1; appended, this shader only)
-  vec4 still;        // still-scene smoothing: this frame's weight, pixels, luma tolerance, history valid (1)
 } p;
 // The answer at the render extent, RGBA16F rows of the padded width as packed half4 (native_composite.comp's,
 // or native_enlarge.comp's).
@@ -70,7 +56,6 @@ const uint GUARD = 2u;
 const uint LUT = 4u;
 const uint DETAIL = 8u;
 const uint PROTECT = 32u;
-const uint STILL = 64u;
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 float truncateHalf(float value) {
@@ -215,25 +200,6 @@ void main() {
   vec3 e = a.rgb - input_;
   vec3 r = a.rgb;
   bool changed = false;
-  if ((flags & STILL) != 0u) {
-    uint at = id.y * p.full.x + id.x;
-    float lum = dot(input_, LUMA);
-    if (p.still.w != 0.0 && u_state.cut == 0u) {
-      vec2 motion = MOTION_HALF ? unpackHalf2x16(u_full_motion.mv[at])
-                                : vec2(uintBitsToFloat(u_full_motion.mv[2u * at]), uintBitsToFloat(u_full_motion.mv[2u * at + 1u]));
-      // The pass's pixels per render pixel is p.ratio.xy: back to render pixels.
-      vec2 mv = motion * p.more.yz / max(p.ratio.xy, vec2(1e-6));
-      uvec2 hb = u_still.h[at];
-      vec2 rg = unpackHalf2x16(hb.x);
-      vec2 bl = unpackHalf2x16(hb.y);
-      vec3 previous = vec3(rg, bl.x);
-      bool same = !any(isnan(mv)) && dot(mv, mv) < p.still.y * p.still.y && abs(lum - bl.y) <= p.still.z
-                  && !any(isnan(previous)) && !any(isinf(previous));
-      if (same) e = mix(previous, e, p.still.x);
-    }
-    u_still.h[at] = uvec2(packHalf2x16(e.rg), packHalf2x16(vec2(e.b, lum)));
-    changed = true;
-  }
   if ((flags & DETAIL) != 0u) {
     vec3 low = u_low.low[id.y * p.full.x + id.x].rgb;
     e = low + p.colour.z * (e - low);
