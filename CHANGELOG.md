@@ -4,6 +4,19 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.10.0 — 2026-11-07
+
+- HDR10 games now get the model on the finished frame too (placement **Finished frame**, or Auto where there is no
+  DLSS hook): the model runs on an SDR picture of the frame (203 nits as white) and its change is added back onto the
+  untouched HDR frame in linear light, so the game's HDR is kept. Bright highlights (above about 185-295 nits) get
+  little or none of the change. Float16 (scRGB) HDR swapchains are still presented untouched.
+  `NEURAL_FORGE_HDR_PRESENT=off` turns it off; `NEURAL_FORGE_HDR_REFERENCE_NITS` moves the white.
+- Four new protections in the Model tab's Colour group, all off by default: **Hue protection** keeps the frame's
+  hues (the model may still change how colourful or bright a colour is), **Grey protection** keeps greys free of a
+  tint, **Shadow protection** holds back darkening of what was already dark (this also takes away much of the
+  detail the model adds in darker textures) and **Highlight protection** holds back brightening of what was already
+  bright.
+
 ## 3.9.9 — 2026-11-01
 
 - A game whose folder ships anti-cheat (Easy Anti-Cheat, BattlEye, EA Javelin, RICOCHET, XIGNCODE3,
