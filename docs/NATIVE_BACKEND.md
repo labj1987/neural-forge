@@ -1431,8 +1431,13 @@ the BT.2020 to BT.709 matrix subtracts two very bright channels to give a dark o
 colours), where the PQ decode's float error is amplified (`an_hdr10_frame_runs_as_its_sdr_picture` bounds it).
 Tested on lavapipe only (`hdr_present::tests`, `composition::gpu::tests::hdr10_*`,
 `native_post::tests::an_hdr10_frame_runs_as_its_sdr_picture`,
-`capture::tests::an_hdr10_present_composes_the_sdr_answer_in_linear_light`); no game with HDR10 output has been
-run yet.
+`capture::tests::an_hdr10_present_composes_the_sdr_answer_in_linear_light`). In a game (2026-11-07, RTX 5070):
+Crimson Desert on Proton-GE with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` (its own HDR option on), GNOME in
+HDR, placement Finished frame: the swapchain is A2B10G10R10 in HDR10_ST2084, the path engages, `[sync] 2560x1440
+HDR10: total 24.2 ms` (server 21.6 ms, the HDR compose 1.6 ms GPU), 33 frames a second composited, no fence
+timeout or Xid; the title screen and an in-game loading scene with bright highlights look right (no shift, no
+banding, highlights kept). The finished frame waits for the network every frame, so it is slow at 1440p whatever
+the format.
 
 ## Activation memory (2026-10-22)
 
