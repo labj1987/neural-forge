@@ -1166,6 +1166,14 @@ comes from Veyra-NRVideo's NR correction stage and Magpie Experimental, which it
 thresholds here are this project's own. After the upscaler the four values travel in the composite's push block
 (`colour.w` and `hud.yzw`), which is at the 128 bytes every device takes.
 
+**Measured in GTA V Enhanced** (2026-11-07; 1440p, DLSS Balanced, FG 4x, the benchmark's still shot, 9 frames
+averaged per run, Oklab against the model-off run on the pixels static in every run): the model alone turns the hue
+of colourful pixels by 4.5 degrees on average and lifts shadow lightness by 0.034 (Alex's settings brighten);
+with hue and shadow protection at 1, 3.6 degrees and 0.038. The hue protection works on the model's render-size
+change, and DLSS and the game's post-processing after it keep part of the shift. Shadow protection holds back
+*darkening* only, and in mid-dark textures that darkening is the model's added local contrast: added detail fell
+from x1.075 to x0.907 (bench-iq, against the model off). Use it to keep shadows open, not as a free extra.
+
 **Why the guard is on by default.** The encode maps scene-linear 0 to 0 in each channel and the shoulder's top to
 1, so an encoded channel below 0 is a colour outside BT.709's primaries in linear terms and one above 1 cannot be
 written back; clamping one channel turns the hue (the decode clamps per channel too). Shortening the whole change

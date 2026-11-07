@@ -151,7 +151,8 @@ breaks up banding in smooth gradients after the upscaler. Four **protections** (
 frame's own look against the model's change, judged by eye-matched colour (Oklab): **Hue protection** keeps each
 colour's hue (the model may still make it more or less colourful, brighter or darker), **Grey protection** keeps
 greys free of a tint, **Shadow protection** holds back darkening of what was already dark and **Highlight
-protection** holds back brightening of what was already bright. **Look-up table** applies a 3D `.cube` file (17 to
+protection** holds back brightening of what was already bright. Shadow protection also takes away much of the
+detail the model adds in darker textures, since that detail is darkening. **Look-up table** applies a 3D `.cube` file (17 to
 65 points; the Choose button or `neural-forge-cli shmctl lut FILE`) to the last pass's result where the model
 changed the picture: its strength (0, off) grows with the size of the change and is full at **Look-up table
 full at**, so a pixel the model left alone keeps its colour. A table that is removed or cannot be read stops
