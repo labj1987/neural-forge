@@ -71,6 +71,10 @@ The Setup tab's **Network** row picks the full network (the default) or the smal
 about half the GPU time and changes the picture less. When video memory runs short, the full network
 steps down to the small one, then pauses, and comes back when there is room.
 
+The Model tab's **Colour** group shapes the model's change rather than the picture: its saturation,
+contrast and detail, and protections that keep the frame's own hues, greys, shadows or highlights
+(all off by default).
+
 The game's HDR works with the model before the upscaler and after DLSS. On the finished frame, an HDR
 or 10-bit swapchain is presented untouched.
 
