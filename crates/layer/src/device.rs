@@ -1917,7 +1917,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let eligible = crate::layer_enabled()
             && self.nvidia
             && crate::ownership::eligible()
-            && swapchain::is_supported_format(create_info.image_format)
+            && swapchain::is_supported_format(create_info.image_format, create_info.image_color_space)
             && create_info.image_extent.width <= neural_forge_protocol::MAX_W
             && create_info.image_extent.height <= neural_forge_protocol::MAX_H
             && swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height);
@@ -2000,6 +2000,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let images = self.fetch_swapchain_images(swapchain);
         let state = SwapchainState {
             format: create_info.image_format,
+            color_space: create_info.image_color_space,
             width: create_info.image_extent.width,
             height: create_info.image_extent.height,
             hdr_kind,
@@ -2008,12 +2009,24 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             images,
         };
         crate::log!(
-            "[layer] swapchain {:?} {}x{} fmt={:?} hdr={} pass_through={} images={}",
+            "[layer] swapchain {:?} {}x{} fmt={:?} colour_space={:?} hdr={}{} pass_through={} images={}",
             swapchain,
             state.width,
             state.height,
             state.format,
+            state.color_space,
             state.hdr_kind,
+            if state.hdr_kind == neural_forge_protocol::enums::hdr_kind::PQ10 {
+                if !crate::hdr_present::enabled() {
+                    " (HDR10: untouched, NEURAL_FORGE_HDR_PRESENT=off)"
+                } else if state.pass_through {
+                    " (HDR10: untouched, not admitted)"
+                } else {
+                    " (HDR10: the network runs on an SDR-mapped copy)"
+                }
+            } else {
+                ""
+            },
             state.pass_through,
             state.images.len()
         );
@@ -3370,20 +3383,53 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 // What the status shows as the game's output (HDR or SDR), whatever is done with it below.
                 state.shm.publish_hdr_detected(sw.hdr_kind);
                 let Some(&image) = sw.images.get(image_index as usize) else { continue };
-                if !swapchain::is_supported_format(sw.format) {
+                let supported = swapchain::is_supported_format(sw.format, sw.color_space);
+                // An HDR10 swapchain's frames take the HDR path (docs/NATIVE_BACKEND.md, "HDR on the finished
+                // frame (3.10.0)"): only from the swapchain's own image, which an admitted swapchain can read
+                // and write raw. A pass-through one's render source is never composed onto.
+                let pq10 = supported && sw.hdr_kind == neural_forge_protocol::enums::hdr_kind::PQ10;
+                state.shm.publish_hdr_active(if pq10 && !sw.pass_through { sw.hdr_kind } else { neural_forge_protocol::enums::hdr_kind::NONE });
+                if !supported || (pq10 && sw.pass_through) {
                     // Not merely `pass_through`: a pass-through swapchain can still be composed
                     // onto from a tracked render source, which is exactly what must not happen
-                    // to a 10-bit or float swapchain (see `swapchain::is_supported_format`).
+                    // to a float or SDR-colour-space 10-bit swapchain (see `swapchain::is_supported_format`),
+                    // nor to an HDR10 one's render source.
                     // A capture of the game's frames cannot be served either: said, not left waiting.
                     if state.shm.capture_requested() && would_be_primary(self.device.handle(), sc, sw.width, sw.height) {
                         crate::series::refuse_waiting(&state.shm, dump_owns_one_shot(), neural_forge_protocol::capture::reason::UNSUPPORTED_FORMAT);
                     }
                     static SAID_FORMAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !SAID_FORMAT.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        crate::log!("[layer] present skipped: swapchain format {:?} is not SDR 8-bit; HDR/10-bit swapchains present untouched", sw.format);
+                        if pq10 {
+                            crate::log!(
+                                "[layer] present skipped: the HDR10 swapchain ({:?}) was not admitted for capture; its frames present untouched",
+                                sw.format
+                            );
+                        } else {
+                            crate::log!(
+                                "[layer] present skipped: swapchain format {:?} in {:?} is neither SDR 8-bit nor HDR10; it presents untouched",
+                                sw.format,
+                                sw.color_space
+                            );
+                        }
                         crate::logging::flush();
                     }
                     continue;
+                }
+                if pq10 && state.shm.capture_requested() && would_be_primary(self.device.handle(), sc, sw.width, sw.height) {
+                    // Captures write 8-bit PNGs of the swapchain image: an HDR10 frame cannot be read as one.
+                    crate::series::refuse_waiting(&state.shm, dump_owns_one_shot(), neural_forge_protocol::capture::reason::UNSUPPORTED_FORMAT);
+                }
+                if pq10 {
+                    static SAID_HDR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID_HDR.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::log!(
+                            "[layer] HDR10 swapchain ({:?}): the network runs on an SDR-mapped copy (reference white {} nits) and its change is composed onto the HDR frame",
+                            sw.format,
+                            crate::hdr_present::reference_nits()
+                        );
+                        crate::logging::flush();
+                    }
                 }
                 // Where the frame is read from. An admitted swapchain was created with
                 // TRANSFER_SRC (see `surface_usage::prepare`), so its own image -- known extent,
@@ -3506,9 +3552,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 layer_slot = Some(slot);
                 let width = sw.width;
                 let height = sw.height;
-                let proxy_format = swapchain::proxy_format_for(sw.format);
+                let proxy_format = swapchain::proxy_format_for(sw.format, sw.color_space);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
-                let readable = sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC);
+                // Whether the frame can be read back for a capture (`crate::series`, 8-bit PNGs): never an HDR10
+                // one (refused above).
+                let readable = sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && !pq10;
                 let (capture_image, capture_layout) = match tap {
                     Some(source) if sw.pass_through => source,
                     _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),

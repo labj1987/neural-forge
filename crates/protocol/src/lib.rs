@@ -108,14 +108,14 @@ pub const MAX_FRAME: usize = MAX_W as usize * MAX_H as usize * 8;
 /// `MAX_W`/`MAX_H`, and even (the proxy's chroma-friendly grid), and the format one the
 /// protocol defines.
 pub fn frame_dims_valid(width: u32, height: u32, proxy_format: u32) -> bool {
-    use enums::proxy_format::{BGRA8, RGBA16F, RGBA8};
+    use enums::proxy_format::{BGRA8, PQ10_BGR, PQ10_RGB, RGBA16F, RGBA8};
     width != 0
         && height != 0
         && width <= MAX_W
         && height <= MAX_H
         && width.is_multiple_of(2)
         && height.is_multiple_of(2)
-        && matches!(proxy_format, RGBA8 | RGBA16F | BGRA8)
+        && matches!(proxy_format, RGBA8 | RGBA16F | BGRA8 | PQ10_RGB | PQ10_BGR)
 }
 
 pub const HEADER_BYTES: usize = 65536;
@@ -186,6 +186,9 @@ mod tests {
         assert!(!frame_dims_valid(1921, 1080, enums::proxy_format::RGBA8));
         assert!(!frame_dims_valid(1920, 1081, enums::proxy_format::RGBA8));
         assert!(!frame_dims_valid(1920, 1080, enums::proxy_format::UNKNOWN));
+        assert!(frame_dims_valid(2560, 1440, enums::proxy_format::PQ10_RGB));
+        assert!(frame_dims_valid(2560, 1440, enums::proxy_format::PQ10_BGR));
+        assert!(!frame_dims_valid(2560, 1440, enums::proxy_format::PQ10_BGR + 1));
         assert!(!frame_dims_valid(1920, 1080, 99));
     }
 

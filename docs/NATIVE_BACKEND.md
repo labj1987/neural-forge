@@ -1378,6 +1378,62 @@ driving and while standing: whether the minimap, the weapon wheel and the money 
 clean, what a first-person weapon model or a third-person character that stays in place does (it can be found
 as HUD while the camera turns), and what the detection costs on the RTX 5070.
 
+## HDR on the finished frame (3.10.0)
+
+Before 3.10.0 an HDR swapchain on the finished frame was presented untouched: the composition and the
+network only took 8-bit SDR frames. HDR10 swapchains (`A2B10G10R10_UNORM_PACK32` or `A2R10G10B10_UNORM_PACK32`
+in the `HDR10_ST2084_EXT` colour space, `swapchain::detect_hdr_kind`'s PQ10) now take the network too. The idea
+of running the network on an SDR-mapped copy of the HDR frame and restoring its change onto the untouched HDR
+frame comes from Veyra-NRVideo (`HdrProxy`/`HdrRestore`; ATTRIBUTION.md); the maths here is this project's own,
+on SMPTE ST 2084 and the BT.2020/BT.709 matrices of ITU-R BT.2087 (`crate::hdr_present`, with its CPU reference).
+
+- **Admission** (`swapchain::is_supported_format(format, colour_space)`): the two 10-bit formats only with the
+  HDR10 colour space; the same `TRANSFER_SRC|TRANSFER_DST` usage as an 8-bit swapchain. A 10-bit swapchain in an
+  SDR colour space, and float16 (scRGB, `R16G16B16A16_SFLOAT`) ones, still present untouched: a float16 frame is
+  8 bytes a pixel, where the shared regions and the composition hold 4. A pass-through HDR10 swapchain (one the
+  layer could not admit) is never composed onto from its render source. `NEURAL_FORGE_HDR_PRESENT=off` leaves
+  HDR10 out, as before (a testing aid).
+- **Capture** (`capture::run`): the frame is copied raw (one packed word a pixel) into the proxy region as
+  `proxy_format::PQ10_RGB` (R in bits 0-9) or `PQ10_BGR` (B there), by the direct or the staging copy, at the
+  frame's own size only. A model resolution below 100%, the model pixel cap or an odd size (all of which need the
+  8-bit scaled scratch) and `NEURAL_FORGE_PIPELINED` present it untouched, logged once. The white meter skips HDR10
+  frames, and captures of them (8-bit PNGs) are refused with "unsupported format".
+- **Server** (`native_post::evaluate`, `convert_hdr10`): `shaders/native_post_hdr.comp` turns the raw frame into
+  an 8-bit SDR picture in a host-visible buffer of the slot's (`SlotBuffers::sdr`), in a submit of its own that
+  is waited for, so the thumbnail (HUD detection, the history's cut test) reads the picture. Per pixel: PQ decode
+  to nits (BT.2020), to BT.709, negatives 0, divided by the reference white (203 nits, BT.2408's HDR reference
+  white; `NEURAL_FORGE_HDR_REFERENCE_NITS`, clamped to 80-1000), the pre-upscaler encode's per-channel shoulder
+  (knee 0.75, K = 5.770780), the sRGB OETF, RGBA8 with alpha 255. Every pass, the history, the previous proxy,
+  the HUD and the flow read that picture in place of the proxy; the answer region gets the 8-bit SDR answer as for
+  an 8-bit frame. A frame the network did not run on is echoed raw, and the layer composes only an answer
+  `seq_eval` names (`ShmClient::answer_evaluated`), so an echo is never read as an SDR answer.
+- **Composition** (`composition::gpu`, `shaders/compose_hdr.comp`, through compose.comp's descriptor set and
+  pipeline layout): the R8G8B8A8 storage images carry the raw words (`packUnorm4x8` of a load gives a word back
+  exactly). With S the frame-the-network-saw's SDR picture recomputed in 8 bits (the same functions as the
+  server's, `precise`) and S⁻¹ the sRGB EOTF and the shoulder's inverse, per pixel: where the answer equals S in
+  all three channels, the frame's word bit for bit; where S's peak is at the shoulder's top (8-bit 255), the
+  frame's word; else `out = PQ(lin(base) + M709→2020 · R · (S⁻¹(answer) - S⁻¹(S)) · (1 - smoothstep(0.954, 0.999,
+  peak)))`, alpha bits kept, the result copied into the swapchain image. The base is the frame presented now, so
+  a carried answer (model interval, frame hold) puts the older frame's change onto the newer one, as the 8-bit
+  delta does; the zero-copy inputs work too. A scaled answer is refused (the frame presented untouched). None of
+  the Composition tab's settings, the compare views or the debug views apply to it.
+  `NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS=off` turns the two highlight rules off here too.
+- **Status:** `swapchain_hdr` says "HDR10, PQ: the network runs on an SDR-mapped copy" while an HDR10 swapchain
+  takes this path (`hdr_active`, otherwise "presented untouched"), the layer logs it once per process, and the
+  `[sync]` timing line carries `HDR10`.
+
+The caveat is the shoulder: an SDR value above the knee stands for more and more light, so the change the network
+makes there is faded out from 0.954 (about 185 nits in the pixel's brightest BT.709 channel at the default
+reference white) and dropped at the top (about 295 nits, where S⁻¹ cannot bring a clamped value back). Brighter
+highlights keep their HDR values; a higher reference white moves both points up and shows the network a darker
+picture. Float differences: the conversion matches the double-precision reference within a code, except where
+the BT.2020 to BT.709 matrix subtracts two very bright channels to give a dark one (saturated wide-gamut
+colours), where the PQ decode's float error is amplified (`an_hdr10_frame_runs_as_its_sdr_picture` bounds it).
+Tested on lavapipe only (`hdr_present::tests`, `composition::gpu::tests::hdr10_*`,
+`native_post::tests::an_hdr10_frame_runs_as_its_sdr_picture`,
+`capture::tests::an_hdr10_present_composes_the_sdr_answer_in_linear_light`); no game with HDR10 output has been
+run yet.
+
 ## Activation memory (2026-10-22)
 
 Each of a build's 81-82 activations had its own allocation, alive for the whole build: 816 MiB at 1280x720, about

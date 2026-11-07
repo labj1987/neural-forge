@@ -75,8 +75,10 @@ The Model tab's **Colour** group shapes the model's change rather than the pictu
 contrast and detail, and protections that keep the frame's own hues, greys, shadows or highlights
 (all off by default).
 
-The game's HDR works with the model before the upscaler and after DLSS. On the finished frame, an HDR
-or 10-bit swapchain is presented untouched.
+The game's HDR works with the model before the upscaler and after DLSS. On the finished frame, HDR10
+works too: the network runs on an SDR copy of the frame and its change is put back onto the HDR frame.
+Highlights above about 185 nits get less and less of the change and none above about 295 nits; a
+float16 (scRGB) or 10-bit SDR swapchain is presented untouched.
 
 A game whose folder ships anti-cheat (Easy Anti-Cheat, BattlEye and others) asks before it is switched
 on. Neural Forge does not hide its layer from anti-cheat: the game may refuse to start or go online
@@ -104,6 +106,9 @@ Every setting, the other placements and all environment variables: [docs/USER_GU
 - **Hogwarts Legacy turns Ray Reconstruction back off** unless you switch it on in its menu.
 - **On the finished frame, Find the HUD can treat a first-person weapon as HUD** and keep the model
   off it. Switch Find the HUD off in the Model tab where that shows.
+- **HDR on the finished frame is untested in a game.** HDR10 needs the model resolution at 100%,
+  takes no captures, and leaves the brightest highlights alone; float16 (scRGB) HDR is presented
+  untouched.
 
 ## Troubleshooting
 

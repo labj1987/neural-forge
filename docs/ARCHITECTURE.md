@@ -145,7 +145,10 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
 - **Edit cache (v17):** `preupscale_dump_request` (cleared by `init_defaults` and when a game's layer
   starts a session on the channel, so a request left for an earlier game never fires on the next),
   `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected`, `cache_gpu_ms_bits`.
-- **Reserved, read by nothing:** `format`, `hdr_encode`, `hdr_mode`/`hdr_detected`/`hdr_active`.
+- **HDR status:** `hdr_detected` (the swapchain's `enums::hdr_kind`) and `hdr_active` (`PQ10` while an
+  HDR10 swapchain takes the HDR path on the finished frame), written by the layer at each present and read
+  by the status's `swapchain_hdr` line.
+- **Reserved, read by nothing:** `format`, `hdr_encode`, `hdr_mode`.
 
 ### The handshake (after the upscaler)
 
@@ -662,9 +665,10 @@ is not held before the upscaler.
 
 - **Swapchain admission** (`surface_usage.rs`, `swapchain.rs`): the layer adds `TRANSFER_SRC` and
   `TRANSFER_DST` usage to the game's swapchain when the surface supports them, after checking the
-  create info's extension chain and flags. Swapchains it cannot admit stay pass-through. Only
-  8-bit SDR formats (`B8G8R8A8`/`R8G8B8A8`, UNORM or sRGB) are processed; HDR and float16
-  swapchains are presented untouched.
+  create info's extension chain and flags. Swapchains it cannot admit stay pass-through. The
+  8-bit SDR formats (`B8G8R8A8`/`R8G8B8A8`, UNORM or sRGB) are processed, and the 10-bit ones
+  (`A2B10G10R10`/`A2R10G10B10`) in the HDR10 colour space (NATIVE_BACKEND.md, "HDR on the finished
+  frame"); float16 and 10-bit SDR swapchains are presented untouched.
 - **Primary swapchain:** one per process (the largest plausible game size), so overlays are left
   alone.
 - **Warm-up** (`swapchain::Warmup`): the layer engages only after 5 s of steady presents and

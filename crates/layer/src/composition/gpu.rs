@@ -22,6 +22,7 @@
 use ash::vk;
 
 const SPV: &[u8] = include_bytes!("../../shaders/compose.spv");
+const HDR_SPV: &[u8] = include_bytes!("../../shaders/compose_hdr.spv");
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const ASYNC_SLOTS: usize = 2;
 
@@ -59,6 +60,10 @@ pub struct ComposeParams {
     /// The curve the proxy encode used (`neural_forge_protocol::enums::reversible_mode`),
     /// which the composition reproduces wherever it rebuilds the frame's proxy.
     pub reversible_mode: u32,
+    /// `Some(reference white in nits)`: the frames are HDR10 (`proxy_format::PQ10_*`), the answer is the
+    /// network's 8-bit SDR answer to their SDR picture, and `shaders/compose_hdr.comp` composes instead of
+    /// `compose.comp` (`crate::hdr_present`). Only full-size answers; none of the settings above apply to it.
+    pub pq10: Option<f32>,
 }
 
 /// The comparison view, straight from the header.
@@ -98,6 +103,19 @@ struct PushConstants {
     /// Matches `compose.comp`'s `params.reversible_mode`: the encode's curve.
     reversible_mode: u32,
 }
+
+/// `compose_hdr.comp`'s `Params` block, field for field: pushed through `compose.comp`'s pipeline layout
+/// (its range covers these 12 bytes).
+#[repr(C)]
+struct HdrPushConstants {
+    reference_nits: f32,
+    /// 1 for `A2R10G10B10` (blue in bits 0-9).
+    b_low: u32,
+    /// `crate::hdr_present::KEEP_CLAMPED`.
+    flags: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<HdrPushConstants>() <= std::mem::size_of::<PushConstants>());
 
 struct Image {
     image: vk::Image,
@@ -227,6 +245,23 @@ pub enum ComposeInputs<'a> {
     /// `gen_base`/`gen_answer` first. Every other present of the same generation (a carried
     /// frame, the other async slot) reads `gen_*` only. Full-size answers only.
     Gpu { fresh: bool },
+}
+
+/// `compose_hdr.comp`'s pipeline over `layout` (compose.comp's).
+///
+/// # Safety
+/// `device` is live; `layout` is compose.comp's pipeline layout.
+unsafe fn hdr_compute_pipeline(device: &ash::Device, layout: vk::PipelineLayout) -> Option<vk::Pipeline> {
+    let code = ash::util::read_spv(&mut std::io::Cursor::new(HDR_SPV)).ok()?;
+    // SAFETY: valid SPIR-V (compose_hdr.spv, from shaders/compose_hdr.comp, checked by spirv-val).
+    let module = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) }.ok()?;
+    let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+    let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+    // SAFETY: `module` and `layout` outlive the call.
+    let pipeline = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&info), None) };
+    // SAFETY: only needed for creation, which returned.
+    unsafe { device.destroy_shader_module(module, None) };
+    pipeline.ok().and_then(|p| p.first().copied())
 }
 
 /// A plain device-local buffer.
@@ -1107,28 +1142,34 @@ impl ComposeSlot {
             // The live settings are threaded now rather than hardcoded: mode 2 reads
             // transfer_strength as a power on the ratio and max_ratio as the guard, so
             // both genuinely decide the picture here.
-            let push = PushConstants {
-                colour_strength: compose.colour_strength,
-                transfer_strength: compose.transfer_strength,
-                max_ratio: compose.max_ratio,
-                bgr_order: bgr_order as u32,
-                mode: if compose.proxy_encoded { 2 } else { 1 },
-                ghost_guard: compose.ghost_guard,
-                compare_mode: compose.compare.mode,
-                compare_split: compose.compare.split,
-                compare_zoom: compose.compare.zoom,
-                compare_swap: compose.compare.swap,
-                colour_trust: compose.colour_trust,
-                ratio_smooth: compose.ratio_smooth,
-                transfer: compose.transfer,
-                model_small: u32::from(compose.model_small),
-                white_point: compose.white_point,
-                debug_view: compose.debug_view,
-                debug_scale: compose.debug_scale,
-                reversible_mode: compose.reversible_mode,
-            };
-            let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
-            device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
+            if let Some(reference_nits) = compose.pq10 {
+                let push = HdrPushConstants { reference_nits, b_low: u32::from(bgr_order), flags: crate::hdr_present::compose_flags() };
+                let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<HdrPushConstants>());
+                device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
+            } else {
+                let push = PushConstants {
+                    colour_strength: compose.colour_strength,
+                    transfer_strength: compose.transfer_strength,
+                    max_ratio: compose.max_ratio,
+                    bgr_order: bgr_order as u32,
+                    mode: if compose.proxy_encoded { 2 } else { 1 },
+                    ghost_guard: compose.ghost_guard,
+                    compare_mode: compose.compare.mode,
+                    compare_split: compose.compare.split,
+                    compare_zoom: compose.compare.zoom,
+                    compare_swap: compose.compare.swap,
+                    colour_trust: compose.colour_trust,
+                    ratio_smooth: compose.ratio_smooth,
+                    transfer: compose.transfer,
+                    model_small: u32::from(compose.model_small),
+                    white_point: compose.white_point,
+                    debug_view: compose.debug_view,
+                    debug_scale: compose.debug_scale,
+                    reversible_mode: compose.reversible_mode,
+                };
+                let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
+                device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
+            }
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
             let output_src = image_barrier(
                 s.output.image,
@@ -1260,6 +1301,9 @@ pub struct GpuCompose {
     descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// `compose_hdr.comp` over the same layout (HDR10 frames, [`ComposeParams::pq10`]); null when it could not
+    /// be built, and HDR10 frames then present untouched.
+    hdr_pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     pool: vk::CommandPool,
     async_slots: [AsyncSlot; ASYNC_SLOTS],
@@ -1423,10 +1467,18 @@ impl GpuCompose {
             async_slots.push(AsyncSlot { slot, timer: None });
         }
 
+        // SAFETY: `pipeline_layout` is live and matches the shader's interface (the same four storage images,
+        // a push block within its range). Not fatal: only HDR10 frames need it.
+        let hdr_pipeline = unsafe { hdr_compute_pipeline(device, pipeline_layout) }.unwrap_or_else(|| {
+            crate::log!("[layer] the HDR10 composition's pipeline could not be built; HDR10 frames present untouched");
+            vk::Pipeline::null()
+        });
+
         Some(Self {
             descriptor_set_layout,
             pipeline_layout,
             pipeline,
+            hdr_pipeline,
             descriptor_pool,
             pool: cmd_pool,
             async_slots: async_slots.try_into().unwrap_or_else(|_| unreachable!("pushed exactly ASYNC_SLOTS elements above")),
@@ -1475,6 +1527,11 @@ impl GpuCompose {
     ) -> Option<vk::Semaphore> {
         let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
         let answer_bytes = (u64::from(answer_width) * u64::from(answer_height) * 4) as usize;
+        // An HDR10 frame composes only a full-size answer (the 8-bit enlargement would blur the frame's own
+        // words), and only with its own pipeline: anything else presents it untouched.
+        if compose.pq10.is_some() && (self.hdr_pipeline == vk::Pipeline::null() || (answer_width, answer_height) != (width, height)) {
+            return None;
+        }
         // The zero-copy sources, `(capture_target, gen_base, gen_answer, fresh_source)`, resolved
         // before a slot is taken.
         let zero_copy = match inputs {
@@ -1588,7 +1645,7 @@ impl GpuCompose {
         unsafe {
             slot.slot.record_temporal_delta_into_image(
                 device,
-                self.pipeline,
+                if compose.pq10.is_some() { self.hdr_pipeline } else { self.pipeline },
                 self.pipeline_layout,
                 width,
                 height,
@@ -1824,6 +1881,7 @@ impl GpuCompose {
             device.destroy_command_pool(self.pool, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline(self.hdr_pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
         }
@@ -2162,6 +2220,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         let Some(rgb) = compose_once_ordered(width, height, &frame, &frame, &answer, (width, height), None, None, params, false) else {
             eprintln!("bgr_order_composes_the_same_true_colours_as_rgb_order: no Vulkan device, skipping");
@@ -2197,6 +2256,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         let Some(sharp) = compose_once(w, h, &grey, &grey, &speckle, base) else {
             eprintln!("ratio smoothing test: no Vulkan device, skipping");
@@ -2249,6 +2309,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
 
         let Some(normal) = compose_once(w, h, &blue, &blue, &red, base) else {
@@ -2338,6 +2399,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         let Some(out) = compose_once_scaled(w, h, &frame, &frame, &answer, (sw, sh), Some(&small_proxy), None, params) else {
             eprintln!("debug view 2 test: no Vulkan device, skipping");
@@ -2368,6 +2430,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         let Some(out) = compose_once(w, h, &frame, &frame, &answer, params) else { return };
         assert_ne!(out[..3], frame[..3], "the answer changed the colour");
@@ -2400,6 +2463,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         let px = |out: &[u8], x: u32| i32::from(out[((4 * w + x) * 4) as usize]);
         for transfer in [0u32, 1, 2] {
@@ -2463,6 +2527,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         // Also with ratio smoothing and the ghost guard on: their neighbourhood taps of the proxy go
         // through the same encode as the centre's.
@@ -2508,6 +2573,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         let colours: [[u8; 3]; 4] = [[250, 60, 20], [30, 90, 245], [200, 200, 200], [120, 140, 60]];
         let frame: Vec<u8> = (0..w * h)
@@ -2591,6 +2657,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         let centre = ((8 * w + 8) * 4) as usize;
         let at = |strength: f32| {
@@ -2635,6 +2702,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         let centre = ((8 * w + 8) * 4) as usize;
         for (replace, composed) in [(reversible_mode::NEUTWO_REPLACE, reversible_mode::NEUTWO), (reversible_mode::HYBRID_REPLACE, reversible_mode::HYBRID)] {
@@ -2677,6 +2745,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         let centre = ((8 * w + 8) * 4) as usize;
         for replace in [reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID_REPLACE] {
@@ -2714,6 +2783,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: true,
             reversible_mode: 0,
+            pq10: None,
         };
         // No edit: the answer is the held frame's own proxy.
         let Some(out) = compose_once_scaled(w, h, &live, &held, &held, (w, h), None, Some(&held), base) else {
@@ -2807,6 +2877,7 @@ mod tests {
                 debug_scale: 1.0,
                 proxy_encoded: true,
                 reversible_mode: 0,
+                pq10: None,
             };
             let sem = gpu
                 .present_temporal_delta_async(
@@ -2976,6 +3047,7 @@ mod tests {
                 debug_scale: 1.0,
                 proxy_encoded: true,
                 reversible_mode: 0,
+                pq10: None,
             };
             let sem = gpu
                 .present_temporal_delta_async(
@@ -3159,6 +3231,7 @@ mod tests {
                 debug_scale: 1.0,
                 proxy_encoded: false,
                 reversible_mode: 0,
+                pq10: None,
             },
         );
         assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
@@ -3220,6 +3293,7 @@ mod tests {
                 debug_scale: 1.0,
                 proxy_encoded: false,
                 reversible_mode: 0,
+                pq10: None,
             },
         );
         assert!(oversized.is_none(), "an answer larger than the frame must be safely rejected, not overflow the staging buffer");
@@ -3281,6 +3355,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: false,
             reversible_mode: 0,
+            pq10: None,
         };
         let expected = compose_once(width, height, &current, &base, &answer, params).expect("the CPU reference composes");
 
@@ -3444,6 +3519,274 @@ mod tests {
             instance.destroy_instance(None);
             libc::munmap(region.cast(), region_len as usize);
         }
+    }
+
+    /// A swapchain-like image of `format` (no view: it is only copied to and from), for the HDR10 tests.
+    fn make_target_image_as(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, width: u32, height: u32, format: vk::Format) -> Image {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None) }.unwrap();
+        let reqs = unsafe { device.get_image_memory_requirements(image) };
+        let type_index = find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL).unwrap();
+        let memory =
+            unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
+        Image { image, view: vk::ImageView::null(), memory }
+    }
+
+    /// One HDR10 composition through the real async path: a `A2B10G10R10` (or, `b_low`, `A2R10G10B10`) target
+    /// holding `current`'s words, the words the network was shown (`proxy`) and its 8-bit answer (R, G, B), at
+    /// the reference white `reference`; the target's words after it. `answer_dims` other than the frame's asks for
+    /// a scaled answer (refused: `None` from the compose is `Some(None)` here). `None` without a Vulkan device.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_hdr_once(
+        width: u32,
+        height: u32,
+        current: &[u32],
+        proxy: &[u32],
+        answer: &[[u8; 3]],
+        b_low: bool,
+        reference: f32,
+        answer_dims: (u32, u32),
+    ) -> Option<Option<Vec<u32>>> {
+        let (_entry, instance, physical_device, device, queue, queue_family) = test_device()?;
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
+        let format = if b_low { vk::Format::A2R10G10B10_UNORM_PACK32 } else { vk::Format::A2B10G10R10_UNORM_PACK32 };
+        let target = make_target_image_as(&device, &mem_props, width, height, format);
+        let words = |w: &[u32]| w.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>();
+        let staging = build_upload_staging(&device, &mem_props, &words(current));
+        let cmd = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+            )
+        }
+        .unwrap()[0];
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+        unsafe {
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            let to_dst = image_barrier(
+                target.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+            device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+            let to_present = image_barrier(
+                target.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
+            device.end_command_buffer(cmd).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
+            device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            device.destroy_buffer(staging.0, None);
+            device.free_memory(staging.1, None);
+        }
+        let answer: Vec<u8> = answer.iter().flat_map(|a| [a[0], a[1], a[2], 255]).collect();
+        let params = ComposeParams {
+            colour_strength: 1.0,
+            transfer_strength: 1.0,
+            max_ratio: 4.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 1.0,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: false,
+            reversible_mode: 0,
+            pq10: Some(reference),
+        };
+        let proxy = words(proxy);
+        let sem = gpu.present_temporal_delta_async(
+            &device,
+            &instance,
+            physical_device,
+            queue,
+            width,
+            height,
+            answer_dims.0,
+            answer_dims.1,
+            ComposeInputs::Cpu { base: &proxy, answer: &answer, proxy_small: None, held_original: None },
+            1,
+            b_low,
+            target.image,
+            params,
+        );
+        let out = sem.map(|sem| {
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+            let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+            unsafe {
+                device
+                    .queue_submit(
+                        queue,
+                        &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                        wait_fence,
+                    )
+                    .unwrap();
+                device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                device.destroy_fence(wait_fence, None);
+            }
+            let bytes = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
+            bytes.as_chunks::<4>().0.iter().map(|&c| u32::from_le_bytes(c)).collect()
+        });
+        unsafe {
+            device.device_wait_idle().unwrap();
+            device.destroy_fence(fence, None);
+            target.destroy(&device);
+            gpu.destroy(&device);
+            device.destroy_command_pool(pool, None);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+        Some(out)
+    }
+
+    /// A varied HDR10 picture: codes over the whole range, every channel its own, the alpha bits varying.
+    fn hdr_words(width: u32, height: u32, b_low: bool) -> Vec<u32> {
+        use crate::hdr_present::reference::pack;
+        (0..width * height).map(|i| pack([(i * 37 + 11) % 1024, (i * 101 + 300) % 1024, (i * 53 + 700) % 1024], i % 4, b_low)).collect()
+    }
+
+    /// Whether the CPU reference's 8-bit SDR picture of `word` sits clear of a rounding step in every channel, so
+    /// the shader's single-precision maths rounds it the same way.
+    fn clear_of_rounding(word: u32, b_low: bool) -> bool {
+        crate::hdr_present::reference::sdr(word, b_low, 203.0).iter().all(|v| ((v * 255.0).fract() - 0.5).abs() > 0.01)
+    }
+
+    /// No edit (the answer equals the frame's SDR picture) leaves every word of an HDR10 frame bit for bit, alpha
+    /// bits included, in both channel orders.
+    #[test]
+    fn hdr10_no_edit_keeps_the_frame_bit_for_bit() {
+        use crate::hdr_present::reference::sdr8;
+        for b_low in [false, true] {
+            let (w, h) = (16u32, 16u32);
+            let frame = hdr_words(w, h, b_low);
+            let answer: Vec<[u8; 3]> = frame.iter().map(|&t| sdr8(t, b_low, 203.0)).collect();
+            let Some(out) = compose_hdr_once(w, h, &frame, &frame, &answer, b_low, 203.0, (w, h)) else { return };
+            let out = out.expect("composed");
+            let rounding = frame.iter().filter(|&&t| !clear_of_rounding(t, b_low)).count();
+            for (i, (&o, &f)) in out.iter().zip(&frame).enumerate() {
+                if clear_of_rounding(f, b_low) {
+                    assert_eq!(o, f, "pixel {i} (b_low {b_low}): {o:#010x} vs {f:#010x}");
+                }
+            }
+            assert!(rounding < frame.len() / 20, "{rounding} of {} pixels near a rounding step", frame.len());
+        }
+    }
+
+    /// A brightening edit raises the light by the reference white times the edit in linear SDR units (the CPU
+    /// reference, within a code), in mid-tones and colours; a pixel the network left alone keeps its word; a
+    /// newer frame than the one the network saw gets the change of the older one.
+    #[test]
+    fn hdr10_an_edit_moves_the_light_as_the_reference_says() {
+        use crate::hdr_present::reference::{code_of, compose, pack, sdr8, unpack};
+        for b_low in [false, true] {
+            let (w, h) = (8u32, 8u32);
+            // Mid-tones and colours: 1 to 120 nits in each channel.
+            let proxy: Vec<u32> = (0..w * h)
+                .map(|i| pack([code_of(1.0 + f64::from(i) * 1.8), code_of(120.0 - f64::from(i) * 1.5), code_of(20.0 + f64::from(i % 7) * 9.0)], i % 4, b_low))
+                .collect();
+            // The frame presented now: the network's frame, a little brighter (the carried case).
+            let current: Vec<u32> = proxy.iter().map(|&t| unpack(t, b_low)).map(|(c, a)| pack(c.map(|v| (v + 6).min(1023)), a, b_low)).collect();
+            let answer: Vec<[u8; 3]> =
+                proxy.iter().enumerate().map(|(i, &t)| sdr8(t, b_low, 203.0).map(|v| if i % 5 == 0 { v } else { v.saturating_add(12) })).collect();
+            let Some(out) = compose_hdr_once(w, h, &current, &proxy, &answer, b_low, 203.0, (w, h)) else { return };
+            let out = out.expect("composed");
+            for i in 0..(w * h) as usize {
+                let (got, alpha) = unpack(out[i], b_low);
+                assert_eq!(alpha, unpack(current[i], b_low).1, "alpha bits kept");
+                if !clear_of_rounding(proxy[i], b_low) {
+                    continue;
+                }
+                if i % 5 == 0 {
+                    assert_eq!(out[i], current[i], "pixel {i}: no edit, the frame's word");
+                    continue;
+                }
+                let want = unpack(compose(current[i], proxy[i], answer[i], b_low, 203.0), b_low).0;
+                let base = unpack(current[i], b_low).0;
+                for c in 0..3 {
+                    assert!(got[c].abs_diff(want[c]) <= 1, "pixel {i} channel {c}: {} vs the reference's {}", got[c], want[c]);
+                    if i % 5 != 0 {
+                        assert!(got[c] > base[c], "pixel {i} channel {c}: brightened ({} -> {})", base[c], got[c]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A highlight whose SDR picture is at the shoulder's top keeps the frame's word whatever the answer, and one
+    /// on the shoulder below it gets a faded change (the CPU reference, within a code).
+    #[test]
+    fn hdr10_a_highlight_at_the_shoulders_top_keeps_the_frame() {
+        use crate::hdr_present::reference::{code_of, compose, pack, sdr8, unpack};
+        let (w, h) = (8u32, 2u32);
+        let frame: Vec<u32> = (0..w * h)
+            .map(|i| {
+                if i < w {
+                    pack([code_of(4000.0 + f64::from(i) * 500.0); 3], 3, false)
+                } else {
+                    pack([code_of(240.0 + f64::from(i - w) * 25.0); 3], 3, false)
+                }
+            })
+            .collect();
+        let answer: Vec<[u8; 3]> = frame.iter().map(|&t| sdr8(t, false, 203.0).map(|v| v.saturating_sub(40))).collect();
+        let Some(out) = compose_hdr_once(w, h, &frame, &frame, &answer, false, 203.0, (w, h)) else { return };
+        let out = out.expect("composed");
+        for i in 0..w as usize {
+            assert_eq!(sdr8(frame[i], false, 203.0), [255; 3]);
+            assert_eq!(out[i], frame[i], "pixel {i}: a clamped highlight keeps the frame");
+        }
+        for i in (w as usize..(2 * w) as usize).filter(|&i| clear_of_rounding(frame[i], false)) {
+            let want = unpack(compose(frame[i], frame[i], answer[i], false, 203.0), false).0;
+            let got = unpack(out[i], false).0;
+            assert!(got.iter().zip(&want).all(|(g, w)| g.abs_diff(*w) <= 1), "pixel {i}: {got:?} vs {want:?}");
+        }
+    }
+
+    /// An HDR10 frame composes only a full-size answer: a scaled one presents the frame untouched (no compose).
+    #[test]
+    fn hdr10_refuses_a_scaled_answer() {
+        let (w, h) = (8u32, 8u32);
+        let frame = hdr_words(w, h, false);
+        let Some(out) = compose_hdr_once(w, h, &frame, &frame, &[[0u8; 3]; 16], false, 203.0, (4, 4)) else { return };
+        assert!(out.is_none(), "a scaled answer is not composed onto an HDR10 frame");
     }
 
     fn make_target_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, width: u32, height: u32) -> Image {

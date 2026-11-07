@@ -1560,8 +1560,10 @@ later on October 22 was tried as the cheapest of them first offline, then built 
 - **Other games before the upscaler.** Only GTA V Enhanced has been probed.
 - **A temporal filter of the change before the upscaler** (Magpie / Veyra's routes; November 7): DLSS already
   leaves no flicker of the model's to remove, and the still-only blend cost a fifth of the added detail.
-- **HDR swapchains on the after-the-upscaler path.** Presented untouched; never tested with a game
-  that has real HDR output.
+- **HDR swapchains on the after-the-upscaler path.** HDR10 since 3.10.0 (NATIVE_BACKEND.md, "HDR on
+  the finished frame"): the network on an SDR-mapped copy, its change carried back in linear light; not
+  yet tested with a game that has real HDR output. Float16 (scRGB) swapchains are still presented
+  untouched.
 - **The copy path below 100% model resolution.** About 4 ms per model frame of CPU copies. The maintainer
   runs at 100%.
 - **The helper's `device_wait_idle` calls** stay unbounded: the Vulkan call has no timeout.

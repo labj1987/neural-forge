@@ -49,11 +49,17 @@ layer picks the place for each game by itself:
   held there, the model runs on the finished frame. Switching Ray Reconstruction on or off in a game
   moves the model within a few frames.
 - **On the finished frame**, for everything else: native resolution, games without DLSS, and
-  devices without NVIDIA's `VK_NVX_image_view_handle`. The finished 8-bit
+  devices without NVIDIA's `VK_NVX_image_view_handle`. The finished
   frame is captured at present, answered by the network and composited back onto the same frame
   before it is shown. It has no history by default (no motion vectors there). The frame has the
   game's HUD in it: the layer finds the HUD and keeps the model's change off it (see
-  [HUD on the finished frame](#settings)).
+  [HUD on the finished frame](#settings)). An HDR10 frame (10-bit, PQ) is shown to the network as an
+  SDR picture, its brightness divided by a reference white of 203 nits, and the network's change is put
+  back onto the HDR frame in linear light. Highlights get less and less of the change from about 185 nits
+  (in their brightest colour channel) and none from about 295 nits, pixels the network did not change keep
+  their exact HDR values, and
+  the model resolution must be 100% (below it the frame is presented untouched). A float16 (scRGB) or
+  10-bit SDR swapchain is presented untouched, and captures of an HDR frame are refused.
 
 The game's own **DLSS Frame Generation** works with the model before the upscaler and after DLSS.
 Generated frames are built from enhanced frames, and the model runs once per real frame.
@@ -245,7 +251,9 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_EDIT_CACHE=off` | layer | Before the upscaler, run the network on every frame instead of the edit cache's cadence (every frame while the camera is still, every second frame while it moves), with none of the cache at all (the game's depth is neither made copyable nor copied). For A/B comparisons, benchmarks and rollback; unset (or `on`) is the default. An unknown value is logged and the cache stays on. |
 | `NEURAL_FORGE_SCENE_CUT=off\|N` | layer | Before the upscaler, how different two frames must be for the model to start afresh: the mean change of brightness, 1 to 255 (default 40), or `off` to never start afresh on a cut. For testing; an unknown value is logged and the default stays. |
 | `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=3` | layer | The HDR encode's paper white (default 3; a positive number up to 1000). Tuning only. |
-| `NEURAL_FORGE_PIPELINED=1` | layer | After the upscaler: a pipelined present. Higher frame rate, but answers land on later frames and ghost. |
+| `NEURAL_FORGE_PIPELINED=1` | layer | After the upscaler: a pipelined present. Higher frame rate, but answers land on later frames and ghost. HDR10 frames are presented untouched in this mode. |
+| `NEURAL_FORGE_HDR_REFERENCE_NITS=203` | layer | On the finished frame of an HDR10 game, the brightness (in nits) the network's SDR picture takes as white before its highlight roll-off (default 203, clamped to 80-1000). Higher shows the network a darker picture and lets brighter highlights be changed. Tuning only. |
+| `NEURAL_FORGE_HDR_PRESENT=off` | layer | Testing aid: present HDR10 frames on the finished frame untouched, as for float16 ones. |
 | `NEURAL_FORGE_TOGGLE_KEY=F10` | layer | Toggle key by name (`F1`-`F12`, `Home`, `N`...) or Linux key code; overrides the GUI's. |
 | `NEURAL_FORGE_HOTKEY_BACKEND=evdev\|x11` | layer | Forces one keyboard backend (default: evdev, then XInput2). |
 | `NEURAL_FORGE_HOTKEY_GLOBAL=1` | layer | The toggle key acts even when another window has the focus. By default a press is ignored only while another window is known to have the focus; where that cannot be told (inside gamescope) the key acts. |
@@ -264,7 +272,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1` | layer | Testing aid: record everything but the network's launches. |
 | `NEURAL_FORGE_NATIVE_NO_HISTORY=1` | layer | Testing aid: every network frame without history, as after a reset. |
 | `NEURAL_FORGE_PREUPSCALE_TRANSFER=aces\|linear` | layer | Testing aids: `aces` encodes the picture before the upscaler with RTX Remix's transfer (an ACES curve, and on the way back the model's change scaled by each pixel's own ratio, with Remix's highlight recovery); `linear` leaves out the sRGB curve (the network sees linear values, and the edit cache decodes the same way). `srgb` is the default. |
-| `NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS=off` | layer | Testing aid: before the upscaler, apply the model's change to the brightest highlights too: no keeping of clipped values, no fade near the top, no highlight recovery with `aces`. |
+| `NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS=off` | layer | Testing aid: before the upscaler (and on an HDR10 finished frame), apply the model's change to the brightest highlights too: no keeping of clipped values, no fade near the top, no highlight recovery with `aces`. |
 | `NEURAL_FORGE_PREUPSCALE_PICK=N` | layer | Testing aid: take the Nth colour candidate where DLSS's input launch names several. |
 | `NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES=N`, `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore` | layer | Testing aids for `NEURAL_FORGE_PREUPSCALE=dump`: consecutive frames per dump (default 1); dump even where DLSS's buffer synchronises depth or motion vectors. |
 | `NEURAL_FORGE_PROBE_DEPTH=1`, `NEURAL_FORGE_PROBE_RR=<a,b,...>\|1` | layer | Testing aids: log the depth choice and barriers of the first 120 holds; log the images of the launches whose kernel names match (first 4000). |
@@ -324,6 +332,8 @@ Valve's VAC) cannot be seen.
 - **The model after DLSS is tested in two games** (Crimson Desert and Hogwarts Legacy, with Ray
   Reconstruction). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
   much lower frame rate (36 against 120 fps shown in Crimson Desert).
+- **HDR on the finished frame:** HDR10 is handled (above) but not yet tested with a game; float16
+  (scRGB) swapchains are presented untouched, and HDR frames cannot be captured.
 - **Not carried over from upstream DLSS5VKLayer:** see
   [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md).
 

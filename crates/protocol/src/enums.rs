@@ -115,9 +115,21 @@ pub mod proxy_format {
     pub const RGBA8: u32 = 1;
     pub const RGBA16F: u32 = 2;
     pub const BGRA8: u32 = 3;
+    /// A 10-bit HDR10 frame (ST 2084 code, BT.2020 primaries), `A2B10G10R10_UNORM_PACK32`: one 32-bit
+    /// word a pixel, R in bits 0-9, G in 10-19, B in 20-29, alpha in 30-31. The model server converts it
+    /// to an 8-bit SDR picture for the network and answers in [`RGBA8`] (docs/NATIVE_BACKEND.md, "HDR on
+    /// the finished frame").
+    pub const PQ10_RGB: u32 = 4;
+    /// [`PQ10_RGB`] in `A2R10G10B10_UNORM_PACK32`'s order: B in bits 0-9, G in 10-19, R in 20-29.
+    pub const PQ10_BGR: u32 = 5;
 
     pub fn is_8bit(format: u32) -> bool {
         matches!(format, RGBA8 | BGRA8)
+    }
+
+    /// One of the 10-bit HDR10 formats ([`PQ10_RGB`], [`PQ10_BGR`]).
+    pub fn is_pq10(format: u32) -> bool {
+        matches!(format, PQ10_RGB | PQ10_BGR)
     }
 
     /// Bytes per pixel for a raw dump in this format -- shared by the layer (which
