@@ -1057,6 +1057,15 @@ fn build_colour_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         0.05,
         set,
     ));
+    let (v, set) = bind_float(shm, Some("edit_still_smoothing"), |h| &h.edit_still_smoothing_bits);
+    group.add(&spin_row(
+        "Still-scene smoothing",
+        "Before the upscaler, where the picture stands still, blends the model's change with its previous one to calm flicker (0 off, 1 most)",
+        v,
+        "edit_still_smoothing",
+        0.05,
+        set,
+    ));
     let (v, set) = bind_float(shm, Some("edit_highlight_protection"), |h| &h.edit_highlight_protection_bits);
     group.add(&spin_row(
         "Highlight protection",

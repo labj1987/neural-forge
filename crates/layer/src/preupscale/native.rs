@@ -1202,6 +1202,10 @@ pub(crate) struct Params {
     /// The Oklab protections of the pass's result (`native_colour.comp`'s `protect`: hue, near-grey chroma,
     /// shadow, highlight, 0-1). Appended: the other frame shaders' blocks end before it.
     protect: [f32; 4],
+    /// Still-scene smoothing (`native_colour.comp`'s `still`): this frame's weight, the pixels and luma a pixel
+    /// may move and change by, and 1 where the history (`ColourPass::still`) is this pass's from the network's
+    /// previous frame.
+    still: [f32; 4],
 }
 
 /// The model resolution's guide sigma (`native_enlarge.comp`), in the encoded picture's units: how far a
@@ -1572,7 +1576,7 @@ impl Feedback {
 const MORE: usize = neural_forge_protocol::MAX_PASSES - 1;
 /// The storage images and storage buffers one frame set binds.
 const IMAGES_PER_SET: u32 = 3;
-const BUFFERS_PER_SET: u32 = 13;
+const BUFFERS_PER_SET: u32 = 14;
 
 /// A device-local buffer of the layer's own.
 pub(crate) struct OwnBuffer {
@@ -1793,6 +1797,8 @@ pub(crate) struct NativePass {
     colour: Option<ColourPass>,
     colour_wanted: bool,
     colour_recorded: bool,
+    /// Whether the network's previous frame ran still-scene smoothing (its history is then this frame's).
+    still_ran: bool,
     /// The look-up table on the GPU (binding 13), the last pass's.
     lut: Option<LutBuffer>,
     /// Whether this frame applies [`Self::lut`] ([`Self::prepare_colour`]): not once `colour::current` gives no
@@ -1805,6 +1811,9 @@ struct ColourPass {
     /// Phase 0 (the edit's low-pass) and 1 (the steps).
     pipelines: [vk::Pipeline; 2],
     low: OwnBuffer,
+    /// Still-scene smoothing's history at the render extent: per pixel the change shown (RGB) and the input's
+    /// luma, as packed halves.
+    still: OwnBuffer,
 }
 
 /// [`NativePass::lut`]: the table's entries (vec4 each) in a host-visible buffer, and the table it holds.
@@ -2004,6 +2013,8 @@ impl NativePass {
             // (`native_colour.comp`).
             binding(16, vk::DescriptorType::STORAGE_BUFFER),
             binding(17, vk::DescriptorType::STORAGE_BUFFER),
+            // Still-scene smoothing's history (`native_colour.comp`).
+            binding(18, vk::DescriptorType::STORAGE_BUFFER),
         ];
         let mut steps = 0usize;
         // `Some` unless this creation step is the one to fail.
@@ -2166,6 +2177,7 @@ impl NativePass {
                 colour: None,
                 colour_wanted: false,
                 colour_recorded: false,
+                still_ran: false,
                 lut: None,
                 lut_applies: false,
                 gap: HistoryGap::default(),
@@ -2471,9 +2483,12 @@ impl NativePass {
         if self.colour.is_some() {
             return true;
         }
+        let half = u32::from(self.motion_half);
         let pipeline = |phase: u32| {
-            let data = phase.to_le_bytes();
-            let entry = [vk::SpecializationMapEntry { constant_id: 1, offset: 0, size: 4 }];
+            let mut data = [0u8; 8];
+            data[..4].copy_from_slice(&half.to_le_bytes());
+            data[4..].copy_from_slice(&phase.to_le_bytes());
+            let entry = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }, vk::SpecializationMapEntry { constant_id: 1, offset: 4, size: 4 }];
             let spec = vk::SpecializationInfo::default().map_entries(&entry).data(&data);
             // SAFETY: `device` is live; the layout is this pass's.
             unsafe { hdr::compute_pipeline_with(device, self.pipeline_layout, COLOUR_SPV, Some(&spec)) }
@@ -2483,12 +2498,19 @@ impl NativePass {
         let low = unsafe {
             OwnBuffer::new(device, instance, physical_device, u64::from(self.width) * u64::from(self.height) * 16, vk::BufferUsageFlags::STORAGE_BUFFER)
         };
-        match (low_pass, steps, low) {
-            (Some(a), Some(b), Some(low)) => {
+        // SAFETY: as above.
+        let still = unsafe {
+            OwnBuffer::new(device, instance, physical_device, u64::from(self.width) * u64::from(self.height) * 8, vk::BufferUsageFlags::STORAGE_BUFFER)
+        };
+        match (low_pass, steps, low, still) {
+            (Some(a), Some(b), Some(low), Some(still)) => {
                 made(());
                 made(());
                 made(());
-                self.colour = Some(ColourPass { pipelines: [a, b], low });
+                made(());
+                self.colour = Some(ColourPass { pipelines: [a, b], low, still });
+                // Its history holds nothing yet.
+                self.still_ran = false;
                 // The sets point binding 12 at the low-pass: written and recorded again.
                 self.recorded = None;
                 if let Some(m) = self.more.as_mut() {
@@ -2496,13 +2518,13 @@ impl NativePass {
                 }
                 true
             }
-            (a, b, low) => {
+            (a, b, low, still) => {
                 // SAFETY: never used.
                 unsafe {
                     for p in [a, b].into_iter().flatten() {
                         device.destroy_pipeline(p, None);
                     }
-                    if let Some(l) = low {
+                    for l in [low, still].into_iter().flatten() {
                         l.destroy(device);
                     }
                 }
@@ -2586,6 +2608,7 @@ impl NativePass {
         // The colour of the edit's buffers, or the mask's 16-byte stand-in until they exist (nothing reads them).
         let stand_in = self.mask.as_ref().map_or(vk::Buffer::null(), |m| m.no_depth.buffer);
         let low_buf = buf(self.colour.as_ref().map_or(stand_in, |c| c.low.buffer), vk::WHOLE_SIZE);
+        let still_buf = buf(self.colour.as_ref().map_or(stand_in, |c| c.still.buffer), vk::WHOLE_SIZE);
         let lut_buf = buf(self.lut.as_ref().map_or(stand_in, |l| l.buffer.buffer), vk::WHOLE_SIZE);
         let (mv, feat, head, params, state, expo, ans) = (
             buf(lane.map_or(full_motion, |l| l.motion.buffer), vk::WHOLE_SIZE),
@@ -2616,6 +2639,7 @@ impl NativePass {
             w(15, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_answer_buf),
             w(16, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&low_buf),
             w(17, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&lut_buf),
+            w(18, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&still_buf),
         ];
         // SAFETY: the set is not in use (contract); every handle is live.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -3312,6 +3336,11 @@ impl NativePass {
         });
         let lut = self.lut.as_ref().filter(|_| self.lut_applies).map(|l| &*l.lut);
         let recorded = self.colour_recorded;
+        // Still-scene smoothing (the last pass's): its history is this frame's only if the network's previous
+        // frame ran it and the frame keeps its history.
+        let still_on = recorded && passes.colour.still.is_finite() && passes.colour.still > 0.0;
+        let still_valid = still_on && history && self.still_ran;
+        self.still_ran = still_on;
         let colour = |k: usize| {
             if recorded {
                 super::colour::PassColour::of(&passes.colour, k, k + 1 == runs, lut, false)
@@ -3349,6 +3378,11 @@ impl NativePass {
                 lut_scale: colour(index).lut_scale,
                 lut_offset: colour(index).lut_offset,
                 protect: colour(index).protect,
+                still: {
+                    let mut st = colour(index).still;
+                    st[3] = if still_valid { 1.0 } else { 0.0 };
+                    st
+                },
             }
         };
         let mut plan = FramePlan {
@@ -3477,7 +3511,8 @@ impl NativePass {
                     device.destroy_pipeline(p, None);
                 }
                 c.low.destroy(device);
-                destroyed(3);
+                c.still.destroy(device);
+                destroyed(4);
             }
             if let Some(l) = &self.lut {
                 l.buffer.destroy(device);

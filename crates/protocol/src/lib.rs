@@ -88,7 +88,8 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// network sees before the upscaler: its brightness (`preupscale_brightness`) and where the exposure comes from
 /// (`preupscale_exposure`), and the network's GPU time on its last hold (`preupscale_network_gpu_ms`); v23
 /// appends the protections of each pass's result against its input (`edit_hue_protection`,
-/// `edit_neutral_protection`, `edit_shadow_protection`, `edit_highlight_protection`)).
+/// `edit_neutral_protection`, `edit_shadow_protection`, `edit_highlight_protection`) and the still-scene
+/// smoothing of the last pass's change (`edit_still_smoothing`)).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.

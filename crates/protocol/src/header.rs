@@ -154,6 +154,10 @@ pub struct ColourSettings {
     /// Oklab (docs/NATIVE_BACKEND.md, "The colour of the edit"): the hue, the chroma of near-grey colours, the
     /// lightness of shadows against darkening and of highlights against brightening.
     pub protect: [f32; 4],
+    /// Still-scene smoothing of the last pass's change (0, off, the default, to 1): where a pixel stayed put and
+    /// its input kept its brightness, the change is blended with the one shown there on the network's previous
+    /// frame (docs/NATIVE_BACKEND.md, "Still-scene smoothing").
+    pub still: f32,
 }
 
 impl ColourSettings {
@@ -166,6 +170,7 @@ impl ColourSettings {
         lut_adapt: 0.05,
         lut_seq: 0,
         protect: [0.0; 4],
+        still: 0.0,
     };
 }
 
@@ -659,6 +664,9 @@ pub struct ShmHeader {
     pub edit_neutral_protection_bits: AtomicU32,
     pub edit_shadow_protection_bits: AtomicU32,
     pub edit_highlight_protection_bits: AtomicU32,
+    /// f32 bits, 0 (the default, off) to 1: still-scene smoothing of the last pass's change
+    /// (`edit_still_smoothing`; docs/NATIVE_BACKEND.md, "Still-scene smoothing").
+    pub edit_still_smoothing_bits: AtomicU32,
 }
 
 /// The most HUD regions (`hud_regions`).
@@ -778,7 +786,8 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2552, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2556, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_still_smoothing_bits) == 2552, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_hue_protection_bits) == 2536, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_highlight_protection_bits) == 2548, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, placement) == 2280, "layout changed -- bump SHM_VERSION");
@@ -833,7 +842,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 182] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 183] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -983,6 +992,8 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 182] = [
     ("edit_neutral_protection", 0.0, 1.0),
     ("edit_shadow_protection", 0.0, 1.0),
     ("edit_highlight_protection", 0.0, 1.0),
+    // Still-scene smoothing of the last pass's change.
+    ("edit_still_smoothing", 0.0, 1.0),
     // Each pass's own colour values (its `overrides` say which it uses).
     ("pass1_edit_saturation", 0.0, 4.0),
     ("pass1_edit_contrast", 0.0, 4.0),
@@ -1140,7 +1151,13 @@ impl ShmHeader {
         self.edit_dither.store(0, Ordering::Relaxed);
         self.edit_lut_strength_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
         self.edit_lut_adapt_bits.store(0.05f32.to_bits(), Ordering::Relaxed);
-        for p in [&self.edit_hue_protection_bits, &self.edit_neutral_protection_bits, &self.edit_shadow_protection_bits, &self.edit_highlight_protection_bits] {
+        for p in [
+            &self.edit_hue_protection_bits,
+            &self.edit_neutral_protection_bits,
+            &self.edit_shadow_protection_bits,
+            &self.edit_highlight_protection_bits,
+            &self.edit_still_smoothing_bits,
+        ] {
             p.store(0.0f32.to_bits(), Ordering::Relaxed);
         }
         self.edit_lut_seq.store(0, Ordering::Relaxed);
@@ -1379,13 +1396,13 @@ impl ShmHeader {
     /// under `/tmp` and does not). Add to [`Self::setting_slots`] (and [`SETTING_BOUNDS`]), not just
     /// to the GUI, whenever a new tunable needs to survive a restart -- that is the one list that
     /// decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 182] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 183] {
         self.setting_slots().map(|(name, kind, field)| (name, kind == Kind::Float, field.load(Ordering::Relaxed)))
     }
 
     /// Every persisted setting's name, kind and field, in [`SETTING_BOUNDS`]'s order (a test holds
     /// the two lists to the same names at the same places). Only addresses: nothing is loaded.
-    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 182] {
+    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 183] {
         [
             ("white_point", Kind::Float, &self.white_point_bits),
             ("white_point_scale", Kind::Float, &self.white_point_scale_bits),
@@ -1527,6 +1544,7 @@ impl ShmHeader {
             ("edit_neutral_protection", Kind::Float, &self.edit_neutral_protection_bits),
             ("edit_shadow_protection", Kind::Float, &self.edit_shadow_protection_bits),
             ("edit_highlight_protection", Kind::Float, &self.edit_highlight_protection_bits),
+            ("edit_still_smoothing", Kind::Float, &self.edit_still_smoothing_bits),
             ("pass1_edit_saturation", Kind::Float, &self.pass_colour[0].saturation_bits),
             ("pass1_edit_contrast", Kind::Float, &self.pass_colour[0].contrast_bits),
             ("pass1_edit_detail", Kind::Float, &self.pass_colour[0].detail_bits),
@@ -1578,7 +1596,7 @@ impl ShmHeader {
     /// clamped to the setting's range in [`SETTING_BOUNDS`] (`None` for one that is not finite), a
     /// whole number clamped to it, and an override mask with the bits that name no override cleared.
     /// `None` for a name that is no setting.
-    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 182], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
+    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 183], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
         let at = SETTING_BOUNDS.iter().position(|(n, ..)| *n == name)?;
         let (_, min, max) = SETTING_BOUNDS[at];
         let (slot_name, kind, field) = slots[at];
@@ -1685,6 +1703,7 @@ impl ShmHeader {
                 f(&self.edit_shadow_protection_bits, "edit_shadow_protection", 0.0),
                 f(&self.edit_highlight_protection_bits, "edit_highlight_protection", 0.0),
             ],
+            still: f(&self.edit_still_smoothing_bits, "edit_still_smoothing", 0.0),
         }
     }
 
@@ -2954,7 +2973,8 @@ mod tests {
     #[test]
     fn the_protections_are_appended_and_start_off() {
         assert_eq!(std::mem::offset_of!(ShmHeader, edit_neutral_protection_bits), std::mem::offset_of!(ShmHeader, edit_hue_protection_bits) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, edit_highlight_protection_bits) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, edit_highlight_protection_bits) + 4, std::mem::offset_of!(ShmHeader, edit_still_smoothing_bits));
+        assert_eq!(std::mem::offset_of!(ShmHeader, edit_still_smoothing_bits) + 4, std::mem::size_of::<ShmHeader>());
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.colour_now().protect, [0.0; 4]);
@@ -2969,7 +2989,9 @@ mod tests {
         h.edit_shadow_protection_bits.store(f32::NAN.to_bits(), Ordering::Relaxed);
         assert_eq!(h.colour_now().protect[2], 0.0);
         let saved: Vec<&str> = h.persisted_settings().iter().map(|(n, ..)| *n).collect();
-        for n in ["edit_hue_protection", "edit_neutral_protection", "edit_shadow_protection", "edit_highlight_protection"] {
+        assert!(h.write_settings(&[("edit_still_smoothing", 0.5f32.to_bits())]));
+        assert_eq!(h.colour_now().still, 0.5);
+        for n in ["edit_hue_protection", "edit_neutral_protection", "edit_shadow_protection", "edit_highlight_protection", "edit_still_smoothing"] {
             assert!(saved.contains(&n), "{n} is saved");
         }
     }

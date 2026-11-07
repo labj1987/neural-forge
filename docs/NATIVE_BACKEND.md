@@ -1137,6 +1137,41 @@ checks the bound on the GPU: e 16 for a dark frame, 0.5 for a bright one, the me
 `swapchain_hdr` line says whether the game presents HDR (`hdr_detected`, written by the layer at each present
 since 3.8.10; nothing wrote it before).
 
+## Still-scene smoothing (3.10.0, 2026-11-07)
+
+`edit_still_smoothing` (0, off, the default, to 1; the Colour group's **Still-scene smoothing**): on the last
+pass before the upscaler, where a pixel moved less than a quarter of a render pixel along the motion back to the
+network's previous frame (the edit cache's accumulated field, binding 13) and its encoded input luma changed by
+0.06 or less, the change shown is `mix(previous, e, w)`, `w = 1 - 0.75 x strength` (0.25 at 1), and that becomes
+the history (`ColourPass::still`, render extent, packed halves of the change and the input's luma). Anywhere else,
+on a scene cut, on a frame without history and on the first frame after the stage did not run, the network's own
+change is shown and stored. It is the first of the colour steps (`native_colour.comp`, bit 64), so the others
+shape the smoothed change; the network's own history (`u_next`) is never smoothed. It is Magpie Experimental's
+"static" temporal route (route 1 of `DLSSNRTemporalShader.h`, as Veyra-NRVideo carries it), idea only.
+
+**Why the still-only route, not a reprojected blend.** Measured offline (task 20, 2026-11-07) on the pre-upscaler
+cache dumps (GTA V Enhanced, 1485x836, 32 holds each, the model's real answer on every hold;
+`~/scratch/nf-temporal/tf_replay.py`, not in the repository): flicker is flicker_lab's motion-compensated
+|picture_t - picture_t-1| x 1000 minus the model's own (negative: calmer than the model); kept is the share of the
+model's picture change that survives.
+
+| variant | still: flicker / kept | pan | drive |
+|---|---|---|---|
+| none | -0.18 / 98.8% | -0.00 / 100.0% | -0.04 / 99.7% |
+| full-band blend, reprojected, w 0.5 | -1.82 / 92.3% | -1.11 / 92.8% | -1.63 / 90.3% |
+| full-band blend, w 0.25 | -2.48 / 88.6% | -1.46 / 87.1% | -2.19 / 84.5% |
+| low band only (Gaussian sigma 2), w 0.5 | -0.39 / 96.5% | -0.24 / 94.7% | -0.23 / 95.7% |
+| low band only, w 0.25 | -0.43 / 95.4% | -0.20 / 89.6% | -0.26 / 92.6% |
+| still pixels only, w 0.5 | -1.77 / 92.4% | -0.04 / 99.8% | -0.04 / 99.7% |
+| still pixels only, w 0.25 | -2.42 / 88.8% | -0.06 / 99.7% | -0.04 / 99.7% |
+
+On the still dump the model's own flicker is 26.4 against the frame's 21.2 without it: the model adds 5.2, and the
+still-only blend at w 0.5 takes 1.77 of that away. A reprojected blend calms moving shots too but takes 7-16% of
+the model's change with it while the camera moves (the 3.8.0 lesson: a history after the upscaler made the edit
+change more); the low band alone calms little. Still pixels only gives the full blend's calm where the picture
+stands and changes nothing while it moves. These are before DLSS, whose own accumulation also calms flicker: the
+setting stays off by default until a game check shows what is left of it after the upscaler.
+
 ## The colour of the edit (3.8.0, 2026-10-19)
 
 Controls that act on the network's **change** to the frame rather than on the frame: the edit e = answer -
