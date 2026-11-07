@@ -1151,15 +1151,20 @@ table on top, comes from another DLSS-NR app's feature list; the design here is 
 | Saturation | `edit_saturation` (1) | l = BT.709 luma of e (0.2126, 0.7152, 0.0722; on the encoded values), e = contrast x l + saturation x (e - l): the grey part scaled by contrast, the part of no luma by saturation |
 | Contrast | `edit_contrast` (1) | (the same line) |
 | Look-up table | `edit_lut_strength` (0, off), `edit_lut_adapt` (0.05); the file is `edit_lut` in `config.ini` | on the last pass's result r: r = mix(r, LUT(r), strength x min(1, max channel abs(r - input) / adapt)), trilinear in a 3D `.cube` table (2 to 65 points, `DOMAIN_MIN`/`MAX` honoured) |
+| Protections | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection`, `edit_highlight_protection` (0, off; to 1) | on the pass's result r against its input i, both read as sRGB-encoded and taken to Oklab (Ottosson): hue, the result's (a, b) turned toward the input's by the angle between them times the strength, fading out where the input's chroma is below 0.04 (none below 0.01: a grey has no hue); grey, the result's (a, b) moved toward the input's where its chroma is below 0.04 (full below 0.01); shadow, where L(r) < L(i), L(r) moved toward L(i), full at L(i) 0.3 and below, none from 0.5; highlight, where L(r) > L(i), likewise, none up to L(i) 0.75, full from 0.92. Back to sRGB with the curve extended past 0 and 1, so the gamut guard still shortens a change that leaves the range |
 | Gamut guard | `edit_gamut_guard` (on) | where input + e leaves 0-1 in a channel, e is shortened along itself (r = input + t x e, the largest t <= 1 that fits); without it each channel clamps |
 | Dither | `edit_dither` (off) | after the upscaler only: an 8x8 Bayer offset in (-0.5, 0.5) of the 8-bit step added before the answer is rounded |
 
-The order is detail, saturation and contrast, the table, the guard, then the clamp to 0-1 and the half-float
+The order is detail, saturation and contrast, the protections, the table, the guard, then the clamp to 0-1 and the half-float
 truncation (before the upscaler) or the 8-bit rounding (after it). The three scales apply to every pass (the
 Model tab's value, "the whole stack"), and a pass may override any of them in the per-pass dialog
 (`pass<N>_edit_saturation`, `_contrast`, `_detail`, override bits 128, 256 and 512 of `pass<N>_overrides`);
-the guard and the dither apply to every pass that has a step, the table to the last pass of the frame only, so
-it grades the stack's result once.
+the guard and the dither apply to every pass that has a step, the protections to every pass the frame runs
+(each against that pass's own input), the table to the last pass of the frame only, so it grades the stack's
+result once. The protections' idea (keeping the network's result close to the input in a perceptual colour space)
+comes from Veyra-NRVideo's NR correction stage and Magpie Experimental, which it credits; the rules and
+thresholds here are this project's own. After the upscaler the four values travel in the composite's push block
+(`colour.w` and `hud.yzw`), which is at the 128 bytes every device takes.
 
 **Why the guard is on by default.** The encode maps scene-linear 0 to 0 in each channel and the shoulder's top to
 1, so an encoded channel below 0 is a colour outside BT.709's primaries in linear terms and one above 1 cannot be

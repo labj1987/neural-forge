@@ -70,7 +70,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
+| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
@@ -147,7 +147,11 @@ model changes colour, how much it brightens or darkens, and its fine detail agai
 the frame keeps its own colours, its own brightness, or only the broad change. They apply to every pass, and
 the per-pass settings can give a pass its own. **Gamut guard** (on) shortens a change that would push a
 colour past what the frame can hold instead of clipping one channel, so the hue stays. **Dither** (off)
-breaks up banding in smooth gradients after the upscaler. **Look-up table** applies a 3D `.cube` file (17 to
+breaks up banding in smooth gradients after the upscaler. Four **protections** (0, off, to 1) keep parts of the
+frame's own look against the model's change, judged by eye-matched colour (Oklab): **Hue protection** keeps each
+colour's hue (the model may still make it more or less colourful, brighter or darker), **Grey protection** keeps
+greys free of a tint, **Shadow protection** holds back darkening of what was already dark and **Highlight
+protection** holds back brightening of what was already bright. **Look-up table** applies a 3D `.cube` file (17 to
 65 points; the Choose button or `neural-forge-cli shmctl lut FILE`) to the last pass's result where the model
 changed the picture: its strength (0, off) grows with the size of the change and is full at **Look-up table
 full at**, so a pixel the model left alone keeps its colour. A table that is removed or cannot be read stops

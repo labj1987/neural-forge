@@ -86,11 +86,13 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// table's strength, its adaptation and reload counter) and each pass's own colour values (`pass_colour`),
 /// where the network runs (`placement`, `pass_placement`) and the HUD at present (`hud_*`); v22 appends what the
 /// network sees before the upscaler: its brightness (`preupscale_brightness`) and where the exposure comes from
-/// (`preupscale_exposure`), and the network's GPU time on its last hold (`preupscale_network_gpu_ms`)).
+/// (`preupscale_exposure`), and the network's GPU time on its last hold (`preupscale_network_gpu_ms`); v23
+/// appends the protections of each pass's result against its input (`edit_hue_protection`,
+/// `edit_neutral_protection`, `edit_shadow_protection`, `edit_highlight_protection`)).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
-pub const SHM_VERSION: u32 = 22;
+pub const SHM_VERSION: u32 = 23;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;

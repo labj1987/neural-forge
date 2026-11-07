@@ -1199,6 +1199,9 @@ pub(crate) struct Params {
     colour_flags: [u32; 4],
     lut_scale: [f32; 4],
     lut_offset: [f32; 4],
+    /// The Oklab protections of the pass's result (`native_colour.comp`'s `protect`: hue, near-grey chroma,
+    /// shadow, highlight, 0-1). Appended: the other frame shaders' blocks end before it.
+    protect: [f32; 4],
 }
 
 /// The model resolution's guide sigma (`native_enlarge.comp`), in the encoded picture's units: how far a
@@ -3345,6 +3348,7 @@ impl NativePass {
                 colour_flags: colour(index).flags,
                 lut_scale: colour(index).lut_scale,
                 lut_offset: colour(index).lut_offset,
+                protect: colour(index).protect,
             }
         };
         let mut plan = FramePlan {
@@ -6029,6 +6033,37 @@ mod tests {
             let inside = at(&guarded, W - 2, 2);
             assert!(inside[0] < 1.0);
             assert_eq!(inside.map(f32::to_bits), at(&clipped, W - 2, 2).map(f32::to_bits), "in range, the guard changes nothing");
+
+            // The protections (Oklab of the encoded values read as sRGB): full hue protection keeps an orange's hue
+            // where the edit turns it toward yellow; full shadow protection holds back darkening a dark grey.
+            let oklab = |v: [f32; 3]| -> [f32; 3] {
+                let [r, g, b] = v.map(|s| if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) });
+                let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_99 * b).cbrt();
+                let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+                let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+                [
+                    0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+                    1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+                    0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+                ]
+            };
+            let hue = |o: [f32; 3]| o[2].atan2(o[1]).to_degrees();
+            let protected = |k: [f32; 4]| neural_forge_protocol::ColourSettings { protect: k, ..neutral };
+            fill(&|_, _, c| [0.78125, 0.34375, 0.25][c as usize]);
+            write_head(&|_, _, c| [0.015625, 0.15625, -0.03125][c as usize]);
+            let (free, _) = run(neutral, None, false, false);
+            let (kept, recorded) = run(protected([1.0, 0.0, 0.0, 0.0]), None, false, false);
+            assert!(recorded, "a protection records the stage");
+            let h0 = hue(oklab([0.78125, 0.34375, 0.25]));
+            let (hf, hk) = (hue(oklab(at(&free, 3, 3))), hue(oklab(at(&kept, 3, 3))));
+            assert!((hf - h0).abs() > 8.0, "the test's edit turns the hue: {h0} -> {hf}");
+            assert!((hk - h0).abs() < 1.0, "full hue protection keeps it before the upscaler too: {h0} -> {hk}");
+            fill(&|_, _, _| 0.125);
+            write_head(&|_, _, _| -0.0625);
+            let (dark, _) = run(neutral, None, false, false);
+            let (held, _) = run(protected([0.0, 0.0, 1.0, 0.0]), None, false, false);
+            assert!(at(&dark, 3, 3)[1] < 0.07, "the test darkens the shadow");
+            assert!((at(&held, 3, 3)[1] - 0.125).abs() < 2f32.powi(-9), "shadow protection holds it: {:?}", at(&held, 3, 3));
 
             // The look-up table (a channel rotation, exact under trilinear): strength 0 changes nothing; at full
             // strength the result is the table's where the edit is large, and untouched where there is none.

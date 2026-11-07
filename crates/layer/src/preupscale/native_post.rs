@@ -73,20 +73,32 @@ struct CompositePush {
     dims: [u32; 4],
     frame: [u32; 4],
     control: [f32; 4],
-    /// The colour of the edit ([`super::colour::PassColour`]; native_post_composite.comp's).
+    /// The colour of the edit ([`super::colour::PassColour`]; native_post_composite.comp's). `colour.w` is the
+    /// hue protection (the block is at the 128 bytes every device takes; `hud.yzw` hold the other three).
     colour: [f32; 4],
     colour_flags: [u32; 4],
     lut_scale: [f32; 4],
     lut_offset: [f32; 4],
-    /// The HUD: x 1 applies its scale of the edit (the last pass).
+    /// The HUD: x 1 applies its scale of the edit (the last pass); y, z, w the near-grey chroma, shadow and
+    /// highlight protections ([`super::colour::PassColour::protect`]).
     hud: [f32; 4],
 }
 
 impl CompositePush {
-    fn with_colour(self, c: super::colour::PassColour) -> Self {
-        Self { colour: c.colour, colour_flags: c.flags, lut_scale: c.lut_scale, lut_offset: c.lut_offset, ..self }
+    /// `apply_hud`: the HUD's scale applies on this pass (the last).
+    fn with_colour(self, c: super::colour::PassColour, apply_hud: bool) -> Self {
+        Self {
+            colour: [c.colour[0], c.colour[1], c.colour[2], c.protect[0]],
+            colour_flags: c.flags,
+            lut_scale: c.lut_scale,
+            lut_offset: c.lut_offset,
+            hud: [if apply_hud { 1.0 } else { 0.0 }, c.protect[1], c.protect[2], c.protect[3]],
+            ..self
+        }
     }
 }
+
+const _: () = assert!(std::mem::size_of::<CompositePush>() <= 128, "native_post_composite.comp's push block must stay within 128 bytes");
 
 /// Which server answers the after-the-upscaler requests in this process: the channel is the process's, so
 /// two answerers (two devices' servers) would race for every request. Holds the owning device's handle, 0 for
@@ -1197,10 +1209,7 @@ unsafe fn evaluate(
             }
             for (k, c) in passes.iter().enumerate() {
                 let (pre, post) = push(c, decision.passes[k]);
-                let post = CompositePush {
-                    hud: [if hud_rec.is_some() && k + 1 == runs { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
-                    ..post.with_colour(super::colour::PassColour::of(colour, k, k + 1 == runs, lut, true))
-                };
+                let post = post.with_colour(super::colour::PassColour::of(colour, k, k + 1 == runs, lut, true), hud_rec.is_some() && k + 1 == runs);
                 // Every pass after the first reads the previous one's answer: copied into `scratch`, after the
                 // composite wrote it and before this pass's shaders read it (and the next composite rewrites it).
                 if k > 0 {
@@ -1884,7 +1893,7 @@ mod tests {
                 std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
             };
             let run = |c: super::super::colour::PassColour| -> Vec<u8> {
-                let push = CompositePush { dims: [W, H, W, H], frame: [0, 0, 0, 0], control: [0.0, 1.0, 1.0, 0.0], ..Default::default() }.with_colour(c);
+                let push = CompositePush { dims: [W, H, W, H], frame: [0, 0, 0, 0], control: [0.0, 1.0, 1.0, 0.0], ..Default::default() }.with_colour(c, false);
                 let cmd = gpu.cmd;
                 device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
                 device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
@@ -1963,6 +1972,65 @@ mod tests {
             let mean = values.iter().sum::<f32>() / values.len() as f32;
             assert!((mean - v).abs() < 0.025, "the dither averages to the value: {mean} against {v}");
             assert_eq!(dithered.chunks(4).map(|p| p[3]).collect::<Vec<_>>(), vec![255; (W * H) as usize], "alpha is the proxy's");
+
+            // The protections, against Oklab on the CPU (the 8-bit values read as sRGB).
+            use super::super::colour::PROTECT;
+            let oklab = |rgb: [u8; 3]| -> [f32; 3] {
+                let lin = rgb.map(|v| {
+                    let s = f32::from(v) / 255.0;
+                    if s <= 0.04045 {
+                        s / 12.92
+                    } else {
+                        ((s + 0.055) / 1.055).powf(2.4)
+                    }
+                });
+                let [r, g, b] = lin;
+                let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_99 * b).cbrt();
+                let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+                let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+                [
+                    0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+                    1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+                    0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+                ]
+            };
+            let hue = |o: [f32; 3]| o[2].atan2(o[1]).to_degrees();
+            let chroma = |o: [f32; 3]| o[1].hypot(o[2]);
+            let protect = |k: [f32; 4]| PassColour { protect: k, ..flags(STEP | GUARD | PROTECT) };
+            let pixel = |a: &[u8]| [a[0], a[1], a[2]];
+            // Hue: an orange the edit turns toward yellow keeps its hue, not its chroma or lightness unchanged.
+            let orange = [200u8, 90, 60];
+            fill(&|_, _, c| orange[c as usize], &|_, _, c| [6.0, 40.0, -10.0][c as usize] / 255.0);
+            let free = pixel(&run(PassColour::default()));
+            let kept = pixel(&run(protect([1.0, 0.0, 0.0, 0.0])));
+            let half = pixel(&run(protect([0.5, 0.0, 0.0, 0.0])));
+            let (h0, hf, hk, hh) = (hue(oklab(orange)), hue(oklab(free)), hue(oklab(kept)), hue(oklab(half)));
+            assert!((hf - h0).abs() > 8.0, "the test's edit turns the hue: {h0} -> {hf}");
+            assert!((hk - h0).abs() < 1.5, "full hue protection keeps it: {h0} -> {hk} ({kept:?})");
+            assert!((hh - h0).abs() > 2.0 && (hh - h0).abs() < (hf - h0).abs() - 2.0, "half turns it part way: {hh}");
+            assert!((oklab(kept)[0] - oklab(free)[0]).abs() < 0.01, "the network's lightness stays");
+            // Near grey: a tint on a grey is taken away; a colourful pixel's chroma is not.
+            fill(&|_, _, _| 120, &|_, _, c| [10.0, 0.0, -10.0][c as usize] / 255.0);
+            let tinted = pixel(&run(PassColour::default()));
+            let neutral = pixel(&run(protect([0.0, 1.0, 0.0, 0.0])));
+            assert!(chroma(oklab(tinted)) > 0.015, "the test tints the grey: {tinted:?}");
+            assert!(chroma(oklab(neutral)) < 0.004, "grey protection keeps it grey: {neutral:?}");
+            fill(&|_, _, c| orange[c as usize], &|_, _, c| [6.0, 40.0, -10.0][c as usize] / 255.0);
+            assert_eq!(pixel(&run(protect([0.0, 1.0, 0.0, 0.0]))), free, "a colourful pixel is no grey: unchanged");
+            // Shadows: darkening a dark grey is held back, brightening it is not.
+            fill(&|_, _, _| 30, &|_, _, _| -12.0 / 255.0);
+            let dark = pixel(&run(PassColour::default()));
+            let held = pixel(&run(protect([0.0, 0.0, 1.0, 0.0])));
+            assert!(dark[0] < 22 && held[0].abs_diff(30) <= 1, "shadow protection: {dark:?} -> {held:?}");
+            fill(&|_, _, _| 30, &|_, _, _| 12.0 / 255.0);
+            assert_eq!(pixel(&run(protect([0.0, 0.0, 1.0, 0.0]))), pixel(&run(PassColour::default())), "brightening a shadow stays");
+            // Highlights: brightening a near-white is held back, a mid grey's is not.
+            fill(&|_, _, _| 235, &|_, _, _| 14.0 / 255.0);
+            let bright = pixel(&run(PassColour::default()));
+            let capped = pixel(&run(protect([0.0, 0.0, 0.0, 1.0])));
+            assert!(bright[0] > 245 && capped[0].abs_diff(235) <= 1, "highlight protection: {bright:?} -> {capped:?}");
+            fill(&|_, _, _| 120, &|_, _, _| 14.0 / 255.0);
+            assert_eq!(pixel(&run(protect([0.0, 0.0, 0.0, 1.0]))), pixel(&run(PassColour::default())), "a mid grey brightens freely");
 
             for b in [&proxy, &head, &answer, &lut, &history] {
                 b.destroy(&device);

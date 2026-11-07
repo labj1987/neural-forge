@@ -150,12 +150,23 @@ pub struct ColourSettings {
     pub lut_adapt: f32,
     /// Bumped when `edit_lut` in `config.ini` names another file (or the same one changed).
     pub lut_seq: u32,
+    /// The protections of each pass's result against that pass's input, 0 (off, the default) to 1, measured in
+    /// Oklab (docs/NATIVE_BACKEND.md, "The colour of the edit"): the hue, the chroma of near-grey colours, the
+    /// lightness of shadows against darkening and of highlights against brightening.
+    pub protect: [f32; 4],
 }
 
 impl ColourSettings {
     /// Every control at its default: the edit as the network made it.
-    pub const DEFAULT: Self =
-        Self { each: [EditColour::NEUTRAL; crate::MAX_PASSES], gamut_guard: true, dither: false, lut_strength: 0.0, lut_adapt: 0.05, lut_seq: 0 };
+    pub const DEFAULT: Self = Self {
+        each: [EditColour::NEUTRAL; crate::MAX_PASSES],
+        gamut_guard: true,
+        dither: false,
+        lut_strength: 0.0,
+        lut_adapt: 0.05,
+        lut_seq: 0,
+        protect: [0.0; 4],
+    };
 }
 
 /// The control mask's rules ([`ShmHeader::mask_settings`]), as plain values.
@@ -637,6 +648,17 @@ pub struct ShmHeader {
     /// f32 bits: the network's GPU milliseconds on the last hold that ran it (before the upscaler or after
     /// DLSS), for the Status tab's graph. 0 before the first.
     pub preupscale_network_gpu_ms_bits: AtomicU32,
+
+    // --- v23 -----------------------------------------------------------------------------
+    /// f32 bits, 0 (the default, off) to 1: how much of its input's look each pass's result keeps,
+    /// measured in Oklab (docs/NATIVE_BACKEND.md, "The colour of the edit"): its hue (`edit_hue_protection`;
+    /// the chroma and lightness stay the network's), the chroma of colours that were near grey
+    /// (`edit_neutral_protection`, against a tint), the lightness of shadows the network darkens
+    /// (`edit_shadow_protection`) and of highlights it brightens (`edit_highlight_protection`).
+    pub edit_hue_protection_bits: AtomicU32,
+    pub edit_neutral_protection_bits: AtomicU32,
+    pub edit_shadow_protection_bits: AtomicU32,
+    pub edit_highlight_protection_bits: AtomicU32,
 }
 
 /// The most HUD regions (`hud_regions`).
@@ -756,7 +778,9 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2536, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2552, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_hue_protection_bits) == 2536, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_highlight_protection_bits) == 2548, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, placement) == 2280, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_placement) == 2284, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hud_detect) == 2324, "layout changed -- bump SHM_VERSION");
@@ -809,7 +833,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 178] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 182] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -953,6 +977,12 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 178] = [
     ("edit_dither", 0.0, 1.0),
     ("edit_lut_strength", 0.0, 1.0),
     ("edit_lut_adapt", 0.001, 1.0),
+    // The protections of each pass's result against its input (Oklab hue, near-grey chroma, shadow and
+    // highlight lightness).
+    ("edit_hue_protection", 0.0, 1.0),
+    ("edit_neutral_protection", 0.0, 1.0),
+    ("edit_shadow_protection", 0.0, 1.0),
+    ("edit_highlight_protection", 0.0, 1.0),
     // Each pass's own colour values (its `overrides` say which it uses).
     ("pass1_edit_saturation", 0.0, 4.0),
     ("pass1_edit_contrast", 0.0, 4.0),
@@ -1110,6 +1140,9 @@ impl ShmHeader {
         self.edit_dither.store(0, Ordering::Relaxed);
         self.edit_lut_strength_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
         self.edit_lut_adapt_bits.store(0.05f32.to_bits(), Ordering::Relaxed);
+        for p in [&self.edit_hue_protection_bits, &self.edit_neutral_protection_bits, &self.edit_shadow_protection_bits, &self.edit_highlight_protection_bits] {
+            p.store(0.0f32.to_bits(), Ordering::Relaxed);
+        }
         self.edit_lut_seq.store(0, Ordering::Relaxed);
         for p in &self.pass_colour {
             p.reset_to_defaults();
@@ -1346,13 +1379,13 @@ impl ShmHeader {
     /// under `/tmp` and does not). Add to [`Self::setting_slots`] (and [`SETTING_BOUNDS`]), not just
     /// to the GUI, whenever a new tunable needs to survive a restart -- that is the one list that
     /// decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 178] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 182] {
         self.setting_slots().map(|(name, kind, field)| (name, kind == Kind::Float, field.load(Ordering::Relaxed)))
     }
 
     /// Every persisted setting's name, kind and field, in [`SETTING_BOUNDS`]'s order (a test holds
     /// the two lists to the same names at the same places). Only addresses: nothing is loaded.
-    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 178] {
+    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 182] {
         [
             ("white_point", Kind::Float, &self.white_point_bits),
             ("white_point_scale", Kind::Float, &self.white_point_scale_bits),
@@ -1490,6 +1523,10 @@ impl ShmHeader {
             ("edit_dither", Kind::Whole, &self.edit_dither),
             ("edit_lut_strength", Kind::Float, &self.edit_lut_strength_bits),
             ("edit_lut_adapt", Kind::Float, &self.edit_lut_adapt_bits),
+            ("edit_hue_protection", Kind::Float, &self.edit_hue_protection_bits),
+            ("edit_neutral_protection", Kind::Float, &self.edit_neutral_protection_bits),
+            ("edit_shadow_protection", Kind::Float, &self.edit_shadow_protection_bits),
+            ("edit_highlight_protection", Kind::Float, &self.edit_highlight_protection_bits),
             ("pass1_edit_saturation", Kind::Float, &self.pass_colour[0].saturation_bits),
             ("pass1_edit_contrast", Kind::Float, &self.pass_colour[0].contrast_bits),
             ("pass1_edit_detail", Kind::Float, &self.pass_colour[0].detail_bits),
@@ -1541,7 +1578,7 @@ impl ShmHeader {
     /// clamped to the setting's range in [`SETTING_BOUNDS`] (`None` for one that is not finite), a
     /// whole number clamped to it, and an override mask with the bits that name no override cleared.
     /// `None` for a name that is no setting.
-    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 178], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
+    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 182], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
         let at = SETTING_BOUNDS.iter().position(|(n, ..)| *n == name)?;
         let (_, min, max) = SETTING_BOUNDS[at];
         let (slot_name, kind, field) = slots[at];
@@ -1642,6 +1679,12 @@ impl ShmHeader {
             lut_strength: f(&self.edit_lut_strength_bits, "edit_lut_strength", 0.0),
             lut_adapt: f(&self.edit_lut_adapt_bits, "edit_lut_adapt", 0.05),
             lut_seq: self.edit_lut_seq.load(Ordering::Relaxed),
+            protect: [
+                f(&self.edit_hue_protection_bits, "edit_hue_protection", 0.0),
+                f(&self.edit_neutral_protection_bits, "edit_neutral_protection", 0.0),
+                f(&self.edit_shadow_protection_bits, "edit_shadow_protection", 0.0),
+                f(&self.edit_highlight_protection_bits, "edit_highlight_protection", 0.0),
+            ],
         }
     }
 
@@ -2720,7 +2763,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_sky), std::mem::offset_of!(ShmHeader, network) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_motion_structure_bits) + 4, std::mem::offset_of!(ShmHeader, pass_feedback_bits));
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4, std::mem::offset_of!(ShmHeader, scene_cuts));
-        assert_eq!(crate::SHM_VERSION, 22);
+        assert_eq!(crate::SHM_VERSION, 23);
         let h = ShmHeader::default();
         h.init_defaults();
         let m = h.mask_settings();
@@ -2744,7 +2787,7 @@ mod tests {
         // v20 appends the Network setting: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, network), std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28);
         assert_eq!(std::mem::offset_of!(ShmHeader, network) + 4, std::mem::offset_of!(ShmHeader, mask_sky));
-        assert_eq!(crate::SHM_VERSION, 22);
+        assert_eq!(crate::SHM_VERSION, 23);
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.network.load(Ordering::Relaxed), crate::enums::network::FULL, "the full network is the default");
@@ -2755,7 +2798,7 @@ mod tests {
         // v20's last word: every earlier field keeps its offset, and v21's fields follow it.
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts), std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts) + 4, std::mem::offset_of!(ShmHeader, preupscale_scale_bits));
-        assert_eq!(crate::SHM_VERSION, 22);
+        assert_eq!(crate::SHM_VERSION, 23);
         let h = ShmHeader::default();
         h.scene_cuts.store(5, Ordering::Relaxed);
         h.init_defaults();
@@ -2770,7 +2813,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<PassColour>(), 12);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour), std::mem::offset_of!(ShmHeader, edit_lut_seq) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour) + crate::MAX_PASSES * 12, std::mem::offset_of!(ShmHeader, placement));
-        assert_eq!(crate::SHM_VERSION, 22);
+        assert_eq!(crate::SHM_VERSION, 23);
         let h = ShmHeader::default();
         h.edit_lut_seq.store(9, Ordering::Relaxed);
         h.init_defaults();
@@ -2906,12 +2949,37 @@ mod tests {
         assert!(h.pass_tunings().passes().iter().all(|t| t.intensity.is_finite() && t.skin_structure.is_finite()));
     }
 
+    /// v23: the four protections follow v22's fields, end the header, start at 0 (off) and reach the colour
+    /// settings clamped to 0-1 (a value that is not a number is off).
+    #[test]
+    fn the_protections_are_appended_and_start_off() {
+        assert_eq!(std::mem::offset_of!(ShmHeader, edit_neutral_protection_bits), std::mem::offset_of!(ShmHeader, edit_hue_protection_bits) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, edit_highlight_protection_bits) + 4, std::mem::size_of::<ShmHeader>());
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(h.colour_now().protect, [0.0; 4]);
+        assert_eq!(h.colour_now(), ColourSettings::DEFAULT);
+        assert!(h.write_settings(&[
+            ("edit_hue_protection", 0.5f32.to_bits()),
+            ("edit_neutral_protection", 2.0f32.to_bits()),
+            ("edit_shadow_protection", 0.25f32.to_bits()),
+            ("edit_highlight_protection", 1.0f32.to_bits()),
+        ]));
+        assert_eq!(h.colour_now().protect, [0.5, 1.0, 0.25, 1.0], "clamped to the bounds");
+        h.edit_shadow_protection_bits.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        assert_eq!(h.colour_now().protect[2], 0.0);
+        let saved: Vec<&str> = h.persisted_settings().iter().map(|(n, ..)| *n).collect();
+        for n in ["edit_hue_protection", "edit_neutral_protection", "edit_shadow_protection", "edit_highlight_protection"] {
+            assert!(saved.contains(&n), "{n} is saved");
+        }
+    }
+
     #[test]
     fn what_the_network_sees_is_appended_after_the_hud_and_defaults_to_the_game_s_own() {
         use crate::enums::exposure_source;
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_brightness_bits), std::mem::offset_of!(ShmHeader, hud_region) + MAX_HUD_REGIONS * 24);
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_network_gpu_ms_bits), std::mem::offset_of!(ShmHeader, preupscale_exposure) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_network_gpu_ms_bits) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_network_gpu_ms_bits) + 4, std::mem::offset_of!(ShmHeader, edit_hue_protection_bits));
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.preupscale_view(), (1.0, false), "the game's exposure, unchanged");
@@ -2980,7 +3048,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_scale_bits), std::mem::offset_of!(ShmHeader, scene_cuts) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits), std::mem::offset_of!(ShmHeader, preupscale_scale_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits) + crate::MAX_PASSES * 4, std::mem::offset_of!(ShmHeader, edit_saturation_bits));
-        assert_eq!(crate::SHM_VERSION, 22);
+        assert_eq!(crate::SHM_VERSION, 23);
         let h = ShmHeader::default();
         h.preupscale_scale_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
         h.pass_scale_bits[2].store(0.5f32.to_bits(), Ordering::Relaxed);
