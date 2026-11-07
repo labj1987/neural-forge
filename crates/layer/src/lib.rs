@@ -23,6 +23,7 @@ mod device;
 mod dump;
 mod entry_points;
 mod gpu_timer;
+mod hdr_present;
 mod hotkey;
 mod loader_data;
 mod logging;

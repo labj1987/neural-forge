@@ -1267,6 +1267,27 @@ pub unsafe fn run(
     // this sent full-size and odd-size frames past every one of those limits on devices that
     // support host-memory import, and the model server rejected them.
     let use_direct = use_direct && (model_width, model_height) == (width, height);
+    // An HDR10 frame (docs/NATIVE_BACKEND.md, "HDR on the finished frame (3.10.0)") is sent raw at the frame's
+    // own size, and its answer composed at that size: a working scale below 1, the model pixel cap and an odd
+    // size (rounded to even above) would need the scaled, 8-bit scratch, and the pipelined mode applies answers
+    // to later frames through a path that keeps only 8-bit ones. Those present it untouched, said once.
+    let pq10 = neural_forge_protocol::enums::proxy_format::is_pq10(proxy_format);
+    if pq10 && ((model_width, model_height) != (width, height) || pipelined_present()) {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if pipelined_present() {
+                crate::log!("[layer] HDR10 frames present untouched: NEURAL_FORGE_PIPELINED composes only 8-bit frames");
+            } else {
+                crate::log!(
+                    "[layer] HDR10 frames present untouched: the model would work at {model_width}x{model_height}, not the frame's {width}x{height} \
+                     (a model resolution below 100%, the model pixel cap or an odd size), and HDR10 frames are only handled at the frame's own size"
+                );
+            }
+            crate::logging::flush();
+        }
+        shm.publish_frame_timing(pipeline_start.elapsed(), false);
+        return untouched(reason::NOT_COMPOSED);
+    }
     // The zero-copy compose (see the synchronous present below) also imports slot 0's answer
     // region: the same live alignment check as the proxy regions above, with the import sized to
     // the frame rounded up to that alignment (not the whole region: fewer pinned pages).
@@ -1488,9 +1509,9 @@ pub unsafe fn run(
                 bgr_order: u32::from(bgr_order),
                 reversible_mode: settings.reversible_mode,
             };
-            // Only 8-bit frames are composed (the present hook passes nothing else here): decided
+            // Only 8-bit and HDR10 frames are composed (the present hook passes nothing else here): decided
             // before anything is captured or waited for.
-            if !neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+            if !neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) && !pq10 {
                 shm.publish_frame_timing(pipeline_start.elapsed(), false);
                 return untouched(reason::UNSUPPORTED_FORMAT);
             }
@@ -1606,7 +1627,9 @@ pub unsafe fn run(
             // so the GUI can show it; only used when the source is Measured.
             {
                 static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if !holding && METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(8) {
+                // Not an HDR10 frame: the meter reads 8-bit code values, and the HDR path's SDR picture divides by
+                // the reference white instead.
+                if !holding && !pq10 && METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(8) {
                     let frame: &[u8] = if zero_copy {
                         // Zero-copy leaves `original_scratch` empty; the same frame is in the proxy
                         // region. SAFETY: the capture that wrote it was just seen complete (its fence,
@@ -1635,6 +1658,12 @@ pub unsafe fn run(
                         // A mismatch is someone else's (or a stale) answer; present untouched. No echo
                         // at all is a model server from before 0.1.81, which is trusted as before.
                         if shm.answered_dims().is_some_and(|d| d != (sent_w, sent_h)) {
+                            shm.publish_frame_timing(pipeline_start.elapsed(), false);
+                            return untouched(reason::NO_ANSWER);
+                        }
+                        // An HDR10 frame the model was not run on comes back as its own raw words (the model
+                        // server's echo), which are no SDR answer: never composed.
+                        if pq10 && !shm.answer_evaluated(SLOT) {
                             shm.publish_frame_timing(pipeline_start.elapsed(), false);
                             return untouched(reason::NO_ANSWER);
                         }
@@ -1766,6 +1795,7 @@ pub unsafe fn run(
                 debug_scale: settings.debug_scale,
                 proxy_encoded,
                 reversible_mode: settings.reversible_mode,
+                pq10: pq10.then(crate::hdr_present::reference_nits),
             },
         );
         // Whatever the compose call read back from the slot it reused, published even when this
@@ -1785,7 +1815,8 @@ pub unsafe fn run(
                     // cannot time). `capture_gpu` is the CPU-observed submit-to-completion time.
                     let (gpu_capture_ms, gpu_compose_ms) = shm.published_gpu_ms();
                     crate::log!(
-                        "[sync] {width}x{height}: total={total:.1?} capture_gpu={:.1?} copy_out={:.1?} meter={:.1?} wait_answer={:.1?} server={:.1?} rest(readback+compose)={:.1?} zc={} gpu_capture={gpu_capture_ms:.2}ms gpu_compose={gpu_compose_ms:.2}ms",
+                        "[sync] {width}x{height}{}: total={total:.1?} capture_gpu={:.1?} copy_out={:.1?} meter={:.1?} wait_answer={:.1?} server={:.1?} rest(readback+compose)={:.1?} zc={} gpu_capture={gpu_capture_ms:.2}ms gpu_compose={gpu_compose_ms:.2}ms",
+                        if pq10 { " HDR10" } else { "" },
                         t.capture_wait,
                         t.copy_out,
                         t.meter,
@@ -3459,6 +3490,253 @@ mod tests {
         unsafe {
             device.destroy_buffer(buffer, None);
             device.free_memory(memory, None);
+        }
+    }
+
+    /// A swapchain-like image of `format` holding `words` (one 32-bit texel each), in `PRESENT_SRC_KHR`.
+    #[allow(clippy::too_many_arguments)]
+    fn make_words_present_src_image(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        pool: vk::CommandPool,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        words: &[u32],
+    ) -> (vk::Image, vk::DeviceMemory) {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None) }.unwrap();
+        let reqs = unsafe { device.get_image_memory_requirements(image) };
+        let type_index = (0..mem_props.memory_type_count)
+            .find(|&i| {
+                reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })
+            .unwrap();
+        let memory =
+            unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let (buffer, buffer_memory, ptr) = host_buffer(device, mem_props, bytes.len() as u64);
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        one_shot(device, queue, pool, |cmd| unsafe {
+            let to_dst =
+                barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            device.cmd_copy_buffer_to_image(cmd, buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+            let to_present = barrier(
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
+        });
+        unsafe {
+            device.destroy_buffer(buffer, None);
+            device.free_memory(buffer_memory, None);
+        }
+        (image, memory)
+    }
+
+    /// An HDR10 present end to end (synchronous, the staging capture), in both channel orders: the frame's raw
+    /// words reach the model server as `PQ10_*`, and its 8-bit answer to their SDR picture is composed back onto
+    /// the frame in linear light (the CPU reference, within a code; untouched words where it did not change the
+    /// picture). An answer the model was not run on (no `seq_eval`: the server's echo) leaves the frame untouched.
+    #[test]
+    fn an_hdr10_present_composes_the_sdr_answer_in_linear_light() {
+        use crate::hdr_present::reference::{code_of, compose, pack, sdr, sdr8, unpack};
+        use neural_forge_protocol::enums::proxy_format::{PQ10_BGR, PQ10_RGB};
+        let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else { return };
+        let (width, height) = (8u32, 8u32);
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let clear = |word: u32, b_low: bool| sdr(word, b_low, 203.0).iter().all(|v| ((v * 255.0).fract() - 0.5).abs() > 0.01);
+        for (b_low, evaluated) in [(false, true), (true, true), (false, false)] {
+            let (format, proxy_format) =
+                if b_low { (vk::Format::A2R10G10B10_UNORM_PACK32, PQ10_BGR) } else { (vk::Format::A2B10G10R10_UNORM_PACK32, PQ10_RGB) };
+            let words: Vec<u32> =
+                (0..width * height).map(|i| pack([code_of(5.0 + f64::from(i) * 1.5), code_of(90.0 - f64::from(i)), code_of(30.0)], i % 4, b_low)).collect();
+            let (image, image_memory) = make_words_present_src_image(&device, &mem_props, queue, pool, width, height, format, &words);
+            let path = scratch_path("hdr10");
+            let _cleanup = RemoveScratch(path.clone());
+            let mut shm = ShmClient::default();
+            assert!(shm.test_open_at(&path));
+            let hdr_ptr = shm.test_header_ptr();
+            let header = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+            header.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
+            let proxy_addr = shm.proxy_region(Slot::Primary).unwrap().0 as usize;
+            let answer_addr = shm.answer_region(Slot::Primary).unwrap().0 as usize;
+            // A model server standing in for the native one: the SDR picture of each word, brightened by 20 codes
+            // except on every fifth pixel.
+            let seen_format = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (stop_s, seen_s) = (Arc::clone(&stop), Arc::clone(&seen_format));
+            let server = std::thread::spawn(move || {
+                // SAFETY: the mapping outlives this thread (joined before the test ends).
+                let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+                let mut last_seen = 0u32;
+                while !stop_s.load(AtomicOrdering::Relaxed) {
+                    hdr.server_heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                    let req = hdr.seq_req.load(AtomicOrdering::Acquire);
+                    if req != 0 && req != last_seen {
+                        last_seen = req;
+                        let (w, h) = (hdr.width.load(AtomicOrdering::Relaxed), hdr.height.load(AtomicOrdering::Relaxed));
+                        seen_s.store(hdr.proxy_format.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+                        let n = (w * h) as usize;
+                        // SAFETY: both regions hold the frame; the layer waits for `seq_resp` before reading the answer.
+                        let proxy = unsafe { std::slice::from_raw_parts(proxy_addr as *const u8, n * 4) };
+                        let answer = unsafe { std::slice::from_raw_parts_mut(answer_addr as *mut u8, n * 4) };
+                        for i in 0..n {
+                            let word = u32::from_le_bytes(proxy[i * 4..i * 4 + 4].try_into().unwrap());
+                            let s = sdr8(word, b_low, 203.0).map(|v| if i % 5 == 0 { v } else { v.saturating_add(20) });
+                            answer[i * 4..i * 4 + 4].copy_from_slice(&[s[0], s[1], s[2], 255]);
+                        }
+                        hdr.answered_w.store(w, AtomicOrdering::Relaxed);
+                        hdr.answered_h.store(h, AtomicOrdering::Relaxed);
+                        if evaluated {
+                            hdr.seq_eval.store(req, AtomicOrdering::Relaxed);
+                        }
+                        hdr.seq_resp.store(req, AtomicOrdering::Release);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            let mut pipeline: Option<CapturePipeline> = None;
+            let mut direct: [Option<DirectCapture>; 2] = [None, None];
+            let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
+            let (mut original_scratch, mut model_scratch, mut answer_scratch, mut raw_answer_base, mut last_answer) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let mut raw_answer_generation = 0u64;
+            let mut last_answer_dims = (0u32, 0u32);
+            let mut last_answer_encoded = false;
+            let mut inflight: [Inflight; 2] = Default::default();
+            let mut bootstrap_complete = false;
+            let mut composed = None;
+            let mut presents = 0;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline && composed.is_none() && (evaluated || presents < 6) {
+                presents += 1;
+                // SAFETY: as in `synchronous_present_composites_the_same_frame_it_captured`.
+                composed = unsafe {
+                    run(
+                        &device,
+                        &instance,
+                        physical_device,
+                        queue,
+                        queue_family,
+                        image,
+                        vk::ImageLayout::PRESENT_SRC_KHR,
+                        image,
+                        width,
+                        height,
+                        proxy_format,
+                        b_low,
+                        &mut pipeline,
+                        &mut direct,
+                        &mut false,
+                        &mut gpu_compose,
+                        &mut shm,
+                        &mut original_scratch,
+                        &mut model_scratch,
+                        &mut inflight,
+                        &mut bootstrap_complete,
+                        &mut answer_scratch,
+                        &mut raw_answer_base,
+                        &mut raw_answer_generation,
+                        &mut last_answer,
+                        &mut last_answer_dims,
+                        &mut last_answer_encoded,
+                    )
+                };
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if let Some(sem) = composed {
+                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+                let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+                let submit = vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage));
+                unsafe {
+                    device.queue_submit(queue, &[submit], wait_fence).unwrap();
+                    device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                    device.destroy_fence(wait_fence, None);
+                }
+            }
+            stop.store(true, AtomicOrdering::Relaxed);
+            server.join().unwrap();
+            unsafe { device.device_wait_idle() }.unwrap();
+            let out: Vec<u32> = read_back_present_src(&device, &mem_props, queue, pool, image, width, height)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| u32::from_le_bytes(c))
+                .collect();
+            assert_eq!(seen_format.load(AtomicOrdering::Relaxed), proxy_format, "the model server is told the frame is HDR10");
+            if evaluated {
+                assert!(composed.is_some(), "the HDR10 present is composed (b_low {b_low})");
+                for (i, (&o, &w)) in out.iter().zip(&words).enumerate().filter(|&(_, (_, &w))| clear(w, b_low)) {
+                    if i % 5 == 0 {
+                        assert_eq!(o, w, "pixel {i}: an unchanged picture keeps the frame's word");
+                        continue;
+                    }
+                    let answer = sdr8(w, b_low, 203.0).map(|v| v.saturating_add(20));
+                    let (want, got) = (unpack(compose(w, w, answer, b_low, 203.0), b_low), unpack(o, b_low));
+                    assert_eq!(got.1, want.1, "pixel {i}: alpha bits kept");
+                    assert!(got.0.iter().zip(&want.0).all(|(g, w)| g.abs_diff(*w) <= 1), "pixel {i}: {:?} vs the reference's {:?}", got.0, want.0);
+                    assert!(got.0.iter().zip(&unpack(w, b_low).0).all(|(g, b)| g > b), "pixel {i}: brightened");
+                }
+            } else {
+                assert!(composed.is_none(), "an echo is never composed onto an HDR10 frame");
+                assert!(header.seq_req.load(AtomicOrdering::Relaxed) > 1, "the frames were sent");
+                assert_eq!(out, words, "the frame is untouched");
+            }
+            unsafe {
+                device.destroy_image(image, None);
+                device.free_memory(image_memory, None);
+                destroy_pipeline(pipeline, &device);
+                for slot in direct {
+                    destroy_direct_capture(slot, &device);
+                }
+                if let Some(gpu) = gpu_compose {
+                    gpu.destroy(&device);
+                }
+            }
+        }
+        unsafe {
+            device.destroy_command_pool(pool, None);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
         }
     }
 

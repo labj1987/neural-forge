@@ -49,11 +49,17 @@ layer picks the place for each game by itself:
   held there, the model runs on the finished frame. Switching Ray Reconstruction on or off in a game
   moves the model within a few frames.
 - **On the finished frame**, for everything else: native resolution, games without DLSS, and
-  devices without NVIDIA's `VK_NVX_image_view_handle`. The finished 8-bit
+  devices without NVIDIA's `VK_NVX_image_view_handle`. The finished
   frame is captured at present, answered by the network and composited back onto the same frame
   before it is shown. It has no history by default (no motion vectors there). The frame has the
   game's HUD in it: the layer finds the HUD and keeps the model's change off it (see
-  [HUD on the finished frame](#settings)).
+  [HUD on the finished frame](#settings)). An HDR10 frame (10-bit, PQ) is shown to the network as an
+  SDR picture, its brightness divided by a reference white of 203 nits, and the network's change is put
+  back onto the HDR frame in linear light. Highlights get less and less of the change from about 185 nits
+  (in their brightest colour channel) and none from about 295 nits, pixels the network did not change keep
+  their exact HDR values, and
+  the model resolution must be 100% (below it the frame is presented untouched). A float16 (scRGB) or
+  10-bit SDR swapchain is presented untouched, and captures of an HDR frame are refused.
 
 The game's own **DLSS Frame Generation** works with the model before the upscaler and after DLSS.
 Generated frames are built from enhanced frames, and the model runs once per real frame.
@@ -70,7 +76,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
+| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
@@ -147,7 +153,12 @@ model changes colour, how much it brightens or darkens, and its fine detail agai
 the frame keeps its own colours, its own brightness, or only the broad change. They apply to every pass, and
 the per-pass settings can give a pass its own. **Gamut guard** (on) shortens a change that would push a
 colour past what the frame can hold instead of clipping one channel, so the hue stays. **Dither** (off)
-breaks up banding in smooth gradients after the upscaler. **Look-up table** applies a 3D `.cube` file (17 to
+breaks up banding in smooth gradients after the upscaler. Four **protections** (0, off, to 1) keep parts of the
+frame's own look against the model's change, judged by eye-matched colour (Oklab): **Hue protection** keeps each
+colour's hue (the model may still make it more or less colourful, brighter or darker), **Grey protection** keeps
+greys free of a tint, **Shadow protection** holds back darkening of what was already dark and **Highlight
+protection** holds back brightening of what was already bright. Shadow protection also takes away much of the
+detail the model adds in darker textures, since that detail is darkening. **Look-up table** applies a 3D `.cube` file (17 to
 65 points; the Choose button or `neural-forge-cli shmctl lut FILE`) to the last pass's result where the model
 changed the picture: its strength (0, off) grows with the size of the change and is full at **Look-up table
 full at**, so a pixel the model left alone keeps its colour. A table that is removed or cannot be read stops
@@ -240,7 +251,9 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_EDIT_CACHE=off` | layer | Before the upscaler, run the network on every frame instead of the edit cache's cadence (every frame while the camera is still, every second frame while it moves), with none of the cache at all (the game's depth is neither made copyable nor copied). For A/B comparisons, benchmarks and rollback; unset (or `on`) is the default. An unknown value is logged and the cache stays on. |
 | `NEURAL_FORGE_SCENE_CUT=off\|N` | layer | Before the upscaler, how different two frames must be for the model to start afresh: the mean change of brightness, 1 to 255 (default 40), or `off` to never start afresh on a cut. For testing; an unknown value is logged and the default stays. |
 | `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=3` | layer | The HDR encode's paper white (default 3; a positive number up to 1000). Tuning only. |
-| `NEURAL_FORGE_PIPELINED=1` | layer | After the upscaler: a pipelined present. Higher frame rate, but answers land on later frames and ghost. |
+| `NEURAL_FORGE_PIPELINED=1` | layer | After the upscaler: a pipelined present. Higher frame rate, but answers land on later frames and ghost. HDR10 frames are presented untouched in this mode. |
+| `NEURAL_FORGE_HDR_REFERENCE_NITS=203` | layer | On the finished frame of an HDR10 game, the brightness (in nits) the network's SDR picture takes as white before its highlight roll-off (default 203, clamped to 80-1000). Higher shows the network a darker picture and lets brighter highlights be changed. Tuning only. |
+| `NEURAL_FORGE_HDR_PRESENT=off` | layer | Testing aid: present HDR10 frames on the finished frame untouched, as for float16 ones. |
 | `NEURAL_FORGE_TOGGLE_KEY=F10` | layer | Toggle key by name (`F1`-`F12`, `Home`, `N`...) or Linux key code; overrides the GUI's. |
 | `NEURAL_FORGE_HOTKEY_BACKEND=evdev\|x11` | layer | Forces one keyboard backend (default: evdev, then XInput2). |
 | `NEURAL_FORGE_HOTKEY_GLOBAL=1` | layer | The toggle key acts even when another window has the focus. By default a press is ignored only while another window is known to have the focus; where that cannot be told (inside gamescope) the key acts. |
@@ -259,7 +272,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1` | layer | Testing aid: record everything but the network's launches. |
 | `NEURAL_FORGE_NATIVE_NO_HISTORY=1` | layer | Testing aid: every network frame without history, as after a reset. |
 | `NEURAL_FORGE_PREUPSCALE_TRANSFER=aces\|linear` | layer | Testing aids: `aces` encodes the picture before the upscaler with RTX Remix's transfer (an ACES curve, and on the way back the model's change scaled by each pixel's own ratio, with Remix's highlight recovery); `linear` leaves out the sRGB curve (the network sees linear values, and the edit cache decodes the same way). `srgb` is the default. |
-| `NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS=off` | layer | Testing aid: before the upscaler, apply the model's change to the brightest highlights too: no keeping of clipped values, no fade near the top, no highlight recovery with `aces`. |
+| `NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS=off` | layer | Testing aid: before the upscaler (and on an HDR10 finished frame), apply the model's change to the brightest highlights too: no keeping of clipped values, no fade near the top, no highlight recovery with `aces`. |
 | `NEURAL_FORGE_PREUPSCALE_PICK=N` | layer | Testing aid: take the Nth colour candidate where DLSS's input launch names several. |
 | `NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES=N`, `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore` | layer | Testing aids for `NEURAL_FORGE_PREUPSCALE=dump`: consecutive frames per dump (default 1); dump even where DLSS's buffer synchronises depth or motion vectors. |
 | `NEURAL_FORGE_PROBE_DEPTH=1`, `NEURAL_FORGE_PROBE_RR=<a,b,...>\|1` | layer | Testing aids: log the depth choice and barriers of the first 120 holds; log the images of the launches whose kernel names match (first 4000). |
@@ -319,6 +332,8 @@ Valve's VAC) cannot be seen.
 - **The model after DLSS is tested in two games** (Crimson Desert and Hogwarts Legacy, with Ray
   Reconstruction). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
   much lower frame rate (36 against 120 fps shown in Crimson Desert).
+- **HDR on the finished frame:** HDR10 is handled (above) but not yet tested with a game; float16
+  (scRGB) swapchains are presented untouched, and HDR frames cannot be captured.
 - **Not carried over from upstream DLSS5VKLayer:** see
   [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md).
 

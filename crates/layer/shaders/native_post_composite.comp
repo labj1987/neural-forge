@@ -43,11 +43,11 @@ layout(push_constant) uniform Params {
   uvec4 dims;      // field width, field height, valid width, valid height
   uvec4 frame;     // unused, BGRA (1) or RGBA (0), blend toward the history (1), write the history (1)
   vec4 control;    // style, local tone, intensity, blend scale
-  vec4 colour;     // the edit's saturation, contrast, detail, unused
+  vec4 colour;     // the edit's saturation, contrast, detail, the hue protection
   uvec4 colour_flags; // 1 a step runs, 2 gamut guard, 4 look-up table, 8 detail, 16 dither; table size; unused x2
   vec4 lut_scale;  // per channel (size - 1) / (domain max - min); strength
   vec4 lut_offset; // per channel -domain min x scale; adapt
-  vec4 hud;        // apply the HUD's scale (1, the last pass), unused x3
+  vec4 hud;        // apply the HUD's scale (1, the last pass); the near-grey, shadow, highlight protections
 } p;
 
 const uint STEP = 1u;
@@ -55,6 +55,7 @@ const uint GUARD = 2u;
 const uint LUT = 4u;
 const uint DETAIL = 8u;
 const uint DITHER = 16u;
+const uint PROTECT = 32u;
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 float truncateHalf(float value) {
@@ -225,6 +226,78 @@ float bayer(uvec2 xy) {
   return (float(v) + 0.5) / 64.0 - 0.5;
 }
 
+// The protections of a pass's result r against its input (docs/NATIVE_BACKEND.md, "The colour of the edit";
+// `k`: hue, near-grey chroma, shadow, highlight, each 0-1), in Oklab (Bjorn Ottosson, public domain,
+// https://bottosson.github.io/posts/oklab/) of the values read as sRGB-encoded. The idea of protecting the
+// network's result in a perceptual space comes from Veyra-NRVideo / Magpie Experimental; these rules are this
+// project's own. Out-of-range values stay out of range (the sRGB curve's linear and power parts extend), so the
+// gamut guard after it still shortens the change instead of clipping a channel.
+float srgbToLinear(float s) {
+  float a = abs(s);
+  float l = a <= 0.04045 ? a / 12.92 : pow((a + 0.055) / 1.055, 2.4);
+  return s < 0.0 ? -l : l;
+}
+float linearToSrgb(float l) {
+  float a = abs(l);
+  float s = a <= 0.0031308 ? 12.92 * a : 1.055 * pow(a, 1.0 / 2.4) - 0.055;
+  return l < 0.0 ? -s : s;
+}
+float cbrtSigned(float x) {
+  return x < 0.0 ? -pow(-x, 1.0 / 3.0) : pow(x, 1.0 / 3.0);
+}
+vec3 toOklab(vec3 c) {
+  float l = cbrtSigned(0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b);
+  float m = cbrtSigned(0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b);
+  float s = cbrtSigned(0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b);
+  return vec3(0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+              1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+              0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s);
+}
+vec3 fromOklab(vec3 c) {
+  float l = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;
+  float m = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;
+  float s = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;
+  l = l * l * l;
+  m = m * m * m;
+  s = s * s * s;
+  return vec3(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+              -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+              -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
+}
+// Where the input's chroma is this low (Oklab) its hue means nothing and the near-grey protection takes over;
+// above GREY_HI the hue protection applies in full.
+const float GREY_LO = 0.01;
+const float GREY_HI = 0.04;
+vec3 protectResult(vec3 input_, vec3 r, vec4 k) {
+  vec3 li = vec3(srgbToLinear(input_.r), srgbToLinear(input_.g), srgbToLinear(input_.b));
+  vec3 lr = vec3(srgbToLinear(r.r), srgbToLinear(r.g), srgbToLinear(r.b));
+  vec3 oi = toOklab(li);
+  vec3 o = toOklab(lr);
+  float ci = length(oi.yz);
+  float cr = length(o.yz);
+  float colourful = smoothstep(GREY_LO, GREY_HI, ci);
+  // Hue: the result's chroma and lightness, its hue turned toward the input's (the shorter way).
+  if (k.x > 0.0 && ci > 1e-5 && cr > 1e-5) {
+    vec2 di = oi.yz / ci;
+    vec2 dr = o.yz / cr;
+    float w = k.x * colourful;
+    float cosA = clamp(dot(dr, di), -1.0, 1.0);
+    float angle = acos(cosA) * w;
+    float side = (dr.x * di.y - dr.y * di.x) < 0.0 ? -1.0 : 1.0;
+    float ca = cos(angle * side);
+    float sa = sin(angle * side);
+    o.yz = cr * vec2(dr.x * ca - dr.y * sa, dr.x * sa + dr.y * ca);
+  }
+  // Near grey: a colour that was (almost) neutral keeps its own chroma, so the network adds no tint.
+  if (k.y > 0.0) o.yz = mix(o.yz, oi.yz, k.y * (1.0 - colourful));
+  // Shadows: darkening of a dark input is held back (Oklab lightness 0.3 and below in full, none from 0.5).
+  if (k.z > 0.0 && o.x < oi.x) o.x = mix(o.x, oi.x, k.z * (1.0 - smoothstep(0.3, 0.5, oi.x)));
+  // Highlights: brightening of a bright input is held back (none up to 0.75, full from 0.92).
+  if (k.w > 0.0 && o.x > oi.x) o.x = mix(o.x, oi.x, k.w * smoothstep(0.75, 0.92, oi.x));
+  vec3 lo = fromOklab(o);
+  return vec3(linearToSrgb(lo.r), linearToSrgb(lo.g), linearToSrgb(lo.b));
+}
+
 // The colour steps on one pixel (native_colour.comp's, on the 8-bit proxy's values).
 vec3 colourOf(vec3 proxy, vec3 published) {
   uint flags = p.colour_flags.x;
@@ -249,6 +322,7 @@ vec3 colourOf(vec3 proxy, vec3 published) {
     changed = true;
   }
   if (changed) r = proxy + e;
+  if ((flags & PROTECT) != 0u) r = protectResult(proxy, r, vec4(p.colour.w, p.hud.yzw));
   if ((flags & LUT) != 0u) {
     vec3 d = abs(r - proxy);
     float w = p.lut_scale.w * min(1.0, max(d.r, max(d.g, d.b)) / p.lut_offset.w);

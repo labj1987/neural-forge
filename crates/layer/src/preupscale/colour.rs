@@ -18,6 +18,8 @@ pub(crate) const GUARD: u32 = 2;
 pub(crate) const LUT: u32 = 4;
 pub(crate) const DETAIL: u32 = 8;
 pub(crate) const DITHER: u32 = 16;
+/// The Oklab protections of the pass's result against its input (`protect`).
+pub(crate) const PROTECT: u32 = 32;
 
 /// A loaded table, numbered so a path's GPU copy knows when to upload it again.
 pub(crate) struct Lut {
@@ -42,13 +44,15 @@ impl Lut {
 }
 
 /// One pass's shader parameters: `colour` (saturation, contrast, detail, 0), `flags` (steps, table size, 0,
-/// 0), `lut_scale` (grid scale, strength) and `lut_offset` (grid offset, adapt).
+/// 0), `lut_scale` (grid scale, strength), `lut_offset` (grid offset, adapt) and `protect` (the hue, near-grey
+/// chroma, shadow and highlight protections, 0-1).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct PassColour {
     pub colour: [f32; 4],
     pub flags: [u32; 4],
     pub lut_scale: [f32; 4],
     pub lut_offset: [f32; 4],
+    pub protect: [f32; 4],
 }
 
 impl PassColour {
@@ -67,6 +71,10 @@ impl PassColour {
         if lut.is_some() {
             flags |= STEP | LUT;
         }
+        let protect = s.protect.map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 });
+        if protect.iter().any(|&v| v > 0.0) {
+            flags |= STEP | PROTECT;
+        }
         if flags & STEP != 0 && s.gamut_guard {
             flags |= GUARD;
         }
@@ -79,6 +87,7 @@ impl PassColour {
             flags: [flags, lut.map_or(0, |l| l.cube.size as u32), 0, 0],
             lut_scale: [scale[0], scale[1], scale[2], if lut.is_some() { s.lut_strength } else { 0.0 }],
             lut_offset: [offset[0], offset[1], offset[2], s.lut_adapt.max(1e-3)],
+            protect,
         }
     }
 
@@ -91,7 +100,7 @@ impl PassColour {
 
 /// Whether any of the frame's first `count` passes reshapes its edit (or the table applies on the last).
 pub(crate) fn wanted(s: &ColourSettings, count: usize, lut: bool) -> bool {
-    s.each.iter().take(count.max(1)).any(|c| !EditColour::is_neutral(c)) || (lut && s.lut_strength > 0.0)
+    s.each.iter().take(count.max(1)).any(|c| !EditColour::is_neutral(c)) || (lut && s.lut_strength > 0.0) || s.protect.iter().any(|&v| v.is_finite() && v > 0.0)
 }
 
 #[derive(Default)]
@@ -211,5 +220,24 @@ mod tests {
         d.dither = true;
         assert_eq!(PassColour::of(&d, 0, true, None, false).flags[0], 0, "no dither before the upscaler");
         assert_eq!(PassColour::of(&d, 0, true, None, true).flags[0], DITHER);
+    }
+
+    /// The protections apply to every pass the frame runs (each against its own input), turn on the guard with
+    /// their step, and are clamped to 0-1 (a value that is not a number is off).
+    #[test]
+    fn the_protections_turn_on_their_step_on_every_pass() {
+        let mut s = ColourSettings::DEFAULT;
+        s.protect = [0.5, 0.0, 0.0, 0.0];
+        assert!(wanted(&s, 1, false));
+        for k in 0..3 {
+            let c = PassColour::of(&s, k, k == 2, None, false);
+            assert_eq!(c.flags[0], STEP | PROTECT | GUARD, "pass {k}");
+            assert_eq!(c.protect, [0.5, 0.0, 0.0, 0.0]);
+        }
+        s.protect = [f32::NAN, 2.0, -1.0, 0.0];
+        let c = PassColour::of(&s, 0, true, None, false);
+        assert_eq!(c.protect, [0.0, 1.0, 0.0, 0.0]);
+        s.protect = [f32::NAN, 0.0, -1.0, 0.0];
+        assert!(!PassColour::of(&s, 0, true, None, false).any() && !wanted(&s, 1, false), "nothing left to do");
     }
 }

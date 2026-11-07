@@ -1151,15 +1151,28 @@ table on top, comes from another DLSS-NR app's feature list; the design here is 
 | Saturation | `edit_saturation` (1) | l = BT.709 luma of e (0.2126, 0.7152, 0.0722; on the encoded values), e = contrast x l + saturation x (e - l): the grey part scaled by contrast, the part of no luma by saturation |
 | Contrast | `edit_contrast` (1) | (the same line) |
 | Look-up table | `edit_lut_strength` (0, off), `edit_lut_adapt` (0.05); the file is `edit_lut` in `config.ini` | on the last pass's result r: r = mix(r, LUT(r), strength x min(1, max channel abs(r - input) / adapt)), trilinear in a 3D `.cube` table (2 to 65 points, `DOMAIN_MIN`/`MAX` honoured) |
+| Protections | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection`, `edit_highlight_protection` (0, off; to 1) | on the pass's result r against its input i, both read as sRGB-encoded and taken to Oklab (Ottosson): hue, the result's (a, b) turned toward the input's by the angle between them times the strength, fading out where the input's chroma is below 0.04 (none below 0.01: a grey has no hue); grey, the result's (a, b) moved toward the input's where its chroma is below 0.04 (full below 0.01); shadow, where L(r) < L(i), L(r) moved toward L(i), full at L(i) 0.3 and below, none from 0.5; highlight, where L(r) > L(i), likewise, none up to L(i) 0.75, full from 0.92. Back to sRGB with the curve extended past 0 and 1, so the gamut guard still shortens a change that leaves the range |
 | Gamut guard | `edit_gamut_guard` (on) | where input + e leaves 0-1 in a channel, e is shortened along itself (r = input + t x e, the largest t <= 1 that fits); without it each channel clamps |
 | Dither | `edit_dither` (off) | after the upscaler only: an 8x8 Bayer offset in (-0.5, 0.5) of the 8-bit step added before the answer is rounded |
 
-The order is detail, saturation and contrast, the table, the guard, then the clamp to 0-1 and the half-float
+The order is detail, saturation and contrast, the protections, the table, the guard, then the clamp to 0-1 and the half-float
 truncation (before the upscaler) or the 8-bit rounding (after it). The three scales apply to every pass (the
 Model tab's value, "the whole stack"), and a pass may override any of them in the per-pass dialog
 (`pass<N>_edit_saturation`, `_contrast`, `_detail`, override bits 128, 256 and 512 of `pass<N>_overrides`);
-the guard and the dither apply to every pass that has a step, the table to the last pass of the frame only, so
-it grades the stack's result once.
+the guard and the dither apply to every pass that has a step, the protections to every pass the frame runs
+(each against that pass's own input), the table to the last pass of the frame only, so it grades the stack's
+result once. The protections' idea (keeping the network's result close to the input in a perceptual colour space)
+comes from Veyra-NRVideo's NR correction stage and Magpie Experimental, which it credits; the rules and
+thresholds here are this project's own. After the upscaler the four values travel in the composite's push block
+(`colour.w` and `hud.yzw`), which is at the 128 bytes every device takes.
+
+**Measured in GTA V Enhanced** (2026-11-07; 1440p, DLSS Balanced, FG 4x, the benchmark's still shot, 9 frames
+averaged per run, Oklab against the model-off run on the pixels static in every run): the model alone turns the hue
+of colourful pixels by 4.5 degrees on average and lifts shadow lightness by 0.034 (Alex's settings brighten);
+with hue and shadow protection at 1, 3.6 degrees and 0.038. The hue protection works on the model's render-size
+change, and DLSS and the game's post-processing after it keep part of the shift. Shadow protection holds back
+*darkening* only, and in mid-dark textures that darkening is the model's added local contrast: added detail fell
+from x1.075 to x0.907 (bench-iq, against the model off). Use it to keep shadows open, not as a free extra.
 
 **Why the guard is on by default.** The encode maps scene-linear 0 to 0 in each channel and the shoulder's top to
 1, so an encoded channel below 0 is a colour outside BT.709's primaries in linear terms and one above 1 cannot be
@@ -1364,6 +1377,67 @@ the HUD text untouched (by eye on a capture). Still to see: GTA V at `present` w
 driving and while standing: whether the minimap, the weapon wheel and the money text are found while moving and stay
 clean, what a first-person weapon model or a third-person character that stays in place does (it can be found
 as HUD while the camera turns), and what the detection costs on the RTX 5070.
+
+## HDR on the finished frame (3.10.0)
+
+Before 3.10.0 an HDR swapchain on the finished frame was presented untouched: the composition and the
+network only took 8-bit SDR frames. HDR10 swapchains (`A2B10G10R10_UNORM_PACK32` or `A2R10G10B10_UNORM_PACK32`
+in the `HDR10_ST2084_EXT` colour space, `swapchain::detect_hdr_kind`'s PQ10) now take the network too. The idea
+of running the network on an SDR-mapped copy of the HDR frame and restoring its change onto the untouched HDR
+frame comes from Veyra-NRVideo (`HdrProxy`/`HdrRestore`; ATTRIBUTION.md); the maths here is this project's own,
+on SMPTE ST 2084 and the BT.2020/BT.709 matrices of ITU-R BT.2087 (`crate::hdr_present`, with its CPU reference).
+
+- **Admission** (`swapchain::is_supported_format(format, colour_space)`): the two 10-bit formats only with the
+  HDR10 colour space; the same `TRANSFER_SRC|TRANSFER_DST` usage as an 8-bit swapchain. A 10-bit swapchain in an
+  SDR colour space, and float16 (scRGB, `R16G16B16A16_SFLOAT`) ones, still present untouched: a float16 frame is
+  8 bytes a pixel, where the shared regions and the composition hold 4. A pass-through HDR10 swapchain (one the
+  layer could not admit) is never composed onto from its render source. `NEURAL_FORGE_HDR_PRESENT=off` leaves
+  HDR10 out, as before (a testing aid).
+- **Capture** (`capture::run`): the frame is copied raw (one packed word a pixel) into the proxy region as
+  `proxy_format::PQ10_RGB` (R in bits 0-9) or `PQ10_BGR` (B there), by the direct or the staging copy, at the
+  frame's own size only. A model resolution below 100%, the model pixel cap or an odd size (all of which need the
+  8-bit scaled scratch) and `NEURAL_FORGE_PIPELINED` present it untouched, logged once. The white meter skips HDR10
+  frames, and captures of them (8-bit PNGs) are refused with "unsupported format".
+- **Server** (`native_post::evaluate`, `convert_hdr10`): `shaders/native_post_hdr.comp` turns the raw frame into
+  an 8-bit SDR picture in a host-visible buffer of the slot's (`SlotBuffers::sdr`), in a submit of its own that
+  is waited for, so the thumbnail (HUD detection, the history's cut test) reads the picture. Per pixel: PQ decode
+  to nits (BT.2020), to BT.709, negatives 0, divided by the reference white (203 nits, BT.2408's HDR reference
+  white; `NEURAL_FORGE_HDR_REFERENCE_NITS`, clamped to 80-1000), the pre-upscaler encode's per-channel shoulder
+  (knee 0.75, K = 5.770780), the sRGB OETF, RGBA8 with alpha 255. Every pass, the history, the previous proxy,
+  the HUD and the flow read that picture in place of the proxy; the answer region gets the 8-bit SDR answer as for
+  an 8-bit frame. A frame the network did not run on is echoed raw, and the layer composes only an answer
+  `seq_eval` names (`ShmClient::answer_evaluated`), so an echo is never read as an SDR answer.
+- **Composition** (`composition::gpu`, `shaders/compose_hdr.comp`, through compose.comp's descriptor set and
+  pipeline layout): the R8G8B8A8 storage images carry the raw words (`packUnorm4x8` of a load gives a word back
+  exactly). With S the frame-the-network-saw's SDR picture recomputed in 8 bits (the same functions as the
+  server's, `precise`) and S⁻¹ the sRGB EOTF and the shoulder's inverse, per pixel: where the answer equals S in
+  all three channels, the frame's word bit for bit; where S's peak is at the shoulder's top (8-bit 255), the
+  frame's word; else `out = PQ(lin(base) + M709→2020 · R · (S⁻¹(answer) - S⁻¹(S)) · (1 - smoothstep(0.954, 0.999,
+  peak)))`, alpha bits kept, the result copied into the swapchain image. The base is the frame presented now, so
+  a carried answer (model interval, frame hold) puts the older frame's change onto the newer one, as the 8-bit
+  delta does; the zero-copy inputs work too. A scaled answer is refused (the frame presented untouched). None of
+  the Composition tab's settings, the compare views or the debug views apply to it.
+  `NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS=off` turns the two highlight rules off here too.
+- **Status:** `swapchain_hdr` says "HDR10, PQ: the network runs on an SDR-mapped copy" while an HDR10 swapchain
+  takes this path (`hdr_active`, otherwise "presented untouched"), the layer logs it once per process, and the
+  `[sync]` timing line carries `HDR10`.
+
+The caveat is the shoulder: an SDR value above the knee stands for more and more light, so the change the network
+makes there is faded out from 0.954 (about 185 nits in the pixel's brightest BT.709 channel at the default
+reference white) and dropped at the top (about 295 nits, where S⁻¹ cannot bring a clamped value back). Brighter
+highlights keep their HDR values; a higher reference white moves both points up and shows the network a darker
+picture. Float differences: the conversion matches the double-precision reference within a code, except where
+the BT.2020 to BT.709 matrix subtracts two very bright channels to give a dark one (saturated wide-gamut
+colours), where the PQ decode's float error is amplified (`an_hdr10_frame_runs_as_its_sdr_picture` bounds it).
+Tested on lavapipe only (`hdr_present::tests`, `composition::gpu::tests::hdr10_*`,
+`native_post::tests::an_hdr10_frame_runs_as_its_sdr_picture`,
+`capture::tests::an_hdr10_present_composes_the_sdr_answer_in_linear_light`). In a game (2026-11-07, RTX 5070):
+Crimson Desert on Proton-GE with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` (its own HDR option on), GNOME in
+HDR, placement Finished frame: the swapchain is A2B10G10R10 in HDR10_ST2084, the path engages, `[sync] 2560x1440
+HDR10: total 24.2 ms` (server 21.6 ms, the HDR compose 1.6 ms GPU), 33 frames a second composited, no fence
+timeout or Xid; the title screen and an in-game loading scene with bright highlights look right (no shift, no
+banding, highlights kept). The finished frame waits for the network every frame, so it is slow at 1440p whatever
+the format.
 
 ## Activation memory (2026-10-22)
 

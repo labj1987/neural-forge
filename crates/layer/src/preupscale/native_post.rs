@@ -45,6 +45,7 @@ const PREPROCESS_SPV: &[u8] = include_bytes!("../../shaders/native_post_preproce
 const COMPOSITE_SPV: &[u8] = include_bytes!("../../shaders/native_post_composite.spv");
 const FEEDBACK_SPV: &[u8] = include_bytes!("../../shaders/native_post_feedback.spv");
 const HUD_SPV: &[u8] = include_bytes!("../../shaders/native_post_hud.spv");
+const HDR_SPV: &[u8] = include_bytes!("../../shaders/native_post_hdr.spv");
 
 /// The model server's smallest frame (`ngx::MIN_FEATURE_DIM`): smaller ones are echoed.
 const MIN_DIM: u32 = 64;
@@ -73,19 +74,50 @@ struct CompositePush {
     dims: [u32; 4],
     frame: [u32; 4],
     control: [f32; 4],
-    /// The colour of the edit ([`super::colour::PassColour`]; native_post_composite.comp's).
+    /// The colour of the edit ([`super::colour::PassColour`]; native_post_composite.comp's). `colour.w` is the
+    /// hue protection (the block is at the 128 bytes every device takes; `hud.yzw` hold the other three).
     colour: [f32; 4],
     colour_flags: [u32; 4],
     lut_scale: [f32; 4],
     lut_offset: [f32; 4],
-    /// The HUD: x 1 applies its scale of the edit (the last pass).
+    /// The HUD: x 1 applies its scale of the edit (the last pass); y, z, w the near-grey chroma, shadow and
+    /// highlight protections ([`super::colour::PassColour::protect`]).
     hud: [f32; 4],
 }
 
 impl CompositePush {
-    fn with_colour(self, c: super::colour::PassColour) -> Self {
-        Self { colour: c.colour, colour_flags: c.flags, lut_scale: c.lut_scale, lut_offset: c.lut_offset, ..self }
+    /// `apply_hud`: the HUD's scale applies on this pass (the last).
+    fn with_colour(self, c: super::colour::PassColour, apply_hud: bool) -> Self {
+        Self {
+            colour: [c.colour[0], c.colour[1], c.colour[2], c.protect[0]],
+            colour_flags: c.flags,
+            lut_scale: c.lut_scale,
+            lut_offset: c.lut_offset,
+            hud: [if apply_hud { 1.0 } else { 0.0 }, c.protect[1], c.protect[2], c.protect[3]],
+            ..self
+        }
     }
+}
+
+const _: () = assert!(std::mem::size_of::<CompositePush>() <= 128, "native_post_composite.comp's push block must stay within 128 bytes");
+
+/// `native_post_hdr.comp`'s push constants, field for field.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HdrConvertPush {
+    size: [u32; 2],
+    b_low: u32,
+    reference_nits: f32,
+}
+
+/// An HDR10 frame (`proxy_format::PQ10_RGB`/`PQ10_BGR`; docs/NATIVE_BACKEND.md, "HDR on the finished frame
+/// (3.10.0)"): converted to the 8-bit SDR picture every pass reads (`native_post_hdr.comp`), at this reference
+/// white, before the passes run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Pq10 {
+    /// Blue in bits 0-9 (`A2R10G10B10`).
+    pub b_low: bool,
+    pub reference_nits: f32,
 }
 
 /// Which server answers the after-the-upscaler requests in this process: the channel is the process's, so
@@ -240,6 +272,9 @@ struct Gpu {
     /// The HUD's pipeline and its one set (`native_post_hud.comp`), built the first time the HUD is wanted
     /// (`None` inside after a failed build: the frames run without it, logged once).
     hud: Option<Option<HudPipeline>>,
+    /// The HDR10 conversion's pipeline and its one set (`native_post_hdr.comp`), built the first time an HDR10
+    /// frame comes (`None` inside after a failed build: HDR10 frames are echoed then, logged once).
+    hdr: Option<Option<HdrConvert>>,
     command_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -283,6 +318,8 @@ struct Bound {
     lut: vk::Buffer,
     /// The HUD's scale buffer (null: none).
     hud: vk::Buffer,
+    /// The frame every pass reads: the proxy region's buffer, or an HDR10 frame's SDR picture.
+    frame: vk::Buffer,
 }
 
 /// The optical flow's state on the server's device.
@@ -331,6 +368,9 @@ impl SlotBuffers {
         unsafe {
             self.proxy.destroy(device);
             self.answer.destroy(device);
+            if let Some(s) = self.sdr {
+                s.destroy(device);
+            }
             if let Some(s) = self.scratch {
                 s.destroy(device);
             }
@@ -354,11 +394,21 @@ impl SlotBuffers {
     }
 }
 
+impl SlotBuffers {
+    /// The buffer holding the frame the passes read: the SDR picture of an HDR10 frame, else the proxy.
+    fn frame(&self) -> vk::Buffer {
+        self.sdr.as_ref().map_or(self.proxy.buffer, |s| s.buffer)
+    }
+}
+
 struct SlotBuffers {
     width: u32,
     height: u32,
     proxy: HostBuffer,
     answer: HostBuffer,
+    /// An HDR10 frame's SDR picture (`native_post_hdr.comp`'s output, host-visible for the thumbnail), which every
+    /// pass reads in place of the proxy; made on the first HDR10 frame, freed on the next frame that is not one.
+    sdr: Option<HostBuffer>,
     /// The previous pass's answer, for the next pass to read (built on the first frame with two or more).
     scratch: Option<OwnBuffer>,
     /// The history's (`zero` and `flow`), built on the first frame with one.
@@ -491,6 +541,7 @@ impl Gpu {
             feedback: None,
             lut: None,
             hud: None,
+            hdr: None,
             command_pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -532,6 +583,9 @@ impl Gpu {
                 l.buffer.destroy(device);
             }
             if let Some(Some(h)) = self.hud.take() {
+                h.destroy(device);
+            }
+            if let Some(Some(h)) = self.hdr.take() {
                 h.destroy(device);
             }
             device.destroy_fence(self.fence, None);
@@ -653,8 +707,11 @@ fn process(
     let format = hdr.proxy_format_slot(slot).load(Ordering::Relaxed);
     let dims_ok = neural_forge_protocol::frame_dims_valid(width, height, format);
     let bytes = if dims_ok { proxy_format::bytes_per_pixel(format) * width as usize * height as usize } else { 0 };
+    // An HDR10 frame runs through the network as its SDR picture (`Pq10`), unless the HDR path is switched off.
+    let pq10 = (proxy_format::is_pq10(format) && crate::hdr_present::enabled())
+        .then(|| Pq10 { b_low: format == proxy_format::PQ10_BGR, reference_nits: crate::hdr_present::reference_nits() });
     let wanted = dims_ok
-        && proxy_format::is_8bit(format)
+        && (proxy_format::is_8bit(format) || pq10.is_some())
         && width >= MIN_DIM
         && height >= MIN_DIM
         && hdr.neural_enabled()
@@ -694,6 +751,7 @@ fn process(
                     width,
                     height,
                     format == proxy_format::BGRA8,
+                    pq10,
                     &passes,
                     feedback,
                     &colour,
@@ -721,7 +779,8 @@ fn process(
     }
     let (proxy, answer) = view.regions(slot);
     if !evaluated && bytes > 0 {
-        // Fail open, as the model server does: the frame itself comes back.
+        // Fail open, as the model server does: the frame itself comes back. For an HDR10 frame these are its raw
+        // words, no SDR answer: the layer composes only an answer `seq_eval` names (`ShmClient::answer_evaluated`).
         // SAFETY: both regions hold at least `bytes` (`frame_dims_valid` bounds the frame by the region size).
         unsafe { std::ptr::copy_nonoverlapping(proxy, answer, bytes) };
     }
@@ -798,6 +857,10 @@ fn applied_lut<'a>(uploaded: Option<&'a PostLut>, now: Option<&Arc<super::colour
 /// for the next frame's rejection, and with the optical flow the frame's proxy goes into the flow session
 /// first (its own submit, then the flow on its queue, then the frame waiting for it).
 ///
+/// `pq10`: the proxy region holds an HDR10 frame's raw words; [`convert_hdr10`] turns it into its SDR picture
+/// first, and everything after (the passes, the history, the HUD, the flow, the thumbnail) reads that picture in
+/// place of the proxy. The answer is 8-bit RGBA as for an 8-bit frame (`bgra` is false then).
+///
 /// # Safety
 /// The regions are live; nothing of `gpu`'s is pending.
 #[allow(clippy::too_many_arguments)]
@@ -814,6 +877,7 @@ unsafe fn evaluate(
     width: u32,
     height: u32,
     bgra: bool,
+    pq10: Option<Pq10>,
     passes: &[Conditioning],
     feedback: f32,
     colour: &neural_forge_protocol::ColourSettings,
@@ -849,7 +913,36 @@ unsafe fn evaluate(
                 return false;
             }
         };
-        gpu.slots[s] = Some(SlotBuffers { width, height, proxy, answer, scratch: None, hist: None, hud: None });
+        gpu.slots[s] = Some(SlotBuffers { width, height, proxy, answer, sdr: None, scratch: None, hist: None, hud: None });
+    }
+    // An HDR10 frame's SDR picture: made on the first one, freed on a frame that is not one (the sets name it).
+    if pq10.is_some() != gpu.slots[s].as_ref().is_some_and(|b| b.sdr.is_some()) {
+        if let Some(b) = gpu.slots[s].as_mut() {
+            match b.sdr.take() {
+                // SAFETY: nothing pending (every request waits for its own work).
+                Some(old) => unsafe { old.destroy(device) },
+                None => {
+                    let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC;
+                    let Some(sdr) = super::own_host_buffer_with(device, instance, physical, bytes, usage) else { return false };
+                    b.sdr = Some(sdr);
+                }
+            }
+        }
+        gpu.bound = None;
+    }
+    if pq10.is_some() && gpu.hdr.is_none() {
+        // SAFETY: `device` is live.
+        gpu.hdr = Some(unsafe { HdrConvert::build(device) });
+        if gpu.hdr.as_ref().is_some_and(Option::is_none) {
+            crate::log!("[native] the HDR10 conversion's pipeline could not be built; HDR10 frames present untouched");
+            crate::logging::flush();
+        }
+    }
+    if let Some(p) = pq10 {
+        // SAFETY: the proxy region holds the frame; nothing of `gpu`'s is pending (contract).
+        if !unsafe { convert_hdr10(device, gpu, s, proxy_region, width, height, p) } {
+            return false;
+        }
     }
     let more = passes.len() > 1;
     if more && gpu.slots[s].as_ref().is_some_and(|b| b.scratch.is_none()) {
@@ -898,8 +991,11 @@ unsafe fn evaluate(
         });
     // The frame's thumbnail, made once for the HUD's detection and the history's cut test.
     let detect = hud_on && hud.detect && gpu.slots[s].as_ref().is_some_and(|b| b.hud.is_some());
-    // SAFETY: the proxy region holds the frame's `bytes`, written before the request was posted.
-    let thumb = (detect || history).then(|| post_history::thumbnail(unsafe { std::slice::from_raw_parts(proxy_region, bytes as usize) }, width, height));
+    // The frame the passes read: an HDR10 frame's SDR picture (converted and waited for above), else the proxy region.
+    let frame_ptr: *const u8 = gpu.slots[s].as_ref().and_then(|b| b.sdr.as_ref()).map_or(proxy_region.cast_const(), |sdr| sdr.ptr.cast_const());
+    // SAFETY: either holds the frame's `bytes`: the proxy region was written before the request was posted, the
+    // picture by the conversion, which completed.
+    let thumb = (detect || history).then(|| post_history::thumbnail(unsafe { std::slice::from_raw_parts(frame_ptr, bytes as usize) }, width, height));
     let hud_moving = match gpu.slots[s].as_mut().and_then(|b| b.hud.as_mut()) {
         Some(h) if detect => {
             let thumb = thumb.as_ref().expect("made for the detection");
@@ -976,14 +1072,15 @@ unsafe fn evaluate(
         flow: flow_buffer.is_some(),
         lut: lut_buffer,
         hud: hud_buffer,
+        frame: b.frame(),
     };
     if gpu.bound != Some(key) {
         let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
-        let proxy_i = info(b.proxy.buffer);
+        let proxy_i = info(b.frame());
         let (feat_i, head_i, ans_i) = (info(f.features), info(f.head), info(b.answer.buffer));
-        let scratch_i = info(scratch.unwrap_or(b.proxy.buffer));
+        let scratch_i = info(scratch.unwrap_or(b.frame()));
         // Without a history the shaders read none of its bindings: the proxy stands in for them.
-        let or_proxy = |buffer: Option<vk::Buffer>| info(buffer.unwrap_or(b.proxy.buffer));
+        let or_proxy = |buffer: Option<vk::Buffer>| info(buffer.unwrap_or(b.frame()));
         let reproj_i = or_proxy(hist.map(|h| h.reproj.buffer));
         let previous_i = or_proxy(hist.map(|h| h.previous.buffer));
         let flow_i = or_proxy(flow_buffer);
@@ -1031,7 +1128,8 @@ unsafe fn evaluate(
         unsafe { device.update_descriptor_sets(&writes, &[]) };
         gpu.bound = Some(key);
     }
-    if b.proxy.staged {
+    if b.proxy.staged && pq10.is_none() {
+        // (An HDR10 frame's was copied for its conversion.)
         // SAFETY: both hold `bytes`; the staging buffer is host-coherent and not in use.
         unsafe { std::ptr::copy_nonoverlapping(proxy_region, b.proxy.ptr, bytes as usize) };
     }
@@ -1046,7 +1144,7 @@ unsafe fn evaluate(
         (Some(h), Some(pipe)) => {
             let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
             let previous = hist.map_or(h.previous.buffer, |x| x.previous.buffer);
-            let infos = [info(b.proxy.buffer), info(previous), info(h.confidence.buffer), info(h.scale.buffer), info(h.regions.buffer), info(h.near.buffer)];
+            let infos = [info(b.frame()), info(previous), info(h.confidence.buffer), info(h.scale.buffer), info(h.regions.buffer), info(h.near.buffer)];
             let writes: Vec<vk::WriteDescriptorSet> = infos
                 .iter()
                 .enumerate()
@@ -1191,16 +1289,13 @@ unsafe fn evaluate(
                     // No flow on this frame (no pass has a history): its proxy still becomes the next frame's
                     // reference, and the next flow starts without the previous one's hints.
                     session.restart();
-                    session.record_upload(device, cmd, b.proxy.buffer);
+                    session.record_upload(device, cmd, b.frame());
                     uploaded_in_frame = true;
                 }
             }
             for (k, c) in passes.iter().enumerate() {
                 let (pre, post) = push(c, decision.passes[k]);
-                let post = CompositePush {
-                    hud: [if hud_rec.is_some() && k + 1 == runs { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
-                    ..post.with_colour(super::colour::PassColour::of(colour, k, k + 1 == runs, lut, true))
-                };
+                let post = post.with_colour(super::colour::PassColour::of(colour, k, k + 1 == runs, lut, true), hud_rec.is_some() && k + 1 == runs);
                 // Every pass after the first reads the previous one's answer: copied into `scratch`, after the
                 // composite wrote it and before this pass's shaders read it (and the next composite rewrites it).
                 if k > 0 {
@@ -1324,7 +1419,7 @@ unsafe fn evaluate(
                     &[],
                     &[],
                 );
-                device.cmd_copy_buffer(cmd, b.proxy.buffer, h.previous.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
+                device.cmd_copy_buffer(cmd, b.frame(), h.previous.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
                 last |= vk::PipelineStageFlags::TRANSFER;
             }
             if let Some((.., Some(previous))) = hud_rec {
@@ -1338,7 +1433,7 @@ unsafe fn evaluate(
                     &[],
                     &[],
                 );
-                device.cmd_copy_buffer(cmd, b.proxy.buffer, previous, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
+                device.cmd_copy_buffer(cmd, b.frame(), previous, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
                 last |= vk::PipelineStageFlags::TRANSFER;
             }
             device.cmd_pipeline_barrier(
@@ -1414,6 +1509,84 @@ unsafe fn evaluate(
     true
 }
 
+/// Converts slot `s`'s HDR10 frame (the proxy region's raw words) into its SDR picture (`SlotBuffers::sdr`) with
+/// `native_post_hdr.comp`, in a submit of its own, waited for (bounded) so the thumbnail can be read from the
+/// picture. `false` when it could not run; a wait that timed out marks the server stalled.
+///
+/// # Safety
+/// The proxy region holds the frame's `width * height` words; nothing of `gpu`'s is pending.
+unsafe fn convert_hdr10(device: &ash::Device, gpu: &mut Gpu, s: usize, proxy_region: *mut u8, width: u32, height: u32, pq10: Pq10) -> bool {
+    let bytes = u64::from(width) * u64::from(height) * 4;
+    let (Some(b), Some(Some(conv))) = (gpu.slots[s].as_ref(), gpu.hdr.as_ref()) else { return false };
+    let Some(sdr) = b.sdr.as_ref() else { return false };
+    if b.proxy.staged {
+        // SAFETY: both hold `bytes`; the staging buffer is host-coherent and not in use.
+        unsafe { std::ptr::copy_nonoverlapping(proxy_region, b.proxy.ptr, bytes as usize) };
+    }
+    let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
+    let (frame_i, sdr_i) = (info(b.proxy.buffer), info(sdr.buffer));
+    let writes = [(0, &frame_i), (1, &sdr_i)]
+        .map(|(n, i)| vk::WriteDescriptorSet::default().dst_set(conv.set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i));
+    // SAFETY: the set is not in use (every frame waits for its own work); the buffers are live.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+    let push = HdrConvertPush { size: [width, height], b_low: u32::from(pq10.b_low), reference_nits: pq10.reference_nits };
+    let barrier = |src: vk::AccessFlags, dst: vk::AccessFlags| [vk::MemoryBarrier::default().src_access_mask(src).dst_access_mask(dst)];
+    let cmd = gpu.cmd;
+    // SAFETY: the layer's own buffer, not pending; every handle is live.
+    let recorded: ash::prelude::VkResult<()> = unsafe {
+        (|| {
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &barrier(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE),
+                &[],
+                &[],
+            );
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, conv.pipeline);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, conv.layout, 0, &[conv.set], &[]);
+            device.cmd_push_constants(
+                cmd,
+                conv.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<HdrConvertPush>()),
+            );
+            device.cmd_dispatch(cmd, width.div_ceil(8), height.div_ceil(8), 1);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::HOST_READ),
+                &[],
+                &[],
+            );
+            device.end_command_buffer(cmd)
+        })()
+    };
+    if recorded.is_err() {
+        return false;
+    }
+    let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+    // SAFETY: the fence is the layer's own and idle; the queue is this thread's alone.
+    let submitted = unsafe { device.reset_fences(&[gpu.fence]).and_then(|()| device.queue_submit(gpu.queue, &[submit], gpu.fence)) };
+    if crate::note_vk(device.handle(), submitted).is_err() {
+        return false;
+    }
+    // SAFETY: the fence was just submitted.
+    let waited = unsafe { device.wait_for_fences(&[gpu.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+    if crate::note_fence_wait(device.handle(), waited, "native::post hdr10").is_err() {
+        gpu.stalled = true;
+        crate::log!("[native] the HDR10 conversion did not finish in time; the after-the-upscaler path is not served from here on");
+        return false;
+    }
+    true
+}
+
 /// The flow's submits before a flow frame on slot `s`: the upload of the frame's proxy into the session
 /// (compute queue, signalling `uploaded`), then the flow (its queue, waiting for that, signalling `flowed`).
 /// The semaphore the frame waits for, or why a submit failed.
@@ -1442,7 +1615,7 @@ unsafe fn flow_submits(device: &ash::Device, gpu: &Gpu, s: usize) -> Result<vk::
             &[],
             &[],
         );
-        session.record_upload(device, fd.upload, b.proxy.buffer);
+        session.record_upload(device, fd.upload, b.frame());
         device.end_command_buffer(fd.upload).map_err(|e| format!("{e:?}"))?;
         session.record_flow(device, fd)?;
         let upload = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&fd.upload)).signal_semaphores(std::slice::from_ref(&fd.uploaded));
@@ -1686,6 +1859,74 @@ impl HudPipeline {
     }
 }
 
+/// The HDR10 conversion's pipeline (`native_post_hdr.comp`) and its one set: binding 0 the frame's raw words,
+/// 1 its SDR picture.
+struct HdrConvert {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+}
+
+impl HdrConvert {
+    /// # Safety
+    /// `device` is live.
+    unsafe fn build(device: &ash::Device) -> Option<Self> {
+        let mut h = Self {
+            set_layout: vk::DescriptorSetLayout::null(),
+            layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            pool: vk::DescriptorPool::null(),
+            set: vk::DescriptorSet::null(),
+        };
+        // SAFETY: valid create infos; on a failure what was made is destroyed (null handles are ignored).
+        let built = unsafe {
+            (|| {
+                let binding = |n: u32| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(n)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                };
+                let bindings = [binding(0), binding(1)];
+                h.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
+                let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(std::mem::size_of::<HdrConvertPush>() as u32);
+                h.layout = device
+                    .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[h.set_layout]).push_constant_ranges(&[push]), None)
+                    .ok()?;
+                h.pipeline = super::hdr::compute_pipeline(device, h.layout, HDR_SPV)?;
+                let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
+                h.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).ok()?;
+                h.set =
+                    device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(h.pool).set_layouts(&[h.set_layout])).ok()?[0];
+                Some(())
+            })()
+        };
+        match built {
+            Some(()) => Some(h),
+            None => {
+                // SAFETY: nothing of it was used.
+                unsafe { h.destroy(device) };
+                None
+            }
+        }
+    }
+
+    /// # Safety
+    /// Nothing of it is pending.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded (null handles are ignored).
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_pool(self.pool, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+    }
+}
+
 /// One slot's HUD buffers, for its frame size.
 struct HudBuffers {
     /// Per pixel, f32: the detection's confidence (0-1), kept from frame to frame.
@@ -1884,7 +2125,7 @@ mod tests {
                 std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
             };
             let run = |c: super::super::colour::PassColour| -> Vec<u8> {
-                let push = CompositePush { dims: [W, H, W, H], frame: [0, 0, 0, 0], control: [0.0, 1.0, 1.0, 0.0], ..Default::default() }.with_colour(c);
+                let push = CompositePush { dims: [W, H, W, H], frame: [0, 0, 0, 0], control: [0.0, 1.0, 1.0, 0.0], ..Default::default() }.with_colour(c, false);
                 let cmd = gpu.cmd;
                 device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
                 device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
@@ -1964,6 +2205,65 @@ mod tests {
             assert!((mean - v).abs() < 0.025, "the dither averages to the value: {mean} against {v}");
             assert_eq!(dithered.chunks(4).map(|p| p[3]).collect::<Vec<_>>(), vec![255; (W * H) as usize], "alpha is the proxy's");
 
+            // The protections, against Oklab on the CPU (the 8-bit values read as sRGB).
+            use super::super::colour::PROTECT;
+            let oklab = |rgb: [u8; 3]| -> [f32; 3] {
+                let lin = rgb.map(|v| {
+                    let s = f32::from(v) / 255.0;
+                    if s <= 0.04045 {
+                        s / 12.92
+                    } else {
+                        ((s + 0.055) / 1.055).powf(2.4)
+                    }
+                });
+                let [r, g, b] = lin;
+                let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_99 * b).cbrt();
+                let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+                let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+                [
+                    0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+                    1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+                    0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+                ]
+            };
+            let hue = |o: [f32; 3]| o[2].atan2(o[1]).to_degrees();
+            let chroma = |o: [f32; 3]| o[1].hypot(o[2]);
+            let protect = |k: [f32; 4]| PassColour { protect: k, ..flags(STEP | GUARD | PROTECT) };
+            let pixel = |a: &[u8]| [a[0], a[1], a[2]];
+            // Hue: an orange the edit turns toward yellow keeps its hue, not its chroma or lightness unchanged.
+            let orange = [200u8, 90, 60];
+            fill(&|_, _, c| orange[c as usize], &|_, _, c| [6.0, 40.0, -10.0][c as usize] / 255.0);
+            let free = pixel(&run(PassColour::default()));
+            let kept = pixel(&run(protect([1.0, 0.0, 0.0, 0.0])));
+            let half = pixel(&run(protect([0.5, 0.0, 0.0, 0.0])));
+            let (h0, hf, hk, hh) = (hue(oklab(orange)), hue(oklab(free)), hue(oklab(kept)), hue(oklab(half)));
+            assert!((hf - h0).abs() > 8.0, "the test's edit turns the hue: {h0} -> {hf}");
+            assert!((hk - h0).abs() < 1.5, "full hue protection keeps it: {h0} -> {hk} ({kept:?})");
+            assert!((hh - h0).abs() > 2.0 && (hh - h0).abs() < (hf - h0).abs() - 2.0, "half turns it part way: {hh}");
+            assert!((oklab(kept)[0] - oklab(free)[0]).abs() < 0.01, "the network's lightness stays");
+            // Near grey: a tint on a grey is taken away; a colourful pixel's chroma is not.
+            fill(&|_, _, _| 120, &|_, _, c| [10.0, 0.0, -10.0][c as usize] / 255.0);
+            let tinted = pixel(&run(PassColour::default()));
+            let neutral = pixel(&run(protect([0.0, 1.0, 0.0, 0.0])));
+            assert!(chroma(oklab(tinted)) > 0.015, "the test tints the grey: {tinted:?}");
+            assert!(chroma(oklab(neutral)) < 0.004, "grey protection keeps it grey: {neutral:?}");
+            fill(&|_, _, c| orange[c as usize], &|_, _, c| [6.0, 40.0, -10.0][c as usize] / 255.0);
+            assert_eq!(pixel(&run(protect([0.0, 1.0, 0.0, 0.0]))), free, "a colourful pixel is no grey: unchanged");
+            // Shadows: darkening a dark grey is held back, brightening it is not.
+            fill(&|_, _, _| 30, &|_, _, _| -12.0 / 255.0);
+            let dark = pixel(&run(PassColour::default()));
+            let held = pixel(&run(protect([0.0, 0.0, 1.0, 0.0])));
+            assert!(dark[0] < 22 && held[0].abs_diff(30) <= 1, "shadow protection: {dark:?} -> {held:?}");
+            fill(&|_, _, _| 30, &|_, _, _| 12.0 / 255.0);
+            assert_eq!(pixel(&run(protect([0.0, 0.0, 1.0, 0.0]))), pixel(&run(PassColour::default())), "brightening a shadow stays");
+            // Highlights: brightening a near-white is held back, a mid grey's is not.
+            fill(&|_, _, _| 235, &|_, _, _| 14.0 / 255.0);
+            let bright = pixel(&run(PassColour::default()));
+            let capped = pixel(&run(protect([0.0, 0.0, 0.0, 1.0])));
+            assert!(bright[0] > 245 && capped[0].abs_diff(235) <= 1, "highlight protection: {bright:?} -> {capped:?}");
+            fill(&|_, _, _| 120, &|_, _, _| 14.0 / 255.0);
+            assert_eq!(pixel(&run(protect([0.0, 0.0, 0.0, 1.0]))), pixel(&run(PassColour::default())), "a mid grey brightens freely");
+
             for b in [&proxy, &head, &answer, &lut, &history] {
                 b.destroy(&device);
             }
@@ -1999,8 +2299,19 @@ mod tests {
             let mut gpu = Gpu::new(&device, setup).expect("builds");
             upload_lut(&device, &instance, physical, &mut gpu, Some(&table(1, 3)));
             let first = gpu.lut.as_ref().map(|l| l.buffer.buffer).expect("a buffer for the table");
-            let key =
-                Bound { slot: 0, width: 4, height: 4, generation: 1, scratch: false, passes: 1, history: 0, flow: false, lut: first, hud: vk::Buffer::null() };
+            let key = Bound {
+                slot: 0,
+                width: 4,
+                height: 4,
+                generation: 1,
+                scratch: false,
+                passes: 1,
+                history: 0,
+                flow: false,
+                lut: first,
+                hud: vk::Buffer::null(),
+                frame: vk::Buffer::null(),
+            };
             gpu.bound = Some(key);
             upload_lut(&device, &instance, physical, &mut gpu, Some(&table(2, 3)));
             assert_eq!(gpu.lut.as_ref().map(|l| l.buffer.buffer), Some(first), "the same size: the same buffer");
@@ -2140,6 +2451,11 @@ mod tests {
 
         /// One frame of `proxy` (RGBA8 texels of the valid extent) through `passes`; the answer's texels.
         fn frame(&mut self, proxy: &[u32], passes: &[Conditioning]) -> Vec<u32> {
+            self.frame_with(proxy, passes, None)
+        }
+
+        /// [`Self::frame`], with `proxy` an HDR10 frame's words when `pq10` is set.
+        fn frame_with(&mut self, proxy: &[u32], passes: &[Conditioning], pq10: Option<Pq10>) -> Vec<u32> {
             for (i, t) in proxy.iter().enumerate() {
                 self.proxy[i * 4..i * 4 + 4].copy_from_slice(&t.to_le_bytes());
             }
@@ -2159,6 +2475,7 @@ mod tests {
                     W,
                     H,
                     false,
+                    pq10,
                     passes,
                     1.0,
                     &neural_forge_protocol::ColourSettings::DEFAULT,
@@ -2256,6 +2573,69 @@ mod tests {
             }
         }
         assert_eq!(got, SHIPPED, "the frame moved");
+    }
+
+    /// A varied HDR10 frame (codes over the whole range, every channel its own, the alpha bits varying).
+    fn hdr_picture(b_low: bool) -> Vec<u32> {
+        use crate::hdr_present::reference::pack;
+        (0..W * H).map(|i| pack([(i * 37 + 11) % 1024, (i * 101 + 300) % 1024, (i * 53 + 700) % 1024], i % 4, b_low)).collect()
+    }
+
+    /// The 8-bit SDR values (per channel, lowest and highest) single-precision maths may give `word`: the CPU
+    /// reference with each channel's BT.709 light moved by 1e-4 of the pixel's brightest BT.2020 channel (the PQ
+    /// decode's float error, which the BT.2020 to BT.709 matrix turns into a large one where it subtracts two
+    /// bright channels to give a dark one), widened by a code of rounding.
+    fn sdr8_bounds(word: u32, b_low: bool, reference: f64) -> ([u8; 3], [u8; 3]) {
+        use crate::hdr_present::reference::{linear_2020, mul, shoulder, srgb_oetf, BT2020_TO_BT709};
+        let lin = linear_2020(word, b_low);
+        let err = 1e-4 * lin.iter().copied().fold(0.0, f64::max);
+        let l709 = mul(&BT2020_TO_BT709, lin);
+        let code = |l: f64| srgb_oetf(shoulder(l.max(0.0) / reference)) * 255.0;
+        (l709.map(|l| (code(l - err).round() as u8).saturating_sub(1)), l709.map(|l| (code(l + err).round() as u8).saturating_add(1)))
+    }
+
+    /// An HDR10 frame runs through the passes as its SDR picture: the conversion matches the CPU reference (within a
+    /// code of rounding, alpha 255), the answer is the one the picture gets as an 8-bit frame, and an 8-bit frame
+    /// after it frees the picture. In both channel orders, and a higher reference white darkens the picture.
+    #[test]
+    fn an_hdr10_frame_runs_as_its_sdr_picture() {
+        use crate::hdr_present::reference::sdr8;
+        let one = [Conditioning::default()];
+        for b_low in [false, true] {
+            let Some(mut rig) = Rig::new() else { return };
+            rig.write_head(head_pattern(1.0));
+            let words = hdr_picture(b_low);
+            let answer = rig.frame_with(&words, &one, Some(Pq10 { b_low, reference_nits: 203.0 }));
+            let read = |rig: &Rig| -> Vec<u32> {
+                let sdr = rig.gpu.slots[0].as_ref().and_then(|b| b.sdr.as_ref()).expect("the picture");
+                // SAFETY: host-coherent, sized for the frame; the frame was waited for.
+                let bytes = unsafe { std::slice::from_raw_parts(sdr.ptr, (W * H * 4) as usize) };
+                bytes.as_chunks::<4>().0.iter().map(|&c| u32::from_le_bytes(c)).collect()
+            };
+            let shown = read(&rig);
+            let mut off = 0;
+            for (i, (&w, &t)) in words.iter().zip(&shown).enumerate() {
+                let (want, got) = (sdr8(w, b_low, 203.0), t.to_le_bytes());
+                let (lo, hi) = sdr8_bounds(w, b_low, 203.0);
+                for c in 0..3 {
+                    assert!((lo[c]..=hi[c]).contains(&got[c]), "pixel {i} channel {c}: {} vs the reference's {} ({}..={})", got[c], want[c], lo[c], hi[c]);
+                    off += usize::from(got[c] != want[c]);
+                }
+                assert_eq!(got[3], 255, "alpha");
+            }
+            assert!(off < words.len() / 10, "{off} channels a code off the reference");
+            let Some(mut plain) = Rig::new() else { return };
+            plain.write_head(head_pattern(1.0));
+            assert_eq!(plain.frame(&shown, &one), answer, "the passes read the picture as they read an 8-bit frame");
+            let darker = {
+                let _ = rig.frame_with(&words, &one, Some(Pq10 { b_low, reference_nits: 400.0 }));
+                read(&rig)
+            };
+            let sum = |p: &[u32]| p.iter().map(|t| t.to_le_bytes()[..3].iter().map(|&v| u64::from(v)).sum::<u64>()).sum::<u64>();
+            assert!(sum(&darker) < sum(&shown), "a higher reference white darkens the picture");
+            let _ = rig.frame(&picture(0), &one);
+            assert!(rig.gpu.slots[0].as_ref().is_some_and(|b| b.sdr.is_none()), "an 8-bit frame frees the picture");
+        }
     }
 
     /// [`the_shipped_frame_stays_bit_for_bit`]'s digests, from 3.7.0's shaders (commit 140c7a2).

@@ -68,12 +68,14 @@ pub fn status_text(header: &ShmHeader) -> String {
     line(format_args!("layer_reason={}", header.layer_reason()));
     line(format_args!("native_running={}", header.native_running.load(Ordering::Relaxed)));
     let hdr = header.hdr_detected.load(Ordering::Relaxed);
+    let hdr_active = header.hdr_active.load(Ordering::Relaxed);
     line(format_args!("swapchain_hdr={hdr} ({})", {
         use neural_forge_protocol::enums::hdr_kind::*;
         match hdr {
             NONE => "SDR, or no game yet",
-            LINEAR_FP16 => "HDR, linear FP16",
-            PQ10 => "HDR10, PQ",
+            LINEAR_FP16 => "HDR, linear FP16: presented untouched",
+            PQ10 if hdr_active == PQ10 => "HDR10, PQ: the network runs on an SDR-mapped copy",
+            PQ10 => "HDR10, PQ: presented untouched",
             _ => "unknown",
         }
     }));
@@ -162,7 +164,9 @@ mod tests {
         assert!(lines.contains(&"preupscale_dump_request=16"), "{text}");
         assert!(lines.contains(&"edit_cache: refresh_holds=30 cached_holds=29 rejected=12.34% gpu_ms=0.250"), "{text}");
         assert!(lines.contains(&"scene_cuts=3"), "{text}");
-        assert!(lines.contains(&"swapchain_hdr=2 (HDR10, PQ)"), "{text}");
+        assert!(lines.contains(&"swapchain_hdr=2 (HDR10, PQ: presented untouched)"), "{text}");
+        header.hdr_active.store(neural_forge_protocol::enums::hdr_kind::PQ10, Ordering::Relaxed);
+        assert!(status_text(&header).lines().any(|l| l == "swapchain_hdr=2 (HDR10, PQ: the network runs on an SDR-mapped copy)"));
         assert!(lines.contains(&"intensity=1"), "{text}");
         assert!(lines.contains(&"skin_structure=-1"), "{text}");
         let settings_at = lines.iter().position(|l| l.starts_with("# settings")).expect("a settings section");

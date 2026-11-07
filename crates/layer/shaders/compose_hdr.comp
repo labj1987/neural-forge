@@ -1,0 +1,147 @@
+#version 450
+// The composition of an HDR10 frame (docs/NATIVE_BACKEND.md, "HDR on the finished frame (3.10.0)";
+// `composition::gpu`): the network answered an 8-bit SDR picture of the frame (native_post_hdr.comp), and its
+// change is carried onto the untouched HDR frame in linear light.
+//
+// The images are compose.comp's (R8G8B8A8_UNORM storage images, the same descriptor set), holding the frames'
+// raw 32-bit words: packUnorm4x8 of a load gives a word back exactly, and unpackUnorm4x8 stores one exactly.
+// Per pixel, with S = SDR(proxy) as native_post_hdr.comp computes it (8 bits) and S⁻¹ the sRGB EOTF and the
+// shoulder's inverse:
+//   answer == S in all three channels: the frame's word, bit for bit;
+//   S's peak at the shoulder's top (>= 0.999): the frame's word (the inverse cannot bring a clamped value back);
+//   else out = PQ(lin(base) + M * R * (S⁻¹(answer) - S⁻¹(S)) * (1 - smoothstep(0.954, 0.999, peak))), with lin
+//   the PQ decode to BT.2020 nits, M BT.709 to BT.2020 and R the reference white; the frame's alpha bits kept.
+// With flags bit 0 clear the two highlight rules are off (the shoulder's inverse everywhere).
+//
+// The push constants match `composition::gpu::HdrPushConstants` field for field, within compose.comp's range.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The frame presented now (the base), the frame the network was shown (the proxy), the answer, the result.
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D u_original;
+layout(set = 0, binding = 1, rgba8) uniform readonly image2D u_proxy;
+layout(set = 0, binding = 2, rgba8) uniform readonly image2D u_model_answer;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D u_output;
+
+layout(push_constant) uniform Params {
+  float reference_nits;
+  uint b_low; // 1: A2R10G10B10 (B in bits 0-9), 0: A2B10G10R10
+  uint flags; // bit 0: keep the frame where S is at the shoulder's top
+} p;
+
+const float CLAMPED = 0.999;
+const float FADE_SRGB = 0.954;
+const uint KEEP_CLAMPED = 1u;
+
+// ---- HDR10 maths, the same functions in native_post_hdr.comp and compose_hdr.comp (no include:
+// scripts/check_shaders.py hashes .comp files only) and in `hdr_present::reference` (the CPU reference). ----
+
+// SMPTE ST 2084.
+const float M1 = 2610.0 / 16384.0;
+const float M2 = 2523.0 / 4096.0 * 128.0;
+const float C1 = 3424.0 / 4096.0;
+const float C2 = 2413.0 / 4096.0 * 32.0;
+const float C3 = 2392.0 / 4096.0 * 32.0;
+const float PEAK_NITS = 10000.0;
+// The pre-upscaler encode's shoulder (preupscale_encode.comp).
+const float KNEE = 0.75;
+const float K = 5.770780;
+
+// ST 2084's EOTF: code (0 to 1) to nits.
+float pq_to_nits(float e) {
+  if (e <= 0.0) {
+    return 0.0;
+  }
+  float ep = pow(min(e, 1.0), 1.0 / M2);
+  float y = max(ep - C1, 0.0) / (C2 - C3 * ep);
+  return y <= 0.0 ? 0.0 : pow(y, 1.0 / M1) * PEAK_NITS;
+}
+
+float shoulder(float v) {
+  return v <= KNEE ? v : KNEE + 0.25 * (1.0 - exp(-K * (v - KNEE)));
+}
+
+float srgb_oetf(float c) {
+  c = clamp(c, 0.0, 1.0);
+  return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+// The (R, G, B) codes of a packed word: R in bits 0-9 (A2B10G10R10), or B there with b_low (A2R10G10B10).
+uvec3 codes(uint word, bool b_low) {
+  uvec3 c = uvec3(word & 1023u, (word >> 10) & 1023u, (word >> 20) & 1023u);
+  return b_low ? c.zyx : c;
+}
+
+// A word's light in linear BT.2020 nits.
+vec3 linear_2020(uint word, bool b_low) {
+  vec3 e = vec3(codes(word, b_low)) / 1023.0;
+  return vec3(pq_to_nits(e.r), pq_to_nits(e.g), pq_to_nits(e.b));
+}
+
+// The SDR picture the network is shown, as packUnorm4x8 rounds it (R first, alpha 255): BT.2020 to BT.709
+// (ITU-R BT.2087), negatives 0, divided by the reference white, the shoulder, the sRGB OETF. `precise`, so this
+// shader and the other compute the same bits.
+uint sdr_word(uint word, bool b_low, float reference_nits) {
+  precise vec3 l = linear_2020(word, b_low);
+  precise vec3 l709 = vec3(dot(vec3(1.660491, -0.587641, -0.072850), l), dot(vec3(-0.124550, 1.132900, -0.008349), l),
+                           dot(vec3(-0.018151, -0.100579, 1.118730), l));
+  precise vec3 v = max(l709, vec3(0.0)) / reference_nits;
+  precise vec3 s = vec3(srgb_oetf(shoulder(v.r)), srgb_oetf(shoulder(v.g)), srgb_oetf(shoulder(v.b)));
+  return packUnorm4x8(vec4(s, 1.0));
+}
+
+// ST 2084's inverse EOTF: nits to code (0 to 1).
+float nits_to_pq(float nits) {
+  float y = clamp(nits / PEAK_NITS, 0.0, 1.0);
+  float ym = pow(y, M1);
+  return pow((C1 + C2 * ym) / (1.0 + C3 * ym), M2);
+}
+
+float srgb_eotf(float s) {
+  s = clamp(s, 0.0, 1.0);
+  return s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4);
+}
+
+float shoulder_inverse(float y) {
+  y = min(y, 1.0 - 1e-4);
+  return y >= KNEE ? KNEE - log(1.0 - (y - KNEE) / 0.25) / K : y;
+}
+
+float sdr_inverse(uint code) {
+  return shoulder_inverse(srgb_eotf(float(code) / 255.0));
+}
+
+uint pack_word(uvec3 rgb, uint alpha, bool b_low) {
+  uvec3 c = b_low ? rgb.zyx : rgb;
+  return c.x | (c.y << 10) | (c.z << 20) | (alpha << 30);
+}
+
+uvec3 bytes3(uint word) {
+  return uvec3(word & 255u, (word >> 8) & 255u, (word >> 16) & 255u);
+}
+
+void main() {
+  ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(at, imageSize(u_output)))) {
+    return;
+  }
+  bool b_low = p.b_low != 0u;
+  uint base = packUnorm4x8(imageLoad(u_original, at));
+  uvec3 s = bytes3(sdr_word(packUnorm4x8(imageLoad(u_proxy, at)), b_low, p.reference_nits));
+  uvec3 answer = bytes3(packUnorm4x8(imageLoad(u_model_answer, at)));
+  float peak = float(max(s.r, max(s.g, s.b))) / 255.0;
+  bool keep = (p.flags & KEEP_CLAMPED) != 0u;
+  if (all(equal(answer, s)) || (keep && peak >= CLAMPED)) {
+    imageStore(u_output, at, unpackUnorm4x8(base));
+    return;
+  }
+  vec3 delta = p.reference_nits * vec3(sdr_inverse(answer.r) - sdr_inverse(s.r), sdr_inverse(answer.g) - sdr_inverse(s.g),
+                                       sdr_inverse(answer.b) - sdr_inverse(s.b));
+  if (keep) {
+    delta *= 1.0 - smoothstep(FADE_SRGB, CLAMPED, peak);
+  }
+  vec3 d2020 = vec3(dot(vec3(0.627404, 0.329283, 0.043313), delta), dot(vec3(0.069097, 0.919540, 0.011362), delta),
+                    dot(vec3(0.016391, 0.088013, 0.895595), delta));
+  vec3 l = clamp(linear_2020(base, b_low) + d2020, vec3(0.0), vec3(PEAK_NITS));
+  uvec3 c = uvec3(round(vec3(nits_to_pq(l.r), nits_to_pq(l.g), nits_to_pq(l.b)) * 1023.0));
+  imageStore(u_output, at, unpackUnorm4x8(pack_word(min(c, uvec3(1023u)), base >> 30, b_low)));
+}

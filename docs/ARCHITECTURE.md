@@ -120,7 +120,10 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   sees before the upscaler (v22): `preupscale_brightness` (2524, f32 bits, 0.25-4, default 1) and
   `preupscale_exposure` (2528, `enums::exposure_source`: 0 game, 1 auto; NATIVE_BACKEND.md, "Brightness before
   the upscaler"), and the network's GPU milliseconds on its last hold (`preupscale_network_gpu_ms_bits`,
-  2532, f32 bits, written by the layer for the Status tab's graph); the header ends at 2536. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
+  2532, f32 bits, written by the layer for the Status tab's graph), then the protections of each pass's result
+  against its input (v23, f32 bits, 0-1, default 0): `edit_hue_protection` (2536), `edit_neutral_protection`
+  (2540), `edit_shadow_protection` (2544) and `edit_highlight_protection` (2548; NATIVE_BACKEND.md, "The colour of
+  the edit"); the header ends at 2552. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
   `persist::HUD_REGIONS`), the one setting that is not a number. NATIVE_BACKEND.md, "Where the model runs"
   and "The HUD at present".
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
@@ -142,7 +145,10 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
 - **Edit cache (v17):** `preupscale_dump_request` (cleared by `init_defaults` and when a game's layer
   starts a session on the channel, so a request left for an earlier game never fires on the next),
   `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected`, `cache_gpu_ms_bits`.
-- **Reserved, read by nothing:** `format`, `hdr_encode`, `hdr_mode`/`hdr_detected`/`hdr_active`.
+- **HDR status:** `hdr_detected` (the swapchain's `enums::hdr_kind`) and `hdr_active` (`PQ10` while an
+  HDR10 swapchain takes the HDR path on the finished frame), written by the layer at each present and read
+  by the status's `swapchain_hdr` line.
+- **Reserved, read by nothing:** `format`, `hdr_encode`, `hdr_mode`.
 
 ### The handshake (after the upscaler)
 
@@ -191,6 +197,7 @@ be private.
 | 20 | `network` (which extracted network the layer runs) and the control mask's rules (`mask_sky`, `mask_sky_margin`, `mask_dark*`, `mask_motion*`) appended | 3.7.0 |
 | 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended; then the colour of the edit (`edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`, `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`) and `pass_colour[10]` (override bits `EDIT_SATURATION` 128, `EDIT_CONTRAST` 256, `EDIT_DETAIL` 512); then `placement`, `pass_placement[10]` (override bit `PLACEMENT` 1024), `hud_detect`, `hud_region_count` and `hud_region[8]` | 3.8.0 |
 | 22 | `preupscale_brightness` and `preupscale_exposure` (what the network sees before the upscaler: its brightness and where the exposure comes from) and `preupscale_network_gpu_ms` (the network's GPU time on its last hold) appended | 3.8.10 |
+| 23 | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection` and `edit_highlight_protection` (the Oklab protections of each pass's result against its input) appended | 3.10.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.
@@ -658,9 +665,10 @@ is not held before the upscaler.
 
 - **Swapchain admission** (`surface_usage.rs`, `swapchain.rs`): the layer adds `TRANSFER_SRC` and
   `TRANSFER_DST` usage to the game's swapchain when the surface supports them, after checking the
-  create info's extension chain and flags. Swapchains it cannot admit stay pass-through. Only
-  8-bit SDR formats (`B8G8R8A8`/`R8G8B8A8`, UNORM or sRGB) are processed; HDR and float16
-  swapchains are presented untouched.
+  create info's extension chain and flags. Swapchains it cannot admit stay pass-through. The
+  8-bit SDR formats (`B8G8R8A8`/`R8G8B8A8`, UNORM or sRGB) are processed, and the 10-bit ones
+  (`A2B10G10R10`/`A2R10G10B10`) in the HDR10 colour space (NATIVE_BACKEND.md, "HDR on the finished
+  frame"); float16 and 10-bit SDR swapchains are presented untouched.
 - **Primary swapchain:** one per process (the largest plausible game size), so overlays are left
   alone.
 - **Warm-up** (`swapchain::Warmup`): the layer engages only after 5 s of steady presents and

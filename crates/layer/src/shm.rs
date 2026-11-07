@@ -666,6 +666,22 @@ impl ShmClient {
         hdr.hdr_detected.store(kind, Ordering::Relaxed);
     }
 
+    /// What the layer does with the swapchain's HDR (`ShmHeader::hdr_active`, `enums::hdr_kind`): `PQ10` while
+    /// it presents an HDR10 swapchain through the HDR path, `NONE` otherwise.
+    pub fn publish_hdr_active(&self, kind: u32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.hdr_active.store(kind, Ordering::Relaxed);
+    }
+
+    /// Whether the last request on `slot` that [`Self::begin_async_request`] started got a model answer rather than
+    /// an echo of its own frame (`ShmHeader::seq_eval`). Only slot 0 publishes `seq_eval`: the second slot never
+    /// reads as evaluated.
+    pub fn answer_evaluated(&self, slot: Slot) -> bool {
+        let Some(hdr) = self.header() else { return false };
+        let req = self.last_req[slot.index()];
+        slot == Slot::Primary && req != 0 && hdr.seq_eval.load(Ordering::Acquire) == req
+    }
+
     /// The channel's path once it is open (empty before).
     pub fn channel_path(&self) -> &str {
         &self.path

@@ -73,8 +73,10 @@ presents untouched. See `RENDER_TAP_DESIGN.md`.
 
 ## Not done yet
 
-- **HDR / 10-bit / float16** swapchains: presented untouched. Needs the float16 proxy, PQ10
-  transfer and half-float compose fallback (`composition.cpp` `Prepare`, `DetectHdrKind`).
+- **Float16 (scRGB) and 10-bit SDR** swapchains: presented untouched. Float16 needs 8 bytes a pixel in
+  the shared regions and a half-float compose (`composition.cpp` `Prepare`, `DetectHdrKind`). HDR10
+  (10-bit, PQ) is handled since 3.10.0, differently from upstream's PQ10 transfer: the network runs on an
+  SDR-mapped copy and its change is restored in linear light (NATIVE_BACKEND.md, "HDR on the finished frame").
 - **A GPU-side white meter**: the meter runs on the CPU over the captured frame instead, which
   the synchronous present already holds -- measured fast enough in practice not to need the GPU.
 - **The CPU downscale kernels** (`composition/downscale.rs`) remain unwired; the model is scaled

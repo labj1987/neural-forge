@@ -1,0 +1,89 @@
+#version 450
+// The model server's HDR10 conversion (docs/NATIVE_BACKEND.md, "HDR on the finished frame (3.10.0)";
+// `preupscale::native_post`): the raw frame the layer captured from an HDR10 swapchain (one packed 10-bit
+// word a pixel, ST 2084 code, BT.2020) becomes the 8-bit SDR picture (RGBA8, R first, alpha 255) every pass
+// after it reads in place of the proxy. Per pixel: PQ decode to nits, BT.2020 to BT.709, negatives 0, divided by
+// the reference white, the pre-upscaler encode's per-channel shoulder, the sRGB OETF. compose_hdr.comp
+// computes the same picture again to take the network's change.
+//
+// The push constants match `native_post::HdrConvertPush` field for field.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Frame {
+  uint px[];
+} u_frame;
+layout(set = 0, binding = 1, std430) writeonly buffer Sdr {
+  uint px[];
+} u_sdr;
+
+layout(push_constant) uniform Params {
+  uvec2 size;           // the frame's extent
+  uint b_low;           // 1: A2R10G10B10 (B in bits 0-9), 0: A2B10G10R10 (R in bits 0-9)
+  float reference_nits; // the light the SDR picture's 1.0 (before the shoulder) stands for
+} p;
+
+// ---- HDR10 maths, the same functions in native_post_hdr.comp and compose_hdr.comp (no include:
+// scripts/check_shaders.py hashes .comp files only) and in `hdr_present::reference` (the CPU reference). ----
+
+// SMPTE ST 2084.
+const float M1 = 2610.0 / 16384.0;
+const float M2 = 2523.0 / 4096.0 * 128.0;
+const float C1 = 3424.0 / 4096.0;
+const float C2 = 2413.0 / 4096.0 * 32.0;
+const float C3 = 2392.0 / 4096.0 * 32.0;
+const float PEAK_NITS = 10000.0;
+// The pre-upscaler encode's shoulder (preupscale_encode.comp).
+const float KNEE = 0.75;
+const float K = 5.770780;
+
+// ST 2084's EOTF: code (0 to 1) to nits.
+float pq_to_nits(float e) {
+  if (e <= 0.0) {
+    return 0.0;
+  }
+  float ep = pow(min(e, 1.0), 1.0 / M2);
+  float y = max(ep - C1, 0.0) / (C2 - C3 * ep);
+  return y <= 0.0 ? 0.0 : pow(y, 1.0 / M1) * PEAK_NITS;
+}
+
+float shoulder(float v) {
+  return v <= KNEE ? v : KNEE + 0.25 * (1.0 - exp(-K * (v - KNEE)));
+}
+
+float srgb_oetf(float c) {
+  c = clamp(c, 0.0, 1.0);
+  return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+// The (R, G, B) codes of a packed word: R in bits 0-9 (A2B10G10R10), or B there with b_low (A2R10G10B10).
+uvec3 codes(uint word, bool b_low) {
+  uvec3 c = uvec3(word & 1023u, (word >> 10) & 1023u, (word >> 20) & 1023u);
+  return b_low ? c.zyx : c;
+}
+
+// A word's light in linear BT.2020 nits.
+vec3 linear_2020(uint word, bool b_low) {
+  vec3 e = vec3(codes(word, b_low)) / 1023.0;
+  return vec3(pq_to_nits(e.r), pq_to_nits(e.g), pq_to_nits(e.b));
+}
+
+// The SDR picture the network is shown, as packUnorm4x8 rounds it (R first, alpha 255): BT.2020 to BT.709
+// (ITU-R BT.2087), negatives 0, divided by the reference white, the shoulder, the sRGB OETF. `precise`, so this
+// shader and the other compute the same bits.
+uint sdr_word(uint word, bool b_low, float reference_nits) {
+  precise vec3 l = linear_2020(word, b_low);
+  precise vec3 l709 = vec3(dot(vec3(1.660491, -0.587641, -0.072850), l), dot(vec3(-0.124550, 1.132900, -0.008349), l),
+                           dot(vec3(-0.018151, -0.100579, 1.118730), l));
+  precise vec3 v = max(l709, vec3(0.0)) / reference_nits;
+  precise vec3 s = vec3(srgb_oetf(shoulder(v.r)), srgb_oetf(shoulder(v.g)), srgb_oetf(shoulder(v.b)));
+  return packUnorm4x8(vec4(s, 1.0));
+}
+
+void main() {
+  uvec2 xy = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(xy, p.size))) {
+    return;
+  }
+  uint i = xy.y * p.size.x + xy.x;
+  u_sdr.px[i] = sdr_word(u_frame.px[i], p.b_low != 0u, p.reference_nits);
+}

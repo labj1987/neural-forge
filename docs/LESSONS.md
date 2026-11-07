@@ -1518,6 +1518,36 @@ with the ogkm-experimental patch series (the same numbers within noise, and no N
     at all; the guard's pause gets 18-20 / 74-80. Every lever on Neural Forge's side tried here gave nothing at 2 GB,
     and the stricter ones cost at 1 GB. Not pursued further.
 
+## November 7: a temporal filter of the change before the upscaler (built, measured, not taken)
+
+Veyra-NRVideo carries Magpie Experimental's temporal filter of the NR residual in four routes (static only, a
+motion-reprojected blend, attack/release, low band only). The "low-band temporal filter of the correction" left for
+later on October 22 was tried as the cheapest of them first offline, then built and measured in GTA V.
+
+- **Offline** (the pre-upscaler cache dumps, 1485x836, 32 holds each, the model's real answer on every hold;
+  flicker_lab's motion-compensated flicker x 1000 minus the model's own, kept = share of the model's picture change
+  left):
+
+  | variant | still: flicker / kept | pan | drive |
+  |---|---|---|---|
+  | full-band blend, reprojected, w 0.5 | -1.82 / 92.3% | -1.11 / 92.8% | -1.63 / 90.3% |
+  | low band only (Gaussian sigma 2), w 0.5 | -0.39 / 96.5% | -0.24 / 94.7% | -0.23 / 95.7% |
+  | still pixels only, w 0.5 | -1.77 / 92.4% | -0.04 / 99.8% | -0.04 / 99.7% |
+
+  The model adds 5.2 to the still dump's 21.2 without it. Still pixels only gave the full blend's calm where the
+  picture stands and changed nothing in motion, so that was built: `edit_still_smoothing`, the first colour step on
+  the last pass, a history at the render extent, a pixel counted still under a quarter of a render pixel of motion
+  and 0.06 of encoded luma change.
+- **In the game** (GTA V Enhanced, 1440p, DLSS Balanced, FG 4x with Preset C, FrameLimit 120, the still shot of the
+  benchmark, 280 presented frames each, bench-iq's flicker and added detail on the frames as presented, windows
+  aligned by image to the model-off run's): model off 0.234%; model on 0.244%, added detail x1.075; smoothing at 1
+  (weight 0.25) 0.242%, x1.059.
+- **Why not taken:** after DLSS the model adds 0.01 points of flicker on the still shot: DLSS's own accumulation has
+  already taken almost all of what the offline replay measured. What the smoothing removes (0.002 points) is inside
+  the runs' spread, and it costs a fifth of the model's added detail (the blended edit loses the sub-pixel part
+  DLSS accumulates from the jittered frames). The full reprojected blend would cost more of both. Reopen only for a
+  path without a temporal upscaler after the model (the finished frame), with a game check like this one.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
@@ -1528,8 +1558,12 @@ with the ogkm-experimental patch series (the same numbers within noise, and no N
 - **The game's own depth and motion vectors for the model.** Optical flow is still used; the
   game's vectors need their scale and sign, which the layer cannot see.
 - **Other games before the upscaler.** Only GTA V Enhanced has been probed.
-- **HDR swapchains on the after-the-upscaler path.** Presented untouched; never tested with a game
-  that has real HDR output.
+- **A temporal filter of the change before the upscaler** (Magpie / Veyra's routes; November 7): DLSS already
+  leaves no flicker of the model's to remove, and the still-only blend cost a fifth of the added detail.
+- **HDR swapchains on the after-the-upscaler path.** HDR10 since 3.10.0 (NATIVE_BACKEND.md, "HDR on
+  the finished frame"): the network on an SDR-mapped copy, its change carried back in linear light; not
+  yet tested with a game that has real HDR output. Float16 (scRGB) swapchains are still presented
+  untouched.
 - **The copy path below 100% model resolution.** About 4 ms per model frame of CPU copies. The maintainer
   runs at 100%.
 - **The helper's `device_wait_idle` calls** stay unbounded: the Vulkan call has no timeout.

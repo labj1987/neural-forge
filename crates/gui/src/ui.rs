@@ -982,7 +982,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 }
 
 /// The Model tab's Colour group: the colour of the network's edit (its change to the frame) for every pass
-/// (the per-pass dialog overrides the three scales), the gamut guard, the dither after the upscaler and the
+/// (the per-pass dialog overrides the three scales), the gamut guard, the dither after the upscaler, the
+/// protections of each pass's result against its input (hue, near grey, shadows, highlights) and the
 /// look-up table, whose `.cube` file is named by `edit_lut` in `config.ini` (the layer reads it itself).
 fn build_colour_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
@@ -1027,6 +1028,42 @@ fn build_colour_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         "Dither",
         "Against banding in smooth gradients after the upscaler: a fixed pattern of half a step before the 8-bit answer is rounded",
         v,
+        set,
+    ));
+    let (v, set) = bind_float(shm, Some("edit_hue_protection"), |h| &h.edit_hue_protection_bits);
+    group.add(&spin_row(
+        "Hue protection",
+        "Keeps the frame's hues: the model may still change how colourful and how bright a colour is (0 off, 1 full)",
+        v,
+        "edit_hue_protection",
+        0.05,
+        set,
+    ));
+    let (v, set) = bind_float(shm, Some("edit_neutral_protection"), |h| &h.edit_neutral_protection_bits);
+    group.add(&spin_row(
+        "Grey protection",
+        "Keeps greys and near-greys free of a tint from the model (0 off, 1 full)",
+        v,
+        "edit_neutral_protection",
+        0.05,
+        set,
+    ));
+    let (v, set) = bind_float(shm, Some("edit_shadow_protection"), |h| &h.edit_shadow_protection_bits);
+    group.add(&spin_row(
+        "Shadow protection",
+        "Holds back the model darkening what was already dark, so shadow detail stays visible (0 off, 1 full)",
+        v,
+        "edit_shadow_protection",
+        0.05,
+        set,
+    ));
+    let (v, set) = bind_float(shm, Some("edit_highlight_protection"), |h| &h.edit_highlight_protection_bits);
+    group.add(&spin_row(
+        "Highlight protection",
+        "Holds back the model brightening what was already bright, so highlights do not wash out (0 off, 1 full)",
+        v,
+        "edit_highlight_protection",
+        0.05,
         set,
     ));
 

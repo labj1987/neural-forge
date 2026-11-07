@@ -6,6 +6,8 @@ use neural_forge_protocol::enums::hdr_kind;
 
 pub struct SwapchainState {
     pub format: vk::Format,
+    /// The colour space it was created with (`imageColorSpace`): with the format, what the frame's light is.
+    pub color_space: vk::ColorSpaceKHR,
     pub width: u32,
     pub height: u32,
     pub hdr_kind: u32,
@@ -163,35 +165,42 @@ pub fn is_plausible_game_size(width: u32, height: u32) -> bool {
     u64::from(width) * u64::from(height) >= 1280 * 720
 }
 
-/// Whether this is a format the pass can capture, compose onto and present. SDR 8-bit only:
-/// the 10-bit and float formats are *recognised* (see [`detect_hdr_kind`]) but not yet handled.
-/// RGBA16F is captured but never composed back (there is no half-float compose fallback), and
-/// the PQ transfer is not ported, so letting them through would hand the model an unencoded HDR
-/// frame and write an SDR result over it. They present untouched instead.
-///
-/// Widen this list only together with the matching compose path (the tracked follow-up:
-/// the float16 proxy, PQ10 transfer and half-float compose fallback).
-pub fn is_supported_format(format: vk::Format) -> bool {
+/// Whether this is a swapchain the pass can capture, compose onto and present: the 8-bit SDR formats, and
+/// the two 10-bit formats in the HDR10 colour space (`HDR10_ST2084_EXT`), whose frames the model server
+/// converts to SDR for the network and whose composition carries the network's change back in linear light
+/// (docs/NATIVE_BACKEND.md, "HDR on the finished frame (3.10.0)"; `NEURAL_FORGE_HDR_PRESENT=off` leaves them
+/// out). A 10-bit swapchain in an SDR colour space, and the float16 (scRGB) formats, present untouched: the
+/// first is not handled yet, and a float16 frame needs 8 bytes a pixel where the shared regions and the
+/// composition hold 4.
+pub fn is_supported_format(format: vk::Format, color_space: vk::ColorSpaceKHR) -> bool {
+    is_sdr_8bit(format) || (detect_hdr_kind(format, color_space) == hdr_kind::PQ10 && crate::hdr_present::enabled())
+}
+
+fn is_sdr_8bit(format: vk::Format) -> bool {
     matches!(format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB)
 }
 
 /// The `neural_forge_protocol::enums::proxy_format` this swapchain's raw
-/// `vkCmdCopyImageToBuffer` dump actually is -- only meaningful for formats
+/// `vkCmdCopyImageToBuffer` dump actually is -- only meaningful for swapchains
 /// [`is_supported_format`] already accepted. `proxy_format::bytes_per_pixel` is the
 /// single source of truth for the byte count that goes with this; nothing here
 /// duplicates it.
-pub fn proxy_format_for(format: vk::Format) -> u32 {
+pub fn proxy_format_for(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u32 {
+    use neural_forge_protocol::enums::proxy_format;
     match format {
-        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => neural_forge_protocol::enums::proxy_format::BGRA8,
-        vk::Format::R16G16B16A16_SFLOAT => neural_forge_protocol::enums::proxy_format::RGBA16F,
-        _ => neural_forge_protocol::enums::proxy_format::RGBA8,
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => proxy_format::BGRA8,
+        vk::Format::R16G16B16A16_SFLOAT => proxy_format::RGBA16F,
+        vk::Format::A2B10G10R10_UNORM_PACK32 if detect_hdr_kind(format, color_space) == hdr_kind::PQ10 => proxy_format::PQ10_RGB,
+        vk::Format::A2R10G10B10_UNORM_PACK32 if detect_hdr_kind(format, color_space) == hdr_kind::PQ10 => proxy_format::PQ10_BGR,
+        _ => proxy_format::RGBA8,
     }
 }
 
-/// Whether raw capture bytes are B,G,R,A. The protocol now preserves this
-/// format; composition still swizzles only its own pixel math, never SHM bytes.
+/// Whether raw capture bytes put blue first: B,G,R,A (the 8-bit BGRA formats), or blue in the low bits of
+/// the packed word (`A2R10G10B10_UNORM_PACK32`). The protocol preserves this format; composition still
+/// swizzles only its own pixel math, never SHM bytes.
 pub fn is_bgr_order(format: vk::Format) -> bool {
-    matches!(format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB)
+    matches!(format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB | vk::Format::A2R10G10B10_UNORM_PACK32)
 }
 
 /// What a swapchain's format and colour space together say about the light in the
@@ -283,22 +292,42 @@ mod format_tests {
     use super::*;
     use neural_forge_protocol::enums::proxy_format;
     #[test]
-    fn only_sdr_8bit_swapchains_are_composable() {
+    fn sdr_8bit_and_hdr10_swapchains_are_composable() {
+        let srgb = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+        let hdr10 = vk::ColorSpaceKHR::HDR10_ST2084_EXT;
         for f in [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_SRGB] {
-            assert!(is_supported_format(f));
+            assert!(is_supported_format(f, srgb));
         }
-        for f in [vk::Format::A2B10G10R10_UNORM_PACK32, vk::Format::A2R10G10B10_UNORM_PACK32, vk::Format::R16G16B16A16_SFLOAT] {
-            assert!(!is_supported_format(f), "{f:?} must present untouched until a compose path exists");
+        for f in [vk::Format::A2B10G10R10_UNORM_PACK32, vk::Format::A2R10G10B10_UNORM_PACK32] {
+            assert!(is_supported_format(f, hdr10), "{f:?} in HDR10 has the HDR path");
+            assert!(!is_supported_format(f, srgb), "{f:?} in an SDR colour space presents untouched");
+            assert!(!is_supported_format(f, vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT));
+        }
+        for cs in [srgb, hdr10, vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT] {
+            assert!(!is_supported_format(vk::Format::R16G16B16A16_SFLOAT, cs), "float16 (scRGB) presents untouched");
         }
     }
     #[test]
     fn raw_formats_preserve_channel_order_and_size() {
+        let srgb = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+        let hdr10 = vk::ColorSpaceKHR::HDR10_ST2084_EXT;
         for f in [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB] {
-            assert_eq!(proxy_format_for(f), proxy_format::BGRA8);
-            assert_eq!(proxy_format::bytes_per_pixel(proxy_format_for(f)), 4);
-            assert!(proxy_format::is_8bit(proxy_format_for(f)));
+            assert_eq!(proxy_format_for(f, srgb), proxy_format::BGRA8);
+            assert_eq!(proxy_format::bytes_per_pixel(proxy_format_for(f, srgb)), 4);
+            assert!(proxy_format::is_8bit(proxy_format_for(f, srgb)));
+            assert!(is_bgr_order(f));
         }
-        assert_eq!(proxy_format_for(vk::Format::R8G8B8A8_UNORM), proxy_format::RGBA8);
+        assert_eq!(proxy_format_for(vk::Format::R8G8B8A8_UNORM, srgb), proxy_format::RGBA8);
         assert!(!proxy_format::is_8bit(proxy_format::RGBA16F));
+        let rgb = proxy_format_for(vk::Format::A2B10G10R10_UNORM_PACK32, hdr10);
+        let bgr = proxy_format_for(vk::Format::A2R10G10B10_UNORM_PACK32, hdr10);
+        assert_eq!((rgb, bgr), (proxy_format::PQ10_RGB, proxy_format::PQ10_BGR));
+        for f in [rgb, bgr] {
+            assert!(proxy_format::is_pq10(f) && !proxy_format::is_8bit(f));
+            assert_eq!(proxy_format::bytes_per_pixel(f), 4, "the shared regions' size does not change");
+        }
+        assert!(!is_bgr_order(vk::Format::A2B10G10R10_UNORM_PACK32));
+        assert!(is_bgr_order(vk::Format::A2R10G10B10_UNORM_PACK32));
+        assert!(!proxy_format::is_pq10(proxy_format::RGBA8) && !proxy_format::is_pq10(proxy_format::BGRA8));
     }
 }
