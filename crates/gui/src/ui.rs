@@ -120,6 +120,7 @@ fn spin_row_scaled(title: &str, subtitle: &str, value: f32, setting: &str, step:
         }
     });
     if let Some((kind, read)) = crate::shm::take_pending_reader() {
+        mark_game_override(row.upcast_ref());
         let adjustment = adjustment.clone();
         register_refresher(move || {
             let bits = read();
@@ -191,6 +192,7 @@ fn switch_row(title: &str, subtitle: &str, active: bool, setter: impl Fn(bool) +
         }
     });
     if let Some((_, read)) = crate::shm::take_pending_reader() {
+        mark_game_override(row.upcast_ref());
         let row = row.downgrade();
         register_refresher(move || {
             if let Some(row) = row.upgrade() {
@@ -217,6 +219,7 @@ fn combo_row(title: &str, options: &[&str], selected: u32, setter: impl Fn(u32) 
         }
     });
     if let Some((_, read)) = crate::shm::take_pending_reader() {
+        mark_game_override(row.upcast_ref());
         let row = row.downgrade();
         register_refresher(move || {
             if let Some(row) = row.upgrade() {
@@ -251,6 +254,7 @@ fn scale_row(title: &str, subtitle: &str, value: f32, setter: impl Fn(f32) + 'st
         }
     });
     if let Some((_, read)) = crate::shm::take_pending_reader() {
+        mark_game_override(row.upcast_ref());
         let row = row.downgrade();
         register_refresher(move || {
             if let Some(row) = row.upgrade() {
@@ -352,6 +356,9 @@ fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
         .title("Toggle key")
         .subtitle("Toggles Neural Forge inside a running game. Needs read access to /dev/input (the 'input' group) or an X11/XWayland session.")
         .build();
+    if reader.is_some() {
+        mark_game_override(&row);
+    }
     let label = key_label;
     let button = gtk4::Button::with_label(&label(initial));
     button.set_valign(gtk4::Align::Center);
@@ -797,6 +804,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_page.add(&model_group);
     model_page.add(&build_colour_group(&shm, &toasts));
     model_page.add(&build_hud_group(&shm));
+    model_page.add(&build_sharpen_group(&shm));
     view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", "applications-graphics-symbolic");
 
     // Model resolution and model-every-Nth-frame apply after the upscaler only: shown while a game runs
@@ -890,9 +898,18 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let switcher_bar = adw::ViewSwitcherBar::new();
     switcher_bar.set_stack(Some(&view_stack));
 
+    let scope_bar = build_scope_bar(&shm, &toasts);
+    // The Setup tab edits no setting.
+    {
+        let scope_bar = scope_bar.clone();
+        view_stack.connect_visible_child_name_notify(move |stack| scope_bar.set_visible(stack.visible_child_name().as_deref() != Some("setup")));
+    }
+    scope_bar.set_visible(view_stack.visible_child_name().as_deref() != Some("setup"));
+
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.add_top_bar(&banner);
+    toolbar_view.add_top_bar(&scope_bar);
     toolbar_view.set_content(Some(&view_stack));
     toolbar_view.add_bottom_bar(&switcher_bar);
     toasts.set_child(Some(&toolbar_view));
@@ -979,6 +996,354 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     }
 
     window.present();
+}
+
+/// The state the rows' per-game marks follow: the game whose settings are shown (`None`: all games'), its
+/// own settings, and what a mark's button needs to drop one.
+#[derive(Default)]
+struct OverrideMarks {
+    /// Each marked row's setting and its mark (held weakly: the per-pass dialog's rows come and go).
+    marks: Vec<(&'static str, glib::WeakRef<gtk4::Box>)>,
+    game: Option<neural_forge_supervisor::game_settings::GameKey>,
+    own: neural_forge_supervisor::game_settings::Section,
+    shm: Option<std::sync::Arc<neural_forge_protocol::mapping::Mapping>>,
+    toasts: Option<adw::ToastOverlay>,
+}
+
+thread_local! {
+    static OVERRIDE_MARKS: std::cell::RefCell<OverrideMarks> = std::cell::RefCell::new(OverrideMarks::default());
+}
+
+/// Whether the row of setting `name` shows the "This game" mark: a game is picked and it has its own value of
+/// that setting. Rows following All games (and every row while All games is picked) stay unmarked.
+fn override_marked(name: &str, game: Option<&neural_forge_supervisor::game_settings::GameKey>, own: &neural_forge_supervisor::game_settings::Section) -> bool {
+    game.is_some() && own.contains_key(&format!("set_{name}"))
+}
+
+/// Gives `row` (built for the setting its binding named) the per-game mark: a "This game" tag and a button
+/// that drops this one setting of the game's own, shown while the game picked in "Settings for" has its own
+/// value of it.
+fn mark_game_override(row: &adw::ActionRow) {
+    let Some(name) = crate::shm::take_pending_name() else { return };
+    let mark = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    mark.set_valign(gtk4::Align::Center);
+    let tag = gtk4::Label::new(Some("This game"));
+    tag.add_css_class("caption-heading");
+    tag.add_css_class("accent");
+    tag.set_tooltip_text(Some("This game's own value: the All games value does not apply to it"));
+    let drop = gtk4::Button::from_icon_name("edit-undo-symbolic");
+    drop.add_css_class("flat");
+    drop.add_css_class("circular");
+    drop.set_valign(gtk4::Align::Center);
+    drop.set_tooltip_text(Some("Use the All games value again"));
+    drop.connect_clicked(move |_| drop_game_override(name));
+    mark.append(&tag);
+    mark.append(&drop);
+    // Beside the row's own control, so the titles of marked and unmarked rows stay in line.
+    row.add_suffix(&mark);
+    OVERRIDE_MARKS.with(|m| {
+        let mut m = m.borrow_mut();
+        mark.set_visible(override_marked(name, m.game.as_ref(), &m.own));
+        m.marks.push((name, mark.downgrade()));
+    });
+}
+
+/// Shows each row's mark for `game`'s own settings `own` (`None`: all games', no marks).
+fn update_override_marks(
+    shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>,
+    toasts: &adw::ToastOverlay,
+    game: Option<&neural_forge_supervisor::game_settings::GameKey>,
+    own: neural_forge_supervisor::game_settings::Section,
+) {
+    OVERRIDE_MARKS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.shm.get_or_insert_with(|| std::sync::Arc::clone(shm));
+        m.toasts.get_or_insert_with(|| toasts.clone());
+        m.game = game.cloned();
+        m.own = own;
+        let OverrideMarks { marks, game, own, .. } = &mut *m;
+        marks.retain(|(name, mark)| match mark.upgrade() {
+            Some(mark) => {
+                let shown = override_marked(name, game.as_ref(), own);
+                if mark.is_visible() != shown {
+                    mark.set_visible(shown);
+                }
+                true
+            }
+            None => false,
+        });
+    });
+}
+
+/// A mark's button: drops the picked game's own value of `name` (`game-settings clear GAME NAME`), so the
+/// game follows All games for it again, and shows (and runs, if the channel holds the game's settings) the
+/// result.
+fn drop_game_override(name: &'static str) {
+    use neural_forge_supervisor::game_settings;
+    let (game, shm, toasts) = OVERRIDE_MARKS.with(|m| {
+        let m = m.borrow();
+        (m.game.clone(), m.shm.clone(), m.toasts.clone())
+    });
+    let (Some(game), Some(shm)) = (game, shm) else { return };
+    let say = |text: String| match &toasts {
+        Some(toasts) => toasts.add_toast(toast(&text)),
+        None => eprintln!("neural-forge: {text}"),
+    };
+    // A change still waiting is saved first, so it cannot write the value back.
+    if let Err(e) = crate::shm::flush_settings() {
+        say(format!("Saving the settings failed: {e}"));
+    }
+    match game_settings::clear(&game, Some(&format!("set_{name}"))) {
+        Ok(_) => {
+            if shm.header().settings_game() == game.scope() {
+                neural_forge_protocol::persist::apply_scope(shm.header(), Some(&game));
+                refresh_all_rows();
+            }
+            let own = game_settings::overrides(&game_settings::load_all(), &game);
+            let toasts = OVERRIDE_MARKS.with(|m| m.borrow().toasts.clone());
+            if let Some(toasts) = &toasts {
+                update_override_marks(&shm, toasts, Some(&game), own);
+            }
+            say(format!("{name} follows All games again"));
+        }
+        Err(e) => say(format!("Not changed: {e}")),
+    }
+}
+
+/// One entry of the "Settings for" menu: all games (`None`) or one game, and its label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScopeEntry {
+    game: Option<neural_forge_supervisor::game_settings::GameKey>,
+    label: String,
+}
+
+/// The "Settings for" menu's entries: All games, the installed Steam games by name (`steam`: app id and
+/// name), then every other game with settings of its own, and `extra` (the game on the channel, the game
+/// whose settings it holds), each once.
+fn scope_entries(
+    steam: &[(String, String)],
+    with_settings: &[neural_forge_supervisor::game_settings::GameKey],
+    extra: &[neural_forge_supervisor::game_settings::GameKey],
+) -> Vec<ScopeEntry> {
+    use neural_forge_supervisor::game_settings::GameKey;
+    let mut entries = vec![ScopeEntry { game: None, label: "All games".into() }];
+    let mut games: Vec<(String, GameKey)> = steam.iter().filter_map(|(appid, name)| GameKey::parse(appid).map(|key| (name.clone(), key))).collect();
+    games.sort_by_key(|a| a.0.to_lowercase());
+    for (label, game) in games {
+        if !entries.iter().any(|e| e.game.as_ref() == Some(&game)) {
+            entries.push(ScopeEntry { game: Some(game), label });
+        }
+    }
+    for game in with_settings.iter().chain(extra) {
+        if !entries.iter().any(|e| e.game.as_ref() == Some(game)) {
+            let label = match game {
+                GameKey::Steam(id) => format!("Steam app {id}"),
+                GameKey::Exe(name) => name.clone(),
+            };
+            entries.push(ScopeEntry { game: Some(game.clone()), label });
+        }
+    }
+    entries
+}
+
+/// The line beside the menu: what the chosen settings are, how many the game has of its own and whether it
+/// runs now.
+fn scope_summary(game: Option<&neural_forge_supervisor::game_settings::GameKey>, own: usize, shipped: usize, running: bool) -> String {
+    let what = match game {
+        None => "Every game without settings of its own uses these".to_string(),
+        Some(_) if own == 0 && shipped == 0 => "Same as All games until you change something here".to_string(),
+        Some(_) => {
+            let mut parts = Vec::new();
+            if own > 0 {
+                parts.push(format!("{own} setting{} of its own", if own == 1 { "" } else { "s" }));
+            }
+            if shipped > 0 {
+                parts.push(format!("{shipped} built in"));
+            }
+            format!("{}; the rest follow All games", parts.join(", "))
+        }
+    };
+    if running {
+        format!("Running now. {what}")
+    } else {
+        what
+    }
+}
+
+/// The bar under the header: whose settings the tabs show and edit ("Settings for": All games or one game)
+/// and "Restore defaults" for a game. The tabs show the header's settings; choosing an entry puts that
+/// game's merge on the channel (`persist::apply_scope`), so the game running shows them while you edit, and
+/// every change is saved to the entry chosen (`game_settings::save_live`). A game's session starting puts
+/// its own settings on the channel, and the menu follows the header.
+fn build_scope_bar(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> gtk4::Box {
+    use neural_forge_supervisor::game_settings::{self, GameKey};
+    // The menu and the button on one line, what the entry holds on the line below.
+    let bar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    bar.add_css_class("toolbar");
+    bar.set_margin_start(6);
+    bar.set_margin_end(6);
+    let line = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    let title = gtk4::Label::new(Some("Settings for"));
+    title.add_css_class("heading");
+    let model = gtk4::StringList::new(&[]);
+    let menu =
+        gtk4::DropDown::new(Some(model.clone()), Some(gtk4::PropertyExpression::new(gtk4::StringObject::static_type(), None::<&gtk4::Expression>, "string")));
+    menu.set_enable_search(true);
+    menu.set_tooltip_text(Some("Whose settings the tabs show and change: all games', or one game's own"));
+    menu.set_hexpand(true);
+    let summary = gtk4::Label::new(None);
+    summary.add_css_class("dim-label");
+    summary.add_css_class("caption");
+    summary.set_xalign(0.0);
+    summary.set_wrap(true);
+    summary.set_margin_start(6);
+    summary.set_margin_bottom(6);
+    let restore = gtk4::Button::with_label("Restore defaults");
+    restore.set_tooltip_text(Some("Remove this game's own settings: it uses the settings for all games again"));
+    line.append(&title);
+    line.append(&menu);
+    line.append(&restore);
+    bar.append(&line);
+    bar.append(&summary);
+
+    let entries: std::rc::Rc<std::cell::RefCell<Vec<ScopeEntry>>> = std::rc::Rc::default();
+    let steam: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>> = std::rc::Rc::default();
+    // Set while this code changes the menu, so it does not react to itself.
+    let syncing = std::rc::Rc::new(std::cell::Cell::new(false));
+    let live = std::rc::Rc::new(Liveness::default());
+
+    let selected_game = {
+        let (menu, entries) = (menu.clone(), entries.clone());
+        move || entries.borrow().get(menu.selected() as usize).and_then(|e| e.game.clone())
+    };
+    // The menu brought in line with the header: its entries (a game the header names that the menu lacks is
+    // added), the entry whose settings it holds, the summary and the button.
+    let sync = {
+        let (menu, model, entries, steam, syncing, live, summary, restore, shm, toasts) = (
+            menu.clone(),
+            model.clone(),
+            entries.clone(),
+            steam.clone(),
+            syncing.clone(),
+            live.clone(),
+            summary.clone(),
+            restore.clone(),
+            std::sync::Arc::clone(shm),
+            toasts.clone(),
+        );
+        std::rc::Rc::new(move || {
+            let hdr = shm.header();
+            let sections = game_settings::load_all();
+            let held = game_settings::held_game(hdr);
+            // The game on the channel: by app id, or by the executable the layer names.
+            let on_channel: Vec<GameKey> = GameKey::exe(&hdr.game_name()).into_iter().collect();
+            let running = neural_forge_protocol::games::key_for_scope(hdr.running_game.load(Ordering::Relaxed), &sections, &on_channel);
+            let extra: Vec<GameKey> = held.iter().chain(running.iter()).cloned().collect();
+            let wanted = scope_entries(&steam.borrow(), &game_settings::games_with_settings(&sections), &extra);
+            if *entries.borrow() != wanted {
+                syncing.set(true);
+                let labels: Vec<&str> = wanted.iter().map(|e| e.label.as_str()).collect();
+                model.splice(0, model.n_items(), &labels);
+                *entries.borrow_mut() = wanted;
+                syncing.set(false);
+            }
+            let scope = hdr.settings_game();
+            let at = entries.borrow().iter().position(|e| e.game.as_ref().map_or(0, GameKey::scope) == scope);
+            if let Some(at) = at.map(|at| at as u32) {
+                if menu.selected() != at {
+                    syncing.set(true);
+                    menu.set_selected(at);
+                    syncing.set(false);
+                }
+            }
+            let game = entries.borrow().get(menu.selected() as usize).and_then(|e| e.game.clone());
+            let own_settings = game.as_ref().map(|g| game_settings::overrides(&sections, g)).unwrap_or_default();
+            let own = own_settings.len();
+            update_override_marks(&shm, &toasts, game.as_ref(), own_settings);
+            let shipped = game.as_ref().and_then(neural_forge_protocol::games::shipped).map_or(0, <[_]>::len);
+            let running_now = live.alive(hdr) && game.as_ref().map_or(0, GameKey::scope) == hdr.running_game.load(Ordering::Relaxed) && game.is_some();
+            summary.set_text(&scope_summary(game.as_ref(), own, shipped, running_now));
+            restore.set_sensitive(own > 0);
+        })
+    };
+    sync();
+    {
+        let sync = std::rc::Rc::clone(&sync);
+        every(&bar, SECOND, move |_| sync());
+    }
+    // The installed Steam games' names, read on a worker thread like the Setup tab's list.
+    {
+        let (steam, sync) = (steam.clone(), std::rc::Rc::clone(&sync));
+        glib::spawn_future_local(async move {
+            let found = gio::spawn_blocking(|| {
+                use neural_forge_supervisor::steam;
+                steam::games(&steam::roots()).into_iter().map(|g| (g.appid, g.name)).collect::<Vec<_>>()
+            })
+            .await;
+            if let Ok(found) = found {
+                *steam.borrow_mut() = found;
+                sync();
+            }
+        });
+    }
+    {
+        let (shm, toasts, syncing, sync, entries) = (std::sync::Arc::clone(shm), toasts.clone(), syncing.clone(), std::rc::Rc::clone(&sync), entries.clone());
+        menu.connect_selected_notify(move |menu| {
+            if syncing.get() {
+                return;
+            }
+            let Some(entry) = entries.borrow().get(menu.selected() as usize).cloned() else { return };
+            // A change still waiting is saved to the settings it was made in, before the header holds another's.
+            if let Err(e) = crate::shm::flush_settings() {
+                toasts.add_toast(toast(&format!("Saving the settings failed: {e}")));
+            }
+            neural_forge_protocol::persist::apply_scope(shm.header(), entry.game.as_ref());
+            refresh_all_rows();
+            sync();
+        });
+    }
+    {
+        let (shm, toasts, sync) = (std::sync::Arc::clone(shm), toasts.clone(), std::rc::Rc::clone(&sync));
+        let label_of = {
+            let (menu, entries) = (menu.clone(), entries.clone());
+            move || entries.borrow().get(menu.selected() as usize).map(|e| e.label.clone()).unwrap_or_default()
+        };
+        restore.connect_clicked(move |button| {
+            let Some(game) = selected_game() else { return };
+            let name = label_of();
+            let dialog = adw::AlertDialog::builder()
+                .heading(format!("Restore the defaults for {name}?"))
+                .body("Its own settings are removed: it uses the settings for all games again (with any Neural Forge has built in for it).")
+                .default_response("cancel")
+                .close_response("cancel")
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("restore", "Restore");
+            dialog.set_response_appearance("restore", adw::ResponseAppearance::Destructive);
+            let (shm, toasts, sync) = (std::sync::Arc::clone(&shm), toasts.clone(), std::rc::Rc::clone(&sync));
+            dialog.choose(button.root().and_downcast::<gtk4::Window>().as_ref(), None::<&gio::Cancellable>, move |response| {
+                if response != "restore" {
+                    return;
+                }
+                if let Err(e) = crate::shm::flush_settings() {
+                    toasts.add_toast(toast(&format!("Saving the settings failed: {e}")));
+                }
+                match game_settings::clear(&game, None) {
+                    Ok(_) => {
+                        // Shown (and running, if it is the game on the channel) as it now is.
+                        if shm.header().settings_game() == game.scope() {
+                            neural_forge_protocol::persist::apply_scope(shm.header(), Some(&game));
+                            refresh_all_rows();
+                        }
+                        toasts.add_toast(toast(&format!("Restored the defaults for {name}")));
+                    }
+                    Err(e) => toasts.add_toast(toast(&format!("Not restored: {e}"))),
+                }
+                sync();
+            });
+        });
+    }
+    bar
 }
 
 /// The Model tab's Colour group: the colour of the network's edit (its change to the frame) for every pass
@@ -1173,6 +1538,53 @@ fn placement_row(selected: u32, setter: impl Fn(u32) + 'static) -> adw::ComboRow
     row
 }
 
+/// The sharpening of the finished frame (`crate::sharpen` in the layer): FidelityFX CAS and Clarity, both off at 0,
+/// applied to every presented frame after everything else, the HUD regions kept out of it.
+fn build_sharpen_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Sharpening");
+    group.set_description(Some("On the finished frame, after the model, in every game; the HUD regions above stay untouched. 0 is off"));
+    let (v, set) = bind_float(shm, Some("sharpen_cas"), |h| &h.sharpen_cas_bits);
+    group.add(&spin_row(
+        "Adaptive sharpening (CAS)",
+        "AMD FidelityFX CAS: sharpens fine detail, less where it is already sharp (0 off, about 0.7 CAS's own default, 1 strongest)",
+        v,
+        "sharpen_cas",
+        0.05,
+        set,
+    ));
+    let (v, set) = bind_float(shm, Some("clarity_strength"), |h| &h.clarity_strength_bits);
+    group.add(&spin_row(
+        "Clarity",
+        "Local contrast of brightness: lifts mid-size detail and texture without changing colours (0 off)",
+        v,
+        "clarity_strength",
+        0.05,
+        set,
+    ));
+    let (v, set) = bind_float(shm, Some("clarity_radius"), |h| &h.clarity_radius_bits);
+    group.add(&spin_row(
+        "Clarity radius",
+        "The size of the detail Clarity lifts, in pixels at 1440p (scaled with the resolution)",
+        v,
+        "clarity_radius",
+        1.0,
+        set,
+    ));
+    let (v, set) = bind_float(shm, Some("clarity_midtones"), |h| &h.clarity_midtones_bits);
+    group.add(&spin_row("Clarity midtones", "Keeps Clarity off the darkest and brightest parts (0 evenly, 1 midtones only)", v, "clarity_midtones", 0.05, set));
+    let (v, set) = bind_float(shm, Some("clarity_edges"), |h| &h.clarity_edges_bits);
+    group.add(&spin_row(
+        "Clarity edge protection",
+        "Stops Clarity at strong edges, against bright or dark halos around them (0 off, 1 most)",
+        v,
+        "clarity_edges",
+        0.05,
+        set,
+    ));
+    group
+}
+
 /// The HUD on the finished frame (the Placement "Finished frame", or where the model runs there anyway): the
 /// detection and the user's regions, a list of rectangles in percent of the frame.
 fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
@@ -1180,7 +1592,9 @@ fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>
     use std::rc::Rc;
     let group = adw::PreferencesGroup::new();
     group.set_title("HUD on the finished frame");
-    group.set_description(Some("Only where the model runs on the presented frame, HUD included. Before the upscaler and after DLSS the HUD is not drawn yet"));
+    group.set_description(Some(
+        "Only where the model runs on the presented frame, HUD included (before the upscaler and after DLSS the HUD is not drawn yet). The regions also keep the sharpening off the HUD",
+    ));
     let (v, set) = bind_bool(shm, Some("hud_detect"), |h| &h.hud_detect);
     group.add(&switch_row("Find the HUD", "Keep the edit off what stays still and sharp while the picture moves (text, icons, the minimap)", v, set));
     let list = gtk4::ListBox::new();
@@ -2453,8 +2867,8 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             let dialog = adw::AlertDialog::builder()
                 .heading("Reset all settings?")
                 .body(
-                    "Every tuning value returns to its default. The running layer \
-                       session (frame counters, transport state) is not affected.",
+                    "Every tuning value of the settings shown (Settings for, at the top) returns to its \
+                       default. The running layer session (frame counters, transport state) is not affected.",
                 )
                 .default_response("cancel")
                 .close_response("cancel")
@@ -2472,13 +2886,9 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
                 // same two places `persist_one` already keeps in sync for a single
                 // setting, done here for all of them at once.
                 shm.header().reset_persisted_settings();
-                let mut cfg = neural_forge_supervisor::Config::load();
-                for (name, value) in neural_forge_protocol::persist::snapshot(shm.header()) {
-                    cfg.settings.insert(name, value);
-                }
-                match cfg.save() {
+                match neural_forge_supervisor::save_settings(shm.header()) {
                     Ok(()) => toasts.add_toast(toast("Settings reset")),
-                    Err(e) => toasts.add_toast(toast(&format!("Reset the live session, but saving config.ini failed: {e}"))),
+                    Err(e) => toasts.add_toast(toast(&format!("Reset the live session, but saving the settings failed: {e}"))),
                 }
             });
         });
@@ -2544,13 +2954,11 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             };
             neural_forge_protocol::persist::apply(shm.header(), settings);
             // Same reasoning as the reset button above: applying to the live header
-            // only affects the running session, so also fold the result into
-            // config.ini via a fresh snapshot so it survives a reboot too.
-            let mut cfg = neural_forge_supervisor::Config::load();
-            cfg.replace_tuning(neural_forge_protocol::persist::snapshot(shm.header()));
-            let message = match cfg.save() {
+            // only affects the running session, so also save the result (to the settings
+            // the header holds: all games' or the game's) so it survives a reboot too.
+            let message = match neural_forge_supervisor::save_settings(shm.header()) {
                 Ok(()) => format!("Loaded profile \"{name}\""),
-                Err(e) => format!("Applied to the running session, but saving config.ini failed: {e}"),
+                Err(e) => format!("Applied to the running session, but saving the settings failed: {e}"),
             };
             toasts.add_toast(toast(&message));
         });
@@ -2884,7 +3292,42 @@ fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::map
 
 #[cfg(test)]
 mod spin_precision_tests {
-    use super::{decimals, kept_spin_value, spin_digits};
+    use super::{decimals, kept_spin_value, override_marked, scope_entries, scope_summary, spin_digits};
+
+    #[test]
+    fn the_settings_menu_lists_all_games_then_each_game_once() {
+        use neural_forge_supervisor::game_settings::GameKey;
+        let steam = [("3240220".to_string(), "Grand Theft Auto V Enhanced".to_string()), ("990080".to_string(), "Hogwarts Legacy".to_string())];
+        let with = [GameKey::Steam(990080), GameKey::Exe("other.exe".into()), GameKey::Steam(570)];
+        let entries = scope_entries(&steam, &with, &[GameKey::Exe("other.exe".into()), GameKey::Exe("running.exe".into())]);
+        let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, ["All games", "Grand Theft Auto V Enhanced", "Hogwarts Legacy", "other.exe", "Steam app 570", "running.exe"]);
+        assert_eq!(entries[0].game, None);
+        assert_eq!(entries[2].game, Some(GameKey::Steam(990080)));
+    }
+
+    #[test]
+    fn only_the_rows_a_picked_game_overrides_are_marked() {
+        use neural_forge_supervisor::game_settings::GameKey;
+        let own: neural_forge_supervisor::game_settings::Section =
+            [("set_intensity", "0.75"), ("set_placement", "1"), ("set_pass2_intensity", "0.5")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let game = GameKey::Steam(3240220);
+        let rows = ["intensity", "local_tone", "placement", "pass2_intensity", "pass2_local_tone", "enabled"];
+        let marked: Vec<&str> = rows.iter().copied().filter(|name| override_marked(name, Some(&game), &own)).collect();
+        assert_eq!(marked, ["intensity", "placement", "pass2_intensity"]);
+        assert!(rows.iter().all(|name| !override_marked(name, None, &own)), "All games: no marks");
+        assert!(rows.iter().all(|name| !override_marked(name, Some(&game), &Default::default())), "a game without its own: no marks");
+    }
+
+    #[test]
+    fn the_settings_line_says_what_the_entry_holds() {
+        use neural_forge_supervisor::game_settings::GameKey;
+        let game = GameKey::Steam(570);
+        assert_eq!(scope_summary(None, 0, 0, false), "Every game without settings of its own uses these");
+        assert_eq!(scope_summary(Some(&game), 0, 0, false), "Same as All games until you change something here");
+        assert_eq!(scope_summary(Some(&game), 1, 0, true), "Running now. 1 setting of its own; the rest follow All games");
+        assert_eq!(scope_summary(Some(&game), 3, 2, false), "3 settings of its own, 2 built in; the rest follow All games");
+    }
 
     #[test]
     fn a_row_shows_the_decimals_its_step_and_value_have() {

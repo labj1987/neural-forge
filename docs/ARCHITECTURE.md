@@ -123,7 +123,13 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   2532, f32 bits, written by the layer for the Status tab's graph), then the protections of each pass's result
   against its input (v23, f32 bits, 0-1, default 0): `edit_hue_protection` (2536), `edit_neutral_protection`
   (2540), `edit_shadow_protection` (2544) and `edit_highlight_protection` (2548; NATIVE_BACKEND.md, "The colour of
-  the edit"); the header ends at 2552. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
+  the edit"); then whose settings the header holds (v24): `settings_game` (2552: 0 all games, else the game's
+  scope, `games::GameKey::scope`: its Steam app id, or 2^31 plus 31 bits of an FNV-1a hash of its executable's
+  name), written with the settings in one unit, and `running_game` (2556, the scope of the game whose layer
+  started the latest session on the channel, 0 before one has; 7.3), then the sharpening of the finished frame (f32 bits): `sharpen_cas` (2560, 0-1, default 0),
+  `clarity_strength` (2564, 0-2, default 0), `clarity_radius` (2568, 2-64, default 16), `clarity_midtones` (2572,
+  0-1, default 0.5) and `clarity_edges` (2576, 0-1, default 0.5; `crate::sharpen`, USER_GUIDE.md, "Sharpening");
+  the header ends at 2580. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
   `persist::HUD_REGIONS`), the one setting that is not a number. NATIVE_BACKEND.md, "Where the model runs"
   and "The HUD at present".
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
@@ -198,6 +204,7 @@ be private.
 | 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended; then the colour of the edit (`edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`, `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`) and `pass_colour[10]` (override bits `EDIT_SATURATION` 128, `EDIT_CONTRAST` 256, `EDIT_DETAIL` 512); then `placement`, `pass_placement[10]` (override bit `PLACEMENT` 1024), `hud_detect`, `hud_region_count` and `hud_region[8]` | 3.8.0 |
 | 22 | `preupscale_brightness` and `preupscale_exposure` (what the network sees before the upscaler: its brightness and where the exposure comes from) and `preupscale_network_gpu_ms` (the network's GPU time on its last hold) appended | 3.8.10 |
 | 23 | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection` and `edit_highlight_protection` (the Oklab protections of each pass's result against its input) appended | 3.10.0 |
+| 24 | `settings_game` (whose settings the header holds: all games or one game's) and `running_game` (the game whose layer holds the channel), then `sharpen_cas`, `clarity_strength`, `clarity_radius`, `clarity_midtones` and `clarity_edges` (the sharpening of the finished frame: FidelityFX CAS and Clarity) appended | unreleased |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.
@@ -387,7 +394,10 @@ sequenceDiagram
    intensity and keeps the answer as the next frame's history. The history is reset after a frame
    that went to DLSS untouched, after 500 ms without a frame, on another extent, after a frame
    whose exposure was unusable, or on a scene cut (the frame `C` marked; read by both shaders on the
-   same frame, for every pass; a cut on a cached hold resets the next network frame instead).
+   same frame, for every pass; a cut on a cached hold resets the next network frame instead), when the
+   exposure the encode used changed by more than a stop since the previous network frame (both shaders,
+   the same frame), and when the game resets DLSS's history (word 4 of the 310.x input kernel's parameters; DLSSNR_PARAMETERS.md,
+   "History reset").
 4. **Write back and decode** (`W`): the decode shader inverts the encode and writes the colour input
    in place, cropping the padding, keeping the original pixel (all three channels, so no hue turns)
    where the encoded input's peak channel was clamped and keeping the original alpha; a closing
@@ -626,7 +636,7 @@ directly as 3.2.0's did; the picture is bit for bit 3.2.0's (the test
 - **When a hold is cached** (`cache::State::plan`): within the regime's interval after a refresh that stored
   an edit, the very next DLSS submit after the previous hold (any frame that went to DLSS untouched
   breaks it), the network's history still good (`HistoryGap::pending`: no skip, no other extent, under
-  500 ms, no scene cut on the hold before: such a cut also drops the stored edit), jitter, vectors, the same depth presence as the refresh, no cache dump armed. A hold that
+  500 ms, no scene cut on the hold before and no reset by the game on this one: both also drop the stored edit), jitter, vectors, the same depth presence as the refresh, no cache dump armed. A hold that
   misses for any reason takes the stored edit with it. Cached holds keep the network's history as it
   is (parity, seed, `last_jitter`), call `claim_pre` and set `evaluated` like a refresh, and
   `HistoryGap::touch` so the 500 ms rule counts from the last hold, not the last network frame.
@@ -785,6 +795,22 @@ cancelled. A request left waiting when a game's layer opens the channel is dropp
 fires on a game started later; the GUI and `shmctl` withdraw a request no game took within 5 s.
 With `NEURAL_FORGE_PREUPSCALE=dump` the one-shot is the pre-upscaler dump's.
 
+### 5.8 Sharpening at present
+
+`crates/layer/src/sharpen.rs`, `shaders/present_sharpen.comp`; settings SHM v24 (`sharpen_cas`, `clarity_*`) or
+`NEURAL_FORGE_SHARPEN`. With a filter on, the present hook sharpens the presented swapchain image of the primary
+swapchain on every path (model before the upscaler, after DLSS, at present, or none): one submit on the present's
+queue that copies the image into a buffer as raw words (8-bit RGBA/BGRA, or HDR10's 10-bit words), runs CAS (ported
+from FidelityFX CAS, MIT) and Clarity (half-size luma, an edge-stopped separable Gaussian base, the luma detail
+weighted toward the midtones and added to the three channels), moves the result back toward the frame inside the HUD
+regions, and copies it back. It relays the application's present waits first when nothing else did, and its own
+semaphore (one a swapchain image, retired and freed like the relay's) is added to the present's waits. Where frames
+are held in the game's frame it runs before a capture's readback, so captures show it; on the after-the-upscaler path
+it runs after the composition and the capture. Off (the default) nothing is read, relayed, allocated or submitted.
+Buffers: 2 x 4 bytes a pixel plus 3 x 1 byte a pixel (about 41 MB at 1440p, made on first use), shared by three command-buffer slots and
+ordered by the queue. GPU time on the RTX 5070 at 2560x1440 (median of 200): CAS 0.29 ms, Clarity r16 0.33, both 0.37,
+Clarity r64 0.43 (LESSONS.md, "November 9: sharpening the finished frame").
+
 ## 6. The network
 
 `crates/native` (the network's C++ from OpenDLSS-NR, in `third_party/opendlss-nr`, `cpp/nf_native.cpp` glue, kernels built and embedded
@@ -828,8 +854,8 @@ such as a strength preset, as one unit under `tuning_seq`). The layer reads them
 hold applies a change at the next frame. The GUI's periodic updates hold their widgets weakly and
 stop when the window closes; liveness everywhere is one rule (the heartbeat moved within 2 s), and
 the Setup tab reads Steam on a worker thread.
-Saved settings live in `~/.config/neural-forge/config.ini` as `set_<name>=` and are applied by the
-layer when it creates the header. Status comes from heartbeats and counters, refreshed once a
+Saved settings live in `~/.config/neural-forge/config.ini` as `set_<name>=` (all games) and
+`games.ini` (each game's own, 7.3), and are applied by the layer when its session on the channel starts. Status comes from heartbeats and counters, refreshed once a
 second; the Status tab's "Model placement" line is `preupscale_state` with the extent, misses and
 the layer's status line (`layer_reason`; a device that cannot run the network is published there as
 "device cannot run the network: <first missing>" when the layer opens the channel).
@@ -903,6 +929,40 @@ root's app cache once for all games; `candidates` ranks the folder's executables
 per-game target editor. A game's app manifest found twice is the copy whose folder exists, fully
 installed, written last. Switching
 off removes it with the rest; switching on again writes it again.
+
+### 7.3 Per-game settings
+
+`crates/protocol/src/games.rs` owns the format and the merge, so the layer and the front ends read the
+same way. A game is a `GameKey`: its Steam app id (the `SteamAppId` Steam puts in the game's environment,
+else Proton's `STEAM_COMPAT_APP_ID`; a Steam launch of GTA V Enhanced has `SteamAppId`, `STEAM_COMPAT_APP_ID` and
+`SteamGameId` all 3240220; 0 and a non-Steam shortcut's id above 2^31 do not count), else its
+executable's file name, lowercase (`ownership::process_name`, the Windows `.exe` under Proton). `games.ini`
+next to `config.ini` holds one section per game (`[570]`, `[exe:game.exe]`) with only the `set_` lines that
+differ; other lines and sections are kept on every rewrite. The merge, lowest first: the defaults
+(`persist::defaults`), `config.ini`, the overrides shipped in `games::SHIPPED` (empty: no tested game needs its
+own), the user's section.
+
+**Where it is applied.** The layer, when its session on the channel starts (`shm.rs::start_session`, a new lease
+generation; the fresh-header apply of `config.ini` moved there too): `persist::apply_for_game` stores the game's
+scope in `running_game`, and writes the game's merge with `settings_game` = its scope in one unit under
+`tuning_seq` when the game has settings of its own; a game without any gets the settings for all games (scope 0)
+only where the header holds another game's or is fresh (then only if nothing wrote first, as before), and
+otherwise the header is left as the GUI and the CLI keep it. It runs on the game's thread and never waits
+(`write_game_settings_without_waiting`; what it cannot write at once the writer thread writes). Because the
+merge starts from the defaults, a setting only the previous game overrode goes back too. One game holds the
+channel at a time (the lease), so two games at once never fight over it: the one holding the lease has its
+settings; a game that takes the lease over later applies its own when its session starts.
+
+**Saving.** Live changes still go straight into the header. Saving them
+(`supervisor::game_settings::save_live`, used by the GUI's delayed save, Reset, profiles and `shmctl`) reads
+`settings_game`: 0 writes `config.ini` as before; a game's scope writes that game's section, keeping a value only
+where it differs from what the game gets without it (the defaults, `config.ini`, the shipped overrides), so a
+later change for all games still reaches it. An executable's scope is named back from `games.ini`, the shipped
+table and the channel's `game_name`. The GUI's "Settings for" menu and `game-settings set/clear` while the header
+holds that game apply a merge with `persist::apply_scope` (the pending save is flushed first, to the settings it
+was made in); the menu follows `settings_game` once a second. Each bound row learns its setting's name from its `bind_*` call
+(`shm::take_pending_name`) and gets a "This game" mark with a button that clears that one key
+(`game_settings::clear`), shown while the picked game's section has it.
 
 ## 8. Failure behaviour
 

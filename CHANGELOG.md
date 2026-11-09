@@ -4,6 +4,30 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.12.0 — 2026-11-09
+
+- Settings can now differ per game. **Settings for**, the bar under the tabs, picks All games or one of your
+  games; a game keeps only the settings you change while it is picked, and follows All games for the rest, so a
+  later change for all games still reaches it. **Restore defaults** removes a game's own settings. When a game
+  starts, its own settings apply and the app switches to them, so changes made while it runs are saved for that
+  game. Games without settings of their own run exactly as before. From a terminal: `neural-forge-cli
+  game-settings list|show|set|clear`. They are saved in `~/.config/neural-forge/games.ini`, which updates never
+  change.
+- The model now starts afresh when the game itself tells DLSS a new shot begins, as it already did when the
+  picture changes as a whole. In GTA V Enhanced this catches camera cuts the picture-based check missed, which
+  carried the last shot's look into the new one for a moment. It works where Neural Forge knows how the game's
+  DLSS passes that signal on (GTA V Enhanced so far); `NEURAL_FORGE_GAME_RESET=off` turns it off.
+- The model also starts afresh when the game's exposure jumps (after a pause, a menu or the map), so the first
+  frames after it no longer carry a look made at the old brightness. `NEURAL_FORGE_EXPOSURE_JUMP` sets how big a
+  change counts (1 stop by default) or turns it off.
+- A new **Sharpening** group in the Model tab, off by default: **Adaptive sharpening (CAS)** (AMD FidelityFX
+  Contrast Adaptive Sharpening) and **Clarity** (local contrast of brightness, with its radius, a midtone setting
+  that keeps it off the darkest and brightest parts and an edge protection against halos). Both work on the
+  finished frame in every game, after the model, and leave the HUD regions alone. They cost 0.3-0.4 ms of GPU
+  time a presented frame at 1440p on an RTX 5070, paid on every shown frame (four times a rendered frame with
+  frame generation 4x). Like any setting, a game can have its own; `NEURAL_FORGE_SHARPEN` overrides them for one
+  launch, for comparisons.
+
 ## 3.11.0 — 2026-11-09
 
 - When video memory runs short, the network now pauses at once instead of first switching to the small network.

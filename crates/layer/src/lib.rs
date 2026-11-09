@@ -33,6 +33,7 @@ mod preupscale;
 mod probe_ngx;
 mod probe_seq;
 mod series;
+mod sharpen;
 mod shm;
 mod surface_usage;
 mod swapchain;

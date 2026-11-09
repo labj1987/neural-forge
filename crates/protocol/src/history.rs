@@ -9,7 +9,8 @@
 //!
 //! The reference pipeline for this model resets on exactly these events: a first frame, a
 //! reset, or a pixel whose previous position the model never saw all get blend weight zero.
-//! See `docs/OPENDLSS_REVIEW.md`, rows "has-history flag" and "reset on idle".
+//! See `docs/OPENDLSS_REVIEW.md`, rows "has-history flag" and "reset on idle". The game's own reset of
+//! DLSS's history, where the layer can read it ([`HistoryGap::game_reset`]), counts as one too.
 //!
 //! Pure bookkeeping with no Vulkan calls, used by the layer's native backend for its history images.
 //! `F` is what counts as a change of input format for the slot (the extent and identification).
@@ -29,11 +30,14 @@ pub struct HistoryGap<F = ()> {
     /// A scene cut seen on a frame the network did not run on (the layer's edit cache carried the last
     /// answer to it), with its mean luma difference: the next evaluate starts afresh.
     cut: Option<u32>,
+    /// The game reset DLSS's history for a frame the history has not been reset for yet: the next evaluate
+    /// starts afresh.
+    game: bool,
 }
 
 impl<F> Default for HistoryGap<F> {
     fn default() -> Self {
-        Self { last: None, broken: false, format: None, format_changed: false, cut: None }
+        Self { last: None, broken: false, format: None, format_changed: false, cut: None, game: false }
     }
 }
 
@@ -53,6 +57,9 @@ pub enum Stale {
     /// `preupscale::scene_cut`): the mean absolute difference of the two frames' luma thumbnails, on
     /// 0-255. The history describes a scene no longer on screen.
     SceneCut(u32),
+    /// The game reset DLSS's history for this frame (its NGX reset flag, as DLSS Super Resolution's input
+    /// kernel was given it: `preupscale::reset_word`): a camera cut or a new scene the game knows of.
+    GameReset,
 }
 
 impl<F: Copy + PartialEq> HistoryGap<F> {
@@ -73,6 +80,12 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
         self.cut = Some(mean);
     }
 
+    /// The game reset DLSS's history for the frame about to be held (or for one the history was kept through):
+    /// the next [`Self::begin`] reports [`Stale::GameReset`], unless a reason above it in [`Self::pending`] does.
+    pub fn game_reset(&mut self) {
+        self.game = true;
+    }
+
     /// Every request on this slot, with its proxy's format class (before deciding whether it
     /// reaches the model). A change from the previous request's class makes the next
     /// [`Self::begin`] report [`Stale::FormatChanged`].
@@ -91,6 +104,7 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
             Some(_) if self.format_changed => Some(Stale::FormatChanged),
             Some(_) if self.broken => Some(Stale::Skipped),
             Some(_) if self.cut.is_some() => self.cut.map(Stale::SceneCut),
+            Some(_) if self.game => Some(Stale::GameReset),
             Some(t) => {
                 let gap = now.saturating_duration_since(t);
                 (gap > Self::MAX_GAP).then_some(Stale::Idle(gap))
@@ -115,6 +129,7 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
         self.broken = false;
         self.format_changed = false;
         self.cut = None;
+        self.game = false;
         self.last = Some(now);
         stale
     }
@@ -176,6 +191,38 @@ mod tests {
         let mut h: HistoryGap = HistoryGap::default();
         h.scene_cut(90);
         assert_eq!(h.begin(t0), None);
+    }
+
+    #[test]
+    fn a_game_reset_resets_the_next_evaluate_once() {
+        let mut g: HistoryGap = HistoryGap::default();
+        let t0 = Instant::now();
+        g.begin(t0);
+        g.game_reset();
+        assert_eq!(g.pending(t0 + Duration::from_millis(8)), Some(Stale::GameReset), "pending does not consume it");
+        assert_eq!(g.begin(t0 + Duration::from_millis(16)), Some(Stale::GameReset));
+        assert_eq!(g.begin(t0 + Duration::from_millis(32)), None, "once");
+        // Kept through a touched (cached) frame, as a latched scene cut is.
+        g.game_reset();
+        g.touch(t0 + Duration::from_millis(48));
+        assert_eq!(g.begin(t0 + Duration::from_millis(64)), Some(Stale::GameReset));
+        // With a scene cut or a skip as well it is one reset, reported as the other.
+        g.game_reset();
+        g.scene_cut(70);
+        assert_eq!(g.begin(t0 + Duration::from_millis(80)), Some(Stale::SceneCut(70)));
+        assert_eq!(g.begin(t0 + Duration::from_millis(96)), None, "both consumed");
+        g.game_reset();
+        g.skipped();
+        assert_eq!(g.begin(t0 + Duration::from_millis(112)), Some(Stale::Skipped));
+        assert_eq!(g.begin(t0 + Duration::from_millis(128)), None);
+        // Over an idle gap too: one reset, reported as the game's.
+        g.game_reset();
+        assert_eq!(g.begin(t0 + Duration::from_secs(2)), Some(Stale::GameReset));
+        // Before the first evaluate a new feature resets on its own.
+        let mut h: HistoryGap = HistoryGap::default();
+        h.game_reset();
+        assert_eq!(h.begin(t0), None);
+        assert_eq!(h.begin(t0 + Duration::from_millis(16)), None, "and it is consumed there");
     }
 
     #[test]

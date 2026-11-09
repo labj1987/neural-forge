@@ -391,6 +391,73 @@ const PATH_SWITCH_MS: u64 = 1000;
 /// The next [`Built::generation`] (process-wide).
 static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// `NEURAL_FORGE_EXPOSURE_JUMP=off|<stops>`: how far the exposure the encode uses may change between two network
+/// frames, in stops, before the second starts without history (the frame shaders' `exposureJumped`).
+pub(crate) const EXPOSURE_JUMP_ENV: &str = "NEURAL_FORGE_EXPOSURE_JUMP";
+
+/// [`EXPOSURE_JUMP_ENV`]'s default: one stop, a factor of 2. The game's own exposure jumps by far more at a
+/// pause, a menu or a map (GTA V: 0.15-0.34 in play); the auto exposure adapts 5% of the way per hold, under a
+/// stop between two network frames unless its target is about 10 stops away.
+pub(crate) const EXPOSURE_JUMP_STOPS: f32 = 1.0;
+
+/// [`EXPOSURE_JUMP_ENV`]'s value in stops, 0 for off: unset, empty or `on` the default; `off` or `0` off; else a
+/// number of stops above 0 and up to 16.
+fn parse_exposure_jump(raw: Option<&str>) -> Result<f32, String> {
+    match raw.map(str::trim) {
+        None | Some("" | "on") => Ok(EXPOSURE_JUMP_STOPS),
+        Some("off" | "0") => Ok(0.0),
+        Some(v) => v.parse::<f32>().ok().filter(|s| s.is_finite() && *s > 0.0 && *s <= 16.0).ok_or_else(|| v.to_string()),
+    }
+}
+
+/// The frame shaders' exposure jump factor (`Params::more[3]`): 2 to the power of [`EXPOSURE_JUMP_ENV`]'s stops, 0
+/// when off. Read once, logged when not the default.
+pub(crate) fn exposure_jump_factor() -> f32 {
+    static FACTOR: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+        let stops = match parse_exposure_jump(neural_forge_protocol::env::var(EXPOSURE_JUMP_ENV).as_deref()) {
+            Ok(s) => s,
+            Err(other) => {
+                crate::log!(
+                    "[native] {EXPOSURE_JUMP_ENV}={other:?} is not off or a number of stops above 0 and up to 16; the default {EXPOSURE_JUMP_STOPS} stays"
+                );
+                EXPOSURE_JUMP_STOPS
+            }
+        };
+        if stops == 0.0 {
+            crate::log!("[native] {EXPOSURE_JUMP_ENV}=off: the history is kept when the exposure jumps");
+        } else if stops != EXPOSURE_JUMP_STOPS {
+            crate::log!("[native] the history resets when the exposure changes by more than {stops} stops ({EXPOSURE_JUMP_ENV})");
+        }
+        if stops > 0.0 {
+            stops.exp2()
+        } else {
+            0.0
+        }
+    });
+    *FACTOR
+}
+
+/// The composite's exposure-jump word (`Exposure::jump`: the previous network frame's exposure in the low half,
+/// the jump frame's in the high, as halves), read back after its frame ran: the two exposures when it reports a
+/// jump not seen before. `last` is the last word read: holds the network did not run on (the edit cache's) may
+/// read the same word again where nothing clears it (inside DLSS's buffer).
+fn take_exposure_jump(last: &mut u32, word: u32) -> Option<(f32, f32)> {
+    let new = word != *last;
+    *last = word;
+    (new && word != 0).then(|| (super::f16_to_f32(word as u16), super::f16_to_f32((word >> 16) as u16)))
+}
+
+/// The CPU's side of an exposure jump the frame shaders reset on (`exposureJumped`), at a hold after the one it
+/// was on: logged once per jump, and the seed restarts as after a scene cut the GPU reset ([`NativePass::restart_seed`]).
+/// The edit cache needs nothing: the jump frame refreshed it at the new exposure.
+pub(crate) fn apply_exposure_jump(word: u32, native: Option<&mut NativePass>) {
+    let Some(n) = native else { return };
+    if let Some((before, now)) = take_exposure_jump(&mut n.last_jump, word) {
+        crate::log!("[native] resetting the history (the exposure changed from {before} to {now}, by {:.1} stops)", (now / before).log2().abs());
+        n.restart_seed();
+    }
+}
+
 /// `NEURAL_FORGE_NATIVE_NO_HISTORY=1` (diagnostics): every network frame runs without history, as after a reset,
 /// to tell what the history adds to the picture from what one frame does.
 fn no_history() -> bool {
@@ -1777,6 +1844,8 @@ pub(crate) struct NativePass {
     frames: u64,
     seed: u32,
     last_jitter: Option<[f32; 2]>,
+    /// The composite's last exposure-jump word read back ([`apply_exposure_jump`]).
+    last_jump: u32,
     pub(crate) gap: HistoryGap<(u32, u32)>,
     /// The network whose answers the history holds ([`Built::network`]), once one has run.
     history_network: Option<u32>,
@@ -2160,6 +2229,7 @@ impl NativePass {
                 frames: 0,
                 seed: 0,
                 last_jitter: None,
+                last_jump: 0,
                 more: None,
                 mask: None,
                 mask_depth: vk::Buffer::null(),
@@ -2593,7 +2663,8 @@ impl NativePass {
             buf(f.head, vk::WHOLE_SIZE),
             buf(params, PARAMS_BYTES),
             buf(self.state.buffer, vk::WHOLE_SIZE),
-            buf(exposure, 4),
+            // The texel the encode used, then the composite's exposure-jump word.
+            buf(exposure, 8),
             buf(lane.map_or(self.answer.buffer, |l| l.answer.buffer), vk::WHOLE_SIZE),
         );
         let w = |binding, ty| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(binding).descriptor_type(ty);
@@ -3145,13 +3216,14 @@ impl NativePass {
                     device.cmd_dispatch(cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
                 }
             }
-            // The answer to `W`'s copy, the history to the next frame's samplers.
+            // The answer to `W`'s copy, the history to the next frame's samplers, the composite's exposure-jump
+            // word to the host.
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
-                &[compute(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)],
+                &[compute(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ)],
                 &[],
                 &[],
             );
@@ -3337,7 +3409,7 @@ impl NativePass {
                 frame: [super::padded(width, height).0, if history { self.seed } else { 0 }, u32::from(history), p as u32],
                 motion: [if history { delta[0] } else { 0.0 }, if history { delta[1] } else { 0.0 }, f.blend_scale, c.intensity],
                 control: [c.style as f32, c.local_tone, c.local_structure, c.skin_structure],
-                more: [if c.auto_mask { 1.0 } else { 0.0 }, mvec_scale[0], mvec_scale[1], 0.0],
+                more: [if c.auto_mask { 1.0 } else { 0.0 }, mvec_scale[0], mvec_scale[1], exposure_jump_factor()],
                 mask: [passes.mask.rules, depth_kind, u32::from(passes.mask.reversed), 0],
                 sky: [passes.mask.sky_margin, 0.0, 0.0, 0.0],
                 dark: [passes.mask.dark[0], passes.mask.dark[1], passes.mask.dark[2], 0.0],
@@ -3905,6 +3977,7 @@ pub(crate) fn note_reset(stale: Option<Stale>) {
             "[native] resetting the history (scene cut: the picture's luma changed by {mean} of 255 on average, threshold {})",
             super::scene_cut::threshold()
         ),
+        Some(Stale::GameReset) => crate::log!("[native] resetting the history (the game reset DLSS's history)"),
         None => {}
     }
 }
@@ -3942,6 +4015,16 @@ pub(crate) fn apply_scene_cut(effect: super::scene_cut::Effect, native: Option<&
             false
         }
         super::scene_cut::Effect::None => false,
+    }
+}
+
+/// The game's reset of DLSS's history for the frame being held ([`super::DlssFrame::reset`]): the next network
+/// frame, this hold's or a later one's, starts afresh ([`HistoryGap::game_reset`]; logged and not counted as a
+/// scene cut when consumed), and the edit cache refreshes rather than carry an edit made for the old scene.
+fn apply_game_reset<F: Copy + PartialEq>(gap: &mut HistoryGap<F>, edit: Option<&mut super::cache::State>) {
+    gap.game_reset();
+    if let Some(e) = edit {
+        e.drop_edit();
     }
 }
 
@@ -4008,7 +4091,7 @@ pub(crate) unsafe fn run_native_hold(
     res: &mut super::Resources,
     target: &Target,
     loader: &Loader,
-    jitter: Option<[f32; 2]>,
+    dlss: super::DlssFrame,
     chain_ok: bool,
     passes: Passes,
     sizes: &[(u32, u32)],
@@ -4019,7 +4102,7 @@ pub(crate) unsafe fn run_native_hold(
     sink: super::Sink,
 ) -> super::HoldResult {
     // SAFETY: forwarded.
-    let result = unsafe { native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, passes, sizes, arm, ask, choice, lut, sink) };
+    let result = unsafe { native_hold(device, instance, physical_device, res, target, loader, dlss, chain_ok, passes, sizes, arm, ask, choice, lut, sink) };
     if !result.evaluated {
         // Every hold that missed once the pass exists, whatever the reason: this DLSS frame went to DLSS
         // without the network, so the history is a frame older than the next frame's motion vectors, and the
@@ -4040,7 +4123,7 @@ unsafe fn native_hold(
     res: &mut super::Resources,
     target: &Target,
     loader: &Loader,
-    jitter: Option<[f32; 2]>,
+    dlss: super::DlssFrame,
     chain_ok: bool,
     passes: Passes,
     sizes: &[(u32, u32)],
@@ -4052,6 +4135,7 @@ unsafe fn native_hold(
 ) -> super::HoldResult {
     let mut result = super::HoldResult { native: true, ..Default::default() };
     let t_hold = Instant::now();
+    let super::DlssFrame { jitter, reset: game_reset } = dlss;
     let (submit, mut ctx) = match sink {
         super::Sink::Queue(s) => (Some(s), None),
         super::Sink::Buffer(c) => (None, Some(c)),
@@ -4095,6 +4179,10 @@ unsafe fn native_hold(
         if let Some((reading, recorded)) = res.scene.as_mut().and_then(super::scene_cut::ScenePass::take) {
             let effect = super::scene_cut::effect(reading, recorded);
             result.scene_cut = apply_scene_cut(effect, res.native.as_mut(), res.edit.as_mut().map(|e| &mut e.state));
+        }
+        // The previous network frame's exposure jump (finished: waited above), before the capture clears the buffer.
+        if let Some(word) = res.hdr.as_ref().map(hdr::HdrPass::exposure_jump_word) {
+            apply_exposure_jump(word, res.native.as_mut());
         }
         // An armed hold's readbacks (finished: waited above), before anything clears the exposure.
         result.cache_frame = res.take_cache_frame();
@@ -4363,6 +4451,11 @@ unsafe fn native_hold(
     // (`frame_passes` below then runs with no history: seed 0, no blend toward it, in every pass).
     if note_network(&mut native.gap, &mut native.history_network, built.network) {
         crate::log!("[native] resetting the history (the {} network runs from here)", network::name(built.network));
+    }
+    // The game reset DLSS's history for this frame: the network's history starts afresh too, at this hold's
+    // network frame or the next one, and the edit cache refreshes rather than carry the old scene's edit here.
+    if game_reset && super::game_reset_honoured() {
+        apply_game_reset(&mut native.gap, res.edit.as_mut().map(|e| &mut e.state));
     }
     let history_ok = native.frames > 0 && native.gap.pending(hold_now()).is_none();
     // The cache's plan for this hold (a refresh at interval 1 with the cache off).
@@ -4644,7 +4737,7 @@ unsafe fn native_hold(
             if let Some(result) = scene_result {
                 copy(result, super::inline::READ_SCENE, 16);
             }
-            copy(exposure, super::inline::READ_EXPOSURE, 4);
+            copy(exposure, super::inline::READ_EXPOSURE, 8);
             if let Some((state, bytes)) = auto_read {
                 copy(state, super::inline::READ_AUTO, bytes.min(super::inline::READBACK_BYTES - super::inline::READ_AUTO));
             }
@@ -6672,7 +6765,43 @@ mod tests {
             let (ka2, _, _) = frame(&mut kept, 1, true, false);
             assert_ne!(ka2, ra2, "with history the answer blends toward it");
 
-            for p in [&reset, &cut, &kept, &lone] {
+            // An exposure jump: frame 2 encoded at 4 times frame 1's exposure (both usable). The CPU kept the history
+            // (seed 1); the frame shaders start afresh as on a reset, and the composite reports the two exposures.
+            let set_exposure = |bits: u32| std::ptr::copy_nonoverlapping(bits.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let jump_word = || std::ptr::read_volatile(exposure.ptr.add(4).cast::<u32>());
+            let mut jump = build();
+            set_exposure(0x3c00);
+            frame(&mut jump, 0, false, false);
+            assert_eq!(jump_word(), 0, "no previous frame: nothing to report");
+            set_exposure(0x4400);
+            let (ja2, jl2, js2) = frame(&mut jump, 1, true, false);
+            assert_eq!(js2, 1, "the CPU's parameters kept the history");
+            assert_eq!(jl2, rl2, "every lane of the last pass (noise seed 0, no history) as on a reset");
+            assert_eq!(ja2, ra2, "the answer of both passes as on a reset");
+            assert_eq!(jump_word(), 0x3c00 | (0x4400 << 16), "the report: 1.0 before, 4.0 now");
+            apply_exposure_jump(jump_word(), Some(&mut jump));
+            let (ja3, jl3, js3) = frame(&mut jump, 2, true, false);
+            assert_eq!(js3, 1, "the seed restarts after the jump");
+            assert_eq!((jl3, ja3), (rl3.clone(), ra3.clone()), "the frame after the jump is the frame after a reset");
+            assert_eq!(jump_word(), 0, "a steady exposure reports nothing");
+            // Within the factor (1.0 to 1.5) the history is kept, as with a steady exposure.
+            let mut small = build();
+            set_exposure(0x3c00);
+            frame(&mut small, 0, false, false);
+            set_exposure(0x3e00);
+            let (sa2, _, _) = frame(&mut small, 1, true, false);
+            assert_eq!(sa2, ka2, "half a stop keeps the history");
+            assert_eq!(jump_word(), 0);
+            // A frame the CPU already resets is not reported as a jump.
+            let mut both = build();
+            set_exposure(0x3c00);
+            frame(&mut both, 0, false, false);
+            set_exposure(0x4400);
+            frame(&mut both, 1, false, false);
+            assert_eq!(jump_word(), 0, "the CPU's reset took the history, not the jump");
+            set_exposure(0x3c00);
+
+            for p in [&reset, &cut, &kept, &lone, &jump, &small, &both] {
                 p.destroy(device);
             }
             encoded.destroy(device);
@@ -6767,6 +6896,76 @@ mod tests {
             assert_eq!(pass.gap.begin(t0), None, "once");
             pass.destroy(device);
         }
+    }
+
+    /// `NEURAL_FORGE_EXPOSURE_JUMP`: one stop by default, `off` or 0 off, else stops above 0 and up to 16.
+    #[test]
+    fn the_exposure_jump_setting_parses() {
+        assert_eq!(parse_exposure_jump(None), Ok(1.0));
+        assert_eq!(parse_exposure_jump(Some(" ")), Ok(1.0));
+        assert_eq!(parse_exposure_jump(Some("on")), Ok(1.0));
+        assert_eq!(parse_exposure_jump(Some("off")), Ok(0.0));
+        assert_eq!(parse_exposure_jump(Some("0")), Ok(0.0));
+        assert_eq!(parse_exposure_jump(Some("2.5")), Ok(2.5));
+        assert_eq!(parse_exposure_jump(Some("16")), Ok(16.0));
+        for bad in ["-1", "17", "NaN", "inf", "two"] {
+            assert_eq!(parse_exposure_jump(Some(bad)), Err(bad.to_string()));
+        }
+    }
+
+    /// The composite's exposure-jump word read back: the two exposures once per jump, also where holds the network did
+    /// not run on read the same word again; nothing for 0.
+    #[test]
+    fn an_exposure_jump_word_is_taken_once() {
+        let mut last = 0;
+        assert_eq!(take_exposure_jump(&mut last, 0), None);
+        let word = 0x3c00 | (0x4400 << 16);
+        assert_eq!(take_exposure_jump(&mut last, word), Some((1.0, 4.0)));
+        assert_eq!(take_exposure_jump(&mut last, word), None, "a cached hold's copy of the same word");
+        assert_eq!(take_exposure_jump(&mut last, 0), None);
+        assert_eq!(take_exposure_jump(&mut last, 0x4400 | (0x3c00 << 16)), Some((4.0, 1.0)), "and back");
+        assert_eq!(take_exposure_jump(&mut last, word), Some((1.0, 4.0)), "a new jump right after");
+    }
+
+    /// The game's reset of DLSS's history: the edit cache refreshes on the hold that carries it (a cached hold would
+    /// carry the old scene's answer), the network frame resets once, logged as the game's and not counted as a
+    /// scene cut; a hold without it changes nothing.
+    #[test]
+    fn a_game_reset_refreshes_the_cache_and_resets_the_next_network_frame_once() {
+        use super::super::cache::{Hold, Kind, State};
+        let hold = |n: u64, history_ok: bool| Hold {
+            interval: 2,
+            hold: n,
+            jitter: Some([0.0; 2]),
+            mvec: true,
+            depth: true,
+            history_ok,
+            armed: false,
+            debug_mask: false,
+            generation: 1,
+        };
+        let mut cache = State::default();
+        let h = hold(1, true);
+        let p = cache.plan(&h);
+        assert_eq!(p.kind, Kind::Refresh);
+        cache.went_through(&h, &p);
+        let mut gap: HistoryGap<(u32, u32)> = HistoryGap::default();
+        let t0 = Instant::now();
+        gap.begin(t0);
+        apply_game_reset(&mut gap, Some(&mut cache));
+        // native_hold's history_ok: the reset is pending until the network frame consumes it.
+        let history_ok = gap.pending(t0).is_none();
+        assert!(!history_ok);
+        assert_eq!(cache.plan(&hold(2, history_ok)).kind, Kind::Refresh, "not served from the edit cache");
+        let stale = gap.begin(t0);
+        assert_eq!(stale, Some(Stale::GameReset));
+        let mut scene_cut = false;
+        note_network_reset(1, stale, &mut scene_cut);
+        assert!(!scene_cut, "not counted as a scene cut");
+        assert_eq!(gap.begin(t0), None, "once");
+        // Without an edit cache (interval 1, or the cache off) only the history resets.
+        apply_game_reset(&mut gap, None);
+        assert_eq!(gap.begin(t0), Some(Stale::GameReset));
     }
 
     /// The render extent of the model resolution tests (half of it is above the 8-texel floor).

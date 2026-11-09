@@ -382,7 +382,12 @@ and composite bit for bit; ATTRIBUTION.md).
   `scene_cuts`) and restarts the CPU's seed (`restart_seed`) so the next frame's is 1, as after a reset;
   a cut on a cached hold (no network ran on it) marks `HistoryGap::scene_cut`, so the next network frame
   resets (and is logged and counted then), and drops the edit cache's stored edit so that frame
-  refreshes. `NEURAL_FORGE_SCENE_CUT=off|<threshold>` is the test override.
+  refreshes. `NEURAL_FORGE_SCENE_CUT=off|<threshold>` is the test override. The game's own reset of DLSS's
+  history, where DLSS's input kernel carries it (310.x `hiluma_engine_input*`, word 4), resets the same way
+  (`HistoryGap::game_reset`, `Stale::GameReset`; DLSSNR_PARAMETERS.md, "History reset");
+  `NEURAL_FORGE_GAME_RESET=off` ignores it. An exposure jump (more than a stop between two network
+  frames' encodes; the state buffer's `exposure[2]`) takes the history in both frame shaders on that frame,
+  as a cut does; `NEURAL_FORGE_EXPOSURE_JUMP=off|<stops>` (DLSSNR_PARAMETERS.md, "History reset").
 - **Motion vectors** (measured on consecutive GTA V frames, `NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES`):
   DLSS's are in render pixels, y down, current to previous (`prev = x + mv`, scale +1 on both axes
   by a 7x7 search). They exclude the camera jitter: the warp error falls a further 20% with a global

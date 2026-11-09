@@ -66,19 +66,17 @@ fn store(header: &ShmHeader, name: &str, bits: u32) -> bool {
     header.persisted_settings().iter().any(|(n, ..)| *n == name) && header.write_settings(&[(name, bits)])
 }
 
-fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
+/// A setting's value as `set` takes it: the HUD regions' text, or the raw bits of any other.
+pub enum Value {
+    Regions(Vec<neural_forge_protocol::HudRegion>),
+    Bits(u32),
+}
+
+/// Reads `value` for setting `name` the way `set` takes it (a placement or exposure source by name, a
+/// decimal or whole number within the setting's range, the HUD regions' text), or says why it cannot.
+pub fn parse_value(header: &ShmHeader, name: &str, value: &str) -> Result<Value, String> {
     if name == neural_forge_protocol::persist::HUD_REGIONS {
-        return match neural_forge_protocol::HudRegion::parse_list(value) {
-            Ok(regions) => {
-                header.set_hud_regions(&regions);
-                println!("{name}={}", neural_forge_protocol::HudRegion::list_text(&header.hud_settings().regions));
-                true
-            }
-            Err(e) => {
-                eprintln!("shmctl set: {name}: {e}");
-                false
-            }
-        };
+        return neural_forge_protocol::HudRegion::parse_list(value).map(Value::Regions).map_err(|e| format!("{name}: {e}"));
     }
     // A placement (`enums::placement`) or an exposure source (`enums::exposure_source`) by name.
     use neural_forge_protocol::enums::{exposure_source, placement};
@@ -97,46 +95,54 @@ fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
                 named = v.to_string();
                 named.as_str()
             }
-            None => {
-                eprintln!("shmctl set: {name} takes one of {}, got {value:?}", names.join(", "));
-                return false;
-            }
+            None => return Err(format!("{name} takes one of {}, got {value:?}", names.join(", "))),
         },
         None => value,
     };
     let Some((is_float, _)) = resolve(header, name) else {
-        eprintln!("shmctl set: unknown setting {name:?}");
-        return false;
+        return Err(format!("unknown setting {name:?}"));
     };
     let bits = if is_float {
-        match value.parse::<f32>() {
-            Ok(v) => v.to_bits(),
-            Err(_) => {
-                eprintln!("shmctl set: {name} takes a decimal value, got {value:?}");
-                return false;
-            }
-        }
+        value.parse::<f32>().map(f32::to_bits).map_err(|_| format!("{name} takes a decimal value, got {value:?}"))?
     } else {
-        match value.parse::<u32>() {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("shmctl set: {name} takes an integer value, got {value:?}");
-                return false;
-            }
-        }
+        value.parse::<u32>().map_err(|_| format!("{name} takes an integer value, got {value:?}"))?
     };
     if let Some((min, max)) = neural_forge_protocol::setting_bounds(name) {
         let v = if is_float { f32::from_bits(bits) } else { bits as f32 };
         if !(min..=max).contains(&v) {
-            eprintln!("shmctl set: {name} takes a value from {min} to {max}, got {value:?}");
-            return false;
+            return Err(format!("{name} takes a value from {min} to {max}, got {value:?}"));
         }
     }
-    if !store(header, name, bits) {
+    Ok(Value::Bits(bits))
+}
+
+/// Writes `value` (from [`parse_value`]) to setting `name` of `header`.
+pub fn write_value(header: &ShmHeader, name: &str, value: &Value) -> bool {
+    match value {
+        Value::Regions(regions) => {
+            header.set_hud_regions(regions);
+            true
+        }
+        Value::Bits(bits) => store(header, name, *bits),
+    }
+}
+
+fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
+    let parsed = match parse_value(header, name, value) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("shmctl set: {e}");
+            return false;
+        }
+    };
+    if !write_value(header, name, &parsed) {
         eprintln!("shmctl set: {name} was not stored");
         return false;
     }
-    println!("{name}={value}");
+    match parsed {
+        Value::Regions(_) => println!("{name}={}", neural_forge_protocol::HudRegion::list_text(&header.hud_settings().regions)),
+        Value::Bits(_) => println!("{name}={value}"),
+    }
     true
 }
 
@@ -416,7 +422,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
     let changes_settings = matches!(args.first().map(String::as_str), Some("set" | "toggle" | "reset"));
     if ok && changes_settings {
         if let Err(e) = neural_forge_supervisor::save_settings(header) {
-            eprintln!("shmctl: applied to the live channel, but saving config.ini failed: {e}");
+            eprintln!("shmctl: applied to the live channel, but saving the settings failed: {e}");
             return std::process::ExitCode::FAILURE;
         }
     }

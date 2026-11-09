@@ -1578,6 +1578,71 @@ later on October 22 was tried as the cheapest of them first offline, then built 
   and their launches OK; only the startup probes with null arguments are refused. Whether NVIDIA's network then
   changes the picture was not compared. No upstream report; the README carries no known issue for it.
 
+## November 9: the game's own reset of DLSS's history
+
+- **Found in the launch parameters.** The layer cannot see the game's NGX parameter block, so its `Reset` was
+  taken to be out of reach (DLSSNR_PARAMETERS.md, "History reset") and the picture-based scene-cut detector
+  (3.7.0) was the only substitute. A diagnostic probe of DLSS Super Resolution's input kernel in GTA V Enhanced
+  (`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`, 31 words) showed word 4 at 0 on every launch of a benchmark run
+  but three: launch 0 (the first frame) and launches 7012 and 9433, both mid-pass with no loading gap. The
+  detector logged no cut at either (only the idle-gap resets at the loading screens), so the network kept its
+  history across two camera cuts the game itself had signalled. Every other word was constant, but for the
+  jitter in word 3.
+- **Now** the holds before the upscaler read word 4 of that kernel family (`preupscale::reset_word`) and start
+  the network's history afresh on it, as on a scene cut, with the edit cache refreshing on that hold. A hold
+  recorded before the launch that carries it resets the next network frame instead. Other families' words are
+  not known and are not read. `NEURAL_FORGE_GAME_RESET=off` turns it off for comparisons. Only 0 and 1 count, and
+  a word set on more than 8 input launches in a row is ignored on that device from then on, so a game whose word 4
+  means something else cannot keep the network without history.
+- **The exposure jump, from AMDLSS5's idea.** AMDLSS5 holds and smooths the exposure so the picture stays steady
+  after a pause or a menu. Neural Forge takes the game's exposure on every hold, unsmoothed, and the network's
+  history is encoded at the exposure of its frame, so the first frames after a jump blended an answer made at the
+  old one. The frame shaders now start afresh where the exposure changed by more than a stop since the previous
+  network frame, on that frame (no readback); a steady exposure is untouched bit for bit.
+  `NEURAL_FORGE_EXPOSURE_JUMP=off|<stops>`.
+
+## November 9: sharpening the finished frame (built, off by default)
+
+From a review of AMDLSS5 (no licence: ideas only), whose optional CAS, LumaSharpen and Clarity filters run on the
+final image before the HUD.
+
+- **Where.** At present (`crate::sharpen`), not after DLSS: DLSS's output is scene-linear HDR before the game's
+  tone mapping, and CAS wants a display-referred picture with 1 at the peak ("best run after tonemapping",
+  ffx_cas.h); the present is also the one stage every game and placement reaches. The HUD is drawn by then, so the
+  HUD regions apply (AMD: CAS "won't harm the UI"; Clarity would halo text). The HUD detection is the post path's
+  own and runs nowhere near a held frame, so it is not used.
+- **No depth.** The only depth is DLSS's input depth at render size, copied inside a hold before the upscaler and
+  only with the edit cache on; the presented frame has the game's post-processing, the HUD and frame generation's
+  frames on it, which that depth does not describe. Clarity's base stops at strong luma edges instead.
+- **Cost** (RTX 5070, 2560x1440, offline on a 1440p capture, median of 200 dispatches, `sharpen::tests::cost_at_1440p_and_effect_on_a_still_frame`
+  with the NVIDIA ICD): CAS 0.29 ms, Clarity radius 16 0.33 ms, radius 64 0.43 ms, both 0.37 ms. CAS's 0.29 ms is
+  mostly the copy of the frame out and back (two 14.7 MB copies); a storage view of the swapchain image would save
+  much of it but needs `STORAGE` usage added to swapchains, which nothing else here does. Paid on every presented
+  frame: four times a rendered frame with frame generation 4x.
+- **Effect** on that capture (mean change of the 8-bit channels; mean absolute Laplacian of luma against the
+  frame's): CAS 0.5 0.06/255, x1.09 (mostly below an 8-bit step); CAS 1.0 1.08/255, x2.71; Clarity 0.5 r16
+  0.65/255, x1.32; both at 0.5 0.76/255, x1.56. CAS's strength maps to `-s / lerp(8, 5, s)` so 0 is off; its own
+  default (sharpness 0) is 0.73 here. In-game A/B in GTA V still to do.
+
+## November 9: a face crop through the network (probed, not built)
+
+AMDLSS5 2.0 (no licence; idea only) magnifies the faces it finds and runs each crop through the network on its own.
+Probed offline before building anything: two GTA V Enhanced story-mode frames at 2560x1440 (faces of about
+140x165 and 400x480 pixels), OpenDLSS-NR's `dlss5vk` (bit-exact against NGX), full and small network, seeds 0-2, no
+history. The whole frame through the network (A) against the face window magnified x2 and x2.67 with Lanczos,
+through the network, area-reduced back and pasted with a feathered ellipse (B), and the window at x1 (C). Detail is
+bench-iq's log-luma Laplacian energy in the face, relative to the model off.
+
+- B added 0.07-0.86x the detail A added (the bar was 1.2x): reducing the magnified answer back to output size
+  averages away the pixel-scale detail the network adds.
+- The crop's answer is darker and weaker than the whole frame's (a 19-32% low-frequency luma difference in the
+  feather ring, 3.5-10 8-bit codes): the network's view of the whole picture changes its tone, so a pasted face
+  shows a seam.
+- C beat A only on the very large selfie face; the crop flickered less (2-3% against 4.8%), which does not help
+  when it adds less.
+
+Not built. A face pass would also need a detector with a licence that fits (SCRFD's weights are non-commercial).
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

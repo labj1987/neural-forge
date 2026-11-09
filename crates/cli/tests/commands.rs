@@ -86,3 +86,41 @@ fn doctor_reads_the_channel_without_creating_it() {
     assert!(!ok);
     assert!(out.lines().any(|l| l.starts_with("[FAILURE] channel: the settings channel cannot be opened")), "{out}");
 }
+
+/// A game's own settings: only what differs from the settings for all games is kept, a value the game gets
+/// anyway removes its line, and `clear` restores its defaults; lines this build does not know stay.
+#[test]
+fn game_settings_keep_only_what_differs() {
+    let dir = scratch("game-settings");
+    let shm = dir.join("shm.bin");
+    let config = dir.join("config/neural-forge");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.ini"), "set_intensity=1.5\n").unwrap();
+    std::fs::write(config.join("games.ini"), "[570]\nfuture_key=1\n").unwrap();
+    let games = || std::fs::read_to_string(config.join("games.ini")).unwrap_or_default();
+
+    let (ok, out) = cli(&dir, &shm, &["game-settings", "set", "570", "intensity", "0.5"]);
+    assert!(ok, "{out}");
+    assert!(games().contains("set_intensity=0.5") && games().contains("future_key=1"), "{}", games());
+    let (ok, out) = cli(&dir, &shm, &["game-settings", "set", "exe:Game.exe", "placement", "present"]);
+    assert!(ok, "{out}");
+    assert!(games().contains("[exe:game.exe]\nset_placement=3"), "a placement by name, stored as config.ini stores it:\n{}", games());
+    let (ok, out) = cli(&dir, &shm, &["game-settings", "list"]);
+    assert!(ok && out.contains("570  intensity=0.5") && out.contains("exe:game.exe  placement=3"), "{out}");
+    let (ok, out) = cli(&dir, &shm, &["game-settings", "show", "570"]);
+    assert!(ok && out.contains("intensity=0.5"), "{out}");
+    // All games' value: the line goes.
+    let (ok, out) = cli(&dir, &shm, &["game-settings", "set", "570", "intensity", "1.5"]);
+    assert!(ok && out.contains("follows the settings for all games"), "{out}");
+    assert!(!games().contains("set_intensity"), "{}", games());
+    let (ok, out) = cli(&dir, &shm, &["game-settings", "set", "570", "intensity", "9"]);
+    assert!(!ok && out.contains("from 0 to 4"), "{out}");
+    let (ok, out) = cli(&dir, &shm, &["game-settings", "set", "570", "no_such_setting", "1"]);
+    assert!(!ok && out.contains("unknown setting"), "{out}");
+    let (ok, out) = cli(&dir, &shm, &["game-settings", "clear", "exe:game.exe"]);
+    assert!(ok && out.contains("removed 1 setting"), "{out}");
+    assert_eq!(games(), "[570]\nfuture_key=1\n\n");
+    let (ok, out) = cli(&dir, &shm, &["game-settings", "show", "no such game"]);
+    assert!(!ok && out.contains("no installed Steam game"), "{out}");
+    assert!(!shm.exists(), "no channel is created for a file change");
+}

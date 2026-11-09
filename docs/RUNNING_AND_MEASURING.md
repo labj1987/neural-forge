@@ -394,7 +394,7 @@ and summarises engage/disengage transitions and the frame rate.
 
 | Line | When | What it says |
 |---|---|---|
-| `[present] N fps (M/s composited by the effect) over Ts` | every 5 s, per presenting process | The real presented frame rate, effect on or off. |
+| `[present] N fps (M/s composited by the effect) over Ts; frame time p99 P ms, 1% low L fps (K intervals)` | every 5 s, per presenting process | The real presented frame rate, effect on or off, and the window's present-to-present intervals: their 99th percentile (nearest rank) and the 1% low, 1000 over the mean of the slowest 1% of them (at least one; the "1% low average"), from the latest 4096 intervals. |
 | `[sync] WxH: total= capture_gpu= copy_out= meter= wait_answer= server= rest(readback+compose)= zc= gpu_capture= gpu_compose=` | every 300 composed frames (after the upscaler) | Per model frame: total time on the present thread; capture submit to observed completion (includes the game's own frame); CPU copy out (0 with zero copy); the white meter; the wait for the answer; the model server's own time; readback and compose; whether zero copy was used; the layer's own GPU time from timestamps. |
 | `[preupscale] mode <mode> (default) in pid N` | once | The mode for this process. |
 | `[preupscale] device ...: vkGetImageViewHandleNVX present, ...` or `no VK_NVX_image_view_handle, ...` | per device | Whether the device can hold at all. |

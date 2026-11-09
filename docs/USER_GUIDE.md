@@ -76,7 +76,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
+| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, the HUD group: finding the HUD and HUD regions on the finished frame, and the Sharpening group: adaptive sharpening (CAS) and Clarity on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
@@ -186,7 +186,28 @@ the change comes back over a few pixels around each one. With a history after th
 not used under the HUD either, so changing HUD text leaves no trail. They are saved as `set_hud_regions` in
 `config.ini` and can be set with `neural-forge-cli shmctl set hud_regions "0,0.88,0.3,0.12;0.7,0,0.3,0.1,soften,0.5"`
 (left, top, width, height in 0-1, then `keep` or `soften` and the strength). Before the upscaler and after
-DLSS the HUD is not drawn yet, so neither setting applies there.
+DLSS the HUD is not drawn yet, so neither setting applies there. The regions also keep the sharpening off the
+HUD (below), wherever the model runs.
+
+**Sharpening** (Model tab) works on the finished frame in every game, whatever the placement: each presented
+frame (frame generation's too) is sharpened just before it is shown, after the model, so the model never sees
+it. Both filters are off at 0, the default. **Adaptive sharpening (CAS)** is AMD FidelityFX Contrast Adaptive
+Sharpening: each pixel is sharpened by as much as its neighbours leave room for, so soft detail gets the most
+and edges that are already sharp, and flat areas, get little; about 0.7 is CAS's own default and 1 its
+strongest. **Clarity** (0 to 2) lifts local contrast of brightness: the difference between each pixel and a
+blurred surround of **Clarity radius** pixels (at 1440p, scaled with the resolution; 2 to 64, default 16) is
+added back times the strength, the same to all three colour channels, so colours keep their hue. **Clarity
+midtones** (0.5) keeps it off the darkest and brightest parts (0 evenly, 1 midtones only), and **Clarity edge
+protection** (0.5) stops the blur at strong brightness edges so they do not grow bright or dark halos. The
+**HUD regions** apply: nothing inside a Keep region, the strength's share inside a Soften one (Find the HUD
+does not apply here). Clarity does not use the game's depth: on the presented frame there is none to use.
+GPU time a presented frame at 1440p on an RTX 5070: 0.29 ms for CAS, 0.33 ms for Clarity at radius 16 (0.43 ms at
+64), 0.37 ms for both; most of it is copying the frame out and back. It is paid on every presented frame, so with
+frame generation 4x four times a rendered frame. `neural-forge-cli shmctl set sharpen_cas 0.5` (and
+`clarity_strength`, `clarity_radius`, `clarity_midtones`, `clarity_edges`) does the same from a terminal, and
+a game can have its own sharpening like any other setting ([Settings for one game](#settings-for-one-game)); `NEURAL_FORGE_SHARPEN` overrides it for one launch, for comparisons. A capture (the Debug tab's Capture button) shows the frame
+sharpened where the model runs in the game's frame (before the upscaler or after DLSS), and before the
+sharpening where the model runs on the finished frame.
 
 ![Per-pass settings, scrolled to the end: an override switch for each of local tone, local structure, skin structure, style, auto mask, model resolution, edit saturation, edit contrast, edit detail and placement, each off](../screenshots/passes.png)
 
@@ -196,6 +217,29 @@ Capture button (and `shmctl capture`) saves the next presented frame before and 
 Forge's composition and says what happened: where the files are and whether the effect changed the
 frame, or why nothing was written; clicking again while it waits cancels it, and a request no game
 takes is withdrawn after 5 seconds.
+
+### Settings for one game
+
+Every game uses the same settings unless it has some of its own. **Settings for**, the bar under the tab
+switcher, picks whose settings the tabs show and change: **All games**, or one of your installed Steam games
+(and any other game that has settings of its own or is running). A game's own settings are only the ones you
+change while it is picked; every other setting follows All games, so a later change there still reaches it.
+Setting a value back to the All games value removes it from the game's own. While a game is picked, each setting
+it has its own value of is marked **This game**, with a button beside the mark that drops just that one (the
+setting follows All games again); settings without the mark follow All games. **Restore defaults** removes all of
+the game's own settings. The line beside the menu says how many it has and whether it is running.
+
+When a game starts, its own settings are put on top of the settings for all games, and the menu switches to
+it, so a change you make while it runs is saved for that game. A game without settings of its own runs with the
+settings for all games. Picking another entry shows that entry's settings in the running game too, until you
+pick the game again or start it again. Reset and loading a profile change the settings shown.
+
+A Steam game is known by its app id; a game outside Steam by its executable's name (`exe:game.exe`). They are
+saved in `~/.config/neural-forge/games.ini`, one `[570]` or `[exe:game.exe]` section per game holding only its own
+`set_<name>=` lines. From a terminal: `neural-forge-cli game-settings list`, `show GAME`,
+`set GAME NAME VALUE` (the names and values `shmctl set` takes) and `clear GAME [NAME]`. Neural Forge can ship
+settings for games that need their own; none of the tested games does, so none are built in now. Your own
+settings win over built-in ones, and an update never changes your files.
 
 ## Tested games
 
@@ -249,11 +293,14 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_PREUPSCALE=off` | layer | Rollback: the network is not loaded, so no frame is changed (the layer log says so once). The model on the finished frame is the Placement setting's Finished frame instead. Unset (or `model`) is the default. An unknown value is logged and treated as `off`. |
 | `NEURAL_FORGE_PREUPSCALE=dump\|identity\|roundtrip` | layer | Diagnostics: write DLSS's input to `captures/`, hold without the model (raw copy back), or run the HDR encode and decode with no model. They wait for their own work inside the game's submit, so a submit that waits on an event or on a timeline value not reached yet goes to DLSS untouched. See [RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md). |
 | `NEURAL_FORGE_EDIT_CACHE=off` | layer | Before the upscaler, run the network on every frame instead of the edit cache's cadence (every frame while the camera is still, every second frame while it moves), with none of the cache at all (the game's depth is neither made copyable nor copied). For A/B comparisons, benchmarks and rollback; unset (or `on`) is the default. An unknown value is logged and the cache stays on. |
+| `NEURAL_FORGE_GAME_RESET=off` | layer | Before the upscaler, ignore the game's own signal that DLSS should start afresh (a camera cut the game knows of; read where Neural Forge knows how the game's DLSS passes it on, such as GTA V Enhanced), so the model keeps its history through it. For testing; unset (or `on`) is the default. |
+| `NEURAL_FORGE_EXPOSURE_JUMP=off\|N` | layer | Before the upscaler, how much the frame's exposure must change between two frames of the model for it to start afresh: N stops, above 0 and up to 16 (default 1, twice or half as bright), or `off` to keep the history through any change. For testing; an unknown value is logged and the default stays. |
 | `NEURAL_FORGE_SCENE_CUT=off\|N` | layer | Before the upscaler, how different two frames must be for the model to start afresh: the mean change of brightness, 1 to 255 (default 40), or `off` to never start afresh on a cut. For testing; an unknown value is logged and the default stays. |
 | `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=3` | layer | The HDR encode's paper white (default 3; a positive number up to 1000). Tuning only. |
 | `NEURAL_FORGE_PIPELINED=1` | layer | After the upscaler: a pipelined present. Higher frame rate, but answers land on later frames and ghost. HDR10 frames are presented untouched in this mode. |
 | `NEURAL_FORGE_HDR_REFERENCE_NITS=203` | layer | On the finished frame of an HDR10 game, the brightness (in nits) the network's SDR picture takes as white before its highlight roll-off (default 203, clamped to 80-1000). Higher shows the network a darker picture and lets brighter highlights be changed. Tuning only. |
 | `NEURAL_FORGE_HDR_PRESENT=off` | layer | Testing aid: present HDR10 frames on the finished frame untouched, as for float16 ones. |
+| `NEURAL_FORGE_SHARPEN=off\|cas=0.5,clarity=0.4,...` | layer | The sharpening of the finished frame for this game, in place of the Model tab's: `off`, or comma-separated `cas`, `clarity`, `radius`, `midtones` and `edges` with their values (clamped to the settings' ranges); a setting not named keeps the Model tab's value. For A/B comparisons; a value that cannot be read is logged and the settings apply. |
 | `NEURAL_FORGE_TOGGLE_KEY=F10` | layer | Toggle key by name (`F1`-`F12`, `Home`, `N`...) or Linux key code; overrides the GUI's. |
 | `NEURAL_FORGE_HOTKEY_BACKEND=evdev\|x11` | layer | Forces one keyboard backend (default: evdev, then XInput2). |
 | `NEURAL_FORGE_HOTKEY_GLOBAL=1` | layer | The toggle key acts even when another window has the focus. By default a press is ignored only while another window is known to have the focus; where that cannot be told (inside gamescope) the key acts. |
@@ -295,7 +342,8 @@ The CLI is installed as `~/.local/share/neural-forge/bin/neural-forge-cli`; add 
 
 `neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID]`, `games`,
 `enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]`, `disable GAME`, `config`, `import-binaries DIR`,
-`extract-model DIR [--network full|small]`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`, and
+`extract-model DIR [--network full|small]`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`,
+`game-settings list|show GAME|set GAME NAME VALUE|clear GAME [NAME]` for a game's own settings, and
 `shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--view V]|capture --cancel|dump-cache [--holds K]|reset|lut FILE|none`
 for the live settings. `doctor`, `report` and `shmctl status` only look: they create and change nothing.
 `neural-forge-cli help [COMMAND]` (or `COMMAND --help`) has the details; an unknown or misspelt
@@ -314,6 +362,7 @@ Valve's VAC) cannot be seen.
 |---|---|
 | `~/.config/neural-forge/config.ini` | Paths (`binaries=`, `shm=`, `edit_lut=` for the look-up table) and every setting as `set_<name>=`. The layer applies the saved settings when it opens the channel. |
 | `~/.config/neural-forge/profiles.ini` | Named profiles. |
+| `~/.config/neural-forge/games.ini` | Each game's own settings: a `[<app id>]` or `[exe:<file.exe>]` section with only the `set_<name>=` lines that differ from `config.ini`'s. The layer applies the game's when it starts. |
 | `~/.local/share/neural-forge/` | The installed layer and GUI, the extracted model (`model/`), an imported DLL (`binaries/`), captures (`captures/`). |
 | `~/.local/state/neural-forge/layer.log` | The layer's session log: state changes and errors only, never per frame (kept to 256 KiB, the previous one as `layer.log.1`). Diagnose and the report read it. |
 | `/tmp/neural-forge-$UID/shm.bin` | The shared memory the layer and the GUI talk through. |
