@@ -2356,6 +2356,11 @@ mod tests {
         // Planned as one too (the guard's reset of the history on the GPU leaves only the noise seed to tell).
         let native = rig.session.res_inline(crate::preupscale::placement::Stage::Before).as_ref().and_then(|r| r.native.as_ref()).expect("the native pass");
         assert_eq!(native.seed(), 0, "the network frame after it was planned with the history's seed");
+        assert_eq!(
+            native.last_stale(),
+            Some(neural_forge_protocol::history::Stale::Unsound),
+            "reset for the hold guard's reason, not as frames gone to DLSS untouched"
+        );
     }
 
     const PROBE_SPV: &[u8] = include_bytes!("../../shaders/test_restore_probe.spv");

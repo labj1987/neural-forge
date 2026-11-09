@@ -31,11 +31,14 @@ fn main() {
 }
 
 /// Installs this AppImage's layer into persistent user storage when they
-/// differ from what is installed (a no-op otherwise). `APPDIR` is set by the AppImage
-/// runtime only, so a `cargo run` build never installs. Returns the error to show, if any.
+/// differ from what is installed (a no-op otherwise). Only when this program runs from the AppDir
+/// that `APPDIR` names (`install::running_appdir`): the AppImage runtime sets it, so a `cargo run`
+/// build never installs, and an `APPDIR` inherited from another AppImage is not ours. Returns the error
+/// to show, if any.
 fn auto_install() -> Option<String> {
-    let appdir = std::env::var("APPDIR").ok()?;
-    match neural_forge_supervisor::install::install(std::path::Path::new(&appdir)) {
+    let exe = std::env::current_exe().ok()?;
+    let appdir = neural_forge_supervisor::install::running_appdir(std::env::var_os("APPDIR").as_deref(), &exe)?;
+    match neural_forge_supervisor::install::install(&appdir) {
         Ok(report) => {
             if report.changed {
                 eprintln!("neural-forge: installed the layer to {}", report.root.display());

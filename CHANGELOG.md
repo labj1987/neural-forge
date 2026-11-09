@@ -4,6 +4,64 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.13.0 — 2026-11-09
+
+This release fixes what a full review of Neural Forge found.
+
+**Picture and stability in games**
+
+- Games with an sRGB swapchain got a much too dark picture from the model on the finished frame (the frame was
+  decoded twice before the model saw it). The model now sees the frame as it is.
+- The sharpening (Adaptive sharpening and Clarity) could crash a game on its first sharpened frame when another
+  Vulkan layer runs below Neural Forge (the validation layers, MangoHud, OBS game capture).
+- A native game that presents from another queue after recreating its swapchain no longer gets Vulkan errors on
+  every frame: Neural Forge rebuilds its work for that queue.
+- After a game recreates its swapchain, the model applies to the new one at once, instead of staying off until
+  the game destroyed the old one (or for good when it never did).
+- When Neural Forge runs out of memory allocating command buffers for a game, the game now gets the empty handles
+  Vulkan requires instead of stale ones it might free. The same holds for every command of that kind that Neural
+  Forge hooks (descriptor sets, pipelines, shared swapchains).
+- Two fixes in the Vulkan layer framework Neural Forge is built on: when the layer or driver below resolves no
+  `vkCreateDevice`, creating a device now fails cleanly instead of running into undefined behaviour, and a layer's
+  own `vkGetInstanceProcAddr` hook is now asked, as the framework documents.
+- In games where the model works inside DLSS's own command buffer, a frame whose input layout had to be guessed
+  and was guessed wrong no longer leaves the next frames unedited: the picture no longer flickers between edited
+  and unedited frames while the camera moves after such a frame. The log names this reset for what it is.
+- A game whose own exposure value is too small to use now falls back to the exposure Neural Forge measures from
+  the picture, instead of leaving every frame unedited.
+- A corrupt network file can no longer overflow memory in the game, and the network's GPU work is ordered so that
+  two runs back to back cannot disturb each other.
+- A `.cube` look-up table whose `DOMAIN_MIN` to `DOMAIN_MAX` span is too narrow (below a millionth) or too wide to
+  give a usable grid is refused, with the reason, in the app, `neural-forge-cli` and the game alike. Before, the
+  app accepted such a file and a game could read outside the table.
+
+**Settings and the app**
+
+- The network's tuning variables now read like every other `NEURAL_FORGE_*` variable: the
+  `NEURAL_FORGE_NR_NO_FUSE_*` and `NEURAL_FORGE_NR_NO_PTX_MLP` switches need `=1` (`=0` used to turn them on), and
+  a value that is not a valid switch or number is reported once on the game's standard error and ignored, instead
+  of being read as 0.
+- A setting changed in the app is no longer lost, or saved for the wrong game, when a game starts (or
+  `neural-forge-cli game-settings` switches whose settings are shown) right after the change. And a
+  `game-settings clear` or `set` made right after a change in the app is no longer undone by it.
+- Editing a HUD region that the frame clips or drops now shows its real values, and the rows below it edit the
+  right region.
+- A game whose switch cannot be used (Flatpak Steam, an unknown executable) no longer gets a usable switch after
+  you switch it off.
+- The video memory estimate for the network is now interpolated between measured sizes instead of taken from the
+  next larger one: an ultrawide 3440x1440 needs about 920 MiB, not the 4K figure. Diagnose's warnings and the
+  video memory guard's decision to switch back on use it.
+- **Save report** no longer copies your other launch options (which can hold passwords or keys) into the report:
+  only Neural Forge's part of each game's launch options is included.
+- Diagnose (`neural-forge-cli doctor`) no longer reports a failure when there is no `config.ini` yet (nothing writes one until you change a
+  setting); a `config.ini` that cannot be read is still a failure, with what to do.
+- Diagnose's suggested `--target-exe` command is quoted for names with spaces and keeps the game's other targets.
+- Install errors name the file and say what to do; a missing install record suggests `neural-forge-cli uninstall`
+  first. The app no longer installs another AppImage's files when it was started from one.
+- `neural-forge-cli uninstall --purge` now also takes Neural Forge out of every game's Steam launch options and
+  removes its copies of Steam's `localconfig.vdf`. It refuses while Steam is running (Steam would write the old
+  launch options back), naming each game left to change.
+
 ## 3.12.0 — 2026-11-09
 
 - Settings can now differ per game. **Settings for**, the bar under the tabs, picks All games or one of your

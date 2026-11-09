@@ -139,7 +139,7 @@ and shows a moment of untouched frames while the model is prepared for the new s
 
 **Model brightness** (Model tab) sets how bright the picture the model works on is, before the upscaler and
 after DLSS; the game's own brightness is kept either way, because the picture is brought back exactly
-afterwards. **Game** (the default) uses the exposure the game gives DLSS (measured from the frame instead where a game's is always 0). **Auto** measures it from the frame, within half
+afterwards. **Game** (the default) uses the exposure the game gives DLSS (measured from the frame instead where a game's is always 0, or too small to use). **Auto** measures it from the frame, within half
 to 16 times the game's own so night stays night, for games that give the model a very dark picture: in daytime
 Crimson Desert's has a median brightness of 0.14 of white with Game and 0.50 with Auto. How the model treats the
 shadows changes with it, so compare the two in the game. **Model
@@ -162,7 +162,8 @@ detail the model adds in darker textures, since that detail is darkening. **Look
 65 points; the Choose button or `neural-forge-cli shmctl lut FILE`) to the last pass's result where the model
 changed the picture: its strength (0, off) grows with the size of the change and is full at **Look-up table
 full at**, so a pixel the model left alone keeps its colour. A table that is removed or cannot be read stops
-applying, before and after the upscaler alike. At their defaults the picture is exactly the model's.
+applying, before and after the upscaler alike; so does one whose `DOMAIN_MIN` to `DOMAIN_MAX` span in a channel
+is below 0.000001 or too wide to give a usable grid, which the Choose button and `shmctl lut` refuse with the reason. At their defaults the picture is exactly the model's.
 
 **Placement** (Model tab) sets where the model runs in the frame: **Auto** (the default; see
 [How it works](#how-it-works)), **Before the upscaler** (with Ray Reconstruction on, the finished
@@ -182,7 +183,8 @@ the picture. **Find the HUD** (on) keeps the model's change off what stays still
 picture moves: text, icons, the minimap. It needs a few seconds of movement to find them, and a still
 scene (a menu, a paused game) never adds to what it found. **HUD regions** are up to eight rectangles in
 percent of the frame: **Keep** has no change inside, **Soften** keeps the change's strength (a share) inside;
-the change comes back over a few pixels around each one. With a history after the upscaler, the history is
+the change comes back over a few pixels around each one. A region is cut at the frame's edges (Left at 90 %
+leaves at most 10 % of width), and the list shows what is kept. With a history after the upscaler, the history is
 not used under the HUD either, so changing HUD text leaves no trail. They are saved as `set_hud_regions` in
 `config.ini` and can be set with `neural-forge-cli shmctl set hud_regions "0,0.88,0.3,0.12;0.7,0,0.3,0.1,soften,0.5"`
 (left, top, width, height in 0-1, then `keep` or `soften` and the strength). Before the upscaler and after
@@ -369,10 +371,17 @@ Valve's VAC) cannot be seen.
 
 ## Uninstall
 
-`neural-forge-cli uninstall` removes the files it installed (files you changed are kept).
-`neural-forge-cli uninstall --purge` also removes the config, everything under
-`~/.local/share/neural-forge` (the model, an imported DLL, captures), `~/.local/state/neural-forge` and
-`/tmp/neural-forge-$UID`.
+`neural-forge-cli uninstall` removes the files it installed (files you changed are kept). The
+games you switched on keep Neural Forge's variables in their launch options, which do nothing without
+the layer.
+`neural-forge-cli uninstall --purge` removes everything Neural Forge wrote. First it takes its
+variables out of every game's Steam launch options (your own options stay), in every Steam account,
+and removes the files it keeps next to each account's `localconfig.vdf` (`.neural-forge.orig` and
+`.neural-forge.bak`, its copies of that file, and `.neural-forge.lock`). Steam must be closed for
+that: while it runs, or while a game's options cannot be changed safely, the purge removes nothing and
+names each game with the launch options to set by hand instead. Then it removes the config,
+everything under `~/.local/share/neural-forge` (the model, an imported DLL, captures),
+`~/.local/state/neural-forge` and `/tmp/neural-forge-$UID`.
 
 ## More known issues
 
@@ -398,4 +407,10 @@ Valve's VAC) cannot be seen.
   layer log (`NEURAL_FORGE_LOG=/path` in the launch options) has the `[native]` lines.
 - **Steam overlay problems.** The layer leaves the overlay's own small swapchain alone, and only the
   executables in `NEURAL_FORGE_TARGET_EXE` (which switching a game on sets) can use Neural Forge.
+- **"Installing the layer for Steam games failed: refusing to overwrite ..."** A file Neural Forge
+  installed under `~/.local/share/neural-forge` was changed, or something else put a file there, so
+  the AppImage leaves it alone and games keep the layer installed before. The message names the file
+  and what to do: move that file aside and start the AppImage again; when the install record
+  (`~/.local/share/neural-forge/installation.json`) is missing, run
+  `~/.local/share/neural-forge/bin/neural-forge-cli uninstall` first.
 - **32-bit games** are not supported (see [Requirements](../README.md#requirements)).

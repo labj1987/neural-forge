@@ -10,6 +10,11 @@ pub const CONFIG_KEY: &str = "edit_lut";
 pub const MIN_SIZE: usize = 2;
 pub const MAX_SIZE: usize = 65;
 
+/// The narrowest DOMAIN_MIN to DOMAIN_MAX span taken in a channel. A narrower one is no real table (its
+/// grid is a millionth of a unit wide), and a far narrower one (a subnormal span) has no finite grid at all
+/// ([`Cube::grid`]).
+pub const MIN_SPAN: f32 = 1e-6;
+
 /// The largest file [`load`] reads: a 65-point table is about 275,000 lines of three numbers, a few
 /// MB even with long numbers and comments.
 pub const MAX_FILE_BYTES: u64 = 64 << 20;
@@ -33,24 +38,36 @@ impl Cube {
         Self { size: n, domain_min: [0.0; 3], domain_max: [1.0; 3], table }
     }
 
-    /// The table's value at `rgb` by trilinear interpolation (the shaders' lookup, on the CPU). A
-    /// table that is not one [`parse`] would give (fewer than [`MIN_SIZE`] points a side, not `size`^3
-    /// entries, an empty or non-finite domain) leaves `rgb` as it is.
+    /// Per channel, the scale and offset that take a value to the table's grid, (size - 1) / (max - min)
+    /// and -min times that: what the shaders' lookup multiplies and adds. `None` for a domain that has no
+    /// usable grid: a span that is not finite or below [`MIN_SPAN`], or a scale or offset that is not
+    /// finite. [`parse`] refuses such a table and the layer never uses one.
+    pub fn grid(&self) -> Option<([f32; 3], [f32; 3])> {
+        let n = self.size.saturating_sub(1) as f32;
+        let spans_ok = (0..3).all(|c| {
+            let span = self.domain_max[c] - self.domain_min[c];
+            span.is_finite() && span >= MIN_SPAN
+        });
+        let scale: [f32; 3] = std::array::from_fn(|c| n / (self.domain_max[c] - self.domain_min[c]));
+        let offset: [f32; 3] = std::array::from_fn(|c| -self.domain_min[c] * scale[c]);
+        (spans_ok && scale.iter().chain(&offset).all(|v| v.is_finite())).then_some((scale, offset))
+    }
+
+    /// The table's value at `rgb` by trilinear interpolation: the shaders' lookup, on the CPU, with the
+    /// same grid ([`Cube::grid`]) and a NaN position taken as 0 as they take it. A table that is not one
+    /// [`parse`] would give (fewer than [`MIN_SIZE`] points a side, not `size`^3 entries, a domain without
+    /// a usable grid) leaves `rgb` as it is.
     pub fn sample(&self, rgb: [f32; 3]) -> [f32; 3] {
         let n = self.size;
         let whole = n >= MIN_SIZE && n.checked_pow(3) == Some(self.table.len());
-        let spans_ok = (0..3).all(|c| {
-            let span = self.domain_max[c] - self.domain_min[c];
-            span.is_finite() && span > 0.0
-        });
-        if !whole || !spans_ok {
+        let Some((scale, offset)) = self.grid().filter(|_| whole) else {
             return rgb;
-        }
+        };
         let mut base = [0usize; 3];
         let mut frac = [0f32; 3];
         for c in 0..3 {
-            let span = self.domain_max[c] - self.domain_min[c];
-            let t = ((rgb[c] - self.domain_min[c]) / span * (n - 1) as f32).clamp(0.0, (n - 1) as f32);
+            let t = rgb[c] * scale[c] + offset[c];
+            let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, (n - 1) as f32) };
             base[c] = (t.floor() as usize).min(n - 2);
             frac[c] = t - base[c] as f32;
         }
@@ -73,7 +90,9 @@ impl Cube {
 
 /// Parses a `.cube` file's text: `LUT_3D_SIZE`, optional `DOMAIN_MIN`/`DOMAIN_MAX` and `TITLE`, `#`
 /// comments, then exactly size^3 lines of three numbers. A 1D table (`LUT_1D_SIZE`) is refused, as is a
-/// size outside [`MIN_SIZE`]..=[`MAX_SIZE`], a non-finite value or an empty domain.
+/// size outside [`MIN_SIZE`]..=[`MAX_SIZE`], a non-finite value, and a domain without a usable grid
+/// ([`Cube::grid`]: empty, reversed, narrower than [`MIN_SPAN`], or so wide or so far out that its grid is
+/// not finite).
 pub fn parse(text: &str) -> Result<Cube, String> {
     let mut size = None;
     let mut domain_min = [0f32; 3];
@@ -130,7 +149,13 @@ pub fn parse(text: &str) -> Result<Cube, String> {
     if (0..3).any(|c| domain_max[c] <= domain_min[c]) {
         return Err("DOMAIN_MAX must be above DOMAIN_MIN in every channel".into());
     }
-    Ok(Cube { size, domain_min, domain_max, table })
+    let cube = Cube { size, domain_min, domain_max, table };
+    if cube.grid().is_none() {
+        return Err(format!(
+            "the DOMAIN_MIN to DOMAIN_MAX span ({domain_min:?} to {domain_max:?}) cannot be used: each channel's must be at least {MIN_SPAN} and give a finite grid for {size} points a side"
+        ));
+    }
+    Ok(cube)
 }
 
 /// Reads and parses the file at `path`: a regular file of at most [`MAX_FILE_BYTES`]. Anything else
@@ -196,6 +221,39 @@ mod tests {
         assert!(parse("LUT_3D_SIZE 2\n0 0 nan\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n").is_err());
     }
 
+    /// A domain too narrow (subnormal, or below MIN_SPAN) or too wide (a span that overflows) has no usable
+    /// grid: refused with the reason, where the layer would refuse it too. A narrow but usable one parses.
+    #[test]
+    fn a_domain_without_a_usable_grid_is_refused() {
+        let with = |min: &str, max: &str| {
+            let mut t = text(&Cube::identity(3));
+            t.push_str(&format!("DOMAIN_MIN {min}\nDOMAIN_MAX {max}\n"));
+            parse(&t)
+        };
+        for (min, max) in [("0 0 0", "1 1e-40 1"), ("0 0 0", "1 1 5e-7"), ("-3e38 0 0", "3e38 1 1")] {
+            let e = with(min, max).expect_err(&format!("{min} to {max}"));
+            assert!(e.contains("span") && e.contains("cannot be used"), "{e}");
+        }
+        let fine = with("0 0 0", "1e-3 1e-6 1").expect("a narrow domain that still has a finite grid");
+        assert!(fine.grid().is_some());
+        assert!((fine.sample([0.0005, 0.0, 0.0])[0] - 0.5).abs() < 1e-3);
+    }
+
+    /// The CPU lookup is the shaders': position = rgb x scale + offset from [`Cube::grid`], a NaN
+    /// position taken as 0.
+    #[test]
+    fn sample_uses_the_shaders_grid_and_takes_nan_as_zero() {
+        let mut c = Cube::identity(3);
+        c.domain_min = [-0.5, 0.0, 0.25];
+        c.domain_max = [1.5, 1.0, 0.75];
+        let (scale, offset) = c.grid().unwrap();
+        assert_eq!(scale, [1.0, 2.0, 4.0]);
+        assert_eq!(offset, [0.5, 0.0, -1.0]);
+        let s = c.sample([f32::NAN, 0.5, 0.5]);
+        assert_eq!(s[0], 0.0, "NaN reads the first point");
+        assert!(s.iter().all(|v| v.is_finite()), "{s:?}");
+    }
+
     /// A table built by hand that `parse` would refuse: sampling it never indexes out of the table.
     #[test]
     fn a_table_parse_would_refuse_samples_to_its_input() {
@@ -210,6 +268,11 @@ mod tests {
         assert_eq!(flat.sample(rgb), rgb);
         flat.domain_max = [f32::NAN; 3];
         assert_eq!(flat.sample(rgb), rgb);
+        flat.domain_max = [1e-40; 3];
+        assert_eq!(flat.sample(rgb), rgb);
+        flat.domain_min = [-3e38; 3];
+        flat.domain_max = [3e38; 3];
+        assert_eq!(flat.sample(rgb), rgb, "an overflowing span");
     }
 
     #[test]

@@ -184,9 +184,42 @@ pub fn strip(existing: &str) -> String {
     out.join(" ")
 }
 
+/// What the report shows of a game's launch options: Neural Forge's own variables (`NEURAL_FORGE_*=...`) and
+/// `%command%` where they are, every run of other tokens in between replaced by one [`OMITTED`]. The rest is the
+/// user's free text (a server password, an API key), and the report goes on public issues.
+pub fn neural_forge_part(options: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for token in split_tokens(options) {
+        if token == COMMAND || (token.starts_with("NEURAL_FORGE_") && assignment(&token)) {
+            out.push(token);
+        } else if out.last().map(String::as_str) != Some(OMITTED) {
+            out.push(OMITTED.to_string());
+        }
+    }
+    out.join(" ")
+}
+
+/// [`neural_forge_part`]'s stand-in for the user's own options.
+pub const OMITTED: &str = "<other options omitted>";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reports_view_keeps_only_neural_forges_part() {
+        assert_eq!(
+            neural_forge_part("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='My Game.exe' %command%"),
+            "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='My Game.exe' %command%"
+        );
+        assert_eq!(
+            neural_forge_part("NEURAL_FORGE_ENABLE=1 API_KEY=s3cret gamemoderun %command% +connect 1.2.3.4:27015 +password hunter2"),
+            "NEURAL_FORGE_ENABLE=1 <other options omitted> %command% <other options omitted>"
+        );
+        assert_eq!(neural_forge_part("-login user pass"), OMITTED);
+        assert_eq!(neural_forge_part("MANGOHUD=1 NEURAL_FORGE_LOG=/tmp/l %command%"), "<other options omitted> NEURAL_FORGE_LOG=/tmp/l %command%");
+        assert_eq!(neural_forge_part(""), "");
+    }
 
     #[test]
     fn the_setup_tab_string_is_unchanged() {
