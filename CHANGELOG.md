@@ -19,12 +19,19 @@ first shipped them; their phase is kept as a subheading.
 
 - When Neural Forge finds the frame a game hands to DLSS but cannot work on it, the Status tab's Model placement
   line now says "DLSS input identified, not holding" and why, instead of "waiting for DLSS Super Resolution" as if
-  the game did not use DLSS. `neural-forge-cli shmctl status` and **Save report** show the same state and reason
-  (`preupscale_state=5`, `preupscale_reason=`).
+  the game did not use DLSS: a reason it found in the game, or that the model is switched off or the Placement
+  setting runs no pass before the upscaler. `neural-forge-cli shmctl status` and **Save report** show the same
+  state and reason (`preupscale_state=5`, `preupscale_reason=`).
 - The game's log says once each why a frame was not worked on inside DLSS's command buffer (missing copy usage, the
   input's format, size or layout, a render pass left open across DLSS), with the image it was.
 - The log's periodic count of DLSS submissions now also says how many frames were actually worked on, by each way
   of holding them, instead of only how many named DLSS's input.
+
+**Captures**
+
+- While the model runs after DLSS (with Ray Reconstruction, or the Placement "After DLSS"), the Debug tab's Capture
+  row and the capture's message now say that both images are the presented frame with the model's edit, as they
+  already did before the upscaler.
 
 ## 3.13.0 — 2026-11-09
 

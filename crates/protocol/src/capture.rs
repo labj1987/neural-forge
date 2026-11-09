@@ -49,7 +49,8 @@ pub mod reason {
     pub const NO_MODEL_SERVER: u32 = 3;
     /// The model did not answer the frame in time, so it went out untouched.
     pub const NO_ANSWER: u32 = 4;
-    /// The model runs before the upscaler: both images are the presented frame, which has its edit.
+    /// The model runs in the game's frame (before the upscaler or after DLSS): both images are the presented frame,
+    /// which has its edit.
     pub const BEFORE_UPSCALER: u32 = 5;
     /// The effect did not compose the frame (or every frame of the series).
     pub const NOT_COMPOSED: u32 = 6;
@@ -79,7 +80,7 @@ pub mod reason {
             MODEL_UNAVAILABLE => "the model is unavailable this session, so both images are the game's frame",
             NO_MODEL_SERVER => "no model server is running, so both images are the game's frame",
             NO_ANSWER => "the model did not answer in time, so the frame went out untouched",
-            BEFORE_UPSCALER => "the model runs before the upscaler, so both images are the presented frame with its edit",
+            BEFORE_UPSCALER => "the model runs in the game's frame (before the upscaler or after DLSS), so both images are the presented frame with its edit",
             NOT_COMPOSED => "the effect did not change the frame",
             PARTLY_COMPOSED => "the effect changed only some of the frames",
             UNREADABLE => "the game's swapchain cannot be read back",

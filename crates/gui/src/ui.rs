@@ -3099,11 +3099,11 @@ fn open_folder(dir: &std::path::Path, parent: Option<gtk4::Window>, toasts: &adw
 const CAPTURE_TAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const CAPTURE_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// What the capture button's row says, from the channel: whether frames are held before the upscaler
-/// now, where a capture has no frame without the model's edit (see the button's tooltip).
-fn capture_subtitle(holding: bool) -> &'static str {
-    if holding {
-        "The model runs before the upscaler now: both images will be the presented frame, which already has its edit"
+/// What the capture button's row says, from the channel: whether the model edits the game's own frame now
+/// ([`edits_in_game_frame`]), where a capture has no frame without the model's edit (see the button's tooltip).
+fn capture_subtitle(in_game_frame: bool) -> &'static str {
+    if in_game_frame {
+        "The model runs in the game's frame now (before the upscaler or after DLSS): both images will be the presented frame, which already has its edit"
     } else {
         "Saves the next frame as two PNGs: the game's frame and Neural Forge's result"
     }
@@ -3111,6 +3111,15 @@ fn capture_subtitle(holding: bool) -> &'static str {
 
 /// The Debug page's captures: the same one-frame request as `neural-forge-cli shmctl capture`, and the
 /// folder the layer writes them to.
+/// Whether `preupscale_state` says the model edits the game's own frame: holding before the upscaler, after DLSS,
+/// or both. The layer then keeps the after-the-upscaler compose off (`Session::suppresses_post`: the plan has a
+/// stage in the game's frame, holds engaged it and DLSS ran lately) and reads the presented frame back as both
+/// images of a capture. Waiting for DLSS input, DLSS identified but not held, and off run the model at present.
+fn edits_in_game_frame(state: u32) -> bool {
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH};
+    matches!(state, HOLDING | HOLDING_AFTER | HOLDING_BOTH)
+}
+
 fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Captures");
@@ -3124,9 +3133,10 @@ fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapp
     // it (`neural_forge_protocol::capture`), which the toast reports.
     capture_button.set_tooltip_text(Some(
         "Saves the next frame the game presents as <time>-original.png (the game's frame) and \
-         <time>-composited.png (what Neural Forge presented). While the model runs before the upscaler \
-         (a DLSS game), the layer has no frame without the model's edit when the game presents, so both \
-         images are the presented frame. HDR and 10-bit games cannot be captured.",
+         <time>-composited.png (what Neural Forge presented). While the model runs in the game's frame \
+         (before the upscaler or after DLSS, in a DLSS game), the layer has no frame without the model's \
+         edit when the game presents, so both images are the presented frame. HDR and 10-bit games \
+         cannot be captured.",
     ));
     capture_row.add_suffix(&capture_button);
     group.add(&capture_row);
@@ -3217,13 +3227,13 @@ fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapp
         });
     }
 
-    // Holding before the upscaler: from the channel, while the layer's heartbeat is fresh.
+    // The model in the game's frame: from the channel, while the layer's heartbeat is fresh.
     let shm = std::sync::Arc::clone(shm);
     let live = Liveness::default();
     every(&capture_row, SECOND, move |capture_row| {
         let hdr = shm.header();
-        let holding = hdr.preupscale_state.load(Ordering::Relaxed) == neural_forge_protocol::enums::preupscale_state::HOLDING;
-        capture_row.set_subtitle(capture_subtitle(live.alive(hdr) && holding));
+        let in_game_frame = edits_in_game_frame(hdr.preupscale_state.load(Ordering::Relaxed));
+        capture_row.set_subtitle(capture_subtitle(live.alive(hdr) && in_game_frame));
     });
     group
 }
@@ -3476,12 +3486,25 @@ mod preupscale_label_tests {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::capture_subtitle;
+    use super::{capture_subtitle, edits_in_game_frame};
 
     #[test]
     fn the_capture_row_says_when_there_is_no_before_image() {
-        assert!(capture_subtitle(true).contains("before the upscaler"));
+        assert!(capture_subtitle(true).contains("before the upscaler or after DLSS"));
         assert!(capture_subtitle(false).contains("two PNGs"));
+    }
+
+    /// Holding before the upscaler, after DLSS or both, the presented frame already has the model's edit and the
+    /// layer captures it as both images; waiting, DLSS identified but not held, and off capture before and after.
+    #[test]
+    fn a_capture_has_no_before_image_exactly_while_the_model_edits_the_game_frame() {
+        use neural_forge_protocol::enums::preupscale_state::*;
+        for state in [HOLDING, HOLDING_AFTER, HOLDING_BOTH] {
+            assert!(edits_in_game_frame(state), "state {state}");
+        }
+        for state in [OFF, WAITING, IDENTIFIED, 99] {
+            assert!(!edits_in_game_frame(state), "state {state}");
+        }
     }
 }
 
