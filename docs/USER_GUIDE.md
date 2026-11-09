@@ -182,7 +182,8 @@ the picture. **Find the HUD** (on) keeps the model's change off what stays still
 picture moves: text, icons, the minimap. It needs a few seconds of movement to find them, and a still
 scene (a menu, a paused game) never adds to what it found. **HUD regions** are up to eight rectangles in
 percent of the frame: **Keep** has no change inside, **Soften** keeps the change's strength (a share) inside;
-the change comes back over a few pixels around each one. With a history after the upscaler, the history is
+the change comes back over a few pixels around each one. A region is cut at the frame's edges (Left at 90 %
+leaves at most 10 % of width), and the list shows what is kept. With a history after the upscaler, the history is
 not used under the HUD either, so changing HUD text leaves no trail. They are saved as `set_hud_regions` in
 `config.ini` and can be set with `neural-forge-cli shmctl set hud_regions "0,0.88,0.3,0.12;0.7,0,0.3,0.1,soften,0.5"`
 (left, top, width, height in 0-1, then `keep` or `soften` and the strength). Before the upscaler and after

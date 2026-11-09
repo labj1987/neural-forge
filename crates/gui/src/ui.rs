@@ -1585,6 +1585,32 @@ fn build_sharpen_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapp
     group
 }
 
+/// The HUD region rows' left and top, and width and height, in percent: no value they take leaves a region
+/// empty once the header clips it to the frame (`HudRegion::clamped`, which drops an empty one), so an edit
+/// can clip a region but never remove it.
+const HUD_POSITION_RANGE: (f64, f64) = (0.0, 99.5);
+const HUD_SIZE_RANGE: (f64, f64) = (0.5, 100.0);
+
+/// Applies `change` to HUD region `k` of the header's list and writes the list (`write`). Returns what the
+/// header holds then, and whether that differs from what was written: the header clips a region to the frame
+/// and drops an empty one, and then the rows (their values, and with a region dropped their indices) no longer
+/// match it and must be rebuilt from it.
+fn edit_hud_region(
+    header: &neural_forge_protocol::ShmHeader,
+    k: usize,
+    change: &dyn Fn(&mut neural_forge_protocol::HudRegion),
+    write: &dyn Fn(&[neural_forge_protocol::HudRegion]),
+) -> (Vec<neural_forge_protocol::HudRegion>, bool) {
+    let mut meant = header.hud_settings().regions;
+    if let Some(r) = meant.get_mut(k) {
+        change(r);
+    }
+    write(&meant);
+    let held = header.hud_settings().regions;
+    let stale = held != meant;
+    (held, stale)
+}
+
 /// The HUD on the finished frame (the Placement "Finished frame", or where the model runs there anyway): the
 /// detection and the user's regions, a list of rectangles in percent of the frame.
 fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
@@ -1637,21 +1663,26 @@ fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>
                 let row = adw::ActionRow::new();
                 row.set_title(&format!("Region {}", k + 1));
                 let edit = {
-                    let (shm, write, shown) = (std::sync::Arc::clone(&shm), Rc::clone(&write), Rc::clone(&shown));
+                    let (shm, write, shown, rebuild) = (std::sync::Arc::clone(&shm), Rc::clone(&write), Rc::clone(&shown), Rc::clone(&rebuild_ref));
                     Rc::new(move |change: &dyn Fn(&mut HudRegion)| {
                         if refreshing() {
                             return;
                         }
-                        let mut regions = shm.header().hud_settings().regions;
-                        if let Some(r) = regions.get_mut(k) {
-                            change(r);
+                        let (held, stale) = edit_hud_region(shm.header(), k, change, &*write);
+                        *shown.borrow_mut() = held;
+                        if stale {
+                            // From an idle callback: the widget being edited is inside the list.
+                            let rebuild = Rc::clone(&rebuild);
+                            glib::idle_add_local_once(move || {
+                                if let Some(f) = rebuild.borrow().clone() {
+                                    f();
+                                }
+                            });
                         }
-                        write(&regions);
-                        *shown.borrow_mut() = shm.header().hud_settings().regions;
                     })
                 };
-                let spin = |value: f32, tip: &str, set: fn(&mut HudRegion, f32)| {
-                    let b = gtk4::SpinButton::with_range(0.0, 100.0, 0.5);
+                let spin = |value: f32, tip: &str, (min, max): (f64, f64), set: fn(&mut HudRegion, f32)| {
+                    let b = gtk4::SpinButton::with_range(min, max, 0.5);
                     b.set_value(f64::from(value) * 100.0);
                     // As `keep_spin_precision` does for the spin rows.
                     b.set_digits(spin_digits(0.5, b.value()));
@@ -1666,10 +1697,10 @@ fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>
                     });
                     row.add_suffix(&b);
                 };
-                spin(r.x, "Left, percent of the width", |r, v| r.x = v);
-                spin(r.y, "Top, percent of the height", |r, v| r.y = v);
-                spin(r.w, "Width, percent", |r, v| r.w = v);
-                spin(r.h, "Height, percent", |r, v| r.h = v);
+                spin(r.x, "Left, percent of the width", HUD_POSITION_RANGE, |r, v| r.x = v);
+                spin(r.y, "Top, percent of the height", HUD_POSITION_RANGE, |r, v| r.y = v);
+                spin(r.w, "Width, percent", HUD_SIZE_RANGE, |r, v| r.w = v);
+                spin(r.h, "Height, percent", HUD_SIZE_RANGE, |r, v| r.h = v);
                 let mode = gtk4::DropDown::from_strings(&["Keep", "Soften"]);
                 mode.set_selected(if r.mode == hud_mode::SOFTEN { 1 } else { 0 });
                 mode.set_valign(gtk4::Align::Center);
@@ -1681,7 +1712,7 @@ fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>
                     });
                 }
                 row.add_suffix(&mode);
-                spin(r.strength, "Soften: how much of the edit stays, percent", |r, v| r.strength = v);
+                spin(r.strength, "Soften: how much of the edit stays, percent", (0.0, 100.0), |r, v| r.strength = v);
                 let remove = gtk4::Button::from_icon_name("list-remove-symbolic");
                 remove.set_valign(gtk4::Align::Center);
                 remove.set_tooltip_text(Some("Remove this region"));
@@ -3288,6 +3319,55 @@ fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::map
     let status = adw::StatusPage::builder().icon_name("dialog-error-symbolic").title(title).description(description).build();
     let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").content(&status).build();
     window.present();
+}
+
+#[cfg(test)]
+mod hud_region_tests {
+    use super::{edit_hud_region, HUD_POSITION_RANGE, HUD_SIZE_RANGE};
+    use neural_forge_protocol::{enums::hud_mode, HudRegion, ShmHeader};
+
+    fn region(x: f32, w: f32) -> HudRegion {
+        HudRegion { x, y: 0.5, w, h: 0.1, mode: hud_mode::KEEP, strength: HudRegion::DEFAULT_STRENGTH }
+    }
+
+    /// An edit the header keeps as it was asks for nothing; one it clips or drops asks for the rows to be rebuilt
+    /// (a dropped region moves the others' indices, so the old rows would edit the wrong one).
+    #[test]
+    fn an_edit_the_header_clips_or_drops_rebuilds_the_rows() {
+        let header = ShmHeader::default();
+        header.init_defaults();
+        let write = |regions: &[HudRegion]| header.set_hud_regions(regions);
+        header.set_hud_regions(&[region(0.0, 0.3), region(0.5, 0.2)]);
+        let (held, stale) = edit_hud_region(&header, 1, &|r| r.w = 0.25, &write);
+        assert!(!stale);
+        assert_eq!(held, [region(0.0, 0.3), region(0.5, 0.25)]);
+        // Left at 90 % with a width of 30 %: clipped to 10 %, which the row must show.
+        let (held, stale) = edit_hud_region(&header, 0, &|r| r.x = 0.9, &write);
+        assert!(stale);
+        assert_eq!(held[0].w, 1.0 - 0.9f32, "{held:?}");
+        // A width of 0: dropped, and the old Region 2 is index 0 now.
+        let (held, stale) = edit_hud_region(&header, 0, &|r| r.w = 0.0, &write);
+        assert!(stale);
+        assert_eq!(held, [region(0.5, 0.25)]);
+    }
+
+    /// No value the region rows' spin buttons take can make the header drop the region.
+    #[test]
+    fn no_spin_value_drops_a_region() {
+        for x in [HUD_POSITION_RANGE.0, 50.0, HUD_POSITION_RANGE.1] {
+            for w in [HUD_SIZE_RANGE.0, 1.0, HUD_SIZE_RANGE.1] {
+                let r = HudRegion {
+                    x: (x / 100.0) as f32,
+                    y: (x / 100.0) as f32,
+                    w: (w / 100.0) as f32,
+                    h: (w / 100.0) as f32,
+                    mode: hud_mode::SOFTEN,
+                    strength: 0.0,
+                };
+                assert!(r.clamped().is_some(), "{r:?}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
