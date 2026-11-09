@@ -34,20 +34,18 @@ impl Lut {
     }
 
     /// Per channel, the scale and offset that take a value to the table's grid: (size - 1) / (max - min)
-    /// and -min times that. `None` when one is not finite: a DOMAIN span so small (a subnormal one) that the
-    /// scale overflows, and its offset is NaN. The shaders would index the table with that (out of bounds
-    /// without robust buffer access), so such a table is never used ([`grid_of`]).
+    /// and -min times that. `None` for a domain without a usable grid ([`Cube::grid`]), e.g. a DOMAIN span so
+    /// small (a subnormal one) that the scale overflows and its offset is NaN. The shaders would index the
+    /// table with that (out of bounds without robust buffer access), so such a table is never used
+    /// ([`grid_of`]); the parser refuses it in the first place.
     pub(crate) fn grid(&self) -> Option<([f32; 3], [f32; 3])> {
         grid_of(&self.cube)
     }
 }
 
-/// [`Lut::grid`] of `cube`.
+/// [`Lut::grid`] of `cube`: [`Cube::grid`], the grid the parser and the CPU reference lookup use.
 fn grid_of(cube: &Cube) -> Option<([f32; 3], [f32; 3])> {
-    let n = (cube.size - 1) as f32;
-    let scale: [f32; 3] = std::array::from_fn(|c| n / (cube.domain_max[c] - cube.domain_min[c]));
-    let offset: [f32; 3] = std::array::from_fn(|c| -cube.domain_min[c] * scale[c]);
-    scale.iter().chain(&offset).all(|v| v.is_finite()).then_some((scale, offset))
+    cube.grid()
 }
 
 /// One pass's shader parameters: `colour` (saturation, contrast, detail, 0), `flags` (steps, table size, 0,
