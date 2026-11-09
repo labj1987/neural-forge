@@ -6,6 +6,13 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Settings can now differ per game. **Settings for**, the bar under the tabs, picks All games or one of your
+  games; a game keeps only the settings you change while it is picked, and follows All games for the rest, so a
+  later change for all games still reaches it. **Restore defaults** removes a game's own settings. When a game
+  starts, its own settings apply and the app switches to them, so changes made while it runs are saved for that
+  game. Games without settings of their own run exactly as before. From a terminal: `neural-forge-cli
+  game-settings list|show|set|clear`. They are saved in `~/.config/neural-forge/games.ini`, which updates never
+  change.
 - The model now starts afresh when the game itself tells DLSS a new shot begins, as it already did when the
   picture changes as a whole. In GTA V Enhanced this catches camera cuts the picture-based check missed, which
   carried the last shot's look into the new one for a moment. It works where Neural Forge knows how the game's

@@ -1,8 +1,9 @@
 //! `neural-forge-cli` -- the command-line front end: config, the NVIDIA DLL import and the model
 //! extraction, install/uninstall, the live settings channel (`shmctl`), settings profiles and the
-//! Steam games' launch options (`games`, `enable`, `disable`). Shares
+//! Steam games' launch options (`games`, `enable`, `disable`) and per-game settings (`game-settings`). Shares
 //! its logic with the GUI through `neural_forge_supervisor` and `neural_forge_protocol`.
 
+mod game_settings;
 mod shmctl;
 
 use std::process::ExitCode;
@@ -37,6 +38,9 @@ fn usage_text() -> &'static str {
          \x20                     instance's live SHM header (see `shmctl help`)\n\
          \x20 profile <sub>        save/load/list/delete named settings profiles\n\
          \x20                     (see `profile help`)\n\
+         \x20 game-settings <sub>  list/show/set/clear a game's own settings, which it\n\
+         \x20                     uses over the settings for all games (see\n\
+         \x20                     `game-settings help`)\n\
          \x20 games                list installed Steam games and whether Neural Forge\n\
          \x20                     is on in their launch options\n\
          \x20 enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]\n\
@@ -524,6 +528,7 @@ enum Command {
     },
     Shmctl(Vec<String>),
     Profile(Vec<String>),
+    GameSettings(Vec<String>),
     Games,
     Enable {
         game: String,
@@ -567,7 +572,9 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
     if command_usage(command).is_none() {
         return Err(UsageError { command: None, message: format!("unknown command: {command}") });
     }
-    if rest.first().is_some_and(|a| matches!(*a, "--help" | "-h")) || (rest.first() == Some(&"help") && matches!(command.as_str(), "shmctl" | "profile")) {
+    if rest.first().is_some_and(|a| matches!(*a, "--help" | "-h"))
+        || (rest.first() == Some(&"help") && matches!(command.as_str(), "shmctl" | "profile" | "game-settings"))
+    {
         return if rest.len() == 1 { Ok(Command::Help(Some(command.clone()))) } else { Err(err(format!("unexpected argument {:?}", rest[1]))) };
     }
     let unexpected = |extra: &[&str]| err(format!("unexpected argument {:?}", extra[0]));
@@ -617,6 +624,7 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
             [other, ..] => Err(err(format!("unknown option {other:?}"))),
         },
         "shmctl" => shmctl::check_args(&args[1..]).map(|()| Command::Shmctl(args[1..].to_vec())).map_err(err),
+        "game-settings" => game_settings::check_args(&rest).map(|()| Command::GameSettings(args[1..].to_vec())).map_err(err),
         "profile" => {
             let ok = match rest.as_slice() {
                 [] | ["list"] => true,
@@ -691,6 +699,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         }
         "shmctl" => "",
         "profile" => "",
+        "game-settings" => "",
         _ => return None,
     })
 }
@@ -700,6 +709,7 @@ fn print_help(command: Option<&str>) {
         None => usage(),
         Some("shmctl") => shmctl::usage(),
         Some("profile") => profile_usage(),
+        Some("game-settings") => game_settings::usage(),
         Some(command) => eprintln!("{}", command_usage(command).unwrap_or_default()),
     }
 }
@@ -726,6 +736,7 @@ fn main() -> ExitCode {
         Command::Uninstall { purge } => cmd_uninstall(purge),
         Command::Shmctl(args) => shmctl::run(&args),
         Command::Profile(args) => cmd_profile(&args),
+        Command::GameSettings(args) => game_settings::run(&args),
         Command::Games => cmd_games(),
         Command::Enable { game, target_exe, anti_cheat_ok } => {
             cmd_set_game(&game, neural_forge_supervisor::steam::Action::Enable { target_exe }, anti_cheat_ok)
@@ -816,6 +827,24 @@ mod tests {
         assert_eq!(parse_str("report --appid 3240220"), Ok(Command::Report(Some("3240220".into()))));
         assert_eq!(parse_str("report --help"), Ok(Command::Help(Some("report".into()))));
         assert_eq!(parse_str("shmctl capture --frames 3"), Ok(Command::Shmctl(vec!["capture".into(), "--frames".into(), "3".into()])));
+    }
+
+    #[test]
+    fn game_settings_commands_parse() {
+        let words = |line: &str| line.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert_eq!(parse_str("game-settings"), Ok(Command::GameSettings(vec![])));
+        assert_eq!(parse_str("game-settings list"), Ok(Command::GameSettings(words("list"))));
+        assert_eq!(parse_str("game-settings show 570"), Ok(Command::GameSettings(words("show 570"))));
+        assert_eq!(parse_str("game-settings set exe:game.exe intensity 0.5"), Ok(Command::GameSettings(words("set exe:game.exe intensity 0.5"))));
+        assert_eq!(parse_str("game-settings clear 570"), Ok(Command::GameSettings(words("clear 570"))));
+        assert_eq!(parse_str("game-settings clear 570 intensity"), Ok(Command::GameSettings(words("clear 570 intensity"))));
+        assert_eq!(parse_str("game-settings help"), Ok(Command::Help(Some("game-settings".into()))));
+        assert!(parse_str("game-settings list now").is_err());
+        assert!(parse_str("game-settings show").is_err());
+        assert!(parse_str("game-settings set 570 intensity").is_err());
+        assert!(parse_str("game-settings clear").is_err());
+        assert!(parse_str("game-settings clear 570 a b").is_err());
+        assert!(parse_str("game-settings forget 570").is_err());
     }
 
     #[test]

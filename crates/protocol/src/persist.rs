@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::games::GameKey;
 use crate::ShmHeader;
 
 /// The one setting that is text, not a number: the HUD regions at present (`set_hud_regions=x,y,w,h;...`,
@@ -42,19 +43,52 @@ pub fn read_config(path: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Applies the saved settings in [`config_file`] to `header` if nothing has since it was last
-/// initialised (`tuning_seq` still 0): the layer does this when it finds a fresh mapping, since no
-/// other process is running to do it. Never waits for another writer of the settings (it runs on the
-/// game's thread): what it cannot write at once this process's writer thread writes. Returns whether it
-/// applied them (or handed them over).
-pub fn apply_saved(header: &'static ShmHeader) -> bool {
-    // Not configured yet is decided again as the write is entered; this only spares reading the file
-    // when it is plainly too late.
-    if header.tuning_seq.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-        return false;
+/// Every persisted setting's default, as [`snapshot`] gives them: the bottom of every merge, so a setting
+/// `config.ini` does not name still goes back to its default when another game's override of it leaves.
+pub fn defaults() -> BTreeMap<String, String> {
+    let header = ShmHeader::default();
+    header.init_defaults();
+    snapshot(&header)
+}
+
+/// The settings `game` runs with (`None`: all games'), from the files: the defaults, `config.ini`, the
+/// overrides shipped for it and the user's (`games.ini`), as `set_<name>` -> value.
+pub fn merged_for(game: Option<&GameKey>) -> BTreeMap<String, String> {
+    let mut base = defaults();
+    base.extend(read_config(&config_file()));
+    crate::games::merged(&base, game, &crate::games::read_user())
+}
+
+/// Applies the settings `game` runs with to `header` when its layer starts a session on the channel
+/// (`game`: its [`crate::games::this_game`]), and states it as the running game (`running_game`). A game
+/// with settings of its own ([`crate::games::has_entry`]) gets its merge, marked as its own
+/// (`settings_game`); one without gets the settings for all games where the header holds another game's,
+/// and on a fresh header (as the saved settings always were: only if nothing has written settings since it
+/// was initialised, so the GUI's write that got in first stays); otherwise the header is left as it is, the
+/// settings for all games that the GUI and the CLI keep live. Never waits for another writer (it runs on
+/// the game's thread): what it cannot write at once this process's writer thread writes. Returns the scope
+/// it applied (0 all games), `None` when it applied nothing.
+pub fn apply_for_game(header: &'static ShmHeader, game: Option<&GameKey>) -> Option<u32> {
+    header.running_game.store(game.map_or(0, GameKey::scope), std::sync::atomic::Ordering::Relaxed);
+    let sections = crate::games::read_user();
+    let own = game.filter(|g| crate::games::has_entry(&sections, g));
+    let scope = own.map_or(0, GameKey::scope);
+    let held = header.settings_game();
+    let fresh = header.tuning_seq.load(std::sync::atomic::Ordering::Relaxed) == 0;
+    if scope == 0 && held == 0 && !fresh {
+        return None;
     }
-    let (settings, regions) = parse(header, &read_config(&config_file()));
-    header.write_settings_if_unconfigured_without_waiting(settings, regions)
+    let mut base = defaults();
+    base.extend(read_config(&config_file()));
+    let (settings, regions) = parse(header, &crate::games::merged(&base, own, &sections));
+    header.write_game_settings_without_waiting(scope, settings, regions, scope == 0 && held == 0).then_some(scope)
+}
+
+/// Applies the settings `game` runs with ([`merged_for`]; `None` all games') to `header` and marks them as
+/// its (`settings_game`), in one unit: the GUI's and the CLI's choice of whose settings to edit.
+pub fn apply_scope(header: &ShmHeader, game: Option<&GameKey>) {
+    let (settings, regions) = parse(header, &merged_for(game));
+    header.write_game_settings(game.map_or(0, GameKey::scope), &settings, regions.as_deref());
 }
 
 /// [`apply`], only if nothing has written settings to `header` since it was initialised: decided as
@@ -253,6 +287,103 @@ mod tests {
         }
         assert!(saved_first + live_first == 2000);
         assert!(!apply_if_unconfigured(&h, &saved), "configured: not applied again");
+    }
+
+    /// A scratch config dir for the tests that read `config.ini` and `games.ini` through
+    /// `XDG_CONFIG_HOME`, one at a time (the variable is the process's).
+    struct ConfigHome {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+        dir: std::path::PathBuf,
+    }
+
+    static CONFIG_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl ConfigHome {
+        fn new(tag: &str, config: &str, games: &str) -> Self {
+            let guard = CONFIG_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = std::env::temp_dir().join(format!("neural-forge-persist-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(dir.join("neural-forge")).unwrap();
+            std::fs::write(dir.join("neural-forge/config.ini"), config).unwrap();
+            std::fs::write(dir.join("neural-forge/games.ini"), games).unwrap();
+            let prev = std::env::var("XDG_CONFIG_HOME").ok();
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+            Self { _guard: guard, prev, dir }
+        }
+    }
+
+    impl Drop for ConfigHome {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    fn leaked() -> &'static ShmHeader {
+        let h: &'static ShmHeader = Box::leak(Box::default());
+        h.init_defaults();
+        h
+    }
+
+    /// [`apply_for_game`], then the writer thread's turn: another test's write may have it busy, and
+    /// then this one is handed to it too.
+    fn session(h: &'static ShmHeader, game: Option<&GameKey>) -> Option<u32> {
+        let applied = apply_for_game(h, game);
+        assert!(crate::deferred::settle(std::time::Duration::from_secs(2)));
+        applied
+    }
+
+    fn intensity(h: &ShmHeader) -> f32 {
+        f32::from_bits(h.intensity_bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// A game's session: its own settings over all games', marked as its; a game without settings of its own
+    /// then gets all games' back, every key (one only the other game set goes back to its default too); and a
+    /// header already holding all games' settings is left as the GUI keeps it.
+    #[test]
+    fn a_session_applies_the_game_s_merge_and_hands_back_to_all_games() {
+        let _home = ConfigHome::new("session", "set_intensity=1.5\nset_style=1\n", "[570]\nset_intensity=0.5\nset_local_tone=2\n");
+        let h = leaked();
+        let dota = GameKey::Steam(570);
+        assert_eq!(session(h, Some(&dota)), Some(570));
+        assert_eq!((h.settings_game(), h.running_game.load(std::sync::atomic::Ordering::Relaxed)), (570, 570));
+        assert_eq!(intensity(h), 0.5, "the game's own value");
+        assert_eq!(h.style.load(std::sync::atomic::Ordering::Relaxed), 1, "all games' where it has none");
+        let other = GameKey::Exe("other.exe".into());
+        assert_eq!(session(h, Some(&other)), Some(0), "another game without settings of its own");
+        assert_eq!(h.settings_game(), 0);
+        assert_eq!(h.running_game.load(std::sync::atomic::Ordering::Relaxed), other.scope());
+        assert_eq!(intensity(h), 1.5);
+        assert_eq!(f32::from_bits(h.local_tone_bits.load(std::sync::atomic::Ordering::Relaxed)), 1.0, "back to its default");
+        // All games' settings held, changed live (the GUI): the next game without settings keeps them.
+        h.write_settings(&[("intensity", 0.75f32.to_bits())]);
+        assert_eq!(session(h, Some(&other)), None);
+        assert_eq!(intensity(h), 0.75);
+        assert_eq!(session(h, None), None, "a game that cannot be named is all games' too");
+    }
+
+    /// On a fresh header a game without settings of its own gets the saved settings once, and never over a
+    /// write that got in first; a game with its own gets them either way.
+    #[test]
+    fn a_fresh_header_gets_the_saved_settings_unless_a_write_got_in_first() {
+        let _home = ConfigHome::new("fresh", "set_intensity=1.5\n", "[570]\nset_intensity=0.5\n");
+        let h = leaked();
+        assert_eq!(session(h, Some(&GameKey::Steam(10))), Some(0));
+        assert_eq!(intensity(h), 1.5);
+        let h = leaked();
+        h.write_settings(&[("intensity", 3.0f32.to_bits())]);
+        assert_eq!(session(h, Some(&GameKey::Steam(10))), None);
+        assert_eq!(intensity(h), 3.0, "the GUI's write stays");
+        assert_eq!(session(h, Some(&GameKey::Steam(570))), Some(570));
+        assert_eq!(intensity(h), 0.5);
+        // The GUI or the CLI picking whose settings to edit.
+        apply_scope(h, None);
+        assert_eq!((h.settings_game(), intensity(h)), (0, 1.5));
+        apply_scope(h, Some(&GameKey::Steam(570)));
+        assert_eq!((h.settings_game(), intensity(h)), (570, 0.5));
     }
 
     #[test]

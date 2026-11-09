@@ -6,6 +6,7 @@ pub mod anti_cheat;
 pub mod appinfo;
 pub mod config;
 pub mod doctor;
+pub mod game_settings;
 pub mod install;
 pub mod launch_options;
 pub mod model;
@@ -40,7 +41,7 @@ pub fn open_channel(cfg: &Config) -> Result<neural_forge_protocol::mapping::Mapp
 /// Applies the saved settings (`config.ini`) to `mapping`, the channel just opened with
 /// [`open_channel`], if nothing has applied them since it was last initialised. The header is
 /// initialised with defaults by whichever of the layer, the GUI or the CLI finds it missing; the
-/// layer applies the saved settings itself then (`neural_forge_protocol::persist::apply_saved`),
+/// layer applies the saved settings itself then (`neural_forge_protocol::persist::apply_for_game`),
 /// and the GUI and CLI call this right after opening the channel for the same reason, so a
 /// command run on a cold boot acts on the saved settings, not the defaults. `init_defaults`
 /// leaves `tuning_seq` at 0 and any settings write bumps it, which is what "not yet applied" is
@@ -50,12 +51,11 @@ pub fn apply_saved_settings(cfg: &Config, mapping: &neural_forge_protocol::mappi
     neural_forge_protocol::persist::apply_if_unconfigured(mapping.header(), &cfg.settings)
 }
 
-/// Writes the live header's settings to `config.ini`, so a change made on the channel also
-/// survives a reboot.
+/// Writes the live header's settings where they belong (`config.ini`, or the game's own settings while the
+/// header holds a game's: [`game_settings::save_live`]), so a change made on the channel also survives a
+/// reboot.
 pub fn save_settings(header: &neural_forge_protocol::ShmHeader) -> std::io::Result<()> {
-    let mut cfg = Config::load();
-    cfg.replace_tuning(neural_forge_protocol::persist::snapshot(header));
-    cfg.save()
+    game_settings::save_live(header, None)
 }
 
 #[cfg(test)]

@@ -30,24 +30,35 @@ pub type Reader = Box<dyn Fn() -> u32>;
 thread_local! {
     /// The reader of the most recent `bind_*` call. Every row builder in `ui.rs` is called
     /// immediately after the binding it displays and takes it from here.
-    static PENDING_READER: std::cell::RefCell<Option<(FieldKind, Reader)>> = const { std::cell::RefCell::new(None) };
+    static PENDING_READER: std::cell::RefCell<Option<(FieldKind, Reader, Option<&'static str>)>> = const { std::cell::RefCell::new(None) };
+    /// The setting name that came with the reader [`take_pending_reader`] last handed out, for the row's
+    /// per-game mark ([`take_pending_name`]).
+    static TAKEN_NAME: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
 /// Takes the reader the last `bind_*` call left for the row being built now.
 pub fn take_pending_reader() -> Option<(FieldKind, Reader)> {
-    PENDING_READER.with(|p| p.borrow_mut().take())
+    let (kind, read, name) = PENDING_READER.with(|p| p.borrow_mut().take())?;
+    TAKEN_NAME.with(|t| t.set(name));
+    Some((kind, read))
+}
+
+/// The persisted setting the row just built displays (the name its `bind_*` call was given), once.
+pub fn take_pending_name() -> Option<&'static str> {
+    TAKEN_NAME.with(std::cell::Cell::take)
 }
 
 fn leave_reader(
     shm: &Arc<Mapping>,
     kind: FieldKind,
+    name: Option<&'static str>,
     get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static {
     let get = std::rc::Rc::new(get);
     let reader_get = std::rc::Rc::clone(&get);
     let reader_shm = Arc::clone(shm);
     PENDING_READER.with(|p| {
-        *p.borrow_mut() = Some((kind, Box::new(move || reader_get(reader_shm.header()).load(Ordering::Relaxed))));
+        *p.borrow_mut() = Some((kind, Box::new(move || reader_get(reader_shm.header()).load(Ordering::Relaxed)), name));
     });
     move |h| get(h)
 }
@@ -105,8 +116,8 @@ fn persist_later(shm: &Arc<Mapping>, name: &'static str) {
             if let Err(e) = flush_settings() {
                 let on_error = PENDING_SAVE.with(|p| p.borrow().on_error.clone());
                 match on_error {
-                    Some(report) => report(format!("Saving config.ini failed: {e}")),
-                    None => eprintln!("neural-forge: saving config.ini failed: {e}"),
+                    Some(report) => report(format!("Saving the settings failed: {e}")),
+                    None => eprintln!("neural-forge: saving the settings failed: {e}"),
                 }
             }
         }));
@@ -121,8 +132,10 @@ pub fn persist_settings_later(shm: &Arc<Mapping>, names: &[&'static str]) {
     }
 }
 
-/// Writes every changed setting to `config.ini` now (the timer does this on its own; the window
-/// calls it on close). A full load-modify-save of the file, so no other key is written stale.
+/// Writes every changed setting now (the timer does this on its own; the window calls it on close, and the
+/// "Settings for" menu before it changes whose settings the header holds): to `config.ini` while the header
+/// holds the settings for all games, else to that game's own (`game_settings::save_live`). A full
+/// load-modify-save of the file, so no other key is written stale.
 pub fn flush_settings() -> std::io::Result<()> {
     let (names, mapping) = PENDING_SAVE.with(|p| {
         let mut p = p.borrow_mut();
@@ -132,15 +145,8 @@ pub fn flush_settings() -> std::io::Result<()> {
         (std::mem::take(&mut p.names), p.mapping.clone())
     });
     let Some(mapping) = mapping.filter(|_| !names.is_empty()) else { return Ok(()) };
-    let snapshot = neural_forge_protocol::persist::snapshot(mapping.header());
-    let mut cfg = neural_forge_supervisor::Config::load();
-    for name in &names {
-        let key = format!("set_{name}");
-        if let Some(value) = snapshot.get(&key) {
-            cfg.settings.insert(key, value.clone());
-        }
-    }
-    let saved = cfg.save();
+    let changed: Vec<&str> = names.iter().copied().collect();
+    let saved = neural_forge_supervisor::game_settings::save_live(mapping.header(), Some(&changed));
     if saved.is_err() {
         // Still unsaved: the next change, or the flush on close, writes them again.
         PENDING_SAVE.with(|p| p.borrow_mut().names.extend(names));
@@ -159,7 +165,7 @@ pub fn bind_float(
     name: Option<&'static str>,
     get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (f32, impl Fn(f32) + 'static) {
-    let get = leave_reader(shm, FieldKind::Float, get);
+    let get = leave_reader(shm, FieldKind::Float, name, get);
     let initial = f32::from_bits(get(shm.header()).load(Ordering::Relaxed));
     let shm = Arc::clone(shm);
     let setter = move |value: f32| {
@@ -179,7 +185,7 @@ pub fn bind_u32(
     name: Option<&'static str>,
     get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (u32, impl Fn(u32) + 'static) {
-    let get = leave_reader(shm, FieldKind::Int, get);
+    let get = leave_reader(shm, FieldKind::Int, name, get);
     let initial = get(shm.header()).load(Ordering::Relaxed);
     let shm = Arc::clone(shm);
     let setter = move |value: u32| {

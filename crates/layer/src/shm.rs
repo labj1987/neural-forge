@@ -168,8 +168,28 @@ static SESSION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 fn start_session(hdr: &'static neural_forge_protocol::ShmHeader) {
     let generation = crate::ownership::generation();
-    if SESSION_GENERATION.swap(generation, Ordering::AcqRel) != generation && !own_session_continues(hdr) {
-        neural_forge_protocol::capture::reset_session(hdr);
+    if SESSION_GENERATION.swap(generation, Ordering::AcqRel) != generation {
+        apply_game_settings(hdr);
+        if !own_session_continues(hdr) {
+            neural_forge_protocol::capture::reset_session(hdr);
+        }
+    }
+}
+
+/// The settings this game runs with, put on the channel as its session starts (`persist::apply_for_game`):
+/// its own (`games.ini`, and those Neural Forge ships for it) over the settings for all games, which a game
+/// without any gets where the channel holds another game's, or a fresh header. The game is its Steam app id,
+/// else its executable (`games::this_game`).
+fn apply_game_settings(hdr: &'static neural_forge_protocol::ShmHeader) {
+    let game = neural_forge_protocol::games::this_game(crate::ownership::process_name());
+    match neural_forge_protocol::persist::apply_for_game(hdr, game.as_ref()) {
+        Some(0) => crate::log!("[shm] applied the saved settings from {}", neural_forge_protocol::persist::config_file()),
+        Some(_) => crate::log!(
+            "[shm] applied the saved settings with {}'s own from {}",
+            game.as_ref().map(neural_forge_protocol::games::GameKey::text).unwrap_or_default(),
+            neural_forge_protocol::games::games_file()
+        ),
+        None => {}
     }
 }
 
@@ -864,14 +884,12 @@ impl ShmClient {
             return false;
         }
         self.leased = true;
-        // A fresh mapping holds the defaults: the saved settings (config.ini's `set_*`) go on it here,
-        // since no other process (the GUI may not be running) does it before the game's first frame.
+        // A fresh mapping holds the defaults: the saved settings (config.ini's `set_*`, with this game's own)
+        // go on it as the session starts, since no other process (the GUI may not be running) does it before
+        // the game's first frame.
         if let Some(hdr) = self.header() {
             // Where the network runs is read at record time, outside the hold's state.
             crate::preupscale::placement::watch(hdr);
-            if neural_forge_protocol::persist::apply_saved(hdr) {
-                crate::log!("[shm] applied the saved settings from {}", neural_forge_protocol::persist::config_file());
-            }
             note_channel_open(hdr, crate::any_device_lost(), crate::native_unavailable().as_deref());
             start_session(hdr);
         }
