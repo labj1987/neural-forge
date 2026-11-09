@@ -4,6 +4,28 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.14.0 — 2026-11-09
+
+**The model before the upscaler in more games**
+
+- Native Vulkan games whose DLSS input is created without copy usage (Indiana Jones and the Great Circle) can now
+  have the model before the upscaler: Neural Forge gives the images that may be DLSS's input the usage it needs to
+  work on them inside DLSS's own command buffer. Before, every frame of such a game went to DLSS untouched and the
+  model ran on the finished frame.
+- Games whose frame moves DLSS's colour input out of the general layout in a command buffer just before DLSS's own
+  (and back after it) no longer fall between both ways of holding the frame, which left every frame unedited.
+
+**Seeing why the model does not run before the upscaler**
+
+- When Neural Forge finds the frame a game hands to DLSS but cannot work on it, the Status tab's Model placement
+  line now says "DLSS input identified, not holding" and why, instead of "waiting for DLSS Super Resolution" as if
+  the game did not use DLSS. `neural-forge-cli shmctl status` and **Save report** show the same state and reason
+  (`preupscale_state=5`, `preupscale_reason=`).
+- The game's log says once each why a frame was not worked on inside DLSS's command buffer (missing copy usage, the
+  input's format, size or layout, a render pass left open across DLSS), with the image it was.
+- The log's periodic count of DLSS submissions now also says how many frames were actually worked on, by each way
+  of holding them, instead of only how many named DLSS's input.
+
 ## 3.13.0 — 2026-11-09
 
 This release fixes what a full review of Neural Forge found.

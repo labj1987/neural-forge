@@ -207,7 +207,7 @@ be private.
 | 22 | `preupscale_brightness` and `preupscale_exposure` (what the network sees before the upscaler: its brightness and where the exposure comes from) and `preupscale_network_gpu_ms` (the network's GPU time on its last hold) appended | 3.8.10 |
 | 23 | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection` and `edit_highlight_protection` (the Oklab protections of each pass's result against its input) appended | 3.10.0 |
 | 24 | `settings_game` (whose settings the header holds: all games or one game's) and `running_game` (the game whose layer holds the channel), then `sharpen_cas`, `clarity_strength`, `clarity_radius`, `clarity_midtones` and `clarity_edges` (the sharpening of the finished frame: FidelityFX CAS and Clarity) appended | 3.12.0 |
-| 25 | `preupscale_reason` (why no hold ran while DLSS's input is identified; `preupscale_state` 5, `IDENTIFIED`) appended | unreleased |
+| 25 | `preupscale_reason` (why no hold ran while DLSS's input is identified; `preupscale_state` 5, `IDENTIFIED`) appended | 3.14.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.
