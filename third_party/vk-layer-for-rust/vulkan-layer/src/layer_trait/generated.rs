@@ -1843,6 +1843,11 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<VkResult<()>> {
         LayerResult::Unhandled
     }
+    /// `vkCreateGraphicsPipelines` can also succeed with `VK_PIPELINE_COMPILE_REQUIRED_EXT`, but a hook
+    /// cannot return one of those with the output: `Ok` reaches the application as
+    /// `VK_SUCCESS`, and `Err(code)` returns the code without the output (an array of
+    /// handles the application sized is set to `VK_NULL_HANDLE`). A hook that needs such a
+    /// code with its output must return `LayerResult::Unhandled`.
     fn create_graphics_pipelines(
         &self,
         _pipeline_cache: vk::PipelineCache,
@@ -1851,6 +1856,11 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<VkResult<Vec<vk::Pipeline>>> {
         LayerResult::Unhandled
     }
+    /// `vkCreateComputePipelines` can also succeed with `VK_PIPELINE_COMPILE_REQUIRED_EXT`, but a hook
+    /// cannot return one of those with the output: `Ok` reaches the application as
+    /// `VK_SUCCESS`, and `Err(code)` returns the code without the output (an array of
+    /// handles the application sized is set to `VK_NULL_HANDLE`). A hook that needs such a
+    /// code with its output must return `LayerResult::Unhandled`.
     fn create_compute_pipelines(
         &self,
         _pipeline_cache: vk::PipelineCache,
@@ -2934,6 +2944,11 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<VkResult<Vec<vk::Image>>> {
         LayerResult::Unhandled
     }
+    /// `vkAcquireNextImageKHR` can also succeed with `VK_TIMEOUT`, `VK_NOT_READY`, `VK_SUBOPTIMAL_KHR`, but a hook
+    /// cannot return one of those with the output: `Ok` reaches the application as
+    /// `VK_SUCCESS`, and `Err(code)` returns the code without the output (an array of
+    /// handles the application sized is set to `VK_NULL_HANDLE`). A hook that needs such a
+    /// code with its output must return `LayerResult::Unhandled`.
     fn acquire_next_image_khr(
         &self,
         _swapchain: vk::SwapchainKHR,
@@ -2964,6 +2979,11 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<VkResult<vk::DeviceGroupPresentModeFlagsKHR>> {
         LayerResult::Unhandled
     }
+    /// `vkAcquireNextImage2KHR` can also succeed with `VK_TIMEOUT`, `VK_NOT_READY`, `VK_SUBOPTIMAL_KHR`, but a hook
+    /// cannot return one of those with the output: `Ok` reaches the application as
+    /// `VK_SUCCESS`, and `Err(code)` returns the code without the output (an array of
+    /// handles the application sized is set to `VK_NULL_HANDLE`). A hook that needs such a
+    /// code with its output must return `LayerResult::Unhandled`.
     fn acquire_next_image2_khr(
         &self,
         _p_acquire_info: &vk::AcquireNextImageInfoKHR,
@@ -3702,6 +3722,11 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<VkResult<*mut vk::AHardwareBuffer>> {
         LayerResult::Unhandled
     }
+    /// `vkCreateExecutionGraphPipelinesAMDX` can also succeed with `VK_PIPELINE_COMPILE_REQUIRED_EXT`, but a hook
+    /// cannot return one of those with the output: `Ok` reaches the application as
+    /// `VK_SUCCESS`, and `Err(code)` returns the code without the output (an array of
+    /// handles the application sized is set to `VK_NULL_HANDLE`). A hook that needs such a
+    /// code with its output must return `LayerResult::Unhandled`.
     fn create_execution_graph_pipelines_amdx(
         &self,
         _pipeline_cache: vk::PipelineCache,
@@ -3892,6 +3917,11 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
+    /// `vkCreateRayTracingPipelinesNV` can also succeed with `VK_PIPELINE_COMPILE_REQUIRED_EXT`, but a hook
+    /// cannot return one of those with the output: `Ok` reaches the application as
+    /// `VK_SUCCESS`, and `Err(code)` returns the code without the output (an array of
+    /// handles the application sized is set to `VK_NULL_HANDLE`). A hook that needs such a
+    /// code with its output must return `LayerResult::Unhandled`.
     fn create_ray_tracing_pipelines_nv(
         &self,
         _pipeline_cache: vk::PipelineCache,
@@ -5064,6 +5094,11 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
+    /// `vkCreateRayTracingPipelinesKHR` can also succeed with `VK_OPERATION_DEFERRED_KHR`, `VK_OPERATION_NOT_DEFERRED_KHR`, `VK_PIPELINE_COMPILE_REQUIRED_EXT`, but a hook
+    /// cannot return one of those with the output: `Ok` reaches the application as
+    /// `VK_SUCCESS`, and `Err(code)` returns the code without the output (an array of
+    /// handles the application sized is set to `VK_NULL_HANDLE`). A hook that needs such a
+    /// code with its output must return `LayerResult::Unhandled`.
     fn create_ray_tracing_pipelines_khr(
         &self,
         _deferred_operation: vk::DeferredOperationKHR,

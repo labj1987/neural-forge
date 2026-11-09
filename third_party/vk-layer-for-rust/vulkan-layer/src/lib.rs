@@ -13,8 +13,9 @@
 // limitations under the License.
 //
 // Modified for Neural Forge (2026): ported to ash 0.38; review fixes, among them the layer's data
-// dropped before the next layer's destroy, the core tables' alias fallback and the instance commands
-// of device extensions in vkGetInstanceProcAddr (UPSTREAM.md).
+// dropped before the next layer's destroy, the core tables' alias fallback, the instance commands
+// of device extensions in vkGetInstanceProcAddr, the vkGetInstanceProcAddr hook gated on the layer's
+// hooked instance commands and the next vkCreateDevice kept nullable (UPSTREAM.md).
 
 #![warn(missing_docs)]
 #![cfg_attr(all(doc, RUSTC_NIGHTLY), feature(doc_auto_cfg))]
@@ -536,6 +537,9 @@ struct InstanceInfoWrapper<T: Layer> {
     instance_commands: Box<[VulkanCommand]>,
     device_commands: Box<[VulkanCommand]>,
     is_create_device_hooked: bool,
+    // Whether `InstanceHooks::get_instance_proc_addr` is consulted: the layer's hooked instance
+    // commands for this instance name vkGetInstanceProcAddr.
+    is_get_instance_proc_addr_hooked: bool,
     customized_info: T::InstanceInfoContainer,
 }
 
@@ -578,7 +582,6 @@ pub struct Global<T: Layer> {
     // logger) in T::default. If the client needs Global to be trivially destructible, the client
     // must guarantee that T is also trivially destructible.
     pub layer_info: T,
-    get_instance_addr_proc_hooked: bool,
 }
 
 impl<T: Layer> Global<T> {
@@ -780,6 +783,10 @@ impl<T: Layer> Global<T> {
             .layer_info
             .hooked_instance_commands(customized_info.borrow())
             .any(|command| command == LayerVulkanCommand::CreateDevice);
+        let is_get_instance_proc_addr_hooked = global
+            .layer_info
+            .hooked_instance_commands(customized_info.borrow())
+            .any(|command| command == LayerVulkanCommand::GetInstanceProcAddr);
         let instance_commands = global.create_instance_commands(customized_info.borrow());
         let device_commands = global.create_device_commands(customized_info.borrow(), None);
         {
@@ -806,6 +813,7 @@ impl<T: Layer> Global<T> {
                     instance_commands,
                     device_commands,
                     is_create_device_hooked,
+                    is_get_instance_proc_addr_hooked,
                     customized_info,
                 }),
             );
@@ -983,8 +991,7 @@ impl<T: Layer> Global<T> {
                 create_device_name.as_ptr(),
             )
         };
-        let next_create_device: vk::PFN_vkCreateDevice =
-            unsafe { std::mem::transmute(next_create_device) };
+        // Still nullable: only the `Unhandled` arm below calls it, and makes it a function pointer.
         let mut create_info = *create_info;
         let requested_extensions = unsafe {
             slice_from_raw_parts(
@@ -1051,6 +1058,13 @@ impl<T: Layer> Global<T> {
                 } else {
                     enabled_extension_ptrs.as_ptr()
                 };
+                let Some(next_create_device) = next_create_device else {
+                    error!("the next layer has no vkCreateDevice");
+                    return vk::Result::ERROR_INITIALIZATION_FAILED;
+                };
+                // SAFETY: the next layer's vkGetInstanceProcAddr gave this for "vkCreateDevice".
+                let next_create_device: vk::PFN_vkCreateDevice =
+                    unsafe { std::mem::transmute(next_create_device) };
                 let res = unsafe {
                     next_create_device(physical_device, &create_info, p_allocator, p_device)
                 };
@@ -1506,7 +1520,7 @@ impl<T: Layer> Global<T> {
             return None;
         }
         let instance_info = global.get_instance_info(instance)?;
-        if global.get_instance_addr_proc_hooked {
+        if instance_info.is_get_instance_proc_addr_hooked {
             if let LayerResult::Handled(res) = instance_info
                 .customized_info
                 .borrow()
@@ -1642,14 +1656,11 @@ impl<T: Layer> Global<T> {
 impl<T: Layer> Default for Global<T> {
     fn default() -> Self {
         let layer_info: T = Default::default();
-        let get_instance_addr_proc_hooked = T::GlobalHooksInfo::hooked_commands()
-            .contains(&LayerVulkanCommand::GetInstanceProcAddr);
         Self {
             instance_map: Default::default(),
             physical_device_map: Default::default(),
             device_map: Default::default(),
             layer_info,
-            get_instance_addr_proc_hooked,
         }
     }
 }

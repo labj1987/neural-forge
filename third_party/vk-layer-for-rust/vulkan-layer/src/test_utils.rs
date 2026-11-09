@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): the instance hooks' mock answers vkGetInstanceProcAddr with
+// `Unhandled` by default (UPSTREAM.md).
 
 //! Utilities used in the integration tests of this crate.
 //!
@@ -28,7 +31,8 @@
 //! 3. Use [`TestLayer`] as a layer implementation.
 
 use crate::{
-    DeviceInfo, Global, GlobalHooksInfo, InstanceInfo, Layer, LayerManifest, LayerVulkanCommand,
+    DeviceInfo, Global, GlobalHooksInfo, InstanceInfo, Layer, LayerManifest, LayerResult,
+    LayerVulkanCommand,
 };
 use ash::vk;
 use mockall::mock;
@@ -205,12 +209,29 @@ impl<T: TestLayerMock> GlobalHooksInfo for MockGlobalHooksInfo<T> {
 ///
 /// The `T` type parameter is a [`TestLayerMock`] type that provides the mock of
 /// [`InstanceInfo::hooked_commands`].
-#[derive(Default)]
 pub struct MockInstanceInfo<T: TestLayerMock> {
     /// The mock of the [`InstanceHooks`][crate::InstanceHooks].
+    ///
+    /// It starts with one expectation: `get_instance_proc_addr` returns [`LayerResult::Unhandled`] for
+    /// every name (ash resolves the instance's commands while the instance is created, before a test can
+    /// set expectations). A test that hooks `vkGetInstanceProcAddr` clears it with `checkpoint` first.
     pub mock_hooks: Mutex<MockInstanceHooks>,
     mock_drop: Mutex<Option<MockDrop>>,
     _marker: PhantomData<fn(T)>,
+}
+
+impl<T: TestLayerMock> Default for MockInstanceInfo<T> {
+    fn default() -> Self {
+        let mut mock_hooks = MockInstanceHooks::default();
+        mock_hooks
+            .expect_get_instance_proc_addr()
+            .returning(|_| LayerResult::Unhandled);
+        Self {
+            mock_hooks: Mutex::new(mock_hooks),
+            mock_drop: Default::default(),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<T: TestLayerMock> MockInstanceInfo<T> {

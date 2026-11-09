@@ -13,7 +13,8 @@
 // limitations under the License.
 //
 // Modified for Neural Forge (2026): function pointers compared by address; ash 0.38; a device-group
-// enumeration test; the destroy order tests; a hook's failed allocation (UPSTREAM.md).
+// enumeration test; the destroy order tests; a hook's failed allocation; the vkGetInstanceProcAddr
+// hook; a next layer without vkCreateDevice (UPSTREAM.md).
 
 use ash::vk::{self};
 use mockall::predicate::{always, eq};
@@ -196,6 +197,86 @@ mod get_instance_proc_addr {
                 get_instance_proc_addr as usize,
                 entry.static_fn().get_instance_proc_addr as usize
             );
+        }
+
+        /// A layer whose hooked instance commands name vkGetInstanceProcAddr has its hook consulted
+        /// (the documented contract of `Global::get_instance_proc_addr`), and its answer returned;
+        /// a layer that does not name it is never asked.
+        #[test]
+        fn test_should_call_the_get_instance_proc_addr_hook_when_hooked() {
+            extern "system" fn hooked_command() {}
+            {
+                static TEST_GLOBAL: TestGlobal = TestGlobal::builder()
+                    .set_layer_mock_builder(|| {
+                        let mut mock = MockTestLayer::default();
+                        mock.expect_hooked_instance_commands()
+                            .return_const(vec![LayerVulkanCommand::GetInstanceProcAddr]);
+                        mock.set_default_expectations();
+                        mock
+                    })
+                    .build();
+                let _ctx = TEST_GLOBAL.create_context();
+                let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
+                let InstanceContext {
+                    entry, instance, ..
+                } = ctx.as_ref();
+                let instance_info = TestLayer::<Tag<0>>::global_instance()
+                    .layer_info
+                    .get_instance_info(instance.handle())
+                    .unwrap();
+                let mut hooks = instance_info.mock_hooks.lock().unwrap();
+                // The mock's default answer for every name, which would match first.
+                hooks.checkpoint();
+                hooks
+                    .expect_get_instance_proc_addr()
+                    .withf(|name| name == "vkSomethingHooked")
+                    .once()
+                    .return_const(LayerResult::Handled(Some(
+                        hooked_command as unsafe extern "system" fn(),
+                    )));
+                // Every other name (ash asks for the instance's own commands): left to the framework.
+                hooks
+                    .expect_get_instance_proc_addr()
+                    .withf(|name| name != "vkSomethingHooked")
+                    .return_const(LayerResult::Unhandled);
+                drop(hooks);
+                drop(instance_info);
+                let fp = unsafe {
+                    entry.get_instance_proc_addr(instance.handle(), c"vkSomethingHooked".as_ptr())
+                };
+                assert_eq!(
+                    fp.map(|f| f as usize),
+                    Some(hooked_command as extern "system" fn() as usize)
+                );
+            }
+            {
+                static TEST_GLOBAL: TestGlobal = TestGlobal::builder()
+                    .set_layer_mock_builder(|| {
+                        let mut mock = MockTestLayer::default();
+                        mock.expect_hooked_instance_commands().return_const(vec![]);
+                        mock.set_default_expectations();
+                        mock
+                    })
+                    .build();
+                let _ctx = TEST_GLOBAL.create_context();
+                let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
+                let InstanceContext {
+                    entry, instance, ..
+                } = ctx.as_ref();
+                TestLayer::<Tag<0>>::global_instance()
+                    .layer_info
+                    .get_instance_info(instance.handle())
+                    .unwrap()
+                    .mock_hooks
+                    .lock()
+                    .unwrap()
+                    .checkpoint();
+                // Not hooked: the hook is never asked (the mock has no expectation left to answer it).
+                let fp = unsafe {
+                    entry.get_instance_proc_addr(instance.handle(), c"vkSomethingHooked".as_ptr())
+                };
+                assert!(fp.is_none());
+            }
         }
 
         #[test]
@@ -2097,6 +2178,21 @@ mod create_destroy_device {
             .unwrap();
         instance_info.hooks().checkpoint();
         drop(device_ctx);
+    }
+
+    /// A next layer that resolves vkCreateDevice to NULL (abnormal) fails the creation with
+    /// VK_ERROR_INITIALIZATION_FAILED when the layer leaves it to the next layer: the NULL is never
+    /// made into a function pointer, let alone called.
+    #[test]
+    fn test_create_device_should_fail_without_the_next_create_device() {
+        static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
+        let _ctx = TEST_GLOBAL.create_context();
+        let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
+        // A reference to the instance's data held past its destruction would leak it.
+        unsafe { InstanceData::from_handle(ctx.instance.handle()) }
+            .remove_instance_command("vkCreateDevice");
+        let res = ctx.default_device();
+        assert_eq!(res.err(), Some(vk::Result::ERROR_INITIALIZATION_FAILED));
     }
 
     #[test]

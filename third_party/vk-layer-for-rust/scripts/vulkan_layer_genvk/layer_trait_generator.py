@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified for Neural Forge (2026): a hook method whose command has success codes other than
+# VK_SUCCESS that come with its output says it cannot return them (UPSTREAM.md).
 
 from generator import OutputGenerator
 import reg
@@ -19,6 +22,7 @@ from typing import Optional
 from .vk_xml_util import (
     VkXmlCommand,
     RustMethod,
+    VkXmlToRustMethodInfo,
     DispatchChainType,
     UnhandledCommand,
     generate_unhandled_command_comments,
@@ -35,6 +39,28 @@ class LayerTraitGenerator(OutputGenerator):
         self.command_aliases: VulkanAliases = VulkanAliases()
         self.unhandled_commands: dict[str, UnhandledCommand] = {}
         self.types: dict[str, reg.TypeInfo | reg.GroupInfo] = {}
+        # A command's success codes besides VK_SUCCESS, and VK_INCOMPLETE (which the framework returns
+        # itself for a count and array pair).
+        self.other_success_codes: dict[str, list[str]] = {}
+
+    # The doc comment of a hook whose command reports a success code other than VK_SUCCESS together with
+    # its output (VK_SUBOPTIMAL_KHR with an image index, VK_PIPELINE_COMPILE_REQUIRED with pipelines):
+    # the hook's VkResult<T> cannot carry both.
+    def limitation_doc_lines(self, command: RustMethod) -> list[str]:
+        codes = self.other_success_codes.get(command.vk_xml_cmd.name, [])
+        if command.vk_xml_cmd.return_type != "VkResult" or not codes:
+            return []
+        return_info = VkXmlToRustMethodInfo.from_vk_xml_command(command.vk_xml_cmd).return_info
+        if not return_info.main_source_vk_xml_params:
+            return []
+        codes_text = ", ".join(f"`{code}`" for code in codes)
+        return [
+            f"    /// `{command.vk_xml_cmd.name}` can also succeed with {codes_text}, but a hook",
+            "    /// cannot return one of those with the output: `Ok` reaches the application as",
+            "    /// `VK_SUCCESS`, and `Err(code)` returns the code without the output (an array of",
+            "    /// handles the application sized is set to `VK_NULL_HANDLE`). A hook that needs such a",
+            "    /// code with its output must return `LayerResult::Unhandled`.",
+        ]
 
     def beginFile(self, gen_opts):
         super().beginFile(gen_opts)
@@ -92,6 +118,7 @@ class LayerTraitGenerator(OutputGenerator):
                     continue
                 hooks_trait_lines = dispatch_chain_type_to_lines.get(dispatch_type, None)
                 if hooks_trait_lines is not None:
+                    hooks_trait_lines += self.limitation_doc_lines(command)
                     hooks_trait_lines += [
                         f"    {command.to_string()} {{",
                         "        LayerResult::Unhandled",
@@ -162,6 +189,11 @@ class LayerTraitGenerator(OutputGenerator):
             return
 
         self.command_aliases.add_alias(name, alias)
+        self.other_success_codes[name] = [
+            code
+            for code in (cmdinfo.elem.get("successcodes") or "").split(",")
+            if code and code not in ("VK_SUCCESS", "VK_INCOMPLETE")
+        ]
         commands = self.all_commands.setdefault(dispatch_chain_type, {})
         rust_method = RustMethod.from_vk_xml_command(vk_xml_cmd)
         commands[name] = rust_method
