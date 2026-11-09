@@ -122,8 +122,49 @@ pub fn clear(game: &GameKey, key: Option<&str>) -> std::io::Result<usize> {
 /// The game whose settings `header` holds (`settings_game`), `None` for all games'. An executable is
 /// named from `games.ini`, the shipped table and the game on the channel (`game_name`).
 pub fn held_game(header: &neural_forge_protocol::ShmHeader) -> Option<GameKey> {
-    let also: Vec<GameKey> = GameKey::exe(&header.game_name()).into_iter().collect();
-    games::key_for_scope(header.settings_game(), &load_all(), &also)
+    LiveScope::of(header).game()
+}
+
+/// Whose settings a header holds at one moment (`settings_game`, and for an executable's scope the game on
+/// the channel that names it), kept with a change so that it is saved to the settings it was made in even
+/// when the header holds another's by the time it is saved ([`save_values`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LiveScope {
+    /// The header's `settings_game`: 0 for all games.
+    pub scope: u32,
+    /// The game on the channel, only for an executable's scope (the one name it may come from).
+    game_name: String,
+}
+
+impl LiveScope {
+    pub fn of(header: &neural_forge_protocol::ShmHeader) -> Self {
+        let scope = header.settings_game();
+        // A Steam app's scope is its id, all games' is 0: only an executable's needs the name.
+        let named_by_scope = scope == 0 || games::key_for_scope(scope, &BTreeMap::new(), &[]).is_some();
+        Self { scope, game_name: if named_by_scope { String::new() } else { header.game_name() } }
+    }
+
+    /// The game whose settings these are, `None` for all games' (or for an executable nothing names).
+    pub fn game(&self) -> Option<GameKey> {
+        let also: Vec<GameKey> = GameKey::exe(&self.game_name).into_iter().collect();
+        games::key_for_scope(self.scope, &load_all(), &also)
+    }
+}
+
+/// Saves `values` (`set_<name>` -> value, as `neural_forge_protocol::persist::snapshot` writes them) to
+/// `scope`'s settings: `config.ini` for all games (every other line kept), else that game's own ([`store`]).
+pub fn save_values(scope: &LiveScope, values: &BTreeMap<String, String>) -> std::io::Result<()> {
+    match scope.scope {
+        0 => {
+            let mut cfg = Config::load();
+            cfg.settings.extend(values.iter().map(|(k, v)| (k.clone(), v.clone())));
+            cfg.save()
+        }
+        n => match scope.game() {
+            Some(game) => store(&game, values),
+            None => Err(std::io::Error::other(format!("the channel holds the settings of a game {} does not name (scope {n:#x})", games_file()))),
+        },
+    }
 }
 
 /// Saves the live header's settings where they belong: `config.ini` while it holds the settings for all
@@ -131,24 +172,18 @@ pub fn held_game(header: &neural_forge_protocol::ShmHeader) -> Option<GameKey> {
 /// every one (a profile, Reset, `shmctl`).
 pub fn save_live(header: &neural_forge_protocol::ShmHeader, names: Option<&[&str]>) -> std::io::Result<()> {
     let snapshot = neural_forge_protocol::persist::snapshot(header);
-    let chosen: BTreeMap<String, String> = match names {
-        None => snapshot,
-        Some(names) => snapshot.into_iter().filter(|(k, _)| k.strip_prefix("set_").is_some_and(|n| names.contains(&n))).collect(),
-    };
-    match header.settings_game() {
-        0 => {
+    let scope = LiveScope::of(header);
+    match names {
+        Some(names) => {
+            let chosen: BTreeMap<String, String> = snapshot.into_iter().filter(|(k, _)| k.strip_prefix("set_").is_some_and(|n| names.contains(&n))).collect();
+            save_values(&scope, &chosen)
+        }
+        None if scope.scope == 0 => {
             let mut cfg = Config::load();
-            if names.is_some() {
-                cfg.settings.extend(chosen);
-            } else {
-                cfg.replace_tuning(chosen);
-            }
+            cfg.replace_tuning(snapshot);
             cfg.save()
         }
-        scope => match held_game(header) {
-            Some(game) => store(&game, &chosen),
-            None => Err(std::io::Error::other(format!("the channel holds the settings of a game {} does not name (scope {scope:#x})", games_file()))),
-        },
+        None => save_values(&scope, &snapshot),
     }
 }
 
@@ -278,6 +313,32 @@ mod tests {
         // One nothing names cannot be saved.
         h.write_game_settings(GameKey::Exe("unknown.exe".into()).scope(), &[], None);
         assert!(save_live(&h, None).is_err());
+    }
+
+    /// A change kept with the scope it was made in is saved there, whatever the header holds by then.
+    #[test]
+    fn values_are_saved_to_the_scope_they_were_made_in() {
+        let home = Home::new("save-values");
+        home.write("config.ini", "binaries=/b\nset_intensity=1.5\n");
+        let h = neural_forge_protocol::ShmHeader::default();
+        h.init_defaults();
+        let all = LiveScope::of(&h);
+        assert_eq!(all.scope, 0);
+        let exe = GameKey::Exe("game.exe".into());
+        h.set_game_name("Game.exe");
+        h.write_game_settings(exe.scope(), &[], None);
+        let game = LiveScope::of(&h);
+        // The header moves on (another game's session) before either is saved.
+        h.set_game_name("Other.exe");
+        h.write_game_settings(570, &[], None);
+        save_values(&all, &values(&[("set_intensity", "2")])).unwrap();
+        save_values(&game, &values(&[("set_style", "1")])).unwrap();
+        assert_eq!(Config::load().settings.get("set_intensity").map(String::as_str), Some("2"));
+        assert_eq!(Config::load().binaries, "/b");
+        assert_eq!(overrides(&load_all(), &exe), values(&[("set_style", "1")]));
+        assert!(overrides(&load_all(), &GameKey::Steam(570)).is_empty());
+        // A Steam app's scope needs no name, all games' neither: equal whatever game is on the channel.
+        assert_eq!(LiveScope::of(&h), LiveScope { scope: 570, game_name: String::new() });
     }
 
     #[test]
