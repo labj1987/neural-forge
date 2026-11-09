@@ -1624,6 +1624,25 @@ final image before the HUD.
   0.65/255, x1.32; both at 0.5 0.76/255, x1.56. CAS's strength maps to `-s / lerp(8, 5, s)` so 0 is off; its own
   default (sharpness 0) is 0.73 here. In-game A/B in GTA V still to do.
 
+## November 9: a face crop through the network (probed, not built)
+
+AMDLSS5 2.0 (no licence; idea only) magnifies the faces it finds and runs each crop through the network on its own.
+Probed offline before building anything: two GTA V Enhanced story-mode frames at 2560x1440 (faces of about
+140x165 and 400x480 pixels), OpenDLSS-NR's `dlss5vk` (bit-exact against NGX), full and small network, seeds 0-2, no
+history. The whole frame through the network (A) against the face window magnified x2 and x2.67 with Lanczos,
+through the network, area-reduced back and pasted with a feathered ellipse (B), and the window at x1 (C). Detail is
+bench-iq's log-luma Laplacian energy in the face, relative to the model off.
+
+- B added 0.07-0.86x the detail A added (the bar was 1.2x): reducing the magnified answer back to output size
+  averages away the pixel-scale detail the network adds.
+- The crop's answer is darker and weaker than the whole frame's (a 19-32% low-frequency luma difference in the
+  feather ring, 3.5-10 8-bit codes): the network's view of the whole picture changes its tone, so a pasted face
+  shows a seam.
+- C beat A only on the very large selfie face; the crop flickered less (2-3% against 4.8%), which does not help
+  when it adds less.
+
+Not built. A face pass would also need a detector with a licence that fits (SCRFD's weights are non-commercial).
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
