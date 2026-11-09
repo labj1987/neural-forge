@@ -413,8 +413,9 @@ impl Sharpen {
             let layouts = [self.set_layout; SLOTS];
             let sets =
                 device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.descriptor_pool).set_layouts(&layouts)).ok()?;
-            let cmds =
-                device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(SLOTS as u32)).ok()?;
+            // Through the loader's dispatch data: these are dispatchable objects made below the loader's trampoline.
+            let cmd_info = vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(SLOTS as u32);
+            let cmds = crate::loader_data::allocate_commands(device, &cmd_info).ok()?;
             for (set, cmd) in sets.into_iter().zip(cmds) {
                 let fence = device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None).ok()?;
                 let regions = match Buf::new(device, &self.props, (REGION_WORDS * 16) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, true) {

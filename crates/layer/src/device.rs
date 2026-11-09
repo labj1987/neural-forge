@@ -4816,25 +4816,10 @@ mod submit_order_tests {
     fn device_wait_idle_is_only_used_at_device_teardown() {
         // Every source file of the layer: the two teardown drains are the only calls.
         let allowed = [("device.rs", "unsafe fn destroy_private_resources"), ("preupscale/inline.rs", "pub(crate) unsafe fn destroy(")];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = vec![root.clone()];
         let mut found = 0;
-        while let Some(path) = files.pop() {
-            if path.is_dir() {
-                files.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
-                continue;
-            }
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).unwrap();
-            // The code before the file's test module (a lone `#[cfg(test)]` item may come earlier).
-            let code = &source[..source.find("#[cfg(test)]\nmod ").unwrap_or(source.len())];
-            let name = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+        for (name, code) in production_sources() {
             for (at, _) in code.match_indices(".device_wait_idle()") {
-                let teardown = allowed.iter().find(|(file, _)| *file == name).and_then(|(_, f)| code.find(f));
-                let inside = teardown.is_some_and(|t| at > t && at < t + code[t..].find("\n}\n").expect("end of the teardown function"));
-                assert!(inside, "{name}: device_wait_idle outside the device teardown");
+                assert!(inside_fn(&code, at, &name, &allowed), "{name}: device_wait_idle outside the device teardown");
                 found += 1;
             }
         }
@@ -4847,6 +4832,104 @@ mod submit_order_tests {
         // And the network is closed only once the device went idle.
         let close = teardown.find("close_native()").expect("the network is closed at teardown");
         assert!(close > teardown.find(".device_wait_idle()").unwrap());
+    }
+
+    /// Every source file of the layer without its tests, as (path under `src`, code): each top-level
+    /// `#[cfg(test)] mod name { .. }` is blanked out (offsets kept), and a file that is itself a test module
+    /// (`#[cfg(test)] mod name;`) is left out.
+    fn production_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![root.clone()];
+        let mut sources = Vec::new();
+        let mut test_files = std::collections::HashSet::new();
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let mut code = std::fs::read_to_string(&path).unwrap();
+            let name = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+            // `foo.rs` and `foo/mod.rs` keep their child modules in `foo/`; `lib.rs` in `src`.
+            let dir = match name.strip_suffix(".rs") {
+                Some("lib") => String::new(),
+                Some(stem) => format!("{}/", stem.strip_suffix("/mod").unwrap_or(stem)),
+                None => unreachable!(),
+            };
+            while let Some(start) = code.find("#[cfg(test)]\nmod ") {
+                let line_end = start + code[start..].find('\n').unwrap() + 1;
+                let header_end = line_end + code[line_end..].find('\n').unwrap();
+                let header = &code[line_end..header_end];
+                let end = if let Some(module) = header.strip_prefix("mod ").and_then(|h| h.strip_suffix(';')) {
+                    test_files.insert(format!("{dir}{module}.rs"));
+                    test_files.insert(format!("{dir}{module}/mod.rs"));
+                    header_end
+                } else {
+                    assert!(header.ends_with('{'), "{name}: a test module's header: {header}");
+                    // A top-level module ends at the first closing brace in column 0.
+                    header_end + code[header_end..].find("\n}\n").unwrap_or_else(|| panic!("{name}: the end of `{header}`")) + 2
+                };
+                let blank: String = code[start..end].chars().map(|c| if c == '\n' { '\n' } else { ' ' }).collect();
+                code.replace_range(start..end, &blank);
+            }
+            sources.push((name, code));
+        }
+        sources.retain(|(name, _)| !test_files.contains(name));
+        assert!(sources.len() > 20 && sources.iter().any(|(n, _)| n == "device.rs"), "the layer's sources");
+        sources
+    }
+
+    /// Whether `at` in `code` (the file `name`) lies inside a function that `allowed` names for that file
+    /// (by the start of its signature; the function ends at the first closing brace indented as its signature).
+    fn inside_fn(code: &str, at: usize, name: &str, allowed: &[(&str, &str)]) -> bool {
+        allowed.iter().filter(|(file, _)| *file == name).any(|(_, f)| {
+            code.match_indices(f).any(|(t, _)| {
+                let line = code[..t].rfind('\n').map_or(0, |n| n + 1);
+                let indent = &code[line..t][..code[line..t].len() - code[line..t].trim_start().len()];
+                let end = code[t..].find(&format!("\n{indent}}}\n")).expect("the end of the function");
+                at > t && at < t + end
+            })
+        })
+    }
+
+    /// The test's own module stripper finds what it is meant to: the code after a top-level test module
+    /// (device.rs keeps several between its production functions), and none of the test module itself.
+    #[test]
+    fn production_sources_keep_the_code_between_test_modules() {
+        let sources = production_sources();
+        let device = &sources.iter().find(|(n, _)| n == "device.rs").unwrap().1;
+        assert!(device.contains("fn allocate_command_buffers(&self"), "the hook (after the first test module)");
+        assert!(!device.contains("fn production_sources_keep_the_code_between_test_modules"));
+        assert!(!sources.iter().any(|(n, _)| n == "sharpen/tests.rs"), "an out-of-line test module");
+    }
+
+    /// Command buffers are dispatchable objects: one the layer allocates for itself below the loader's
+    /// trampoline must get the loader's dispatch data (`loader_data::allocate_commands`) or a layer below
+    /// this one, which looks its state up by that word, fails on it (LoaderLayerInterface.md, "Creating New
+    /// Dispatchable Objects"). The only other call is the application's own `vkAllocateCommandBuffers`
+    /// hook, whose buffers the loader's trampoline initialises.
+    #[test]
+    fn command_buffers_are_allocated_through_the_loader_data() {
+        let allowed = [("loader_data.rs", "pub unsafe fn allocate_commands("), ("device.rs", "fn allocate_command_buffers(&self")];
+        let mut found = 0;
+        for (name, code) in production_sources() {
+            for (at, _) in code.match_indices("allocate_command_buffers") {
+                let before = &code[..at];
+                // Other names that end in it (`on_allocate_command_buffers`) and the hook's own signature.
+                if before.ends_with(|c: char| c.is_alphanumeric() || c == '_') || before.ends_with("fn ") {
+                    continue;
+                }
+                assert!(
+                    inside_fn(&code, at, &name, &allowed),
+                    "{name}:{}: a command buffer allocated without the loader's dispatch data (use loader_data::allocate_commands)",
+                    before.lines().count()
+                );
+                found += 1;
+            }
+        }
+        assert_eq!(found, 2, "the helper's and the hook's calls");
     }
 
     /// Real (lavapipe) queue: the relay batch must consume the application's wait
