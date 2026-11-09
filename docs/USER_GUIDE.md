@@ -197,6 +197,29 @@ Forge's composition and says what happened: where the files are and whether the 
 frame, or why nothing was written; clicking again while it waits cancels it, and a request no game
 takes is withdrawn after 5 seconds.
 
+### Settings for one game
+
+Every game uses the same settings unless it has some of its own. **Settings for**, the bar under the tab
+switcher, picks whose settings the tabs show and change: **All games**, or one of your installed Steam games
+(and any other game that has settings of its own or is running). A game's own settings are only the ones you
+change while it is picked; every other setting follows All games, so a later change there still reaches it.
+Setting a value back to the All games value removes it from the game's own. While a game is picked, each setting
+it has its own value of is marked **This game**, with a button beside the mark that drops just that one (the
+setting follows All games again); settings without the mark follow All games. **Restore defaults** removes all of
+the game's own settings. The line beside the menu says how many it has and whether it is running.
+
+When a game starts, its own settings are put on top of the settings for all games, and the menu switches to
+it, so a change you make while it runs is saved for that game. A game without settings of its own runs with the
+settings for all games. Picking another entry shows that entry's settings in the running game too, until you
+pick the game again or start it again. Reset and loading a profile change the settings shown.
+
+A Steam game is known by its app id; a game outside Steam by its executable's name (`exe:game.exe`). They are
+saved in `~/.config/neural-forge/games.ini`, one `[570]` or `[exe:game.exe]` section per game holding only its own
+`set_<name>=` lines. From a terminal: `neural-forge-cli game-settings list`, `show GAME`,
+`set GAME NAME VALUE` (the names and values `shmctl set` takes) and `clear GAME [NAME]`. Neural Forge can ship
+settings for games that need their own; none of the tested games does, so none are built in now. Your own
+settings win over built-in ones, and an update never changes your files.
+
 ## Tested games
 
 Each game was run on the test machine (RTX 5070, 2560x1440, Proton) with its own settings as found:
@@ -295,7 +318,8 @@ The CLI is installed as `~/.local/share/neural-forge/bin/neural-forge-cli`; add 
 
 `neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID]`, `games`,
 `enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]`, `disable GAME`, `config`, `import-binaries DIR`,
-`extract-model DIR [--network full|small]`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`, and
+`extract-model DIR [--network full|small]`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`,
+`game-settings list|show GAME|set GAME NAME VALUE|clear GAME [NAME]` for a game's own settings, and
 `shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--view V]|capture --cancel|dump-cache [--holds K]|reset|lut FILE|none`
 for the live settings. `doctor`, `report` and `shmctl status` only look: they create and change nothing.
 `neural-forge-cli help [COMMAND]` (or `COMMAND --help`) has the details; an unknown or misspelt
@@ -314,6 +338,7 @@ Valve's VAC) cannot be seen.
 |---|---|
 | `~/.config/neural-forge/config.ini` | Paths (`binaries=`, `shm=`, `edit_lut=` for the look-up table) and every setting as `set_<name>=`. The layer applies the saved settings when it opens the channel. |
 | `~/.config/neural-forge/profiles.ini` | Named profiles. |
+| `~/.config/neural-forge/games.ini` | Each game's own settings: a `[<app id>]` or `[exe:<file.exe>]` section with only the `set_<name>=` lines that differ from `config.ini`'s. The layer applies the game's when it starts. |
 | `~/.local/share/neural-forge/` | The installed layer and GUI, the extracted model (`model/`), an imported DLL (`binaries/`), captures (`captures/`). |
 | `~/.local/state/neural-forge/layer.log` | The layer's session log: state changes and errors only, never per frame (kept to 256 KiB, the previous one as `layer.log.1`). Diagnose and the report read it. |
 | `/tmp/neural-forge-$UID/shm.bin` | The shared memory the layer and the GUI talk through. |

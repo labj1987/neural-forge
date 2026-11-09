@@ -4,6 +4,16 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## Unreleased
+
+- Settings can now differ per game. **Settings for**, the bar under the tabs, picks All games or one of your
+  games; a game keeps only the settings you change while it is picked, and follows All games for the rest, so a
+  later change for all games still reaches it. **Restore defaults** removes a game's own settings. When a game
+  starts, its own settings apply and the app switches to them, so changes made while it runs are saved for that
+  game. Games without settings of their own run exactly as before. From a terminal: `neural-forge-cli
+  game-settings list|show|set|clear`. They are saved in `~/.config/neural-forge/games.ini`, which updates never
+  change.
+
 ## 3.11.0 — 2026-11-09
 
 - When video memory runs short, the network now pauses at once instead of first switching to the small network.

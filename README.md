@@ -71,6 +71,10 @@ The Setup tab's **Network** row picks the full network (the default) or the smal
 about half the GPU time and changes the picture less. When video memory runs short, the network
 pauses and comes back when there is room.
 
+Settings can differ per game: **Settings for**, under the tabs, picks All games or one game, and a game keeps
+only the settings you change for it (**Restore defaults** removes them). A game without its own uses the
+settings for all games.
+
 The Model tab's **Colour** group shapes the model's change rather than the picture: its saturation,
 contrast and detail, and protections that keep the frame's own hues, greys, shadows or highlights
 (all off by default).
