@@ -640,10 +640,20 @@ impl Loader {
         *self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(InFlight::of(device, fence));
     }
 
-    /// The pre-upscaler path's work has completed (its fence was waited on), and the fence may be
-    /// reset or destroyed from here on.
-    pub(crate) fn pre_idle(&self) {
-        *self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    /// The pre-upscaler path's work on `fence` has completed (the fence was waited on, or nothing on it is
+    /// pending), and the fence may be reset or destroyed from here on: forgotten if it is the one noted. Only
+    /// that one: the hold's other resources (`Session::res_inline`, `res_after`) note fences of their own.
+    pub(crate) fn pre_idle(&self, fence: vk::Fence) {
+        let mut inflight = self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inflight.is_some_and(|f| f.fence == fence) {
+            *inflight = None;
+        }
+    }
+
+    /// The fence noted by [`Self::pre_submitted`] and not forgotten yet.
+    #[cfg(test)]
+    pub(crate) fn pre_fence(&self) -> Option<vk::Fence> {
+        self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).map(|f| f.fence)
     }
 
     /// Whether a pre-upscaler hold's work may still use the network: a split hold's (its fence), or one

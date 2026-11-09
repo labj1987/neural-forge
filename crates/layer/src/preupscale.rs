@@ -4739,7 +4739,8 @@ pub(crate) struct Resources {
     /// after it.
     pub(crate) cache: Option<cache_dump::Buffers>,
     /// The network whose pre-upscaler work these resources' fences cover, told when it was waited on
-    /// (`native::Loader::pre_idle`).
+    /// (`native::Loader::pre_idle`): each time these resources go idle, and when they are destroyed, so the
+    /// loader never keeps (and later asks the status of) a fence destroyed with them.
     #[cfg(target_arch = "x86_64")]
     pub(crate) pre_loader: Option<NativeLoader>,
     capture_pending: bool,
@@ -4987,8 +4988,8 @@ impl Resources {
     /// fences reset or destroyed.
     fn idle(&mut self) {
         #[cfg(target_arch = "x86_64")]
-        if let Some(loader) = self.pre_loader.take() {
-            loader.pre_idle();
+        if let Some(loader) = &self.pre_loader {
+            loader.pre_idle(self.writeback_fence);
         }
     }
 
@@ -11420,6 +11421,53 @@ mod tests {
                 "preupscale roundtrip test (import={import}): e={e} white={white}; max relative error {strict:.2e} (encoded <= 0.9), {steep:.2e} (0.9 < encoded < 0.999); {kept} clamped channels kept exactly; {nearest}/{channels} proxy halves round-to-nearest of the CPU encode"
             );
             finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
+        }
+    }
+
+    /// A split hold's write-back fence, noted with the network's loader (`Loader::pre_submitted`), is forgotten
+    /// when the resources it belongs to go idle or are destroyed, also when no later hold of theirs comes: the
+    /// loader asks a noted fence for its status later (another device's lend, the after-the-upscaler path's
+    /// claim), and must never ask a destroyed one. Another resources' fence is left noted.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn destroyed_resources_leave_no_fence_noted_with_the_loader() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let d = &gpu.device;
+        let shm = scratch_shm("prefence");
+        let setup = native::Setup::for_test(&gpu._entry, &gpu.instance, gpu.physical, gpu.family);
+        let loader: NativeLoader = Arc::new(native::Loader::for_test(setup, Vec::new(), Arc::default(), Box::new(|_, _| {})));
+        // SAFETY: a fresh device; each submit below is waited on before the resources are destroyed.
+        unsafe {
+            let mut first = Resources::build(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false).expect("resources");
+            let mut second = Resources::build(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false).expect("resources");
+            // As a hold does: the loader set, the resources waited for, the write-back submitted and noted.
+            let hold = |res: &mut Resources| {
+                res.pre_loader = Some(loader.clone());
+                assert!(res.wait_idle(d, &mut None));
+                d.reset_fences(&[res.writeback_fence]).unwrap();
+                d.queue_submit(gpu.queue, &[], res.writeback_fence).unwrap();
+                res.writeback_pending = true;
+                loader.pre_submitted(d, res.writeback_fence);
+            };
+            hold(&mut first);
+            assert_eq!(loader.pre_fence(), Some(first.writeback_fence));
+            d.queue_wait_idle(gpu.queue).unwrap();
+            // The second resources' wait leaves the first one's fence noted.
+            second.pre_loader = Some(loader.clone());
+            assert!(second.wait_idle(d, &mut None));
+            assert_eq!(loader.pre_fence(), Some(first.writeback_fence), "another resources' fence stays noted");
+            // The first resources are destroyed (a new extent, `Session::ensure_in`) with no hold of theirs after.
+            first.destroy(d);
+            assert_eq!(loader.pre_fence(), None, "the destroyed fence is forgotten");
+            // And a wait of the resources whose fence is noted forgets it too.
+            hold(&mut second);
+            d.queue_wait_idle(gpu.queue).unwrap();
+            assert!(second.wait_idle(d, &mut None));
+            assert_eq!(loader.pre_fence(), None);
+            second.destroy(d);
         }
     }
 
