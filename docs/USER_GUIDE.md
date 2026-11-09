@@ -398,4 +398,10 @@ Valve's VAC) cannot be seen.
   layer log (`NEURAL_FORGE_LOG=/path` in the launch options) has the `[native]` lines.
 - **Steam overlay problems.** The layer leaves the overlay's own small swapchain alone, and only the
   executables in `NEURAL_FORGE_TARGET_EXE` (which switching a game on sets) can use Neural Forge.
+- **"Installing the layer for Steam games failed: refusing to overwrite ..."** A file Neural Forge
+  installed under `~/.local/share/neural-forge` was changed, or something else put a file there, so
+  the AppImage leaves it alone and games keep the layer installed before. The message names the file
+  and what to do: move that file aside and start the AppImage again; when the install record
+  (`~/.local/share/neural-forge/installation.json`) is missing, run
+  `~/.local/share/neural-forge/bin/neural-forge-cli uninstall` first.
 - **32-bit games** are not supported (see [Requirements](../README.md#requirements)).

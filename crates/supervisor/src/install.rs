@@ -25,13 +25,49 @@ pub const MANIFEST: &str = "neural_forge_layer.json";
 #[derive(Debug)]
 pub enum InstallError {
     Io(std::io::Error),
+    /// An I/O error on a named file: what was being done (`read`, `write`, ...), the file, the error.
+    File(&'static str, PathBuf, std::io::Error),
     Json(serde_json::Error),
     InvalidManifest(String),
     RefusedSymlink(PathBuf),
     /// A symlink in the AppDir's files: following it could copy a tree from anywhere (or loop).
     RefusedSourceSymlink(PathBuf),
-    RefusedUnowned(PathBuf),
+    /// A destination holds something the install record does not name as what this installer last
+    /// wrote there.
+    RefusedUnowned(RefusedUnowned),
     CorruptRecord(CorruptRecord),
+}
+
+/// A file in the way of an install: changed since Neural Forge installed it, put there by something
+/// else, or (with no install record) simply not known to be Neural Forge's.
+#[derive(Debug)]
+pub struct RefusedUnowned {
+    pub path: PathBuf,
+    /// The install record does not exist, so no installed file is known as Neural Forge's own.
+    pub record_missing: bool,
+}
+
+impl std::fmt::Display for RefusedUnowned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = self.path.display();
+        let cli = PathBuf::from(paths::data_dir()).join("bin/neural-forge-cli");
+        if self.record_missing {
+            write!(
+                f,
+                "refusing to overwrite {path}: the install record {} is missing, so no installed file is known to be Neural Forge's own. \
+                 Run `{} uninstall` (without a record it removes the installed layer and programs by their location), then start the \
+                 AppImage again; or, if you put this file there yourself, move it aside",
+                record_path().display(),
+                cli.display()
+            )
+        } else {
+            write!(
+                f,
+                "refusing to overwrite {path}: it is not what Neural Forge last installed there (it was changed afterwards, or another \
+                 program put it there). Move it aside (gio trash {path}) and start the AppImage again"
+            )
+        }
+    }
 }
 
 /// `installation.json` exists but is not a record this installer can read.
@@ -64,11 +100,12 @@ impl std::fmt::Display for InstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "{e}"),
+            Self::File(action, path, e) => write!(f, "cannot {action} {}: {e}", path.display()),
             Self::Json(e) => write!(f, "{e}"),
             Self::InvalidManifest(msg) => write!(f, "{msg}"),
             Self::RefusedSymlink(path) => write!(f, "refusing symlink destination: {}", path.display()),
             Self::RefusedSourceSymlink(path) => write!(f, "refusing a symlink in the AppDir: {}", path.display()),
-            Self::RefusedUnowned(path) => write!(f, "refusing to overwrite unowned or changed file: {}", path.display()),
+            Self::RefusedUnowned(e) => write!(f, "{e}"),
             Self::CorruptRecord(e) => write!(f, "{e}"),
         }
     }
@@ -84,6 +121,11 @@ impl From<serde_json::Error> for InstallError {
     fn from(e: serde_json::Error) -> Self {
         Self::Json(e)
     }
+}
+
+/// Maps an I/O error on `path` to [`InstallError::File`], so the message names the file.
+fn on<'a>(action: &'static str, path: &'a Path) -> impl FnOnce(std::io::Error) -> InstallError + 'a {
+    move |e| InstallError::File(action, path.to_path_buf(), e)
 }
 
 #[derive(Debug)]
@@ -189,9 +231,9 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), InstallError>
         Ok(m) if m.is_dir() => {}
         _ => return Ok(()),
     }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
+    for entry in std::fs::read_dir(dir).map_err(on("read the folder", dir))? {
+        let entry = entry.map_err(on("read the folder", dir))?;
+        let kind = entry.file_type().map_err(on("read the type of", &entry.path()))?;
         let path = entry.path();
         if kind.is_symlink() {
             return Err(InstallError::RefusedSourceSymlink(path));
@@ -221,15 +263,18 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     collect_files(&lib_src_root, &mut lib_files)?;
     for src in lib_files {
         let rel = src.strip_prefix(&lib_src_root).expect("collect_files only yields paths under lib_src_root");
-        files.insert(root.join("lib/neural-forge").join(rel), std::fs::read(&src)?);
+        files.insert(root.join("lib/neural-forge").join(rel), std::fs::read(&src).map_err(on("read", &src))?);
     }
 
     for binary in ["neural-forge", "neural-forge-cli"] {
-        files.insert(root.join("bin").join(binary), std::fs::read(usr.join("bin").join(binary))?);
+        let src = usr.join("bin").join(binary);
+        files.insert(root.join("bin").join(binary), std::fs::read(&src).map_err(on("read", &src))?);
     }
 
     let manifest_src = usr.join(format!("share/vulkan/implicit_layer.d/{MANIFEST}"));
-    let mut manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&manifest_src)?)?;
+    let manifest_text = std::fs::read_to_string(&manifest_src).map_err(on("read", &manifest_src))?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&manifest_text).map_err(|e| InstallError::InvalidManifest(format!("{}: {e}", manifest_src.display())))?;
     let layer_name = manifest.get("layer").and_then(|l| l.get("name")).and_then(|n| n.as_str()).map(str::to_owned);
     if layer_name.as_deref() != Some(LAYER) {
         return Err(InstallError::InvalidManifest(format!("{}: expected layer.name {LAYER:?}, found {layer_name:?}", manifest_src.display())));
@@ -259,11 +304,11 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
             return Err(InstallError::RefusedSymlink(link));
         }
         if path.exists() {
-            let current = digest_file(path)?;
+            let current = digest_file(path).map_err(on("read", path))?;
             let name = path.to_string_lossy().into_owned();
             if old.get(&name) != Some(&current) {
                 if current != digest(content) {
-                    return Err(InstallError::RefusedUnowned(path.clone()));
+                    return Err(InstallError::RefusedUnowned(RefusedUnowned { path: path.clone(), record_missing: !record_path().exists() }));
                 }
                 adopted.insert(name, current);
             }
@@ -288,12 +333,13 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     let bin_dir = root.join("bin");
     let mut record = old.clone();
     record.extend(adopted);
-    save_record(&record)?;
+    let record_file = record_path();
+    save_record(&record).map_err(on("write", &record_file))?;
     for (path, content) in files.iter().filter(|(path, _)| **path != manifest_dest) {
         let mode = if path.parent() == Some(bin_dir.as_path()) { 0o755 } else { 0o644 };
-        write_atomic(path, content, mode)?;
+        write_atomic(path, content, mode).map_err(on("write", path))?;
         record.insert(path.to_string_lossy().into_owned(), digest(content));
-        save_record(&record)?;
+        save_record(&record).map_err(on("write", &record_file))?;
     }
 
     // Anything an older install shipped that this one no longer does is stale: remove
@@ -304,20 +350,30 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     for (name, recorded) in stale {
         let path = PathBuf::from(&name);
         if removable(&path) && digest_file(&path).ok().as_ref() == Some(&recorded) {
-            std::fs::remove_file(&path)?;
+            std::fs::remove_file(&path).map_err(on("remove", &path))?;
         }
         record.remove(&name);
-        save_record(&record)?;
+        save_record(&record).map_err(on("write", &record_file))?;
         if let Some(parent) = path.parent() {
             prune_empty_dirs(parent, &root);
         }
     }
 
-    write_atomic(&manifest_dest, &files[&manifest_dest], 0o644)?;
+    write_atomic(&manifest_dest, &files[&manifest_dest], 0o644).map_err(on("write", &manifest_dest))?;
     record.insert(manifest_dest.to_string_lossy().into_owned(), digest(&files[&manifest_dest]));
-    save_record(&record)?;
+    save_record(&record).map_err(on("write", &record_file))?;
 
     Ok(InstallReport { changed: true, root: root.clone(), gui_path: root.join("bin/neural-forge"), cli_path: root.join("bin/neural-forge-cli") })
+}
+
+/// The AppDir this program runs from, for installing from it: `appdir` (the `APPDIR` variable) only
+/// when the running executable `exe` lies inside it. The AppImage runtime exports `APPDIR` to everything
+/// an AppImage starts, so the installed Neural Forge started from a terminal or launcher that is itself an
+/// AppImage inherits that AppImage's `APPDIR`; installing from it would read another program's files.
+pub fn running_appdir(appdir: Option<&std::ffi::OsStr>, exe: &Path) -> Option<PathBuf> {
+    let appdir = Path::new(appdir.filter(|a| !a.is_empty())?).canonicalize().ok()?;
+    let exe = exe.canonicalize().ok()?;
+    exe.starts_with(&appdir).then_some(appdir)
 }
 
 /// The first symlink among `path` and its ancestors below the XDG data home, if any.
@@ -622,7 +678,7 @@ mod tests {
         save_record(&record).unwrap();
         std::fs::write(&binary, "someone else's").unwrap();
         let err = install(&appdir).expect_err("an unowned file with other content must be refused");
-        assert!(matches!(err, InstallError::RefusedUnowned(ref path) if path == &binary), "unexpected error: {err}");
+        assert!(matches!(err, InstallError::RefusedUnowned(ref r) if r.path == binary), "unexpected error: {err}");
     }
 
     #[test]
@@ -753,7 +809,7 @@ mod tests {
         std::fs::write(&binary, "user changed").unwrap();
 
         let err = install(&appdir).expect_err("install must refuse once a tracked file no longer matches its record");
-        assert!(matches!(err, InstallError::RefusedUnowned(ref path) if path == &binary), "unexpected error: {err}");
+        assert!(matches!(err, InstallError::RefusedUnowned(ref r) if r.path == binary), "unexpected error: {err}");
         // Refusal must not have touched anything else either.
         assert_eq!(std::fs::read_to_string(&binary).unwrap(), "user changed");
     }
@@ -857,6 +913,74 @@ mod tests {
         std::fs::write(&manifest, r#"{"layer": {"name": "VK_LAYER_other"}}"#).unwrap();
         uninstall().unwrap();
         assert!(manifest.exists());
+    }
+
+    #[test]
+    fn an_install_error_names_the_file() {
+        let scratch = ScratchDataHome::new("names-the-file");
+        // A mistyped --appdir: nothing there.
+        let appdir = scratch.dir.join("squashfs-roo");
+        let err = install(&appdir).expect_err("an AppDir that is not there cannot be installed");
+        let wanted = appdir.join("usr/bin/neural-forge");
+        assert!(matches!(err, InstallError::File("read", ref path, _) if *path == wanted), "unexpected error: {err:?}");
+        assert!(err.to_string().starts_with(&format!("cannot read {}: ", wanted.display())), "{err}");
+        // A manifest that is not JSON names the manifest.
+        write_fixture_appdir(&appdir);
+        let manifest = appdir.join(format!("usr/share/vulkan/implicit_layer.d/{MANIFEST}"));
+        std::fs::write(&manifest, "{").unwrap();
+        let err = install(&appdir).expect_err("a manifest that is not JSON must be rejected");
+        assert!(err.to_string().starts_with(&format!("{}: ", manifest.display())), "{err}");
+    }
+
+    #[test]
+    fn a_refused_file_says_what_to_do_with_and_without_a_record() {
+        let scratch = ScratchDataHome::new("refused-says-what-to-do");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+        let binary = PathBuf::from(paths::data_dir()).join("bin/neural-forge");
+        std::fs::write(&binary, "user changed").unwrap();
+        let text = install(&appdir).expect_err("a changed file is refused").to_string();
+        assert!(text.starts_with(&format!("refusing to overwrite {}: it is not what Neural Forge last installed there", binary.display())), "{text}");
+        assert!(text.contains("Move it aside") && text.contains("start the AppImage again"), "{text}");
+
+        // The record lost (the files are in place, a newer AppImage differs from every one of them).
+        std::fs::write(&binary, "gui").unwrap();
+        std::fs::remove_file(record_path()).unwrap();
+        write_fixture_appdir(&appdir);
+        std::fs::write(appdir.join("usr/bin/neural-forge"), "newer gui").unwrap();
+        let err = install(&appdir).expect_err("an unrecorded file with other content is refused");
+        assert!(matches!(err, InstallError::RefusedUnowned(RefusedUnowned { record_missing: true, .. })), "{err:?}");
+        let text = err.to_string();
+        let cli = PathBuf::from(paths::data_dir()).join("bin/neural-forge-cli");
+        assert!(text.contains(&format!("the install record {} is missing", record_path().display())), "{text}");
+        assert!(text.contains(&format!("Run `{} uninstall`", cli.display())), "{text}");
+        // And the way out it names works: uninstall removes the record-less install, the next start installs.
+        uninstall().unwrap();
+        install(&appdir).expect("after the uninstall the AppImage installs again");
+        assert_eq!(std::fs::read_to_string(&binary).unwrap(), "newer gui");
+    }
+
+    #[test]
+    fn only_an_executable_inside_appdir_installs_from_it() {
+        let scratch = ScratchDataHome::new("running-appdir");
+        let appdir = scratch.dir.join("mount_ours");
+        write_fixture_appdir(&appdir);
+        let ours = appdir.join("usr/bin/neural-forge");
+        let other = scratch.dir.join("mount_other");
+        std::fs::create_dir_all(&other).unwrap();
+        // Run from the AppImage: its own APPDIR.
+        assert_eq!(running_appdir(Some(appdir.as_os_str()), &ours), Some(appdir.canonicalize().unwrap()));
+        // The installed copy started from another AppImage, which exported its own APPDIR.
+        let installed = scratch.dir.join("data-home/neural-forge/bin/neural-forge");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "gui").unwrap();
+        assert_eq!(running_appdir(Some(other.as_os_str()), &installed), None);
+        assert_eq!(running_appdir(Some(other.as_os_str()), &ours), None);
+        // No APPDIR, an empty one, one that is not there.
+        assert_eq!(running_appdir(None, &ours), None);
+        assert_eq!(running_appdir(Some(std::ffi::OsStr::new("")), &ours), None);
+        assert_eq!(running_appdir(Some(scratch.dir.join("gone").as_os_str()), &ours), None);
     }
 
     #[test]
