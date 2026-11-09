@@ -44,9 +44,12 @@ layout(set = 0, binding = 4, std140) uniform Params {
 // The control mask (native_mask.comp): r scales the intensity blend per pixel. Read only while p.mask.x
 // names a rule.
 layout(set = 0, binding = 10, std430) readonly buffer Mask { uint m[]; } u_mask;
-layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; uint cut; } u_state;
-// The exposure texel the encode used (R16_SFLOAT in the low 16 bits).
-layout(set = 0, binding = 6, std430) readonly buffer Exposure { uint bits; } u_exposure;
+// As native_preprocess.comp's: this shader writes ok[] and exposure[] for its frame's parity.
+layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; uint cut; uint last; uint changing; uint exposure[2]; } u_state;
+// The exposure texel the encode used (R16_SFLOAT in the low 16 bits). `jump`: this shader's report of an exposure
+// jump that took this frame's history (the previous network frame's exposure in the low 16 bits, this one's in
+// the high), else 0; the host reads it once the frame ran (`native::apply_exposure_jump`).
+layout(set = 0, binding = 6, std430) buffer Exposure { uint bits; uint jump; } u_exposure;
 // The next frame's history, valid extent.
 layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D u_next;
 // The answer for preupscale_decode.comp: RGBA16F rows of the padded width, as packed half4.
@@ -147,8 +150,17 @@ vec2 previousPosition(uvec2 xy) {
   return vec2(xy) + 0.5 + mv + p.motion.xy;
 }
 
+// As native_preprocess.comp's.
+bool exposureJumped() {
+  if (p.more.w <= 0.0) return false;
+  float now = unpackHalf2x16(u_exposure.bits).x;
+  float before = unpackHalf2x16(u_state.exposure[1u - p.frame.w]).x;
+  if (!exposure_ok(now) || !exposure_ok(before)) return false;
+  return max(now, before) > min(now, before) * p.more.w;
+}
+
 bool hasHistory(uvec2 xy) {
-  if (p.frame.z == 0u || u_state.cut != 0u || u_state.ok[1u - p.frame.w] == 0u) return false;
+  if (p.frame.z == 0u || u_state.cut != 0u || u_state.ok[1u - p.frame.w] == 0u || exposureJumped()) return false;
   vec2 at = previousPosition(xy);
   vec2 valid = vec2(p.dims.zw);
   return all(greaterThanEqual(at, vec2(0.0))) && all(lessThan(at, valid));
@@ -185,7 +197,13 @@ vec3 historySample(uvec2 xy) {
 void main() {
   uvec2 id = gl_GlobalInvocationID.xy;
   if (id.x >= p.dims.z || id.y >= p.dims.w) return;
-  if (id == uvec2(0u)) u_state.ok[p.frame.w] = exposure_ok(unpackHalf2x16(u_exposure.bits).x) ? 1u : 0u;
+  if (id == uvec2(0u)) {
+    u_state.ok[p.frame.w] = exposure_ok(unpackHalf2x16(u_exposure.bits).x) ? 1u : 0u;
+    u_state.exposure[p.frame.w] = u_exposure.bits & 0xffffu;
+    // Reported only where the jump is what took the history (not a reset, a cut or an unusable exposure).
+    bool jumped = p.frame.z != 0u && u_state.cut == 0u && u_state.ok[1u - p.frame.w] != 0u && exposureJumped();
+    u_exposure.jump = jumped ? (u_state.exposure[1u - p.frame.w] & 0xffffu) | ((u_exposure.bits & 0xffffu) << 16) : 0u;
+  }
   vec3 proxy = imageLoad(u_encoded, ivec2(id)).rgb;
   uint feature = (id.y * p.dims.x + id.x) * 4u;
   vec3 h = vec3(u_head.head[feature], u_head.head[feature + 1u], u_head.head[feature + 2u]);

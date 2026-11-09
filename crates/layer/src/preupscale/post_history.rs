@@ -237,6 +237,9 @@ pub(crate) fn note_reset(reset: Reset) {
         Reset::Stale(Stale::SceneCut(mean)) => {
             crate::log!("[native] after the upscaler: resetting the history (scene cut: the picture's luma changed by {mean} of 255 on average)")
         }
+        // Not given here: the game's reset is read from DLSS's input launch, which only the holds before the
+        // upscaler belong to.
+        Reset::Stale(Stale::GameReset) => crate::log!("[native] after the upscaler: resetting the history (the game reset DLSS's history)"),
         Reset::Network => crate::log!("[native] after the upscaler: resetting the history (the network was built again)"),
     }
 }

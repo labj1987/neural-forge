@@ -4,6 +4,17 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## Unreleased
+
+- The model now starts afresh when the game itself tells DLSS a new shot begins, as it already did when the
+  picture changes as a whole. In GTA V Enhanced this catches camera cuts the picture-based check missed, which
+  carried the last shot's look into the new one for a moment. It works where Neural Forge knows how the game's
+  DLSS passes that signal on (GTA V Enhanced so far); `NEURAL_FORGE_GAME_RESET=off` turns it off.
+- The model also starts afresh when the game's exposure jumps (after a pause, a menu or the map), so the first
+  frames after it no longer carry a look made at the old brightness. `NEURAL_FORGE_EXPOSURE_JUMP` sets how big a
+  change counts (1 stop by default) or turns it off.
+- The layer log's frame-rate line every 5 seconds now also gives the 99th percentile frame time and the 1% low.
+
 ## 3.11.0 — 2026-11-09
 
 - When video memory runs short, the network now pauses at once instead of first switching to the small network.

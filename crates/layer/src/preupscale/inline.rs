@@ -56,7 +56,8 @@ pub(crate) const READBACK_BYTES: u64 = 256;
 pub(crate) const READ_STATS: u64 = 0;
 /// The scene-cut detector's result (4 words).
 pub(crate) const READ_SCENE: u64 = 64;
-/// The exposure the encode used (the HDR pass's exposure buffer's first 4 bytes).
+/// The exposure the encode used (the HDR pass's exposure buffer's first 4 bytes), then the composite's
+/// exposure-jump word (`native::apply_exposure_jump`).
 pub(crate) const READ_EXPOSURE: u64 = 80;
 /// The auto-exposure's state (`hdr::AutoState`'s 5 words).
 pub(crate) const READ_AUTO: u64 = 96;
@@ -2005,7 +2006,7 @@ mod tests {
                     res,
                     &target,
                     self.loader.as_ref().expect("loader"),
-                    jitter,
+                    crate::preupscale::DlssFrame { jitter, reset: false },
                     true,
                     Passes::default(),
                     &[(W, H)],
@@ -2101,7 +2102,7 @@ mod tests {
                         res,
                         &target,
                         loader,
-                        jitter,
+                        crate::preupscale::DlssFrame { jitter, reset: false },
                         false,
                         Passes::default(),
                         sizes,

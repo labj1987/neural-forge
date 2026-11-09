@@ -974,6 +974,14 @@ impl HdrPass {
         exposure_word(unsafe { std::ptr::read_volatile(self.exposure.ptr.cast::<[u8; 4]>()) })
     }
 
+    /// The composite's exposure-jump word (the buffer's second; `native::apply_exposure_jump`), once the hold that
+    /// wrote it was waited for.
+    pub(crate) fn exposure_jump_word(&self) -> u32 {
+        // SAFETY: as `exposure_values`; the word is inside EXPOSURE_BYTES, and the native pass's last barrier made
+        // the composite's write available to the host.
+        u32::from_le_bytes(unsafe { std::ptr::read_volatile(self.exposure.ptr.add(4).cast::<[u8; 4]>()) })
+    }
+
     /// Clears the exposure buffer to 0 (so a capture that did not read the exposure image leaves
     /// "unusable" behind, never the previous frame's value).
     pub(crate) fn clear_exposure(&self) {

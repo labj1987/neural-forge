@@ -159,6 +159,8 @@ feature, not reset, when the resolution or formats change.
 | Scene cut detected from the picture | reset, **only while motion vectors are on** (`scene.rs`, threshold 40 on an 8-pixel-step luma thumbnail) | no model reset; drops the flow history and zeroes motion (threshold 55, two frames) | no detector | no detector | n/a |
 | Scene cut, the native backend (3.7.0) | reset on every hold, motion vectors or not (`preupscale::scene_cut`, `Stale::SceneCut`): the same thumbnail and threshold on the GPU, in the capture; the cut frame itself starts afresh in every pass, a cut on a cached hold resets the next network frame and refreshes the edit cache | | | | |
 | The game's own NGX reset flag | not visible | not visible | reset | reset | reset |
+| The game's own reset, the native backend | reset where DLSS Super Resolution's input kernel carries it: word 4 of the 310.x `hiluma_engine_input*` kernels' parameters (`preupscale::reset_word`, `Stale::GameReset`), every hold of that buffer; a hold recorded before the launch that carries it resets the next network frame; the edit cache refreshes. Only the values 0 and 1 count, and a word set on more than 8 input launches in a row is ignored on that device from then on. Other kernel families: not read | | | | |
+| The exposure jumped, the native backend | reset when the exposure the encode used changed by more than 1 stop (a factor of 2, either way) since the previous network frame, both usable: the frame shaders' `exposureJumped` (`native_preprocess.comp`, `native_composite.comp`) on that frame, every pass, seed 0; logged at the next hold | | | | |
 
 Findings:
 
@@ -182,9 +184,32 @@ Findings:
   `scene_cuts=N`, the Debug tab's Scene cuts row) and the CPU's side (`restart_seed`, or
   `HistoryGap::scene_cut` and `cache::State::drop_edit` for a cut on a cached hold). No readback stall.
   `NEURAL_FORGE_SCENE_CUT=off|<1-255>` switches it off or sets the threshold, for testing.
-- **The game's own reset is out of reach.** OptiScaler, RenoDX and the AMD project sit inside the
-  game's NGX calls and forward its `Reset`. Neural Forge sees DLSS from a Vulkan layer, where the
-  game's NGX parameter block is not visible; the picture-based detector is its substitute.
+- **The game's own reset, read from DLSS's input kernel.** OptiScaler, RenoDX and the AMD project sit inside
+  the game's NGX calls and forward its `Reset`. Neural Forge sees DLSS from a Vulkan layer, where the game's NGX
+  parameter block is not visible, but DLSS Super Resolution passes the flag on to its input kernel: word 4 of
+  the 310.x `hiluma_engine_input*` kernels' launch parameters (beside the jitter in word 3). In a GTA V Enhanced
+  benchmark run (`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`) it was 0 on every launch but three: the first
+  frame and two camera cuts mid-pass (launches 7012 and 9433, no loading gap) that the picture-based detector
+  did not take for cuts. The holds now reset the network's history on it (`Stale::GameReset`, logged as
+  `[native] resetting the history (the game reset DLSS's history)`, not counted in `scene_cuts`) and refresh the
+  edit cache; the hold after DLSS's output in the same buffer resets too. Only 0 and 1 count (any other value is
+  another parameter in that word), and a word set on more than 8 input launches in a row is taken for no reset
+  flag on that device and ignored from then on (logged once): a game's resets are single frames. Where the hold comes before the launch
+  carrying it, the next network frame resets (a reset cannot be predicted like the jitter).
+  `NEURAL_FORGE_GAME_RESET=off` ignores it, for testing. Other kernel families' words are not known (2.x and
+  3.x `cuda_engine_*`, Crimson Desert's `rrlite_*`): there the picture-based detector is still the only
+  substitute, as it is after the upscaler (placement Finished frame), which is not tied to DLSS's launches.
+- **An exposure jump resets too (the native backend).** The network's history is in the encoded domain, with the
+  exposure the encode used baked in, and the game's exposure is taken unsmoothed on every hold. After a pause, a
+  menu or a map the exposure can jump many stops, and the first frames after it blended an answer made at the old
+  exposure. Both frame shaders keep the exposure each network frame was encoded with in the native pass's state
+  buffer (`exposure[2]`, beside `ok[2]`) and take no history where the current one differs from the previous
+  network frame's by more than the factor in `Params::more[3]` (2 by default; `NEURAL_FORGE_EXPOSURE_JUMP=off|<stops>`).
+  The composite reports a jump that took the history in the exposure buffer's second word, which the host reads at
+  the next hold for the log line (`[native] resetting the history (the exposure changed from A to B, by N stops)`)
+  and to restart the CPU's seed, as for a cut the GPU reset. With a steady exposure nothing changes, bit for bit.
+  The auto exposure adapts 5% of the way to its target per hold, under a stop between two network frames unless
+  the target is about 10 stops away. A jump on a hold the edit cache served is seen by the next network frame.
 - **The helper resets more than DLSS5VKLayer does** (on cuts, gaps and pauses). Those rules came
   from OpenDLSS-NR's documented "history counts only for the frame that directly follows it"
   (OPENDLSS_REVIEW.md) and are kept.

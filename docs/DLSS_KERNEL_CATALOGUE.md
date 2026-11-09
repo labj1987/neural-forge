@@ -50,6 +50,7 @@ readings, not specifications:
 | Output / render ratio | w1 | | | |
 | Render / output ratio | w5, w6 | w14, w15, w17 | w15, w16, w18 | w16, w22 |
 | Network tile width (640) | w8 | | | |
+| History reset (0/1: the game's NGX `Reset`) | w4 (GTA V Enhanced, 2026-11-09) | | | |
 
 ## Kernel names say how the game set DLSS up
 

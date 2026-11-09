@@ -164,7 +164,7 @@ pub(crate) unsafe fn run_native(
     res: &mut Resources,
     target: &Target,
     loader: &NativeLoader,
-    jitter: Option<[f32; 2]>,
+    dlss: DlssFrame,
     chain_ok: bool,
     shm: &ShmClient,
     arm: Option<cache_dump::Arm>,
@@ -203,7 +203,7 @@ pub(crate) unsafe fn run_native(
                 res,
                 target,
                 loader,
-                jitter,
+                dlss,
                 chain_ok,
                 passes,
                 &sizes,
@@ -216,7 +216,7 @@ pub(crate) unsafe fn run_native(
         };
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, arm, hold, at, sink);
+    let _ = (device, instance, physical_device, res, target, dlss, chain_ok, shm, arm, hold, at, sink);
     #[cfg(not(target_arch = "x86_64"))]
     match *loader {}
 }
@@ -1486,6 +1486,13 @@ pub(crate) struct Tracker {
     jitter_checks: (u64, u64),
     jitter_stopped: bool,
     jitter_said: bool,
+    /// DLSS's own history reset, carried by a buffer's input launch recorded after a hold in that buffer had
+    /// already been told there was none ([`Self::reset_for_hold`]): for the next hold.
+    reset_latched: bool,
+    /// Input launches in a row whose reset word was set, and whether it stopped counting as the game's reset on this
+    /// device ([`Self::reset_flag`]).
+    reset_streak: u32,
+    reset_ignored: bool,
     /// The identification ([`Self::generation`]) a hold inside DLSS's buffer was recorded for: from
     /// then on [`Self::inline_point`] answers for the buffers the split could take too
     /// ([`Hazard::HeldInside`]).
@@ -1559,12 +1566,20 @@ pub(crate) struct Scan {
     /// The camera jitter DLSS was given for this frame, when its input kernel's parameters say
     /// ([`LaunchRefs::jitter`]; [`Self::jitter_px`] reads it).
     pub jitter: Option<u64>,
+    /// The game reset DLSS's history for this frame ([`LaunchRefs::reset`]). A reset latched for the next hold
+    /// ([`Tracker::reset_for_hold`]) is added only where the split hold runs ([`Tracking::split_dlss_frame`]).
+    pub reset: bool,
 }
 
 impl Scan {
     /// The camera jitter (x, y, render pixels), if known.
     pub(crate) fn jitter_px(&self) -> Option<[f32; 2]> {
         self.jitter.map(|v| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
+    }
+
+    /// What DLSS's input launch said of this submit's frame (without a latched reset).
+    pub(crate) fn dlss_frame(&self) -> DlssFrame {
+        DlssFrame { jitter: self.jitter_px(), reset: self.reset }
     }
 
     /// Whether the colour input can be taken to be in `GENERAL` at this submit: its last committed
@@ -1615,6 +1630,19 @@ pub(crate) struct LaunchRefs {
     /// The jitter a hold recorded before the launch carrying it was given ([`Tracker::jitter_for_hold`]), until
     /// that launch checks it.
     pub predicted: Option<u64>,
+    /// Whether the game reset DLSS's history for this frame: the reset word ([`reset_word`]) of the buffer's
+    /// first launch that carries one, non-zero. `None` until such a launch is recorded, and for other kernels.
+    pub reset: Option<bool>,
+    /// A hold recorded into the buffer before the launch carrying the reset word ([`Tracker::reset_for_hold`]).
+    pub reset_asked: bool,
+}
+
+/// What DLSS Super Resolution's input launch says of the frame a hold belongs to: the camera jitter (render
+/// pixels, x and y) and whether the game reset DLSS's history ([`LaunchRefs::reset`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct DlssFrame {
+    pub jitter: Option<[f32; 2]>,
+    pub reset: bool,
 }
 
 /// Wrong predictions of the camera jitter ([`Tracker::jitter_for_hold`]) after which, with more than one in nine
@@ -1645,6 +1673,44 @@ const CUDA_ENGINE_JITTER_WORD: usize = 10;
 /// bytes 168-175, Halton(2,3) minus 0.5 in render pixels; bytes 176-183 hold the previous frame's
 /// (`NEURAL_FORGE_PROBE_KERNEL`, 3000 launches, 2026-10-09).
 const RRLITE_ENC0_JITTER_WORD: usize = 21;
+
+/// The word of a 310.x SR input kernel's parameters that holds the game's history reset (NGX's `Reset`, as DLSS
+/// was given it): 0 on every launch of a GTA V Enhanced benchmark run (`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`)
+/// but the first frame's and two camera cuts mid-pass that the picture-based detector missed (2026-11-09).
+const HILUMA_RESET_WORD: usize = 4;
+
+/// Input launches in a row with the reset word set after which it is not taken for the game's reset on that device
+/// ([`Tracker::reset_flag`]).
+const RESET_STREAK_MAX: u32 = 8;
+
+/// Which 8-byte word of a DLSS kernel's parameters holds the game's history reset, by kernel name
+/// ([`LaunchRefs::reset`]). Only where it was measured: the other families' words are not known.
+fn reset_word(name: &str) -> Option<usize> {
+    name.starts_with("hiluma_engine_input").then_some(HILUMA_RESET_WORD)
+}
+
+/// The variable that switches honouring the game's history reset off (`off`), for testing.
+pub(crate) const GAME_RESET_ENV: &str = "NEURAL_FORGE_GAME_RESET";
+
+/// Whether the holds honour the game's history reset ([`GAME_RESET_ENV`]). Read once, logged when off.
+pub(crate) fn game_reset_honoured() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        let raw = neural_forge_protocol::env::var(GAME_RESET_ENV);
+        let on = parse_game_reset(raw.as_deref());
+        if !on {
+            crate::log!("[preupscale] {GAME_RESET_ENV}=off: the game's own reset of DLSS's history is not followed");
+        } else if raw.as_deref().is_some_and(|v| !v.trim().is_empty() && v.trim() != "on") {
+            crate::log!("[preupscale] {GAME_RESET_ENV}={raw:?} is not on or off; it stays on");
+        }
+        on
+    });
+    *ON
+}
+
+/// [`GAME_RESET_ENV`]'s value: on unless `off`.
+fn parse_game_reset(raw: Option<&str>) -> bool {
+    raw.map(str::trim) != Some("off")
+}
 
 /// Which 8-byte word of a DLSS kernel's parameters holds the camera jitter, by kernel name.
 fn jitter_word(name: &str) -> Option<usize> {
@@ -1978,6 +2044,17 @@ impl Tracker {
             if refs.jitter.is_none() {
                 refs.jitter = Some(value);
                 self.learn_jitter(command_buffer, value);
+            }
+        }
+        // The game's history reset, from the first launch of the buffer whose kernel is known to carry it.
+        let at = self.functions.get(&function).and_then(|(_, name)| reset_word(name));
+        if let Some(value) = at.and_then(|at| bytes.as_chunks::<8>().0.get(at)).map(|w| u64::from_le_bytes(*w)) {
+            if self.launch.get(&command_buffer).is_none_or(|r| r.reset.is_none()) {
+                let reset = self.reset_flag(value);
+                let refs = self.launch.entry(command_buffer).or_default();
+                refs.reset = Some(reset);
+                // A hold already recorded into this buffer went without it: the next hold starts afresh.
+                self.reset_latched |= reset && refs.reset_asked;
             }
         }
         let mut named: Vec<vk::Image> = Vec::new();
@@ -2378,6 +2455,37 @@ impl Tracker {
     }
 
     /// Takes the mark [`Self::launch_kernel`] left for the launch just recorded.
+    /// An input launch's reset word ([`reset_word`]) as the game's reset. Only 0 and 1 are one: any other value is
+    /// another parameter in that word, and no reset. A word set on more than [`RESET_STREAK_MAX`] input launches in a
+    /// row is no reset flag on this device (the game's resets are single frames: three in a GTA V benchmark run), and
+    /// is ignored from then on, logged once.
+    fn reset_flag(&mut self, value: u64) -> bool {
+        if self.reset_ignored {
+            return false;
+        }
+        match value {
+            0 => {
+                self.reset_streak = 0;
+                false
+            }
+            1 => {
+                self.reset_streak += 1;
+                if self.reset_streak <= RESET_STREAK_MAX {
+                    return true;
+                }
+                self.reset_ignored = true;
+                self.reset_latched = false;
+                crate::log!(
+                    "[preupscale] DLSS's reset word (word {HILUMA_RESET_WORD} of its input kernel's parameters) set on {} launches in a row: not a reset flag here; the game's reset is ignored from now",
+                    self.reset_streak
+                );
+                crate::logging::flush();
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// A buffer's camera jitter seen in a launch (`cb`'s first): checks the jitter predicted for a hold recorded
     /// before it, and learns the sequence (the jitter seen before it is followed by this one).
     fn learn_jitter(&mut self, cb: vk::CommandBuffer, value: u64) {
@@ -2427,6 +2535,32 @@ impl Tracker {
         }
         self.launch.entry(cb).or_default().predicted = Some(next);
         Some(next)
+    }
+
+    /// Whether a hold recorded into `cb` now (before DLSS's upscaler) starts the history afresh for the game: its
+    /// input launch carried the reset, or a reset reached a buffer whose hold came before the launch carrying
+    /// it (latched for this one: unlike the jitter, a reset cannot be predicted). Consumes the latch.
+    pub(crate) fn reset_for_hold(&mut self, cb: vk::CommandBuffer) -> bool {
+        let refs = self.launch.entry(cb).or_default();
+        let own = match refs.reset {
+            Some(r) => r,
+            None => {
+                refs.reset_asked = true;
+                false
+            }
+        };
+        self.take_reset_latch() | own
+    }
+
+    /// A reset latched for the next hold ([`Self::reset_for_hold`]), consumed.
+    fn take_reset_latch(&mut self) -> bool {
+        std::mem::take(&mut self.reset_latched)
+    }
+
+    /// Whether `cb`'s input launch carried the game's reset, for a hold after DLSS's output in the same buffer
+    /// (the latch is the holds' before the upscaler).
+    fn reset_seen(&self, cb: vk::CommandBuffer) -> bool {
+        self.launch.get(&cb).and_then(|r| r.reset).unwrap_or(false)
     }
 
     pub(crate) fn take_inline_at(&mut self) -> Option<(vk::CommandBuffer, vk::Image)> {
@@ -2645,6 +2779,10 @@ impl Tracker {
                 if refs.jitter.is_none() {
                     refs.jitter = c.jitter;
                 }
+                if refs.reset.is_none() {
+                    refs.reset = c.reset;
+                }
+                refs.reset_asked |= c.reset_asked;
                 if c.input.is_some() && c.input == refs.input {
                     refs.output_pair |= c.output_pair;
                     // The secondary's output kernel follows the input launch it was found after, and
@@ -3331,6 +3469,7 @@ impl Tracker {
                         depth_hazard,
                         colour_owner,
                         jitter: self.launch.get(&cb).and_then(|r| r.jitter),
+                        reset: self.reset_seen(cb),
                     });
                 }
                 if found.is_none() {
@@ -3585,9 +3724,24 @@ impl Tracking {
         plan.has(placement::Stage::Before).then(|| placement::Hold::of(&plan, placement::Stage::Before, render, t.output_extent()))
     }
 
-    /// The camera jitter for a hold recorded into `cb` now ([`Tracker::jitter_for_hold`]).
-    pub(crate) fn jitter_px_of(&self, cb: vk::CommandBuffer) -> Option<[f32; 2]> {
-        self.lock().jitter_for_hold(cb).map(jitter_px)
+    /// What a hold recorded into `cb` now, before the upscaler, is given of DLSS's frame: the camera jitter
+    /// ([`Tracker::jitter_for_hold`]) and the game's reset ([`Tracker::reset_for_hold`]).
+    pub(crate) fn dlss_frame_of(&self, cb: vk::CommandBuffer) -> DlssFrame {
+        let mut t = self.lock();
+        DlssFrame { jitter: t.jitter_for_hold(cb).map(jitter_px), reset: t.reset_for_hold(cb) }
+    }
+
+    /// What the split hold at the submit `scan` found is given of DLSS's frame: its launch's jitter and reset, and
+    /// a reset latched for the next hold ([`Tracker::reset_for_hold`]). Called where the hold runs.
+    pub(crate) fn split_dlss_frame(&self, scan: &Scan) -> DlssFrame {
+        let latched = self.lock().take_reset_latch();
+        DlssFrame { reset: scan.reset | latched, ..scan.dlss_frame() }
+    }
+
+    /// The same for a hold after DLSS's output kernel in `cb`: DLSS's output is not jittered (its jitter is
+    /// zero, known, so the edit cache keeps its interval there), and the reset is the buffer's input launch's.
+    pub(crate) fn dlss_frame_after(&self, cb: vk::CommandBuffer) -> DlssFrame {
+        DlssFrame { jitter: Some([0.0, 0.0]), reset: self.lock().reset_seen(cb) }
     }
 
     /// Whether `cb` has CUDA launches recorded (diagnostics: `NEURAL_FORGE_LOG_LAUNCH_QUEUES`).
@@ -6487,6 +6641,7 @@ impl Session {
             let effect = scene_cut::effect(reading, recorded);
             res.readings.scene_cut |= native::apply_scene_cut(effect, res.native.as_mut(), res.edit.as_mut().map(|e| &mut e.state));
         }
+        native::apply_exposure_jump(word(inline::READ_EXPOSURE, 1), res.native.as_mut());
         if h.meta.exposure_source == Some(ExposureSource::Game) {
             let at = inline::READ_EXPOSURE as usize;
             let (_, game) = hdr::exposure_word([h.readback[at], h.readback[at + 1], h.readback[at + 2], h.readback[at + 3]]);
@@ -7202,6 +7357,122 @@ mod jitter_tests {
         assert_eq!(jitter_word("rr2_enc0_kernel"), None, "Ray Reconstruction is never held");
         assert_eq!(jitter_word("rr2_enc1_kernel"), None);
         assert_eq!(jitter_word("main_kernel"), None);
+    }
+
+    /// The game's history reset is word 4 of a 310.x SR input kernel's parameters (GTA V Enhanced), and no other
+    /// family's word is known.
+    #[test]
+    fn the_reset_word_is_hiluma_s_only() {
+        assert_eq!(reset_word("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel"), Some(4));
+        assert_eq!(reset_word("hiluma_engine_input_depthreg_mvhi_ldr_v1_rel"), Some(4));
+        assert_eq!(reset_word("hiluma_engine_output_depthinv_mvlo_hdr_v2_rel"), None, "the output kernel");
+        assert_eq!(reset_word("cuda_engine_input_kernel"), None);
+        assert_eq!(reset_word("cuda_engine_input_kernel_rel_hdr_mvdiff_mvhi"), None);
+        assert_eq!(reset_word("rrlite_enc0_4x4_mvlo_hdr_folded"), None);
+        assert_eq!(reset_word("rr2_enc0_kernel"), None);
+        assert_eq!(reset_word("main_kernel"), None);
+        assert!(parse_game_reset(None) && parse_game_reset(Some("")) && parse_game_reset(Some("on")) && parse_game_reset(Some("1")));
+        assert!(!parse_game_reset(Some("off")) && !parse_game_reset(Some(" off ")));
+    }
+
+    /// A 310.x SR input launch records the game's reset from its word 4 (its first launch carrying one; other
+    /// kernels none), and a hold in its buffer is given it; a hold recorded before the launch that carries it
+    /// goes without it, and the next hold starts afresh instead, once.
+    #[test]
+    fn the_input_launch_records_the_reset_and_a_hold_before_it_passes_it_to_the_next_hold() {
+        let mut t = Tracker::default();
+        let (input, other) = (vk::CuFunctionNVX::from_raw(0x9201), vk::CuFunctionNVX::from_raw(0x9202));
+        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
+        t.record_function(other, "cuda_dldn_engine_luma_convert_kernel");
+        // 31 words as GTA V's: the jitter at word 3, the reset at word 4.
+        let params = |reset: u64| -> Vec<u8> {
+            let mut words = [0u64; 31];
+            words[3] = word(-0.25, 0.125);
+            words[4] = reset;
+            words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        };
+        let cb = |n: u64| vk::CommandBuffer::from_raw(0x7000 + n);
+        // An ordinary frame: recorded as no reset, and the hold is given none.
+        t.launch_kernel(cb(0), input, Some(&params(0)));
+        assert_eq!(t.launch[&cb(0)].reset, Some(false));
+        assert!(!t.reset_for_hold(cb(0)));
+        // A frame the game reset: recorded, given to every hold of the buffer (before and after DLSS's output).
+        t.launch_kernel(cb(1), input, Some(&params(1)));
+        assert_eq!((t.launch[&cb(1)].reset, t.launch[&cb(1)].jitter), (Some(true), Some(word(-0.25, 0.125))));
+        assert!(t.reset_for_hold(cb(1)));
+        assert!(t.reset_for_hold(cb(1)) && t.reset_seen(cb(1)));
+        assert!(!t.reset_for_hold(cb(0)), "nothing latched");
+        // The first launch carrying the word decides: a later one in the same buffer does not change it.
+        t.launch_kernel(cb(0), input, Some(&params(1)));
+        assert_eq!(t.launch[&cb(0)].reset, Some(false));
+        // Another kernel's word 4 is not read.
+        t.launch_kernel(cb(2), other, Some(&params(1)));
+        assert_eq!(t.launch[&cb(2)].reset, None);
+        // A hold before the launch carrying the reset: none for it; the launch latches it for the next hold, once.
+        t.launch_kernel(cb(3), other, Some(&params(0)));
+        assert!(!t.reset_for_hold(cb(3)));
+        t.launch_kernel(cb(3), input, Some(&params(1)));
+        assert!(!t.reset_seen(cb(0)) && !t.reset_seen(cb(2)));
+        assert!(t.reset_for_hold(cb(4)), "the next hold starts afresh (its own launch not seen yet)");
+        assert!(!t.reset_for_hold(cb(4)), "once");
+        t.launch_kernel(cb(5), input, Some(&params(0)));
+        assert!(!t.reset_for_hold(cb(5)));
+        // The same with the next hold's own launch seen: latched or its own, one reset.
+        t.launch_kernel(cb(6), other, Some(&params(0)));
+        assert!(!t.reset_for_hold(cb(6)));
+        t.launch_kernel(cb(6), input, Some(&params(1)));
+        t.launch_kernel(cb(7), input, Some(&params(0)));
+        assert!(t.reset_for_hold(cb(7)));
+        assert!(!t.reset_for_hold(cb(8)));
+        // A hold before a launch without the reset latches nothing.
+        t.launch_kernel(cb(9), other, Some(&params(0)));
+        assert!(!t.reset_for_hold(cb(9)));
+        t.launch_kernel(cb(9), input, Some(&params(0)));
+        assert!(!t.reset_for_hold(cb(10)));
+    }
+
+    /// Only 0 and 1 are the game's reset; a word set on more than 8 input launches in a row is no reset flag, and
+    /// is ignored on the device from then on (a latched reset with it).
+    #[test]
+    fn the_reset_word_takes_only_0_and_1_and_stops_when_set_on_too_many_launches_in_a_row() {
+        let mut t = Tracker::default();
+        let input = vk::CuFunctionNVX::from_raw(0x9301);
+        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
+        let params = |reset: u64| -> Vec<u8> {
+            let mut words = [0u64; 31];
+            words[4] = reset;
+            words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        };
+        let mut n = 0u64;
+        let mut launch = |t: &mut Tracker, value: u64| {
+            n += 1;
+            let cb = vk::CommandBuffer::from_raw(0x8000 + n);
+            t.launch_kernel(cb, input, Some(&params(value)));
+            t.launch[&cb].reset
+        };
+        assert_eq!(launch(&mut t, 1), Some(true));
+        for other in [2, 0x3f80_0000, u64::MAX, 0x1_0000_0001] {
+            assert_eq!(launch(&mut t, other), Some(false), "{other:#x} is no reset flag");
+        }
+        // Single resets between ordinary frames: always honoured.
+        for _ in 0..20 {
+            assert_eq!(launch(&mut t, 0), Some(false));
+            assert_eq!(launch(&mut t, 1), Some(true));
+        }
+        // Eight in a row (counting the last one above) are honoured; a ninth means it is no reset flag.
+        assert_eq!(launch(&mut t, 0), Some(false));
+        for k in 0..8 {
+            assert_eq!(launch(&mut t, 1), Some(true), "launch {k} of the streak");
+        }
+        // A hold before the launch that carries the ninth: nothing latched for the next.
+        let cb = vk::CommandBuffer::from_raw(0x9000);
+        assert!(!t.reset_for_hold(cb));
+        t.launch_kernel(cb, input, Some(&params(1)));
+        assert_eq!(t.launch[&cb].reset, Some(false));
+        assert!(t.reset_ignored);
+        assert!(!t.reset_for_hold(vk::CommandBuffer::from_raw(0x9001)));
+        assert_eq!(launch(&mut t, 0), Some(false));
+        assert_eq!(launch(&mut t, 1), Some(false), "ignored from then on");
     }
 
     /// Crimson Desert's buffer: the hold is recorded at NGX's luma kernel, before `rrlite_enc0_*` carries the
@@ -9514,11 +9785,12 @@ mod tests {
         let refs = &t.launch[&primary];
         assert_eq!(refs.input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
         assert_eq!(refs.jitter, Some(jitter), "the secondary's jitter");
+        assert_eq!(refs.reset, Some(false), "the secondary's reset word (word 4: the depth handle in this block, no reset flag)");
         assert_eq!(refs.output, Some((output, img(0x400))), "the secondary's output kernel and image");
         assert_eq!(t.attached.get(&primary), Some(&vec![(img(0x100), vk::ImageLayout::GENERAL)]), "the secondary's attachment layout");
         for n in 0..OUTPUT_SETTLE {
             let scan = submit(&mut t, &[vec![primary]]).0.expect("launch-bearing");
-            assert_eq!(scan.jitter_px(), Some([-0.25, 0.1667]), "submit {n}");
+            assert_eq!(scan.dlss_frame(), DlssFrame { jitter: Some([-0.25, 0.1667]), reset: false }, "submit {n}");
             assert_eq!(t.committed.get(&img(0x100)), Some(&vk::ImageLayout::GENERAL), "submit {n}: committed from the primary");
         }
         assert_eq!(t.dlss_output.map(|o| (o.function, o.image, o.input)), Some((output, img(0x400), img(0x100))), "DLSS's output is learnt from the primary");

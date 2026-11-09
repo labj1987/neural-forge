@@ -1578,6 +1578,29 @@ later on October 22 was tried as the cheapest of them first offline, then built 
   and their launches OK; only the startup probes with null arguments are refused. Whether NVIDIA's network then
   changes the picture was not compared. No upstream report; the README carries no known issue for it.
 
+## November 9: the game's own reset of DLSS's history
+
+- **Found in the launch parameters.** The layer cannot see the game's NGX parameter block, so its `Reset` was
+  taken to be out of reach (DLSSNR_PARAMETERS.md, "History reset") and the picture-based scene-cut detector
+  (3.7.0) was the only substitute. A diagnostic probe of DLSS Super Resolution's input kernel in GTA V Enhanced
+  (`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`, 31 words) showed word 4 at 0 on every launch of a benchmark run
+  but three: launch 0 (the first frame) and launches 7012 and 9433, both mid-pass with no loading gap. The
+  detector logged no cut at either (only the idle-gap resets at the loading screens), so the network kept its
+  history across two camera cuts the game itself had signalled. Every other word was constant, but for the
+  jitter in word 3.
+- **Now** the holds before the upscaler read word 4 of that kernel family (`preupscale::reset_word`) and start
+  the network's history afresh on it, as on a scene cut, with the edit cache refreshing on that hold. A hold
+  recorded before the launch that carries it resets the next network frame instead. Other families' words are
+  not known and are not read. `NEURAL_FORGE_GAME_RESET=off` turns it off for comparisons. Only 0 and 1 count, and
+  a word set on more than 8 input launches in a row is ignored on that device from then on, so a game whose word 4
+  means something else cannot keep the network without history.
+- **The exposure jump, from AMDLSS5's idea.** AMDLSS5 holds and smooths the exposure so the picture stays steady
+  after a pause or a menu. Neural Forge takes the game's exposure on every hold, unsmoothed, and the network's
+  history is encoded at the exposure of its frame, so the first frames after a jump blended an answer made at the
+  old one. The frame shaders now start afresh where the exposure changed by more than a stop since the previous
+  network frame, on that frame (no readback); a steady exposure is untouched bit for bit.
+  `NEURAL_FORGE_EXPOSURE_JUMP=off|<stops>`.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

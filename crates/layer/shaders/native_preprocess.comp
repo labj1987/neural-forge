@@ -33,7 +33,7 @@ layout(set = 0, binding = 4, std140) uniform Params {
   uvec4 frame;       // padded width, seed, history valid (CPU), parity
   vec4 motion;       // jitter[t-1] - jitter[t] (x, y), blend scale, intensity
   vec4 control;      // style, local tone, local structure, skin structure (< 0: follow structure)
-  vec4 more;         // auto mask (> 0 on), motion-vector scale (x, y), unused
+  vec4 more;         // auto mask (> 0 on), motion-vector scale (x, y), exposure jump factor (0: off)
   uvec4 mask;        // the control mask's rules (0: no mask, nothing reads it; native_mask.comp), depth kind, reversed depth, unused
   vec4 sky;          // the mask's sky margin, unused
   vec4 dark;         // the mask's dark rule: threshold, intensity, structure, unused
@@ -50,8 +50,11 @@ layout(set = 0, binding = 4, std140) uniform Params {
 layout(set = 0, binding = 10, std430) readonly buffer Mask { uint m[]; } u_mask;
 // [0], [1]: whether the frame of that parity was encoded with a usable exposure (written by the composite).
 // cut: 1 when this frame's capture is a scene cut (preupscale_scene_cut.comp, written in the capture before
-// this frame): no history, as on a reset.
-layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; uint cut; } u_state;
+// this frame): no history, as on a reset. last, changing: the hold guard's and the detector's. exposure[0], [1]:
+// the exposure (half bits) the frame of that parity was encoded with (written by the composite).
+layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; uint cut; uint last; uint changing; uint exposure[2]; } u_state;
+// The exposure texel this frame's encode used (R16_SFLOAT in the low 16 bits).
+layout(set = 0, binding = 6, std430) readonly buffer Exposure { uint bits; } u_exposure;
 
 float roundF16(float value) {
   uint bits = floatBitsToUint(value);
@@ -99,10 +102,26 @@ vec2 previousPosition(uvec2 xy) {
   return vec2(xy) + 0.5 + mv + p.motion.xy;
 }
 
+bool exposure_ok(float e) {
+  return e > 1e-6 && e < 65504.0;
+}
+
+// The exposure the encode used changed by more than the factor p.more.w (either way) since the previous
+// network frame: the history was encoded at the other one (a pause, a menu, a map), and this frame starts
+// afresh, as on a scene cut. Never with the factor 0 (NEURAL_FORGE_EXPOSURE_JUMP=off) or an unusable value.
+bool exposureJumped() {
+  if (p.more.w <= 0.0) return false;
+  float now = unpackHalf2x16(u_exposure.bits).x;
+  float before = unpackHalf2x16(u_state.exposure[1u - p.frame.w]).x;
+  if (!exposure_ok(now) || !exposure_ok(before)) return false;
+  return max(now, before) > min(now, before) * p.more.w;
+}
+
 // The previous frame showed this pixel: its previous position is inside the frame, the CPU has a
-// history for this frame, this frame is not a scene cut and the previous frame's exposure was usable.
+// history for this frame, this frame is not a scene cut, the previous frame's exposure was usable and the
+// exposure did not jump since.
 bool hasHistory(uvec2 xy) {
-  if (p.frame.z == 0u || u_state.cut != 0u || u_state.ok[1u - p.frame.w] == 0u) return false;
+  if (p.frame.z == 0u || u_state.cut != 0u || u_state.ok[1u - p.frame.w] == 0u || exposureJumped()) return false;
   vec2 at = previousPosition(xy);
   vec2 valid = vec2(p.dims.zw);
   return all(greaterThanEqual(at, vec2(0.0))) && all(lessThan(at, valid));
@@ -155,8 +174,8 @@ void main() {
   // A no-op on every valid frame.
   proxy = clamp(mix(proxy, vec3(0.0), isnan(proxy)), 0.0, 1.0);
   vec3 centered = centre(proxy);
-  // A scene cut starts afresh: the seed of a frame without history.
-  vec3 noise = gaussian3(id.x, id.y, u_state.cut != 0u ? 0u : p.frame.y);
+  // A scene cut or an exposure jump starts afresh: the seed of a frame without history.
+  vec3 noise = gaussian3(id.x, id.y, u_state.cut != 0u || exposureJumped() ? 0u : p.frame.y);
   uint base = (id.y * p.dims.x + id.x) * 4u;
   u_features.features[base + 0u] = vec4(noise, 1.0);
   vec3 history = centered;

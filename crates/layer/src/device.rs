@@ -896,7 +896,7 @@ fn record_inline_hold(
     physical_device: vk::PhysicalDevice,
     hold_state: &Arc<Mutex<HoldState>>,
     inline: &crate::preupscale::inline::Inline,
-    jitter: Option<[f32; 2]>,
+    dlss: crate::preupscale::DlssFrame,
     ctx: &mut crate::preupscale::inline::Ctx,
 ) -> Result<crate::preupscale::inline::Meta, crate::preupscale::inline::Recorded> {
     use crate::preupscale::inline::Recorded;
@@ -992,7 +992,7 @@ fn record_inline_hold(
             res,
             &target,
             &loader,
-            jitter,
+            dlss,
             inline_chain_kept(),
             shm,
             arm,
@@ -1003,7 +1003,7 @@ fn record_inline_hold(
     };
     session.note_native(shm, &hold);
     session.cache_dump_after(arm, &mut hold);
-    inline_tally(match (hold.wrote_back, jitter.is_some()) {
+    inline_tally(match (hold.wrote_back, dlss.jitter.is_some()) {
         (true, true) => "held",
         (true, false) => "held without the jitter",
         (false, _) => hold.miss.unwrap_or("not held"),
@@ -1086,23 +1086,120 @@ unsafe fn capture_untouched(
     }
 }
 
+/// The most present-to-present intervals one `[present]` window keeps (the latest, when it has more): 5 s at
+/// over 800 presents a second. Fixed, so the present path allocates nothing.
+const PRESENT_INTERVALS: usize = 4096;
+
+/// One `[present]` window: its start, presents, composited presents, and the intervals between presents (ms).
+struct PresentWindow {
+    start: std::time::Instant,
+    presents: u32,
+    composed: u32,
+    intervals: [f32; PRESENT_INTERVALS],
+    len: usize,
+    next: usize,
+}
+
+impl PresentWindow {
+    fn new(start: std::time::Instant) -> Self {
+        Self { start, presents: 0, composed: 0, intervals: [0.0; PRESENT_INTERVALS], len: 0, next: 0 }
+    }
+
+    fn push(&mut self, ms: f32) {
+        self.intervals[self.next] = ms;
+        self.next = (self.next + 1) % PRESENT_INTERVALS;
+        self.len = (self.len + 1).min(PRESENT_INTERVALS);
+    }
+}
+
+/// The 99th percentile of `intervals` (ms, nearest rank) and the 1% low: 1000 over the mean of the slowest 1% of
+/// the intervals (at least one), in fps, the "1% low average" frame-time tools report. Reorders `intervals`.
+fn frame_time_stats(intervals: &mut [f32]) -> Option<(f32, f32)> {
+    let n = intervals.len();
+    if n == 0 {
+        return None;
+    }
+    let rank = ((n as f64 * 0.99).ceil() as usize).clamp(1, n) - 1;
+    let p99 = *intervals.select_nth_unstable_by(rank, f32::total_cmp).1;
+    let slow = n.div_ceil(100);
+    intervals.select_nth_unstable_by(n - slow, f32::total_cmp);
+    let mean = intervals[n - slow..].iter().sum::<f32>() / slow as f32;
+    Some((p99, 1000.0 / mean))
+}
+
 /// Logs the real presented frame rate every 5 s, whether or not the effect is on --
 /// `layer_frames` counts only the presents the layer engages on, so it stops on loading screens
-/// and cannot say whether turning the effect off actually gave the frames back.
+/// and cannot say whether turning the effect off actually gave the frames back. The line ends with the
+/// window's frame times ([`frame_time_stats`]): the present-to-present interval's 99th percentile and the 1% low.
 fn note_present_rate(composited: bool) {
     const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
-    static RATE: std::sync::Mutex<Option<(std::time::Instant, u32, u32)>> = std::sync::Mutex::new(None);
+    // The window, and the last present (intervals run on across windows).
+    static RATE: std::sync::Mutex<(Option<PresentWindow>, Option<std::time::Instant>)> = std::sync::Mutex::new((None, None));
     let Ok(mut rate) = RATE.lock() else { return };
     let now = std::time::Instant::now();
-    let (start, presents, composed) = rate.get_or_insert((now, 0, 0));
-    *presents += 1;
-    *composed += u32::from(composited);
-    let elapsed = now.duration_since(*start);
+    let (window, last) = &mut *rate;
+    let w = window.get_or_insert_with(|| PresentWindow::new(now));
+    if let Some(l) = last.replace(now) {
+        w.push(now.duration_since(l).as_secs_f32() * 1000.0);
+    }
+    w.presents += 1;
+    w.composed += u32::from(composited);
+    let elapsed = now.duration_since(w.start);
     if elapsed >= WINDOW {
         let secs = elapsed.as_secs_f64();
-        crate::log!("[present] {:.1} fps ({:.1}/s composited by the effect) over {:.1}s", f64::from(*presents) / secs, f64::from(*composed) / secs, secs);
+        let len = w.len;
+        let times = frame_time_stats(&mut w.intervals[..len])
+            .map_or_else(String::new, |(p99, low)| format!("; frame time p99 {p99:.1} ms, 1% low {low:.1} fps ({len} intervals)"));
+        crate::log!(
+            "[present] {:.1} fps ({:.1}/s composited by the effect) over {:.1}s{times}",
+            f64::from(w.presents) / secs,
+            f64::from(w.composed) / secs,
+            secs
+        );
         crate::logging::flush();
-        *rate = Some((now, 0, 0));
+        *w = PresentWindow::new(now);
+    }
+}
+
+#[cfg(test)]
+mod present_rate_tests {
+    use super::{frame_time_stats, PresentWindow, PRESENT_INTERVALS};
+
+    /// p99 by nearest rank; the 1% low from the mean of the slowest 1% (at least one interval).
+    #[test]
+    fn the_frame_time_percentile_and_the_1_percent_low() {
+        assert_eq!(frame_time_stats(&mut []), None);
+        // 1000 intervals: 980 at 10 ms, 10 at 20 ms, 10 at 40 ms, shuffled.
+        let mut v: Vec<f32> = (0..1000)
+            .map(|i| {
+                if i % 100 == 7 {
+                    40.0
+                } else if i % 100 == 50 {
+                    20.0
+                } else {
+                    10.0
+                }
+            })
+            .collect();
+        let (p99, low) = frame_time_stats(&mut v).unwrap();
+        assert_eq!(p99, 20.0, "the 990th of 1000 sorted");
+        assert_eq!(low, 25.0, "the slowest 10 average 40 ms");
+        // Under 100 intervals: the slowest one.
+        let mut few = [16.0, 17.0, 50.0, 16.5];
+        assert_eq!(frame_time_stats(&mut few), Some((50.0, 20.0)));
+        assert_eq!(frame_time_stats(&mut [8.0]), Some((8.0, 125.0)));
+    }
+
+    /// More intervals than the window keeps: the latest.
+    #[test]
+    fn the_window_keeps_the_latest_intervals() {
+        let mut w = PresentWindow::new(std::time::Instant::now());
+        for i in 0..PRESENT_INTERVALS + 10 {
+            w.push(if i < 10 { 100.0 } else { 5.0 });
+        }
+        assert_eq!(w.len, PRESENT_INTERVALS);
+        let len = w.len;
+        assert_eq!(frame_time_stats(&mut w.intervals[..len]), Some((5.0, 200.0)), "the first 10 (100 ms) were overwritten");
     }
 }
 
@@ -1585,11 +1682,11 @@ impl NeuralForgeDeviceInfo {
     fn record_hold(
         &self,
         inline: &crate::preupscale::inline::Inline,
-        jitter: Option<[f32; 2]>,
+        dlss: crate::preupscale::DlssFrame,
         ctx: &mut crate::preupscale::inline::Ctx,
     ) -> Result<crate::preupscale::inline::Meta, crate::preupscale::inline::Recorded> {
         let Some(instance) = self.instance.as_ref() else { return Err(crate::preupscale::inline::Recorded::Refused) };
-        record_inline_hold(&self.device, instance, self.physical_device, &self.hold, inline, jitter, ctx)
+        record_inline_hold(&self.device, instance, self.physical_device, &self.hold, inline, dlss, ctx)
     }
 
     /// The pre-upscaler hold at a `vkQueueSubmit`/`vkQueueSubmit2` (`crate::preupscale`'s module
@@ -1795,7 +1892,7 @@ impl NeuralForgeDeviceInfo {
             identification: scan.identification,
         };
         let loader = session.native.as_ref().filter(|_| native);
-        let jitter = scan.jitter_px();
+        let dlss = tracking.split_dlss_frame(&scan);
         let seen = session.seen();
         let res = session.res.as_mut()?;
         res.on_queue(queue);
@@ -1824,7 +1921,7 @@ impl NeuralForgeDeviceInfo {
                             res,
                             &target,
                             loader,
-                            jitter,
+                            dlss,
                             true,
                             shm,
                             arm,
@@ -2903,8 +3000,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 // DLSS's buffer renders its own input before this launch: the hold is recorded here, inside
                 // it (`crate::preupscale::inline`), when the mode holds at all; the launch follows it.
                 let identification = point.identification;
-                let jitter = t.jitter_px_of(command_buffer);
-                if inline.record_outcome(command_buffer, point, |ctx| self.record_hold(inline, jitter, ctx)) == crate::preupscale::inline::Recorded::Held {
+                let dlss = t.dlss_frame_of(command_buffer);
+                if inline.record_outcome(command_buffer, point, |ctx| self.record_hold(inline, dlss, ctx)) == crate::preupscale::inline::Recorded::Held {
                     t.inline_recorded(identification);
                 }
             }
@@ -2920,9 +3017,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             return LayerResult::Handled(());
                         }
                         let identification = point.identification;
-                        // DLSS's output is not jittered: its jitter is zero (known, so the edit cache keeps its
-                        // interval there).
-                        match inline.record_outcome(command_buffer, point, |ctx| self.record_hold(inline, Some([0.0, 0.0]), ctx)) {
+                        // DLSS's output is not jittered (`dlss_frame_after`); the game's reset is its input launch's.
+                        let dlss = t.dlss_frame_after(command_buffer);
+                        match inline.record_outcome(command_buffer, point, |ctx| self.record_hold(inline, dlss, ctx)) {
                             crate::preupscale::inline::Recorded::Held => {
                                 t.inline_recorded(identification);
                                 t.after_recorded();

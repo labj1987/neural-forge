@@ -387,7 +387,10 @@ sequenceDiagram
    intensity and keeps the answer as the next frame's history. The history is reset after a frame
    that went to DLSS untouched, after 500 ms without a frame, on another extent, after a frame
    whose exposure was unusable, or on a scene cut (the frame `C` marked; read by both shaders on the
-   same frame, for every pass; a cut on a cached hold resets the next network frame instead).
+   same frame, for every pass; a cut on a cached hold resets the next network frame instead), when the
+   exposure the encode used changed by more than a stop since the previous network frame (both shaders,
+   the same frame), and when the game resets DLSS's history (word 4 of the 310.x input kernel's parameters; DLSSNR_PARAMETERS.md,
+   "History reset").
 4. **Write back and decode** (`W`): the decode shader inverts the encode and writes the colour input
    in place, cropping the padding, keeping the original pixel (all three channels, so no hue turns)
    where the encoded input's peak channel was clamped and keeping the original alpha; a closing
@@ -626,7 +629,7 @@ directly as 3.2.0's did; the picture is bit for bit 3.2.0's (the test
 - **When a hold is cached** (`cache::State::plan`): within the regime's interval after a refresh that stored
   an edit, the very next DLSS submit after the previous hold (any frame that went to DLSS untouched
   breaks it), the network's history still good (`HistoryGap::pending`: no skip, no other extent, under
-  500 ms, no scene cut on the hold before: such a cut also drops the stored edit), jitter, vectors, the same depth presence as the refresh, no cache dump armed. A hold that
+  500 ms, no scene cut on the hold before and no reset by the game on this one: both also drop the stored edit), jitter, vectors, the same depth presence as the refresh, no cache dump armed. A hold that
   misses for any reason takes the stored edit with it. Cached holds keep the network's history as it
   is (parity, seed, `last_jitter`), call `claim_pre` and set `evaluated` like a refresh, and
   `HistoryGap::touch` so the 500 ms rule counts from the last hold, not the last network frame.
