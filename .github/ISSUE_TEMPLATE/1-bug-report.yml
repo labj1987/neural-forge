@@ -1,0 +1,140 @@
+name: Bug report
+description: Something in Neural Forge doesn't work as it should
+labels:
+- bug
+body:
+- type: markdown
+  attributes:
+    value: |-
+      Thanks for taking the time to report this. Before you start:
+      - **Try the [newest release](https://github.com/labj1987/neural-forge/releases/latest) first.** Every release includes the fixes before it, and yours may already be fixed.
+      - **Search the [open issues](https://github.com/labj1987/neural-forge/issues).** If yours is there, add your details to it instead.
+      - English, please.
+      - **Never attach NVIDIA's files**: no `nvngx_dlssnr.dll`, other DLLs or the extracted model folder. Save report leaves them out.
+      - Turn the game's own DLSS 5 (Neural Rendering) setting off while Neural Forge runs, or the frame gets both.
+- type: input
+  id: version
+  attributes:
+    label: Neural Forge version
+    description: Shown in the app's About window, or in the AppImage's file name (`neural-forge-X.Y.Z-x86_64.AppImage`).
+    placeholder: 1.2.3
+  validations:
+    required: true
+- type: dropdown
+  id: kind
+  attributes:
+    label: What kind of problem
+    options:
+    - The model never runs, or the Status tab stays "waiting"
+    - Picture problem (flicker, colours, brightness, smearing, artefacts)
+    - Crash, freeze or GPU hang (Xid)
+    - Low frame rate or stutter
+    - The app, the CLI or the install
+    - Something else
+  validations:
+    required: true
+- type: textarea
+  id: what
+  attributes:
+    label: What happened
+    description: What you saw, what you expected instead, and the steps to get there.
+  validations:
+    required: true
+- type: input
+  id: game
+  attributes:
+    label: Game
+    description: The game, its store, and whether its DLSS (Super Resolution, Frame Generation, Ray Reconstruction) is on.
+    placeholder: GTA V Enhanced (Steam), DLSS Quality + Frame Generation 4x
+  validations:
+    required: true
+- type: input
+  id: placement
+  attributes:
+    label: Model placement
+    description: The **Model placement** line on the Status tab while the problem shows.
+    placeholder: before the upscaler, 1708x960
+  validations:
+    required: true
+- type: dropdown
+  id: often
+  attributes:
+    label: How often
+    options:
+    - Every time
+    - Sometimes
+    - Once so far
+  validations:
+    required: true
+- type: input
+  id: gpu
+  attributes:
+    label: Graphics card and NVIDIA driver version
+    placeholder: RTX 5070 12 GB, NVIDIA 620.70.06
+  validations:
+    required: true
+- type: input
+  id: proton
+  attributes:
+    label: Proton version and how the game starts
+    description: Proton build, and gamescope, HDR or anything else in the launch options.
+    placeholder: Proton Experimental 11.0-20261027b, no gamescope
+  validations:
+    required: true
+- type: input
+  id: system
+  attributes:
+    label: Distribution, kernel and desktop
+    description: For example from `uname -r` and your desktop's About page.
+    placeholder: Ubuntu 26.04, kernel 7.3.0, GNOME Wayland
+  validations:
+    required: true
+- type: textarea
+  id: settings
+  attributes:
+    label: Settings you changed
+    description: Network, placement, model resolution, colour settings or environment variables you set. Leave empty if none.
+  validations:
+    required: false
+- type: dropdown
+  id: others
+  attributes:
+    label: Other software hooked into the game
+    options:
+    - No, nothing else
+    - Yes (named under "Settings you changed")
+    description: MangoHud, vkBasalt, ReShade, OptiScaler, other DLSS 5 tools and overlays change what Neural Forge sees. Please also try without them.
+  validations:
+    required: true
+- type: textarea
+  id: report
+  attributes:
+    label: Save report zip
+    description: Press **Save report** on the Status tab (or run `neural-forge-cli report`) right after the problem, and drag the zip from your desktop here. Personal names are removed; it has no NVIDIA files in it.
+  validations:
+    required: true
+- type: textarea
+  id: log
+  attributes:
+    label: Layer log (optional)
+    description: 'For problems in a game: add `NEURAL_FORGE_LOG=/tmp/nf.log` to the game''s launch options, reproduce it, and attach `/tmp/nf.log`.'
+  validations:
+    required: false
+- type: textarea
+  id: media
+  attributes:
+    label: Screenshots or video
+    description: A short video helps most with picture problems.
+  validations:
+    required: false
+- type: checkboxes
+  id: checks
+  attributes:
+    label: Before you send it
+    options:
+    - label: I'm on the newest release, or the problem is still there on it.
+      required: true
+    - label: I searched the open issues for this problem.
+      required: true
+    - label: I'm not attaching nvngx_dlssnr.dll, other NVIDIA files or the extracted model.
+      required: true
