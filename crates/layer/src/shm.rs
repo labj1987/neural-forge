@@ -523,6 +523,16 @@ impl ShmClient {
         self.header().map(|hdr| hdr.pass_tunings())
     }
 
+    /// The sharpening of the finished frame (`crate::sharpen`); the defaults (off) before the mapping is open.
+    pub fn sharpen_settings(&self) -> neural_forge_protocol::SharpenSettings {
+        self.header().map_or(neural_forge_protocol::SharpenSettings::DEFAULT, neural_forge_protocol::ShmHeader::sharpen_settings_for_frame)
+    }
+
+    /// The HUD regions in use (none before the mapping is open).
+    pub fn hud_regions(&self) -> Vec<neural_forge_protocol::HudRegion> {
+        self.header().map(|h| h.hud_settings_for_frame().regions).unwrap_or_default()
+    }
+
     /// The Network setting (`neural_forge_protocol::enums::network`): which extracted network runs.
     #[cfg(target_arch = "x86_64")]
     pub fn network_choice(&self) -> Option<u32> {

@@ -123,7 +123,10 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   2532, f32 bits, written by the layer for the Status tab's graph), then the protections of each pass's result
   against its input (v23, f32 bits, 0-1, default 0): `edit_hue_protection` (2536), `edit_neutral_protection`
   (2540), `edit_shadow_protection` (2544) and `edit_highlight_protection` (2548; NATIVE_BACKEND.md, "The colour of
-  the edit"); the header ends at 2552. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
+  the edit"), then the sharpening of the finished frame (v24, f32 bits): `sharpen_cas` (2552, 0-1, default 0),
+  `clarity_strength` (2556, 0-2, default 0), `clarity_radius` (2560, 2-64, default 16), `clarity_midtones` (2564,
+  0-1, default 0.5) and `clarity_edges` (2568, 0-1, default 0.5; `crate::sharpen`, USER_GUIDE.md, "Sharpening");
+  the header ends at 2572. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
   `persist::HUD_REGIONS`), the one setting that is not a number. NATIVE_BACKEND.md, "Where the model runs"
   and "The HUD at present".
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
@@ -198,6 +201,7 @@ be private.
 | 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended; then the colour of the edit (`edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`, `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`) and `pass_colour[10]` (override bits `EDIT_SATURATION` 128, `EDIT_CONTRAST` 256, `EDIT_DETAIL` 512); then `placement`, `pass_placement[10]` (override bit `PLACEMENT` 1024), `hud_detect`, `hud_region_count` and `hud_region[8]` | 3.8.0 |
 | 22 | `preupscale_brightness` and `preupscale_exposure` (what the network sees before the upscaler: its brightness and where the exposure comes from) and `preupscale_network_gpu_ms` (the network's GPU time on its last hold) appended | 3.8.10 |
 | 23 | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection` and `edit_highlight_protection` (the Oklab protections of each pass's result against its input) appended | 3.10.0 |
+| 24 | `sharpen_cas`, `clarity_strength`, `clarity_radius`, `clarity_midtones` and `clarity_edges` (the sharpening of the finished frame: FidelityFX CAS and Clarity) appended | unreleased |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.
@@ -784,6 +788,22 @@ failed (unreadable or HDR swapchain, readback or write failure, another capture 
 cancelled. A request left waiting when a game's layer opens the channel is dropped, so it never
 fires on a game started later; the GUI and `shmctl` withdraw a request no game took within 5 s.
 With `NEURAL_FORGE_PREUPSCALE=dump` the one-shot is the pre-upscaler dump's.
+
+### 5.8 Sharpening at present
+
+`crates/layer/src/sharpen.rs`, `shaders/present_sharpen.comp`; settings SHM v24 (`sharpen_cas`, `clarity_*`) or
+`NEURAL_FORGE_SHARPEN`. With a filter on, the present hook sharpens the presented swapchain image of the primary
+swapchain on every path (model before the upscaler, after DLSS, at present, or none): one submit on the present's
+queue that copies the image into a buffer as raw words (8-bit RGBA/BGRA, or HDR10's 10-bit words), runs CAS (ported
+from FidelityFX CAS, MIT) and Clarity (half-size luma, an edge-stopped separable Gaussian base, the luma detail
+weighted toward the midtones and added to the three channels), moves the result back toward the frame inside the HUD
+regions, and copies it back. It relays the application's present waits first when nothing else did, and its own
+semaphore (one a swapchain image, retired and freed like the relay's) is added to the present's waits. Where frames
+are held in the game's frame it runs before a capture's readback, so captures show it; on the after-the-upscaler path
+it runs after the composition and the capture. Off (the default) nothing is read, relayed, allocated or submitted.
+Buffers: 2 x 4 bytes a pixel plus 3 x 1 byte a pixel (about 41 MB at 1440p, made on first use), shared by three command-buffer slots and
+ordered by the queue. GPU time on the RTX 5070 at 2560x1440 (median of 200): CAS 0.29 ms, Clarity r16 0.33, both 0.37,
+Clarity r64 0.43 (LESSONS.md, "November 9: sharpening the finished frame").
 
 ## 6. The network
 

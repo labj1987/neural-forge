@@ -51,7 +51,7 @@ pub mod vram_need;
 
 pub use header::{
     load64, pass_setting, resolved_scale, setting_bounds, store64, ColourSettings, EditColour, HudRegion, HudRegionWords, HudSettings, MaskSettings,
-    PassColour, PassControl, PassTunings, ShmHeader, Tuning, MAX_HUD_REGIONS, SETTING_BOUNDS,
+    PassColour, PassControl, PassTunings, SharpenSettings, ShmHeader, Tuning, MAX_HUD_REGIONS, SETTING_BOUNDS,
 };
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub use slot::{next_request, Slot};
@@ -88,11 +88,12 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// network sees before the upscaler: its brightness (`preupscale_brightness`) and where the exposure comes from
 /// (`preupscale_exposure`), and the network's GPU time on its last hold (`preupscale_network_gpu_ms`); v23
 /// appends the protections of each pass's result against its input (`edit_hue_protection`,
-/// `edit_neutral_protection`, `edit_shadow_protection`, `edit_highlight_protection`)).
+/// `edit_neutral_protection`, `edit_shadow_protection`, `edit_highlight_protection`); v24 appends the sharpening
+/// of the finished frame (`sharpen_cas`, `clarity_strength`, `clarity_radius`, `clarity_midtones`, `clarity_edges`)).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
-pub const SHM_VERSION: u32 = 23;
+pub const SHM_VERSION: u32 = 24;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;

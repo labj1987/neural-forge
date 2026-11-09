@@ -169,6 +169,33 @@ impl ColourSettings {
     };
 }
 
+/// The sharpening of the finished frame ([`ShmHeader::sharpen_settings_for_frame`]; docs/USER_GUIDE.md,
+/// "Sharpening"): applied at present, after everything else of the layer's, to every presented frame. Each value
+/// is clamped to its range in [`SETTING_BOUNDS`]; both strengths at 0 (the default) leave the frame untouched.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SharpenSettings {
+    /// FidelityFX CAS's strength, 0 (off) to 1 (CAS's strongest; about 0.73 is CAS's own default).
+    pub cas: f32,
+    /// Clarity (local contrast of luma): its strength, 0 (off) to 2.
+    pub clarity: f32,
+    /// Clarity's radius in pixels at 1440 lines (scaled with the frame's height), 2-64.
+    pub radius: f32,
+    /// How much Clarity keeps off shadows and highlights, 0 (evenly everywhere) to 1 (midtones only).
+    pub midtones: f32,
+    /// How much Clarity's blur stops at strong luma edges (against halos), 0 (none) to 1.
+    pub edges: f32,
+}
+
+impl SharpenSettings {
+    /// Every control at its default: nothing applied.
+    pub const DEFAULT: Self = Self { cas: 0.0, clarity: 0.0, radius: 16.0, midtones: 0.5, edges: 0.5 };
+
+    /// Whether anything is applied.
+    pub fn any(&self) -> bool {
+        self.cas > 0.0 || self.clarity > 0.0
+    }
+}
+
 /// The control mask's rules ([`ShmHeader::mask_settings`]), as plain values.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaskSettings {
@@ -659,6 +686,17 @@ pub struct ShmHeader {
     pub edit_neutral_protection_bits: AtomicU32,
     pub edit_shadow_protection_bits: AtomicU32,
     pub edit_highlight_protection_bits: AtomicU32,
+
+    // --- v24 -----------------------------------------------------------------------------
+    /// f32 bits: the sharpening of the finished frame ([`SharpenSettings`]): FidelityFX CAS's strength
+    /// (`sharpen_cas`, 0 off to 1), Clarity's strength (`clarity_strength`, 0 off to 2), its radius in pixels at
+    /// 1440 lines (`clarity_radius`, 2-64, default 16), how much it keeps to the midtones (`clarity_midtones`, 0-1,
+    /// default 0.5) and how much its blur stops at strong edges (`clarity_edges`, 0-1, default 0.5).
+    pub sharpen_cas_bits: AtomicU32,
+    pub clarity_strength_bits: AtomicU32,
+    pub clarity_radius_bits: AtomicU32,
+    pub clarity_midtones_bits: AtomicU32,
+    pub clarity_edges_bits: AtomicU32,
 }
 
 /// The most HUD regions (`hud_regions`).
@@ -778,7 +816,9 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2552, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2572, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, sharpen_cas_bits) == 2552, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, clarity_edges_bits) == 2568, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_hue_protection_bits) == 2536, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_highlight_protection_bits) == 2548, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, placement) == 2280, "layout changed -- bump SHM_VERSION");
@@ -833,7 +873,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 182] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 187] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -983,6 +1023,12 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 182] = [
     ("edit_neutral_protection", 0.0, 1.0),
     ("edit_shadow_protection", 0.0, 1.0),
     ("edit_highlight_protection", 0.0, 1.0),
+    // The sharpening of the finished frame (CAS and Clarity).
+    ("sharpen_cas", 0.0, 1.0),
+    ("clarity_strength", 0.0, 2.0),
+    ("clarity_radius", 2.0, 64.0),
+    ("clarity_midtones", 0.0, 1.0),
+    ("clarity_edges", 0.0, 1.0),
     // Each pass's own colour values (its `overrides` say which it uses).
     ("pass1_edit_saturation", 0.0, 4.0),
     ("pass1_edit_contrast", 0.0, 4.0),
@@ -1143,6 +1189,12 @@ impl ShmHeader {
         for p in [&self.edit_hue_protection_bits, &self.edit_neutral_protection_bits, &self.edit_shadow_protection_bits, &self.edit_highlight_protection_bits] {
             p.store(0.0f32.to_bits(), Ordering::Relaxed);
         }
+        let d = SharpenSettings::DEFAULT;
+        self.sharpen_cas_bits.store(d.cas.to_bits(), Ordering::Relaxed);
+        self.clarity_strength_bits.store(d.clarity.to_bits(), Ordering::Relaxed);
+        self.clarity_radius_bits.store(d.radius.to_bits(), Ordering::Relaxed);
+        self.clarity_midtones_bits.store(d.midtones.to_bits(), Ordering::Relaxed);
+        self.clarity_edges_bits.store(d.edges.to_bits(), Ordering::Relaxed);
         self.edit_lut_seq.store(0, Ordering::Relaxed);
         for p in &self.pass_colour {
             p.reset_to_defaults();
@@ -1379,13 +1431,13 @@ impl ShmHeader {
     /// under `/tmp` and does not). Add to [`Self::setting_slots`] (and [`SETTING_BOUNDS`]), not just
     /// to the GUI, whenever a new tunable needs to survive a restart -- that is the one list that
     /// decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 182] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 187] {
         self.setting_slots().map(|(name, kind, field)| (name, kind == Kind::Float, field.load(Ordering::Relaxed)))
     }
 
     /// Every persisted setting's name, kind and field, in [`SETTING_BOUNDS`]'s order (a test holds
     /// the two lists to the same names at the same places). Only addresses: nothing is loaded.
-    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 182] {
+    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 187] {
         [
             ("white_point", Kind::Float, &self.white_point_bits),
             ("white_point_scale", Kind::Float, &self.white_point_scale_bits),
@@ -1527,6 +1579,11 @@ impl ShmHeader {
             ("edit_neutral_protection", Kind::Float, &self.edit_neutral_protection_bits),
             ("edit_shadow_protection", Kind::Float, &self.edit_shadow_protection_bits),
             ("edit_highlight_protection", Kind::Float, &self.edit_highlight_protection_bits),
+            ("sharpen_cas", Kind::Float, &self.sharpen_cas_bits),
+            ("clarity_strength", Kind::Float, &self.clarity_strength_bits),
+            ("clarity_radius", Kind::Float, &self.clarity_radius_bits),
+            ("clarity_midtones", Kind::Float, &self.clarity_midtones_bits),
+            ("clarity_edges", Kind::Float, &self.clarity_edges_bits),
             ("pass1_edit_saturation", Kind::Float, &self.pass_colour[0].saturation_bits),
             ("pass1_edit_contrast", Kind::Float, &self.pass_colour[0].contrast_bits),
             ("pass1_edit_detail", Kind::Float, &self.pass_colour[0].detail_bits),
@@ -1578,7 +1635,7 @@ impl ShmHeader {
     /// clamped to the setting's range in [`SETTING_BOUNDS`] (`None` for one that is not finite), a
     /// whole number clamped to it, and an override mask with the bits that name no override cleared.
     /// `None` for a name that is no setting.
-    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 182], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
+    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 187], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
         let at = SETTING_BOUNDS.iter().position(|(n, ..)| *n == name)?;
         let (_, min, max) = SETTING_BOUNDS[at];
         let (slot_name, kind, field) = slots[at];
@@ -1685,6 +1742,32 @@ impl ShmHeader {
                 f(&self.edit_shadow_protection_bits, "edit_shadow_protection", 0.0),
                 f(&self.edit_highlight_protection_bits, "edit_highlight_protection", 0.0),
             ],
+        }
+    }
+
+    /// The sharpening of the finished frame ([`SharpenSettings`]), each value clamped to its range (one that is
+    /// not a number is its default), read as one unit for the game's threads (never waits for a writer).
+    pub fn sharpen_settings_for_frame(&self) -> SharpenSettings {
+        self.read_settings_for_frame(Self::sharpen_now)
+    }
+
+    fn sharpen_now(&self) -> SharpenSettings {
+        let f = |a: &AtomicU32, name: &str, default: f32| {
+            let (lo, hi) = setting_bounds(name).expect("a sharpening setting");
+            let v = f32::from_bits(a.load(Ordering::Relaxed));
+            if v.is_finite() {
+                v.clamp(lo, hi)
+            } else {
+                default
+            }
+        };
+        let d = SharpenSettings::DEFAULT;
+        SharpenSettings {
+            cas: f(&self.sharpen_cas_bits, "sharpen_cas", d.cas),
+            clarity: f(&self.clarity_strength_bits, "clarity_strength", d.clarity),
+            radius: f(&self.clarity_radius_bits, "clarity_radius", d.radius),
+            midtones: f(&self.clarity_midtones_bits, "clarity_midtones", d.midtones),
+            edges: f(&self.clarity_edges_bits, "clarity_edges", d.edges),
         }
     }
 
@@ -2763,7 +2846,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_sky), std::mem::offset_of!(ShmHeader, network) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_motion_structure_bits) + 4, std::mem::offset_of!(ShmHeader, pass_feedback_bits));
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4, std::mem::offset_of!(ShmHeader, scene_cuts));
-        assert_eq!(crate::SHM_VERSION, 23);
+        assert_eq!(crate::SHM_VERSION, 24);
         let h = ShmHeader::default();
         h.init_defaults();
         let m = h.mask_settings();
@@ -2787,7 +2870,7 @@ mod tests {
         // v20 appends the Network setting: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, network), std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28);
         assert_eq!(std::mem::offset_of!(ShmHeader, network) + 4, std::mem::offset_of!(ShmHeader, mask_sky));
-        assert_eq!(crate::SHM_VERSION, 23);
+        assert_eq!(crate::SHM_VERSION, 24);
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.network.load(Ordering::Relaxed), crate::enums::network::FULL, "the full network is the default");
@@ -2798,7 +2881,7 @@ mod tests {
         // v20's last word: every earlier field keeps its offset, and v21's fields follow it.
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts), std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts) + 4, std::mem::offset_of!(ShmHeader, preupscale_scale_bits));
-        assert_eq!(crate::SHM_VERSION, 23);
+        assert_eq!(crate::SHM_VERSION, 24);
         let h = ShmHeader::default();
         h.scene_cuts.store(5, Ordering::Relaxed);
         h.init_defaults();
@@ -2813,7 +2896,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<PassColour>(), 12);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour), std::mem::offset_of!(ShmHeader, edit_lut_seq) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour) + crate::MAX_PASSES * 12, std::mem::offset_of!(ShmHeader, placement));
-        assert_eq!(crate::SHM_VERSION, 23);
+        assert_eq!(crate::SHM_VERSION, 24);
         let h = ShmHeader::default();
         h.edit_lut_seq.store(9, Ordering::Relaxed);
         h.init_defaults();
@@ -2954,7 +3037,7 @@ mod tests {
     #[test]
     fn the_protections_are_appended_and_start_off() {
         assert_eq!(std::mem::offset_of!(ShmHeader, edit_neutral_protection_bits), std::mem::offset_of!(ShmHeader, edit_hue_protection_bits) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, edit_highlight_protection_bits) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, edit_highlight_protection_bits) + 4, std::mem::offset_of!(ShmHeader, sharpen_cas_bits));
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.colour_now().protect, [0.0; 4]);
@@ -2970,6 +3053,35 @@ mod tests {
         assert_eq!(h.colour_now().protect[2], 0.0);
         let saved: Vec<&str> = h.persisted_settings().iter().map(|(n, ..)| *n).collect();
         for n in ["edit_hue_protection", "edit_neutral_protection", "edit_shadow_protection", "edit_highlight_protection"] {
+            assert!(saved.contains(&n), "{n} is saved");
+        }
+    }
+
+    /// v24: the sharpening of the finished frame follows v23's protections, ends the header, starts off and reaches
+    /// the layer clamped to its bounds (a value that is not a number is its default); every value is saved.
+    #[test]
+    fn the_sharpening_is_appended_and_starts_off() {
+        assert_eq!(std::mem::offset_of!(ShmHeader, clarity_strength_bits), std::mem::offset_of!(ShmHeader, sharpen_cas_bits) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, clarity_edges_bits) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 24);
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(h.sharpen_settings_for_frame(), SharpenSettings::DEFAULT);
+        assert!(!SharpenSettings::DEFAULT.any(), "off by default");
+        assert!(h.write_settings(&[
+            ("sharpen_cas", 0.5f32.to_bits()),
+            ("clarity_strength", 3.0f32.to_bits()),
+            ("clarity_radius", 1.0f32.to_bits()),
+            ("clarity_midtones", 0.25f32.to_bits()),
+            ("clarity_edges", 1.0f32.to_bits()),
+        ]));
+        let s = h.sharpen_settings_for_frame();
+        assert_eq!(s, SharpenSettings { cas: 0.5, clarity: 2.0, radius: 2.0, midtones: 0.25, edges: 1.0 }, "clamped to the bounds");
+        assert!(s.any());
+        h.clarity_radius_bits.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        assert_eq!(h.sharpen_settings_for_frame().radius, 16.0);
+        let saved: Vec<&str> = h.persisted_settings().iter().map(|(n, ..)| *n).collect();
+        for n in ["sharpen_cas", "clarity_strength", "clarity_radius", "clarity_midtones", "clarity_edges"] {
             assert!(saved.contains(&n), "{n} is saved");
         }
     }
@@ -3048,7 +3160,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_scale_bits), std::mem::offset_of!(ShmHeader, scene_cuts) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits), std::mem::offset_of!(ShmHeader, preupscale_scale_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits) + crate::MAX_PASSES * 4, std::mem::offset_of!(ShmHeader, edit_saturation_bits));
-        assert_eq!(crate::SHM_VERSION, 23);
+        assert_eq!(crate::SHM_VERSION, 24);
         let h = ShmHeader::default();
         h.preupscale_scale_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
         h.pass_scale_bits[2].store(0.5f32.to_bits(), Ordering::Relaxed);

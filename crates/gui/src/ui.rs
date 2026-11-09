@@ -797,6 +797,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_page.add(&model_group);
     model_page.add(&build_colour_group(&shm, &toasts));
     model_page.add(&build_hud_group(&shm));
+    model_page.add(&build_sharpen_group(&shm));
     view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", "applications-graphics-symbolic");
 
     // Model resolution and model-every-Nth-frame apply after the upscaler only: shown while a game runs
@@ -1173,6 +1174,53 @@ fn placement_row(selected: u32, setter: impl Fn(u32) + 'static) -> adw::ComboRow
     row
 }
 
+/// The sharpening of the finished frame (`crate::sharpen` in the layer): FidelityFX CAS and Clarity, both off at 0,
+/// applied to every presented frame after everything else, the HUD regions kept out of it.
+fn build_sharpen_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Sharpening");
+    group.set_description(Some("On the finished frame, after the model, in every game; the HUD regions above stay untouched. 0 is off"));
+    let (v, set) = bind_float(shm, Some("sharpen_cas"), |h| &h.sharpen_cas_bits);
+    group.add(&spin_row(
+        "Adaptive sharpening (CAS)",
+        "AMD FidelityFX CAS: sharpens fine detail, less where it is already sharp (0 off, about 0.7 CAS's own default, 1 strongest)",
+        v,
+        "sharpen_cas",
+        0.05,
+        set,
+    ));
+    let (v, set) = bind_float(shm, Some("clarity_strength"), |h| &h.clarity_strength_bits);
+    group.add(&spin_row(
+        "Clarity",
+        "Local contrast of brightness: lifts mid-size detail and texture without changing colours (0 off)",
+        v,
+        "clarity_strength",
+        0.05,
+        set,
+    ));
+    let (v, set) = bind_float(shm, Some("clarity_radius"), |h| &h.clarity_radius_bits);
+    group.add(&spin_row(
+        "Clarity radius",
+        "The size of the detail Clarity lifts, in pixels at 1440p (scaled with the resolution)",
+        v,
+        "clarity_radius",
+        1.0,
+        set,
+    ));
+    let (v, set) = bind_float(shm, Some("clarity_midtones"), |h| &h.clarity_midtones_bits);
+    group.add(&spin_row("Clarity midtones", "Keeps Clarity off the darkest and brightest parts (0 evenly, 1 midtones only)", v, "clarity_midtones", 0.05, set));
+    let (v, set) = bind_float(shm, Some("clarity_edges"), |h| &h.clarity_edges_bits);
+    group.add(&spin_row(
+        "Clarity edge protection",
+        "Stops Clarity at strong edges, against bright or dark halos around them (0 off, 1 most)",
+        v,
+        "clarity_edges",
+        0.05,
+        set,
+    ));
+    group
+}
+
 /// The HUD on the finished frame (the Placement "Finished frame", or where the model runs there anyway): the
 /// detection and the user's regions, a list of rectangles in percent of the frame.
 fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
@@ -1180,7 +1228,9 @@ fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>
     use std::rc::Rc;
     let group = adw::PreferencesGroup::new();
     group.set_title("HUD on the finished frame");
-    group.set_description(Some("Only where the model runs on the presented frame, HUD included. Before the upscaler and after DLSS the HUD is not drawn yet"));
+    group.set_description(Some(
+        "Only where the model runs on the presented frame, HUD included (before the upscaler and after DLSS the HUD is not drawn yet). The regions also keep the sharpening off the HUD",
+    ));
     let (v, set) = bind_bool(shm, Some("hud_detect"), |h| &h.hud_detect);
     group.add(&switch_row("Find the HUD", "Keep the edit off what stays still and sharp while the picture moves (text, icons, the minimap)", v, set));
     let list = gtk4::ListBox::new();

@@ -4,6 +4,14 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## Unreleased
+
+- A new **Sharpening** group in the Model tab, off by default: **Adaptive sharpening (CAS)** (AMD FidelityFX
+  Contrast Adaptive Sharpening) and **Clarity** (local contrast of brightness, with its radius, a midtone setting
+  that keeps it off the darkest and brightest parts and an edge protection against halos). Both work on the
+  finished frame in every game, after the model, and leave the HUD regions alone. They cost 0.3-0.4 ms of GPU
+  time a presented frame at 1440p on an RTX 5070. `NEURAL_FORGE_SHARPEN` sets them for one game, for comparisons.
+
 ## 3.11.0 — 2026-11-09
 
 - When video memory runs short, the network now pauses at once instead of first switching to the small network.

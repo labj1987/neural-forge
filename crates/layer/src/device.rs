@@ -314,6 +314,8 @@ struct State {
     engaged_swapchains: HashSet<vk::SwapchainKHR>,
     /// A running `capture_request = N` frame series (see `crate::series`).
     series: crate::series::Series,
+    /// The sharpening of the finished frame (`crate::sharpen`), made the first time a filter is on.
+    sharpen: Option<crate::sharpen::Sharpen>,
 }
 
 /// The pre-upscaler path's per-device state, under a lock of its own: the game's submit threads
@@ -358,14 +360,17 @@ impl State {
     fn drain_layer_work(&mut self, device: &ash::Device) -> bool {
         let captures = capture::wait_in_flight(self.capture_pipeline.as_ref(), &self.direct_capture, device);
         let composes = self.gpu_compose.as_ref().is_none_or(|gpu| gpu.wait_in_flight(device));
-        captures && composes
+        let sharpened = self.sharpen.as_mut().is_none_or(|s| s.wait_idle(device));
+        captures && composes && sharpened
     }
 
     /// Frees the retired present semaphores (the relay's and the composition's) whose last wait is
     /// known complete, after looking at every pending present fence once (no wait). Returns how many
     /// were freed, and how many retired ones are left.
     fn reclaim_present_semaphores(&mut self, device: &ash::Device) -> (usize, usize) {
-        let retired = self.relay_semaphores.retired() + self.gpu_compose.as_mut().map_or(0, |g| g.present_semaphores_mut().retired());
+        let retired = self.relay_semaphores.retired()
+            + self.gpu_compose.as_mut().map_or(0, |g| g.present_semaphores_mut().retired())
+            + self.sharpen.as_ref().map_or(0, |s| s.semaphores.retired());
         if retired == 0 {
             // Nothing to free: the fences are looked at when there is.
             return (0, 0);
@@ -378,6 +383,9 @@ impl State {
             if let Some(gpu) = &mut self.gpu_compose {
                 freed += gpu.present_semaphores_mut().reclaim(device, &self.present_tickets);
             }
+            if let Some(sharpen) = &mut self.sharpen {
+                freed += sharpen.semaphores.reclaim(device, &self.present_tickets);
+            }
             (freed, retired - freed)
         }
     }
@@ -385,7 +393,9 @@ impl State {
     /// Of the retired present semaphores, those kept until device teardown (waited on by a present the
     /// layer could not fence).
     fn present_semaphores_kept_until_teardown(&mut self) -> usize {
-        self.relay_semaphores.kept_until_teardown() + self.gpu_compose.as_mut().map_or(0, |g| g.present_semaphores_mut().kept_until_teardown())
+        self.relay_semaphores.kept_until_teardown()
+            + self.gpu_compose.as_mut().map_or(0, |g| g.present_semaphores_mut().kept_until_teardown())
+            + self.sharpen.as_ref().map_or(0, |s| s.semaphores.kept_until_teardown())
     }
 }
 
@@ -765,6 +775,7 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
         if state.capture_pipeline.is_some()
             || state.direct_capture.iter().any(Option::is_some)
             || state.gpu_compose.is_some()
+            || state.sharpen.is_some()
             || !state.relay_semaphores.is_empty()
             || !state.present_tickets.is_empty()
             || state.series.has_stranded()
@@ -786,6 +797,13 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                     if let Some(compose) = state.gpu_compose.take() {
                         unsafe {
                             compose.destroy(&device);
+                        }
+                    }
+                    // SAFETY: the device is idle (or lost) and the application's swapchains are gone, so no
+                    // present still waits on its semaphores.
+                    if let Some(sharpen) = state.sharpen.take() {
+                        unsafe {
+                            sharpen.destroy(&device);
                         }
                     }
                     // SAFETY: device is idle (or lost) and the application's swapchains are
@@ -1067,7 +1085,8 @@ unsafe fn capture_untouched(
     }
     // SAFETY: `p_wait_semaphores` is valid for `wait_semaphore_count`.
     let app_waits: &[vk::Semaphore] = unsafe { preupscale_slice(present_info.p_wait_semaphores, present_info.wait_semaphore_count) };
-    if !app_waits.is_empty() {
+    // Relayed already when the frame was sharpened (`sharpen_frame`).
+    if !app_waits.is_empty() && relay_semaphore.is_none() {
         // SAFETY: per this function's contract.
         match unsafe { relay_app_waits(device, queue, relay_semaphores, image, app_waits) } {
             Some(relay) => *relay_semaphore = Some(relay),
@@ -1205,11 +1224,92 @@ fn first_report<T: PartialEq>(seen: &Mutex<Vec<T>>, reason: T) -> bool {
     true
 }
 
-/// Notes the present's wait on the layer's semaphores for it (`queue_present_khr`): the relay's and the
-/// composition's ([`crate::present_sync::PresentSemaphores::note`]).
-fn note_present_waits(state: &mut State, relay: Option<vk::Semaphore>, composed: Option<vk::Semaphore>, last: crate::present_sync::LastUse) {
+/// The swapchain image a present may sharpen (`queue_present_khr`), once the layer engaged on it.
+struct SharpenTarget {
+    swapchain: vk::SwapchainKHR,
+    queue_family: u32,
+    frame: crate::sharpen::Frame,
+}
+
+/// Sharpens the presented frame when a filter is on (`crate::sharpen`; the settings, or `NEURAL_FORGE_SHARPEN`):
+/// relays the application's present waits first unless that was done (`relay_semaphore` then takes the relay's
+/// semaphore for the present), so the work is ordered after the game's rendering, then submits it on `queue`.
+/// Returns the semaphore the present must wait on as well, `None` when nothing was submitted.
+///
+/// # Safety
+/// `queue` is the present's queue, of `target.queue_family`, externally synchronized for the call; `target.frame`
+/// is the presented swapchain image, in `PRESENT_SRC_KHR`, readable and writable by transfers.
+#[allow(clippy::too_many_arguments)]
+unsafe fn sharpen_frame(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue: vk::Queue,
+    target: &SharpenTarget,
+    shm: &ShmClient,
+    sharpen: &mut Option<crate::sharpen::Sharpen>,
+    relay_semaphores: &mut crate::present_sync::PresentSemaphores,
+    present_info: &vk::PresentInfoKHR,
+    relay_semaphore: &mut Option<vk::Semaphore>,
+    engaged_swapchains: &mut HashSet<vk::SwapchainKHR>,
+) -> Option<vk::Semaphore> {
+    let settings = crate::sharpen::env_override().apply(shm.sharpen_settings());
+    if !settings.any() {
+        return None;
+    }
+    if sharpen.is_none() {
+        // SAFETY: the device's own handles.
+        *sharpen = unsafe { crate::sharpen::Sharpen::new(device, instance, physical_device, target.queue_family) };
+        if sharpen.is_none() {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!(
+                    "[sharpen] could not be set up for queue family {} (no compute, or out of memory): frames present unsharpened",
+                    target.queue_family
+                );
+                crate::logging::flush();
+            }
+            return None;
+        }
+    }
+    let pass = sharpen.as_mut()?;
+    if pass.family() != target.queue_family {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[sharpen] a present on queue family {} (set up for {}): that frame presents unsharpened", target.queue_family, pass.family());
+            crate::logging::flush();
+        }
+        return None;
+    }
+    // SAFETY: `p_wait_semaphores` is valid for `wait_semaphore_count`.
+    let app_waits: &[vk::Semaphore] = unsafe { preupscale_slice(present_info.p_wait_semaphores, present_info.wait_semaphore_count) };
+    if !app_waits.is_empty() && relay_semaphore.is_none() {
+        // SAFETY: per this function's contract; the application's waits were not consumed yet.
+        *relay_semaphore = Some(unsafe { relay_app_waits(device, queue, relay_semaphores, target.frame.image, app_waits) }?);
+    }
+    let regions = shm.hud_regions();
+    // SAFETY: per this function's contract; the game's rendering is ordered before by the relay (or needs no wait).
+    let semaphore = unsafe { pass.apply(device, queue, &target.frame, &settings, &regions) }?;
+    // Its destruction drains the layer's work on it first.
+    engaged_swapchains.insert(target.swapchain);
+    Some(semaphore)
+}
+
+/// Notes the present's wait on the layer's semaphores for it (`queue_present_khr`): the relay's, the
+/// composition's and the sharpening's ([`crate::present_sync::PresentSemaphores::note`]). A semaphore the sharpening's
+/// submit waited on in the present's place is noted with the present's wait, which completes after it.
+fn note_present_waits(
+    state: &mut State,
+    relay: Option<vk::Semaphore>,
+    composed: Option<vk::Semaphore>,
+    sharpened: Option<vk::Semaphore>,
+    last: crate::present_sync::LastUse,
+) {
     if let Some(relay) = relay {
         state.relay_semaphores.note(relay, last);
+    }
+    if let (Some(semaphore), Some(sharpen)) = (sharpened, state.sharpen.as_mut()) {
+        sharpen.semaphores.note(semaphore, last);
     }
     if let (Some(semaphore), Some(gpu)) = (composed, state.gpu_compose.as_mut()) {
         gpu.present_semaphores_mut().note(semaphore, last);
@@ -1221,7 +1321,7 @@ fn note_present_waits(state: &mut State, relay: Option<vk::Semaphore>, composed:
 /// `last`, since the present waits on what the readback's wait is ordered before.
 fn note_series_consumed(state: &mut State, consumed: Option<(vk::Semaphore, Option<crate::present_sync::LastUse>)>, present: crate::present_sync::LastUse) {
     if let Some((semaphore, last)) = consumed {
-        note_present_waits(state, None, Some(semaphore), last.unwrap_or(present));
+        note_present_waits(state, None, Some(semaphore), None, last.unwrap_or(present));
     }
 }
 
@@ -2589,6 +2689,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     gpu.retire_present_images(&old.images);
                 }
                 state.relay_semaphores.retire(&old.images);
+                if let Some(sharpen) = &mut state.sharpen {
+                    sharpen.semaphores.retire(&old.images);
+                }
                 let (freed, left) = state.reclaim_present_semaphores(&self.device);
                 if freed + left > 0 {
                     let kept = state.present_semaphores_kept_until_teardown();
@@ -3313,6 +3416,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let mut series_consumed: Option<(vk::Semaphore, Option<crate::present_sync::LastUse>)> = None;
         // Which of the present's swapchains the layer worked on (the one its semaphores are for).
         let mut layer_slot: Option<usize> = None;
+        // The frame the sharpening may work on (`sharpen_frame`), and its semaphore once it did.
+        let mut sharpen_target: Option<SharpenTarget> = None;
+        let mut sharpened: Option<vk::Semaphore> = None;
         if crate::layer_enabled() {
             // The channel's lease follows presenting (`ownership`): an atomic store.
             crate::ownership::note_present();
@@ -3557,6 +3663,15 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 // Whether the frame can be read back for a capture (`crate::series`, 8-bit PNGs): never an HDR10
                 // one (refused above).
                 let readable = sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && !pq10;
+                // The sharpening reads and writes the swapchain's image itself: an admitted swapchain's (a pass-through
+                // one's frames come from its render source, which is not sharpened).
+                if !sw.pass_through && sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST) {
+                    sharpen_target = Some(SharpenTarget {
+                        swapchain: sc,
+                        queue_family,
+                        frame: crate::sharpen::Frame { image, layout: vk::ImageLayout::PRESENT_SRC_KHR, width, height, bgr: bgr_order, ten_bit: pq10 },
+                    });
+                }
                 let (capture_image, capture_layout) = match tap {
                     Some(source) if sw.pass_through => source,
                     _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),
@@ -3580,6 +3695,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     relay_semaphores,
                     engaged_swapchains,
                     series,
+                    sharpen,
                     ..
                 } = &mut *state;
                 // The hold's state, for the hand-back, its captures and the model server: let go
@@ -3623,6 +3739,25 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             take_capture(shm, series, readable, true);
                             // The readbacks below wait on the GPU: not with the hold's state.
                             drop(hold_guard);
+                            // Sharpened before the capture's readback, so a capture shows what is presented.
+                            if let Some(target) = sharpen_target.take() {
+                                // SAFETY: as for `capture_untouched` below; nothing of the layer's was submitted yet.
+                                sharpened = unsafe {
+                                    sharpen_frame(
+                                        &self.device,
+                                        instance,
+                                        self.physical_device,
+                                        queue,
+                                        &target,
+                                        shm,
+                                        sharpen,
+                                        relay_semaphores,
+                                        present_info,
+                                        &mut relay_semaphore,
+                                        engaged_swapchains,
+                                    )
+                                };
+                            }
                             // SAFETY: `queue` is this present's, externally synchronized for its
                             // duration; nothing of the layer's was submitted for it yet.
                             unsafe {
@@ -3844,6 +3979,28 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 }
                 break;
             }
+            // Every other path: the sharpening after all of the layer's work for the frame (the model's composition
+            // and a capture's readback on the finished-frame path, which then shows the frame unsharpened).
+            if let (Some(target), Some(instance)) = (sharpen_target.take(), &self.instance) {
+                let State { shm, sharpen, relay_semaphores, engaged_swapchains, .. } = &mut *state;
+                // SAFETY: `queue` is this present's, externally synchronized for its duration; the target is its
+                // image, back in `PRESENT_SRC_KHR` after anything of the layer's (each submit on this queue).
+                sharpened = unsafe {
+                    sharpen_frame(
+                        &self.device,
+                        instance,
+                        self.physical_device,
+                        queue,
+                        &target,
+                        shm,
+                        sharpen,
+                        relay_semaphores,
+                        present_info,
+                        &mut relay_semaphore,
+                        engaged_swapchains,
+                    )
+                };
+            }
             if let Some(engaged) = any_engaged {
                 note_engaged(engaged);
             }
@@ -3853,7 +4010,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
 
         // SAFETY: `present_info` is valid for the duration of this call; `next_present`
         // was resolved from the next layer/driver's own proc-addr table.
-        let result = if relay_semaphore.is_some() || wait_semaphore.is_some() || series_wait.is_some() {
+        let result = if relay_semaphore.is_some() || wait_semaphore.is_some() || series_wait.is_some() || sharpened.is_some() {
             // Never drop a dependency the application had: either its own wait
             // semaphores go through unchanged (the layer did no relay), or the relay
             // batch already waited on them and its semaphore stands in for them.
@@ -3872,6 +4029,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             }
             combined.extend(wait_semaphore);
             combined.extend(series_wait);
+            combined.extend(sharpened);
             // Copies every other field (`p_next`, `swapchain_count`, `p_swapchains`,
             // `p_image_indices`, `p_results`) unchanged from the app's own
             // `present_info` -- only the wait-semaphore list is actually different.
@@ -3892,7 +4050,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 if tracking != Tracking::PresentFence {
                     // Known before the present: noted now, so the present costs no second lock.
                     let last = if tracking == Tracking::AppFenced { LastUse::AppFenced } else { LastUse::Unknown };
-                    note_present_waits(&mut state, relay_semaphore, wait_semaphore, last);
+                    note_present_waits(&mut state, relay_semaphore, wait_semaphore, sharpened, last);
                     note_series_consumed(&mut state, series_consumed, last);
                 }
                 (tracking, fence)
@@ -3912,7 +4070,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     } else {
                         state.present_tickets.stranded(fence)
                     };
-                    note_present_waits(&mut state, relay_semaphore, wait_semaphore, LastUse::Ticket(ticket));
+                    note_present_waits(&mut state, relay_semaphore, wait_semaphore, sharpened, LastUse::Ticket(ticket));
                     note_series_consumed(&mut state, series_consumed, LastUse::Ticket(ticket));
                     debug_assert_eq!(tracking, Tracking::PresentFence);
                     result

@@ -1578,6 +1578,29 @@ later on October 22 was tried as the cheapest of them first offline, then built 
   and their launches OK; only the startup probes with null arguments are refused. Whether NVIDIA's network then
   changes the picture was not compared. No upstream report; the README carries no known issue for it.
 
+## November 9: sharpening the finished frame (built, off by default)
+
+From a review of AMDLSS5 (no licence: ideas only), whose optional CAS, LumaSharpen and Clarity filters run on the
+final image before the HUD.
+
+- **Where.** At present (`crate::sharpen`), not after DLSS: DLSS's output is scene-linear HDR before the game's
+  tone mapping, and CAS wants a display-referred picture with 1 at the peak ("best run after tonemapping",
+  ffx_cas.h); the present is also the one stage every game and placement reaches. The HUD is drawn by then, so the
+  HUD regions apply (AMD: CAS "won't harm the UI"; Clarity would halo text). The HUD detection is the post path's
+  own and runs nowhere near a held frame, so it is not used.
+- **No depth.** The only depth is DLSS's input depth at render size, copied inside a hold before the upscaler and
+  only with the edit cache on; the presented frame has the game's post-processing, the HUD and frame generation's
+  frames on it, which that depth does not describe. Clarity's base stops at strong luma edges instead.
+- **Cost** (RTX 5070, 2560x1440, offline on a 1440p capture, median of 200 dispatches, `sharpen::tests::cost_at_1440p_and_effect_on_a_still_frame`
+  with the NVIDIA ICD): CAS 0.29 ms, Clarity radius 16 0.33 ms, radius 64 0.43 ms, both 0.37 ms. CAS's 0.29 ms is
+  mostly the copy of the frame out and back (two 14.7 MB copies); a storage view of the swapchain image would save
+  much of it but needs `STORAGE` usage added to swapchains, which nothing else here does. Paid on every presented
+  frame: four times a rendered frame with frame generation 4x.
+- **Effect** on that capture (mean change of the 8-bit channels; mean absolute Laplacian of luma against the
+  frame's): CAS 0.5 0.06/255, x1.09 (mostly below an 8-bit step); CAS 1.0 1.08/255, x2.71; Clarity 0.5 r16
+  0.65/255, x1.32; both at 0.5 0.76/255, x1.56. CAS's strength maps to `-s / lerp(8, 5, s)` so 0 is off; its own
+  default (sharpness 0) is 0.73 here. In-game A/B in GTA V still to do.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
