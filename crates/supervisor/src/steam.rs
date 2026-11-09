@@ -720,6 +720,74 @@ pub fn apply(root: &Path, appid: &str, action: &Action, steam_running: bool) -> 
     Outcome::Changed(edits)
 }
 
+/// Every app whose launch options in some account under `root` carry Neural Forge's variables (what
+/// [`launch_options::strip`] takes out), sorted, each once; and the accounts' `localconfig.vdf` files
+/// that could not be read or parsed, whose launch options were therefore not looked at.
+pub fn apps_with_our_options(root: &Path) -> (Vec<String>, Vec<PathBuf>) {
+    let mut apps = Vec::new();
+    let mut unreadable = Vec::new();
+    for file in localconfigs(root) {
+        let Some(tree) = std::fs::read(&file).ok().and_then(|text| vdf::parse(&text).ok()) else {
+            unreadable.push(file);
+            continue;
+        };
+        let Some(block) = tree.block_at(&APPS) else { continue };
+        for entry in &block.0 {
+            let vdf::Value::Block(app) = &entry.value else { continue };
+            if app.string_at(&["LaunchOptions"]).is_some_and(|options| launch_options::strip(options) != options) {
+                apps.push(entry.key.clone());
+            }
+        }
+    }
+    apps.sort();
+    apps.dedup();
+    (apps, unreadable)
+}
+
+/// What [`switch_all_off`] did under one root.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SwitchedOff {
+    /// The apps whose launch options no longer carry Neural Forge's variables, with the files changed.
+    pub done: Vec<(String, Vec<FileEdit>)>,
+    /// The apps that still carry them: the app, why ([`Outcome::SteamRunning`] or
+    /// [`Outcome::Failed`]), and the launch options to set by hand instead.
+    pub left: Vec<(String, Outcome)>,
+    /// Account files that could not be read: their launch options were not checked.
+    pub unreadable: Vec<PathBuf>,
+}
+
+/// Takes Neural Forge's variables out of every app's launch options in every account under `root`
+/// ([`apply`] with [`Action::Disable`] for each app [`apps_with_our_options`] finds, installed or not),
+/// with the same guards: nothing is written while Steam runs.
+pub fn switch_all_off(root: &Path, steam_running: bool) -> SwitchedOff {
+    let (apps, unreadable) = apps_with_our_options(root);
+    let mut out = SwitchedOff { unreadable, ..SwitchedOff::default() };
+    for appid in apps {
+        match apply(root, &appid, &Action::Disable, steam_running) {
+            Outcome::Changed(edits) => out.done.push((appid, edits)),
+            Outcome::Unchanged => {}
+            refused => out.left.push((appid, refused)),
+        }
+    }
+    out
+}
+
+/// The files Neural Forge keeps next to each account's `localconfig.vdf` under `root` (its first
+/// original, the backup from before the last edit, the lock): every one that is a regular file.
+pub fn our_localconfig_siblings(root: &Path) -> Vec<PathBuf> {
+    let Ok(dir) = std::fs::read_dir(root.join("userdata")) else { return Vec::new() };
+    let mut out: Vec<PathBuf> = dir
+        .flatten()
+        .flat_map(|account| {
+            let config = account.path().join("config/localconfig.vdf");
+            [".neural-forge.orig", ".neural-forge.bak", ".neural-forge.lock"].map(|suffix| sibling(&config, suffix))
+        })
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
+        .collect();
+    out.sort();
+    out
+}
+
 fn sibling(file: &Path, suffix: &str) -> PathBuf {
     let mut name = file.file_name().unwrap_or_default().to_os_string();
     name.push(suffix);
@@ -1174,6 +1242,52 @@ mod tests {
         let leftovers: Vec<_> =
             std::fs::read_dir(lc.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).filter(|n| n.to_string_lossy().ends_with(".tmp")).collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn switching_every_app_off_takes_only_our_variables_out() {
+        let home = Scratch::new("all-off");
+        let lc1 = home.0.join("userdata/1/config/localconfig.vdf");
+        let lc2 = home.0.join("userdata/2/config/localconfig.vdf");
+        // Two accounts: an installed game and one no longer installed, a game never switched on, and one
+        // with no launch options at all.
+        write(&lc1, &localconfig(&[("3240220", Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe gamemoderun %command% -x")), ("990080", None)]));
+        write(&lc2, &localconfig(&[("271590", Some("NEURAL_FORGE_ENABLE=1 %command%")), ("10", Some("-novid"))]));
+        assert_eq!(apps_with_our_options(&home.0), (vec!["271590".to_string(), "3240220".to_string()], Vec::new()));
+
+        // Steam running: nothing written, each app named with the string to set by hand.
+        let before = (std::fs::read_to_string(&lc1).unwrap(), std::fs::read_to_string(&lc2).unwrap());
+        let refused = switch_all_off(&home.0, true);
+        assert!(refused.done.is_empty());
+        assert_eq!(
+            refused.left,
+            vec![
+                ("271590".to_string(), Outcome::SteamRunning { manual: String::new() }),
+                ("3240220".to_string(), Outcome::SteamRunning { manual: "gamemoderun %command% -x".into() }),
+            ]
+        );
+        assert_eq!((std::fs::read_to_string(&lc1).unwrap(), std::fs::read_to_string(&lc2).unwrap()), before);
+
+        let done = switch_all_off(&home.0, false);
+        assert!(done.left.is_empty() && done.unreadable.is_empty(), "{done:?}");
+        assert_eq!(done.done.iter().map(|(app, _)| app.as_str()).collect::<Vec<_>>(), ["271590", "3240220"]);
+        assert_eq!(options_in(&lc1, "3240220").as_deref(), Some("gamemoderun %command% -x"));
+        assert_eq!(options_in(&lc2, "271590").as_deref(), Some(""));
+        assert_eq!(options_in(&lc2, "10").as_deref(), Some("-novid"), "another game's options are not ours");
+        assert_eq!(apps_with_our_options(&home.0), (Vec::new(), Vec::new()));
+        // The backups and locks the edits left are what `our_localconfig_siblings` names.
+        let siblings = our_localconfig_siblings(&home.0);
+        for account in ["1", "2"] {
+            for suffix in ["orig", "bak", "lock"] {
+                let p = home.0.join(format!("userdata/{account}/config/localconfig.vdf.neural-forge.{suffix}"));
+                assert!(siblings.contains(&p), "{p:?} in {siblings:?}");
+            }
+        }
+        assert_eq!(siblings.len(), 6);
+
+        // An account file that does not parse is named, not skipped in silence.
+        write(&lc2, "\"UserLocalConfigStore\"\n{\n");
+        assert_eq!(apps_with_our_options(&home.0), (Vec::new(), vec![lc2]));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 #include "vk_context.h"
+#include "nr_env.h"
 
 #include <algorithm>
 #include <atomic>
@@ -13,10 +14,7 @@ constexpr VkDeviceSize kStagingBytes = 256ull << 20;  // 256 MiB staging window
 constexpr const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
 std::atomic<uint32_t> g_validationErrors{0};
 
-bool envFlag(const char* name) {
-  const char* value = getenv(name);
-  return value && *value && strcmp(value, "0") != 0;
-}
+bool envFlag(const char* name) { return nr::env::flag(name, false); }
 
 VkBool32 VKAPI_PTR onDebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT type,
                                   const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
@@ -91,13 +89,13 @@ void Context::create() {
     for (const auto& extension : extensions) {
       if (!strcmp(extension.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) coop = true;
       if (!strcmp(extension.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) fp8 = true;
-      if (getenv("NEURAL_FORGE_NR_LIST_EXTENSIONS") && (strstr(extension.extensionName, "cooperative") || strstr(extension.extensionName, "NV_")))
+      if (envFlag("NEURAL_FORGE_NR_LIST_EXTENSIONS") && (strstr(extension.extensionName, "cooperative") || strstr(extension.extensionName, "NV_")))
         printf("  device extension: %s (v%u)\n", extension.extensionName, extension.specVersion);
     }
     if (coop && fp8) { physical_ = candidate; break; }
   }
   if (!physical_) throw std::runtime_error("no device with VK_KHR_cooperative_matrix + VK_EXT_shader_float8");
-  if (getenv("NEURAL_FORGE_NR_LIST_EXTENSIONS")) {
+  if (envFlag("NEURAL_FORGE_NR_LIST_EXTENSIONS")) {
     VkPhysicalDeviceCooperativeMatrix2FeaturesNV cm2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &cm2;
@@ -747,6 +745,20 @@ void Context::transferBarrier(VkCommandBuffer commands) {
   barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
                           VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.memoryBarrierCount = 1;
+  dependency.pMemoryBarriers = &barrier;
+  vkCmdPipelineBarrier2(commands, &dependency);
+}
+
+void Context::beforeTransferWrite(VkCommandBuffer commands) {
+  ++barriers_;
+  // Writes need making available; reads (write-after-read) need only the execution dependency.
+  VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
   VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
   dependency.memoryBarrierCount = 1;
   dependency.pMemoryBarriers = &barrier;

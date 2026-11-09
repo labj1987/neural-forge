@@ -122,7 +122,8 @@ Every setting, the other placements and all environment variables: [docs/USER_GU
 
 Start with **Diagnose** on the Status tab (or `neural-forge-cli doctor`): it checks the install, GPU,
 driver, video memory, GPU faults, the last game's log and your launch options, and says what to do.
-To report a bug, attach the zip **Save report** writes to your desktop (personal names are removed).
+To report a bug, attach the zip **Save report** writes to your desktop (personal names are removed, and of
+each game's launch options only Neural Forge's part is included).
 
 - **No effect in game.** Check the launch option, that the model is extracted, and give the game 5 s
   of play. The Status tab's Model placement line says where the model runs, or why it does not.

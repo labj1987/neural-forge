@@ -38,7 +38,9 @@ External `nvngx_dlssnr.dll`, other NVIDIA DLL names, exported NGX functions,
 
 Build with `bash build-appimage.sh` (after `bash scripts/fetch-native-tools.sh` once). The
 AppImage launches the GUI directly and, each time it starts, installs its layer into persistent
-user storage, since Steam games launched later cannot see inside an AppImage mount. From a
+user storage, since Steam games launched later cannot see inside an AppImage mount. It installs from
+`APPDIR` only when the running GUI is inside it: the installed GUI started from another AppImage
+inherits that AppImage's `APPDIR` and installs nothing. From a
 source build, install the extracted AppDir the same way:
 
 ```sh
@@ -49,11 +51,13 @@ The installer places the binaries under `$XDG_DATA_HOME/neural-forge/bin` and th
 `lib/neural-forge/`, and writes the layer manifest with an absolute library path to
 `$XDG_DATA_HOME/vulkan/implicit_layer.d/`. It writes no desktop, icon or metainfo files: menu
 integration belongs to whatever integrated the AppImage. It refuses unknown or modified
-destinations, replaces files atomically (running processes keep their mapped copies), and removes
+destinations (naming the file and what to do: move it aside, or uninstall first when the install
+record is missing), replaces files atomically (running processes keep their mapped copies), and removes
 files a previous version installed that this one no longer ships, if they are unchanged.
 `python3 scripts/install.py uninstall` removes only unchanged, hash-recorded files; it keeps
 config, the extracted model, an imported DLL and runtime data (`neural-forge-cli uninstall --purge`
-removes those too). It
+removes those too, after taking Neural Forge's variables out of every game's Steam launch options and
+removing its `localconfig.vdf.neural-forge.*` files; it refuses, removing nothing, while Steam runs). It
 never calls a package manager or stops another app.
 
 Neural Forge does not migrate or touch upstream's shared `~/.config/dlssnr`, `/tmp/dlssnr-*`,

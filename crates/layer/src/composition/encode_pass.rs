@@ -194,3 +194,30 @@ pub fn supports_storage(instance: &ash::Instance, physical_device: vk::PhysicalD
     let props = unsafe { instance.get_physical_device_format_properties(physical_device, format) };
     props.optimal_tiling_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
 }
+
+/// The create flags a scratch image of `format` needs to carry the encode's `R8G8B8A8_UNORM` storage view, or
+/// `None` when this device cannot give it one (the proxy then crosses unencoded). A format that supports storage
+/// itself (the UNORM scratches) needs only `MUTABLE_FORMAT`. An sRGB scratch (an sRGB swapchain's: the blit into
+/// it then keeps the frame's bytes) supports no storage on any device, so it also needs `EXTENDED_USAGE`, core in
+/// Vulkan 1.1 (`extended_usage`: the device's effective version is at least that), with storage supported by the
+/// view's format and the image's usage accepted for the format with those flags.
+pub fn storage_create_flags(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    format: vk::Format,
+    extended_usage: bool,
+) -> Option<vk::ImageCreateFlags> {
+    if supports_storage(instance, physical_device, format) {
+        return Some(vk::ImageCreateFlags::MUTABLE_FORMAT);
+    }
+    if !extended_usage || !supports_storage(instance, physical_device, vk::Format::R8G8B8A8_UNORM) {
+        return None;
+    }
+    let flags = vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE;
+    let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::STORAGE;
+    // SAFETY: as above; `extended_usage` says the flag is valid for this device's version.
+    let supported = unsafe {
+        instance.get_physical_device_image_format_properties(physical_device, format, vk::ImageType::TYPE_2D, vk::ImageTiling::OPTIMAL, usage, flags)
+    };
+    supported.ok().map(|_| flags)
+}

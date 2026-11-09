@@ -102,3 +102,21 @@ this project's own code: upstream is no longer tracked.
    instance's enabled extensions, which never hold a device extension, so a hook on one was never returned. It is
    now available as a device command is: when the layer supports the extension or the next layer resolves it. The
    generator emits `Extension::is_device_extension` from the registry's `type="device"` for that.
+6. **A hook's error from a command that fills an array of handles** (2026-11-09 review). For
+   vkAllocateCommandBuffers, vkAllocateDescriptorSets, vkCreate*Pipelines and vkCreateSharedSwapchainsKHR, a hook's
+   `Handled(Err(code))` returned the code and left the application's array as it was; the spec has a failed
+   allocation or creation set every entry to `VK_NULL_HANDLE`, and an application may free or destroy the whole
+   array after the error. Neural Forge's always-on `vkAllocateCommandBuffers` hook hit this on every out-of-memory
+   failure. The generator now writes `VK_NULL_HANDLE` into every entry before it returns the error; a test with a
+   pre-filled array holds it.
+7. **vkGetInstanceProcAddr's hook, the next vkCreateDevice, success codes with an output** (2026-11-09 review).
+   `InstanceHooks::get_instance_proc_addr` was consulted only when the global hooks named vkGetInstanceProcAddr,
+   which they never can (`GlobalHooks` has only `create_instance`), so a layer that hooked it was never asked; it
+   is now consulted when the layer's hooked instance commands for that instance name it, as `get_instance_proc_addr`'s
+   documentation says. The next layer's vkCreateDevice was transmuted to a non-nullable function pointer before the
+   layer's hook ran, undefined behaviour if the next layer resolved it to NULL; it stays an `Option` and only the
+   path that calls it fails with `VK_ERROR_INITIALIZATION_FAILED` on NULL. The instance hooks' test mock answers
+   vkGetInstanceProcAddr with `Unhandled` by default, and the mock driver can resolve a command to NULL, for the
+   tests of both. A hook's `VkResult<T>` cannot carry a success code other than `VK_SUCCESS` together with the
+   output (`VK_SUBOPTIMAL_KHR` with an image index, `VK_PIPELINE_COMPILE_REQUIRED` with pipelines): the generator
+   documents that on each such hook method instead of changing the trait.

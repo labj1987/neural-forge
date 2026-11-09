@@ -34,13 +34,18 @@ impl Lut {
     }
 
     /// Per channel, the scale and offset that take a value to the table's grid: (size - 1) / (max - min)
-    /// and -min times that.
-    pub(crate) fn grid(&self) -> ([f32; 3], [f32; 3]) {
-        let n = (self.cube.size - 1) as f32;
-        let scale: [f32; 3] = std::array::from_fn(|c| n / (self.cube.domain_max[c] - self.cube.domain_min[c]));
-        let offset: [f32; 3] = std::array::from_fn(|c| -self.cube.domain_min[c] * scale[c]);
-        (scale, offset)
+    /// and -min times that. `None` for a domain without a usable grid ([`Cube::grid`]), e.g. a DOMAIN span so
+    /// small (a subnormal one) that the scale overflows and its offset is NaN. The shaders would index the
+    /// table with that (out of bounds without robust buffer access), so such a table is never used
+    /// ([`grid_of`]); the parser refuses it in the first place.
+    pub(crate) fn grid(&self) -> Option<([f32; 3], [f32; 3])> {
+        grid_of(&self.cube)
     }
+}
+
+/// [`Lut::grid`] of `cube`: [`Cube::grid`], the grid the parser and the CPU reference lookup use.
+fn grid_of(cube: &Cube) -> Option<([f32; 3], [f32; 3])> {
+    cube.grid()
 }
 
 /// One pass's shader parameters: `colour` (saturation, contrast, detail, 0), `flags` (steps, table size, 0,
@@ -60,7 +65,9 @@ impl PassColour {
     /// on the GPU; `dither` only after the upscaler (the answer before it is half floats, not 8 bits).
     pub(crate) fn of(s: &ColourSettings, index: usize, last: bool, lut: Option<&Lut>, dither: bool) -> Self {
         let c = s.each[index.min(s.each.len() - 1)];
-        let lut = lut.filter(|_| last && s.lut_strength > 0.0);
+        // A table without a finite grid is never loaded (`load`); the check here keeps one from the shaders anyway.
+        let grid = lut.filter(|_| last && s.lut_strength > 0.0).and_then(|l| Some((l, l.grid()?)));
+        let lut = grid.map(|(l, _)| l);
         let mut flags = 0;
         if c.saturation != 1.0 || c.contrast != 1.0 {
             flags |= STEP;
@@ -81,7 +88,7 @@ impl PassColour {
         if dither && s.dither {
             flags |= DITHER;
         }
-        let (scale, offset) = lut.map_or(([0.0; 3], [0.0; 3]), Lut::grid);
+        let (scale, offset) = grid.map_or(([0.0; 3], [0.0; 3]), |(_, g)| g);
         Self {
             colour: [c.saturation, c.contrast, c.detail, 0.0],
             flags: [flags, lut.map_or(0, |l| l.cube.size as u32), 0, 0],
@@ -154,22 +161,37 @@ fn load() {
         crate::log!("[colour] no look-up table named (edit_lut in config.ini)");
         None
     } else {
-        match neural_forge_protocol::cube::load(&path) {
-            Ok(c) => {
-                crate::log!("[colour] look-up table {path}: {} points a side", c.size);
-                Some(c)
-            }
-            Err(e) => {
-                crate::log!("[colour] the look-up table could not be read: {e}");
-                None
-            }
-        }
+        table_of(&path, neural_forge_protocol::cube::load(&path))
     };
     let mut store = STORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     store.generation += 1;
     let generation = store.generation;
     store.lut = cube.map(|cube| Arc::new(Lut { generation, cube }));
     store.loading = false;
+}
+
+/// The table `load` keeps of what reading `path` gave: none when it could not be read or parsed, or when its
+/// grid is not finite ([`Lut::grid`]), each logged.
+fn table_of(path: &str, loaded: Result<Cube, String>) -> Option<Cube> {
+    match loaded {
+        Ok(c) if grid_of(&c).is_none() => {
+            crate::log!(
+                "[colour] the look-up table {path} cannot be used: its DOMAIN_MIN to DOMAIN_MAX span ({:?} to {:?}) is too small for its {} points a side",
+                c.domain_min,
+                c.domain_max,
+                c.size
+            );
+            None
+        }
+        Ok(c) => {
+            crate::log!("[colour] look-up table {path}: {} points a side", c.size);
+            Some(c)
+        }
+        Err(e) => {
+            crate::log!("[colour] the look-up table could not be read: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -194,6 +216,28 @@ mod tests {
         request(&mut store, 4, || unreachable!("read for this seq already"));
         request(&mut store, 5, || Ok(()));
         assert_eq!(store.seen, Some(5), "a new seq reads again");
+    }
+
+    /// A `.cube` whose DOMAIN span is subnormal (the parser takes any max above min) has an infinite grid scale
+    /// and a NaN offset, which the shaders would turn into an index outside the table: it is not loaded, and a
+    /// table with such a grid gets no LUT step even if it were.
+    #[test]
+    fn a_table_whose_grid_is_not_finite_is_never_used() {
+        let mut cube = Cube::identity(3);
+        cube.domain_max[1] = 1e-40;
+        cube.domain_min[1] = 0.0;
+        let lut = Lut { generation: 1, cube: cube.clone() };
+        assert_eq!(lut.grid(), None);
+        let s = ColourSettings { lut_strength: 1.0, ..ColourSettings::DEFAULT };
+        let pass = PassColour::of(&s, 0, true, Some(&lut), false);
+        assert_eq!(pass.flags[0] & LUT, 0, "no LUT step");
+        assert!(pass.lut_scale.iter().chain(&pass.lut_offset).all(|v| v.is_finite()), "{pass:?}");
+        assert!(table_of("/x.cube", Ok(cube)).is_none(), "not loaded");
+        // A small but normal span is fine: a finite grid.
+        let mut fine = Cube::identity(3);
+        fine.domain_max = [1e-3; 3];
+        assert!(Lut { generation: 2, cube: fine.clone() }.grid().is_some());
+        assert!(table_of("/y.cube", Ok(fine)).is_some());
     }
 
     #[test]

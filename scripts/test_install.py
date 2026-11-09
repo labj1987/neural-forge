@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -14,8 +15,19 @@ CLI = Path(os.environ.get('NEURAL_FORGE_CLI', ROOT / os.environ.get('CARGO_TARGE
 def scratch_env(root, data):
     # Every XDG home lives in the scratch dir, so the CLI never sees the real ones. The unique uid names a
     # runtime dir that cannot belong to a real session.
-    return {**os.environ, 'XDG_DATA_HOME': str(data), 'XDG_CONFIG_HOME': str(root / 'config'),
+    # HOME too: purge looks for Steam (and its launch options) under it.
+    return {**os.environ, 'HOME': str(root / 'home'), 'XDG_DATA_HOME': str(data), 'XDG_CONFIG_HOME': str(root / 'config'),
             'XDG_STATE_HOME': str(root / 'state'), 'NEURAL_FORGE_UID': f'installtest-{os.getpid()}'}
+def steam_running():
+    # What the CLI checks before it edits Steam's launch options: a `steam` or `steamwebhelper` process.
+    for pid in Path('/proc').iterdir():
+        if pid.name.isdigit():
+            try:
+                if (pid / 'comm').read_text().rstrip('\n') in ('steam', 'steamwebhelper'):
+                    return True
+            except OSError:
+                pass
+    return False
 class InstallTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -84,6 +96,9 @@ class InstallTests(unittest.TestCase):
             upstream.write_text('upstream sentinel')
             env = scratch_env(root, data)
             runtime = Path(f"/tmp/neural-forge-{env['NEURAL_FORGE_UID']}")
+            # Outside the scratch dir: gone after the test whichever way it ends (with Steam running the purge
+            # is refused and leaves it).
+            self.addCleanup(shutil.rmtree, runtime, ignore_errors=True)
             def cli(*args):
                 result = subprocess.run([str(CLI), *args], env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -104,11 +119,35 @@ class InstallTests(unittest.TestCase):
             for path in installed:
                 self.assertTrue(path.is_file(), path)
             self.assertFalse((data / 'applications').exists(), 'the installer writes no menu entry')
+            # A Steam account with a game switched on, and the copies of its localconfig.vdf an edit left.
+            steam_config = root / 'home/.local/share/Steam/userdata/1/config'
+            (root / 'home/.local/share/Steam/steamapps').mkdir(parents=True)
+            steam_config.mkdir(parents=True)
+            localconfig = steam_config / 'localconfig.vdf'
+            text = ('"UserLocalConfigStore"\n{\n\t"Software"\n\t{\n\t\t"Valve"\n\t\t{\n\t\t\t"Steam"\n\t\t\t{\n\t\t\t\t"apps"\n'
+                    '\t\t\t\t{\n\t\t\t\t\t"3240220"\n\t\t\t\t\t{\n\t\t\t\t\t\t"LaunchOptions"\t\t"NEURAL_FORGE_ENABLE=1 '
+                    'NEURAL_FORGE_TARGET_EXE=G.exe gamemoderun %command%"\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n')
+            localconfig.write_text(text)
+            copies = [steam_config / f'localconfig.vdf.neural-forge.{suffix}' for suffix in ('orig', 'bak', 'lock')]
+            for copy in copies:
+                copy.write_text(text)
             # A lost record: purge still takes the manifest that would load the deleted library.
             (data / 'neural-forge/installation.json').unlink()
+            if steam_running():
+                # This machine's Steam is running (the purge reads the real /proc): refused, nothing removed.
+                result = subprocess.run([str(CLI), 'uninstall', '--purge'], env=env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('app 3240220: Steam is running', result.stderr)
+                self.assertIn('nothing was removed', result.stderr)
+                self.assertEqual(localconfig.read_text(), text)
+                for kept in installed[:-1] + copies:
+                    self.assertTrue(kept.exists(), kept)
+                return
             cli('uninstall', '--purge')
-            for gone in installed + [data / 'neural-forge', root / 'config/neural-forge', root / 'state/neural-forge', runtime]:
+            for gone in installed + copies + [data / 'neural-forge', root / 'config/neural-forge', root / 'state/neural-forge', runtime]:
                 self.assertFalse(gone.exists(), gone)
+            self.assertNotIn('NEURAL_FORGE', localconfig.read_text())
+            self.assertIn('"gamemoderun %command%"', localconfig.read_text())
             self.assertEqual(upstream.read_text(), 'upstream sentinel')
 
 if __name__ == '__main__': unittest.main()

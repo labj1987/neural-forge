@@ -496,6 +496,12 @@ wrong guess cannot be taken back (the commands are in the application's buffer),
 harmless instead: the host writes the slot's verdict word before the submission, and the guard, reading
 it, clears what the hold carries from the holds before and leaves `last` at 0, so the next hold starts
 afresh too; the hold's readings (the edit cache's counters, the scene cut, the exposure) are not used.
+When its reading comes back (`Session::harvest`), the CPU follows the GPU: it drops the edit cache's
+stored edit, so the next hold it plans refreshes instead of being a cached hold with nothing to apply (one
+that would give DLSS its frame unedited, every other frame while the camera moves if every guess is
+wrong), and marks the history stale for the guard's own reason (`history::Stale::Unsound`, logged as
+the hold guard's reset), so the next network frame runs without history and with seed 0, as
+the guard's reset made it on the GPU. Holds planned before the reading came back are not changed.
 A device without the verdicts' buffer reads no input in a guessed layout. The alternative, copying the history back into one image at the end of every hold so no
 parity is needed, would cost a copy every frame and still not cover the edit cache's chain or the seed.
 The native pass's initialisation (its state cleared, its history images to `GENERAL`) is not recorded

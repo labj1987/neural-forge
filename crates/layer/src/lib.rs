@@ -473,9 +473,15 @@ pub(crate) fn requests_extension(create_info: &vk::DeviceCreateInfo, name: &CStr
 /// application's instance `api_version`, where 0 means 1.0, and the device's), or the application enables
 /// it itself.
 fn external_memory_host_allowed(instance_api_version: u32, device_api_version: u32, app_enables_external_memory: bool) -> bool {
+    app_enables_external_memory || core_1_1(instance_api_version, device_api_version)
+}
+
+/// Whether a device has Vulkan 1.1 core: its effective version, the lower of the application's instance
+/// `api_version` (0 means 1.0) and the device's, is at least 1.1.
+pub(crate) fn core_1_1(instance_api_version: u32, device_api_version: u32) -> bool {
     let instance = if instance_api_version == 0 { vk::API_VERSION_1_0 } else { instance_api_version };
     let effective = instance.min(device_api_version);
-    app_enables_external_memory || (vk::api_version_major(effective), vk::api_version_minor(effective)) >= (1, 1)
+    (vk::api_version_major(effective), vk::api_version_minor(effective)) >= (1, 1)
 }
 
 pub(crate) fn take_external_memory_host_enabled(device: vk::Device) -> bool {
@@ -1122,6 +1128,9 @@ impl Layer for NeuralForgeLayer {
         // instance from before this layer was loaded, which never happens for an implicit
         // layer, and then capture is simply skipped.
         let instance = PHYSICAL_DEVICE_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&physical_device).cloned();
+        // SAFETY: `physical_device` belongs to the instance it was recorded with.
+        let extended_usage =
+            instance.as_ref().is_some_and(|ctx| core_1_1(ctx.api_version, unsafe { ctx.instance.get_physical_device_properties(physical_device) }.api_version));
         NeuralForgeDeviceInfo::new(
             instance.as_ref().map(|ctx| ctx.instance.clone()),
             instance.and_then(|ctx| ctx.surface_caps),
@@ -1129,6 +1138,7 @@ impl Layer for NeuralForgeLayer {
             device,
             next_get_device_proc_addr,
             create_info,
+            extended_usage,
         )
     }
 }

@@ -30,15 +30,34 @@ struct Primary {
 static PRIMARY: Mutex<Option<Primary>> = Mutex::new(None);
 
 fn claim_primary(device: vk::Device, swapchain: vk::SwapchainKHR, width: u32, height: u32) -> bool {
-    let mut guard = PRIMARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    claim(&mut PRIMARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner), device, swapchain, width, height)
+}
+
+fn claim(primary: &mut Option<Primary>, device: vk::Device, swapchain: vk::SwapchainKHR, width: u32, height: u32) -> bool {
     let area = u64::from(width) * u64::from(height);
-    match &*guard {
+    match &*primary {
         Some(p) if p.device == device && p.swapchain == swapchain => true,
         Some(p) if area <= p.area => false,
         _ => {
-            *guard = Some(Primary { device, swapchain, area });
+            *primary = Some(Primary { device, swapchain, area });
             true
         }
+    }
+}
+
+/// A swapchain created with `oldSwapchain` replaces it: the old one is retired (it can present no
+/// more), though the application may keep it alive for a few frames until its presents complete, or
+/// never destroy it. When the retired one holds the primary claim, the claim follows to the new one
+/// (with its own size; a pass-through swapchain may hold it too, through the render tap). Without this,
+/// a recreation at the same size is refused the claim for as long as the retired swapchain lives, and
+/// its presents go out untouched.
+fn succeed_primary(device: vk::Device, old: vk::SwapchainKHR, new: vk::SwapchainKHR, width: u32, height: u32) {
+    succeed(&mut PRIMARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner), device, old, new, width, height);
+}
+
+fn succeed(primary: &mut Option<Primary>, device: vk::Device, old: vk::SwapchainKHR, new: vk::SwapchainKHR, width: u32, height: u32) {
+    if old != vk::SwapchainKHR::null() && matches!(&*primary, Some(p) if p.device == device && p.swapchain == old) {
+        *primary = Some(Primary { device, swapchain: new, area: u64::from(width) * u64::from(height) });
     }
 }
 
@@ -253,6 +272,9 @@ struct State {
     /// requests this extension on its own); `capture::run` treats it as "keep using
     /// the staging-buffer path", not an error.
     external_memory_host: bool,
+    /// Whether the device may create images with `EXTENDED_USAGE` (its effective Vulkan version is 1.1 or later,
+    /// `crate::core_1_1`): the capture's sRGB model scratch needs it for the encode (`capture::ScratchSource`).
+    extended_usage: bool,
     gpu_compose: Option<crate::composition::gpu::GpuCompose>,
     /// Reused across frames by `capture::run` for its own pre-edit frame snapshot,
     /// instead of a fresh `frame_bytes`-sized heap allocation every single present
@@ -1271,6 +1293,40 @@ fn post_path_idle(effect_off: Option<bool>, bootstrap_complete: bool, capture_re
 }
 
 #[cfg(test)]
+mod primary_claim_tests {
+    use super::*;
+    use vk::Handle;
+
+    /// A recreation with `oldSwapchain` takes the retired swapchain's claim, at the same size or a smaller
+    /// one, and the retired swapchain no longer holds it; the claim stays where it is when the retired one
+    /// did not hold it.
+    #[test]
+    fn the_primary_claim_follows_a_recreated_swapchain() {
+        let (device, other_device) = (vk::Device::from_raw(0x10), vk::Device::from_raw(0x20));
+        let (old, new, smaller, overlay) = (sc(1), sc(2), sc(3), sc(4));
+        let mut primary = None;
+        assert!(claim(&mut primary, device, old, 1920, 1080));
+        assert!(!claim(&mut primary, device, new, 1920, 1080), "the same size while the old one holds it");
+        succeed(&mut primary, device, old, new, 1920, 1080);
+        assert!(claim(&mut primary, device, new, 1920, 1080), "the replacement holds the claim");
+        assert!(!claim(&mut primary, device, old, 1920, 1080), "the retired one does not");
+        // A smaller replacement (the window shrank) still takes it, at its own size.
+        succeed(&mut primary, device, new, smaller, 1280, 720);
+        assert!(claim(&mut primary, device, smaller, 1280, 720));
+        assert!(!claim(&mut primary, device, overlay, 640, 480), "a smaller swapchain is still refused");
+        // A retirement of a swapchain that does not hold the claim (or another device's) changes nothing.
+        succeed(&mut primary, device, overlay, sc(5), 3840, 2160);
+        succeed(&mut primary, other_device, smaller, sc(6), 3840, 2160);
+        succeed(&mut primary, device, vk::SwapchainKHR::null(), sc(7), 3840, 2160);
+        assert!(matches!(&primary, Some(p) if p.swapchain == smaller && p.device == device && p.area == 1280 * 720));
+    }
+
+    fn sc(raw: u64) -> vk::SwapchainKHR {
+        vk::SwapchainKHR::from_raw(raw)
+    }
+}
+
+#[cfg(test)]
 mod shares_memory_tests {
     use super::*;
 
@@ -1446,6 +1502,7 @@ impl NeuralForgeDeviceInfo {
         device: Arc<ash::Device>,
         next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
         create_info: &vk::DeviceCreateInfo,
+        extended_usage: bool,
     ) -> Self {
         let handle = device.handle();
         // SAFETY: `next_get_device_proc_addr` is the next layer/driver's own
@@ -1527,7 +1584,7 @@ impl NeuralForgeDeviceInfo {
         // line after this one, including real per-frame activity, purely because
         // nothing forced a flush past this first, coincidentally-flushed call).
         crate::logging::flush();
-        let state = Arc::new(Mutex::new(State { external_memory_host, present_fences, ..State::default() }));
+        let state = Arc::new(Mutex::new(State { external_memory_host, extended_usage, present_fences, ..State::default() }));
         let hold = Arc::new(Mutex::new(HoldState { external_memory_host, ..HoldState::default() }));
         CLEANUP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(handle, (device.clone(), state.clone(), hold.clone()));
         // SAFETY: create_info is the loader chain for this newly created device.
@@ -2190,6 +2247,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if result != vk::Result::SUCCESS {
             return LayerResult::Handled(Err(result));
         }
+        // The retired swapchain's primary claim (if it holds it) goes to its replacement. Also after the
+        // fallback creation above, which cleared `oldSwapchain`: the first attempt already retired it.
+        succeed_primary(self.device.handle(), create_info.old_swapchain, swapchain, create_info.image_extent.width, create_info.image_extent.height);
         let hdr_kind = swapchain::detect_hdr_kind(create_info.image_format, create_info.image_color_space);
         // Cache even a pass-through swapchain's images. This lets the passive command
         // diagnostics identify a legal render-to-swapchain transfer without touching
@@ -3757,6 +3817,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format, sw.color_space);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
+                let srgb = swapchain::is_srgb(sw.format);
                 // Whether the frame can be read back for a capture (`crate::series`, 8-bit PNGs): never an HDR10
                 // one (refused above).
                 let readable = sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && !pq10;
@@ -3778,6 +3839,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     capture_pipeline,
                     direct_capture,
                     external_memory_host,
+                    extended_usage,
                     gpu_compose,
                     original_scratch,
                     model_scratch,
@@ -4024,6 +4086,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             height,
                             proxy_format,
                             bgr_order,
+                            capture::ScratchSource { srgb, extended_usage: *extended_usage },
                             capture_pipeline,
                             direct_capture,
                             external_memory_host,
@@ -4816,25 +4879,10 @@ mod submit_order_tests {
     fn device_wait_idle_is_only_used_at_device_teardown() {
         // Every source file of the layer: the two teardown drains are the only calls.
         let allowed = [("device.rs", "unsafe fn destroy_private_resources"), ("preupscale/inline.rs", "pub(crate) unsafe fn destroy(")];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = vec![root.clone()];
         let mut found = 0;
-        while let Some(path) = files.pop() {
-            if path.is_dir() {
-                files.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
-                continue;
-            }
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).unwrap();
-            // The code before the file's test module (a lone `#[cfg(test)]` item may come earlier).
-            let code = &source[..source.find("#[cfg(test)]\nmod ").unwrap_or(source.len())];
-            let name = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+        for (name, code) in production_sources() {
             for (at, _) in code.match_indices(".device_wait_idle()") {
-                let teardown = allowed.iter().find(|(file, _)| *file == name).and_then(|(_, f)| code.find(f));
-                let inside = teardown.is_some_and(|t| at > t && at < t + code[t..].find("\n}\n").expect("end of the teardown function"));
-                assert!(inside, "{name}: device_wait_idle outside the device teardown");
+                assert!(inside_fn(&code, at, &name, &allowed), "{name}: device_wait_idle outside the device teardown");
                 found += 1;
             }
         }
@@ -4847,6 +4895,104 @@ mod submit_order_tests {
         // And the network is closed only once the device went idle.
         let close = teardown.find("close_native()").expect("the network is closed at teardown");
         assert!(close > teardown.find(".device_wait_idle()").unwrap());
+    }
+
+    /// Every source file of the layer without its tests, as (path under `src`, code): each top-level
+    /// `#[cfg(test)] mod name { .. }` is blanked out (offsets kept), and a file that is itself a test module
+    /// (`#[cfg(test)] mod name;`) is left out.
+    fn production_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![root.clone()];
+        let mut sources = Vec::new();
+        let mut test_files = std::collections::HashSet::new();
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let mut code = std::fs::read_to_string(&path).unwrap();
+            let name = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+            // `foo.rs` and `foo/mod.rs` keep their child modules in `foo/`; `lib.rs` in `src`.
+            let dir = match name.strip_suffix(".rs") {
+                Some("lib") => String::new(),
+                Some(stem) => format!("{}/", stem.strip_suffix("/mod").unwrap_or(stem)),
+                None => unreachable!(),
+            };
+            while let Some(start) = code.find("#[cfg(test)]\nmod ") {
+                let line_end = start + code[start..].find('\n').unwrap() + 1;
+                let header_end = line_end + code[line_end..].find('\n').unwrap();
+                let header = &code[line_end..header_end];
+                let end = if let Some(module) = header.strip_prefix("mod ").and_then(|h| h.strip_suffix(';')) {
+                    test_files.insert(format!("{dir}{module}.rs"));
+                    test_files.insert(format!("{dir}{module}/mod.rs"));
+                    header_end
+                } else {
+                    assert!(header.ends_with('{'), "{name}: a test module's header: {header}");
+                    // A top-level module ends at the first closing brace in column 0.
+                    header_end + code[header_end..].find("\n}\n").unwrap_or_else(|| panic!("{name}: the end of `{header}`")) + 2
+                };
+                let blank: String = code[start..end].chars().map(|c| if c == '\n' { '\n' } else { ' ' }).collect();
+                code.replace_range(start..end, &blank);
+            }
+            sources.push((name, code));
+        }
+        sources.retain(|(name, _)| !test_files.contains(name));
+        assert!(sources.len() > 20 && sources.iter().any(|(n, _)| n == "device.rs"), "the layer's sources");
+        sources
+    }
+
+    /// Whether `at` in `code` (the file `name`) lies inside a function that `allowed` names for that file
+    /// (by the start of its signature; the function ends at the first closing brace indented as its signature).
+    fn inside_fn(code: &str, at: usize, name: &str, allowed: &[(&str, &str)]) -> bool {
+        allowed.iter().filter(|(file, _)| *file == name).any(|(_, f)| {
+            code.match_indices(f).any(|(t, _)| {
+                let line = code[..t].rfind('\n').map_or(0, |n| n + 1);
+                let indent = &code[line..t][..code[line..t].len() - code[line..t].trim_start().len()];
+                let end = code[t..].find(&format!("\n{indent}}}\n")).expect("the end of the function");
+                at > t && at < t + end
+            })
+        })
+    }
+
+    /// The test's own module stripper finds what it is meant to: the code after a top-level test module
+    /// (device.rs keeps several between its production functions), and none of the test module itself.
+    #[test]
+    fn production_sources_keep_the_code_between_test_modules() {
+        let sources = production_sources();
+        let device = &sources.iter().find(|(n, _)| n == "device.rs").unwrap().1;
+        assert!(device.contains("fn allocate_command_buffers(&self"), "the hook (after the first test module)");
+        assert!(!device.contains("fn production_sources_keep_the_code_between_test_modules"));
+        assert!(!sources.iter().any(|(n, _)| n == "sharpen/tests.rs"), "an out-of-line test module");
+    }
+
+    /// Command buffers are dispatchable objects: one the layer allocates for itself below the loader's
+    /// trampoline must get the loader's dispatch data (`loader_data::allocate_commands`) or a layer below
+    /// this one, which looks its state up by that word, fails on it (LoaderLayerInterface.md, "Creating New
+    /// Dispatchable Objects"). The only other call is the application's own `vkAllocateCommandBuffers`
+    /// hook, whose buffers the loader's trampoline initialises.
+    #[test]
+    fn command_buffers_are_allocated_through_the_loader_data() {
+        let allowed = [("loader_data.rs", "pub unsafe fn allocate_commands("), ("device.rs", "fn allocate_command_buffers(&self")];
+        let mut found = 0;
+        for (name, code) in production_sources() {
+            for (at, _) in code.match_indices("allocate_command_buffers") {
+                let before = &code[..at];
+                // Other names that end in it (`on_allocate_command_buffers`) and the hook's own signature.
+                if before.ends_with(|c: char| c.is_alphanumeric() || c == '_') || before.ends_with("fn ") {
+                    continue;
+                }
+                assert!(
+                    inside_fn(&code, at, &name, &allowed),
+                    "{name}:{}: a command buffer allocated without the loader's dispatch data (use loader_data::allocate_commands)",
+                    before.lines().count()
+                );
+                found += 1;
+            }
+        }
+        assert_eq!(found, 2, "the helper's and the hook's calls");
     }
 
     /// Real (lavapipe) queue: the relay batch must consume the application's wait

@@ -13,7 +13,7 @@
 # limitations under the License.
 #
 # Modified for Neural Forge (2026): ported to ash 0.38; the command alias table; whether an extension is a
-# device one (UPSTREAM.md).
+# device one; a hook's error leaves NULL in every entry of an output array of handles (UPSTREAM.md).
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
@@ -336,8 +336,14 @@ class VulkanCommand(NamedTuple):
 
     # Return lines of code to assign the variable of ret_var to the FFI return parameter correctly,
     # e.g. assign the result of create_image to the p_image pointer of the FFI parameter.
+    #
+    # With null_fill, the lines for a hook's error instead: an output array of handles whose length the
+    # application gave (vkAllocateCommandBuffers, vkAllocateDescriptorSets, vkCreate*Pipelines,
+    # vkCreateSharedSwapchainsKHR) gets VK_NULL_HANDLE in every entry, as the spec asks of a failed
+    # allocation or creation (the application may free or destroy every entry of the array after the
+    # error); no lines for any other output.
     def __generate_assign_to_ret_param_lines(
-        self, ret_var: str, ret_param_index: int, last_expr_type: str = "()"
+        self, ret_var: str, ret_param_index: int, last_expr_type: str = "()", null_fill: bool = False
     ) -> list[str]:
         assert last_expr_type in ["()", "vk::Result"]
         assert ret_param_index < len(
@@ -389,6 +395,13 @@ class VulkanCommand(NamedTuple):
                 else:
                     assert False, f"Unhandled length parameter type: {len_xml_type}"
 
+            if null_fill:
+                if need_to_assign_len_param or ret_param_xml_type.points_to.name == "void":
+                    return []
+                return [
+                    f"unsafe {{ std::slice::from_raw_parts_mut({ret_rust_param.name}, {len_expr}) "
+                    "}.fill(vk::Handle::from_raw(0));"
+                ]
             lines = []
             if ret_param_xml_type.points_to.name == "void":
                 lines.append(f"let {ret_rust_param.name} = {ret_rust_param.name} as *mut u8;")
@@ -423,6 +436,8 @@ class VulkanCommand(NamedTuple):
                         + ["}"]
                     )
         elif ret_param_xml_type.len is None:
+            if null_fill:
+                return []
             assert (
                 not ret_param_xml_type.is_optional
             ), f"Optional return type in {self.vk_xml_command.name} is not supported."
@@ -512,17 +527,25 @@ class VulkanCommand(NamedTuple):
                 assign_to_ret_param_lines = self.__generate_assign_to_ret_param_lines(
                     "res", param_index, last_expr_type="vk::Result"
                 )
+                null_fill_lines = self.__generate_assign_to_ret_param_lines(
+                    "res", param_index, last_expr_type="vk::Result", null_fill=True
+                )
+                err_lines = ["    Err(e) => e,"]
+                if null_fill_lines:
+                    err_lines = (
+                        ["    Err(e) => {"]
+                        + [8 * " " + line for line in null_fill_lines]
+                        + ["        e", "    }"]
+                    )
                 return (
                     [
                         f"match {ret_var} {{",
                         "    Ok(res) => {",
                     ]
                     + [8 * " " + line for line in assign_to_ret_param_lines]
-                    + [
-                        "    }",
-                        "    Err(e) => e,",
-                        "}",
-                    ]
+                    + ["    }"]
+                    + err_lines
+                    + ["}"]
                 )
             elif self.vk_xml_command.return_type == "void":
                 if len(return_info.main_source_vk_xml_params) != 0:

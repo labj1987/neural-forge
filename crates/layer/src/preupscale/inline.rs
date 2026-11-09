@@ -2307,8 +2307,11 @@ mod tests {
 
     /// A hold recorded with its motion vectors in a guessed layout (not set in its buffer: vkd3d-proton records
     /// in parallel and submits later), found wrong when the buffer is submitted: the hold still runs, but as a
-    /// network frame without history (as the split hold after a reset), and the hold after it starts afresh too
-    /// (a cached hold applies no edit). A guess found right changes nothing.
+    /// network frame without history (as the split hold after a reset), and the hold after it starts afresh too.
+    /// Once the CPU has its reading (`Session::harvest`), it plans the next hold as the GPU left things: a network
+    /// frame without history, not a cached hold, which would find no edit to apply and give DLSS the frame
+    /// unedited (every other frame, while the camera moves and every guess is wrong). A guess found right
+    /// changes nothing.
     #[test]
     fn a_hold_whose_guessed_layout_was_wrong_carries_nothing_to_the_next() {
         let Some(mut rig) = Rig::open(false) else { return };
@@ -2334,12 +2337,23 @@ mod tests {
         rig.submit_checked(&[cb], |_, image| (image == mvec).then_some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
         let got = rig.read(readback);
         assert!(got == split[4], "the hold whose guess was wrong used its history (first difference {:?})", first_difference(&got, &split[4]));
-        // Frame 5 (hold 6, planned as cached on hold 5's refresh): nothing carried over.
+        // Frame 5 (hold 6, recorded once hold 5's reading came back): a network frame starting afresh, not a cached
+        // hold (the guard cleared the edit it would carry, and it would leave the frame unedited).
+        let fresh = rig.split_frame(5, 6, true);
         rig.guessed = crate::preupscale::Guessed::default();
         let readback = rig.record_held(cb, 5, 6);
         rig.submit(&[cb]);
         let got = rig.read(readback);
-        assert!(got == Rig::input(5), "the hold after it applied an edit carried from it (first difference {:?})", first_difference(&got, &Rig::input(5)));
+        assert!(got != Rig::input(5), "the hold after it gave DLSS the frame unedited");
+        assert!(got == fresh, "the hold after it is not a network frame without history (first difference {:?})", first_difference(&got, &fresh));
+        // Planned as one too (the guard's reset of the history on the GPU leaves only the noise seed to tell).
+        let native = rig.session.res_inline(crate::preupscale::placement::Stage::Before).as_ref().and_then(|r| r.native.as_ref()).expect("the native pass");
+        assert_eq!(native.seed(), 0, "the network frame after it was planned with the history's seed");
+        assert_eq!(
+            native.last_stale(),
+            Some(neural_forge_protocol::history::Stale::Unsound),
+            "reset for the hold guard's reason, not as frames gone to DLSS untouched"
+        );
     }
 
     const PROBE_SPV: &[u8] = include_bytes!("../../shaders/test_restore_probe.spv");

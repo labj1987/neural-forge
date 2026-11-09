@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
+// Modified for Neural Forge (2026): ported to ash 0.38; vkGetInstanceProcAddr (UPSTREAM.md).
 
 use std::mem::MaybeUninit;
 
@@ -39,5 +39,7 @@ mock! {
             _p_allocator: Option<&'a vk::AllocationCallbacks<'b>>,
             _p_device: &mut MaybeUninit<vk::Device>,
         ) -> LayerResult<VkResult<()>>;
+
+        fn get_instance_proc_addr(&self, _p_name: &str) -> LayerResult<vk::PFN_vkVoidFunction>;
     }
 }

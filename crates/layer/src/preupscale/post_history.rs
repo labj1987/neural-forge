@@ -240,6 +240,8 @@ pub(crate) fn note_reset(reset: Reset) {
         // Not given here: the game's reset is read from DLSS's input launch, which only the holds before the
         // upscaler belong to.
         Reset::Stale(Stale::GameReset) => crate::log!("[native] after the upscaler: resetting the history (the game reset DLSS's history)"),
+        // Not given here either: the hold guard belongs to the holds inside DLSS's buffer.
+        Reset::Stale(Stale::Unsound) => crate::log!("[native] after the upscaler: resetting the history (the hold guard reset it on the GPU)"),
         Reset::Network => crate::log!("[native] after the upscaler: resetting the history (the network was built again)"),
     }
 }

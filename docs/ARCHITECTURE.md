@@ -680,7 +680,8 @@ is not held before the upscaler.
   (`A2B10G10R10`/`A2R10G10B10`) in the HDR10 colour space (NATIVE_BACKEND.md, "HDR on the finished
   frame"); float16 and 10-bit SDR swapchains are presented untouched.
 - **Primary swapchain:** one per process (the largest plausible game size), so overlays are left
-  alone.
+  alone. A swapchain created with `oldSwapchain` takes over the retired one's claim at creation, so a
+  recreation is not refused while the application keeps the retired swapchain alive.
 - **Warm-up** (`swapchain::Warmup`): the layer engages only after 5 s of steady presents and
   steps back out on loading screens. Composing during GTA V's loading screens used to freeze it.
 
@@ -694,7 +695,9 @@ is not held before the upscaler.
 - **Copy path:** when the import is not possible, or the model works below the frame's size
   (`working_scale` < 1), the layer blits into a smaller scratch image, encodes it
   (`encode.comp`: the white-point divide and the soft knee), reads it back into host-cached
-  memory and copies it into shared memory.
+  memory and copies it into shared memory. The scratch is sRGB when the swapchain is (`*_SRGB`), so
+  the blit keeps the frame's encoded bytes (a blit converts formats); the encode reads them through
+  a `R8G8B8A8_UNORM` storage view (`EXTENDED_USAGE`, Vulkan 1.1) and decodes them once itself.
 - **Model size:** at most 3840x2160 pixels (`NEURAL_FORGE_MAX_MODEL_PIXELS`), always even;
   larger frames are scaled down for the model and the answer scaled back up.
 
@@ -960,7 +963,14 @@ where it differs from what the game gets without it (the defaults, `config.ini`,
 later change for all games still reaches it. An executable's scope is named back from `games.ini`, the shipped
 table and the channel's `game_name`. The GUI's "Settings for" menu and `game-settings set/clear` while the header
 holds that game apply a merge with `persist::apply_scope` (the pending save is flushed first, to the settings it
-was made in); the menu follows `settings_game` once a second. Each bound row learns its setting's name from its `bind_*` call
+was made in); the menu follows `settings_game` once a second. The GUI's delayed save keeps each change with the
+scope the header held when it was made (`game_settings::LiveScope`) and the value, and saves it there
+(`game_settings::save_values`): with the header's value at the time of the save while the header still holds
+that scope (a profile or Reset in between wins), else with the recorded one, so a game's session starting, or
+`game-settings` switching the header, within the delay never moves a change to another scope or loses it. It also keeps
+what the scope's file stored for the setting when the change was made (`game_settings::stored_value`) and saves
+the change only while the file still stores that: a `game-settings clear` or `set` (or a CLI profile) in the delay
+is the newer write and stays. Each bound row learns its setting's name from its `bind_*` call
 (`shm::take_pending_name`) and gets a "This game" mark with a button that clears that one key
 (`game_settings::clear`), shown while the picked game's section has it.
 

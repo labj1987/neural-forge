@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
+// Modified for Neural Forge (2026): ported to ash 0.38; vkAllocateCommandBuffers (UPSTREAM.md).
 
 use mockall::mock;
 
 use crate::{DeviceHooks, LayerResult};
-use ash::vk;
+use ash::{prelude::VkResult, vk};
 
 mock! {
     pub DeviceHooks {}
@@ -39,5 +39,10 @@ mock! {
             _swapchain: vk::SwapchainKHR,
             _p_allocator: Option<&'a vk::AllocationCallbacks<'b>>,
         ) -> LayerResult<()>;
+
+        fn allocate_command_buffers<'a, 'b>(
+            &self,
+            _p_allocate_info: &'a vk::CommandBufferAllocateInfo<'b>,
+        ) -> LayerResult<VkResult<Vec<vk::CommandBuffer>>>;
     }
 }

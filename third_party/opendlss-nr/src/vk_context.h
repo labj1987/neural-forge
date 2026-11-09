@@ -177,6 +177,9 @@ class Context {
   void cudaLaunch(VkCommandBuffer commands, VkCudaFunctionNV function, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
                   uint32_t blockX, uint32_t sharedBytes, const void* const* params, size_t paramCount);
   void transferBarrier(VkCommandBuffer commands);  // compute/transfer -> compute/transfer (captures, uploads)
+  // Compute/transfer -> transfer writes only: before a transfer overwrites what earlier compute or transfer
+  // work (an earlier execution of the same recording) wrote or read.
+  void beforeTransferWrite(VkCommandBuffer commands);
 
   // Timestamps -----------------------------------------------------------------
   VkQueryPool createTimestampPool(uint32_t count);

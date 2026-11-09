@@ -148,7 +148,7 @@ impl Guard {
     /// What `net` needs at `size` (MiB): its last fresh build here scaled by the measured table
     /// (`network_need_mib`) from that build's size to this one, else the table's figure, else a fixed guess.
     fn estimate(&self, net: u32, size: Option<(u32, u32)>) -> u64 {
-        let table = |(w, h): (u32, u32)| network_need_mib(w, h).2;
+        let table = |(w, h): (u32, u32)| network_need_mib(w, h);
         match (self.need.get(net as usize).copied().flatten(), size) {
             (Some((mib, at)), Some(size)) => mib * table(size) / table(at).max(1),
             (Some((mib, _)), None) => mib,
