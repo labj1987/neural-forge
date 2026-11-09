@@ -2516,7 +2516,7 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                     let on = row.is_active();
                     let action = if on { steam::Action::Enable { target_exe: target.borrow().clone() } } else { steam::Action::Disable };
                     let (row_weak, game_for_apply, reverting_for_apply, toasts) = (row.downgrade(), game.clone(), reverting.clone(), toasts.clone());
-                    let (group_for_row, rows_for_row, running) = (group_for_row.clone(), rows_for_row.clone(), running.clone());
+                    let (group_for_row, rows_for_row, running, target) = (group_for_row.clone(), rows_for_row.clone(), running.clone(), target.clone());
                     let apply = move || {
                         let (row, game, reverting) = (row_weak, game_for_apply, reverting_for_apply);
                         if let Some(switch) = row.upgrade() {
@@ -2526,7 +2526,6 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                             let (root, appid) = (game.root.path.clone(), game.appid.clone());
                             let outcome = gio::spawn_blocking(move || steam::apply_now(&root, &appid, &action)).await;
                             let Some(row) = row.upgrade() else { return };
-                            row.set_sensitive(true);
                             let revert = || {
                                 reverting.set(true);
                                 row.set_active(!on);
@@ -2557,6 +2556,9 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                                     toasts.add_toast(toast("Could not change the launch options: the worker stopped"));
                                 }
                             }
+                            // As the scan sets it: a game switched off that cannot be switched on (the Flatpak
+                            // Steam's, or one without a target) keeps its switch insensitive.
+                            row.set_sensitive(switch_usable(&game, &target.borrow(), row.is_active(), running.get()));
                         });
                     };
                     // Switching on a game with anti-cheat asks first; switching off never does.
