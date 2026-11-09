@@ -207,7 +207,7 @@ jobs:
             if [ "$BUMP" = success ] && [ -z "$BUMP_SHA" ]; then
               : # nothing was behind by the time the bump ran
             elif [ -n "$failed" ]; then
-              printf '\nThe automatic bump (%s) did not land, %s is unchanged: %s failed.\n' "${SUMMARY:-not made}" "$GITHUB_REF_NAME" "$failed" >> report.md
+              printf '\nThe automatic bump (%s) did not land, %s is unchanged. Failed: %s.\n' "${SUMMARY:-not made}" "$GITHUB_REF_NAME" "$failed" >> report.md
             else
               printf '\nThe automatic bump (%s) did not land, %s is unchanged: bump %s, check %s, land %s (%s).\n' \
                 "${SUMMARY:-not made}" "$GITHUB_REF_NAME" "$BUMP" "$CI" "$LAND" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> report.md
