@@ -612,6 +612,69 @@ mod tests {
         assert!(!record[..first].contains("commands,") && !record[..first].contains("(commands)"), "nothing recorded before the reset");
     }
 
+    extern "C" {
+        fn nf_native_env_flag(name: *const c_char, fallback: u32) -> u32;
+        fn nf_native_env_number(name: *const c_char, value: *mut u32) -> u32;
+    }
+
+    /// The network's own variables read as every `NEURAL_FORGE_*` variable is (`neural_forge_protocol::env`):
+    /// trimmed, a switch on only for exactly 1 and off for 0, a number only when it is a whole one; anything
+    /// else leaves the default. Before, `=0` turned the fusion switches on (presence counted), a stray space kept
+    /// `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0 ` from working, and `atoi` read junk as 0.
+    #[test]
+    fn the_networks_variables_follow_the_projects_rules() {
+        let flag = |value: Option<&str>, fallback: bool| {
+            // One variable name per call (the process environment is shared with other tests).
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let name = format!("NEURAL_FORGE_NR_ENVTEST_FLAG_{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            if let Some(v) = value {
+                // SAFETY: a name no other code reads.
+                unsafe { std::env::set_var(&name, v) };
+            }
+            let name = std::ffi::CString::new(name).unwrap();
+            // SAFETY: a NUL-terminated name.
+            unsafe { nf_native_env_flag(name.as_ptr(), u32::from(fallback)) != 0 }
+        };
+        for fallback in [false, true] {
+            assert_eq!(flag(None, fallback), fallback, "unset");
+            assert_eq!(flag(Some(" \t"), fallback), fallback, "blank");
+            assert!(flag(Some("1"), fallback) && flag(Some(" 1 "), fallback), "1, trimmed");
+            assert!(!flag(Some("0"), fallback) && !flag(Some("0 "), fallback), "0, trimmed");
+            for junk in ["yes", "2", "01", "on", "true", "-1"] {
+                assert_eq!(flag(Some(junk), fallback), fallback, "{junk:?} is ignored");
+            }
+        }
+        let number = |value: &str| {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let name = format!("NEURAL_FORGE_NR_ENVTEST_NUMBER_{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            // SAFETY: a name no other code reads.
+            unsafe { std::env::set_var(&name, value) };
+            let name = std::ffi::CString::new(name).unwrap();
+            let mut out = 7;
+            // SAFETY: a NUL-terminated name and a valid output.
+            (unsafe { nf_native_env_number(name.as_ptr(), &mut out) } != 0).then_some(out)
+        };
+        assert_eq!(number("128"), Some(128));
+        assert_eq!(number(" 3\n"), Some(3), "trimmed");
+        assert_eq!(number("0"), Some(0));
+        assert_eq!(number("4294967295"), Some(u32::MAX));
+        for junk in ["abc", "12abc", "-1", "+5", "4294967296", "1.5", " ", "0x10"] {
+            assert_eq!(number(junk), None, "{junk:?} is ignored");
+        }
+        // And every variable of the C++ side is read through those rules: no `getenv` outside `nr_env.h`.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for dir in [root.join("cpp"), root.join("../../third_party/opendlss-nr/src")] {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.file_name().is_some_and(|n| n == "nr_env.h") || !path.extension().is_some_and(|e| e == "cpp" || e == "h") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                assert!(!source.contains("getenv("), "{}: a variable read without nr::env", path.display());
+            }
+        }
+    }
+
     /// The layer's slot count and the C++ side's pool count are one number.
     #[test]
     fn hold_slots_match_the_c_side() {

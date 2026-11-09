@@ -1,4 +1,5 @@
 #include "nr_graph.h"
+#include "nr_env.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -130,13 +131,13 @@ FusedLayout postFusedLayout() {
 
 Graph::Routes Graph::routesFromEnvironment() {
   Routes r;
-  r.fusePre = !getenv("NEURAL_FORGE_NR_NO_FUSE_PRE");
-  r.fusePool = !getenv("NEURAL_FORGE_NR_NO_FUSE_POOL");
-  r.fuseUpres = !getenv("NEURAL_FORGE_NR_NO_FUSE_UPRES");
-  r.fusePost = !getenv("NEURAL_FORGE_NR_NO_FUSE_POST");
-  r.chainMask = getenv("NEURAL_FORGE_NR_CHAIN_MASK") ? atoi(getenv("NEURAL_FORGE_NR_CHAIN_MASK")) : 3;   // bit 4 measured neutral
-  r.deferMax = getenv("NEURAL_FORGE_NR_DEFER_MAX") ? (uint32_t)atoi(getenv("NEURAL_FORGE_NR_DEFER_MAX")) : 128u;
-  r.vitChain = getenv("NEURAL_FORGE_NR_VIT_CHAIN") ? atoi(getenv("NEURAL_FORGE_NR_VIT_CHAIN")) != 0 : true;
+  r.fusePre = !env::flag("NEURAL_FORGE_NR_NO_FUSE_PRE", false);
+  r.fusePool = !env::flag("NEURAL_FORGE_NR_NO_FUSE_POOL", false);
+  r.fuseUpres = !env::flag("NEURAL_FORGE_NR_NO_FUSE_UPRES", false);
+  r.fusePost = !env::flag("NEURAL_FORGE_NR_NO_FUSE_POST", false);
+  r.chainMask = env::number("NEURAL_FORGE_NR_CHAIN_MASK").value_or(3u);   // bit 4 measured neutral
+  r.deferMax = env::number("NEURAL_FORGE_NR_DEFER_MAX").value_or(128u);
+  r.vitChain = env::flag("NEURAL_FORGE_NR_VIT_CHAIN", true);
   return r;
 }
 
@@ -418,7 +419,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
       kernels_.expertFfnPtx(commands, ffn, fc);
       if (ffn.stateOut) capture(commands, "block-" + std::to_string(pendingProjection_.block), *ffn.stateOut);
     } else if (options_.fusedBlocks && !options_.captureIntermediates) {
-      static const bool ptxMlp = !getenv("NEURAL_FORGE_NR_NO_PTX_MLP");
+      static const bool ptxMlp = !env::flag("NEURAL_FORGE_NR_NO_PTX_MLP", false);
       Kernels::MlpArgs mlp;
       mlp.input = &state; mlp.broadcastInput = true;
       mlp.output = temps.ffnNarrow; mlp.rows = rows; mlp.K = channels; mlp.hidden = 128; mlp.nout = 32;

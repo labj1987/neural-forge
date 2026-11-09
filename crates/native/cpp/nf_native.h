@@ -214,6 +214,11 @@ void nf_native_weight_bytes(const NfNative* n, uint64_t* raw_loaded, uint64_t* r
 // recording (nf_native_graph_commands*, nf_native_record_graph*) may still run.
 void nf_native_close(NfNative* n);
 
+// How the network reads its NEURAL_FORGE_* variables (nr_env.h), for tests: a switch ("1" on, "0" off,
+// `fallback` when unset, blank or anything else), and a whole number (1 with `*value` set, 0 when unset or not one).
+uint32_t nf_native_env_flag(const char* name, uint32_t fallback);
+uint32_t nf_native_env_number(const char* name, uint32_t* value);
+
 #ifdef __cplusplus
 }
 #endif
