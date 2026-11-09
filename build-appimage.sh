@@ -121,9 +121,8 @@ chmod 755 "$APPDIR/AppRun"
 
 # ── appimagetool ──────────────────────────────────────────────────────
 # Pinned to a released version and verified by checksum (the `continuous` tag moves
-# under us, so two builds of the same commit could use different tools). To bump:
-# pick a release at https://github.com/AppImage/appimagetool/releases, and take the
-# x86_64 asset's sha256 from that release page.
+# under us, so two builds of the same commit could use different tools). The weekly pin
+# check (scripts/check_pins.py --bump) moves the version and its sha256 to each new release.
 APPIMAGETOOL_VERSION="1.9.1"
 APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
 # Kept in .cache/, outside the build directory this script wipes, so a second build reuses it.
@@ -144,8 +143,8 @@ fi
 
 # The runtime appimagetool puts in front of the squashfs. Without --runtime-file it downloads
 # the moving `continuous` build at pack time, so it is pinned and checked the same way.
-# To bump: pick a release at https://github.com/AppImage/type2-runtime/releases and take the
-# sha256 of its runtime-x86_64 asset (download it and run sha256sum).
+# The weekly pin check (scripts/check_pins.py --bump) moves the version and the sha256 of the
+# runtime-x86_64 asset to each new release.
 RUNTIME_VERSION="20251108"
 RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
 RUNTIME="$TOOL_DIR/runtime-x86_64-$RUNTIME_VERSION"

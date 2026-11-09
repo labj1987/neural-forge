@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks the dependency graph with cargo-deny (deny.toml): RustSec advisories, licences and sources. Runs
 # the pinned cargo-deny release below, fetched once (SHA-256 checked) into tools/ (or NEURAL_FORGE_NATIVE_TOOLS);
-# scripts/check_pins.py reads the pin. The advisory database is fetched fresh on every run.
+# scripts/check_pins.py reads and bumps the pin. The advisory database is fetched fresh on every run.
 #   bash scripts/cargo-deny.sh [cargo-deny check arguments]
 set -euo pipefail
 

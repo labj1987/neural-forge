@@ -117,8 +117,8 @@ the 1x1 exposure), not from Filament.
 In the scratch clone (`~/scratch/OpenDLSS-NR/linux/`, not in this repo): `CMakeLists.txt`,
 `build.sh`, `run_ptx.py`, `linux-port.patch` and `load_check.cpp`.
 
-- Pins from `scripts/fetch_tools.ps1`: glslang 16.6.0 (official Linux release binary),
-  Vulkan-Headers `v1.4.367`, volk `vulkan-sdk-1.4.363.0`. CMake 3.31.12 portable (the machine has
+- Pins from upstream's `scripts/fetch_tools.ps1`: glslang (official Linux release binary),
+  Vulkan-Headers and volk (this repository's current pins: `scripts/fetch-native-tools.sh`). CMake 3.31.12 portable (the machine has
   no system cmake), Ninja 1.13.2 and GCC 15.2 from the system.
 - Shaders: `glslang -V --target-env vulkan1.3 -I shaders`, one `.spv` per `.comp` (13). PTX: the
   generator invocations of `build_shaders.ps1` (78 files) under Python with `-I`, through
@@ -296,8 +296,8 @@ section.
 - `crates/native` (`neural-forge-native`): `build.rs` compiles the 13 GLSL kernels with the pinned
   glslang and runs the 78 PTX generator invocations of upstream's `build_shaders.ps1` at build time,
   embeds both (`.incbin`), and compiles the network's C++ with the glue (`cpp/nf_native.cpp`) into the
-  rlib. Nothing prebuilt is committed. `scripts/fetch-native-tools.sh` fetches glslang 16.6.0,
-  Vulkan-Headers v1.4.367 and volk vulkan-sdk-1.4.363.0 (SHA-256 pinned) into `tools/native/`
+  rlib. Nothing prebuilt is committed. `scripts/fetch-native-tools.sh` fetches glslang,
+  Vulkan-Headers and volk (the versions and SHA-256 pinned there) into `tools/native/`
   (ignored); CI runs it. A clean native build takes 3.5 s.
 - libstdc++ is linked statically and nothing of the C++ is exported: the layer's `NEEDED` list is
   unchanged (`libgcc_s`, `libm`, `libc`, `ld-linux`), its dynamic symbols too. volk is compiled as C++
