@@ -866,7 +866,8 @@ stop when the window closes; liveness everywhere is one rule (the heartbeat move
 the Setup tab reads Steam on a worker thread.
 Saved settings live in `~/.config/neural-forge/config.ini` as `set_<name>=` (all games) and
 `games.ini` (each game's own, 7.3), and are applied by the layer when its session on the channel starts. Status comes from heartbeats and counters, refreshed once a
-second; the Status tab's "Model placement" line is `preupscale_state` with the extent, misses and
+second; the Status tab's "Model placement" line is `preupscale_state` with the extent, misses (with state 5,
+`IDENTIFIED`, the reason no hold runs: `preupscale_reason`) and
 the layer's status line (`layer_reason`; a device that cannot run the network is published there as
 "device cannot run the network: <first missing>" when the layer opens the channel).
 

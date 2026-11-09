@@ -17,6 +17,21 @@ pub fn server_state_name(v: u32) -> &'static str {
     }
 }
 
+/// What `preupscale_state` (`neural_forge_protocol::enums::preupscale_state`) means, as `shmctl status` and the
+/// report say it.
+pub fn preupscale_state_name(v: u32) -> &'static str {
+    use neural_forge_protocol::enums::preupscale_state::*;
+    match v {
+        OFF => "off",
+        WAITING => "waiting for DLSS input",
+        HOLDING => "holding before the upscaler",
+        HOLDING_AFTER => "holding after DLSS",
+        HOLDING_BOTH => "holding before the upscaler and after DLSS",
+        IDENTIFIED => "DLSS input identified, not holding",
+        _ => "unknown",
+    }
+}
+
 /// The channel's status text and the game it names, looked at read-only
 /// (`neural_forge_protocol::mapping::open_existing`): `shmctl status`, the report and the GUI's
 /// "Save report" never create the channel, apply settings to it or write to it. Without a
@@ -54,17 +69,8 @@ pub fn status_text(header: &ShmHeader) -> String {
     line(format_args!("layer_capture_gpu_ms={}", f32::from_bits(header.layer_capture_gpu_ms_bits.load(Ordering::Relaxed))));
     line(format_args!("layer_compose_gpu_ms={}", f32::from_bits(header.layer_compose_gpu_ms_bits.load(Ordering::Relaxed))));
     let preupscale = header.preupscale_state.load(Ordering::Relaxed);
-    line(format_args!("preupscale_state={preupscale} ({})", {
-        use neural_forge_protocol::enums::preupscale_state::*;
-        match preupscale {
-            OFF => "off",
-            WAITING => "waiting for DLSS input",
-            HOLDING => "holding before the upscaler",
-            HOLDING_AFTER => "holding after DLSS",
-            HOLDING_BOTH => "holding before the upscaler and after DLSS",
-            _ => "unknown",
-        }
-    }));
+    line(format_args!("preupscale_state={preupscale} ({})", preupscale_state_name(preupscale)));
+    line(format_args!("preupscale_reason={}", header.preupscale_reason()));
     line(format_args!("layer_reason={}", header.layer_reason()));
     line(format_args!("native_running={}", header.native_running.load(Ordering::Relaxed)));
     let hdr = header.hdr_detected.load(Ordering::Relaxed);
@@ -129,6 +135,31 @@ mod tests {
             assert_ne!(server_state_name(state), "unknown");
         }
         assert_eq!(server_state_name(9999), "unknown");
+    }
+
+    #[test]
+    fn preupscale_state_name_covers_every_real_state() {
+        use neural_forge_protocol::enums::preupscale_state::*;
+        let names: Vec<_> = [OFF, WAITING, HOLDING, HOLDING_AFTER, HOLDING_BOTH, IDENTIFIED].map(preupscale_state_name).into();
+        assert!(!names.contains(&"unknown"), "{names:?}");
+        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), names.len(), "each its own: {names:?}");
+        assert_eq!(preupscale_state_name(IDENTIFIED), "DLSS input identified, not holding");
+        assert_eq!(preupscale_state_name(IDENTIFIED + 1), "unknown");
+    }
+
+    /// DLSS identified with every frame refused (#51): the state says so, and the next line says why.
+    #[test]
+    fn the_status_says_why_dlss_identified_is_not_held() {
+        let header = ShmHeader::default();
+        header.init_defaults();
+        let text = status_text(&header);
+        assert!(text.lines().any(|l| l == "preupscale_reason="), "empty while nothing is refused: {text}");
+        header.preupscale_state.store(neural_forge_protocol::enums::preupscale_state::IDENTIFIED, Ordering::Relaxed);
+        header.set_preupscale_reason("no hold inside DLSS's buffer: the colour input is 1920x1080, the identified one 1280x720");
+        let text = status_text(&header);
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines.iter().position(|l| *l == "preupscale_state=5 (DLSS input identified, not holding)").expect(&text);
+        assert_eq!(lines[at + 1], "preupscale_reason=no hold inside DLSS's buffer: the colour input is 1920x1080, the identified one 1280x720");
     }
 
     #[test]

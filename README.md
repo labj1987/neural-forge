@@ -129,6 +129,8 @@ each game's launch options only Neural Forge's part is included).
   of play. The Status tab's Model placement line says where the model runs, or why it does not.
 - **"Waiting for DLSS Super Resolution" never changes.** The game is not using DLSS Super Resolution
   (native resolution counts as not); the model runs on the finished frame instead.
+- **"DLSS input identified, not holding".** Neural Forge found the frame DLSS upscales but cannot hold it,
+  and says why on the same line; the model runs on the finished frame. Attach **Save report**'s zip to an issue.
 - **Something looks wrong.** Press F11 to compare. `NEURAL_FORGE_PREUPSCALE=off` in the launch
   options keeps the network from loading at all.
 - **F11 does nothing.** Add yourself to the `input` group (see [Usage](#usage)).

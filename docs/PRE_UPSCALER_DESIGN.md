@@ -693,8 +693,13 @@ What to look for in the launch log (`grep -F '[preupscale]'`):
 - Dump mode: `[preupscale] dump of the DLSS input (WxH, frame N) written to <dir>: colour.rgba16f, depth.r32f, mvec.rg16f, colour-preview.png, meta.json`.
 
 `neural-forge-cli shmctl status` shows `preupscale_state` (0 off, 1 waiting for DLSS input,
-2 holding), `preupscale_extent`, `preupscale_hold_ms` (the last hold's CPU time) and
-`preupscale_misses` (shared-memory protocol 9).
+2 holding before the upscaler, 3 holding after DLSS, 4 both, 5 DLSS input identified but every frame
+refused), `preupscale_reason` (with 5: the last refusal of the split hold or of the hold inside DLSS's
+buffer, as the layer log's `[preupscale]` lines say each once: `no hold inside DLSS's buffer
+(identification N): ...` for the latter, the reason itself for the split; empty otherwise, protocol 25), `preupscale_extent`, `preupscale_hold_ms` (the last hold's CPU time) and
+`preupscale_misses` (shared-memory protocol 9). State 5 tells a game whose DLSS the layer found but
+cannot hold (Indiana Jones and the Great Circle before its colour input got transfer usage, #51) from one
+without DLSS (1); the model runs after the upscaler in both.
 
 ### Not verified without NVX hardware
 

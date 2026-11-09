@@ -2866,6 +2866,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             hdr.preupscale_width.load(Ordering::Relaxed),
             hdr.preupscale_height.load(Ordering::Relaxed),
             hdr.preupscale_misses.load(Ordering::Relaxed),
+            &hdr.preupscale_reason(),
         );
         // The layer's own status line: the model running, or why it is not.
         let layer_reason = if layer_active { hdr.layer_reason() } else { String::new() };
@@ -3288,9 +3289,10 @@ fn finding_row(finding: &neural_forge_supervisor::doctor::Finding) -> adw::Actio
 
 /// The Status page's one line on the pre-upscaler path, from the header's `preupscale_*` fields
 /// (`neural_forge_protocol::enums::preupscale_state`). `layer_active`: the layer's heartbeat is
-/// fresh; otherwise the fields are a closed game's leftovers.
-fn preupscale_label(layer_active: bool, state: u32, width: u32, height: u32, misses: u32) -> String {
-    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH, WAITING};
+/// fresh; otherwise the fields are a closed game's leftovers. `reason`: why no hold runs while DLSS's input is
+/// identified (`preupscale_reason`, with `IDENTIFIED`).
+fn preupscale_label(layer_active: bool, state: u32, width: u32, height: u32, misses: u32, reason: &str) -> String {
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH, IDENTIFIED, WAITING};
     let missed = if misses == 0 { String::new() } else { format!(", {misses} frame{} missed", if misses == 1 { "" } else { "s" }) };
     match state {
         _ if !layer_active => "no game running".to_string(),
@@ -3298,6 +3300,8 @@ fn preupscale_label(layer_active: bool, state: u32, width: u32, height: u32, mis
         HOLDING_AFTER => format!("after DLSS, before the HUD: holding DLSS's {width}x{height} output{missed}"),
         HOLDING_BOTH => format!("before the upscaler and after DLSS, before the HUD{missed}"),
         WAITING => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
+        IDENTIFIED if reason.is_empty() => format!("after the upscaler: DLSS input identified, not holding{missed}"),
+        IDENTIFIED => format!("after the upscaler: DLSS input identified, not holding{missed} -- {reason}"),
         _ => "after the upscaler".to_string(),
     }
 }
@@ -3448,14 +3452,25 @@ mod preupscale_label_tests {
 
     #[test]
     fn says_where_the_model_runs_in_one_line() {
-        assert_eq!(preupscale_label(false, 2, 1485, 836, 3), "no game running");
-        assert_eq!(preupscale_label(true, 0, 0, 0, 0), "after the upscaler");
-        assert_eq!(preupscale_label(true, 1, 0, 0, 0), "after the upscaler: waiting for DLSS Super Resolution");
-        assert_eq!(preupscale_label(true, 2, 1485, 836, 0), "before the upscaler: holding DLSS's 1485x836 input");
-        assert_eq!(preupscale_label(true, 2, 1485, 836, 1), "before the upscaler: holding DLSS's 1485x836 input, 1 frame missed");
-        assert_eq!(preupscale_label(true, 1, 1485, 836, 85), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
-        assert_eq!(preupscale_label(true, 3, 2560, 1440, 0), "after DLSS, before the HUD: holding DLSS's 2560x1440 output");
-        assert_eq!(preupscale_label(true, 4, 2560, 1440, 2), "before the upscaler and after DLSS, before the HUD, 2 frames missed");
+        assert_eq!(preupscale_label(false, 2, 1485, 836, 3, ""), "no game running");
+        assert_eq!(preupscale_label(true, 0, 0, 0, 0, ""), "after the upscaler");
+        assert_eq!(preupscale_label(true, 1, 0, 0, 0, ""), "after the upscaler: waiting for DLSS Super Resolution");
+        assert_eq!(preupscale_label(true, 2, 1485, 836, 0, ""), "before the upscaler: holding DLSS's 1485x836 input");
+        assert_eq!(preupscale_label(true, 2, 1485, 836, 1, ""), "before the upscaler: holding DLSS's 1485x836 input, 1 frame missed");
+        assert_eq!(preupscale_label(true, 1, 1485, 836, 85, ""), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
+        assert_eq!(preupscale_label(true, 3, 2560, 1440, 0, ""), "after DLSS, before the HUD: holding DLSS's 2560x1440 output");
+        assert_eq!(preupscale_label(true, 4, 2560, 1440, 2, ""), "before the upscaler and after DLSS, before the HUD, 2 frames missed");
+    }
+
+    /// DLSS runs with its input identified but every frame is refused (#51): the line says so, and why.
+    #[test]
+    fn says_why_an_identified_dlss_input_is_not_held() {
+        let why = "no hold inside DLSS's buffer: the colour input is 1920x1080, the identified one 1280x720";
+        assert_eq!(preupscale_label(true, 5, 1280, 720, 0, why), format!("after the upscaler: DLSS input identified, not holding -- {why}"));
+        assert_eq!(preupscale_label(true, 5, 1280, 720, 2, why), format!("after the upscaler: DLSS input identified, not holding, 2 frames missed -- {why}"));
+        assert_eq!(preupscale_label(true, 5, 1280, 720, 0, ""), "after the upscaler: DLSS input identified, not holding");
+        assert_eq!(preupscale_label(false, 5, 1280, 720, 0, why), "no game running");
+        assert_eq!(preupscale_label(true, 1, 0, 0, 0, why), "after the upscaler: waiting for DLSS Super Resolution", "the reason belongs to state 5 only");
     }
 }
 
