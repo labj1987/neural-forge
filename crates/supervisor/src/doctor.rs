@@ -318,12 +318,24 @@ pub fn render_text(findings: &[Finding]) -> String {
 
 // ---- the five original checks ------------------------------------------------------------------
 
+/// `config.ini` holds only the settings changed from their defaults, and nothing on the way from
+/// installing to playing writes it, so a missing file is normal. Only one that exists and cannot be read
+/// fails: settings cannot be saved then ([`crate::Config::save`] refuses), and the layer runs on the defaults.
 fn check_config(roots: &Roots) -> Finding {
     let path = roots.config_file.display().to_string();
-    if roots.config_file.exists() {
-        Finding::new("config", Severity::Ok, "the config file exists", path, None)
+    let cfg = crate::Config::load_from(&roots.config_file.to_string_lossy());
+    if let Some(why) = cfg.read_error() {
+        Finding::new(
+            "config",
+            Severity::Failure,
+            "the config file cannot be read",
+            why.to_string(),
+            Some("Make it a readable file again (its permissions, its owner), or move it aside to start again from the defaults. Until then no setting can be saved.".into()),
+        )
+    } else if roots.config_file.exists() {
+        Finding::new("config", Severity::Ok, "the saved settings can be read", path, None)
     } else {
-        Finding::new("config", Severity::Failure, "the config file is missing", path, Some("Run `neural-forge-cli init`.".into()))
+        Finding::new("config", Severity::Info, "no saved settings yet: the defaults apply", path, None)
     }
 }
 
@@ -1338,7 +1350,9 @@ mod tests {
     fn the_original_checks_report_a_missing_config_and_model() {
         let f = quiet();
         let v = run(&f.roots);
-        assert_eq!(one(&v, "config").severity, Severity::Failure);
+        // Nothing on the way from installing to playing writes config.ini: missing means the defaults apply.
+        assert_eq!(one(&v, "config").severity, Severity::Info);
+        assert_eq!(one(&v, "config").summary, "no saved settings yet: the defaults apply");
         assert_eq!(one(&v, "model").severity, Severity::Failure);
         assert_eq!(one(&v, "nvngx-dll").severity, Severity::Info, "the DLL is only needed to extract");
         assert_eq!(one(&v, "user-dirs").severity, Severity::Ok, "they can be created");
@@ -1381,6 +1395,21 @@ mod tests {
         std::fs::write(&first, [9u8; 16]).unwrap();
         let m = one(&run(&f.roots), "model").clone();
         assert_eq!((m.severity, m.summary.as_str()), (Severity::Failure, "the extracted small network is damaged: the network cannot load it"));
+    }
+
+    #[test]
+    fn a_config_that_exists_but_cannot_be_read_fails() {
+        let f = quiet();
+        // A directory where the file goes: it exists, and reading it fails with something other than NotFound.
+        std::fs::create_dir_all(&f.roots.config_file).unwrap();
+        let c = check_config(&f.roots);
+        assert_eq!((c.severity, c.summary.as_str()), (Severity::Failure, "the config file cannot be read"));
+        assert!(c.evidence.contains("cannot be read"), "{}", c.evidence);
+        assert!(c.fix.as_deref().is_some_and(|fix| fix.contains("move it aside")), "{:?}", c.fix);
+        // Readable again: OK.
+        std::fs::remove_dir(&f.roots.config_file).unwrap();
+        write(&f.roots.config_file, "set_intensity=0.5\n");
+        assert_eq!(check_config(&f.roots).severity, Severity::Ok);
     }
 
     #[test]
