@@ -5,7 +5,8 @@
 /// memory").
 pub const NETWORK_VRAM_MIB: [(u32, u32, u64); 4] = [(1485, 836, 377), (2228, 1253, 607), (2560, 1440, 729), (3840, 2160, 1415)];
 
-/// The small network takes about this much less than the full one at the same size.
+/// The small network takes about this much less than the full one at the same size (45-46 MiB at each size of
+/// [`NETWORK_VRAM_MIB`]: the rig's `what_each_network_takes_at_the_tables_sizes`, 2026-11-09).
 pub const SMALL_LESS_MIB: u64 = 45;
 
 /// The full network's need at `width` x `height`: the smallest measured size that covers it, or the largest.

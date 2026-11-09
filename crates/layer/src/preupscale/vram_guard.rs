@@ -9,12 +9,15 @@
 //!
 //! So a step down needs both signs at once: the device at its VRAM budget (`VK_EXT_memory_budget`), and
 //! the network's GPU time far above its best since it was built (or above [`SPILL_ABS_MS`]), for
-//! [`SPILL_FOR`]; or a build that ended with the device already at its budget. The full network steps
-//! down to the small one (about half its memory), the small one to [`Level::Paused`]: no network, frames
-//! go to DLSS untouched and the game gets the memory back. A step up waits until the budget has room for
-//! the bigger network (as much as its last build took, plus [`ROOM_MARGIN_MIB`]) for [`ROOM_FOR`], and at
-//! least the current backoff since the last step down, which doubles when a step up is followed by a step
-//! down within [`FLAP_WINDOW`].
+//! [`SPILL_FOR`]; or a build that ended with the device already at its budget. A step down pauses the
+//! network ([`Level::Paused`]: no network, frames go to DLSS untouched and the game gets the memory back).
+//! The full network steps down to the small one first only where the small one needs at least
+//! [`SMALL_STEP_MIN_MIB`] less: with NVIDIA's 310.9.16 networks it never does (45-46 MiB less at every size,
+//! measured 2026-11-09 by the rig's `what_each_network_takes_at_the_tables_sizes`), and a step that frees so
+//! little cannot end a spill, it only costs a rebuild before the pause. A step up waits until the budget has
+//! room for the bigger network (as much as its last build took, plus [`ROOM_MARGIN_MIB`]) for [`ROOM_FOR`],
+//! and at least the current backoff since the last step down, which doubles when a step up is followed by a
+//! step down within [`FLAP_WINDOW`].
 //!
 //! The guard only decides ([`Guard::proposal`]); the loader applies a step where a switch of the Network
 //! setting is applied, after the frames that used the network were drained. A change of the setting
@@ -40,6 +43,9 @@ const WINDOW: Duration = Duration::from_secs(1);
 const WINDOW_MIN: usize = 5;
 /// Samples after a build before its best time counts (the first frames warm the clocks and caches).
 const WARMUP: u32 = 10;
+/// The small network is a step of its own only when it needs at least this much less than the full one at the
+/// size the holds want: twice the budget's margin, below which the difference is lost in the reading.
+pub(crate) const SMALL_STEP_MIN_MIB: u64 = 2 * OVER_MARGIN_MIB;
 /// A step up needs room for the bigger network plus this, for this long.
 pub(crate) const ROOM_MARGIN_MIB: u64 = 512;
 pub(crate) const ROOM_FOR: Duration = Duration::from_secs(10);
@@ -82,6 +88,8 @@ pub(crate) struct Guard {
     need: [Option<(u64, (u32, u32))>; 2],
     /// Why the last step down was taken, for the status line.
     why: Option<String>,
+    /// The size the holds last wanted (or the last build's), for the needs a step down compares.
+    size: Option<(u32, u32)>,
 }
 
 fn at_budget((used, budget): (u64, u64)) -> bool {
@@ -134,7 +142,7 @@ impl Guard {
     /// The Network setting changed: the guard starts afresh with the chosen network (what each network
     /// needs is kept: it is the device's).
     pub(crate) fn reset(&mut self) {
-        *self = Self { need: self.need, ..Self::default() };
+        *self = Self { need: self.need, size: self.size, ..Self::default() };
     }
 
     /// What `net` needs at `size` (MiB): its last fresh build here scaled by the measured table
@@ -147,6 +155,12 @@ impl Guard {
             (None, Some(size)) => table(size).saturating_sub(if net == network::SMALL { SMALL_LESS_MIB } else { 0 }),
             (None, None) => UNKNOWN_NEED_MIB,
         }
+    }
+
+    /// Whether the small network is worth a step of its own in place of the full one: it needs at least
+    /// [`SMALL_STEP_MIN_MIB`] less at the size the holds want (estimated as for a step up).
+    fn small_frees_enough(&self) -> bool {
+        self.estimate(network::SMALL, self.size) + SMALL_STEP_MIN_MIB <= self.estimate(network::FULL, self.size)
     }
 
     /// A build of `running` finished, for `size` (its first). `fresh_need`: the VRAM a fresh open and build
@@ -166,6 +180,7 @@ impl Guard {
         if let (Some(need), Some(slot)) = (fresh_need, self.need.get_mut(running as usize)) {
             *slot = Some((need, size));
         }
+        self.size = Some(size);
         self.samples.clear();
         self.seen = 0;
         self.best_ms = None;
@@ -210,6 +225,9 @@ impl Guard {
         small_present: bool,
         now: Instant,
     ) -> Option<String> {
+        if size.is_some() {
+            self.size = size;
+        }
         let reading = reading?;
         if self.proposal.is_some() {
             return None;
@@ -239,7 +257,7 @@ impl Guard {
         let up = match self.level {
             Level::Chosen => return None,
             Level::Small => Level::Chosen,
-            Level::Paused if choice == network::FULL && small_present => Level::Small,
+            Level::Paused if choice == network::FULL && small_present && self.small_frees_enough() => Level::Small,
             Level::Paused => Level::Chosen,
         };
         let want = match up {
@@ -272,7 +290,7 @@ impl Guard {
 
     fn step_down(&mut self, choice: u32, small_present: bool, now: Instant, why: String) -> Option<String> {
         let down = match self.level {
-            Level::Chosen if choice == network::FULL && small_present => Level::Small,
+            Level::Chosen if choice == network::FULL && small_present && self.small_frees_enough() => Level::Small,
             Level::Chosen | Level::Small => Level::Paused,
             Level::Paused => return None,
         };
@@ -321,7 +339,8 @@ mod tests {
     }
 
     /// The 2 GiB case: the device at its budget and the network twenty times slower than its best: the
-    /// full network steps down to the small one after two seconds of it, not before.
+    /// full network steps down after two seconds of it, not before; to the small one, which in these
+    /// builds (1500 against about 560 MiB) frees enough to be a step of its own.
     #[test]
     fn a_spilled_network_steps_down_to_the_small_one() {
         let base = Instant::now();
@@ -383,9 +402,10 @@ mod tests {
         assert_eq!(g.apply(), Some(Level::Paused), "no small network extracted");
     }
 
-    /// Paused: once the budget has room for the small network (its last build plus the margin) for ten
-    /// seconds and the backoff has passed, it comes back; then the full one once there is room for it
-    /// (counting what closing the small one frees). Not before.
+    /// Paused, with a small network that frees enough (700 against 1500 MiB here): once the budget has room
+    /// for the small network (its last build plus the margin) for ten seconds and the backoff has passed, it
+    /// comes back; then the full one once there is room for it (counting what closing the small one frees).
+    /// Not before.
     #[test]
     fn room_again_steps_back_up_one_level_at_a_time() {
         let base = Instant::now();
@@ -445,20 +465,47 @@ mod tests {
         assert_eq!(g.estimate(FULL, Some((2228, 1253))), 1352 * 607 / 1415);
         assert_eq!(g.estimate(SMALL, Some((2228, 1253))), 607 - SMALL_LESS_MIB, "no build of it: the table");
         assert!(g.fake_spill(FULL, true, base).unwrap().contains("NEURAL_FORGE_NATIVE_FAIL=vram"));
-        g.apply();
-        g.built(SMALL, Some(370), (2228, 1253), None, FULL, true, t(base, 100));
-        // 800 MiB free + 370 the small one frees: room for the full one at 2228x1253 (580 + 512), not at 4K (1352 + 512).
+        assert_eq!(g.apply(), Some(Level::Paused));
+        // 1100 MiB free: room for the full one at 2228x1253 (580 + 512), not at 4K (1352 + 512).
         let s = Some((2228, 1253));
-        assert!(g.tick(Some((7200, 8000)), Some(SMALL), s, FULL, true, t(base, 40_000)).is_none());
-        assert!(g.tick(Some((7200, 8000)), Some(SMALL), s, FULL, true, t(base, 50_000)).is_some());
+        assert!(g.tick(Some((6900, 8000)), None, s, FULL, true, t(base, 40_000)).is_none());
+        assert!(g.tick(Some((6900, 8000)), None, s, FULL, true, t(base, 50_000)).unwrap().contains("back to the full network"));
         let mut g = Guard::default();
         g.built(FULL, Some(1352), (3840, 2160), None, FULL, true, base);
         g.fake_spill(FULL, true, base);
         g.apply();
-        g.built(SMALL, Some(370), (3840, 2160), None, FULL, true, t(base, 100));
         let s = Some((3840, 2160));
-        assert!(g.tick(Some((7200, 8000)), Some(SMALL), s, FULL, true, t(base, 40_000)).is_none());
-        assert!(g.tick(Some((7200, 8000)), Some(SMALL), s, FULL, true, t(base, 50_000)).is_none(), "no room for the 4K build");
+        assert!(g.tick(Some((6900, 8000)), None, s, FULL, true, t(base, 40_000)).is_none());
+        assert!(g.tick(Some((6900, 8000)), None, s, FULL, true, t(base, 50_000)).is_none(), "no room for the 4K build");
+    }
+
+    /// NVIDIA's 310.9.16 networks as measured on the rig (2026-11-09): the small one takes only 45-46 MiB less than the
+    /// full one at every size, so a spill pauses the full network at once (a step to the small one would free too little
+    /// to end it) and room again brings the full one straight back, from the table alone and from real builds.
+    #[test]
+    fn a_small_network_that_frees_too_little_is_skipped() {
+        let base = Instant::now();
+        let s = (2560, 1440);
+        let mut g = Guard::default();
+        let line = g.built(FULL, None, s, Some((11_900, 11_950)), FULL, true, base).expect("a step down");
+        assert!(line.contains("paused"), "{line}");
+        assert_eq!(g.apply(), Some(Level::Paused));
+        assert!(g.tick(Some((10_000, 11_950)), None, Some(s), FULL, true, t(base, 40_000)).is_none());
+        let line = g.tick(Some((10_000, 11_950)), None, Some(s), FULL, true, t(base, 50_000)).expect("a step up");
+        assert!(line.contains("back to the full network"), "{line}");
+        assert_eq!(g.apply(), Some(Level::Chosen));
+        // With both networks' real builds recorded (729 and 683 MiB) it is the same.
+        let mut g = Guard::default();
+        g.built(SMALL, Some(683), s, None, SMALL, true, base);
+        g.built(FULL, Some(729), s, None, FULL, true, base);
+        assert!(!g.small_frees_enough());
+        assert!(g.fake_spill(FULL, true, base).unwrap().contains("paused"));
+        // A small network that does free enough is still a step of its own.
+        let mut g = Guard::default();
+        g.built(SMALL, Some(729 - SMALL_STEP_MIN_MIB), s, None, SMALL, true, base);
+        g.built(FULL, Some(729), s, None, FULL, true, base);
+        assert!(g.small_frees_enough());
+        assert!(g.fake_spill(FULL, true, base).unwrap().contains("small network runs"));
     }
 
     /// A change of the Network setting starts the guard afresh (keeping what each network needs); without

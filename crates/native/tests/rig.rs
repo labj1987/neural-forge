@@ -914,6 +914,37 @@ fn shared_activations_take_less_memory() {
     }
 }
 
+/// What a fresh open and build of each network takes (device-local memory, `VK_EXT_memory_budget`), at the sizes of
+/// `neural_forge_protocol::vram_need::NETWORK_VRAM_MIB`: the figures the VRAM guard and doctor use. Each open is its own
+/// (dropped before the next), measured from before the open to after the build, as the layer measures a fresh build.
+/// The small network needs `NEURAL_FORGE_NATIVE_SMALL_MODEL` or the installed `model/small`.
+#[test]
+fn what_each_network_takes_at_the_tables_sizes() {
+    if std::env::var_os("NEURAL_FORGE_NATIVE_RIG").is_none() {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
+        return;
+    }
+    let _one = one_at_a_time();
+    let g = gpu();
+    let small = std::env::var_os("NEURAL_FORGE_NATIVE_SMALL_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/neural-forge/model/small"));
+    let mib = |b: u64| b >> 20;
+    for (w, h, table) in neural_forge_protocol::vram_need::NETWORK_VRAM_MIB {
+        let mut taken = [0u64; 2];
+        for (i, dir) in [model_dir(), small.clone()].iter().enumerate() {
+            let base = device_local_usage(&g);
+            let mut net = open_network(&g, dir, chain_wanted());
+            // SAFETY: a fresh network; nothing of it was submitted.
+            unsafe { net.build(w, h) }.expect("build");
+            taken[i] = device_local_usage(&g).saturating_sub(base);
+            drop(net);
+        }
+        eprintln!("{w}x{h}: full {} MiB, small {} MiB (table: full {table} MiB)", mib(taken[0]), mib(taken[1]));
+        assert!(taken[1] <= taken[0] + (16 << 20), "{w}x{h}: the small network took more than the full one");
+    }
+}
+
 /// A build never holds much more than it keeps: its activations are placed by lifetime before the warm-up runs, not
 /// allocated each on its own first (which took about twice the kept memory at the moment of the build, and when a game had
 /// filled its VRAM budget the driver moved the game's memory to system memory for good). Sampled every millisecond

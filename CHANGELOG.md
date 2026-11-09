@@ -4,6 +4,17 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.11.0 — 2026-11-09
+
+- When video memory runs short, the network now pauses at once instead of first switching to the small network.
+  The small network needs only about 45 MiB less video memory than the full one, too little to help, so the
+  switch only cost a reload before the pause. When there is room again, the network you chose comes straight back.
+- Driver 620.70.06 is tested.
+- Known issue: Hogwarts Legacy's own DLSS 5 (its Neural Rendering setting) does nothing under Proton. Neural Forge
+  runs in it as usual.
+- The user guide shows how to choose NVIDIA's own DLSS 5 preset in a game that ships it, for comparing it with
+  Neural Forge.
+
 ## 3.10.0 — 2026-11-07
 
 - HDR10 games now get the model on the finished frame too (placement **Finished frame**, or Auto where there is no

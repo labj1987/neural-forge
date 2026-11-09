@@ -3837,8 +3837,9 @@ pub(crate) struct Retries {
 }
 
 /// `NEURAL_FORGE_NATIVE_FAIL=vram`: the VRAM guard steps down as if the network had spilled at the 600th network frame
-/// and again at the 900th (inside the backoff, so from the small network to the pause), to exercise the step to the small network, the pause (with the hold's resources freed)
-/// and the way back on the rig. Unset (the default) does nothing.
+/// and again at the 900th (inside the backoff: from a small network that frees enough to the pause; with NVIDIA's
+/// networks the first step is already the pause, so no 900th frame comes), to exercise the steps, the pause (with the
+/// hold's resources freed) and the way back on the rig. Unset (the default) does nothing.
 fn fake_vram_spill(frames: u64) -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_NATIVE_FAIL").as_deref() == Some("vram"));
     *ON && (frames == 600 || frames == 900)
