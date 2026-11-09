@@ -968,6 +968,7 @@ fn record_inline_hold(
     #[cfg(target_arch = "x86_64")]
     for h in inline.take_harvest() {
         inline_tally_n("ran", h.runs);
+        crate::preupscale::note_held_inside(h.runs);
         session.harvest(h);
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -2104,6 +2105,9 @@ impl NeuralForgeDeviceInfo {
             }
             session.check_exposure(scan.identification, &hold);
             session.note_exposure_source(scan.identification, &inputs, &hold);
+            if hold.wrote_back {
+                crate::preupscale::note_held_split();
+            }
             session.note(shm, &hold, cpu, extent);
             if let Some(frame) = hold.dump.take() {
                 // A waiting one-shot is this dump's (`dump_owns_one_shot`): its outcome names the dump.

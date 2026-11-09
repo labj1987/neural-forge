@@ -635,6 +635,17 @@ impl ShmClient {
         hdr.preupscale_height.store(height, Ordering::Relaxed);
     }
 
+    /// Why no hold ran while DLSS's input is identified (`preupscale_state::IDENTIFIED`), or empty.
+    pub fn publish_preupscale_reason(&self, reason: &str) {
+        let Some(hdr) = self.header() else { return };
+        hdr.set_preupscale_reason(reason);
+    }
+
+    /// Whether the header already says `reason` ([`Self::publish_preupscale_reason`]); true without a header.
+    pub fn preupscale_reason_is(&self, reason: &str) -> bool {
+        self.header().is_none_or(|hdr| hdr.preupscale_reason() == reason)
+    }
+
     /// The last hold's CPU milliseconds and the running count of answers over budget.
     pub fn publish_preupscale_hold(&self, hold_ms: f32, misses: u32) {
         let Some(hdr) = self.header() else { return };

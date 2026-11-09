@@ -19,6 +19,10 @@ pub mod preupscale_state {
     pub const HOLDING_AFTER: u32 = 3;
     /// Holding both: some passes run before the upscaler and the rest after DLSS.
     pub const HOLDING_BOTH: u32 = 4;
+    /// DLSS runs with its inputs identified, but no hold ran lately: every frame was refused, and
+    /// `ShmHeader::preupscale_reason` says why (the last reason the split hold or the hold inside DLSS's
+    /// buffer gave). The model runs after the upscaler meanwhile, as with [`WAITING`].
+    pub const IDENTIFIED: u32 = 5;
 }
 
 /// Which of the networks `extract-model` writes the layer runs (`ShmHeader::network`, the Network

@@ -409,7 +409,8 @@ and summarises engage/disengage transitions and the frame rate.
 | `[native] <why>; frames go to DLSS untouched, trying again in N ms`, `the network is up again after N failed attempt(s)` | on a failed build | The retry schedule. |
 | `[native] resetting the history (...)` | on a reset | A gap, another extent, or untouched frames. |
 | `[native] answering the after-the-upscaler path's requests on queue N of family M` | once per device | The model server for the after-the-upscaler path is up. |
-| `[preupscale] launch-bearing submits: N held reading the colour input, N held undecided, N forwarded untouched` | every 3000 forwarded submits | Frame generation's submits being left alone. |
+| `[preupscale] launch-bearing submits: N named the colour input, N undecided, N forwarded untouched; holds: N split, N inside DLSS's buffer` | every 3000 forwarded submits | Frame generation's submits being left alone; how many frames were actually held, by each hold (a submit that names the colour input may still be refused). |
+| `[preupscale] no hold inside DLSS's buffer (identification N): <why>; colour input 0x… WxH FORMAT USAGE` | once per identification and reason | Why a launch naming the colour input got no hold inside its buffer (missing transfer usage, format, extent, layout, a suspended render pass, or left to the split). |
 | `[hotkey] watching N keyboard(s) through evdev` / `watching XInput2 raw keys on :0` / `no way to read the keyboard here ...` | first poll | Which keyboard backend the toggle key uses. |
 | `[layer] fence wait timed out after 5s at <site> ...` | on a timeout | A driver stall without device loss; a breadcrumb dump follows. |
 

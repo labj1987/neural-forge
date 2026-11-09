@@ -1743,7 +1743,7 @@ What changed (`Tracker::switch_by_evidence`, `Tracker::retarget`):
   it this frame)`, and, if the target changes more than 4 times in 60 held submits, `DLSS's input
   kernel alternates between colour candidates 0x... and 0x... (...): each submit is held with the
   candidate its input launch names`. The tally counts them:
-  `N held reading the colour input (M of them another candidate their input launch names)`.
+  `N named the colour input (M of them another candidate their input launch names)`.
 - **Scope.** Only among the size rule's candidates (render-size RGBA16F storage images smaller than
   the output, with depth and motion vectors at their extent). GTA V (one candidate) and DLAA (no
   size-rule candidate) never switch or retarget. A buffer naming another candidate without an input

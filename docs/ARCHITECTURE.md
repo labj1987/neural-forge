@@ -145,8 +145,10 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   sequence-locked capture result the layer publishes: request id, state (running, written, failed,
   cancelled), reason, pairs written and composed, the files' paths (5.7).
 - **Pre-upscaler status (v9):** `preupscale_state` (`enums::preupscale_state`: off, waiting for DLSS
-  input, holding), `preupscale_width`/`height`, `preupscale_hold_ms`, `preupscale_misses`,
-  `native_running` (v13).
+  input, holding before the upscaler, after DLSS or both, and DLSS identified but every frame refused),
+  `preupscale_width`/`height`, `preupscale_hold_ms`, `preupscale_misses`, `native_running` (v13), and
+  `preupscale_reason` (v25, 2580: why no hold ran while DLSS is identified, the last refusal of either hold;
+  empty in every other state).
 - **Device loss (v16):** `device_lost_at`.
 - **Edit cache (v17):** `preupscale_dump_request` (cleared by `init_defaults` and when a game's layer
   starts a session on the channel, so a request left for an earlier game never fires on the next),
@@ -204,7 +206,8 @@ be private.
 | 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended; then the colour of the edit (`edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`, `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`) and `pass_colour[10]` (override bits `EDIT_SATURATION` 128, `EDIT_CONTRAST` 256, `EDIT_DETAIL` 512); then `placement`, `pass_placement[10]` (override bit `PLACEMENT` 1024), `hud_detect`, `hud_region_count` and `hud_region[8]` | 3.8.0 |
 | 22 | `preupscale_brightness` and `preupscale_exposure` (what the network sees before the upscaler: its brightness and where the exposure comes from) and `preupscale_network_gpu_ms` (the network's GPU time on its last hold) appended | 3.8.10 |
 | 23 | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection` and `edit_highlight_protection` (the Oklab protections of each pass's result against its input) appended | 3.10.0 |
-| 24 | `settings_game` (whose settings the header holds: all games or one game's) and `running_game` (the game whose layer holds the channel), then `sharpen_cas`, `clarity_strength`, `clarity_radius`, `clarity_midtones` and `clarity_edges` (the sharpening of the finished frame: FidelityFX CAS and Clarity) appended | unreleased |
+| 24 | `settings_game` (whose settings the header holds: all games or one game's) and `running_game` (the game whose layer holds the channel), then `sharpen_cas`, `clarity_strength`, `clarity_radius`, `clarity_midtones` and `clarity_edges` (the sharpening of the finished frame: FidelityFX CAS and Clarity) appended | 3.12.0 |
+| 25 | `preupscale_reason` (why no hold ran while DLSS's input is identified; `preupscale_state` 5, `IDENTIFIED`) appended | unreleased |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.

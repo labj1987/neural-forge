@@ -1387,8 +1387,9 @@ pub(crate) struct Tracker {
     /// Launch-bearing submits whose buffers all had readable parameters none of which named the
     /// colour input (DLSS Frame Generation's, in GTA V), forwarded untouched.
     pub(crate) foreign_submits: u64,
-    /// Held launch-bearing submits whose held buffer reads the colour input.
-    pub(crate) colour_submits: u64,
+    /// Launch-bearing submits whose launch buffer names the colour input: the hold point, though either hold may
+    /// still refuse the frame ([`HOLDS_SPLIT`] and [`HOLDS_INSIDE`] count the holds that ran).
+    pub(crate) named_colour_submits: u64,
     /// Forwarded (foreign) launch-bearing buffers whose launches name another colour candidate
     /// ([`Inputs::others`]) and not the colour input, and the first such candidate seen: evidence
     /// for a game that alternates DLSS's colour input between images (none is held for it).
@@ -1527,7 +1528,7 @@ pub(crate) struct Tracker {
     streak: Option<(Named, u32)>,
     /// Held launch-bearing submits whose buffer's input launch names another size-rule candidate
     /// (with the colour input's depth and motion vectors): held with that candidate as the target
-    /// ([`Self::scan`]). Counted in [`Self::colour_submits`] too.
+    /// ([`Self::scan`]). Counted in [`Self::named_colour_submits`] too.
     pub(crate) retargeted_submits: u64,
     retarget_named: Option<vk::Image>,
     /// The last held submit's target colour image, and the evaluations at which it changed (the
@@ -1844,6 +1845,49 @@ impl InlineRefusal {
             Self::LeftToSplit => 10,
         }
     }
+}
+
+/// Why the last frame DLSS ran with was not held, for the status ([`Session::publish_status`]): a reason the split
+/// hold or the hold inside DLSS's buffer gave.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Refusal {
+    Text(std::borrow::Cow<'static, str>),
+    Inside(InlineRefusal),
+}
+
+impl Refusal {
+    fn text(&self) -> String {
+        match self {
+            Self::Text(t) => t.to_string(),
+            Self::Inside(r) => format!("no hold inside DLSS's buffer: {}", r.said().unwrap_or_default()),
+        }
+    }
+}
+
+/// The process's last [`Refusal`] (any device's; the status describes the game, as [`LAST_HELD`] does).
+static LAST_REFUSAL: Mutex<Option<Refusal>> = Mutex::new(None);
+
+/// Notes why a frame was not held, for the status.
+pub(crate) fn note_refusal(refusal: Refusal) {
+    let mut last = lock(&LAST_REFUSAL);
+    if last.as_ref() != Some(&refusal) {
+        *last = Some(refusal);
+    }
+}
+
+/// Holds that ran, for the tally line ([`Tracking::scan`]): split holds that wrote back, and holds recorded
+/// inside DLSS's buffers that ran (each run of a buffer counts).
+static HOLDS_SPLIT: AtomicU64 = AtomicU64::new(0);
+static HOLDS_INSIDE: AtomicU64 = AtomicU64::new(0);
+
+/// A split hold wrote its frame back.
+pub(crate) fn note_held_split() {
+    HOLDS_SPLIT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Buffers with a hold inside them ran `runs` times.
+pub(crate) fn note_held_inside(runs: u32) {
+    HOLDS_INSIDE.fetch_add(u64::from(runs), Ordering::Relaxed);
 }
 
 /// Where a hold runs inside DLSS's own command buffer ([`Tracker::inline_point`],
@@ -2553,6 +2597,7 @@ impl Tracker {
     /// said once per identification and kind of refusal, with the image and how it was made.
     fn note_inline_refusal(&mut self, colour: vk::Image, refusal: InlineRefusal) {
         let Some(why) = refusal.said() else { return };
+        note_refusal(Refusal::Inside(refusal));
         if self.said_refusals.0 != self.generation {
             self.said_refusals = (self.generation, 0);
         }
@@ -3612,7 +3657,7 @@ impl Tracker {
             self.evaluations += 1;
             self.identified = false;
             if held_kind == Some(LaunchKind::Colour) {
-                self.colour_submits += 1;
+                self.named_colour_submits += 1;
             }
             if let Some((target, retargeted)) = held_target.filter(|_| held_kind == Some(LaunchKind::Colour)) {
                 self.retargeted_submits += u64::from(retargeted);
@@ -3754,8 +3799,8 @@ impl Tracker {
     /// one held undecided (a launch's parameters could not be read, or no colour input yet: the rule
     /// before the distinction). `undecided_before`: held-undecided submits before this scan.
     fn classify_line(&mut self, scan: Option<&Scan>, undecided_before: u64) -> Option<String> {
-        let undecided = self.evaluations - self.colour_submits;
-        let (bit, line) = if scan.is_some() && self.colour_submits > 0 && self.said_kinds & 1 == 0 {
+        let undecided = self.evaluations - self.named_colour_submits;
+        let (bit, line) = if scan.is_some() && self.named_colour_submits > 0 && self.said_kinds & 1 == 0 {
             (1, "a launch-bearing submit reads DLSS's colour input (its registered handle is in a launch's parameters): DLSS Super Resolution's, the hold point".to_string())
         } else if scan.is_none() && self.foreign_submits > 0 && self.said_kinds & 2 == 0 {
             (2, "a launch-bearing submit whose CUDA launches never name DLSS's colour input (DLSS Frame Generation's, or another NGX feature's) is forwarded untouched; only the one that reads it is held".to_string())
@@ -4082,23 +4127,25 @@ impl Tracking {
             let line = t.refresh().map(|l| format!("{l} [device {device:#x}]"));
             self.watching.store(t.inputs.is_some(), Ordering::Relaxed);
             self.extent.store(t.inputs.map_or(0, |i| u64::from(i.colour.1.width) << 32 | u64::from(i.colour.1.height)), Ordering::Relaxed);
-            let undecided_before = t.evaluations - t.colour_submits;
+            let undecided_before = t.evaluations - t.named_colour_submits;
             let foreign_before = t.foreign_submits;
             let scan = t.scan(batches);
             let kind_line = t.classify_line(scan.as_ref(), undecided_before);
             // Every 3000th forwarded one: the running counts.
             let tally = (t.foreign_submits != foreign_before && t.foreign_submits.is_multiple_of(3000)).then(|| {
                 format!(
-                    "launch-bearing submits: {} held reading the colour input{}, {} held undecided, {} forwarded untouched (their launches never name the colour input){}; registered images: {} kept after their last view was destroyed, {} destroyed; {} depth-only changes",
-                    t.colour_submits,
+                    "launch-bearing submits: {} named the colour input{}, {} undecided, {} forwarded untouched (their launches never name the colour input){}; holds: {} split, {} inside DLSS's buffer; registered images: {} kept after their last view was destroyed, {} destroyed; {} depth-only changes",
+                    t.named_colour_submits,
                     if t.retargeted_submits > 0 { format!(" ({} of them another candidate their input launch names)", t.retargeted_submits) } else { String::new() },
-                    t.evaluations - t.colour_submits,
+                    t.evaluations - t.named_colour_submits,
                     t.foreign_submits,
                     if t.other_candidate_buffers > 0 {
                         format!("; {} forwarded buffers named another colour candidate", t.other_candidate_buffers)
                     } else {
                         String::new()
                     },
+                    HOLDS_SPLIT.load(Ordering::Relaxed),
+                    HOLDS_INSIDE.load(Ordering::Relaxed),
                     t.unregistered_by_view,
                     t.unregistered_by_image,
                     t.depth_changes
@@ -6607,6 +6654,7 @@ impl Session {
 
     /// Logs `what` once per process-session for this device.
     pub(crate) fn say_once(&mut self, what: &'static str) {
+        note_refusal(Refusal::Text(what.into()));
         if self.said.insert(what) {
             crate::log!("[preupscale] {what}");
             crate::logging::flush();
@@ -7001,6 +7049,8 @@ impl Session {
     pub(crate) fn note(&mut self, shm: &ShmClient, result: &HoldResult, cpu: Duration, extent: (u32, u32)) {
         let now = Instant::now();
         if result.wrote_back || result.dump.is_some() {
+            // A frame held: refusals from before it are no longer why nothing is.
+            *lock(&LAST_REFUSAL) = None;
             self.last_hold = Some(now);
             self.last_hold_native = result.native;
             self.last_hold_extent = Some(extent);
@@ -7282,11 +7332,35 @@ impl Session {
         if !self.holding() {
             if let Some((_, state, native, (w, h))) = (*lock(&LAST_HELD)).filter(|(at, ..)| at.elapsed() < RECENT) {
                 shm.publish_preupscale_state(state, native, w, h);
+                publish_reason(shm, "");
                 return;
             }
         }
         let (w, h) = self.last_hold_extent.filter(|_| self.holding()).or(extent).unwrap_or((0, 0));
-        shm.publish_preupscale_state(hold_state(self.holding()), self.last_hold_native, w, h);
+        let dlss = self.last_dlss.is_some_and(|t| t.elapsed() < RECENT);
+        let (state, reason) = status_of(self.holding(), dlss, lock(&LAST_REFUSAL).as_ref());
+        shm.publish_preupscale_state(state, self.last_hold_native, w, h);
+        publish_reason(shm, &reason);
+    }
+}
+
+/// The pre-upscaler status of a device that is `holding` (a hold within [`RECENT`]) or not, with DLSS seen running
+/// with its inputs identified within [`RECENT`] (`dlss`, [`Session::saw_dlss`]), and `refusal` the last reason a frame
+/// was not held: the state and the reason the header gets. DLSS identified with no hold is every frame refused, which
+/// is not the same as no DLSS at all ("waiting for DLSS input", #51): `IDENTIFIED`, with the reason.
+fn status_of(holding: bool, dlss: bool, refusal: Option<&Refusal>) -> (u32, String) {
+    if !holding && dlss {
+        (neural_forge_protocol::enums::preupscale_state::IDENTIFIED, refusal.map(Refusal::text).unwrap_or_default())
+    } else {
+        (hold_state(holding), String::new())
+    }
+}
+
+/// Publishes why no hold ran ([`neural_forge_protocol::enums::preupscale_state::IDENTIFIED`]; empty otherwise) when it
+/// changed: the header's string is written under its own sequence, not on every present.
+fn publish_reason(shm: &ShmClient, reason: &str) {
+    if !shm.preupscale_reason_is(reason) {
+        shm.publish_preupscale_reason(reason);
     }
 }
 
@@ -8218,7 +8292,7 @@ mod tests {
             (inputs.colour.0.as_raw(), inputs.depth.0.as_raw(), inputs.mvec.0.as_raw(), inputs.candidates, inputs.exposure_input.map(|e| e.0.as_raw())),
             (0x100, 0x200, 0x300, 1, Some(0x610))
         );
-        assert_eq!((t.colour_submits, t.foreign_submits, t.other_candidate_buffers), (1, 0, 0));
+        assert_eq!((t.named_colour_submits, t.foreign_submits, t.other_candidate_buffers), (1, 0, 0));
     }
 
     /// (b) Two render-size colour candidates (Crimson Desert registers two or three): the lowest
@@ -8258,7 +8332,7 @@ mod tests {
         assert!(t.submit_ok(&[vec![cb(2)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
         t.launch(cb(3), Some(&param_block(&[0x1110, 0x1100])));
         assert!(t.submit_ok(&[vec![cb(3)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
-        assert_eq!((t.colour_submits, t.other_candidate_buffers), (2, 1));
+        assert_eq!((t.named_colour_submits, t.other_candidate_buffers), (2, 1));
         // An input launch naming the other candidate with the same depth and motion vectors: held
         // with it as the target, not counted as forwarded.
         // Its layout is tracked like the colour input's (a barrier in an earlier buffer of the
@@ -8268,8 +8342,8 @@ mod tests {
         let s = t.submit_ok(&[vec![cb(5), cb(4)]]).expect("held with the candidate its input launch names");
         assert_eq!(s.inputs.map(|i| (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw())), Some((0x110, 0x200, 0x300)));
         assert_eq!((s.index, s.colour_layout), (1, Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)));
-        assert_eq!((t.colour_submits, t.retargeted_submits, t.other_candidate_buffers), (3, 1, 1));
-        let undecided = t.evaluations - t.colour_submits;
+        assert_eq!((t.named_colour_submits, t.retargeted_submits, t.other_candidate_buffers), (3, 1, 1));
+        let undecided = t.evaluations - t.named_colour_submits;
         assert!(t.classify_line(Some(&s), undecided).is_some_and(|l| l.starts_with("a launch-bearing submit reads DLSS's colour input")));
         let held = t.classify_line(Some(&s), undecided).expect("the retarget, once");
         assert!(held.starts_with("a launch-bearing buffer's input launch names another colour candidate (0x110)"), "{held}");
@@ -8706,6 +8780,31 @@ mod tests {
         assert!(scan.colour_in_general());
         // Resubmitted unchanged: the same.
         assert_eq!(t.submit_ok(&[vec![cb(1), cb(2)]]).and_then(|s| s.hazard), None);
+    }
+
+    /// DLSS running with its inputs identified while no hold runs is not "waiting for DLSS input" (#51): the status
+    /// is `IDENTIFIED` with the last reason a frame was refused, from the split hold or the hold inside DLSS's
+    /// buffer; holding, or no DLSS lately, publishes no reason. The header carries it to the CLI and GUI.
+    #[test]
+    fn dlss_identified_with_every_frame_refused_is_not_waiting_for_dlss_input() {
+        use neural_forge_protocol::enums::preupscale_state::{IDENTIFIED, WAITING};
+        let split = Refusal::Text("the colour input was last transitioned out of GENERAL; not holding".into());
+        assert_eq!(status_of(false, false, Some(&split)), (WAITING, String::new()), "no DLSS lately: waiting");
+        assert_eq!(status_of(false, true, Some(&split)), (IDENTIFIED, "the colour input was last transitioned out of GENERAL; not holding".into()));
+        assert_eq!(status_of(false, true, None), (IDENTIFIED, String::new()), "identified, no reason noted yet");
+        assert_ne!(status_of(true, true, Some(&split)).0, IDENTIFIED);
+        assert!(status_of(true, true, Some(&split)).1.is_empty(), "holding: no reason");
+        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let (_, inside) = status_of(false, true, Some(&Refusal::Inside(InlineRefusal::Usage(usage))));
+        assert!(inside.starts_with("no hold inside DLSS's buffer: the colour input's usage") && inside.contains("TRANSFER_DST"), "{inside}");
+        // Through the header.
+        let header = neural_forge_protocol::ShmHeader::default();
+        let shm = ShmClient::test_over_header(&header);
+        publish_reason(&shm, &inside);
+        assert_eq!(header.preupscale_reason(), inside[..inside.len().min(neural_forge_protocol::REASON_BYTES - 1)]);
+        assert!(shm.preupscale_reason_is(&header.preupscale_reason()));
+        publish_reason(&shm, "");
+        assert_eq!(header.preupscale_reason(), "");
     }
 
     /// A game that moves the colour input out of GENERAL in a buffer in front of DLSS's launch buffer and back
@@ -9663,13 +9762,13 @@ mod tests {
         // An FG buffer first in the same submit: the split point is SR's buffer behind it.
         let scan = t.submit_ok(&[vec![cb(2)], vec![cb(7), cb(1)]]).expect("SR's buffer is held");
         assert_eq!((scan.batch, scan.index), (1, 1));
-        assert_eq!((t.colour_submits, t.evaluations, t.foreign_submits), (1, 1, 2));
+        assert_eq!((t.named_colour_submits, t.evaluations, t.foreign_submits), (1, 1, 2));
         // SR's buffer through a secondary carries its references to the primary.
         t.begin(cb(1));
         t.launch(cb(11), Some(&param_block(&[colour])));
         t.execute(cb(1), &[cb(11)]);
         assert!(t.submit_ok(&[vec![cb(3), cb(1)]]).is_some_and(|s| s.index == 1));
-        assert_eq!(t.colour_submits, 2);
+        assert_eq!(t.named_colour_submits, 2);
     }
 
     /// Without readable parameters (another translation layer's launch form) or before the colour
@@ -9682,7 +9781,7 @@ mod tests {
         t.launch(cb(1), None);
         assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Unknown);
         assert!(t.submit_ok(&[vec![cb(1)]]).is_some(), "an opaque launch could be SR's: held");
-        assert_eq!((t.colour_submits, t.foreign_submits), (0, 0));
+        assert_eq!((t.named_colour_submits, t.foreign_submits), (0, 0));
         let refs = LaunchRefs::default();
         assert_eq!(refs.kind(None), LaunchKind::Unknown, "no colour input identified yet");
         // A destroyed colour view drops its key: its handle no longer matches anything.
@@ -9793,7 +9892,7 @@ mod tests {
     fn submit(t: &mut Tracker, batches: &[Vec<vk::CommandBuffer>]) -> (Option<Scan>, Vec<String>) {
         let mut lines = t.observe(batches);
         lines.extend(t.refresh());
-        let undecided = t.evaluations - t.colour_submits;
+        let undecided = t.evaluations - t.named_colour_submits;
         let scan = t.submit_ok(batches);
         lines.extend(t.classify_line(scan.as_ref(), undecided));
         (scan, lines)
@@ -9903,7 +10002,7 @@ mod tests {
                 assert!(s.is_none(), "frame {frame}: frame generation's buffers are forwarded");
             }
         }
-        assert_eq!((t.colour_submits, t.foreign_submits, t.evaluations), (40, 80, 40));
+        assert_eq!((t.named_colour_submits, t.foreign_submits, t.evaluations), (40, 80, 40));
         assert_eq!(
             t.named,
             vec![Named::new(img(0x100), img(0x200), img(0x300), Some(img(0x610)))],
@@ -9938,7 +10037,7 @@ mod tests {
             assert!(submit(&mut t, &[vec![cb(3)]]).0.is_none());
         }
         assert_eq!((t.named.len(), t.inputs.map(|i| i.rule)), (1, Some(Rule::Params)));
-        assert_eq!((t.colour_submits, t.foreign_submits), (30, 60));
+        assert_eq!((t.named_colour_submits, t.foreign_submits), (30, 60));
     }
 
     /// DLSS's launches recorded into a secondary that is executed into the submitted primary: the
@@ -10048,7 +10147,7 @@ mod tests {
         // 16 quiet submits after the first: frame 5's second FG submit decides, frame 6 is the
         // identifying (unheld) SR submit, frame 7 the first hold.
         assert_eq!(first_held, Some(7));
-        assert_eq!(t.colour_submits, 40 - 6, "SR submits reading the colour input from the identifying one on");
+        assert_eq!(t.named_colour_submits, 40 - 6, "SR submits reading the colour input from the identifying one on");
         let ids = identification_lines(&lines);
         assert_eq!(ids.len(), 2, "{lines:#?}");
         assert!(
@@ -10224,7 +10323,7 @@ mod tests {
                 assert!(s.is_none());
             }
         }
-        assert_eq!((t.colour_submits, t.foreign_submits, t.other_candidate_buffers), (20, 100, 0));
+        assert_eq!((t.named_colour_submits, t.foreign_submits, t.other_candidate_buffers), (20, 100, 0));
         let ids = identification_lines(&lines);
         assert_eq!(ids.len(), 2, "{lines:#?}");
         assert!(ids[0].contains("(first of 2 candidates; others 0x110 1516x852)") && ids[0].ends_with("identified by size"), "{}", ids[0]);
@@ -10323,7 +10422,7 @@ mod tests {
                 ids.last().unwrap().ends_with("identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"),
                 "{ids:#?}"
             );
-            assert_eq!((t.colour_submits, t.retargeted_submits, t.other_candidate_buffers), (41, 1 + SWITCH_AFTER as u64 - 1, 0));
+            assert_eq!((t.named_colour_submits, t.retargeted_submits, t.other_candidate_buffers), (41, 1 + SWITCH_AFTER as u64 - 1, 0));
             assert!(t.alternation.is_none());
         }
     }
@@ -10484,7 +10583,7 @@ mod tests {
             ids[0]
         );
         assert!(lines.iter().all(|l| !l.contains("switched")), "{lines:#?}");
-        assert_eq!((t.colour_submits, t.retargeted_submits), (20, 0));
+        assert_eq!((t.named_colour_submits, t.retargeted_submits), (20, 0));
     }
 
     /// A game that alternates DLSS's colour input between two candidates frame by frame: every SR
@@ -10514,7 +10613,7 @@ mod tests {
             let alternates: Vec<&String> = lines.iter().filter(|l| l.starts_with("DLSS's input kernel alternates between colour candidates")).collect();
             assert_eq!(alternates.len(), 1, "{lines:#?}");
             let expected_retargets = if pair[0] == 0x100 { 30 } else { 60 };
-            assert_eq!((t.colour_submits, t.retargeted_submits, t.other_candidate_buffers), (60, expected_retargets, 0), "{pair:x?}");
+            assert_eq!((t.named_colour_submits, t.retargeted_submits, t.other_candidate_buffers), (60, expected_retargets, 0), "{pair:x?}");
         }
     }
 

@@ -473,6 +473,13 @@ impl Inline {
         self.app_family
     }
 
+    /// [`Self::say_once`] for a reason the hold is not recorded: also the status's last refusal
+    /// ([`super::note_refusal`]).
+    fn refuse(&self, what: String) {
+        super::note_refusal(super::Refusal::Text(what.clone().into()));
+        self.say_once(what);
+    }
+
     fn say_once(&self, what: String) {
         if lock(&self.said).insert(what.clone()) {
             crate::log!("[preupscale] {what}");
@@ -781,11 +788,11 @@ impl Inline {
         let (index, staging, queries, readback, outstanding, mut cache_dump) = {
             let mut s = lock(&self.slots);
             if s.simultaneous.contains(&cb) {
-                self.say_once("a DLSS buffer recorded with SIMULTANEOUS_USE is not held inside".into());
+                self.refuse("a DLSS buffer recorded with SIMULTANEOUS_USE is not held inside".into());
                 return Recorded::Refused;
             }
             if s.secondary.contains(&cb) {
-                self.say_once("DLSS is recorded in a secondary command buffer; it is not held inside".into());
+                self.refuse("DLSS is recorded in a secondary command buffer; it is not held inside".into());
                 return Recorded::Refused;
             }
             // The hold's dispatches, copies and blits run on DLSS's graphics queue: a buffer of another
@@ -793,7 +800,7 @@ impl Inline {
             match s.pool_of.get(&cb).and_then(|p| s.pool_family.get(p)).copied() {
                 Some(family) if family == self.app_family => {}
                 family => {
-                    self.say_once(match family {
+                    self.refuse(match family {
                         Some(f) => format!("DLSS is recorded for queue family {f}, not the graphics family {}; it is not held inside", self.app_family),
                         None => "DLSS's command buffer comes from a pool the layer did not see created; it is not held inside".to_string(),
                     });
@@ -805,7 +812,7 @@ impl Inline {
                 return Recorded::Skipped;
             }
             if convert && !self.blit_r11g11b10 {
-                self.say_once(format!("the colour input is {:?} and the device cannot blit it to RGBA16F; not holding", point.desc.format));
+                self.refuse(format!("the colour input is {:?} and the device cannot blit it to RGBA16F; not holding", point.desc.format));
                 return Recorded::Refused;
             }
             // The application's compute state must be put back after the hold: noted from the first hold
@@ -820,7 +827,7 @@ impl Inline {
             let unrestorable =
                 self.restore.with(cb, |s| s.unrestorable().or(s.needs_missing(&self.restore.fns).then_some("a binding command the layer cannot repeat")));
             if let Some(why) = unrestorable {
-                self.say_once(format!("a DLSS buffer is not held inside: its compute state cannot be put back after the hold ({why})"));
+                self.refuse(format!("a DLSS buffer is not held inside: its compute state cannot be put back after the hold ({why})"));
                 return Recorded::Skipped;
             }
             let index = match s.slots.iter().position(|sl| sl.owner.is_none()) {
@@ -828,7 +835,7 @@ impl Inline {
                 None if s.slots.len() < MAX_SLOTS => {
                     // SAFETY: the device is live.
                     let Some(slot) = (unsafe { self.build_slot() }) else {
-                        self.say_once("a slot for the hold inside DLSS's buffer could not be built; not holding there".into());
+                        self.refuse("a slot for the hold inside DLSS's buffer could not be built; not holding there".into());
                         return Recorded::Refused;
                     };
                     s.slots.push(slot);
@@ -853,7 +860,7 @@ impl Inline {
                 // SAFETY: the device is live.
                 s.staging[k] = unsafe { self.build_staging(extent) };
                 if s.staging[k].is_none() {
-                    self.say_once(format!("staging images of {}x{} could not be built; that buffer is not held inside", extent.0, extent.1));
+                    self.refuse(format!("staging images of {}x{} could not be built; that buffer is not held inside", extent.0, extent.1));
                     return Recorded::Refused;
                 }
             }
