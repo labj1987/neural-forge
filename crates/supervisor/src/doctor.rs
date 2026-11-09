@@ -1149,16 +1149,31 @@ fn check_target_excluded(roots: &Roots, events: &[state_log::Event]) -> Vec<Find
     }
     let missed = [newest];
     let games = crate::steam::games(&roots.steam_roots);
+    let cfg = crate::Config::load_from(&roots.config_file.to_string_lossy());
     missed
         .iter()
         .map(|e| {
             let exe = &e.process;
             let fix = match crate::steam::games_for_exe(&games, exe).as_slice() {
-                [game] => format!(
-                    "With Steam closed, run `neural-forge-cli enable {} --target-exe {exe}` (or choose {exe} in the Setup tab's target editor for {}), then start the game.",
-                    game.appid, game.name
+                [game] => {
+                    // The targets the game has plus the one left out: `--target-exe` replaces the list.
+                    let mut targets: Vec<String> =
+                        crate::steam::target_for(&cfg, game).split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect();
+                    if !targets.iter().any(|t| t.eq_ignore_ascii_case(exe)) {
+                        targets.push(exe.clone());
+                    }
+                    format!(
+                        "With Steam closed, run `neural-forge-cli enable {} --target-exe {}` (or add {exe} in the Setup tab's target editor for {}), then start the game.",
+                        game.appid,
+                        crate::launch_options::shell_quote(&targets.join(",")),
+                        game.name
+                    )
+                }
+                _ => format!(
+                    "Add {exe} to `NEURAL_FORGE_TARGET_EXE` in the game's launch options: `neural-forge-cli enable GAME --target-exe {}`, with the \
+                     game's other targets in front, comma-separated (the option replaces the list), then start the game.",
+                    crate::launch_options::shell_quote(exe)
                 ),
-                _ => format!("Add {exe} to `NEURAL_FORGE_TARGET_EXE` in the game's launch options (`neural-forge-cli enable GAME --target-exe {exe}`), then start the game."),
             };
             Finding::new(
                 CHECK,
@@ -1708,14 +1723,26 @@ mod tests {
         let mut f = quiet();
         steam(&mut f, "steam", false, &[("306130", "ESO", Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=eso.exe %command%"))]);
         write(&f.dir.join("steam/steamapps/common/ESO/game/client/eso64.exe"), "");
+        // eso.exe chosen by hand as the target (`enable ESO --target-exe eso.exe`).
+        write(&f.roots.config_file, "target_exe_306130=eso.exe\n");
         let excluded = event(100, 7, "target-excluded", "NEURAL_FORGE_TARGET_EXE=eso.exe leaves out eso64.exe").replace("\tGame.exe\t", "\teso64.exe\t");
         let events: Vec<state_log::Event> = excluded.lines().filter_map(state_log::parse_line).collect();
         assert_eq!(events.len(), 1, "{excluded}");
         let v = check_target_excluded(&f.roots, &events);
         assert_eq!(v.len(), 1);
         assert!(v[0].summary.contains("excluded eso64.exe"), "{}", v[0].summary);
-        assert!(v[0].fix.as_deref().unwrap().contains("neural-forge-cli enable 306130 --target-exe eso64.exe"), "{:?}", v[0].fix);
+        // The game's own target kept in front of the one left out (the option replaces the list).
+        assert!(v[0].fix.as_deref().unwrap().contains("`neural-forge-cli enable 306130 --target-exe eso.exe,eso64.exe`"), "{:?}", v[0].fix);
         assert_eq!(v[0].evidence.matches(" UTC").count(), 1, "the time once: {}", v[0].evidence);
+        // A name with a space is quoted, so the pasted command passes it as one argument.
+        let mut g = quiet();
+        steam(&mut g, "steam", false, &[("219990", "Grim Dawn", Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=x64/GrimDawn.exe %command%"))]);
+        write(&g.dir.join("steam/steamapps/common/Grim Dawn/Grim Dawn.exe"), "");
+        write(&g.roots.config_file, "target_exe_219990=Launcher.exe\n");
+        let spaced = event(100, 7, "target-excluded", "x").replace("\tGame.exe\t", "\tGrim Dawn.exe\t");
+        let events: Vec<state_log::Event> = spaced.lines().filter_map(state_log::parse_line).collect();
+        let v = check_target_excluded(&g.roots, &events);
+        assert!(v[0].fix.as_deref().unwrap().contains("`neural-forge-cli enable 219990 --target-exe 'Launcher.exe,Grim Dawn.exe'`"), "{:?}", v[0].fix);
         // A process engaged in the same session (the target's own) or later: nothing to say.
         let attach = event(200, 8, "attach", "engaged");
         let events: Vec<state_log::Event> = format!("{excluded}{attach}").lines().filter_map(state_log::parse_line).collect();
