@@ -22,11 +22,11 @@ while the network loads, and the network's history starts afresh. When the chose
 extracted (a DLL without the small one), the other one runs.
 
 When the game and other programs leave too little video memory for the network, the driver would move
-part of it to system memory, where it runs many times slower. Instead the full network gives way to the
-small one, and when that does not fit either, the network pauses and frames go to DLSS untouched. It
-steps back up, one network at a time, once the memory has had room for it for 10 s (and no sooner than
-30 s after the step down, longer when the steps repeat). While paused, Neural Forge holds no video memory. The Status tab's Model placement line says when
-the small network runs in place of the full one, or that the network is paused.
+part of it to system memory, where it runs many times slower. Instead the network pauses and frames go
+to DLSS untouched. The small network is no way out: it needs only about 45 MiB less video memory than the
+full one. The network comes back once the memory has had room for it for 10 s (and no sooner than 30 s
+after the pause, longer when pauses repeat). While paused, Neural Forge holds no video memory. The Status
+tab's Model placement line says when the network is paused.
 
 Each network's answer for an input frame is bit-exact with NGX's own
 ([NATIVE_BACKEND.md](NATIVE_BACKEND.md), 0.6 and "The small network").
@@ -279,7 +279,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_PROBE_IMAGE=<kernel>[+],...` | layer | Testing aid: copy the images a named CUDA launch reads, before it (or after it with `+`), once, into `captures/probe-<ms>/`. |
 | `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` | layer | Gives every network activation its own allocation again instead of sharing memory by lifetime (more video memory, same result). |
 | `NEURAL_FORGE_POST_MOTION=none\|zero\|flow`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | Testing aids: after the upscaler, give the model a history: its previous output at the same pixel (`zero`) or where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; `zero` elsewhere), not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and dropped on a scene cut. Default `none`: no history (measured, neither is steadier than none). |
-| `NEURAL_FORGE_FAIL_CREATE=N[@K]`, `NEURAL_FORGE_NATIVE_FAIL=chain`, `NEURAL_FORGE_NATIVE_FAIL=vram` | layer | Testing aids: let K network builds through, then fail the next N; report one counter-chain timeout; or have the video memory guard step down at the 600th and 900th network frame, as if the network did not fit. |
+| `NEURAL_FORGE_FAIL_CREATE=N[@K]`, `NEURAL_FORGE_NATIVE_FAIL=chain`, `NEURAL_FORGE_NATIVE_FAIL=vram` | layer | Testing aids: let K network builds through, then fail the next N; report one counter-chain timeout; or have the video memory guard pause the network at its 600th and 900th frame, as if it did not fit. |
 | `NEURAL_FORGE_GUI_OPEN=<tab>` | GUI | Testing aid: open a tab (`model`, `composition`, `debug`, `status`, `setup`, or `passes` for the per-pass dialog) at start, for screenshots. |
 | `NEURAL_FORGE_BENCH=1`, `NEURAL_FORGE_REQUIRE_VULKAN=1`, `NEURAL_FORGE_TEST_DISPLAY=:N` | layer tests | Testing aids: run the hot-path GPU benchmark; fail instead of skipping when no Vulkan device exists; run the present-fence test on a real swapchain in an X server (an Xvfb's display). |
 | `NEURAL_FORGE_CLI=/path` | `scripts/install.py`, `scripts/test_install.py` | The `neural-forge-cli` to use. |
@@ -332,8 +332,13 @@ Valve's VAC) cannot be seen.
 - **The model after DLSS is tested in two games** (Crimson Desert and Hogwarts Legacy, with Ray
   Reconstruction). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
   much lower frame rate (36 against 120 fps shown in Crimson Desert).
-- **HDR on the finished frame:** HDR10 is handled (above) but not yet tested with a game; float16
+- **HDR on the finished frame:** HDR10 is handled (above) and tested in Crimson Desert; float16
   (scRGB) swapchains are presented untouched, and HDR frames cannot be captured.
+- **Comparing with NVIDIA's own DLSS 5 in a game that ships it:** Proton's dxvk-nvapi 0.9.3 or newer passes
+  NVIDIA's driver override for it, so the launch options
+  `DXVK_NVAPI_DRS_NGX_DLSS_NR_OVERRIDE=on DXVK_NVAPI_DRS_NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION=render_preset_a`
+  (presets `a` to `d`) pick which of NVIDIA's presets the game runs. They do not change Neural Forge. Switch
+  the game's own DLSS 5 off while Neural Forge runs, or the frame gets both.
 - **Not carried over from upstream DLSS5VKLayer:** see
   [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md).
 

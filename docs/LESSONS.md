@@ -1275,8 +1275,10 @@ logs, Streamline's own log and the game's memory read while it ran.
   (`steam -applaunch 3240220` with the benchmark arguments, so Alex's launch options, the Steam overlay and
   the script mods) 3 of 4, the fourth with the same Streamline line. The runner's `env -i` environment is not
   the cause: the launch Alex uses fails the same way.
-- **Tried, no help:** `DXVK_NVAPI_VKREFLEX=1` (dxvk-nvapi's Vulkan Reflex layer instead of vkd3d-proton's own
-  `VK_NV_low_latency2` path; the layer loaded) lost it in 1 of 3 launches. dxvk-nvapi has no option that keeps
+- **Tried, no help:** `DXVK_NVAPI_VKREFLEX=1` (dxvk-nvapi's Vulkan Reflex layer; the layer loaded) lost it in 1
+  of 3 launches. That layer only serves native Vulkan games' `NvAPI_Vulkan_*` calls, so for GTA V Enhanced
+  (D3D12, Reflex through vkd3d-proton's own `VK_NV_low_latency2` path) it most likely changed nothing (checked
+  against dxvk-nvapi's source, 2026-11-09); since dxvk-nvapi 0.9.3 with driver 615 or newer it is not needed at all. dxvk-nvapi has no option that keeps
   Reflex on (its options: `DXVK_NVAPI_DRIVER_VERSION`, `_GPU_ARCH`, `_ALLOW_OTHER_DRIVERS`,
   `_DISABLE_ENTRYPOINTS`, `_VKREFLEX`, `_FAKE_VKREFLEX`, `_DRS_*`, logging), and none could: the check reads
   sl.reflex's own mode, which only GTA's `slReflexSetOptions` sets, and Streamline's production DLLs read no
@@ -1547,6 +1549,34 @@ later on October 22 was tried as the cheapest of them first offline, then built 
   the runs' spread, and it costs a fifth of the model's added detail (the blended edit loses the sub-pixel part
   DLSS accumulates from the jittered frames). The full reprojected blend would cost more of both. Reopen only for a
   path without a temporal upscaler after the model (the finished frame), with a game check like this one.
+
+## November 9: the small network is no step down for video memory (3.11.0)
+
+- **The guard's first step freed almost nothing.** Since 3.9.6 the VRAM guard stepped the full network down to the
+  small one before pausing, on the assumption (written into its comment) that the small one takes about half the
+  memory. That was true of the weights' share before activations were shared by lifetime (3.8.7), not after: a fresh
+  open and build measured on the rig (`what_each_network_takes_at_the_tables_sizes`) takes 377/331, 607/561,
+  729/683 and 1415/1370 MiB (full/small) at 1485x836, 2228x1253, 2560x1440 and 3840x2160, 45-46 MiB apart at every
+  size. The activations' peak is set by the blocks' width, which both networks share; the small one only has fewer
+  blocks. A spill is hundreds of MiB to GBs (October 29: 2 GB held), so the step only cost a rebuild before the
+  pause, as in that day's 2 GB run.
+- **Now** the small network is a step of its own only where it needs at least 256 MiB (twice the budget's margin)
+  less at the wanted size, from the measured builds or the table; with NVIDIA's 310.9.16 networks it never does, so a
+  spill pauses at once and room brings the full network straight back.
+- **Checked in GTA V Enhanced** (1440p, frame generation 4x, `NEURAL_FORGE_NATIVE_FAIL=vram`): paused at the 600th
+  network frame with no step to the small network, the hold's resources freed, back to the full network once 3353 MiB
+  were free for 10 s, paused again at the 900th with the backoff doubled to 60 s; no NVRM or Xid lines.
+- **Context, same day:** dxvk-nvapi 0.9.3 changed `curAvailableDedicatedVideoMemory` to subtract the process's use
+  (PR #403); the guard and doctor never ask NVAPI (`VK_EXT_memory_budget` and `nvidia-smi`), and a game reading
+  NVAPI can only see less free memory than before, so nothing else changed. Driver 620.70.06: GTA V Enhanced
+  1440p frame generation 4x, Preset C, `FrameLimit` 120, 3.10.0: 61.4 real / 247.4 shown with the full network,
+  80.4 / 323.1 without, frame generation engaged on the first launch, no NVRM or Xid lines.
+- **Hogwarts Legacy's own DLSS 5 under Proton, retested:** on November 5 dxvk-nvapi answered the game's
+  `NvAPI_D3D12_GetCudaIndependentDescriptorObject` with "Invalid argument" and the picture did not change. With
+  Proton Experimental 20261027b (trace log, `NeuralRendering=(Mode=Nvidia_On)`, title screen into the save) every
+  call succeeded: 9 descriptor objects (type 0) and 10 merged texture-sampler objects OK, 95 cubin kernels created
+  and their launches OK; only the startup probes with null arguments are refused. Whether NVIDIA's network then
+  changes the picture was not compared. No upstream report; the README carries no known issue for it.
 
 ## Deliberately not done, or left open
 

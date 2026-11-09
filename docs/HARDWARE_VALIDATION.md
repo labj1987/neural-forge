@@ -692,8 +692,9 @@ work). Real evidence this time, not just an absent log:
 project**: `Xid 109 CTX_SWITCH_TIMEOUT` under Proton is a long-running, widely
 reported issue (NVIDIA forums, `forums.developer.nvidia.com/t/xid109-ctx-switch-timeout-driver-crashes-in-many-applications/283722`,
 and a matching RTX 5090/Blackwell report at `github.com/NVIDIA/open-gpu-kernel-modules/issues/1097`)
-spanning driver branches from at least 545.x through 595.x (the test machine runs 615.71.09,
-newer than every version in those reports) and a wide range of GPUs (RTX 2080 through
+spanning driver branches from at least 545.x through 595.x (the test machine ran 615.71.09,
+newer than every version in those reports at the time; as of 2026-11-09 it is also reported on 615.78.08, and
+620.70.06's release notes list no fix) and a wide range of GPUs (RTX 2080 through
 5090) and completely unrelated games (CS2, Elden Ring, Apex Legends, Path of Exile,
 Assassin's Creed Shadows, Crimson Desert) -- none of them running any DLSS/neural
 rendering layer at all. NVIDIA staff acknowledged it internally ("bug 5052028") with

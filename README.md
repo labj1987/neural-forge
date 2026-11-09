@@ -21,7 +21,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
   libadwaita 1.5 or newer from the system.
 - An NVIDIA RTX 40-series or newer GPU (the network uses FP8 tensor cores) with a driver that offers
   `VK_NV_cuda_kernel_launch`, `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2` and
-  `VK_EXT_shader_float8` (tested with 615.71.09 and 615.78.08). On other GPUs the layer does nothing.
+  `VK_EXT_shader_float8` (tested with 615.71.09, 615.78.08 and 620.70.06). On other GPUs the layer does nothing.
 - 64-bit games. A game that uses DLSS through Vulkan (under Proton: vkd3d-proton or DXVK, with
   DXVK-NVAPI) gets the model before the upscaler; other games get it on the finished frame.
 - Your own `nvngx_dlssnr.dll` (from a game that ships it, or NVIDIA's SDK), once: build 310.9.16 has
@@ -68,8 +68,8 @@ sudo usermod -aG input "$USER"
 ```
 
 The Setup tab's **Network** row picks the full network (the default) or the small one, which takes
-about half the GPU time and changes the picture less. When video memory runs short, the full network
-steps down to the small one, then pauses, and comes back when there is room.
+about half the GPU time and changes the picture less. When video memory runs short, the network
+pauses and comes back when there is room.
 
 The Model tab's **Colour** group shapes the model's change rather than the picture: its saturation,
 contrast and detail, and protections that keep the frame's own hues, greys, shadows or highlights
@@ -106,9 +106,9 @@ Every setting, the other placements and all environment variables: [docs/USER_GU
 - **Hogwarts Legacy turns Ray Reconstruction back off** unless you switch it on in its menu.
 - **On the finished frame, Find the HUD can treat a first-person weapon as HUD** and keep the model
   off it. Switch Find the HUD off in the Model tab where that shows.
-- **HDR on the finished frame is untested in a game.** HDR10 needs the model resolution at 100%,
-  takes no captures, and leaves the brightest highlights alone; float16 (scRGB) HDR is presented
-  untouched.
+- **HDR on the finished frame** works with HDR10 games (tested in Crimson Desert). It needs the model
+  resolution at 100%, takes no captures, and leaves the brightest highlights alone; float16 (scRGB) HDR
+  is presented untouched.
 
 ## Troubleshooting
 
