@@ -1634,6 +1634,7 @@ screenshots of one state do.
 | 2026-10-07 | Driver 615.71.09 -> 615.78.08 (the maintainer's request, installed with a separate driver install script, rebooted) between the first and the second Phase 3 pass | Same capabilities (32-bit still has no `VK_NV_cuda_kernel_launch`); the rig test still bit-exact; network time unchanged (1485x836 5.505 ms, 2228x1253 10.672, 2560x1440 13.349, 3840x2160 30.018; chaining off 5.947, 10.939, 13.731, 30.118). Phase 3 runs again in full on 615.78.08; the 615.71.09 pass of 1440p without frame generation is kept as a reference. |
 | 2026-10-07 | `NEURAL_FORGE_CAPTURE_AT=5:20000` in the first Phase 3 runs | Nothing captured: the trigger never fired. Resumes are now logged when it is set; the captures move to dedicated runs. |
 | 2026-10-07 | Stale motion vectors? (DLSS's buffer synchronizes them before its launch) | Consecutive dumps 393-396: inconclusive, the scene barely moves (median 0.33 px). Open. |
+| 2026-11-09 | Driver 615.78.08 -> 620.70.06 (installed 2026-11-07) | Rig suite 17 of 17; the C API's head against dlss5vk 0 values different; 1485x836 graph 5.26 ms GPU (5.33 median back to back); fresh open and build full/small 729/683 MiB at 2560x1440 (`what_each_network_takes_at_the_tables_sizes`). GTA V Enhanced 1440p frame generation 4x, Preset C, `FrameLimit` 120 (3.10.0): 61.4 real / 247.4 shown, frame generation engaged, no NVRM or Xid. The release notes' `VK_NV_low_latency2` frame-limit fix changed nothing visible here. |
 
 ## Checklist
 

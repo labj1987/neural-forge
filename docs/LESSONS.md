@@ -1563,6 +1563,9 @@ later on October 22 was tried as the cheapest of them first offline, then built 
 - **Now** the small network is a step of its own only where it needs at least 256 MiB (twice the budget's margin)
   less at the wanted size, from the measured builds or the table; with NVIDIA's 310.9.16 networks it never does, so a
   spill pauses at once and room brings the full network straight back.
+- **Checked in GTA V Enhanced** (1440p, frame generation 4x, `NEURAL_FORGE_NATIVE_FAIL=vram`): paused at the 600th
+  network frame with no step to the small network, the hold's resources freed, back to the full network once 3353 MiB
+  were free for 10 s, paused again at the 900th with the backoff doubled to 60 s; no NVRM or Xid lines.
 - **Context, same day:** dxvk-nvapi 0.9.3 changed `curAvailableDedicatedVideoMemory` to subtract the process's use
   (PR #403); the guard and doctor never ask NVAPI (`VK_EXT_memory_budget` and `nvidia-smi`), and a game reading
   NVAPI can only see less free memory than before, so nothing else changed. Driver 620.70.06: GTA V Enhanced
