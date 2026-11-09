@@ -753,6 +753,20 @@ void Context::transferBarrier(VkCommandBuffer commands) {
   vkCmdPipelineBarrier2(commands, &dependency);
 }
 
+void Context::beforeTransferWrite(VkCommandBuffer commands) {
+  ++barriers_;
+  // Writes need making available; reads (write-after-read) need only the execution dependency.
+  VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.memoryBarrierCount = 1;
+  dependency.pMemoryBarriers = &barrier;
+  vkCmdPipelineBarrier2(commands, &dependency);
+}
+
 VkQueryPool Context::createTimestampPool(uint32_t count) {
   VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
   info.queryType = VK_QUERY_TYPE_TIMESTAMP;

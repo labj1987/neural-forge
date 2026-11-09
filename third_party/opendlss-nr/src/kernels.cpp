@@ -166,6 +166,10 @@ VkDeviceAddress Kernels::tileCounters(uint32_t count) {
 // Consumers spin on these. A stale count starts one early.
 void Kernels::resetSync(VkCommandBuffer commands) {
   if (syncBuffer_.buffer == VK_NULL_HANDLE) syncAddress(0, kSyncBands);
+  // The counters are shared by every recording and execution of the graph: the previous execution's
+  // launches (which increment and wait on them) finish before the fill zeroes them, whatever the caller put
+  // between the two executions.
+  context_.beforeTransferWrite(commands);
   context_.cmdFillZero(commands, syncBuffer_);
   context_.transferBarrier(commands);
   chainLaunches_.clear();

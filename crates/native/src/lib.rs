@@ -382,7 +382,10 @@ impl Network {
         (unsafe { ffi::nf_native_frame(self.raw, &mut frame) } == 1).then_some(frame)
     }
 
-    /// The recorded graph (a simultaneous-use secondary of `frame_family`).
+    /// The recorded graph (a simultaneous-use secondary of `frame_family`). The caller orders its own writes
+    /// of the features before it and its reads of the head after it; the graph orders the rest itself (it opens
+    /// with a barrier before it resets the counters its executions share, so two executions need nothing
+    /// between them).
     pub fn graph_commands(&self) -> vk::CommandBuffer {
         // SAFETY: `raw` is live.
         unsafe { ffi::nf_native_graph_commands(self.raw) }
@@ -438,8 +441,8 @@ impl Network {
     }
 
     /// Records slot `slot`'s graph ([`Self::build_sizes`]) straight into `primary`, a primary command buffer of
-    /// `frame_family` being recorded (the application's: the hold inside DLSS's command buffer), between two
-    /// compute barriers, with descriptor sets from hold slot `hold`'s own pool (`0..HOLD_SLOTS`), which this
+    /// `frame_family` being recorded (the application's: the hold inside DLSS's command buffer), between
+    /// barriers as [`Self::graph_commands`] says, with descriptor sets from hold slot `hold`'s own pool (`0..HOLD_SLOTS`), which this
     /// resets first. Binds compute pipelines and descriptor sets and pushes constants: the caller restores its
     /// own state afterwards. On an error part of the graph may be recorded.
     ///
@@ -577,6 +580,36 @@ mod tests {
     #[test]
     fn abi_version_is_6() {
         assert_eq!(abi_version(), 6);
+    }
+
+    /// The graph's first command zeroes the counters every execution of it shares (the chaining and split-K
+    /// counters, written and waited on by the previous execution's launches). It must be ordered after that
+    /// earlier work by the graph itself, because the C API promises the caller nothing else is needed (the
+    /// caller's barriers may be compute-only). Read from the source: the graph runs only on an NVIDIA GPU.
+    #[test]
+    fn the_graph_orders_its_counter_reset_after_earlier_work() {
+        let kernels = include_str!("../../../third_party/opendlss-nr/src/kernels.cpp");
+        let reset = &kernels[kernels.find("void Kernels::resetSync(").expect("resetSync")..];
+        let reset = &reset[..reset.find("\n}\n").unwrap()];
+        let barrier = reset.find("context_.beforeTransferWrite(commands);").expect("a barrier before the counters' reset");
+        assert!(barrier < reset.find("cmdFillZero").expect("the reset"));
+        let context = include_str!("../../../third_party/opendlss-nr/src/vk_context.cpp");
+        let body = &context[context.find("void Context::beforeTransferWrite(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        for needed in [
+            "srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;",
+            "srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;",
+            "dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;",
+            "dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;",
+        ] {
+            assert!(body.contains(needed), "{needed}");
+        }
+        // And the graph records the reset first.
+        let graph = include_str!("../../../third_party/opendlss-nr/src/nr_graph.cpp");
+        let record = &graph[graph.find("void Graph::record(VkCommandBuffer commands").unwrap()..];
+        let record = &record[record.find('{').unwrap()..];
+        let first = record.find("kernels_.resetSync(commands);").unwrap();
+        assert!(!record[..first].contains("commands,") && !record[..first].contains("(commands)"), "nothing recorded before the reset");
     }
 
     /// The layer's slot count and the C++ side's pool count are one number.
