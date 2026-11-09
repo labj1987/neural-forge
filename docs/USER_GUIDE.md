@@ -76,7 +76,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
+| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, the HUD group: finding the HUD and HUD regions on the finished frame, and the Sharpening group: adaptive sharpening (CAS) and Clarity on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
@@ -186,7 +186,28 @@ the change comes back over a few pixels around each one. With a history after th
 not used under the HUD either, so changing HUD text leaves no trail. They are saved as `set_hud_regions` in
 `config.ini` and can be set with `neural-forge-cli shmctl set hud_regions "0,0.88,0.3,0.12;0.7,0,0.3,0.1,soften,0.5"`
 (left, top, width, height in 0-1, then `keep` or `soften` and the strength). Before the upscaler and after
-DLSS the HUD is not drawn yet, so neither setting applies there.
+DLSS the HUD is not drawn yet, so neither setting applies there. The regions also keep the sharpening off the
+HUD (below), wherever the model runs.
+
+**Sharpening** (Model tab) works on the finished frame in every game, whatever the placement: each presented
+frame (frame generation's too) is sharpened just before it is shown, after the model, so the model never sees
+it. Both filters are off at 0, the default. **Adaptive sharpening (CAS)** is AMD FidelityFX Contrast Adaptive
+Sharpening: each pixel is sharpened by as much as its neighbours leave room for, so soft detail gets the most
+and edges that are already sharp, and flat areas, get little; about 0.7 is CAS's own default and 1 its
+strongest. **Clarity** (0 to 2) lifts local contrast of brightness: the difference between each pixel and a
+blurred surround of **Clarity radius** pixels (at 1440p, scaled with the resolution; 2 to 64, default 16) is
+added back times the strength, the same to all three colour channels, so colours keep their hue. **Clarity
+midtones** (0.5) keeps it off the darkest and brightest parts (0 evenly, 1 midtones only), and **Clarity edge
+protection** (0.5) stops the blur at strong brightness edges so they do not grow bright or dark halos. The
+**HUD regions** apply: nothing inside a Keep region, the strength's share inside a Soften one (Find the HUD
+does not apply here). Clarity does not use the game's depth: on the presented frame there is none to use.
+GPU time a presented frame at 1440p on an RTX 5070: 0.29 ms for CAS, 0.33 ms for Clarity at radius 16 (0.43 ms at
+64), 0.37 ms for both; most of it is copying the frame out and back. It is paid on every presented frame, so with
+frame generation 4x four times a rendered frame. `neural-forge-cli shmctl set sharpen_cas 0.5` (and
+`clarity_strength`, `clarity_radius`, `clarity_midtones`, `clarity_edges`) does the same from a terminal, and
+a game can have its own sharpening like any other setting ([Settings for one game](#settings-for-one-game)); `NEURAL_FORGE_SHARPEN` overrides it for one launch, for comparisons. A capture (the Debug tab's Capture button) shows the frame
+sharpened where the model runs in the game's frame (before the upscaler or after DLSS), and before the
+sharpening where the model runs on the finished frame.
 
 ![Per-pass settings, scrolled to the end: an override switch for each of local tone, local structure, skin structure, style, auto mask, model resolution, edit saturation, edit contrast, edit detail and placement, each off](../screenshots/passes.png)
 
@@ -279,6 +300,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_PIPELINED=1` | layer | After the upscaler: a pipelined present. Higher frame rate, but answers land on later frames and ghost. HDR10 frames are presented untouched in this mode. |
 | `NEURAL_FORGE_HDR_REFERENCE_NITS=203` | layer | On the finished frame of an HDR10 game, the brightness (in nits) the network's SDR picture takes as white before its highlight roll-off (default 203, clamped to 80-1000). Higher shows the network a darker picture and lets brighter highlights be changed. Tuning only. |
 | `NEURAL_FORGE_HDR_PRESENT=off` | layer | Testing aid: present HDR10 frames on the finished frame untouched, as for float16 ones. |
+| `NEURAL_FORGE_SHARPEN=off\|cas=0.5,clarity=0.4,...` | layer | The sharpening of the finished frame for this game, in place of the Model tab's: `off`, or comma-separated `cas`, `clarity`, `radius`, `midtones` and `edges` with their values (clamped to the settings' ranges); a setting not named keeps the Model tab's value. For A/B comparisons; a value that cannot be read is logged and the settings apply. |
 | `NEURAL_FORGE_TOGGLE_KEY=F10` | layer | Toggle key by name (`F1`-`F12`, `Home`, `N`...) or Linux key code; overrides the GUI's. |
 | `NEURAL_FORGE_HOTKEY_BACKEND=evdev\|x11` | layer | Forces one keyboard backend (default: evdev, then XInput2). |
 | `NEURAL_FORGE_HOTKEY_GLOBAL=1` | layer | The toggle key acts even when another window has the focus. By default a press is ignored only while another window is known to have the focus; where that cannot be told (inside gamescope) the key acts. |

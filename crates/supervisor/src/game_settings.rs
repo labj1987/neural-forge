@@ -228,6 +228,27 @@ mod tests {
         assert!(!home.read("games.ini").contains("Other.exe"), "an emptied section goes:\n{}", home.read("games.ini"));
     }
 
+    /// A sharpening change made while a game is picked is saved as that game's own, like any other setting, and
+    /// all games' stay as they were.
+    #[test]
+    fn a_sharpening_change_for_a_game_is_saved_as_its_own() {
+        let home = Home::new("save-sharpen");
+        home.write("config.ini", "set_clarity_radius=24\n");
+        let h = neural_forge_protocol::ShmHeader::default();
+        h.init_defaults();
+        h.write_game_settings(570, &[("sharpen_cas", 0.5f32.to_bits()), ("clarity_strength", 0.4f32.to_bits()), ("clarity_radius", 24.0f32.to_bits())], None);
+        save_live(&h, Some(&["sharpen_cas", "clarity_strength", "clarity_radius"])).unwrap();
+        assert_eq!(
+            overrides(&load_all(), &GameKey::Steam(570)),
+            values(&[("set_clarity_strength", "0.4"), ("set_sharpen_cas", "0.5")]),
+            "all games' radius is not stored"
+        );
+        let cfg = Config::load();
+        assert!(!cfg.settings.contains_key("set_sharpen_cas") && !cfg.settings.contains_key("set_clarity_strength"));
+        assert_eq!(clear(&GameKey::Steam(570), Some("set_sharpen_cas")).unwrap(), 1, "one override dropped (the row's undo)");
+        assert_eq!(overrides(&load_all(), &GameKey::Steam(570)), values(&[("set_clarity_strength", "0.4")]));
+    }
+
     #[test]
     fn a_change_on_the_channel_is_saved_where_its_settings_belong() {
         let home = Home::new("save-live");

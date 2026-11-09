@@ -1,0 +1,202 @@
+#version 450
+// The sharpening of the finished frame (docs/USER_GUIDE.md, "Sharpening"; crates/layer/src/sharpen.rs): applied at
+// present to the swapchain image's raw words (copied into `Src`, written into `Dst`, copied back), after all of
+// the layer's own work, on every presented frame. Both filters are off by default; with both off nothing is
+// dispatched. One invocation a pixel (phases 0-2: a pixel of the half-size luma grid).
+//
+// Phase 0: the frame's luma at half size (the mean of each 2x2 block), for Clarity's base.
+// Phase 1: the base along the rows: a Gaussian (sigma half the radius) whose taps are weighted down where their
+//          luma differs from the centre's (the edge stop, against halos at strong edges).
+// Phase 2: the same down the columns.
+// Phase 3: per pixel, CAS (FidelityFX Contrast Adaptive Sharpening, sharpen-only path, ported below) on the
+//          3x3 neighbourhood, then Clarity: the pixel's luma minus the base (read bilinearly), weighted toward the
+//          midtones, added to all three channels; then the HUD regions move the result back toward the frame
+//          (keep: none of it inside, soften: its strength), over a feather outside each rectangle.
+//
+// The words are the swapchain's: 8 bits a channel (RGBA8 or BGRA8, UNORM or SRGB alike: the encoded values are
+// filtered) or 10 bits (A2B10G10R10 / A2R10G10B10, the HDR10 PQ code values), alpha kept bit for bit. A pixel
+// nothing changes is written back exactly.
+//
+// The CAS part is a port of AMD FidelityFX CAS 1.20190610 (ffx_cas.h, CasFilter with noScaling,
+// CAS_BETTER_DIAGONALS and CAS_GO_SLOWER, the green channel's weight for all three, the "UNORM with linear
+// conversion approximation" input: squared on load, square root on store). Its sharpness maps to the peak weight
+// as -s / lerp(8, 5, s), so the strength starts from nothing (CAS's own -1 / lerp(8, 5, s) starts at -1/8; its
+// default, sharpness 0, is strength 8/11 here).
+//
+// Copyright (c) 2017-2019 Advanced Micro Devices, Inc. All rights reserved.
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+// documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+// to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions
+// of the Software.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+// THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+// CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Src { uint texel[]; } u_src;
+layout(set = 0, binding = 1, std430) writeonly buffer Dst { uint texel[]; } u_dst;
+// The half-size luma (phase 0), the row pass (phase 1) and the base (phase 2).
+layout(set = 0, binding = 2, std430) buffer Luma { float v[]; } u_luma;
+layout(set = 0, binding = 3, std430) buffer Rows { float v[]; } u_rows;
+layout(set = 0, binding = 4, std430) buffer Base { float v[]; } u_base;
+// Per region: (left, top, right, bottom) in pixels, then (mode: 0 keep, 1 soften; strength; unused x2).
+layout(set = 0, binding = 5, std430) readonly buffer Regions { vec4 r[]; } u_regions;
+
+layout(push_constant) uniform Params {
+  uvec4 dims;     // width, height, phase, region count
+  uvec4 flags;    // x: bit 0 blue first, bit 1 ten bits a channel; y: CAS on; z: Clarity on; w: unused
+  vec4 cas;       // peak weight (negative), unused x3
+  vec4 clarity;   // strength, radius in half-size pixels (taps each side), midtones, edge stop (1 / (2 sigma^2), 0 off)
+  vec4 misc;      // region feather (pixels), spatial 1 / (2 sigma^2) in half-size pixels, unused x2
+} p;
+
+bool tenBit() { return (p.flags.x & 2u) != 0u; }
+
+// The luma weights in the words' channel order: BT.709 for 8-bit frames, BT.2020 for HDR10.
+vec3 lumaWeights() {
+  vec3 w = tenBit() ? vec3(0.2627, 0.6780, 0.0593) : vec3(0.2126, 0.7152, 0.0722);
+  return (p.flags.x & 1u) != 0u ? w.bgr : w;
+}
+
+vec3 decode(uint word) {
+  if (tenBit()) return vec3(word & 1023u, (word >> 10) & 1023u, (word >> 20) & 1023u) / 1023.0;
+  return unpackUnorm4x8(word).rgb;
+}
+
+uint encode(vec3 c, uint word) {
+  c = clamp(c, 0.0, 1.0);
+  if (tenBit()) {
+    uvec3 q = uvec3(round(c * 1023.0));
+    return (word & 0xC0000000u) | q.x | (q.y << 10) | (q.z << 20);
+  }
+  return (word & 0xFF000000u) | (packUnorm4x8(vec4(c, 0.0)) & 0x00FFFFFFu);
+}
+
+uint at(ivec2 q, ivec2 size) {
+  ivec2 c = clamp(q, ivec2(0), size - 1);
+  return uint(c.y) * uint(size.x) + uint(c.x);
+}
+
+ivec2 fullSize() { return ivec2(p.dims.xy); }
+ivec2 halfSize() { return (ivec2(p.dims.xy) + 1) / 2; }
+
+vec3 load(ivec2 q) { return decode(u_src.texel[at(q, fullSize())]); }
+
+void halfLuma(ivec2 id) {
+  vec3 w = lumaWeights();
+  ivec2 f = id * 2;
+  float s = dot(load(f), w) + dot(load(f + ivec2(1, 0)), w) + dot(load(f + ivec2(0, 1)), w) + dot(load(f + ivec2(1, 1)), w);
+  u_luma.v[at(id, halfSize())] = 0.25 * s;
+}
+
+// One direction of the edge-stopped Gaussian over the half-size grid.
+void blur(ivec2 id, ivec2 dir) {
+  ivec2 size = halfSize();
+  int r = int(p.clarity.y);
+  bool rows = dir.x != 0;
+  float centre = rows ? u_luma.v[at(id, size)] : u_rows.v[at(id, size)];
+  float sum = 0.0;
+  float weight = 0.0;
+  for (int t = -r; t <= r; t++) {
+    uint i = at(id + dir * t, size);
+    float v = rows ? u_luma.v[i] : u_rows.v[i];
+    float d = v - centre;
+    float w = exp(-float(t * t) * p.misc.y - d * d * p.clarity.w);
+    sum += v * w;
+    weight += w;
+  }
+  float result = sum / max(weight, 1e-6);
+  if (rows) u_rows.v[at(id, size)] = result;
+  else u_base.v[at(id, size)] = result;
+}
+
+float base(ivec2 id) {
+  ivec2 size = halfSize();
+  vec2 q = (vec2(id) + 0.5) * 0.5 - 0.5;
+  ivec2 q0 = ivec2(floor(q));
+  vec2 f = q - vec2(q0);
+  float a = u_base.v[at(q0, size)];
+  float b = u_base.v[at(q0 + ivec2(1, 0), size)];
+  float c = u_base.v[at(q0 + ivec2(0, 1), size)];
+  float d = u_base.v[at(q0 + ivec2(1, 1), size)];
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// FidelityFX CAS, sharpen only (see the header).
+vec3 cas(ivec2 sp, vec3 e0) {
+  // a b c
+  // d e f
+  // g h i
+  vec3 a = load(sp + ivec2(-1, -1));
+  vec3 b = load(sp + ivec2(0, -1));
+  vec3 c = load(sp + ivec2(1, -1));
+  vec3 d = load(sp + ivec2(-1, 0));
+  vec3 e = e0;
+  vec3 f = load(sp + ivec2(1, 0));
+  vec3 g = load(sp + ivec2(-1, 1));
+  vec3 h = load(sp + ivec2(0, 1));
+  vec3 i = load(sp + ivec2(1, 1));
+  // CasInput: gamma 2.0 to linear.
+  a *= a; b *= b; c *= c; d *= d; e *= e; f *= f; g *= g; h *= h; i *= i;
+  // Soft min and max, 2x bigger (cross plus the full 3x3).
+  vec3 mn = min(min(min(d, e), min(f, b)), h);
+  vec3 mn2 = min(min(min(mn, a), min(c, g)), i);
+  mn = mn + mn2;
+  vec3 mx = max(max(max(d, e), max(f, b)), h);
+  vec3 mx2 = max(max(max(mx, a), max(c, g)), i);
+  mx = mx + mx2;
+  // Smooth minimum distance to signal limit divided by smooth max, shaped by a square root.
+  float ampG = mx.g > 0.0 ? sqrt(clamp(min(mn.g, 2.0 - mx.g) / mx.g, 0.0, 1.0)) : 0.0;
+  // Filter shape: 0 w 0 / w 1 w / 0 w 0, the green channel's weight for all three.
+  float wG = ampG * p.cas.x;
+  float rcpWeight = 1.0 / (1.0 + 4.0 * wG);
+  vec3 pix = clamp((b * wG + d * wG + f * wG + h * wG + e) * rcpWeight, 0.0, 1.0);
+  // Linear to gamma 2.0.
+  return sqrt(pix);
+}
+
+float hudScale(ivec2 id) {
+  vec2 c = vec2(id) + 0.5;
+  float feather = max(p.misc.x, 1.0);
+  float s = 1.0;
+  for (uint k = 0u; k < p.dims.w; k++) {
+    vec4 rect = u_regions.r[2u * k];
+    vec4 mode = u_regions.r[2u * k + 1u];
+    float inside = mode.x > 0.5 ? mode.y : 0.0;
+    vec2 out2 = max(max(rect.xy - c, c - rect.zw), vec2(0.0));
+    float d = max(out2.x, out2.y);
+    float v = d >= feather ? 1.0 : inside + (1.0 - inside) * (d / feather);
+    s = min(s, v);
+  }
+  return s;
+}
+
+void apply(ivec2 id) {
+  uint i = at(id, fullSize());
+  uint word = u_src.texel[i];
+  vec3 e = decode(word);
+  vec3 outc = p.flags.y != 0u ? cas(id, e) : e;
+  if (p.flags.z != 0u) {
+    float y = dot(e, lumaWeights());
+    float detail = y - base(id);
+    float mid = mix(1.0, 4.0 * y * (1.0 - y), p.clarity.z);
+    outc += vec3(p.clarity.x * detail * mid);
+  }
+  float s = hudScale(id);
+  outc = e + s * (outc - e);
+  u_dst.texel[i] = outc == e ? word : encode(outc, word);
+}
+
+void main() {
+  ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = p.dims.z == 3u ? fullSize() : halfSize();
+  if (id.x >= size.x || id.y >= size.y) return;
+  if (p.dims.z == 0u) halfLuma(id);
+  else if (p.dims.z == 1u) blur(id, ivec2(1, 0));
+  else if (p.dims.z == 2u) blur(id, ivec2(0, 1));
+  else apply(id);
+}

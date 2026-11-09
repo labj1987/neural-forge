@@ -365,6 +365,21 @@ mod tests {
         assert_eq!(session(h, None), None, "a game that cannot be named is all games' too");
     }
 
+    /// The sharpening goes the generic way: a game's own values reach the layer's reading for its session, the
+    /// settings it has none of come from all games', and another game gets all games' back (here: off).
+    #[test]
+    fn a_game_s_own_sharpening_applies_to_its_session_only() {
+        let _home = ConfigHome::new("sharpen", "set_clarity_radius=24\n", "[570]\nset_sharpen_cas=0.73\nset_clarity_strength=0.4\n");
+        let h = leaked();
+        assert_eq!(session(h, Some(&GameKey::Steam(570))), Some(570));
+        let s = h.sharpen_settings_for_frame();
+        assert_eq!((s.cas, s.clarity, s.radius), (0.73, 0.4, 24.0), "the game's own, and all games' radius");
+        assert_eq!(session(h, Some(&GameKey::Steam(10))), Some(0));
+        let s = h.sharpen_settings_for_frame();
+        assert!(!s.any(), "all games' sharpening is off");
+        assert_eq!(s.radius, 24.0);
+    }
+
     /// On a fresh header a game without settings of its own gets the saved settings once, and never over a
     /// write that got in first; a game with its own gets them either way.
     #[test]

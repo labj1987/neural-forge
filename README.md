@@ -79,6 +79,10 @@ The Model tab's **Colour** group shapes the model's change rather than the pictu
 contrast and detail, and protections that keep the frame's own hues, greys, shadows or highlights
 (all off by default).
 
+The Model tab's **Sharpening** group adds AMD FidelityFX CAS (adaptive sharpening) and Clarity (local
+contrast) to the finished frame, in every game, after the model; both are off by default, and the HUD
+regions keep them off the HUD.
+
 The game's HDR works with the model before the upscaler and after DLSS. On the finished frame, HDR10
 works too: the network runs on an SDR copy of the frame and its change is put back onto the HDR frame.
 Highlights above about 185 nits get less and less of the change and none above about 295 nits; a
