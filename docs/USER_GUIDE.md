@@ -182,7 +182,8 @@ the picture. **Find the HUD** (on) keeps the model's change off what stays still
 picture moves: text, icons, the minimap. It needs a few seconds of movement to find them, and a still
 scene (a menu, a paused game) never adds to what it found. **HUD regions** are up to eight rectangles in
 percent of the frame: **Keep** has no change inside, **Soften** keeps the change's strength (a share) inside;
-the change comes back over a few pixels around each one. With a history after the upscaler, the history is
+the change comes back over a few pixels around each one. A region is cut at the frame's edges (Left at 90 %
+leaves at most 10 % of width), and the list shows what is kept. With a history after the upscaler, the history is
 not used under the HUD either, so changing HUD text leaves no trail. They are saved as `set_hud_regions` in
 `config.ini` and can be set with `neural-forge-cli shmctl set hud_regions "0,0.88,0.3,0.12;0.7,0,0.3,0.1,soften,0.5"`
 (left, top, width, height in 0-1, then `keep` or `soften` and the strength). Before the upscaler and after
@@ -369,10 +370,17 @@ Valve's VAC) cannot be seen.
 
 ## Uninstall
 
-`neural-forge-cli uninstall` removes the files it installed (files you changed are kept).
-`neural-forge-cli uninstall --purge` also removes the config, everything under
-`~/.local/share/neural-forge` (the model, an imported DLL, captures), `~/.local/state/neural-forge` and
-`/tmp/neural-forge-$UID`.
+`neural-forge-cli uninstall` removes the files it installed (files you changed are kept). The
+games you switched on keep Neural Forge's variables in their launch options, which do nothing without
+the layer.
+`neural-forge-cli uninstall --purge` removes everything Neural Forge wrote. First it takes its
+variables out of every game's Steam launch options (your own options stay), in every Steam account,
+and removes the files it keeps next to each account's `localconfig.vdf` (`.neural-forge.orig` and
+`.neural-forge.bak`, its copies of that file, and `.neural-forge.lock`). Steam must be closed for
+that: while it runs, or while a game's options cannot be changed safely, the purge removes nothing and
+names each game with the launch options to set by hand instead. Then it removes the config,
+everything under `~/.local/share/neural-forge` (the model, an imported DLL, captures),
+`~/.local/state/neural-forge` and `/tmp/neural-forge-$UID`.
 
 ## More known issues
 
@@ -398,4 +406,10 @@ Valve's VAC) cannot be seen.
   layer log (`NEURAL_FORGE_LOG=/path` in the launch options) has the `[native]` lines.
 - **Steam overlay problems.** The layer leaves the overlay's own small swapchain alone, and only the
   executables in `NEURAL_FORGE_TARGET_EXE` (which switching a game on sets) can use Neural Forge.
+- **"Installing the layer for Steam games failed: refusing to overwrite ..."** A file Neural Forge
+  installed under `~/.local/share/neural-forge` was changed, or something else put a file there, so
+  the AppImage leaves it alone and games keep the layer installed before. The message names the file
+  and what to do: move that file aside and start the AppImage again; when the install record
+  (`~/.local/share/neural-forge/installation.json`) is missing, run
+  `~/.local/share/neural-forge/bin/neural-forge-cli uninstall` first.
 - **32-bit games** are not supported (see [Requirements](../README.md#requirements)).

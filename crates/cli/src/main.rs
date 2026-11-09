@@ -32,8 +32,10 @@ fn usage_text() -> &'static str {
          \x20                     persistent user storage (see scripts/install.py --\n\
          \x20                     same operation, same record, either tool works)\n\
          \x20 uninstall [--purge]  remove unchanged tracked installed files; --purge also\n\
-         \x20                     removes config, data (the DLL, the model), state and\n\
-         \x20                     /tmp/neural-forge-$UID\n\
+         \x20                     takes Neural Forge out of every game's Steam launch\n\
+         \x20                     options (not while Steam runs) and removes its copies\n\
+         \x20                     of localconfig.vdf, config, data (the DLL, the model),\n\
+         \x20                     state and /tmp/neural-forge-$UID\n\
          \x20 shmctl <sub>         raw status/set/toggle/capture against a running\n\
          \x20                     instance's live SHM header (see `shmctl help`)\n\
          \x20 profile <sub>        save/load/list/delete named settings profiles\n\
@@ -268,8 +270,14 @@ fn cmd_install(appdir: &str) -> ExitCode {
 fn cmd_uninstall(purge: bool) -> ExitCode {
     if purge {
         return match neural_forge_supervisor::install::purge() {
-            Ok(removed) => {
-                for path in &removed {
+            Ok(purged) => {
+                for game in &purged.switched_off {
+                    println!("switched Neural Forge off in the launch options of {game}");
+                }
+                for file in &purged.unchecked {
+                    println!("could not read {}: check its games' launch options in Steam for NEURAL_FORGE_ variables", file.display());
+                }
+                for path in &purged.removed {
                     println!("removed {}", path.display());
                 }
                 ExitCode::SUCCESS
@@ -687,7 +695,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "extract-model" => "usage: neural-forge-cli extract-model DIR [--network full|small]\n  write the model directory from nvngx_dlssnr.dll (DIR holds it, or is the DLL): every network\n  the DLL carries, replacing what was extracted before. Build 310.9.16 carries two: full, the\n  71-block network every build has (stronger shading and depth), and small, 31 blocks (faster,\n  subtler); older builds have only full. --network extracts only that one and leaves the other\n  as it is. Which one runs is the Network setting (the Setup tab, `shmctl set network 0|1`; full\n  by default); a game already running switches to a newly chosen one at once, and picks up a\n  newly extracted model when it next starts",
         "install" => "usage: neural-forge-cli install --appdir DIR\n  install an extracted AppImage AppDir into persistent user storage",
         "uninstall" => {
-            "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also removes config, data\n  (the DLL, the model), state and /tmp/neural-forge-$UID"
+            "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also takes Neural Forge out of\n  every game's Steam launch options (it refuses, removing nothing, while Steam runs)\n  and removes its copies of each account's localconfig.vdf, config, data (the DLL,\n  the model), state and /tmp/neural-forge-$UID"
         }
         "games" => "usage: neural-forge-cli games\n  list installed Steam games (appid, Neural Forge on/off, name, library, the executable\n  Neural Forge targets, and the anti-cheat the game's folder ships)",
         "enable" => {
@@ -695,7 +703,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         }
         "disable" => "usage: neural-forge-cli disable GAME\n  take Neural Forge back out of GAME's Steam launch options (see `enable --help`)",
         "report" => {
-            "usage: neural-forge-cli report [--appid ID]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game and its Proton -- found from the game the channel names, or\n  from ID, its Steam app id -- and the doctor's findings, which list your installed Steam\n  games and their library folders), config.ini, the model's manifest, the layer's logs,\n  this boot's GPU fault (Xid) lines, the channel's status and the newest capture pair.\n  The home directory, user name and host name are replaced with ~, <user> and <host>;\n  nothing is uploaded"
+            "usage: neural-forge-cli report [--appid ID]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game and its Proton -- found from the game the channel names, or\n  from ID, its Steam app id -- and the doctor's findings, which list your installed Steam\n  games and their library folders, and of a game's launch options only Neural Forge's\n  part), config.ini, the model's manifest, the layer's logs,\n  this boot's GPU fault (Xid) lines, the channel's status and the newest capture pair.\n  The home directory, user name and host name are replaced with ~, <user> and <host>;\n  nothing is uploaded"
         }
         "shmctl" => "",
         "profile" => "",

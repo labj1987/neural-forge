@@ -48,11 +48,14 @@ pub struct Finding {
     pub evidence: String,
     /// One concrete thing to do about it.
     pub fix: Option<String>,
+    /// The evidence as the report shows it ([`render_report_text`]), when it differs from what is shown on
+    /// screen: a game's launch options reduced to Neural Forge's own part.
+    pub report_evidence: Option<String>,
 }
 
 impl Finding {
     fn new(check: &'static str, severity: Severity, summary: impl Into<String>, evidence: impl Into<String>, fix: Option<String>) -> Self {
-        Self { check, severity, summary: summary.into(), evidence: evidence.into(), fix }
+        Self { check, severity, summary: summary.into(), evidence: evidence.into(), fix, report_evidence: None }
     }
 }
 
@@ -295,10 +298,21 @@ pub fn any_failure(findings: &[Finding]) -> bool {
 
 /// The findings as text, in the order given, each with its evidence and fix, and a count at the end.
 pub fn render_text(findings: &[Finding]) -> String {
+    render(findings, false)
+}
+
+/// [`render_text`] for the report (`summary.txt`, attached to public issues): with each finding's
+/// [`Finding::report_evidence`] where it has one, so no game's own launch options are in it.
+pub fn render_report_text(findings: &[Finding]) -> String {
+    render(findings, true)
+}
+
+fn render(findings: &[Finding], for_report: bool) -> String {
     let mut s = String::new();
     for f in findings {
         s.push_str(&format!("[{}] {}: {}\n", f.severity.label(), f.check, f.summary));
-        for line in f.evidence.lines() {
+        let evidence = if for_report { f.report_evidence.as_deref().unwrap_or(&f.evidence) } else { &f.evidence };
+        for line in evidence.lines() {
             s.push_str(&format!("    {line}\n"));
         }
         if let Some(fix) = &f.fix {
@@ -318,12 +332,24 @@ pub fn render_text(findings: &[Finding]) -> String {
 
 // ---- the five original checks ------------------------------------------------------------------
 
+/// `config.ini` holds only the settings changed from their defaults, and nothing on the way from
+/// installing to playing writes it, so a missing file is normal. Only one that exists and cannot be read
+/// fails: settings cannot be saved then ([`crate::Config::save`] refuses), and the layer runs on the defaults.
 fn check_config(roots: &Roots) -> Finding {
     let path = roots.config_file.display().to_string();
-    if roots.config_file.exists() {
-        Finding::new("config", Severity::Ok, "the config file exists", path, None)
+    let cfg = crate::Config::load_from(&roots.config_file.to_string_lossy());
+    if let Some(why) = cfg.read_error() {
+        Finding::new(
+            "config",
+            Severity::Failure,
+            "the config file cannot be read",
+            why.to_string(),
+            Some("Make it a readable file again (its permissions, its owner), or move it aside to start again from the defaults. Until then no setting can be saved.".into()),
+        )
+    } else if roots.config_file.exists() {
+        Finding::new("config", Severity::Ok, "the saved settings can be read", path, None)
     } else {
-        Finding::new("config", Severity::Failure, "the config file is missing", path, Some("Run `neural-forge-cli init`.".into()))
+        Finding::new("config", Severity::Info, "no saved settings yet: the defaults apply", path, None)
     }
 }
 
@@ -608,8 +634,9 @@ fn check_compute_capability(gpus: &Gpus) -> Vec<Finding> {
 
 // ---- VRAM ----------------------------------------------------------------------------------------
 
-// What the network needs at a size (`NETWORK_VRAM_MIB`, measured; the small network takes about 45 MiB less).
-use neural_forge_protocol::vram_need::{network_need_mib, NETWORK_VRAM_MIB};
+// What the network needs at a size (`NETWORK_VRAM_MIB`, measured, linear in the pixel count between and beyond the
+// measured sizes; the small network takes about 45 MiB less).
+use neural_forge_protocol::vram_need::{network_need, NETWORK_VRAM_MIB};
 
 /// Whether a game's layer is presenting now: its heartbeat (one beat per present) moves within half a second. A
 /// closed game leaves its last values in the channel, `native_running` among them.
@@ -643,15 +670,16 @@ fn check_vram(gpus: &Gpus, hdr: Option<&neural_forge_protocol::ShmHeader>, runni
             CHECK,
             Severity::Info,
             format!(
-                "{free} MiB of {total} MiB VRAM free; the network needs about {}-{} MiB depending on the game's resolution",
-                NETWORK_VRAM_MIB[0].2, NETWORK_VRAM_MIB[3].2
+                "{free} MiB of {total} MiB VRAM free; the network needs about {} MiB at {}x{} to {} MiB at {}x{}, more above",
+                NETWORK_VRAM_MIB[0].2, NETWORK_VRAM_MIB[0].0, NETWORK_VRAM_MIB[0].1, NETWORK_VRAM_MIB[3].2, NETWORK_VRAM_MIB[3].0, NETWORK_VRAM_MIB[3].1
             ),
             evidence,
             None,
         )];
     };
-    let (mw, mh, need) = network_need_mib(w, h);
-    let evidence = format!("{evidence}\nthe layer's last frame: {w}x{h}; the network measured {need} MiB at {mw}x{mh}");
+    let estimate = network_need(w, h);
+    let need = estimate.mib;
+    let evidence = format!("{evidence}\nthe layer's last frame: {w}x{h}; the network needs about {need} MiB there ({})", estimate.basis());
     if running {
         // Already resident: what is free is what is left beside it.
         return vec![Finding::new(CHECK, Severity::Ok, format!("the network is running at {w}x{h}; {free} MiB VRAM still free"), evidence, None)];
@@ -827,13 +855,17 @@ fn check_steam(roots: &Roots) -> Vec<Finding> {
     if !untargeted.is_empty() {
         let names = untargeted.iter().map(|(g, _)| g.name.as_str()).collect::<Vec<_>>().join(", ");
         let wanted = untargeted.iter().map(|(g, o)| format!("{}: {o}", g.name)).collect::<Vec<_>>().join("\n");
-        out.push(Finding::new(
+        let ours = untargeted.iter().map(|(g, o)| format!("{}: {}", g.name, crate::launch_options::neural_forge_part(o))).collect::<Vec<_>>().join("\n");
+        let mut finding = Finding::new(
             "steam-target",
             Severity::Warning,
             format!("on without the game's executable as its target, so a launcher or helper can take the effect: {names}"),
             format!("{evidence}\nlaunch options to set:\n{wanted}"),
             Some("With Steam closed, switch each game off and on again in the Setup tab, or run `neural-forge-cli enable GAME`; or set the launch options listed above by hand.".into()),
-        ));
+        );
+        finding.report_evidence =
+            Some(format!("{evidence}\nlaunch options to set (Neural Forge's part; the game's own options are left out of the report):\n{ours}"));
+        out.push(finding);
     }
     out
 }
@@ -1137,16 +1169,31 @@ fn check_target_excluded(roots: &Roots, events: &[state_log::Event]) -> Vec<Find
     }
     let missed = [newest];
     let games = crate::steam::games(&roots.steam_roots);
+    let cfg = crate::Config::load_from(&roots.config_file.to_string_lossy());
     missed
         .iter()
         .map(|e| {
             let exe = &e.process;
             let fix = match crate::steam::games_for_exe(&games, exe).as_slice() {
-                [game] => format!(
-                    "With Steam closed, run `neural-forge-cli enable {} --target-exe {exe}` (or choose {exe} in the Setup tab's target editor for {}), then start the game.",
-                    game.appid, game.name
+                [game] => {
+                    // The targets the game has plus the one left out: `--target-exe` replaces the list.
+                    let mut targets: Vec<String> =
+                        crate::steam::target_for(&cfg, game).split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect();
+                    if !targets.iter().any(|t| t.eq_ignore_ascii_case(exe)) {
+                        targets.push(exe.clone());
+                    }
+                    format!(
+                        "With Steam closed, run `neural-forge-cli enable {} --target-exe {}` (or add {exe} in the Setup tab's target editor for {}), then start the game.",
+                        game.appid,
+                        crate::launch_options::shell_quote(&targets.join(",")),
+                        game.name
+                    )
+                }
+                _ => format!(
+                    "Add {exe} to `NEURAL_FORGE_TARGET_EXE` in the game's launch options: `neural-forge-cli enable GAME --target-exe {}`, with the \
+                     game's other targets in front, comma-separated (the option replaces the list), then start the game.",
+                    crate::launch_options::shell_quote(exe)
                 ),
-                _ => format!("Add {exe} to `NEURAL_FORGE_TARGET_EXE` in the game's launch options (`neural-forge-cli enable GAME --target-exe {exe}`), then start the game."),
             };
             Finding::new(
                 CHECK,
@@ -1338,7 +1385,9 @@ mod tests {
     fn the_original_checks_report_a_missing_config_and_model() {
         let f = quiet();
         let v = run(&f.roots);
-        assert_eq!(one(&v, "config").severity, Severity::Failure);
+        // Nothing on the way from installing to playing writes config.ini: missing means the defaults apply.
+        assert_eq!(one(&v, "config").severity, Severity::Info);
+        assert_eq!(one(&v, "config").summary, "no saved settings yet: the defaults apply");
         assert_eq!(one(&v, "model").severity, Severity::Failure);
         assert_eq!(one(&v, "nvngx-dll").severity, Severity::Info, "the DLL is only needed to extract");
         assert_eq!(one(&v, "user-dirs").severity, Severity::Ok, "they can be created");
@@ -1381,6 +1430,21 @@ mod tests {
         std::fs::write(&first, [9u8; 16]).unwrap();
         let m = one(&run(&f.roots), "model").clone();
         assert_eq!((m.severity, m.summary.as_str()), (Severity::Failure, "the extracted small network is damaged: the network cannot load it"));
+    }
+
+    #[test]
+    fn a_config_that_exists_but_cannot_be_read_fails() {
+        let f = quiet();
+        // A directory where the file goes: it exists, and reading it fails with something other than NotFound.
+        std::fs::create_dir_all(&f.roots.config_file).unwrap();
+        let c = check_config(&f.roots);
+        assert_eq!((c.severity, c.summary.as_str()), (Severity::Failure, "the config file cannot be read"));
+        assert!(c.evidence.contains("cannot be read"), "{}", c.evidence);
+        assert!(c.fix.as_deref().is_some_and(|fix| fix.contains("move it aside")), "{:?}", c.fix);
+        // Readable again: OK.
+        std::fs::remove_dir(&f.roots.config_file).unwrap();
+        write(&f.roots.config_file, "set_intensity=0.5\n");
+        assert_eq!(check_config(&f.roots).severity, Severity::Ok);
     }
 
     #[test]
@@ -1456,10 +1520,11 @@ mod tests {
 
     #[test]
     fn vram_below_the_networks_need_at_the_games_size_warns() {
-        assert_eq!(network_need_mib(1485, 836).2, 377);
-        assert_eq!(network_need_mib(1920, 1080).2, 607);
-        assert_eq!(network_need_mib(2560, 1440).2, 729);
-        assert_eq!(network_need_mib(7680, 4320).2, 1415);
+        assert_eq!(network_need(1485, 836).mib, 377);
+        assert_eq!(network_need(1920, 1080).mib, 500);
+        assert_eq!(network_need(2560, 1440).mib, 729);
+        // Beyond 4K the need keeps growing with the pixel count (it is not the 4K figure).
+        assert_eq!(network_need(7680, 4320).mib, 5119);
         let gpus = |free: u64| Gpus::Listed(vec![parse_gpu_line(&format!("NVIDIA GeForce RTX 5070, 12.0, 12227, {free}"))]);
         let hdr = neural_forge_protocol::ShmHeader::default();
         hdr.init_defaults();
@@ -1470,6 +1535,16 @@ mod tests {
         let low = check_vram(&gpus(500), Some(&hdr), false);
         assert_eq!(low[0].severity, Severity::Warning);
         assert!(low[0].summary.contains("below the 607 MiB the network needs at 2228x1253"), "{}", low[0].summary);
+        assert!(low[0].evidence.ends_with("the network needs about 607 MiB there (measured 607 MiB at 2228x1253)"), "{}", low[0].evidence);
+        // An ultrawide frame between two measured sizes: interpolated (918 MiB), not the 4K figure (1415).
+        hdr.preupscale_width.store(3440, Ordering::Relaxed);
+        hdr.preupscale_height.store(1440, Ordering::Relaxed);
+        let wide = check_vram(&gpus(1000), Some(&hdr), false);
+        assert_eq!(wide[0].severity, Severity::Ok, "{}", wide[0].summary);
+        assert_eq!(wide[0].summary, "1000 MiB VRAM free, enough for the network at 3440x1440 (918 MiB)");
+        assert!(wide[0].evidence.contains("from the 729 MiB measured at 2560x1440 and the 1415 MiB at 3840x2160"), "{}", wide[0].evidence);
+        hdr.preupscale_width.store(2228, Ordering::Relaxed);
+        hdr.preupscale_height.store(1253, Ordering::Relaxed);
         assert_eq!(check_vram(&gpus(4000), Some(&hdr), false)[0].severity, Severity::Ok);
         // Running: the network is already in what is used.
         let running = check_vram(&gpus(300), Some(&hdr), true);
@@ -1618,6 +1693,29 @@ mod tests {
         );
     }
 
+    /// The report (public issues) carries only Neural Forge's part of a game's launch options; the screen keeps them.
+    #[test]
+    fn the_report_leaves_a_games_own_launch_options_out() {
+        let mut f = quiet();
+        let options = "NEURAL_FORGE_ENABLE=1 API_KEY=s3cret %command% +connect 1.2.3.4:27015 +password hunter2";
+        steam(&mut f, "steam", false, &[("3240220", "Grand Theft Auto V Enhanced", Some(options))]);
+        write(&f.dir.join("steam/steamapps/common/Grand Theft Auto V Enhanced/GTA5_Enhanced.exe"), "");
+        let v = check_steam(&f.roots);
+        let screen = render_text(&v);
+        assert!(screen.contains("+password hunter2") && screen.contains("API_KEY=s3cret"), "{screen}");
+        let report = render_report_text(&v);
+        assert!(!report.contains("hunter2") && !report.contains("s3cret") && !report.contains("1.2.3.4"), "{report}");
+        assert!(
+            report.contains(
+                "Grand Theft Auto V Enhanced: NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe <other options omitted> %command% <other options omitted>"
+            ),
+            "{report}"
+        );
+        // Every other finding reads the same in both.
+        let others: Vec<Finding> = v.into_iter().filter(|x| x.check != "steam-target").collect();
+        assert_eq!(render_text(&others), render_report_text(&others));
+    }
+
     #[test]
     fn a_game_on_that_ships_anti_cheat_is_a_warning() {
         let mut f = quiet();
@@ -1679,14 +1777,26 @@ mod tests {
         let mut f = quiet();
         steam(&mut f, "steam", false, &[("306130", "ESO", Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=eso.exe %command%"))]);
         write(&f.dir.join("steam/steamapps/common/ESO/game/client/eso64.exe"), "");
+        // eso.exe chosen by hand as the target (`enable ESO --target-exe eso.exe`).
+        write(&f.roots.config_file, "target_exe_306130=eso.exe\n");
         let excluded = event(100, 7, "target-excluded", "NEURAL_FORGE_TARGET_EXE=eso.exe leaves out eso64.exe").replace("\tGame.exe\t", "\teso64.exe\t");
         let events: Vec<state_log::Event> = excluded.lines().filter_map(state_log::parse_line).collect();
         assert_eq!(events.len(), 1, "{excluded}");
         let v = check_target_excluded(&f.roots, &events);
         assert_eq!(v.len(), 1);
         assert!(v[0].summary.contains("excluded eso64.exe"), "{}", v[0].summary);
-        assert!(v[0].fix.as_deref().unwrap().contains("neural-forge-cli enable 306130 --target-exe eso64.exe"), "{:?}", v[0].fix);
+        // The game's own target kept in front of the one left out (the option replaces the list).
+        assert!(v[0].fix.as_deref().unwrap().contains("`neural-forge-cli enable 306130 --target-exe eso.exe,eso64.exe`"), "{:?}", v[0].fix);
         assert_eq!(v[0].evidence.matches(" UTC").count(), 1, "the time once: {}", v[0].evidence);
+        // A name with a space is quoted, so the pasted command passes it as one argument.
+        let mut g = quiet();
+        steam(&mut g, "steam", false, &[("219990", "Grim Dawn", Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=x64/GrimDawn.exe %command%"))]);
+        write(&g.dir.join("steam/steamapps/common/Grim Dawn/Grim Dawn.exe"), "");
+        write(&g.roots.config_file, "target_exe_219990=Launcher.exe\n");
+        let spaced = event(100, 7, "target-excluded", "x").replace("\tGame.exe\t", "\tGrim Dawn.exe\t");
+        let events: Vec<state_log::Event> = spaced.lines().filter_map(state_log::parse_line).collect();
+        let v = check_target_excluded(&g.roots, &events);
+        assert!(v[0].fix.as_deref().unwrap().contains("`neural-forge-cli enable 219990 --target-exe 'Launcher.exe,Grim Dawn.exe'`"), "{:?}", v[0].fix);
         // A process engaged in the same session (the target's own) or later: nothing to say.
         let attach = event(200, 8, "attach", "engaged");
         let events: Vec<state_log::Event> = format!("{excluded}{attach}").lines().filter_map(state_log::parse_line).collect();
