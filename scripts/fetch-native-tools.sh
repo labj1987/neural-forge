@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Downloads the pinned tools the native backend (crates/native) builds with into tools/native/ (git-ignored):
-#   glslang 16.6.0 (Linux x86_64 release binary), Vulkan-Headers v1.4.367 and volk vulkan-sdk-1.4.363.0.
+#   glslang 16.6.0 (Linux x86_64 release binary), Vulkan-Headers vulkan-sdk-1.4.363.0 and volk vulkan-sdk-1.4.363.0.
+# Vulkan-Headers and volk are pinned to the same Vulkan SDK release (vulkan-sdk-* tags, not Khronos's weekly
+# spec-update tags), so the headers and the loader always come from one SDK.
 # The network's own source is in the repository (third_party/opendlss-nr). Every archive is checked against
 # the SHA-256 pinned below before it is unpacked. Re-running skips a tool whose unpacked copy carries the
 # stamp of the same pinned archive, so it is safe to run on every build, and a filled tools/native/ builds
-# offline. scripts/check_pins.py reads the pins below.
+# offline. scripts/check_pins.py reads the pins below, and its weekly run (.github/workflows/pin-check.yml)
+# rewrites them when upstream moves on.
 #   bash scripts/fetch-native-tools.sh            (NEURAL_FORGE_NATIVE_TOOLS=<dir> to unpack elsewhere)
 set -euo pipefail
 
@@ -15,7 +18,7 @@ mkdir -p "$TOOLS"
 # name | url | sha256 | file that must exist after unpacking (relative to tools/native/<name>)
 PINS=(
   "glslang|https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-linux-x86_64-release.tar.gz|2c34071f56ecf39d16233294d3739cf43f981fd39080f2fd9dccb782101191ce|bin/glslang"
-  "Vulkan-Headers|https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.367.tar.gz|0df7d58b5df617e0a6a17dec521af459206719f9c7cb12d05d09275597c16f70|include/vulkan/vulkan_core.h"
+  "Vulkan-Headers|https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz|4a078be12bef21cfebc09d878b77a63cff9d68f899254a0b00d0e37ef73e7f7e|include/vulkan/vulkan_core.h"
   "volk|https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz|1547d8d74395d4048fb3f4a6313da56db626e89b55db238d0d7e8944c8a645f3|volk.c"
 )
 
