@@ -30,15 +30,34 @@ struct Primary {
 static PRIMARY: Mutex<Option<Primary>> = Mutex::new(None);
 
 fn claim_primary(device: vk::Device, swapchain: vk::SwapchainKHR, width: u32, height: u32) -> bool {
-    let mut guard = PRIMARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    claim(&mut PRIMARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner), device, swapchain, width, height)
+}
+
+fn claim(primary: &mut Option<Primary>, device: vk::Device, swapchain: vk::SwapchainKHR, width: u32, height: u32) -> bool {
     let area = u64::from(width) * u64::from(height);
-    match &*guard {
+    match &*primary {
         Some(p) if p.device == device && p.swapchain == swapchain => true,
         Some(p) if area <= p.area => false,
         _ => {
-            *guard = Some(Primary { device, swapchain, area });
+            *primary = Some(Primary { device, swapchain, area });
             true
         }
+    }
+}
+
+/// A swapchain created with `oldSwapchain` replaces it: the old one is retired (it can present no
+/// more), though the application may keep it alive for a few frames until its presents complete, or
+/// never destroy it. When the retired one holds the primary claim, the claim follows to the new one
+/// (with its own size; a pass-through swapchain may hold it too, through the render tap). Without this,
+/// a recreation at the same size is refused the claim for as long as the retired swapchain lives, and
+/// its presents go out untouched.
+fn succeed_primary(device: vk::Device, old: vk::SwapchainKHR, new: vk::SwapchainKHR, width: u32, height: u32) {
+    succeed(&mut PRIMARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner), device, old, new, width, height);
+}
+
+fn succeed(primary: &mut Option<Primary>, device: vk::Device, old: vk::SwapchainKHR, new: vk::SwapchainKHR, width: u32, height: u32) {
+    if old != vk::SwapchainKHR::null() && matches!(&*primary, Some(p) if p.device == device && p.swapchain == old) {
+        *primary = Some(Primary { device, swapchain: new, area: u64::from(width) * u64::from(height) });
     }
 }
 
@@ -1271,6 +1290,40 @@ fn post_path_idle(effect_off: Option<bool>, bootstrap_complete: bool, capture_re
 }
 
 #[cfg(test)]
+mod primary_claim_tests {
+    use super::*;
+    use vk::Handle;
+
+    /// A recreation with `oldSwapchain` takes the retired swapchain's claim, at the same size or a smaller
+    /// one, and the retired swapchain no longer holds it; the claim stays where it is when the retired one
+    /// did not hold it.
+    #[test]
+    fn the_primary_claim_follows_a_recreated_swapchain() {
+        let (device, other_device) = (vk::Device::from_raw(0x10), vk::Device::from_raw(0x20));
+        let (old, new, smaller, overlay) = (sc(1), sc(2), sc(3), sc(4));
+        let mut primary = None;
+        assert!(claim(&mut primary, device, old, 1920, 1080));
+        assert!(!claim(&mut primary, device, new, 1920, 1080), "the same size while the old one holds it");
+        succeed(&mut primary, device, old, new, 1920, 1080);
+        assert!(claim(&mut primary, device, new, 1920, 1080), "the replacement holds the claim");
+        assert!(!claim(&mut primary, device, old, 1920, 1080), "the retired one does not");
+        // A smaller replacement (the window shrank) still takes it, at its own size.
+        succeed(&mut primary, device, new, smaller, 1280, 720);
+        assert!(claim(&mut primary, device, smaller, 1280, 720));
+        assert!(!claim(&mut primary, device, overlay, 640, 480), "a smaller swapchain is still refused");
+        // A retirement of a swapchain that does not hold the claim (or another device's) changes nothing.
+        succeed(&mut primary, device, overlay, sc(5), 3840, 2160);
+        succeed(&mut primary, other_device, smaller, sc(6), 3840, 2160);
+        succeed(&mut primary, device, vk::SwapchainKHR::null(), sc(7), 3840, 2160);
+        assert!(matches!(&primary, Some(p) if p.swapchain == smaller && p.device == device && p.area == 1280 * 720));
+    }
+
+    fn sc(raw: u64) -> vk::SwapchainKHR {
+        vk::SwapchainKHR::from_raw(raw)
+    }
+}
+
+#[cfg(test)]
 mod shares_memory_tests {
     use super::*;
 
@@ -2190,6 +2243,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if result != vk::Result::SUCCESS {
             return LayerResult::Handled(Err(result));
         }
+        // The retired swapchain's primary claim (if it holds it) goes to its replacement. Also after the
+        // fallback creation above, which cleared `oldSwapchain`: the first attempt already retired it.
+        succeed_primary(self.device.handle(), create_info.old_swapchain, swapchain, create_info.image_extent.width, create_info.image_extent.height);
         let hdr_kind = swapchain::detect_hdr_kind(create_info.image_format, create_info.image_color_space);
         // Cache even a pass-through swapchain's images. This lets the passive command
         // diagnostics identify a legal render-to-swapchain transfer without touching

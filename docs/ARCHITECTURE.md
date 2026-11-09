@@ -680,7 +680,8 @@ is not held before the upscaler.
   (`A2B10G10R10`/`A2R10G10B10`) in the HDR10 colour space (NATIVE_BACKEND.md, "HDR on the finished
   frame"); float16 and 10-bit SDR swapchains are presented untouched.
 - **Primary swapchain:** one per process (the largest plausible game size), so overlays are left
-  alone.
+  alone. A swapchain created with `oldSwapchain` takes over the retired one's claim at creation, so a
+  recreation is not refused while the application keeps the retired swapchain alive.
 - **Warm-up** (`swapchain::Warmup`): the layer engages only after 5 s of steady presents and
   steps back out on loading screens. Composing during GTA V's loading screens used to freeze it.
 
