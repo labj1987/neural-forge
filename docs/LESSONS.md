@@ -1571,6 +1571,12 @@ later on October 22 was tried as the cheapest of them first offline, then built 
   NVAPI can only see less free memory than before, so nothing else changed. Driver 620.70.06: GTA V Enhanced
   1440p frame generation 4x, Preset C, `FrameLimit` 120, 3.10.0: 61.4 real / 247.4 shown with the full network,
   80.4 / 323.1 without, frame generation engaged on the first launch, no NVRM or Xid lines.
+- **Hogwarts Legacy's own DLSS 5 under Proton, retested:** on November 5 dxvk-nvapi answered the game's
+  `NvAPI_D3D12_GetCudaIndependentDescriptorObject` with "Invalid argument" and the picture did not change. With
+  Proton Experimental 20261027b (trace log, `NeuralRendering=(Mode=Nvidia_On)`, title screen into the save) every
+  call succeeded: 9 descriptor objects (type 0) and 10 merged texture-sampler objects OK, 95 cubin kernels created
+  and their launches OK; only the startup probes with null arguments are refused. Whether NVIDIA's network then
+  changes the picture was not compared. No upstream report; the README carries no known issue for it.
 
 ## Deliberately not done, or left open
 

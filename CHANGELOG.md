@@ -10,8 +10,6 @@ first shipped them; their phase is kept as a subheading.
   The small network needs only about 45 MiB less video memory than the full one, too little to help, so the
   switch only cost a reload before the pause. When there is room again, the network you chose comes straight back.
 - Driver 620.70.06 is tested.
-- Known issue: Hogwarts Legacy's own DLSS 5 (its Neural Rendering setting) does nothing under Proton. Neural Forge
-  runs in it as usual.
 - The user guide shows how to choose NVIDIA's own DLSS 5 preset in a game that ships it, for comparing it with
   Neural Forge.
 

@@ -104,9 +104,6 @@ Every setting, the other placements and all environment variables: [docs/USER_GU
   Myth: Wukong Benchmark Tool faulted the GPU intermittently (`Xid 13`, `Xid 32`) with frame
   generation on.
 - **Hogwarts Legacy turns Ray Reconstruction back off** unless you switch it on in its menu.
-- **Hogwarts Legacy's own DLSS 5 (its Neural Rendering setting) does nothing under Proton:** the switch
-  turns on, but Proton refuses a call NVIDIA's network needs, so the picture stays the same. Neural Forge
-  runs in the game as usual.
 - **On the finished frame, Find the HUD can treat a first-person weapon as HUD** and keep the model
   off it. Switch Find the HUD off in the Model tab where that shows.
 - **HDR on the finished frame** works with HDR10 games (tested in Crimson Desert). It needs the model
