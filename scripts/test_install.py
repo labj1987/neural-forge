@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -95,6 +96,9 @@ class InstallTests(unittest.TestCase):
             upstream.write_text('upstream sentinel')
             env = scratch_env(root, data)
             runtime = Path(f"/tmp/neural-forge-{env['NEURAL_FORGE_UID']}")
+            # Outside the scratch dir: gone after the test whichever way it ends (with Steam running the purge
+            # is refused and leaves it).
+            self.addCleanup(shutil.rmtree, runtime, ignore_errors=True)
             def cli(*args):
                 result = subprocess.run([str(CLI), *args], env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
