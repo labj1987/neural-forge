@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "kernels.h"
+#include "nr_env.h"
 #include "nr_graph.h"
 #include "nr_model.h"
 #include "numeric.h"
@@ -494,10 +495,7 @@ struct NfNative {
   // writes and reads them outside the graph. So do a graph's captures (nf_native_set_captures), read after a run
   // (nf_native_capture); their copies' sources are placed like any activation, alive until the copy (a use the
   // warm-up reported). The block starts zeroed, as the activations did.
-  static bool sharingActivations() {
-    const char* off = getenv("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS");
-    return !(off && std::string(off) == "0");
-  }
+  static bool sharingActivations() { return nr::env::flag("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS", true); }
 
   void shareActivations() {
     struct Placement {
@@ -1041,6 +1039,14 @@ void nf_native_close(NfNative* n) {
   }
   delete n;
   g_live.store(false);
+}
+
+uint32_t nf_native_env_flag(const char* name, uint32_t fallback) { return nr::env::flag(name, fallback != 0); }
+
+uint32_t nf_native_env_number(const char* name, uint32_t* value) {
+  const std::optional<uint32_t> n = nr::env::number(name);
+  if (n) *value = *n;
+  return n.has_value();
 }
 
 }  // extern "C"

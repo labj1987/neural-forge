@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): ported to ash 0.38; the mock driver enumerates device groups
-// (UPSTREAM.md).
+// Modified for Neural Forge (2026): ported to ash 0.38; the mock driver enumerates device groups and
+// can resolve an instance command to NULL (UPSTREAM.md).
 
 use ash::{
     prelude::VkResult,
@@ -213,6 +213,18 @@ impl InstanceData {
                 }
             )
             .is_none())
+    }
+
+    /// Makes the next layer resolve `command_name` to NULL for this instance.
+    pub fn remove_instance_command(&self, command_name: &str) {
+        assert!(self
+            .base
+            .dispatch_table
+            .commands
+            .lock()
+            .unwrap()
+            .remove(&command_name.into())
+            .is_some())
     }
 
     pub fn set_supported_device_version(&self, api_version: &ApiVersion) {

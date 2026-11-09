@@ -382,7 +382,10 @@ impl Network {
         (unsafe { ffi::nf_native_frame(self.raw, &mut frame) } == 1).then_some(frame)
     }
 
-    /// The recorded graph (a simultaneous-use secondary of `frame_family`).
+    /// The recorded graph (a simultaneous-use secondary of `frame_family`). The caller orders its own writes
+    /// of the features before it and its reads of the head after it; the graph orders the rest itself (it opens
+    /// with a barrier before it resets the counters its executions share, so two executions need nothing
+    /// between them).
     pub fn graph_commands(&self) -> vk::CommandBuffer {
         // SAFETY: `raw` is live.
         unsafe { ffi::nf_native_graph_commands(self.raw) }
@@ -438,8 +441,8 @@ impl Network {
     }
 
     /// Records slot `slot`'s graph ([`Self::build_sizes`]) straight into `primary`, a primary command buffer of
-    /// `frame_family` being recorded (the application's: the hold inside DLSS's command buffer), between two
-    /// compute barriers, with descriptor sets from hold slot `hold`'s own pool (`0..HOLD_SLOTS`), which this
+    /// `frame_family` being recorded (the application's: the hold inside DLSS's command buffer), between
+    /// barriers as [`Self::graph_commands`] says, with descriptor sets from hold slot `hold`'s own pool (`0..HOLD_SLOTS`), which this
     /// resets first. Binds compute pipelines and descriptor sets and pushes constants: the caller restores its
     /// own state afterwards. On an error part of the graph may be recorded.
     ///
@@ -577,6 +580,99 @@ mod tests {
     #[test]
     fn abi_version_is_6() {
         assert_eq!(abi_version(), 6);
+    }
+
+    /// The graph's first command zeroes the counters every execution of it shares (the chaining and split-K
+    /// counters, written and waited on by the previous execution's launches). It must be ordered after that
+    /// earlier work by the graph itself, because the C API promises the caller nothing else is needed (the
+    /// caller's barriers may be compute-only). Read from the source: the graph runs only on an NVIDIA GPU.
+    #[test]
+    fn the_graph_orders_its_counter_reset_after_earlier_work() {
+        let kernels = include_str!("../../../third_party/opendlss-nr/src/kernels.cpp");
+        let reset = &kernels[kernels.find("void Kernels::resetSync(").expect("resetSync")..];
+        let reset = &reset[..reset.find("\n}\n").unwrap()];
+        let barrier = reset.find("context_.beforeTransferWrite(commands);").expect("a barrier before the counters' reset");
+        assert!(barrier < reset.find("cmdFillZero").expect("the reset"));
+        let context = include_str!("../../../third_party/opendlss-nr/src/vk_context.cpp");
+        let body = &context[context.find("void Context::beforeTransferWrite(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        for needed in [
+            "srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;",
+            "srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;",
+            "dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;",
+            "dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;",
+        ] {
+            assert!(body.contains(needed), "{needed}");
+        }
+        // And the graph records the reset first.
+        let graph = include_str!("../../../third_party/opendlss-nr/src/nr_graph.cpp");
+        let record = &graph[graph.find("void Graph::record(VkCommandBuffer commands").unwrap()..];
+        let record = &record[record.find('{').unwrap()..];
+        let first = record.find("kernels_.resetSync(commands);").unwrap();
+        assert!(!record[..first].contains("commands,") && !record[..first].contains("(commands)"), "nothing recorded before the reset");
+    }
+
+    extern "C" {
+        fn nf_native_env_flag(name: *const c_char, fallback: u32) -> u32;
+        fn nf_native_env_number(name: *const c_char, value: *mut u32) -> u32;
+    }
+
+    /// The network's own variables read as every `NEURAL_FORGE_*` variable is (`neural_forge_protocol::env`):
+    /// trimmed, a switch on only for exactly 1 and off for 0, a number only when it is a whole one; anything
+    /// else leaves the default. Before, `=0` turned the fusion switches on (presence counted), a stray space kept
+    /// `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0 ` from working, and `atoi` read junk as 0.
+    #[test]
+    fn the_networks_variables_follow_the_projects_rules() {
+        let flag = |value: Option<&str>, fallback: bool| {
+            // One variable name per call (the process environment is shared with other tests).
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let name = format!("NEURAL_FORGE_NR_ENVTEST_FLAG_{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            if let Some(v) = value {
+                // SAFETY: a name no other code reads.
+                unsafe { std::env::set_var(&name, v) };
+            }
+            let name = std::ffi::CString::new(name).unwrap();
+            // SAFETY: a NUL-terminated name.
+            unsafe { nf_native_env_flag(name.as_ptr(), u32::from(fallback)) != 0 }
+        };
+        for fallback in [false, true] {
+            assert_eq!(flag(None, fallback), fallback, "unset");
+            assert_eq!(flag(Some(" \t"), fallback), fallback, "blank");
+            assert!(flag(Some("1"), fallback) && flag(Some(" 1 "), fallback), "1, trimmed");
+            assert!(!flag(Some("0"), fallback) && !flag(Some("0 "), fallback), "0, trimmed");
+            for junk in ["yes", "2", "01", "on", "true", "-1"] {
+                assert_eq!(flag(Some(junk), fallback), fallback, "{junk:?} is ignored");
+            }
+        }
+        let number = |value: &str| {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let name = format!("NEURAL_FORGE_NR_ENVTEST_NUMBER_{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            // SAFETY: a name no other code reads.
+            unsafe { std::env::set_var(&name, value) };
+            let name = std::ffi::CString::new(name).unwrap();
+            let mut out = 7;
+            // SAFETY: a NUL-terminated name and a valid output.
+            (unsafe { nf_native_env_number(name.as_ptr(), &mut out) } != 0).then_some(out)
+        };
+        assert_eq!(number("128"), Some(128));
+        assert_eq!(number(" 3\n"), Some(3), "trimmed");
+        assert_eq!(number("0"), Some(0));
+        assert_eq!(number("4294967295"), Some(u32::MAX));
+        for junk in ["abc", "12abc", "-1", "+5", "4294967296", "1.5", " ", "0x10"] {
+            assert_eq!(number(junk), None, "{junk:?} is ignored");
+        }
+        // And every variable of the C++ side is read through those rules: no `getenv` outside `nr_env.h`.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for dir in [root.join("cpp"), root.join("../../third_party/opendlss-nr/src")] {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.file_name().is_some_and(|n| n == "nr_env.h") || !path.extension().is_some_and(|e| e == "cpp" || e == "h") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                assert!(!source.contains("getenv("), "{}: a variable read without nr::env", path.display());
+            }
+        }
     }
 
     /// The layer's slot count and the C++ side's pool count are one number.

@@ -4,13 +4,20 @@
 //! where they are for as long as it lives.
 //!
 //! Everything a record says is checked here: each stage file is a regular file of the manifest's length and
-//! SHA-256, every record names one stage and lies inside it, and no two stages or records share a name.
+//! SHA-256, every record names one stage and lies inside it and is at most [`MAX_TENSOR_BYTES`] long, and no two
+//! stages or records share a name.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CString};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
+
+/// The longest tensor record taken: 16 times the longest tensor either network has (4,196,352 bytes, the
+/// widest layers' FP8 weights, `crates/supervisor/src/model_shape.rs`). The graph checks each tensor's exact
+/// length against its topology anyway; this bound is what keeps every length computed from a record on the C side
+/// (a copy padded to 4 bytes, an offset plus a length) far from 32-bit overflow, whatever the manifest says.
+pub const MAX_TENSOR_BYTES: u32 = 64 << 20;
 
 /// One tensor record as the C side reads it (`NfNativeTensor`).
 #[repr(C)]
@@ -138,6 +145,9 @@ impl ModelFile {
             let byte_length = unsigned(entry, "byteLength", &what)?;
             let &index = stage_index.get(stage).ok_or_else(|| format!("{what} is in stage {stage}, which the manifest does not list"))?;
             let (stage_name, bytes) = &stages[index];
+            if byte_length > MAX_TENSOR_BYTES {
+                return Err(format!("{what} ({byte_length} bytes) is longer than any tensor the network has ({MAX_TENSOR_BYTES} bytes at most)"));
+            }
             if u64::from(stage_offset) + u64::from(byte_length) > bytes.len() as u64 {
                 return Err(format!("{what} ({byte_length} bytes at {stage_offset}) runs past the end of stage {stage} ({} bytes)", bytes.len()));
             }
@@ -310,7 +320,10 @@ mod tests {
 
     #[test]
     fn bad_records_are_refused() {
-        let cases: [(&str, Edit, &str); 9] = [
+        let cases: [(&str, Edit, &str); 11] = [
+            ("toolong", |m| m["tensors"][1]["byteLength"] = (MAX_TENSOR_BYTES + 1).into(), "is longer than any tensor the network has"),
+            // The length that wrapped the C side's padded copy to nothing.
+            ("u32max", |m| m["tensors"][1]["byteLength"] = u32::MAX.into(), "is longer than any tensor the network has"),
             ("unknownstage", |m| m["tensors"][1]["stage"] = "s9".into(), "is in stage s9, which the manifest does not list"),
             ("pastend", |m| m["tensors"][1]["byteLength"] = 3.into(), "runs past the end of stage s0 (8 bytes)"),
             ("offsetwrap", |m| m["tensors"][2]["stageOffset"] = u32::MAX.into(), "runs past the end of stage s1"),

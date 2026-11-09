@@ -1310,7 +1310,8 @@ pub struct GpuCompose {
     next_async_slot: usize,
     present_semaphores: crate::present_sync::PresentSemaphores,
     zc: ZeroCopy,
-    /// The queue family the command pool (and so every slot) serves, for the timers.
+    /// The queue family the command pool (and so every slot's command buffers) serves: only a present on a
+    /// queue of this family may use it (`capture::run` builds a new one for a present on another family).
     queue_family: u32,
     /// Whether the async slots' timers were built yet: lazily, by the first async compose,
     /// which is the first call that has the instance and physical device they need.
@@ -1845,6 +1846,18 @@ impl GpuCompose {
         self.compose_gpu_ms.take()
     }
 
+    /// The queue family this compose's command buffers may be submitted to.
+    pub fn queue_family(&self) -> u32 {
+        self.queue_family
+    }
+
+    /// Makes this compose look as if it were built for `family`, for tests of the rebuild on a
+    /// family change (lavapipe has one queue family).
+    #[cfg(test)]
+    pub(crate) fn pretend_queue_family(&mut self, family: u32) {
+        self.queue_family = family;
+    }
+
     pub fn retire_present_images(&mut self, images: &[vk::Image]) {
         self.present_semaphores.retire(images);
     }
@@ -1856,8 +1869,9 @@ impl GpuCompose {
     }
 
     /// # Safety
-    /// Must only be called at device-destruction time, with no submitted work
-    /// referencing these handles still in flight.
+    /// No submitted work may still reference these handles (every compose's fence waited), and
+    /// no present may still wait on its present semaphores: at device destruction, or after they were
+    /// moved out ([`Self::present_semaphores_mut`]) to the compose that replaces this one.
     pub unsafe fn destroy(&self, device: &ash::Device) {
         // SAFETY: forwarded from this function's own contract.
         unsafe {

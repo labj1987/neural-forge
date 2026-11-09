@@ -1,4 +1,5 @@
 #include "kernels.h"
+#include "nr_env.h"
 
 #include <filesystem>
 #include <fstream>
@@ -66,7 +67,7 @@ std::string readPtx(const std::string& directory, const std::string& file) {
 }  // namespace
 
 Kernels::Kernels(vk::Context& context, const std::string& shaderDirectory) : context_(context) {
-  ptxDirectory_ = getenv("NEURAL_FORGE_NR_PTX_DIR") ? getenv("NEURAL_FORGE_NR_PTX_DIR") : shaderDirectory + "/../ptx";
+  ptxDirectory_ = env::value("NEURAL_FORGE_NR_PTX_DIR").value_or(shaderDirectory + "/../ptx");
   for (const char* name : {"gemm_fp8", "gemm_f16", "ops", "window_normalize", "window_attend", "global_normalize",
                            "global_attend", "preprocess", "fused_block32", "qkv_attention", "gemm_mlp", "global_attention", "gemm_reduce"}) {
     modules_[name] = context_.loadShaderModule(shaderDirectory + "/" + name + ".spv");
@@ -145,7 +146,7 @@ void Kernels::dispatch(VkCommandBuffer commands, VkPipeline pipeline,
   ++dispatches_;
 }
 
-static bool g_chainEnabled = getenv("NEURAL_FORGE_NR_CHAIN") ? atoi(getenv("NEURAL_FORGE_NR_CHAIN")) != 0 : true;
+static bool g_chainEnabled = env::flag("NEURAL_FORGE_NR_CHAIN", true);
 bool Kernels::chainEnabled() { return g_chainEnabled; }
 void Kernels::setChainEnabled(bool on) { g_chainEnabled = on; }
 
@@ -166,6 +167,10 @@ VkDeviceAddress Kernels::tileCounters(uint32_t count) {
 // Consumers spin on these. A stale count starts one early.
 void Kernels::resetSync(VkCommandBuffer commands) {
   if (syncBuffer_.buffer == VK_NULL_HANDLE) syncAddress(0, kSyncBands);
+  // The counters are shared by every recording and execution of the graph: the previous execution's
+  // launches (which increment and wait on them) finish before the fill zeroes them, whatever the caller put
+  // between the two executions.
+  context_.beforeTransferWrite(commands);
   context_.cmdFillZero(commands, syncBuffer_);
   context_.transferBarrier(commands);
   chainLaunches_.clear();
@@ -237,12 +242,12 @@ void Kernels::dispatchLinear(VkCommandBuffer commands, VkPipeline pipeline,
 }
 
 bool Kernels::ptxGemmEnabled() {
-  static const bool enabled = getenv("NEURAL_FORGE_NR_PTX_GEMM") ? atoi(getenv("NEURAL_FORGE_NR_PTX_GEMM")) != 0 : true;
+  static const bool enabled = env::flag("NEURAL_FORGE_NR_PTX_GEMM", true);
   return enabled;
 }
 
 bool Kernels::ptxQkvEnabled() {
-  static const bool enabled = getenv("NEURAL_FORGE_NR_PTX_QKV") ? atoi(getenv("NEURAL_FORGE_NR_PTX_QKV")) != 0 : true;
+  static const bool enabled = env::flag("NEURAL_FORGE_NR_PTX_QKV", true);
   return enabled;
 }
 
@@ -267,7 +272,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& args) {
   // Split-K: independent partition chains in separate workgroups plus a reduce pass, for the
   // small-M partitioned GEMMs (ViT) whose workgroup count would otherwise starve the GPU.
   uint32_t splits = 1;
-  static const int splitEnv = getenv("NEURAL_FORGE_NR_SPLITK") ? atoi(getenv("NEURAL_FORGE_NR_SPLITK")) : -1;   // -1 auto, 0 off, K value: only that K
+  static const int64_t splitEnv = env::numberOr("NEURAL_FORGE_NR_SPLITK", -1);   // -1 auto, 0 off, K value: only that K
   if (a.partition && a.K > a.partition && a.batches == 1 &&
       ((a.rows + 63) / 64) * std::max(1u, a.N / 64) < 2 * context_.smCount() && splitEnv != 0 && (splitEnv <= 0 || (uint32_t)splitEnv == a.K) &&
       (VkDeviceSize)(a.K / a.partition) * alignRows(a.rows) * a.N * 2 <= (16u << 20))
@@ -325,7 +330,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& args) {
   }
   // Tall-tile PTX GEMM (gemmt_e4m3.py, 192-row tiles, partitions in the workgroup or one partition per split-K
   // workgroup + a PTX reduce): the few-row stages (ViT / transitions), when the variant was generated.
-  static const bool ptxGemmT = getenv("NEURAL_FORGE_NR_PTX_GEMMT") ? atoi(getenv("NEURAL_FORGE_NR_PTX_GEMMT")) != 0 : true;
+  static const bool ptxGemmT = env::flag("NEURAL_FORGE_NR_PTX_GEMMT", true);
   if (ptxGemmT && ptxGemm && a.batches == 1 && !a.broadcastInput && a.N % 64 == 0 &&
       (!a.residual || (a.scaleResidual && a.residual->format == Format::E4)) && a.partition != 0 &&   // (rows <= 384 without a partition: gemm2 is faster)
       (a.rows + 191) / 192 <= 65535) {
@@ -635,7 +640,7 @@ void Kernels::upsampleResidual(VkCommandBuffer commands, const Activation& proje
 }
 
 bool Kernels::ptxGemmVEnabled() {
-  static const bool enabled = getenv("NEURAL_FORGE_NR_PTX_GEMMV") ? atoi(getenv("NEURAL_FORGE_NR_PTX_GEMMV")) != 0 : true;
+  static const bool enabled = env::flag("NEURAL_FORGE_NR_PTX_GEMMV", true);
   return enabled && ptxGemmEnabled();   // NEURAL_FORGE_NR_PTX_GEMM=0 turns off every PTX GEMM route
 }
 
@@ -653,7 +658,7 @@ uint32_t Kernels::vitGemmSignals(uint32_t rows, uint32_t N) {
 }
 
 bool Kernels::ptxBlock32Enabled() {
-  static const bool enabled = getenv("NEURAL_FORGE_NR_PTX_BLOCK32") ? atoi(getenv("NEURAL_FORGE_NR_PTX_BLOCK32")) != 0 : true;
+  static const bool enabled = env::flag("NEURAL_FORGE_NR_PTX_BLOCK32", true);
   return enabled;
 }
 
@@ -826,7 +831,7 @@ void Kernels::gemmMlp(VkCommandBuffer commands, const MlpArgs& a) {
 }
 
 bool Kernels::ptxFfnEnabled() {
-  static const bool enabled = getenv("NEURAL_FORGE_NR_PTX_FFN") ? atoi(getenv("NEURAL_FORGE_NR_PTX_FFN")) != 0 : true;
+  static const bool enabled = env::flag("NEURAL_FORGE_NR_PTX_FFN", true);
   return enabled;
 }
 
@@ -956,7 +961,7 @@ void Kernels::windowAttend(VkCommandBuffer commands, const Activation& normalize
 }
 
 bool Kernels::ptxGlobalAttentionEnabled() {
-  static const bool enabled = getenv("NEURAL_FORGE_NR_PTX_ATTN") ? atoi(getenv("NEURAL_FORGE_NR_PTX_ATTN")) != 0 : true;
+  static const bool enabled = env::flag("NEURAL_FORGE_NR_PTX_ATTN", true);
   return enabled;
 }
 
@@ -966,7 +971,7 @@ bool Kernels::globalAttentionPtx(uint32_t paddedTokens, const Activation* normal
 
 // NEURAL_FORGE_NR_ATTN_STREAM: -1 (default) streamed route for padded > 256 (the resident kernel below), 1 always, 0 never.
 bool Kernels::globalAttentionStreamPtx(uint32_t paddedTokens) const {
-  static const int mode = getenv("NEURAL_FORGE_NR_ATTN_STREAM") ? atoi(getenv("NEURAL_FORGE_NR_ATTN_STREAM")) : -1;
+  static const int64_t mode = env::numberOr("NEURAL_FORGE_NR_ATTN_STREAM", -1);
   if (!ptxGlobalAttentionEnabled() || mode == 0) return false;
   if (mode < 0 && paddedTokens <= 256) return false;
   static const bool available = ptxAvailable(ptxDirectory_, "global_attention_stream_e4m3.ptx") &&

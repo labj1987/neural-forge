@@ -128,8 +128,10 @@ uint32_t nf_native_frame(const NfNative* n, NfNativeFrame* frame);
 uint32_t nf_native_frame_at(const NfNative* n, uint32_t slot, NfNativeFrame* frame);
 
 // The recorded graph: a secondary command buffer (simultaneous use, no render pass) of `frame_family`,
-// reading `features` and writing `head`. It opens and closes with compute barriers only; the caller
-// orders its own writes of `features` before it and its reads of `head` after it.
+// reading `features` and writing `head`. The caller orders its own writes of `features` before it and its
+// reads of `head` after it. Everything else the graph orders itself: it opens with a barrier from earlier
+// compute and transfer work to its reset of the counters it shares between executions (so two executions of
+// the graph's recordings need nothing between them), and its own work ends with compute barriers.
 VkCommandBuffer nf_native_graph_commands(const NfNative* n);
 
 // The same graph recorded a second time, as a secondary of `queue_family` (the network's own queue's
@@ -157,7 +159,7 @@ uint32_t nf_native_profile_end(NfNative* n, char* out, size_t out_len);
 
 // Records slot `slot`'s graph (nf_native_build_sizes) straight into `primary`, a primary command buffer of
 // `frame_family` the caller is recording (the application's: the hold inside DLSS's command buffer), between
-// two compute barriers. Its descriptor sets come from hold slot `hold`'s own pool (0..15, made on first use),
+// barriers as nf_native_graph_commands describes. Its descriptor sets come from hold slot `hold`'s own pool (0..15, made on first use),
 // which this call resets first: the caller guarantees that no command buffer recorded with that hold slot
 // may still be submitted or pending. The recording reads the build's activations, so the build must not be
 // dropped (a rebuild, nf_native_fall_back_to_barriers, nf_native_close) while any such buffer may still be
@@ -211,6 +213,11 @@ void nf_native_weight_bytes(const NfNative* n, uint64_t* raw_loaded, uint64_t* r
 // Destroys everything this side made. Nothing of it may be pending: no submitted work that executes a
 // recording (nf_native_graph_commands*, nf_native_record_graph*) may still run.
 void nf_native_close(NfNative* n);
+
+// How the network reads its NEURAL_FORGE_* variables (nr_env.h), for tests: a switch ("1" on, "0" off,
+// `fallback` when unset, blank or anything else), and a whole number (1 with `*value` set, 0 when unset or not one).
+uint32_t nf_native_env_flag(const char* name, uint32_t fallback);
+uint32_t nf_native_env_number(const char* name, uint32_t* value);
 
 #ifdef __cplusplus
 }

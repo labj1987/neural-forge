@@ -166,9 +166,13 @@ vec3 lutEntry(uint r, uint g, uint b) {
 
 // Trilinear, as `neural_forge_protocol::cube::Cube::sample`.
 vec3 lutSample(vec3 rgb) {
-  float last = float(p.colour_flags.y - 1u);
-  vec3 t = clamp(rgb * p.lut_scale.xyz + p.lut_offset.xyz, vec3(0.0), vec3(last));
-  uvec3 b = uvec3(min(floor(t), vec3(last - 1.0)));
+  uint n = p.colour_flags.y;
+  float last = float(n - 1u);
+  // NaN goes to 0 (clamp() and the conversion to uint are undefined for it; colour.rs never hands the
+  // shader a grid that is not finite), and the cell's index is bounded to the table whatever t is.
+  vec3 t = rgb * p.lut_scale.xyz + p.lut_offset.xyz;
+  t = clamp(mix(t, vec3(0.0), isnan(t)), vec3(0.0), vec3(last));
+  uvec3 b = min(uvec3(t), uvec3(n - 2u));
   vec3 f = t - vec3(b);
   vec3 c00 = mix(lutEntry(b.x, b.y, b.z), lutEntry(b.x + 1u, b.y, b.z), f.x);
   vec3 c10 = mix(lutEntry(b.x, b.y + 1u, b.z), lutEntry(b.x + 1u, b.y + 1u, b.z), f.x);

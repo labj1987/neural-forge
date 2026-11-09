@@ -68,7 +68,8 @@ Model::Model(vk::Context& context, uint32_t blockCount, std::vector<Tensor> reco
     for (Tensor& tensor : records) {
       if (tensor.byteLength && !tensor.bytes) throw std::runtime_error("tensor " + tensor.name + " has no bytes");
       // Raw bytes on the GPU for per-column aux vectors (padded to 4 bytes).
-      size_t padded = (tensor.byteLength + 3) & ~3u;
+      // In size_t: a byteLength near 4 GiB must not wrap to a tiny buffer that the copy then overruns.
+      size_t padded = ((size_t)tensor.byteLength + 3) & ~(size_t)3;
       std::vector<uint8_t> paddedBytes(padded, 0);
       if (tensor.byteLength) memcpy(paddedBytes.data(), tensor.bytes, tensor.byteLength);
       // Owned by tensors_ before anything that can throw, so a failure releases it.
@@ -129,7 +130,7 @@ bool Model::compactAux() {
       at += end - i;
       i = end;
     }
-    plan.bytes.assign(std::max<size_t>(4, (at + 3) & ~3u), 0);
+    plan.bytes.assign(std::max<size_t>(4, ((size_t)at + 3) & ~(size_t)3), 0);
     for (const Tensor::AuxRun& run : plan.runs) memcpy(plan.bytes.data() + run.at, tensor.bytes + run.from, run.to - run.from);
     plans.push_back(std::move(plan));
   }
