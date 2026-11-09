@@ -695,7 +695,9 @@ is not held before the upscaler.
 - **Copy path:** when the import is not possible, or the model works below the frame's size
   (`working_scale` < 1), the layer blits into a smaller scratch image, encodes it
   (`encode.comp`: the white-point divide and the soft knee), reads it back into host-cached
-  memory and copies it into shared memory.
+  memory and copies it into shared memory. The scratch is sRGB when the swapchain is (`*_SRGB`), so
+  the blit keeps the frame's encoded bytes (a blit converts formats); the encode reads them through
+  a `R8G8B8A8_UNORM` storage view (`EXTENDED_USAGE`, Vulkan 1.1) and decodes them once itself.
 - **Model size:** at most 3840x2160 pixels (`NEURAL_FORGE_MAX_MODEL_PIXELS`), always even;
   larger frames are scaled down for the model and the answer scaled back up.
 

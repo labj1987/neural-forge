@@ -272,6 +272,9 @@ struct State {
     /// requests this extension on its own); `capture::run` treats it as "keep using
     /// the staging-buffer path", not an error.
     external_memory_host: bool,
+    /// Whether the device may create images with `EXTENDED_USAGE` (its effective Vulkan version is 1.1 or later,
+    /// `crate::core_1_1`): the capture's sRGB model scratch needs it for the encode (`capture::ScratchSource`).
+    extended_usage: bool,
     gpu_compose: Option<crate::composition::gpu::GpuCompose>,
     /// Reused across frames by `capture::run` for its own pre-edit frame snapshot,
     /// instead of a fresh `frame_bytes`-sized heap allocation every single present
@@ -1499,6 +1502,7 @@ impl NeuralForgeDeviceInfo {
         device: Arc<ash::Device>,
         next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
         create_info: &vk::DeviceCreateInfo,
+        extended_usage: bool,
     ) -> Self {
         let handle = device.handle();
         // SAFETY: `next_get_device_proc_addr` is the next layer/driver's own
@@ -1580,7 +1584,7 @@ impl NeuralForgeDeviceInfo {
         // line after this one, including real per-frame activity, purely because
         // nothing forced a flush past this first, coincidentally-flushed call).
         crate::logging::flush();
-        let state = Arc::new(Mutex::new(State { external_memory_host, present_fences, ..State::default() }));
+        let state = Arc::new(Mutex::new(State { external_memory_host, extended_usage, present_fences, ..State::default() }));
         let hold = Arc::new(Mutex::new(HoldState { external_memory_host, ..HoldState::default() }));
         CLEANUP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(handle, (device.clone(), state.clone(), hold.clone()));
         // SAFETY: create_info is the loader chain for this newly created device.
@@ -3813,6 +3817,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format, sw.color_space);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
+                let srgb = swapchain::is_srgb(sw.format);
                 // Whether the frame can be read back for a capture (`crate::series`, 8-bit PNGs): never an HDR10
                 // one (refused above).
                 let readable = sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && !pq10;
@@ -3834,6 +3839,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     capture_pipeline,
                     direct_capture,
                     external_memory_host,
+                    extended_usage,
                     gpu_compose,
                     original_scratch,
                     model_scratch,
@@ -4080,6 +4086,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             height,
                             proxy_format,
                             bgr_order,
+                            capture::ScratchSource { srgb, extended_usage: *extended_usage },
                             capture_pipeline,
                             direct_capture,
                             external_memory_host,

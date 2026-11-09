@@ -199,6 +199,11 @@ pub fn proxy_format_for(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u
 /// Whether raw capture bytes put blue first: B,G,R,A (the 8-bit BGRA formats), or blue in the low bits of
 /// the packed word (`A2R10G10B10_UNORM_PACK32`). The protocol preserves this format; composition still
 /// swizzles only its own pixel math, never SHM bytes.
+/// Whether the swapchain's 8-bit format stores sRGB-encoded values that a blit decodes (`*_SRGB`).
+pub fn is_srgb(format: vk::Format) -> bool {
+    matches!(format, vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB)
+}
+
 pub fn is_bgr_order(format: vk::Format) -> bool {
     matches!(format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB | vk::Format::A2R10G10B10_UNORM_PACK32)
 }

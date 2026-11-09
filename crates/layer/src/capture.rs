@@ -83,10 +83,13 @@ struct ModelScratch {
     /// proxy crosses to the model server unencoded, exactly as it did before the encode
     /// existed, and the resolve is told so.
     ///
-    /// The view is always `R8G8B8A8_UNORM` even when `image` is `B8G8R8A8_UNORM`: the
-    /// image carries `MUTABLE_FORMAT` and the two are format-compatible (same 32-bit
-    /// class), which makes `encode.comp`'s `rgba8` layout qualifier correct against
-    /// the view while `bgr_order` carries what the channels actually mean.
+    /// The view is always `R8G8B8A8_UNORM` even when `image` is `B8G8R8A8_UNORM` or an
+    /// sRGB format: the image carries `MUTABLE_FORMAT` (and, for sRGB, `EXTENDED_USAGE`:
+    /// [`crate::composition::encode_pass::storage_create_flags`]) and the formats are
+    /// compatible (same 32-bit class), which makes `encode.comp`'s `rgba8` layout qualifier
+    /// correct against the view while `bgr_order` carries what the channels actually mean.
+    /// Through it the encode reads the stored (sRGB-encoded) bytes as they are and decodes
+    /// them once, itself.
     encode_view: Option<vk::ImageView>,
     encode_set: Option<vk::DescriptorSet>,
 }
@@ -119,6 +122,7 @@ impl ModelScratch {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_model_scratch(
     device: &ash::Device,
     instance: &ash::Instance,
@@ -126,6 +130,7 @@ fn build_model_scratch(
     width: u32,
     height: u32,
     format: vk::Format,
+    extended_usage: bool,
     encode: Option<&crate::composition::encode_pass::EncodePass>,
 ) -> Option<ModelScratch> {
     #[cfg(test)]
@@ -140,7 +145,8 @@ fn build_model_scratch(
     // `MUTABLE_FORMAT` is what lets the view below be `R8G8B8A8_UNORM` over a BGRA
     // image (same 32-bit compatibility class), so `encode.comp`'s `rgba8` qualifier is
     // correct against the view rather than relying on a driver tolerating a mismatch.
-    let want_encode = encode.is_some() && crate::composition::encode_pass::supports_storage(instance, physical_device, format);
+    let encode_flags = encode.and(crate::composition::encode_pass::storage_create_flags(instance, physical_device, format, extended_usage));
+    let want_encode = encode_flags.is_some();
     // Logged once per process, because "is the encode actually running" cannot be read
     // off the self-check below: on SDR content the encode's own effect is small, so an
     // unencoded proxy and a correctly encoded one produce similar deltas against the
@@ -153,16 +159,16 @@ fn build_model_scratch(
             } else if encode.is_none() {
                 crate::log!("[encode] unavailable: the encode pipeline itself failed to build, composition stays on mode 1");
             } else {
-                crate::log!("[encode] unavailable: {format:?} has no STORAGE_IMAGE support on this device, composition stays on mode 1");
+                crate::log!("[encode] unavailable: a {format:?} image cannot have a storage view on this device, composition stays on mode 1");
             }
             crate::logging::flush();
         }
     }
     let mut usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
     let mut create_flags = vk::ImageCreateFlags::empty();
-    if want_encode {
+    if let Some(flags) = encode_flags {
         usage |= vk::ImageUsageFlags::STORAGE;
-        create_flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
+        create_flags |= flags;
     }
     let image_info = vk::ImageCreateInfo::default()
         .flags(create_flags)
@@ -282,9 +288,10 @@ fn build_model_scratch(
                     .base_array_layer(0)
                     .layer_count(1),
             );
-        // SAFETY: `image` is bound and was created with `MUTABLE_FORMAT` plus
-        // `STORAGE` usage (both gated on `want_encode`); `R8G8B8A8_UNORM` is in the
-        // same format-compatibility class as the image's own format.
+        // SAFETY: `image` is bound and was created with `MUTABLE_FORMAT` (and
+        // `EXTENDED_USAGE` where its format has no storage) plus `STORAGE` usage (all
+        // gated on `want_encode`); `R8G8B8A8_UNORM` is in the same format-compatibility
+        // class as the image's own format.
         match unsafe { device.create_image_view(&view_info, None) } {
             Ok(view) => match encode.and_then(|e| e.allocate_set(device, view)) {
                 Some(set) => (Some(view), Some(set)),
@@ -581,17 +588,38 @@ fn scaled_dims(width: u32, height: u32, scale: f32) -> (u32, u32) {
 }
 
 /// The `vk::Format` [`build_model_scratch`] should create its scratch image as, for a
-/// given `proxy_format`/`bgr_order` pair -- `None` when `working_scale`'s GPU-blit
+/// given `proxy_format`/`bgr_order` pair and whether the captured image is sRGB -- `None` when `working_scale`'s GPU-blit
 /// mechanism does not (yet) support this proxy format at all. Restricted to the two
 /// 8-bit formats: an HDR float16 proxy's blit-filtering and byte-layout behavior
 /// differ enough from the 8-bit case that this first cut deliberately does not attempt
 /// it (matches the same `is_8bit` gate several other advanced paths in this crate and
 /// the model server already use).
-fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format> {
+///
+/// The scratch has the captured image's sRGB-ness: a blit converts between formats, so an
+/// `*_SRGB` frame blitted into a UNORM scratch arrives decoded to linear light, and the encode
+/// (which decodes sRGB itself) then hands the model a frame decoded twice, crushed toward black.
+/// sRGB to sRGB, the blit filters in linear light and stores sRGB again: at 1:1 the frame's own bytes.
+fn model_scratch_format(proxy_format: u32, bgr_order: bool, srgb: bool) -> Option<vk::Format> {
     if !neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         return None;
     }
-    Some(if bgr_order { vk::Format::B8G8R8A8_UNORM } else { vk::Format::R8G8B8A8_UNORM })
+    Some(match (bgr_order, srgb) {
+        (true, false) => vk::Format::B8G8R8A8_UNORM,
+        (false, false) => vk::Format::R8G8B8A8_UNORM,
+        (true, true) => vk::Format::B8G8R8A8_SRGB,
+        (false, true) => vk::Format::R8G8B8A8_SRGB,
+    })
+}
+
+/// What the capture's model scratch needs to know of the image it is blitted from and of the device.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScratchSource {
+    /// The captured image is `*_SRGB` ([`crate::swapchain::is_srgb`]): the scratch is too ([`model_scratch_format`]).
+    pub srgb: bool,
+    /// The device may create images with `EXTENDED_USAGE` (its effective Vulkan version is 1.1 or later): what an
+    /// sRGB scratch needs for the encode's storage view
+    /// ([`crate::composition::encode_pass::storage_create_flags`]).
+    pub extended_usage: bool,
 }
 
 /// Real per-frame NR compute (a model server round trip, plus
@@ -709,7 +737,7 @@ fn poll_or_submit_capture(
     height: u32,
     proxy_format: u32,
     frame_bytes: u64,
-    model: Option<(u32, u32, vk::Format)>,
+    model: Option<(u32, u32, vk::Format, bool)>,
     encode_push: crate::composition::encode_pass::EncodePush,
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
@@ -1098,6 +1126,7 @@ pub unsafe fn run(
     height: u32,
     proxy_format: u32,
     bgr_order: bool,
+    scratch_source: ScratchSource,
     pipeline: &mut Option<CapturePipeline>,
     direct: &mut [Option<DirectCapture>; 2],
     external_memory_host: &mut bool,
@@ -1264,7 +1293,8 @@ pub unsafe fn run(
     // blit into it is 1:1 -- a device-local full-rate blit, which is what buys the
     // encode a storage image to dispatch over. `None` only when the proxy format
     // itself cannot be scratched at all, which is the same condition as before.
-    let model_request = model_scratch_format(proxy_format, bgr_order).map(|format| (model_width, model_height, format));
+    let model_request =
+        model_scratch_format(proxy_format, bgr_order, scratch_source.srgb).map(|format| (model_width, model_height, format, scratch_source.extended_usage));
     // Direct capture writes the whole frame straight into shared memory: no resize, no encode.
     // It is only correct when the model works on exactly the frame, which rules it out for any
     // working_scale, the model pixel cap, and odd-sized frames (rounded to even above). Missing
@@ -2360,7 +2390,7 @@ fn submit_pipeline_capture(
     width: u32,
     height: u32,
     proxy_format: u32,
-    model: Option<(u32, u32, vk::Format)>,
+    model: Option<(u32, u32, vk::Format, bool)>,
     encode_push: crate::composition::encode_pass::EncodePush,
 ) -> bool {
     // Split borrow: the slot is taken mutably while `encode` is read immutably, and
@@ -2371,7 +2401,7 @@ fn submit_pipeline_capture(
     if slot.pending.is_some() {
         return false;
     }
-    let model_dims = if let Some((model_width, model_height, format)) = model {
+    let model_dims = if let Some((model_width, model_height, format, extended_usage)) = model {
         let needs_rebuild = slot.model.as_ref().is_none_or(|m| (m.width, m.height, m.format) != (model_width, model_height, format));
         if needs_rebuild {
             if let Some(old) = slot.model.take() {
@@ -2381,7 +2411,7 @@ fn submit_pipeline_capture(
                 // nothing submitted against the old scratch can still be in flight.
                 unsafe { old.destroy(device, encode) };
             }
-            slot.model = build_model_scratch(device, instance, physical_device, model_width, model_height, format, encode);
+            slot.model = build_model_scratch(device, instance, physical_device, model_width, model_height, format, extended_usage, encode);
         }
         slot.model.as_ref().map(|m| (m.image, m.buffer, model_width, model_height))
     } else {
@@ -3438,6 +3468,7 @@ mod tests {
                     height,
                     proxy_format,
                     false,
+                    ScratchSource::default(),
                     &mut pipeline,
                     &mut direct,
                     // This test's own device never enables `VK_EXT_external_memory_host`
@@ -3527,6 +3558,7 @@ mod tests {
                     height,
                     proxy_format,
                     false,
+                    ScratchSource::default(),
                     &mut pipeline,
                     &mut direct,
                     &mut false,
@@ -3814,6 +3846,7 @@ mod tests {
                         height,
                         proxy_format,
                         b_low,
+                        ScratchSource::default(),
                         &mut pipeline,
                         &mut direct,
                         &mut false,
@@ -4133,6 +4166,7 @@ mod tests {
                     self.height,
                     neural_forge_protocol::enums::proxy_format::RGBA8,
                     false,
+                    ScratchSource::default(),
                     &mut s.pipeline,
                     &mut s.direct,
                     &mut false,
@@ -4238,7 +4272,7 @@ mod tests {
                 width,
                 height,
                 proxy_format,
-                Some((4, 4, format)),
+                Some((4, 4, format, false)),
                 push
             ));
             unsafe { device.queue_wait_idle(queue) }.unwrap();
@@ -4256,6 +4290,196 @@ mod tests {
             destroy_pipeline(pipeline, &device);
             device.destroy_image(image, None);
             device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    /// An image of `format` holding exactly `bytes` (no conversion: a buffer copy), in `PRESENT_SRC_KHR`.
+    #[allow(clippy::too_many_arguments)]
+    fn make_present_src_image_with_bytes(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        pool: vk::CommandPool,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        bytes: &[u8],
+    ) -> (vk::Image, vk::DeviceMemory) {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let memory_type = |bits: u32, flags: vk::MemoryPropertyFlags| {
+            (0..mem_props.memory_type_count).find(|&i| bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(flags)).unwrap()
+        };
+        unsafe {
+            let image = device.create_image(&image_info, None).unwrap();
+            let reqs = device.get_image_memory_requirements(image);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(reqs.size)
+                .memory_type_index(memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()));
+            let memory = device.allocate_memory(&alloc, None).unwrap();
+            device.bind_image_memory(image, memory, 0).unwrap();
+            let staging =
+                device.create_buffer(&vk::BufferCreateInfo::default().size(bytes.len() as u64).usage(vk::BufferUsageFlags::TRANSFER_SRC), None).unwrap();
+            let reqs = device.get_buffer_memory_requirements(staging);
+            let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let alloc = vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(memory_type(reqs.memory_type_bits, host));
+            let staging_memory = device.allocate_memory(&alloc, None).unwrap();
+            device.bind_buffer_memory(staging, staging_memory, 0).unwrap();
+            let ptr = device.map_memory(staging_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()).unwrap();
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+            device.unmap_memory(staging_memory);
+            let cmd = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+                )
+                .unwrap()[0];
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            let to_dst =
+                barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            device.cmd_copy_buffer_to_image(cmd, staging, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+            let to_present = barrier(
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
+            device.end_command_buffer(cmd).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], vk::Fence::null()).unwrap();
+            device.queue_wait_idle(queue).unwrap();
+            device.free_command_buffers(pool, &[cmd]);
+            device.destroy_buffer(staging, None);
+            device.free_memory(staging_memory, None);
+            (image, memory)
+        }
+    }
+
+    /// An sRGB frame reaches the model as its own bytes. The model scratch takes the frame's sRGB-ness
+    /// (`model_scratch_format`): a blit from an `*_SRGB` frame into a UNORM scratch decoded it to linear
+    /// light, and the encode (which decodes sRGB itself) then gave the model a frame decoded twice, crushed
+    /// toward black. At 1:1, without the encode, the scratch holds exactly the frame's bytes; with the encode
+    /// (its storage view over the sRGB scratch through `EXTENDED_USAGE`), the model gets exactly what it gets
+    /// from a UNORM frame of the same bytes.
+    #[test]
+    fn an_srgb_frame_reaches_the_model_as_its_own_bytes() {
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("an_srgb_frame_reaches_the_model_as_its_own_bytes: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let (width, height) = (16u32, 8u32);
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        // Every byte value 0..=255 in each colour channel somewhere (128 pixels, two each), alpha opaque.
+        let bytes: Vec<u8> = (0..width * height).flat_map(|i| [(i * 2) as u8, (255 - i * 2) as u8, (i * 2 + 1) as u8, 255]).collect();
+        let capture = |p: &mut CapturePipeline, image: vk::Image, proxy_format: u32, scratch: vk::Format| -> (Vec<u8>, bool) {
+            assert!(submit_pipeline_capture(
+                p,
+                Slot::Primary,
+                &device,
+                &instance,
+                physical_device,
+                queue,
+                image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                width,
+                height,
+                proxy_format,
+                Some((width, height, scratch, true)),
+                crate::composition::encode_pass::EncodePush {
+                    white_point: 1.0,
+                    bgr_order: u32::from(proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8),
+                    reversible_mode: 0
+                },
+            ));
+            unsafe { device.queue_wait_idle(queue) }.unwrap();
+            let (mut full, mut model) = (Vec::new(), Vec::new());
+            let (done, dims) = poll_pipeline_capture(p, Slot::Primary, &device, &mut full, &mut model);
+            assert!(done.is_some() && dims == Some((width, height)), "the capture and its model scratch completed");
+            assert_eq!(full, bytes, "the full-resolution capture is a raw copy");
+            let encoded = p.slots[Slot::Primary.index()].model.as_ref().is_some_and(|m| m.encode_set.is_some());
+            (model, encoded)
+        };
+        for (srgb_format, unorm_format, proxy_format) in [
+            (vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM, neural_forge_protocol::enums::proxy_format::BGRA8),
+            (vk::Format::R8G8B8A8_SRGB, vk::Format::R8G8B8A8_UNORM, neural_forge_protocol::enums::proxy_format::RGBA8),
+        ] {
+            let bgr = proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8;
+            let scratch = model_scratch_format(proxy_format, bgr, crate::swapchain::is_srgb(srgb_format)).unwrap();
+            let (srgb_image, srgb_memory) = make_present_src_image_with_bytes(&device, &mem_props, queue, pool, width, height, srgb_format, &bytes);
+            let (unorm_image, unorm_memory) = make_present_src_image_with_bytes(&device, &mem_props, queue, pool, width, height, unorm_format, &bytes);
+            let mut pipeline = None;
+            assert!(ensure_pipeline(&mut pipeline, &device, &instance, physical_device, queue_family, bytes.len() as u64));
+            let p = pipeline.as_mut().unwrap();
+            // With the encode: the same proxy as from the UNORM frame of the same bytes.
+            let (from_srgb, encoded) = capture(p, srgb_image, proxy_format, scratch);
+            assert!(encoded, "{srgb_format:?}: the encode runs over the sRGB scratch");
+            let unorm_scratch = model_scratch_format(proxy_format, bgr, false).unwrap();
+            let (from_unorm, encoded) = capture(p, unorm_image, proxy_format, unorm_scratch);
+            assert!(encoded);
+            assert!(
+                from_srgb == from_unorm,
+                "{srgb_format:?}: the encoded proxy differs from the UNORM frame's: {:?} vs {:?}",
+                &from_srgb[..16],
+                &from_unorm[..16]
+            );
+            // Without the encode: the scratch holds the frame's own bytes.
+            if let Some(pass) = p.encode.take() {
+                // SAFETY: the queue is idle.
+                unsafe {
+                    for slot in &mut p.slots {
+                        if let Some(model) = slot.model.take() {
+                            model.destroy(&device, Some(&pass));
+                        }
+                    }
+                    pass.destroy(&device);
+                }
+            }
+            let (raw, encoded) = capture(p, srgb_image, proxy_format, scratch);
+            assert!(!encoded);
+            assert!(raw == bytes, "{srgb_format:?}: the scratch is not the frame's bytes: {:?} vs {:?}", &raw[..16], &bytes[..16]);
+            // SAFETY: the queue is idle; nothing references any of these any more.
+            unsafe {
+                destroy_pipeline(pipeline, &device);
+                device.destroy_image(srgb_image, None);
+                device.free_memory(srgb_memory, None);
+                device.destroy_image(unorm_image, None);
+                device.free_memory(unorm_memory, None);
+            }
+        }
+        unsafe {
             device.destroy_command_pool(pool, None);
             device.destroy_device(None);
             instance.destroy_instance(None);
@@ -4492,6 +4716,7 @@ mod tests {
                     height,
                     proxy_format,
                     false,
+                    ScratchSource::default(),
                     &mut pipeline,
                     &mut direct,
                     &mut true,
@@ -4704,6 +4929,7 @@ mod tests {
                     height,
                     proxy_format,
                     false,
+                    ScratchSource::default(),
                     &mut pipeline,
                     &mut direct,
                     &mut external_memory_host,
@@ -4973,6 +5199,7 @@ mod tests {
                 height,
                 proxy_format,
                 false,
+                ScratchSource::default(),
                 &mut pipeline,
                 &mut direct,
                 external_memory_host,
@@ -5159,6 +5386,7 @@ mod tests {
                     height,
                     proxy_format,
                     false,
+                    ScratchSource::default(),
                     &mut pipeline,
                     &mut direct,
                     // This test's own device never enables `VK_EXT_external_memory_host`
@@ -5361,6 +5589,7 @@ mod tests {
                     height,
                     proxy_format,
                     false,
+                    ScratchSource::default(),
                     &mut pipeline,
                     &mut direct,
                     &mut false,
@@ -5533,6 +5762,7 @@ mod tests {
                     height,
                     proxy_format,
                     false,
+                    ScratchSource::default(),
                     &mut pipeline,
                     &mut direct,
                     &mut false,
