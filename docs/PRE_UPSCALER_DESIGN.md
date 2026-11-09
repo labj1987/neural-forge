@@ -550,6 +550,11 @@ state. Outside `GENERAL` it is moved to `TRANSFER_SRC_OPTIMAL` for the copy in, 
 (`NEAREST`, same extent) to the RGBA16F staging image and back, when the device can blit both
 formats. Such inputs are held here even with nothing in the buffer before the launch
 (`Hazard::NotSplittable`): the split reads and writes the colour input as an RGBA16F storage image.
+The copies need `TRANSFER_SRC | TRANSFER_DST` on the colour input, which the layer adds to every colour
+candidate it sees created (`added_usage`; a native Vulkan game asks for none, #51). Every refusal of a
+hold inside the buffer at a launch naming the colour input (no transfer usage, format, extent, layout,
+a suspended render pass, left to the split) is logged once per identification and kind
+(`InlineRefusal`).
 
 **One hold per identification (3.1.4).** Once a hold inside DLSS's buffer has been recorded for an
 identification (`Tracker::inline_recorded`), a buffer the split could take is held inside too

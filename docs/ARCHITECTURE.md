@@ -526,8 +526,12 @@ ownership transfer, a write in its source access; `Scan::depth_hazard`) leaves t
 depth instead of stopping it. Every depth image at the identified depth's extent has its barriers
 tracked. `NEURAL_FORGE_PROBE_DEPTH=1` logs the first 120 held buffers' depth choice and barriers.
 While the pre-upscaler path and the edit cache are on, depth images get `TRANSFER_SRC` added at
-creation, as RG16F images do (`wants_copyable`; `NEURAL_FORGE_EDIT_CACHE=off` adds it to RG16F images
-only, `NEURAL_FORGE_PREUPSCALE=off` creates every image as asked).
+creation, as RG16F images do (`added_usage`; `NEURAL_FORGE_EDIT_CACHE=off` adds it to RG16F images
+only, `NEURAL_FORGE_PREUPSCALE=off` creates every image as asked). Colour candidates (2D single-sample
+RGBA16F or B10G11R11 images with `SAMPLED` or `STORAGE`) get `TRANSFER_SRC | TRANSFER_DST`, which the
+hold inside DLSS's buffer copies its colour input with: a native Vulkan game creates its images with the
+usage it needs and nothing more (Indiana Jones and the Great Circle, #51). Never an image whose memory
+is shared; the memory-requirements queries by create info are answered for the same usage.
 
 **The cache dump** (`preupscale::cache_dump`) writes K consecutive model-mode holds for the offline
 replay of the edit cache (`scripts/cache_replay.py`). Requests: `neural-forge-cli shmctl dump-cache

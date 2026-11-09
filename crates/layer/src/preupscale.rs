@@ -122,19 +122,34 @@ pub(crate) type NativeLoader = Arc<native::Loader>;
 #[derive(Clone)]
 pub(crate) enum NativeLoader {}
 
-/// Whether an image the application creates gets `TRANSFER_SRC` added: a 2D, single-sample RG16F image
-/// without it (DLSS's motion vectors; the hold copies only RG16F, for the native backend's history),
-/// or, while the edit cache is on, a depth image without it (the hold copies DLSS's depth every frame
-/// for the cache, [`native::DepthCopy`]; `NEURAL_FORGE_EDIT_CACHE=off` copies none, as 3.2.0).
-/// Only asked while the pre-upscaler path is on (`NEURAL_FORGE_PREUPSCALE=off` creates every image
-/// as the application asked).
-pub(crate) fn wants_copyable(info: &vk::ImageCreateInfo) -> bool {
-    cfg!(target_arch = "x86_64")
-        && (info.format == vk::Format::R16G16_SFLOAT || (DEPTH_FORMATS.contains(&info.format) && edit_cache_on()))
-        && info.image_type == vk::ImageType::TYPE_2D
-        && info.samples == vk::SampleCountFlags::TYPE_1
-        && info.tiling == vk::ImageTiling::OPTIMAL
-        && !info.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+/// The usage an image the application creates gets added (empty: none), for 2D, single-sample, optimally
+/// tiled images only:
+/// - `TRANSFER_SRC` for an RG16F image (DLSS's motion vectors; the hold copies only RG16F, for the native
+///   backend's history), or, while the edit cache is on, a depth image (the hold copies DLSS's depth every
+///   frame for the cache, [`native::DepthCopy`]; `NEURAL_FORGE_EDIT_CACHE=off` copies none, as 3.2.0);
+/// - `TRANSFER_SRC | TRANSFER_DST` for a colour candidate: an RGBA16F or B10G11R11 image the shaders read
+///   or write (`SAMPLED` or `STORAGE`), as DLSS's colour input is. The hold inside DLSS's buffer copies the
+///   colour input in and back with transfers ([`inline`]); a native Vulkan game creates its images with
+///   exactly the usage it needs (Indiana Jones and the Great Circle's: `SAMPLED | STORAGE |
+///   COLOR_ATTACHMENT`, #51), and without them nothing could ever be held there.
+///
+/// Only what the image does not have already. Only asked while the pre-upscaler path is on
+/// (`NEURAL_FORGE_PREUPSCALE=off` creates every image as the application asked).
+pub(crate) fn added_usage(info: &vk::ImageCreateInfo) -> vk::ImageUsageFlags {
+    let plain = info.image_type == vk::ImageType::TYPE_2D && info.samples == vk::SampleCountFlags::TYPE_1 && info.tiling == vk::ImageTiling::OPTIMAL;
+    if !cfg!(target_arch = "x86_64") || !plain {
+        return vk::ImageUsageFlags::empty();
+    }
+    let copied = info.format == vk::Format::R16G16_SFLOAT || (DEPTH_FORMATS.contains(&info.format) && edit_cache_on());
+    let colour = OUTPUT_FORMATS.contains(&info.format) && info.usage.intersects(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE);
+    let wanted = if colour {
+        vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST
+    } else if copied {
+        vk::ImageUsageFlags::TRANSFER_SRC
+    } else {
+        vk::ImageUsageFlags::empty()
+    };
+    wanted & !info.usage
 }
 
 /// Whether the edit cache runs (`cache::interval` above 1): only then are DLSS's depth images made
@@ -1469,11 +1484,11 @@ pub(crate) struct Tracker {
     /// this set too). A buffer recorded before (a re-submitted one, or one recorded ahead on another
     /// thread) may carry barriers on the inputs that were never seen ([`Hazard::RecordedBefore`]).
     recorded_watched: HashSet<vk::CommandBuffer>,
-    /// Diagnostics: barriers seen on the identified colour input, the last one's new layout, and
-    /// whether the in-buffer hold's "layout unknown" line was logged.
+    /// Diagnostics: barriers seen on the identified colour input, and the last one's new layout.
     colour_barriers: u64,
     last_colour_layout: Option<vk::ImageLayout>,
-    said_layout_miss: bool,
+    /// The identification ([`Self::generation`]) and the kinds of [`InlineRefusal`] logged for it.
+    said_refusals: (u64, u16),
     /// The last launch's kernel name and the registered images it named, kept only for
     /// `NEURAL_FORGE_PROBE_IMAGE` ([`probe_image`]).
     last_launch: Option<(String, Vec<vk::Image>)>,
@@ -1759,6 +1774,73 @@ pub(crate) const MVEC_COPY_LAYOUTS: [vk::ImageLayout; 4] =
 pub(crate) struct Before {
     pub barriers: usize,
     pub global: Option<Hazard>,
+}
+
+/// Why [`Tracker::inline_point`] records no hold inside DLSS's buffer at a launch naming the colour input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InlineRefusal {
+    /// Nothing identified.
+    NotIdentified,
+    /// The buffer was begun before this identification (or it changed with this submit): what its earlier
+    /// commands did to the inputs is not known.
+    BegunBefore,
+    /// The colour image is not one the layer saw created.
+    UnknownImage,
+    /// Not RGBA16F or B10G11R11.
+    Format(vk::Format),
+    /// Not a 2D single-sample image.
+    NotPlain,
+    /// Without both transfer usages: the copies in and back need them (the layer adds them at creation;
+    /// an image created before the layer was loaded, or one whose memory is shared, keeps its own).
+    Usage(vk::ImageUsageFlags),
+    /// Not the identified colour input's extent.
+    Extent((u32, u32), (u32, u32)),
+    /// A dynamic render pass instance is suspended across the launch, or resumed in the buffer.
+    SuspendedRendering,
+    /// The colour input's layout at the launch is not known.
+    LayoutUnknown,
+    /// A layout the copies in and back do not take.
+    Layout(vk::ImageLayout),
+    /// The buffer itself left the colour input in `GENERAL` and nothing in it keeps the split from it: the
+    /// split hold takes the frame at the submit.
+    LeftToSplit,
+}
+
+impl InlineRefusal {
+    /// What the log says (once per identification and kind): `None` for the ordinary ones.
+    fn said(&self) -> Option<String> {
+        Some(match self {
+            Self::NotIdentified | Self::BegunBefore => return None,
+            Self::UnknownImage => "the colour input is an image the layer did not see created".into(),
+            Self::Format(f) => format!("the colour input is {f:?} (RGBA16F or B10G11R11 only)"),
+            Self::NotPlain => "the colour input is not a 2D single-sample image".into(),
+            Self::Usage(u) => format!(
+                "the colour input's usage {u:?} lacks TRANSFER_SRC and TRANSFER_DST, which the copies in and back need (the layer adds them to the images it sees created, unless their memory is shared)"
+            ),
+            Self::Extent(have, want) => format!("the colour input is {}x{}, the identified one {}x{}", have.0, have.1, want.0, want.1),
+            Self::SuspendedRendering => "a render pass is suspended across DLSS's launch in its buffer".into(),
+            Self::LayoutUnknown => "the colour input's layout at DLSS's launch is unknown".into(),
+            Self::Layout(l) => format!("the colour input is in {l:?} at DLSS's launch (the copies take GENERAL, SHADER_READ_ONLY, COLOR_ATTACHMENT or TRANSFER layouts)"),
+            Self::LeftToSplit => "the buffer leaves the colour input in GENERAL with nothing in the way: the hold splits the submit instead".into(),
+        })
+    }
+
+    /// The kind, for saying each once per identification.
+    fn kind(&self) -> u8 {
+        match self {
+            Self::NotIdentified => 0,
+            Self::BegunBefore => 1,
+            Self::UnknownImage => 2,
+            Self::Format(_) => 3,
+            Self::NotPlain => 4,
+            Self::Usage(_) => 5,
+            Self::Extent(..) => 6,
+            Self::SuspendedRendering => 7,
+            Self::LayoutUnknown => 8,
+            Self::Layout(_) => 9,
+            Self::LeftToSplit => 10,
+        }
+    }
 }
 
 /// Where a hold runs inside DLSS's own command buffer ([`Tracker::inline_point`],
@@ -2327,38 +2409,44 @@ impl Tracker {
     /// refused ([`Self::launch_hazard`]), or the colour input is not an RGBA16F image in `GENERAL`
     /// (the split reads and writes it as a storage image). A buffer the split can take (GTA V's)
     /// gets nothing.
-    pub(crate) fn inline_point(&self, cb: vk::CommandBuffer, colour: vk::Image) -> Option<InlinePoint> {
-        let inputs = self.inputs?;
+    pub(crate) fn inline_point(&self, cb: vk::CommandBuffer, colour: vk::Image) -> Result<InlinePoint, InlineRefusal> {
+        let inputs = self.inputs.ok_or(InlineRefusal::NotIdentified)?;
         // Begun before this identification: the layouts its earlier commands left are not known.
         if self.identified || !self.recorded_watched.contains(&cb) {
-            return None;
+            return Err(InlineRefusal::BegunBefore);
         }
-        let desc = *self.images.get(&colour)?;
+        let desc = *self.images.get(&colour).ok_or(InlineRefusal::UnknownImage)?;
         let copyable = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        if !OUTPUT_FORMATS.contains(&desc.format)
-            || !desc.plain
-            || !desc.usage.contains(copyable)
-            || (desc.width, desc.height) != (inputs.colour.1.width, inputs.colour.1.height)
-        {
-            return None;
+        if !OUTPUT_FORMATS.contains(&desc.format) {
+            return Err(InlineRefusal::Format(desc.format));
+        }
+        if !desc.plain {
+            return Err(InlineRefusal::NotPlain);
+        }
+        if !desc.usage.contains(copyable) {
+            return Err(InlineRefusal::Usage(desc.usage));
+        }
+        if (desc.width, desc.height) != (inputs.colour.1.width, inputs.colour.1.height) {
+            return Err(InlineRefusal::Extent((desc.width, desc.height), (inputs.colour.1.width, inputs.colour.1.height)));
         }
         if self.rendering.get(&cb).is_some_and(|r| r.last_suspending || r.open_resume) {
-            return None;
+            return Err(InlineRefusal::SuspendedRendering);
         }
         let rgba16f = desc.format == vk::Format::R16G16B16A16_SFLOAT;
         let mut guessed = Guessed::default();
-        let (layout, set) = self.layout_in(cb, colour, true, rgba16f && desc.usage.contains(vk::ImageUsageFlags::STORAGE))?;
+        let (layout, set) =
+            self.layout_in(cb, colour, true, rgba16f && desc.usage.contains(vk::ImageUsageFlags::STORAGE)).ok_or(InlineRefusal::LayoutUnknown)?;
         if !set {
             guessed.colour = Some(layout);
         }
         if !INLINE_LAYOUTS.contains(&layout) {
-            return None;
+            return Err(InlineRefusal::Layout(layout));
         }
         let at = Inputs { colour: (colour, desc), ..inputs };
         let hazard = match self.launch_hazard(cb, Some(&at)).0 {
             Some(h) => h,
             None if rgba16f && layout == vk::ImageLayout::GENERAL && self.inline_in_use == Some(self.generation) => Hazard::HeldInside,
-            None if rgba16f && layout == vk::ImageLayout::GENERAL => return None,
+            None if rgba16f && layout == vk::ImageLayout::GENERAL => return Err(InlineRefusal::LeftToSplit),
             None => Hazard::NotSplittable,
         };
         // The inputs are refreshed on the next submit, not when an image is destroyed: an exposure
@@ -2404,7 +2492,7 @@ impl Tracker {
                 && layout.is_some_and(|l| depth_copy_layout(d.format, l));
             Aux { image, format: d.format, layout, readable }
         });
-        Some(InlinePoint {
+        Ok(InlinePoint {
             colour,
             desc,
             layout,
@@ -2447,6 +2535,28 @@ impl Tracker {
                     .or_else(|| self.attached.get(cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
             })
             .or_else(|| self.committed.get(&image).copied())
+    }
+
+    /// [`Self::inline_point`] refused a hold inside DLSS's buffer at a launch naming the colour input `colour`:
+    /// said once per identification and kind of refusal, with the image and how it was made.
+    fn note_inline_refusal(&mut self, colour: vk::Image, refusal: InlineRefusal) {
+        let Some(why) = refusal.said() else { return };
+        if self.said_refusals.0 != self.generation {
+            self.said_refusals = (self.generation, 0);
+        }
+        let bit = 1u16 << refusal.kind();
+        if self.said_refusals.1 & bit != 0 {
+            return;
+        }
+        self.said_refusals.1 |= bit;
+        let image = self.images.get(&colour).map_or_else(|| "unknown".to_string(), |d| format!("{}x{} {:?} {:?}", d.width, d.height, d.format, d.usage));
+        let layout = if refusal == InlineRefusal::LayoutUnknown {
+            format!(" ({} barriers on it seen since identification, last to {:?})", self.colour_barriers, self.last_colour_layout)
+        } else {
+            String::new()
+        };
+        crate::log!("[preupscale] no hold inside DLSS's buffer (identification {}): {why}{layout}; colour input {} {image}", self.generation, hex(colour));
+        crate::logging::flush();
     }
 
     /// A hold inside DLSS's buffer was recorded at a point of identification `identification`.
@@ -3813,21 +3923,10 @@ impl Tracking {
         let point = t
             .inline_point(cb, colour)
             .map(|p| InlinePoint { hold: placement::Hold::of(&plan, placement::Stage::Before, (p.desc.width, p.desc.height), output), ..p });
-        if point.is_none() && !t.said_layout_miss && t.images.contains_key(&colour) && t.recorded_watched.contains(&cb) {
-            let own = t.pending.get(&cb).is_some_and(|p| p.iter().any(|s| s.image == colour))
-                || t.attached.get(&cb).is_some_and(|a| a.iter().any(|(i, _)| *i == colour));
-            if !own && !t.committed.contains_key(&colour) {
-                t.said_layout_miss = true;
-                crate::log!(
-                    "[preupscale] no hold inside DLSS's buffer: the colour input {}'s layout is unknown there ({} barriers on it seen since identification, last to {:?})",
-                    hex(colour),
-                    t.colour_barriers,
-                    t.last_colour_layout
-                );
-                crate::logging::flush();
-            }
+        if let Err(refusal) = point {
+            t.note_inline_refusal(colour, refusal);
         }
-        point
+        point.ok()
     }
 
     /// `vkCreateCuFunctionNVX` created `function` for the kernel `name`.
@@ -8674,12 +8773,12 @@ mod tests {
         t.global(early, Hazard::MemoryBarrier);
         t.launch(early, Some(&params));
         assert_eq!(t.take_inline_at(), Some((early, colour())));
-        assert!(t.inline_point(early, colour()).is_none(), "recorded (in part) before the identification");
+        assert_eq!(t.inline_point(early, colour()).err(), Some(InlineRefusal::BegunBefore), "recorded (in part) before the identification");
         t.begin(early);
         t.global(early, Hazard::MemoryBarrier);
         t.launch(early, Some(&params));
         assert_eq!(t.take_inline_at(), Some((early, colour())));
-        assert_eq!(t.inline_point(early, colour()).map(|p| p.hazard), Some(Hazard::MemoryBarrier), "begun since: held inside");
+        assert_eq!(t.inline_point(early, colour()).ok().map(|p| p.hazard), Some(Hazard::MemoryBarrier), "begun since: held inside");
     }
 
     /// The hold goes inside DLSS's buffer exactly where the split is refused: Crimson Desert's and
@@ -8721,31 +8820,31 @@ mod tests {
         let (mut t, params) = held_tracker_with(copyable);
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert!(t.inline_point(b, c).is_none());
+        assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::LeftToSplit));
         // Barriers on depth only (GTA V with frame generation): the split holds it too.
         let (mut t, params) = held_tracker_with(copyable);
         t.barrier(cb(2), general_to_general(vk::Image::from_raw(0x200)));
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert!(t.inline_point(b, c).is_none());
-        // Not copyable (STORAGE only): nothing.
+        assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::LeftToSplit));
+        // Not copyable (STORAGE only, an image created before the layer could add the transfer usages): nothing.
         let (mut t, params) = held_tracker();
         t.global(cb(2), Hazard::MemoryBarrier);
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert!(t.inline_point(b, c).is_none());
+        assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::Usage(vk::ImageUsageFlags::STORAGE)));
         // Left in SHADER_READ_ONLY_OPTIMAL by the buffer's own barrier: held inside, moved to the
         // transfer layouts and back to that one; in a layout outside those the hold handles: nothing.
         let (mut t, params) = held_tracker_with(copyable);
         t.barrier(cb(2), ImageSync { old_layout: GENERAL, ..ImageSync::to(colour(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) });
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert_eq!(t.inline_point(b, c).map(|p| p.layout), Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
+        assert_eq!(t.inline_point(b, c).ok().map(|p| p.layout), Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
         let (mut t, params) = held_tracker_with(copyable);
         t.barrier(cb(2), ImageSync { old_layout: GENERAL, ..ImageSync::to(colour(), vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL) });
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert!(t.inline_point(b, c).is_none());
+        assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::Layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)));
         // A launch naming no colour candidate leaves no mark.
         let (mut t, _) = held_tracker_with(copyable);
         t.launch(cb(3), Some(&param_block(&[0x1200])));
@@ -8836,17 +8935,17 @@ mod tests {
         // GTA V's pattern before any hold inside was recorded: the split's.
         t.launch(cb(3), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert!(t.inline_point(b, c).is_none());
+        assert!(t.inline_point(b, c).is_err());
         // Recorded: the same pattern is held inside now.
         t.inline_recorded(point.identification);
         t.launch(cb(4), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert_eq!(t.inline_point(b, c).map(|p| p.hazard), Some(Hazard::HeldInside));
+        assert_eq!(t.inline_point(b, c).ok().map(|p| p.hazard), Some(Hazard::HeldInside));
         // A hold inside recorded for another identification: the split's again.
         t.inline_recorded(point.identification + 1);
         t.launch(cb(5), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert!(t.inline_point(b, c).is_none());
+        assert!(t.inline_point(b, c).is_err());
     }
 
     /// Motion vectors are in their own image's pixels: at the colour input's extent they are its pixels,
@@ -12186,11 +12285,14 @@ mod tests {
                 .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
         };
         let x86 = cfg!(target_arch = "x86_64");
-        assert_eq!(wants_copyable(&info(vk::Format::D32_SFLOAT_S8_UINT)), x86);
-        assert_eq!(wants_copyable(&info(vk::Format::D16_UNORM)), x86);
-        assert!(!wants_copyable(&info(vk::Format::R16G16B16A16_SFLOAT)));
+        let src = if x86 { vk::ImageUsageFlags::TRANSFER_SRC } else { vk::ImageUsageFlags::empty() };
+        assert_eq!(added_usage(&info(vk::Format::D32_SFLOAT_S8_UINT)), src);
+        assert_eq!(added_usage(&info(vk::Format::D16_UNORM)), src);
         let already = vk::ImageCreateInfo { usage: vk::ImageUsageFlags::TRANSFER_SRC, ..info(vk::Format::D32_SFLOAT) };
-        assert!(!wants_copyable(&already));
+        assert!(added_usage(&already).is_empty());
+        // A sampled RGBA16F image is a colour candidate: copied in and back by the hold inside DLSS's buffer.
+        let both = if x86 { vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST } else { vk::ImageUsageFlags::empty() };
+        assert_eq!(added_usage(&info(vk::Format::R16G16B16A16_SFLOAT)), both);
     }
 
     /// A native capture on a real device: the depth aspect of a D32S8 image in

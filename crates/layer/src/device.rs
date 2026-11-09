@@ -107,12 +107,12 @@ fn shares_memory(info: &vk::ImageCreateInfo) -> bool {
 }
 
 /// The create info an application's image is actually created with on a device with the pre-upscaler
-/// tracking: `TRANSFER_SRC` added where `preupscale::wants_copyable` asks for it and the memory is not
+/// tracking: the transfer usage `preupscale::added_usage` asks for added, where the memory is not
 /// shared. `None`: created as asked. Also what a memory-requirements query for such an image is
 /// answered from (`vkGetDeviceImage*MemoryRequirements`), so memory placed by those numbers fits.
 fn copyable_create_info<'a>(info: &vk::ImageCreateInfo<'a>) -> Option<vk::ImageCreateInfo<'a>> {
-    (crate::preupscale::wants_copyable(info) && !shares_memory(info))
-        .then(|| vk::ImageCreateInfo { usage: info.usage | vk::ImageUsageFlags::TRANSFER_SRC, ..*info })
+    let added = crate::preupscale::added_usage(info);
+    (!added.is_empty() && !shares_memory(info)).then(|| vk::ImageCreateInfo { usage: info.usage | added, ..*info })
 }
 
 /// Whether the pre-upscaler dump (`NEURAL_FORGE_PREUPSCALE=dump`) serves one-shot capture requests:
@@ -4511,8 +4511,10 @@ mod submit_order_tests {
     use super::*;
 
     /// The usage an image is created with and the usage its memory-requirements query is answered for
-    /// are one rule: an RG16F or (the edit cache on) depth image gets `TRANSFER_SRC`, one that shares
-    /// its memory or already has it does not, and nothing else changes.
+    /// are one rule: an RG16F or (the edit cache on) depth image gets `TRANSFER_SRC`, a colour candidate
+    /// (RGBA16F or B10G11R11, sampled or storage: DLSS's colour input, which the hold inside DLSS's buffer
+    /// copies in and back) `TRANSFER_SRC | TRANSFER_DST`, one that shares its memory or already has it does
+    /// not, and nothing else changes.
     #[test]
     fn images_are_created_and_queried_with_the_same_added_usage() {
         let base = vk::ImageCreateInfo {
@@ -4534,8 +4536,26 @@ mod submit_order_tests {
         assert!(copyable_create_info(&shared).is_none(), "shared memory: as asked");
         let has = vk::ImageCreateInfo { usage: vk::ImageUsageFlags::TRANSFER_SRC, ..base };
         assert!(copyable_create_info(&has).is_none());
-        let colour = vk::ImageCreateInfo { format: vk::Format::R16G16B16A16_SFLOAT, ..base };
-        assert!(copyable_create_info(&colour).is_none());
+        // Indiana Jones and the Great Circle's colour input (#51): SAMPLED | STORAGE | COLOR_ATTACHMENT.
+        let indy = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let transfer = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        for format in [vk::Format::R16G16B16A16_SFLOAT, vk::Format::B10G11R11_UFLOAT_PACK32] {
+            let colour = vk::ImageCreateInfo { format, usage: indy, ..base };
+            assert_eq!(copyable_create_info(&colour).map(|i| i.usage), Some(indy | transfer), "{format:?}");
+            let sampled = vk::ImageCreateInfo { format, usage: vk::ImageUsageFlags::SAMPLED, ..base };
+            assert_eq!(copyable_create_info(&sampled).map(|i| i.usage), Some(vk::ImageUsageFlags::SAMPLED | transfer));
+            let half = vk::ImageCreateInfo { format, usage: indy | vk::ImageUsageFlags::TRANSFER_SRC, ..base };
+            assert_eq!(copyable_create_info(&half).map(|i| i.usage), Some(indy | transfer), "the missing one only");
+            assert!(copyable_create_info(&vk::ImageCreateInfo { usage: indy | transfer, ..colour }).is_none(), "has both");
+        }
+        let colour = vk::ImageCreateInfo { format: vk::Format::R16G16B16A16_SFLOAT, usage: indy, ..base };
+        // Not a colour candidate: only an attachment (never read by a shader), multisampled, 3D, linear, shared.
+        assert!(copyable_create_info(&vk::ImageCreateInfo { usage: vk::ImageUsageFlags::COLOR_ATTACHMENT, ..colour }).is_none());
+        assert!(copyable_create_info(&vk::ImageCreateInfo { samples: vk::SampleCountFlags::TYPE_4, ..colour }).is_none());
+        assert!(copyable_create_info(&vk::ImageCreateInfo { image_type: vk::ImageType::TYPE_3D, ..colour }).is_none());
+        assert!(copyable_create_info(&vk::ImageCreateInfo { tiling: vk::ImageTiling::LINEAR, ..colour }).is_none());
+        assert!(copyable_create_info(&vk::ImageCreateInfo { p_next: std::ptr::from_ref(&external).cast(), ..colour }).is_none());
+        assert!(copyable_create_info(&vk::ImageCreateInfo { format: vk::Format::R8G8B8A8_UNORM, ..colour }).is_none());
     }
     use ash::vk::Handle;
 
