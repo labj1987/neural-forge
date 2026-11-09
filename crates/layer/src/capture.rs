@@ -1162,6 +1162,10 @@ pub unsafe fn run(
             })
         });
     let settings = shm.composition_settings()?;
+    // SAFETY: the device's own compose and captures.
+    if !unsafe { compose_for_family(gpu_compose, direct, device, queue_family) } {
+        return None;
+    }
     // "Off keeps the whole pass running... and simply presents the clean frame" --
     // `ShmHeader::apply_model`'s own doc comment -- and the model being permanently
     // unavailable is the same "nothing will ever consume a captured frame" case
@@ -2553,6 +2557,8 @@ pub struct DirectCapture {
     pending: Option<(u32, u32, u32, Option<vk::Buffer>, std::time::Instant)>,
     /// Same as `PipelineSlot::timer`, read by [`poll_direct_capture`].
     timer: Option<crate::gpu_timer::GpuTimer>,
+    /// The queue family `buf`'s command pool serves: a capture on another family's queue rebuilds it.
+    queue_family: u32,
 }
 
 /// Builds (or rebuilds, on a capacity/queue-family change) the one slot
@@ -2579,12 +2585,13 @@ unsafe fn ensure_direct_capture(
         return false;
     }
     if let Some(d) = existing.as_ref() {
-        if d.buf.capacity >= capacity && d.buf.ptr == host_ptr {
+        if d.buf.capacity >= capacity && d.buf.ptr == host_ptr && d.queue_family == queue_family {
             return true;
         }
         // A resize/pointer change (the mapping is only ever established once per
         // process in practice, but this mirrors `ensure_pipeline`'s own rebuild
-        // discipline rather than assuming that) needs the same drain-before-destroy
+        // discipline rather than assuming that), or a present on a queue of another
+        // family than the command pool serves, needs the same drain-before-destroy
         // care: never touch a slot that might still be in flight.
         if d.pending.is_some() {
             // SAFETY: `d.buf.fence` is this slot's own fence; waiting for it before
@@ -2611,7 +2618,49 @@ unsafe fn ensure_direct_capture(
         return false;
     };
     let timer = crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family);
-    *existing = Some(DirectCapture { buf, pending: None, timer });
+    *existing = Some(DirectCapture { buf, pending: None, timer, queue_family });
+    true
+}
+
+/// Makes `gpu_compose` one built for `queue_family`, the family of the present at hand. Its command pool
+/// (and so every slot's command buffers) serves one family, and submitting them to a queue of another is
+/// undefined (VUID-vkQueueSubmit-pCommandBuffers-00074). A compose built for another family is replaced by
+/// a new one once its own work and the zero-copy captures (which may still be writing its capture target)
+/// are drained. Its present semaphores, which presents may still wait on and which belong to no family,
+/// move to the new compose. A compose not built yet is left to its first use. `false` when the drain or
+/// the new compose failed: the old one is kept, and this present goes out untouched.
+///
+/// # Safety
+/// `gpu_compose` and `direct` are `device`'s.
+unsafe fn compose_for_family(
+    gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
+    direct: &mut [Option<DirectCapture>; 2],
+    device: &ash::Device,
+    queue_family: u32,
+) -> bool {
+    let Some(old) = gpu_compose.as_ref().filter(|gpu| gpu.queue_family() != queue_family) else { return true };
+    let was = old.queue_family();
+    if !wait_in_flight(None, direct, device) || !old.wait_in_flight(device) {
+        return false;
+    }
+    let Some(mut new) = crate::composition::gpu::GpuCompose::new(device, queue_family) else { return false };
+    let mut old = gpu_compose.take().expect("checked above");
+    *new.present_semaphores_mut() = std::mem::take(old.present_semaphores_mut());
+    // The drained captures' bytes are in the shared region; the capture target they also wrote goes with the
+    // old compose, so their completion copies them out of the region instead.
+    for d in direct.iter_mut().flatten() {
+        if let Some(pending) = d.pending.as_mut() {
+            pending.3 = None;
+        }
+    }
+    // SAFETY: every compose and capture that could use it was waited above, and its present semaphores moved.
+    unsafe { old.destroy(device) };
+    *gpu_compose = Some(new);
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::log!("[compose] presents moved to queue family {queue_family} (the compose was built for {was}): rebuilt for it");
+        crate::logging::flush();
+    }
     true
 }
 
@@ -3189,6 +3238,107 @@ mod tests {
             device.destroy_device(None);
             instance.destroy_instance(None);
             libc::munmap(host_ptr.cast(), region_len);
+        }
+    }
+
+    /// The compose and the zero-copy capture serve the queue family their command pools were made for. A
+    /// present on another family gets them rebuilt for it, after their work is drained: the compose's present
+    /// semaphores (which presents may still wait on) move to the new compose, and a capture still pending
+    /// forgets the old compose's capture target it also wrote. (Lavapipe has one family: the old objects are
+    /// made to look as if they were built for another.)
+    #[test]
+    fn compose_and_direct_capture_are_rebuilt_for_another_queue_family() {
+        let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_entry, instance, physical_device, device, queue, queue_family, supported)) = test_device_with_external_memory_host() else {
+            eprintln!("compose_and_direct_capture_are_rebuilt_for_another_queue_family: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let alignment = min_imported_host_pointer_alignment(&instance, physical_device).filter(|_| supported);
+        let (width, height) = (8u32, 8u32);
+        let frame_bytes = u64::from(width * height * 4);
+        let region_len = alignment.map_or(0, |a| frame_bytes.max(a).div_ceil(a) * a) as usize;
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let (image, image_memory) = make_filled_present_src_image(&device, &mem_props, queue, pool, width, height, [0.5, 0.5, 0.5, 1.0]);
+
+        let mut gpu = crate::composition::gpu::GpuCompose::new(&device, queue_family);
+        // Only a key of the semaphore map (the swapchain image a present semaphore is for), never used as an image.
+        let key = image;
+        let semaphore = gpu
+            .as_mut()
+            .unwrap()
+            .present_semaphores_mut()
+            .get(key, || unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.ok())
+            .unwrap();
+        let mut direct: [Option<DirectCapture>; 2] = [None, None];
+        let mut host_ptr = std::ptr::null_mut::<u8>();
+        if alignment.is_some() {
+            // SAFETY: a plain anonymous mapping, valid until the end of this test.
+            let ptr =
+                unsafe { libc::mmap(std::ptr::null_mut(), region_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+            assert_ne!(ptr, libc::MAP_FAILED);
+            host_ptr = ptr.cast();
+            // SAFETY: `host_ptr` is valid for `region_len` bytes for the rest of this test, written by nothing else.
+            assert!(unsafe {
+                ensure_direct_capture(&mut direct[0], &device, &instance, physical_device, queue_family, host_ptr, region_len as vk::DeviceSize)
+            });
+            // A capture in flight that also writes the compose's capture target.
+            let target = gpu.as_mut().unwrap().zero_copy_capture_target(&device, &instance, physical_device, queue, frame_bytes, true);
+            assert!(target.is_some(), "the zero-copy capture target");
+            let d = direct[0].as_mut().unwrap();
+            assert!(submit_direct_capture(
+                d,
+                &device,
+                queue,
+                image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                width,
+                height,
+                neural_forge_protocol::enums::proxy_format::RGBA8,
+                target
+            ));
+        } else {
+            eprintln!("compose_and_direct_capture_are_rebuilt_for_another_queue_family: no VK_EXT_external_memory_host, the compose only");
+        }
+
+        // The same family: kept as it is.
+        assert!(unsafe { compose_for_family(&mut gpu, &mut direct, &device, queue_family) });
+        assert_eq!(gpu.as_ref().unwrap().queue_family(), queue_family);
+        gpu.as_mut().unwrap().pretend_queue_family(queue_family + 1);
+        assert!(unsafe { compose_for_family(&mut gpu, &mut direct, &device, queue_family) });
+        let rebuilt = gpu.as_mut().unwrap();
+        assert_eq!(rebuilt.queue_family(), queue_family, "rebuilt for the present's family");
+        assert_eq!(rebuilt.present_semaphores_mut().get(key, || None), Some(semaphore), "the present semaphore moved to the new compose");
+        if let Some(d) = direct[0].as_mut() {
+            assert_eq!(d.pending.map(|p| p.3), Some(None), "the pending capture forgets the old compose's capture target");
+            // The zero-copy capture on another family: rebuilt for this one (the pending capture drained first).
+            d.queue_family = queue_family + 1;
+            // SAFETY: as above.
+            assert!(unsafe {
+                ensure_direct_capture(&mut direct[0], &device, &instance, physical_device, queue_family, host_ptr, region_len as vk::DeviceSize)
+            });
+            let d = direct[0].as_ref().unwrap();
+            assert_eq!(d.queue_family, queue_family, "the zero-copy capture rebuilt for the present's family");
+            assert!(d.pending.is_none());
+        }
+
+        unsafe {
+            device.device_wait_idle().unwrap();
+            if let Some(gpu) = gpu.take() {
+                gpu.destroy(&device);
+            }
+            for d in direct {
+                destroy_direct_capture(d, &device);
+            }
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+            if !host_ptr.is_null() {
+                libc::munmap(host_ptr.cast(), region_len);
+            }
         }
     }
 
