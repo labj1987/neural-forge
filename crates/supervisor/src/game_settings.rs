@@ -167,6 +167,17 @@ pub fn save_values(scope: &LiveScope, values: &BTreeMap<String, String>) -> std:
     }
 }
 
+/// What `scope`'s settings store for `key` (`set_<name>`) now: `config.ini`'s line for all games, else the game's
+/// own line in `games.ini`; `None` without one (or for an executable nothing names). A delayed save compares it
+/// with what it was when the change was made, so a newer write by another program (`game-settings clear` or `set`,
+/// a profile from the CLI) is never overwritten with the older change.
+pub fn stored_value(scope: &LiveScope, key: &str) -> Option<String> {
+    match scope.scope {
+        0 => Config::load().settings.get(key).cloned(),
+        _ => scope.game().and_then(|game| overrides(&load_all(), &game).remove(key)),
+    }
+}
+
 /// Saves the live header's settings where they belong: `config.ini` while it holds the settings for all
 /// games, else that game's own ([`store`]). `names`: only these settings (the GUI's changed rows), `None`
 /// every one (a profile, Reset, `shmctl`).
@@ -313,6 +324,25 @@ mod tests {
         // One nothing names cannot be saved.
         h.write_game_settings(GameKey::Exe("unknown.exe".into()).scope(), &[], None);
         assert!(save_live(&h, None).is_err());
+    }
+
+    /// What a scope stores for a key, as a delayed save reads it again: config.ini's line, a game's own line.
+    #[test]
+    fn stored_value_reads_the_scopes_own_line() {
+        let home = Home::new("stored-value");
+        home.write("config.ini", "set_intensity=1.5\n");
+        home.write("games.ini", "[570]\nset_style=1\n");
+        let h = neural_forge_protocol::ShmHeader::default();
+        h.init_defaults();
+        let all = LiveScope::of(&h);
+        h.write_game_settings(570, &[], None);
+        let game = LiveScope::of(&h);
+        assert_eq!(stored_value(&all, "set_intensity").as_deref(), Some("1.5"));
+        assert_eq!(stored_value(&all, "set_style"), None);
+        assert_eq!(stored_value(&game, "set_style").as_deref(), Some("1"));
+        assert_eq!(stored_value(&game, "set_intensity"), None, "all games' value is not the game's own");
+        clear(&GameKey::Steam(570), Some("set_style")).unwrap();
+        assert_eq!(stored_value(&game, "set_style"), None);
     }
 
     /// A change kept with the scope it was made in is saved there, whatever the header holds by then.

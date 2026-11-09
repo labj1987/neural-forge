@@ -967,7 +967,10 @@ was made in); the menu follows `settings_game` once a second. The GUI's delayed 
 scope the header held when it was made (`game_settings::LiveScope`) and the value, and saves it there
 (`game_settings::save_values`): with the header's value at the time of the save while the header still holds
 that scope (a profile or Reset in between wins), else with the recorded one, so a game's session starting, or
-`game-settings` switching the header, within the delay never moves a change to another scope or loses it. Each bound row learns its setting's name from its `bind_*` call
+`game-settings` switching the header, within the delay never moves a change to another scope or loses it. It also keeps
+what the scope's file stored for the setting when the change was made (`game_settings::stored_value`) and saves
+the change only while the file still stores that: a `game-settings clear` or `set` (or a CLI profile) in the delay
+is the newer write and stays. Each bound row learns its setting's name from its `bind_*` call
 (`shm::take_pending_name`) and gets a "This game" mark with a button that clears that one key
 (`game_settings::clear`), shown while the picked game's section has it.
 

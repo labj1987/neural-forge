@@ -83,16 +83,28 @@ impl Shm {
 /// or dragged changes the value many times a second, and each change was a full rewrite.
 const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
-use neural_forge_supervisor::game_settings::LiveScope;
+use neural_forge_supervisor::game_settings::{stored_value, LiveScope};
+
+/// One setting changed since the last save.
+#[derive(Clone)]
+struct Change {
+    /// The value it was changed to (the latest change's).
+    value: String,
+    /// What its scope's file stored for it when it was first changed (`game_settings::stored_value`): if that
+    /// is different by the time of the save, another program stored a newer value (`game-settings clear` or
+    /// `set`, a profile from the CLI), and the change is dropped instead of writing the older value over it.
+    stored: Option<String>,
+}
 
 #[derive(Default)]
 struct PendingSave {
     /// Settings changed since the last save, by whose settings the header held when each was changed (the
-    /// scope it is saved to), with the value it was changed to. While the header still holds that scope the
-    /// value saved is the header's own at the time of the save, so a Reset or profile load in between is never
-    /// overwritten with an older value; once it holds another's (a game's session started, `game-settings`
-    /// switched it), the value recorded here is saved to the scope it was made in.
-    changes: std::collections::BTreeMap<(LiveScope, &'static str), String>,
+    /// scope it is saved to). While the header still holds that scope the value saved is the header's own at
+    /// the time of the save, so a Reset or profile load in between is never overwritten with an older value;
+    /// once it holds another's (a game's session started, `game-settings` switched it), the value recorded
+    /// here is saved to the scope it was made in. Either way only while the scope's file still stores what it
+    /// did when the change was made ([`Change::stored`]).
+    changes: std::collections::BTreeMap<(LiveScope, &'static str), Change>,
     mapping: Option<Arc<Mapping>>,
     timer: Option<glib::SourceId>,
     on_error: Option<std::rc::Rc<dyn Fn(String)>>,
@@ -114,7 +126,13 @@ fn persist_later(shm: &Arc<Mapping>, name: &'static str) {
     let scope = LiveScope::of(header);
     PENDING_SAVE.with(|p| {
         let mut p = p.borrow_mut();
-        p.changes.insert((scope, name), value);
+        match p.changes.entry((scope, name)) {
+            std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().value = value,
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let stored = stored_value(&e.key().0, &format!("set_{name}"));
+                e.insert(Change { value, stored });
+            }
+        }
         p.mapping = Some(Arc::clone(shm));
         if let Some(timer) = p.timer.take() {
             timer.remove();
@@ -143,7 +161,8 @@ pub fn persist_settings_later(shm: &Arc<Mapping>, names: &[&'static str]) {
 /// Writes every changed setting now (the timer does this on its own; the window calls it on close, and the
 /// "Settings for" menu before it changes whose settings the header holds), each to the settings it was
 /// changed in: `config.ini` for all games, else that game's own (`game_settings::save_values`). A full
-/// load-modify-save of each file, so no other key is written stale.
+/// load-modify-save of each file, so no other key is written stale. A change whose setting another program
+/// stored anew since it was made is not saved: that write is the newer one.
 pub fn flush_settings() -> std::io::Result<()> {
     let (changes, mapping) = PENDING_SAVE.with(|p| {
         let mut p = p.borrow_mut();
@@ -157,10 +176,14 @@ pub fn flush_settings() -> std::io::Result<()> {
     let held = header.settings_game();
     let now = neural_forge_protocol::persist::snapshot(header);
     let mut by_scope: std::collections::BTreeMap<LiveScope, std::collections::BTreeMap<String, String>> = std::collections::BTreeMap::new();
-    for ((scope, name), value) in &changes {
+    for ((scope, name), change) in &changes {
         let key = format!("set_{name}");
+        if stored_value(scope, &key) != change.stored {
+            eprintln!("neural-forge: not saving {name}: its stored value changed since it was changed here (another program saved a newer one)");
+            continue;
+        }
         // Still the scope it was changed in: the header's value now (a Reset or a profile may have changed it).
-        let value = if scope.scope == held { now.get(&key).unwrap_or(value) } else { value };
+        let value = if scope.scope == held { now.get(&key).unwrap_or(&change.value) } else { &change.value };
         by_scope.entry(scope.clone()).or_default().insert(key, value.clone());
     }
     let mut result = Ok(());
@@ -169,9 +192,9 @@ pub fn flush_settings() -> std::io::Result<()> {
             // Still unsaved: the next change, or the flush on close, writes them again (to the same scope).
             PENDING_SAVE.with(|p| {
                 let mut p = p.borrow_mut();
-                for ((s, name), value) in &changes {
-                    if *s == scope {
-                        p.changes.entry((s.clone(), *name)).or_insert_with(|| value.clone());
+                for ((s, name), change) in &changes {
+                    if *s == scope && values.contains_key(&format!("set_{name}")) {
+                        p.changes.entry((s.clone(), *name)).or_insert_with(|| change.clone());
                     }
                 }
             });
@@ -323,6 +346,48 @@ mod tests {
         header.write_settings(&[("intensity", 1.5f32.to_bits())]);
         flush_settings().unwrap();
         assert!(env.read("config.ini").contains("set_intensity=1.5"), "{}", env.read("config.ini"));
+    }
+
+    /// A change still waiting to be saved never undoes what another program stored for the same setting after it
+    /// was made: `game-settings clear` (or `set`) on the game while the header holds another scope, so the
+    /// recorded value would otherwise be written back. A change to another setting in the same save is kept.
+    #[test]
+    fn a_pending_change_never_overwrites_a_newer_stored_value() {
+        use neural_forge_supervisor::game_settings::{self, GameKey};
+        let env = ScratchEnv::new("pending-newer");
+        std::fs::write(env.dir.join("config/neural-forge/games.ini"), "[570]\nset_intensity=0.5\nset_style=1\n").unwrap();
+        let shm = Shm::open().unwrap();
+        let header = shm.0.header();
+        let (_, set_intensity) = bind_float(&shm.0, Some("intensity"), |h| &h.intensity_bits);
+        let (_, set_saturation) = bind_float(&shm.0, Some("edit_saturation"), |h| &h.edit_saturation_bits);
+        let game = GameKey::Steam(570);
+
+        // Changed for the game; the header goes to all games' (another game's session, say), and the CLI's
+        // `game-settings clear 570 intensity` runs, all before the save.
+        neural_forge_protocol::persist::apply_scope(header, Some(&game));
+        set_intensity(0.75);
+        set_saturation(1.25);
+        neural_forge_protocol::persist::apply_scope(header, None);
+        assert_eq!(game_settings::clear(&game, Some("set_intensity")).unwrap(), 1);
+        flush_settings().unwrap();
+        let games = env.read("games.ini");
+        assert!(!games.contains("set_intensity"), "the clear was undone:\n{games}");
+        assert!(games.contains("set_edit_saturation=1.25"), "the other change is kept:\n{games}");
+
+        // The same with `game-settings set`: its value stays.
+        neural_forge_protocol::persist::apply_scope(header, Some(&game));
+        set_intensity(0.25);
+        neural_forge_protocol::persist::apply_scope(header, None);
+        game_settings::store(&game, &[("set_intensity".to_string(), "2".to_string())].into()).unwrap();
+        flush_settings().unwrap();
+        assert!(env.read("games.ini").contains("set_intensity=2"), "{}", env.read("games.ini"));
+
+        // Nothing stored anew: the change is saved as before.
+        neural_forge_protocol::persist::apply_scope(header, Some(&game));
+        set_intensity(0.25);
+        neural_forge_protocol::persist::apply_scope(header, None);
+        flush_settings().unwrap();
+        assert!(env.read("games.ini").contains("set_intensity=0.25"), "{}", env.read("games.ini"));
     }
 
     /// Exercises the real production path end to end: change a value through
