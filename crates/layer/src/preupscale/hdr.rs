@@ -426,8 +426,12 @@ pub(crate) fn paper_white() -> f32 {
 /// Whether an exposure value can be divided by: finite and clearly positive (the shaders' own
 /// `exposure_ok`).
 pub(crate) fn exposure_ok(e: f32) -> bool {
-    e > 1e-6 && e < 65504.0
+    e > EXPOSURE_MIN && e < 65504.0
 }
+
+/// The smallest exposure the shaders take (`exposure_ok` in every shader that reads one): at or below it the
+/// encode writes 0 and nothing is edited.
+pub(crate) const EXPOSURE_MIN: f32 = 1e-6;
 
 /// A device-local RGBA16F storage image of the layer's own, with its view.
 pub(super) struct OwnImage {

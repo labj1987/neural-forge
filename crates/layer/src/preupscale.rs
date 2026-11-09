@@ -6787,7 +6787,10 @@ impl Session {
             return;
         }
         let Some(read) = result.game_exposure.or(result.exposure).or(result.previous_exposure) else { return };
-        if !(read.is_finite() && read > 0.0) {
+        // Unusable as the shaders judge it (`hdr::exposure_ok`'s low end): a positive value at or below
+        // `EXPOSURE_MIN` (a half float's subnormals) edits nothing either, and must lead to the measured exposure
+        // as 0 does. Values the shaders refuse at the top are caught below (`EXPOSURE_TRUST_MAX`).
+        if !(read.is_finite() && read > hdr::EXPOSURE_MIN) {
             let (id, holds) = &mut self.exposure_unusable;
             *holds = if *id == identification { *holds + 1 } else { 1 };
             *id = identification;
@@ -8948,6 +8951,17 @@ mod tests {
         session.check_exposure(5, &native(f32::NAN));
         assert!(!session.game_exposure_trusted(5), "{EXPOSURE_UNUSABLE_HOLDS} unusable in a row");
         assert!(session.game_exposure_trusted(3));
+        // A positive exposure the shaders refuse (a half float's subnormal: 5.96e-8 to 9.5e-7, at or below 1e-6)
+        // is as unusable as 0, and a value just above it is usable.
+        for _ in 0..EXPOSURE_UNUSABLE_HOLDS {
+            assert!(!hdr::exposure_ok(6.0e-8));
+            session.check_exposure(6, &game(6.0e-8));
+        }
+        assert!(!session.game_exposure_trusted(6), "a subnormal exposure leads to the measured one");
+        for _ in 0..EXPOSURE_UNUSABLE_HOLDS {
+            session.check_exposure(7, &game(2.0e-6));
+        }
+        assert!(session.game_exposure_trusted(7) && hdr::exposure_ok(2.0e-6));
     }
 
     #[test]
