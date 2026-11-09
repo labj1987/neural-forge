@@ -620,8 +620,9 @@ fn check_compute_capability(gpus: &Gpus) -> Vec<Finding> {
 
 // ---- VRAM ----------------------------------------------------------------------------------------
 
-// What the network needs at a size (`NETWORK_VRAM_MIB`, measured; the small network takes about 45 MiB less).
-use neural_forge_protocol::vram_need::{network_need_mib, NETWORK_VRAM_MIB};
+// What the network needs at a size (`NETWORK_VRAM_MIB`, measured, linear in the pixel count between and beyond the
+// measured sizes; the small network takes about 45 MiB less).
+use neural_forge_protocol::vram_need::{network_need, NETWORK_VRAM_MIB};
 
 /// Whether a game's layer is presenting now: its heartbeat (one beat per present) moves within half a second. A
 /// closed game leaves its last values in the channel, `native_running` among them.
@@ -655,15 +656,16 @@ fn check_vram(gpus: &Gpus, hdr: Option<&neural_forge_protocol::ShmHeader>, runni
             CHECK,
             Severity::Info,
             format!(
-                "{free} MiB of {total} MiB VRAM free; the network needs about {}-{} MiB depending on the game's resolution",
-                NETWORK_VRAM_MIB[0].2, NETWORK_VRAM_MIB[3].2
+                "{free} MiB of {total} MiB VRAM free; the network needs about {} MiB at {}x{} to {} MiB at {}x{}, more above",
+                NETWORK_VRAM_MIB[0].2, NETWORK_VRAM_MIB[0].0, NETWORK_VRAM_MIB[0].1, NETWORK_VRAM_MIB[3].2, NETWORK_VRAM_MIB[3].0, NETWORK_VRAM_MIB[3].1
             ),
             evidence,
             None,
         )];
     };
-    let (mw, mh, need) = network_need_mib(w, h);
-    let evidence = format!("{evidence}\nthe layer's last frame: {w}x{h}; the network measured {need} MiB at {mw}x{mh}");
+    let estimate = network_need(w, h);
+    let need = estimate.mib;
+    let evidence = format!("{evidence}\nthe layer's last frame: {w}x{h}; the network needs about {need} MiB there ({})", estimate.basis());
     if running {
         // Already resident: what is free is what is left beside it.
         return vec![Finding::new(CHECK, Severity::Ok, format!("the network is running at {w}x{h}; {free} MiB VRAM still free"), evidence, None)];
@@ -1500,10 +1502,11 @@ mod tests {
 
     #[test]
     fn vram_below_the_networks_need_at_the_games_size_warns() {
-        assert_eq!(network_need_mib(1485, 836).2, 377);
-        assert_eq!(network_need_mib(1920, 1080).2, 607);
-        assert_eq!(network_need_mib(2560, 1440).2, 729);
-        assert_eq!(network_need_mib(7680, 4320).2, 1415);
+        assert_eq!(network_need(1485, 836).mib, 377);
+        assert_eq!(network_need(1920, 1080).mib, 500);
+        assert_eq!(network_need(2560, 1440).mib, 729);
+        // Beyond 4K the need keeps growing with the pixel count (it is not the 4K figure).
+        assert_eq!(network_need(7680, 4320).mib, 5119);
         let gpus = |free: u64| Gpus::Listed(vec![parse_gpu_line(&format!("NVIDIA GeForce RTX 5070, 12.0, 12227, {free}"))]);
         let hdr = neural_forge_protocol::ShmHeader::default();
         hdr.init_defaults();
@@ -1514,6 +1517,16 @@ mod tests {
         let low = check_vram(&gpus(500), Some(&hdr), false);
         assert_eq!(low[0].severity, Severity::Warning);
         assert!(low[0].summary.contains("below the 607 MiB the network needs at 2228x1253"), "{}", low[0].summary);
+        assert!(low[0].evidence.ends_with("the network needs about 607 MiB there (measured 607 MiB at 2228x1253)"), "{}", low[0].evidence);
+        // An ultrawide frame between two measured sizes: interpolated (918 MiB), not the 4K figure (1415).
+        hdr.preupscale_width.store(3440, Ordering::Relaxed);
+        hdr.preupscale_height.store(1440, Ordering::Relaxed);
+        let wide = check_vram(&gpus(1000), Some(&hdr), false);
+        assert_eq!(wide[0].severity, Severity::Ok, "{}", wide[0].summary);
+        assert_eq!(wide[0].summary, "1000 MiB VRAM free, enough for the network at 3440x1440 (918 MiB)");
+        assert!(wide[0].evidence.contains("from the 729 MiB measured at 2560x1440 and the 1415 MiB at 3840x2160"), "{}", wide[0].evidence);
+        hdr.preupscale_width.store(2228, Ordering::Relaxed);
+        hdr.preupscale_height.store(1253, Ordering::Relaxed);
         assert_eq!(check_vram(&gpus(4000), Some(&hdr), false)[0].severity, Severity::Ok);
         // Running: the network is already in what is used.
         let running = check_vram(&gpus(300), Some(&hdr), true);
