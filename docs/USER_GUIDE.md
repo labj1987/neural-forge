@@ -407,7 +407,9 @@ everything under `~/.local/share/neural-forge` (the model, an imported DLL, capt
   layer log (`NEURAL_FORGE_LOG=/path` in the launch options) has the `[native]` lines.
 - **Model placement says "DLSS input identified, not holding".** The layer found the frame the game hands
   to DLSS but could not hold it, so the model runs on the finished frame; the reason follows on the same
-  line (`preupscale_state=5` and `preupscale_reason=` in `neural-forge-cli shmctl status`). The layer log
+  line (`preupscale_state=5` and `preupscale_reason=` in `neural-forge-cli shmctl status`). "The model is switched
+  off" (F11 or the app) and "the Placement setting runs no pass before the upscaler" are your own choices, not a
+  problem. The layer log
   says each reason once: `[preupscale] no hold inside DLSS's buffer (identification N): <why>; colour input ...`
   when the hold inside DLSS's own command buffer refuses the frame, and `[preupscale] <why>; not holding` when
   the hold that splits the game's submission does. Attach **Save report**'s zip and that log to an issue.

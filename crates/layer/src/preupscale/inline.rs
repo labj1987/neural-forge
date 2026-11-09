@@ -771,8 +771,9 @@ impl Inline {
     /// calls [`Ctx::open`], and returns the hold's [`Meta`] once recorded, or why it did not
     /// ([`Recorded::Skipped`] for what passes, [`Recorded::Refused`] for what stays).
     pub(crate) fn record_outcome(&self, cb: vk::CommandBuffer, point: InlinePoint, hold: impl FnOnce(&mut Ctx) -> Result<Meta, Recorded>) -> Recorded {
-        // Switched off: nothing to hold for.
+        // Switched off: nothing to hold for, and the status says so.
         if self.model_switched_off() {
+            super::note_not_held(super::MODEL_OFF);
             return Recorded::Skipped;
         }
         if self.stopped.load(Ordering::Relaxed) {
@@ -2548,7 +2549,9 @@ mod tests {
         inline.switch.store(&mut *header, Ordering::Release);
         let real = rig.buffer();
         rig.begin(real);
+        crate::preupscale::note_refusal(crate::preupscale::Refusal::Text("an older refusal".into()));
         assert_eq!(inline.record_outcome(real, rig.point(), copies_only), Recorded::Skipped, "switched off");
+        assert_eq!(crate::preupscale::last_refusal_text().as_deref(), Some(crate::preupscale::MODEL_OFF), "the status says why, over the older refusal");
         header.apply_model.store(1, Ordering::Relaxed);
         assert_eq!(inline.record_outcome(real, rig.point(), copies_only), Recorded::Held, "switched on again");
         // A second launch at the same stage in that buffer adds no hold, and that passes.

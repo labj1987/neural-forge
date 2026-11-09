@@ -430,7 +430,7 @@ The `# live status` block:
 | `layer_frames`, `layer_ms` | Frames the layer captured, and its last per-frame time. |
 | `layer_capture_gpu_ms`, `layer_compose_gpu_ms` | The layer's own GPU time from timestamps (after the upscaler). |
 | `preupscale_state` | 0 off, 1 waiting for DLSS input, 2 holding before the upscaler, 3 holding after DLSS, 4 both, 5 DLSS input identified but every frame refused (the model runs after the upscaler). |
-| `preupscale_reason` | With state 5, why: the last refusal of the split hold or the hold inside DLSS's buffer (the log says each once: `[preupscale] no hold inside DLSS's buffer (identification N): ...` for the latter, `[preupscale] <why>; not holding` for the split). Empty otherwise. |
+| `preupscale_reason` | With state 5, why no hold runs now: the model switched off, a Placement with no pass before the upscaler, or the last refusal of the split hold or the hold inside DLSS's buffer (the log says each once: `[preupscale] no hold inside DLSS's buffer (identification N): ...` for the latter, `[preupscale] <why>; not holding` for the split). Empty otherwise. |
 | `preupscale_extent`, `preupscale_hold_ms`, `preupscale_misses` | DLSS's render size, the last hold's CPU time, and holds whose answer did not make it. |
 | `layer_measured_white`, `layer_composition_up` | The white meter, whether the compose is up. |
 | `capture_request`, `capture_result`, `capture_path` | A capture waiting for the game, and what became of the latest one: written, failed or cancelled, why, and its files. |

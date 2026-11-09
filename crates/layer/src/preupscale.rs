@@ -1865,14 +1865,65 @@ impl Refusal {
 }
 
 /// The process's last [`Refusal`] (any device's; the status describes the game, as [`LAST_HELD`] does).
+#[cfg(not(test))]
 static LAST_REFUSAL: Mutex<Option<Refusal>> = Mutex::new(None);
 
-/// Notes why a frame was not held, for the status.
-pub(crate) fn note_refusal(refusal: Refusal) {
-    let mut last = lock(&LAST_REFUSAL);
-    if last.as_ref() != Some(&refusal) {
-        *last = Some(refusal);
+#[cfg(test)]
+thread_local! {
+    /// In tests, each thread keeps its own last refusal: the tests running in parallel do not see each other's.
+    static LAST_REFUSAL: std::cell::RefCell<Option<Refusal>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `f` on the last [`Refusal`] ([`LAST_REFUSAL`]).
+fn with_last_refusal<R>(f: impl FnOnce(&mut Option<Refusal>) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&mut lock(&LAST_REFUSAL))
     }
+    #[cfg(test)]
+    {
+        LAST_REFUSAL.with_borrow_mut(f)
+    }
+}
+
+/// Notes why a frame was not held, for the status: it replaces any older reason.
+pub(crate) fn note_refusal(refusal: Refusal) {
+    with_last_refusal(|last| {
+        if last.as_ref() != Some(&refusal) {
+            *last = Some(refusal);
+        }
+    });
+}
+
+/// Why no hold runs although nothing refused one: the model is switched off (F11, the app, `shmctl`).
+pub(crate) const MODEL_OFF: &str = "the model is switched off (F11 or the app)";
+/// Why no hold runs before the upscaler although nothing refused one: the Placement setting puts every pass after
+/// the upscaler (at present, or after DLSS once its output is learnt; the state is then 5 only while no hold after
+/// DLSS runs either).
+pub(crate) const NO_PASS_BEFORE: &str = "the Placement setting runs no pass before the upscaler";
+/// Why no hold runs: the device cannot run the network (both holds give the same reason).
+pub(crate) const NATIVE_UNAVAILABLE: &str = "the native backend is not available on this device; frames go to DLSS untouched";
+
+/// Notes one of the reasons above (or another fixed one) as why no hold runs, replacing an older refusal so the
+/// status never names one that no longer applies.
+pub(crate) fn note_not_held(why: &'static str) {
+    note_refusal(Refusal::Text(why.into()));
+}
+
+/// The last reason noted ([`note_refusal`]) on this test's thread, as the status says it.
+#[cfg(test)]
+pub(crate) fn last_refusal_text() -> Option<String> {
+    with_last_refusal(|last| last.as_ref().map(Refusal::text))
+}
+
+/// Whether `plan` runs a pass before the upscaler; if not, notes [`NO_PASS_BEFORE`] for the status. Both holds
+/// before the upscaler (the split one and the one inside DLSS's buffer) ask it.
+fn plans_before(plan: &placement::Plan) -> bool {
+    let before = plan.has(placement::Stage::Before);
+    if !before {
+        note_not_held(NO_PASS_BEFORE);
+    }
+    before
 }
 
 /// Holds that ran, for the tally line ([`Tracking::scan`]): split holds that wrote back, and holds recorded
@@ -3894,7 +3945,7 @@ impl Tracking {
     pub(crate) fn split_hold(&self, render: (u32, u32)) -> Option<placement::Hold> {
         let t = self.lock();
         let plan = placement::current(t.frame());
-        plan.has(placement::Stage::Before).then(|| placement::Hold::of(&plan, placement::Stage::Before, render, t.output_extent()))
+        plans_before(&plan).then(|| placement::Hold::of(&plan, placement::Stage::Before, render, t.output_extent()))
     }
 
     /// What a hold recorded into `cb` now, before the upscaler, is given of DLSS's frame: the camera jitter
@@ -3979,7 +4030,7 @@ impl Tracking {
         let (cb, colour) = t.take_inline_at()?;
         // No pass runs before the upscaler (they run after DLSS or at present): no hold here.
         let plan = placement::current(t.frame());
-        if !plan.has(placement::Stage::Before) {
+        if !plans_before(&plan) {
             return None;
         }
         let output = t.output_extent();
@@ -7050,7 +7101,7 @@ impl Session {
         let now = Instant::now();
         if result.wrote_back || result.dump.is_some() {
             // A frame held: refusals from before it are no longer why nothing is.
-            *lock(&LAST_REFUSAL) = None;
+            with_last_refusal(|last| *last = None);
             self.last_hold = Some(now);
             self.last_hold_native = result.native;
             self.last_hold_extent = Some(extent);
@@ -7338,7 +7389,7 @@ impl Session {
         }
         let (w, h) = self.last_hold_extent.filter(|_| self.holding()).or(extent).unwrap_or((0, 0));
         let dlss = self.last_dlss.is_some_and(|t| t.elapsed() < RECENT);
-        let (state, reason) = status_of(self.holding(), dlss, lock(&LAST_REFUSAL).as_ref());
+        let (state, reason) = with_last_refusal(|last| status_of(self.holding(), dlss, last.as_ref()));
         shm.publish_preupscale_state(state, self.last_hold_native, w, h);
         publish_reason(shm, &reason);
     }
@@ -7486,13 +7537,17 @@ pub(crate) fn ray_reconstruction_running(now: Instant) -> bool {
 /// Whether a launch-bearing submit is held in `mode`, given the live switches: `None` forwards it
 /// untouched; `Some(dump)` holds it, `dump` saying whether this hold writes a dump. In model mode the
 /// live toggle (F11, the GUI, `shmctl set enabled 0`) or `apply_model` off mean no hold at all (the
-/// post path then sees the toggle too and presents the game's frame as it is). `layouts_known`: the depth and motion-vector layouts are known (a
-/// dump waits for them, [`Session::dump_ready`]).
+/// post path then sees the toggle too and presents the game's frame as it is; the status says so, [`MODEL_OFF`]).
+/// `layouts_known`: the depth and motion-vector layouts are known (a dump waits for them, [`Session::dump_ready`]).
 pub(crate) fn gate(mode: Mode, session: &mut Session, shm: &mut ShmClient, layouts_known: bool) -> Option<bool> {
     match mode {
         Mode::Off => None,
         Mode::Dump => (session.dump_due(shm) && session.dump_ready(layouts_known)).then_some(true),
-        Mode::Model => shm.model_enabled().then_some(false),
+        Mode::Model if !shm.model_enabled() => {
+            note_not_held(MODEL_OFF);
+            None
+        }
+        Mode::Model => Some(false),
         Mode::Identity | Mode::Roundtrip => Some(false),
     }
 }
@@ -8804,6 +8859,52 @@ mod tests {
         assert_eq!(header.preupscale_reason(), inside[..inside.len().min(neural_forge_protocol::REASON_BYTES - 1)]);
         assert!(shm.preupscale_reason_is(&header.preupscale_reason()));
         publish_reason(&shm, "");
+        assert_eq!(header.preupscale_reason(), "");
+    }
+
+    /// The status's reason is why no hold runs now (#51): the model switched off (the split hold's gate) or a
+    /// Placement with no pass before the upscaler (both holds before it ask [`plans_before`]) replace an older
+    /// refusal, as a held frame clears it, so the Status line never names a refusal that no longer applies.
+    #[test]
+    fn the_status_reason_is_why_no_hold_runs_now() {
+        use neural_forge_protocol::enums::placement::{BEFORE, PRESENT, UPSCALED};
+        use neural_forge_protocol::enums::preupscale_state::IDENTIFIED;
+        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
+        let refusal = Refusal::Inside(InlineRefusal::Usage(usage));
+        note_refusal(refusal.clone());
+        assert_eq!(last_refusal_text(), Some(refusal.text()));
+        // The model switched off (F11, the app): the split hold's gate says so, over the older refusal.
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.init_defaults();
+        let mut shm = ShmClient::test_over_header(&header);
+        let mut session = Session::default();
+        header.apply_model.store(0, Ordering::Relaxed);
+        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), None);
+        assert_eq!(last_refusal_text().as_deref(), Some(MODEL_OFF));
+        assert_eq!(with_last_refusal(|last| status_of(false, true, last.as_ref())), (IDENTIFIED, MODEL_OFF.to_string()));
+        header.apply_model.store(1, Ordering::Relaxed);
+        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), Some(false), "on again: held");
+        // No pass before the upscaler: every pass at present, or after DLSS with its output learnt (without it, After
+        // DLSS falls back to before the upscaler).
+        let frame = placement::Frame { rr: false, output: true, hook: true };
+        note_refusal(refusal.clone());
+        assert!(!plans_before(&placement::Plan::of(1, &[PRESENT; neural_forge_protocol::MAX_PASSES], frame)));
+        assert_eq!(last_refusal_text().as_deref(), Some(NO_PASS_BEFORE));
+        note_refusal(refusal.clone());
+        assert!(!plans_before(&placement::Plan::of(1, &[UPSCALED; neural_forge_protocol::MAX_PASSES], frame)));
+        assert_eq!(last_refusal_text().as_deref(), Some(NO_PASS_BEFORE));
+        // A plan with a pass before the upscaler notes nothing: the reason stays until a hold or another reason.
+        note_refusal(refusal.clone());
+        let mut before_then_after = [UPSCALED; neural_forge_protocol::MAX_PASSES];
+        before_then_after[0] = BEFORE;
+        assert!(plans_before(&placement::Plan::of(2, &before_then_after, frame)));
+        assert_eq!(last_refusal_text(), Some(refusal.text()));
+        // A held frame clears it: holding, the header's reason is empty.
+        session.note(&shm, &HoldResult { wrote_back: true, ..Default::default() }, Duration::ZERO, (16, 8));
+        assert_eq!(last_refusal_text(), None);
+        assert!(session.holding());
+        session.publish_status(&shm, Some((16, 8)));
+        assert_ne!(header.preupscale_state.load(Ordering::Relaxed), IDENTIFIED);
         assert_eq!(header.preupscale_reason(), "");
     }
 

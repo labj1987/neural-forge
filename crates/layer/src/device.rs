@@ -985,10 +985,12 @@ fn record_inline_hold(
     }
     if !crate::preupscale::native_on(session.native.as_ref()) {
         inline_tally("skipped (the native backend is not available on this device)");
+        crate::preupscale::note_not_held(crate::preupscale::NATIVE_UNAVAILABLE);
         return Err(Recorded::Refused);
     }
     if !shm.model_enabled() {
         inline_tally("skipped (the model is switched off)");
+        crate::preupscale::note_not_held(crate::preupscale::MODEL_OFF);
         return Err(Recorded::Skipped);
     }
     // The after-the-upscaler path stays off the network while the holds run before the upscaler.
@@ -1938,7 +1940,7 @@ impl NeuralForgeDeviceInfo {
         // model mode has nothing to run.
         let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
         if mode == Mode::Model && !native {
-            session.say_once("the native backend is not available on this device; frames go to DLSS untouched");
+            session.say_once(crate::preupscale::NATIVE_UNAVAILABLE);
             return None;
         }
         // Follows the toggle (F11, the GUI): off, the submit goes to DLSS untouched.
