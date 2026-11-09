@@ -1857,6 +1857,9 @@ pub(crate) struct NativePass {
     /// The composite's last exposure-jump word read back ([`apply_exposure_jump`]).
     last_jump: u32,
     pub(crate) gap: HistoryGap<(u32, u32)>,
+    /// The reset reason the last network frame planned was given ([`HistoryGap::begin`]), for the tests.
+    #[cfg(test)]
+    last_stale: Option<Stale>,
     /// The network whose answers the history holds ([`Built::network`]), once one has run.
     history_network: Option<u32>,
     /// Passes 2 and on, built on the first frame with more than one.
@@ -2249,6 +2252,8 @@ impl NativePass {
                 lut: None,
                 lut_applies: false,
                 gap: HistoryGap::default(),
+                #[cfg(test)]
+                last_stale: None,
                 history_network: None,
             })
         }
@@ -2364,6 +2369,12 @@ impl NativePass {
     #[cfg(test)]
     pub(crate) fn seed(&self) -> u32 {
         self.seed
+    }
+
+    /// The reset reason the last network frame planned was given (`None`: it kept the history, or it was the first).
+    #[cfg(test)]
+    pub(crate) fn last_stale(&self) -> Option<Stale> {
+        self.last_stale
     }
 
     pub(crate) fn answer(&self) -> vk::Buffer {
@@ -3994,6 +4005,9 @@ pub(crate) fn note_reset(stale: Option<Stale>) {
             super::scene_cut::threshold()
         ),
         Some(Stale::GameReset) => crate::log!("[native] resetting the history (the game reset DLSS's history)"),
+        Some(Stale::Unsound) => crate::log!(
+            "[native] resetting the history (the hold guard reset it on the GPU: a hold inside DLSS's buffer was recorded with a guessed input layout that was wrong when the buffer ran)"
+        ),
         None => {}
     }
 }
@@ -4629,6 +4643,10 @@ unsafe fn native_hold(
             (false, None)
         } else {
             let stale = native.gap.begin(hold_now());
+            #[cfg(test)]
+            {
+                native.last_stale = stale;
+            }
             note_network_reset(native.frames, stale, &mut result.scene_cut);
             let history = native.frames > 0 && stale.is_none() && mvec.is_some() && !no_history();
             (history, Some(native.frame_plan(&graphs, history, jitter, target.mvec_scale, &passes)))
@@ -4894,6 +4912,10 @@ unsafe fn native_hold(
         (false, [None, None], Vec::new())
     } else {
         let stale = native.gap.begin(hold_now());
+        #[cfg(test)]
+        {
+            native.last_stale = stale;
+        }
         note_network_reset(native.frames, stale, &mut result.scene_cut);
         let history = native.frames > 0 && stale.is_none() && mvec.is_some() && !no_history();
         let (cmds, later) = native.frame_graphs(&graphs, history, jitter, target.mvec_scale, &passes);

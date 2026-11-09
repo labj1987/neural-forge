@@ -6639,7 +6639,7 @@ impl Session {
                     e.state.drop_edit();
                 }
                 if let Some(n) = res.native.as_mut() {
-                    n.gap.skipped();
+                    n.gap.unsound();
                 }
             }
             return;

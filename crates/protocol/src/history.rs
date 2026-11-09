@@ -33,11 +33,14 @@ pub struct HistoryGap<F = ()> {
     /// The game reset DLSS's history for a frame the history has not been reset for yet: the next evaluate
     /// starts afresh.
     game: bool,
+    /// The GPU already reset the history (the layer's hold guard, for a hold inside DLSS's buffer whose
+    /// guessed input layout was wrong when the buffer ran): the next evaluate starts afresh.
+    unsound: bool,
 }
 
 impl<F> Default for HistoryGap<F> {
     fn default() -> Self {
-        Self { last: None, broken: false, format: None, format_changed: false, cut: None, game: false }
+        Self { last: None, broken: false, format: None, format_changed: false, cut: None, game: false, unsound: false }
     }
 }
 
@@ -60,6 +63,10 @@ pub enum Stale {
     /// The game reset DLSS's history for this frame (its NGX reset flag, as DLSS Super Resolution's input
     /// kernel was given it: `preupscale::reset_word`): a camera cut or a new scene the game knows of.
     GameReset,
+    /// The GPU reset the history itself: the layer's hold guard found a hold inside DLSS's buffer
+    /// recorded with a guessed input layout that was wrong when the buffer ran, and cleared what the
+    /// holds carry (`preupscale::inline`). The next evaluate follows it.
+    Unsound,
 }
 
 impl<F: Copy + PartialEq> HistoryGap<F> {
@@ -78,6 +85,12 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
     /// a frame that evaluates is reset on the GPU for that frame and never comes here.
     pub fn scene_cut(&mut self, mean: u32) {
         self.cut = Some(mean);
+    }
+
+    /// The GPU's hold guard reset the history for a hold whose guessed input layout was wrong: the next
+    /// [`Self::begin`] reports [`Stale::Unsound`], unless a reason above it in [`Self::pending`] does.
+    pub fn unsound(&mut self) {
+        self.unsound = true;
     }
 
     /// The game reset DLSS's history for the frame about to be held (or for one the history was kept through):
@@ -102,6 +115,7 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
         match self.last {
             None => None,
             Some(_) if self.format_changed => Some(Stale::FormatChanged),
+            Some(_) if self.unsound => Some(Stale::Unsound),
             Some(_) if self.broken => Some(Stale::Skipped),
             Some(_) if self.cut.is_some() => self.cut.map(Stale::SceneCut),
             Some(_) if self.game => Some(Stale::GameReset),
@@ -130,6 +144,7 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
         self.format_changed = false;
         self.cut = None;
         self.game = false;
+        self.unsound = false;
         self.last = Some(now);
         stale
     }
@@ -251,6 +266,25 @@ mod tests {
         g.skipped();
         assert_eq!(g.begin(t0 + Duration::from_millis(16)), Some(Stale::Skipped));
         assert_eq!(g.begin(t0 + Duration::from_millis(32)), None);
+    }
+
+    /// The hold guard's reset is its own reason (not a skipped request: no frame went to DLSS untouched),
+    /// pending until the next evaluate consumes it once; a format change still names itself first.
+    #[test]
+    fn an_unsound_hold_resets_once_with_its_own_reason() {
+        let mut g: HistoryGap<u8> = HistoryGap::default();
+        let t0 = Instant::now();
+        g.begin(t0);
+        g.unsound();
+        assert_eq!(g.pending(t0), Some(Stale::Unsound));
+        g.skipped();
+        assert_eq!(g.begin(t0 + Duration::from_millis(16)), Some(Stale::Unsound));
+        assert_eq!(g.begin(t0 + Duration::from_millis(32)), None, "once");
+        g.note_format(1);
+        g.note_format(2);
+        g.unsound();
+        assert_eq!(g.begin(t0 + Duration::from_millis(48)), Some(Stale::FormatChanged));
+        assert_eq!(g.begin(t0 + Duration::from_millis(64)), None, "both consumed");
     }
 
     #[test]

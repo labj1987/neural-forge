@@ -499,7 +499,8 @@ afresh too; the hold's readings (the edit cache's counters, the scene cut, the e
 When its reading comes back (`Session::harvest`), the CPU follows the GPU: it drops the edit cache's
 stored edit, so the next hold it plans refreshes instead of being a cached hold with nothing to apply (one
 that would give DLSS its frame unedited, every other frame while the camera moves if every guess is
-wrong), and marks the history stale, so the next network frame runs without history and with seed 0, as
+wrong), and marks the history stale for the guard's own reason (`history::Stale::Unsound`, logged as
+the hold guard's reset), so the next network frame runs without history and with seed 0, as
 the guard's reset made it on the GPU. Holds planned before the reading came back are not changed.
 A device without the verdicts' buffer reads no input in a guessed layout. The alternative, copying the history back into one image at the end of every hold so no
 parity is needed, would cost a copy every frame and still not cover the edit cache's chain or the seed.
