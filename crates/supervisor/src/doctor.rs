@@ -48,11 +48,14 @@ pub struct Finding {
     pub evidence: String,
     /// One concrete thing to do about it.
     pub fix: Option<String>,
+    /// The evidence as the report shows it ([`render_report_text`]), when it differs from what is shown on
+    /// screen: a game's launch options reduced to Neural Forge's own part.
+    pub report_evidence: Option<String>,
 }
 
 impl Finding {
     fn new(check: &'static str, severity: Severity, summary: impl Into<String>, evidence: impl Into<String>, fix: Option<String>) -> Self {
-        Self { check, severity, summary: summary.into(), evidence: evidence.into(), fix }
+        Self { check, severity, summary: summary.into(), evidence: evidence.into(), fix, report_evidence: None }
     }
 }
 
@@ -295,10 +298,21 @@ pub fn any_failure(findings: &[Finding]) -> bool {
 
 /// The findings as text, in the order given, each with its evidence and fix, and a count at the end.
 pub fn render_text(findings: &[Finding]) -> String {
+    render(findings, false)
+}
+
+/// [`render_text`] for the report (`summary.txt`, attached to public issues): with each finding's
+/// [`Finding::report_evidence`] where it has one, so no game's own launch options are in it.
+pub fn render_report_text(findings: &[Finding]) -> String {
+    render(findings, true)
+}
+
+fn render(findings: &[Finding], for_report: bool) -> String {
     let mut s = String::new();
     for f in findings {
         s.push_str(&format!("[{}] {}: {}\n", f.severity.label(), f.check, f.summary));
-        for line in f.evidence.lines() {
+        let evidence = if for_report { f.report_evidence.as_deref().unwrap_or(&f.evidence) } else { &f.evidence };
+        for line in evidence.lines() {
             s.push_str(&format!("    {line}\n"));
         }
         if let Some(fix) = &f.fix {
@@ -841,13 +855,17 @@ fn check_steam(roots: &Roots) -> Vec<Finding> {
     if !untargeted.is_empty() {
         let names = untargeted.iter().map(|(g, _)| g.name.as_str()).collect::<Vec<_>>().join(", ");
         let wanted = untargeted.iter().map(|(g, o)| format!("{}: {o}", g.name)).collect::<Vec<_>>().join("\n");
-        out.push(Finding::new(
+        let ours = untargeted.iter().map(|(g, o)| format!("{}: {}", g.name, crate::launch_options::neural_forge_part(o))).collect::<Vec<_>>().join("\n");
+        let mut finding = Finding::new(
             "steam-target",
             Severity::Warning,
             format!("on without the game's executable as its target, so a launcher or helper can take the effect: {names}"),
             format!("{evidence}\nlaunch options to set:\n{wanted}"),
             Some("With Steam closed, switch each game off and on again in the Setup tab, or run `neural-forge-cli enable GAME`; or set the launch options listed above by hand.".into()),
-        ));
+        );
+        finding.report_evidence =
+            Some(format!("{evidence}\nlaunch options to set (Neural Forge's part; the game's own options are left out of the report):\n{ours}"));
+        out.push(finding);
     }
     out
 }
@@ -1673,6 +1691,29 @@ mod tests {
             "{}",
             w.evidence
         );
+    }
+
+    /// The report (public issues) carries only Neural Forge's part of a game's launch options; the screen keeps them.
+    #[test]
+    fn the_report_leaves_a_games_own_launch_options_out() {
+        let mut f = quiet();
+        let options = "NEURAL_FORGE_ENABLE=1 API_KEY=s3cret %command% +connect 1.2.3.4:27015 +password hunter2";
+        steam(&mut f, "steam", false, &[("3240220", "Grand Theft Auto V Enhanced", Some(options))]);
+        write(&f.dir.join("steam/steamapps/common/Grand Theft Auto V Enhanced/GTA5_Enhanced.exe"), "");
+        let v = check_steam(&f.roots);
+        let screen = render_text(&v);
+        assert!(screen.contains("+password hunter2") && screen.contains("API_KEY=s3cret"), "{screen}");
+        let report = render_report_text(&v);
+        assert!(!report.contains("hunter2") && !report.contains("s3cret") && !report.contains("1.2.3.4"), "{report}");
+        assert!(
+            report.contains(
+                "Grand Theft Auto V Enhanced: NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe <other options omitted> %command% <other options omitted>"
+            ),
+            "{report}"
+        );
+        // Every other finding reads the same in both.
+        let others: Vec<Finding> = v.into_iter().filter(|x| x.check != "steam-target").collect();
+        assert_eq!(render_text(&others), render_report_text(&others));
     }
 
     #[test]

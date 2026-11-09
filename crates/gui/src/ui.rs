@@ -3036,8 +3036,10 @@ fn build_diagnosis_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     save.set_valign(gtk4::Align::Center);
     save.set_tooltip_text(Some(
         "Saves a zip to the desktop to attach to a problem report: these findings (which list your installed \
-         Steam games and their library folders), system details, settings, the layer's logs and the newest \
-         capture. Your home folder, user name and computer name are replaced; nothing is uploaded",
+         Steam games, their library folders and whether Neural Forge is on in them; of a game's launch options only \
+         Neural Forge's part), system details (GPU, driver, kernel, session), settings, the extracted model's \
+         manifests, the layer's logs, the kernel's GPU errors and the newest capture. Your home folder, user name \
+         and computer name are replaced; nothing is uploaded",
     ));
     connect_save_report(&save, shm, toasts);
     actions.append(&save);
@@ -3062,6 +3064,7 @@ fn build_diagnosis_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
                     summary: "the checks stopped with an internal error".into(),
                     evidence: "run `neural-forge-cli doctor` in a terminal to see it".into(),
                     fix: None,
+                    report_evidence: None,
                 }]
             });
             for finding in &findings {

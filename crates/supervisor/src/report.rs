@@ -11,7 +11,10 @@
 //! Every text member, and every member's name, is redacted before it is written ([`Redactor`]): the
 //! home directory becomes `~`, the user name `<user>` and the host name `<host>`. The doctor's
 //! findings in `summary.txt` list every installed Steam game with its library folder (a library
-//! outside the home keeps its path): that is what the report is for, and the front ends say so. PNGs are stored as they are: the layer's
+//! outside the home keeps its path) and whether Neural Forge is on in it: that is what the report is
+//! for, and the front ends say so. A game's launch options appear only as Neural Forge's part of them
+//! (`doctor::render_report_text`, `launch_options::neural_forge_part`): the rest is the user's free text,
+//! which can hold a password or a key. PNGs are stored as they are: the layer's
 //! encoder (`neural_forge_layer::dump::write_png`) writes no text chunks, so they carry no paths.
 //!
 //! Everything this module reads comes in through [`Sources`] (paths) and [`Inputs`] (text the
@@ -436,7 +439,7 @@ pub fn save(channel_status: &str, game: &str, steam_appid: Option<&str>) -> std:
     let mut sources = Sources::from_env();
     let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     let doctor_roots = crate::doctor::Roots::system();
-    let findings = crate::doctor::render_text(&crate::doctor::run(&doctor_roots));
+    let findings = crate::doctor::render_report_text(&crate::doctor::run(&doctor_roots));
     let xid_lines = crate::doctor::xid_lines(&doctor_roots);
     let games = crate::steam::games(&doctor_roots.steam_roots);
     let candidates: Vec<&crate::steam::Game> = match steam_appid {

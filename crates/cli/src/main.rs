@@ -703,7 +703,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         }
         "disable" => "usage: neural-forge-cli disable GAME\n  take Neural Forge back out of GAME's Steam launch options (see `enable --help`)",
         "report" => {
-            "usage: neural-forge-cli report [--appid ID]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game and its Proton -- found from the game the channel names, or\n  from ID, its Steam app id -- and the doctor's findings, which list your installed Steam\n  games and their library folders), config.ini, the model's manifest, the layer's logs,\n  this boot's GPU fault (Xid) lines, the channel's status and the newest capture pair.\n  The home directory, user name and host name are replaced with ~, <user> and <host>;\n  nothing is uploaded"
+            "usage: neural-forge-cli report [--appid ID]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game and its Proton -- found from the game the channel names, or\n  from ID, its Steam app id -- and the doctor's findings, which list your installed Steam\n  games and their library folders, and of a game's launch options only Neural Forge's\n  part), config.ini, the model's manifest, the layer's logs,\n  this boot's GPU fault (Xid) lines, the channel's status and the newest capture pair.\n  The home directory, user name and host name are replaced with ~, <user> and <host>;\n  nothing is uploaded"
         }
         "shmctl" => "",
         "profile" => "",
