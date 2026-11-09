@@ -46,7 +46,7 @@ jobs:
       # The tag names the version that is released: refuse a tag that is not the workspace
       # version before anything is built.
       - name: Tag matches the Cargo version
-        if: inputs.release
+        if: inputs.release && github.event_name == 'push'
         run: |
           version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
