@@ -489,11 +489,69 @@ fn remove_empty_parents(path: &Path) {
     }
 }
 
-/// `uninstall`, then everything else Neural Forge ever wrote: its config, data (the imported
-/// NVIDIA DLL and the extracted model included), state and `/tmp/neural-forge-$UID`. Each directory
-/// must be one of Neural Forge's own (named `neural-forge` or `neural-forge-<uid>`) or it is left
-/// alone. Returns what was removed.
-pub fn purge() -> std::io::Result<Vec<PathBuf>> {
+/// What [`purge`] did.
+#[derive(Debug, Default)]
+pub struct Purged {
+    /// The games whose Steam launch options no longer carry Neural Forge's variables (name and app id).
+    pub switched_off: Vec<String>,
+    /// Steam account files that could not be read: their launch options were not checked.
+    pub unchecked: Vec<PathBuf>,
+    /// The directories and files removed.
+    pub removed: Vec<PathBuf>,
+}
+
+/// `uninstall`, then everything else Neural Forge ever wrote: Neural Forge's variables in every
+/// game's Steam launch options and its files next to each account's `localconfig.vdf` (the copies
+/// of it and the lock), then its config, data (the imported NVIDIA DLL and the extracted model
+/// included), state and `/tmp/neural-forge-$UID`. Each directory must be one of Neural Forge's own
+/// (named `neural-forge` or `neural-forge-<uid>`) or it is left alone.
+///
+/// The launch options go first, and while any game still carries them (Steam is running, or a file
+/// could not be edited safely) nothing at all is removed: the error names each game and says what to do.
+pub fn purge() -> std::io::Result<Purged> {
+    purge_in(&crate::steam::roots(), crate::steam::steam_running(Path::new("/proc")))
+}
+
+/// [`purge`] with the Steam roots and whether Steam is running given.
+fn purge_in(steam_roots: &[crate::steam::Root], steam_running: bool) -> std::io::Result<Purged> {
+    use crate::steam::{self, Outcome};
+    let mut purged = Purged::default();
+    let games = steam::games(steam_roots);
+    let name = |appid: &str| match games.iter().find(|g| g.appid == appid) {
+        Some(g) => format!("{} ({appid})", g.name),
+        None => format!("app {appid}"),
+    };
+    let mut left = Vec::new();
+    for root in steam_roots {
+        let off = steam::switch_all_off(&root.path, steam_running);
+        purged.switched_off.extend(off.done.iter().map(|(appid, _)| name(appid)));
+        purged.unchecked.extend(off.unreadable);
+        for (appid, outcome) in off.left {
+            let (why, manual) = match outcome {
+                Outcome::SteamRunning { manual } => ("Steam is running, and it writes its own copy back when it exits".to_string(), manual),
+                Outcome::Failed { reason, manual } => (reason, manual),
+                Outcome::Changed(_) | Outcome::Unchanged => continue,
+            };
+            let manual = if manual.is_empty() { "nothing (empty)".to_string() } else { format!("`{manual}`") };
+            left.push(format!("  {}: {why}; its launch options without Neural Forge: {manual}", name(&appid)));
+        }
+    }
+    if !left.is_empty() {
+        let switched = if purged.switched_off.is_empty() { String::new() } else { format!(" (switched off already: {})", purged.switched_off.join(", ")) };
+        return Err(std::io::Error::other(format!(
+            "these games still have Neural Forge in their Steam launch options, so nothing was removed{switched}:\n{}\n\
+             Close Steam and run `neural-forge-cli uninstall --purge` again, or set each game's launch options in Steam \
+             (Properties, General) to what is shown and run it again.",
+            left.join("\n")
+        )));
+    }
+    for root in steam_roots {
+        for file in steam::our_localconfig_siblings(&root.path) {
+            std::fs::remove_file(&file)?;
+            purged.removed.push(file);
+        }
+    }
+
     let preserved = uninstall()?;
     for path in &preserved {
         if removable(path) {
@@ -508,7 +566,6 @@ pub fn purge() -> std::io::Result<Vec<PathBuf>> {
         std::fs::remove_file(&manifest)?;
         remove_empty_parents(&manifest);
     }
-    let mut removed = Vec::new();
     let runtime = neural_forge_protocol::shm_runtime_dir();
     for dir in [crate::paths::config_dir(), crate::paths::data_dir(), crate::paths::state_dir(), runtime] {
         let dir = PathBuf::from(dir);
@@ -517,9 +574,9 @@ pub fn purge() -> std::io::Result<Vec<PathBuf>> {
             continue;
         }
         std::fs::remove_dir_all(&dir)?;
-        removed.push(dir);
+        purged.removed.push(dir);
     }
-    Ok(removed)
+    Ok(purged)
 }
 
 #[cfg(test)]
@@ -906,7 +963,7 @@ mod tests {
         // purge never leaves a manifest pointing at the deleted library, record or not.
         install(&appdir).unwrap();
         std::fs::remove_file(record_path()).unwrap();
-        purge().unwrap();
+        purge_in(&[], false).unwrap();
         assert!(!manifest.exists() && !PathBuf::from(paths::data_dir()).exists());
         // A manifest of another layer at our name is not ours to remove.
         std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
@@ -1011,9 +1068,64 @@ mod tests {
         assert!(err.to_string().contains("cannot be read"), "{err}");
         assert!(record.is_dir() && theirs.is_file() && manifest_path().is_file(), "nothing may be removed");
         assert!(PathBuf::from(paths::data_dir()).join("bin/neural-forge").is_file());
-        assert!(purge().is_err());
+        assert!(purge_in(&[], false).is_err());
         assert!(theirs.is_file() && manifest_path().is_file());
         assert!(matches!(install(&appdir), Err(InstallError::Io(_))), "install says the record cannot be read");
+    }
+
+    #[test]
+    fn purge_switches_every_game_off_first_and_removes_the_localconfig_copies() {
+        let scratch = ScratchDataHome::new("purge-steam");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+        // A Steam root with one installed game switched on, and a game no longer installed still carrying it.
+        let steam = scratch.dir.join("Steam");
+        std::fs::create_dir_all(steam.join("steamapps/common/Game")).unwrap();
+        std::fs::write(
+            steam.join("steamapps/appmanifest_3240220.acf"),
+            "\"AppState\"\n{\n\t\"appid\"\t\t\"3240220\"\n\t\"name\"\t\t\"Some Game\"\n\t\"installdir\"\t\t\"Game\"\n\t\"StateFlags\"\t\t\"4\"\n}\n",
+        )
+        .unwrap();
+        let config = steam.join("userdata/1/config");
+        std::fs::create_dir_all(&config).unwrap();
+        let lc = config.join("localconfig.vdf");
+        let app = |id: &str, options: &str| format!("\t\t\t\t\"{id}\"\n\t\t\t\t{{\n\t\t\t\t\t\"LaunchOptions\"\t\t\"{options}\"\n\t\t\t\t}}\n");
+        let text = format!(
+            "\"UserLocalConfigStore\"\n{{\n\t\"Software\"\n\t{{\n\t\t\"Valve\"\n\t\t{{\n\t\t\t\"Steam\"\n\t\t\t{{\n\t\t\t\t\"apps\"\n\t\t\t\t{{\n{}{}{}\t\t\t\t}}\n\t\t\t}}\n\t\t}}\n\t}}\n}}\n",
+            app("3240220", "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe gamemoderun %command%"),
+            app("271590", "NEURAL_FORGE_ENABLE=1 %command% -windowed"),
+            app("10", "-novid"),
+        );
+        std::fs::write(&lc, &text).unwrap();
+        // What earlier edits left next to it.
+        for suffix in ["orig", "bak", "lock"] {
+            std::fs::write(config.join(format!("localconfig.vdf.neural-forge.{suffix}")), &text).unwrap();
+        }
+        let roots = [crate::steam::Root { path: steam.clone(), flatpak: false }];
+
+        // Steam running: refused, every game named, and nothing at all removed.
+        let err = purge_in(&roots, true).expect_err("Steam running: the launch options cannot be changed");
+        let msg = err.to_string();
+        assert!(msg.contains("nothing was removed"), "{msg}");
+        assert!(msg.contains("Some Game (3240220): Steam is running") && msg.contains("`gamemoderun %command%`"), "{msg}");
+        assert!(msg.contains("app 271590: Steam is running") && msg.contains("`%command% -windowed`"), "{msg}");
+        assert!(msg.contains("Close Steam and run `neural-forge-cli uninstall --purge` again"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&lc).unwrap(), text);
+        assert!(config.join("localconfig.vdf.neural-forge.orig").is_file());
+        assert!(PathBuf::from(paths::data_dir()).join("bin/neural-forge").is_file() && manifest_path().is_file());
+
+        let purged = purge_in(&roots, false).unwrap();
+        assert_eq!(purged.switched_off, ["app 271590", "Some Game (3240220)"]);
+        let after = std::fs::read_to_string(&lc).unwrap();
+        assert!(!after.contains("NEURAL_FORGE"), "{after}");
+        assert!(after.contains("\"gamemoderun %command%\"") && after.contains("\"%command% -windowed\"") && after.contains("\"-novid\""), "{after}");
+        let left: Vec<_> = std::fs::read_dir(&config).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        assert_eq!(left, ["localconfig.vdf"], "the copies and the lock are gone");
+        for suffix in ["orig", "bak", "lock"] {
+            assert!(purged.removed.contains(&config.join(format!("localconfig.vdf.neural-forge.{suffix}"))), "{purged:?}");
+        }
+        assert!(!PathBuf::from(paths::data_dir()).exists() && !manifest_path().exists());
     }
 
     #[test]

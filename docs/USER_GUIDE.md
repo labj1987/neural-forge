@@ -369,10 +369,17 @@ Valve's VAC) cannot be seen.
 
 ## Uninstall
 
-`neural-forge-cli uninstall` removes the files it installed (files you changed are kept).
-`neural-forge-cli uninstall --purge` also removes the config, everything under
-`~/.local/share/neural-forge` (the model, an imported DLL, captures), `~/.local/state/neural-forge` and
-`/tmp/neural-forge-$UID`.
+`neural-forge-cli uninstall` removes the files it installed (files you changed are kept). The
+games you switched on keep Neural Forge's variables in their launch options, which do nothing without
+the layer.
+`neural-forge-cli uninstall --purge` removes everything Neural Forge wrote. First it takes its
+variables out of every game's Steam launch options (your own options stay), in every Steam account,
+and removes the files it keeps next to each account's `localconfig.vdf` (`.neural-forge.orig` and
+`.neural-forge.bak`, its copies of that file, and `.neural-forge.lock`). Steam must be closed for
+that: while it runs, or while a game's options cannot be changed safely, the purge removes nothing and
+names each game with the launch options to set by hand instead. Then it removes the config,
+everything under `~/.local/share/neural-forge` (the model, an imported DLL, captures),
+`~/.local/state/neural-forge` and `/tmp/neural-forge-$UID`.
 
 ## More known issues
 

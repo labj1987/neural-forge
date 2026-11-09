@@ -56,7 +56,8 @@ record is missing), replaces files atomically (running processes keep their mapp
 files a previous version installed that this one no longer ships, if they are unchanged.
 `python3 scripts/install.py uninstall` removes only unchanged, hash-recorded files; it keeps
 config, the extracted model, an imported DLL and runtime data (`neural-forge-cli uninstall --purge`
-removes those too). It
+removes those too, after taking Neural Forge's variables out of every game's Steam launch options and
+removing its `localconfig.vdf.neural-forge.*` files; it refuses, removing nothing, while Steam runs). It
 never calls a package manager or stops another app.
 
 Neural Forge does not migrate or touch upstream's shared `~/.config/dlssnr`, `/tmp/dlssnr-*`,
