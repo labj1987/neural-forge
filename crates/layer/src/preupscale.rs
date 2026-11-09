@@ -6628,7 +6628,20 @@ impl Session {
         }
         if !h.sound {
             // A guessed input layout was wrong when the buffer ran (`inline::Inline::check`): the guard reset
-            // what it carries; what it measured from those inputs is not used either.
+            // what it carries (the network's history, the edit cache's stored edit) for this hold and the one
+            // after it; what it measured from those inputs is not used either. The CPU's plan follows the GPU:
+            // the next hold planned refreshes (a cached one would find no edit to apply and give DLSS its frame
+            // unedited, every other frame while the camera moves), and the next network frame starts afresh
+            // (no history, seed 0) as the GPU's did.
+            #[cfg(target_arch = "x86_64")]
+            {
+                if let Some(e) = res.edit.as_mut() {
+                    e.state.drop_edit();
+                }
+                if let Some(n) = res.native.as_mut() {
+                    n.gap.skipped();
+                }
+            }
             return;
         }
         if let (true, Some(kind), Some(edit)) = (h.meta.stats, h.meta.kind, res.edit.as_mut()) {

@@ -2360,6 +2360,12 @@ impl NativePass {
         self.seed = 0;
     }
 
+    /// The noise seed of the last network frame planned (0: it ran without history).
+    #[cfg(test)]
+    pub(crate) fn seed(&self) -> u32 {
+        self.seed
+    }
+
     pub(crate) fn answer(&self) -> vk::Buffer {
         self.answer.buffer
     }
