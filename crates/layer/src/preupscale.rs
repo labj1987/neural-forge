@@ -1489,6 +1489,9 @@ pub(crate) struct Tracker {
     last_colour_layout: Option<vk::ImageLayout>,
     /// The identification ([`Self::generation`]) and the kinds of [`InlineRefusal`] logged for it.
     said_refusals: (u64, u16),
+    /// The colour input's layout at DLSS's launch buffer in the last submission that had it, and for which
+    /// identification ([`Self::scan`]): what the split's check reads there.
+    launch_colour_layout: Option<(u64, vk::ImageLayout)>,
     /// The last launch's kernel name and the registered images it named, kept only for
     /// `NEURAL_FORGE_PROBE_IMAGE` ([`probe_image`]).
     last_launch: Option<(String, Vec<vk::Image>)>,
@@ -2434,8 +2437,17 @@ impl Tracker {
         }
         let rgba16f = desc.format == vk::Format::R16G16B16A16_SFLOAT;
         let mut guessed = Guessed::default();
-        let (layout, set) =
-            self.layout_in(cb, colour, true, rgba16f && desc.usage.contains(vk::ImageUsageFlags::STORAGE)).ok_or(InlineRefusal::LayoutUnknown)?;
+        // A layout the buffer did not set itself is a guess. The best one is what the colour input was in at DLSS's
+        // launch buffer in the last submission (`launch_colour_layout`, which the split's check reads in its own
+        // submission): what the buffers submitted so far left (`committed`) is the end of that submission, and
+        // a game that moves the colour input out of GENERAL in a buffer in front of DLSS's and back after it
+        // left both paths refusing every frame: this one leaving the frame to the split on GENERAL, the split
+        // refusing it on the layout in front of the launch.
+        let learned = self.launch_colour_layout.filter(|(g, _)| *g == self.generation && colour == inputs.colour.0).map(|(_, l)| l);
+        let (layout, set) = match self.layout_in(cb, colour, true, rgba16f && desc.usage.contains(vk::ImageUsageFlags::STORAGE)) {
+            Some((l, true)) => (l, true),
+            guess => learned.map(|l| (l, false)).or(guess).ok_or(InlineRefusal::LayoutUnknown)?,
+        };
         if !set {
             guessed.colour = Some(layout);
         }
@@ -3581,6 +3593,12 @@ impl Tracker {
                         jitter: self.launch.get(&cb).and_then(|r| r.jitter),
                         reset: self.reset_seen(cb),
                     });
+                    // The colour input's layout at DLSS's launch buffer as this submission has it (what the
+                    // split's check reads): the guess of the next hold recorded inside a buffer that does not
+                    // set it itself ([`Self::inline_point`]).
+                    if let (None, Some(l), false) = (retarget, found.as_ref().and_then(|s| s.colour_layout), self.identified) {
+                        self.launch_colour_layout = Some((self.generation, l));
+                    }
                 }
                 if found.is_none() {
                     for sync in self.pending.get(&cb).into_iter().flatten() {
@@ -8688,6 +8706,42 @@ mod tests {
         assert!(scan.colour_in_general());
         // Resubmitted unchanged: the same.
         assert_eq!(t.submit_ok(&[vec![cb(1), cb(2)]]).and_then(|s| s.hazard), None);
+    }
+
+    /// A game that moves the colour input out of GENERAL in a buffer in front of DLSS's launch buffer and back
+    /// after it, every frame: the split's check sees the layout in front of the launch and refuses; the record-time
+    /// choice must not hand the next frame to the split on the GENERAL the end of the submission left, but hold
+    /// inside the buffer with the layout the launch had (a guess, checked at the submit).
+    #[test]
+    fn a_layout_set_in_front_of_dlss_s_buffer_is_held_inside_not_left_to_the_split() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, params) = held_tracker_with(copyable);
+        let read_only = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let frame = |t: &mut Tracker, front: u64, launch: u64, back: u64| {
+            t.barrier(cb(front), ImageSync { old_layout: GENERAL, ..ImageSync::to(colour(), read_only) });
+            t.launch(cb(launch), Some(&params));
+            t.barrier(cb(back), ImageSync { old_layout: read_only, ..ImageSync::to(colour(), GENERAL) });
+        };
+        frame(&mut t, 1, 2, 3);
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::LeftToSplit), "nothing known of the launch's layout yet");
+        let scan = t.submit_ok(&[vec![cb(1), cb(2), cb(3)]]).expect("launch-bearing");
+        assert_eq!(scan.colour_layout, Some(read_only));
+        assert!(!scan.colour_in_general(), "the split refuses it");
+        // The next frame, recorded in fresh buffers: held inside, with the launch's layout as the guess.
+        frame(&mut t, 4, 5, 6);
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        let point = t.inline_point(b, c).expect("held inside the buffer");
+        assert_eq!((point.layout, point.guessed.colour, point.hazard), (read_only, Some(read_only), Hazard::NotSplittable));
+        // GTA V's pattern (GENERAL at the launch): still the split's.
+        let (mut t, params) = held_tracker_with(copyable);
+        for (launch, back) in [(2, 3), (5, 6)] {
+            t.launch(cb(launch), Some(&params));
+            t.barrier(cb(back), general_to_general(colour()));
+            let (b, c) = t.take_inline_at().expect("first colour launch");
+            assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::LeftToSplit));
+            assert!(t.submit_ok(&[vec![cb(launch), cb(back)]]).expect("launch-bearing").colour_in_general());
+        }
     }
 
     /// Synchronization on a DLSS input inside the launch buffer, before the launch, is something

@@ -487,8 +487,13 @@ did not run.
 
 **Layouts the buffer did not set.** The copies in name each input's layout at the hold point. Where the
 buffer itself set it before that point (a barrier on the image, or its use as an attachment), that is what
-it is. Otherwise it is taken from what the buffers submitted so far left, or `GENERAL` for a storage image
-never seen in a barrier (`Tracker::inline_point`, `Guessed`): a guess, since vkd3d-proton records several
+it is. Otherwise, for the colour input, it is taken from the layout it had at DLSS's launch buffer in the last
+submission (`launch_colour_layout`: what the split's check reads in its own submission), and for the others and
+before such a submission from what the buffers submitted so far left, or `GENERAL` for a storage image
+never seen in a barrier (`Tracker::inline_point`, `Guessed`). Taking the end of the last submission for the
+colour input left a game that moves it out of `GENERAL` in a buffer in front of DLSS's and back after it
+refused by both paths every frame: the recording handed the frame to the split on `GENERAL`, and the split
+refused it on the layout in front of the launch. Either way a guess, since vkd3d-proton records several
 command lists in parallel and submits them later, and a buffer submitted in between can leave another
 layout. Each guess is checked when the buffer is submitted, against what the buffers in front of it in
 that submission and the ones submitted before leave (`Tracker::layout_when_run`, `Inline::check`). A
