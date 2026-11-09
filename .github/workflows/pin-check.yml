@@ -15,7 +15,9 @@ name: Pin check
 # the only time it needs a person. A run that cannot reach upstream does not fail.
 #
 # A run on any other branch than the default one (workflow_dispatch, to test this workflow) bumps and
-# lands on that branch and only prints what it would do to the issue.
+# lands on that branch and only prints what it would do to the issue. The schedule always runs on the
+# default branch; its event carries no repository object, so github.event.repository.default_branch is
+# empty there and cannot be the test on its own (ON_DEFAULT_BRANCH below).
 on:
   schedule:
     - cron: "17 6 * * 1"
@@ -27,6 +29,11 @@ permissions:
 concurrency:
   group: pin-check-${{ github.ref_name }}
   cancel-in-progress: false
+
+env:
+  # Whether this run is on the default branch: the schedule always is (GitHub runs it there); a dispatch is
+  # when its branch is the one the dispatch event's repository names as the default.
+  ON_DEFAULT_BRANCH: ${{ github.event_name == 'schedule' || (github.event.repository.default_branch != '' && github.ref_name == github.event.repository.default_branch) }}
 
 defaults:
   run:
@@ -103,7 +110,7 @@ jobs:
           test "$status" = 0
           git diff --stat
           branch="pin-bump"
-          [ "$GITHUB_REF_NAME" = "${{ github.event.repository.default_branch }}" ] || branch="pin-bump-$GITHUB_REF_NAME"
+          [ "$ON_DEFAULT_BRANCH" = true ] || branch="pin-bump-$GITHUB_REF_NAME"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -a -q -F - <<EOF
@@ -222,8 +229,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           STATE: ${{ steps.report.outputs.state }}
           TITLE: "Pinned versions behind upstream"
-          DRY_RUN: ${{ github.ref_name != github.event.repository.default_branch }}
         run: |
+          DRY_RUN=true
+          [ "$ON_DEFAULT_BRANCH" != true ] || DRY_RUN=false
           repo="$GITHUB_REPOSITORY"
           act() {
             if [ "$DRY_RUN" = true ]; then
