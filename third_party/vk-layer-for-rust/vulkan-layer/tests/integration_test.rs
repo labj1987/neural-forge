@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Modified for Neural Forge (2026): function pointers compared by address; ash 0.38; a device-group
-// enumeration test; the destroy order tests (UPSTREAM.md).
+// enumeration test; the destroy order tests; a hook's failed allocation (UPSTREAM.md).
 
 use ash::vk::{self};
 use mockall::predicate::{always, eq};
@@ -1449,6 +1449,54 @@ mod device_commands {
             .once()
             .return_const(LayerResult::Unhandled);
         unsafe { device.destroy_image(vk::Image::null(), None) };
+    }
+
+    /// A hook's error from a command that fills an array of handles the application sized leaves NULL in
+    /// every entry (vkAllocateCommandBuffers: "set all entries of the pCommandBuffers array to NULL"), so an
+    /// application that frees the array after the error frees nothing, never what it held before.
+    #[test]
+    fn test_hooked_allocation_error_should_null_the_output_array() {
+        use ash::vk::Handle;
+        static TEST_GLOBAL: TestGlobal = TestGlobal::builder()
+            .set_layer_mock_builder(|| {
+                let mut mock = MockTestLayer::default();
+                mock.expect_hooked_device_commands()
+                    .return_const(vec![LayerVulkanCommand::AllocateCommandBuffers]);
+                mock.set_default_expectations();
+                mock
+            })
+            .build();
+        let _ctx = TEST_GLOBAL.create_context();
+        let ctx = vk::InstanceCreateInfo::default()
+            .default_instance::<(TestLayer,)>()
+            .default_device()
+            .unwrap();
+        let DeviceContext { device, .. } = ctx.as_ref();
+        let device_info = TestLayer::<Tag<0>>::global_instance()
+            .layer_info
+            .get_device_info(device.handle())
+            .unwrap();
+        device_info
+            .mock_hooks
+            .lock()
+            .unwrap()
+            .expect_allocate_command_buffers()
+            .once()
+            .return_const(LayerResult::Handled(Err(
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            )));
+        let info = vk::CommandBufferAllocateInfo::default().command_buffer_count(3);
+        // What the application's array held before: stale handles.
+        let mut command_buffers = [0xdead_u64, 0xbeef, 0xf00d].map(vk::CommandBuffer::from_raw);
+        let result = unsafe {
+            (device.fp_v1_0().allocate_command_buffers)(
+                device.handle(),
+                &info,
+                command_buffers.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        assert_eq!(command_buffers, [vk::CommandBuffer::null(); 3]);
     }
 
     #[test]

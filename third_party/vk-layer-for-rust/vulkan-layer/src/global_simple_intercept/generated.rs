@@ -13074,7 +13074,16 @@ impl<T: Layer> Global<T> {
                     .copy_from_slice(&res);
                     vk::Result::SUCCESS
                 }
-                Err(e) => e,
+                Err(e) => {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            p_pipelines,
+                            create_info_count.try_into().unwrap(),
+                        )
+                    }
+                    .fill(vk::Handle::from_raw(0));
+                    e
+                }
             },
             LayerResult::Unhandled => unsafe {
                 (dispatch_table.create_graphics_pipelines)(
@@ -13121,7 +13130,16 @@ impl<T: Layer> Global<T> {
                     .copy_from_slice(&res);
                     vk::Result::SUCCESS
                 }
-                Err(e) => e,
+                Err(e) => {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            p_pipelines,
+                            create_info_count.try_into().unwrap(),
+                        )
+                    }
+                    .fill(vk::Handle::from_raw(0));
+                    e
+                }
             },
             LayerResult::Unhandled => unsafe {
                 (dispatch_table.create_compute_pipelines)(
@@ -13432,7 +13450,19 @@ impl<T: Layer> Global<T> {
                     .copy_from_slice(&res);
                     vk::Result::SUCCESS
                 }
-                Err(e) => e,
+                Err(e) => {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            p_descriptor_sets,
+                            unsafe { p_allocate_info.as_ref().unwrap() }
+                                .descriptor_set_count
+                                .try_into()
+                                .unwrap(),
+                        )
+                    }
+                    .fill(vk::Handle::from_raw(0));
+                    e
+                }
             },
             LayerResult::Unhandled => unsafe {
                 (dispatch_table.allocate_descriptor_sets)(
@@ -13752,7 +13782,19 @@ impl<T: Layer> Global<T> {
                     .copy_from_slice(&res);
                     vk::Result::SUCCESS
                 }
-                Err(e) => e,
+                Err(e) => {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            p_command_buffers,
+                            unsafe { p_allocate_info.as_ref().unwrap() }
+                                .command_buffer_count
+                                .try_into()
+                                .unwrap(),
+                        )
+                    }
+                    .fill(vk::Handle::from_raw(0));
+                    e
+                }
             },
             LayerResult::Unhandled => unsafe {
                 (dispatch_table.allocate_command_buffers)(
@@ -17142,7 +17184,16 @@ impl<T: Layer> Global<T> {
                     .copy_from_slice(&res);
                     vk::Result::SUCCESS
                 }
-                Err(e) => e,
+                Err(e) => {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            p_swapchains,
+                            swapchain_count.try_into().unwrap(),
+                        )
+                    }
+                    .fill(vk::Handle::from_raw(0));
+                    e
+                }
             },
             LayerResult::Unhandled => unsafe {
                 (dispatch_table.create_shared_swapchains_khr)(
@@ -20039,7 +20090,16 @@ impl<T: Layer> Global<T> {
                     .copy_from_slice(&res);
                     vk::Result::SUCCESS
                 }
-                Err(e) => e,
+                Err(e) => {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            p_pipelines,
+                            create_info_count.try_into().unwrap(),
+                        )
+                    }
+                    .fill(vk::Handle::from_raw(0));
+                    e
+                }
             },
             LayerResult::Unhandled => unsafe {
                 (dispatch_table.create_execution_graph_pipelines_amdx)(
@@ -20768,7 +20828,16 @@ impl<T: Layer> Global<T> {
                     .copy_from_slice(&res);
                     vk::Result::SUCCESS
                 }
-                Err(e) => e,
+                Err(e) => {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            p_pipelines,
+                            create_info_count.try_into().unwrap(),
+                        )
+                    }
+                    .fill(vk::Handle::from_raw(0));
+                    e
+                }
             },
             LayerResult::Unhandled => unsafe {
                 (dispatch_table.create_ray_tracing_pipelines_nv)(
@@ -25223,7 +25292,16 @@ impl<T: Layer> Global<T> {
                     .copy_from_slice(&res);
                     vk::Result::SUCCESS
                 }
-                Err(e) => e,
+                Err(e) => {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            p_pipelines,
+                            create_info_count.try_into().unwrap(),
+                        )
+                    }
+                    .fill(vk::Handle::from_raw(0));
+                    e
+                }
             },
             LayerResult::Unhandled => unsafe {
                 (dispatch_table.create_ray_tracing_pipelines_khr)(
