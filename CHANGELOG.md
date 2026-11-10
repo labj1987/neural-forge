@@ -40,6 +40,10 @@ first shipped them; their phase is kept as a subheading.
 - In games that give DLSS their motion vectors as fractions of the frame rather than in pixels (Cyberpunk 2077),
   the model's history now follows the motion. Neural Forge reads the motion vectors' unit from what the game tells
   DLSS instead of assuming pixels; before, the history barely moved with the picture.
+- Crimson Desert (Ray Reconstruction off): the model's history before the upscaler now follows the motion. It read
+  one of DLSS's own internal motion-vector images instead of the game's, which moved the history by less than half
+  of the camera's motion and a frame late on every second frame; it now reads the game's motion vectors, in the
+  unit and direction the game gives DLSS (fractions of the frame, y pointing up).
 - In Cyberpunk 2077 the model before the upscaler now knows the camera's sub-pixel jitter on every frame. On every
   second frame it went without, so its history lost the jitter's step on two frames in a row and could not carry the
   model's edit from one frame to the next.

@@ -1005,6 +1005,35 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
     })
 }
 
+/// Crimson Desert's Super Resolution encoder (`rrlite_enc0_*`, 310.9, Ray Reconstruction off) names, at the render
+/// size, the game's motion vectors (R32G32_SFLOAT, parameter 12; the image Frame Generation's
+/// `Kernel_InputMvecProcessing` reads as the game's, 2026-10-09 `NEURAL_FORGE_PROBE_NGX`) beside four RG16F images of
+/// DLSS's own (parameters 16 and 35-37: its motion vectors of earlier frames, in its working size's pixels, two of
+/// them written on alternate frames). [`input_launch`]'s RG16F-first rule took one of those: the hold's history moved
+/// by 0.39 of the camera's motion, a frame late on every second hold (cache dumps, 2026-11-10). For this kernel the
+/// motion vectors are its one RG32F image at the colour input's extent; `input` unchanged otherwise.
+fn rrlite_game_mvec(name: &str, images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], input: Option<InputLaunch>) -> Option<InputLaunch> {
+    let Some(InputLaunch::Inputs { colour, depth, mvec }) = input else { return input };
+    if !name.starts_with("rrlite_enc0_") {
+        return input;
+    }
+    let Some(cd) = images.get(&colour) else { return input };
+    let rg32: Vec<vk::Image> = named
+        .iter()
+        .copied()
+        .filter(|i| images.get(i).is_some_and(|d| d.plain && d.format == vk::Format::R32G32_SFLOAT && (d.width, d.height) == (cd.width, cd.height)))
+        .fold(Vec::new(), |mut v, i| {
+            if !v.contains(&i) {
+                v.push(i);
+            }
+            v
+        });
+    match rg32[..] {
+        [game] => Some(InputLaunch::Inputs { colour, depth, mvec: game }),
+        _ => Some(InputLaunch::Inputs { colour, depth, mvec }),
+    }
+}
+
 /// DLSS Ray Reconstruction's first launch read for its colour input and motion vectors when it does not
 /// read as SR's input form ([`input_launch`]): the colour input is a [`colour_candidate`] it names that was
 /// identified as DLSS's colour input before (`known`, with its motion vectors; Ray Reconstruction running clears
@@ -1993,37 +2022,58 @@ fn mv_units_product(scale: [f32; 2], ratio: [f32; 2]) -> Option<[f32; 2]> {
     Some(out)
 }
 
-/// The words of DLSS Ray Reconstruction's first kernel's parameters (`rr2_enc0_kernel`, 310.x, 1088 bytes) that say
-/// what the motion vectors are measured in, laid out as Super Resolution's (`rrlite_enc0_*`: words 23, 24, 25, 8 and
-/// 32 hold the same): word 51 the render size over the size Ray Reconstruction works at, word 52 its inverse, word 53
-/// one over the render size, word 54 one over that working size, word 56 NGX's `MVScale` carried to that size (what
-/// turns the motion vectors into its pixels); x in the low and y in the high 32 bits of each. Probed (issue #49,
-/// 2026-11-10): Cyberpunk 2077 at 2560x1440, Ray Reconstruction working at 3840x2160 before its own downsample to
-/// the output, 0.38672 x 0.38657, 2.5859 x 2.5868, 1/1485 x 1/835, 1/3840 x 1/2160 and 3840 x 2160 (its motion
-/// vectors are fractions of the frame: 1485 x 835 render pixels each, as its Super Resolution's input kernel says);
-/// Crimson Desert at 3840x2160 (2026-10-09), 0.39479 x 0.39444, 2.5330 x 2.5352, 1/1516 x 1/852, 1/3840 x 1/2160
-/// and 3840 x -2160.
-const RR2_ENC0_RATIO_WORD: usize = 51;
-const RR2_ENC0_INVERSE_RATIO_WORD: usize = 52;
-const RR2_ENC0_INVERSE_RENDER_WORD: usize = 53;
-const RR2_ENC0_INVERSE_WORKING_WORD: usize = 54;
-const RR2_ENC0_MV_SCALE_WORD: usize = 56;
+/// Where a DLSS engine kernel's parameters say what the motion vectors are measured in: the render size over the size
+/// the engine works at, its inverse, one over the render size, one over that working size, and NGX's `MVScale` carried
+/// to that size (what turns the motion vectors into its pixels); x in the low and y in the high 32 bits of each word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EngineMvWords {
+    ratio: usize,
+    inverse_ratio: usize,
+    inverse_render: usize,
+    inverse_working: usize,
+    mv_scale: usize,
+}
 
-/// What turns DLSS's motion vectors into render pixels as Ray Reconstruction's first launch says it, and the render
-/// size it says (the extent [`mv_units_scale`]'s answer is in): Ray Reconstruction from the start of a session runs
-/// no Super Resolution input kernel to read it from (issue #49). `None` unless the kernel is `rr2_enc0_kernel` and its
-/// words agree with each other: the ratio times its inverse 1, the ratio the working size's inverse over the render
-/// size's, and the render size whole pixels; so another parameter layout is never read as units.
-fn rr_mv_units_scale(name: &str, words: &[[u8; 8]]) -> Option<([f32; 2], (u32, u32))> {
-    if !name.starts_with("rr2_enc0") {
-        return None;
+/// DLSS Ray Reconstruction's first kernel (`rr2_enc0_kernel`, 310.x, 1088 bytes): words 51, 52, 53, 54 and 56. Probed
+/// (issue #49, 2026-11-10): Cyberpunk 2077 at 2560x1440, Ray Reconstruction working at 3840x2160 before its own
+/// downsample to the output, 0.38672 x 0.38657, 2.5859 x 2.5868, 1/1485 x 1/835, 1/3840 x 1/2160 and 3840 x 2160 (its
+/// motion vectors are fractions of the frame: 1485 x 835 render pixels each, as its Super Resolution's input kernel
+/// says); Crimson Desert at 3840x2160 (2026-10-09), 0.39479 x 0.39444, 2.5330 x 2.5352, 1/1516 x 1/852, 1/3840 x
+/// 1/2160 and 3840 x -2160.
+const RR2_ENC0_MV_WORDS: EngineMvWords = EngineMvWords { ratio: 51, inverse_ratio: 52, inverse_render: 53, inverse_working: 54, mv_scale: 56 };
+
+/// The same block in Crimson Desert's Super Resolution encoder (`rrlite_enc0_*`, 310.9, with Ray Reconstruction off;
+/// its hold, at NGX's luma kernel before it, has no `hiluma` input launch to read the units from): words 23, 24, 8, 32
+/// and 25. Probed at 3840x2160, DLSS Balanced (2026-10-09, `NEURAL_FORGE_PROBE_KERNEL`, 3000 launches): 0.39479 x
+/// 0.39444, 2.5330 x 2.5352, 1/1516 x 1/852, 1/3840 x 1/2160 and 3840 x -2160 on every launch: fractions of the frame
+/// with y up, 1516 x -852 render pixels each (the extents rule took them for render pixels, y down).
+const RRLITE_ENC0_MV_WORDS: EngineMvWords = EngineMvWords { ratio: 23, inverse_ratio: 24, inverse_render: 8, inverse_working: 32, mv_scale: 25 };
+
+/// Which engine kernel's parameters carry [`EngineMvWords`], by name, and what to call it in the log.
+fn engine_mv_words(name: &str) -> Option<(EngineMvWords, &'static str)> {
+    if name.starts_with("rr2_enc0") {
+        Some((RR2_ENC0_MV_WORDS, "Ray Reconstruction's parameters"))
+    } else if name.starts_with("rrlite_enc0_") {
+        Some((RRLITE_ENC0_MV_WORDS, "its Super Resolution encoder's parameters"))
+    } else {
+        None
     }
+}
+
+/// What turns DLSS's motion vectors into render pixels as a DLSS engine kernel's launch says it, and the render size
+/// it says (the extent [`mv_units_scale`]'s answer is in): Ray Reconstruction from the start of a session runs no Super
+/// Resolution input kernel to read it from (issue #49), nor does Crimson Desert's Super Resolution (`rrlite_*`).
+/// `None` unless the kernel is one [`engine_mv_words`] knows and its words agree with each other: the ratio times its
+/// inverse 1, the ratio the working size's inverse over the render size's, and the render size whole pixels; so
+/// another parameter layout is never read as units.
+fn engine_mv_units_scale(name: &str, words: &[[u8; 8]]) -> Option<([f32; 2], (u32, u32), &'static str)> {
+    let (at, source) = engine_mv_words(name)?;
     let pair = |at: usize| -> Option<[f32; 2]> {
         let v = u64::from_le_bytes(*words.get(at)?);
         Some([f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
     };
-    let (ratio, inverse) = (pair(RR2_ENC0_RATIO_WORD)?, pair(RR2_ENC0_INVERSE_RATIO_WORD)?);
-    let (inv_render, inv_working) = (pair(RR2_ENC0_INVERSE_RENDER_WORD)?, pair(RR2_ENC0_INVERSE_WORKING_WORD)?);
+    let (ratio, inverse) = (pair(at.ratio)?, pair(at.inverse_ratio)?);
+    let (inv_render, inv_working) = (pair(at.inverse_render)?, pair(at.inverse_working)?);
     let mut render = [0u32; 2];
     for axis in 0..2 {
         let (r, i, ir, iw) = (ratio[axis], inverse[axis], inv_render[axis], inv_working[axis]);
@@ -2036,7 +2086,7 @@ fn rr_mv_units_scale(name: &str, words: &[[u8; 8]]) -> Option<([f32; 2], (u32, u
         }
         render[axis] = size.round() as u32;
     }
-    Some((mv_units_product(pair(RR2_ENC0_MV_SCALE_WORD)?, ratio)?, (render[0], render[1])))
+    Some((mv_units_product(pair(at.mv_scale)?, ratio)?, (render[0], render[1]), source))
 }
 
 /// What turns DLSS's motion vectors into output pixels at a hold after DLSS's output (`output`, from the render size
@@ -2615,17 +2665,12 @@ impl Tracker {
         // The motion vectors' units, from every SR input launch (they change with the render size); set below, with the
         // extent of the colour input they are in.
         let sr_mv_scale = self.functions.get(&function).and_then(|(_, name)| mv_units_scale(name, bytes.as_chunks::<8>().0));
-        // The same from Ray Reconstruction's first launch, with the render size it is at: the only source while Ray
-        // Reconstruction runs from the start of a session (no Super Resolution input launch says it).
-        if let Some((scale, at)) = self.functions.get(&function).and_then(|(_, name)| rr_mv_units_scale(name, bytes.as_chunks::<8>().0)) {
+        // The same from Ray Reconstruction's first launch, or Crimson Desert's Super Resolution encoder, with the render
+        // size it is at: the only source while Ray Reconstruction runs from the start of a session (no Super Resolution
+        // input launch says it), and for Crimson Desert's Super Resolution (`rrlite_*`, no `hiluma` input launch).
+        if let Some((scale, at, source)) = self.functions.get(&function).and_then(|(_, name)| engine_mv_units_scale(name, bytes.as_chunks::<8>().0)) {
             if self.mv_scale != Some(scale) || self.mv_scale_render != Some(at) {
-                crate::log!(
-                    "[preupscale] DLSS's motion vectors are {} x {} render pixels at {}x{} (Ray Reconstruction's parameters)",
-                    scale[0],
-                    scale[1],
-                    at.0,
-                    at.1
-                );
+                crate::log!("[preupscale] DLSS's motion vectors are {} x {} render pixels at {}x{} ({source})", scale[0], scale[1], at.0, at.1);
                 self.mv_scale = Some(scale);
                 self.mv_scale_render = Some(at);
             }
@@ -2747,6 +2792,9 @@ impl Tracker {
         } else if refs.input.is_none() {
             fresh_input = true;
             refs.input = input_launch(&self.images, &named);
+            if let Some((_, name)) = self.functions.get(&function) {
+                refs.input = rrlite_game_mvec(name, &self.images, &named, refs.input.take());
+            }
             // DLSS Ray Reconstruction's first launch may not read as SR's input form (Hogwarts Legacy's
             // `cuda_dldn_engine_swin_enc0_kernel` names two R32_SFLOAT depth-like images, and its colour
             // input is not at their extent): taken from the colour input and motion vectors it names, so
@@ -10334,24 +10382,24 @@ mod tests {
         };
         let near = |got: [f32; 2], want: [f32; 2]| (got[0] - want[0]).abs() < 1e-3 * want[0].abs() && (got[1] - want[1]).abs() < 1e-3 * want[1].abs();
         let cyberpunk = words((1485.0, 835.0), (3840.0, 2160.0), (3840.0, 2160.0));
-        let (scale, at) = rr_mv_units_scale("rr2_enc0_kernel", &cyberpunk).expect("Cyberpunk 2077's words");
+        let (scale, at, _) = engine_mv_units_scale("rr2_enc0_kernel", &cyberpunk).expect("Cyberpunk 2077's words");
         assert!(near(scale, [1485.0, 835.0]), "{scale:?}");
         assert_eq!(at, (1485, 835));
-        let (scale, at) = rr_mv_units_scale("rr2_enc0_kernel", &words((1516.0, 852.0), (3840.0, 2160.0), (3840.0, -2160.0))).expect("Crimson Desert's");
+        let (scale, at, _) = engine_mv_units_scale("rr2_enc0_kernel", &words((1516.0, 852.0), (3840.0, 2160.0), (3840.0, -2160.0))).expect("Crimson Desert's");
         assert!(near(scale, [1516.0, -852.0]), "y up: {scale:?}");
         assert_eq!(at, (1516, 852));
-        assert_eq!(rr_mv_units_scale("rr2_enc1_kernel", &cyberpunk), None, "another kernel");
-        assert_eq!(rr_mv_units_scale("rr2_enc0_kernel", &cyberpunk[..55]), None, "too few words");
+        assert_eq!(engine_mv_units_scale("rr2_enc1_kernel", &cyberpunk), None, "another kernel");
+        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &cyberpunk[..55]), None, "too few words");
         let mut bad = cyberpunk.clone();
         bad[52] = word(2.0, 2.0);
-        assert_eq!(rr_mv_units_scale("rr2_enc0_kernel", &bad), None, "the ratio and its inverse disagree");
+        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &bad), None, "the ratio and its inverse disagree");
         let mut bad = cyberpunk.clone();
         bad[54] = word(1.0 / 2560.0, 1.0 / 1440.0);
-        assert_eq!(rr_mv_units_scale("rr2_enc0_kernel", &bad), None, "the ratio and the sizes disagree");
+        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &bad), None, "the ratio and the sizes disagree");
         let mut bad = words((1485.5, 835.0), (3840.0, 2160.0), (3840.0, 2160.0));
         bad[56] = word(3840.0, 2160.0);
-        assert_eq!(rr_mv_units_scale("rr2_enc0_kernel", &bad), None, "not a whole render size");
-        assert_eq!(rr_mv_units_scale("rr2_enc0_kernel", &words((1485.0, 835.0), (3840.0, 2160.0), (f32::NAN, 2160.0))), None);
+        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &bad), None, "not a whole render size");
+        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &words((1485.0, 835.0), (3840.0, 2160.0), (f32::NAN, 2160.0))), None);
         // In the tracker: a session whose first DLSS launches are Ray Reconstruction's learns the units from them, and
         // the hold after its 2560x1440 output moves the history by output pixels (it took the extents' 1.72 before).
         let mut t = Tracker::default();
@@ -10362,6 +10410,92 @@ mod tests {
         let (scale, at) = (t.mv_scale.expect("learnt"), t.mv_scale_render.expect("its render size"));
         let units = after_mv_units(scale, at, (1485, 835), (2560, 1440)).expect("units");
         assert!(near(units, [2560.0, 1440.0]), "{units:?}");
+    }
+
+    /// Crimson Desert's Super Resolution encoder names the game's motion vectors (RG32F) beside DLSS's own earlier ones
+    /// (RG16F, lower handles): the hold takes the game's. Other kernels keep the RG16F-first rule; two RG32F images at
+    /// the extent leave the rule's pick.
+    #[test]
+    fn crimson_desert_s_encoder_gives_the_game_s_motion_vectors_not_dlss_s_own() {
+        let storage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
+        let attach = storage | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let mut images = HashMap::new();
+        images.insert(img(0x100), desc(2272, 1280, vk::Format::R16G16B16A16_SFLOAT, attach));
+        images
+            .insert(img(0x200), desc(2272, 1280, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT));
+        images.insert(img(0x500), desc(2272, 1280, vk::Format::R32G32_SFLOAT, attach));
+        for own in [0x300, 0x310, 0x320, 0x330] {
+            images.insert(img(own), desc(2272, 1280, vk::Format::R16G16_SFLOAT, attach));
+        }
+        // In the encoder's parameter order: colour, the game's motion vectors, DLSS's, the depth, DLSS's again.
+        let named = [img(0x100), img(0x500), img(0x310), img(0x200), img(0x300), img(0x320), img(0x330)];
+        let rule = input_launch(&images, &named);
+        assert_eq!(rule, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }), "RG16F first, lowest handle");
+        let enc0 = "rrlite_enc0_4x4_mvlo_hdr";
+        assert_eq!(
+            rrlite_game_mvec(enc0, &images, &named, rule.clone()),
+            Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x500) }),
+            "the game's RG32F"
+        );
+        assert_eq!(rrlite_game_mvec("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", &images, &named, rule.clone()), rule, "another kernel");
+        assert_eq!(rrlite_game_mvec(enc0, &images, &named, None), None);
+        assert_eq!(rrlite_game_mvec(enc0, &images, &named, Some(InputLaunch::Unusable)), Some(InputLaunch::Unusable));
+        images.insert(img(0x510), desc(2272, 1280, vk::Format::R32G32_SFLOAT, attach));
+        let two = [&named[..], &[img(0x510)]].concat();
+        assert_eq!(rrlite_game_mvec(enc0, &images, &two, input_launch(&images, &two)), rule, "two RG32F: which?");
+        images.insert(img(0x510), desc(1136, 640, vk::Format::R32G32_SFLOAT, attach));
+        assert_eq!(
+            rrlite_game_mvec(enc0, &images, &two, input_launch(&images, &two)).map(|i| matches!(i, InputLaunch::Inputs { mvec, .. } if mvec == img(0x500))),
+            Some(true),
+            "another extent is not counted"
+        );
+    }
+
+    /// Crimson Desert's Super Resolution (`rrlite_enc0_*`, Ray Reconstruction off) has no `hiluma` input launch: its
+    /// encoder's words 23, 24, 8, 32 and 25 say the motion vectors are fractions of the frame with y up (probed at
+    /// 3840x2160, DLSS Balanced: 1516 x -852 render pixels each). The hold before the upscaler takes that, not the
+    /// extents' 1 x 1 (y down); words that disagree give nothing.
+    #[test]
+    fn crimson_desert_s_super_resolution_encoder_says_what_the_motion_vectors_are_measured_in() {
+        let word = |x: f32, y: f32| -> [u8; 8] { (u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32)).to_le_bytes() };
+        let words = |render: (f32, f32), working: (f32, f32), scale: (f32, f32)| -> Vec<[u8; 8]> {
+            let mut w = vec![[0u8; 8]; 45];
+            w[21] = word(-0.25, 0.166_667);
+            w[23] = word(render.0 / working.0, render.1 / working.1);
+            w[24] = word(working.0 / render.0, working.1 / render.1);
+            w[8] = word(1.0 / render.0, 1.0 / render.1);
+            w[32] = word(1.0 / working.0, 1.0 / working.1);
+            w[25] = word(scale.0, scale.1);
+            w
+        };
+        let near = |got: [f32; 2], want: [f32; 2]| (got[0] - want[0]).abs() < 1e-3 * want[0].abs() && (got[1] - want[1]).abs() < 1e-3 * want[1].abs();
+        let crimson = words((1516.0, 852.0), (3840.0, 2160.0), (3840.0, -2160.0));
+        let name = "rrlite_enc0_4x4_mvlo_hdr_folded";
+        let (scale, at, _) = engine_mv_units_scale(name, &crimson).expect("Crimson Desert's words");
+        assert!(near(scale, [1516.0, -852.0]), "fractions of the frame, y up: {scale:?}");
+        assert_eq!(at, (1516, 852));
+        assert_eq!(engine_mv_units_scale("rrlite_enc1_4x4", &crimson), None, "another kernel");
+        assert_eq!(engine_mv_units_scale(name, &crimson[..32]), None, "too few words");
+        assert_eq!(mv_units_scale(name, &crimson), None, "not the hiluma layout");
+        let mut bad = crimson.clone();
+        bad[24] = word(2.0, 2.0);
+        assert_eq!(engine_mv_units_scale(name, &bad), None, "the ratio and its inverse disagree");
+        let mut bad = crimson.clone();
+        bad[32] = word(1.0 / 2560.0, 1.0 / 1440.0);
+        assert_eq!(engine_mv_units_scale(name, &bad), None, "the ratio and the sizes disagree");
+        let mut bad = crimson.clone();
+        bad[8] = word(1.0 / 1516.5, 1.0 / 852.0);
+        assert_eq!(engine_mv_units_scale(name, &bad), None, "not a whole render size");
+        // Ray Reconstruction's layout read from Super Resolution's words gives nothing (its words 51-56 are not there).
+        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &crimson), None);
+        // In the tracker: the encoder's launch sets the units the next hold before the upscaler takes.
+        let mut t = Tracker::default();
+        let enc0 = vk::CuFunctionNVX::from_raw(0x9003);
+        t.record_function(enc0, name);
+        let bytes: Vec<u8> = crimson.iter().flatten().copied().collect();
+        t.launch_kernel(cb(1), enc0, Some(&bytes));
+        assert!(near(t.mv_scale.expect("learnt"), [1516.0, -852.0]));
+        assert_eq!(t.mv_scale_render, Some((1516, 852)));
     }
 
     /// A hold after DLSS's output works on the output: the motion vectors' units are carried into output pixels

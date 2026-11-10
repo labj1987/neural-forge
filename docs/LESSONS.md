@@ -1804,6 +1804,29 @@ A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neit
 - **Testing lesson:** launch games for tests through Steam (or with exactly the Proton Steam maps them to). A direct
   launch with another Proton broke the game's Rockstar launcher for the user.
 
+## November 10: Crimson Desert's motion vectors before the upscaler (3.14.0)
+
+- **The lead:** Ray Reconstruction's parameters say Crimson Desert's motion vectors are fractions of the frame with y
+  up; its Super Resolution encoder (`rrlite_enc0_*`, the hold at NGX's luma kernel before it) had no unit source, so
+  the hold used the extents rule (1 x 1, y down).
+- **What was really wrong:** the encoder names, at the render size, the game's motion vectors (R32G32_SFLOAT,
+  parameter 12, the image Frame Generation's `Kernel_InputMvecProcessing` reads) and four RG16F images of DLSS's own
+  (16, 35-37). `input_launch`'s RG16F-first rule took one of DLSS's. Cache dumps (4K, DLSS Balanced, 2272x1280
+  render, a camera pan) showed it: the dumped vectors changed only every second hold, and lined up with the picture
+  at about 0.4 of their value (DLSS's working size is 5760x3240 there: 0.394), so the history moved by the wrong
+  amount and a frame late every other frame. The hold now takes the encoder's one RG32F image at the colour's extent
+  (`rrlite_game_mvec`).
+- **The unit:** the encoder carries the same block as `rr2_enc0_kernel` (words 23, 24, 8, 32 and 25: the render over
+  the working size, its inverse, both sizes' inverses, `MVScale` at the working size), read with the same
+  consistency checks: 5760 x -3240 times 0.3944 = 2272 x -1280 render pixels per unit.
+- **Measured** (three dumps of 10 holds each with the game's vectors, mean warp error of the previous frame through
+  them): pan 0.091 at 2272 x -1280 against 0.148 at the old 1 x 1, 0.150 with no motion, 0.120 with y down and
+  0.116-0.117 at 0.9x and 1.1x; walk 0.049 against 0.083 (0.054 at 0.9x and 1.1x); a pitch (image moved down 18-21 px a
+  hold, vectors 0.014 x 1280 = 18 px) 0.056 against 0.106, 0.107 with y down. Some vectors overflow RG16F in the
+  hold's copy (up to 119 pixels a frame become infinite); the model's answer stayed finite.
+- **Lesson:** a "which image is the motion vectors" rule that picks by format and handle is a guess wherever the
+  engine names its own history beside the game's input; a dump whose vectors repeat on alternate holds is the sign.
+
 ## November 10: a review of the #49 and #51 changes before 3.14.0
 
 Ten findings of a code review of the branch, each checked against the code and fixed with a test that fails without
