@@ -478,10 +478,10 @@ of the layer's own, waited for (bounded). Anything else is echoed, as the helper
 the heartbeat and `helper_state` keep the layer's `helper_alive` true. The regions are imported as host
 memory where the device allows (staged copies otherwise).
 
-- **History**: there are no motion vectors after the upscaler. By default (`NEURAL_FORGE_POST_MOTION=flow`,
-  since 3.14.0) each frame blends toward the previous output where the GPU's optical flow says the pixel was
-  (as the helper's NGX had); `zero` uses the same pixel, and `none` makes every frame a first frame with a
-  fixed seed: "History after the upscaler" below.
+- **History**: there are no motion vectors after the upscaler. By default (`NEURAL_FORGE_POST_MOTION=zero`,
+  since 3.14.0) each frame blends toward the previous output at the same pixel; `flow` reprojects it by the GPU's
+  optical flow (as the helper's NGX had), and `none` makes every frame a first frame with a fixed seed: "History
+  after the upscaler" below.
 - **Never both paths at once**: the pre-upscaler hold and this server share the network's frame state; each
   refuses for a second after the other used it (`Loader::claim_pre`, `claim_post`).
 - **A helper process that is running wins**: the server does not start if the helper's heartbeat moves.
@@ -937,19 +937,19 @@ against the effect off at 0.931%):
 passes); flicker does not move beyond the run-to-run noise. No value is clearly better, so 1 stays the
 default.
 
-## History after the upscaler (2026-10-19; `flow` the default since 3.14.0)
+## History after the upscaler (2026-10-19; `zero` the default since 3.14.0)
 
 Without a history every frame after the upscaler is a first frame, which costs temporal stability: the
 network's answer to a grainy or noisy frame changes from frame to frame in large soft patches (issue #49,
 Cyberpunk 2077 with the model at present). `NEURAL_FORGE_POST_MOTION` selects the history (read once, logged
-once). `flow` is the default since 3.14.0 ("Measured again" below); 3.8.0 to 3.13.0 shipped `none` on a
+once). `zero` is the default since 3.14.0 ("Measured again" below); 3.8.0 to 3.13.0 shipped `none` on a
 measurement that scored the wrong quantity ("Measured" below):
 
 | Value | History |
 |---|---|
 | `none` | None: lanes 7-9 copy the proxy, seed 0, no blend. Bit for bit as 3.7.0 (`the_shipped_frame_stays_bit_for_bit` pins the answers and lanes from 3.7.0's shaders). |
-| `zero` | Each pass's previous output at the same pixel. |
-| `flow` (default) | Each pass's previous output where the GPU's optical flow (`VK_NV_optical_flow`) says the pixel was, read with the pre-upscaler preprocess's five-tap Catmull-Rom filter. `zero` where the device has no optical flow (logged once, with the reason). |
+| `zero` (default) | Each pass's previous output at the same pixel. |
+| `flow` | Each pass's previous output where the GPU's optical flow (`VK_NV_optical_flow`) says the pixel was, read with the pre-upscaler preprocess's five-tap Catmull-Rom filter. `zero` where the device has no optical flow (logged once, with the reason). |
 
 With a history the after-the-upscaler shaders do what the pre-upscaler ones do with theirs:
 `native_post_preprocess.comp` puts the centred previous output into lanes 7-9 and the noise seed counts frames
@@ -973,11 +973,11 @@ grew) starts afresh. What gets no history:
 **The optical flow** (`post_flow`). With `flow` selected, `create_device` adds the extension, its
 `opticalFlow` feature and one queue of the family flagged `QUEUE_OPTICAL_FLOW_BIT_NV` (family 5 on the RTX
 5070, its only queue), where the device has all three and the application does not use that family itself;
-a request with them that the driver refuses is made again without. With `flow` the default, that is every
-NVIDIA device the native backend extends, also in a game whose model runs only before the upscaler: which pass
-will run (DLSS found or not, the Placement setting, `NEURAL_FORGE_PREUPSCALE`) is not known when the device is
-created, so the extension and the queue are requested wherever the device offers them, and stay unused there.
-`NEURAL_FORGE_POST_MOTION=zero` (or `none`) leaves them out. Each device creation logs one `[native]` line on
+a request with them that the driver refuses is made again without. That is every NVIDIA device the native
+backend extends, also in a game whose model runs only before the upscaler (which pass will run is not known when
+the device is created), and that is why `flow` is not the default: GTA V Enhanced hung at the start of its
+benchmark with them added to the devices its frame generation creates (2026-11-10; 3 of 3 launches, the same build
+with `zero` ran at 62.1 / 250.0 fps). Each device creation logs one `[native]` line on
 it: added (with the family), not added and why (no extension, feature or family; the application uses that
 family itself; the application chains its own optical-flow features), or refused and created without. The RTX 5070's driver offers output grids
 of 1x1, 2x2 and 4x4 for 32x32 to 8192x8192, inputs `B8G8R8A8_UNORM`, `R8_UNORM` and NV12, vectors
@@ -1036,7 +1036,10 @@ frame, minus the original's (the flicker the model adds in large patches; 0.284-
 against 13.29 of 255 at scale 1, moving) and moving edges show no trail. Per pixel, the grain dominates: the
 composited frame changes 3-7% more than the original with every setting. A fixed seed with a history (tried: the
 seed counting frames is the one difference from `none`'s noise) changed nothing. A lower working scale doubles
-the flicker with every history. So `flow` is the default from 3.14.0, `zero` where the device has no optical flow.
+the flicker with every history. `flow` was made the default first; it hung GTA V Enhanced (the optical flow's
+extension and queue added to the game's devices, "The optical flow" above), and in Cyberpunk 2077 and Red Dead
+Redemption 2 the game uses the optical-flow family itself, so they ran `zero` anyway. So `zero` is the default from
+3.14.0: a third of `none`'s added flicker in motion, none on a still frame, nothing added to the game's devices.
 
 ## Model resolution before the upscaler (3.8.0, 2026-10-19)
 

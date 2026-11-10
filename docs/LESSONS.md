@@ -1657,7 +1657,9 @@ Not built. A face pass would also need a detector with a licence that fits (SCRF
   in motion from +0.214 to +0.022 at working scale 1, and zero motion takes it below the input's own on a still frame.
   The edit keeps its size and moving edges keep no trail. A fixed seed with the history changed nothing. Working
   scale 0.5 doubles the flicker in every mode.
-- **Taken:** `flow` is the default after the upscaler (`zero` on devices without optical flow). The Status tab says
+- **Taken:** `zero` is the default after the upscaler. `flow` was the default first and hung GTA V Enhanced at the
+  start of its benchmark, 3 of 3 launches: the optical flow's extension and queue are added to every device the
+  game creates, its frame generation's included; `zero` adds nothing and ran normally (62.1 / 250.0 fps). The Status tab says
   "at present, on the finished frame" when the Placement setting puts the model there, rather than "waiting for
   DLSS Super Resolution".
 - **Lesson:** for temporal stability, measure what is shown (the composited picture, motion-compensated, against the

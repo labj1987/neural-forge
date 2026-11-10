@@ -44,19 +44,13 @@ first shipped them; their phase is kept as a subheading.
 
 **A steadier picture on the finished frame**
 
-- Games whose Vulkan swapchain carries a single-GPU device-group description (Red Dead Redemption 2) now get the
-  model on the finished frame; before, Neural Forge left such a swapchain untouched.
-
+- A Vulkan swapchain that carries a single-GPU device-group description (Red Dead Redemption 2's) is no longer
+  left untouched: the model can work on its finished frame.
 - With the model on the finished frame (no DLSS, or the Placement setting "At present"), it now carries its result
-  from frame to frame along the GPU's optical flow, as it does before the upscaler. Before, every frame was worked
-  on afresh, and on grainy or noisy pictures (film grain in Cyberpunk 2077) large soft patches of the picture
-  flickered. `NEURAL_FORGE_POST_MOTION=none` brings the old behaviour back. A working scale below 1 makes this
-  flicker stronger. For this the game's device gets NVIDIA's optical-flow extension and one optical-flow queue
-  where the GPU offers them, also in games where the model runs before the upscaler (which way it will run is not
-  known when the game creates its device); the game's log says so. `NEURAL_FORGE_POST_MOTION=zero` (or `none`)
-  leaves them out.
-- With the Placement setting "At present", the Status tab's Model placement line now says the model runs on the
-  finished frame by that setting, instead of "waiting for DLSS Super Resolution".
+  from frame to frame, as it does before the upscaler. Before, every frame was worked on afresh, and on grainy or
+  noisy pictures (film grain in Cyberpunk 2077) large soft patches of the picture flickered.
+  `NEURAL_FORGE_POST_MOTION=none` brings the old behaviour back. A working scale below 1 makes this flicker
+  stronger.
 
 **Seeing why the model does not run before the upscaler**
 

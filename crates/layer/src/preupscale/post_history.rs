@@ -1,8 +1,11 @@
 //! The after-the-upscaler path's history (docs/NATIVE_BACKEND.md, "History after the upscaler"): what the
 //! native backend's frames there blend toward ([`MOTION_ENV`]).
 //!
-//! - `flow` (the default, 3.14.0): as `zero` below, with the history reprojected by the GPU's optical flow
-//!   (`VK_NV_optical_flow`, `super::post_flow`); `zero` where the device has none.
+//! - `zero` (the default, 3.14.0): each pass's previous output at the same pixel (zero motion), see below.
+//! - `flow`: as `zero`, with the history reprojected by the GPU's optical flow (`VK_NV_optical_flow`,
+//!   `super::post_flow`); `zero` where the device has none. Not the default: it adds the optical flow's extension,
+//!   feature and a queue to the game's devices, and GTA V Enhanced hung at the start of its benchmark with them added
+//!   to the devices its frame generation creates (2026-11-10).
 //! - `none`: no history, every frame a first frame with a fixed seed, bit for bit as 3.7.0 (the default
 //!   before 3.14.0: without a history the network's answer to a grainy or noisy frame changes from frame to
 //!   frame in large soft patches, issue #49, docs/LESSONS.md "November 10").
@@ -22,7 +25,7 @@ use std::time::Instant;
 
 use neural_forge_protocol::history::{HistoryGap, Stale};
 
-/// The selector: `flow` (the default), `zero` or `none`. Read once, logged once.
+/// The selector: `zero` (the default), `flow` or `none`. Read once, logged once.
 pub(crate) const MOTION_ENV: &str = "NEURAL_FORGE_POST_MOTION";
 
 /// The per-pixel rejection threshold: the largest channel difference (0 to 1 of the 8-bit proxy's scale)
@@ -54,11 +57,11 @@ impl Motion {
     }
 }
 
-/// [`MOTION_ENV`]'s value: unset or empty is `flow`.
+/// [`MOTION_ENV`]'s value: unset or empty is `zero`.
 pub(crate) fn parse_motion(raw: Option<&str>) -> Result<Motion, String> {
     match raw.map(str::trim) {
-        None | Some("" | "flow") => Ok(Motion::Flow),
-        Some("zero") => Ok(Motion::Zero),
+        None | Some("" | "zero") => Ok(Motion::Zero),
+        Some("flow") => Ok(Motion::Flow),
         Some("none") => Ok(Motion::None),
         Some(other) => Err(other.to_string()),
     }
@@ -81,8 +84,8 @@ pub(crate) fn motion() -> Motion {
             m
         }
         Err(other) => {
-            crate::log!("[native] {MOTION_ENV}={other:?} is not flow, zero or none; the default, the optical flow");
-            Motion::Flow
+            crate::log!("[native] {MOTION_ENV}={other:?} is not zero, flow or none; the default, zero motion");
+            Motion::Zero
         }
     });
     *MOTION
@@ -258,8 +261,8 @@ mod tests {
 
     #[test]
     fn the_selector_and_the_threshold_parse() {
-        assert_eq!(parse_motion(None), Ok(Motion::Flow), "the default (#49)");
-        assert_eq!(parse_motion(Some("")), Ok(Motion::Flow));
+        assert_eq!(parse_motion(None), Ok(Motion::Zero), "the default (#49)");
+        assert_eq!(parse_motion(Some("")), Ok(Motion::Zero));
         assert_eq!(parse_motion(Some("none")), Ok(Motion::None));
         assert_eq!(parse_motion(Some(" zero ")), Ok(Motion::Zero));
         assert_eq!(parse_motion(Some("flow")), Ok(Motion::Flow));
