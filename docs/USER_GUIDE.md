@@ -261,8 +261,13 @@ ran with no missed frames and no GPU fault.
 | Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | Before the upscaler, inside DLSS's buffer |
 | Remnant II | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Before the upscaler, inside DLSS's buffer |
 | Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Ray Reconstruction, Frame Generation | After DLSS with Ray Reconstruction on; before the upscaler, inside DLSS's buffer, with it off |
+| Cyberpunk 2077 | REDengine 4, DX12 | Super Resolution, Frame Generation 3x (its built-in benchmark) | Before the upscaler, inside DLSS's buffer |
+| Red Dead Redemption 2 | RAGE, Vulkan | Super Resolution (Quality) | Before the upscaler, inside DLSS's buffer, on a compute queue shared with the game; not on the finished frame |
 
 Setup notes for these games:
+
+- **Red Dead Redemption 2** runs on Vulkan (Settings > Graphics > Advanced > Graphics API). Start it through Steam as
+  usual (its Rockstar launcher checks Steam). The model runs only before the upscaler there, so turn DLSS on.
 
 - **GTA San Andreas - The Definitive Edition** resets its Frame Rate setting to 60 at every launch,
   whatever its settings files say (a game bug). Set it to Unlocked in Options > Graphics each time.
