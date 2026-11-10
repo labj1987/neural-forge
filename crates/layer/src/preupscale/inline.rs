@@ -43,8 +43,10 @@ use super::{lock, Aux, InlinePoint};
 
 /// Slots per device: DLSS's buffers recorded with a hold whose holds may still run. A slot is free again only
 /// once its buffer cannot be submitted again unchanged: re-recorded, reset, freed, or its pool reset or
-/// destroyed; never by time.
-pub(crate) const MAX_SLOTS: usize = 8;
+/// destroyed; never by time. Red Dead Redemption 2 keeps about 15 of DLSS's one-time-submit buffers recorded ahead
+/// (8 slots held 54% of its frames and the rest went to DLSS unedited, flickering, #49): 32, as many as the network's
+/// hold pools ([`neural_forge_native::HOLD_SLOTS`]), which are made only once a slot is used.
+pub(crate) const MAX_SLOTS: usize = 32;
 
 /// The timestamps a hold writes into its slot's pool: after the copy in, after the capture, after the
 /// network, after the write-back.

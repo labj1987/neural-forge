@@ -281,7 +281,7 @@ static std::string invalidSizes(const uint32_t* sizes, uint32_t count) {
 }
 
 // Hold slots nf_native_record_graph_at serves (nf_native_hold_slots; the layer's slots per device).
-constexpr uint32_t kHoldPools = 16;
+constexpr uint32_t kHoldPools = 32;
 
 // A warm-up whose counter chain timed out: the build falls back to barriers and runs again.
 struct WarmUpChainTimeout : std::runtime_error {

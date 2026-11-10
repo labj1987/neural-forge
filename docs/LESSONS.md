@@ -1760,6 +1760,11 @@ A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neit
 - **Measured:** RDR2, 1440p, DLSS Quality, Story mode in the world (launched through Steam with its Proton-GE): the
   hold inside DLSS's buffer from the second frame (the learned launch layout, SHADER_READ_ONLY_OPTIMAL), 0 misses over
   90 s, hold 0.8-1.4 ms, 81 fps against 125 without the model, no Xid.
+- **A flicker the user saw while watching:** with the hold inside DLSS's buffer running, 46% of RDR2's frames were
+  skipped ("every slot is in use": 8 slots, and RDR2 keeps about 15 one-time-submit DLSS buffers recorded ahead), so
+  edited and unedited frames alternated: on a still scene the presented frame's 32-pixel blocks changed 0.794 per
+  frame against 0.055 with the model off. 32 slots (and 32 hold pools on the network's side, made only when used):
+  every frame held, 0.149-0.150 against 0.106 off on a still scene, no alternation.
 - **Testing lesson:** launch games for tests through Steam (or with exactly the Proton Steam maps them to). A direct
   launch with another Proton broke the game's Rockstar launcher for the user.
 

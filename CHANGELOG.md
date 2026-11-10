@@ -41,6 +41,8 @@ first shipped them; their phase is kept as a subheading.
   (the model now uses that one's feature), and it takes every compute queue of the GPU (the model now shares one of
   the game's, with every use of it synchronized; `NEURAL_FORGE_SHARE_QUEUE=off` turns that off). Where the queue is
   shared, the model runs before the upscaler only, not on the finished frame.
+- Games that record many of DLSS's command buffers ahead (Red Dead Redemption 2 about 15) no longer get every other
+  frame without the model, which flickered: the hold inside DLSS's buffer now has room for 32.
 
 **A steadier picture on the finished frame**
 

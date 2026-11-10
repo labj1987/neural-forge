@@ -97,7 +97,7 @@ const MESSAGE: usize = 512;
 
 /// The hold slots [`Network::record_graph_at`] serves (`kHoldPools` in nf_native.cpp, which
 /// `nf_native_hold_slots` reports: a test holds the two equal).
-pub const HOLD_SLOTS: u32 = 16;
+pub const HOLD_SLOTS: u32 = 32;
 
 /// Sets the loader's dispatch pointer on a dispatchable object the network got from below the loader.
 pub type InitDispatchable = unsafe extern "C" fn(user: *mut c_void, device: vk::Device, object: *mut c_void);
