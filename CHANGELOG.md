@@ -43,7 +43,9 @@ first shipped them; their phase is kept as a subheading.
 - With Ray Reconstruction on in Cyberpunk 2077 (with or without path tracing), Placement Auto and "After DLSS" now
   run the model right after DLSS, on its denoised, upscaled picture. Before, Neural Forge did not find Ray
   Reconstruction's output and the model fell back to the finished frame, HUD included. Ray Reconstruction writes its
-  picture in several parts, and the model now waits for the last one.
+  picture in several parts, and the model now waits for the last one. The model's history there follows the motion
+  also when Ray Reconstruction is on from the start of the game (it reads the motion vectors' unit from Ray
+  Reconstruction itself); before, it barely moved with the picture.
 
 - Red Dead Redemption 2 (Vulkan) has the model before the upscaler with DLSS on. Three things kept the model out of
   it, and every Vulkan game like it: its instance asks for Vulkan 1.1 (Neural Forge now creates it for 1.3, which

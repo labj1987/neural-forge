@@ -1739,6 +1739,24 @@ A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neit
 - **Measured:** Cyberpunk's benchmark, 1440p, DLSS Auto, FG 3x: about 2,600 holds inside DLSS's buffer per run, 0
   misses, the log says 1485 x 835, no Xid.
 
+## November 10: Cyberpunk 2077 after DLSS: Ray Reconstruction's motion-vector unit (3.14.0, issue #49)
+
+- **What:** with Ray Reconstruction on from the start of a session (the reporter's normal case) no Super Resolution
+  input launch ever says what the motion vectors are measured in, so the hold after Ray Reconstruction's output fell
+  back to the extents and moved its history by 1/1485 of the camera's motion.
+- **The source:** `rr2_enc0_kernel`'s parameters (1088 bytes, `NEURAL_FORGE_PROBE_NGX=1`) hold the same block as Super
+  Resolution's `rrlite_enc0_*` (words 23-25, 8, 32 there): word 51 the render size over the size Ray Reconstruction
+  works at, 52 its inverse, 53 one over the render size, 54 one over that working size, 56 `MVScale` carried to that
+  size. Cyberpunk 2077 at 2560x1440: Ray Reconstruction works at 3840x2160 and downsamples to the output itself;
+  word 56 is 3840 x 2160 and word 51 0.3867, so 1485 x 835 render pixels per unit, what its Super Resolution's word
+  1 times word 5 says. Crimson Desert's (October probe) has 3840 x -2160 there: the sign is kept (y up). The words
+  are read only when they agree with each other (ratio times inverse 1, the ratio the sizes' quotient, a whole render
+  size); Frame Generation's `Kernel_InputMvecProcessing` was no source (its scale word is 1 x 1 in Cyberpunk).
+- **Measured:** cache dumps of four holds after DLSS, with Ray Reconstruction off and on from the session's start:
+  `mvec_scale` 2560 x 1440 in both, and consecutive frames warped by the motion vectors line up best at exactly that
+  scale (mean error 0.0036-0.0039 at 1x against 0.0078-0.0086 at 0.9x and 1.1x and 0.028-0.030 without motion;
+  `~/scratch/issue49/tools/mvcheck.py`).
+
 ## November 10: Red Dead Redemption 2 (Vulkan) before the upscaler (3.14.0, issue #49)
 
 - **What kept the model out:** three refusals in a row, each found from the game's own log on the rig. (1) The
