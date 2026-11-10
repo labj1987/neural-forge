@@ -5895,6 +5895,22 @@ mod tests {
             assert_ne!(neural(6, 4, 0, 2), neural(7, 7, 0, 2), "the test tells the scaled position from the unscaled one");
             assert_eq!(lanes(5, 3)[7], centre(neural(6, 4, 0, 2)), "history lane from the previous answer where the scaled vector points");
 
+            // Frame 4 with y pointing up (a negative `MVScale`, as Crimson Desert's Ray Reconstruction gets it): vectors
+            // of (2, -4) at a scale of (0.5, -0.25) point to the same pixel. A frame without history first, so the
+            // history is frame 3's network answer again.
+            write_head(2, 10.0);
+            let cmds = pass.frame(&built, false, None, [1.0, 1.0], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            let field: Vec<f32> = (0..W * H).flat_map(|_| [2.0f32, -4.0]).collect();
+            std::ptr::copy_nonoverlapping(field.as_ptr().cast::<u8>(), staging.ptr, field.len() * 4);
+            fx.one_shot(|cmd| {
+                device.cmd_copy_buffer(cmd, staging.buffer, pass.acc.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(W * H) * 8 }])
+            });
+            write_head(3, 10.0);
+            let cmds = pass.frame(&built, true, None, [0.5, -0.25], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            assert_eq!(lanes(5, 3)[7], centre(neural(6, 4, 0, 2)), "a negative y scale: the same pixel as frame 4's");
+
             // Frame 5: a NaN head at (5, 3), residual and logit, on a frame with history (no motion again): clamp()
             // of a NaN is undefined, so the composite reads it as 0. The answer there is 0 and the history the
             // next frame reads is 0, not NaN (which would reach the network's input lanes, frame after frame).

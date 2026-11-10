@@ -2044,8 +2044,8 @@ fn rr_mv_units_scale(name: &str, words: &[[u8; 8]]) -> Option<([f32; 2], (u32, u
 /// moved its history by 1/1485 of the camera's motion (issue #49).
 ///
 /// Ray Reconstruction's launches say nothing of the units, which are the game's, so a hold after it takes the last SR
-/// input launch's, carried to its render size by what they are: 1 is render pixels at any render size; anything else
-/// is proportional to it (the frame's fractions: the render size; output pixels: render over output). `None` for an
+/// input launch's, carried to its render size by what they are: 1 (or -1, y up) is render pixels at any render size;
+/// anything else is proportional to it (the frame's fractions: the render size; output pixels: render over output). `None` for an
 /// empty extent.
 fn after_mv_units(scale: [f32; 2], at: (u32, u32), render: (u32, u32), output: (u32, u32)) -> Option<[f32; 2]> {
     let (at, render, output) = ([at.0, at.1], [render.0, render.1], [output.0, output.1]);
@@ -2055,7 +2055,8 @@ fn after_mv_units(scale: [f32; 2], at: (u32, u32), render: (u32, u32), output: (
     let mut units = [0.0f32; 2];
     for axis in 0..2 {
         let s = scale[axis];
-        let in_render = if (s - 1.0).abs() < 1e-3 { 1.0 } else { s / at[axis] as f32 * render[axis] as f32 };
+        // Render pixels with y up (a negative `MVScale`) stay -1 at any render size.
+        let in_render = if (s.abs() - 1.0).abs() < 1e-3 { s.signum() } else { s / at[axis] as f32 * render[axis] as f32 };
         units[axis] = in_render * output[axis] as f32 / render[axis] as f32;
     }
     Some(units)
@@ -2609,13 +2610,9 @@ impl Tracker {
                 self.learn_jitter(command_buffer, value);
             }
         }
-        // The motion vectors' units, from every SR input launch (they change with the render size).
-        if let Some(scale) = self.functions.get(&function).and_then(|(_, name)| mv_units_scale(name, bytes.as_chunks::<8>().0)) {
-            if self.mv_scale != Some(scale) {
-                crate::log!("[preupscale] DLSS's motion vectors are {} x {} of the colour input's pixels (its input kernel's parameters)", scale[0], scale[1]);
-                self.mv_scale = Some(scale);
-            }
-        }
+        // The motion vectors' units, from every SR input launch (they change with the render size); set below, with the
+        // extent of the colour input they are in.
+        let sr_mv_scale = self.functions.get(&function).and_then(|(_, name)| mv_units_scale(name, bytes.as_chunks::<8>().0));
         // The same from Ray Reconstruction's first launch, with the render size it is at: the only source while Ray
         // Reconstruction runs from the start of a session (no Super Resolution input launch says it).
         if let Some((scale, at)) = self.functions.get(&function).and_then(|(_, name)| rr_mv_units_scale(name, bytes.as_chunks::<8>().0)) {
@@ -2662,6 +2659,19 @@ impl Tracker {
             }
         }
         probe_rr(command_buffer, self.functions.get(&function).map(|(_, n)| n.as_str()), &named, &self.images);
+        // The SR input launch's units, together with the render size they are at (its colour input's extent, `None`
+        // where this launch does not read as SR's input form): a launch that does not say them leaves the last pair,
+        // which the hold after DLSS carries to the render size it runs at ([`after_mv_units`]).
+        if let Some(scale) = sr_mv_scale {
+            if self.mv_scale != Some(scale) {
+                crate::log!("[preupscale] DLSS's motion vectors are {} x {} of the colour input's pixels (its input kernel's parameters)", scale[0], scale[1]);
+            }
+            self.mv_scale = Some(scale);
+            self.mv_scale_render = match input_launch(&self.images, &named) {
+                Some(InputLaunch::Inputs { colour, .. }) => self.images.get(&colour).map(|d| (d.width, d.height)),
+                _ => None,
+            };
+        }
         if probe_image::enabled() {
             self.last_launch = self.functions.get(&function).map(|(_, n)| (n.clone(), named.clone()));
         }
@@ -2744,12 +2754,9 @@ impl Tracker {
                     refs.input = Some(rr);
                 }
             }
-            if let Some(InputLaunch::Inputs { colour, mvec, .. }) = refs.input {
+            if let Some(InputLaunch::Inputs { mvec, .. }) = refs.input {
                 if kernel != Some(Kernel::RayReconstruction) {
                     self.current_mvec = Some(mvec);
-                }
-                if kernel == Some(Kernel::SrInput) && self.mv_scale.is_some() {
-                    self.mv_scale_render = self.images.get(&colour).map(|d| (d.width, d.height));
                 }
             }
             if refs.input.is_some() {
@@ -10232,6 +10239,10 @@ mod tests {
         assert!(near(hogwarts, [1708.0 / 2560.0, 964.0 / 1440.0]), "{hogwarts:?}");
         let cyberpunk = mv_units_scale(input, &words((2560.0, 1440.0), (0.5800781, 0.5798611)));
         assert!(near(cyberpunk, [1485.0, 835.0]), "{cyberpunk:?}");
+        // y pointing up (a negative `MVScale`): the sign is kept, and the hold before DLSS is given it as it is.
+        let up = mv_units_scale(input, &words((1.7239056, -1.7224879), (0.5800781, 0.58055556)));
+        assert!(up.is_some_and(|u| (u[0] - 1.0).abs() < 0.01 && (u[1] + 1.0).abs() < 0.01), "{up:?}");
+        assert_eq!(mv_units_scale(input, &words((1.7239056, -1e9), (0.5800781, 0.58055556))), None, "too large either way");
         assert_eq!(mv_units_scale("cuda_engine_input_kernel", &words((2560.0, 1440.0), (0.58, 0.58))), None, "another family");
         assert_eq!(mv_units_scale(input, &words((f32::NAN, 1.0), (0.58, 0.58))), None);
         assert_eq!(mv_units_scale(input, &words((1.0, 1.0), (0.0, 0.58))), None, "no ratio");
@@ -10252,7 +10263,45 @@ mod tests {
             guessed: Guessed::default(),
         };
         assert!(near(Some(point.mvec_scale()), [1485.0, 835.0]), "the launch's word over the extents' 1");
+        assert_eq!(InlinePoint { mv_units: up, ..point }.mvec_scale(), up.expect("y up"), "the hold takes the sign as the launch says it");
         assert_eq!(InlinePoint { mv_units: None, ..point }.mvec_scale(), [1.0, 1.0]);
+    }
+
+    /// The motion vectors' units and the render size they are at are set together, from the SR input launch that says
+    /// them: a launch at a new render size whose words say none leaves the last pair (the hold after DLSS carries it to
+    /// the render size it runs at), not the old units with the new size.
+    #[test]
+    fn the_motion_vector_units_keep_the_render_size_they_were_read_at() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let depth = vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        let set = set_of(&[
+            (0x100, desc(1485, 835, rgba, storage)),
+            (0x200, desc(1485, 835, vk::Format::D32_SFLOAT_S8_UINT, depth)),
+            (0x300, desc(1485, 835, vk::Format::R16G16_SFLOAT, storage)),
+            (0x110, desc(1280, 720, rgba, storage)),
+            (0x210, desc(1280, 720, vk::Format::D32_SFLOAT_S8_UINT, depth)),
+            (0x310, desc(1280, 720, vk::Format::R16G16_SFLOAT, storage)),
+        ]);
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        let input = vk::CuFunctionNVX::from_raw(0x9010);
+        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
+        let word = |x: f32, y: f32| u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32);
+        let launch = |t: &mut Tracker, c: vk::CommandBuffer, base: u64, scale: u64, ratio: u64| {
+            let words = [h(base), scale, h(base + 0x100), h(base + 0x200), 0, ratio, 0, 0];
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            t.launch_kernel(c, input, Some(&bytes));
+        };
+        // Cyberpunk 2077's units (fractions of the frame) at 1485x835.
+        launch(&mut t, cb(1), 0x100, word(2560.0, 1440.0), word(0.5800781, 0.5798611));
+        let scale = t.mv_scale.expect("learnt");
+        assert_eq!(t.mv_scale_render, Some((1485, 835)));
+        // At 1280x720 with words that say nothing: the pair stays.
+        launch(&mut t, cb(2), 0x110, word(f32::NAN, 1440.0), word(0.5, 0.5));
+        assert_eq!((t.mv_scale, t.mv_scale_render), (Some(scale), Some((1485, 835))));
+        // At 1280x720 saying them: both.
+        launch(&mut t, cb(3), 0x110, word(2560.0, 1440.0), word(0.5, 0.5));
+        assert_eq!((t.mv_scale, t.mv_scale_render), (Some([1280.0, 720.0]), Some((1280, 720))));
     }
 
     /// With Ray Reconstruction on from the start of a session no Super Resolution input launch says what the motion
@@ -10325,6 +10374,9 @@ mod tests {
         assert!(near(after_mv_units([1.0, 1.0], render, rr, output), [2.0, 2.0]));
         assert!(near(after_mv_units([1708.0 / 2560.0, 964.0 / 1440.0], (1708, 964), rr, output), [1.0, 1.0]));
         assert_eq!(after_mv_units([1.0, 1.0], render, (0, 0), output), None);
+        // y pointing up (a negative `MVScale`): the same with y's sign, render pixels too.
+        assert!(near(after_mv_units([1.0, -1.0], render, rr, output), [2.0, -2.0]));
+        assert!(near(after_mv_units([1485.0, -835.0], render, rr, output), [2560.0, -1440.0]));
     }
 
     /// The hold copies the identified motion vectors only while DLSS's latest input launch names them:
