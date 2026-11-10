@@ -738,7 +738,21 @@ pub(crate) const MVEC_HOLD_FORMATS: [vk::Format; 3] = [vk::Format::R16G16_SFLOAT
 /// that image too) and its depth as R32F, all at the render size. Read so only when the launch names exactly one
 /// such render target, one such storage image and one depth-like image at one extent; anything else stays
 /// unread.
+///
+/// Cyberpunk 2077 under vkd3d-proton (patch of late 2026, `hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`,
+/// issue #49, probed 2026-11-10) names the same set, but vkd3d-proton gives every image the same usage, so
+/// usage cannot tell the colour from the motion vectors. There the launch's parameters name the colour first and
+/// the motion vectors second (parameters 21 and 23; DLSS's output is 22): exactly two RGBA16F images at the
+/// depth's extent with the same usage are read in parameter order, the colour first.
 fn four_channel_inputs(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<InputLaunch> {
+    if let Some(inputs) = four_channel_render_target(images, named) {
+        return Some(inputs);
+    }
+    four_channel_in_parameter_order(images, named)
+}
+
+/// Metro Last Light Redux's form of [`four_channel_inputs`]: the colour a render target, the motion vectors a storage image.
+fn four_channel_render_target(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<InputLaunch> {
     let with = |keep: &dyn Fn(&ImageDesc) -> bool| -> Vec<(vk::Image, ImageDesc)> {
         named.iter().filter_map(|i| images.get(i).filter(|d| d.plain && keep(d)).map(|d| (*i, *d))).collect()
     };
@@ -750,6 +764,29 @@ fn four_channel_inputs(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Imag
     let [(mvec, _)] = with(&|d| rgba(d) && storage(d) && !attachment(d) && extent(d))[..] else { return None };
     let [(depth, _)] = with(&|d| (DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format)) && extent(d))[..] else { return None };
     Some(InputLaunch::Inputs { colour, depth, mvec })
+}
+
+/// Cyberpunk 2077's form of [`four_channel_inputs`] (vkd3d-proton): exactly one depth-like image, and at its extent
+/// exactly two copyable RGBA16F images with the same usage, named colour first, motion vectors second.
+fn four_channel_in_parameter_order(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<InputLaunch> {
+    let with = |keep: &dyn Fn(&ImageDesc) -> bool| -> Vec<(vk::Image, ImageDesc)> {
+        let mut seen: Vec<vk::Image> = Vec::new();
+        named
+            .iter()
+            .filter(|i| {
+                let first = !seen.contains(i);
+                seen.push(**i);
+                first
+            })
+            .filter_map(|i| images.get(i).filter(|d| d.plain && keep(d)).map(|d| (*i, *d)))
+            .collect()
+    };
+    let [(depth, dd)] = with(&|d| DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format))[..] else { return None };
+    let pair = with(&|d| {
+        d.format == vk::Format::R16G16B16A16_SFLOAT && d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (d.width, d.height) == (dd.width, dd.height)
+    });
+    let [(colour, c), (mvec, m)] = pair[..] else { return None };
+    (c.usage == m.usage && colour_candidate(&c)).then_some(InputLaunch::Inputs { colour, depth, mvec })
 }
 
 /// The formats of an image DLSS Super Resolution writes (its output, NGX's output-size scratch).
@@ -1585,6 +1622,9 @@ pub(crate) struct Tracker {
     /// device ([`Self::reset_flag`]).
     reset_streak: u32,
     reset_ignored: bool,
+    /// What turns DLSS's motion vectors into the colour input's pixels, as the last SR input launch gave it
+    /// ([`mv_units_scale`]): `None` until one did, and for other kernels.
+    mv_scale: Option<[f32; 2]>,
     /// The identification ([`Self::generation`]) a hold inside DLSS's buffer was recorded for: from
     /// then on [`Self::inline_point`] answers for the buffers the split could take too
     /// ([`Hazard::HeldInside`]).
@@ -1770,6 +1810,42 @@ const RRLITE_ENC0_JITTER_WORD: usize = 21;
 /// was given it): 0 on every launch of a GTA V Enhanced benchmark run (`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`)
 /// but the first frame's and two camera cuts mid-pass that the picture-based detector missed (2026-11-09).
 const HILUMA_RESET_WORD: usize = 4;
+
+/// The words of a 310.x SR input kernel's parameters that say what DLSS's motion vectors are measured in: word 1 is
+/// the factor that turns them into output pixels (NGX's `MVScale` over the render-to-output ratio), word 5 the render
+/// size over the output's, x in the low and y in the high 32 bits of each. Their product turns them into the colour
+/// input's pixels. Measured (2026-11-10, #49): GTA V Enhanced 1.7239 x 0.5801 = 1 (render pixels, `mvlo`), Hogwarts
+/// Legacy 1 x 0.6672 = 0.667 (output pixels, `mvhi`; the frames line up there at 0.667), Cyberpunk 2077 2560 x 0.5801
+/// = 1485 (fractions of the frame: its frames line up at 1485 times their value, not at 1).
+const HILUMA_MV_SCALE_WORD: usize = 1;
+const HILUMA_RENDER_RATIO_WORD: usize = 5;
+
+/// [`HILUMA_MV_SCALE_WORD`] times [`HILUMA_RENDER_RATIO_WORD`] from a SR input launch's parameters, per axis; `None`
+/// unless the kernel is a `hiluma_engine_input*` one and both halves of both words are plausible (finite, the ratio
+/// in (0, 4], the product in [1e-3, 1e5]).
+fn mv_units_scale(name: &str, words: &[[u8; 8]]) -> Option<[f32; 2]> {
+    if !name.starts_with("hiluma_engine_input") {
+        return None;
+    }
+    let pair = |at: usize| -> Option<[f32; 2]> {
+        let v = u64::from_le_bytes(*words.get(at)?);
+        Some([f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
+    };
+    let (scale, ratio) = (pair(HILUMA_MV_SCALE_WORD)?, pair(HILUMA_RENDER_RATIO_WORD)?);
+    let mut out = [0.0f32; 2];
+    for axis in 0..2 {
+        let (s, r) = (scale[axis], ratio[axis]);
+        if !(s.is_finite() && r.is_finite() && r > 0.0 && r <= 4.0) {
+            return None;
+        }
+        let p = s * r;
+        if !(1e-3..=1e5).contains(&p) {
+            return None;
+        }
+        out[axis] = p;
+    }
+    Some(out)
+}
 
 /// Input launches in a row with the reset word set after which it is not taken for the game's reset on that device
 /// ([`Tracker::reset_flag`]).
@@ -2041,6 +2117,9 @@ pub(crate) struct InlinePoint {
     /// vectors (the `mvhi` input kernels; Hogwarts Legacy), which the copy resamples to the colour
     /// input's ([`Self::mvec_scale`]).
     pub mvec_extent: (u32, u32),
+    /// What turns the motion vectors into the colour input's pixels as DLSS's input launch says it
+    /// ([`mv_units_scale`]); [`Self::mvec_scale`] falls back to the extents without it.
+    pub mv_units: Option<[f32; 2]>,
     /// DLSS's depth at the hold, where its depth aspect can be copied (the native backend's depth
     /// copy): at the colour input's extent, in a layout [`depth_copy_layout`] takes.
     pub depth_input: Option<Aux>,
@@ -2072,6 +2151,9 @@ impl InlinePoint {
     /// line up at 0.667 of their value, 1708 over 2560), so 1 at the colour input's extent and the
     /// colour input's over theirs for high-resolution ones.
     pub(crate) fn mvec_scale(&self) -> [f32; 2] {
+        if let Some(scale) = self.mv_units {
+            return scale;
+        }
         let (w, h) = self.mvec_extent;
         if w == 0 || h == 0 {
             return [1.0, 1.0];
@@ -2310,6 +2392,13 @@ impl Tracker {
             if refs.jitter.is_none() {
                 refs.jitter = Some(value);
                 self.learn_jitter(command_buffer, value);
+            }
+        }
+        // The motion vectors' units, from every SR input launch (they change with the render size).
+        if let Some(scale) = self.functions.get(&function).and_then(|(_, name)| mv_units_scale(name, bytes.as_chunks::<8>().0)) {
+            if self.mv_scale != Some(scale) {
+                crate::log!("[preupscale] DLSS's motion vectors are {} x {} of the colour input's pixels (its input kernel's parameters)", scale[0], scale[1]);
+                self.mv_scale = Some(scale);
             }
         }
         // The game's history reset, from the first launch of the buffer whose kernel is known to carry it.
@@ -2693,6 +2782,7 @@ impl Tracker {
             exposure_input,
             mvec_input,
             mvec_extent,
+            mv_units: self.mv_scale,
             depth_input,
             identification: self.generation,
             hazard,
@@ -3027,6 +3117,7 @@ impl Tracker {
             exposure_input: None,
             mvec_input,
             mvec_extent: mvec.map_or((0, 0), |d| (d.width, d.height)),
+            mv_units: None,
             depth_input: None,
             // Its own identification: the output image's handle with the top bit set (never an input's).
             identification: o.image.as_raw() | (1 << 63),
@@ -8659,6 +8750,43 @@ mod tests {
         assert!(MVEC_HOLD_FORMATS.contains(&rgba) && MVEC_HOLD_FORMATS[0] == vk::Format::R16G16_SFLOAT);
     }
 
+    /// Cyberpunk 2077 under vkd3d-proton (#49, probed 2026-11-10): `hiluma_engine_input_depthinv_mvlo_hdr_v2_rel` names
+    /// the colour (1485x835 RGBA16F), DLSS's output, the motion vectors (1485x835 RGBA16F) and the depth (R32_UINT), every
+    /// image with the same usage. Read in parameter order, the colour first; a third RGBA16F image at the render size, a
+    /// second depth or differing usage leave it unread.
+    #[test]
+    fn same_usage_four_channel_inputs_are_read_in_parameter_order() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let all = vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let images: HashMap<vk::Image, ImageDesc> = [
+            (0x300, desc(1485, 835, rgba, all)),
+            (0x400, desc(2560, 1440, rgba, all)),
+            (0x100, desc(1485, 835, rgba, all)),
+            (0x200, desc(1485, 835, vk::Format::R32_UINT, all)),
+            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, all)),
+            (0x500, desc(640, 384, rgba, all)),
+        ]
+        .into_iter()
+        .map(|(raw, d)| (img(raw), d))
+        .collect();
+        // In parameter order, not by handle: the colour has the higher handle here.
+        let named: Vec<vk::Image> = [0x300, 0x400, 0x100, 0x200, 0x610, 0x610, 0x610, 0x500].map(img).to_vec();
+        assert_eq!(input_launch(&images, &named), Some(InputLaunch::Inputs { colour: img(0x300), depth: img(0x200), mvec: img(0x100) }));
+        let mut third = images.clone();
+        third.insert(img(0x310), desc(1485, 835, rgba, all));
+        assert_eq!(input_launch(&third, &[named.clone(), vec![img(0x310)]].concat()), None, "three: which two?");
+        let mut depths = images.clone();
+        depths.insert(img(0x210), desc(1485, 835, vk::Format::R32_SFLOAT, all));
+        assert_eq!(input_launch(&depths, &[named.clone(), vec![img(0x210)]].concat()), None, "two depths");
+        let mut differ = images.clone();
+        differ.insert(img(0x100), desc(1485, 835, rgba, all & !vk::ImageUsageFlags::COLOR_ATTACHMENT));
+        assert_eq!(input_launch(&differ, &named), None, "usage tells them apart: the render-target form's business");
+    }
+
     fn gta_registered() -> BTreeMap<u64, (vk::Image, ImageDesc)> {
         let rgba = vk::Format::R16G16B16A16_SFLOAT;
         let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
@@ -9626,6 +9754,7 @@ mod tests {
             exposure_input: None,
             mvec_input: None,
             mvec_extent,
+            mv_units: None,
             depth_input: None,
             identification: 1,
             hazard: Hazard::MemoryBarrier,
@@ -9635,6 +9764,50 @@ mod tests {
         assert_eq!(point((1708, 964)).mvec_scale(), [1.0, 1.0]);
         assert_eq!(point((2560, 1440)).mvec_scale(), [1708.0 / 2560.0, 964.0 / 1440.0]);
         assert_eq!(point((0, 0)).mvec_scale(), [1.0, 1.0]);
+    }
+
+    /// The motion vectors' units from a SR input launch's words 1 and 5 (#49), as three games give them: GTA V Enhanced
+    /// (render pixels), Hogwarts Legacy (output pixels at a 1708x964 render size) and Cyberpunk 2077 (fractions of
+    /// the frame at 1485x835). A launch's scale wins over the extents; other kernels and implausible words give none.
+    #[test]
+    fn the_input_launch_says_what_the_motion_vectors_are_measured_in() {
+        let word = |x: f32, y: f32| -> [u8; 8] { (u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32)).to_le_bytes() };
+        let words = |scale: (f32, f32), ratio: (f32, f32)| -> Vec<[u8; 8]> {
+            let mut w = vec![[0u8; 8]; 8];
+            w[1] = word(scale.0, scale.1);
+            w[5] = word(ratio.0, ratio.1);
+            w
+        };
+        let near =
+            |got: Option<[f32; 2]>, want: [f32; 2]| got.is_some_and(|g| (g[0] - want[0]).abs() < 0.01 * want[0] && (g[1] - want[1]).abs() < 0.01 * want[1]);
+        let input = "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel";
+        let gta = mv_units_scale(input, &words((1.7239056, 1.7224879), (0.5800781, 0.58055556)));
+        assert!(near(gta, [1.0, 1.0]), "{gta:?}");
+        let hogwarts = mv_units_scale("hiluma_engine_input_depthinv_mvhi_hdr_v2_rel", &words((1.0, 1.0), (0.6671875, 0.66736114)));
+        assert!(near(hogwarts, [1708.0 / 2560.0, 964.0 / 1440.0]), "{hogwarts:?}");
+        let cyberpunk = mv_units_scale(input, &words((2560.0, 1440.0), (0.5800781, 0.5798611)));
+        assert!(near(cyberpunk, [1485.0, 835.0]), "{cyberpunk:?}");
+        assert_eq!(mv_units_scale("cuda_engine_input_kernel", &words((2560.0, 1440.0), (0.58, 0.58))), None, "another family");
+        assert_eq!(mv_units_scale(input, &words((f32::NAN, 1.0), (0.58, 0.58))), None);
+        assert_eq!(mv_units_scale(input, &words((1.0, 1.0), (0.0, 0.58))), None, "no ratio");
+        assert_eq!(mv_units_scale(input, &words((1e9, 1.0), (0.58, 0.58))), None, "too large");
+        assert_eq!(mv_units_scale(input, &[[0u8; 8]; 3]), None, "too few words");
+        let point = InlinePoint {
+            colour: vk::Image::null(),
+            desc: ImageDesc { width: 1485, height: 835, format: vk::Format::R16G16B16A16_SFLOAT, usage: vk::ImageUsageFlags::STORAGE, plain: true },
+            layout: vk::ImageLayout::GENERAL,
+            exposure_input: None,
+            mvec_input: None,
+            mvec_extent: (1485, 835),
+            mv_units: cyberpunk,
+            depth_input: None,
+            identification: 1,
+            hazard: Hazard::MemoryBarrier,
+            hold: placement::Hold::ALL_BEFORE,
+            guessed: Guessed::default(),
+        };
+        assert!(near(Some(point.mvec_scale()), [1485.0, 835.0]), "the launch's word over the extents' 1");
+        assert_eq!(InlinePoint { mv_units: None, ..point }.mvec_scale(), [1.0, 1.0]);
     }
 
     /// The hold copies the identified motion vectors only while DLSS's latest input launch names them:

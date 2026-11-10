@@ -1719,6 +1719,24 @@ A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neit
   refusals"). Splitting ahead of the barrier was not done: proving nothing before it writes the input would need
   hooks on every draw.
 
+## November 10: Cyberpunk 2077 before the upscaler again, and DLSS's motion-vector unit (3.14.0, issue #49)
+
+- **What:** a user's Cyberpunk 2077 never got the model before the upscaler ("waiting for DLSS input"). On the rig the
+  game's current version names, in its SR input launch (`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`), the colour
+  (1485x835 RGBA16F, parameter 21), DLSS's output (22), the motion vectors as a second 1485x835 **RGBA16F** image (23;
+  RG16F in October) and the depth as R32_UINT (24). vkd3d-proton gives every image the same usage, so Metro's
+  four-channel rule (colour a render target, motion vectors storage) could not tell them apart and nothing was
+  identified. Now two same-usage RGBA16F images at the depth's extent are read in parameter order, colour first.
+  A dump of four holds confirmed it: the frame, a smooth camera-rotation field, inverted depth.
+- **The motion vectors' unit:** Cyberpunk's are fractions of the frame (consecutive colour inputs line up when
+  warped by 1485 times their value, not 1), while the hold assumed pixels, so the network's history would barely have
+  moved. Word 1 of the input kernel's parameters times word 5 is the factor into the colour input's pixels in all
+  three games measured: GTA V 1.724 x 0.580 = 1, Hogwarts Legacy 1 x 0.667 = 0.667 (the value measured in October
+  from aligned frames), Cyberpunk 2560 x 0.580 = 1485. The hold inside DLSS's buffer now takes it from the launch,
+  the extents rule only without one. The split hold (GTA) is unchanged.
+- **Measured:** Cyberpunk's benchmark, 1440p, DLSS Auto, FG 3x: about 2,600 holds inside DLSS's buffer per run, 0
+  misses, the log says 1485 x 835, no Xid.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

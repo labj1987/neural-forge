@@ -2093,6 +2093,7 @@ mod tests {
                 exposure_input: aux(self.exposure, vk::Format::R16_SFLOAT),
                 mvec_input: aux(self.mvec, vk::Format::R16G16_SFLOAT),
                 mvec_extent: (W, H),
+                mv_units: None,
                 depth_input: None,
                 identification: 1,
                 hazard: Hazard::MemoryBarrier,

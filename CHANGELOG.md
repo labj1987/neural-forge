@@ -28,6 +28,13 @@ first shipped them; their phase is kept as a subheading.
   model on every frame. Before, only the frames in one of those images were worked on, and the others flickered
   through unedited while the camera moved.
 
+- Cyberpunk 2077 has the model before the upscaler again (with Placement on Auto). A game update hands DLSS its
+  motion vectors in a four-channel image, which Neural Forge did not recognise, so every frame went to DLSS
+  untouched and the model ran on the finished frame.
+- In games that give DLSS their motion vectors as fractions of the frame rather than in pixels (Cyberpunk 2077),
+  the model's history now follows the motion. Neural Forge reads the motion vectors' unit from what the game tells
+  DLSS instead of assuming pixels; before, the history barely moved with the picture.
+
 **A steadier picture on the finished frame**
 
 - With the model on the finished frame (no DLSS, or the Placement setting "At present"), it now carries its result
