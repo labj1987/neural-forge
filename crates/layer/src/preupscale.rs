@@ -1008,12 +1008,12 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
 /// DLSS Ray Reconstruction's first launch read for its colour input and motion vectors when it does not
 /// read as SR's input form ([`input_launch`]): the colour input is a [`colour_candidate`] it names that was
 /// identified as DLSS's colour input before (`known`, with its motion vectors; Ray Reconstruction running clears
-/// the identification), else its only RGBA16F one usable as a colour attachment (Hogwarts Legacy's also names two
-/// R11G11B10 attachments), else its only colour attachment, else the first of the RGBA16F images at the depth's
-/// extent in parameter order ([`rr_in_parameter_order`]); the motion vectors the known ones where it names them,
-/// else the second of those RGBA16F images when the colour is the first, else the [`MVEC_FORMATS`] image nearest
-/// its extent; the depth a depth-like image at the motion vectors' extent, or none (the hold after DLSS reads no
-/// depth).
+/// the identification, not this evidence), else its only RGBA16F one usable as a colour attachment (Hogwarts Legacy's
+/// also names two R11G11B10 attachments), else its only colour attachment, else the first of the RGBA16F images at the
+/// depth's extent in parameter order ([`rr_in_parameter_order`]); the motion vectors the known ones where it names
+/// them, else the second of those RGBA16F images when the parameter order gave the colour, else the [`MVEC_FORMATS`]
+/// image nearest its extent, else that second image when the colour is the first; the depth a depth-like image at the
+/// motion vectors' extent, or none (the hold after DLSS reads no depth).
 fn rr_input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], known: &[(vk::Image, vk::Image)]) -> Option<InputLaunch> {
     let desc = |i: &vk::Image| images.get(i).copied();
     let candidates: Vec<vk::Image> = named.iter().copied().filter(|i| desc(i).is_some_and(|d| colour_candidate(&d))).collect();
@@ -1026,17 +1026,22 @@ fn rr_input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], 
     };
     let ordered = rr_in_parameter_order(images, named);
     let known_colour = candidates.iter().copied().find(|i| known.iter().any(|(c, _)| c == i));
-    let colour = known_colour.or_else(|| only(&rgba)).or_else(|| only(&attachments)).or(ordered.map(|(c, _)| c))?;
+    let by_rule = known_colour.or_else(|| only(&rgba)).or_else(|| only(&attachments));
+    let colour = by_rule.or(ordered.map(|(c, _)| c))?;
     let cd = desc(&colour)?;
     let known_mvec = known.iter().find(|(c, m)| *c == colour && named.contains(m)).map(|(_, m)| *m);
     let ordered_mvec = ordered.filter(|(c, _)| *c == colour).map(|(_, m)| m);
-    let mvec = known_mvec.or(ordered_mvec).or_else(|| {
+    let nearest = || {
         named
             .iter()
             .copied()
             .filter(|i| desc(i).is_some_and(|d| d.plain && MVEC_FORMATS.contains(&d.format)))
             .min_by_key(|i| desc(i).map_or(u64::MAX, |d| u64::from(d.width.abs_diff(cd.width)) + u64::from(d.height.abs_diff(cd.height))))
-    })?;
+    };
+    // The second RGBA16F image is the motion vectors only where the parameter order gave the colour too: a colour
+    // found by another rule may be the first RGBA16F image by chance, beside Ray Reconstruction's guide buffers
+    // (albedo, specular, normals) in the same format. Then it is a last resort, where no motion-vector format is named.
+    let mvec = known_mvec.or(ordered_mvec.filter(|_| by_rule.is_none())).or_else(nearest).or(ordered_mvec)?;
     let md = desc(&mvec)?;
     let depth = named
         .iter()
@@ -1505,8 +1510,10 @@ pub(crate) struct DlssOutput {
 }
 
 /// Whether two buffers' DLSS outputs are the same output: the same kernel writing an image of the same
-/// extent and format from an input of the same extent in as many launches, Ray Reconstruction's or not (the
-/// handles may alternate frame by frame).
+/// extent and format from an input of the same extent with motion vectors of the same extent and format, in
+/// as many launches, Ray Reconstruction's or not (the handles may alternate frame by frame). Motion vectors of
+/// another kind are another reading of the buffer (Ray Reconstruction's launch read with other known inputs,
+/// [`rr_input_launch`]): the hold after it waits until that is learnt.
 fn same_output(a: &DlssOutput, b: &DlssOutput, images: &HashMap<vk::Image, ImageDesc>) -> bool {
     let kind = |i: &vk::Image| images.get(i).map(|d| (d.width, d.height, d.format));
     let extent = |i: &vk::Image| images.get(i).map(|d| (d.width, d.height));
@@ -1516,6 +1523,7 @@ fn same_output(a: &DlssOutput, b: &DlssOutput, images: &HashMap<vk::Image, Image
         && kind(&a.image).is_some()
         && kind(&a.image) == kind(&b.image)
         && extent(&a.input) == extent(&b.input)
+        && kind(&a.mvec) == kind(&b.mvec)
 }
 
 /// Submitted DLSS buffers in a row naming the same output kernel and kind of output image ([`same_output`])
@@ -11461,6 +11469,56 @@ mod tests {
         }
         assert_eq!(t.dlss_output.map(|o| o.writes), Some(6));
         assert_eq!(short(&mut t, cb(3)), 1);
+    }
+
+    /// Ray Reconstruction's first launch whose colour input is known from Super Resolution and happens to be the first
+    /// of the RGBA16F images at the depth's extent, beside a guide buffer (albedo, specular, normals) of the same format
+    /// and usage: the motion vectors are the motion-vector image it names, not the guide buffer the parameter-order rule
+    /// would read as them. The parameter order gives them only with the colour, or where no motion-vector format is named.
+    #[test]
+    fn ray_reconstruction_guide_buffer_is_not_taken_for_motion_vectors() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let u = vkd3d_usage();
+        let set = set_of(&[
+            (0x100, desc(1485, 835, rgba, u)),
+            (0x120, desc(1485, 835, rgba, u)),
+            (0x210, desc(1485, 835, vk::Format::R32_SFLOAT, u)),
+            (0x300, desc(1485, 835, vk::Format::R16G16_SFLOAT, u)),
+            (0x900, desc(1485, 835, vk::Format::R16G16_SFLOAT, u)),
+        ]);
+        let t = tracker_with(&set, Some((2560, 1440)));
+        let named: Vec<vk::Image> = [0x100, 0x120, 0x210, 0x300].iter().map(|&r| img(r)).collect();
+        // The colour known from Super Resolution, its motion vectors not named by this launch.
+        assert_eq!(
+            rr_input_launch(&t.images, &named, &[(img(0x100), img(0x900))]),
+            Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x300) })
+        );
+        // Known with its motion vectors named: those.
+        let with_known: Vec<vk::Image> = named.iter().copied().chain([img(0x900)]).collect();
+        assert_eq!(
+            rr_input_launch(&t.images, &with_known, &[(img(0x100), img(0x900))]),
+            Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x900) })
+        );
+        // The colour from the parameter order: the second RGBA16F image, as in Cyberpunk 2077.
+        assert_eq!(rr_input_launch(&t.images, &named, &[]), Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x120) }));
+        // Known colour and no motion-vector format named: the parameter order is the last resort.
+        let no_rg: Vec<vk::Image> = [0x100, 0x120, 0x210].iter().map(|&r| img(r)).collect();
+        assert_eq!(
+            rr_input_launch(&t.images, &no_rg, &[(img(0x100), img(0x900))]),
+            Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x120) })
+        );
+        // A buffer read with motion vectors of another kind is another output: the hold after it waits until it is learnt.
+        let o = DlssOutput {
+            function: vk::CuFunctionNVX::from_raw(9),
+            image: img(0x100),
+            input: img(0x100),
+            depth: img(0x210),
+            mvec: img(0x300),
+            rr: true,
+            writes: 1,
+        };
+        assert!(same_output(&o, &DlssOutput { mvec: img(0x900), ..o }, &t.images), "other motion vectors of the same kind");
+        assert!(!same_output(&o, &DlssOutput { mvec: img(0x120), ..o }, &t.images), "a guide buffer's kind");
     }
 
     /// (a) GTA V with DLSS Frame Generation: SR's buffer (input kernel naming colour, depth and
