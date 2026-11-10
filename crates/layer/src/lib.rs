@@ -16,6 +16,7 @@
 //! filter additionally excludes small overlays. See docs/HARDWARE_VALIDATION.md for
 //! presentation-validation failures still under review.
 
+mod added_usage;
 mod breadcrumbs;
 mod capture;
 mod composition;
@@ -730,6 +731,8 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         if !(layer_enabled() && ownership::eligible()) {
             return LayerResult::Unhandled;
         }
+        // From the first device the layer works on, a panic leaves its message in the log (`logging`).
+        logging::install_panic_hook();
         let Some(instance) = self.ctx.clone() else {
             return LayerResult::Unhandled;
         };

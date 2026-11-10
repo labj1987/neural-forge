@@ -397,6 +397,8 @@ pub(crate) struct Inline {
     /// The hold's buffers were submitted on more than one queue: no more holds are recorded (their work
     /// shares the stage's resources and must run one after another).
     stopped: AtomicBool,
+    /// The first hold recorded into one of DLSS's buffers on this device was said ([`Self::record_outcome`]).
+    first_recorded: AtomicBool,
     said: Mutex<HashSet<String>>,
     /// The shared memory's header once the device's state opened it ([`watch_switch`]): the model's
     /// switch (F11, the GUI), read at every launch so nothing is recorded while it is off.
@@ -456,13 +458,16 @@ impl Inline {
             harvest: Mutex::new(Vec::new()),
             outstanding,
             stopped: AtomicBool::new(false),
+            first_recorded: AtomicBool::new(false),
             said: Mutex::new(HashSet::new()),
             switch: AtomicPtr::new(std::ptr::null_mut()),
             restore: Arc::new(super::restore::Tracker::new(restore)),
         });
         lock(&INLINES).insert(device.handle(), inline.clone());
+        // Said apart from the first hold actually recorded ("first hold recorded into DLSS's command buffer"):
+        // this line comes at device creation, before anything is identified or held.
         crate::log!(
-            "[preupscale] hold inside DLSS's command buffer available: recorded into it, on family {app_family} (NEURAL_FORGE_INLINE=off turns it off)"
+            "[preupscale] hold inside DLSS's command buffer available on this device (family {app_family}); nothing is held yet (NEURAL_FORGE_INLINE=off turns it off)"
         );
         crate::logging::flush();
         inline
@@ -976,6 +981,17 @@ impl Inline {
                 slot.recorded = Some(Instant::now());
                 s.by_cb.entry(cb).or_default().push(index);
                 drop(s);
+                if !self.first_recorded.swap(true, Ordering::Relaxed) {
+                    // Flushed at once: a crash from here on (the game submitting the buffer) still shows it.
+                    crate::log!(
+                        "[preupscale] first hold recorded into DLSS's command buffer on this device: {}x{} {:?}, {}; it runs when the game submits that buffer",
+                        extent.0,
+                        extent.1,
+                        point.desc.format,
+                        if stage == Stage::Upscaled { "after DLSS's output" } else { "before the upscaler" }
+                    );
+                    crate::logging::flush();
+                }
                 self.say_once(format!(
                     "holding inside DLSS's command buffer, {} ({:?} in {:?}{}; why not the split: {:?}; motion vectors {})",
                     match stage {

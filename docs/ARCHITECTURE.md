@@ -534,7 +534,14 @@ only, `NEURAL_FORGE_PREUPSCALE=off` creates every image as asked). Colour candid
 RGBA16F or B10G11R11 images with `SAMPLED` or `STORAGE`) get `TRANSFER_SRC | TRANSFER_DST`, which the
 hold inside DLSS's buffer copies its colour input with: a native Vulkan game creates its images with the
 usage it needs and nothing more (Indiana Jones and the Great Circle, #51). Never an image whose memory
-is shared; the memory-requirements queries by create info are answered for the same usage.
+is shared, and only where the added usage leaves the image's memory requirements (size, alignment, memory
+types) as they would have been (`added_usage.rs`): an engine that places its images in its own heaps (id Tech)
+sizes and aliases them by those numbers. Each create info is judged once (one with a `pNext` chain each time):
+by the application's own `vkGetDeviceImageMemoryRequirements` query for it where it makes one, else by creating
+the image both ways, comparing and destroying the one not kept (Vulkan 1.0 calls only). On a difference the
+image is created as asked, which the log says once per format and usage with both sets of numbers
+(`[preupscale] adding ... changes its memory requirements (as asked: ...; with it: ...)`). The
+memory-requirements queries by create info are answered for the create info the image is made with.
 
 **The cache dump** (`preupscale::cache_dump`) writes K consecutive model-mode holds for the offline
 replay of the edit cache (`scripts/cache_replay.py`). Requests: `neural-forge-cli shmctl dump-cache
@@ -987,6 +994,12 @@ is the newer write and stays. Each bound row learns its setting's name from its 
 Everything fails open: a missing model, a network that will not build, a late answer, an
 unsupported swapchain, a submit the layer cannot split, or a Vulkan error means the frame goes on
 untouched. Every fence wait the layer can hit is bounded (5 s, `FENCE_WAIT_TIMEOUT`); a timeout is
-logged once with a breadcrumb trail (`crates/layer/src/breadcrumbs.rs`). `VK_ERROR_DEVICE_LOST`
+logged once with a breadcrumb trail (`crates/layer/src/breadcrumbs.rs`). The layer is built with
+`panic = "abort"`; from the first device it works on, its panic hook (`logging::install_panic_hook`) writes
+`[panic] the layer panicked on thread '...' at <file:line:col>: <message>; ...` with the breadcrumb trail into
+the log and waits for it to be written (straight to the file when the log's writer thread does not answer, or
+is the one that panicked) before the standard hook and the abort. The first split hold that wrote back, the
+first hold recorded into DLSS's buffer and the first such hold read back once its buffer ran are each logged
+once and flushed, so a crash can be placed before or after them. `VK_ERROR_DEVICE_LOST`
 latches the layer off and stamps the header's `device_lost_at`, so the Status tab and `doctor`
 can say so without a log; the state log records it too.

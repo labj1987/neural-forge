@@ -6414,6 +6414,10 @@ pub(crate) struct Session {
     /// Launch-bearing submits a due dump waited for the depth and motion-vector layouts.
     dump_waits: u32,
     said: HashSet<&'static str>,
+    /// The first split hold that wrote back, and the first hold recorded into DLSS's buffer that was read back
+    /// (it ran), were said ([`Self::note_first_split`], [`Self::harvest`]).
+    first_split_said: bool,
+    first_inside_ran_said: bool,
     /// Until when the after-the-upscaler path keeps off slot 0: hold resources were left behind
     /// without a fence ([`Self::recover_unfenced`]), and their write-back may still read it.
     post_held_off_until: Option<Instant>,
@@ -6703,6 +6707,21 @@ impl Session {
         }
     }
 
+    /// After a split hold that wrote back: the first one on this device is said, and flushed at once (a crash
+    /// right after it still shows it).
+    pub(crate) fn note_first_split(&mut self, extent: (u32, u32), native: bool) {
+        if !self.first_split_said {
+            self.first_split_said = true;
+            crate::log!(
+                "[preupscale] first split hold written back on this device: {}x{} ({}); the game's DLSS submit follows it",
+                extent.0,
+                extent.1,
+                if native { "the network ran" } else { "a diagnostic mode" }
+            );
+            crate::logging::flush();
+        }
+    }
+
     /// Logs `what` once per process-session for this device.
     pub(crate) fn say_once(&mut self, what: &'static str) {
         note_refusal(Refusal::Text(what.into()));
@@ -6824,6 +6843,11 @@ impl Session {
     pub(crate) fn harvest(&mut self, h: inline::Harvest) {
         if let Some(frame) = h.cache_frame {
             self.cache_dump.after_hold(None, true, Some(frame));
+        }
+        if !self.first_inside_ran_said {
+            self.first_inside_ran_said = true;
+            crate::log!("[preupscale] the first hold recorded into DLSS's command buffer ran (its buffer finished on the GPU and was read back)");
+            crate::logging::flush();
         }
         let Some(res) = self.res_inline(h.meta.stage).as_mut().filter(|r| r.id == h.meta.resources) else { return };
         let word = |at: u64, k: usize| {

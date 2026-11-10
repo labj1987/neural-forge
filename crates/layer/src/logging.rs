@@ -157,21 +157,88 @@ pub fn log(args: Arguments<'_>) {
 /// what was still queued -- including one-time milestones like device/swapchain creation that matter
 /// far more than steady-state logging.
 pub fn flush() {
+    flush_confirmed();
+}
+
+/// [`flush`], saying whether the writer confirmed it wrote everything queued before it (`false`: the queue
+/// was full, the wait ran out, or the direct sink's lock was taken).
+fn flush_confirmed() -> bool {
     match logger() {
         Logger::Queued(sender) => {
             let done: Done = Arc::default();
             if sender.try_send(Message::Flush(done.clone())).is_err() {
-                return;
+                return false;
             }
             let (flag, wake) = &*done;
             let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = wake.wait_timeout_while(guard, FLUSH_WAIT, |written| !*written);
+            wake.wait_timeout_while(guard, FLUSH_WAIT, |written| !*written).is_ok_and(|(written, _)| *written)
         }
-        Logger::Direct(sink) => {
-            if let Ok(mut sink) = sink.lock() {
+        Logger::Direct(sink) => match sink.try_lock() {
+            Ok(mut sink) => {
                 sink.flush();
+                true
             }
-        }
+            Err(_) => false,
+        },
+    }
+}
+
+/// Installs, once per process, a panic hook that writes the panic's message, where it happened and the
+/// breadcrumbs' trail into the layer's log and waits for it to be written before the process aborts (the
+/// layer is built with `panic = "abort"`: without it, a panic in a game left only the lines the writer had
+/// already written, and the message went to a stderr nobody keeps). The hook it replaces (the standard one,
+/// which prints to stderr) runs after it. Only in a process that opted in (`NEURAL_FORGE_ENABLE`): the hook
+/// is process-wide for this copy of the standard library.
+pub fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            log_panic(info);
+            previous(info);
+        }));
+    });
+}
+
+/// The panic hook's own work ([`install_panic_hook`]). Never panics (a panic inside a panic hook aborts at
+/// once) and never waits on a lock the panicking thread may hold: the breadcrumbs and the direct sink are
+/// only tried. A panic on the writer thread itself, or a writer that does not answer within [`FLUSH_WAIT`],
+/// gets the line written straight to the log file (or stderr).
+fn log_panic(info: &std::panic::PanicHookInfo<'_>) {
+    thread_local! {
+        static IN_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    // A panic while this thread is already in the hook (it would abort anyway) writes nothing more.
+    if IN_HOOK.try_with(|h| h.replace(true)).unwrap_or(true) {
+        return;
+    }
+    let line = panic_line(info, std::thread::current().name(), crate::breadcrumbs::try_trail().as_deref());
+    log(format_args!("{line}"));
+    if !flush_confirmed() {
+        write_now(&format!("[neural-forge-layer] {line}\n"));
+    }
+    let _ = IN_HOOK.try_with(|h| h.set(false));
+}
+
+/// The panic's log line (without the prefix): the thread, where, the message and the breadcrumbs' trail.
+fn panic_line(info: &std::panic::PanicHookInfo<'_>, thread: Option<&str>, trail: Option<&str>) -> String {
+    let message = info.payload_as_str().unwrap_or("(no message)");
+    let at = info.location().map_or_else(|| "an unknown place".to_string(), |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+    format!(
+        "[panic] the layer panicked on thread '{}' at {at}: {message}; the game aborts now (last stage markers, newest first: {})",
+        thread.unwrap_or("unnamed"),
+        trail.filter(|t| !t.is_empty()).unwrap_or("none")
+    )
+}
+
+/// Writes `line` to the log file (`NEURAL_FORGE_LOG`) or stderr at once, past the writer thread: the panic
+/// hook's fallback ([`log_panic`]).
+fn write_now(line: &str) {
+    let path = neural_forge_protocol::env::var("NEURAL_FORGE_LOG").filter(|p| !p.is_empty() && neural_forge_protocol::isolated_path(p));
+    if let Some(mut file) = path.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok()) {
+        let _ = file.write_all(line.as_bytes());
+    } else {
+        let _ = std::io::stderr().write_all(line.as_bytes());
     }
 }
 
@@ -243,6 +310,49 @@ mod tests {
         assert!(current.ends_with("line 09\n"), "{current:?}");
         assert!(rotated.contains("line 0") && !rotated.contains("line 09"), "{rotated:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A panic in a process with the hook installed ([`install_panic_hook`]) leaves its message, where it
+    /// happened and the breadcrumbs' trail in the log file before the process ends, and the hook it replaced
+    /// still runs (the standard one's "panicked at" on stderr). Run in a child process (this test binary,
+    /// [`panic_hook_child`] only), whose panic must not touch the other tests' hook.
+    #[test]
+    fn a_panic_is_written_to_the_log_before_the_process_ends() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(format!("target/test-scratch/panic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("layer.log");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["logging::tests::panic_hook_child", "--exact", "--nocapture", "--test-threads=1"])
+            .env("NEURAL_FORGE_TEST_PANIC_CHILD", "1")
+            .env("NEURAL_FORGE_LOG", &path)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "the child panicked");
+        let log = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(log.contains("[neural-forge-layer] [test] a line before the panic\n"), "{log}");
+        let line = log.lines().find(|l| l.contains("[panic]")).unwrap_or_else(|| panic!("no panic line in {log:?}"));
+        assert!(line.starts_with("[neural-forge-layer] [panic] the layer panicked on thread 'logging::tests::panic_hook_child' at "), "{line}");
+        assert!(line.contains("logging.rs:") && line.contains(": the child's own panic 42;"), "{line}");
+        assert!(line.contains("newest first: test-child-stage"), "{line}");
+        assert_eq!(log.matches("[panic]").count(), 1, "{log}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("the child's own panic 42"), "the standard hook ran after it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The child of [`a_panic_is_written_to_the_log_before_the_process_ends`]: does nothing unless it is that
+    /// child.
+    #[test]
+    fn panic_hook_child() {
+        if std::env::var_os("NEURAL_FORGE_TEST_PANIC_CHILD").is_none() {
+            return;
+        }
+        install_panic_hook();
+        crate::breadcrumbs::mark("test-child-stage");
+        log(format_args!("[test] a line before the panic"));
+        let n = std::hint::black_box(42);
+        panic!("the child's own panic {n}");
     }
 
     /// A flush returns once what was logged before it is written, and never waits past its bound.

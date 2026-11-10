@@ -413,6 +413,12 @@ everything under `~/.local/share/neural-forge` (the model, an imported DLL, capt
   says each reason once: `[preupscale] no hold inside DLSS's buffer (identification N): <why>; colour input ...`
   when the hold inside DLSS's own command buffer refuses the frame, and `[preupscale] <why>; not holding` when
   the hold that splits the game's submission does. Attach **Save report**'s zip and that log to an issue.
+- **The game crashes with Neural Forge on.** Run it with `NEURAL_FORGE_LOG=/path` (and `NEURAL_FORGE_LOG_TIME=1`)
+  in the launch options and attach that log. If Neural Forge itself failed, its last line starts with
+  `[panic]` and says where. Otherwise the last milestone lines say how far it got: `first hold recorded into
+  DLSS's command buffer` (the model's work was put into the game's own DLSS work), `the first hold recorded into
+  DLSS's command buffer ran` (that work ran on the GPU), or `first split hold written back`. A
+  `hold inside DLSS's command buffer available on this device` line alone means nothing was held yet.
 - **Steam overlay problems.** The layer leaves the overlay's own small swapchain alone, and only the
   executables in `NEURAL_FORGE_TARGET_EXE` (which switching a game on sets) can use Neural Forge.
 - **"Installing the layer for Steam games failed: refusing to overwrite ..."** A file Neural Forge

@@ -195,6 +195,9 @@ pub struct NeuralForgeDeviceInfo {
     /// The pre-upscaler path's state, apart from the present's ([`HoldState`]).
     hold: Arc<Mutex<HoldState>>,
     tracker: Mutex<TapTracker>,
+    /// Whether the transfer usage the pre-upscaler path adds keeps an image's memory requirements, by create
+    /// info (`added_usage`).
+    added_usage: crate::added_usage::AddedUsage,
     /// Which queue family a `VkQueue` handle belongs to -- learned by observing the
     /// app's own `vkGetDeviceQueue`/`vkGetDeviceQueue2` calls (see those hooks below),
     /// since Vulkan has no query that answers this for a handle after the fact. Needed
@@ -1498,6 +1501,33 @@ unsafe fn relay_app_waits(
 }
 
 impl NeuralForgeDeviceInfo {
+    /// Whether the image `asked` describes is created with the added usage (`copyable`): the verdict reached
+    /// for it before, else the requirements of the two create infos compared (`added_usage`), so that this
+    /// query and `create_image` answer for the same image.
+    ///
+    /// # Safety
+    /// `next` is the next layer's `vkGetDeviceImageMemoryRequirements` (or its KHR alias), which the
+    /// application is calling with `info` (so it is enabled on this device).
+    unsafe fn added_usage_kept(
+        &self,
+        next: vk::PFN_vkGetDeviceImageMemoryRequirements,
+        info: &vk::DeviceImageMemoryRequirements,
+        asked: &vk::ImageCreateInfo,
+        copyable: &vk::ImageCreateInfo,
+    ) -> bool {
+        if let Some(kept) = self.added_usage.cached(asked) {
+            return kept;
+        }
+        let query = |create: &vk::ImageCreateInfo| {
+            let mut out = vk::MemoryRequirements2::default();
+            let query = vk::DeviceImageMemoryRequirements { p_create_info: create, ..*info };
+            // SAFETY: the contract; `out` has no chain.
+            unsafe { next(self.device.handle(), &query, &mut out) };
+            out.memory_requirements
+        };
+        self.added_usage.judge(asked, copyable, query(asked), query(copyable))
+    }
+
     pub fn new(
         instance: Option<Arc<ash::Instance>>,
         surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
@@ -1691,6 +1721,7 @@ impl NeuralForgeDeviceInfo {
             state,
             hold,
             tracker: Mutex::new(TapTracker::default()),
+            added_usage: Default::default(),
             queue_families: Default::default(),
             tap_sources: Default::default(),
             timeline_semaphores: Default::default(),
@@ -2109,6 +2140,7 @@ impl NeuralForgeDeviceInfo {
             session.note_exposure_source(scan.identification, &inputs, &hold);
             if hold.wrote_back {
                 crate::preupscale::note_held_split();
+                session.note_first_split(extent, hold.native);
             }
             session.note(shm, &hold, cpu, extent);
             if let Some(frame) = hold.dump.take() {
@@ -2892,7 +2924,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     ) -> LayerResult<()> {
         let Some(next) = self.next_image_requirements.filter(|_| self.preupscale.is_some()) else { return LayerResult::Unhandled };
         // SAFETY: the application's query: a valid create info.
-        let Some(create) = copyable_create_info(unsafe { &*info.p_create_info }) else { return LayerResult::Unhandled };
+        let asked = unsafe { &*info.p_create_info };
+        let Some(create) = copyable_create_info(asked) else { return LayerResult::Unhandled };
+        // SAFETY: `next` is the application's own (enabled) query.
+        if !unsafe { self.added_usage_kept(next, info, asked, &create) } {
+            return LayerResult::Unhandled;
+        }
         let query = vk::DeviceImageMemoryRequirements { p_create_info: &create, ..*info };
         // SAFETY: the next layer's command with the application's query, but for that usage bit.
         unsafe { next(self.device.handle(), &query, requirements.as_mut_ptr()) };
@@ -2907,7 +2944,18 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     ) -> LayerResult<()> {
         let Some(next) = self.next_image_sparse_requirements.filter(|_| self.preupscale.is_some()) else { return LayerResult::Unhandled };
         // SAFETY: as above.
-        let Some(create) = copyable_create_info(unsafe { &*info.p_create_info }) else { return LayerResult::Unhandled };
+        let asked = unsafe { &*info.p_create_info };
+        let Some(create) = copyable_create_info(asked) else { return LayerResult::Unhandled };
+        // The image's own (non-sparse) requirements decide, as for `create_image`; without that query here, the
+        // verdict reached for it before (none yet: as asked, which `create_image` then judges for itself).
+        let kept = match self.next_image_requirements {
+            // SAFETY: the core command (or the KHR one) beside the sparse one the application is calling.
+            Some(requirements) => unsafe { self.added_usage_kept(requirements, info, asked, &create) },
+            None => self.added_usage.cached(asked).unwrap_or(false),
+        };
+        if !kept {
+            return LayerResult::Unhandled;
+        }
         let query = vk::DeviceImageMemoryRequirements { p_create_info: &create, ..*info };
         let out = requirements.map_or(std::ptr::null_mut(), |r| r.as_mut_ptr().cast());
         // SAFETY: as above; `count` and `out` are the application's, as the two-call idiom has them.
@@ -2957,23 +3005,48 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // Never to an image whose memory is shared with another API or process (an external-memory
         // chain: its usage is part of what the other side agreed to), and an image the driver refuses
         // with the bit is created exactly as the application asked.
+        // The usage is added only where it keeps the image's memory requirements (`added_usage`: an engine that
+        // places its images in its own heaps sizes and aliases them by those).
         let copyable = self.preupscale.as_ref().and_then(|_| copyable_create_info(create_info));
-        let added = copyable.is_some();
-        let mut info = copyable.unwrap_or(*create_info);
-        // SAFETY: `next` is the next layer/driver's own `vkCreateImage`; `info` (with
-        // its whole pNext chain) and the allocator are the application's, passed unchanged but
-        // for that usage bit.
-        let mut result = unsafe { next(self.device.handle(), &info, alloc_ptr, &mut image) };
-        if result != vk::Result::SUCCESS && added {
-            image = vk::Image::null();
-            info = *create_info;
-            // SAFETY: as above, with the application's own create info.
-            result = unsafe { next(self.device.handle(), &info, alloc_ptr, &mut image) };
-        }
+        let info = match copyable {
+            Some(copyable) => {
+                let create = |info: &vk::ImageCreateInfo| {
+                    let mut image = vk::Image::null();
+                    // SAFETY: `next` is the next layer/driver's own `vkCreateImage`; `info` (with its whole pNext
+                    // chain) and the allocator are the application's, passed unchanged but for that usage.
+                    let result = unsafe { next(self.device.handle(), info, alloc_ptr, &mut image) };
+                    if result == vk::Result::SUCCESS {
+                        Ok(image)
+                    } else {
+                        Err(result)
+                    }
+                };
+                // SAFETY: an image made just above, never seen by the application, destroyed with its allocator.
+                let destroy = |image: vk::Image| unsafe { (self.device.fp_v1_0().destroy_image)(self.device.handle(), image, alloc_ptr) };
+                // SAFETY: an image made just above.
+                let requirements = |image: vk::Image| unsafe { self.device.get_image_memory_requirements(image) };
+                match self.added_usage.create(create_info, &copyable, &create, &destroy, &requirements) {
+                    (Ok(made), added) => {
+                        image = made;
+                        if added {
+                            copyable
+                        } else {
+                            *create_info
+                        }
+                    }
+                    (Err(e), _) => return LayerResult::Handled(Err(e)),
+                }
+            }
+            None => {
+                // SAFETY: `next` is the next layer/driver's own `vkCreateImage` with the application's arguments.
+                let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut image) };
+                if result != vk::Result::SUCCESS {
+                    return LayerResult::Handled(Err(result));
+                }
+                *create_info
+            }
+        };
         let create_info = &info;
-        if result != vk::Result::SUCCESS {
-            return LayerResult::Handled(Err(result));
-        }
         self.tracker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record_image(image, create_info);
         crate::probe_ngx::on_create_image(image, create_info);
         if let Some(t) = &self.preupscale {

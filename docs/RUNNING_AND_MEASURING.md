@@ -372,9 +372,11 @@ Set in the game's launch environment (for `gta-bench.sh`, as extra arguments):
 
 Where DLSS's buffer renders its own input (Crimson Desert, Cyberpunk 2077) the whole hold is recorded
 into that buffer as the game records it (PRE_UPSCALER_DESIGN.md, "The hold inside DLSS's command
-buffer"). Its lines: `hold inside DLSS's command buffer available: recorded into it, on family N` per
-device, `noting the application's compute state from here on ...` at the first hold point (that
-buffer, begun before, is not held), then `holding inside DLSS's command buffer ...` once; every 5 s `inside DLSS's buffer, last
+buffer"). Its lines: `hold inside DLSS's command buffer available on this device (family N); nothing is held
+yet` per device at its creation, `noting the application's compute state from here on ...` at the first hold
+point (that buffer, begun before, is not held), then `first hold recorded into DLSS's command buffer on this
+device: WxH ...` and `holding inside DLSS's command buffer ...` once, `the first hold recorded into DLSS's
+command buffer ran` once its buffer finished on the GPU; every 5 s `inside DLSS's buffer, last
 5.0 s: held N, ran M, ...` (holds recorded, holds whose buffers ran, and each reason a hold point got
 none, such as `waiting for the holds recorded in DLSS's buffers ...` while a change waits for the
 buffers recorded before it); the 300-hold summaries are the ordinary ones, with `hold_ms` the CPU time

@@ -14,6 +14,9 @@ first shipped them; their phase is kept as a subheading.
   model ran on the finished frame.
 - Games whose frame moves DLSS's colour input out of the general layout in a command buffer just before DLSS's own
   (and back after it) no longer fall between both ways of holding the frame, which left every frame unedited.
+- Images whose memory needs would change with the copy usage Neural Forge adds are created exactly as the game asks: an engine
+  that places its images in its own memory (id Tech, Indiana Jones and the Great Circle) relies on those needs.
+  The game's log says so once, with the numbers.
 
 **A steadier picture on the finished frame**
 
@@ -36,6 +39,15 @@ first shipped them; their phase is kept as a subheading.
   input's format, size or layout, a render pass left open across DLSS), with the image it was.
 - The log's periodic count of DLSS submissions now also says how many frames were actually worked on, by each way
   of holding them, instead of only how many named DLSS's input.
+
+**Diagnosing crashes**
+
+- If Neural Forge itself fails inside a game, the game's log (`NEURAL_FORGE_LOG`) now ends with a `[panic]` line
+  saying what failed and where, instead of stopping at whatever was last written.
+- The log says when the model's work was first put into DLSS's own command buffer and when that work first ran,
+  and when the first frame was worked on before DLSS otherwise, each written out at once, so a crash can be
+  placed before or after them. The line at start-up that said the hold inside DLSS's command buffer is
+  "available" now also says nothing is held yet.
 
 **Captures**
 

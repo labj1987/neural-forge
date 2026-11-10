@@ -1663,6 +1663,21 @@ Not built. A face pass would also need a detector with a licence that fits (SCRF
 - **Lesson:** for temporal stability, measure what is shown (the composited picture, motion-compensated, against the
   original's own change), never a difference that is meant to change.
 
+## November 10: #51, a crash with no last words
+
+- **Indiana Jones and the Great Circle crashed with no Xid** on the 3.14.0 test build, which gives DLSS's possible
+  colour inputs copy usage at creation. The last line the reporter had, `hold inside DLSS's command buffer
+  available ...`, is written at device creation, not by a hold, and it was the last one only because the log is
+  written by a thread with a queue and a release build aborts on a panic without a word: whatever was queued,
+  and any panic message, was lost. Now a panic hook writes the panic with its place and the breadcrumbs and waits
+  for it (`[panic] ...`), the first hold recorded into DLSS's buffer, the first such hold read back after its
+  buffer ran and the first split hold each get a flushed line, and the start-up line says nothing is held yet.
+- **The added usage and id Tech's heaps.** id Tech places and aliases its render targets in its own memory by the
+  requirements it learns; a driver may give an image with `TRANSFER_SRC | TRANSFER_DST` other ones (a different
+  compression layout). The usage is now kept only where the requirements are the same, judged once per create
+  info by the application's own `vkGetDeviceImageMemoryRequirements` query or by creating the image both ways.
+  Whether this was Indiana's crash is not known (no log reached the layer's last lines); the next log will say:
+  a `[panic]` line, an `adding ... changes its memory requirements` line, or neither.
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
