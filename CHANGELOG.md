@@ -35,6 +35,13 @@ first shipped them; their phase is kept as a subheading.
   the model's history now follows the motion. Neural Forge reads the motion vectors' unit from what the game tells
   DLSS instead of assuming pixels; before, the history barely moved with the picture.
 
+- Red Dead Redemption 2 (Vulkan) has the model before the upscaler with DLSS on. Three things kept the model out of
+  it, and every Vulkan game like it: its instance asks for Vulkan 1.1 (Neural Forge now creates it for 1.3, which
+  the model needs; `NEURAL_FORGE_RAISE_VULKAN=off` keeps the game's), it uses the older buffer-address extension
+  (the model now uses that one's feature), and it takes every compute queue of the GPU (the model now shares one of
+  the game's, with every use of it synchronized; `NEURAL_FORGE_SHARE_QUEUE=off` turns that off). Where the queue is
+  shared, the model runs before the upscaler only, not on the finished frame.
+
 **A steadier picture on the finished frame**
 
 - Games whose Vulkan swapchain carries a single-GPU device-group description (Red Dead Redemption 2) now get the

@@ -7805,6 +7805,17 @@ impl Session {
                 return;
             }
             let (Some(loader), Some(view)) = (self.native.clone(), shm.view()) else { return };
+            // The network's queue is the application's, shared (`crate::shared_queue`): no after-the-upscaler server.
+            // Its frames are waited for at the present, and on that queue they run behind the application's own work,
+            // which can wait on what the application does only after that present: Red Dead Redemption 2 froze at its
+            // loading screen. The holds before the upscaler record into DLSS's buffer and never wait there.
+            if loader.setup().shared.is_some() {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::log!("[native] no model on the finished frame on this device: its queue is shared with the application, and a frame waited for there could wait on the application itself; the model runs before the upscaler only");
+                }
+                return;
+            }
             self.post_server = native_post::PostServer::start(device.clone(), instance.clone(), physical_device, loader.setup(), import, loader, view);
         }
         #[cfg(not(target_arch = "x86_64"))]

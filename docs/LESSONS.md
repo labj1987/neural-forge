@@ -1737,6 +1737,30 @@ A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neit
 - **Measured:** Cyberpunk's benchmark, 1440p, DLSS Auto, FG 3x: about 2,600 holds inside DLSS's buffer per run, 0
   misses, the log says 1485 x 835, no Xid.
 
+## November 10: Red Dead Redemption 2 (Vulkan) before the upscaler (3.14.0, issue #49)
+
+- **What kept the model out:** three refusals in a row, each found from the game's own log on the rig. (1) The
+  instance asks for Vulkan 1.1 (and 1.0 for a second one); the network needs a 1.3 instance. The layer now creates
+  such an instance for 1.3 (drivers keep an older application's behaviour; DXVK and vkd3d-proton ask for 1.3
+  themselves), falling back to the game's request if refused. (2) The device enables VK_EXT_buffer_device_address,
+  which excludes the core feature the network asked for; the network now enables the extension's feature instead
+  (the kernels' PhysicalStorageBufferAddresses allows either), allocates without the core-only
+  VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT and takes addresses through vkGetBufferDeviceAddressEXT. (3) The game asks for
+  all 8 queues of the compute-only family; the graphics family stays out (its Xid history). The network now shares
+  the application's last compute-only queue (`shared_queue`): the application's submit, wait-idle, sparse-bind,
+  present and label calls on it and the network's own submits (Rust, and the C++ side through a lock callback) take
+  one re-entrant lock around the bare driver call only, so it is always the innermost lock.
+- **A freeze found on the way:** with the queue shared, the after-the-upscaler server's frames (waited for at the
+  present) ran behind the game's own work on that queue, which waits on what the game does after that present: the
+  game froze at its loading screen, no Xid. A first suspicion (the lock held across the whole submit hook, taking the
+  hold's lock inside) was real and fixed, but not the cause. The finished frame stays off on a shared queue; the
+  holds record into DLSS's buffer on the graphics queue and never wait on the shared one.
+- **Measured:** RDR2, 1440p, DLSS Quality, Story mode in the world (launched through Steam with its Proton-GE): the
+  hold inside DLSS's buffer from the second frame (the learned launch layout, SHADER_READ_ONLY_OPTIMAL), 0 misses over
+  90 s, hold 0.8-1.4 ms, 81 fps against 125 without the model, no Xid.
+- **Testing lesson:** launch games for tests through Steam (or with exactly the Proton Steam maps them to). A direct
+  launch with another Proton broke the game's Rockstar launcher for the user.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

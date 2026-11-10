@@ -134,6 +134,11 @@ pub(crate) struct Setup {
     pub properties2: crate::vram::Properties2,
     /// The optical-flow queue (`NEURAL_FORGE_POST_MOTION=flow` on a device that has one; `native_post`).
     pub flow: Option<super::post_flow::FlowQueue>,
+    /// `family`/`index` (and `post_index`, the same queue then) is the application's, shared: every submit to it
+    /// holds this lock ([`crate::shared_queue`]).
+    pub shared: Option<&'static crate::shared_queue::SharedQueue>,
+    /// The application enables `VK_EXT_buffer_device_address` (Red Dead Redemption 2): the network uses its feature.
+    pub bda_ext: bool,
 }
 
 #[cfg(test)]
@@ -150,6 +155,8 @@ impl Setup {
             post_index: 1,
             properties2: crate::vram::Properties2::default(),
             flow: None,
+            shared: None,
+            bda_ext: false,
         }
     }
 }
@@ -802,6 +809,10 @@ impl Loader {
             chain: chain_wanted() && chain,
             fence_timeout_ms: crate::FENCE_WAIT_TIMEOUT.as_millis() as u32,
             init_dispatchable: Some(init_dispatchable),
+            // The application's queue, shared: every submit and queue wait on that side under its lock.
+            queue_lock: setup.shared.map(|_| crate::shared_queue::c_lock as nn::QueueLock),
+            queue_user: setup.shared.map_or(std::ptr::null_mut(), crate::shared_queue::SharedQueue::as_user),
+            buffer_device_address_ext: setup.bda_ext,
         };
         let t = Instant::now();
         // SAFETY: the device was created with the network's additions, and the queue is the loader's
@@ -5111,6 +5122,8 @@ mod tests {
             post_index: 0,
             properties2: crate::vram::Properties2::None,
             flow: None,
+            shared: None,
+            bda_ext: false,
         };
         let loader = Loader::start(vk::Device::null(), setup, Arc::default(), true);
         // No hold for longer than the path switch: the post path may claim.
@@ -5145,6 +5158,8 @@ mod tests {
             post_index: 0,
             properties2: crate::vram::Properties2::None,
             flow: None,
+            shared: None,
+            bda_ext: false,
         };
         let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader = Loader::start(vk::Device::null(), setup, holds.clone(), true);
@@ -5187,6 +5202,8 @@ mod tests {
             post_index: 0,
             properties2: crate::vram::Properties2::None,
             flow: None,
+            shared: None,
+            bda_ext: false,
         };
         use std::sync::atomic::Ordering::SeqCst;
         let loader = Loader::for_test(setup, vec![built((64, 32), 1, network::FULL)], Arc::default(), Box::new(|_, _| {}));

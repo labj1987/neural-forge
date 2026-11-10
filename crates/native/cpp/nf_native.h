@@ -87,6 +87,13 @@ typedef struct NfNativeOpen {
   // buffers), to set the loader's dispatch pointer; null outside a layer.
   void (*init_dispatchable)(void* user, VkDevice device, void* object);
   void* init_user;
+  // When the queue is the application's, shared (the layer had none to spare): called with 1 before and 0 after every
+  // vkQueueSubmit and vkQueueWaitIdle on it, never around a fence wait. Null: the queue is the layer's own.
+  void (*queue_lock)(void* user, int lock);
+  void* queue_user;
+  // 1: the device was created with VK_EXT_buffer_device_address (nf_native_device_extend then enables its feature,
+  // not the core one): no VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, addresses through vkGetBufferDeviceAddressEXT.
+  uint32_t buffer_device_address_ext;
 } NfNativeOpen;
 
 // Uploads the model's records, builds the kernels. Slow (seconds): run off the game's

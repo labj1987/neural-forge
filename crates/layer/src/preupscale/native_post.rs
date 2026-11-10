@@ -257,6 +257,8 @@ struct PostLut {
 /// The per-request GPU objects.
 struct Gpu {
     queue: vk::Queue,
+    /// `queue` is the application's, shared: its submits hold this lock (`crate::shared_queue`).
+    shared: Option<&'static crate::shared_queue::SharedQueue>,
     set_layout: vk::DescriptorSetLayout,
     layouts: [vk::PipelineLayout; 2],
     pipelines: [vk::Pipeline; 2],
@@ -451,6 +453,7 @@ impl Gpu {
         unsafe {
             step(0)?;
             g.gpu.queue = device.get_device_queue(setup.family, setup.post_index);
+            g.gpu.shared = setup.shared;
             crate::loader_data::initialize_queue(device.handle(), g.gpu.queue).ok()?;
             let binding = |n: u32| {
                 vk::DescriptorSetLayoutBinding::default()
@@ -533,6 +536,7 @@ impl Gpu {
     fn empty(setup: Setup) -> Self {
         Self {
             queue: vk::Queue::null(),
+            shared: None,
             set_layout: vk::DescriptorSetLayout::null(),
             layouts: [vk::PipelineLayout::null(); 2],
             pipelines: [vk::Pipeline::null(); 2],
@@ -1470,7 +1474,13 @@ unsafe fn evaluate(
         submit = submit.wait_semaphores(std::slice::from_ref(sem)).wait_dst_stage_mask(&wait_stages);
     }
     // SAFETY: the fence is the layer's own and idle; the queue is this thread's alone.
-    let submitted = unsafe { device.reset_fences(&[gpu.fence]).and_then(|()| device.queue_submit(gpu.queue, &[submit], gpu.fence)) };
+    let submitted = unsafe {
+        device.reset_fences(&[gpu.fence]).and_then(|()| {
+            // The application's queue when shared (`crate::shared_queue`): the submit under its lock, the wait after it not.
+            let _shared = gpu.shared.map(|q| q.guard());
+            device.queue_submit(gpu.queue, &[submit], gpu.fence)
+        })
+    };
     if crate::note_vk(device.handle(), submitted).is_err() {
         if waits.is_some() {
             // The flow ran (or runs) with nothing waiting for it: its queue drains, and the flow is not used again.
@@ -1573,7 +1583,13 @@ unsafe fn convert_hdr10(device: &ash::Device, gpu: &mut Gpu, s: usize, proxy_reg
     }
     let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
     // SAFETY: the fence is the layer's own and idle; the queue is this thread's alone.
-    let submitted = unsafe { device.reset_fences(&[gpu.fence]).and_then(|()| device.queue_submit(gpu.queue, &[submit], gpu.fence)) };
+    let submitted = unsafe {
+        device.reset_fences(&[gpu.fence]).and_then(|()| {
+            // The application's queue when shared (`crate::shared_queue`): the submit under its lock, the wait after it not.
+            let _shared = gpu.shared.map(|q| q.guard());
+            device.queue_submit(gpu.queue, &[submit], gpu.fence)
+        })
+    };
     if crate::note_vk(device.handle(), submitted).is_err() {
         return false;
     }
@@ -1619,7 +1635,10 @@ unsafe fn flow_submits(device: &ash::Device, gpu: &Gpu, s: usize) -> Result<vk::
         device.end_command_buffer(fd.upload).map_err(|e| format!("{e:?}"))?;
         session.record_flow(device, fd)?;
         let upload = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&fd.upload)).signal_semaphores(std::slice::from_ref(&fd.uploaded));
-        device.queue_submit(gpu.queue, &[upload], vk::Fence::null()).map_err(|e| format!("the upload's submit: {e:?}"))?;
+        {
+            let _shared = gpu.shared.map(|q| q.guard());
+            device.queue_submit(gpu.queue, &[upload], vk::Fence::null()).map_err(|e| format!("the upload's submit: {e:?}"))?;
+        }
         session.uploaded();
         let stage = [vk::PipelineStageFlags::ALL_COMMANDS];
         let flow = vk::SubmitInfo::default()
@@ -2058,6 +2077,8 @@ mod tests {
             post_index: 0,
             properties2: crate::vram::Properties2::None,
             flow: None,
+            shared: None,
+            bda_ext: false,
         };
         // Objects that exist when each step fails (the sets and the command buffer go with their pools).
         let before = [0, 0, 1, 2, 3, 4, 5, 6, 6, 7, 7];
@@ -2099,6 +2120,8 @@ mod tests {
             post_index: 0,
             properties2: crate::vram::Properties2::None,
             flow: None,
+            shared: None,
+            bda_ext: false,
         };
         const W: u32 = 16;
         const H: u32 = 16;
@@ -2292,6 +2315,8 @@ mod tests {
             post_index: 0,
             properties2: crate::vram::Properties2::None,
             flow: None,
+            shared: None,
+            bda_ext: false,
         };
         let table = |generation: u64, size: usize| Arc::new(super::super::colour::Lut { generation, cube: neural_forge_protocol::cube::Cube::identity(size) });
         // SAFETY: a live test device whose queue 0 of `family` exists; nothing is submitted.
@@ -2391,6 +2416,8 @@ mod tests {
                 post_index: 0,
                 properties2: crate::vram::Properties2::None,
                 flow: None,
+                shared: None,
+                bda_ext: false,
             };
             // SAFETY: a live test device; every object below is destroyed in Drop after the device idles.
             unsafe {

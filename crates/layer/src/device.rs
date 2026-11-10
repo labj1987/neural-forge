@@ -173,6 +173,14 @@ pub struct NeuralForgeDeviceInfo {
     next_get_swapchain_images_khr: Option<vk::PFN_vkGetSwapchainImagesKHR>,
     next_get_device_queue: Option<vk::PFN_vkGetDeviceQueue>,
     next_get_device_queue2: Option<vk::PFN_vkGetDeviceQueue2>,
+    /// The application's queue the network shares ([`crate::shared_queue`]) and its lock: the hooks below hold it
+    /// for the application's calls on that queue.
+    shared_queue: Option<(vk::Queue, &'static crate::shared_queue::SharedQueue)>,
+    /// The next layer's queue commands the layer forwards itself on the shared queue (under its lock).
+    next_queue_wait_idle: Option<vk::PFN_vkQueueWaitIdle>,
+    next_queue_bind_sparse: Option<vk::PFN_vkQueueBindSparse>,
+    next_queue_labels:
+        (Option<vk::PFN_vkQueueBeginDebugUtilsLabelEXT>, Option<vk::PFN_vkQueueEndDebugUtilsLabelEXT>, Option<vk::PFN_vkQueueInsertDebugUtilsLabelEXT>),
     next_create_image: Option<vk::PFN_vkCreateImage>,
     /// The next layer's `vkGetDeviceImageMemoryRequirements` and its sparse variant (core, else the KHR
     /// names), resolved with the pre-upscaler tracking: answered for the usage `create_image` adds.
@@ -1646,8 +1654,18 @@ impl NeuralForgeDeviceInfo {
         // The game's graphics family, where DLSS's buffers run: the network's frame family.
         #[cfg(target_arch = "x86_64")]
         let mut frame_family = None;
+        let mut shared_queue = None;
         #[cfg(target_arch = "x86_64")]
         if let Some(setup) = crate::take_native(handle) {
+            // The application's queue the network shares: the same handle the application gets for it.
+            if let (Some(shared), Some(get)) = (setup.shared, get_queue) {
+                let mut queue = vk::Queue::null();
+                // SAFETY: the next layer's `vkGetDeviceQueue` for this device, for a queue its creation asked for.
+                unsafe { get(handle, shared.family, shared.index, &mut queue) };
+                if queue != vk::Queue::null() {
+                    shared_queue = Some((queue, shared));
+                }
+            }
             // Also without DLSS's tracking (no VK_NVX_image_view_handle): the after-the-upscaler path
             // uses the network too (`preupscale::native_post`). Nothing loads until a path asks.
             if nvidia && active {
@@ -1701,6 +1719,17 @@ impl NeuralForgeDeviceInfo {
             next_get_swapchain_images_khr: get_images,
             next_get_device_queue: get_queue,
             next_get_device_queue2: get_queue2,
+            shared_queue,
+            // SAFETY: names resolved from the device's own next-layer gdpa, typed as those commands.
+            next_queue_wait_idle: unsafe { resolve(next_get_device_proc_addr, handle, c"vkQueueWaitIdle") },
+            next_queue_bind_sparse: unsafe { resolve(next_get_device_proc_addr, handle, c"vkQueueBindSparse") },
+            next_queue_labels: unsafe {
+                (
+                    resolve(next_get_device_proc_addr, handle, c"vkQueueBeginDebugUtilsLabelEXT"),
+                    resolve(next_get_device_proc_addr, handle, c"vkQueueEndDebugUtilsLabelEXT"),
+                    resolve(next_get_device_proc_addr, handle, c"vkQueueInsertDebugUtilsLabelEXT"),
+                )
+            },
             next_create_image: create_image,
             // SAFETY: names resolved from the device's own next-layer gdpa, typed as those commands.
             next_image_requirements: preupscale_mode
@@ -2190,6 +2219,12 @@ impl DeviceInfo for NeuralForgeDeviceInfo {
             VulkanCommand::CmdExecuteCommands,
             VulkanCommand::QueueSubmit,
             VulkanCommand::QueueSubmit2,
+            // Forwarded untouched but on the queue the network shares, where they are locked (`crate::shared_queue`).
+            VulkanCommand::QueueWaitIdle,
+            VulkanCommand::QueueBindSparse,
+            VulkanCommand::QueueBeginDebugUtilsLabelExt,
+            VulkanCommand::QueueEndDebugUtilsLabelExt,
+            VulkanCommand::QueueInsertDebugUtilsLabelExt,
         ]
     }
 
@@ -2748,6 +2783,49 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
+    fn queue_wait_idle(&self, queue: vk::Queue) -> LayerResult<ash::prelude::VkResult<()>> {
+        let (Some(next), Some(_shared)) = (self.next_queue_wait_idle, crate::shared_queue::guard_if(self.shared_queue, queue)) else {
+            return LayerResult::Unhandled;
+        };
+        // SAFETY: the application's own call, forwarded unchanged, under the shared queue's lock.
+        LayerResult::Handled(unsafe { next(queue) }.result())
+    }
+
+    fn queue_bind_sparse(&self, queue: vk::Queue, binds: &[vk::BindSparseInfo], fence: vk::Fence) -> LayerResult<ash::prelude::VkResult<()>> {
+        let (Some(next), Some(_shared)) = (self.next_queue_bind_sparse, crate::shared_queue::guard_if(self.shared_queue, queue)) else {
+            return LayerResult::Unhandled;
+        };
+        // SAFETY: as above; `binds` is the application's array.
+        LayerResult::Handled(unsafe { next(queue, binds.len() as u32, binds.as_ptr(), fence) }.result())
+    }
+
+    fn queue_begin_debug_utils_label_ext(&self, queue: vk::Queue, label: &vk::DebugUtilsLabelEXT) -> LayerResult<()> {
+        let (Some(next), Some(_shared)) = (self.next_queue_labels.0, crate::shared_queue::guard_if(self.shared_queue, queue)) else {
+            return LayerResult::Unhandled;
+        };
+        // SAFETY: as above.
+        unsafe { next(queue, label) };
+        LayerResult::Handled(())
+    }
+
+    fn queue_end_debug_utils_label_ext(&self, queue: vk::Queue) -> LayerResult<()> {
+        let (Some(next), Some(_shared)) = (self.next_queue_labels.1, crate::shared_queue::guard_if(self.shared_queue, queue)) else {
+            return LayerResult::Unhandled;
+        };
+        // SAFETY: as above.
+        unsafe { next(queue) };
+        LayerResult::Handled(())
+    }
+
+    fn queue_insert_debug_utils_label_ext(&self, queue: vk::Queue, label: &vk::DebugUtilsLabelEXT) -> LayerResult<()> {
+        let (Some(next), Some(_shared)) = (self.next_queue_labels.2, crate::shared_queue::guard_if(self.shared_queue, queue)) else {
+            return LayerResult::Unhandled;
+        };
+        // SAFETY: as above.
+        unsafe { next(queue, label) };
+        LayerResult::Handled(())
+    }
+
     fn queue_submit(&self, queue: vk::Queue, submits: &[vk::SubmitInfo], fence: vk::Fence) -> LayerResult<ash::prelude::VkResult<()>> {
         if crate::probe_ngx::enabled() {
             crate::probe_ngx::on_submit(
@@ -2776,6 +2854,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let built = crate::preupscale::build1(batches);
                 // SAFETY: `built` owns every array its infos point at and outlives the call; the
                 // queue is the application's, externally synchronized for its `vkQueueSubmit`.
+                // On the queue the network shares, only the call itself holds its lock: never another lock of the
+                // layer's (the hold's state is taken around this), so the lock order is always the same.
+                let _shared = crate::shared_queue::guard_if(self.shared_queue, queue);
                 unsafe { (device.fp_v1_0().queue_submit)(queue, built.infos.len() as u32, built.infos.as_ptr(), fence) }
             };
             // SAFETY: `submits` is the application's own, valid for this call.
@@ -2789,7 +2870,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // Forwarded by the layer itself, not the framework, so that the result is known: a
         // submission the next layer refused executed nothing, and must not advance tracked state.
         // SAFETY: the application's own arguments, passed on unchanged to the next layer.
-        let result = unsafe { (device.fp_v1_0().queue_submit)(queue, submits.len() as u32, submits.as_ptr(), fence) };
+        let result = {
+            // The queue the network shares: the call alone under its lock.
+            let _shared = crate::shared_queue::guard_if(self.shared_queue, queue);
+            unsafe { (device.fp_v1_0().queue_submit)(queue, submits.len() as u32, submits.as_ptr(), fence) }
+        };
         if result == vk::Result::SUCCESS {
             self.inline_submitted(queue, buffers());
             self.commit_submitted(buffers());
@@ -2837,6 +2922,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let infos = crate::preupscale::build2(batches);
                 // SAFETY: `infos` points into `batches`, both alive for the call; `next` is the next
                 // layer's `vkQueueSubmit2`; the queue is externally synchronized by the caller.
+                let _shared = crate::shared_queue::guard_if(self.shared_queue, queue);
                 unsafe { next(queue, infos.len() as u32, infos.as_ptr(), fence) }
             };
             // SAFETY: `submits` is the application's own, valid for this call.
@@ -2849,7 +2935,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         }
         // As in `queue_submit`: forwarded here so that a refused submission advances nothing.
         // SAFETY: the application's own arguments, passed on unchanged to the next layer.
-        let result = unsafe { next(queue, submits.len() as u32, submits.as_ptr(), fence) };
+        let result = {
+            // The queue the network shares: the call alone under its lock.
+            let _shared = crate::shared_queue::guard_if(self.shared_queue, queue);
+            unsafe { next(queue, submits.len() as u32, submits.as_ptr(), fence) }
+        };
         if result == vk::Result::SUCCESS {
             self.inline_submitted(queue, buffers());
             self.commit_submitted(buffers());
@@ -3639,6 +3729,16 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next_present) = self.next_queue_present_khr else {
             return LayerResult::Unhandled;
         };
+        // A present on the queue the network shares: forwarded under its lock with nothing of the layer's (its work
+        // here would wait on the network, which waits on the lock). Never seen: games present on their graphics queue.
+        if let Some(_shared) = crate::shared_queue::guard_if(self.shared_queue, queue) {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!("[layer] the application presents on the queue the network shares: those presents go out untouched");
+            }
+            // SAFETY: the application's own arguments, forwarded unchanged to the next layer, under the queue's lock.
+            return LayerResult::Handled(unsafe { next_present(queue, present_info) }.result());
+        }
         // Set by `capture::run` only when `composition::gpu::GpuCompose::present_temporal_delta_async`
         // wrote this frame's composited result asynchronously -- see that function's
         // own doc comment. When `Some`, the real present call below *must* wait on it,
