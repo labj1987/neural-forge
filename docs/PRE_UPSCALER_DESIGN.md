@@ -1890,7 +1890,13 @@ input, depth and motion vectors.
   colour input, depth and motion vectors. The layer also records the 1x1 `R16_SFLOAT` image the same
   buffer names, if any. GTA's SR buffer ends with `cuda_copy_exposure_kernel` on DLSS's 1x1
   exposure input. The evidence is kept per colour image (at most 4) and dropped when one of its
-  images is destroyed.
+  images is destroyed, or when no input launch has named its colour image for 64 launch-bearing
+  submits (`SR_RECENT`; logged: `no input launch named colour input 0x... in 64 launch-bearing
+  submits: dropped as evidence`). Loading a save in Cyberpunk 2077 (#49) can hand DLSS a new set of
+  images while the old set stays registered (alive, or only its views destroyed): the old entry stayed
+  forever beside the new one, two evaluations with an exposure each, so none was chosen, the size
+  rule (which Cyberpunk's RGBA16F motion vectors never meet) found nothing, and the status stayed
+  "waiting for DLSS input" until the game was restarted.
 - **Settling.** A decision is taken only after 16 launch-bearing submits without new evidence
   (`SETTLE_SUBMITS`), and again when the registered set or the swapchains change after that. With
   FG there are 2 (GTA 3x) to about 5 (Crimson Desert 6x) FG submits per real frame. So a few real

@@ -31,6 +31,9 @@ first shipped them; their phase is kept as a subheading.
 - Cyberpunk 2077 has the model before the upscaler again (with Placement on Auto). A game update hands DLSS its
   motion vectors in a four-channel image, which Neural Forge did not recognise, so every frame went to DLSS
   untouched and the model ran on the finished frame.
+- When a game replaces DLSS's input images while the old ones stay alive (a loaded save can do that), Neural Forge
+  now finds the new input again. Before, the old images' traces could keep it waiting for DLSS's input until the
+  game was restarted.
 - In games that give DLSS their motion vectors as fractions of the frame rather than in pixels (Cyberpunk 2077),
   the model's history now follows the motion. Neural Forge reads the motion vectors' unit from what the game tells
   DLSS instead of assuming pixels; before, the history barely moved with the picture.
