@@ -14,9 +14,14 @@ first shipped them; their phase is kept as a subheading.
   model ran on the finished frame.
 - Games whose frame moves DLSS's colour input out of the general layout in a command buffer just before DLSS's own
   (and back after it) no longer fall between both ways of holding the frame, which left every frame unedited.
-- Images whose memory needs would change with the copy usage Neural Forge adds are created exactly as the game asks: an engine
-  that places its images in its own memory (id Tech, Indiana Jones and the Great Circle) relies on those needs.
-  The game's log says so once, with the numbers.
+- Images whose memory needs would change with the copy usage Neural Forge adds are created exactly as the game
+  asks: an engine that places its images in its own memory (id Tech, Indiana Jones and the Great Circle) relies on
+  those needs. The game's log says so once, with the numbers.
+- Games that hand DLSS a frame they already brightened, with a very small exposure value beside it (Clair Obscur:
+  Expedition 33), no longer get a white fog over the picture and a line down its right edge with Model brightness
+  on Game: within about half a second Neural Forge notices that the game's exposure would make the model's
+  picture far too dark, measures the brightness from the frame instead and says so in the game's log (`the
+  colour input looks pre-exposed`).
 
 **A steadier picture on the finished frame**
 

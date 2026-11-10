@@ -1665,6 +1665,8 @@ Not built. A face pass would also need a detector with a licence that fits (SCRF
 
 ## November 10: #51, a crash with no last words
 
+## November 10: #51, a crash with no last words and a frame the game already exposed
+
 - **Indiana Jones and the Great Circle crashed with no Xid** on the 3.14.0 test build, which gives DLSS's possible
   colour inputs copy usage at creation. The last line the reporter had, `hold inside DLSS's command buffer
   available ...`, is written at device creation, not by a hold, and it was the last one only because the log is
@@ -1678,6 +1680,23 @@ Not built. A face pass would also need a detector with a licence that fits (SCRF
   info by the application's own `vkGetDeviceImageMemoryRequirements` query or by creating the image both ways.
   Whether this was Indiana's crash is not known (no log reached the layer's last lines); the next log will say:
   a `[panic]` line, an `adding ... changes its memory requirements` line, or neither.
+- **Clair Obscur: Expedition 33's white fog** with Model brightness on Game. Unreal Engine 5 hands DLSS its colour
+  pre-exposed (near display brightness) with its eye-adaptation texel (0.0078-0.019 in the reporter's log) and the
+  pre-exposure as an NGX parameter, which a Vulkan layer under Proton does not see. Multiplying the texel in, as
+  is right for GTA V (scene-referred, median about 6, exposure 0.15-0.34), put the frame 7-9 stops below the
+  network's brightness, and the decode multiplied the network's change back up by as much: fog (and, likely, the
+  line at the right edge, which went with it under Auto). Auto lifted it at most 16x (4 stops), so at high
+  strengths some fog stayed. Now the auto-exposure measures beside the game's exposure on every hold (only its state, the picture
+  unchanged: GTA V's holds stay bit for bit), and a frame the game's exposure puts more than 5 stops below the
+  key while the frame itself is within 3 stops of it, 30 holds in a row, is measured from the frame for that
+  identification, without the 16x bound. Crimson Desert's daytime frame (about 3.7 stops below with its exposure,
+  which is why Auto exists) stays under the 5 stops, and a dark scene-referred frame fails the second test.
+- **The line down the right edge** was not traced to an input subrect: the layer reads no render size from DLSS's
+  launch parameters (DLSS_KERNEL_CATALOGUE.md lists words that may hold it, measured only where the image was the
+  render size), so it cannot feed the network less than the image. The reporter saw it go with Auto; it should go
+  with the fog. If it stays, `NEURAL_FORGE_PROBE_PARAMS=1` would show whether DLSS is given 1485x835 inside the
+  1488x836 image.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

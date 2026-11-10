@@ -77,8 +77,31 @@ pub(crate) struct ExposurePush {
     pub rate: f32,
     /// `uint pass`: 0 the histogram, 1 the resolve.
     pub pass: u32,
-    /// `uint relative`: 1 keeps the e within [`LIFT_LO`]..[`LIFT_HI`] of the game's in the exposure buffer.
+    /// `uint relative`: [`AutoUse`] as a number: 0 the measured e is the one used, 1 it is kept within
+    /// [`LIFT_LO`]..[`LIFT_HI`] of the game's in the exposure buffer, 2 only the state is written.
     pub relative: u32,
+}
+
+/// What the auto-exposure's resolve does with the e it measured ([`ExposurePush::relative`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoUse {
+    /// The encode uses it: the game gives no exposure, or it is not trusted.
+    Measured,
+    /// The encode uses it kept within [`LIFT_LO`]..[`LIFT_HI`] of the game's (the Model brightness setting's Auto).
+    Lift,
+    /// The encode uses the game's; the measurement is only read back, for the check whether the colour input
+    /// is already exposed (`Session::check_exposure`).
+    Observe,
+}
+
+impl AutoUse {
+    fn word(self) -> u32 {
+        match self {
+            Self::Measured => 0,
+            Self::Lift => 1,
+            Self::Observe => 2,
+        }
+    }
 }
 
 /// With the Model brightness setting's Auto where the game gives an exposure, the measured e is kept within
@@ -691,14 +714,14 @@ impl AutoExposure {
 
     /// # Safety
     /// `cmd` is recording; binding 0 holds a live view of the colour input.
-    unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, width: u32, height: u32, relative: bool) {
+    unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, width: u32, height: u32, using: AutoUse) {
         let filled = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         let counted = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-        let push = |pass: u32| ExposurePush { width, height, key: AUTO_KEY, rate: AUTO_RATE, pass, relative: u32::from(relative) };
+        let push = |pass: u32| ExposurePush { width, height, key: AUTO_KEY, rate: AUTO_RATE, pass, relative: using.word() };
         let bytes = |p: &ExposurePush| {
             // SAFETY: `ExposurePush` is `repr(C)`, plain data; read as bytes for its own size.
             unsafe { std::slice::from_raw_parts(std::ptr::from_ref(p).cast::<u8>(), std::mem::size_of::<ExposurePush>()) }.to_vec()
@@ -1068,18 +1091,24 @@ impl HdrPass {
     }
 
     /// Records the auto-exposure (histogram, then resolve into the exposure buffer) for the colour
-    /// input; [`Self::record_encode`]'s opening barrier makes its write visible to the encode. `relative`:
-    /// the game's texel was copied into the exposure buffer before (the fill barrier at the start makes it
-    /// visible), and the e written is kept within [`LIFT_LO`]..[`LIFT_HI`] of it.
+    /// input; [`Self::record_encode`]'s opening barrier makes its write visible to the encode. With
+    /// [`AutoUse::Lift`] or [`AutoUse::Observe`] the game's texel was copied into the exposure buffer before
+    /// (the fill barrier at the start makes it visible): the e written is kept within [`LIFT_LO`]..[`LIFT_HI`]
+    /// of it, or the buffer is left as it is.
     /// Returns `false` (nothing recorded) when the pass is not built.
     ///
     /// # Safety
     /// `cmd` is recording; [`Self::bind_colour`] was called for this hold.
-    pub(crate) unsafe fn record_auto_exposure(&self, device: &ash::Device, cmd: vk::CommandBuffer, relative: bool) -> bool {
+    pub(crate) unsafe fn record_auto_exposure(&self, device: &ash::Device, cmd: vk::CommandBuffer, using: AutoUse) -> bool {
         let Some(auto) = &self.auto else { return false };
         // SAFETY: forwarded.
-        unsafe { auto.record(device, cmd, self.width, self.height, relative) };
+        unsafe { auto.record(device, cmd, self.width, self.height, using) };
         true
+    }
+
+    /// Whether the auto-exposure pass is built.
+    pub(crate) fn auto_built(&self) -> bool {
+        self.auto.is_some()
     }
 
     /// Points binding 0 at a fresh view of `colour`, destroying the previous one.

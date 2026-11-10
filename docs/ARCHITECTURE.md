@@ -478,7 +478,12 @@ texel would be copied into, so the encode and the decode of a hold use the very 
 0.6 is calibrated on GTA V's own exposure (within -21% / +27% of it on both E1b dumps). The source
 is logged once per identification: `[preupscale] exposure: the game's 1x1 R16F` or `[preupscale]
 exposure: measured from the frame (auto)`, and the 300-hold summary ends with `exposure median=...
-(auto|game)`.
+(auto|game)`. Where the game gives an exposure the auto-exposure runs too, writing only its state
+(`relative` 2, `hdr::AutoUse::Observe`): `Session::check_exposure` compares the frame's measured target with
+the game's `e`, and when the game's puts the frame more than 5 stops below the key while the frame as given is
+within 3 stops of it, on 30 holds in a row (a hold under 4 stops starts the count over), the colour input is
+taken for one the game already exposed (Clair Obscur: Expedition 33, #51): that identification's holds measure
+`e` from the frame, not bounded by the game's (`[preupscale] the colour input looks pre-exposed: ...`).
 
 ### 4.7 Failures and the hand-back
 

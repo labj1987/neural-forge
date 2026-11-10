@@ -4225,6 +4225,10 @@ unsafe fn native_hold(
         if res.game_exposure_read.take() == Some(target.identification) {
             previous_exposure = res.hdr.as_ref().map(|h| h.exposure_values().1);
         }
+        // What the previous hold's auto-exposure measured (finished: waited above), with that exposure.
+        if res.auto_read.take() == Some(target.identification) {
+            result.auto_exposure = res.hdr.as_ref().and_then(hdr::HdrPass::auto_state);
+        }
     }
     if !loader.claim_pre() {
         result.miss = Some("the network is serving the after-the-upscaler path");
@@ -4303,14 +4307,18 @@ unsafe fn native_hold(
         result.miss = Some("the HDR encode/decode pipelines could not be built");
         return result;
     };
-    // Inside DLSS's buffer the auto-exposure's state is reset there, in the buffer's order.
+    // Inside DLSS's buffer the auto-exposure's state is reset there, in the buffer's order. It runs in every hold:
+    // where the game's exposure is used as it is it only measures (`ExposureSource::auto_use`), and a failed
+    // build then only leaves that out.
     let mut auto_reset = false;
-    if super::ExposureSource::measures(target) {
-        // SAFETY: `device` is live; nothing of the pass is pending.
-        if res.native_retry.auto.build(extent, now, || unsafe { pass.ensure_auto(device, instance, physical_device) }.then_some(())).is_none() {
-            result.miss = Some("the auto-exposure pipeline could not be built (no exposure image to read)");
-            return result;
-        }
+    // SAFETY: `device` is live; nothing of the pass is pending.
+    let auto_built = pass.auto_built()
+        || res.native_retry.auto.build(extent, now, || unsafe { pass.ensure_auto(device, instance, physical_device) }.then_some(())).is_some();
+    if !auto_built && super::ExposureSource::measures(target) {
+        result.miss = Some("the auto-exposure pipeline could not be built (no exposure image to read)");
+        return result;
+    }
+    if auto_built {
         if inline {
             auto_reset = pass.auto_reset_due(target.identification);
         } else {
@@ -4654,7 +4662,7 @@ unsafe fn native_hold(
         let seq = res.seq + 1;
         let stats = edit.map(super::cache::CachePass::stats_buffer);
         let auto_state = res.hdr.as_ref().and_then(hdr::HdrPass::auto_state_buffer).filter(|_| auto_reset);
-        let auto_read = res.hdr.as_ref().and_then(hdr::HdrPass::auto_state_buffer).filter(|_| super::ExposureSource::measures(target));
+        let auto_read = res.hdr.as_ref().and_then(hdr::HdrPass::auto_state_buffer);
         let scene_result = scene.map(super::scene_cut::ScenePass::result_buffer);
         // SAFETY: DLSS's buffer is being recorded on this thread (the contract); every handle is live and
         // stays so while the buffer may run (nothing is destroyed or rewritten while a hold may run).
@@ -4943,6 +4951,7 @@ unsafe fn native_hold(
         s.submitted(super::scene_cut::Recorded { network: !cached, history });
     }
     res.game_exposure_read = (source == super::ExposureSource::Game).then_some(target.identification);
+    res.auto_read = res.hdr.as_ref().is_some_and(hdr::HdrPass::auto_built).then_some(target.identification);
     // From here on something of this hold is on the queue: a failure fences what went (so the next
     // hold waits for it before it records any of those buffers again), and the network's history and
     // the cache's chain start afresh (the capture's motion pass moved the field on already).

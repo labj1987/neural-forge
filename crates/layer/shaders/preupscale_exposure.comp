@@ -26,6 +26,9 @@
 //    goes into the high 16 bits for the CPU's plausibility check; an unusable game e leaves the adapted
 //    one as it is. The state keeps the adapted e unbounded either way, so the bound does not slow the
 //    adaptation.
+//    With `relative` 2 (observe: the game's exposure is used as it is) only the state is written: the
+//    exposure buffer keeps the game's texel, and the CPU compares the frame's measured target with it
+//    (a colour input the game already exposed, Session::check_exposure).
 //
 // The CPU reference is `preupscale::hdr::auto_exposure_reference`; constants must match.
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -67,7 +70,7 @@ layout(push_constant) uniform Params {
   float key;   // the exposed luma the log-average maps to
   float rate;  // per-frame adaptation towards the target, in log2 space
   uint pass;   // 0 histogram, 1 resolve
-  uint relative; // 1: within LIFT_LO_LOG2..LIFT_HI_LOG2 of the game's e in the exposure buffer
+  uint relative; // 1: within LIFT_LO_LOG2..LIFT_HI_LOG2 of the game's e in the exposure buffer; 2: state only
 } p;
 
 shared uint s_count[BINS];
@@ -161,6 +164,9 @@ void resolve() {
   u_state.log2_e = log2_e;
   u_state.valid = 1u;
   u_state.samples = total;
+  if (p.relative == 2u) {
+    return;
+  }
   if (p.relative != 0u) {
     float game = unpackHalf2x16(u_exposure.bits).x;
     float used = log2_e;

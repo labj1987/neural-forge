@@ -139,7 +139,7 @@ and shows a moment of untouched frames while the model is prepared for the new s
 
 **Model brightness** (Model tab) sets how bright the picture the model works on is, before the upscaler and
 after DLSS; the game's own brightness is kept either way, because the picture is brought back exactly
-afterwards. **Game** (the default) uses the exposure the game gives DLSS (measured from the frame instead where a game's is always 0, or too small to use). **Auto** measures it from the frame, within half
+afterwards. **Game** (the default) uses the exposure the game gives DLSS (measured from the frame instead where a game's is always 0, or too small to use, or where the game hands DLSS a frame it already brightened and its exposure would make the model's picture far too dark: Clair Obscur: Expedition 33; the layer log says so with `the colour input looks pre-exposed`). **Auto** measures it from the frame, within half
 to 16 times the game's own so night stays night, for games that give the model a very dark picture: in daytime
 Crimson Desert's has a median brightness of 0.14 of white with Game and 0.50 with Auto. How the model treats the
 shadows changes with it, so compare the two in the game. **Model
