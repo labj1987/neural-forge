@@ -1567,3 +1567,30 @@ game driven to gameplay through its menus with a virtual pad and Ray Reconstruct
 
 The README's GUI screenshots were retaken from the 3.9.3 AppImage (Xvfb, own D-Bus session, default
 settings, dark theme, 1240x1400); only the Setup tab's content changed (the Network row's subtitle).
+
+## 2026-11-10: HDR in a nested gamescope, with and without Neural Forge (#51)
+
+A user's Stellar Blade and Indiana Jones with HDR on in the game, under gamescope 3.16.20 (`--hdr-enabled
+--hdr-debug-force-output --backend wayland`, nested in GNOME on Wayland), made only `A2B10G10R10_UNORM_PACK32
+SRGB_NONLINEAR` swapchains while gamescope logged the game's BT.2020 HDR metadata. The same gamescope (3.16.20,
+same flags) here, nested in the HDR desktop, RTX 5070, driver 615.71.09, fix-51b's layer:
+
+- `vulkaninfo` in it, with and without Neural Forge (`VK_LOADER_DEBUG=layer`: Neural Forge above
+  `VK_LAYER_FROG_gamescope_wsi`): the "Presentable Surfaces" sections are identical. A small window gamescope
+  cannot flip offers only the SDR formats: gamescope's WSI layer adds its HDR10 formats only to a surface it can
+  flip (`canBypassXWayland`) whose output is HDR.
+- Cyberpunk 2077 (vkd3d-proton, Proton-GE) `-benchmark` at 2560x1440 in it, `DXVK_HDR=1`, HDR10 PQ in the game
+  (UserSettings.json for the run, restored byte for byte), with Neural Forge: gamescope's `Creating swapchain ...
+  format: VK_FORMAT_A2B10G10R10_UNORM_PACK32 - colorspace: VK_COLOR_SPACE_HDR10_ST2084_EXT - flip: true`, the layer's
+  `colour_space=HDR10_ST2084_EXT hdr=2`, and its new line `HDR metadata for a A2B10G10R10_UNORM_PACK32
+  HDR10_ST2084_EXT swapchain: BT.2020 primaries, mastering luminance 0.1000-500 nits, MaxCLL 500, MaxFALL 100`.
+  The model ran before the upscaler (holds every frame, about 120 fps shown). Without Neural Forge, gamescope's
+  lines are the same.
+
+So the layer neither hides gamescope's HDR10 formats nor changes a swapchain's colour space: the colour space
+gamescope logs in `Creating swapchain` is what the game asked for, as the layer logs it. vkd3d-proton sends a
+game's HDR10 metadata whatever the swapchain's colour space, and makes an HDR10 swapchain only after a
+`SetColorSpace1` the surface's formats allow. gamescope segfaulted each time its child exited, with and without
+Neural Forge. The desktop's colour mode was found at "default" afterwards (monitors.xml has bt2100) and was set back
+to bt2100 at 2560x1440@288.001+vrr (a nested gamescope does not change the desktop's modes; what reset it was
+not found).
