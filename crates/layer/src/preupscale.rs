@@ -3626,10 +3626,15 @@ impl Tracker {
         // on its depth's depth aspect alone in front of DLSS's buffer: taken as apart, the hold inside DLSS's buffer
         // (which had guessed the depth GENERAL) was found wrong by its guard at every submit, and every hold dropped
         // the network's history.
+        // Only where the layout tracked at that point is the one the barrier names: one tracked otherwise (a render
+        // pass's final layout the tracking did not follow, a buffer recorded before the identification) says only that
+        // this aspect is in the barrier's layout, so the two may be apart. Where none is tracked, none is set: the
+        // other aspect's layout is still not known, and an image without a known layout is not read.
         let one_aspect = sync.one_aspect_of_two() && self.images.get(&sync.image).is_some_and(|d| has_stencil(d.format));
+        let keeps = |t: &Self| t.layout_in(command_buffer, sync.image, true, false).is_none_or(|(l, _)| l == sync.old_layout);
         let sync = match (one_aspect, sync.old_layout == sync.new_layout) {
-            (true, true) => ImageSync { keeps_layout: true, ..sync },
-            (true, false) => ImageSync { new_layout: ASPECTS_APART, ..sync },
+            (true, true) if keeps(self) => ImageSync { keeps_layout: true, ..sync },
+            (true, _) => ImageSync { new_layout: ASPECTS_APART, ..sync },
             (false, _) => sync,
         };
         let colour_shape = self.colour_watch.is_some_and(|w| self.images.get(&sync.image).is_some_and(|d| w.covers(d)));
@@ -10935,6 +10940,50 @@ mod tests {
         t.begin(cb(6));
         t.barrier(cb(6), ImageSync { old_layout: ASPECTS_APART, ..ImageSync::to(depth, GENERAL) });
         assert_eq!(t.layout_when_run(&[cb(6)], depth), Some(GENERAL));
+    }
+
+    /// A same-layout barrier on one aspect of the depth that contradicts the layout tracked there (a render pass's
+    /// final layout the tracking did not follow): only that aspect is known to be in it, so the aspects may be apart
+    /// and the depth is not read; kept as tracked, the hold copied the depth in the wrong layout and its guard compared
+    /// against the same wrong state. Where no layout is tracked, none is set.
+    #[test]
+    fn a_one_aspect_barrier_contradicting_the_tracked_layout_leaves_the_aspects_apart() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, params) = held_tracker_with(copyable);
+        let depth = vk::Image::from_raw(0x200);
+        let one = |old: vk::ImageLayout, new: vk::ImageLayout| ImageSync {
+            old_layout: old,
+            aspect: vk::ImageAspectFlags::DEPTH.as_raw(),
+            src_access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE.as_raw(),
+            dst_access: vk::AccessFlags2::SHADER_READ.as_raw(),
+            ..ImageSync::to(depth, new)
+        };
+        // Nothing tracked on the depth: a one-aspect barrier sets nothing.
+        t.barrier(cb(1), one(GENERAL, GENERAL));
+        assert_eq!(t.layout_when_run(&[cb(1)], depth), None);
+        let _ = t.submit_ok(&[vec![cb(1)]]);
+        assert_eq!(t.layout_when_run(&[], depth), None);
+        // Tracked as the attachment layout; the game's one-aspect barrier says GENERAL.
+        let attachment = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        t.barrier(cb(2), general_to_general(colour()));
+        t.barrier(cb(2), ImageSync::to(depth, attachment));
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        assert_eq!(t.layout_when_run(&[], depth), Some(attachment));
+        t.barrier(cb(3), one(GENERAL, GENERAL));
+        assert_eq!(t.layout_when_run(&[cb(3)], depth), Some(ASPECTS_APART), "contradicted: apart");
+        // The same barrier in DLSS's buffer before its launch: the hold there does not read the depth as tracked.
+        t.barrier(cb(4), one(GENERAL, GENERAL));
+        t.barrier(cb(4), general_to_general(colour()));
+        t.launch(cb(4), Some(&params));
+        let point = t.inline_point(cb(4), colour()).expect("held inside the buffer");
+        assert!(point.depth_input.is_none_or(|d| !d.readable), "the depth is not read: {:?}", point.depth_input);
+        let _ = t.submit_ok(&[vec![cb(3), cb(4)]]);
+        assert_eq!(t.layout_when_run(&[], depth), Some(ASPECTS_APART));
+        // A barrier on both aspects says where they are again; then one that agrees with it keeps it.
+        t.begin(cb(5));
+        t.barrier(cb(5), ImageSync { old_layout: ASPECTS_APART, ..ImageSync::to(depth, GENERAL) });
+        t.barrier(cb(5), one(GENERAL, GENERAL));
+        assert_eq!(t.layout_when_run(&[cb(5)], depth), Some(GENERAL));
     }
 
     /// Depth and motion vectors are read only by a dump: a barrier on them before the launch stops

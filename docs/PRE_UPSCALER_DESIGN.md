@@ -677,10 +677,15 @@ records such a barrier before the launch, the depth was not read at all (`ASPECT
 from).
 
 Now (`ImageSync::keeps_layout`, `ImageSync::layout_after`): a barrier on one aspect of a depth/stencil image that
-keeps its layout records no layout. The layout before it stands, in the buffer (`layout_in`), at the submit
-(`layout_when_run`, the guard's check), in the commit and in the scan's proposed layouts. A barrier on one aspect
-that does transition it still leaves the aspects apart until a barrier on both, and one that keeps its layout
-after it does not bring them together. Hazards and the depth the hold reads (`hold_depth`) still see the barrier
+keeps its layout records no layout, where the layout tracked at that point of the buffer (its own barriers, else
+the committed state) is the one the barrier names, or none is tracked (the other aspect's layout is then still
+unknown, and an image without a known layout is not read). The layout before it stands, in the buffer
+(`layout_in`), at the submit (`layout_when_run`, the guard's check), in the commit and in the scan's proposed
+layouts. One that names another layout than the tracked one (a render pass's final layout the tracking did not
+follow, a buffer recorded before the identification) says only where that aspect is: the aspects are apart, as
+after a barrier on one aspect that does transition it, until a barrier on both; kept as tracked, the hold would
+copy the depth in the wrong layout and its guard compare against the same wrong state
+(`a_one_aspect_barrier_contradicting_the_tracked_layout_leaves_the_aspects_apart`). Hazards and the depth the hold reads (`hold_depth`) still see the barrier
 as recorded. Test: `a_same_layout_barrier_on_one_aspect_of_the_depth_moves_no_layout` (the depth unreadable and
 apart without the change).
 
