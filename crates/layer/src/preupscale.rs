@@ -3862,6 +3862,16 @@ impl Tracker {
             let Some(InputLaunch::Inputs { colour, depth, mvec }) = refs.input.clone() else { continue };
             let seen =
                 DlssOutput { function, image, input: colour, depth, mvec, rr: refs.input_rr || !refs.rr.is_empty(), writes: refs.writes_of(function, image) };
+            // The learnt output written in more parts than learnt (Ray Reconstruction's working size changed): this
+            // buffer's hold went after the learnt count of parts, on a partly written output, before the rest could be
+            // seen. Dropped at once, so that is the only such frame; the new count is learnt as any output is.
+            if let Some(l) = self.dlss_output.filter(|l| seen.writes > l.writes && same_output(l, &DlssOutput { writes: l.writes, ..seen }, &self.images)) {
+                lines.push(format!(
+                    "DLSS's output is written in {} launches, not {}: no hold after it until that is learnt (one in this frame went after part of it)",
+                    seen.writes, l.writes
+                ));
+                self.dlss_output = None;
+            }
             // By kernel and the images' kind, not their handles: Hogwarts Legacy's Ray Reconstruction
             // alternates two output images (and inputs) frame by frame.
             match &mut self.output_streak {
@@ -11460,24 +11470,44 @@ mod tests {
         }
         // A buffer written in fewer parts than learnt (the render size changed) gets no hold on a partly written
         // output; 8 such in a row are learnt as the new output.
-        let short = |t: &mut Tracker, c: vk::CommandBuffer| {
+        // Returns after which parts a hold after DLSS's output was asked for.
+        let parts = |t: &mut Tracker, c: vk::CommandBuffer, n: u32| -> Vec<u32> {
             t.launch_kernel(c, histogram, Some(&param_block(&[h(0x100), h(0x610)])));
             t.launch_kernel(c, enc0, Some(&param_block(&enc0_names.map(h))));
-            let mut held = 0;
-            for _ in 0..6 {
+            let mut held = Vec::new();
+            for part in 1..=n {
                 t.launch_kernel(c, post, Some(&param_block(&[h(0x110), h(0x600), h(0x122), h(0x310), h(0x311), h(0x100)])));
                 t.launch_kernel(c, down, Some(&param_block(&[h(0x420), h(0x121), h(0x120), h(0x430), h(0x431)])));
-                held += usize::from(t.after_at.take().is_some());
+                if t.after_at.take().is_some() {
+                    held.push(part);
+                }
             }
             held
         };
         for n in 0..OUTPUT_SETTLE {
-            assert_eq!(short(&mut t, cb(3)), 0, "submit {n}");
+            assert_eq!(parts(&mut t, cb(3), 6), Vec::<u32>::new(), "submit {n}");
             submit(&mut t, &[vec![cb(3)]]);
             t.launch.remove(&cb(3));
         }
         assert_eq!(t.dlss_output.map(|o| o.writes), Some(6));
-        assert_eq!(short(&mut t, cb(3)), 1);
+        assert_eq!(parts(&mut t, cb(3), 6), vec![6]);
+        submit(&mut t, &[vec![cb(3)]]);
+        t.launch.remove(&cb(3));
+        // A buffer written in more parts than learnt (16: the render size grew) is held after the learnt 6th, on a
+        // partly written output, before it can be known; its submit drops the learnt output at once, so that is the
+        // only such frame, and the next hold is after the 16th part once 16 are learnt.
+        assert_eq!(parts(&mut t, cb(3), 16), vec![6], "the first buffer in 16 parts");
+        let lines = submit(&mut t, &[vec![cb(3)]]).1;
+        t.launch.remove(&cb(3));
+        assert!(t.dlss_output.is_none(), "dropped at once: {lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("DLSS's output is written in 16 launches, not 6")), "{lines:#?}");
+        for n in 1..OUTPUT_SETTLE {
+            assert_eq!(parts(&mut t, cb(3), 16), Vec::<u32>::new(), "submit {n}: no hold on a partly written output");
+            submit(&mut t, &[vec![cb(3)]]);
+            t.launch.remove(&cb(3));
+        }
+        assert_eq!(t.dlss_output.map(|o| o.writes), Some(16));
+        assert_eq!(parts(&mut t, cb(3), 16), vec![16]);
     }
 
     /// Ray Reconstruction's first launch whose colour input is known from Super Resolution and happens to be the first
