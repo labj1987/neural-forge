@@ -2841,8 +2841,9 @@ impl Tracker {
         let mut first_colour = if had_colour && !refs.hold_deferred {
             None
         } else if refs.hold_deferred {
-            // The hold put off to the input launch ([`LaunchRefs::hold_deferred`]): here, if this is it.
-            input_colour.filter(|c| named.contains(c))
+            // The hold put off to the input launch ([`LaunchRefs::hold_deferred`]): here, if this is it and its colour
+            // image is one the hold may take, as below.
+            input_colour.filter(|c| named.contains(c) && (candidate(c) || own_colour == Some(*c)))
         } else {
             named.iter().copied().find(candidate).filter(|c| input_colour == Some(*c) || sr_kernel).or(own_colour)
         };
@@ -9721,6 +9722,31 @@ mod tests {
             assert_eq!(frame(&mut t, n, n % 2 == 0, j), (Some("input launch"), Some(j)), "frame {n}");
         }
         assert!(t.launch[&cb(2)].before_named.iter().any(|(i, _)| *i == colour()));
+        // A buffer whose input launch, after the auto-exposure, reads another colour image: one at the output size with
+        // depth and motion vectors of its own (DLSS Frame Generation's form), no colour candidate and not this launch's
+        // own render-size input. The hold put off is not given to that image.
+        for (raw, format) in [(0x110, vk::Format::R16G16B16A16_SFLOAT), (0x210, vk::Format::D32_SFLOAT_S8_UINT), (0x310, vk::Format::R16G16_SFLOAT)] {
+            let info = vk::ImageCreateInfo {
+                image_type: vk::ImageType::TYPE_2D,
+                extent: vk::Extent3D { width: 2560, height: 1440, depth: 1 },
+                format,
+                usage: copyable,
+                samples: vk::SampleCountFlags::TYPE_1,
+                ..Default::default()
+            };
+            t.record_image(vk::Image::from_raw(raw), &info);
+            t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
+            t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
+        }
+        let other = vk::CuFunctionNVX::from_raw(0xf4);
+        t.global(cb(30), Hazard::MemoryBarrier);
+        t.launch_kernel(cb(30), luma, Some(&bytes(&[0x1100])));
+        assert_eq!(t.take_inline_at(), None, "put off at the auto-exposure");
+        assert!(t.launch[&cb(30)].hold_deferred);
+        t.launch_kernel(cb(30), other, Some(&bytes(&[0x1110, 0x1210, 0x1310])));
+        assert_eq!(t.launch[&cb(30)].input, Some(InputLaunch::Inputs { colour: img(0x110), depth: img(0x210), mvec: img(0x310) }));
+        assert_eq!(t.take_inline_at(), None, "no hold on an image that is no colour candidate");
+        t.free(&[cb(30)]);
         // A sequence that goes round (two jitters in turn): predicted at the auto-exposure, the hold stays there.
         let (a, b) = (word(0.25, -0.25), word(-0.25, 0.25));
         for n in 8..12 {
