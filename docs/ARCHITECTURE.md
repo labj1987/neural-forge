@@ -274,7 +274,10 @@ CUDA kernels: `vkCmdCuLaunchKernelNVX`, on image views registered with
   "extra" buffer form (what vkd3d-proton uses), the layer reads that parameter buffer (never writes
   it; at most 4 KiB) and notes which registered handles appear among its 8-byte words.
 - Image barriers on the watched images, committed in submission order, so the layer knows their
-  layout at a submit.
+  layout at a submit. Watched are DLSS's inputs, every depth image at the depth's extent and every
+  image of the colour input's extent and format (still while nothing is identified, so a game handing
+  DLSS several images in turn has a layout for each). A new identification keeps what was recorded on
+  an image watched before and after it, and drops the rest.
 
 On a device with NVX but no DLSS, the per-command-buffer and per-submit hooks cost one atomic
 read.

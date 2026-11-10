@@ -368,7 +368,8 @@ Not split, each with its own once-per-session log line:
 - **A buffer recorded before the inputs were identified** (`Hazard::RecordedBefore`): the launch
   buffer, a buffer ahead of it in the same call, or a secondary executed into one of them was begun
   before the current identification (`Tracker::recorded_watched`). Barriers are recorded only while
-  inputs are watched, and a new identification drops what was recorded, so what such a buffer does
+  inputs are watched, and a new identification drops what was recorded on the images it did not
+  watch throughout ("Inputs that cycle through images of one shape"), so what such a buffer does
   to the inputs is not known: a D3D12 command list executed again without being recorded again, or
   one recorded ahead on another thread while the submit that identified the inputs went out, can
   carry a transition or a same-layout barrier before DLSS's launch. Before, only the identifying
@@ -487,8 +488,8 @@ did not run.
 
 **Layouts the buffer did not set.** The copies in name each input's layout at the hold point. Where the
 buffer itself set it before that point (a barrier on the image, or its use as an attachment), that is what
-it is. Otherwise, for the colour input, it is taken from the layout it had at DLSS's launch buffer in the last
-submission (`launch_colour_layout`: what the split's check reads in its own submission), and for the others and
+it is. Otherwise, for the colour input, it is taken from the layout that image had at DLSS's launch buffer in the last
+submission held with it (`launch_layouts`, per image: what the split's check reads in its own submission), and for the others and
 before such a submission from what the buffers submitted so far left, or `GENERAL` for a storage image
 never seen in a barrier (`Tracker::inline_point`, `Guessed`). Taking the end of the last submission for the
 colour input left a game that moves it out of `GENERAL` in a buffer in front of DLSS's and back after it
@@ -591,6 +592,36 @@ waits on (`VUID-vkSetEvent-event-09543`); events cannot be set from another queu
 hold into the buffer needs neither the events nor the queue: the extra queue `vkCreateDevice` got for
 it is gone (the network's loader keeps its own two, which are separate), and the hold's GPU tests run
 under the validation layer with nothing to report and nothing filtered.
+
+### Inputs that cycle through images of one shape (Expedition 33, 3.14.0, #51)
+
+Clair Obscur: Expedition 33 (Unreal Engine 5 under vkd3d-proton, RTX 5060 Ti) hands DLSS its colour input in one
+of several 1488x836 `B10G11R11` images in turn, as Remnant II alternates between two. The input kernel's
+parameters identify the lowest handle ("one evaluation alternating its input"), and `Tracker::retarget` holds
+each frame with the image its buffer names. Only the identified image was watched, though, so for the others the
+hold inside DLSS's buffer knew no layout: every frame on another image was refused with "the colour input's
+layout at DLSS's launch is unknown" and went to DLSS unedited, flickering through while the camera moved. The
+layout learnt at DLSS's launch was kept for the identified image only, and every new identification (the
+reporter's log names many; destroying the identified image is one way to one) dropped what was known of all of
+them.
+
+Now (`Tracker::colour_watch`, `watched_by`, `keep_watched_across`):
+
+- Every 2D single-sample image of the identified colour input's extent and format is watched, as every depth
+  image at the depth's extent already was, and stays watched while nothing is identified (until a colour input
+  of another shape is). Its barriers and attachments are recorded and committed like the inputs'.
+- The layout at DLSS's launch is learnt per image (`launch_layouts`), for a retargeted submit too.
+- A new identification keeps what was recorded on an image watched before and after it (committed layout,
+  owner, launch layout, its barriers in buffers not yet submitted) and drops the rest: an image watched
+  throughout had every barrier on it seen. Buffers begun before the identification stay `RecordedBefore` (and
+  `BegunBefore` for the hold inside): what they recorded on newly watched images was not seen.
+- The refusal on an unknown layout now counts the barriers on the refused image itself since this
+  identification (it counted those on the identified image, never reset), or says it is not watched.
+
+Not done: taking `GENERAL` for a `B10G11R11` image no barrier was seen on, as the split does for an `RGBA16F`
+storage image. Nothing shows Expedition 33's are in `GENERAL` (its refusals say barriers on them were seen), and a
+guess on an image whose layout is unknown at the submit too is the one the hold guard cannot check. Nor is the
+layout of one image guessed from another of its shape.
 
 ### The HDR encode and decode (model, roundtrip)
 

@@ -33,6 +33,10 @@ first shipped them; their phase is kept as a subheading.
 - With the Placement setting "At present", the Status tab's Model placement line now says the model runs on the
   finished frame by that setting, instead of "waiting for DLSS Super Resolution".
 
+- Games that hand DLSS their frame in one of several images in turn (Clair Obscur: Expedition 33) now have the
+  model on every frame. Before, only the frames in one of those images were worked on, and the others flickered
+  through unedited while the camera moved.
+
 **Seeing why the model does not run before the upscaler**
 
 - When Neural Forge finds the frame a game hands to DLSS but cannot work on it, the Status tab's Model placement

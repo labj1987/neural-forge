@@ -1697,6 +1697,18 @@ Not built. A face pass would also need a detector with a licence that fits (SCRF
   with the fog. If it stays, `NEURAL_FORGE_PROBE_PARAMS=1` would show whether DLSS is given 1485x835 inside the
   1488x836 image.
 
+## November 10: two vkd3d-proton games the hold missed (#51)
+
+A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neither held:
+
+- **Expedition 33 (UE5)** hands DLSS its input in one of several images of one shape in turn. The layer watched
+  only the image it had identified, so the hold inside DLSS's buffer knew the layout of one and refused the
+  others, and every re-identification threw away what it knew of all of them: frames flickered through unedited.
+  Lesson: track every image that can be DLSS's input this frame, by shape, the way the depth already was, and do
+  not throw away knowledge that was recorded continuously (PRE_UPSCALER_DESIGN.md, "Inputs that cycle through
+  images of one shape"). Its refusal counted barriers on another image than the one refused, never reset: a
+  diagnostic must describe the thing it names.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

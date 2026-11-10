@@ -641,6 +641,25 @@ const EXPOSURE_STRIDE: u64 = 16;
 /// the identification line. Every candidate is in [`Tracker::candidates`].
 pub(crate) const MAX_OTHERS: usize = 3;
 
+/// The shape of the identified colour input ([`Tracker::colour_watch`]): every 2D single-sample image of its extent
+/// and format is watched, as every depth image at the depth's extent is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ColourWatch {
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+}
+
+impl ColourWatch {
+    fn of(d: &ImageDesc) -> Self {
+        Self { width: d.width, height: d.height, format: d.format }
+    }
+
+    fn covers(&self, d: &ImageDesc) -> bool {
+        d.plain && d.format == self.format && (d.width, d.height) == (self.width, self.height)
+    }
+}
+
 /// The DLSS inputs among the registered images.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Inputs {
@@ -1505,14 +1524,22 @@ pub(crate) struct Tracker {
     /// this set too). A buffer recorded before (a re-submitted one, or one recorded ahead on another
     /// thread) may carry barriers on the inputs that were never seen ([`Hazard::RecordedBefore`]).
     recorded_watched: HashSet<vk::CommandBuffer>,
-    /// Diagnostics: barriers seen on the identified colour input, and the last one's new layout.
-    colour_barriers: u64,
-    last_colour_layout: Option<vk::ImageLayout>,
+    /// Diagnostics: barriers seen on each colour image of the watched shape ([`Self::colour_watch`]) and on the
+    /// identified colour input since the current identification, with the last one's new layout.
+    colour_barriers: HashMap<vk::Image, (u64, vk::ImageLayout)>,
+    /// The identified colour input's shape (extent and format), kept while nothing is identified: barriers on every
+    /// image of that shape are recorded ([`Self::watched`]), so each image a game hands DLSS in turn has a known
+    /// layout, and what was recorded on one carries across a new identification that watches it too
+    /// ([`Self::keep_watched_across`]). Expedition 33 (Unreal Engine 5, #51) cycles DLSS's input through several
+    /// 1488x836 B10G11R11 images; only the identified one was watched, so the hold inside DLSS's buffer knew no
+    /// layout for the others, and each new identification dropped what was known of all of them.
+    colour_watch: Option<ColourWatch>,
     /// The identification ([`Self::generation`]) and the kinds of [`InlineRefusal`] logged for it.
     said_refusals: (u64, u16),
-    /// The colour input's layout at DLSS's launch buffer in the last submission that had it, and for which
-    /// identification ([`Self::scan`]): what the split's check reads there.
-    launch_colour_layout: Option<(u64, vk::ImageLayout)>,
+    /// Each colour image's layout at DLSS's launch buffer in the last submission held with it (the identified
+    /// colour input, or the candidate its input launch named, [`Self::retarget`]; [`Self::scan`]): what the split's
+    /// check reads there. Kept across identifications as the committed layouts are ([`Self::keep_watched_across`]).
+    launch_layouts: HashMap<vk::Image, vk::ImageLayout>,
     /// The last launch's kernel name and the registered images it named, kept only for
     /// `NEURAL_FORGE_PROBE_IMAGE` ([`probe_image`]).
     last_launch: Option<(String, Vec<vk::Image>)>,
@@ -2116,6 +2143,8 @@ impl Tracker {
         }
         self.committed.remove(&image);
         self.owners.remove(&image);
+        self.launch_layouts.remove(&image);
+        self.colour_barriers.remove(&image);
         // Evidence naming a destroyed image is dropped; the rest settles again before it decides. Not
         // for its depth image: a game rotating its depth images (Black Myth: Wukong with frame
         // generation on, a new one every frame) would drop the evidence every frame; the depth is
@@ -2557,8 +2586,9 @@ impl Tracker {
         // submission): what the buffers submitted so far left (`committed`) is the end of that submission, and
         // a game that moves the colour input out of GENERAL in a buffer in front of DLSS's and back after it
         // left both paths refusing every frame: this one leaving the frame to the split on GENERAL, the split
-        // refusing it on the layout in front of the launch.
-        let learned = self.launch_colour_layout.filter(|(g, _)| *g == self.generation && colour == inputs.colour.0).map(|(_, l)| l);
+        // refusing it on the layout in front of the launch. Per image: a game alternating its input between
+        // images (Expedition 33) has one for each.
+        let learned = self.launch_layouts.get(&colour).copied();
         let (layout, set) = match self.layout_in(cb, colour, true, rgba16f && desc.usage.contains(vk::ImageUsageFlags::STORAGE)) {
             Some((l, true)) => (l, true),
             guess => learned.map(|l| (l, false)).or(guess).ok_or(InlineRefusal::LayoutUnknown)?,
@@ -2678,13 +2708,19 @@ impl Tracker {
         }
         self.said_refusals.1 |= bit;
         let image = self.images.get(&colour).map_or_else(|| "unknown".to_string(), |d| format!("{}x{} {:?} {:?}", d.width, d.height, d.format, d.usage));
-        let layout = if refusal == InlineRefusal::LayoutUnknown {
-            format!(" ({} barriers on it seen since identification, last to {:?})", self.colour_barriers, self.last_colour_layout)
-        } else {
-            String::new()
-        };
+        let layout = if refusal == InlineRefusal::LayoutUnknown { self.colour_barrier_text(colour) } else { String::new() };
         crate::log!("[preupscale] no hold inside DLSS's buffer (identification {}): {why}{layout}; colour input {} {image}", self.generation, hex(colour));
         crate::logging::flush();
+    }
+
+    /// What was seen of `colour`'s barriers, for a refusal on its unknown layout: how many since this identification
+    /// and the last one's layout, or that it is not watched (not of the identified colour input's shape).
+    fn colour_barrier_text(&self, colour: vk::Image) -> String {
+        match self.colour_barriers.get(&colour) {
+            Some((n, last)) => format!(" ({n} barriers on it seen since this identification, last to {last:?})"),
+            None if self.watched(colour) => " (no barrier on it seen since this identification)".to_string(),
+            None => " (its barriers are not watched: it is not of the identified colour input's extent and format)".to_string(),
+        }
     }
 
     /// A hold inside DLSS's buffer was recorded at a point of identification `identification`.
@@ -3059,27 +3095,71 @@ impl Tracker {
         }
     }
 
+    /// Whether barriers on `image` are recorded now.
     fn watched(&self, image: vk::Image) -> bool {
-        self.inputs.is_some_and(|i| {
-            i.colour.0 == image
-                || i.others.iter().flatten().any(|o| o.0 == image)
-                || i.depth.0 == image
-                || i.mvec.0 == image
-                || i.exposure.iter().flatten().any(|e| e.0 == image)
-                || i.exposure_input.is_some_and(|e| e.0 == image)
-                // Every depth image at the identified depth's extent: the input launch may name
-                // another one than the identified (`Self::hold_depth`; GTA V Enhanced alternates two).
-                || self.images.get(&image).is_some_and(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == (i.depth.1.width, i.depth.1.height))
-        })
+        self.watched_by(self.inputs, self.colour_watch, image)
+    }
+
+    /// Whether barriers on `image` are recorded with `inputs` identified and `watch` the colour shape watched.
+    fn watched_by(&self, inputs: Option<Inputs>, watch: Option<ColourWatch>, image: vk::Image) -> bool {
+        let desc = self.images.get(&image);
+        // Every image of the colour input's shape: the input launch may name another one than the identified
+        // (`Self::retarget`; Remnant II and Expedition 33 alternate between several).
+        watch.is_some_and(|w| desc.is_some_and(|d| w.covers(d)))
+            || inputs.is_some_and(|i| {
+                i.colour.0 == image
+                    || i.others.iter().flatten().any(|o| o.0 == image)
+                    || i.depth.0 == image
+                    || i.mvec.0 == image
+                    || i.exposure.iter().flatten().any(|e| e.0 == image)
+                    || i.exposure_input.is_some_and(|e| e.0 == image)
+                    // Every depth image at the identified depth's extent: the input launch may name
+                    // another one than the identified (`Self::hold_depth`; GTA V Enhanced alternates two).
+                    || desc.is_some_and(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == (i.depth.1.width, i.depth.1.height))
+            })
+    }
+
+    /// At a new identification (`inputs`, watching `watch`): what was recorded on an image watched both before and
+    /// after (its committed layout and owner, its layout at DLSS's launch, its barriers in buffers not yet
+    /// submitted) was recorded throughout, and is kept; everything else is dropped, as everything was before
+    /// (#51: Expedition 33's identification changes as Unreal Engine 5 hands DLSS other images, and each change
+    /// left the hold inside DLSS's buffer without a layout for any of them). Buffers begun before stay
+    /// [`Hazard::RecordedBefore`] and [`InlineRefusal::BegunBefore`]: what they recorded on images newly watched
+    /// was not seen.
+    fn keep_watched_across(&mut self, inputs: Option<Inputs>, watch: Option<ColourWatch>) {
+        let (old, old_watch) = (self.inputs, self.colour_watch);
+        let seen: HashSet<vk::Image> = self
+            .committed
+            .keys()
+            .chain(self.owners.keys())
+            .chain(self.launch_layouts.keys())
+            .copied()
+            .chain(self.pending.values().flatten().map(|s| s.image))
+            .chain(self.attached.values().flatten().map(|a| a.0))
+            .collect();
+        let keep: HashSet<vk::Image> = seen.into_iter().filter(|&i| self.watched_by(old, old_watch, i) && self.watched_by(inputs, watch, i)).collect();
+        self.committed.retain(|i, _| keep.contains(i));
+        self.owners.retain(|i, _| keep.contains(i));
+        self.launch_layouts.retain(|i, _| keep.contains(i));
+        for recorded in self.pending.values_mut() {
+            recorded.retain(|s| keep.contains(&s.image));
+        }
+        self.pending.retain(|_, recorded| !recorded.is_empty());
+        for attached in self.attached.values_mut() {
+            attached.retain(|a| keep.contains(&a.0));
+        }
+        self.attached.retain(|_, attached| !attached.is_empty());
+        self.colour_watch = watch;
     }
 
     pub(crate) fn barrier(&mut self, command_buffer: vk::CommandBuffer, sync: ImageSync) {
         // One aspect of a depth/stencil image: the two may be apart from here on.
         let apart = sync.one_aspect_of_two() && self.images.get(&sync.image).is_some_and(|d| has_stencil(d.format));
         let sync = if apart { ImageSync { new_layout: ASPECTS_APART, ..sync } } else { sync };
-        if self.inputs.is_some_and(|i| i.colour.0 == sync.image) {
-            self.colour_barriers += 1;
-            self.last_colour_layout = Some(sync.new_layout);
+        let colour_shape = self.colour_watch.is_some_and(|w| self.images.get(&sync.image).is_some_and(|d| w.covers(d)));
+        if colour_shape || self.inputs.is_some_and(|i| i.colour.0 == sync.image) {
+            let seen = self.colour_barriers.entry(sync.image).or_insert((0, sync.new_layout));
+            *seen = (seen.0 + 1, sync.new_layout);
         }
         if self.watched(sync.image) {
             self.pending.entry(command_buffer).or_default().push(sync);
@@ -3216,10 +3296,10 @@ impl Tracker {
         // 97% of its log was this line). Taken silently, after the depth-only change below.
         let unchanged = inputs.is_some() && key(inputs) == key(self.inputs) && inputs.map(|i| i.rule) == self.inputs.map(|i| i.rule);
         if key(inputs) != key(self.inputs) {
-            self.committed.clear();
-            self.owners.clear();
-            self.pending.clear();
+            // The colour shape watched: the new colour input's, else (nothing identified) the last one's.
+            self.keep_watched_across(inputs, inputs.map(|i| ColourWatch::of(&i.colour.1)).or(self.colour_watch));
             self.recorded_watched.clear();
+            self.colour_barriers.clear();
             self.identified = true;
             self.generation += 1;
         } else if let (Some(new), Some(old)) = (inputs, self.inputs) {
@@ -3709,11 +3789,11 @@ impl Tracker {
                         jitter: self.launch.get(&cb).and_then(|r| r.jitter),
                         reset: self.reset_seen(cb),
                     });
-                    // The colour input's layout at DLSS's launch buffer as this submission has it (what the
+                    // The colour image's layout at DLSS's launch buffer as this submission has it (what the
                     // split's check reads): the guess of the next hold recorded inside a buffer that does not
-                    // set it itself ([`Self::inline_point`]).
-                    if let (None, Some(l), false) = (retarget, found.as_ref().and_then(|s| s.colour_layout), self.identified) {
-                        self.launch_colour_layout = Some((self.generation, l));
+                    // set it itself ([`Self::inline_point`]). For the candidate a retargeted buffer names too.
+                    if let (Some(i), Some(l), false) = (inputs, found.as_ref().and_then(|s| s.colour_layout), self.identified) {
+                        self.launch_layouts.insert(i.colour.0, l);
                     }
                 }
                 if found.is_none() {
@@ -4196,7 +4276,7 @@ impl Tracking {
             let device = self.device;
             let observed = t.observe(batches);
             let line = t.refresh().map(|l| format!("{l} [device {device:#x}]"));
-            self.watching.store(t.inputs.is_some(), Ordering::Relaxed);
+            self.watching.store(t.inputs.is_some() || t.colour_watch.is_some(), Ordering::Relaxed);
             self.extent.store(t.inputs.map_or(0, |i| u64::from(i.colour.1.width) << 32 | u64::from(i.colour.1.height)), Ordering::Relaxed);
             let undecided_before = t.evaluations - t.named_colour_submits;
             let foreign_before = t.foreign_submits;
@@ -9528,6 +9608,111 @@ mod tests {
         t.forget_image(vk::Image::from_raw(0x300));
         let point = t.inline_point(b, c).expect("still held inside the buffer");
         assert!(point.mvec_input.is_none(), "a destroyed motion-vector image is copied from");
+    }
+
+    /// Expedition 33 (Unreal Engine 5 under vkd3d-proton, #51): DLSS's input cycles through several 1488x836
+    /// B10G11R11 images, each moved into its layout in a buffer in front of DLSS's. Every image of the identified
+    /// colour input's shape is watched, so the hold inside DLSS's buffer knows the layout of each, not only of the
+    /// identified one (before: "the colour input's layout at DLSS's launch is unknown" for the others, frames
+    /// flickering through unprocessed). When the identified image is destroyed and another is identified, what was
+    /// known of the images watched throughout is kept: the next hold on one needs no new barrier on it.
+    #[test]
+    fn every_image_of_the_colour_input_s_shape_has_its_layout_known_across_identifications() {
+        let r11 = vk::Format::B10G11R11_UFLOAT_PACK32;
+        let colour_usage =
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let set = set_of(&[
+            (0x100, desc(1488, 836, r11, colour_usage)),
+            (0x110, desc(1488, 836, r11, colour_usage)),
+            (0x120, desc(1488, 836, r11, colour_usage)),
+            (0x200, desc(1488, 836, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)),
+            (0x300, desc(1488, 836, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)),
+            (0x600, desc(1, 1, vk::Format::R16_SFLOAT, vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC)),
+        ]);
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        let read_only = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let rendered = |image: u64| ImageSync { old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, ..ImageSync::to(img(image), read_only) };
+        // One frame: the game's buffer moves the image into SHADER_READ_ONLY (when `front`), DLSS's buffer, begun
+        // since, names it. The hold inside DLSS's buffer is decided on at the launch, then the two are submitted.
+        let frame = |t: &mut Tracker, colour: u64, front: bool| -> Option<Result<InlinePoint, InlineRefusal>> {
+            t.begin(cb(10));
+            t.begin(cb(11));
+            if front {
+                t.barrier(cb(10), rendered(colour));
+            }
+            t.launch(cb(11), Some(&param_block(&[h(colour), h(0x200), h(0x300), h(0x600)])));
+            let point = t.take_inline_at().map(|(b, c)| t.inline_point(b, c));
+            let _ = submit(t, &[vec![cb(10), cb(11)]]);
+            point
+        };
+        let cycle = [0x100, 0x110, 0x120];
+        for k in 0..(SETTLE_SUBMITS as usize + 8) {
+            frame(&mut t, cycle[k % 3], true);
+        }
+        let inputs = t.inputs.expect("identified by the input kernel's parameters");
+        assert_eq!((inputs.colour.0, inputs.rule), (img(0x100), Rule::Params));
+        // A full cycle since: each image's barrier was committed while watched.
+        for colour in cycle {
+            frame(&mut t, colour, true);
+        }
+        for k in 0..6 {
+            let colour = cycle[k % 3];
+            let point = frame(&mut t, colour, true).expect("a hold point").unwrap_or_else(|r| panic!("{colour:#x}: refused, {r:?}"));
+            assert_eq!((point.colour, point.layout, point.hazard), (img(colour), read_only, Hazard::NotSplittable), "{colour:#x}");
+            assert_eq!(t.launch_layouts.get(&img(colour)), Some(&read_only), "{colour:#x}: its layout at DLSS's launch, retargeted or not");
+        }
+        assert_eq!(t.colour_barriers.get(&img(0x110)).map(|b| b.1), Some(read_only), "barriers counted per image");
+        // The identified image is destroyed: the next identification follows the input kernel to another. No
+        // barrier is recorded from here on; what was committed on the others carries across.
+        t.forget_image(img(0x100));
+        let before = t.generation;
+        let mut k = 0;
+        while t.generation == before || t.inputs.is_none() || t.identified {
+            frame(&mut t, [0x110, 0x120][k % 2], false);
+            k += 1;
+            assert!(k < 200, "identified again");
+        }
+        assert_eq!(t.inputs.map(|i| i.colour.0), Some(img(0x110)));
+        for colour in [0x110, 0x120] {
+            let point = frame(&mut t, colour, false).expect("a hold point").unwrap_or_else(|r| panic!("{colour:#x}: refused, {r:?}"));
+            assert_eq!(point.layout, read_only, "{colour:#x}: committed before the identification changed");
+        }
+    }
+
+    /// What is kept at a new identification ([`Tracker::keep_watched_across`]): what was recorded on an image
+    /// watched before and after it; an image watched before only (the old depth with nothing identified, an image
+    /// of the old colour shape after the shape changed) is dropped, as its later barriers go unseen.
+    #[test]
+    fn a_new_identification_keeps_only_what_was_watched_throughout() {
+        let (mut t, _) = held_tracker();
+        let same = vk::Image::from_raw(0x110);
+        let info = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D { width: 1707, height: 960, depth: 1 },
+            format: vk::Format::R16G16B16A16_SFLOAT,
+            usage: vk::ImageUsageFlags::STORAGE,
+            samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        t.record_image(same, &info);
+        let read_only = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        for image in [colour(), same, vk::Image::from_raw(0x200)] {
+            t.barrier(cb(1), ImageSync::to(image, read_only));
+        }
+        // Recorded, not yet submitted: kept as the commit's input, also for an image of the shape alone.
+        t.barrier(cb(2), ImageSync::to(same, GENERAL));
+        let _ = t.submit_ok(&[vec![cb(1)]]);
+        assert_eq!(t.committed.len(), 3, "the colour input, an image of its shape and the depth are watched");
+        let watch = t.colour_watch;
+        assert_eq!(watch, Some(ColourWatch { width: 1707, height: 960, format: vk::Format::R16G16B16A16_SFLOAT }));
+        // Nothing identified, the shape still watched.
+        t.keep_watched_across(None, watch);
+        assert_eq!((t.committed.get(&colour()), t.committed.get(&same)), (Some(&read_only), Some(&read_only)));
+        assert!(!t.committed.contains_key(&vk::Image::from_raw(0x200)), "the depth is no longer watched");
+        assert_eq!(t.pending.get(&cb(2)).map(Vec::len), Some(1));
+        // Another shape: nothing of the old one is kept.
+        t.keep_watched_across(None, Some(ColourWatch { width: 1280, height: 720, format: vk::Format::R16G16B16A16_SFLOAT }));
+        assert!(t.committed.is_empty() && t.pending.is_empty());
     }
 
     /// The depth a hold reads is the one this buffer's input launch names, with that image's own
