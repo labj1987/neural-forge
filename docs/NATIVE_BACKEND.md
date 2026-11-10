@@ -724,6 +724,16 @@ is out of scope).
     `PROTON_ENABLE_HDR=1` (its HDR option on, `bUseHDRDisplayOutput=True`, the desktop in bt2100): the swapchain stays
     A2B10G10R10 in the sRGB colour space. The layer does not touch surface formats; the model before the upscaler is
     the same with 8-bit and 10-bit output (a change of 12 of 255, detail x1.14).
+  - **Cyberpunk 2077 (issue #49, 2026-11-10).** On every second frame NGX's auto-exposure (`cuda_luma_convert_kernel`,
+    three `cuda_reduce_sum_kernel`, `cuda_auto_exposure_copy_kernel`) reads the colour input before
+    `hiluma_engine_input_*` carries the jitter, and Cyberpunk's jitter never repeats (3000 launches probed, 3000
+    different values), so nothing can be predicted: half the holds logged "held without the jitter", which also cost
+    the next frame its jitter step (no previous jitter) and broke the edit cache's chain on each. Where a hold would
+    come before the launch carrying the jitter and none can be predicted, it now goes at that input launch
+    (`LaunchRefs::hold_deferred`; logged once, "the camera jitter does not repeat"). DLSS's auto-exposure then reads
+    the frame before the model, as a game's own exposure always is. Where prediction works (Crimson Desert) the hold
+    stays at the first launch reading the colour input. Measured: every hold with its jitter (no "held without the
+    jitter" in a benchmark run, it was 106 of 212 in 5 s).
 - **Fixed on the way:**
   - The after-the-upscaler path kept its claim on the network when the network was not built at its size,
     so the paths fought over the build. The claim is now always released.

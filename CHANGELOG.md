@@ -37,6 +37,9 @@ first shipped them; their phase is kept as a subheading.
 - In games that give DLSS their motion vectors as fractions of the frame rather than in pixels (Cyberpunk 2077),
   the model's history now follows the motion. Neural Forge reads the motion vectors' unit from what the game tells
   DLSS instead of assuming pixels; before, the history barely moved with the picture.
+- In Cyberpunk 2077 the model before the upscaler now knows the camera's sub-pixel jitter on every frame. On every
+  second frame it went without, so its history lost the jitter's step on two frames in a row and could not carry the
+  model's edit from one frame to the next.
 - Placement "After DLSS" works in Cyberpunk 2077. With Ray Reconstruction off, the model was put on an internal
   image of DLSS instead of its output, so nothing changed on screen (and DLSS's own history was disturbed); it now
   works on the picture DLSS hands the game, and its history there follows the motion.

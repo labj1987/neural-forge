@@ -1677,6 +1677,8 @@ pub(crate) struct Tracker {
     jitter_checks: (u64, u64),
     jitter_stopped: bool,
     jitter_said: bool,
+    /// Logged once: a hold waited for the input launch for its jitter ([`LaunchRefs::hold_deferred`]).
+    jitter_deferred_said: bool,
     /// DLSS's own history reset, carried by a buffer's input launch recorded after a hold in that buffer had
     /// already been told there was none ([`Self::reset_for_hold`]): for the next hold.
     reset_latched: bool,
@@ -1836,6 +1838,9 @@ pub(crate) struct LaunchRefs {
     pub reset: Option<bool>,
     /// A hold recorded into the buffer before the launch carrying the reset word ([`Tracker::reset_for_hold`]).
     pub reset_asked: bool,
+    /// The buffer's first launch naming the colour input came before its input launch, and the camera jitter
+    /// could not be predicted there: the hold goes at the input launch instead ([`Tracker::launch_kernel`]).
+    pub hold_deferred: bool,
 }
 
 impl LaunchRefs {
@@ -2666,6 +2671,10 @@ impl Tracker {
         }
         // The colour inputs identified so far (Ray Reconstruction's first launch, [`rr_input_launch`]).
         let known: Vec<(vk::Image, vk::Image)> = self.named.iter().map(|n| (n.colour, n.mvec)).collect();
+        // A hold recorded before the launch that carries the camera jitter gets it only by prediction
+        // ([`Self::jitter_for_hold`]): whether none could be made now, though the device's input launches carry one.
+        let jitter_unpredictable = self.jitter_last.is_some_and(|last| self.jitter_stopped || !self.jitter_next.contains_key(&last));
+        let mut deferred_now = false;
         let refs = self.launch.entry(command_buffer).or_default();
         // Whether this launch is the buffer's first one read as an input launch.
         let mut fresh_input = false;
@@ -2782,14 +2791,42 @@ impl Tracker {
         // DLSS Frame Generation's by its kernel's name (`main_kernel` in Wukong's frame-generation
         // buffers, which took every staging slot) and not an input launch naming that image.
         let sr_kernel = !self.functions.get(&function).is_some_and(|(_, n)| fg_kernel_name(n));
-        let first_colour =
-            if had_colour { None } else { named.iter().copied().find(candidate).filter(|c| input_colour == Some(*c) || sr_kernel).or(own_colour) };
+        let mut first_colour = if had_colour && !refs.hold_deferred {
+            None
+        } else if refs.hold_deferred {
+            // The hold put off to the input launch ([`LaunchRefs::hold_deferred`]): here, if this is it.
+            input_colour.filter(|c| named.contains(c))
+        } else {
+            named.iter().copied().find(candidate).filter(|c| input_colour == Some(*c) || sr_kernel).or(own_colour)
+        };
+        // A launch before the buffer's input launch (DLSS's auto-exposure, `cuda_luma_convert_kernel` in Cyberpunk
+        // 2077 on every second frame) where the camera jitter cannot be predicted (Cyberpunk's never repeats): the
+        // hold waits for the input launch, which carries the jitter. A hold without it loses the history's jitter
+        // step on that frame and the next and breaks the edit cache's chain (issue #49).
+        if first_colour.is_some_and(|c| input_colour != Some(c)) && refs.jitter.is_none() && jitter_unpredictable {
+            first_colour = None;
+            refs.hold_deferred = true;
+            deferred_now = true;
+        }
         for image in named {
             if !refs.images.contains(&image) {
                 refs.images.push(image);
                 refs.before_named.push((image, before));
                 refs.named_by.push((image, function));
             }
+        }
+        if let Some(c) = first_colour.filter(|_| refs.hold_deferred) {
+            // What the buffer held at the input launch, not at the earlier launch: the hazards up to the hold.
+            refs.hold_deferred = false;
+            if let Some(entry) = refs.before_named.iter_mut().find(|(i, _)| *i == c) {
+                entry.1 = before;
+            }
+        }
+        if deferred_now && !self.jitter_deferred_said {
+            self.jitter_deferred_said = true;
+            crate::log!(
+                "[preupscale] the camera jitter does not repeat, so it cannot be predicted for a hold before DLSS's input launch: such holds go at the input launch, which carries it"
+            );
         }
         self.inline_at = first_colour.map(|c| (command_buffer, c));
         if crate::probe_ngx::enabled() {
@@ -9549,6 +9586,54 @@ mod tests {
                 assert!(why.contains("VkFrameBoundaryEXT"), "{why}");
             }
         }
+    }
+
+    /// Cyberpunk 2077 (issue #49): on every second frame DLSS's auto-exposure (`cuda_luma_convert_kernel`) reads the
+    /// colour input before the input launch carries the frame's camera jitter, and the jitter never repeats, so none
+    /// can be predicted there. The hold then goes at the input launch, with the frame's own jitter, instead of at the
+    /// auto-exposure without one; where the jitter can be predicted (a sequence that goes round, Crimson Desert's)
+    /// it stays at the first launch naming the colour input.
+    #[test]
+    fn a_hold_waits_for_the_input_launch_when_the_jitter_cannot_be_predicted() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, _) = held_tracker_with(copyable);
+        let (luma, input) = (vk::CuFunctionNVX::from_raw(0xf2), vk::CuFunctionNVX::from_raw(0xf3));
+        t.record_function(luma, "cuda_luma_convert_kernel");
+        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
+        let word = |x: f32, y: f32| u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32);
+        let bytes = |words: &[u64]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        // The input kernel's parameters: the jitter at word 3, then colour, depth and motion vectors.
+        let input_params = |j: u64| bytes(&[0, 0, 0, j, 0, 0x1100, 0x1200, 0x1300]);
+        // One buffer: optionally the auto-exposure first, then the input launch; where the hold went, and its jitter.
+        let frame = |t: &mut Tracker, n: u64, exposure: bool, j: u64| {
+            let buffer = cb(n);
+            t.global(buffer, Hazard::MemoryBarrier);
+            let mut at = None;
+            if exposure {
+                t.launch_kernel(buffer, luma, Some(&bytes(&[0x1100])));
+                at = t.take_inline_at().map(|_| "auto-exposure");
+            }
+            t.launch_kernel(buffer, input, Some(&input_params(j)));
+            if let Some(b) = t.take_inline_at() {
+                assert_eq!(b, (buffer, colour()));
+                at = Some("input launch");
+            }
+            (at, t.jitter_for_hold(buffer))
+        };
+        // No jitter seen yet: nothing to wait for, the hold goes at the auto-exposure.
+        assert_eq!(frame(&mut t, 1, true, word(0.1, 0.2)).0, Some("auto-exposure"));
+        // A jitter that never repeats: the hold goes at the input launch, with that frame's jitter.
+        for n in 2..8 {
+            let j = word(0.01 * n as f32, -0.02 * n as f32);
+            assert_eq!(frame(&mut t, n, n % 2 == 0, j), (Some("input launch"), Some(j)), "frame {n}");
+        }
+        assert!(t.launch[&cb(2)].before_named.iter().any(|(i, _)| *i == colour()));
+        // A sequence that goes round (two jitters in turn): predicted at the auto-exposure, the hold stays there.
+        let (a, b) = (word(0.25, -0.25), word(-0.25, 0.25));
+        for n in 8..12 {
+            frame(&mut t, n, false, if n % 2 == 0 { a } else { b });
+        }
+        assert_eq!(frame(&mut t, 12, true, a), (Some("auto-exposure"), Some(a)), "predicted where the hold was recorded");
     }
 
     /// A tracker with GTA's three inputs identified (colour 0x100, depth 0x200, motion vectors
