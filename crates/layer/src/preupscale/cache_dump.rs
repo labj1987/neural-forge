@@ -263,6 +263,10 @@ impl CacheDump {
             self.end("an armed hold missed");
             return;
         }
+        if run.last_hold == Some(arm.hold) {
+            self.end("two holds in one DLSS frame (passes placed both before and after DLSS)");
+            return;
+        }
         if run.last_hold.is_some_and(|last| arm.hold != last + 1) {
             self.end("a DLSS frame between two armed holds went unheld");
             return;
@@ -630,6 +634,14 @@ mod tests {
         let a = d.arm(20, false).unwrap();
         d.after_hold(Some(a), false, None);
         assert!(!d.running(), "a missed armed hold ends the dump");
+        // Two holds in one DLSS frame (passes before and after DLSS) are not two consecutive frames either.
+        let (tx, _rx) = mpsc::sync_channel(QUEUED_FRAMES);
+        d.run = Some(Run { id: 3, want: 4, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx });
+        let a = d.arm(30, true).unwrap();
+        d.after_hold(Some(a), true, None);
+        let b = d.arm(30, false).unwrap();
+        d.after_hold(Some(b), true, None);
+        assert!(!d.running(), "the same frame twice ends the dump");
     }
 
     #[test]

@@ -582,8 +582,13 @@ impl Inline {
     /// Whether `cb` carries a hold before the upscaler (the split path then leaves it alone; one carrying only
     /// the hold after DLSS's output is still split in front of).
     pub(crate) fn owns_before(&self, cb: vk::CommandBuffer) -> bool {
+        self.owns_at(cb, Some(Stage::Before))
+    }
+
+    /// Whether `cb` carries a recorded hold at `stage`, or at any stage for `None`.
+    pub(crate) fn owns_at(&self, cb: vk::CommandBuffer, stage: Option<Stage>) -> bool {
         let s = lock(&self.slots);
-        s.by_cb.get(&cb).is_some_and(|slots| slots.iter().any(|&i| s.slots[i].stage == Stage::Before && s.slots[i].meta.is_some()))
+        s.by_cb.get(&cb).is_some_and(|slots| slots.iter().any(|&i| stage.is_none_or(|st| s.slots[i].stage == st) && s.slots[i].meta.is_some()))
     }
 
     /// Whether the model is switched off (F11, the GUI, `shmctl set enabled 0`), as far as known: before
@@ -2596,10 +2601,21 @@ mod tests {
         // A second launch at the same stage in that buffer adds no hold, and that passes.
         assert_eq!(inline.record_outcome(real, rig.point(), copies_only), Recorded::Skipped, "this stage is held in it already");
         assert_eq!(inline.outstanding.load(Ordering::SeqCst), 1, "one hold may run");
+        // What the split path asks: a hold before the upscaler, and none after DLSS's output yet; then that one too.
+        assert!(inline.owns_before(real) && inline.owns_at(real, None) && !inline.owns_at(real, Some(Stage::Upscaled)));
+        let mut after = rig.point();
+        after.hold.stage = Stage::Upscaled;
+        let after_only = |ctx: &mut Ctx| {
+            // SAFETY: the test's buffer, recording on this thread.
+            unsafe { ctx.open() };
+            Ok(Meta::empty(Stage::Upscaled))
+        };
+        assert_eq!(inline.record_outcome(real, after, after_only), Recorded::Held, "the hold after DLSS's output");
+        assert!(inline.owns_at(real, Some(Stage::Upscaled)));
         rig.end(real);
         // Its pool reset: the slot is free for another buffer, and nothing may run any more.
         inline.reset_pool(rig.pool, false);
-        assert!(!inline.owns(real));
+        assert!(!inline.owns(real) && !inline.owns_at(real, None));
         assert_eq!(inline.outstanding.load(Ordering::SeqCst), 0);
         inline.switch.store(std::ptr::null_mut(), Ordering::Release);
         // A buffer whose compute state cannot be put back is not held.

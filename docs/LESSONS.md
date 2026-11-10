@@ -1756,6 +1756,11 @@ A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neit
   `mvec_scale` 2560 x 1440 in both, and consecutive frames warped by the motion vectors line up best at exactly that
   scale (mean error 0.0036-0.0039 at 1x against 0.0078-0.0086 at 0.9x and 1.1x and 0.028-0.030 without motion;
   `~/scratch/issue49/tools/mvcheck.py`).
+- **Found on the way:** every cache dump of the hold after DLSS ended at its second hold ("a DLSS frame between two
+  armed holds went unheld", 0 of 4): the hold counted the DLSS frame when it was recorded, and the submit of the
+  same buffer counted it again on its way to the split path (which still runs for a buffer holding only the hold
+  after DLSS). A buffer carrying any recorded hold is now counted once; two holds in one frame (passes both before
+  and after DLSS) end a dump with their own reason.
 
 ## November 10: Red Dead Redemption 2 (Vulkan) before the upscaler (3.14.0, issue #49)
 

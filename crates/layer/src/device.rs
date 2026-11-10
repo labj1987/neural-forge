@@ -1929,10 +1929,13 @@ impl NeuralForgeDeviceInfo {
     ) -> Option<(vk::Result, Vec<vk::CommandBuffer>)> {
         use crate::preupscale::{Mode, Which};
         let scan = tracking.scan(cbs)?;
+        let launch_cb = cbs.get(scan.batch).and_then(|b| b.get(scan.index)).copied();
         // DLSS's buffer carries the hold inside it (`crate::preupscale::inline`): nothing to split.
-        if self.inline.as_ref().is_some_and(|i| cbs.get(scan.batch).and_then(|b| b.get(scan.index)).is_some_and(|cb| i.owns_before(*cb))) {
+        if self.inline.as_ref().is_some_and(|i| launch_cb.is_some_and(|cb| i.owns_before(cb))) {
             return None;
         }
+        // A hold after DLSS's output recorded into it already counted this DLSS frame (`record_inline_hold`).
+        let counted = self.inline.as_ref().is_some_and(|i| launch_cb.is_some_and(|cb| i.owns_at(cb, None)));
         let mode = crate::preupscale::mode();
         if !crate::layer_enabled() || !self.nvidia || crate::device_lost(self.device.handle()) {
             return None;
@@ -1942,8 +1945,12 @@ impl NeuralForgeDeviceInfo {
         let mut hold_guard = self.hold.lock().unwrap_or_else(|e| e.into_inner());
         let HoldState { shm, preupscale: session, external_memory_host } = &mut *hold_guard;
         // DLSS is running on this device (held or not): the post path stays off for
-        // `preupscale::HAND_BACK` after this once the device has held.
-        session.saw_dlss();
+        // `preupscale::HAND_BACK` after this once the device has held. Counted once a frame: a second count for a
+        // frame whose hold after DLSS was recorded made every cache dump of those holds end at its second hold
+        // ("a DLSS frame between two armed holds went unheld", issue #49).
+        if !counted {
+            session.saw_dlss();
+        }
         // No pass runs before the upscaler (`preupscale::placement`: they run after DLSS or at present): the
         // frame goes to DLSS untouched.
         let at = tracking.split_hold((inputs.colour.1.width, inputs.colour.1.height))?;
