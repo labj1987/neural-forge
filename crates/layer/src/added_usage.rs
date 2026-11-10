@@ -21,10 +21,14 @@ use ash::vk;
 const VERDICTS_MAX: usize = 4096;
 /// Lines logged at most about images whose requirements change.
 const SAID_MAX: usize = 8;
+/// The view formats a kept verdict's format list may name at most; a longer list is judged every time.
+const VIEW_FORMATS_MAX: usize = 64;
 
 /// What a verdict is kept by: every field of the create info that can change the requirements, for a create
-/// info without a `pNext` chain (one with a chain is judged every time).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// info without a `pNext` chain or whose chain is one `VkImageFormatListCreateInfo` (vkd3d-proton's placed
+/// resources, created while the game runs: each one judged would create two images); one with any other chain is
+/// judged every time.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
     flags: vk::ImageCreateFlags,
     image_type: vk::ImageType,
@@ -36,11 +40,36 @@ struct Key {
     tiling: vk::ImageTiling,
     usage: vk::ImageUsageFlags,
     sharing_mode: vk::SharingMode,
+    /// The format list's view formats, in its order (`None`: no chain).
+    view_formats: Option<Vec<vk::Format>>,
 }
 
 impl Key {
+    /// `info`'s chain is valid: the application's own, as `vkCreateImage` (or the requirements query) has it.
     fn of(info: &vk::ImageCreateInfo) -> Option<Self> {
-        info.p_next.is_null().then_some(Key {
+        let view_formats = match info.p_next.cast::<vk::BaseInStructure>() {
+            next if next.is_null() => None,
+            next => {
+                // SAFETY: a valid chain (above): its first node starts with the common header.
+                let node = unsafe { &*next };
+                if node.s_type != vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO || !node.p_next.is_null() {
+                    return None;
+                }
+                // SAFETY: a node of this type is that structure.
+                let list = unsafe { &*next.cast::<vk::ImageFormatListCreateInfo>() };
+                let count = list.view_format_count as usize;
+                if count > VIEW_FORMATS_MAX {
+                    return None;
+                }
+                Some(if count == 0 || list.p_view_formats.is_null() {
+                    Vec::new()
+                } else {
+                    // SAFETY: the application's array of `view_format_count` formats.
+                    unsafe { std::slice::from_raw_parts(list.p_view_formats, count) }.to_vec()
+                })
+            }
+        };
+        Some(Key {
             flags: info.flags,
             image_type: info.image_type,
             format: info.format,
@@ -51,6 +80,7 @@ impl Key {
             tiling: info.tiling,
             usage: info.usage,
             sharing_mode: info.sharing_mode,
+            view_formats,
         })
     }
 }
@@ -174,10 +204,19 @@ mod tests {
         (asked, copyable)
     }
 
+    /// [`colour`] for a chain whose format list names more than one format: such an image is `MUTABLE_FORMAT`
+    /// (VUID-VkImageCreateInfo-flags-04738).
+    fn mutable(p_next: *const std::ffi::c_void) -> (vk::ImageCreateInfo<'static>, vk::ImageCreateInfo<'static>) {
+        let (asked, copyable) = colour(p_next);
+        let flags = vk::ImageCreateFlags::MUTABLE_FORMAT;
+        (vk::ImageCreateInfo { flags, ..asked }, vk::ImageCreateInfo { flags, ..copyable })
+    }
+
     /// On a real (lavapipe) device, through real images: where the requirements with the added usage differ
     /// (made to differ here: the driver's are the same) the image is created as asked and the other destroyed,
     /// the verdict is kept (the next one is created once, as asked) and said; where they are the same the image
-    /// gets the usage, and the next one is created once, with it. A create info with a chain is judged each time.
+    /// gets the usage, and the next one is created once, with it. A chain of one format list is kept by its formats
+    /// too (the same list: one image; another list: judged again); any other chain is judged each time.
     #[test]
     fn the_added_usage_is_kept_only_where_the_memory_requirements_do_not_change() {
         let Some((_entry, instance, _physical, device, _queue, _family)) = crate::composition::gpu::test_device() else {
@@ -219,13 +258,36 @@ mod tests {
             assert_eq!((added_again, *creates.borrow()), (added, 1), "the kept verdict: one image");
             assert_eq!(live.borrow()[&again.unwrap()], live.borrow()[&image]);
             assert_eq!(usage.said.lock().unwrap().len(), usize::from(differ));
-            // With a chain: judged again each time, never kept.
-            let list = vk::ImageFormatListCreateInfo::default();
-            let (chained, chained_copyable) = colour(std::ptr::from_ref(&list).cast());
+            // A chain of one format list (vkd3d-proton's placed resources): judged once per list, then kept.
+            let formats = [vk::Format::R16G16B16A16_SFLOAT, vk::Format::R16G16B16A16_UINT];
+            let list = vk::ImageFormatListCreateInfo::default().view_formats(&formats);
+            let (chained, chained_copyable) = mutable(std::ptr::from_ref(&list).cast());
+            assert_eq!(usage.cached(&chained), None, "not the verdict of the create info without the list");
             *creates.borrow_mut() = 0;
-            let (third, _) = usage.create(&chained, &chained_copyable, &create, &destroy, &requirements);
-            assert_eq!((*creates.borrow(), usage.cached(&chained)), (2, None));
-            for image in [image, again.unwrap(), third.unwrap()] {
+            let (third, third_added) = usage.create(&chained, &chained_copyable, &create, &destroy, &requirements);
+            assert_eq!((*creates.borrow(), usage.cached(&chained), third_added), (2, Some(!differ), !differ), "judged");
+            let same_formats = formats;
+            let same_list = vk::ImageFormatListCreateInfo::default().view_formats(&same_formats);
+            let (same, same_copyable) = mutable(std::ptr::from_ref(&same_list).cast());
+            *creates.borrow_mut() = 0;
+            let (fourth, fourth_added) = usage.create(&same, &same_copyable, &create, &destroy, &requirements);
+            assert_eq!((*creates.borrow(), fourth_added), (1, !differ), "the same formats in another list: the kept verdict, one image");
+            assert_eq!(live.borrow()[fourth.as_ref().unwrap()], live.borrow()[third.as_ref().unwrap()]);
+            let other_formats = [vk::Format::R16G16B16A16_SFLOAT];
+            let other_list = vk::ImageFormatListCreateInfo::default().view_formats(&other_formats);
+            let (other, _) = colour(std::ptr::from_ref(&other_list).cast());
+            assert_eq!(usage.cached(&other), None, "other formats: another verdict");
+            // A list followed by anything else: judged each time, never kept.
+            let mut stencil = vk::ImageStencilUsageCreateInfo::default().stencil_usage(vk::ImageUsageFlags::SAMPLED);
+            stencil.p_next = std::ptr::from_ref(&list).cast();
+            let (longer, longer_copyable) = mutable(std::ptr::from_ref(&stencil).cast());
+            let mut followed = list;
+            followed.p_next = std::ptr::from_ref(&stencil).cast();
+            let (behind, _) = mutable(std::ptr::from_ref(&followed).cast());
+            *creates.borrow_mut() = 0;
+            let (fifth, _) = usage.create(&longer, &longer_copyable, &create, &destroy, &requirements);
+            assert_eq!((*creates.borrow(), usage.cached(&longer), usage.cached(&behind)), (2, None, None));
+            for image in [image, again.unwrap(), third.unwrap(), fourth.unwrap(), fifth.unwrap()] {
                 destroy(image);
             }
             assert!(live.borrow().is_empty());

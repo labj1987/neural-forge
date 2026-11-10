@@ -1689,6 +1689,11 @@ Not built. A face pass would also need a detector with a licence that fits (SCRF
   key while the frame itself is within 3 stops of it, 30 holds in a row, is measured from the frame for that
   identification, without the 16x bound. Crimson Desert's daytime frame (about 3.7 stops below with its exposure,
   which is why Auto exists) stays under the 5 stops, and a dark scene-referred frame fails the second test.
+  A review found the 30 holds (half a second) too short and the switch for good: GTA V walking from daylight (`e`
+  0.15) into a tunnel (luma 0.1) is as far below while its eye adaptation lags, and would have stayed measured.
+  The test now needs 2.5 s with the game's exposure held within half a stop (a lagging adaptation moves it; UE's
+  texel does not, within a scene), reads the game's texel on beside the measured `e`, and goes back to it after
+  2.5 s under 4 stops.
 - **The line down the right edge** was not traced to an input subrect: the layer reads no render size from DLSS's
   launch parameters (DLSS_KERNEL_CATALOGUE.md lists words that may hold it, measured only where the image was the
   render size), so it cannot feed the network less than the image. The reporter saw it go with Auto; it should go

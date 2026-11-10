@@ -19,9 +19,11 @@ first shipped them; their phase is kept as a subheading.
   those needs. The game's log says so once, with the numbers.
 - Games that hand DLSS a frame they already brightened, with a very small exposure value beside it (Clair Obscur:
   Expedition 33), no longer get a white fog over the picture and a line down its right edge with Model brightness
-  on Game: within about half a second Neural Forge notices that the game's exposure would make the model's
-  picture far too dark, measures the brightness from the frame instead and says so in the game's log (`the
-  colour input looks pre-exposed`).
+  on Game: after about two and a half seconds in which the game's exposure stays steady and would make the
+  model's picture far too dark, Neural Forge measures the brightness from the frame instead and says so in the
+  game's log (`the colour input looks pre-exposed`); once that has passed for as long, it goes back to the game's
+  exposure (`no longer looks pre-exposed`). A game walking from daylight into a dark interior, whose eye
+  adaptation catches up over a second or two, keeps its own exposure.
 - Games that hand DLSS their frame in one of several images in turn (Clair Obscur: Expedition 33) now have the
   model on every frame. Before, only the frames in one of those images were worked on, and the others flickered
   through unedited while the camera moved.
@@ -32,7 +34,10 @@ first shipped them; their phase is kept as a subheading.
   from frame to frame along the GPU's optical flow, as it does before the upscaler. Before, every frame was worked
   on afresh, and on grainy or noisy pictures (film grain in Cyberpunk 2077) large soft patches of the picture
   flickered. `NEURAL_FORGE_POST_MOTION=none` brings the old behaviour back. A working scale below 1 makes this
-  flicker stronger.
+  flicker stronger. For this the game's device gets NVIDIA's optical-flow extension and one optical-flow queue
+  where the GPU offers them, also in games where the model runs before the upscaler (which way it will run is not
+  known when the game creates its device); the game's log says so. `NEURAL_FORGE_POST_MOTION=zero` (or `none`)
+  leaves them out.
 - With the Placement setting "At present", the Status tab's Model placement line now says the model runs on the
   finished frame by that setting, instead of "waiting for DLSS Super Resolution".
 

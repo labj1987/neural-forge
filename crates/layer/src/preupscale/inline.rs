@@ -2033,6 +2033,7 @@ mod tests {
                 exposure_input: aux(self.exposure, vk::Format::R16_SFLOAT),
                 paper_white: 2.5,
                 lift_exposure: false,
+                pre_exposed: false,
                 identification: 1,
             };
             let mut submit = |_: crate::preupscale::Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
@@ -2132,6 +2133,7 @@ mod tests {
                     exposure_input: ctx.point.exposure_input,
                     paper_white: 2.5,
                     lift_exposure: false,
+                    pre_exposed: false,
                     identification: 1,
                 };
                 let res = session.res_inline(crate::preupscale::placement::Stage::Before).as_mut().expect("ensured");

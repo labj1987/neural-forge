@@ -1025,6 +1025,7 @@ fn record_inline_hold(
         exposure_input: point.exposure_input.filter(|_| session.game_exposure_trusted(point.identification)),
         paper_white: crate::preupscale::hdr::paper_white() / brightness,
         lift_exposure: measure,
+        pre_exposed: session.pre_exposed_measured(point.identification),
         identification: point.identification,
     };
     let res = session.res_inline(stage).as_mut().expect("ensured above");
@@ -2088,6 +2089,7 @@ impl NeuralForgeDeviceInfo {
             // Only the modes that encode read (and so log) the paper white; the brightness divides it.
             paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() / brightness } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
             lift_exposure: measure,
+            pre_exposed: session.pre_exposed_measured(scan.identification),
             identification: scan.identification,
         };
         let loader = session.native.as_ref().filter(|_| native);

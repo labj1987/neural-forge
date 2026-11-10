@@ -78,7 +78,8 @@ pub(crate) struct ExposurePush {
     /// `uint pass`: 0 the histogram, 1 the resolve.
     pub pass: u32,
     /// `uint relative`: [`AutoUse`] as a number: 0 the measured e is the one used, 1 it is kept within
-    /// [`LIFT_LO`]..[`LIFT_HI`] of the game's in the exposure buffer, 2 only the state is written.
+    /// [`LIFT_LO`]..[`LIFT_HI`] of the game's in the exposure buffer, 2 only the state is written, 3 the measured e
+    /// is used with the game's kept beside it.
     pub relative: u32,
 }
 
@@ -92,6 +93,10 @@ pub(crate) enum AutoUse {
     /// The encode uses the game's; the measurement is only read back, for the check whether the colour input
     /// is already exposed (`Session::check_exposure`).
     Observe,
+    /// The encode uses it, unbounded, for a colour input the game already exposed; the game's (copied in as for
+    /// [`Self::Lift`]) is kept in the exposure buffer's high half, for the check whether it still is
+    /// (`Session::check_exposure`).
+    Beside,
 }
 
 impl AutoUse {
@@ -100,6 +105,7 @@ impl AutoUse {
             Self::Measured => 0,
             Self::Lift => 1,
             Self::Observe => 2,
+            Self::Beside => 3,
         }
     }
 }
@@ -1092,9 +1098,10 @@ impl HdrPass {
 
     /// Records the auto-exposure (histogram, then resolve into the exposure buffer) for the colour
     /// input; [`Self::record_encode`]'s opening barrier makes its write visible to the encode. With
-    /// [`AutoUse::Lift`] or [`AutoUse::Observe`] the game's texel was copied into the exposure buffer before
-    /// (the fill barrier at the start makes it visible): the e written is kept within [`LIFT_LO`]..[`LIFT_HI`]
-    /// of it, or the buffer is left as it is.
+    /// [`AutoUse::Lift`], [`AutoUse::Observe`] or [`AutoUse::Beside`] the game's texel was copied into the exposure
+    /// buffer before (the fill barrier at the start makes it visible): the e written is kept within
+    /// [`LIFT_LO`]..[`LIFT_HI`] of it, the buffer is left as it is, or the e written is the measured one with the
+    /// game's beside it.
     /// Returns `false` (nothing recorded) when the pass is not built.
     ///
     /// # Safety

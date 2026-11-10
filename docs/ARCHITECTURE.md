@@ -484,9 +484,16 @@ exposure: measured from the frame (auto)`, and the 300-hold summary ends with `e
 (auto|game)`. Where the game gives an exposure the auto-exposure runs too, writing only its state
 (`relative` 2, `hdr::AutoUse::Observe`): `Session::check_exposure` compares the frame's measured target with
 the game's `e`, and when the game's puts the frame more than 5 stops below the key while the frame as given is
-within 3 stops of it, on 30 holds in a row (a hold under 4 stops starts the count over), the colour input is
-taken for one the game already exposed (Clair Obscur: Expedition 33, #51): that identification's holds measure
-`e` from the frame, not bounded by the game's (`[preupscale] the colour input looks pre-exposed: ...`).
+within 3 stops of it, on every hold for 2.5 s of the holds' clock (and 30 holds at least; a hold under 4 stops,
+or a gap of over 500 ms, starts the run over) with the game's `e` held within half a stop meanwhile, the colour
+input is taken for one the game already exposed (Clair Obscur: Expedition 33, #51): that identification's holds
+measure `e` from the frame, not bounded by the game's (`[preupscale] the colour input looks pre-exposed: ...`).
+The game's texel is still copied in and kept in the exposure buffer's high half (`relative` 3,
+`hdr::AutoUse::Beside`), and the same run the other way (under 4 stops, or the frame as given more than 3 stops
+from the key, for 2.5 s; a hold past 5 stops starts it over) hands the frame back to the game's `e` (`... no
+longer looks pre-exposed: ...`). Each direction is logged at most once a minute, the changes left out counted.
+The steadiness is what tells a scene-referred game whose eye adaptation lags (GTA V walking from daylight, `e`
+0.15, into a tunnel of luma 0.1: as far below for a second or so) from a pre-exposed one: its `e` moves.
 
 ### 4.7 Failures and the hand-back
 
@@ -544,8 +551,9 @@ hold inside DLSS's buffer copies its colour input with: a native Vulkan game cre
 usage it needs and nothing more (Indiana Jones and the Great Circle, #51). Never an image whose memory
 is shared, and only where the added usage leaves the image's memory requirements (size, alignment, memory
 types) as they would have been (`added_usage.rs`): an engine that places its images in its own heaps (id Tech)
-sizes and aliases them by those numbers. Each create info is judged once (one with a `pNext` chain each time):
-by the application's own `vkGetDeviceImageMemoryRequirements` query for it where it makes one, else by creating
+sizes and aliases them by those numbers. Each create info is judged once (a chain of one
+`VkImageFormatListCreateInfo`, vkd3d-proton's placed resources, by its view formats too; one with any other
+`pNext` chain each time): by the application's own `vkGetDeviceImageMemoryRequirements` query for it where it makes one, else by creating
 the image both ways, comparing and destroying the one not kept (Vulkan 1.0 calls only). On a difference the
 image is created as asked, which the log says once per format and usage with both sets of numbers
 (`[preupscale] adding ... changes its memory requirements (as asked: ...; with it: ...)`). The

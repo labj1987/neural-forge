@@ -358,7 +358,7 @@ impl InFlight {
 /// The holds' clock for the history's gap rule (`HistoryGap::MAX_GAP`): the time now, or in a test the
 /// rig's stopped clock ([`stop_clock`]), so that how long the test machine takes between two holds does not
 /// decide whether the second one has the first one's history.
-fn hold_now() -> Instant {
+pub(crate) fn hold_now() -> Instant {
     #[cfg(test)]
     if let Some(t) = STOPPED_CLOCK.get() {
         return t;

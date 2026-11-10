@@ -973,7 +973,13 @@ grew) starts afresh. What gets no history:
 **The optical flow** (`post_flow`). With `flow` selected, `create_device` adds the extension, its
 `opticalFlow` feature and one queue of the family flagged `QUEUE_OPTICAL_FLOW_BIT_NV` (family 5 on the RTX
 5070, its only queue), where the device has all three and the application does not use that family itself;
-a request with them that the driver refuses is made again without. The RTX 5070's driver offers output grids
+a request with them that the driver refuses is made again without. With `flow` the default, that is every
+NVIDIA device the native backend extends, also in a game whose model runs only before the upscaler: which pass
+will run (DLSS found or not, the Placement setting, `NEURAL_FORGE_PREUPSCALE`) is not known when the device is
+created, so the extension and the queue are requested wherever the device offers them, and stay unused there.
+`NEURAL_FORGE_POST_MOTION=zero` (or `none`) leaves them out. Each device creation logs one `[native]` line on
+it: added (with the family), not added and why (no extension, feature or family; the application uses that
+family itself; the application chains its own optical-flow features), or refused and created without. The RTX 5070's driver offers output grids
 of 1x1, 2x2 and 4x4 for 32x32 to 8192x8192, inputs `B8G8R8A8_UNORM`, `R8_UNORM` and NV12, vectors
 `R16G16_S10_5_NV` (queried 2026-10-19). Per slot and frame size a session at the proxy's size with the 4x4
 grid, performance level fast: two input images used in turn (the proxy's four bytes copied in as they are,

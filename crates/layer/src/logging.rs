@@ -129,15 +129,7 @@ fn write_message(sink: &mut Sink, message: Message) {
 /// Writes one `[neural-forge-layer] ...` line. Never called directly -- use the
 /// [`crate::log!`] macro so every call site gets the same prefix and newline handling.
 pub fn log(args: Arguments<'_>) {
-    // `NEURAL_FORGE_LOG_TIME=1`: each line starts with the wall-clock time (Unix seconds, milliseconds),
-    // to line the log up with the kernel's (an Xid's time).
-    static TIME: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_LOG_TIME").as_deref() == Some("1"));
-    let line = if *TIME {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        format!("[neural-forge-layer] {}.{:03} {args}\n", t.as_secs(), t.subsec_millis())
-    } else {
-        format!("[neural-forge-layer] {args}\n")
-    };
+    let line = line_of(args);
     match logger() {
         Logger::Queued(sender) => {
             if let Err(TrySendError::Full(_)) = sender.try_send(Message::Line(line)) {
@@ -149,6 +141,19 @@ pub fn log(args: Arguments<'_>) {
                 sink.line(&line, ROTATE_BYTES);
             }
         }
+    }
+}
+
+/// One log line as [`log`] writes it: the prefix, the time where asked for, the newline.
+fn line_of(args: Arguments<'_>) -> String {
+    // `NEURAL_FORGE_LOG_TIME=1`: each line starts with the wall-clock time (Unix seconds, milliseconds),
+    // to line the log up with the kernel's (an Xid's time).
+    static TIME: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_LOG_TIME").as_deref() == Some("1"));
+    if *TIME {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        format!("[neural-forge-layer] {}.{:03} {args}\n", t.as_secs(), t.subsec_millis())
+    } else {
+        format!("[neural-forge-layer] {args}\n")
     }
 }
 
@@ -202,7 +207,7 @@ pub fn install_panic_hook() {
 
 /// The panic hook's own work ([`install_panic_hook`]). Never panics (a panic inside a panic hook aborts at
 /// once) and never waits on a lock the panicking thread may hold: the breadcrumbs and the direct sink are
-/// only tried. A panic on the writer thread itself, or a writer that does not answer within [`FLUSH_WAIT`],
+/// only tried ([`write_panic_line`]). A panic on the writer thread itself, or a writer that does not answer within [`FLUSH_WAIT`],
 /// gets the line written straight to the log file (or stderr).
 fn log_panic(info: &std::panic::PanicHookInfo<'_>) {
     thread_local! {
@@ -212,12 +217,30 @@ fn log_panic(info: &std::panic::PanicHookInfo<'_>) {
     if IN_HOOK.try_with(|h| h.replace(true)).unwrap_or(true) {
         return;
     }
-    let line = panic_line(info, std::thread::current().name(), crate::breadcrumbs::try_trail().as_deref());
-    log(format_args!("{line}"));
-    if !flush_confirmed() {
-        write_now(&format!("[neural-forge-layer] {line}\n"));
+    let line = line_of(format_args!("{}", panic_line(info, std::thread::current().name(), crate::breadcrumbs::try_trail().as_deref())));
+    if !write_panic_line(LOGGER.get(), &line) {
+        write_now(&line);
     }
     let _ = IN_HOOK.try_with(|h| h.set(false));
+}
+
+/// The panic hook's line through the logger, if there is one yet (its first use may be what panicked), without
+/// waiting on anything the panicking thread may hold: queued and flushed within [`FLUSH_WAIT`], or written to
+/// the direct sink only if its lock is free (a panic inside [`Sink::line`] holds it). `false`: not confirmed
+/// written, for [`write_now`].
+fn write_panic_line(logger: Option<&Logger>, line: &str) -> bool {
+    match logger {
+        Some(Logger::Queued(sender)) => sender.try_send(Message::Line(line.to_string())).is_ok() && flush_confirmed(),
+        Some(Logger::Direct(sink)) => match sink.try_lock() {
+            Ok(mut sink) => {
+                sink.line(line, ROTATE_BYTES);
+                sink.flush();
+                true
+            }
+            Err(_) => false,
+        },
+        None => false,
+    }
 }
 
 /// The panic's log line (without the prefix): the thread, where, the message and the breadcrumbs' trail.
@@ -353,6 +376,35 @@ mod tests {
         log(format_args!("[test] a line before the panic"));
         let n = std::hint::black_box(42);
         panic!("the child's own panic {n}");
+    }
+
+    /// The panic hook's line with no writer thread (the direct sink): written while the sink's lock is free, and
+    /// refused at once, not waited for, while it is held (a panic inside [`Sink::line`] on the hook's own thread
+    /// holds it: waiting deadlocked the hook), so that the hook falls back to [`write_now`].
+    #[test]
+    fn the_panic_line_never_waits_for_the_direct_sink() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .join(format!("target/test-scratch/panic-direct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("layer.log");
+        let logger = Logger::Direct(Mutex::new(Sink::file(path.clone()).unwrap()));
+        assert!(!write_panic_line(None, "[test] no logger yet\n"));
+        assert!(write_panic_line(Some(&logger), "[test] the lock is free\n"));
+        let Logger::Direct(sink) = &logger else { unreachable!() };
+        let held = sink.lock().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| sender.send(write_panic_line(Some(&logger), "[test] the lock is held\n")).unwrap());
+            let written = receiver.recv_timeout(std::time::Duration::from_secs(5));
+            drop(held);
+            assert_eq!(written, Ok(false), "refused at once while the lock is held");
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[test] the lock is free\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A flush returns once what was logged before it is written, and never waits past its bound.

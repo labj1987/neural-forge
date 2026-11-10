@@ -292,11 +292,26 @@ pub(crate) const PREEXPOSED_STOPS: f32 = 5.0;
 /// [`hdr::LIFT_HI`] by the brightness setting's Auto. Games whose exposure is their eye adaptation keep the frame
 /// near the key: GTA V's put it at 0.47-0.76, about a stop around it.
 pub(crate) const PREEXPOSED_FRAME_STOPS: f32 = 3.0;
-/// ... on this many holds in a row; a hold under [`PREEXPOSED_CLEAR_STOPS`] (or a frame darker than
-/// [`PREEXPOSED_FRAME_STOPS`]) starts the count over, one between the two leaves it.
+/// ... on every hold for [`PREEXPOSED_WINDOW`] (and at least [`PREEXPOSED_HOLDS`] holds), while the game's exposure
+/// stayed within [`PREEXPOSED_STEADY_STOPS`]; a hold under [`PREEXPOSED_CLEAR_STOPS`] (or a frame darker than
+/// [`PREEXPOSED_FRAME_STOPS`]) starts the run over, one between the two leaves it. A scene-referred game walking
+/// from daylight into a dark interior puts the frame as far below the key while its eye adaptation catches up
+/// (GTA V: e 0.15 on a daylight frame of luma 6, then a tunnel of 0.1), but its exposure moves meanwhile; a
+/// pre-exposed one's holds nearly still (Expedition 33: 0.0078-0.019 from scene to scene).
+pub(crate) const PREEXPOSED_WINDOW: Duration = Duration::from_millis(2500);
+/// See [`PREEXPOSED_WINDOW`].
 pub(crate) const PREEXPOSED_HOLDS: u32 = 30;
-/// See [`PREEXPOSED_HOLDS`].
+/// See [`PREEXPOSED_WINDOW`]: how far the game's exposure may move (log2, the lowest to the highest of the run) and
+/// still count as held steady. Half a stop: an eye adaptation catching up moves more within the window.
+pub(crate) const PREEXPOSED_STEADY_STOPS: f32 = 0.5;
+/// See [`PREEXPOSED_WINDOW`]. Once the frame is measured, the same run of holds under this (or of a frame darker
+/// than [`PREEXPOSED_FRAME_STOPS`]) hands it back to the game's exposure; a hold past [`PREEXPOSED_STOPS`] starts
+/// that run over.
 pub(crate) const PREEXPOSED_CLEAR_STOPS: f32 = 4.0;
+/// A gap between two holds longer than this starts a run of [`PREEXPOSED_WINDOW`] over: nothing was seen between.
+pub(crate) const PREEXPOSED_GAP: Duration = Duration::from_millis(500);
+/// Each direction of the switch is logged at most once in this long; the changes left out are counted in the next line.
+pub(crate) const PREEXPOSED_SAY_EVERY: Duration = Duration::from_secs(60);
 
 /// The fence waits of this path, by class. Both are the layer-wide bound today
 /// ([`crate::FENCE_WAIT_TIMEOUT`], 5 s, there against a driver that stalls without losing the
@@ -2717,15 +2732,13 @@ impl Tracker {
     }
 
     /// [`Self::inline_point`] refused a hold inside DLSS's buffer at a launch naming the colour input `colour`:
-    /// said once per identification and kind of refusal, with the image and how it was made.
-    fn note_inline_refusal(&mut self, colour: vk::Image, refusal: InlineRefusal) {
+    /// said once per identification and kind of refusal, with the image and how it was made. The line is logged
+    /// by the caller once the tracker's lock is let go ([`Said`]).
+    fn note_inline_refusal(&mut self, colour: vk::Image, refusal: InlineRefusal) -> Option<Said> {
         note_refusal(Refusal::Inside(refusal));
         if refusal.quiet() {
-            if let Some(line) = self.quiet_refusal_line(refusal, Instant::now()) {
-                crate::log!("[preupscale] {line}");
-                crate::logging::flush();
-            }
-            return;
+            // Periodic: not flushed.
+            return self.quiet_refusal_line(refusal, Instant::now()).map(|line| Said { line, flush: false });
         }
         let why = refusal.said();
         if self.said_refusals.0 != self.generation {
@@ -2733,13 +2746,13 @@ impl Tracker {
         }
         let bit = 1u16 << refusal.kind();
         if self.said_refusals.1 & bit != 0 {
-            return;
+            return None;
         }
         self.said_refusals.1 |= bit;
         let image = self.images.get(&colour).map_or_else(|| "unknown".to_string(), |d| format!("{}x{} {:?} {:?}", d.width, d.height, d.format, d.usage));
         let layout = if refusal == InlineRefusal::LayoutUnknown { self.colour_barrier_text(colour) } else { String::new() };
-        crate::log!("[preupscale] no hold inside DLSS's buffer (identification {}): {why}{layout}; colour input {} {image}", self.generation, hex(colour));
-        crate::logging::flush();
+        let line = format!("no hold inside DLSS's buffer (identification {}): {why}{layout}; colour input {} {image}", self.generation, hex(colour));
+        Some(Said { line, flush: true })
     }
 
     /// What was seen of `colour`'s barriers, for a refusal on its unknown layout: how many since this identification
@@ -4195,33 +4208,40 @@ impl Tracking {
         t.launch_kernel(command_buffer, function, params);
         self.rearm(&t);
         let after = t.after_point();
-        (Self::before_point(&mut t), after)
+        let (before, said) = Self::before_point(&mut t);
+        // Logged (and flushed, up to `logging::FLUSH_WAIT`) with the lock let go: other threads' launches wait on it.
+        drop(t);
+        if let Some(said) = said {
+            said.say();
+        }
+        (before, after)
     }
 
-    fn before_point(t: &mut Tracker) -> Option<InlinePoint> {
-        let (cb, colour) = t.take_inline_at()?;
+    /// The hold point inside DLSS's buffer, if any, and a refusal's line to log once the lock is let go.
+    fn before_point(t: &mut Tracker) -> (Option<InlinePoint>, Option<Said>) {
+        let Some((cb, colour)) = t.take_inline_at() else { return (None, None) };
         // No pass runs before the upscaler (they run after DLSS or at present): no hold here.
         let plan = placement::current(t.frame());
         if !plans_before(&plan) {
-            return None;
+            return (None, None);
         }
         t.inline_tried.insert(cb);
         let output = t.output_extent();
         let point = t
             .inline_point(cb, colour)
             .map(|p| InlinePoint { hold: placement::Hold::of(&plan, placement::Stage::Before, (p.desc.width, p.desc.height), output), ..p });
-        if let Err(refusal) = point {
-            t.note_inline_refusal(colour, refusal);
+        match point {
+            Ok(point) => (Some(point), None),
+            Err(refusal) => (None, t.note_inline_refusal(colour, refusal)),
         }
-        point.ok()
     }
 
     /// The split refused launch buffer `cb` for a hazard: logs why no hold inside it was decided on either, once per
-    /// reason ([`Tracker::untried_line`]).
+    /// reason ([`Tracker::untried_line`]), with the lock let go.
     pub(crate) fn say_inside_untried(&self, cb: vk::CommandBuffer) {
-        if let Some(line) = self.lock().untried_line(cb) {
-            crate::log!("[preupscale] {line}");
-            crate::logging::flush();
+        let line = self.lock().untried_line(cb);
+        if let Some(line) = line {
+            Said { line, flush: true }.say();
         }
     }
 
@@ -5565,6 +5585,9 @@ pub(crate) struct Target {
     /// [`ExposureSource::Auto`], and where the game gives one it is kept within [`hdr::LIFT_LO`]..[`hdr::LIFT_HI`]
     /// of the game's ([`ExposureSource::measures`]).
     pub lift_exposure: bool,
+    /// The colour input looks already exposed by the game ([`Session::pre_exposed_measured`]): the exposure is
+    /// measured from the frame, unbounded, while the game's is still copied in beside it ([`hdr::AutoUse::Beside`]).
+    pub pre_exposed: bool,
     /// Which identification of DLSS's inputs this hold works on ([`Scan::identification`]): the
     /// auto-exposure starts its adaptation afresh when it changes.
     pub identification: u64,
@@ -5593,7 +5616,7 @@ impl ExposureSource {
     /// Whether the capture measures the exposure from the frame for `target`: the source is the frame, or the
     /// game's exposure is lifted toward the measured one ([`Target::lift_exposure`]).
     pub(crate) fn measures(target: &Target) -> bool {
-        target.lift_exposure || Self::of(target) == Self::Auto
+        target.lift_exposure || target.pre_exposed || Self::of(target) == Self::Auto
     }
 
     /// What the auto-exposure does for `target` ([`hdr::AutoUse`]). It runs in every hold that encodes: where the
@@ -5602,6 +5625,7 @@ impl ExposureSource {
     pub(crate) fn auto_use(target: &Target) -> hdr::AutoUse {
         match (Self::of(target), target.lift_exposure) {
             (Self::Auto, _) => hdr::AutoUse::Measured,
+            (Self::Game, _) if target.pre_exposed => hdr::AutoUse::Beside,
             (Self::Game, true) => hdr::AutoUse::Lift,
             (Self::Game, false) => hdr::AutoUse::Observe,
         }
@@ -6591,6 +6615,55 @@ fn median(values: &[f32]) -> f32 {
     v[v.len() / 2]
 }
 
+/// A line the tracker decided on under its lock, logged by the caller once the lock is let go: [`crate::logging::flush`]
+/// waits up to 100 ms, and other threads' recording waits on the lock.
+#[must_use]
+pub(crate) struct Said {
+    line: String,
+    /// A one-off line (flushed); a periodic one is not.
+    flush: bool,
+}
+
+impl Said {
+    fn say(self) {
+        crate::log!("[preupscale] {}", self.line);
+        if self.flush {
+            crate::logging::flush();
+        }
+    }
+}
+
+/// [`Session::check_exposure`]'s test for a colour input the game already exposed, for one identification.
+#[derive(Clone, Copy, Debug, Default)]
+struct PreExposed {
+    identification: u64,
+    /// The frame is measured, not exposed with the game's ([`hdr::AutoUse::Beside`]).
+    measuring: bool,
+    /// The run of holds toward the other state ([`PREEXPOSED_WINDOW`]).
+    run: Option<Run>,
+}
+
+/// See [`PreExposed::run`].
+#[derive(Clone, Copy, Debug)]
+struct Run {
+    /// The run's first hold, and its last, on the holds' clock.
+    since: Instant,
+    last: Instant,
+    /// Its holds toward the other state (not those between).
+    holds: u32,
+    /// The lowest and highest game exposure in it, log2.
+    lo: f32,
+    hi: f32,
+}
+
+/// The holds' clock ([`native::hold_now`]: a test can stop it).
+fn hold_clock() -> Instant {
+    #[cfg(target_arch = "x86_64")]
+    return native::hold_now();
+    #[cfg(not(target_arch = "x86_64"))]
+    Instant::now()
+}
+
 /// One device's pre-upscaler state, kept in its `State` (so holds and presents are serialized by
 /// the same lock).
 #[derive(Default)]
@@ -6644,9 +6717,11 @@ pub(crate) struct Session {
     exposure_jumps: (u32, u32),
     /// The identification and the holds in a row its game exposure read unusable ([`EXPOSURE_UNUSABLE_HOLDS`]).
     exposure_unusable: (u64, u32),
-    /// The identification and the holds in a row whose frame the game's exposure put far below the
-    /// auto-exposure's key while the frame itself is near it ([`PREEXPOSED_HOLDS`]).
-    exposure_preexposed: (u64, u32),
+    /// The test for a colour input the game already exposed ([`PREEXPOSED_WINDOW`]).
+    exposure_preexposed: PreExposed,
+    /// When [`Session::say_pre_exposed`] last logged each direction (into the game's exposure, into the measured
+    /// one), and the changes it left out since.
+    exposure_preexposed_said: [(Option<Instant>, u32); 2],
     /// The native backend's network on this device, when it was created for it.
     pub(crate) native: Option<NativeLoader>,
     /// The native backend's after-the-upscaler server (`native_post`), once the mapping is open.
@@ -7225,6 +7300,11 @@ impl Session {
     /// below the key ([`PREEXPOSED_STOPS`]) is not one to multiply in (Clair Obscur: Expedition 33). From then on
     /// that identification's holds measure the exposure from the frame. Logged once.
     pub(crate) fn check_exposure(&mut self, identification: u64, result: &HoldResult) {
+        self.check_exposure_at(identification, result, hold_clock());
+    }
+
+    /// [`Self::check_exposure`] at `now` on the holds' clock.
+    fn check_exposure_at(&mut self, identification: u64, result: &HoldResult, now: Instant) {
         if result.exposure_source != Some(ExposureSource::Game) || self.exposure_untrusted == Some(identification) {
             return;
         }
@@ -7247,11 +7327,8 @@ impl Session {
         }
         self.exposure_unusable = (identification, 0);
         let e = read;
-        if let Some(why) = self.pre_exposed(identification, e, result.auto_exposure) {
-            self.exposure_untrusted = Some(identification);
-            crate::log!("[preupscale] the colour input looks pre-exposed: {why}; measuring the exposure from the frame for this identification, not bounded by the game's");
-            crate::logging::flush();
-            return;
+        if let Some((measuring, why)) = self.pre_exposed(identification, e, result.auto_exposure, now) {
+            self.say_pre_exposed(measuring, &why, now);
         }
         let previous = self.last_game_exposure.filter(|(id, _)| *id == identification).map(|(_, p)| p);
         if previous.is_none() {
@@ -7283,31 +7360,105 @@ impl Session {
 
     /// [`Self::check_exposure`]'s test for a colour input the game already exposed ([`PREEXPOSED_STOPS`]): the
     /// game's exposure `e` against what the auto-exposure measured from the same hold's frame (`auto`: it runs
-    /// beside the game's exposure, [`hdr::AutoUse::Observe`]). `Some` (why) once it held on [`PREEXPOSED_HOLDS`]
-    /// holds in a row. A hold without a measurement changes nothing.
-    fn pre_exposed(&mut self, identification: u64, e: f32, auto: Option<hdr::AutoState>) -> Option<String> {
+    /// beside the game's exposure, [`hdr::AutoUse::Observe`], or is used beside it, [`hdr::AutoUse::Beside`]).
+    /// `Some` (whether the frame is now measured, and why) when a run of holds switched it ([`PREEXPOSED_WINDOW`]).
+    /// A hold without a measurement changes nothing.
+    fn pre_exposed(&mut self, identification: u64, e: f32, auto: Option<hdr::AutoState>, now: Instant) -> Option<(bool, String)> {
+        let p = &mut self.exposure_preexposed;
+        if p.identification != identification {
+            *p = PreExposed { identification, ..PreExposed::default() };
+        }
         let a = auto.filter(|a| a.valid && a.samples > 0 && a.target_log2_e.is_finite())?;
+        if p.run.is_some_and(|r| now.saturating_duration_since(r.last) > PREEXPOSED_GAP) {
+            p.run = None;
+        }
         // The measured target is log2(key) - the frame's mean log2 luma: the lift the frame as given needs.
         let below = a.target_log2_e - e.log2();
         let exposed = a.target_log2_e <= PREEXPOSED_FRAME_STOPS;
-        let (id, holds) = &mut self.exposure_preexposed;
-        if *id != identification {
-            *id = identification;
-            *holds = 0;
+        let far = exposed && below > PREEXPOSED_STOPS;
+        let clear = !exposed || below < PREEXPOSED_CLEAR_STOPS;
+        // Toward the other state, or against it (which ends the run); a hold between the two leaves the run.
+        let (toward, against) = if p.measuring { (clear, far) } else { (far, clear) };
+        if against {
+            p.run = None;
+            return None;
         }
-        if exposed && below > PREEXPOSED_STOPS {
-            *holds += 1;
-        } else if !exposed || below < PREEXPOSED_CLEAR_STOPS {
-            *holds = 0;
+        let l = e.log2();
+        let fresh = Run { since: now, last: now, holds: 0, lo: l, hi: l };
+        if p.run.is_none() {
+            if !toward {
+                return None;
+            }
+            p.run = Some(fresh);
         }
-        (*holds >= PREEXPOSED_HOLDS).then(|| {
-            format!(
-                "the game's exposure {e} puts the frame {below:.1} stops below the brightness the network is tuned for on {} holds in a row, while the frame as given (log-average luma {:.3}) is within {:.1} stops of it",
-                *holds,
-                a.mean_log2.exp2(),
-                a.target_log2_e.max(0.0)
+        let run = p.run.as_mut()?;
+        // Into the measured frame only while the game's exposure holds steady: an eye adaptation catching up
+        // moves it, and starts the run over from this hold.
+        if !p.measuring && l.max(run.hi) - l.min(run.lo) > PREEXPOSED_STEADY_STOPS {
+            *run = fresh;
+        }
+        run.lo = run.lo.min(l);
+        run.hi = run.hi.max(l);
+        run.last = now;
+        run.holds += u32::from(toward);
+        let held = now.saturating_duration_since(run.since);
+        if run.holds < PREEXPOSED_HOLDS || held < PREEXPOSED_WINDOW {
+            return None;
+        }
+        let (holds, lo, hi) = (run.holds, run.lo, run.hi);
+        p.run = None;
+        p.measuring = !p.measuring;
+        let seconds = held.as_secs_f32();
+        Some(if p.measuring {
+            (
+                true,
+                format!(
+                    "the game's exposure {e} puts the frame {below:.1} stops below the brightness the network is tuned for over {seconds:.1} s ({holds} holds), held within {:.2} stops, while the frame as given (log-average luma {:.3}) is within {:.1} stops of it",
+                    hi - lo,
+                    a.mean_log2.exp2(),
+                    a.target_log2_e.max(0.0)
+                ),
+            )
+        } else {
+            (
+                false,
+                format!(
+                    "the game's exposure {e} puts the frame {below:.1} stops from the brightness the network is tuned for (log-average luma {:.3} as given) over {seconds:.1} s ({holds} holds)",
+                    a.mean_log2.exp2()
+                ),
             )
         })
+    }
+
+    /// Logs a switch of [`Self::pre_exposed`]: each direction at most once per [`PREEXPOSED_SAY_EVERY`], with the
+    /// changes left out since counted.
+    fn say_pre_exposed(&mut self, measuring: bool, why: &str, now: Instant) {
+        let (said, unsaid) = &mut self.exposure_preexposed_said[usize::from(measuring)];
+        if said.is_some_and(|t| now.saturating_duration_since(t) < PREEXPOSED_SAY_EVERY) {
+            *unsaid += 1;
+            return;
+        }
+        let more = match *unsaid {
+            0 => String::new(),
+            n => format!(" ({n} more such change(s) since the last line went unlogged)"),
+        };
+        *said = Some(now);
+        *unsaid = 0;
+        if measuring {
+            crate::log!(
+                "[preupscale] the colour input looks pre-exposed: {why}; measuring the exposure from the frame for this identification, not bounded by the game's{more}"
+            );
+        } else {
+            crate::log!("[preupscale] the colour input no longer looks pre-exposed: {why}; the game's exposure again for this identification{more}");
+        }
+        crate::logging::flush();
+    }
+
+    /// Whether `identification`'s colour input looks already exposed by the game ([`Self::check_exposure`]): its
+    /// holds measure the exposure from the frame, with the game's read beside it ([`Target::pre_exposed`]).
+    pub(crate) fn pre_exposed_measured(&self, identification: u64) -> bool {
+        let p = &self.exposure_preexposed;
+        p.measuring && p.identification == identification
     }
 
     /// What the network sees before the upscaler for the next hold ([`ShmClient::preupscale_view`]): the
@@ -12138,6 +12289,7 @@ mod tests {
                 exposure_input: exposure_aux(exposure),
                 paper_white: white,
                 lift_exposure: false,
+                pre_exposed: false,
                 identification: 1,
             };
             let (device, queue) = (&gpu.device, gpu.queue);
@@ -12295,6 +12447,7 @@ mod tests {
             exposure_input: None,
             paper_white: hdr::DEFAULT_PAPER_WHITE,
             lift_exposure: false,
+            pre_exposed: false,
             identification: 1,
         };
         {
@@ -12706,6 +12859,7 @@ mod tests {
             exposure_input: None,
             paper_white: hdr::DEFAULT_PAPER_WHITE,
             lift_exposure: false,
+            pre_exposed: false,
             identification,
         };
         let (device, queue) = (&gpu.device, gpu.queue);
@@ -12812,6 +12966,7 @@ mod tests {
                 exposure_input: exposure_aux(exposure),
                 paper_white: hdr::DEFAULT_PAPER_WHITE,
                 lift_exposure: true,
+                pre_exposed: false,
                 identification: identification as u64 + 1,
             };
             let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
@@ -12832,9 +12987,10 @@ mod tests {
 
     /// #51, Clair Obscur: Expedition 33: a colour input the game already exposed (a flat 0.2 here) with the
     /// game's eye-adaptation texel beside it (0.0077) is held with the game's exposure, measured beside it, until
-    /// [`PREEXPOSED_HOLDS`] holds in a row found the frame far below the key; from then on the exposure is
+    /// the holds of [`PREEXPOSED_WINDOW`] found the frame far below the key; from then on the exposure is
     /// measured from the frame, unbounded by the game's: e 3, the encode's scale (e over the paper white) 1, where
-    /// the game's put it at 0.0026. A scene-referred frame (GTA V: about 6, with its exposure of 0.1 or 1) and a
+    /// the game's put it at 0.0026. The game's texel is still read, into the exposure buffer's high half
+    /// ([`hdr::AutoUse::Beside`]), for the test whether the frame still is pre-exposed. A scene-referred frame (GTA V: about 6, with its exposure of 0.1 or 1) and a
     /// dark one the game's exposure puts far below the key (Crimson Desert at night) keep the game's exposure, used
     /// exactly as it is (the measurement beside it writes nothing the encode reads).
     #[test]
@@ -12864,7 +13020,12 @@ mod tests {
             let mut session = Session::default();
             let mut game_holds = 0;
             let mut last = None;
-            for _ in 0..PREEXPOSED_HOLDS + 5 {
+            // A hold every 50 ms of the holds' clock: the window's holds, and five more.
+            let step = Duration::from_millis(50);
+            let window = (PREEXPOSED_WINDOW.as_millis() / step.as_millis()) as u32 + 1;
+            assert!(window >= PREEXPOSED_HOLDS);
+            let t0 = Instant::now();
+            for k in 0..window + 5 {
                 // Each hold on the game's next frame (the roundtrip's write-back changed this one).
                 gpu.upload(image, w, h, &texels);
                 let target = Target {
@@ -12880,6 +13041,7 @@ mod tests {
                     exposure_input: exposure_aux(exposure).filter(|_| session.game_exposure_trusted(identification)),
                     paper_white: white,
                     lift_exposure: false,
+                    pre_exposed: session.pre_exposed_measured(identification),
                     identification,
                 };
                 let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
@@ -12888,27 +13050,30 @@ mod tests {
                 let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut submit) };
                 assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{name}: {result:?}");
                 assert!(result.auto_exposure.is_some_and(|a| a.valid && a.samples > 0), "{name}: measured beside the game's: {result:?}");
-                if result.exposure_source == Some(ExposureSource::Game) {
+                assert_eq!(result.exposure_source, Some(ExposureSource::Game), "{name}: the game's texel is read throughout");
+                if !target.pre_exposed {
                     game_holds += 1;
                     let e = result.exposure.unwrap();
                     assert!((e - game).abs() <= game * 1e-3, "{name}: the game's exposure as it is, {e}");
                     assert_eq!(result.game_exposure, Some(e), "{name}: nothing in the high half");
                 }
-                session.check_exposure(identification, &result);
+                session.check_exposure_at(identification, &result, t0 + step * k);
                 last = Some(result);
             }
             let last = last.unwrap();
+            assert!(session.game_exposure_trusted(identification), "{name}: never untrusted, only measured beside it");
             if pre_exposed {
-                assert_eq!(game_holds, PREEXPOSED_HOLDS, "{name}: the game's exposure until the count was reached");
-                assert!(!session.game_exposure_trusted(identification), "{name}");
-                assert_eq!(last.exposure_source, Some(ExposureSource::Auto), "{name}");
+                assert_eq!(game_holds, window, "{name}: the game's exposure until the window was over");
+                assert!(session.pre_exposed_measured(identification), "{name}");
                 let e = last.exposure.unwrap();
+                let read = last.game_exposure.unwrap();
+                assert!((read - game).abs() <= game * 1e-3, "{name}: the game's {read} in the high half beside the measured {e}");
                 let want = hdr::auto_exposure_reference(&texels, w, h, None).log2_e.exp2();
                 assert!((e - want).abs() <= want * 2e-3, "{name}: e {e}, the CPU reference's {want}");
                 assert!((e / white - 1.0).abs() < 0.02, "{name}: the encode's scale {} (key {} over the frame's {luma})", e / white, hdr::AUTO_KEY);
             } else {
-                assert_eq!(game_holds, PREEXPOSED_HOLDS + 5, "{name}");
-                assert!(session.game_exposure_trusted(identification), "{name}");
+                assert_eq!(game_holds, window + 5, "{name}");
+                assert!(!session.pre_exposed_measured(identification), "{name}");
             }
             unsafe {
                 gpu.device.destroy_image(exposure, None);
@@ -12918,52 +13083,189 @@ mod tests {
         finish(&gpu, res, &[(image, memory)]);
     }
 
-    /// The count of [`Session::check_exposure`]'s pre-exposed test: holds in a row past [`PREEXPOSED_STOPS`]
-    /// with the frame near the key; one between [`PREEXPOSED_CLEAR_STOPS`] and it keeps the count, one under it,
-    /// a frame darker than [`PREEXPOSED_FRAME_STOPS`] or another identification starts over; a hold without a
-    /// measurement changes nothing.
-    #[test]
-    fn the_pre_exposed_test_needs_its_holds_in_a_row() {
-        let key = hdr::AUTO_KEY.log2();
-        // A frame of mean log2 luma `mean` with the game's exposure e.
-        let hold = |mean: f32, e: f32| HoldResult {
+    /// A hold of [`Session::check_exposure`]'s pre-exposed test: a frame of log-average luma `luma` with the game's
+    /// exposure `e`, the measurement beside it.
+    fn pre_exposed_hold(luma: f32, e: f32) -> HoldResult {
+        let target = hdr::AUTO_KEY.log2() - luma.log2();
+        HoldResult {
             exposure_source: Some(ExposureSource::Game),
             exposure: Some(e),
-            auto_exposure: Some(hdr::AutoState { log2_e: key - mean, valid: true, target_log2_e: key - mean, mean_log2: mean, samples: 100 }),
+            auto_exposure: Some(hdr::AutoState { log2_e: target, valid: true, target_log2_e: target, mean_log2: luma.log2(), samples: 100 }),
             ..HoldResult::default()
-        };
-        let far = || hold(0.2f32.log2(), 0.0077); // 8.6 stops below, the frame 1.6 stops under the key
-        let between = || hold(0.2f32.log2(), 0.2f32.recip() * hdr::AUTO_KEY / 4.5f32.exp2()); // 4.5 stops
-        let near = || hold(0.2f32.log2(), 0.2f32.recip() * hdr::AUTO_KEY / 2.0); // 1 stop
-        let dark = || hold(0.01f32.log2(), 0.0077); // far below, but so is the frame itself
-        let mut session = Session::default();
-        for _ in 0..PREEXPOSED_HOLDS - 1 {
-            session.check_exposure(1, &far());
         }
-        session.check_exposure(1, &between());
-        session.check_exposure(1, &HoldResult { auto_exposure: None, ..far() });
-        assert!(session.game_exposure_trusted(1), "one short");
-        session.check_exposure(1, &far());
-        assert!(!session.game_exposure_trusted(1), "in a row, the one between and the one unmeasured not breaking it");
-        for (name, breaker) in [("near", near()), ("dark", dark())] {
-            let mut session = Session::default();
-            for _ in 0..PREEXPOSED_HOLDS - 1 {
-                session.check_exposure(2, &far());
+    }
+
+    /// The holds' clock for [`Session::check_exposure_at`]: a hold every `step`.
+    struct HoldClock {
+        t0: Instant,
+        step: Duration,
+        k: u32,
+    }
+
+    impl HoldClock {
+        /// 60 holds a second.
+        fn new() -> Self {
+            Self { t0: Instant::now(), step: Duration::from_micros(16_667), k: 0 }
+        }
+
+        /// The holds a run of [`PREEXPOSED_WINDOW`] takes, its first included: the last of them can switch.
+        fn window(&self) -> u32 {
+            PREEXPOSED_WINDOW.as_nanos().div_ceil(self.step.as_nanos()) as u32 + 1
+        }
+
+        fn hold(&mut self, session: &mut Session, identification: u64, result: &HoldResult) {
+            session.check_exposure_at(identification, result, self.t0 + self.step * self.k);
+            self.k += 1;
+        }
+
+        fn holds(&mut self, session: &mut Session, identification: u64, n: u32, result: &HoldResult) {
+            for _ in 0..n {
+                self.hold(session, identification, result);
             }
-            session.check_exposure(2, &breaker);
-            session.check_exposure(2, &far());
-            assert!(session.game_exposure_trusted(2), "{name} starts the count over");
-            session.check_exposure(3, &far());
-            assert!(session.game_exposure_trusted(3), "{name}: another identification starts over");
         }
+
+        /// Nothing held for `gap`.
+        fn wait(&mut self, gap: Duration) {
+            self.k += gap.as_nanos().div_ceil(self.step.as_nanos()) as u32;
+        }
+    }
+
+    /// The window of [`Session::check_exposure`]'s pre-exposed test: holds past [`PREEXPOSED_STOPS`] with the frame
+    /// near the key for [`PREEXPOSED_WINDOW`], [`PREEXPOSED_HOLDS`] of them at least, the game's exposure steady
+    /// within [`PREEXPOSED_STEADY_STOPS`]; one between [`PREEXPOSED_CLEAR_STOPS`] and it keeps the run, one under
+    /// it, a frame darker than [`PREEXPOSED_FRAME_STOPS`], a gap or another identification starts it over; a hold
+    /// without a measurement changes nothing. The game's exposure stays trusted: only measured beside.
+    #[test]
+    fn the_pre_exposed_test_needs_its_window() {
+        let far = pre_exposed_hold(0.2, 0.0077); // 8.6 stops below, the frame 1.6 stops under the key
+        let between = pre_exposed_hold(hdr::AUTO_KEY / (4.5f32.exp2() * 0.0077), 0.0077); // 4.5 stops: a brighter frame, the exposure as it was
+        let near = pre_exposed_hold(0.2, hdr::AUTO_KEY / 0.2 / 2.0); // 1 stop
+        let dark = pre_exposed_hold(0.01, 0.0077); // far below, but so is the frame itself
         let mut session = Session::default();
-        for _ in 0..PREEXPOSED_HOLDS * 4 {
-            session.check_exposure(4, &dark());
+        let mut clock = HoldClock::new();
+        let window = clock.window();
+        clock.holds(&mut session, 1, window - 2, &far);
+        clock.hold(&mut session, 1, &between);
+        clock.hold(&mut session, 1, &HoldResult { auto_exposure: None, ..pre_exposed_hold(0.2, 0.0077) });
+        assert!(!session.pre_exposed_measured(1), "one short");
+        clock.hold(&mut session, 1, &far);
+        assert!(session.pre_exposed_measured(1), "the window, the one between and the one unmeasured not breaking it");
+        assert!(session.game_exposure_trusted(1), "measured beside the game's, which stays read");
+        assert!(!session.pre_exposed_measured(2), "only for its identification");
+        for (name, breaker) in [("near", &near), ("dark", &dark)] {
+            let mut session = Session::default();
+            let mut clock = HoldClock::new();
+            clock.holds(&mut session, 2, window - 1, &far);
+            clock.hold(&mut session, 2, breaker);
+            clock.hold(&mut session, 2, &far);
+            assert!(!session.pre_exposed_measured(2), "{name} starts the run over");
+            clock.hold(&mut session, 3, &far);
+            assert!(!session.pre_exposed_measured(3), "{name}: another identification starts over");
         }
-        for _ in 0..PREEXPOSED_HOLDS * 4 {
-            session.check_exposure(5, &near());
+        // A gap longer than PREEXPOSED_GAP starts over: nothing was seen in it.
+        let mut session = Session::default();
+        let mut clock = HoldClock::new();
+        clock.holds(&mut session, 4, window / 2, &far);
+        clock.wait(PREEXPOSED_GAP * 2);
+        clock.holds(&mut session, 4, window / 2 + 2, &far);
+        assert!(!session.pre_exposed_measured(4), "a gap");
+        clock.holds(&mut session, 4, window, &far);
+        assert!(session.pre_exposed_measured(4), "a whole window after it");
+        // Sparse holds: the window's time but fewer than PREEXPOSED_HOLDS.
+        let mut session = Session::default();
+        let mut clock = HoldClock { step: PREEXPOSED_GAP - Duration::from_millis(10), ..HoldClock::new() };
+        clock.holds(&mut session, 5, clock.window() + 1, &far);
+        assert!(clock.window() < PREEXPOSED_HOLDS && !session.pre_exposed_measured(5), "too few holds");
+        clock.holds(&mut session, 5, PREEXPOSED_HOLDS, &far);
+        assert!(session.pre_exposed_measured(5), "enough of them");
+        // The game's exposure moving by more than PREEXPOSED_STEADY_STOPS over the window (a stop a second here,
+        // far below throughout) is an adaptation, not a pre-exposed frame.
+        let mut session = Session::default();
+        let mut clock = HoldClock::new();
+        for k in 0..window * 3 {
+            let e = 0.0005 * (k as f32 / 60.0).exp2();
+            clock.hold(&mut session, 6, &pre_exposed_hold(0.2, e));
         }
-        assert!(session.game_exposure_trusted(4) && session.game_exposure_trusted(5));
+        assert!(!session.pre_exposed_measured(6), "a moving exposure");
+        let mut session = Session::default();
+        let mut clock = HoldClock::new();
+        clock.holds(&mut session, 7, window * 4, &dark);
+        clock.holds(&mut session, 8, window * 4, &near);
+        assert!(!session.pre_exposed_measured(7) && !session.pre_exposed_measured(8));
+    }
+
+    /// #51: a scene-referred game walking from daylight into a dark tunnel (GTA V: e 0.15 on a frame of luma 6, then
+    /// a frame of 0.1) puts the frame more than [`PREEXPOSED_STOPS`] below the key while its eye adaptation lags
+    /// (here held for 1.5 s, which a count of 30 holds in a row tripped on) and then catches up: never measured.
+    /// Expedition 33's pre-exposed frame (luma 0.2) with its eye-adaptation texel steady anywhere in 0.0077-0.019
+    /// (a little noise on it) is, after [`PREEXPOSED_WINDOW`].
+    #[test]
+    fn an_eye_adaptation_catching_up_is_not_a_pre_exposed_frame() {
+        let mut session = Session::default();
+        let mut clock = HoldClock::new();
+        clock.holds(&mut session, 1, 120, &pre_exposed_hold(6.0, 0.15));
+        let mut e = 0.15f32;
+        for k in 0..600 {
+            // 1.5 s at the daylight exposure, then 4% of the way (log2) per hold towards the tunnel's.
+            if k >= 90 {
+                e = (e.log2() + 0.04 * (6.0f32.log2() - e.log2())).exp2();
+            }
+            clock.hold(&mut session, 1, &pre_exposed_hold(0.1, e));
+            assert!(!session.pre_exposed_measured(1), "hold {k} in the tunnel, e {e}");
+        }
+        for (identification, game) in [(2, 0.0077f32), (3, 0.012), (4, 0.019)] {
+            let mut session = Session::default();
+            let mut clock = HoldClock::new();
+            let window = clock.window();
+            for k in 0..window {
+                assert!(!session.pre_exposed_measured(identification), "{game}: hold {k}");
+                let noise = [1.0, 1.08, 0.94, 1.03][k as usize % 4];
+                clock.hold(&mut session, identification, &pre_exposed_hold(0.2, game * noise));
+            }
+            assert!(session.pre_exposed_measured(identification), "{game}");
+        }
+    }
+
+    /// The switch to the measured frame is undone once the frame as given is no longer far below the game's
+    /// exposure for [`PREEXPOSED_WINDOW`] (under [`PREEXPOSED_CLEAR_STOPS`], or a frame darker than
+    /// [`PREEXPOSED_FRAME_STOPS`]); a hold past [`PREEXPOSED_STOPS`] starts that run over, one between leaves it.
+    /// Each direction is logged once per change, at most once per [`PREEXPOSED_SAY_EVERY`]: the rest are counted.
+    #[test]
+    fn a_pre_exposed_frame_goes_back_to_the_game_s_exposure_once_it_clears() {
+        let far = pre_exposed_hold(0.2, 0.0077);
+        let between = pre_exposed_hold(hdr::AUTO_KEY / (4.5f32.exp2() * 0.0077), 0.0077);
+        // A stop: a frame brighter by as much, the game's exposure as it was (a change of it by over EXPOSURE_JUMP_MAX
+        // back and forth would be the jumps that untrust it).
+        let near = pre_exposed_hold(hdr::AUTO_KEY / (2.0 * 0.0077), 0.0077);
+        let dark = pre_exposed_hold(0.01, 0.0077);
+        for (name, clear) in [("near", &near), ("dark", &dark)] {
+            let mut session = Session::default();
+            let mut clock = HoldClock::new();
+            let window = clock.window();
+            clock.holds(&mut session, 1, window, &far);
+            assert!(session.pre_exposed_measured(1), "{name}");
+            assert_eq!(session.exposure_preexposed_said[1], (Some(clock.t0 + clock.step * (window - 1)), 0), "{name}: logged");
+            clock.holds(&mut session, 1, window - 1, clear);
+            clock.hold(&mut session, 1, &far);
+            assert!(session.pre_exposed_measured(1), "{name}: a hold far below starts the run over");
+            clock.holds(&mut session, 1, window - 2, clear);
+            clock.hold(&mut session, 1, &between);
+            assert!(session.pre_exposed_measured(1), "{name}: one short, and one between leaves the run");
+            clock.hold(&mut session, 1, clear);
+            assert!(!session.pre_exposed_measured(1), "{name}: undone");
+            assert!(session.exposure_preexposed_said[0].0.is_some(), "{name}: logged");
+            // Back and forth within PREEXPOSED_SAY_EVERY: switched each time, logged once each way.
+            for _ in 0..2 {
+                clock.holds(&mut session, 1, window, &far);
+                assert!(session.pre_exposed_measured(1), "{name}: again");
+                clock.holds(&mut session, 1, window, clear);
+                assert!(!session.pre_exposed_measured(1), "{name}: undone again");
+            }
+            assert_eq!(session.exposure_preexposed_said.map(|(_, n)| n), [2, 2], "{name}: the changes not logged");
+            clock.wait(PREEXPOSED_SAY_EVERY);
+            clock.holds(&mut session, 1, window, &far);
+            assert_eq!(session.exposure_preexposed_said[1], (Some(clock.t0 + clock.step * (clock.k - 1)), 0), "{name}: logged again");
+        }
     }
 
     /// Roundtrip with the auto-exposure is the identity the game-exposure roundtrip is: the encode
@@ -13054,6 +13356,7 @@ mod tests {
             exposure_input: None,
             paper_white: hdr::DEFAULT_PAPER_WHITE,
             lift_exposure: false,
+            pre_exposed: false,
             identification: 1,
         };
         assert_eq!(native::depth_source(&base), None);
@@ -13194,6 +13497,7 @@ mod tests {
             exposure_input: None,
             paper_white: hdr::DEFAULT_PAPER_WHITE,
             lift_exposure: false,
+            pre_exposed: false,
             identification: 1,
         };
         let run = |res: &Resources, target: &Target, cache: Option<&CacheCopies>| unsafe {
@@ -13365,6 +13669,7 @@ mod tests {
             exposure_input: None,
             paper_white: hdr::DEFAULT_PAPER_WHITE,
             lift_exposure: false,
+            pre_exposed: false,
             identification: 1,
         };
         let queue = gpu.queue;
