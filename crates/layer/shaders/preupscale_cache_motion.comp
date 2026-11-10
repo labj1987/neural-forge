@@ -230,8 +230,14 @@ vec3 print_at(ivec2 at) {
   return vec3(log2(dot(max(v, vec3(0.0)), LUMA) + p.eps_v), log2(q.r / q.g), log2(q.b / q.g));
 }
 
-vec2 finite_or_zero(vec2 v) {
-  return vec2(isnan(v.x) || isinf(v.x) ? 0.0 : v.x, isnan(v.y) || isinf(v.y) ? 0.0 : v.y);
+// A vector as the hold's RG16F copy holds it, before its scale: one that is not a number is the largest finite
+// half, and an infinite one the largest of its sign, so that each leaves the frame and the chain is lost there
+// (no history), as the network's own read of such a vector (native_preprocess.comp's hasHistory) has none.
+// Crimson Desert's RG32F vectors are NaN on a few texels a frame and past the half's range (infinite in the
+// copy) on up to 119 at 4K; read as zero, they carried the history as if nothing there had moved.
+vec2 half_vector(vec2 v) {
+  const float HALF_MAX = 65504.0;
+  return vec2(isnan(v.x) ? HALF_MAX : clamp(v.x, -HALF_MAX, HALF_MAX), isnan(v.y) ? HALF_MAX : clamp(v.y, -HALF_MAX, HALF_MAX));
 }
 
 // sample_bilinear_taken: the previous accumulated field (render pixels) at pos; taps of weight 0
@@ -300,7 +306,7 @@ void accumulate(uvec2 xy) {
       }
     }
   }
-  vec2 mv = finite_or_zero(unpackHalf2x16(u_motion.mv[pick]) * p.mvec_scale);
+  vec2 mv = half_vector(unpackHalf2x16(u_motion.mv[pick])) * p.mvec_scale;
   count_still(mv);
   // acc_step: acc_t(x) = mv_t(x) + acc_{t-1}(x + mv_t(x) + jitter[t-1] - jitter[t]).
   vec2 at = vec2(xy) + 0.5 + mv + p.step_jitter;

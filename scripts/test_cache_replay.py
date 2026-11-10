@@ -179,6 +179,29 @@ class CacheReplayTests(unittest.TestCase):
         # this is 0 on every numpy and SIMD level; checked on both sides.
         self.assertLess(abs(r["none"]["kept"]), 1e-6)
 
+    def test_a_vector_that_is_not_finite_leaves_the_frame(self):
+        # As preupscale_cache_motion.comp: an infinite vector in the dump's RG16F copy (an RG32F vector past
+        # the half's range) is the largest finite half of its sign and a NaN one the largest finite half, so
+        # the chain is lost there (NaN), where both were read as zero motion.
+        holds, white, _ = cr.synthetic_holds("still")
+        path = os.path.join(self.tmp.name, "infinite")
+        mv = np.zeros_like(holds[1].mvec)
+        mv[5, 7] = (np.inf, 0.0)
+        mv[9, 11] = (0.0, -np.inf)
+        mv[13, 17] = (np.nan, 0.0)
+        holds = [holds[0], dataclasses.replace(holds[1], mvec=mv)]
+        cc.write_dump(path, holds, white, extra={"mvec_scale": [2272.0, -1280.0]})
+        dump = cc.load_dump(path)
+        got = dump.hold(1).mvec
+        np.testing.assert_array_equal(got[5, 7], [65504.0 * 2272.0, 0.0])
+        np.testing.assert_array_equal(got[9, 11], [0.0, 65504.0 * 1280.0])
+        p = dataclasses.replace(cc.Params(), nearest_surface=False)  # each texel's own vector
+        f = cc.prepare(dump.hold(1), dump.paper_white, True, p)
+        acc = cc.acc_step(None, f, np.zeros(2, np.float32), p)
+        self.assertTrue(np.isnan(acc[5, 7]).all() and np.isnan(acc[9, 11]).all())
+        self.assertTrue(np.isnan(acc[13, 17]).all())
+        self.assertEqual(int(np.isnan(acc).any(axis=-1).sum()), 3)
+
     def test_history_read_keeps_a_pixel_scale_edit(self):
         # A checkerboard edit read at a sub-pixel offset: the strongest tap's own edit comes through
         # whole, where a bilinear blend of the four taps keeps a fraction of it.
