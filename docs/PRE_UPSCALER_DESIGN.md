@@ -663,7 +663,8 @@ the split's one refusal line ("same-layout barrier ... not holding"), `holding i
 why not the split: SameLayoutBarrier` follows, and the tally says `held 263, ran 263` every 5 s (about 52 holds a
 second; 3597 holds inside against 1 split in the run). The split's line was read as the frame's fate. With the
 hold inside on, that line now says the hold inside takes such buffers and which lines say whether it holds
-(`Hazard::why_inside`).
+(`Hazard::why_inside`); for a buffer recorded before the identification, that the hold inside takes it only where
+DLSS's own buffer was begun since (it refuses one begun before, `InlineRefusal::BegunBefore`).
 
 What did go wrong: every hold's history was dropped. The log had `an input of a hold inside DLSS's buffer was read
 as GENERAL ... but it is 2147418113 when the buffer runs` on both of the game's D32_SFLOAT_S8_UINT depth images,

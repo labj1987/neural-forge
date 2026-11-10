@@ -1478,7 +1478,9 @@ impl Hazard {
             Self::EventWait => inside!("waits on an event before its launch"),
             Self::SuspendedRendering => inside!("resumes dynamic rendering suspended in the buffer before it"),
             Self::NotSplittable | Self::HeldInside => self.why(),
-            Self::RecordedBefore => inside!("or a buffer before it in the submit, was recorded before DLSS's inputs were identified"),
+            // Not "takes such buffers": the hold inside refuses a DLSS buffer begun before the identification
+            // ([`InlineRefusal::BegunBefore`]); only one begun since, behind an earlier buffer begun before, is taken.
+            Self::RecordedBefore => "the DLSS launch buffer, or a buffer before it in the submit, was recorded before DLSS's inputs were identified, so its barriers on them were not seen and the submit is not split in front of it; the hold inside DLSS's buffer takes it only where DLSS's own buffer was begun since (\"holding inside DLSS's command buffer\" says when it holds), and buffers recorded since are held",
         }
     }
 }
@@ -9562,6 +9564,10 @@ mod tests {
         let resubmitted = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert!(!resubmitted.identified_now && resubmitted.colour_in_general());
         assert_eq!(resubmitted.hazard, Some(Hazard::RecordedBefore), "recorded before the identification: not held");
+        // The hold inside DLSS's buffer refuses that buffer too (begun before): the line does not say it takes it.
+        assert_eq!(t.lock().inline_point(cb(1), img(0x1000)).err(), Some(InlineRefusal::BegunBefore));
+        let why = Hazard::RecordedBefore.why_inside();
+        assert!(!why.contains("takes such buffers") && why.contains("only where DLSS's own buffer was begun since"), "{why}");
         record(cb(1));
         let second = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert!(!second.identified_now && second.colour_layout.is_none());
