@@ -261,7 +261,7 @@ ran with no missed frames and no GPU fault.
 | Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | Before the upscaler, inside DLSS's buffer |
 | Remnant II | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Before the upscaler, inside DLSS's buffer |
 | Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Ray Reconstruction, Frame Generation | After DLSS with Ray Reconstruction on; before the upscaler, inside DLSS's buffer, with it off |
-| Cyberpunk 2077 | REDengine 4, DX12 | Super Resolution, Frame Generation 3x (its built-in benchmark) | Before the upscaler, inside DLSS's buffer |
+| Cyberpunk 2077 | REDengine 4, DX12 | Super Resolution, Ray Reconstruction, path tracing, Frame Generation 3x (its built-in benchmark) | After DLSS with Ray Reconstruction on; before the upscaler, inside DLSS's buffer, with it off; After DLSS on request either way |
 | Red Dead Redemption 2 | RAGE, Vulkan | Super Resolution (Quality) | Before the upscaler, inside DLSS's buffer, on a compute queue shared with the game; not on the finished frame |
 
 Setup notes for these games:
@@ -394,8 +394,8 @@ everything under `~/.local/share/neural-forge` (the model, an imported DLL, capt
 
 - **Each DLSS game needs a test run before it is claimed:** engines hand DLSS its inputs in
   different ways, and several broke an assumption the first time. See [Tested games](#tested-games).
-- **The model after DLSS is tested in two games** (Crimson Desert and Hogwarts Legacy, with Ray
-  Reconstruction). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
+- **The model after DLSS is tested in three games** (Crimson Desert and Hogwarts Legacy with Ray
+  Reconstruction; Cyberpunk 2077 with and without it). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
   much lower frame rate (36 against 120 fps shown in Crimson Desert).
 - **HDR on the finished frame:** HDR10 is handled (above) and tested in Crimson Desert; float16
   (scRGB) swapchains are presented untouched, and HDR frames cannot be captured.

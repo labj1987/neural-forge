@@ -1007,12 +1007,14 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
 
 /// DLSS Ray Reconstruction's first launch read for its colour input and motion vectors when it does not
 /// read as SR's input form ([`input_launch`]): the colour input is a [`colour_candidate`] it names that was
-/// identified as DLSS's colour input before (`known`; Ray Reconstruction running clears the identification),
-/// else its only RGBA16F one usable as a colour attachment (Hogwarts Legacy's also names two R11G11B10
-/// attachments), else its only colour attachment; the
-/// motion vectors the [`MVEC_FORMATS`] image nearest its extent; the depth a depth-like image at the motion
-/// vectors' extent, or none (the hold after DLSS reads no depth).
-fn rr_input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], known: &[vk::Image]) -> Option<InputLaunch> {
+/// identified as DLSS's colour input before (`known`, with its motion vectors; Ray Reconstruction running clears
+/// the identification), else its only RGBA16F one usable as a colour attachment (Hogwarts Legacy's also names two
+/// R11G11B10 attachments), else its only colour attachment, else the first of the RGBA16F images at the depth's
+/// extent in parameter order ([`rr_in_parameter_order`]); the motion vectors the known ones where it names them,
+/// else the second of those RGBA16F images when the colour is the first, else the [`MVEC_FORMATS`] image nearest
+/// its extent; the depth a depth-like image at the motion vectors' extent, or none (the hold after DLSS reads no
+/// depth).
+fn rr_input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], known: &[(vk::Image, vk::Image)]) -> Option<InputLaunch> {
     let desc = |i: &vk::Image| images.get(i).copied();
     let candidates: Vec<vk::Image> = named.iter().copied().filter(|i| desc(i).is_some_and(|d| colour_candidate(&d))).collect();
     let attachments: Vec<vk::Image> =
@@ -1022,13 +1024,19 @@ fn rr_input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], 
         [one] => Some(*one),
         _ => None,
     };
-    let colour = candidates.iter().copied().find(|i| known.contains(i)).or_else(|| only(&rgba)).or_else(|| only(&attachments))?;
+    let ordered = rr_in_parameter_order(images, named);
+    let known_colour = candidates.iter().copied().find(|i| known.iter().any(|(c, _)| c == i));
+    let colour = known_colour.or_else(|| only(&rgba)).or_else(|| only(&attachments)).or(ordered.map(|(c, _)| c))?;
     let cd = desc(&colour)?;
-    let mvec = named
-        .iter()
-        .copied()
-        .filter(|i| desc(i).is_some_and(|d| d.plain && MVEC_FORMATS.contains(&d.format)))
-        .min_by_key(|i| desc(i).map_or(u64::MAX, |d| u64::from(d.width.abs_diff(cd.width)) + u64::from(d.height.abs_diff(cd.height))))?;
+    let known_mvec = known.iter().find(|(c, m)| *c == colour && named.contains(m)).map(|(_, m)| *m);
+    let ordered_mvec = ordered.filter(|(c, _)| *c == colour).map(|(_, m)| m);
+    let mvec = known_mvec.or(ordered_mvec).or_else(|| {
+        named
+            .iter()
+            .copied()
+            .filter(|i| desc(i).is_some_and(|d| d.plain && MVEC_FORMATS.contains(&d.format)))
+            .min_by_key(|i| desc(i).map_or(u64::MAX, |d| u64::from(d.width.abs_diff(cd.width)) + u64::from(d.height.abs_diff(cd.height))))
+    })?;
     let md = desc(&mvec)?;
     let depth = named
         .iter()
@@ -1040,6 +1048,39 @@ fn rr_input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], 
         })
         .unwrap_or(vk::Image::null());
     Some(InputLaunch::Inputs { colour, depth, mvec })
+}
+
+/// Cyberpunk 2077's Ray Reconstruction (vkd3d-proton, 310.x `rr2_enc0_kernel`, issue #49, probed 2026-11-10) as
+/// [`four_channel_in_parameter_order`] reads its Super Resolution: every image has the same usage, so usage tells
+/// nothing, and its first launch names five RGBA16F images at the render size beside two RG16F ones (not the
+/// motion vectors) and two depth-like images. In parameter order the first of the RGBA16F ones is the colour input
+/// (the one its auto-exposure kernel reads) and the second the motion vectors (the ones DLSS Frame Generation's
+/// `Kernel_InputMvecProcessing` reads with the depth). Read so only when every depth-like image it names is at one
+/// extent and at least two copyable RGBA16F images with the same usage are there, the first a [`colour_candidate`]:
+/// `(colour, motion vectors)`.
+fn rr_in_parameter_order(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<(vk::Image, vk::Image)> {
+    let mut seen: Vec<vk::Image> = Vec::new();
+    let unique: Vec<(vk::Image, ImageDesc)> = named
+        .iter()
+        .filter(|i| {
+            let first = !seen.contains(i);
+            seen.push(**i);
+            first
+        })
+        .filter_map(|i| images.get(i).filter(|d| d.plain).map(|d| (*i, *d)))
+        .collect();
+    let mut depths = unique.iter().filter(|(_, d)| DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format)).map(|(_, d)| (d.width, d.height));
+    let extent = depths.next()?;
+    if depths.any(|e| e != extent) {
+        return None;
+    }
+    let rgba: Vec<(vk::Image, ImageDesc)> = unique
+        .iter()
+        .copied()
+        .filter(|(_, d)| d.format == vk::Format::R16G16B16A16_SFLOAT && d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (d.width, d.height) == extent)
+        .collect();
+    let [(colour, c), (mvec, m), ..] = rgba[..] else { return None };
+    (c.usage == m.usage && colour_candidate(&c)).then_some((colour, mvec))
 }
 
 /// `NEURAL_FORGE_PREUPSCALE_PICK=N` (diagnostics only): when an input launch names several colour
@@ -1418,20 +1459,32 @@ pub(crate) struct DlssOutput {
     pub mvec: vk::Image,
     /// The buffer is Ray Reconstruction's.
     pub rr: bool,
+    /// How many launches of the output kernel name the output in one buffer: DLSS writes it in that many
+    /// parts (Cyberpunk 2077's Ray Reconstruction: 12 `rr2_downsample_kernel_static_hdr` launches, each
+    /// after an `rr2_post_kernel`), so the hold goes after the last ([`Tracker::launch_kernel`]).
+    pub writes: u32,
 }
 
 /// Whether two buffers' DLSS outputs are the same output: the same kernel writing an image of the same
-/// extent and format from an input of the same extent, Ray Reconstruction's or not (the handles may
-/// alternate frame by frame).
+/// extent and format from an input of the same extent in as many launches, Ray Reconstruction's or not (the
+/// handles may alternate frame by frame).
 fn same_output(a: &DlssOutput, b: &DlssOutput, images: &HashMap<vk::Image, ImageDesc>) -> bool {
     let kind = |i: &vk::Image| images.get(i).map(|d| (d.width, d.height, d.format));
     let extent = |i: &vk::Image| images.get(i).map(|d| (d.width, d.height));
-    a.function == b.function && a.rr == b.rr && kind(&a.image).is_some() && kind(&a.image) == kind(&b.image) && extent(&a.input) == extent(&b.input)
+    a.function == b.function
+        && a.rr == b.rr
+        && a.writes == b.writes
+        && kind(&a.image).is_some()
+        && kind(&a.image) == kind(&b.image)
+        && extent(&a.input) == extent(&b.input)
 }
 
 /// Submitted DLSS buffers in a row naming the same output kernel and kind of output image ([`same_output`])
 /// before it is taken.
 const OUTPUT_SETTLE: u32 = 8;
+
+/// The (kernel, image) output pairs counted per buffer ([`LaunchRefs::output_writes`]), at most.
+const MAX_OUTPUT_PAIRS: usize = 8;
 
 /// Holds after DLSS's output that could not be had in a row before the output counts as not learnable
 /// ([`Tracker::after_missed`]).
@@ -1628,6 +1681,8 @@ pub(crate) struct Tracker {
     /// What turns DLSS's motion vectors into the colour input's pixels, as the last SR input launch gave it
     /// ([`mv_units_scale`]): `None` until one did, and for other kernels.
     mv_scale: Option<[f32; 2]>,
+    /// The extent of the colour input of the SR input launch [`Self::mv_scale`] was read from ([`after_mv_units`]).
+    mv_scale_render: Option<(u32, u32)>,
     /// The identification ([`Self::generation`]) a hold inside DLSS's buffer was recorded for: from
     /// then on [`Self::inline_point`] answers for the buffers the split could take too
     /// ([`Hazard::HeldInside`]).
@@ -1758,6 +1813,11 @@ pub(crate) struct LaunchRefs {
     /// (DLSS's output kernel writing the upscaled frame, Super Resolution's or Ray Reconstruction's), and
     /// that output image ([`Tracker::dlss_output`]).
     pub output: Option<(vk::CuFunctionNVX, vk::Image)>,
+    /// How many launches of the buffer named each (kernel, image) pair as their output ([`Self::output`];
+    /// [`DlssOutput::writes`]).
+    pub output_writes: Vec<((vk::CuFunctionNVX, vk::Image), u32)>,
+    /// The kernel of the first launch naming each image of [`Self::images`].
+    pub named_by: Vec<(vk::Image, vk::CuFunctionNVX)>,
     /// The camera jitter the buffer's DLSS Super Resolution input launch was given: word 3 of a 310.x
     /// `hiluma_engine_input*` kernel's parameters, x in its low and y in its high 32 bits, render
     /// pixels (docs/NATIVE_BACKEND.md, "Motion vectors"). `None` for other kernels.
@@ -1770,6 +1830,22 @@ pub(crate) struct LaunchRefs {
     pub reset: Option<bool>,
     /// A hold recorded into the buffer before the launch carrying the reset word ([`Tracker::reset_for_hold`]).
     pub reset_asked: bool,
+}
+
+impl LaunchRefs {
+    /// How many launches of the buffer so far named `image` as `function`'s output ([`Self::output_writes`]).
+    fn writes_of(&self, function: vk::CuFunctionNVX, image: vk::Image) -> u32 {
+        self.output_writes.iter().find(|(k, _)| *k == (function, image)).map_or(0, |(_, n)| *n)
+    }
+
+    /// `n` more launches naming `key`'s image as its kernel's output ([`Self::output_writes`]).
+    fn count_output(&mut self, key: (vk::CuFunctionNVX, vk::Image), n: u32) {
+        if let Some((_, m)) = self.output_writes.iter_mut().find(|(k, _)| *k == key) {
+            *m += n;
+        } else if self.output_writes.len() < MAX_OUTPUT_PAIRS {
+            self.output_writes.push((key, n));
+        }
+    }
 }
 
 /// What DLSS Super Resolution's input launch says of the frame a hold belongs to: the camera jitter (render
@@ -1848,6 +1924,30 @@ fn mv_units_scale(name: &str, words: &[[u8; 8]]) -> Option<[f32; 2]> {
         out[axis] = p;
     }
     Some(out)
+}
+
+/// What turns DLSS's motion vectors into output pixels at a hold after DLSS's output (`output`, from the render size
+/// `render`), from what an SR input launch said ([`mv_units_scale`]: `scale` turns them into the pixels of its colour
+/// input, of extent `at`). The hold works on the output, so the motion vectors' render pixels are scaled by output
+/// over render; without this the hold took them for render pixels, and Cyberpunk 2077's (fractions of the frame)
+/// moved its history by 1/1485 of the camera's motion (issue #49).
+///
+/// Ray Reconstruction's launches say nothing of the units, which are the game's, so a hold after it takes the last SR
+/// input launch's, carried to its render size by what they are: 1 is render pixels at any render size; anything else
+/// is proportional to it (the frame's fractions: the render size; output pixels: render over output). `None` for an
+/// empty extent.
+fn after_mv_units(scale: [f32; 2], at: (u32, u32), render: (u32, u32), output: (u32, u32)) -> Option<[f32; 2]> {
+    let (at, render, output) = ([at.0, at.1], [render.0, render.1], [output.0, output.1]);
+    if at.contains(&0) || render.contains(&0) || output.contains(&0) {
+        return None;
+    }
+    let mut units = [0.0f32; 2];
+    for axis in 0..2 {
+        let s = scale[axis];
+        let in_render = if (s - 1.0).abs() < 1e-3 { 1.0 } else { s / at[axis] as f32 * render[axis] as f32 };
+        units[axis] = in_render * output[axis] as f32 / render[axis] as f32;
+    }
+    Some(units)
 }
 
 /// Input launches in a row with the reset word set after which it is not taken for the game's reset on that device
@@ -2447,12 +2547,24 @@ impl Tracker {
                 .copied()
                 .filter(|i| *i != colour && self.images.get(i).is_some_and(|d| colour_candidate(d) && input.is_some_and(|(w, h)| d.width > w && d.height > h)))
                 .collect();
+            // DLSS's own output-size images are named by its earlier launches too, and the output kernel names
+            // them beside its output: Cyberpunk 2077's Super Resolution (`dltss_pwin_*`, 2026-11-10) keeps its
+            // history in two 2560x1440 RGBA16F images it alternates frame by frame, named by its input kernel
+            // and network and then by its output kernel ahead of the output, the image only the output kernel
+            // names. The output is one no other kernel of the buffer named before ([`LaunchRefs::named_by`]),
+            // where there is one; a hold on the history was never seen (issue #49).
+            let refs = self.launch.get(&command_buffer);
+            let own = |i: &vk::Image| refs.and_then(|r| r.named_by.iter().find(|(n, _)| n == i)).is_none_or(|(_, f)| *f == function);
+            let fresh: Vec<vk::Image> = larger.iter().copied().filter(own).collect();
+            let larger = if fresh.is_empty() { larger } else { fresh };
             // Several (Hogwarts Legacy's Ray Reconstruction names an internal 3416x1922 image beside its
             // 2560x1440 output): the one at the swapchain's extent, else the first.
             let swapchain = self.swapchain_extent();
             let out = larger.iter().copied().find(|i| self.images.get(i).is_some_and(|d| Some((d.width, d.height)) == swapchain)).or(larger.first().copied());
             if let Some(out) = out {
-                self.launch.entry(command_buffer).or_default().output = Some((function, out));
+                let refs = self.launch.entry(command_buffer).or_default();
+                refs.output = Some((function, out));
+                refs.count_output((function, out), 1);
             }
         }
         if let Some(o) = self.launch.get(&command_buffer).and_then(|r| r.output) {
@@ -2466,7 +2578,7 @@ impl Tracker {
         // output of the learnt kind ([`same_output`]).
         let this = self.launch.get(&command_buffer).and_then(|r| match (r.output, r.input.clone()) {
             (Some((f, image)), Some(InputLaunch::Inputs { colour, depth, mvec })) if f == function && named.contains(&image) => {
-                Some(DlssOutput { function, image, input: colour, depth, mvec, rr: r.input_rr || !r.rr.is_empty() })
+                Some(DlssOutput { function, image, input: colour, depth, mvec, rr: r.input_rr || !r.rr.is_empty(), writes: r.writes_of(f, image) })
             }
             _ => None,
         });
@@ -2478,7 +2590,7 @@ impl Tracker {
             }
         }
         // The colour inputs identified so far (Ray Reconstruction's first launch, [`rr_input_launch`]).
-        let known: Vec<vk::Image> = self.named.iter().map(|n| n.colour).collect();
+        let known: Vec<(vk::Image, vk::Image)> = self.named.iter().map(|n| (n.colour, n.mvec)).collect();
         let refs = self.launch.entry(command_buffer).or_default();
         // Whether this launch is the buffer's first one read as an input launch.
         let mut fresh_input = false;
@@ -2501,9 +2613,12 @@ impl Tracker {
                     refs.input = Some(rr);
                 }
             }
-            if let Some(InputLaunch::Inputs { mvec, .. }) = refs.input {
+            if let Some(InputLaunch::Inputs { colour, mvec, .. }) = refs.input {
                 if kernel != Some(Kernel::RayReconstruction) {
                     self.current_mvec = Some(mvec);
+                }
+                if kernel == Some(Kernel::SrInput) && self.mv_scale.is_some() {
+                    self.mv_scale_render = self.images.get(&colour).map(|d| (d.width, d.height));
                 }
             }
             if refs.input.is_some() {
@@ -2598,6 +2713,7 @@ impl Tracker {
             if !refs.images.contains(&image) {
                 refs.images.push(image);
                 refs.before_named.push((image, before));
+                refs.named_by.push((image, function));
             }
         }
         self.inline_at = first_colour.map(|c| (command_buffer, c));
@@ -3120,7 +3236,7 @@ impl Tracker {
             exposure_input: None,
             mvec_input,
             mvec_extent: mvec.map_or((0, 0), |d| (d.width, d.height)),
-            mv_units: None,
+            mv_units: self.mv_scale.zip(self.mv_scale_render).and_then(|(scale, at)| after_mv_units(scale, at, render, (desc.width, desc.height))),
             depth_input: None,
             // Its own identification: the output image's handle with the top bit set (never an input's).
             identification: o.image.as_raw() | (1 << 63),
@@ -3243,12 +3359,18 @@ impl Tracker {
                     if c.output.is_some() {
                         refs.output = c.output;
                     }
+                    for (k, n) in c.output_writes {
+                        refs.count_output(k, n);
+                    }
                 }
                 for image in c.images {
                     if !refs.images.contains(&image) {
                         refs.images.push(image);
                         let before = c.before_named.iter().find(|(i, _)| *i == image).map(|(_, b)| *b).or(c.before_first).unwrap_or_default();
                         refs.before_named.push((image, shift(before)));
+                        if let Some(by) = c.named_by.iter().find(|(i, _)| *i == image) {
+                            refs.named_by.push(*by);
+                        }
                     }
                 }
             }
@@ -3569,7 +3691,8 @@ impl Tracker {
             let Some(refs) = self.launch.get(cb) else { continue };
             let Some((function, image)) = refs.output else { continue };
             let Some(InputLaunch::Inputs { colour, depth, mvec }) = refs.input.clone() else { continue };
-            let seen = DlssOutput { function, image, input: colour, depth, mvec, rr: refs.input_rr || !refs.rr.is_empty() };
+            let seen =
+                DlssOutput { function, image, input: colour, depth, mvec, rr: refs.input_rr || !refs.rr.is_empty(), writes: refs.writes_of(function, image) };
             // By kernel and the images' kind, not their handles: Hogwarts Legacy's Ray Reconstruction
             // alternates two output images (and inputs) frame by frame.
             match &mut self.output_streak {
@@ -3582,17 +3705,19 @@ impl Tracker {
                     self.dlss_output = Some(o);
                     let name = |f: vk::CuFunctionNVX| self.functions.get(&f).map_or("unnamed".to_string(), |(_, n)| n.clone());
                     let desc = |i: vk::Image| self.images.get(&i).map_or("unregistered".to_string(), |d| format!("{}x{} {:?}", d.width, d.height, d.format));
-                    lines.push(format!(
-                        "DLSS's output: image {} ({}), written by {} after its input launch on {} ({}; depth {}, motion vectors {}){}",
-                        hex(o.image),
-                        desc(o.image),
-                        name(o.function),
-                        hex(o.input),
-                        desc(o.input),
-                        hex(o.depth),
-                        hex(o.mvec),
-                        if o.rr { "; Ray Reconstruction" } else { "" }
-                    ));
+                    lines.push(
+                        format!(
+                            "DLSS's output: image {} ({}), written by {} after its input launch on {} ({}; depth {}, motion vectors {}){}",
+                            hex(o.image),
+                            desc(o.image),
+                            name(o.function),
+                            hex(o.input),
+                            desc(o.input),
+                            hex(o.depth),
+                            hex(o.mvec),
+                            if o.rr { "; Ray Reconstruction" } else { "" }
+                        ) + &if o.writes > 1 { format!("; written in {} launches, the hold goes after the last", o.writes) } else { String::new() },
+                    );
                 }
             }
         }
@@ -9824,6 +9949,29 @@ mod tests {
         assert_eq!(InlinePoint { mv_units: None, ..point }.mvec_scale(), [1.0, 1.0]);
     }
 
+    /// A hold after DLSS's output works on the output: the motion vectors' units are carried into output pixels
+    /// (issue #49: Cyberpunk 2077's, fractions of the frame, moved the history by 1/1485 of the camera's motion). After
+    /// Ray Reconstruction, which says nothing of them, the last SR input launch's are carried to its render size by
+    /// what they are.
+    #[test]
+    fn after_dlss_motion_vector_units_are_output_pixels() {
+        let near = |a: Option<[f32; 2]>, b: [f32; 2]| a.is_some_and(|a| (a[0] - b[0]).abs() < 1e-2 && (a[1] - b[1]).abs() < 1e-2);
+        let (render, output) = ((1485, 835), (2560, 1440));
+        // Cyberpunk 2077: fractions of the frame (1485 x 835 render pixels each).
+        assert!(near(after_mv_units([1485.0, 835.0], render, render, output), [2560.0, 1440.0]));
+        // GTA V: render pixels.
+        assert!(near(after_mv_units([1.0, 1.0], render, render, output), [2560.0 / 1485.0, 1440.0 / 835.0]));
+        // Hogwarts Legacy: output pixels (0.667 render pixels each), on output-size motion vectors: 1.
+        assert!(near(after_mv_units([1708.0 / 2560.0, 964.0 / 1440.0], (1708, 964), (1708, 964), output), [1.0, 1.0]));
+        // Measured at another render size (Super Resolution before Ray Reconstruction was switched on): fractions of the
+        // frame are the new render size, render pixels stay 1, output pixels stay output pixels.
+        let rr = (1280, 720);
+        assert!(near(after_mv_units([1485.0, 835.0], render, rr, output), [2560.0, 1440.0]));
+        assert!(near(after_mv_units([1.0, 1.0], render, rr, output), [2.0, 2.0]));
+        assert!(near(after_mv_units([1708.0 / 2560.0, 964.0 / 1440.0], (1708, 964), rr, output), [1.0, 1.0]));
+        assert_eq!(after_mv_units([1.0, 1.0], render, (0, 0), output), None);
+    }
+
     /// The hold copies the identified motion vectors only while DLSS's latest input launch names them:
     /// a game switching DLSS to new images (Hogwarts Legacy loading a save) names the new ones in its
     /// launches before the identification follows, and the old ones, which DLSS no longer reads, are
@@ -10809,6 +10957,167 @@ mod tests {
         }
     }
 
+    /// Every image as vkd3d-proton creates it for Cyberpunk 2077: the same usage whatever the image is for.
+    fn vkd3d_usage() -> vk::ImageUsageFlags {
+        vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST
+    }
+
+    /// Cyberpunk 2077's DLSS Super Resolution (310.x transformer, `NEURAL_FORGE_PROBE_RR=1`, issue #49,
+    /// 2026-11-10): DLSS keeps its history in two 2560x1440 RGBA16F images it alternates frame by frame; its input
+    /// kernel names one, its network (`dltss_pwin_*`) the other, and its output kernel names both ahead of the
+    /// output, the image only it names. DLSS's output is learnt as that image; the swapchain-size rule alone took
+    /// the history the output kernel names first, so the hold after DLSS edited DLSS's history and the picture
+    /// never showed it ("After DLSS never shows anything").
+    #[test]
+    fn cyberpunk_super_resolution_output_is_the_image_only_its_output_kernel_names() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let u = vkd3d_usage();
+        let set = set_of(&[
+            (0x100, desc(1485, 835, rgba, u)),
+            (0x300, desc(1485, 835, rgba, u)),
+            (0x200, desc(1485, 835, vk::Format::R32_UINT, u)),
+            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, u)),
+            (0x410, desc(2560, 1440, rgba, u)),
+            (0x411, desc(2560, 1440, rgba, u)),
+            (0x500, desc(5120, 2880, vk::Format::R16_SFLOAT, u)),
+            (0x420, desc(2560, 1440, rgba, u)),
+        ]);
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        let (input, net, output) = (vk::CuFunctionNVX::from_raw(0x9001), vk::CuFunctionNVX::from_raw(0x9002), vk::CuFunctionNVX::from_raw(0x9003));
+        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
+        t.record_function(net, "dltss_pwin_enc0_layer");
+        t.record_function(output, "hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel");
+        let frame = |t: &mut Tracker, c: vk::CommandBuffer, k: u64| {
+            let (history, other) = (0x410 + k, 0x411 - k);
+            t.launch_kernel(c, input, Some(&param_block(&[h(0x100), h(history), h(0x300), h(0x200), h(0x610)])));
+            t.launch_kernel(c, net, Some(&param_block(&[h(other)])));
+            t.launch_kernel(c, output, Some(&param_block(&[h(0x100), h(other), h(0x500), h(0x300), h(0x200), h(0x610), h(history), h(0x420)])));
+        };
+        for n in 0..OUTPUT_SETTLE {
+            let k = u64::from(n % 2);
+            frame(&mut t, cb(1), k);
+            assert_eq!(t.launch[&cb(1)].input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
+            assert_eq!(t.launch[&cb(1)].output, Some((output, img(0x420))), "frame {n}: the image only the output kernel names, not DLSS's history");
+            submit(&mut t, &[vec![cb(1)]]);
+            t.launch.remove(&cb(1));
+        }
+        let o = t.dlss_output.expect("DLSS's output is learnt");
+        assert_eq!((o.function, o.image, o.input, o.mvec, o.rr, o.writes), (output, img(0x420), img(0x100), img(0x300), false, 1));
+    }
+
+    /// Cyberpunk 2077's DLSS Ray Reconstruction (310.x `rr2_*`, vkd3d-proton, `NEURAL_FORGE_PROBE_RR=1`, issue #49,
+    /// 2026-11-10): its first launch names five RGBA16F images at the render size (the colour input first, the
+    /// motion vectors second), two RG16F ones and two depth-like ones, all with the same usage, so neither SR's
+    /// input form nor the single-attachment rule reads it, and DLSS's output was never learnt: placement "After
+    /// DLSS" and Auto with Ray Reconstruction on fell back to the finished frame. It is read in parameter order. Then
+    /// Ray Reconstruction writes its 2560x1440 output in 12 parts (an `rr2_post_kernel` and an
+    /// `rr2_downsample_kernel_static_hdr` launch each, the latter naming the output and its alternating history):
+    /// the hold goes after the last part only, where the whole output is written.
+    #[test]
+    fn cyberpunk_ray_reconstruction_output_is_learnt_and_held_after_its_last_part() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let u = vkd3d_usage();
+        let set = set_of(&[
+            (0x600, desc(3840, 2160, rgba, u)),
+            (0x100, desc(1485, 835, rgba, u)),
+            (0x110, desc(1485, 835, vk::Format::R8G8B8A8_UNORM, u)),
+            (0x111, desc(1485, 835, vk::Format::R8G8B8A8_UNORM, u)),
+            (0x300, desc(1485, 835, rgba, u)),
+            (0x120, desc(1485, 835, rgba, u)),
+            (0x121, desc(1485, 835, rgba, u)),
+            (0x210, desc(1485, 835, vk::Format::R32_SFLOAT, u)),
+            (0x211, desc(1485, 835, vk::Format::R16_SFLOAT, u)),
+            (0x122, desc(1485, 835, rgba, u)),
+            (0x310, desc(1485, 835, vk::Format::R16G16_SFLOAT, u)),
+            (0x311, desc(1485, 835, vk::Format::R16G16_SFLOAT, u)),
+            (0x112, desc(1485, 835, vk::Format::R8G8B8A8_SNORM, u)),
+            (0x700, desc(1920, 1080, vk::Format::A2B10G10R10_UNORM_PACK32, u)),
+            (0x200, desc(1485, 835, vk::Format::R32_UINT, u)),
+            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, u)),
+            (0x420, desc(2560, 1440, rgba, u)),
+            (0x430, desc(2560, 1440, rgba, u)),
+            (0x431, desc(2560, 1440, rgba, u)),
+        ]);
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        let f = |raw: u64| vk::CuFunctionNVX::from_raw(raw);
+        let (histogram, enc0, post, down) = (f(0x9001), f(0x9002), f(0x9003), f(0x9004));
+        t.record_function(histogram, "rr2_histogram_auto_exposure_basic_kernel");
+        t.record_function(enc0, "rr2_enc0_kernel");
+        t.record_function(post, "rr2_post_kernel");
+        t.record_function(down, "rr2_downsample_kernel_static_hdr");
+        let enc0_names = [0x600, 0x100, 0x110, 0x111, 0x300, 0x120, 0x121, 0x210, 0x211, 0x122, 0x310, 0x311, 0x112, 0x700, 0x200];
+        let named: Vec<vk::Image> = enc0_names.iter().map(|&r| img(r)).collect();
+        assert_eq!(input_launch(&t.images, &named), Some(InputLaunch::Unusable), "two depth-like images: not SR's input form");
+        assert_eq!(rr_input_launch(&t.images, &named, &[]), Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x300) }));
+        // Ray Reconstruction switched on in a session that identified Super Resolution's inputs: those are taken.
+        assert_eq!(
+            rr_input_launch(&t.images, &named, &[(img(0x120), img(0x121))]),
+            Some(InputLaunch::Inputs { colour: img(0x120), depth: img(0x210), mvec: img(0x121) })
+        );
+        // A frame: the auto-exposure kernel on the colour input, the encoder, then 12 parts of the output. Returns
+        // after which part a hold after DLSS's output was asked for.
+        let frame = |t: &mut Tracker, c: vk::CommandBuffer, k: u64| -> Vec<u32> {
+            let mut held = Vec::new();
+            t.launch_kernel(c, histogram, Some(&param_block(&[h(0x100), h(0x610)])));
+            t.launch_kernel(c, enc0, Some(&param_block(&enc0_names.map(h))));
+            for part in 1..=12 {
+                t.launch_kernel(c, post, Some(&param_block(&[h(0x110), h(0x600), h(0x122), h(0x310), h(0x311), h(0x100)])));
+                t.launch_kernel(c, down, Some(&param_block(&[h(0x420), h(0x121), h(0x120), h(0x430 + k), h(0x431 - k)])));
+                if t.after_at.take().is_some() {
+                    held.push(part);
+                }
+            }
+            held
+        };
+        let mut lines = Vec::new();
+        for n in 0..OUTPUT_SETTLE {
+            let k = u64::from(n % 2);
+            assert!(frame(&mut t, cb(1), k).is_empty(), "frame {n}: nothing held before the output is learnt");
+            assert_eq!(t.launch[&cb(1)].input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x300) }));
+            assert!(t.launch[&cb(1)].input_rr);
+            assert_eq!(t.launch[&cb(1)].output, Some((down, img(0x420))), "the output, not the internal 3840x2160 image nor the history");
+            lines.extend(submit(&mut t, &[vec![cb(1)]]).1);
+            t.launch.remove(&cb(1));
+        }
+        let o = t.dlss_output.expect("Ray Reconstruction's output is learnt");
+        assert_eq!((o.function, o.image, o.input, o.mvec, o.rr, o.writes), (down, img(0x420), img(0x100), img(0x300), true, 12));
+        assert!(t.named.is_empty(), "Ray Reconstruction's buffer is never evidence: {:?}", t.named);
+        let learnt: Vec<&String> = lines.iter().filter(|l| l.starts_with("DLSS's output: image")).collect();
+        assert_eq!(learnt.len(), 1, "{lines:#?}");
+        assert!(learnt[0].ends_with("; Ray Reconstruction; written in 12 launches, the hold goes after the last"), "{}", learnt[0]);
+        // With the output learnt (and Ray Reconstruction running, Auto runs after DLSS), each frame is held once,
+        // after the 12th part, on its own output.
+        for k in [0u64, 1] {
+            assert_eq!(frame(&mut t, cb(2), k), vec![12], "frame {k}");
+            submit(&mut t, &[vec![cb(2)]]);
+            t.launch.remove(&cb(2));
+        }
+        // A buffer written in fewer parts than learnt (the render size changed) gets no hold on a partly written
+        // output; 8 such in a row are learnt as the new output.
+        let short = |t: &mut Tracker, c: vk::CommandBuffer| {
+            t.launch_kernel(c, histogram, Some(&param_block(&[h(0x100), h(0x610)])));
+            t.launch_kernel(c, enc0, Some(&param_block(&enc0_names.map(h))));
+            let mut held = 0;
+            for _ in 0..6 {
+                t.launch_kernel(c, post, Some(&param_block(&[h(0x110), h(0x600), h(0x122), h(0x310), h(0x311), h(0x100)])));
+                t.launch_kernel(c, down, Some(&param_block(&[h(0x420), h(0x121), h(0x120), h(0x430), h(0x431)])));
+                held += usize::from(t.after_at.take().is_some());
+            }
+            held
+        };
+        for n in 0..OUTPUT_SETTLE {
+            assert_eq!(short(&mut t, cb(3)), 0, "submit {n}");
+            submit(&mut t, &[vec![cb(3)]]);
+            t.launch.remove(&cb(3));
+        }
+        assert_eq!(t.dlss_output.map(|o| o.writes), Some(6));
+        assert_eq!(short(&mut t, cb(3)), 1);
+    }
+
     /// (a) GTA V with DLSS Frame Generation: SR's buffer (input kernel naming colour, depth and
     /// motion vectors, then the network, the output kernel and the exposure copy) and FG's two
     /// buffers (fg_tracker's shape: FG's output-size frame beside the render-size depth and motion
@@ -11715,7 +12024,15 @@ mod tests {
         let mut t = Tracker::default();
         let t0 = Instant::now();
         assert!(!t.frame_at(t0).output, "no output learnt");
-        let o = DlssOutput { function: vk::CuFunctionNVX::from_raw(9), image: img(0x400), input: img(0x100), depth: img(0x200), mvec: img(0x300), rr: true };
+        let o = DlssOutput {
+            function: vk::CuFunctionNVX::from_raw(9),
+            image: img(0x400),
+            input: img(0x100),
+            depth: img(0x200),
+            mvec: img(0x300),
+            rr: true,
+            writes: 1,
+        };
         t.dlss_output = Some(o);
         assert!(t.frame_at(t0).output);
         for _ in 0..AFTER_MISSES - 1 {
