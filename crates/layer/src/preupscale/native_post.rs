@@ -2395,6 +2395,10 @@ mod tests {
             // SAFETY: a live test device; every object below is destroyed in Drop after the device idles.
             unsafe {
                 let gpu = Gpu::new(&device, setup).expect("the server's objects build");
+                // The tests start from no history (`none`) whatever the process default; `Rig::with` picks one.
+                let mut gpu = gpu;
+                gpu.motion = Motion::None;
+                gpu.flow = FlowState::Off;
                 let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
                 let features = super::super::own_host_buffer_with(&device, &instance, physical, u64::from(FW * FH) * 64, usage).unwrap();
                 let head = super::super::own_host_buffer_with(&device, &instance, physical, u64::from(FW * FH) * 16, usage).unwrap();

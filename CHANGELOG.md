@@ -15,6 +15,16 @@ first shipped them; their phase is kept as a subheading.
 - Games whose frame moves DLSS's colour input out of the general layout in a command buffer just before DLSS's own
   (and back after it) no longer fall between both ways of holding the frame, which left every frame unedited.
 
+**A steadier picture on the finished frame**
+
+- With the model on the finished frame (no DLSS, or the Placement setting "At present"), it now carries its result
+  from frame to frame along the GPU's optical flow, as it does before the upscaler. Before, every frame was worked
+  on afresh, and on grainy or noisy pictures (film grain in Cyberpunk 2077) large soft patches of the picture
+  flickered. `NEURAL_FORGE_POST_MOTION=none` brings the old behaviour back. A working scale below 1 makes this
+  flicker stronger.
+- With the Placement setting "At present", the Status tab's Model placement line now says the model runs on the
+  finished frame by that setting, instead of "waiting for DLSS Super Resolution".
+
 **Seeing why the model does not run before the upscaler**
 
 - When Neural Forge finds the frame a game hands to DLSS but cannot work on it, the Status tab's Model placement

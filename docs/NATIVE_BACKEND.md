@@ -478,10 +478,10 @@ of the layer's own, waited for (bounded). Anything else is echoed, as the helper
 the heartbeat and `helper_state` keep the layer's `helper_alive` true. The regions are imported as host
 memory where the device allows (staged copies otherwise).
 
-- **History, selectable**: there are no motion vectors after the upscaler. By default
-  (`NEURAL_FORGE_POST_MOTION=none`) every frame is a first frame, with a fixed seed (a changing seed with
-  nothing blending frames would shimmer). `zero` and `flow` give the path a history (zero motion, or the
-  GPU's optical flow, as the helper's NGX had): "History after the upscaler" below.
+- **History**: there are no motion vectors after the upscaler. By default (`NEURAL_FORGE_POST_MOTION=flow`,
+  since 3.14.0) each frame blends toward the previous output where the GPU's optical flow says the pixel was
+  (as the helper's NGX had); `zero` uses the same pixel, and `none` makes every frame a first frame with a
+  fixed seed: "History after the upscaler" below.
 - **Never both paths at once**: the pre-upscaler hold and this server share the network's frame state; each
   refuses for a second after the other used it (`Loader::claim_pre`, `claim_post`).
 - **A helper process that is running wins**: the server does not start if the helper's heartbeat moves.
@@ -937,17 +937,19 @@ against the effect off at 0.931%):
 passes); flicker does not move beyond the run-to-run noise. No value is clearly better, so 1 stays the
 default.
 
-## History after the upscaler (selectable, 2026-10-19)
+## History after the upscaler (2026-10-19; `flow` the default since 3.14.0)
 
-Without a history every frame after the upscaler is a first frame, which costs temporal stability
-(shimmer). `NEURAL_FORGE_POST_MOTION` selects one, for measurement (read once, logged once). `none` stays the
-default: measured, neither history is steadier than none ("Measured" below), so it is a testing aid:
+Without a history every frame after the upscaler is a first frame, which costs temporal stability: the
+network's answer to a grainy or noisy frame changes from frame to frame in large soft patches (issue #49,
+Cyberpunk 2077 with the model at present). `NEURAL_FORGE_POST_MOTION` selects the history (read once, logged
+once). `flow` is the default since 3.14.0 ("Measured again" below); 3.8.0 to 3.13.0 shipped `none` on a
+measurement that scored the wrong quantity ("Measured" below):
 
 | Value | History |
 |---|---|
-| `none` (default) | None: lanes 7-9 copy the proxy, seed 0, no blend. Bit for bit as 3.7.0 (`the_shipped_frame_stays_bit_for_bit` pins the answers and lanes from 3.7.0's shaders). |
+| `none` | None: lanes 7-9 copy the proxy, seed 0, no blend. Bit for bit as 3.7.0 (`the_shipped_frame_stays_bit_for_bit` pins the answers and lanes from 3.7.0's shaders). |
 | `zero` | Each pass's previous output at the same pixel. |
-| `flow` | Each pass's previous output where the GPU's optical flow (`VK_NV_optical_flow`) says the pixel was, read with the pre-upscaler preprocess's five-tap Catmull-Rom filter. `zero` where the device has no optical flow (logged once, with the reason). |
+| `flow` (default) | Each pass's previous output where the GPU's optical flow (`VK_NV_optical_flow`) says the pixel was, read with the pre-upscaler preprocess's five-tap Catmull-Rom filter. `zero` where the device has no optical flow (logged once, with the reason). |
 
 With a history the after-the-upscaler shaders do what the pre-upscaler ones do with theirs:
 `native_post_preprocess.comp` puts the centred previous output into lanes 7-9 and the noise seed counts frames
@@ -1009,6 +1011,26 @@ the pan (`flow` is close to `none` while moving, where `zero` is worse). Neither
 steadier than none, even on a still frame, where `zero` is the exact previous output: the network's answer
 blended toward its own previous answer changes more from frame to frame, not less. The default stays `none`
 and both histories stay a testing aid.
+
+**Measured again** (RTX 5070, 2026-11-10, issue #49; `pan` at 2048x1536 with film grain 0.3, still and at 6 px/frame,
+24-frame series with the reporter's settings: placement At present, style 1, working scale 0.5 or 1). The 2026-10-19
+number is the *edit's* change between frames. On a grainy frame a steadier picture has to change its edit more (the
+edit cancels part of the grain), so that number rewards an edit that follows the noise. What a viewer sees is the
+*picture's* change. Here: the motion-compensated frame-to-frame change of 32x32-pixel block means of the composited
+frame, minus the original's (the flicker the model adds in large patches; 0.284-0.287 of 255 is the grain's own):
+
+| Case | `none` | `zero` | `flow` |
+|---|---|---|---|
+| Still, working scale 1 | +0.082 | -0.049 | |
+| Still, working scale 0.5 | +0.118 | -0.020 | +0.034 |
+| 6 px/frame, working scale 1 | +0.214 | +0.070 | **+0.022** |
+| 6 px/frame, working scale 0.5 | +0.256 | +0.197 | +0.150 |
+
+`flow` adds a tenth of `none`'s patch flicker in motion and none on a still frame; the edit stays as large (13.05
+against 13.29 of 255 at scale 1, moving) and moving edges show no trail. Per pixel, the grain dominates: the
+composited frame changes 3-7% more than the original with every setting. A fixed seed with a history (tried: the
+seed counting frames is the one difference from `none`'s noise) changed nothing. A lower working scale doubles
+the flicker with every history. So `flow` is the default from 3.14.0, `zero` where the device has no optical flow.
 
 ## Model resolution before the upscaler (3.8.0, 2026-10-19)
 

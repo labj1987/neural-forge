@@ -1188,7 +1188,7 @@ pass feedback. Measured in GTA V Enhanced at 1440p, FG 4x, Preset C, mods off, p
 
 ## October 19: placement, model resolution and history after the upscaler (3.8.0)
 
-- **A history after the upscaler does not steady the edit.** Measured with `pan` (2492x1370, 60 frames;
+- **A history after the upscaler does not steady the edit** (superseded on November 10: the score below is the edit's change, which rewards following the grain; the picture's change favours the optical-flow history, now the default). Measured with `pan` (2492x1370, 60 frames;
   the edit's change between frames over its size): none 0.314, the previous output at the same pixel 0.355,
   reprojected by the GPU's optical flow 0.324 while panning at 6 px/frame; 0.249 against 0.296 on a still
   frame. Blending toward the network's own previous answer makes it change more, and the flow only brings
@@ -1642,6 +1642,26 @@ bench-iq's log-luma Laplacian energy in the face, relative to the model off.
   when it adds less.
 
 Not built. A face pass would also need a detector with a licence that fits (SCRFD's weights are non-commercial).
+
+## November 10: a history on the finished frame after all (3.14.0, issue #49)
+
+- **What:** a user saw the whole picture flicker with the model at present (Cyberpunk 2077 at 2048x1536, Placement
+  "At present", working scale 0.5). Their two screen recordings, measured frame by frame: with the camera still,
+  32-pixel blocks of the picture changed 2-4 levels of 255 per frame with the model on against 0.2-0.8 with it
+  toggled off. That is large soft patches, not frames alternating between edited and unedited (frame n was never
+  closer to n+2 than to n+1).
+- **The October 19 decision was measured on the wrong quantity.** It scored the history by the *edit's* change between
+  frames. On a grainy frame a picture that holds steady needs an edit that changes (it cancels part of the grain),
+  so that score preferred no history. Scored by the *picture's* change (`pan` with grain 0.3, the reporter's
+  settings, NATIVE_BACKEND.md "Measured again"), the optical-flow history cuts the patch flicker the model adds
+  in motion from +0.214 to +0.022 at working scale 1, and zero motion takes it below the input's own on a still frame.
+  The edit keeps its size and moving edges keep no trail. A fixed seed with the history changed nothing. Working
+  scale 0.5 doubles the flicker in every mode.
+- **Taken:** `flow` is the default after the upscaler (`zero` on devices without optical flow). The Status tab says
+  "at present, on the finished frame" when the Placement setting puts the model there, rather than "waiting for
+  DLSS Super Resolution".
+- **Lesson:** for temporal stability, measure what is shown (the composited picture, motion-compensated, against the
+  original's own change), never a difference that is meant to change.
 
 ## Deliberately not done, or left open
 
