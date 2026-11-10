@@ -1663,8 +1663,6 @@ Not built. A face pass would also need a detector with a licence that fits (SCRF
 - **Lesson:** for temporal stability, measure what is shown (the composited picture, motion-compensated, against the
   original's own change), never a difference that is meant to change.
 
-## November 10: #51, a crash with no last words
-
 ## November 10: #51, a crash with no last words and a frame the game already exposed
 
 - **Indiana Jones and the Great Circle crashed with no Xid** on the 3.14.0 test build, which gives DLSS's possible

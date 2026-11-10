@@ -22,6 +22,9 @@ first shipped them; their phase is kept as a subheading.
   on Game: within about half a second Neural Forge notices that the game's exposure would make the model's
   picture far too dark, measures the brightness from the frame instead and says so in the game's log (`the
   colour input looks pre-exposed`).
+- Games that hand DLSS their frame in one of several images in turn (Clair Obscur: Expedition 33) now have the
+  model on every frame. Before, only the frames in one of those images were worked on, and the others flickered
+  through unedited while the camera moved.
 
 **A steadier picture on the finished frame**
 
@@ -32,10 +35,6 @@ first shipped them; their phase is kept as a subheading.
   flicker stronger.
 - With the Placement setting "At present", the Status tab's Model placement line now says the model runs on the
   finished frame by that setting, instead of "waiting for DLSS Super Resolution".
-
-- Games that hand DLSS their frame in one of several images in turn (Clair Obscur: Expedition 33) now have the
-  model on every frame. Before, only the frames in one of those images were worked on, and the others flickered
-  through unedited while the camera moved.
 
 **Seeing why the model does not run before the upscaler**
 
