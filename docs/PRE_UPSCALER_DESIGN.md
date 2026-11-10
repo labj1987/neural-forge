@@ -1926,7 +1926,10 @@ input, depth and motion vectors.
   exposure input. The evidence is kept per colour image (at most 4) and dropped when one of its
   images is destroyed, or when no input launch has named its colour image for 64 launch-bearing
   submits (`SR_RECENT`; logged: `no input launch named colour input 0x... in 64 launch-bearing
-  submits: dropped as evidence`). Loading a save in Cyberpunk 2077 (#49) can hand DLSS a new set of
+  submits: dropped as evidence`); not while Ray Reconstruction runs, whose buffers are never evidence: the entries
+  count as seen until it stops, so Super Resolution is identified again at once then, and Ray Reconstruction's own
+  first launch keeps the colour input and motion vectors it is read with (`rr_input_launch`). Loading a save in
+  Cyberpunk 2077 (#49) can hand DLSS a new set of
   images while the old set stays registered (alive, or only its views destroyed): the old entry stayed
   forever beside the new one, two evaluations with an exposure each, so none was chosen, the size
   rule (which Cyberpunk's RGBA16F motion vectors never meet) found nothing, and the status stayed

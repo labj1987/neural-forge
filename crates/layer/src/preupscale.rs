@@ -3971,6 +3971,15 @@ impl Tracker {
         for n in &evidence {
             self.named_seen.insert(n.colour, now);
         }
+        // Not while DLSS Ray Reconstruction runs: its buffers are never evidence, so every entry would age out
+        // (and Ray Reconstruction's own launch would lose the colour input and motion vectors it is read with,
+        // [`rr_input_launch`]). The entries count as seen until it stops, so Super Resolution is identified again
+        // at once then, and ages them from there.
+        if self.rr_running() {
+            for n in &self.named {
+                self.named_seen.insert(n.colour, now);
+            }
+        }
         let seen = &self.named_seen;
         let stale: Vec<vk::Image> = self.named.iter().map(|n| n.colour).filter(|c| seen.get(c).is_none_or(|&at| now.saturating_sub(at) >= SR_RECENT)).collect();
         if !stale.is_empty() {
@@ -12499,6 +12508,48 @@ mod tests {
         t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
         let (first_held, _) = run_frames(&mut t, 10);
         assert!(first_held.is_some(), "without names the shape rules alone hold it");
+    }
+
+    /// Super Resolution identified, then Ray Reconstruction for twice [`SR_RECENT`] launch-bearing submits (its
+    /// buffers are never evidence), then Super Resolution again: the evidence does not age while Ray Reconstruction
+    /// runs (no "dropped as evidence" line, which blames a save load, and Ray Reconstruction's own launch keeps the
+    /// inputs it is read with), and DLSS's input is identified again at the submit that sees it stopped.
+    #[test]
+    fn evidence_does_not_age_while_ray_reconstruction_runs() {
+        let mut t = gta_with("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
+        let (first_held, _) = run_frames(&mut t, 20);
+        assert!(first_held.is_some(), "Super Resolution is held");
+        let colours = |t: &Tracker| t.named.iter().map(|n| n.colour.as_raw()).collect::<Vec<u64>>();
+        assert_eq!(colours(&t), vec![0x100]);
+        let f = kernels(&mut t, &["rr2_enc0_kernel", "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel"]);
+        let record = |t: &mut Tracker, kernel: vk::CuFunctionNVX| {
+            t.begin(cb(1));
+            t.launch_kernel(cb(1), kernel, Some(&param_block(&[h(0x100), h(0x200), h(0x300), h(0x620)])));
+            t.launch_kernel(cb(1), kernel, Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
+        };
+        record(&mut t, f[0]);
+        let (held, lines) = run_frames(&mut t, 2 * SR_RECENT as usize);
+        assert_eq!(held, None, "Ray Reconstruction is never held");
+        assert!(lines.iter().any(|l| l.starts_with("DLSS Ray Reconstruction runs")), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("dropped as evidence")), "{lines:#?}");
+        assert_eq!(colours(&t), vec![0x100], "the evidence is kept while Ray Reconstruction runs");
+        record(&mut t, f[1]);
+        let (mut stopped, mut held) = (None, None);
+        for frame in 0..2 * SR_RECENT as usize {
+            let (h, lines) = run_frames(&mut t, 1);
+            assert!(!lines.iter().any(|l| l.contains("dropped as evidence")), "frame {frame}: {lines:#?}");
+            if lines.iter().any(|l| l.starts_with("DLSS Ray Reconstruction stopped")) {
+                stopped = Some(frame);
+            }
+            if h.is_some() && held.is_none() {
+                held = Some(frame);
+            }
+        }
+        let stopped = stopped.expect("Ray Reconstruction is seen stopped");
+        // Identified at the submit that sees it stopped (which may be a Frame Generation buffer's), held from the next
+        // Super Resolution buffer after the identifying one.
+        assert!(held.is_some_and(|h| h > stopped && h <= stopped + 2), "held from frame {held:?}, stopped at {stopped}");
+        assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.rule)), Some((0x100, Rule::Params)));
     }
 
     /// Super Resolution under every name it is known by (GTA V's `hiluma_engine_input*`, NGX's
