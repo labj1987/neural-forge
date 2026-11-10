@@ -1804,6 +1804,46 @@ A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neit
 - **Testing lesson:** launch games for tests through Steam (or with exactly the Proton Steam maps them to). A direct
   launch with another Proton broke the game's Rockstar launcher for the user.
 
+## November 10: a review of the #49 and #51 changes before 3.14.0
+
+Ten findings of a code review of the branch, each checked against the code and fixed with a test that fails without
+the fix (none reached a release):
+
+- **Ray Reconstruction's motion vectors:** the parameter-order rule (Cyberpunk's: colour the first RGBA16F image at
+  the depth's extent, motion vectors the second) gave the motion vectors whenever the colour happened to be that
+  first image, however it was found; beside a guide buffer of the same format (albedo, specular, normals) the guide
+  buffer became the motion vectors. It gives them now only with the colour, or where no motion-vector format is
+  named (`ray_reconstruction_guide_buffer_is_not_taken_for_motion_vectors`). An output whose motion vectors change
+  kind is another output, learnt again before the hold after it runs.
+- **Evidence and Ray Reconstruction:** the ageing of stale evidence (save loads) ran while Ray Reconstruction ran,
+  whose buffers are never evidence: after 64 submits everything was dropped with a line blaming a save load, and
+  Ray Reconstruction's own launch lost the inputs it is read with. Evidence does not age while it runs
+  (`evidence_does_not_age_while_ray_reconstruction_runs`).
+- **An output written in more parts than learnt** (Ray Reconstruction's working size changed): the hold went after
+  the learnt count, on a partly written output, for 8 frames until the new count was learnt. The learnt output is
+  dropped at the first such submit, so one frame at most.
+- **Two holds in one DLSS buffer** (passes before and after DLSS) counted the frame twice when recorded, the same
+  fault the split path's count had: the edit cache saw a gap and a dump's arm check never fired. Counted once per
+  buffer (`two_holds_in_one_dlss_buffer_count_its_frame_once`).
+- **The hold put off to the input launch** for its jitter took that launch's colour image without the checks the
+  first launch gets (a colour candidate, or the launch's own render-size input): a Frame-Generation-shaped launch's
+  output-size image could get it.
+- **The motion vectors' unit and the render size it is at** are set together now; a launch that said no unit took
+  the new size beside the old unit. A unit of -1 (render pixels, y up) stays -1 at another render size after
+  DLSS. The hold before the upscaler takes a negative y as it is, through to the native shaders (checked on
+  lavapipe: vectors (2, -4) at a scale of (0.5, -0.25) read the same pixel as (2, 4) at (0.5, 0.25)).
+- **A same-layout barrier on one aspect of the depth** keeps the layout only where the layout tracked there is the
+  one it names (or none is tracked); one naming another layout leaves the aspects apart.
+- **The split's refusal line for a buffer recorded before the identification** no longer says the hold inside takes
+  it: that hold refuses a DLSS buffer begun before the identification.
+- **Hogwarts Legacy's Ray Reconstruction** (`cuda_dldn_engine_swin_enc0_kernel`, 952 bytes) has no unit source: the
+  one probe line (October, `~/nf-spike/runs/hl-rr-on`) shows its render size (1707x960 and 1708x961), padded and
+  working sizes (1728x992, 3416x1922) and factors of 2 and 0.5 between them, and matrices, but no word that reads
+  as `MVScale` and no second launch to check one against. Not added; the user guide says the unit there is assumed.
+- **Lesson:** a rule found for one game's shape (the parameter order) must say how sure it is of its own premise
+  before it outranks a general one; and every new ageing or counting rule needs the question "and while Ray
+  Reconstruction runs?" asked of it.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

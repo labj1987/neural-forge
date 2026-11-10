@@ -397,6 +397,10 @@ everything under `~/.local/share/neural-forge` (the model, an imported DLL, capt
 - **The model after DLSS is tested in three games** (Crimson Desert and Hogwarts Legacy with Ray
   Reconstruction; Cyberpunk 2077 with and without it). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
   much lower frame rate (36 against 120 fps shown in Crimson Desert).
+- **Hogwarts Legacy with Ray Reconstruction:** its Ray Reconstruction does not say what unit its motion vectors
+  are in (Cyberpunk 2077's does), so the model after DLSS takes them as render pixels, as their size suggests, or
+  in the unit Super Resolution gave if it ran earlier in the session. Neither has been checked against the picture
+  in this game: if the model's history drags or smears behind moving things there, set Placement to Finished frame.
 - **HDR on the finished frame:** HDR10 is handled (above) and tested in Crimson Desert; float16
   (scRGB) swapchains are presented untouched, and HDR frames cannot be captured.
 - **Comparing with NVIDIA's own DLSS 5 in a game that ships it:** Proton's dxvk-nvapi 0.9.3 or newer passes
