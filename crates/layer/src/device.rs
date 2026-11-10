@@ -897,7 +897,7 @@ fn launch_queue_tally(device: u64, family: Option<u32>, n: u32) {
 
 /// Counts what the hold inside DLSS's buffer did at each hold point and logs the counts every 5 s: a hold
 /// that stops being recorded there otherwise says nothing.
-fn inline_tally(what: &'static str) {
+pub(crate) fn inline_tally(what: &'static str) {
     inline_tally_n(what, 1);
 }
 
@@ -1932,6 +1932,14 @@ impl NeuralForgeDeviceInfo {
         // render pass suspended across the split point: the layer does not run ahead of either.
         if let Some(hazard) = scan.hazard.or(scan.dump_hazard.filter(|_| mode == Mode::Dump && !crate::preupscale::dump_ignores_hazard())) {
             session.say_once(hazard.why());
+            drop(hold_guard);
+            // Such a buffer is the hold inside DLSS's buffer's to take: when none was even decided on in it, why
+            // (#51: Stellar Blade's refusal here was all its log said).
+            if self.inline.is_some() && mode.holds_inline() {
+                if let Some(&cb) = cbs.get(scan.batch).and_then(|b| b.get(scan.index)) {
+                    tracking.say_inside_untried(cb);
+                }
+            }
             return None;
         }
         let colour = inputs.colour.1;

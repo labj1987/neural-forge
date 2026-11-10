@@ -660,6 +660,9 @@ impl ColourWatch {
     }
 }
 
+/// At most one line per this long with the counts of the ordinary hold-inside refusals ([`InlineRefusal::quiet`]).
+const QUIET_REFUSALS_EVERY: Duration = Duration::from_secs(5);
+
 /// The DLSS inputs among the registered images.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Inputs {
@@ -1534,6 +1537,14 @@ pub(crate) struct Tracker {
     /// 1488x836 B10G11R11 images; only the identified one was watched, so the hold inside DLSS's buffer knew no
     /// layout for the others, and each new identification dropped what was known of all of them.
     colour_watch: Option<ColourWatch>,
+    /// Hold-inside refusals ordinary at a new identification ([`InlineRefusal::quiet`]): counted, logged with the
+    /// counts at most every [`QUIET_REFUSALS_EVERY`] ([`Self::quiet_refusal_line`]), when last logged.
+    quiet_refusals: (Option<Instant>, [u64; 2]),
+    /// Command buffers in which a hold inside was decided on ([`Tracking::launch`] ran [`Self::inline_point`] for
+    /// them), until they are begun again: a launch buffer the split refuses without one says why
+    /// ([`Self::untried_line`]).
+    inline_tried: HashSet<vk::CommandBuffer>,
+    said_untried: u8,
     /// The identification ([`Self::generation`]) and the kinds of [`InlineRefusal`] logged for it.
     said_refusals: (u64, u16),
     /// Each colour image's layout at DLSS's launch buffer in the last submission held with it (the identified
@@ -1858,10 +1869,21 @@ pub(crate) enum InlineRefusal {
 }
 
 impl InlineRefusal {
-    /// What the log says (once per identification and kind): `None` for the ordinary ones.
-    fn said(&self) -> Option<String> {
-        Some(match self {
-            Self::NotIdentified | Self::BegunBefore => return None,
+    /// Refused for what happens at every new identification: counted and logged with the counts
+    /// ([`Tracker::quiet_refusal_line`]), not once per identification (a game that is identified again and again
+    /// would log it every time). Before, these said nothing at all, and a game whose every buffer was refused so
+    /// (#51) showed no reason.
+    fn quiet(&self) -> bool {
+        matches!(self, Self::NotIdentified | Self::BegunBefore)
+    }
+
+    /// What the log and the status say.
+    fn said(&self) -> String {
+        match self {
+            Self::NotIdentified => "nothing is identified".into(),
+            Self::BegunBefore => {
+                "DLSS's buffer was begun before DLSS's inputs were identified (or identified again), so what it did to them before is not known".into()
+            }
             Self::UnknownImage => "the colour input is an image the layer did not see created".into(),
             Self::Format(f) => format!("the colour input is {f:?} (RGBA16F or B10G11R11 only)"),
             Self::NotPlain => "the colour input is not a 2D single-sample image".into(),
@@ -1873,7 +1895,7 @@ impl InlineRefusal {
             Self::LayoutUnknown => "the colour input's layout at DLSS's launch is unknown".into(),
             Self::Layout(l) => format!("the colour input is in {l:?} at DLSS's launch (the copies take GENERAL, SHADER_READ_ONLY, COLOR_ATTACHMENT or TRANSFER layouts)"),
             Self::LeftToSplit => "the buffer leaves the colour input in GENERAL with nothing in the way: the hold splits the submit instead".into(),
-        })
+        }
     }
 
     /// The kind, for saying each once per identification.
@@ -1906,7 +1928,7 @@ impl Refusal {
     fn text(&self) -> String {
         match self {
             Self::Text(t) => t.to_string(),
-            Self::Inside(r) => format!("no hold inside DLSS's buffer: {}", r.said().unwrap_or_default()),
+            Self::Inside(r) => format!("no hold inside DLSS's buffer: {}", r.said()),
         }
     }
 }
@@ -2697,8 +2719,15 @@ impl Tracker {
     /// [`Self::inline_point`] refused a hold inside DLSS's buffer at a launch naming the colour input `colour`:
     /// said once per identification and kind of refusal, with the image and how it was made.
     fn note_inline_refusal(&mut self, colour: vk::Image, refusal: InlineRefusal) {
-        let Some(why) = refusal.said() else { return };
         note_refusal(Refusal::Inside(refusal));
+        if refusal.quiet() {
+            if let Some(line) = self.quiet_refusal_line(refusal, Instant::now()) {
+                crate::log!("[preupscale] {line}");
+                crate::logging::flush();
+            }
+            return;
+        }
+        let why = refusal.said();
         if self.said_refusals.0 != self.generation {
             self.said_refusals = (self.generation, 0);
         }
@@ -2721,6 +2750,48 @@ impl Tracker {
             None if self.watched(colour) => " (no barrier on it seen since this identification)".to_string(),
             None => " (its barriers are not watched: it is not of the identified colour input's extent and format)".to_string(),
         }
+    }
+
+    /// Counts a [`InlineRefusal::quiet`] refusal at `now`; the line with the counts since the last one, at the first
+    /// and then at most every [`QUIET_REFUSALS_EVERY`].
+    fn quiet_refusal_line(&mut self, refusal: InlineRefusal, now: Instant) -> Option<String> {
+        let (since, counts) = &mut self.quiet_refusals;
+        counts[usize::from(refusal == InlineRefusal::BegunBefore)] += 1;
+        if since.is_some_and(|s| now.duration_since(s) < QUIET_REFUSALS_EVERY) {
+            return None;
+        }
+        let line = format!(
+            "no hold inside DLSS's buffer{}: {} buffer(s) begun before the current identification ({}; what they did to DLSS's inputs before it is not known), {} with nothing identified",
+            since.map_or_else(String::new, |s| format!(" in the last {:.1} s", now.duration_since(s).as_secs_f32())),
+            counts[1],
+            self.generation,
+            counts[0]
+        );
+        *since = Some(now);
+        *counts = [0; 2];
+        Some(line)
+    }
+
+    /// Why no hold inside DLSS's buffer was even decided on in launch buffer `cb`, which the split refused: once
+    /// per reason. `None` when one was ([`Self::inline_tried`]: its refusal, or the tally of what the hold did,
+    /// says the rest) or the reason was said.
+    fn untried_line(&mut self, cb: vk::CommandBuffer) -> Option<String> {
+        if self.inline_tried.contains(&cb) {
+            return None;
+        }
+        let refs = self.launch.get(&cb);
+        let (bit, why) = if refs.is_some_and(|r| r.opaque && r.input.is_none()) {
+            (1, "its CUDA launches' parameters are not readable (not in CUDA's buffer form), so none of them is known to be DLSS's input launch")
+        } else if refs.is_some_and(|r| r.input.is_none()) {
+            (2, "none of its launches reads as DLSS's input launch (a colour image with depth and motion vectors)")
+        } else {
+            (4, "its first launch naming a colour candidate was not taken as the hold point")
+        };
+        if self.said_untried & bit != 0 {
+            return None;
+        }
+        self.said_untried |= bit;
+        Some(format!("the hold inside DLSS's buffer was not tried in a launch buffer the split refused either: {why}"))
     }
 
     /// A hold inside DLSS's buffer was recorded at a point of identification `identification`.
@@ -2980,6 +3051,7 @@ impl Tracker {
             self.rendering.remove(cb);
             self.attached.remove(cb);
             self.recorded_watched.remove(cb);
+            self.inline_tried.remove(cb);
         }
     }
 
@@ -4133,6 +4205,7 @@ impl Tracking {
         if !plans_before(&plan) {
             return None;
         }
+        t.inline_tried.insert(cb);
         let output = t.output_extent();
         let point = t
             .inline_point(cb, colour)
@@ -4141,6 +4214,15 @@ impl Tracking {
             t.note_inline_refusal(colour, refusal);
         }
         point.ok()
+    }
+
+    /// The split refused launch buffer `cb` for a hazard: logs why no hold inside it was decided on either, once per
+    /// reason ([`Tracker::untried_line`]).
+    pub(crate) fn say_inside_untried(&self, cb: vk::CommandBuffer) {
+        if let Some(line) = self.lock().untried_line(cb) {
+            crate::log!("[preupscale] {line}");
+            crate::logging::flush();
+        }
     }
 
     /// `vkCreateCuFunctionNVX` created `function` for the kernel `name`.
@@ -9713,6 +9795,49 @@ mod tests {
         // Another shape: nothing of the old one is kept.
         t.keep_watched_across(None, Some(ColourWatch { width: 1280, height: 720, format: vk::Format::R16G16B16A16_SFLOAT }));
         assert!(t.committed.is_empty() && t.pending.is_empty());
+    }
+
+    /// Stellar Blade (Unreal Engine 4 under vkd3d-proton, #51): DLSS's buffer has the game's same-layout barrier on
+    /// the colour input (render target to shader resource) before its input launch. The split refuses that buffer;
+    /// the hold inside it takes it, after the barrier, in the layout the barrier set. When the hold inside is not
+    /// even tried in a buffer the split refuses, the reason is said once per reason; one begun before the
+    /// identification is counted, and logged with the counts.
+    #[test]
+    fn a_same_layout_barrier_before_dlss_s_launch_is_left_to_the_hold_inside_and_a_refusal_says_why() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, params) = held_tracker_with(copyable);
+        let rt_to_srv = ImageSync {
+            src_access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE.as_raw(),
+            dst_access: vk::AccessFlags2::SHADER_READ.as_raw(),
+            ..general_to_general(colour())
+        };
+        t.barrier(cb(2), rt_to_srv);
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        let point = t.inline_point(b, c).expect("held inside the buffer");
+        assert_eq!((point.layout, point.guessed.colour, point.hazard), (GENERAL, None, Hazard::SameLayoutBarrier));
+        t.inline_tried.insert(cb(2));
+        assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing").hazard, Some(Hazard::SameLayoutBarrier), "the split refuses it");
+        assert_eq!(t.untried_line(cb(2)), None, "tried: its own refusal or the tally says the rest");
+        // Launches whose parameters cannot be read: never a hold point, said once.
+        t.barrier(cb(3), rt_to_srv);
+        t.launch(cb(3), None);
+        assert_eq!(t.submit_ok(&[vec![cb(3)]]).expect("held undecided").hazard, Some(Hazard::SameLayoutBarrier));
+        assert!(t.untried_line(cb(3)).is_some_and(|l| l.contains("not readable")));
+        assert_eq!(t.untried_line(cb(3)), None, "once");
+        // A buffer begun before the identification: refused, and no longer silently.
+        let early = cb(HELD_BEGUN + 1);
+        let refusal = InlineRefusal::BegunBefore;
+        assert!(refusal.quiet() && !refusal.said().is_empty());
+        assert!(Refusal::Inside(refusal).text().contains("begun before"));
+        let now = Instant::now();
+        let first = t.quiet_refusal_line(refusal, now).expect("the first is logged");
+        assert!(first.contains("1 buffer(s) begun before"), "{first}");
+        assert_eq!(t.quiet_refusal_line(refusal, now + Duration::from_secs(1)), None, "counted");
+        let next = t.quiet_refusal_line(refusal, now + QUIET_REFUSALS_EVERY + Duration::from_secs(1)).expect("then with the counts");
+        assert!(next.contains("2 buffer(s) begun before") && next.contains("in the last 6.0 s"), "{next}");
+        t.launch(early, Some(&params));
+        assert_eq!(t.inline_point(early, colour()).err(), Some(refusal));
     }
 
     /// The depth a hold reads is the one this buffer's input launch names, with that image's own

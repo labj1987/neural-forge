@@ -45,7 +45,10 @@ first shipped them; their phase is kept as a subheading.
   setting runs no pass before the upscaler. `neural-forge-cli shmctl status` and **Save report** show the same
   state and reason (`preupscale_state=5`, `preupscale_reason=`).
 - The game's log says once each why a frame was not worked on inside DLSS's command buffer (missing copy usage, the
-  input's format, size or layout, a render pass left open across DLSS), with the image it was.
+  input's format, size or layout, a render pass left open across DLSS), with the image it was. The reasons that
+  said nothing before (DLSS's command buffer recorded before its input was found, DLSS's work not readable, the
+  work inside DLSS's buffer not set up yet) are now counted in the log every few seconds, and the log says when a
+  frame refused before DLSS's buffer was not tried inside it either, and why.
 - The log's periodic count of DLSS submissions now also says how many frames were actually worked on, by each way
   of holding them, instead of only how many named DLSS's input.
 

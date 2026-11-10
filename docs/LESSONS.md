@@ -1708,6 +1708,13 @@ A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neit
   not throw away knowledge that was recorded continuously (PRE_UPSCALER_DESIGN.md, "Inputs that cycle through
   images of one shape"). Its refusal counted barriers on another image than the one refused, never reset: a
   diagnostic must describe the thing it names.
+- **Stellar Blade (UE4)** has a same-layout barrier on DLSS's input inside DLSS's buffer, which the split rightly
+  refuses and the hold inside is built for, yet the log showed only the split's refusal: the hold inside had
+  refusals that said nothing (a buffer begun before the identification, a launch whose parameters cannot be read,
+  its own early skips). Lesson: every path that drops a frame says so, counted where it is ordinary, so the next
+  log answers the question (PRE_UPSCALER_DESIGN.md, "A same-layout barrier before DLSS's launch, and silent
+  refusals"). Splitting ahead of the barrier was not done: proving nothing before it writes the input would need
+  hooks on every draw.
 
 ## Deliberately not done, or left open
 

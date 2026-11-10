@@ -623,6 +623,39 @@ storage image. Nothing shows Expedition 33's are in `GENERAL` (its refusals say 
 guess on an image whose layout is unknown at the submit too is the one the hold guard cannot check. Nor is the
 layout of one image guessed from another of its shape.
 
+### A same-layout barrier before DLSS's launch, and silent refusals (Stellar Blade, 3.14.0, #51)
+
+Stellar Blade (Unreal Engine 4 under vkd3d-proton, same user) records a same-layout barrier on a DLSS input in
+DLSS's own buffer before its input launch (vkd3d-proton's render target to shader resource). The split refuses
+that buffer (`Hazard::SameLayoutBarrier`), and it is the hold inside's to take: recorded at the launch, after the
+barrier, in the layout the barrier set (the test of that stream gets a hold point from `inline_point`). The
+user's log had only the split's refusal and a status that stayed waiting: when the hold inside does not run,
+several of its paths said nothing. Now:
+
+- `inline_point`'s ordinary refusals (`BegunBefore`: the buffer was begun before the current identification;
+  `NotIdentified`) are counted and logged with the counts, at the first and then at most every 5 s
+  (`no hold inside DLSS's buffer in the last N s: ...`), and are the status's reason. Once per identification
+  would log them at every identification of a game identified again and again.
+- What `Inline::record_outcome` returns before the hold is asked (the compute state not noted yet, or noted only
+  from after the buffer began; every slot in use; staging images waiting for earlier holds; no hold guard for a
+  guessed layout; holds stopped) is counted in the `inside DLSS's buffer, last N s` tally with the closure's own
+  outcomes.
+- A launch buffer the split refuses in which no hold inside was decided on says why, once per reason
+  (`Tracker::untried_line`): its launches' parameters are not readable (an opaque launch is never an input launch,
+  so the buffer has no hold point; the split still takes it as "held undecided"), none reads as DLSS's input
+  launch, or its first launch naming a colour candidate was not taken.
+
+Not done: splitting in front of such a buffer when nothing before the barrier in it writes the colour input.
+Showing that takes every command recorded before the barrier (draws, dispatches, copies, clears, render passes),
+which the layer hooks only for the probe; hooking every draw costs every game and was not measured; and the
+barrier is the game's own statement that a producer must be finished, which the split does not run ahead of
+("When a submit is not split"). Without the user's log it is not known which of the paths above stopped the hold
+inside; the lines to ask for are the `[preupscale]` lines of a normal run (`no hold inside DLSS's buffer`,
+`inside DLSS's buffer, last`, `the hold inside DLSS's buffer was not tried`, `held undecided`, `holding inside
+DLSS's command buffer`, `noting the application's compute state`, `colour input:`), and with
+`NEURAL_FORGE_PROBE_NGX=1` the `[probe-ngx] seq cb=` lines of DLSS's buffer (what is recorded before the barrier,
+the first launch's kernel) and `cmdbuf stats after frame`.
+
 ### The HDR encode and decode (model, roundtrip)
 
 The model treats its input as a display-referred [0, 1] picture (E1b), so the capture encodes and
