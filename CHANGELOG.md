@@ -27,6 +27,9 @@ first shipped them; their phase is kept as a subheading.
 - Games that hand DLSS their frame in one of several images in turn (Clair Obscur: Expedition 33) now have the
   model on every frame. Before, only the frames in one of those images were worked on, and the others flickered
   through unedited while the camera moved.
+- In Stellar Blade the model before the upscaler now carries its result from frame to frame. Its frames were
+  already worked on inside DLSS's command buffer, but the way the game marks its depth buffer made Neural Forge
+  throw the model's history away on every frame, so each frame was worked on afresh.
 
 - Cyberpunk 2077 has the model before the upscaler again (with Placement on Auto). A game update hands DLSS its
   motion vectors in a four-channel image, which Neural Forge did not recognise, so every frame went to DLSS
@@ -84,6 +87,12 @@ first shipped them; their phase is kept as a subheading.
   frame refused before DLSS's buffer was not tried inside it either, and why.
 - The log's periodic count of DLSS submissions now also says how many frames were actually worked on, by each way
   of holding them, instead of only how many named DLSS's input.
+- Where a frame cannot be worked on in front of DLSS's command buffer but is worked on inside it, the log no longer
+  says "not holding, frames go to DLSS untouched": it says the work inside DLSS's buffer takes such frames, and
+  which lines say whether it does.
+- The game's log now says when a game sends HDR metadata for its window, and whether the window was created as HDR10
+  or as SDR (sRGB). A game with HDR switched on whose window is still SDR is either drawing SDR or putting HDR10
+  code into an SDR window, which Neural Forge leaves untouched.
 
 **Diagnosing crashes**
 

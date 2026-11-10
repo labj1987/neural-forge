@@ -656,6 +656,40 @@ DLSS's command buffer`, `noting the application's compute state`, `colour input:
 `NEURAL_FORGE_PROBE_NGX=1` the `[probe-ngx] seq cb=` lines of DLSS's buffer (what is recorded before the barrier,
 the first launch's kernel) and `cmdbuf stats after frame`.
 
+### Stellar Blade is held inside DLSS's buffer; its depth's one-aspect barriers dropped the history (#51)
+
+The user's full logs (3.14.0 test build 117) showed what the earlier section could not: Stellar Blade is held. After
+the split's one refusal line ("same-layout barrier ... not holding"), `holding inside DLSS's command buffer ...
+why not the split: SameLayoutBarrier` follows, and the tally says `held 263, ran 263` every 5 s (about 52 holds a
+second; 3597 holds inside against 1 split in the run). The split's line was read as the frame's fate. With the
+hold inside on, that line now says the hold inside takes such buffers and which lines say whether it holds
+(`Hazard::why_inside`).
+
+What did go wrong: every hold's history was dropped. The log had `an input of a hold inside DLSS's buffer was read
+as GENERAL ... but it is 2147418113 when the buffer runs` on both of the game's D32_SFLOAT_S8_UINT depth images,
+and `resetting the history (the hold guard reset it on the GPU ...)` 3813 times in that run. 2147418113 is
+`ASPECTS_APART`, the tracking's mark for a depth/stencil image whose aspects may be in different layouts after a
+barrier on one aspect. vkd3d-proton records barriers on the depth aspect alone (a D3D12 barrier on the depth
+plane), and every one of them in the probe run is `GENERAL -> GENERAL`. Such a barrier moves neither aspect, but it
+was tracked as leaving them apart: the hold read the depth as `GENERAL` (what the last submission left), the guard
+compared that with `ASPECTS_APART` at the submit, and reset the network's history every frame. In a buffer that
+records such a barrier before the launch, the depth was not read at all (`ASPECTS_APART` is no layout to copy
+from).
+
+Now (`ImageSync::keeps_layout`, `ImageSync::layout_after`): a barrier on one aspect of a depth/stencil image that
+keeps its layout records no layout. The layout before it stands, in the buffer (`layout_in`), at the submit
+(`layout_when_run`, the guard's check), in the commit and in the scan's proposed layouts. A barrier on one aspect
+that does transition it still leaves the aspects apart until a barrier on both, and one that keeps its layout
+after it does not bring them together. Hazards and the depth the hold reads (`hold_depth`) still see the barrier
+as recorded. Test: `a_same_layout_barrier_on_one_aspect_of_the_depth_moves_no_layout` (the depth unreadable and
+apart without the change).
+
+The probe excerpt the user sent ("colour input not identified before the first launch ... untouched: 544") said
+nothing about the colour input: the probe's own size rule wants an RGBA16F storage image, and Stellar Blade's
+input had no storage usage until the layer added it, so the probe had identified nothing. The probe now follows
+the tracking's identification (`probe_ngx::note_identified_colour`), and its sequences print a barrier's aspect
+when it is one of depth and stencil (`(depth only)`).
+
 ### The HDR encode and decode (model, roundtrip)
 
 The model treats its input as a display-referred [0, 1] picture (E1b), so the capture encodes and
