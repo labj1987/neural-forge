@@ -120,6 +120,8 @@ pub(crate) struct ImageBarrier {
     pub src_access: u64,
     pub dst_stage: u64,
     pub dst_access: u64,
+    /// The barrier's aspect mask (`VkImageAspectFlags`).
+    pub aspect: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,8 +392,9 @@ impl Recording {
                         format!("{kind} [{}] draws={draws} clear-attachments={clears}", atts.join(", "))
                     }
                     Op::Barrier(b) => format!(
-                        "barrier {} {:?}->{:?} src {}:{} dst {}:{}",
+                        "barrier {}{} {:?}->{:?} src {}:{} dst {}:{}",
                         label(b.image),
+                        aspect_text(b.aspect),
                         b.old,
                         b.new,
                         stages(b.src_stage),
@@ -403,6 +406,23 @@ impl Recording {
                 format!("[{i}] {body}")
             })
             .collect()
+    }
+}
+
+/// A barrier's aspects where they are not the whole image's usual ones: " (depth only)", " (stencil only)", and
+/// the raw mask for anything else; nothing for colour or both depth and stencil. Stellar Blade (#51) records
+/// barriers on one aspect of its depth/stencil image, which the tracking has to tell from barriers on both.
+fn aspect_text(aspect: u32) -> String {
+    let a = vk::ImageAspectFlags::from_raw(aspect);
+    let both = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
+    if a == vk::ImageAspectFlags::DEPTH {
+        " (depth only)".into()
+    } else if a == vk::ImageAspectFlags::STENCIL {
+        " (stencil only)".into()
+    } else if a == vk::ImageAspectFlags::COLOR || a == both || a.is_empty() {
+        String::new()
+    } else {
+        format!(" (aspects {a:?})")
     }
 }
 
@@ -473,6 +493,7 @@ mod tests {
             src_access: src_access.as_raw(),
             dst_stage: vk::PipelineStageFlags2::ALL_COMMANDS.as_raw(),
             dst_access: vk::AccessFlags2::SHADER_READ.as_raw(),
+            aspect: vk::ImageAspectFlags::COLOR.as_raw(),
         }
     }
 
@@ -592,6 +613,7 @@ mod tests {
                     src_access: 0,
                     dst_stage: 0,
                     dst_access: 0,
+                    aspect: vk::ImageAspectFlags::COLOR.as_raw(),
                 },
                 true,
             );

@@ -1721,6 +1721,19 @@ A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neit
   refusals"). Splitting ahead of the barrier was not done: proving nothing before it writes the input would need
   hooks on every draw.
 
+## November 10 (later): Stellar Blade was held all along (#51)
+
+- **What:** the user's full logs, read line by line, show the hold inside DLSS's buffer running in Stellar Blade from
+  its first seconds (`held 263, ran 263` every 5 s). The "same-layout barrier ... not holding" line both the user and
+  the earlier analysis went by was the split's, said once; the line after it said the hold inside took the buffer.
+  The real fault was further down: every hold's history was reset by the hold guard, because barriers on the depth
+  aspect alone (`GENERAL -> GENERAL`) were tracked as leaving the depth's aspects apart.
+- **Lessons:** read the whole log, not the lines someone quoted, before deciding what a game does; the counts and
+  the "resetting the history" lines were there. A diagnostic line must not state the frame's fate when another path
+  decides it ("frames go to DLSS untouched" from the split while the hold inside holds them). And a barrier that
+  keeps a layout is not a transition, on one aspect as on the whole image (PRE_UPSCALER_DESIGN.md, "Stellar Blade is
+  held inside DLSS's buffer; its depth's one-aspect barriers dropped the history").
+
 ## November 10: Cyberpunk 2077 before the upscaler again, and DLSS's motion-vector unit (3.14.0, issue #49)
 
 - **What:** a user's Cyberpunk 2077 never got the model before the upscaler ("waiting for DLSS input"). On the rig the

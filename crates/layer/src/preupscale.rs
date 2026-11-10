@@ -1228,6 +1228,10 @@ pub(crate) struct ImageSync {
     pub dst_queue_family: u32,
     /// The barrier's aspect mask (`VkImageAspectFlags`); 0 where not known (the whole image).
     pub aspect: u32,
+    /// A barrier on one aspect of a depth/stencil image that keeps that aspect's layout
+    /// (`separateDepthStencilLayouts`): it orders memory and moves neither aspect, so the image is
+    /// in whatever layout it was in before it ([`Self::layout_after`]). Set by [`Tracker::barrier`].
+    pub keeps_layout: bool,
 }
 
 /// The layout tracked for a depth/stencil image after a barrier on one of its two aspects only
@@ -1249,6 +1253,7 @@ impl ImageSync {
             src_queue_family: b.src_queue_family_index,
             dst_queue_family: b.dst_queue_family_index,
             aspect: b.subresource_range.aspect_mask.as_raw(),
+            keeps_layout: false,
         }
     }
 
@@ -1264,6 +1269,7 @@ impl ImageSync {
             src_queue_family: b.src_queue_family_index,
             dst_queue_family: b.dst_queue_family_index,
             aspect: b.subresource_range.aspect_mask.as_raw(),
+            keeps_layout: false,
         }
     }
 
@@ -1281,6 +1287,7 @@ impl ImageSync {
             src_queue_family: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family: vk::QUEUE_FAMILY_IGNORED,
             aspect: 0,
+            keeps_layout: false,
         }
     }
 
@@ -1289,6 +1296,12 @@ impl ImageSync {
         let both = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
         let a = vk::ImageAspectFlags::from_raw(self.aspect);
         a.intersects(both) && !a.contains(both)
+    }
+
+    /// The image's layout after this barrier, as the tracking records it; `None` for one that keeps
+    /// whatever layout the image was in ([`Self::keeps_layout`]).
+    pub(crate) fn layout_after(&self) -> Option<vk::ImageLayout> {
+        (!self.keeps_layout).then_some(self.new_layout)
     }
 
     /// A queue-family ownership transfer (its release or its acquire: both name the same pair).
@@ -1394,6 +1407,32 @@ impl Hazard {
             Self::NotSplittable => "the colour input is not an RGBA16F image in GENERAL; only the hold inside DLSS's buffer takes it",
             Self::HeldInside => "this identification's holds run inside DLSS's buffer; every buffer is held there, so the hold keeps one set of resources and the network its history",
             Self::RecordedBefore => "the DLSS launch buffer, or a buffer before it in the submit, was recorded before DLSS's inputs were identified, so its barriers on them were not seen; not holding it (buffers recorded since are held)",
+        }
+    }
+
+    /// [`Self::why`] where the hold inside DLSS's buffer is on: the split's refusal is not what becomes of the frame,
+    /// that hold takes such buffers and its own lines say whether it runs. Stellar Blade's log (#51) said "not
+    /// holding, frames go to DLSS untouched" once, and was read as no hold, while every frame after it was held
+    /// inside DLSS's buffer.
+    pub(crate) fn why_inside(self) -> &'static str {
+        macro_rules! inside {
+            ($what:literal) => {
+                concat!(
+                    "the DLSS launch buffer ",
+                    $what,
+                    ", so the submit is not split in front of it; the hold inside DLSS's buffer takes such buffers (\"holding inside DLSS's command buffer\" and \"inside DLSS's buffer, last 5.0 s\" say whether it holds)"
+                )
+            };
+        }
+        match self {
+            Self::QueueFamilyTransfer => inside!("transfers queue-family ownership of a DLSS input before its launch"),
+            Self::SameLayoutBarrier => inside!("has a same-layout barrier on a DLSS input before its launch"),
+            Self::LayoutTransition => inside!("transitions a DLSS input's layout before its launch"),
+            Self::MemoryBarrier => inside!("has a global memory barrier with a write in its source access before its launch"),
+            Self::EventWait => inside!("waits on an event before its launch"),
+            Self::SuspendedRendering => inside!("resumes dynamic rendering suspended in the buffer before it"),
+            Self::NotSplittable | Self::HeldInside => self.why(),
+            Self::RecordedBefore => inside!("or a buffer before it in the submit, was recorded before DLSS's inputs were identified"),
         }
     }
 }
@@ -2809,7 +2848,7 @@ impl Tracker {
         let set = self
             .pending
             .get(&cb)
-            .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
+            .and_then(|p| p.iter().rev().filter(|s| s.image == image).find_map(ImageSync::layout_after))
             .or_else(|| attachments.then(|| self.attached.get(&cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l))).flatten());
         set.map(|l| (l, true)).or_else(|| self.committed.get(&image).map(|l| (*l, false))).or(storage_general.then_some((vk::ImageLayout::GENERAL, false)))
     }
@@ -2825,7 +2864,7 @@ impl Tracker {
                 // A buffer's barriers follow its attachments ([`Self::commit_submitted`]).
                 self.pending
                     .get(cb)
-                    .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
+                    .and_then(|p| p.iter().rev().filter(|s| s.image == image).find_map(ImageSync::layout_after))
                     .or_else(|| self.attached.get(cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
             })
             .or_else(|| self.committed.get(&image).copied())
@@ -3339,9 +3378,17 @@ impl Tracker {
     }
 
     pub(crate) fn barrier(&mut self, command_buffer: vk::CommandBuffer, sync: ImageSync) {
-        // One aspect of a depth/stencil image: the two may be apart from here on.
-        let apart = sync.one_aspect_of_two() && self.images.get(&sync.image).is_some_and(|d| has_stencil(d.format));
-        let sync = if apart { ImageSync { new_layout: ASPECTS_APART, ..sync } } else { sync };
+        // One aspect of a depth/stencil image: a transition leaves the two possibly apart from here on; a barrier that
+        // keeps that aspect's layout moves neither. Stellar Blade (#51, vkd3d-proton) has `GENERAL -> GENERAL` barriers
+        // on its depth's depth aspect alone in front of DLSS's buffer: taken as apart, the hold inside DLSS's buffer
+        // (which had guessed the depth GENERAL) was found wrong by its guard at every submit, and every hold dropped
+        // the network's history.
+        let one_aspect = sync.one_aspect_of_two() && self.images.get(&sync.image).is_some_and(|d| has_stencil(d.format));
+        let sync = match (one_aspect, sync.old_layout == sync.new_layout) {
+            (true, true) => ImageSync { keeps_layout: true, ..sync },
+            (true, false) => ImageSync { new_layout: ASPECTS_APART, ..sync },
+            (false, _) => sync,
+        };
         let colour_shape = self.colour_watch.is_some_and(|w| self.images.get(&sync.image).is_some_and(|d| w.covers(d)));
         if colour_shape || self.inputs.is_some_and(|i| i.colour.0 == sync.image) {
             let seen = self.colour_barriers.entry(sync.image).or_insert((0, sync.new_layout));
@@ -3366,7 +3413,9 @@ impl Tracker {
             }
             let Some(recorded) = self.pending.get(&cb) else { continue };
             for sync in recorded {
-                self.committed.insert(sync.image, sync.new_layout);
+                if let Some(layout) = sync.layout_after() {
+                    self.committed.insert(sync.image, layout);
+                }
                 if sync.transfers_ownership() {
                     self.owners.insert(sync.image, sync.dst_queue_family);
                 }
@@ -4010,7 +4059,11 @@ impl Tracker {
                 if found.is_none() {
                     for sync in self.pending.get(&cb).into_iter().flatten() {
                         let owner = sync.transfers_ownership().then_some(sync.dst_queue_family).or(proposed.get(&sync.image).and_then(|p| p.1));
-                        proposed.insert(sync.image, (sync.new_layout, owner));
+                        // A barrier that keeps the layout leaves the one before it (none known: none proposed).
+                        let layout = sync.layout_after().or(proposed.get(&sync.image).map(|p| p.0)).or(self.committed.get(&sync.image).copied());
+                        if let Some(layout) = layout {
+                            proposed.insert(sync.image, (layout, owner));
+                        }
                     }
                 }
             }
@@ -4496,7 +4549,7 @@ impl Tracking {
         if !self.armed() {
             return None;
         }
-        let (scan, line) = {
+        let (scan, identified, line) = {
             let mut t = self.lock();
             if !t.armed() {
                 return None;
@@ -4504,6 +4557,7 @@ impl Tracking {
             let device = self.device;
             let observed = t.observe(batches);
             let line = t.refresh().map(|l| format!("{l} [device {device:#x}]"));
+            let identified = line.is_some().then(|| t.inputs.map(|i| i.colour.0));
             self.watching.store(t.inputs.is_some() || t.colour_watch.is_some(), Ordering::Relaxed);
             self.extent.store(t.inputs.map_or(0, |i| u64::from(i.colour.1.width) << 32 | u64::from(i.colour.1.height)), Ordering::Relaxed);
             let undecided_before = t.evaluations - t.named_colour_submits;
@@ -4531,11 +4585,14 @@ impl Tracking {
                 )
             });
             self.rearm(&t);
-            (scan, observed.into_iter().map(Some).chain([line, kind_line, tally]))
+            (scan, identified, observed.into_iter().map(Some).chain([line, kind_line, tally]))
         };
         for line in line.flatten() {
             crate::log!("[preupscale] {line}");
             crate::logging::flush();
+        }
+        if let Some(colour) = identified {
+            crate::probe_ngx::note_identified_colour(colour);
         }
         scan
     }
@@ -9555,6 +9612,8 @@ mod tests {
             let scan = t.submit_ok(&[vec![cb(1), cb(2)]]).expect("launch-bearing");
             assert_eq!(scan.hazard, Some(hazard), "{what}");
             assert!(!hazard.why().is_empty());
+            // With the hold inside DLSS's buffer on, the line says that hold takes the buffer, never "untouched".
+            assert!(hazard.why_inside().contains("the hold inside DLSS's buffer takes such buffers") && !hazard.why_inside().contains("untouched"));
             // The layout alone would have allowed it.
             assert!(scan.colour_in_general(), "{what}");
             // Re-recorded without it: held again.
@@ -10360,6 +10419,58 @@ mod tests {
         // The separate depth layouts are only taken for a format without stencil.
         assert!(!depth_copy_layout(vk::Format::D32_SFLOAT_S8_UINT, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL));
         assert!(depth_copy_layout(vk::Format::D32_SFLOAT, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL));
+    }
+
+    /// Stellar Blade (Unreal Engine 4 under vkd3d-proton, #51): `GENERAL -> GENERAL` barriers on the depth aspect
+    /// alone of DLSS's D32_SFLOAT_S8_UINT depth, in a buffer in front of DLSS's in the same submission. They move
+    /// neither aspect. Taken as leaving the aspects apart, the hold inside DLSS's buffer read the depth as GENERAL
+    /// (what the last submission left) and its guard found it apart when the buffer ran, at every submit: every
+    /// hold dropped the network's history. A transition of one aspect still leaves them apart, and a barrier that
+    /// keeps its layout after it does not bring them together.
+    #[test]
+    fn a_same_layout_barrier_on_one_aspect_of_the_depth_moves_no_layout() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, params) = held_tracker_with(copyable);
+        let depth = vk::Image::from_raw(0x200);
+        let one = |aspect: vk::ImageAspectFlags, old: vk::ImageLayout, new: vk::ImageLayout| ImageSync {
+            old_layout: old,
+            aspect: aspect.as_raw(),
+            src_access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE.as_raw(),
+            dst_access: vk::AccessFlags2::SHADER_READ.as_raw(),
+            ..ImageSync::to(depth, new)
+        };
+        t.barrier(cb(1), general_to_general(colour()));
+        t.barrier(cb(1), general_to_general(depth));
+        let _ = t.submit_ok(&[vec![cb(1)]]);
+        // The buffer in front: the game's barriers on the depth aspect alone. DLSS's buffer: the hold inside.
+        t.barrier(cb(2), one(vk::ImageAspectFlags::DEPTH, GENERAL, GENERAL));
+        t.barrier(cb(3), one(vk::ImageAspectFlags::DEPTH, GENERAL, GENERAL));
+        t.barrier(cb(3), general_to_general(colour()));
+        t.launch(cb(3), Some(&params));
+        let point = t.inline_point(cb(3), colour()).expect("held inside the buffer");
+        assert_eq!(point.hazard, Hazard::SameLayoutBarrier, "the split refuses it");
+        let read = point.depth_input.expect("the depth is read");
+        assert_eq!((read.image, read.layout, read.readable), (depth, Some(GENERAL), true));
+        assert_eq!(point.guessed.depth, Some(GENERAL), "not set by DLSS's buffer: checked at the submit");
+        // The guard's check at the submit: the depth is as guessed when DLSS's buffer runs.
+        assert_eq!(t.layout_when_run(&[cb(2)], depth), Some(GENERAL));
+        let scan = t.submit_ok(&[vec![cb(2), cb(3)]]).expect("launch-bearing");
+        assert_eq!(scan.depth_layout, Some(GENERAL));
+        assert_eq!(t.layout_when_run(&[], depth), Some(GENERAL), "and after the submission");
+        // A transition of one aspect: apart, and a same-layout barrier on one aspect after it keeps them apart.
+        let read_only = vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        t.begin(cb(4));
+        t.barrier(cb(4), one(vk::ImageAspectFlags::DEPTH, GENERAL, read_only));
+        assert_eq!(t.layout_when_run(&[cb(4)], depth), Some(ASPECTS_APART));
+        t.begin(cb(5));
+        t.barrier(cb(5), one(vk::ImageAspectFlags::STENCIL, GENERAL, GENERAL));
+        assert_eq!(t.layout_when_run(&[cb(4), cb(5)], depth), Some(ASPECTS_APART));
+        let _ = t.submit_ok(&[vec![cb(4), cb(5)]]);
+        assert_eq!(t.layout_when_run(&[], depth), Some(ASPECTS_APART));
+        // Both aspects together again.
+        t.begin(cb(6));
+        t.barrier(cb(6), ImageSync { old_layout: ASPECTS_APART, ..ImageSync::to(depth, GENERAL) });
+        assert_eq!(t.layout_when_run(&[cb(6)], depth), Some(GENERAL));
     }
 
     /// Depth and motion vectors are read only by a dump: a barrier on them before the launch stops

@@ -259,8 +259,11 @@ struct State {
     view_images: HashMap<vk::ImageView, vk::Image>,
     /// Images of interest: those with a view registered through a handle/address query.
     interest: BTreeMap<vk::Image, ViewDesc>,
-    /// The colour input among them (see [`identify_colour`]).
+    /// The colour input among them: the pre-upscaler tracking's ([`note_identified_colour`]) once it identified
+    /// one, else the probe's own size rule's ([`identify_colour`]).
     colour: Option<vk::Image>,
+    /// The colour input the pre-upscaler tracking identified (by DLSS's input kernel's parameters), if any.
+    tracked: Option<vk::Image>,
     /// The frame of the last first-time view registration.
     last_new_registration: Option<u64>,
     framebuffers: HashMap<vk::Framebuffer, Vec<vk::ImageView>>,
@@ -326,8 +329,33 @@ impl State {
         self.images.remove(&image);
         // A destroyed image's handle may come back as another image: it is of no interest until a
         // view of it is registered again, and the colour input is identified anew.
-        if self.interest.remove(&image).is_some() && self.colour == Some(image) {
+        let tracked = self.tracked == Some(image);
+        if tracked {
+            self.tracked = None;
+        }
+        if (self.interest.remove(&image).is_some() || tracked) && self.colour == Some(image) {
             self.colour = identify_colour(&self.interest).0;
+        }
+    }
+
+    /// The pre-upscaler tracking identified `image` as DLSS's colour input (`None`: nothing identified now).
+    fn identified(&mut self, image: Option<vk::Image>) -> Vec<String> {
+        if image == self.tracked {
+            return Vec::new();
+        }
+        self.tracked = image;
+        let colour = image.or_else(|| identify_colour(&self.interest).0);
+        if colour == self.colour {
+            return Vec::new();
+        }
+        self.colour = colour;
+        match image {
+            Some(c) => vec![format!(
+                "colour input: image {} ({}), as the pre-upscaler tracking identified it (DLSS's input kernel's parameters)",
+                hex(c),
+                self.interest.get(&c).map_or_else(|| "not registered".to_string(), ToString::to_string)
+            )],
+            None => Vec::new(),
         }
     }
 
@@ -393,7 +421,7 @@ impl State {
         if let (Some(desc), Some(image)) = (desc, self.view_images.get(&view).copied()) {
             self.interest.insert(image, desc);
             let (colour, candidates) = identify_colour(&self.interest);
-            if colour != self.colour {
+            if colour != self.colour && self.tracked.is_none() {
                 self.colour = colour;
                 if let Some(c) = colour {
                     lines.push(format!(
@@ -747,6 +775,16 @@ pub(crate) fn on_create_image(image: vk::Image, info: &vk::ImageCreateInfo) {
     }
 }
 
+/// The pre-upscaler tracking identified DLSS's colour input (`None`: it identifies none now). The probe's
+/// sequences follow it from then on: its own size rule wants a storage image, and Stellar Blade's input (#51)
+/// had no storage usage, so every sequence of that run said "colour input not identified".
+pub(crate) fn note_identified_colour(image: Option<vk::Image>) {
+    if enabled() {
+        let lines = state().identified(image);
+        emit(lines);
+    }
+}
+
 pub(crate) fn on_destroy_image(image: vk::Image) {
     if enabled() {
         state().forget_image(image);
@@ -1093,6 +1131,27 @@ mod tests {
         assert_eq!(s.label(vk::Image::from_raw(0x999)), "0x999");
     }
 
+    /// Stellar Blade (#51): DLSS's colour input has no storage usage, so the probe's size rule found none and every
+    /// sequence said "colour input not identified". The pre-upscaler tracking's identification is followed instead,
+    /// and the size rule's again once that image is gone.
+    #[test]
+    fn the_colour_input_the_tracking_identified_wins_over_the_size_rule() {
+        let mut s = State::default();
+        let (rule, _) = register_dlss_inputs(&mut s);
+        let input = vk::Image::from_raw(0x150);
+        s.record_image(input, &image_info(1707, 960, vk::Format::R16G16B16A16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT));
+        s.record_view(vk::ImageView::from_raw(0x151), &view_info(input, vk::Format::R16G16B16A16_SFLOAT, 0));
+        s.register("vkGetImageViewHandleNVX", vk::ImageView::from_raw(0x151), "0x2".into());
+        assert_eq!(s.colour, Some(rule));
+        let lines = s.identified(Some(input));
+        assert_eq!(s.colour, Some(input));
+        assert!(lines.len() == 1 && lines[0].starts_with("colour input: image 0x150 (1707x960 R16G16B16A16_SFLOAT"), "{lines:?}");
+        assert!(s.label(input).ends_with("[COLOUR-IN]"));
+        assert!(s.identified(Some(input)).is_empty(), "said once");
+        s.forget_image(input);
+        assert_eq!((s.tracked, s.colour), (None, Some(rule)), "the size rule's again");
+    }
+
     #[test]
     fn launch_bearing_sequences_are_printed_after_the_views_settle_and_then_sampled() {
         let mut s = State::default();
@@ -1115,6 +1174,7 @@ mod tests {
                     src_access: vk::AccessFlags2::SHADER_WRITE.as_raw(),
                     dst_stage: vk::PipelineStageFlags2::ALL_COMMANDS.as_raw(),
                     dst_access: vk::AccessFlags2::SHADER_READ.as_raw(),
+                    aspect: vk::ImageAspectFlags::COLOR.as_raw(),
                 }]
                 .into_iter(),
                 std::iter::empty(),

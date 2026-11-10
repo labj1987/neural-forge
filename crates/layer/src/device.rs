@@ -1961,11 +1961,12 @@ impl NeuralForgeDeviceInfo {
         // Synchronization the application recorded for DLSS's inputs inside the launch buffer, or a
         // render pass suspended across the split point: the layer does not run ahead of either.
         if let Some(hazard) = scan.hazard.or(scan.dump_hazard.filter(|_| mode == Mode::Dump && !crate::preupscale::dump_ignores_hazard())) {
-            session.say_once(hazard.why());
+            let inside = self.inline.is_some() && mode.holds_inline();
+            session.say_once(if inside { hazard.why_inside() } else { hazard.why() });
             drop(hold_guard);
             // Such a buffer is the hold inside DLSS's buffer's to take: when none was even decided on in it, why
             // (#51: Stellar Blade's refusal here was all its log said).
-            if self.inline.is_some() && mode.holds_inline() {
+            if inside {
                 if let Some(&cb) = cbs.get(scan.batch).and_then(|b| b.get(scan.index)) {
                     tracking.say_inside_untried(cb);
                 }
@@ -2471,6 +2472,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     src_access: u64::from(b.src_access_mask.as_raw()),
                     dst_stage,
                     dst_access: u64::from(b.dst_access_mask.as_raw()),
+                    aspect: b.subresource_range.aspect_mask.as_raw(),
                 }),
                 memory.iter().map(|m| (src_stage, u64::from(m.src_access_mask.as_raw()), dst_stage, u64::from(m.dst_access_mask.as_raw()))),
                 u32::try_from(buffers.len()).unwrap_or(u32::MAX),
@@ -2515,6 +2517,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     src_access: b.src_access_mask.as_raw(),
                     dst_stage: b.dst_stage_mask.as_raw(),
                     dst_access: b.dst_access_mask.as_raw(),
+                    aspect: b.subresource_range.aspect_mask.as_raw(),
                 }),
                 memory.iter().map(|m| (m.src_stage_mask.as_raw(), m.src_access_mask.as_raw(), m.dst_stage_mask.as_raw(), m.dst_access_mask.as_raw())),
                 if info.p_buffer_memory_barriers.is_null() { 0 } else { info.buffer_memory_barrier_count },
