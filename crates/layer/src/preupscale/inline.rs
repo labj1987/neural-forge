@@ -2625,6 +2625,34 @@ mod tests {
         rig.end(real);
     }
 
+    /// Passes both before and after DLSS: two holds recorded into one DLSS buffer count its frame once
+    /// ([`Session::saw_dlss_inline`], as `device.rs` records each hold), so the edit cache sees consecutive holds
+    /// and a cache dump's arm check fires; the buffer begun again for the next frame counts that one.
+    #[test]
+    fn two_holds_in_one_dlss_buffer_count_its_frame_once() {
+        let Some(rig) = Rig::open(false) else { return };
+        let inline = &rig.inline;
+        let mut session = Session::default();
+        let real = rig.buffer();
+        let mut after = rig.point();
+        after.hold.stage = Stage::Upscaled;
+        for frame in 1..=2u64 {
+            rig.begin(real);
+            for (point, stage) in [(rig.point(), Stage::Before), (after, Stage::Upscaled)] {
+                let outcome = inline.record_outcome(real, point, |ctx| {
+                    session.saw_dlss_inline(inline, ctx.cb);
+                    // SAFETY: the test's buffer, recording on this thread.
+                    unsafe { ctx.open() };
+                    Ok(Meta::empty(stage))
+                });
+                assert_eq!(outcome, Recorded::Held, "frame {frame}, {stage:?}");
+            }
+            rig.end(real);
+            assert_eq!(session.seen(), frame, "one count per frame");
+        }
+        inline.reset_pool(rig.pool, false);
+    }
+
     /// Held buffers about to go to a second queue stop the holds before the next layer has them, and from then
     /// on a submission carrying holds is fenced on its queue and one on another queue waits for that fence
     /// first: the buffers recorded before the stop may still be submitted on either queue, and their holds

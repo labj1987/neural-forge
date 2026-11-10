@@ -986,7 +986,7 @@ fn record_inline_hold(
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = inline;
-    session.saw_dlss();
+    session.saw_dlss_inline(inline, ctx.cb);
     if !shm.open() {
         inline_tally("skipped (no shared memory)");
         return Err(Recorded::Skipped);

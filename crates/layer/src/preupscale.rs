@@ -7372,6 +7372,15 @@ impl Session {
         self.share_post_off();
     }
 
+    /// [`Self::saw_dlss`] for a hold being recorded into DLSS's buffer `cb`: once per buffer. With passes both before
+    /// and after DLSS a buffer carries two holds, and the first one recorded counted its frame already: counted again,
+    /// the edit cache saw a gap between consecutive holds and a cache dump's arm check never fired.
+    pub(crate) fn saw_dlss_inline(&mut self, inline: &inline::Inline, cb: vk::CommandBuffer) {
+        if !inline.owns_at(cb, None) {
+            self.saw_dlss();
+        }
+    }
+
     /// Starts a requested cache dump ([`cache_dump::CacheDump::poll`]), then whether this model-mode
     /// hold (the DLSS submit [`Self::saw_dlss`] just counted) is armed for one. `copyable`: the colour
     /// input can be copied from (TRANSFER_SRC); a dump cannot run on one that cannot.
