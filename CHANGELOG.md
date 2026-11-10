@@ -78,6 +78,9 @@ first shipped them; their phase is kept as a subheading.
 - Where a frame cannot be worked on in front of DLSS's command buffer but is worked on inside it, the log no longer
   says "not holding, frames go to DLSS untouched": it says the work inside DLSS's buffer takes such frames, and
   which lines say whether it does.
+- The game's log now says when a game sends HDR metadata for its window, and whether the window was created as HDR10
+  or as SDR (sRGB). A game with HDR switched on whose window is still SDR is either drawing SDR or putting HDR10
+  code into an SDR window, which Neural Forge leaves untouched.
 
 **Diagnosing crashes**
 

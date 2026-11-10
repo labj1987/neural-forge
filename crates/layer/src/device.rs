@@ -257,6 +257,8 @@ impl ProbeNext {
 #[derive(Default)]
 struct State {
     swapchains: HashMap<vk::SwapchainKHR, SwapchainState>,
+    /// Swapchains whose first HDR metadata was logged (`set_hdr_metadata_ext`).
+    hdr_metadata_seen: HashSet<vk::SwapchainKHR>,
     /// Per swapchain: when the layer may engage (see `swapchain::Warmup`), and how long the
     /// layer spent in that swapchain's previous present.
     warmup: HashMap<vk::SwapchainKHR, (swapchain::Warmup, std::time::Duration)>,
@@ -2227,6 +2229,8 @@ impl DeviceInfo for NeuralForgeDeviceInfo {
             VulkanCommand::QueueBeginDebugUtilsLabelExt,
             VulkanCommand::QueueEndDebugUtilsLabelExt,
             VulkanCommand::QueueInsertDebugUtilsLabelExt,
+            // Forwarded untouched; the first metadata per swapchain is logged with what its colour space says (#51).
+            VulkanCommand::SetHdrMetadataExt,
         ]
     }
 
@@ -2959,6 +2963,29 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Handled(result.result())
     }
 
+    fn set_hdr_metadata_ext(&self, swapchains: &[vk::SwapchainKHR], metadata: &[vk::HdrMetadataEXT]) -> LayerResult<()> {
+        let lines: Vec<String> = {
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = &mut *state;
+            swapchains
+                .iter()
+                .zip(metadata)
+                .filter(|(s, _)| state.hdr_metadata_seen.insert(**s))
+                .map(|(s, m)| match state.swapchains.get(s) {
+                    Some(sc) => format!("[layer] swapchain {s:?}: {}", swapchain::hdr_metadata_line(sc.format, sc.color_space, m)),
+                    None => format!("[layer] HDR metadata for swapchain {s:?}, which the layer did not see created"),
+                })
+                .collect()
+        };
+        for line in &lines {
+            crate::log!("{line}");
+        }
+        if !lines.is_empty() {
+            crate::logging::flush();
+        }
+        LayerResult::Unhandled
+    }
+
     fn destroy_swapchain_khr(&self, swapchain: vk::SwapchainKHR, allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
         let Some(next_destroy) = self.next_destroy_swapchain_khr else {
             return LayerResult::Unhandled;
@@ -2979,6 +3006,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 crate::logging::flush();
             }
             state.warmup.remove(&swapchain);
+            state.hdr_metadata_seen.remove(&swapchain);
             if let Some(old) = state.swapchains.remove(&swapchain) {
                 {
                     let mut tracker = self.tracker.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
