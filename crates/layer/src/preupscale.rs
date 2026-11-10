@@ -1579,6 +1579,12 @@ pub(crate) struct Tracker {
     /// What submitted launch-bearing buffers' input launches named ([`InputLaunch::Inputs`]), one
     /// entry per colour input, at most [`MAX_NAMED`].
     named: Vec<Named>,
+    /// The launch-bearing submit ([`Self::launch_submits`]) at which an input launch last named each entry of
+    /// [`Self::named`], by its colour input: an entry no input launch named for [`SR_RECENT`] of them is dropped
+    /// ([`Self::observe`]).
+    named_seen: HashMap<vk::Image, u64>,
+    /// Lines logged for evidence dropped that way (at most [`MAX_DIAGNOSES`]).
+    named_dropped: u32,
     /// Launch-bearing submits since [`Self::named`] last changed.
     named_quiet: u32,
     /// The evidence chosen once it settled ([`SETTLE_SUBMITS`]); [`Self::refresh`] prefers it to
@@ -2373,6 +2379,7 @@ impl Tracker {
         // taken from the registered set instead ([`by_params`]).
         let before = self.named.len();
         self.named.retain(|n| ![n.colour, n.mvec].contains(&image));
+        self.named_seen.remove(&image);
         for n in &mut self.named {
             if n.exposure == Some(image) {
                 n.exposure = None;
@@ -3794,6 +3801,31 @@ impl Tracker {
                         self.rr_names.push(name.clone());
                     }
                 }
+            }
+        }
+        // Evidence no input launch names any more is dropped: loading a save in Cyberpunk 2077 hands DLSS a new set of
+        // images while the old one stays alive (#49), and an entry for the old set kept forever made two
+        // evaluations of it, so none was chosen again, and with [`MAX_NAMED`] stale entries new evidence had no room.
+        for n in &evidence {
+            self.named_seen.insert(n.colour, now);
+        }
+        let seen = &self.named_seen;
+        let stale: Vec<vk::Image> = self.named.iter().map(|n| n.colour).filter(|c| seen.get(c).is_none_or(|&at| now.saturating_sub(at) >= SR_RECENT)).collect();
+        if !stale.is_empty() {
+            if self.named_dropped < MAX_DIAGNOSES {
+                self.named_dropped += 1;
+                let list: Vec<String> = stale.iter().map(|c| hex(*c)).collect();
+                lines.push(format!(
+                    "no input launch named colour input {} in {SR_RECENT} launch-bearing submits: dropped as evidence (the game hands DLSS other images, as after loading a save)",
+                    list.join(", ")
+                ));
+            }
+            self.named.retain(|n| !stale.contains(&n.colour));
+            self.named_seen.retain(|c, _| !stale.contains(c));
+            changed = true;
+            if self.named_pick.is_some_and(|n| stale.contains(&n.colour)) {
+                self.named_pick = None;
+                self.dirty = true;
             }
         }
         let rr = self.rr_running();
@@ -14248,6 +14280,111 @@ mod tests {
             for (i, m) in [(image, memory), (depth, depth_mem), (mvec, mvec_mem), (exp32, exp32_mem), (exp16, exp16_mem)] {
                 d.destroy_image(i, None);
                 d.free_memory(m, None);
+            }
+        }
+    }
+
+    /// Cyberpunk 2077's DLSS inputs under vkd3d-proton (#49) from `base`: colour, DLSS's output, motion vectors,
+    /// depth and exposure, every image with the same usage, each with view `raw + 1` registered under key `raw + key`.
+    fn cyberpunk_images(base: u64) -> Vec<(u64, ImageDesc)> {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let all = vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        vec![
+            (base, desc(1485, 835, rgba, all)),
+            (base + 0x10, desc(2560, 1440, rgba, all)),
+            (base + 0x20, desc(1485, 835, rgba, all)),
+            (base + 0x30, desc(1485, 835, vk::Format::R32_UINT, all)),
+            (base + 0x40, desc(1, 1, vk::Format::R16_SFLOAT, all)),
+        ]
+    }
+
+    fn create_registered(t: &mut Tracker, raw: u64, d: ImageDesc, key: u64) {
+        let info = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D { width: d.width, height: d.height, depth: 1 },
+            format: d.format,
+            usage: d.usage,
+            samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        t.record_image(img(raw), &info);
+        t.record_view(vk::ImageView::from_raw(raw + 1), img(raw));
+        t.register(vk::ImageView::from_raw(raw + 1), Some(key));
+    }
+
+    /// `frames` frames of Cyberpunk's DLSS buffer (re-recorded each frame) naming the set from `base` by keys
+    /// `raw + key`, in its parameter order (colour, output, motion vectors, depth, exposure); with `fg`, a DLSS Frame
+    /// Generation buffer after it naming the output with the motion vectors and depth.
+    fn cyberpunk_frames(t: &mut Tracker, base: u64, key: u64, fg: bool, frames: usize) -> Vec<String> {
+        let words = |offsets: &[u64]| -> Vec<u8> { param_block(&offsets.iter().map(|o| base + o + key).collect::<Vec<u64>>()) };
+        let mut lines = Vec::new();
+        for _ in 0..frames {
+            t.begin(cb(1));
+            t.launch(cb(1), Some(&words(&[0, 0x10, 0x20, 0x30, 0x40])));
+            lines.extend(submit(t, &[vec![cb(1)]]).1);
+            if fg {
+                t.begin(cb(2));
+                t.launch(cb(2), Some(&words(&[0x10, 0x20, 0x30])));
+                lines.extend(submit(t, &[vec![cb(2)]]).1);
+            }
+        }
+        lines
+    }
+
+    /// Loading a save in Cyberpunk 2077 (#49): DLSS's inputs are identified by the input kernel's parameters, then
+    /// the game hands DLSS a new set of images, with DLSS Frame Generation switched off or on again across the
+    /// loading screen. However the old set goes (destroyed, its handles and NVX keys reused by the new one, only its
+    /// views destroyed, or kept alive and no longer named), the new set is identified, load after load.
+    #[test]
+    fn cyberpunk_inputs_are_identified_again_after_a_save_load() {
+        #[derive(Debug, Clone, Copy)]
+        enum Old {
+            Destroyed,
+            Reused,
+            ViewsDestroyed,
+            Alive,
+        }
+        for old in [Old::Destroyed, Old::Reused, Old::ViewsDestroyed, Old::Alive] {
+            let mut t = Tracker::default();
+            let (mut base, mut key) = (0x100, 0x10_0000);
+            for (raw, d) in cyberpunk_images(base) {
+                create_registered(&mut t, raw, d, raw + key);
+            }
+            cyberpunk_frames(&mut t, base, key, true, 40);
+            assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.mvec.0.as_raw(), i.rule)), Some((0x100, 0x120, Rule::Params)), "{old:?}: before the load");
+            for load in 1..=6u64 {
+                let was = base;
+                if !matches!(old, Old::Reused) {
+                    (base, key) = (0x100 + load * 0x1000, 0x10_0000 * (load + 1));
+                }
+                for (raw, _) in cyberpunk_images(was) {
+                    match old {
+                        Old::Destroyed | Old::Reused => {
+                            t.forget_view(vk::ImageView::from_raw(raw + 1));
+                            t.forget_image(img(raw));
+                        }
+                        Old::ViewsDestroyed => t.forget_view(vk::ImageView::from_raw(raw + 1)),
+                        Old::Alive => {}
+                    }
+                }
+                for (raw, d) in cyberpunk_images(base) {
+                    create_registered(&mut t, raw, d, raw + key);
+                }
+                let fg = load % 2 == 0;
+                let lines = cyberpunk_frames(&mut t, base, key, fg, 120);
+                if matches!(old, Old::Alive | Old::ViewsDestroyed) {
+                    let dropped = format!("no input launch named colour input {} in {SR_RECENT}", hex(img(was)));
+                    assert_eq!(lines.iter().filter(|l| l.starts_with(&dropped)).count(), 1, "{old:?}, load {load}: {lines:#?}");
+                }
+                assert_eq!(
+                    t.inputs.map(|i| (i.colour.0.as_raw(), i.mvec.0.as_raw(), i.rule)),
+                    Some((base, base + 0x20, Rule::Params)),
+                    "{old:?}, load {load}, frame generation {fg}: {lines:#?}"
+                );
             }
         }
     }
