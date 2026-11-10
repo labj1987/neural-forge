@@ -37,6 +37,9 @@ first shipped them; their phase is kept as a subheading.
 
 **A steadier picture on the finished frame**
 
+- Games whose Vulkan swapchain carries a single-GPU device-group description (Red Dead Redemption 2) now get the
+  model on the finished frame; before, Neural Forge left such a swapchain untouched.
+
 - With the model on the finished frame (no DLSS, or the Placement setting "At present"), it now carries its result
   from frame to frame along the GPU's optical flow, as it does before the upscaler. Before, every frame was worked
   on afresh, and on grainy or noisy pictures (film grain in Cyberpunk 2077) large soft patches of the picture

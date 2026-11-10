@@ -23,9 +23,19 @@ fn chain_is_understood(info: &vk::SwapchainCreateInfoKHR) -> bool {
         // the Vulkan spec, and this chain is the application's own, valid for this call.
         let base = unsafe { &*next.cast::<vk::BaseInStructure>() };
         match base.s_type {
-            // Multi-device layouts and exclusive full-screen control change how the
-            // images are owned and presented. Not admitted.
-            vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR | vk::StructureType::SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT => return false,
+            // Multi-device presentation changes how the images are owned and presented: not admitted. Local presentation
+            // only is what a swapchain without the structure has (the spec: "If this structure is not present, modes is
+            // considered to be VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR"); Red Dead Redemption 2's Vulkan renderer
+            // chains it so on one GPU (#49), and refusing it left that game's finished frame untouched.
+            vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR => {
+                // SAFETY: the sType identifies the struct, the application's own and valid for this call.
+                let group = unsafe { &*next.cast::<vk::DeviceGroupSwapchainCreateInfoKHR>() };
+                if group.modes != vk::DeviceGroupPresentModeFlagsKHR::LOCAL {
+                    return false;
+                }
+            }
+            // Exclusive full-screen control changes how the images are presented. Not admitted.
+            vk::StructureType::SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT => return false,
             _ => {}
         }
         next = base.p_next.cast();
@@ -201,24 +211,42 @@ mod tests {
     #[test]
     fn structures_that_change_what_the_images_are_still_disqualify_the_chain() {
         let mut info = vk::SwapchainCreateInfoKHR::default().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO);
-        for s_type in [vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR, vk::StructureType::SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT] {
-            let refused = vk::BaseInStructure { s_type, p_next: std::ptr::null(), _marker: std::marker::PhantomData };
-            info.p_next = std::ptr::from_ref(&refused).cast();
-            assert!(!candidate(&info), "{s_type:?} should not be admitted");
+        let exclusive = vk::SurfaceFullScreenExclusiveInfoEXT::default();
+        info.p_next = std::ptr::from_ref(&exclusive).cast();
+        assert!(!candidate(&info), "exclusive full screen should not be admitted");
+        for modes in [
+            vk::DeviceGroupPresentModeFlagsKHR::REMOTE,
+            vk::DeviceGroupPresentModeFlagsKHR::SUM,
+            vk::DeviceGroupPresentModeFlagsKHR::LOCAL_MULTI_DEVICE,
+            vk::DeviceGroupPresentModeFlagsKHR::LOCAL | vk::DeviceGroupPresentModeFlagsKHR::REMOTE,
+            vk::DeviceGroupPresentModeFlagsKHR::empty(),
+        ] {
+            let group = vk::DeviceGroupSwapchainCreateInfoKHR::default().modes(modes);
+            info.p_next = std::ptr::from_ref(&group).cast();
+            assert!(!candidate(&info), "device-group modes {modes:?} should not be admitted");
         }
+    }
+
+    /// Red Dead Redemption 2 (Vulkan, one GPU) chains a device-group struct with local presentation only, which is
+    /// what a swapchain without it has (#49): admitted.
+    #[test]
+    fn local_only_device_group_presentation_is_admitted() {
+        let group = vk::DeviceGroupSwapchainCreateInfoKHR::default().modes(vk::DeviceGroupPresentModeFlagsKHR::LOCAL);
+        let mut info = vk::SwapchainCreateInfoKHR::default().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO);
+        info.p_next = std::ptr::from_ref(&group).cast();
+        assert!(candidate(&info));
     }
 
     #[test]
     fn the_whole_chain_is_walked_not_just_its_first_link() {
         // A refused struct hiding behind an allowed one still has to be found.
         let mut info = vk::SwapchainCreateInfoKHR::default().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO);
-        let deep = vk::BaseInStructure {
-            s_type: vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR,
-            p_next: std::ptr::null(),
+        let deep = vk::DeviceGroupSwapchainCreateInfoKHR::default().modes(vk::DeviceGroupPresentModeFlagsKHR::REMOTE);
+        let shallow = vk::BaseInStructure {
+            s_type: vk::StructureType::from_raw(1_000_505_007),
+            p_next: std::ptr::from_ref(&deep).cast(),
             _marker: std::marker::PhantomData,
         };
-        let shallow =
-            vk::BaseInStructure { s_type: vk::StructureType::from_raw(1_000_505_007), p_next: std::ptr::from_ref(&deep), _marker: std::marker::PhantomData };
         info.p_next = std::ptr::from_ref(&shallow).cast();
         assert!(!candidate(&info), "a refused struct deeper in the chain was missed");
     }
