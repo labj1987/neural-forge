@@ -2221,6 +2221,7 @@ impl DeviceInfo for NeuralForgeDeviceInfo {
             VulkanCommand::QueueSubmit2,
             // Forwarded untouched but on the queue the network shares, where they are locked (`crate::shared_queue`).
             VulkanCommand::QueueWaitIdle,
+            VulkanCommand::DeviceWaitIdle,
             VulkanCommand::QueueBindSparse,
             VulkanCommand::QueueBeginDebugUtilsLabelExt,
             VulkanCommand::QueueEndDebugUtilsLabelExt,
@@ -2791,6 +2792,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Handled(unsafe { next(queue) }.result())
     }
 
+    /// `vkDeviceWaitIdle` needs every queue of the device externally synchronized: the shared one under its lock.
+    fn device_wait_idle(&self) -> LayerResult<ash::prelude::VkResult<()>> {
+        let Some((_, shared)) = self.shared_queue else { return LayerResult::Unhandled };
+        let _shared = shared.guard();
+        // SAFETY: the application's own call, forwarded unchanged to the next layer, under the shared queue's lock.
+        LayerResult::Handled(unsafe { (self.device.fp_v1_0().device_wait_idle)(self.device.handle()) }.result())
+    }
+
     fn queue_bind_sparse(&self, queue: vk::Queue, binds: &[vk::BindSparseInfo], fence: vk::Fence) -> LayerResult<ash::prelude::VkResult<()>> {
         let (Some(next), Some(_shared)) = (self.next_queue_bind_sparse, crate::shared_queue::guard_if(self.shared_queue, queue)) else {
             return LayerResult::Unhandled;
@@ -3047,7 +3056,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let asked = unsafe { &*info.p_create_info };
         let Some(create) = copyable_create_info(asked) else { return LayerResult::Unhandled };
         // The image's own (non-sparse) requirements decide, as for `create_image`; without that query here, the
-        // verdict reached for it before (none yet: as asked, which `create_image` then judges for itself).
+        // verdict reached for it before (none yet: as asked, which `create_image` then judges for itself). Both
+        // queries are Vulkan 1.3 / VK_KHR_maintenance4 commands: a device that resolves this sparse one below the layer
+        // resolves the plain one too, so the arm without it is a guard, not a path a game takes.
         let kept = match self.next_image_requirements {
             // SAFETY: the core command (or the KHR one) beside the sparse one the application is calling.
             Some(requirements) => unsafe { self.added_usage_kept(requirements, info, asked, &create) },
@@ -4701,9 +4712,9 @@ mod submit_order_tests {
 
     /// The usage an image is created with and the usage its memory-requirements query is answered for
     /// are one rule: an RG16F or (the edit cache on) depth image gets `TRANSFER_SRC`, a colour candidate
-    /// (RGBA16F or B10G11R11, sampled or storage: DLSS's colour input, which the hold inside DLSS's buffer
-    /// copies in and back) `TRANSFER_SRC | TRANSFER_DST`, one that shares its memory or already has it does
-    /// not, and nothing else changes.
+    /// (RGBA16F or B10G11R11, sampled or storage, rendered or written into, one level and layer: DLSS's colour
+    /// input, which the hold inside DLSS's buffer copies in and back) `TRANSFER_SRC | TRANSFER_DST`, a texture
+    /// (only sampled) or one that shares its memory or already has it does not, and nothing else changes.
     #[test]
     fn images_are_created_and_queried_with_the_same_added_usage() {
         let base = vk::ImageCreateInfo {
@@ -4713,6 +4724,8 @@ mod submit_order_tests {
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
             usage: vk::ImageUsageFlags::STORAGE,
+            mip_levels: 1,
+            array_layers: 1,
             ..Default::default()
         };
         let added = copyable_create_info(&base).expect("RG16F gets TRANSFER_SRC");
@@ -4732,7 +4745,10 @@ mod submit_order_tests {
             let colour = vk::ImageCreateInfo { format, usage: indy, ..base };
             assert_eq!(copyable_create_info(&colour).map(|i| i.usage), Some(indy | transfer), "{format:?}");
             let sampled = vk::ImageCreateInfo { format, usage: vk::ImageUsageFlags::SAMPLED, ..base };
-            assert_eq!(copyable_create_info(&sampled).map(|i| i.usage), Some(vk::ImageUsageFlags::SAMPLED | transfer));
+            assert!(copyable_create_info(&sampled).is_none(), "a texture: only sampled");
+            let rendered = vk::ImageCreateInfo { format, usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT, ..base };
+            let rendered_usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT | transfer;
+            assert_eq!(copyable_create_info(&rendered).map(|i| i.usage), Some(rendered_usage));
             let half = vk::ImageCreateInfo { format, usage: indy | vk::ImageUsageFlags::TRANSFER_SRC, ..base };
             assert_eq!(copyable_create_info(&half).map(|i| i.usage), Some(indy | transfer), "the missing one only");
             assert!(copyable_create_info(&vk::ImageCreateInfo { usage: indy | transfer, ..colour }).is_none(), "has both");

@@ -744,8 +744,8 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
     nr::Kernels::setChainEnabled(open->chain != 0 && !g_fellBack.load());
     n->context = std::make_unique<vk::Context>(open->gipa, open->instance, open->physical, open->device, open->queue_family,
                                                open->queue_index, n->fenceTimeoutNs, open->init_dispatchable, open->init_user,
-                                               open->frame_family, open->buffer_device_address_ext != 0);
-    n->context->setQueueLock(open->queue_lock, open->queue_user);
+                                               open->frame_family, open->buffer_device_address_ext != 0, open->queue_lock,
+                                               open->queue_user);
     if (!open->model || (open->model->tensor_count && !open->model->tensors)) throw std::runtime_error("no model");
     std::vector<nr::Tensor> records(open->model->tensor_count);
     for (size_t i = 0; i < records.size(); ++i) {

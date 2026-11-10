@@ -88,7 +88,8 @@ class Context {
   // application's, where the recorded graph runs): every buffer is created VK_SHARING_MODE_CONCURRENT over both.
   Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
           uint32_t queueFamily, uint32_t queueIndex, uint64_t waitTimeoutNs, InitDispatchable initDispatchable = nullptr,
-          void* initUser = nullptr, uint32_t sharedFamily = VK_QUEUE_FAMILY_IGNORED, bool bufferDeviceAddressExt = false);
+          void* initUser = nullptr, uint32_t sharedFamily = VK_QUEUE_FAMILY_IGNORED, bool bufferDeviceAddressExt = false,
+          void (*queueLock)(void* user, int lock) = nullptr, void* queueLockUser = nullptr);
   void initDispatchable(void* object) const { if (initDispatchable_) initDispatchable_(initUser_, device_, object); }
   // A queue shared with the application (Neural Forge, #49): `lock(user, 1)` before and `lock(user, 0)` after every
   // vkQueueSubmit and vkQueueWaitIdle on it (QueueGuard), never around a fence wait.

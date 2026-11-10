@@ -186,9 +186,13 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device
 
 Context::Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
                  uint32_t queueFamily, uint32_t queueIndex, uint64_t waitTimeoutNs, InitDispatchable initDispatchable,
-                 void* initUser, uint32_t sharedFamily, bool bufferDeviceAddressExt) {
+                 void* initUser, uint32_t sharedFamily, bool bufferDeviceAddressExt, void (*queueLock)(void* user, int lock),
+                 void* queueLockUser) {
   initDispatchable_ = initDispatchable;
   bdaExt_ = bufferDeviceAddressExt;
+  // Before anything can submit: a constructor that fails part-way releases what it made, and that waits on the queue.
+  queueLock_ = queueLock;
+  queueLockUser_ = queueLockUser;
   sharedFamily_ = sharedFamily == queueFamily ? VK_QUEUE_FAMILY_IGNORED : sharedFamily;
   initUser_ = initUser;
   volkInitializeCustom(getInstanceProcAddr);

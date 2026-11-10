@@ -4,7 +4,7 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
-## 3.14.0 — 2026-11-09
+## 3.14.0 — 2026-11-10
 
 **The model before the upscaler in more games**
 
@@ -44,8 +44,9 @@ first shipped them; their phase is kept as a subheading.
 
 **A steadier picture on the finished frame**
 
-- A Vulkan swapchain that carries a single-GPU device-group description (Red Dead Redemption 2's) is no longer
-  left untouched: the model can work on its finished frame.
+- A Vulkan swapchain that carries a single-GPU device-group description is no longer left untouched: the model can
+  work on its finished frame (Red Dead Redemption 2's Vulkan renderer makes one; there the model runs before the
+  upscaler only, see above).
 - With the model on the finished frame (no DLSS, or the Placement setting "At present"), it now carries its result
   from frame to frame, as it does before the upscaler. Before, every frame was worked on afresh, and on grainy or
   noisy pictures (film grain in Cyberpunk 2077) large soft patches of the picture flickered.

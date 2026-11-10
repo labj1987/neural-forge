@@ -366,8 +366,10 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
         let asked = unsafe { create_info.p_application_info.as_ref() }.copied();
         // No version query first: below a layer `vkEnumerateInstanceVersion` need not resolve; a loader or driver
         // without 1.3 refuses the creation, and the instance is then created as asked.
-        let raised_info = (layer_enabled() && ownership::eligible() && raise_wanted() && asked.map_or(0, |a| a.api_version) < vk::API_VERSION_1_3)
-            .then(|| vk::ApplicationInfo { api_version: vk::API_VERSION_1_3, ..asked.unwrap_or_default() });
+        // Only where the network may run: the layer engaged in this process and its native path on.
+        let raised_info =
+            (layer_enabled() && ownership::eligible() && preupscale::active() && raise_wanted() && asked.map_or(0, |a| a.api_version) < vk::API_VERSION_1_3)
+                .then(|| vk::ApplicationInfo { api_version: vk::API_VERSION_1_3, ..asked.unwrap_or_default() });
         let raised = raised_info.as_ref().map(|app| vk::InstanceCreateInfo { p_application_info: app, ..*create_info });
         if let Some(raised) = &raised {
             // SAFETY: the framework's request, whose chain is the loader's.
@@ -375,7 +377,11 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
             let result = self.create_instance_as(raised, create_instance, allocator, p_instance);
             if result == vk::Result::SUCCESS {
                 // SAFETY: written by the successful call.
-                RAISED_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(unsafe { *p_instance });
+                let created = unsafe { *p_instance };
+                let mut raised = RAISED_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !raised.contains(&created) {
+                    raised.push(created);
+                }
                 log!(
                     "[native] the application's instance asks for Vulkan {}.{}: created for Vulkan 1.3, which the network needs (NEURAL_FORGE_RAISE_VULKAN=off keeps the application's)",
                     vk::api_version_major(asked.map_or(0, |a| a.api_version).max(vk::API_VERSION_1_0)),

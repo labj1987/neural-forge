@@ -595,7 +595,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn abi_version_is_6() {
+    fn abi_version_is_7() {
         assert_eq!(abi_version(), 7);
     }
 

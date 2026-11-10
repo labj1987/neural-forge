@@ -36,7 +36,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use ash::vk::Handle;
@@ -115,6 +115,10 @@ fn model_source(text: &str) -> String {
     let network = field("network").unwrap_or_else(|| "full".to_string());
     format!("{network} network, build {build}, {}", if verified { "verified" } else { "not verified against NVIDIA's runtime" })
 }
+
+/// The bound on the network's waits on a queue shared with the application ([`Setup::shared`]): the application's work
+/// queued ahead of the network's there is waited for too.
+pub(crate) const SHARED_FENCE_WAIT: Duration = Duration::from_secs(60);
 
 /// Where the network runs on a device: what `create_device` added for it.
 #[derive(Clone, Copy, Debug)]
@@ -807,7 +811,9 @@ impl Loader {
             frame_family: setup.frame_family,
             model_dir: &dir,
             chain: chain_wanted() && chain,
-            fence_timeout_ms: crate::FENCE_WAIT_TIMEOUT.as_millis() as u32,
+            // On a shared queue the network's work runs behind the application's own there, which may wait on the
+            // application (a pause, a loading screen): a longer bound before the network is given up for good.
+            fence_timeout_ms: if setup.shared.is_some() { SHARED_FENCE_WAIT.as_millis() as u32 } else { crate::FENCE_WAIT_TIMEOUT.as_millis() as u32 },
             init_dispatchable: Some(init_dispatchable),
             // The application's queue, shared: every submit and queue wait on that side under its lock.
             queue_lock: setup.shared.map(|_| crate::shared_queue::c_lock as nn::QueueLock),

@@ -349,7 +349,8 @@ impl FlowState {
     }
 
     /// A submit of the flow's failed: both queues (this thread's alone) drain, so nothing of the flow is
-    /// pending, and `zero` runs from here on.
+    /// pending, and `zero` runs from here on. Never on a queue shared with the application: no after-the-upscaler
+    /// server runs there (`Session::ensure_post_server`); if one ever does, this wait needs that queue's lock.
     fn give_up(&mut self, device: &ash::Device, compute: vk::Queue, why: &str) {
         if let Self::Ready(fd) = std::mem::replace(self, Self::Off) {
             // SAFETY: both queues are this thread's alone.

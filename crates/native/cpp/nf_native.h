@@ -38,7 +38,8 @@ uint32_t nf_native_device_supported(PFN_vkGetInstanceProcAddr gipa, VkInstance i
 // the application's, linked as it is and never written) with the flags set in the copies, and the structures the
 // application has none of prepended, all in memory owned by `*state`. Fails where
 // nf_native_device_supported does (an instance older than 1.3 says so as is; a missing device requirement
-// as "the device lacks <it>"), and when the application enables VK_EXT_buffer_device_address (it excludes the core feature the kernels need). `out`, its
+// as "the device lacks <it>"). Where the application enables VK_EXT_buffer_device_address (it excludes the core feature),
+// that extension's own feature is enabled instead (NfNativeOpen::buffer_device_address_ext). `out`, its
 // extension list and its chain stay valid until nf_native_device_restore(*state), which frees them
 // and must be called once vkCreateDevice has returned, whatever it returned.
 uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, uint32_t instance_api_version,

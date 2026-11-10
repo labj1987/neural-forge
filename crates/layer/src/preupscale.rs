@@ -128,7 +128,9 @@ pub(crate) enum NativeLoader {}
 ///   backend's history), or, while the edit cache is on, a depth image (the hold copies DLSS's depth every
 ///   frame for the cache, [`native::DepthCopy`]; `NEURAL_FORGE_EDIT_CACHE=off` copies none, as 3.2.0);
 /// - `TRANSFER_SRC | TRANSFER_DST` for a colour candidate: an RGBA16F or B10G11R11 image the shaders read
-///   or write (`SAMPLED` or `STORAGE`), as DLSS's colour input is. The hold inside DLSS's buffer copies the
+///   or write (`SAMPLED` or `STORAGE`) that is also rendered or written into (`COLOR_ATTACHMENT` or `STORAGE`),
+///   with one mip level and one layer, as DLSS's colour input is (not a texture: those are made with mip levels or
+///   only sampled, and each image the rule takes is created twice to compare its memory needs, `added_usage.rs`). The hold inside DLSS's buffer copies the
 ///   colour input in and back with transfers ([`inline`]); a native Vulkan game creates its images with
 ///   exactly the usage it needs (Indiana Jones and the Great Circle's: `SAMPLED | STORAGE |
 ///   COLOR_ATTACHMENT`, #51), and without them nothing could ever be held there.
@@ -141,7 +143,8 @@ pub(crate) fn added_usage(info: &vk::ImageCreateInfo) -> vk::ImageUsageFlags {
         return vk::ImageUsageFlags::empty();
     }
     let copied = info.format == vk::Format::R16G16_SFLOAT || (DEPTH_FORMATS.contains(&info.format) && edit_cache_on());
-    let colour = OUTPUT_FORMATS.contains(&info.format) && info.usage.intersects(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE);
+    let target = info.usage.intersects(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE) && info.mip_levels == 1 && info.array_layers == 1;
+    let colour = OUTPUT_FORMATS.contains(&info.format) && info.usage.intersects(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE) && target;
     let wanted = if colour {
         vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST
     } else if copied {
@@ -13576,9 +13579,24 @@ mod tests {
         assert_eq!(added_usage(&info(vk::Format::D16_UNORM)), src);
         let already = vk::ImageCreateInfo { usage: vk::ImageUsageFlags::TRANSFER_SRC, ..info(vk::Format::D32_SFLOAT) };
         assert!(added_usage(&already).is_empty());
-        // A sampled RGBA16F image is a colour candidate: copied in and back by the hold inside DLSS's buffer.
+        // A sampled RGBA16F render target is a colour candidate: copied in and back by the hold inside DLSS's buffer.
         let both = if x86 { vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST } else { vk::ImageUsageFlags::empty() };
-        assert_eq!(added_usage(&info(vk::Format::R16G16B16A16_SFLOAT)), both);
+        let target = |format| vk::ImageCreateInfo {
+            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            mip_levels: 1,
+            array_layers: 1,
+            ..info(format)
+        };
+        assert_eq!(added_usage(&target(vk::Format::R16G16B16A16_SFLOAT)), both);
+        assert_eq!(added_usage(&target(vk::Format::B10G11R11_UFLOAT_PACK32)), both);
+        let storage = vk::ImageCreateInfo { usage: vk::ImageUsageFlags::STORAGE, ..target(vk::Format::R16G16B16A16_SFLOAT) };
+        assert_eq!(added_usage(&storage), both, "a storage image is written into");
+        // Textures are left as asked: only sampled, or with mip levels or layers.
+        let texture =
+            vk::ImageCreateInfo { usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST, ..target(vk::Format::R16G16B16A16_SFLOAT) };
+        assert!(added_usage(&texture).is_empty(), "only sampled");
+        assert!(added_usage(&vk::ImageCreateInfo { mip_levels: 6, ..target(vk::Format::R16G16B16A16_SFLOAT) }).is_empty(), "mip levels");
+        assert!(added_usage(&vk::ImageCreateInfo { array_layers: 6, ..target(vk::Format::R16G16B16A16_SFLOAT) }).is_empty(), "layers");
     }
 
     /// A native capture on a real device: the depth aspect of a D32S8 image in
