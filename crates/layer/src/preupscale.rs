@@ -2295,6 +2295,11 @@ impl Tracker {
                     // Every depth image at the identified depth's extent: an evaluate may name another one than the
                     // identified (`Self::hold_depth`; GTA V Enhanced alternates two).
                     || desc.is_some_and(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == (i.depth.1.width, i.depth.1.height))
+                    // Every image of the motion vectors' and the exposure image's shape: GTA V Enhanced hands DLSS four
+                    // motion-vector images and as many exposure images in turn (2026-11-11), and a hold needs the
+                    // layout of the one its evaluate names, recorded before that evaluate's record was read.
+                    || desc.is_some_and(|d| (d.width, d.height, d.format) == (i.mvec.1.width, i.mvec.1.height, i.mvec.1.format))
+                    || i.exposure_input.is_some_and(|(_, e)| desc.is_some_and(|d| (d.width, d.height, d.format) == (e.width, e.height, e.format)))
             })
     }
 
