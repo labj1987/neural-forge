@@ -23,6 +23,13 @@ pub mod preupscale_state {
     /// `ShmHeader::preupscale_reason` says why (the last reason the split hold or the hold inside DLSS's
     /// buffer gave). The model runs after the upscaler meanwhile, as with [`WAITING`].
     pub const IDENTIFIED: u32 = 5;
+    /// The game stopped calling DLSS altogether (no Super Resolution launch at all: a pause menu, a map, a loading
+    /// screen) after holds ran the model before the upscaler or after DLSS: nothing runs it now (the
+    /// after-the-upscaler path is kept off for up to 5 minutes after the last held frame), and it runs again on DLSS's
+    /// next frame, with the network still loaded. While DLSS goes on launching with no frame held (DLAA, inputs not
+    /// identified, every frame refused) the state is [`WAITING`] or [`IDENTIFIED`] instead, and the
+    /// after-the-upscaler path takes over 30 s after the last held frame.
+    pub const PAUSED: u32 = 6;
 }
 
 /// Which of the networks `extract-model` writes the layer runs (`ShmHeader::network`, the Network

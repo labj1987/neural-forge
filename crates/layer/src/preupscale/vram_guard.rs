@@ -7,7 +7,8 @@
 //! alone kept 222 under the same pressure. A tight budget alone is not that: with 1 GiB held the network
 //! stayed resident (12.5 ms) and is left as it is.
 //!
-//! So a step down needs both signs at once: the device at its VRAM budget (`VK_EXT_memory_budget`), and
+//! So a step down needs both signs at once: the device at its VRAM budget (`VK_EXT_memory_budget`; within
+//! [`SEVERE_MARGIN_MIB`] of it when the network is ten times slower than its best or slower than half a second), and
 //! the network's GPU time far above its best since it was built (or above [`SPILL_ABS_MS`]), for
 //! [`SPILL_FOR`]; or a build that ended with the device already at its budget. A step down pauses the
 //! network ([`Level::Paused`]: no network, frames go to DLSS untouched and the game gets the memory back).
@@ -41,6 +42,10 @@ pub(crate) const SPILL_FOR: Duration = Duration::from_secs(2);
 /// The window the network's time is judged over (its median), and the samples it needs.
 const WINDOW: Duration = Duration::from_secs(1);
 const WINDOW_MIN: usize = 5;
+/// A spill that slows the game below [`WINDOW_MIN`] holds a second (Cyberpunk 2077 at 4K with path tracing: 1-8 fps,
+/// the network 311 ms) has fewer samples in [`WINDOW`]: the last [`WINDOW_MIN`] are kept as long as they are this
+/// recent, and the newest counts as fresh within it.
+const SLOW_WINDOW: Duration = Duration::from_secs(5);
 /// Samples after a build before its best time counts (the first frames warm the clocks and caches).
 const WARMUP: u32 = 10;
 /// The small network is a step of its own only when it needs at least this much less than the full one at the
@@ -96,6 +101,19 @@ fn at_budget((used, budget): (u64, u64)) -> bool {
     used + OVER_MARGIN_MIB >= budget
 }
 
+/// A network this many times slower than its best...
+const SEVERE_FACTOR: f32 = 10.0;
+/// ...or slower than this...
+const SEVERE_ABS_MS: f32 = 500.0;
+/// ...counts as spilled within this much of the budget, not only within [`OVER_MARGIN_MIB`]: Cyberpunk 2077 at 4K with
+/// Ray Reconstruction and path tracing had the network at 1.7 s a frame (best 31 ms) with the reading 217 MiB under
+/// the budget (10189 of 10406 MiB), the game at 0.1-0.7 fps. No GPU is that much slower without a spill.
+const SEVERE_MARGIN_MIB: u64 = 512;
+
+fn near_budget((used, budget): (u64, u64)) -> bool {
+    used + SEVERE_MARGIN_MIB >= budget
+}
+
 fn median(v: &mut [f32]) -> f32 {
     v.sort_by(f32::total_cmp);
     v[v.len() / 2]
@@ -128,6 +146,15 @@ impl Guard {
     }
 
     /// Applies the decided step; returns it.
+    /// A step down is decided and not applied yet.
+    pub(crate) fn step_down_pending(&self) -> bool {
+        match (self.level, self.proposal) {
+            (_, Some(Level::Paused)) => self.level != Level::Paused,
+            (Level::Chosen, Some(Level::Small)) => true,
+            _ => false,
+        }
+    }
+
     pub(crate) fn apply(&mut self) -> Option<Level> {
         let level = self.proposal.take()?;
         self.level = level;
@@ -196,12 +223,28 @@ impl Guard {
         }
         self.seen += 1;
         self.samples.push_back((now, ms));
-        while self.samples.front().is_some_and(|&(t, _)| now.duration_since(t) > WINDOW) {
+        // Older than WINDOW, unless it is one of the last WINDOW_MIN and within SLOW_WINDOW (a slow game).
+        while self.samples.front().is_some_and(|&(t, _)| {
+            let age = now.duration_since(t);
+            age > SLOW_WINDOW || (age > WINDOW && self.samples.len() > WINDOW_MIN)
+        }) {
             self.samples.pop_front();
         }
         if self.seen > WARMUP {
             self.best_ms = Some(self.best_ms.map_or(ms, |b| b.min(ms)));
         }
+    }
+
+    /// `NEURAL_FORGE_PROBE_VRAM=1`'s line: the level, the samples kept (their age and time) and the best time.
+    pub(crate) fn probe(&self, now: Instant) -> String {
+        let samples: Vec<String> = self.samples.iter().map(|&(t, ms)| format!("{:.1}s:{ms:.1}", now.saturating_duration_since(t).as_secs_f32())).collect();
+        format!(
+            "level {:?}, best {:?}, spill since {:?}, samples [{}]",
+            self.level,
+            self.best_ms,
+            self.spill_since.map(|t| now.saturating_duration_since(t)),
+            samples.join(" ")
+        )
     }
 
     /// `NEURAL_FORGE_NATIVE_FAIL=vram`: a step down as if the network had spilled, to exercise the steps, the pause
@@ -234,10 +277,21 @@ impl Guard {
         }
         // A network running: is it spilling?
         if running.is_some() && self.level != Level::Paused {
-            let fresh = self.samples.back().is_some_and(|&(t, _)| now.duration_since(t) <= WINDOW);
-            let window = (fresh && self.samples.len() >= WINDOW_MIN).then(|| median(&mut self.samples.iter().map(|&(_, ms)| ms).collect::<Vec<_>>()));
+            let fresh = self.samples.back().is_some_and(|&(t, _)| now.duration_since(t) <= SLOW_WINDOW);
+            // Five samples give a median; a game the spill stalls may deliver fewer (a few network frames over seconds,
+            // each well over a second in Cyberpunk 2077 with path tracing at 4K): two or more all above SPILL_ABS_MS are
+            // as clear, and their smallest is taken. Not among the first WARMUP frames after a build: those warm the
+            // clocks and caches, and two of them over SPILL_ABS_MS on a slower GPU are no spill.
+            let times: Vec<f32> = self.samples.iter().map(|&(_, ms)| ms).collect();
+            let window = match times.len() {
+                _ if !fresh => None,
+                n if n >= WINDOW_MIN => Some(median(&mut times.clone())),
+                n if n >= 2 && self.seen > WARMUP && times.iter().all(|&ms| ms > SPILL_ABS_MS) => times.iter().copied().reduce(f32::min),
+                _ => None,
+            };
             let slow = window.is_some_and(|m| m > SPILL_ABS_MS || self.best_ms.is_some_and(|b| m > b * SPILL_FACTOR));
-            if slow && at_budget(reading) {
+            let severe = window.is_some_and(|m| m > SEVERE_ABS_MS || self.best_ms.is_some_and(|b| m > b * SEVERE_FACTOR));
+            if slow && (at_budget(reading) || severe && near_budget(reading)) {
                 let since = *self.spill_since.get_or_insert(now);
                 if now.duration_since(since) >= SPILL_FOR {
                     let m = window.unwrap_or_default();
@@ -354,6 +408,94 @@ mod tests {
         assert_eq!(g.apply(), Some(Level::Small));
         assert_eq!(g.target(FULL), Some(SMALL));
         assert!(g.why().unwrap().contains("running the small one"));
+    }
+
+    /// A spill bad enough to slow the game to a few frames a second (Cyberpunk 2077 at 4K with Ray Reconstruction
+    /// and path tracing: 1-8 fps, the network 311 ms against its 32): under five holds a second never filled the
+    /// one-second window, so the guard never stepped down. The last five holds within five seconds count.
+    #[test]
+    fn a_spill_that_slows_the_game_to_a_few_fps_still_steps_down() {
+        let base = Instant::now();
+        let mut g = Guard::default();
+        g.built(FULL, Some(1500), (3840, 2160), Some((5000, 8000)), FULL, false, base);
+        assert!(run(&mut g, base, 0, 5000, 32.0, (7000, 8000), Some(FULL)).is_none(), "normal frames");
+        // Four holds a second of 311 ms, at the budget.
+        let mut line = None;
+        let mut at = 5000;
+        while at < 12_000 && line.is_none() {
+            g.gpu_ms(311.0, t(base, at));
+            line = g.tick(Some((7990, 8000)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, at + 10));
+            at += 250;
+        }
+        let line = line.expect("a step down");
+        assert!(line.contains("paused"), "{line}");
+        assert!(at <= 9000, "within about three seconds of the spill (the median turning, then SPILL_FOR), at {at}");
+        // One hold a second, as slow: also stepped down.
+        let mut g = Guard::default();
+        g.built(FULL, Some(1500), (3840, 2160), Some((5000, 8000)), FULL, false, base);
+        run(&mut g, base, 0, 5000, 32.0, (7000, 8000), Some(FULL));
+        let stepped = (5..20).any(|k| {
+            g.gpu_ms(600.0, t(base, k * 1000));
+            g.tick(Some((7990, 8000)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, k * 1000 + 500)).is_some()
+        });
+        assert!(stepped);
+        // Two network frames five seconds apart, each over a second (holds that come only now and then, the game
+        // stalling on each): stepped down too; one such frame alone is not enough.
+        let mut g = Guard::default();
+        g.built(FULL, Some(1500), (3840, 2160), Some((5000, 8000)), FULL, false, base);
+        run(&mut g, base, 0, 5000, 32.0, (7000, 8000), Some(FULL));
+        g.gpu_ms(1325.0, t(base, 11_000));
+        assert!(g.tick(Some((7990, 8000)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, 11_500)).is_none(), "one slow frame");
+        g.gpu_ms(1325.0, t(base, 14_000));
+        let stepped = (0..6).any(|k| g.tick(Some((7990, 8000)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, 14_100 + k * 1000)).is_some());
+        assert!(stepped, "two slow frames within five seconds, at the budget");
+        // The network 50 times slower than its best, 217 MiB under the budget (the reading in that game): a spill too.
+        let mut g = Guard::default();
+        g.built(FULL, Some(1500), (3840, 2160), Some((5000, 10406)), FULL, false, base);
+        run(&mut g, base, 0, 5000, 31.0, (7000, 10406), Some(FULL));
+        let stepped = (0..8).any(|k| {
+            g.gpu_ms(1700.0, t(base, 5000 + k * 1000));
+            g.tick(Some((10189, 10406)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, 5000 + k * 1000 + 500)).is_some()
+        });
+        assert!(stepped, "severe, near the budget");
+        // As slow with a gigabyte to spare: not a spill.
+        let mut g = Guard::default();
+        g.built(FULL, Some(1500), (3840, 2160), Some((5000, 10406)), FULL, false, base);
+        run(&mut g, base, 0, 5000, 31.0, (7000, 10406), Some(FULL));
+        let stepped = (0..8).any(|k| {
+            g.gpu_ms(1700.0, t(base, 5000 + k * 1000));
+            g.tick(Some((9400, 10406)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, 5000 + k * 1000 + 500)).is_some()
+        });
+        assert!(!stepped, "severe with room");
+        // Slow frames with room to spare stay as they are; and samples older than five seconds do not count.
+        let mut g = Guard::default();
+        g.built(FULL, Some(1500), (3840, 2160), Some((5000, 8000)), FULL, false, base);
+        for k in 0..5 {
+            g.gpu_ms(311.0, t(base, k * 250));
+        }
+        assert!(g.tick(Some((7990, 8000)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, 7000)).is_none(), "stale samples");
+    }
+
+    /// The first frames after a build warm the clocks and caches (WARMUP): two of them over SPILL_ABS_MS at the budget
+    /// (a slower GPU's first frames at 4K) are no spill, however long they are the only ones; once the build is past
+    /// its warm-up, two such frames are.
+    #[test]
+    fn two_slow_frames_right_after_a_build_are_no_spill() {
+        let base = Instant::now();
+        let mut g = Guard::default();
+        g.built(FULL, Some(1500), (3840, 2160), Some((5000, 8000)), FULL, false, base);
+        g.gpu_ms(400.0, t(base, 100));
+        g.gpu_ms(400.0, t(base, 600));
+        let stepped = (0..5).any(|k| g.tick(Some((7990, 8000)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, 700 + k * 1000)).is_some());
+        assert!(!stepped, "the build's first two frames");
+        // Past the warm-up (frames at the build's own pace), two slow frames are a spill again.
+        for k in 0..WARMUP as u64 {
+            g.gpu_ms(30.0, t(base, 5000 + k * 16));
+        }
+        g.gpu_ms(400.0, t(base, 11_000));
+        g.gpu_ms(400.0, t(base, 11_500));
+        let stepped = (0..5).any(|k| g.tick(Some((7990, 8000)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, 11_600 + k * 1000)).is_some());
+        assert!(stepped, "two slow frames after the warm-up");
     }
 
     /// The 1 GiB case: at its budget but as fast as ever, the network is left as it is; and a GPU that is

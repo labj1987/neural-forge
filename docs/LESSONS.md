@@ -1823,7 +1823,8 @@ A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neit
   them): pan 0.091 at 2272 x -1280 against 0.148 at the old 1 x 1, 0.150 with no motion, 0.120 with y down and
   0.116-0.117 at 0.9x and 1.1x; walk 0.049 against 0.083 (0.054 at 0.9x and 1.1x); a pitch (image moved down 18-21 px a
   hold, vectors 0.014 x 1280 = 18 px) 0.056 against 0.106, 0.107 with y down. Some vectors overflow RG16F in the
-  hold's copy (up to 119 pixels a frame become infinite); the model's answer stayed finite.
+  hold's copy (up to 119 pixels a frame become infinite); the model's answer stayed finite (read since as leaving the
+  frame, below).
 - **Lesson:** a "which image is the motion vectors" rule that picks by format and handle is a guess wherever the
   engine names its own history beside the game's input; a dump whose vectors repeat on alternate holds is the sign.
 
@@ -1866,6 +1867,40 @@ the fix (none reached a release):
 - **Lesson:** a rule found for one game's shape (the parameter order) must say how sure it is of its own premise
   before it outranks a general one; and every new ageing or counting rule needs the question "and while Ray
   Reconstruction runs?" asked of it.
+
+## November 10: Crimson Desert's Xid 32 at start, and its motion vectors that are not finite (#51)
+
+- **The freeze:** one Crimson Desert launch (4K, HDR through Proton-GE's Wayland driver, the #51 development build,
+  the patched open module nvidia-ogkm 620.70.06) stayed black and logged two `Xid 32` lines 27 s after start, on a
+  copy-engine channel of the game's (`intr1 00000008 HCE_DBG0 00001b00/00001b04`); an identical launch right after
+  was clean. NVIDIA's catalogue has Xid 32 as a PBDMA error, an invalid or corrupted push buffer stream (a driver
+  error, memory or bus corruption); nothing public decodes the HCE registers. The layer's log stopped at the
+  identification of DLSS's inputs, before any hold: nothing is recorded into a game's buffers before "game is
+  rendering steadily; engaging", which comes seconds later. What the layer had done by then is what it does at
+  every start: the instance raised from Vulkan 1.0 to 1.3, a sixth queue of the compute family for the network's
+  loading, the network's extensions and features on the device, transfer usage added to two-channel float images
+  where their memory requirements stay the same, and the NVX handle and CUDA-launch tracking. No copy-engine work
+  of its own.
+- **Reproduced?** No. Interleaved launches of the same route, each through the start and about a minute of play:
+  three each of the development build, the installed 3.13.0 and Neural Forge disabled
+  (`NEURAL_FORGE_DISABLE=1`), all nine into the game (the GPU busy, the layer holding where on), none with an Xid; the kernel log has no other Xid for Crimson Desert since the 620.70.06 module was
+  built (November 7), over at least 17 launches today (the kernel's
+  emulation notices name each process), with and without the layer. One fault in all of them, before the layer
+  did anything to the frame, is not Neural Forge's on this evidence; if it comes back, the same comparison with
+  more launches of the layer off is the test.
+- **Motion vectors that are not finite:** the hold inside DLSS's buffer blits Crimson Desert's R32G32_SFLOAT
+  motion vectors into its RG16F staging image (`record_copy_in`). A few are NaN every frame (2-10 at 4K in a pan and
+  a walk), and in an earlier session up to 119 a frame were past the half's range and became infinite in the copy.
+  The network's own read of either already found no history there, but the edit cache's motion pass read both as
+  zero motion and carried the history as if nothing there had moved. It now reads an infinite vector as the
+  largest finite half of its sign and a NaN one as the largest finite half: each leaves the frame, so the chain is
+  lost there, with no NaN reaching the staleness field; the replay tool reads them the same way. With the nearest
+  surface's vector, a texel takes a non-finite vector only where it is the nearest depth around it (15 of 58 in
+  both dumps). The edit cache's replay of both dumps did not move (err, p99.5 and kept the same to the last digit
+  shown). RG16F vectors (GTA V) are copied as they are and RGBA16F ones (Metro Last Light Redux) blitted half to
+  half, so only RG32F narrows; the reading covers a non-finite vector from any of them.
+- **Lesson:** a game's motion vectors can hold values no conversion keeps (NaN, beyond the half's range); every
+  reader of the copy must agree on what such a vector means, and "no history" is the one that cannot smear.
 
 ## Deliberately not done, or left open
 

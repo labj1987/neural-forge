@@ -24,7 +24,9 @@ extracted (a DLL without the small one), the other one runs.
 When the game and other programs leave too little video memory for the network, the driver would move
 part of it to system memory, where it runs many times slower. Instead the network pauses and frames go
 to DLSS untouched. The small network is no way out: it needs only about 45 MiB less video memory than the
-full one. The network comes back once the memory has had room for it for 10 s (and no sooner than 30 s
+full one. The guard needs only a couple of slow network frames, so it also steps in when a game slows to a few
+frames a second (a pause decided while the game is too slow for the model to run is applied after 6 s). The
+network comes back once the memory has had room for it for 10 s (and no sooner than 30 s
 after the pause, longer when pauses repeat). While paused, Neural Forge holds no video memory. The Status
 tab's Model placement line says when the network is paused.
 
@@ -61,6 +63,13 @@ layer picks the place for each game by itself:
   the model resolution must be 100% (below it the frame is presented untouched). A float16 (scRGB) or
   10-bit SDR swapchain is presented untouched, and captures of an HDR frame are refused.
 
+In a pause menu, a map or a loading screen many games stop calling DLSS (Cyberpunk 2077's Esc menu shows the
+last frame, which already has the model's edit, under the menu). The model then stays where it is, with its
+network loaded, and runs again on the game's first frame after the menu; the Model placement line says "paused
+with the game's DLSS". It moves to the finished frame when the game goes on calling DLSS for 30 s with no frame
+worked on before the upscaler (DLAA, or a DLSS input Neural Forge no longer recognises), or sends DLSS nothing for
+5 minutes (DLSS switched off for another upscaler).
+
 The game's own **DLSS Frame Generation** works with the model before the upscaler and after DLSS.
 Generated frames are built from enhanced frames, and the model runs once per real frame.
 
@@ -79,7 +88,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, the HUD group: finding the HUD and HUD regions on the finished frame, and the Sharpening group: adaptive sharpening (CAS) and Clarity on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
-| Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
+| Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
 | Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on; a tested game says where the model runs in it), and the launch option to copy by hand for a game you pick. |
 
 **The HDR verdict** (the Status tab's HDR line, `hdr_verdict=` in `neural-forge-cli shmctl status`, Save report and the
@@ -118,16 +127,16 @@ GrimsVerk's runtime research).
 
 **Passes** (1 to 10, default 1) runs the model that many times over each frame, before or after the
 upscaler: every pass after the first works on the previous pass's picture. Each pass costs about as much
-GPU time as the first, and the effect builds up with every pass. In GTA V Enhanced at 1440p with frame
-generation 4x (real frames per second, pass 4 of the built-in benchmark, one run each; the small
-network's one pass is from 2026-10-19, the rest from 2026-10-28):
+GPU time as the first, and the effect builds up with every pass. In GTA V Enhanced at 3840x2160 (DLSS
+Balanced) with frame generation 4x on an RTX 5070 (real frames per second, pass 4 of the built-in benchmark,
+one run each, 2026-11-10; 58.1 with the model off):
 
 | Network | 1 pass | 2 passes | 3 passes |
 |---|---|---|---|
-| Small | 74.3 | 60.4 | 52.8 |
-| Full | 62.1 | 50.7 | |
+| Small | 41.0 | 33.6 | 28.3 |
+| Full | 36.7 | 27.4 | |
 
-Two passes of the small network cost about as much as one pass of the full network, and look
+Two passes of the small network cost a little more than one pass of the full network, and look
 over-processed: grittier stone and noisier roads. Each pass keeps its own history, so the passes do not
 blend toward each other's pictures over time. **Per-pass settings** (Edit…) let each pass use its own
 intensity, local tone, local structure, skin structure, style, auto mask, model resolution, colour of the
@@ -140,9 +149,10 @@ values keep more of the pass's own input, so the passes add less to each other.
 **Balanced** (58%), **Performance** (50%) or **Ultra Performance** (33.3%). Below Full the model works on a
 downscaled copy of the frame and its change is brought back to full size, following the frame's own edges,
 so the frame keeps its own detail; the model costs less GPU time and memory but adds less detail of its own.
-Before the upscaler the frame is already small (1486x836 in GTA V at 1440p) and the smaller sizes keep
-little of the model's detail; after DLSS, on the full output (with Ray Reconstruction), Performance keeps
-most of it for about 30 fps more (see [MEASURED_RESULTS.md](MEASURED_RESULTS.md)). Full is the frame exactly as
+Before the upscaler the frame is already small (2228x1253 in GTA V at 4K with DLSS Balanced, 1486x836 at
+1440p) and the smaller sizes keep little of the model's detail; after DLSS, on the full output (with Ray
+Reconstruction), Performance keeps most of it for about a fifth more frames (Crimson Desert at 4K: 84 against
+70 fps shown; see [MEASURED_RESULTS.md](MEASURED_RESULTS.md)). Full is the frame exactly as
 without the setting. Each pass can have its own model resolution in the per-pass settings: a pass works
 on the previous pass's full-size picture at its own size. Changing it starts the model's history afresh
 and shows a moment of untouched frames while the model is prepared for the new size.
@@ -213,8 +223,8 @@ midtones** (0.5) keeps it off the darkest and brightest parts (0 evenly, 1 midto
 protection** (0.5) stops the blur at strong brightness edges so they do not grow bright or dark halos. The
 **HUD regions** apply: nothing inside a Keep region, the strength's share inside a Soften one (Find the HUD
 does not apply here). Clarity does not use the game's depth: on the presented frame there is none to use.
-GPU time a presented frame at 1440p on an RTX 5070: 0.29 ms for CAS, 0.33 ms for Clarity at radius 16 (0.43 ms at
-64), 0.37 ms for both; most of it is copying the frame out and back. It is paid on every presented frame, so with
+GPU time a presented frame at 3840x2160 on an RTX 5070: 0.69 ms for CAS, 0.86 ms for Clarity at radius 16 (1.05 ms
+at 64), 0.94 ms for both (at 2560x1440: 0.28, 0.32, 0.43 and 0.37 ms); most of it is copying the frame out and back. It is paid on every presented frame, so with
 frame generation 4x four times a rendered frame. `neural-forge-cli shmctl set sharpen_cas 0.5` (and
 `clarity_strength`, `clarity_radius`, `clarity_midtones`, `clarity_edges`) does the same from a terminal, and
 a game can have its own sharpening like any other setting ([Settings for one game](#settings-for-one-game)); `NEURAL_FORGE_SHARPEN` overrides it for one launch, for comparisons. A capture (the Debug tab's Capture button) shows the frame
@@ -257,7 +267,9 @@ settings win over built-in ones, and an update never changes your files.
 
 Each game was run on the test machine (RTX 5070, 2560x1440 or 3840x2160, Proton) with its own settings as found:
 DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. In each one the model
-ran with no missed frames and no GPU fault.
+ran with no missed frames and no GPU fault. GTA V Enhanced (`FrameLimit` 120), Cyberpunk 2077, Red Dead
+Redemption 2 and Crimson Desert were run again at 3840x2160, the last three with the game's HDR (HDR10) on
+(Proton-GE with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`); GTA V has no HDR.
 
 The same facts, with the version each game was last seen working in and its known issues, are built into the app:
 the Status tab's **Tested game** line shows the running game's, the Setup tab's games list says where the model runs
@@ -352,6 +364,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_POST_MOTION=zero\|flow\|none`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | After the upscaler (the finished frame), the model's history: its previous output at the same pixel (`zero`, the default), where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; it adds that extension and one optical-flow queue to the game's devices, which hung GTA V Enhanced), or none (`none`: every frame on its own, which flickers in large soft patches on grainy or noisy frames). The history is not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and is dropped on a scene cut. |
 | `NEURAL_FORGE_RAISE_VULKAN=off` | layer | A game whose Vulkan instance asks for a version below 1.3 (Red Dead Redemption 2 asks for 1.1) gets one created for 1.3, which the model needs; `off` creates it as the game asks (the model then cannot run in that game). |
 | `NEURAL_FORGE_SHARE_QUEUE=off` | layer | A game that takes every compute queue of the GPU (Red Dead Redemption 2) gets one of them shared with the model, every use of it synchronized; the model then runs before the upscaler only. `off`: no model on such a game. |
+| `NEURAL_FORGE_PROBE_VRAM=1` | layer | Diagnostics: the video memory guard logs what it sees once a second (the device's memory use and budget, the network's recent times and its best). |
 | `NEURAL_FORGE_FAIL_CREATE=N[@K]`, `NEURAL_FORGE_NATIVE_FAIL=chain`, `NEURAL_FORGE_NATIVE_FAIL=vram` | layer | Testing aids: let K network builds through, then fail the next N; report one counter-chain timeout; or have the video memory guard pause the network at its 600th and 900th frame, as if it did not fit. |
 | `NEURAL_FORGE_GUI_OPEN=<tab>` | GUI | Testing aid: open a tab (`model`, `composition`, `debug`, `status`, `setup`, or `passes` for the per-pass dialog) at start, for screenshots. |
 | `NEURAL_FORGE_BENCH=1`, `NEURAL_FORGE_REQUIRE_VULKAN=1`, `NEURAL_FORGE_TEST_DISPLAY=:N` | layer tests | Testing aids: run the hot-path GPU benchmark; fail instead of skipping when no Vulkan device exists; run the present-fence test on a real swapchain in an X server (an Xvfb's display). |
@@ -413,7 +426,7 @@ everything under `~/.local/share/neural-forge` (the model, an imported DLL, capt
   different ways, and several broke an assumption the first time. See [Tested games](#tested-games).
 - **The model after DLSS is tested in three games** (Crimson Desert and Hogwarts Legacy with Ray
   Reconstruction; Cyberpunk 2077 with and without it). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
-  much lower frame rate (36 against 120 fps shown in Crimson Desert).
+  much lower frame rate (14 against 70 fps shown in Crimson Desert at 4K with Ray Reconstruction).
 - **Hogwarts Legacy with Ray Reconstruction:** its Ray Reconstruction does not say what unit its motion vectors
   are in (Cyberpunk 2077's does), so the model after DLSS takes them as render pixels, as their size suggests, or
   in the unit Super Resolution gave if it ran earlier in the session. Neither has been checked against the picture

@@ -793,6 +793,10 @@ fn process(
     // The model server's per-stage times, as the `[sync]` line and the Status tab read them: the whole frame on
     // the GPU, waited for, counts as the evaluate; nothing is uploaded or read back separately.
     if evaluated {
+        // The VRAM guard judges a spill by the network's time: this path's frames count too (the frame waited for, on
+        // the GPU), or a game whose network runs only here, at the output size, was never stepped down however far
+        // it spilled (Cyberpunk 2077 at 4K with Ray Reconstruction and path tracing: 1-8 fps).
+        loader.note_gpu_ms(t.elapsed().as_secs_f32() * 1000.0);
         let ms = |v: f32| v.to_bits();
         hdr.server_upload_ms_bits.store(ms(0.0), Ordering::Relaxed);
         hdr.server_eval_ms_bits.store(ms(t.elapsed().as_secs_f32() * 1000.0), Ordering::Relaxed);

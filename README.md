@@ -104,7 +104,8 @@ Every setting, the other placements and all environment variables: [docs/USER_GU
   GTA V Enhanced, set a frame rate limit (`FrameLimit` 120 in its settings.xml) and it stays on.
 - **At 4K a 12 GB card is at its video memory limit.** Close programs that hold video memory
   (browsers with hardware acceleration) before playing at 4K: once the game runs short, it can stay
-  slow until it restarts.
+  slow until it restarts. With Ray Reconstruction the model runs on the 4K output and takes the most
+  memory: Cyberpunk 2077 with path tracing at 4K runs short with the model on.
 - **NVIDIA `Xid 109` or `Xid 119` GPU hangs** are a known NVIDIA driver bug under Proton, also in
   games without Neural Forge ([NVIDIA/open-gpu-kernel-modules#1097](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1097)).
   Workarounds other users report: [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) (2026-09-16).

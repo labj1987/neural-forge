@@ -28,6 +28,7 @@ pub fn preupscale_state_name(v: u32) -> &'static str {
         HOLDING_AFTER => "holding after DLSS",
         HOLDING_BOTH => "holding before the upscaler and after DLSS",
         IDENTIFIED => "DLSS input identified, not holding",
+        PAUSED => "paused with DLSS (a menu or loading screen); the model resumes with it",
         _ => "unknown",
     }
 }
@@ -157,11 +158,11 @@ mod tests {
     #[test]
     fn preupscale_state_name_covers_every_real_state() {
         use neural_forge_protocol::enums::preupscale_state::*;
-        let names: Vec<_> = [OFF, WAITING, HOLDING, HOLDING_AFTER, HOLDING_BOTH, IDENTIFIED].map(preupscale_state_name).into();
+        let names: Vec<_> = [OFF, WAITING, HOLDING, HOLDING_AFTER, HOLDING_BOTH, IDENTIFIED, PAUSED].map(preupscale_state_name).into();
         assert!(!names.contains(&"unknown"), "{names:?}");
         assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), names.len(), "each its own: {names:?}");
         assert_eq!(preupscale_state_name(IDENTIFIED), "DLSS input identified, not holding");
-        assert_eq!(preupscale_state_name(IDENTIFIED + 1), "unknown");
+        assert_eq!(preupscale_state_name(PAUSED + 1), "unknown");
     }
 
     /// DLSS identified with every frame refused (#51): the state says so, and the next line says why.

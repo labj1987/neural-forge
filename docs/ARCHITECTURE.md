@@ -223,7 +223,7 @@ flowchart TD
     nvx -- yes --> dlss{"DLSS SR input identified<br/>and a submit reads it?"}
     dlss -- "no (no DLSS, native)" --> post
     dlss -- yes --> pre["Before the upscaler:<br/>hold the DLSS submit"]
-    pre --> handback{"No DLSS submit<br/>for 30 s?"}
+    pre --> handback{"No frame held for 30 s<br/>while DLSS launches,<br/>or no DLSS for 5 min?"}
     handback -- yes --> post
 ```
 
@@ -235,10 +235,12 @@ hooked-command list, the resolved entry points and every hot path are exactly 1.
 (`lib.rs::probe_command_tests`) and the smoke test's `off` pass guard that. A device without NVX
 never gets the tracking either.
 
-Once a device has held a DLSS submit, the after-the-upscaler compose stays off for that device
-until no DLSS submit has been seen for 30 s (`preupscale::HAND_BACK`). Loading screens, where
-DLSS does not run, are presented untouched instead of switching paths (see
-[LESSONS.md](LESSONS.md), "The stuck NGX feature").
+Once a device has held a DLSS submit, the after-the-upscaler compose stays off for that device until the
+hand-back (`preupscale::hand_back_at`, 4.7): 30 s after the last held frame while DLSS Super Resolution's input
+kernel goes on launching (`preupscale::HAND_BACK`: DLAA, inputs no longer identified, every frame refused), 5 minutes
+after it while the game sends DLSS nothing at all (`PAUSE_HAND_BACK`). Loading screens and pause menus, where DLSS
+does not run, are presented untouched instead of switching paths (see [LESSONS.md](LESSONS.md), "The stuck NGX
+feature").
 
 ## 4. Before the upscaler (2.0)
 
@@ -503,8 +505,28 @@ The steadiness is what tells a scene-referred game whose eye adaptation lags (GT
   network running" or "... not running: <why>"). Failed builds are retried after 0.5, 1 and 2 s, the
   4th attempt closes and reopens the network, then every 30 s (`neural_forge_protocol::rebuild`).
 - **Counter-chain timeout:** the graph is rebuilt with barriers and the history reset.
-- **Hand-back.** Once a device has held, the after-the-upscaler path stays off on it until no DLSS
-  submit has been seen for 30 s (`HAND_BACK`), so loading screens are presented untouched.
+- **Hand-back.** Once a device has held, the after-the-upscaler path stays off on it until the hand-back
+  (`preupscale::hand_back_at`), counted from the last held frame (`Session::last_hold`): 30 s (`HAND_BACK`) while
+  DLSS Super Resolution's input kernel goes on launching with no frame held, its inputs identified or not (by the
+  kernel's name, or by what its parameters name: `Tracker::observe`, `note_sr_launch`): DLAA, inputs no longer
+  identified, every frame refused (counted from the start of that run of launches when it began later, so a resume
+  is not one); else 5 minutes (`PAUSE_HAND_BACK`): a game that stops calling DLSS altogether is in a pause menu or a
+  loading screen, whose picture (Cyberpunk 2077: the last frame under the menu) already carries the edit. Only then
+  is the status `PAUSED` (6) (`Session::status_at`: no Super Resolution launch within `RECENT`); while DLSS launches
+  it is `IDENTIFIED` with the reason, or `WAITING`. Loading screens and menus are presented untouched, and the
+  network is not rebuilt at the output size and back (#49).
+- **Nothing freed under a frame in flight.** The loader thread closes the network or frees a build only while no
+  frame that used it may still run (`native::Claims::in_flight`, checked under the loader's lock right before):
+  no hold recorded into DLSS's buffers, no split hold whose fence is pending or whose work no fence covers (until
+  `FENCE_WAIT_TIMEOUT` after its submit), no after-the-upscaler frame running or stalled with its fence unsignalled.
+  The VRAM guard's idle step (`LoaderState::apply_idle_step`) also needs both paths quiet (`Claims::unused`, as for
+  lending the network to another device): a frame whose 5 s wait timed out can still run after `IDLE_STEP`, and
+  closing the network under it is a copy-engine read of freed memory (Xid 31, #59). While a step down is pending and
+  other holds may still run, no hold takes the build (`Loader::ready_sizes`), so holds that keep coming cannot keep
+  the step from being applied.
+- **A pending rebuild yields to a path on the current build.** When one path takes the current build while the
+  other path's request for another set of sizes waits for the loader thread, the request is dropped
+  (`LoaderState::want_sizes`), so the thread never frees a build under a frame just recorded with it.
 
 ### 4.8 Timings, 1440p Balanced (render 1485x836, padded 1486x836)
 

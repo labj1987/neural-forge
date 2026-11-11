@@ -77,6 +77,38 @@ first shipped them; their phase is kept as a subheading.
   `NEURAL_FORGE_POST_MOTION=none` brings the old behaviour back. A working scale below 1 makes this flicker
   stronger.
 
+**Pause menus and loading screens**
+
+- A pause menu (Cyberpunk 2077's Esc menu) no longer moves the model to the finished frame after 30 seconds. The
+  menu shows the last frame, which already carries the model's edit; after half a minute the model ran over the
+  menu a second time, at the output size (about 50 ms a frame at 4K), and was rebuilt for it and rebuilt again on
+  resume, so the model was gone for one to six seconds after each long pause, and on a 12 GB card at 4K the video
+  memory guard turned it off for the rest of the game. While the game sends DLSS nothing at all, the model now stays
+  where it was for 5 minutes, and runs again on the first frame after the menu. A game that goes on calling DLSS
+  with no frame worked on before the upscaler (DLAA, or a DLSS input Neural Forge no longer recognises) gets the
+  model on the finished frame 30 seconds after the last frame worked on, and the Status tab never says paused
+  meanwhile; one switched to another upscaler, after 5 minutes.
+- While DLSS is paused that way, the Status tab's Model placement line says "paused with the game's DLSS (a menu
+  or loading screen): the model resumes with its next frame" (`preupscale_state=6`) instead of "after the upscaler:
+  waiting for DLSS Super Resolution", which read as if the model had moved. The game's log says when DLSS frames
+  resume and after how long.
+- Fixed a GPU crash (Xid 13, device lost) when the game came back from a pause menu at the moment the model moved
+  from the finished frame back to before the upscaler: the network could be rebuilt for the finished frame under a
+  frame that had just been recorded with the old build.
+- The video memory guard now pauses the network when it runs out of video memory in a game it slows to a few frames
+  a second (Cyberpunk 2077 at 4K with Ray Reconstruction and path tracing on a 12 GB card: 0.1-7 fps with the network
+  at 0.4-1.7 s a frame, and no pause ever). Four things kept it out: it needed five network frames within a second
+  to judge, which such a game never delivered; the network's frames on the finished frame were never timed for it;
+  the device's memory reading stayed a little under the budget the driver reports (217 MiB) while the network was
+  over fifty times slower than its best; and once it had decided to pause, the pause waited for the next frame to
+  use the network, which never came, because the layer stops working on a game below 15 fps, so the network kept the
+  memory the game needed. Now two slow frames within five seconds are enough, both places time the network, a
+  network ten times slower than its best counts within 512 MiB of the budget, and the decided pause is applied once
+  no frame has used the network for six seconds and none that did can still be running on the GPU (closing the
+  network under such a frame would crash the game); while it waits, no new frame takes the network, so a game that
+  keeps handing it frames still gets the pause. Measured: the game back at 65-69 fps seconds after the pause was
+  decided, steady from there.
+
 **Seeing why the model does not run before the upscaler**
 
 - When Neural Forge finds the frame a game hands to DLSS but cannot work on it, the Status tab's Model placement

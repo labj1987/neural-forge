@@ -1960,8 +1960,9 @@ impl NeuralForgeDeviceInfo {
         let inputs = scan.inputs?;
         let mut hold_guard = self.hold.lock().unwrap_or_else(|e| e.into_inner());
         let HoldState { shm, preupscale: session, external_memory_host } = &mut *hold_guard;
-        // DLSS is running on this device (held or not): the post path stays off for
-        // `preupscale::HAND_BACK` after this once the device has held. Counted once a frame: a second count for a
+        // DLSS is running on this device with its inputs identified (held or not): the status says so while no frame is
+        // held (`preupscale::status_of`); the hand-back to the post path counts from the last held frame instead
+        // (`preupscale::hand_back_at`), so frames refused from here on (DLAA) hand back. Counted once a frame: a second count for a
         // frame whose hold after DLSS was recorded made every cache dump of those holds end at its second hold
         // ("a DLSS frame between two armed holds went unheld", issue #49).
         if !counted {
@@ -4149,8 +4150,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let held_elsewhere = crate::preupscale::active() && crate::preupscale::post_off_by_any_device(std::time::Instant::now());
                 if self.preupscale.is_some() || held_elsewhere {
                     // Model mode: once this device (or another of the process) has held, the
-                    // post-upscaler compose stays off while DLSS ran within `preupscale::HAND_BACK`
-                    // (30 s), loading screens included: the model is not applied a second time, and
+                    // post-upscaler compose stays off until the hand-back (`preupscale::hand_back_at`: 30 s after
+                    // the last held frame while DLSS Super Resolution still launches, 5 minutes while the game paused
+                    // DLSS: a pause menu, a loading screen): the model is not applied a second time, and
                     // the model server's feature is not rebuilt at the output size and back at every
                     // loading screen. Logged on change.
                     static SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4161,7 +4163,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             if suppressed {
                                 "the model runs in the game's frame (before the upscaler or after DLSS); the post-upscaler compose is off while frames are held"
                             } else {
-                                "the post-upscaler compose runs: no DLSS submit held in the last 30 s (DLSS off, DLAA, or never held), or every pass is placed at present"
+                                "the post-upscaler compose runs: no DLSS frame held for 30 s while DLSS still launched (DLAA, its input not held), for 5 minutes without any DLSS launch (switched off), or never; or every pass is placed at present"
                             }
                         );
                         crate::logging::flush();
