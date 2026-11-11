@@ -44,8 +44,9 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   creation flags (`IsHDR`, `MVLowRes`, `MVJittered`, `DepthInverted`, `AutoExposure`).
 - **The ring.** `crates/ngx-wrapper/src/ring.rs`: a 32-byte header, 1024 slots of 128 bytes. A writer reserves a slot
   with an atomic add, zeroes its `seq`, writes it, then sets `seq` to its number; the reader takes a slot only while
-  `seq` reads the same before and after copying it. The file is named by the Linux pid (the wrapper reads it from
-  `/proc/self/stat` through `Z:`), which the layer gets from `getpid()`. The layer maps it read-only and removes the
+  `seq` reads the same before and after copying it. The file is named by the Linux pid (the wrapper asks Wine with
+  `NtQueryInformationProcess(ProcessWineUnixPid)`; `Z:\proc\self` would name the wineserver, which opens files for
+  Wine), which the layer gets from `getpid()`. The layer maps it read-only and removes the
   file, so nothing is left behind; `uninstall --purge` removes rings no layer opened. The record is written before
   NGX records the evaluate's launches, on the same thread, so the newest record naming a launch's images is that
   launch's evaluate.

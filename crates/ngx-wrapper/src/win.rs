@@ -92,17 +92,28 @@ pub(crate) fn log(line: &str) {
     }
 }
 
-/// The Linux pid of this process, which the layer's `getpid()` gives: the first field of `/proc/self/stat`, read
-/// through Wine's `Z:` drive.
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationProcess(process: Handle, class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+}
+
+/// Wine's `ProcessWineUnixPid` information class (`include/winternl.h`).
+const PROCESS_WINE_UNIX_PID: u32 = 1101;
+
+/// The Linux pid of this process, which the layer's `getpid()` gives, from Wine's `ProcessWineUnixPid`. (Not
+/// `Z:\proc\self`: Wine's server opens files, so that names the wineserver.)
 fn unix_pid() -> Option<u32> {
-    let stat = std::fs::read_to_string("Z:\\proc\\self\\stat").ok()?;
-    stat.split_whitespace().next()?.parse().ok()
+    let mut pid: i32 = 0;
+    let current = -1isize as Handle;
+    // SAFETY: an out-parameter of the size the class writes.
+    let status = unsafe { NtQueryInformationProcess(current, PROCESS_WINE_UNIX_PID, &mut pid as *mut i32 as *mut c_void, 4, core::ptr::null_mut()) };
+    (status == 0 && pid > 0).then_some(pid as u32)
 }
 
 static RING: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 
 fn open_ring() -> Result<String, String> {
-    let pid = unix_pid().ok_or("no /proc/self/stat")?;
+    let pid = unix_pid().ok_or("Wine gave no unix pid (ProcessWineUnixPid)")?;
     let path = format!("Z:\\dev\\shm\\neural-forge-ngx-{pid}.ring");
     let name = wide(&path);
     unsafe {

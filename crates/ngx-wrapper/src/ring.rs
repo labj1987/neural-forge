@@ -1,6 +1,6 @@
 //! The record format the wrapper writes and the Neural Forge layer reads (`crates/layer/src/ngx_ring.rs` parses the
 //! same bytes; both sides test the offsets). One file per process, `/dev/shm/neural-forge-ngx-<pid>.ring` (the
-//! Linux pid, which the layer gets from `getpid()`), mapped by both.
+//! Linux pid, which the layer gets from `getpid()` and the wrapper from Wine's `ProcessWineUnixPid`), mapped by both.
 //!
 //! Header (32 bytes): magic `NFNGXRG1`, version, record size, record count, pid, then the number of records
 //! reserved so far (u64). Record `n` (0-based) lives in slot `n % count` after the header. A writer reserves `n`
