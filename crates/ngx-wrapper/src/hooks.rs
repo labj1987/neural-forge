@@ -5,9 +5,11 @@
 
 use core::ffi::{c_char, c_void};
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::ring::{Record, API_D3D11, API_D3D12, API_VULKAN, KIND_END};
+use crate::rules;
 use crate::win::{log, logging, publish, target};
 
 /// NGX's `NVSDK_NGX_Parameter` (an MSVC C++ object): its getters' vtable slots. MSVC groups overloads and lays
@@ -87,12 +89,31 @@ const IID_INTEROP: Guid = Guid(0x39da4e09, 0xbd1c, 0x4198, [0x9f, 0xae, 0x86, 0x
 /// DXVK's `IDXGIVkInteropSurface`.
 const IID_DXGI_VK_INTEROP_SURFACE: Guid = Guid(0x5546cf8c, 0x77e7, 0x4341, [0xb0, 0x5d, 0x8d, 0x4d, 0x50, 0x00, 0xe7, 0x7d]);
 
-/// The interop device, found once (vkd3d-proton has one per process for a game's device).
-struct Interop {
-    device: usize,
-    v1: bool,
+/// The interop interface of the device `res` was made on, with a reference the caller releases ([`release_com`]):
+/// asked for per resource, so a game that makes a new device (a settings change, a device lost) is asked through the
+/// new one, and no device is kept alive by the wrapper. `true` for `ID3D12DXVKInteropDevice1`.
+unsafe fn interop_device(res: Com) -> Option<(Com, bool)> {
+    let get_device: unsafe extern "system" fn(Com, *const Guid, *mut usize) -> i32 = method(res, 7);
+    let mut dev = 0usize;
+    let found = if get_device(res, &IID_INTEROP1, &mut dev) == 0 && dev != 0 {
+        Some((dev as Com, true))
+    } else if get_device(res, &IID_INTEROP, &mut dev) == 0 && dev != 0 {
+        Some((dev as Com, false))
+    } else {
+        None
+    };
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        log(&format!("interop: ID3D12DXVKInteropDevice{}", found.map_or(" not available", |(_, v1)| if v1 { "1" } else { "" })));
+    }
+    found
 }
-static INTEROP: Mutex<Option<Option<Interop>>> = Mutex::new(None);
+
+/// `IUnknown::Release`.
+unsafe fn release_com(obj: Com) {
+    let release: unsafe extern "system" fn(Com) -> u32 = method(obj, 2);
+    release(obj);
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -121,24 +142,9 @@ unsafe fn d3d12_image(res: Com) -> Image {
     get_desc(res, &mut desc);
     img.width = desc.width as u32;
     img.height = desc.height;
-    let mut interop = INTEROP.lock().unwrap_or_else(|e| e.into_inner());
-    if interop.is_none() {
-        let get_device: unsafe extern "system" fn(Com, *const Guid, *mut usize) -> i32 = method(res, 7);
-        let mut dev = 0usize;
-        let found = if get_device(res, &IID_INTEROP1, &mut dev) == 0 && dev != 0 {
-            Some(Interop { device: dev, v1: true })
-        } else if get_device(res, &IID_INTEROP, &mut dev) == 0 && dev != 0 {
-            Some(Interop { device: dev, v1: false })
-        } else {
-            None
-        };
-        log(&format!("interop: ID3D12DXVKInteropDevice{}", found.as_ref().map_or(" not available", |i| if i.v1 { "1" } else { "" })));
-        *interop = Some(found);
-    }
-    if let Some(Some(i)) = interop.as_ref() {
-        let dev = i.device as Com;
+    if let Some((dev, v1)) = interop_device(res) {
         let mut offset = 0u64;
-        if i.v1 {
+        if v1 {
             let info1: unsafe extern "system" fn(Com, Com, *mut u64, *mut u64, *mut i32) -> i32 = method(dev, 13);
             info1(dev, res, &mut img.vk, &mut offset, &mut img.format);
         } else {
@@ -148,6 +154,7 @@ unsafe fn d3d12_image(res: Com) -> Image {
         // D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE: the state DLSS takes its inputs in.
         let layout: unsafe extern "system" fn(Com, Com, u32, *mut i32) = method(dev, 9);
         layout(dev, res, 0x40, &mut img.layout);
+        release_com(dev);
     }
     img
 }
@@ -190,8 +197,7 @@ unsafe fn d3d11_image(res: Com) -> Image {
     img.width = info.extent[0];
     img.height = info.extent[1];
     img.format = info.format;
-    let release: unsafe extern "system" fn(Com) -> u32 = method(surface, 2);
-    release(surface);
+    release_com(surface);
     img
 }
 
@@ -212,8 +218,7 @@ struct ResourceVk {
     read_write: u8,
 }
 
-unsafe fn vk_image(p: *mut Parameter, key: &str) -> Option<Image> {
-    let r = get_ptr(p, GET_VOID_POINTER, key) as *const ResourceVk;
+unsafe fn vk_image(r: *const ResourceVk) -> Option<Image> {
     if r.is_null() || (*r).kind != 0 {
         return None;
     }
@@ -244,12 +249,33 @@ impl Api {
     }
 }
 
-unsafe fn image(api: Api, p: *mut Parameter, key: &str) -> Option<Image> {
+/// The getter slot of `api`'s resources.
+fn resource_slot(api: Api) -> usize {
     match api {
-        Api::Vulkan => vk_image(p, key),
-        Api::D3D12 => Some(get_ptr(p, GET_D3D12_RESOURCE, key)).filter(|r| !r.is_null()).map(|r| d3d12_image(r as Com)),
-        Api::D3D11 => Some(get_ptr(p, GET_D3D11_RESOURCE, key)).filter(|r| !r.is_null()).map(|r| d3d11_image(r as Com)),
+        Api::Vulkan => GET_VOID_POINTER,
+        Api::D3D12 => GET_D3D12_RESOURCE,
+        Api::D3D11 => GET_D3D11_RESOURCE,
     }
+}
+
+/// The image the parameter `key` names. This calls into the resource (or reads the `NVSDK_NGX_Resource_VK`), so only
+/// for parameters this evaluate's NVIDIA call reads too, which the game must keep alive ([`rules::reads_images`],
+/// [`rules::reads_exposure_texture`]); anything else is logged as its bare pointer ([`raw`]).
+unsafe fn image(api: Api, p: *mut Parameter, key: &str) -> Option<Image> {
+    let r = get_ptr(p, resource_slot(api), key);
+    if r.is_null() {
+        return None;
+    }
+    Some(match api {
+        Api::Vulkan => vk_image(r as *const ResourceVk)?,
+        Api::D3D12 => d3d12_image(r as Com),
+        Api::D3D11 => d3d11_image(r as Com),
+    })
+}
+
+/// The pointer the parameter `key` holds, not followed.
+unsafe fn raw(api: Api, p: *mut Parameter, key: &str) -> *mut c_void {
+    get_ptr(p, resource_slot(api), key)
 }
 
 /// A created feature, told apart by its handle's address (NGX's ids repeat across features).
@@ -272,11 +298,17 @@ fn feature_name(f: u32) -> &'static str {
     }
 }
 
-/// The names the text log lists beside the five the record carries.
+/// The names the text log lists beside the five the record carries (their pointers only: [`raw`]).
 const LOGGED_IMAGES: &[&str] = &["TransparencyMask", "DLSSG.Backbuffer", "DLSSG.HUDLess", "DLSSG.UI", "DLSSG.OutputInterpolated", "DLSSG.OutputReal"];
 
+/// After NVIDIA's `CreateFeature` returned `result`. `*out` is NVIDIA's only on success (a failed call need not
+/// write it, so it may hold whatever the caller left there): a failed creation is logged and nothing more.
 unsafe fn create(api: Api, feature: i32, p: *mut Parameter, out: *mut *mut NgxHandle, result: u32) {
     let flags = get_i(p, "DLSS.Feature.Create.Flags").unwrap_or(0) as u32;
+    if !rules::ngx_succeeded(result) {
+        log(&format!("CREATE {} feature={feature}({}) result={result:#x}: failed", api.name(), feature_name(feature as u32)));
+        return;
+    }
     let handle = if out.is_null() { core::ptr::null_mut() } else { *out };
     let id = if handle.is_null() { 0 } else { (*handle).id };
     if !handle.is_null() {
@@ -323,27 +355,34 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
         ..Record::default()
     };
     let mut line = String::new();
-    let mut take = |key: &str| -> Option<Image> {
+    let mut take = |key: &str, follow: bool| -> Option<Image> {
+        if !follow {
+            if logging() {
+                let _ = write!(line, " {key}={:p}", raw(api, p, key));
+            }
+            return None;
+        }
         let img = image(api, p, key)?;
         if logging() {
             let _ = write!(line, " {key}=vk:{:#x}({}x{} fmt={} lay={})", img.vk, img.width, img.height, img.format, img.layout);
         }
         Some(img)
     };
-    if let Some(i) = take("Color") {
+    let images = rules::reads_images(rec.feature);
+    if let Some(i) = take("Color", images) {
         rec.colour = i.vk;
         rec.colour_extent = [i.width, i.height];
     }
-    rec.mvec = take("MotionVectors").map_or(0, |i| i.vk);
-    rec.depth = take("Depth").map_or(0, |i| i.vk);
-    if let Some(i) = take("Output") {
+    rec.mvec = take("MotionVectors", images).map_or(0, |i| i.vk);
+    rec.depth = take("Depth", images).map_or(0, |i| i.vk);
+    if let Some(i) = take("Output", images) {
         rec.output = i.vk;
         rec.output_extent = [i.width, i.height];
     }
-    rec.exposure = take("ExposureTexture").map_or(0, |i| i.vk);
+    rec.exposure = take("ExposureTexture", images && rules::reads_exposure_texture(rec.create_flags)).map_or(0, |i| i.vk);
     if logging() {
         for key in LOGGED_IMAGES {
-            take(key);
+            take(key, false);
         }
     }
     rec.jitter = [get_f(p, "Jitter.Offset.X").unwrap_or(0.0), get_f(p, "Jitter.Offset.Y").unwrap_or(0.0)];
