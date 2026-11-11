@@ -513,23 +513,10 @@ pub enum Leftovers {
     Report,
 }
 
-/// Neural Forge's own Proton builds in a Steam root: `compatibilitytools.d/*-NeuralForge` directories (not symlinks).
-pub fn proton_copies(steam_root: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = std::fs::read_dir(steam_root.join("compatibilitytools.d"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with("-NeuralForge")))
-        .filter(|p| p.is_dir() && !p.is_symlink())
-        .collect();
-    out.sort();
-    out
-}
-
 /// `uninstall`, then everything else Neural Forge ever wrote: Neural Forge's variables in every
 /// game's Steam launch options and its files next to each account's `localconfig.vdf` (the copies
-/// of it and the lock) and its own Proton builds ([`proton_copies`]), then its config, data (the imported NVIDIA DLL and the extracted model
+/// of it and the lock) and its own Proton builds (the marked copies `proton_tool::tools` lists, and what a stopped
+/// copy left), then its config, data (the imported NVIDIA DLL and the extracted model
 /// included), state and `/tmp/neural-forge-$UID`. Each directory must be one of Neural Forge's own
 /// (named `neural-forge` or `neural-forge-<uid>`) or it is left alone.
 ///
@@ -542,7 +529,8 @@ pub fn purge() -> std::io::Result<Purged> {
 /// [`purge`], with what to do about launch options that cannot be cleaned, and the AppImage file the app runs from
 /// (`$APPIMAGE`) to delete last, if given: a `.AppImage` file, never a directory.
 pub fn purge_with(leftovers: Leftovers, appimage: Option<&Path>) -> std::io::Result<Purged> {
-    let mut purged = purge_in(&crate::steam::roots(), crate::steam::steam_running(Path::new("/proc")), leftovers)?;
+    let roots = crate::steam::roots();
+    let mut purged = purge_in(&roots, crate::steam::steam_running(Path::new("/proc")), leftovers, Path::new(crate::proton_tool::RING_DIR))?;
     if let Some(file) = appimage {
         let is_appimage = file.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("appimage"));
         if is_appimage && file.is_file() && !file.is_symlink() {
@@ -553,8 +541,8 @@ pub fn purge_with(leftovers: Leftovers, appimage: Option<&Path>) -> std::io::Res
     Ok(purged)
 }
 
-/// [`purge`] with the Steam roots and whether Steam is running given.
-fn purge_in(steam_roots: &[crate::steam::Root], steam_running: bool, leftovers: Leftovers) -> std::io::Result<Purged> {
+/// [`purge`] with the Steam roots, whether Steam is running and the NGX wrapper's ring directory given.
+fn purge_in(steam_roots: &[crate::steam::Root], steam_running: bool, leftovers: Leftovers, ring_dir: &Path) -> std::io::Result<Purged> {
     use crate::steam::{self, Outcome};
     let mut purged = Purged::default();
     let games = steam::games(steam_roots);
@@ -590,9 +578,11 @@ fn purge_in(steam_roots: &[crate::steam::Root], steam_running: bool, leftovers: 
             left.join("\n")
         )));
     }
-    // Every game's Proton Neural Forge chose goes back to what it was (`compat_tool`), before its copies go.
+    // Every game's Proton Neural Forge chose goes back to what it was (`compat_tool`), and any game still set to one
+    // of its copies (chosen by hand, or its record lost) goes to Steam's default, before the copies go.
     for root in steam_roots.iter().filter(|r| !r.flatpak) {
         crate::compat_tool::switch_all_off(&root.path, steam_running).map_err(std::io::Error::other)?;
+        crate::compat_tool::forget_copies(&root.path, steam_running).map_err(std::io::Error::other)?;
     }
     for root in steam_roots {
         for file in steam::our_localconfig_siblings(&root.path) {
@@ -608,23 +598,18 @@ fn purge_in(steam_roots: &[crate::steam::Root], steam_running: bool, leftovers: 
                 purged.removed.push(file);
             }
         }
-        for dir in proton_copies(&root.path) {
+        // Only Neural Forge's marked copies, never one a game runs with (that is an error: close the game).
+        for tool in crate::proton_tool::tools(&root.path) {
+            crate::proton_tool::remove(&root.path, &tool.name).map_err(std::io::Error::other)?;
+            purged.removed.push(tool.dir);
+        }
+        for dir in crate::proton_tool::leftovers(&root.path) {
             std::fs::remove_dir_all(&dir)?;
             purged.removed.push(dir);
         }
     }
-    // Rings the NGX wrapper left in /dev/shm where the layer never opened them.
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
-    if let Ok(entries) = std::fs::read_dir("/dev/shm") {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with("neural-forge-ngx-") && name.ends_with(".ring") && e.metadata().is_ok_and(|m| std::os::unix::fs::MetadataExt::uid(&m) == uid) {
-                let _ = std::fs::remove_file(e.path());
-                purged.removed.push(e.path());
-            }
-        }
-    }
+    // Rings the NGX wrapper left where the layer never opened them, of games that are gone.
+    purged.removed.extend(crate::proton_tool::sweep_dead_rings(ring_dir));
 
     let preserved = uninstall()?;
     for path in &preserved {
@@ -656,6 +641,11 @@ fn purge_in(steam_roots: &[crate::steam::Root], steam_running: bool, leftovers: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ring directory that does not exist: the purge tests never sweep the real /dev/shm.
+    fn no_rings() -> PathBuf {
+        std::env::temp_dir().join(format!("neural-forge-install-test-no-rings-{}", std::process::id()))
+    }
 
     struct ScratchDataHome {
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -1037,7 +1027,7 @@ mod tests {
         // purge never leaves a manifest pointing at the deleted library, record or not.
         install(&appdir).unwrap();
         std::fs::remove_file(record_path()).unwrap();
-        purge_in(&[], false, Leftovers::Refuse).unwrap();
+        purge_in(&[], false, Leftovers::Refuse, &no_rings()).unwrap();
         assert!(!manifest.exists() && !PathBuf::from(paths::data_dir()).exists());
         // A manifest of another layer at our name is not ours to remove.
         std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
@@ -1142,7 +1132,7 @@ mod tests {
         assert!(err.to_string().contains("cannot be read"), "{err}");
         assert!(record.is_dir() && theirs.is_file() && manifest_path().is_file(), "nothing may be removed");
         assert!(PathBuf::from(paths::data_dir()).join("bin/neural-forge").is_file());
-        assert!(purge_in(&[], false, Leftovers::Refuse).is_err());
+        assert!(purge_in(&[], false, Leftovers::Refuse, &no_rings()).is_err());
         assert!(theirs.is_file() && manifest_path().is_file());
         assert!(matches!(install(&appdir), Err(InstallError::Io(_))), "install says the record cannot be read");
     }
@@ -1179,7 +1169,7 @@ mod tests {
         let roots = [crate::steam::Root { path: steam.clone(), flatpak: false }];
 
         // Steam running: refused, every game named, and nothing at all removed.
-        let err = purge_in(&roots, true, Leftovers::Refuse).expect_err("Steam running: the launch options cannot be changed");
+        let err = purge_in(&roots, true, Leftovers::Refuse, &no_rings()).expect_err("Steam running: the launch options cannot be changed");
         let msg = err.to_string();
         assert!(msg.contains("nothing was removed"), "{msg}");
         assert!(msg.contains("Some Game (3240220): Steam is running") && msg.contains("`gamemoderun %command%`"), "{msg}");
@@ -1189,7 +1179,7 @@ mod tests {
         assert!(config.join("localconfig.vdf.neural-forge.orig").is_file());
         assert!(PathBuf::from(paths::data_dir()).join("bin/neural-forge").is_file() && manifest_path().is_file());
 
-        let purged = purge_in(&roots, false, Leftovers::Refuse).unwrap();
+        let purged = purge_in(&roots, false, Leftovers::Refuse, &no_rings()).unwrap();
         assert_eq!(purged.switched_off, ["app 271590", "Some Game (3240220)"]);
         let after = std::fs::read_to_string(&lc).unwrap();
         assert!(!after.contains("NEURAL_FORGE"), "{after}");
@@ -1215,19 +1205,29 @@ mod tests {
         let text = "\"UserLocalConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t\t\"apps\"\n\t\t\t\t{\n\t\t\t\t\t\"271590\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"NEURAL_FORGE_ENABLE=1 %command%\"\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n";
         std::fs::write(config.join("localconfig.vdf"), text).unwrap();
         let tools = steam.join("compatibilitytools.d");
-        for dir in ["GE-Proton10-25-NeuralForge", "GE-Proton10-25", "Other-NeuralForge-not"] {
+        for dir in ["GE-Proton10-25-NeuralForge", "GE-Proton10-25", "Other-NeuralForge-not", "Unmarked-NeuralForge", ".GE-Proton10-26-NeuralForge.tmp"] {
             std::fs::create_dir_all(tools.join(dir)).unwrap();
             std::fs::write(tools.join(dir).join("proton"), "#!/bin/sh\n").unwrap();
         }
-        std::os::unix::fs::symlink(tools.join("GE-Proton10-25"), tools.join("Linked-NeuralForge")).unwrap();
+        std::fs::write(tools.join("GE-Proton10-25-NeuralForge").join(crate::proton_tool::MARKER), "source=x\n").unwrap();
+        std::os::unix::fs::symlink(tools.join("GE-Proton10-25-NeuralForge"), tools.join("Linked-NeuralForge")).unwrap();
         let roots = [crate::steam::Root { path: steam.clone(), flatpak: false }];
-        assert_eq!(proton_copies(&steam), [tools.join("GE-Proton10-25-NeuralForge")], "only real *-NeuralForge directories");
-        let purged = purge_in(&roots, true, Leftovers::Report).unwrap();
+        // The wrapper's rings: a running process's stays, a gone one's goes.
+        let shm = scratch.dir.join("shm");
+        std::fs::create_dir_all(&shm).unwrap();
+        let (live, dead) = (shm.join(format!("neural-forge-ngx-{}.ring", std::process::id())), shm.join("neural-forge-ngx-999999999.ring"));
+        std::fs::write(&live, "").unwrap();
+        std::fs::write(&dead, "").unwrap();
+        let purged = purge_in(&roots, true, Leftovers::Report, &shm).unwrap();
         assert_eq!(purged.left.len(), 1, "{purged:?}");
         assert!(purged.left[0].starts_with("app 271590: Steam is running"), "{:?}", purged.left);
         assert_eq!(std::fs::read_to_string(config.join("localconfig.vdf")).unwrap(), text, "Steam's file is left to Steam");
         assert!(!tools.join("GE-Proton10-25-NeuralForge").exists() && purged.removed.contains(&tools.join("GE-Proton10-25-NeuralForge")));
-        assert!(tools.join("GE-Proton10-25/proton").is_file() && tools.join("Other-NeuralForge-not").is_dir() && tools.join("Linked-NeuralForge").exists());
+        assert!(!tools.join(".GE-Proton10-26-NeuralForge.tmp").exists(), "what a stopped copy left goes too");
+        assert!(tools.join("GE-Proton10-25/proton").is_file() && tools.join("Other-NeuralForge-not").is_dir(), "never a tool that is not ours");
+        assert!(tools.join("Unmarked-NeuralForge/proton").is_file(), "only a marked copy is removed, whatever its name");
+        assert!(tools.join("Linked-NeuralForge").is_symlink(), "a link is not a copy");
+        assert!(live.is_file() && !dead.exists() && purged.removed.contains(&dead));
         assert!(!PathBuf::from(paths::data_dir()).exists() && !manifest_path().exists());
     }
 
