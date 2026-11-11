@@ -93,6 +93,9 @@ pub struct Inputs<'a> {
     pub hdr: &'a str,
     /// A trace file to include (`NEURAL_FORGE_TRACE`'s recording), when one is named.
     pub trace: Option<&'a Path>,
+    /// The games switched on in Steam, one per line, each with its Proton and whether that is a Neural Forge Proton
+    /// ([`switched_on_games`]); empty when none or not gathered.
+    pub switched_on: &'a str,
     /// GPU, driver and compute capability: [`probe_system`] or the caller's own.
     pub system: SystemInfo,
 }
@@ -306,6 +309,30 @@ pub fn proton_tool(steam_roots: &[PathBuf], appid: &str) -> Option<String> {
     None
 }
 
+/// Every game switched on in Steam's launch options (`steam::enabled`), one line each: its name, app id, the Proton
+/// Steam runs it with ([`proton_tool`]) and whether that is a Neural Forge Proton.
+pub fn switched_on_games(games: &[crate::steam::Game], steam_roots: &[PathBuf]) -> String {
+    let mut out = String::new();
+    for g in games.iter().filter(|g| crate::steam::enabled(&g.root.path, &g.appid)) {
+        let mut roots = vec![g.root.path.clone()];
+        roots.extend(steam_roots.iter().filter(|r| **r != g.root.path).cloned());
+        let line = match proton_tool(&roots, &g.appid) {
+            Some(tool) if is_neural_forge_proton(&tool) => format!("  {} ({}): {tool}, a Neural Forge Proton", g.name, g.appid),
+            Some(tool) => format!("  {} ({}): {tool}, NOT a Neural Forge Proton", g.name, g.appid),
+            None => format!("  {} ({}): Proton not known", g.name, g.appid),
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether a Steam compatibility tool (as [`proton_tool`] names it, maybe with "(this game's setting)" after it) is one
+/// of Neural Forge's own Proton builds: their names end in `-NeuralForge`.
+pub fn is_neural_forge_proton(tool: &str) -> bool {
+    tool.split(" (").next().is_some_and(|name| name.trim().ends_with("-NeuralForge"))
+}
+
 /// The newest capture pair under `captures_dir`: `<stamp>-original.png` with its `-composited.png`,
 /// at the top level or the last pair of a `series-<ms>/` directory, by the original's modification
 /// time. Returns (name in the zip, path) for both halves.
@@ -356,8 +383,18 @@ fn or_unknown(s: &str) -> &str {
 pub fn summary(sources: &Sources, inputs: &Inputs, created: u64) -> String {
     let kernel = std::fs::read_to_string(sources.proc_root.join("sys/kernel/osrelease")).unwrap_or_default();
     let proton = match inputs.steam_appid {
-        Some(appid) => proton_tool(&sources.steam_roots, appid).unwrap_or_else(|| format!("unknown (no Steam mapping found for app {appid})")),
+        Some(appid) => match proton_tool(&sources.steam_roots, appid) {
+            // Since 4.0 DLSS's placements need a Neural Forge Proton (its NGX wrapper hands the layer DLSS's records).
+            Some(tool) if is_neural_forge_proton(&tool) => format!("{tool}; a Neural Forge Proton: yes"),
+            Some(tool) => format!("{tool}; a Neural Forge Proton: NO (the game's DLSS records cannot reach Neural Forge)"),
+            None => format!("unknown (no Steam mapping found for app {appid})"),
+        },
         None => "unknown (the game's Steam app id is not known)".to_string(),
+    };
+    let records = match inputs.channel_status.lines().find_map(|l| l.strip_prefix("ngx_records=")) {
+        Some(n) if n.trim() != "0" => format!("{} (from the Neural Forge Proton's NGX wrapper)", n.trim()),
+        Some(_) => "none: the game's DLSS calls did not reach Neural Forge (not on a Neural Forge Proton, or no DLSS yet)".to_string(),
+        None => "not reported by the channel".to_string(),
     };
     let mut s = format!(
         "Neural Forge diagnostic report\n\
@@ -370,9 +407,10 @@ pub fn summary(sources: &Sources, inputs: &Inputs, created: u64) -> String {
          session type: {}\n\
          game: {}\n\
          Proton: {proton}\n\
+         DLSS hook records: {records}\n\
          tested game: {}\n\
          HDR: {}\n\n\
-         Findings:\n",
+         {}Findings:\n",
         env!("CARGO_PKG_VERSION"),
         or_unknown(&inputs.system.gpu),
         or_unknown(&inputs.system.driver),
@@ -386,6 +424,11 @@ pub fn summary(sources: &Sources, inputs: &Inputs, created: u64) -> String {
             None => "not in the list (game-compat.txt)".to_string(),
         },
         or_unknown(inputs.hdr),
+        if inputs.switched_on.trim().is_empty() {
+            String::new()
+        } else {
+            format!("Games with Neural Forge on, and their Proton:\n{}\n\n", inputs.switched_on.trim_end())
+        },
     );
     match inputs.findings {
         Some(findings) if !findings.trim().is_empty() => {
@@ -501,6 +544,7 @@ pub fn save(channel_status: &str, game: &str, steam_appid: Option<&str>, trace: 
         _ => None,
     };
     let hdr = hdr_line(channel_status, crate::desktop_hdr::read().as_deref());
+    let switched_on = switched_on_games(&games, &sources.steam_roots);
     let env_trace = std::env::var_os("NEURAL_FORGE_TRACE").map(PathBuf::from);
     let inputs = Inputs {
         findings: Some(&findings),
@@ -512,6 +556,7 @@ pub fn save(channel_status: &str, game: &str, steam_appid: Option<&str>, trace: 
         exe: game,
         hdr: &hdr,
         trace: trace.or(env_trace.as_deref()),
+        switched_on: &switched_on,
         system: probe_system(&sources.proc_root, compute.as_deref()),
     };
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -743,6 +788,7 @@ mod tests {
             exe: "GTA5_Enhanced.exe",
             hdr: "game outputs SDR (swapchain B8G8R8A8_UNORM SRGB_NONLINEAR); desktop: GNOME: HDMI-1 HDR off",
             trace: None,
+            switched_on: "  Cyberpunk 2077 (1091500): GE-Proton10-25-NeuralForge (this game's setting), a Neural Forge Proton\n",
             system: SystemInfo { gpu: "NVIDIA GeForce RTX 5070".into(), driver: "615.78.08".into(), compute_capability: "12.0".into() },
         }
     }
@@ -797,6 +843,11 @@ mod tests {
         );
         let get = |name: &str| String::from_utf8_lossy(&members.iter().find(|(n, ..)| n == name).unwrap().2).into_owned();
         assert!(get("summary.txt").contains("tested game: GTA V Enhanced -- Tested in "), "{}", get("summary.txt"));
+        assert!(
+            get("summary.txt").contains("Games with Neural Forge on, and their Proton:\n  Cyberpunk 2077 (1091500): GE-Proton10-25-NeuralForge"),
+            "{}",
+            get("summary.txt")
+        );
         assert!(get("summary.txt").contains("HDR: game outputs SDR (swapchain B8G8R8A8_UNORM SRGB_NONLINEAR); desktop: GNOME: HDMI-1 HDR off\n"));
         assert!(get("game-compat.txt").starts_with("GTA V Enhanced\n  Steam app id: 3240220\n"), "{}", get("game-compat.txt"));
         for (name, method, data) in &members {
@@ -844,6 +895,7 @@ mod tests {
         i.game = "";
         i.exe = "";
         i.hdr = "";
+        i.switched_on = "";
         i.session_type = "";
         let members = collect(&s, &i, &Redactor::new(&[], "", ""), 1);
         let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
@@ -857,6 +909,7 @@ mod tests {
             "session type: unknown",
             "game: none named",
             "tested game: no game named",
+            "DLSS hook records: not reported by the channel",
             "HDR: unknown",
         ] {
             assert!(summary.contains(line), "{line} in\n{summary}");
@@ -959,6 +1012,9 @@ mod tests {
         );
         assert_eq!(hdr_line("no channel\n", Some("GNOME: HDMI-1 HDR on")), "not known (no channel); desktop: GNOME: HDMI-1 HDR on");
         assert_eq!(hdr_line("no channel\n", None), "");
+        assert!(is_neural_forge_proton("GE-Proton10-25-NeuralForge (this game's setting)"));
+        assert!(!is_neural_forge_proton("GE-Proton10-25 (Steam's default for every game)"));
+        assert!(!is_neural_forge_proton("NeuralForge-GE (this game's setting)"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

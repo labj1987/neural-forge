@@ -60,6 +60,17 @@ body:
     - Something else (say which under "What happened")
   validations:
     required: true
+- type: dropdown
+  id: neural-forge-proton
+  attributes:
+    label: The game is set to the Neural Forge Proton (Status tab shows it)
+    description: The game's Properties > Compatibility in Steam names the Proton it runs with; Neural Forge's own end in "-NeuralForge". The Status tab says so while the game runs ("isn't on the Neural Forge Proton" when it is not), and Save report lists every game's.
+    options:
+    - Yes, a -NeuralForge Proton
+    - No (another Proton, or the game is not on Steam)
+    - I don't know
+  validations:
+    required: true
 - type: checkboxes
   id: dlss
   attributes:

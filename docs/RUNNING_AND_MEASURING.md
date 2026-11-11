@@ -553,16 +553,16 @@ Routes:
   launch options carry Neural Forge (`NEURAL_FORGE_ENABLE=1`, the game's executables), the run's log
   (`NEURAL_FORGE_LOG`), `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` for an HDR run, and the run's arguments
   after `%command%` (Cyberpunk 2077: `--launcher-skip -skipStartScreen -benchmark`, its built-in benchmark, which
-  quits when done). Steam rewrites its config when it exits, so the sweep shuts Steam down, writes the options,
-  starts Steam with the session's environment (`systemd-run --user`, so `environment.d`'s variables apply as at
-  login), and at the end shuts it down, puts every account's `localconfig.vdf` back byte for byte and starts it
-  again if it was running.
+  quits when done). Steam rewrites its config when it exits, so for each such run the sweep shuts Steam down,
+  writes the options, starts Steam with the session's environment (`systemd-run --user`, so `environment.d`'s
+  variables apply as at login), runs the game, then shuts Steam down again, puts every account's `localconfig.vdf`
+  back byte for byte and starts it again if it was running.
 - `gta-bench`: GTA V Enhanced's built-in benchmark through `scripts/gta-bench.sh` (section 3), one launch, with
   the session's `DXVK_NVAPI_*` frame-generation variables passed on.
 
 A run's game settings (`edit_file`: Cyberpunk 2077's `UserSettings.json` for 3840x2160, HDR10 PQ and Ray
 Reconstruction; GTA's `settings.xml` for 3840x2160) are set from the file as found before each run and put back
-byte for byte afterwards. `--layer` puts a build in place of the installed layer for the sweep and the channel
+byte for byte afterwards. `--layer` puts a build in place of the installed layer for each run and the channel
 directory (`/tmp/neural-forge-$UID`) aside, so that build makes its own; both are put back, the layer
 hash-checked. All of this also happens after an error or Ctrl-C; `restore:` lines say what was put back.
 
@@ -575,7 +575,8 @@ the kernel logged no `NVRM: Xid` since the run began, and the HDR verdict says H
 otherwise. Each run's layer log, its status samples (`<label>.samples`) and `results.txt` go to `--out` (default
 `~/nf-sweep/<unix time>`).
 
-It takes the GPU lock for the whole sweep (`--lock`, default `$NF_GPU_LOCK`, else `~/scratch/gpu.lock`, an
-`flock`), waiting while another run holds it, and refuses to start while the Neural Forge window or one of its
-games is open. A parent that holds the lock already sets `NF_GPU_LOCK_HELD=1`; the sweep passes that to
-`gta-bench.sh`. Runs take 3 to 8 minutes each.
+Each run takes the GPU lock (`--lock`, default `$NF_GPU_LOCK`, else `~/scratch/gpu.lock`, an `flock`; waiting
+while another run holds it) from before it changes anything until everything is put back, and lets it go between
+runs, so other work on the machine goes in between; a run whose game is already open is skipped. The sweep refuses
+to start while the Neural Forge window is open. A parent that holds the lock already sets `NF_GPU_LOCK_HELD=1`; the
+sweep passes that to `gta-bench.sh`. A run takes 4 to 8 minutes, Steam's two restarts included.

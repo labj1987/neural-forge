@@ -7,16 +7,18 @@
 //! Routes (`scripts/game-sweep.toml`, one `[[run]]` per run):
 //! - `steam`: the game is started by Steam (`steam steam://rungameid/<appid>`), with Neural Forge's variables, the
 //!   run's log file, Proton's HDR switches (with `hdr = true`) and the run's arguments in its launch options. Launch
-//!   options are only written while Steam is shut down, so the sweep shuts Steam down, writes them, starts Steam
-//!   (through `systemd-run --user`, with the session's environment), runs the games, shuts it down again and puts
-//!   every account's `localconfig.vdf` back byte for byte, then starts Steam again if it was running.
+//!   options are only written while Steam is shut down, so for each such run the sweep shuts Steam down, writes them,
+//!   starts Steam (through `systemd-run --user`, with the session's environment), runs the game, and puts them back
+//!   the same way.
 //! - `gta-bench`: `scripts/gta-bench.sh` (GTA V Enhanced's built-in benchmark, one launch), with Steam running.
 //!
-//! Everything the sweep changes is put back, also after an error or Ctrl-C: the launch options, the game settings
-//! a run edits (`edit_file`, restored byte for byte and hash-checked), the installed layer when `--layer` swaps in
-//! a build under test (hash-checked) and the channel directory that build would re-create. It takes the rig's GPU
-//! lock (`--lock`, default `$NF_GPU_LOCK` or `~/scratch/gpu.lock`; flock) for the whole sweep, unless a parent holds
-//! it (`NF_GPU_LOCK_HELD`), and passes `NF_GPU_LOCK_HELD=1` to what it runs.
+//! Each run is made from start to finish under the rig's GPU lock (`--lock`, default `$NF_GPU_LOCK` or
+//! `~/scratch/gpu.lock`; flock), unless a parent holds it (`NF_GPU_LOCK_HELD`), and everything it changed is put
+//! back before the lock is let go, also after an error or Ctrl-C: the launch options (Steam shut down, every
+//! account's `localconfig.vdf` put back byte for byte, Steam started again), the game settings the run edits
+//! (`edit_file`, byte for byte, hash-checked), the installed layer when `--layer` swaps in a build under test
+//! (hash-checked) and the channel directory that build would re-create. Between runs the lock is free, so other
+//! runs on the machine go in between. What it runs gets `NF_GPU_LOCK_HELD=1`.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -283,7 +285,7 @@ fn evaluate(expect: Placement, hdr: HdrExpect, samples: &[Sample], log: &str, xi
             if expect != Placement::FinishedFrame && grew == 0 && last.holds == 0 {
                 o.failures.push("no frame was held: the model did not run in the game's frame".into());
             }
-            if last.state != want && last.state != preupscale_state::WAITING {
+            if last.state != want && last.state != preupscale_state::WAITING && last.state != preupscale_state::PAUSED {
                 o.failures.push(format!(
                     "left the placement: ended {}{}",
                     state_name(last.state),
@@ -343,6 +345,7 @@ fn short_state(state: u32) -> &'static str {
         preupscale_state::HOLDING_BOTH => "both",
         preupscale_state::IDENTIFIED => "refused",
         preupscale_state::WAITING => "waiting",
+        preupscale_state::PAUSED => "paused",
         _ => "finished frame",
     }
 }
@@ -729,7 +732,6 @@ fn sweep(o: &Options) -> Result<bool, String> {
         let log = o.out.join(format!("{}.log", run.label));
         prepared.push(Prepared { run, game, facts, log });
     }
-    let steam_runs: Vec<&Prepared> = prepared.iter().filter(|p| p.run.route == Route::Steam).collect();
     let user_dir = |p: &Prepared| p.game.library.join("steamapps/compatdata").join(p.run.appid.to_string()).join("pfx/drive_c/users/steamuser");
     if o.dry_run {
         for p in &prepared {
@@ -758,133 +760,112 @@ fn sweep(o: &Options) -> Result<bool, String> {
         }
     }
     std::fs::create_dir_all(&o.out).map_err(|e| format!("{}: {e}", o.out.display()))?;
-    // The lock first: another run holding it may have a game open or a layer swapped in until it lets go.
-    let _lock = if std::env::var_os("NF_GPU_LOCK_HELD").is_some() || std::env::var_os("NF_GPU_LOCKED").is_some() { None } else { Some(take_lock(&o.lock)?) };
     if Command::new("pgrep").args(["-x", "neural-forge"]).stdout(Stdio::null()).status().is_ok_and(|s| s.success()) {
         return Err("the Neural Forge window is open: close it first (it keeps the channel of the installed version)".into());
     }
-    for p in &prepared {
-        if !pids_with_env(&format!("compatdata/{}", p.run.appid)).is_empty() {
-            return Err(format!("{} is running: close it first", p.facts.name));
-        }
-    }
-    let installed_layer = PathBuf::from(neural_forge_supervisor::paths::data_home()).join("neural-forge/lib/neural-forge/libneural_forge_layer.so");
-    if let Ok(found) = std::fs::read(&installed_layer) {
-        println!("installed layer {}", &sha256(&found)[..12]);
-    }
     let env = session_env();
-    let mut restore = Restore {
-        out: o.out.clone(),
-        localconfigs: Vec::new(),
-        files: Vec::new(),
-        layer: None,
-        channel: None,
-        steam_was_running: steam_running(),
-        steam_stopped: false,
-        env: env.clone(),
-    };
-    // The build under test in place of the installed layer, and its channel kept apart from the installed one's.
-    if let Some(layer) = &o.layer {
-        let installed = PathBuf::from(neural_forge_supervisor::paths::data_home()).join("neural-forge/lib/neural-forge/libneural_forge_layer.so");
-        let found = std::fs::read(&installed).map_err(|e| format!("{}: {e}", installed.display()))?;
-        let new = std::fs::read(layer).map_err(|e| format!("{}: {e}", layer.display()))?;
-        restore.layer = Some((installed.clone(), found));
-        let tmp = installed.with_extension("sweep-tmp");
-        std::fs::write(&tmp, &new).and_then(|()| std::fs::rename(&tmp, &installed)).map_err(|e| format!("swapping in {}: {e}", layer.display()))?;
-        println!("layer under test {} in place ({})", layer.display(), &sha256(&new)[..12]);
-        // SAFETY: getuid(2) cannot fail.
-        let channel = PathBuf::from(format!("/tmp/neural-forge-{}", unsafe { libc::getuid() }));
-        if channel.exists() {
-            let aside = PathBuf::from(format!("{}-sweep-aside", channel.display()));
-            std::fs::rename(&channel, &aside).map_err(|e| format!("moving {} aside: {e}", channel.display()))?;
-            restore.channel = Some((aside, channel));
-        }
-    }
-    // Launch options: only while Steam is shut down.
-    if !steam_runs.is_empty() {
-        stop_steam(&env)?;
-        restore.steam_stopped = true;
-        let backup = o.out.join("localconfig");
-        std::fs::create_dir_all(&backup).map_err(|e| e.to_string())?;
-        for root in roots.iter().filter(|r| !r.flatpak) {
-            for file in steam::localconfigs(&root.path) {
-                let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-                let account = file.parent().and_then(Path::parent).and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                std::fs::write(backup.join(format!("{account}-localconfig.vdf")), &bytes).map_err(|e| e.to_string())?;
-                restore.localconfigs.push((file, bytes));
-            }
-        }
-        for (file, found) in restore.localconfigs.clone() {
-            let mut text = found.clone();
-            for p in &steam_runs {
-                let path = ["UserLocalConfigStore", "Software", "Valve", "Steam", "apps", &p.run.appid.to_string(), "LaunchOptions"];
-                let Ok(tree) = vdf::parse(&text) else { return Err(format!("{} does not parse", file.display())) };
-                if tree.path(&path[..6]).is_none() {
-                    continue;
-                }
-                let current = tree.string_at(&path).unwrap_or_default().to_string();
-                let options = sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.args);
-                let (new, _) = vdf::set_string(&text, &path, &options).map_err(|e| format!("{}: {e}", file.display()))?;
-                if !vdf::verify_edit(&text, &new, &path, &options) {
-                    return Err(format!("{}: the edit did not verify", file.display()));
-                }
-                println!("{}: launch options {options}", p.run.label);
-                text = new;
-            }
-            if text != found {
-                std::fs::write(&file, &text).map_err(|e| format!("{}: {e}", file.display()))?;
-            }
-        }
-    }
-    // Game settings.
-    for p in &prepared {
-        let (Some(file), Some(kind)) = (&p.run.edit_file, p.run.edit_kind) else { continue };
-        let path = user_dir(p).join(file);
-        let found = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if !restore.files.iter().any(|(f, _)| *f == path) {
-            restore.files.push((path.clone(), found.clone()));
-        }
-        let _ = (kind, &found);
-    }
-    if !steam_runs.is_empty() || prepared.iter().any(|p| p.run.route == Route::GtaBench) {
-        start_steam(&env)?;
-        restore.steam_stopped = false;
-    }
+    let held = std::env::var_os("NF_GPU_LOCK_HELD").is_some() || std::env::var_os("NF_GPU_LOCKED").is_some();
     let mut rows = Vec::new();
+    let mut report = Vec::new();
     let mut all_ok = true;
+    // One run at a time, each from start to finish under the GPU lock, and everything it changed put back before the
+    // lock is let go: other runs on the machine use the same installed layer, channel, Steam and game settings.
     for p in &prepared {
         if cancelled() {
             break;
         }
-        // The run's own settings, from the settings as found (another run of the same game may have edited them).
-        if let (Some(file), Some(kind)) = (&p.run.edit_file, p.run.edit_kind) {
-            let path = user_dir(p).join(file);
-            let found = restore.files.iter().find(|(f, _)| *f == path).map(|(_, b)| b.clone()).unwrap_or_default();
-            let edited = apply_edits(kind, &String::from_utf8_lossy(&found), &p.run.edits).map_err(|e| format!("{}: {e}", path.display()))?;
-            std::fs::write(&path, edited).map_err(|e| format!("{}: {e}", path.display()))?;
+        let lock = if held { None } else { Some(take_lock(&o.lock)?) };
+        if !pids_with_env(&format!("compatdata/{}", p.run.appid)).is_empty() {
+            println!("skip {}: {} is running (another run's?)", p.run.label, p.facts.name);
+            drop(lock);
+            continue;
         }
-        println!("== {} ({})", p.run.label, p.facts.name);
-        let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let samples = match p.run.route {
-            Route::Steam => run_steam(o, p, &env),
-            Route::GtaBench => run_gta(o, p, &env),
+        let mut restore = Restore {
+            out: o.out.join(&p.run.label),
+            localconfigs: Vec::new(),
+            files: Vec::new(),
+            layer: None,
+            channel: None,
+            steam_was_running: steam_running(),
+            steam_stopped: false,
+            env: env.clone(),
         };
-        std::fs::write(o.out.join(format!("{}.samples", p.run.label)), samples.iter().map(|s| format!("{s:?}\n")).collect::<String>()).ok();
-        let log = std::fs::read_to_string(&p.log).unwrap_or_default();
-        let xid = Command::new("journalctl")
-            .args(["-k", "--no-pager", "--since", &format!("@{started}")])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter(|l| l.contains("NVRM: Xid")).collect::<Vec<_>>().join("\n"))
-            .unwrap_or_default();
-        let expect = p.run.placement().unwrap_or(p.facts.placement);
-        let outcome = evaluate(expect, p.run.hdr_expect(), &samples, &log, &xid);
+        let outcome = (|| -> Result<Outcome, String> {
+            std::fs::create_dir_all(&restore.out).map_err(|e| format!("{}: {e}", restore.out.display()))?;
+            // The build under test in place of the installed layer, and its channel kept apart from the installed one's.
+            let installed = PathBuf::from(neural_forge_supervisor::paths::data_home()).join("neural-forge/lib/neural-forge/libneural_forge_layer.so");
+            if let Some(layer) = &o.layer {
+                let found = std::fs::read(&installed).map_err(|e| format!("{}: {e}", installed.display()))?;
+                let new = std::fs::read(layer).map_err(|e| format!("{}: {e}", layer.display()))?;
+                println!("installed layer {}; the layer under test {} in place", &sha256(&found)[..12], &sha256(&new)[..12]);
+                restore.layer = Some((installed.clone(), found));
+                let tmp = installed.with_extension("sweep-tmp");
+                std::fs::write(&tmp, &new).and_then(|()| std::fs::rename(&tmp, &installed)).map_err(|e| format!("swapping in {}: {e}", layer.display()))?;
+                // SAFETY: getuid(2) cannot fail.
+                let channel = PathBuf::from(format!("/tmp/neural-forge-{}", unsafe { libc::getuid() }));
+                if channel.exists() {
+                    let aside = PathBuf::from(format!("{}-sweep-aside", channel.display()));
+                    std::fs::rename(&channel, &aside).map_err(|e| format!("moving {} aside: {e}", channel.display()))?;
+                    restore.channel = Some((aside, channel));
+                }
+            }
+            // Launch options: written only while Steam is shut down, put back (and Steam started again) before the
+            // lock is let go, so no other run starts the game with them.
+            if p.run.route == Route::Steam {
+                stop_steam(&env)?;
+                restore.steam_stopped = true;
+                let backup = restore.out.join("localconfig");
+                std::fs::create_dir_all(&backup).map_err(|e| e.to_string())?;
+                for root in roots.iter().filter(|r| !r.flatpak) {
+                    for file in steam::localconfigs(&root.path) {
+                        let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+                        let account =
+                            file.parent().and_then(Path::parent).and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        std::fs::write(backup.join(format!("{account}-localconfig.vdf")), &bytes).map_err(|e| e.to_string())?;
+                        restore.localconfigs.push((file, bytes));
+                    }
+                }
+                write_launch_options(&restore.localconfigs, p)?;
+            }
+            // The run's game settings.
+            if let (Some(file), Some(kind)) = (&p.run.edit_file, p.run.edit_kind) {
+                let path = user_dir(p).join(file);
+                let found = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                restore.files.push((path.clone(), found.clone()));
+                let edited = apply_edits(kind, &String::from_utf8_lossy(&found), &p.run.edits).map_err(|e| format!("{}: {e}", path.display()))?;
+                std::fs::write(&path, edited).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+            start_steam(&env)?;
+            restore.steam_stopped = false;
+            println!("== {} ({})", p.run.label, p.facts.name);
+            let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let samples = match p.run.route {
+                Route::Steam => run_steam(o, p, &env),
+                Route::GtaBench => run_gta(o, p, &env),
+            };
+            std::fs::write(o.out.join(format!("{}.samples", p.run.label)), samples.iter().map(|s| format!("{s:?}\n")).collect::<String>()).ok();
+            let log = std::fs::read_to_string(&p.log).unwrap_or_default();
+            let xid = Command::new("journalctl")
+                .args(["-k", "--no-pager", "--since", &format!("@{started}")])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter(|l| l.contains("NVRM: Xid")).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default();
+            Ok(evaluate(p.run.placement().unwrap_or(p.facts.placement), p.run.hdr_expect(), &samples, &log, &xid))
+        })();
+        let put_back = restore.put_back();
+        drop(lock);
+        for line in &put_back {
+            println!("restore: {line}");
+        }
+        report.extend(put_back.into_iter().map(|l| format!("{}: {l}", p.run.label)));
+        let outcome =
+            outcome.unwrap_or_else(|e| Outcome { reached: "-".into(), failures: vec![format!("the run could not be made: {e}")], ..Outcome::default() });
         for f in &outcome.failures {
             println!("  FAIL: {f}");
         }
         all_ok &= outcome.failures.is_empty();
-        rows.push((p, expect, outcome));
+        rows.push((p, p.run.placement().unwrap_or(p.facts.placement), outcome));
     }
-    let report = restore.put_back();
     let mut table = String::new();
     table.push_str(&format!(
         "{:<14} {:<32} {:<18} {:<14} {:>12} {:>6} {:<18} {:<8} result\n",
@@ -923,6 +904,30 @@ fn sweep(o: &Options) -> Result<bool, String> {
     }
     let restored = report.iter().all(|l| !l.starts_with("ERROR"));
     Ok(all_ok && restored && !cancelled())
+}
+
+/// Sets the run's launch options in every account that has the game, starting from each file as found (so no other
+/// run's options stay behind). Steam must be shut down.
+fn write_launch_options(localconfigs: &[(PathBuf, Vec<u8>)], p: &Prepared) -> Result<(), String> {
+    let appid = p.run.appid.to_string();
+    let path = ["UserLocalConfigStore", "Software", "Valve", "Steam", "apps", &appid, "LaunchOptions"];
+    for (file, found) in localconfigs {
+        let Ok(tree) = vdf::parse(found) else { return Err(format!("{} does not parse", file.display())) };
+        let text = if tree.path(&path[..6]).is_none() {
+            found.clone()
+        } else {
+            let current = tree.string_at(&path).unwrap_or_default().to_string();
+            let options = sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.args);
+            let (new, _) = vdf::set_string(found, &path, &options).map_err(|e| format!("{}: {e}", file.display()))?;
+            if !vdf::verify_edit(found, &new, &path, &options) {
+                return Err(format!("{}: the edit did not verify", file.display()));
+            }
+            println!("{}: launch options {options}", p.run.label);
+            new
+        };
+        std::fs::write(file, &text).map_err(|e| format!("{}: {e}", file.display()))?;
+    }
+    Ok(())
 }
 
 fn status(cli: &Path, secs: u64) -> Option<Sample> {

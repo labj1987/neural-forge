@@ -737,10 +737,12 @@ fn check_game_compat(hdr: &neural_forge_protocol::ShmHeader) -> Option<Finding> 
     let state = hdr.preupscale_state.load(Ordering::Relaxed);
     let expected: Vec<crate::compat::Placement> = [Some(game.placement), game.placement_rr].into_iter().flatten().collect();
     // Only a game running now, with the Placement setting on Auto, is compared: a setting that moves the model, or
-    // a closed game's last state, says nothing about the game; nor does waiting for DLSS (a menu, a loading screen).
+    // a closed game's last state, says nothing about the game; nor does waiting for DLSS or a pause with it (a menu, a
+    // loading screen).
     let comparable = layer_alive(hdr)
         && hdr.placement.load(Ordering::Relaxed) == neural_forge_protocol::enums::placement::AUTO
-        && state != neural_forge_protocol::enums::preupscale_state::WAITING;
+        && state != neural_forge_protocol::enums::preupscale_state::WAITING
+        && state != neural_forge_protocol::enums::preupscale_state::PAUSED;
     if comparable && !expected.iter().any(|p| p.preupscale_state() == state) {
         return Some(Finding::new(
             CHECK,
