@@ -225,9 +225,26 @@ struct LoaderState {
     guard: super::vram_guard::Guard,
     /// The network frames the guard was told of ([`Loader::note_gpu_ms`]), for [`fake_vram_spill`].
     guard_frames: u64,
+    /// When a path last took the network ([`Loader::ready_sizes`] answering with a build): the loader thread applies
+    /// a step down of the VRAM guard itself once none has for [`IDLE_STEP`] ([`LoaderState::apply_idle_step`]).
+    last_use: Option<Instant>,
 }
 
+/// How long no path may have taken the network before the loader thread applies a step down of the VRAM guard itself:
+/// longer than any wait of the layer's, so no frame that used the network can still run.
+const IDLE_STEP: std::time::Duration = std::time::Duration::from_secs(crate::FENCE_WAIT_TIMEOUT.as_secs() + 1);
+
 impl LoaderState {
+    /// A step down the VRAM guard decided is applied where the paths ask for the network ([`Self::want_sizes`]); while
+    /// the spill stalls the game, no path may ask again: below 15 fps the layer stops working on its frames, and the
+    /// network kept the video memory the game needed (Cyberpunk 2077 at 4K with Ray Reconstruction and path tracing
+    /// stayed at 9 fps for minutes with the step decided). With no hold recorded with the build (`holds`) and no path
+    /// having taken it for [`IDLE_STEP`], the loader thread applies it (and closes the network for a pause).
+    fn apply_idle_step(&mut self, holds: usize, now: Instant) -> Option<super::vram_guard::Level> {
+        let idle = self.last_use.is_none_or(|t| now.saturating_duration_since(t) >= IDLE_STEP);
+        (holds == 0 && idle && self.guard.step_down_pending()).then(|| self.guard.apply()).flatten()
+    }
+
     /// Whether the loader thread has work: the network is not open yet, the graph is to fall back to
     /// barriers, the network open is not the one the setting chooses, or a size is wanted that is not
     /// built.
@@ -898,16 +915,27 @@ impl Loader {
                 let running = (!state.built.is_empty()).then_some(state.running);
                 let choice = state.choice;
                 let size = state.wanted.as_ref().and_then(|w| w.first().copied()).or_else(|| state.built.first().map(|b| (b.width, b.height)));
+                // `NEURAL_FORGE_PROBE_VRAM=1`: what the guard saw at each tick (the reading, the network's times).
+                if *PROBE_VRAM {
+                    let probe = format!("[native] VRAM guard probe: reading {reading:?}, running {running:?}, {}", state.guard.probe(Instant::now()));
+                    crate::log!("{probe}");
+                }
                 if let Some(line) = state.guard.tick(reading, running, size, choice, small, Instant::now()) {
                     drop(state);
                     crate::log!("{line}");
                     crate::logging::flush();
                     state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
+                if let Some(level) = state.apply_idle_step(holds.load(std::sync::atomic::Ordering::SeqCst), Instant::now()) {
+                    crate::log!("[native] VRAM guard: no frame has used the network for {} s; the step down ({level:?}) is applied now", IDLE_STEP.as_secs());
+                    crate::logging::flush();
+                }
                 continue;
             }
             // Paused by the VRAM guard: the network is closed, its memory given back to the game. SAFETY of the
-            // close: the pause is applied only where a switch of the setting is ([`LoaderState::want_sizes`]).
+            // close: the pause is applied only where a switch of the setting is ([`LoaderState::want_sizes`]), or here
+            // with no hold recorded with the build and no path having taken it for longer than any wait of the layer's
+            // ([`LoaderState::apply_idle_step`]).
             if state.pausing() {
                 let n = state.network.take();
                 state.built = Vec::new();
@@ -1187,6 +1215,7 @@ impl Loader {
         let (built, woken) = st.want_sizes(sizes, choice, !holds_out);
         if built.is_some() {
             st.uses += 1;
+            st.last_use = Some(Instant::now());
         }
         drop(st);
         if woken {
@@ -3961,6 +3990,9 @@ pub(crate) struct Retries {
     pub(crate) scene: PassRetry,
 }
 
+/// `NEURAL_FORGE_PROBE_VRAM=1`: the VRAM guard's reading and samples logged at each of its ticks.
+static PROBE_VRAM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::flag("NEURAL_FORGE_PROBE_VRAM"));
+
 /// `NEURAL_FORGE_NATIVE_FAIL=vram`: the VRAM guard steps down as if the network had spilled at the 600th network frame
 /// and again at the 900th (with NVIDIA's networks both are pauses: the first ends after the backoff and the room check,
 /// the network's frames count on, and the second comes after the network is back; with a small network that frees
@@ -5276,6 +5308,44 @@ mod tests {
         // A dead network is never switched.
         s.dead = true;
         assert!(!s.wants_work());
+    }
+
+    /// A step down decided while no path takes the network (the spill stalls the game, the layer stops working on its
+    /// frames) is applied by the loader thread once none has for IDLE_STEP and no hold recorded with the build may run;
+    /// not before, and not with holds outstanding; a step up is left to the paths.
+    #[test]
+    fn a_step_down_nobody_asks_for_is_applied_when_the_network_is_idle() {
+        use super::super::vram_guard::Level;
+        let now = Instant::now();
+        let mut s = LoaderState { opened: true, opened_for: Some(network::FULL), running: network::FULL, ..Default::default() };
+        s.built = vec![built((3840, 2160), 1, network::FULL)];
+        assert!(s.guard.built(network::FULL, Some(1500), (3840, 2160), Some((8000, 8010)), network::FULL, false, now).is_some());
+        assert!(s.guard.step_down_pending());
+        s.last_use = Some(now);
+        assert_eq!(s.apply_idle_step(0, now + Duration::from_secs(2)), None, "a path took it 2 s ago");
+        assert_eq!(s.apply_idle_step(1, now + IDLE_STEP), None, "a hold recorded with the build may run");
+        assert_eq!(s.apply_idle_step(0, now + IDLE_STEP), Some(Level::Paused));
+        assert!(s.pausing() && s.wants_work(), "the loader thread closes the network");
+        assert_eq!(s.apply_idle_step(0, now + IDLE_STEP * 2), None, "nothing pending any more");
+    }
+
+    /// #59: the after-the-upscaler path asks for its size (the loader thread is woken to rebuild), and a hold takes the
+    /// current render-size build before the thread got to it: the request is dropped, so the thread does not free the
+    /// build that hold was just recorded with. Asked again with no path on the current build, it is honoured.
+    #[test]
+    fn a_path_taking_the_current_build_drops_the_other_paths_pending_rebuild() {
+        let mut s = LoaderState { opened: true, opened_for: Some(network::FULL), running: network::FULL, ..Default::default() };
+        s.built = vec![built((1920, 1080), 1, network::FULL)];
+        s.wanted = Some(vec![(1920, 1080)]);
+        let (b, wake) = s.want((3840, 2160), network::FULL);
+        assert!(b.is_none() && wake, "the after-the-upscaler path's size: not built, the thread is woken");
+        assert!(s.wants_work());
+        let (b, _) = s.want((1920, 1080), network::FULL);
+        assert_eq!(b.map(|b| b.generation), Some(1), "the hold takes the current build");
+        assert!(!s.wants_work(), "and the pending rebuild is dropped: the thread leaves the build alone");
+        assert_eq!(s.built.len(), 1);
+        let (b, wake) = s.want((3840, 2160), network::FULL);
+        assert!(b.is_none() && wake && s.wants_work(), "asked again: honoured");
     }
 
     /// The VRAM guard's steps reach the loader the way a switch of the Network setting does: not while holds
