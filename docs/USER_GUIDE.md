@@ -89,7 +89,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
-| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on), and the launch option to copy by hand for a game you pick. |
+| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on), the launch option to copy by hand for a game you pick, and **Proton with DLSS parameters** (below). |
 
 Before the upscaler the network runs on every frame while the camera is still and on every second
 frame while it moves; the frame in between reuses its last result, moved with the game's motion and
@@ -230,6 +230,29 @@ Forge's composition and says what happened: where the files are and whether the 
 frame, or why nothing was written; clicking again while it waits cancels it, and a request no game
 takes is withdrawn after 5 seconds.
 
+### Proton with DLSS parameters
+
+On its own the layer works out what DLSS was given (its input and output images, the camera jitter, how the motion
+vectors are measured, a reset, the exposure) from the kernels DLSS launches; a new game engine can need new rules there.
+Games run with a **Neural Forge copy of Proton** hand the layer what the game gave DLSS itself, by name, and the
+layer's own rules are kept as the fallback and checked against it (docs/PROTON_NGX.md).
+
+The Setup tab lists your installed Protons (GE-Proton, Proton-CachyOS, Valve's Proton and Proton Experimental) with
+**Make copy**. The copy is made next to the original in Steam's `compatibilitytools.d`, named `<version>-NeuralForge`
+(`GE-Proton11-12-NeuralForge`); on the same drive it takes no space (hard links). It differs from the original in one
+thing: NVIDIA's NGX core (`_nvngx.dll`) is reached through Neural Forge's small wrapper, which passes every DLSS call on
+unchanged. Your original Proton is not changed. Then:
+
+1. Restart Steam (it lists new Protons when it starts).
+2. In the game's Properties > Compatibility, tick "Force the use of a specific Steam Play compatibility tool" and
+   choose the copy.
+
+A copy whose original has changed since (a new GE-Proton in a "Latest" folder, a Proton Experimental update) is marked
+with **Make again**: that makes a copy of the new version under its new name; choose it for your games, then
+**Remove** the old one. `PROTON_NO_NEURAL_FORGE_NGX=1 %command%` in a game's launch options turns the wrapper off for
+that game while it keeps the copy. Online games with anti-cheat may refuse a changed module: use the copy for
+single-player games. From the CLI: `neural-forge-cli proton-tool list|create SOURCE|update|remove NAME`.
+
 ### Settings for one game
 
 Every game uses the same settings unless it has some of its own. **Settings for**, the bar under the tab
@@ -356,6 +379,10 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_NATIVE_RIG`, `NEURAL_FORGE_NATIVE_MODEL`, `NEURAL_FORGE_NATIVE_HEADS`, `NEURAL_FORGE_NATIVE_PROFILE=1` | native tests | Testing aids: run the network tests on a dumped frame, with a model folder, saving or comparing output heads, and timing each kernel. |
 | `NEURAL_FORGE_NR_NO_FUSE_PRE=1`, `_NO_FUSE_POOL=1`, `_NO_FUSE_UPRES=1`, `_NO_FUSE_POST=1`, `_NO_PTX_MLP=1`, `NEURAL_FORGE_NR_CHAIN=0`, `_VIT_CHAIN=0`, `_CHAIN_MASK=N`, `_DEFER_MAX=N`, `_PTX_GEMM=0`, `_PTX_GEMMT=0`, `_PTX_GEMMV=0`, `_PTX_QKV=0`, `_PTX_FFN=0`, `_PTX_ATTN=0`, `_PTX_BLOCK32=0`, `_SPLITK=N`, `_ATTN_STREAM=N` | network | Testing aids: turn off one of the network's fused kernels or PTX kernel families, or change how its launches are chained and split (`third_party/opendlss-nr/src/nr_graph.cpp`, `kernels.cpp`). A switch takes `1` or `0` and a number a whole number; anything else is reported once on the game's standard error and ignored. `NEURAL_FORGE_NR_VALIDATION=1` and `NEURAL_FORGE_NR_DEBUG=1` apply only to the network's own standalone Vulkan context (its tools), not inside a game. |
 | `NEURAL_FORGE_SMOKE_SO=/path` | `scripts/smoke-test.sh` | Test this layer library instead of building the debug one. |
+| `PROTON_NO_NEURAL_FORGE_NGX=1` | a Proton copy's `proton` script | The game runs without the NGX wrapper (NVIDIA's core directly), as with the original Proton. |
+| `NEURAL_FORGE_NGX_RING=off\|/path` | layer | `off`: the layer reads no NGX records and works from DLSS's kernels alone (for an A/B). A path: read that ring file (left in place) instead of this process's. |
+| `NEURAL_FORGE_NGX_LOG=Z:\path\ngx.log` | NGX wrapper (a Windows path) | One line per DLSS creation, evaluate (every named image, the jitter, motion vector scale, exposure and reset) and release. Off by default. |
+| `NEURAL_FORGE_NGX_CORE=C:\path\_nvngx.dll` | NGX wrapper | Load NVIDIA's core from here instead of `NVIDIA_WINE_DLL_DIR`. |
 
 ## CLI
 
@@ -365,6 +392,7 @@ The CLI is installed as `~/.local/share/neural-forge/bin/neural-forge-cli`; add 
 `neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID]`, `games`,
 `enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]`, `disable GAME`, `config`, `import-binaries DIR`,
 `extract-model DIR [--network full|small]`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`,
+`proton-tool [list|create SOURCE|update|remove NAME]` for the Proton copies (above),
 `game-settings list|show GAME|set GAME NAME VALUE|clear GAME [NAME]` for a game's own settings, and
 `shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--view V]|capture --cancel|dump-cache [--holds K]|reset|lut FILE|none`
 for the live settings. `doctor`, `report` and `shmctl status` only look: they create and change nothing.
@@ -388,6 +416,9 @@ Valve's VAC) cannot be seen.
 | `~/.local/share/neural-forge/` | The installed layer and GUI, the extracted model (`model/`), an imported DLL (`binaries/`), captures (`captures/`). |
 | `~/.local/state/neural-forge/layer.log` | The layer's session log: state changes and errors only, never per frame (kept to 256 KiB, the previous one as `layer.log.1`). Diagnose and the report read it. |
 | `/tmp/neural-forge-$UID/shm.bin` | The shared memory the layer and the GUI talk through. |
+| `~/.local/share/neural-forge/lib/neural-forge/proton/_nvngx.dll` | The NGX wrapper the Proton copies get. |
+| `<Steam>/compatibilitytools.d/<version>-NeuralForge/` | A Proton copy (`neural-forge-proton.txt` in it says what it was made from). |
+| `/dev/shm/neural-forge-ngx-<pid>.ring` | The wrapper's records for one game process; the layer removes the file when it opens it. |
 
 ## Uninstall
 
@@ -401,7 +432,8 @@ and removes the files it keeps next to each account's `localconfig.vdf` (`.neura
 that: while it runs, or while a game's options cannot be changed safely, the purge removes nothing and
 names each game with the launch options to set by hand instead. Then it removes the config,
 everything under `~/.local/share/neural-forge` (the model, an imported DLL, captures),
-`~/.local/state/neural-forge` and `/tmp/neural-forge-$UID`.
+`~/.local/state/neural-forge`, `/tmp/neural-forge-$UID` and the Proton copies it made (choose another Proton for
+the games that used one).
 
 ## More known issues
 

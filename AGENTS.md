@@ -156,7 +156,11 @@ second frame in motion with the edit cache carrying it between (docs/ARCHITECTUR
 the layer (`crates/native`, `crates/layer/src/preupscale/native.rs`; docs/NATIVE_BACKEND.md); the
 2.x Windows helper and everything around it (runners, Wine prefix, DMA-BUF, NGX) are removed and
 not to be brought back. Do not lower model resolution or turn the model off by default without
-explicit user authorization.
+explicit user authorization. The one Windows-side piece is the NGX wrapper for Proton (`crates/ngx-wrapper`,
+docs/PROTON_NGX.md): it never runs NGX or the network, it forwards NVIDIA's NGX core unchanged and records the
+parameters the game gives DLSS for the layer (`ngx_ring.rs`). It ships only inside Proton copies made on the user's
+machine (`proton_tool.rs`), never as a published Proton build, and every layer decision it feeds keeps the kernel rules
+as the fallback.
 
 Do not reapply the reverted capture/composition fence changes. Validate actual GPU
 operations and measure before and after every performance change. The matched comparator
