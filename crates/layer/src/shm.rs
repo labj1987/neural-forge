@@ -659,11 +659,8 @@ impl ShmClient {
         let Some(hdr) = self.header() else { return };
         let c = &crate::ngx_ring::COUNTERS;
         let sat = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
-        let (total, kinds) = crate::ngx_ring::disagreements();
         hdr.ngx_records.store(sat(c.records.load(Ordering::Relaxed)), Ordering::Relaxed);
         hdr.ngx_matched.store(sat(c.matched.load(Ordering::Relaxed)), Ordering::Relaxed);
-        hdr.ngx_disagreements.store(sat(total), Ordering::Relaxed);
-        hdr.ngx_disagree_kinds.store(kinds, Ordering::Relaxed);
     }
 
     /// `debug_view` (0 before the mapping is open).

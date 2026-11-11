@@ -1992,7 +1992,7 @@ impl NeuralForgeDeviceInfo {
             return None;
         }
         // Dump and identity copy the colour input with transfers; model and roundtrip read and write
-        // it from the HDR encode/decode shaders (STORAGE, which `identify` already requires).
+        // it from the HDR encode/decode shaders (STORAGE).
         let usage_ok = match mode {
             Mode::Off | Mode::Dump => colour.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC),
             Mode::Identity => colour.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST),
@@ -2110,12 +2110,12 @@ impl NeuralForgeDeviceInfo {
                 .map(|a| crate::preupscale::Aux { readable: a.readable && a.format == vk::Format::R16G16_SFLOAT, ..a }),
             // Read only at the colour input's extent (`aux`): in its pixels.
             mvec_scale: [1.0, 1.0],
-            // The 1x1 candidates: read in their committed layout, or as GENERAL (assumed, flagged in
+            // The exposure image NGX's record names: read in its committed layout, or as GENERAL (assumed, flagged in
             // exposure.json) when no barrier on a storage image was seen.
             exposure: std::array::from_fn(|k| {
-                inputs.exposure[k].map(|(image, desc)| {
-                    let assumed = scan.exposure_layouts[k].is_none() && desc.usage.contains(vk::ImageUsageFlags::STORAGE);
-                    let layout = if assumed { Some(vk::ImageLayout::GENERAL) } else { scan.exposure_layouts[k] };
+                inputs.exposure_input.filter(|_| k == 0).map(|(image, desc)| {
+                    let assumed = scan.exposure_input_layout.is_none() && desc.usage.contains(vk::ImageUsageFlags::STORAGE);
+                    let layout = if assumed { Some(vk::ImageLayout::GENERAL) } else { scan.exposure_input_layout };
                     let readable = desc.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (desc.width, desc.height) == (1, 1);
                     (crate::preupscale::Aux { image, format: desc.format, layout, readable }, assumed)
                 })
@@ -2135,7 +2135,7 @@ impl NeuralForgeDeviceInfo {
         };
         let target = target.with_ngx_exposure();
         let loader = session.native.as_ref().filter(|_| native);
-        let dlss = tracking.split_dlss_frame(&scan);
+        let dlss = scan.frame;
         let seen = session.seen();
         let res = session.res.as_mut()?;
         res.on_queue(queue);
@@ -2386,11 +2386,6 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             state.pass_through,
             state.images.len()
         );
-        if let Some(t) = &self.preupscale {
-            t.lock().swapchain(swapchain, Some((state.width, state.height)));
-            // Which device presents: DLSS's views may be registered on another one.
-            crate::log!("[preupscale] device {:?}: swapchain {}x{} tracked for the DLSS input's size test", self.device.handle(), state.width, state.height);
-        }
         let mut layer_state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.tracker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).swapchain_images.extend(state.images.iter().copied());
         layer_state.swapchains.insert(swapchain, state);
@@ -3001,9 +2996,6 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             return LayerResult::Unhandled;
         };
         release_primary(self.device.handle(), swapchain);
-        if let Some(t) = &self.preupscale {
-            t.lock().swapchain(swapchain, None);
-        }
         {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // Drain before anything per-swapchain is freed: a capture or compose the layer
@@ -3333,8 +3325,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             crate::probe_ngx::on_create_cu_function(function, create_info, result);
         }
         if let Some(t) = self.preupscale.as_ref().filter(|_| result == vk::Result::SUCCESS && !create_info.p_name.is_null()) {
-            // Only DLSS Super Resolution's input kernel identifies its colour input
-            // (`preupscale::Kernel`, docs/PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction").
+            // The kernels' names are for the probes' lines only: NGX's records say which launches are DLSS's.
             // SAFETY: `pName` is a NUL-terminated string per `VkCuFunctionCreateInfoNVX`'s own
             // contract, valid for the duration of the application's call.
             let name = unsafe { std::ffi::CStr::from_ptr(create_info.p_name) }.to_string_lossy();

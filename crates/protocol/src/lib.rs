@@ -94,7 +94,7 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// (`running_game`), then the sharpening of the finished frame (`sharpen_cas`,
 /// `clarity_strength`, `clarity_radius`, `clarity_midtones`, `clarity_edges`); v25 appends why no hold ran
 /// while DLSS's input is identified (`preupscale_reason`, with `preupscale_state` `IDENTIFIED`); v26 appends the
-/// NGX wrapper ring's counters (`ngx_records`, `ngx_matched`, `ngx_disagreements`, `ngx_disagree_kinds`)).
+/// NGX wrapper ring's counters (`ngx_records`, `ngx_matched`)).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.

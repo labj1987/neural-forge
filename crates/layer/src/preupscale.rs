@@ -7,13 +7,15 @@
 //! colour input is final when the launch-bearing submit starts and sits in `GENERAL`. So this
 //! module:
 //!
-//! 1. tracks the registered views and marks launch-bearing command buffers ([`Tracking`]), noting
-//!    whether their launches name the colour input ([`LaunchRefs`]: only those are held, so DLSS
-//!    Frame Generation's launch-bearing submits go through untouched);
-//! 2. identifies the colour input (and depth, motion vectors) from what DLSS Super Resolution's
-//!    input kernel names in its parameters ([`input_launch`], [`Tracker::observe`]; also finds
-//!    DLAA's output-size input), with the registered set's shapes as the fallback ([`identify`]);
-//! 3. at a `vkQueueSubmit`/`vkQueueSubmit2` carrying a launch-bearing buffer, splits the call
+//! 1. takes everything about DLSS's evaluates from NGX's records ([`crate::ngx_ring`], written by Neural Forge's NGX
+//!    wrapper in a Neural Forge Proton): which images are its colour input, depth, motion vectors, output and exposure
+//!    image, the jitter, the motion vectors' units, the reset and whether it is Ray Reconstruction. Nothing is
+//!    inferred from DLSS's kernels: without records nothing is held;
+//! 2. tracks the registered views and marks launch-bearing command buffers ([`Tracking`]); a buffer belongs to an
+//!    evaluate when one of its launches names the evaluate's colour input between the evaluate's record and its end
+//!    ([`LaunchRefs::ngx`]). Only Super Resolution's are held, so DLSS Frame Generation's and Ray Reconstruction's
+//!    launch-bearing submits go through untouched;
+//! 3. at a `vkQueueSubmit`/`vkQueueSubmit2` carrying a buffer with Super Resolution's evaluate, splits the call
 //!    around that buffer ([`plan`]) and, between the two halves, runs its own capture submit,
 //!    the model round trip and a write-back submit on the same queue ([`run_hold`]).
 //!
@@ -248,7 +250,7 @@ pub(crate) const ENV: &str = "NEURAL_FORGE_PREUPSCALE";
 /// How long after the last hold the device counts as holding (`preupscale_state` 2).
 pub(crate) const RECENT: Duration = Duration::from_millis(500);
 
-/// In model mode, on a device that has held, how long DLSS Super Resolution's input kernel may go on launching with no
+/// In model mode, on a device that has held, how long DLSS's evaluates may go on being submitted with no
 /// frame held before the post-upscaler path takes over (frames are presented as DLSS made them until then): DLAA, inputs
 /// no longer identified, every frame refused. With no Super Resolution launch at all since the last held frame the game
 /// paused DLSS (a pause menu, a map, a loading screen): the model stays where it is for [`PAUSE_HAND_BACK`]. Handing a
@@ -256,7 +258,7 @@ pub(crate) const RECENT: Duration = Duration::from_millis(500);
 /// screen, at 4K near full VRAM); loading screens do not need the model.
 pub(crate) const HAND_BACK: Duration = Duration::from_secs(30);
 
-/// [`HAND_BACK`] while DLSS Super Resolution has not launched at all since the last held frame: the game paused it (a
+/// [`HAND_BACK`] while no DLSS evaluate was submitted at all since the last held frame: the game paused it (a
 /// pause menu over the last frame, which already carries the model's edit, #49). Handing those frames to the post
 /// path after 30 s ran the network a second time over the menu (at the output size: 49 ms a frame at 4K), rebuilt it
 /// at the output size and back at the render size on resume (the model off for over a second, and on a 12 GB card at
@@ -264,7 +266,7 @@ pub(crate) const HAND_BACK: Duration = Duration::from_secs(30);
 /// upscaler gets the post path after this.
 pub(crate) const PAUSE_HAND_BACK: Duration = Duration::from_secs(300);
 
-/// DLSS Super Resolution's input-kernel launches a device of the process saw, identified or not ([`note_sr_launch`]):
+/// The submits of DLSS evaluates a device of the process saw, held or not ([`note_sr_launch`]):
 /// when the current run of them began (launches less than [`RECENT`] apart) and the last one.
 static SR_LAUNCHES: Mutex<Option<SrLaunches>> = Mutex::new(None);
 
@@ -285,7 +287,7 @@ impl SrLaunches {
     }
 }
 
-/// A launch-bearing submit carried DLSS Super Resolution's input launch, its inputs identified or not ([`Tracker::observe`]).
+/// A launch-bearing submit carried a DLSS evaluate's launches, held or not ([`Tracker::observe`]).
 fn note_sr_launch() {
     let mut run = lock(&SR_LAUNCHES);
     *run = Some(SrLaunches::after(*run, Instant::now()));
@@ -296,7 +298,7 @@ fn sr_launches() -> Option<SrLaunches> {
 }
 
 /// When the post path gets the frames back after the last held frame at `last`: [`HAND_BACK`] after Super Resolution
-/// went on launching without a frame held (DLAA, inputs no longer identified, every frame refused: a run of launches
+/// went on being evaluated without a frame held (inputs not identified, every frame refused: a run of evaluates
 /// that goes on more than [`RECENT`] past `last`, counted from `last` or from the run's start if it began later), else
 /// [`PAUSE_HAND_BACK`] after `last` (DLSS paused: a pause menu, a loading screen). A run that begins as the game
 /// resumes is DLSS coming back, and its input is held again within a few frames: it hands nothing back for
@@ -513,7 +515,7 @@ pub(crate) const COMMANDS: &[VulkanCommand] = &[
     VulkanCommand::GetImageViewHandleNvx,
     VulkanCommand::GetImageViewAddressNvx,
     VulkanCommand::CmdCuLaunchKernelNvx,
-    // The kernels' names ([`Kernel`]): only DLSS Super Resolution's input kernel identifies.
+    // The kernels' names, for the probes' lines only (NGX's records say which launches are DLSS's).
     VulkanCommand::CreateCuFunctionNvx,
     VulkanCommand::DestroyCuFunctionNvx,
     // Synchronization a split must not come before or between ([`Hazard`]): event waits, and
@@ -542,59 +544,6 @@ pub(crate) const COMMANDS: &[VulkanCommand] = &[
     VulkanCommand::CmdBeginConditionalRenderingExt,
     VulkanCommand::CmdEndConditionalRenderingExt,
 ];
-
-/// What a CUDA kernel is, by the name `vkCreateCuFunctionNVX` gave it (docs/PRE_UPSCALER_DESIGN.md, "DLSS Ray
-/// Reconstruction"). Only a positive sign of Ray Reconstruction changes a decision: Super Resolution's
-/// kernels change names between DLSS versions (`hiluma_engine_input*` in 310.4, `rrlite_*` in Crimson
-/// Desert's 310.9 with Ray Reconstruction off), so nothing waits for a Super Resolution name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kernel {
-    /// DLSS Super Resolution's input kernel (`hiluma_engine_input_*` in GTA V,
-    /// `cuda_engine_input_kernel_*` among NGX's modules): it reads the colour input, depth and
-    /// motion vectors. Only the logs and the probe use it.
-    SrInput,
-    /// DLSS Ray Reconstruction: its input is the noisy ray-traced frame with its guide buffers, so the
-    /// model must not run before it. Two families, both seen with the game's Ray Reconstruction option on
-    /// and gone with it off (2026-10-09): `rr2_*` (DLSS 310.9, Crimson Desert; `rr2_enc0_kernel` names the
-    /// colour input with diffuse and specular albedo, normals, roughness and hit distance; with it off the
-    /// game launches `rrlite_*`) and the denoiser engine's network, `cuda_dldn_engine_hkpn_*` and
-    /// `cuda_dldn_engine_swin_*` (DLSS 310.0, Hogwarts Legacy; `cuda_dldn_engine_swin_enc0_kernel` names the
-    /// colour input with two B10G11R11 albedo images, normals and hit distance; with it off the game
-    /// launches Super Resolution's `hiluma_*`). The engine's helpers (`cuda_dldn_engine_luma_convert_kernel`,
-    /// `_reduce_sum_`, `_auto_exposure_copy_`) are not Ray Reconstruction: Crimson Desert's `rrlite_*` Super
-    /// Resolution launches them too.
-    RayReconstruction,
-    /// Anything else: Super Resolution's network and output kernels, Frame Generation's (`main_kernel`,
-    /// `k_*`, `custom_block*`, `custom_upsample*`, `Kernel_*`), NGX's helpers.
-    Other,
-}
-
-impl Kernel {
-    pub(crate) fn of(name: &str) -> Self {
-        if name.starts_with("hiluma_engine_input") || name.starts_with("cuda_engine_input_kernel") {
-            Self::SrInput
-        } else if ["rr2_", "cuda_dldn_engine_hkpn_", "cuda_dldn_engine_swin_"].iter().any(|p| name.starts_with(p)) {
-            Self::RayReconstruction
-        } else {
-            Self::Other
-        }
-    }
-}
-
-/// Whether a kernel is DLSS Frame Generation's by its name: `main_kernel` (Black Myth: Wukong's
-/// frame-generation buffers, Resident Evil Requiem's) and the network kernels launched beside it
-/// there (`k_conv_fp16_nhwc`, `k_pooling`, `k_upscale`, `k_element_wise`). Everything else reading
-/// the colour input first may be the hold point, as before: DLSS Super Resolution's own kernels
-/// (Cyberpunk 2077's `cuda_luma_convert_kernel`, Crimson Desert's `rrlite_*`). DLSS Ray Reconstruction's
-/// buffers are never the hold point ([`Kernel::RayReconstruction`]).
-pub(crate) fn fg_kernel_name(name: &str) -> bool {
-    name == "main_kernel" || ["k_conv_fp16_nhwc", "k_pooling", "k_upscale", "k_element_wise"].iter().any(|p| name.starts_with(p))
-}
-
-/// Launch-bearing submits after DLSS Ray Reconstruction's last launch during which nothing is identified
-/// ([`Tracker::rr_running`]). With frame generation at 6x there are about 6 per real frame, so this is
-/// about 10 real frames: switching Ray Reconstruction off in a game's settings takes effect within it.
-pub(crate) const SR_RECENT: u64 = 64;
 
 /// What the diagnostic modes' split hold (`dump`, `identity`, `roundtrip`) hooks besides [`COMMANDS`]: the
 /// semaphores' creation, so the hold knows which are timeline semaphores (whose waits it checks before it
@@ -666,8 +615,8 @@ impl ImageDesc {
 /// Depth as a single-channel 32-bit colour image: what DLSS reads when Streamline hands it a copy of
 /// the depth. Cyberpunk 2077 with DLSS Frame Generation copies its depth into an `R32_SFLOAT` image in
 /// DLSS's buffer right before the launches (NGX probe `cp/cp-fgprobe-1`, 2026-10-05), and no
-/// depth-format image is registered at all then. Only taken when an input launch names no image of
-/// [`DEPTH_FORMATS`].
+/// depth-format image is registered at all then: NGX's record names it as the depth, and the hold copies it from
+/// [`depth_copy_layout`]'s layouts.
 const DEPTH_AS_COLOUR: [vk::Format; 2] = [vk::Format::R32_SFLOAT, vk::Format::R32_UINT];
 
 pub(crate) const DEPTH_FORMATS: [vk::Format; 6] = [
@@ -702,15 +651,12 @@ pub(crate) fn exposure_texel_bytes(format: vk::Format) -> Option<u64> {
     }
 }
 
-/// At most this many registered 1x1 images are kept as exposure candidates (GTA registers two).
+/// The 1x1 exposure images a dump can read ([`Target::exposure`]); the split hold fills the first, with DLSS's exposure
+/// input as NGX's record names it.
 pub(crate) const MAX_EXPOSURE: usize = 4;
 
 /// Bytes reserved per exposure image in the dump readback (the largest texel).
 const EXPOSURE_STRIDE: u64 = 16;
-
-/// At most this many further colour candidates are kept beside the first in [`Inputs::others`], for
-/// the identification line. Every candidate is in [`Tracker::candidates`].
-pub(crate) const MAX_OTHERS: usize = 3;
 
 /// The shape of the identified colour input ([`Tracker::colour_watch`]): every 2D single-sample image of its extent
 /// and format is watched, as every depth image at the depth's extent is.
@@ -734,116 +680,23 @@ impl ColourWatch {
 /// At most one line per this long with the counts of the ordinary hold-inside refusals ([`InlineRefusal::quiet`]).
 const QUIET_REFUSALS_EVERY: Duration = Duration::from_secs(5);
 
-/// The DLSS inputs among the registered images.
+/// DLSS's inputs as NGX's record of an evaluate names them ([`crate::ngx_ring`]), each with what `vkCreateImage` said of
+/// it: the colour input, depth, motion vectors and exposure image of the identification ([`Tracker::refresh`]), or of
+/// one command buffer's evaluate ([`Scan::inputs`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Inputs {
-    /// The colour input: the candidate with the lowest handle. Only a launch-bearing buffer whose
-    /// launches name it is held as reading it ([`LaunchRefs::kind`]).
     pub colour: (vk::Image, ImageDesc),
-    /// The depth and motion-vector images at the colour input's extent.
     pub depth: (vk::Image, ImageDesc),
     pub mvec: (vk::Image, ImageDesc),
-    /// How many colour candidates there were.
-    pub candidates: usize,
-    /// The further candidates' colour images, lowest handles first. A buffer whose input launch
-    /// names one of them with the colour input's depth and motion vectors is held with it as the
-    /// target ([`Tracker::retarget`]); one that names it otherwise stays forwarded, and is only
-    /// counted ([`Tracker::other_candidate_buffers`]).
-    pub others: [Option<(vk::Image, ImageDesc)>; MAX_OTHERS],
-    /// What the candidates were judged smaller than: the swapchain's extent, or (no swapchain known
-    /// on the device) the largest registered output-like image ([`output_candidate`]).
-    pub output: (u32, u32),
-    pub output_from_swapchain: bool,
-    /// The registered 1x1 float images (DLSS's exposure input among them), lowest handles first.
-    /// Only dump mode reads them.
-    pub exposure: [Option<(vk::Image, ImageDesc)>; MAX_EXPOSURE],
-    /// DLSS's exposure input, which the HDR encode multiplies in: the registered 1x1 R16_SFLOAT
-    /// image the input kernel's command buffer names ([`Rule::Params`]), else the registered one
-    /// (lowest handle among several). NGX's own 1x1 RGBA32F images are not it.
+    /// DLSS's exposure input (`ExposureTexture`), which the HDR encode multiplies in; `None` when the game gives DLSS
+    /// none (the exposure is measured from the frame then).
     pub exposure_input: Option<(vk::Image, ImageDesc)>,
-    /// The exposure input is the one DLSS's own command buffer names (not just the registered one).
-    pub exposure_named: bool,
-    /// Which rule found the colour input.
-    pub rule: Rule,
 }
-
-/// How the colour input was found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Rule {
-    /// A launch of DLSS's own command buffer names it together with exactly one depth image and
-    /// motion vectors ([`InputLaunch`], [`Tracker::observe`]): what DLSS Super Resolution's input
-    /// kernel reads. Works with DLAA (input extent == output extent).
-    Params,
-    /// The registered set alone ([`identify`]): the RGBA16F storage image beside depth and motion
-    /// vectors that is smaller than the output. The fallback (unreadable parameters, other launch
-    /// forms, before the parameters have settled).
-    Size,
-}
-
-/// DLSS's motion-vector formats: RG16F (GTA V) or RG32F. RG16F first where both are at an extent.
-const MVEC_FORMATS: [vk::Format; 2] = [vk::Format::R16G16_SFLOAT, vk::Format::R32G32_SFLOAT];
 
 /// The motion-vector formats the hold inside DLSS's buffer copies into its RG16F staging image: RG16F as it is,
 /// the others blitted (which converts; Vulkan requires blits from RGBA16F and RG32F and into RG16F with optimal
-/// tiling). RGBA16F is Metro Last Light Redux's ([`four_channel_inputs`]).
+/// tiling). RGBA16F is Metro Last Light Redux's.
 pub(crate) const MVEC_HOLD_FORMATS: [vk::Format; 3] = [vk::Format::R16G16_SFLOAT, vk::Format::R16G16B16A16_SFLOAT, vk::Format::R32G32_SFLOAT];
-
-/// DLSS's inputs where its input launch names no two-channel motion vectors: Metro Last Light Redux (310.9.16,
-/// `hiluma_engine_input_depthreg_*`, 2026-10-23) hands DLSS its colour as an RGBA16F render target without storage
-/// use, its motion vectors as an RGBA16F storage image (x and y in the first two channels; NVIDIA's own NR reads
-/// that image too) and its depth as R32F, all at the render size. Read so only when the launch names exactly one
-/// such render target, one such storage image and one depth-like image at one extent; anything else stays
-/// unread.
-///
-/// Cyberpunk 2077 under vkd3d-proton (patch of late 2026, `hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`,
-/// issue #49, probed 2026-11-10) names the same set, but vkd3d-proton gives every image the same usage, so
-/// usage cannot tell the colour from the motion vectors. There the launch's parameters name the colour first and
-/// the motion vectors second (parameters 21 and 23; DLSS's output is 22): exactly two RGBA16F images at the
-/// depth's extent with the same usage are read in parameter order, the colour first.
-fn four_channel_inputs(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<InputLaunch> {
-    if let Some(inputs) = four_channel_render_target(images, named) {
-        return Some(inputs);
-    }
-    four_channel_in_parameter_order(images, named)
-}
-
-/// Metro Last Light Redux's form of [`four_channel_inputs`]: the colour a render target, the motion vectors a storage image.
-fn four_channel_render_target(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<InputLaunch> {
-    let with = |keep: &dyn Fn(&ImageDesc) -> bool| -> Vec<(vk::Image, ImageDesc)> {
-        named.iter().filter_map(|i| images.get(i).filter(|d| d.plain && keep(d)).map(|d| (*i, *d))).collect()
-    };
-    let rgba = |d: &ImageDesc| d.format == vk::Format::R16G16B16A16_SFLOAT && d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC);
-    let attachment = |d: &ImageDesc| d.usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT);
-    let storage = |d: &ImageDesc| d.usage.contains(vk::ImageUsageFlags::STORAGE);
-    let [(colour, c)] = with(&|d| rgba(d) && attachment(d) && !storage(d))[..] else { return None };
-    let extent = |d: &ImageDesc| (d.width, d.height) == (c.width, c.height);
-    let [(mvec, _)] = with(&|d| rgba(d) && storage(d) && !attachment(d) && extent(d))[..] else { return None };
-    let [(depth, _)] = with(&|d| (DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format)) && extent(d))[..] else { return None };
-    Some(InputLaunch::Inputs { colour, depth, mvec })
-}
-
-/// Cyberpunk 2077's form of [`four_channel_inputs`] (vkd3d-proton): exactly one depth-like image, and at its extent
-/// exactly two copyable RGBA16F images with the same usage, named colour first, motion vectors second.
-fn four_channel_in_parameter_order(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<InputLaunch> {
-    let with = |keep: &dyn Fn(&ImageDesc) -> bool| -> Vec<(vk::Image, ImageDesc)> {
-        let mut seen: Vec<vk::Image> = Vec::new();
-        named
-            .iter()
-            .filter(|i| {
-                let first = !seen.contains(i);
-                seen.push(**i);
-                first
-            })
-            .filter_map(|i| images.get(i).filter(|d| d.plain && keep(d)).map(|d| (*i, *d)))
-            .collect()
-    };
-    let [(depth, dd)] = with(&|d| DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format))[..] else { return None };
-    let pair = with(&|d| {
-        d.format == vk::Format::R16G16B16A16_SFLOAT && d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (d.width, d.height) == (dd.width, dd.height)
-    });
-    let [(colour, c), (mvec, m)] = pair[..] else { return None };
-    (c.usage == m.usage && colour_candidate(&c)).then_some(InputLaunch::Inputs { colour, depth, mvec })
-}
 
 /// The formats of an image DLSS Super Resolution writes (its output, NGX's output-size scratch).
 const OUTPUT_FORMATS: [vk::Format; 2] = [vk::Format::R16G16B16A16_SFLOAT, vk::Format::B10G11R11_UFLOAT_PACK32];
@@ -857,489 +710,6 @@ const INLINE_LAYOUTS: [vk::ImageLayout; 5] = [
     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
 ];
-
-/// The largest registered output-like image (a 2D RGBA16F or R11G11B10 storage image): what the
-/// colour input is compared against when no swapchain is known on the device (Cyberpunk 2077 under
-/// vkd3d-proton logged "swapchain None").
-fn output_candidate(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>) -> Option<(u32, u32)> {
-    registered
-        .values()
-        .filter(|(_, d)| d.plain && OUTPUT_FORMATS.contains(&d.format) && d.usage.contains(vk::ImageUsageFlags::STORAGE))
-        .map(|(_, d)| (d.width, d.height))
-        .max_by_key(|&(w, h)| u64::from(w) * u64::from(h))
-}
-
-/// Whether `d` has the shape of DLSS's colour input: a 2D single-sample RGBA16F storage image.
-fn colour_like(d: &ImageDesc) -> bool {
-    d.plain && d.format == vk::Format::R16G16B16A16_SFLOAT && d.usage.contains(vk::ImageUsageFlags::STORAGE)
-}
-
-/// Whether an image of extent `(w, h)` is smaller than `output` (fits inside it, fewer texels).
-fn smaller(w: u32, h: u32, (ow, oh): (u32, u32)) -> bool {
-    w <= ow && h <= oh && u64::from(w) * u64::from(h) < u64::from(ow) * u64::from(oh)
-}
-
-/// The registered image at `(w, h)` with the first format of `formats` present there (lowest
-/// handle).
-fn at(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, formats: &[vk::Format], w: u32, h: u32) -> Option<(vk::Image, ImageDesc)> {
-    formats.iter().find_map(|&f| registered.values().find(|(_, d)| d.plain && d.format == f && (d.width, d.height) == (w, h)).copied())
-}
-
-/// The colour candidates: every registered RGBA16F storage image smaller than the output (the
-/// swapchain, or without one the largest registered output-like image, [`output_candidate`]) with a
-/// registered depth image ([`DEPTH_FORMATS`]) and motion-vector image ([`MVEC_FORMATS`]) at the
-/// same extent. DLSS's inputs share the render extent; its output and NGX's scratch images have no
-/// depth image beside them, and DLAA (render extent == output) is refused by the size test.
-/// Deterministic: among several candidates, the lowest handles win (Crimson Desert registers two
-/// or three; the others are kept in [`Inputs::others`] for the log). This is the size rule
-/// ([`Rule::Size`]), the fallback: what DLSS's own input kernel names ([`Tracker::observe`],
-/// [`Rule::Params`]) wins once it has settled.
-pub(crate) fn identify(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapchain: Option<(u32, u32)>) -> Option<Inputs> {
-    let (output, output_from_swapchain) = match swapchain {
-        Some(e) => (e, true),
-        None => (output_candidate(registered)?, false),
-    };
-    let candidates = size_candidates(registered, output);
-    let colour = *candidates.first()?;
-    let (w, h) = (colour.1.width, colour.1.height);
-    let mut others = [None; MAX_OTHERS];
-    for (slot, other) in others.iter_mut().zip(&candidates[1..]) {
-        *slot = Some(*other);
-    }
-    Some(Inputs {
-        colour,
-        depth: at(registered, &DEPTH_FORMATS, w, h)?,
-        mvec: at(registered, &MVEC_FORMATS, w, h)?,
-        candidates: candidates.len(),
-        others,
-        output,
-        output_from_swapchain,
-        exposure: exposure_images(registered),
-        exposure_input: registered_exposure_input(registered),
-        exposure_named: false,
-        rule: Rule::Size,
-    })
-}
-
-/// The size rule's colour candidates ([`identify`]), lowest handles first: every one, where
-/// [`Inputs::others`] keeps three for the log.
-fn size_candidates(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, output: (u32, u32)) -> Vec<(vk::Image, ImageDesc)> {
-    registered
-        .values()
-        .filter(|(_, d)| {
-            colour_like(d)
-                && smaller(d.width, d.height, output)
-                && at(registered, &DEPTH_FORMATS, d.width, d.height).is_some()
-                && at(registered, &MVEC_FORMATS, d.width, d.height).is_some()
-        })
-        .copied()
-        .collect()
-}
-
-/// The registered 1x1 float images (DLSS's exposure input among them), lowest handles first.
-fn exposure_images(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>) -> [Option<(vk::Image, ImageDesc)>; MAX_EXPOSURE] {
-    let mut exposure = [None; MAX_EXPOSURE];
-    for (slot, found) in
-        exposure.iter_mut().zip(registered.values().filter(|(_, d)| d.plain && (d.width, d.height) == (1, 1) && exposure_texel_bytes(d.format).is_some()))
-    {
-        *slot = Some(*found);
-    }
-    exposure
-}
-
-/// Whether `d` is DLSS's exposure input's kind: a 2D single-sample 1x1 `R16_SFLOAT` image.
-fn exposure_like(d: &ImageDesc) -> bool {
-    d.plain && (d.width, d.height) == (1, 1) && d.format == vk::Format::R16_SFLOAT
-}
-
-/// The registered 1x1 R16_SFLOAT image (lowest handle): the exposure input when DLSS's buffer
-/// names none.
-fn registered_exposure_input(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>) -> Option<(vk::Image, ImageDesc)> {
-    registered.values().find(|(_, d)| exposure_like(d)).copied()
-}
-
-/// What DLSS Super Resolution's input kernel reads, as one launch's parameters name it: the colour
-/// input, depth and motion vectors. Found by [`input_launch`], kept per command buffer
-/// ([`LaunchRefs::input`]) and decided on in [`Tracker::observe`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum InputLaunch {
-    /// Exactly one depth image, motion vectors, and exactly one colour candidate at the depth's
-    /// extent.
-    Inputs { colour: vk::Image, depth: vk::Image, mvec: vk::Image },
-    /// Exactly one depth image and motion vectors, but several colour candidates at its extent: not
-    /// used, logged once.
-    Ambiguous { depth: vk::Image, colours: Vec<(vk::Image, ImageDesc)> },
-    /// Depth and motion vectors, but several depth images, or no colour candidate at the depth's
-    /// extent (DLSS Frame Generation's launches in GTA V: the output-size frame beside the
-    /// render-size depth).
-    Unusable,
-}
-
-/// Whether `d` can be DLSS's colour input as its input kernel's parameters name it: a 2D
-/// single-sample RGBA16F storage image, or an R11G11B10 one that is a storage or a sampled image
-/// (Unreal Engine 5 hands DLSS a sampled `B10G11R11_UFLOAT` colour input: Black Myth: Wukong's
-/// benchmark, 2026-10-05). The split holds RGBA16F only; the hold inside DLSS's buffer converts.
-fn colour_candidate(d: &ImageDesc) -> bool {
-    d.plain
-        && match d.format {
-            vk::Format::R16G16B16A16_SFLOAT => d.usage.contains(vk::ImageUsageFlags::STORAGE),
-            vk::Format::B10G11R11_UFLOAT_PACK32 => d.usage.intersects(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED),
-            _ => false,
-        }
-}
-
-/// A sampled, copyable 2D single-sample RGBA16F image: DLSS's colour input in a launch naming no
-/// [`colour_candidate`] at the depth's extent ([`input_launch`]); held inside DLSS's buffer only.
-fn sampled_colour(d: &ImageDesc) -> bool {
-    d.plain
-        && d.format == vk::Format::R16G16B16A16_SFLOAT
-        && d.usage.contains(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
-}
-
-/// Reads one launch's named registered images (`named`; `images` has their descriptions) the way
-/// DLSS Super Resolution's input kernel names its inputs. `None` when the launch names no depth
-/// image or no 2-channel float image (it is not an input launch). Otherwise exactly one depth image
-/// ([`DEPTH_FORMATS`], or without one a single-channel 32-bit image, [`DEPTH_AS_COLOUR`]) and exactly
-/// one colour candidate ([`colour_candidate`]) **at the depth's
-/// extent** give [`InputLaunch::Inputs`]: DLSS's colour input and depth share the render extent
-/// (with DLAA both are the output's), while DLSS Frame Generation reads the output-size frame
-/// beside the render-size depth. The colour input need not be smaller than the output. The motion
-/// vectors: at the depth's extent first, RG16F before RG32F, lowest handle.
-pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<InputLaunch> {
-    let of = |keep: fn(&ImageDesc) -> bool| -> Vec<(vk::Image, ImageDesc)> {
-        let mut list: Vec<(vk::Image, ImageDesc)> = named.iter().filter_map(|i| images.get(i).filter(|d| keep(d)).map(|d| (*i, *d))).collect();
-        list.sort_by_key(|(i, _)| i.as_raw());
-        list
-    };
-    let mvecs = of(|d| d.plain && MVEC_FORMATS.contains(&d.format));
-    if mvecs.is_empty() {
-        if let Some(inputs) = four_channel_inputs(images, named) {
-            return Some(inputs);
-        }
-    }
-    let mut depths = of(|d| d.plain && DEPTH_FORMATS.contains(&d.format));
-    if depths.is_empty() && !mvecs.is_empty() {
-        // Depth handed over as a colour image (Streamline's copy): one at a motion-vector or colour
-        // candidate's extent.
-        let extents: Vec<(u32, u32)> =
-            mvecs.iter().map(|(_, d)| (d.width, d.height)).chain(of(colour_candidate).iter().map(|(_, d)| (d.width, d.height))).collect();
-        depths = of(|d| d.plain && DEPTH_AS_COLOUR.contains(&d.format)).into_iter().filter(|(_, d)| extents.contains(&(d.width, d.height))).collect();
-    }
-    if depths.is_empty() || mvecs.is_empty() {
-        return None;
-    }
-    let [(depth, dd)] = depths[..] else {
-        return Some(InputLaunch::Unusable);
-    };
-    let extent = (dd.width, dd.height);
-    // In the order the launch's parameters name them (not by handle).
-    let at_extent = |keep: fn(&ImageDesc) -> bool| -> Vec<(vk::Image, ImageDesc)> {
-        named.iter().filter_map(|i| images.get(i).filter(|d| keep(d) && (d.width, d.height) == extent).map(|d| (*i, *d))).collect()
-    };
-    // Without one, a sampled RGBA16F image the layer can copy: GTA San Andreas - The Definitive
-    // Edition (Unreal Engine 4's DLSS plugin) hands DLSS a sampled colour input (2026-10-06). Only as
-    // a fallback, so the games whose launches name several RGBA16F images keep their pick.
-    let mut colours = at_extent(colour_candidate);
-    if colours.is_empty() {
-        colours = at_extent(sampled_colour);
-    }
-    let mvec =
-        mvecs.iter().min_by_key(|(i, d)| ((d.width, d.height) != extent, MVEC_FORMATS.iter().position(|f| *f == d.format), i.as_raw())).map(|(i, _)| *i)?;
-    Some(match colours[..] {
-        [] => InputLaunch::Unusable,
-        [(colour, _)] => InputLaunch::Inputs { colour, depth, mvec },
-        // Several: the first in parameter order is DLSS's colour input (Cyberpunk 2077: dumped, the
-        // first is the rendered frame, the second a near-uniform dark buffer, 2026-10-05).
-        // `NEURAL_FORGE_PREUPSCALE_PICK` takes another one, for diagnostics.
-        _ => match colours.get(pick().unwrap_or(0)) {
-            Some(&(colour, _)) => InputLaunch::Inputs { colour, depth, mvec },
-            None => InputLaunch::Ambiguous { depth, colours },
-        },
-    })
-}
-
-/// Crimson Desert's Super Resolution encoder (`rrlite_enc0_*`, 310.9, Ray Reconstruction off) names, at the render
-/// size, the game's motion vectors (R32G32_SFLOAT, parameter 12; the image Frame Generation's
-/// `Kernel_InputMvecProcessing` reads as the game's, 2026-10-09 `NEURAL_FORGE_PROBE_NGX`) beside four RG16F images of
-/// DLSS's own (parameters 16 and 35-37: its motion vectors of earlier frames, in its working size's pixels, two of
-/// them written on alternate frames). [`input_launch`]'s RG16F-first rule took one of those: the hold's history moved
-/// by 0.39 of the camera's motion, a frame late on every second hold (cache dumps, 2026-11-10). For this kernel the
-/// motion vectors are its one RG32F image at the colour input's extent; `input` unchanged otherwise.
-fn rrlite_game_mvec(name: &str, images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], input: Option<InputLaunch>) -> Option<InputLaunch> {
-    let Some(InputLaunch::Inputs { colour, depth, mvec }) = input else { return input };
-    if !name.starts_with("rrlite_enc0_") {
-        return input;
-    }
-    let Some(cd) = images.get(&colour) else { return input };
-    let rg32: Vec<vk::Image> = named
-        .iter()
-        .copied()
-        .filter(|i| images.get(i).is_some_and(|d| d.plain && d.format == vk::Format::R32G32_SFLOAT && (d.width, d.height) == (cd.width, cd.height)))
-        .fold(Vec::new(), |mut v, i| {
-            if !v.contains(&i) {
-                v.push(i);
-            }
-            v
-        });
-    match rg32[..] {
-        [game] => Some(InputLaunch::Inputs { colour, depth, mvec: game }),
-        _ => Some(InputLaunch::Inputs { colour, depth, mvec }),
-    }
-}
-
-/// DLSS Ray Reconstruction's first launch read for its colour input and motion vectors when it does not
-/// read as SR's input form ([`input_launch`]): the colour input is a [`colour_candidate`] it names that was
-/// identified as DLSS's colour input before (`known`, with its motion vectors; Ray Reconstruction running clears
-/// the identification, not this evidence), else its only RGBA16F one usable as a colour attachment (Hogwarts Legacy's
-/// also names two R11G11B10 attachments), else its only colour attachment, else the first of the RGBA16F images at the
-/// depth's extent in parameter order ([`rr_in_parameter_order`]); the motion vectors the known ones where it names
-/// them, else the second of those RGBA16F images when the parameter order gave the colour, else the [`MVEC_FORMATS`]
-/// image nearest its extent, else that second image when the colour is the first; the depth a depth-like image at the
-/// motion vectors' extent, or none (the hold after DLSS reads no depth).
-fn rr_input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], known: &[(vk::Image, vk::Image)]) -> Option<InputLaunch> {
-    let desc = |i: &vk::Image| images.get(i).copied();
-    let candidates: Vec<vk::Image> = named.iter().copied().filter(|i| desc(i).is_some_and(|d| colour_candidate(&d))).collect();
-    let attachments: Vec<vk::Image> =
-        candidates.iter().copied().filter(|i| desc(i).is_some_and(|d| d.usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT))).collect();
-    let rgba: Vec<vk::Image> = attachments.iter().copied().filter(|i| desc(i).is_some_and(|d| d.format == vk::Format::R16G16B16A16_SFLOAT)).collect();
-    let only = |list: &[vk::Image]| match list {
-        [one] => Some(*one),
-        _ => None,
-    };
-    let ordered = rr_in_parameter_order(images, named);
-    let known_colour = candidates.iter().copied().find(|i| known.iter().any(|(c, _)| c == i));
-    let by_rule = known_colour.or_else(|| only(&rgba)).or_else(|| only(&attachments));
-    let colour = by_rule.or(ordered.map(|(c, _)| c))?;
-    let cd = desc(&colour)?;
-    let known_mvec = known.iter().find(|(c, m)| *c == colour && named.contains(m)).map(|(_, m)| *m);
-    let ordered_mvec = ordered.filter(|(c, _)| *c == colour).map(|(_, m)| m);
-    let nearest = || {
-        named
-            .iter()
-            .copied()
-            .filter(|i| desc(i).is_some_and(|d| d.plain && MVEC_FORMATS.contains(&d.format)))
-            .min_by_key(|i| desc(i).map_or(u64::MAX, |d| u64::from(d.width.abs_diff(cd.width)) + u64::from(d.height.abs_diff(cd.height))))
-    };
-    // The second RGBA16F image is the motion vectors only where the parameter order gave the colour too: a colour
-    // found by another rule may be the first RGBA16F image by chance, beside Ray Reconstruction's guide buffers
-    // (albedo, specular, normals) in the same format. Then it is a last resort, where no motion-vector format is named.
-    let mvec = known_mvec.or(ordered_mvec.filter(|_| by_rule.is_none())).or_else(nearest).or(ordered_mvec)?;
-    let md = desc(&mvec)?;
-    let depth = named
-        .iter()
-        .copied()
-        .find(|i| {
-            desc(i).is_some_and(|d| {
-                d.plain && (DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format)) && (d.width, d.height) == (md.width, md.height)
-            })
-        })
-        .unwrap_or(vk::Image::null());
-    Some(InputLaunch::Inputs { colour, depth, mvec })
-}
-
-/// Cyberpunk 2077's Ray Reconstruction (vkd3d-proton, 310.x `rr2_enc0_kernel`, issue #49, probed 2026-11-10) as
-/// [`four_channel_in_parameter_order`] reads its Super Resolution: every image has the same usage, so usage tells
-/// nothing, and its first launch names five RGBA16F images at the render size beside two RG16F ones (not the
-/// motion vectors) and two depth-like images. In parameter order the first of the RGBA16F ones is the colour input
-/// (the one its auto-exposure kernel reads) and the second the motion vectors (the ones DLSS Frame Generation's
-/// `Kernel_InputMvecProcessing` reads with the depth). Read so only when every depth-like image it names is at one
-/// extent and at least two copyable RGBA16F images with the same usage are there, the first a [`colour_candidate`]:
-/// `(colour, motion vectors)`.
-fn rr_in_parameter_order(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<(vk::Image, vk::Image)> {
-    let mut seen: Vec<vk::Image> = Vec::new();
-    let unique: Vec<(vk::Image, ImageDesc)> = named
-        .iter()
-        .filter(|i| {
-            let first = !seen.contains(i);
-            seen.push(**i);
-            first
-        })
-        .filter_map(|i| images.get(i).filter(|d| d.plain).map(|d| (*i, *d)))
-        .collect();
-    let mut depths = unique.iter().filter(|(_, d)| DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format)).map(|(_, d)| (d.width, d.height));
-    let extent = depths.next()?;
-    if depths.any(|e| e != extent) {
-        return None;
-    }
-    let rgba: Vec<(vk::Image, ImageDesc)> = unique
-        .iter()
-        .copied()
-        .filter(|(_, d)| d.format == vk::Format::R16G16B16A16_SFLOAT && d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (d.width, d.height) == extent)
-        .collect();
-    let [(colour, c), (mvec, m), ..] = rgba[..] else { return None };
-    (c.usage == m.usage && colour_candidate(&c)).then_some((colour, mvec))
-}
-
-/// `NEURAL_FORGE_PREUPSCALE_PICK=N` (diagnostics only): when an input launch names several colour
-/// candidates at the depth's extent, take the Nth in parameter order (from 0) instead of the first.
-/// With `NEURAL_FORGE_PREUPSCALE=dump` it shows which candidate is the game's frame; an N past the
-/// candidates leaves the launch ambiguous (not used, logged once).
-fn pick() -> Option<usize> {
-    static PICK: LazyLock<Option<usize>> = LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_PREUPSCALE_PICK").and_then(|v| v.parse().ok()));
-    *PICK
-}
-
-/// One command buffer's evidence: its input launch's colour input, depth and motion vectors, and
-/// the 1x1 R16_SFLOAT image (DLSS's exposure input) the buffer names, if any.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Named {
-    pub colour: vk::Image,
-    pub depth: vk::Image,
-    pub mvec: vk::Image,
-    pub exposure: Option<vk::Image>,
-    /// A later launch of a buffer whose input launch names this colour input names it again
-    /// together with another colour candidate of its extent ([`LaunchRefs::output_pair`]): DLSS
-    /// Super Resolution's output kernel, which reads the input and writes the output.
-    pub output_pair: bool,
-    /// A submitted launch-bearing buffer whose input launch does not name this colour input still
-    /// names it: something besides an input kernel reads it (DLSS Frame Generation's other buffer
-    /// reads FG's frame; nothing but SR's own buffer reads SR's input).
-    pub foreign: bool,
-}
-
-impl Named {
-    /// The evidence of an input launch naming `colour`, `depth` and `mvec`, nothing else known yet.
-    pub(crate) fn new(colour: vk::Image, depth: vk::Image, mvec: vk::Image, exposure: Option<vk::Image>) -> Self {
-        Self { colour, depth, mvec, exposure, output_pair: false, foreign: false }
-    }
-
-    /// Whether this output-size entry without an exposure image may still be DLSS Super
-    /// Resolution's input (DLAA in a game that gives DLSS no exposure, Resident Evil Requiem): its
-    /// buffer's output kernel names it with the output, and no other buffer names it.
-    pub(crate) fn sr_without_exposure(&self) -> bool {
-        self.output_pair && !self.foreign
-    }
-}
-
-/// Launch-bearing submits without new evidence before [`Tracker::observe`] decides. With DLSS Frame
-/// Generation each real frame has one Super Resolution buffer and two (GTA V's 3x) to about five
-/// (Crimson Desert's 6x) FG submits, so this spans a few real frames: both kinds are seen before
-/// anything is chosen.
-pub(crate) const SETTLE_SUBMITS: u32 = 16;
-
-/// At most this many different colour inputs are kept as evidence.
-const MAX_NAMED: usize = 4;
-
-/// The inputs as DLSS's own input kernel names them ([`Rule::Params`]); `None` when one of the
-/// images is no longer registered. `size` is what the size rule found; its other candidates are
-/// listed beside the colour input (and a forwarded buffer naming one is counted, as before).
-fn by_params(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, n: Named, swapchain: Option<(u32, u32)>, size: Option<&Inputs>) -> Option<Inputs> {
-    let get = |i: vk::Image| registered.get(&i.as_raw()).copied();
-    let colour = get(n.colour)?;
-    let rest: Vec<(vk::Image, ImageDesc)> =
-        size.into_iter().flat_map(|s| std::iter::once(s.colour).chain(s.others.iter().flatten().copied())).filter(|o| o.0 != n.colour).collect();
-    let mut others = [None; MAX_OTHERS];
-    for (slot, other) in others.iter_mut().zip(&rest) {
-        *slot = Some(*other);
-    }
-    let (output, output_from_swapchain) = match swapchain {
-        Some(e) => (e, true),
-        None => (output_candidate(registered).unwrap_or((colour.1.width, colour.1.height)), false),
-    };
-    let named_exposure = n.exposure.and_then(get);
-    // An output-size colour input whose buffer names no exposure (DLAA in a game that gives DLSS
-    // none): a registered 1x1 R16F elsewhere is not DLSS's; the exposure is measured from the frame.
-    let measured = named_exposure.is_none() && !smaller(colour.1.width, colour.1.height, output);
-    Some(Inputs {
-        colour,
-        // Its own depth image, or (destroyed since: a game rotating its depth images) the registered
-        // depth image at the colour input's extent.
-        depth: get(n.depth).or_else(|| at(registered, &DEPTH_FORMATS, colour.1.width, colour.1.height))?,
-        mvec: get(n.mvec)?,
-        candidates: size.map_or(1, |s| s.candidates.max(1 + rest.len())),
-        others,
-        output,
-        output_from_swapchain,
-        exposure: exposure_images(registered),
-        exposure_input: if measured { None } else { named_exposure.or_else(|| registered_exposure_input(registered)) },
-        exposure_named: named_exposure.is_some(),
-        rule: Rule::Params,
-    })
-}
-
-/// Short names for the usage bits that matter here, for [`diagnose`].
-fn usage_short(usage: vk::ImageUsageFlags) -> String {
-    let names = [
-        (vk::ImageUsageFlags::STORAGE, "storage"),
-        (vk::ImageUsageFlags::SAMPLED, "sampled"),
-        (vk::ImageUsageFlags::COLOR_ATTACHMENT, "colour"),
-        (vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, "depth"),
-        (vk::ImageUsageFlags::TRANSFER_SRC, "src"),
-        (vk::ImageUsageFlags::TRANSFER_DST, "dst"),
-    ];
-    let list: Vec<&str> = names.iter().filter(|(bit, _)| usage.contains(*bit)).map(|(_, n)| *n).collect();
-    if list.is_empty() {
-        "-".to_string()
-    } else {
-        list.join("+")
-    }
-}
-
-/// The longest [`diagnose`] text.
-pub(crate) const DIAGNOSE_MAX: usize = 1500;
-
-/// At most this many failed identifications per device are logged with [`diagnose`].
-const MAX_DIAGNOSES: u32 = 16;
-
-/// Why [`identify`] found nothing, compactly: what the output was taken to be, for every extent
-/// with an RGBA16F storage image the first condition it failed, and the registered views grouped by
-/// extent, format and usage (largest first, with counts). At most [`DIAGNOSE_MAX`] bytes.
-pub(crate) fn diagnose(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapchain: Option<(u32, u32)>) -> String {
-    let output = swapchain.or_else(|| output_candidate(registered));
-    type Key = (std::cmp::Reverse<u64>, u32, u32, i32, u32, bool);
-    let mut kinds: BTreeMap<Key, usize> = BTreeMap::new();
-    for (_, d) in registered.values() {
-        let key = (std::cmp::Reverse(u64::from(d.width) * u64::from(d.height)), d.width, d.height, d.format.as_raw(), d.usage.as_raw(), d.plain);
-        *kinds.entry(key).or_default() += 1;
-    }
-    let mut extents: Vec<(u32, u32)> = registered.values().filter(|(_, d)| colour_like(d)).map(|(_, d)| (d.width, d.height)).collect();
-    extents.sort_by_key(|&(w, h)| (std::cmp::Reverse(u64::from(w) * u64::from(h)), w, h));
-    extents.dedup();
-    const MAX_REASONS: usize = 8;
-    let mut reasons: Vec<String> = extents
-        .iter()
-        .take(MAX_REASONS)
-        .map(|&(w, h)| {
-            let why = if output.is_none_or(|o| !smaller(w, h, o)) {
-                "not smaller than the output"
-            } else if at(registered, &DEPTH_FORMATS, w, h).is_none() {
-                "no depth image at this extent"
-            } else if at(registered, &MVEC_FORMATS, w, h).is_none() {
-                "no R16G16/R32G32_SFLOAT motion vectors at this extent"
-            } else {
-                "qualifies"
-            };
-            format!("{w}x{h} {why}")
-        })
-        .collect();
-    if extents.len() > MAX_REASONS {
-        reasons.push(format!("... (+{} more)", extents.len() - MAX_REASONS));
-    }
-    let output_text = match (swapchain, output) {
-        (Some(s), _) => format!("output: swapchain {}x{}", s.0, s.1),
-        (None, Some(o)) => format!("output: no swapchain known, largest RGBA16F/R11G11B10 storage image {}x{}", o.0, o.1),
-        (None, None) => "output: no swapchain known and no RGBA16F/R11G11B10 storage image to compare with".to_string(),
-    };
-    let mut line =
-        format!("{output_text}; RGBA16F storage extents: {}; registered: ", if reasons.is_empty() { "none".to_string() } else { reasons.join(", ") });
-    let total = kinds.len();
-    for (k, (&(_, w, h, format, usage, plain), n)) in kinds.iter().enumerate() {
-        let item = format!(
-            "{}{w}x{h} {:?} {}{} x{n}",
-            if k > 0 { ", " } else { "" },
-            vk::Format::from_raw(format),
-            usage_short(vk::ImageUsageFlags::from_raw(usage)),
-            if plain { "" } else { " (not 2D single-sample)" }
-        );
-        let more = format!("{}... (+{} more)", if k > 0 { ", " } else { "" }, total - k);
-        if line.len() + item.len() + more.len() > DIAGNOSE_MAX {
-            line.push_str(&more);
-            break;
-        }
-        line.push_str(&item);
-    }
-    line
-}
 
 /// One image barrier on a watched image, as the application recorded it (stages and accesses as
 /// their sync2 values; the sync1 bits are the same low bits).
@@ -1577,45 +947,35 @@ struct Rendering {
     last_suspending: bool,
 }
 
-/// DLSS's output kernel, its output image and the inputs of the same buffer ([`Tracker::dlss_output`]).
+/// DLSS's output as its evaluates write it ([`Tracker::dlss_output`]): the output image and the inputs of the same
+/// evaluate, from NGX's record, and how many of the evaluate's launches name the output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DlssOutput {
-    pub function: vk::CuFunctionNVX,
     pub image: vk::Image,
     pub input: vk::Image,
     pub depth: vk::Image,
     pub mvec: vk::Image,
-    /// The buffer is Ray Reconstruction's.
+    /// The evaluate is Ray Reconstruction's.
     pub rr: bool,
-    /// How many launches of the output kernel name the output in one buffer: DLSS writes it in that many
-    /// parts (Cyberpunk 2077's Ray Reconstruction: 12 `rr2_downsample_kernel_static_hdr` launches, each
-    /// after an `rr2_post_kernel`), so the hold goes after the last ([`Tracker::launch_kernel`]).
+    /// How many of the evaluate's launches (those between its record and its end, [`crate::ngx_ring::ended`]) name
+    /// the output: DLSS writes it in that many parts (Cyberpunk 2077's Ray Reconstruction: 12), so the hold goes after
+    /// the last ([`Tracker::launch_kernel`]).
     pub writes: u32,
 }
 
-/// Whether two buffers' DLSS outputs are the same output: the same kernel writing an image of the same
-/// extent and format from an input of the same extent with motion vectors of the same extent and format, in
-/// as many launches, Ray Reconstruction's or not (the handles may alternate frame by frame). Motion vectors of
-/// another kind are another reading of the buffer (Ray Reconstruction's launch read with other known inputs,
-/// [`rr_input_launch`]): the hold after it waits until that is learnt.
+/// Whether two evaluates' outputs are the same output: an image of the same extent and format from an input of the
+/// same extent with motion vectors of the same extent and format, in as many launches, Ray Reconstruction's or not
+/// (the handles may alternate frame by frame: Hogwarts Legacy's Ray Reconstruction).
 fn same_output(a: &DlssOutput, b: &DlssOutput, images: &HashMap<vk::Image, ImageDesc>) -> bool {
     let kind = |i: &vk::Image| images.get(i).map(|d| (d.width, d.height, d.format));
     let extent = |i: &vk::Image| images.get(i).map(|d| (d.width, d.height));
-    a.function == b.function
-        && a.rr == b.rr
+    a.rr == b.rr
         && a.writes == b.writes
         && kind(&a.image).is_some()
         && kind(&a.image) == kind(&b.image)
         && extent(&a.input) == extent(&b.input)
         && kind(&a.mvec) == kind(&b.mvec)
 }
-
-/// Submitted DLSS buffers in a row naming the same output kernel and kind of output image ([`same_output`])
-/// before it is taken.
-const OUTPUT_SETTLE: u32 = 8;
-
-/// The (kernel, image) output pairs counted per buffer ([`LaunchRefs::output_writes`]), at most.
-const MAX_OUTPUT_PAIRS: usize = 8;
 
 /// Holds after DLSS's output that could not be had in a row before the output counts as not learnable
 /// ([`Tracker::after_missed`]).
@@ -1625,12 +985,17 @@ const AFTER_MISSES: u32 = 8;
 /// layout first seen a few frames late, or a game still loading, does not keep the passes away for good.
 const AFTER_RETRY: Duration = Duration::from_secs(5);
 
+/// The identification's images ([`Tracker::refresh`]): what changes it, so a new frame of the same evaluate on another
+/// colour image of the same shape (a game alternating DLSS's input between images: Remnant II, Expedition 33) is no
+/// new identification; each buffer is held with its own evaluate's colour input ([`Tracker::scan`]).
+type Key = (ColourWatch, vk::Image, Option<vk::Image>);
+
 /// Per-device tracking state. Every hook that feeds it only does map operations under the lock.
 #[derive(Default)]
 pub(crate) struct Tracker {
-    /// DLSS's output kernel and image, learned from submitted buffers ([`DlssOutput`]).
+    /// DLSS's output as its last evaluate wrote it ([`DlssOutput`]).
     dlss_output: Option<DlssOutput>,
-    /// The launch just recorded is DLSS's output kernel naming its output, and passes run after DLSS
+    /// The launch just recorded is the last of its evaluate to write DLSS's output, and passes run after DLSS
     /// ([`placement`]): the hold goes right after it, for those passes (taken by [`Tracking::launch_with_after`]).
     after_at: Option<(vk::CommandBuffer, DlssOutput, placement::Plan)>,
     /// Holds after DLSS's output missed in a row, and for which output ([`Self::after_missed`]).
@@ -1639,15 +1004,13 @@ pub(crate) struct Tracker {
     after_refused: Option<(DlssOutput, Instant)>,
     /// Outputs whose refusal was logged (once each).
     after_refused_said: Vec<DlssOutput>,
-    output_streak: Option<(DlssOutput, u32)>,
     images: HashMap<vk::Image, ImageDesc>,
     views: HashMap<vk::ImageView, vk::Image>,
     /// Views registered through `vkGetImageViewHandle*NVX`/`vkGetImageViewAddressNVX`, and their image.
     registered: HashMap<vk::ImageView, vk::Image>,
-    swapchains: HashMap<vk::SwapchainKHR, (u32, u32)>,
-    /// The registered set or the swapchains changed since the last identification.
-    dirty: bool,
+    /// The identification: DLSS's inputs as the newest Super Resolution evaluate on this device names them.
     inputs: Option<Inputs>,
+    key: Option<Key>,
     /// What the last identification log line said, so a change is logged once.
     announced: Option<String>,
     /// Command buffers with a `vkCmdCuLaunchKernelNVX` recorded since their last begin (directly or
@@ -1655,32 +1018,14 @@ pub(crate) struct Tracker {
     launch: HashMap<vk::CommandBuffer, LaunchRefs>,
     /// The values a view registration returned (`vkGetImageViewHandle*NVX` handles,
     /// `vkGetImageViewAddressNVX` addresses), for every registered view: what a kernel parameter
-    /// buffer that reads one of them carries. A launch counts as someone else's only when it names
-    /// a registered view and none of them is the colour input.
+    /// buffer that reads one of them carries.
     keys: Vec<(u64, vk::ImageView, vk::Image)>,
-    /// The motion vectors DLSS's most recently recorded input launch named. The hold copies the
-    /// identified ones only while they are these: when a game switches DLSS to new images (Hogwarts
-    /// Legacy loading a save), launches name the new ones before the identification follows, and the
-    /// old ones, which DLSS no longer reads, may already be on their way out; reading them then made
-    /// the GPU hang (Xid 109) on about half of all loads (docs/PRE_UPSCALER_DESIGN.md,
-    /// "High-resolution motion vectors").
-    current_mvec: Option<vk::Image>,
-    /// Launch-bearing submits whose buffers all had readable parameters none of which named the
-    /// colour input (DLSS Frame Generation's, in GTA V), forwarded untouched.
+    /// Launch-bearing submits held at a buffer with DLSS's Super Resolution evaluate, and those forwarded (no
+    /// buffer of theirs carries one: DLSS Frame Generation's, Ray Reconstruction's).
+    pub(crate) evaluate_submits: u64,
     pub(crate) foreign_submits: u64,
-    /// Launch-bearing submits whose launch buffer names the colour input: the hold point, though either hold may
-    /// still refuse the frame ([`HOLDS_SPLIT`] and [`HOLDS_INSIDE`] count the holds that ran).
-    pub(crate) named_colour_submits: u64,
-    /// Forwarded (foreign) launch-bearing buffers whose launches name another colour candidate
-    /// ([`Inputs::others`]) and not the colour input, and the first such candidate seen: evidence
-    /// for a game that alternates DLSS's colour input between images (none is held for it).
-    pub(crate) other_candidate_buffers: u64,
-    other_named: Option<vk::Image>,
     /// Which first-of-a-kind classification lines were logged.
     said_kinds: u8,
-    /// Failed identifications logged with the registered set ([`diagnose`]); at most
-    /// [`MAX_DIAGNOSES`], later ones get the short line only.
-    diagnoses: u32,
     /// Barriers recorded into each command buffer for the watched images, in recording order,
     /// awaiting submission.
     pending: HashMap<vk::CommandBuffer, Vec<ImageSync>>,
@@ -1697,72 +1042,31 @@ pub(crate) struct Tracker {
     /// The command buffers that wait on an event (`vkCmdWaitEvents*`) while an input was watched, whatever
     /// synchronization came first in them: an event the host sets after the submission returns.
     event_waits: HashSet<vk::CommandBuffer>,
-    /// The launch just recorded was the first of its command buffer to name a colour candidate:
-    /// the buffer and that image ([`Self::inline_point`] decides on a hold inside the buffer there).
-    inline_at: Option<(vk::CommandBuffer, vk::Image)>,
+    /// The launch just recorded was the first of its command buffer to name the colour input of the Super
+    /// Resolution evaluate it belongs to: the buffer and its record ([`Self::inline_point`] decides on a hold inside
+    /// the buffer there).
+    inline_at: Option<(vk::CommandBuffer, crate::ngx_ring::Record)>,
     /// Command buffers with a suspending or resuming dynamic render pass instance.
     rendering: HashMap<vk::CommandBuffer, Rendering>,
-    /// Launch-bearing submits seen.
+    /// Launch-bearing submits held at a buffer with an evaluate.
     evaluations: u64,
     /// The inputs changed in [`Self::refresh`] and no launch-bearing submit has been scanned since
     /// ([`Scan::identified_now`]).
     identified: bool,
-    /// What submitted launch-bearing buffers' input launches named ([`InputLaunch::Inputs`]), one
-    /// entry per colour input, at most [`MAX_NAMED`].
-    named: Vec<Named>,
-    /// The launch-bearing submit ([`Self::launch_submits`]) at which an input launch last named each entry of
-    /// [`Self::named`], by its colour input: an entry no input launch named for [`SR_RECENT`] of them is dropped
-    /// ([`Self::observe`]).
-    named_seen: HashMap<vk::Image, u64>,
-    /// Lines logged for evidence dropped that way (at most [`MAX_DIAGNOSES`]).
-    named_dropped: u32,
-    /// Launch-bearing submits since [`Self::named`] last changed.
-    named_quiet: u32,
-    /// The evidence chosen once it settled ([`SETTLE_SUBMITS`]); [`Self::refresh`] prefers it to
-    /// the size rule.
-    named_pick: Option<Named>,
-    /// Which of [`Self::observe`]'s once-only lines were logged.
-    said_named: u8,
     /// Counts identifications: bumped whenever [`Self::refresh`] changes the inputs
     /// ([`Scan::identification`]).
     generation: u64,
-    /// The CUDA kernels created on the device (`vkCreateCuFunctionNVX`), with what they are.
-    functions: HashMap<vk::CuFunctionNVX, (Kernel, String)>,
+    /// The CUDA kernels' names (`vkCreateCuFunctionNVX`), for the probes.
+    functions: HashMap<vk::CuFunctionNVX, String>,
     /// Launch-bearing submits seen by [`Self::observe`].
     launch_submits: u64,
-    /// The last of those carrying a DLSS Super Resolution input launch, identified or not ([`note_sr_launch`]).
-    last_sr_launch: Option<u64>,
-    /// The last of those carrying a DLSS Ray Reconstruction launch.
-    last_rr: Option<u64>,
-    /// The Ray Reconstruction-family kernels seen launching (at most 4 names, for the log).
-    rr_names: Vec<String>,
-    /// [`Self::rr_running`] as of the last [`Self::observe`] (a change re-runs the identification).
-    rr_gate: bool,
-    /// The size rule's choice among several candidates overridden by what DLSS's input kernel
-    /// names ([`Self::observe`]: the same other candidate in [`SWITCH_AFTER`] consecutive input
-    /// launches, or at once when nothing is identified yet). [`Self::refresh`] prefers it while its
-    /// colour image is still one of the size rule's candidates.
-    switched: Option<Named>,
-    /// Every colour candidate of the size rule at the last [`Self::refresh`], lowest handles first
-    /// ([`size_candidates`]): what the input kernel may be followed to ([`Self::switch_by_evidence`],
-    /// [`Self::retarget`]). Crimson Desert registers up to ten at its render extent once it has
-    /// loaded into the world from the title screen, and in play its input kernel reads one past the
-    /// three [`Inputs::others`] keeps (2.0.6 regression run, 2026-10-05: never switched to, nothing
-    /// held in play).
-    pub(crate) candidates: Vec<(vk::Image, ImageDesc)>,
-    /// Registered images whose last registered view was destroyed. They stay registered (in
-    /// [`Self::registered_set`]) until the image itself is destroyed: Black Myth: Wukong's
-    /// benchmark with DLSS Frame Generation on destroys and re-creates the views it hands DLSS every
-    /// frame (about 65 a second, the images never), and dropping the image with its view flipped the
-    /// identification every frame, so nothing was ever held (2026-10-05).
+    /// The newest upscaling evaluate on this device is Ray Reconstruction's ([`Self::rr_running`]), as of the last
+    /// [`Self::refresh`].
+    rr: bool,
+    /// Registered images whose last registered view was destroyed. They stay registered until the image itself is
+    /// destroyed: Black Myth: Wukong's benchmark with DLSS Frame Generation on destroys and re-creates the views it
+    /// hands DLSS every frame (about 65 a second, the images never), and its launches still name the images.
     kept: HashSet<vk::Image>,
-    /// For the running tally line: registered images whose last view was destroyed (kept), and
-    /// registered images destroyed.
-    pub(crate) unregistered_by_view: u64,
-    pub(crate) unregistered_by_image: u64,
-    /// Changes of the depth image alone, and gaps without one, taken without re-identifying
-    /// ([`Self::refresh`]).
-    pub(crate) depth_changes: u64,
     /// Watched images attached in `vkCmdBeginRendering`, per command buffer, with their layout
     /// ([`Self::attachments`]).
     attached: HashMap<vk::CommandBuffer, Vec<(vk::Image, vk::ImageLayout)>>,
@@ -1781,8 +1085,7 @@ pub(crate) struct Tracker {
     /// image of that shape are recorded ([`Self::watched`]), so each image a game hands DLSS in turn has a known
     /// layout, and what was recorded on one carries across a new identification that watches it too
     /// ([`Self::keep_watched_across`]). Expedition 33 (Unreal Engine 5, #51) cycles DLSS's input through several
-    /// 1488x836 B10G11R11 images; only the identified one was watched, so the hold inside DLSS's buffer knew no
-    /// layout for the others, and each new identification dropped what was known of all of them.
+    /// 1488x836 B10G11R11 images.
     colour_watch: Option<ColourWatch>,
     /// Hold-inside refusals ordinary at a new identification ([`InlineRefusal::quiet`]): counted, logged with the
     /// counts at most every [`QUIET_REFUSALS_EVERY`] ([`Self::quiet_refusal_line`]), when last logged.
@@ -1794,85 +1097,36 @@ pub(crate) struct Tracker {
     said_untried: u8,
     /// The identification ([`Self::generation`]) and the kinds of [`InlineRefusal`] logged for it.
     said_refusals: (u64, u16),
-    /// Each colour image's layout at DLSS's launch buffer in the last submission held with it (the identified
-    /// colour input, or the candidate its input launch named, [`Self::retarget`]; [`Self::scan`]): what the split's
-    /// check reads there. Kept across identifications as the committed layouts are ([`Self::keep_watched_across`]).
+    /// Each colour image's layout at DLSS's launch buffer in the last submission held with it ([`Self::scan`]): what
+    /// the split's check reads there. Kept across identifications as the committed layouts are
+    /// ([`Self::keep_watched_across`]).
     launch_layouts: HashMap<vk::Image, vk::ImageLayout>,
     /// The last launch's kernel name and the registered images it named, kept only for
     /// `NEURAL_FORGE_PROBE_IMAGE` ([`probe_image`]).
     last_launch: Option<(String, Vec<vk::Image>)>,
-    /// The camera jitter's sequence as the launches that carry it showed it ([`Self::jitter_for_hold`]): each
-    /// jitter and the one seen after it, and the last one seen.
-    jitter_next: HashMap<u64, u64>,
-    jitter_last: Option<u64>,
-    /// Predicted jitters checked against the one the same buffer's launch carried after the hold: right, wrong;
-    /// and whether prediction stopped for this device (too many wrong, [`JITTER_WRONG_MAX`]).
-    jitter_checks: (u64, u64),
-    jitter_stopped: bool,
-    jitter_said: bool,
-    /// Logged once: a hold waited for the input launch for its jitter ([`LaunchRefs::hold_deferred`]).
-    jitter_deferred_said: bool,
-    /// DLSS's own history reset, carried by a buffer's input launch recorded after a hold in that buffer had
-    /// already been told there was none ([`Self::reset_for_hold`]): for the next hold.
-    reset_latched: bool,
-    /// Input launches in a row whose reset word was set, and whether it stopped counting as the game's reset on this
-    /// device ([`Self::reset_flag`]).
-    reset_streak: u32,
-    reset_ignored: bool,
-    /// What turns DLSS's motion vectors into the colour input's pixels, as the last SR input launch gave it
-    /// ([`mv_units_scale`]): `None` until one did, and for other kernels.
-    mv_scale: Option<[f32; 2]>,
-    /// The extent of the colour input of the SR input launch [`Self::mv_scale`] was read from ([`after_mv_units`]).
-    mv_scale_render: Option<(u32, u32)>,
     /// The identification ([`Self::generation`]) a hold inside DLSS's buffer was recorded for: from
     /// then on [`Self::inline_point`] answers for the buffers the split could take too
     /// ([`Hazard::HeldInside`]).
     inline_in_use: Option<u64>,
-    /// Diagnostics: the kernels seen making a buffer's first launch naming a colour candidate.
-    said_first_kernels: Vec<String>,
     /// The probe's parameter-layout lines already written, by kernel name and buffer size
     /// ([`Self::probe_layout`]).
     layouts_said: Vec<(String, usize)>,
-    /// The launch-bearing submit at which the current gap without a depth image began: the inputs
-    /// are kept for at most [`SR_RECENT`] launch-bearing submits from it.
-    depth_gap: Option<u64>,
-    /// Consecutive input launches naming the same size-rule candidate other than the colour input.
-    streak: Option<(Named, u32)>,
-    /// Held launch-bearing submits whose buffer's input launch names another size-rule candidate
-    /// (with the colour input's depth and motion vectors): held with that candidate as the target
-    /// ([`Self::scan`]). Counted in [`Self::named_colour_submits`] too.
-    pub(crate) retargeted_submits: u64,
-    retarget_named: Option<vk::Image>,
-    /// The last held submit's target colour image, and the evaluations at which it changed (the
-    /// last [`ALTERNATION_WINDOW`]); more than [`ALTERNATION_FLIPS`] there is alternation, logged once.
-    last_target: Option<vk::Image>,
-    flips: std::collections::VecDeque<u64>,
-    alternation: Option<(vk::Image, vk::Image)>,
 }
 
-/// Consecutive input launches naming the same other size-rule candidate before the colour input
-/// is switched to it ([`Tracker::observe`]).
-pub(crate) const SWITCH_AFTER: u32 = 8;
-
-/// Alternation of the hold target between colour candidates is logged when it changes more than
-/// [`ALTERNATION_FLIPS`] times within [`ALTERNATION_WINDOW`] held submits.
-const ALTERNATION_WINDOW: u64 = 60;
-const ALTERNATION_FLIPS: usize = 4;
-
-/// Where a submit's first launch-bearing command buffer is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where a submit's launch-bearing command buffer with DLSS's Super Resolution evaluate is.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Scan {
     pub batch: usize,
     pub index: usize,
     /// The colour input's committed layout just before the launch buffer, if any barrier on it was
     /// ever seen.
     pub colour_layout: Option<vk::ImageLayout>,
+    /// The buffer's evaluate's inputs, as NGX's record names them; `None` when one of its colour input, depth and
+    /// motion vectors is an image the layer did not see created on this device.
     pub inputs: Option<Inputs>,
     /// The depth and motion-vector images' committed layouts at the same point.
     pub depth_layout: Option<vk::ImageLayout>,
     pub mvec_layout: Option<vk::ImageLayout>,
-    /// The exposure candidates' committed layouts, index for index with [`Inputs::exposure`].
-    pub exposure_layouts: [Option<vk::ImageLayout>; MAX_EXPOSURE],
     /// The exposure input's committed layout.
     pub exposure_input_layout: Option<vk::ImageLayout>,
     pub evaluation: u64,
@@ -1885,8 +1139,8 @@ pub(crate) struct Scan {
     pub identification: u64,
     /// Why the submit must not be split in front of its launch buffer, if anything recorded says so.
     pub hazard: Option<Hazard>,
-    /// Why a dump (which also reads depth, the motion vectors and the 1x1 exposure candidates)
-    /// must not be taken in front of the launch buffer: a barrier on one of those images only.
+    /// Why a dump (which also reads depth, the motion vectors and the exposure image) must not be taken in front of
+    /// the launch buffer: a barrier on one of those images only.
     pub dump_hazard: Option<Hazard>,
     /// A barrier on the depth image itself in front of the launch: the model-mode hold then does not
     /// copy the depth (it would read it before the launch buffer finished it), and marks it invalid
@@ -1894,25 +1148,11 @@ pub(crate) struct Scan {
     pub depth_hazard: Option<Hazard>,
     /// The queue family that owns the colour input, when a submitted ownership transfer said so.
     pub colour_owner: Option<u32>,
-    /// The camera jitter DLSS was given for this frame, when its input kernel's parameters say
-    /// ([`LaunchRefs::jitter`]; [`Self::jitter_px`] reads it).
-    pub jitter: Option<u64>,
-    /// The game reset DLSS's history for this frame ([`LaunchRefs::reset`]). A reset latched for the next hold
-    /// ([`Tracker::reset_for_hold`]) is added only where the split hold runs ([`Tracking::split_dlss_frame`]).
-    pub reset: bool,
+    /// What NGX's record of the evaluate says of its frame: the camera jitter and the game's reset.
+    pub frame: DlssFrame,
 }
 
 impl Scan {
-    /// The camera jitter (x, y, render pixels), if known.
-    pub(crate) fn jitter_px(&self) -> Option<[f32; 2]> {
-        self.jitter.map(|v| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
-    }
-
-    /// What DLSS's input launch said of this submit's frame (without a latched reset).
-    pub(crate) fn dlss_frame(&self) -> DlssFrame {
-        DlssFrame { jitter: self.jitter_px(), reset: self.reset }
-    }
-
     /// Whether the colour input can be taken to be in `GENERAL` at this submit: its last committed
     /// barrier left it there, or no barrier on it was seen since it was watched. Never on the
     /// submit that (re)identified the inputs ([`Self::identified_now`]): that one goes to DLSS
@@ -1924,267 +1164,46 @@ impl Scan {
 }
 
 /// What one command buffer's `vkCmdCuLaunchKernelNVX` launches referenced.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct LaunchRefs {
     /// A launch whose parameter buffer could not be read.
     pub opaque: bool,
     /// Registered images whose handle (or address) is in a launch's parameters.
     pub images: Vec<vk::Image>,
-    /// The first launch (in recording order) that names a depth image and a 2-channel float image,
-    /// read as DLSS Super Resolution's input kernel ([`input_launch`]): the first launch of SR's
-    /// buffer.
-    pub input: Option<InputLaunch>,
-    /// A launch after the input launch names its colour input again together with another colour
-    /// candidate of the same extent (DLSS Super Resolution's output kernel: input and output).
-    pub output_pair: bool,
-    /// Whether the input launch's kernel is DLSS Super Resolution's input kernel ([`Kernel`]);
-    /// `None` when its name is not known.
-    pub input_sr: Option<bool>,
-    /// The input launch's kernel is DLSS Ray Reconstruction's ([`Kernel::RayReconstruction`]): never
-    /// evidence for the identification.
-    pub input_rr: bool,
-    /// The buffer launches DLSS Super Resolution's input kernel, known by name ([`Kernel::SrInput`]), whatever its
-    /// parameters name: DLSS runs, its inputs identified or not ([`note_sr_launch`]).
-    pub sr_launched: bool,
-    /// The Ray Reconstruction-family kernels launched in the buffer ([`Kernel::RayReconstruction`]),
-    /// at most 4 distinct.
-    pub rr: Vec<vk::CuFunctionNVX>,
+    /// The DLSS evaluate the buffer's launches belong to: NGX's record ([`crate::ngx_ring`]) of the evaluate whose
+    /// colour input the buffer's first launch naming it named before the evaluate ended. Every later launch of the
+    /// buffer until the evaluate's end ([`Self::ended`]) is the evaluate's.
+    pub ngx: Option<crate::ngx_ring::Record>,
+    /// The evaluate's end record was read: the buffer's later launches are not its.
+    pub ended: bool,
     /// What the buffer held when its first launch was recorded.
     pub before_first: Option<Before>,
     /// The same for the first launch naming each image of [`Self::images`].
     pub before_named: Vec<(vk::Image, Before)>,
-    /// The last launch after the input launch that names a colour candidate larger than the input
-    /// (DLSS's output kernel writing the upscaled frame, Super Resolution's or Ray Reconstruction's), and
-    /// that output image ([`Tracker::dlss_output`]).
-    pub output: Option<(vk::CuFunctionNVX, vk::Image)>,
-    /// How many launches of the buffer named each (kernel, image) pair as their output ([`Self::output`];
-    /// [`DlssOutput::writes`]).
-    pub output_writes: Vec<((vk::CuFunctionNVX, vk::Image), u32)>,
-    /// The kernel of the first launch naming each image of [`Self::images`].
-    pub named_by: Vec<(vk::Image, vk::CuFunctionNVX)>,
-    /// The camera jitter the buffer's DLSS Super Resolution input launch was given: word 3 of a 310.x
-    /// `hiluma_engine_input*` kernel's parameters, x in its low and y in its high 32 bits, render
-    /// pixels (docs/NATIVE_BACKEND.md, "Motion vectors"). `None` for other kernels.
-    pub jitter: Option<u64>,
-    /// The jitter a hold recorded before the launch carrying it was given ([`Tracker::jitter_for_hold`]), until
-    /// that launch checks it.
-    pub predicted: Option<u64>,
-    /// Whether the game reset DLSS's history for this frame: the reset word ([`reset_word`]) of the buffer's
-    /// first launch that carries one, non-zero. `None` until such a launch is recorded, and for other kernels.
-    pub reset: Option<bool>,
-    /// A hold recorded into the buffer before the launch carrying the reset word ([`Tracker::reset_for_hold`]).
-    pub reset_asked: bool,
-    /// The buffer's first launch naming the colour input came before its input launch, and the camera jitter
-    /// could not be predicted there: the hold goes at the input launch instead ([`Tracker::launch_kernel`]).
-    pub hold_deferred: bool,
-    /// The images of the NGX evaluate this buffer's input launch belongs to, from the NGX wrapper's ring
-    /// ([`crate::ngx_ring`]): the source of truth for the buffer where present.
-    pub ngx: Option<crate::ngx_ring::Images>,
-    /// The output the kernel rules chose ([`Self::output`] holds NGX's where there is a record), for the check.
-    pub kernel_output: Option<vk::Image>,
+    /// How many of the evaluate's launches named its output ([`DlssOutput::writes`]).
+    pub output_writes: u32,
 }
 
 impl LaunchRefs {
-    /// How many launches of the buffer so far named `image` as `function`'s output ([`Self::output_writes`]).
-    fn writes_of(&self, function: vk::CuFunctionNVX, image: vk::Image) -> u32 {
-        self.output_writes.iter().find(|(k, _)| *k == (function, image)).map_or(0, |(_, n)| *n)
-    }
-
-    /// `n` more launches naming `key`'s image as its kernel's output ([`Self::output_writes`]).
-    fn count_output(&mut self, key: (vk::CuFunctionNVX, vk::Image), n: u32) {
-        if let Some((_, m)) = self.output_writes.iter_mut().find(|(k, _)| *k == key) {
-            *m += n;
-        } else if self.output_writes.len() < MAX_OUTPUT_PAIRS {
-            self.output_writes.push((key, n));
-        }
+    /// The buffer's Super Resolution evaluate, if it carries one: the hold point before the upscaler.
+    pub(crate) fn sr(&self) -> Option<crate::ngx_ring::Record> {
+        self.ngx.filter(|r| !r.is_rr())
     }
 }
 
-/// What DLSS Super Resolution's input launch says of the frame a hold belongs to: the camera jitter (render
-/// pixels, x and y) and whether the game reset DLSS's history ([`LaunchRefs::reset`]).
+/// What NGX's record of an evaluate says of the frame a hold belongs to: the camera jitter (render pixels, x and y)
+/// and whether the game reset DLSS's history.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct DlssFrame {
     pub jitter: Option<[f32; 2]>,
     pub reset: bool,
 }
 
-/// Wrong predictions of the camera jitter ([`Tracker::jitter_for_hold`]) after which, with more than one in nine
-/// wrong, a device's holds go without a jitter again.
-const JITTER_WRONG_MAX: u64 = 8;
-
-/// The most jitters of a sequence kept ([`Tracker::jitter_next`]); DLSS's are 8 to a few dozen long.
-const JITTER_SEQUENCE_MAX: usize = 1024;
-
-/// A jitter word as render pixels, x and y.
-fn jitter_px(v: u64) -> [f32; 2] {
-    [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)]
-}
-
-/// The word of a 310.x SR input kernel's parameters that holds the camera jitter ([`LaunchRefs::jitter`]).
-const HILUMA_JITTER_WORD: usize = 3;
-
-/// The same in plain `cuda_engine_input_kernel` (GTA San Andreas - The Definitive Edition, Unreal Engine 4's DLSS
-/// plugin): bytes 72-79, Halton(2,3) minus 0.5 in render pixels; bytes 80-87 hold 0 (`NEURAL_FORGE_PROBE_KERNEL`,
-/// 3000 launches, 2026-10-23). Read as the family's word 10 before, every hold had a jitter of 0.
-const CUDA_ENGINE_PLAIN_JITTER_WORD: usize = 9;
-
-/// The same in the `cuda_engine_input_kernel_*` family (Black Myth: Wukong's DLSS): bytes 80-87, a
-/// Halton(2,3) sequence minus 0.5 in render pixels, 24 frames long (`NEURAL_FORGE_PROBE_KERNEL`, 2026-10-07).
-const CUDA_ENGINE_JITTER_WORD: usize = 10;
-
-/// The same in Crimson Desert's 310.9 Super Resolution encoder (`rrlite_enc0_*`, with Ray Reconstruction off):
-/// bytes 168-175, Halton(2,3) minus 0.5 in render pixels; bytes 176-183 hold the previous frame's
-/// (`NEURAL_FORGE_PROBE_KERNEL`, 3000 launches, 2026-10-09).
-const RRLITE_ENC0_JITTER_WORD: usize = 21;
-
-/// The word of a 310.x SR input kernel's parameters that holds the game's history reset (NGX's `Reset`, as DLSS
-/// was given it): 0 on every launch of a GTA V Enhanced benchmark run (`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`)
-/// but the first frame's and two camera cuts mid-pass that the picture-based detector missed (2026-11-09).
-const HILUMA_RESET_WORD: usize = 4;
-
-/// The words of a 310.x SR input kernel's parameters that say what DLSS's motion vectors are measured in: word 1 is
-/// the factor that turns them into output pixels (NGX's `MVScale` over the render-to-output ratio), word 5 the render
-/// size over the output's, x in the low and y in the high 32 bits of each. Their product turns them into the colour
-/// input's pixels. Measured (2026-11-10, #49): GTA V Enhanced 1.7239 x 0.5801 = 1 (render pixels, `mvlo`), Hogwarts
-/// Legacy 1 x 0.6672 = 0.667 (output pixels, `mvhi`; the frames line up there at 0.667), Cyberpunk 2077 2560 x 0.5801
-/// = 1485 (fractions of the frame: its frames line up at 1485 times their value, not at 1).
-const HILUMA_MV_SCALE_WORD: usize = 1;
-const HILUMA_RENDER_RATIO_WORD: usize = 5;
-
-/// [`HILUMA_MV_SCALE_WORD`] times [`HILUMA_RENDER_RATIO_WORD`] from a SR input launch's parameters, per axis; `None`
-/// unless the kernel is a `hiluma_engine_input*` one and both halves of both words are plausible (finite, the ratio
-/// in (0, 4], the product in [1e-3, 1e5]).
-fn mv_units_scale(name: &str, words: &[[u8; 8]]) -> Option<[f32; 2]> {
-    if !name.starts_with("hiluma_engine_input") {
-        return None;
+impl DlssFrame {
+    /// `record`'s jitter (where finite) and reset.
+    pub(crate) fn of(record: &crate::ngx_ring::Record) -> Self {
+        Self { jitter: record.jitter.iter().all(|v| v.is_finite()).then_some(record.jitter), reset: record.reset }
     }
-    let pair = |at: usize| -> Option<[f32; 2]> {
-        let v = u64::from_le_bytes(*words.get(at)?);
-        Some([f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
-    };
-    mv_units_product(pair(HILUMA_MV_SCALE_WORD)?, pair(HILUMA_RENDER_RATIO_WORD)?)
-}
-
-/// A kernel's motion-vector scale word (`scale`, what turns them into the pixels of the frame it writes) times its
-/// render-over-output ratio word (`ratio`), per axis: what turns them into render pixels. `None` unless both are
-/// finite, the ratio in (0, 4] and the product's magnitude in [1e-3, 1e5]. The sign is kept: NGX's `MVScale` is
-/// negative for motion vectors whose y points up (Crimson Desert's: -2160 at 3840x2160).
-fn mv_units_product(scale: [f32; 2], ratio: [f32; 2]) -> Option<[f32; 2]> {
-    let mut out = [0.0f32; 2];
-    for axis in 0..2 {
-        let (s, r) = (scale[axis], ratio[axis]);
-        if !(s.is_finite() && r.is_finite() && r > 0.0 && r <= 4.0) {
-            return None;
-        }
-        let p = s * r;
-        if !(1e-3..=1e5).contains(&p.abs()) {
-            return None;
-        }
-        out[axis] = p;
-    }
-    Some(out)
-}
-
-/// Where a DLSS engine kernel's parameters say what the motion vectors are measured in: the render size over the size
-/// the engine works at, its inverse, one over the render size, one over that working size, and NGX's `MVScale` carried
-/// to that size (what turns the motion vectors into its pixels); x in the low and y in the high 32 bits of each word.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EngineMvWords {
-    ratio: usize,
-    inverse_ratio: usize,
-    inverse_render: usize,
-    inverse_working: usize,
-    mv_scale: usize,
-}
-
-/// DLSS Ray Reconstruction's first kernel (`rr2_enc0_kernel`, 310.x, 1088 bytes): words 51, 52, 53, 54 and 56. Probed
-/// (issue #49, 2026-11-10): Cyberpunk 2077 at 2560x1440, Ray Reconstruction working at 3840x2160 before its own
-/// downsample to the output, 0.38672 x 0.38657, 2.5859 x 2.5868, 1/1485 x 1/835, 1/3840 x 1/2160 and 3840 x 2160 (its
-/// motion vectors are fractions of the frame: 1485 x 835 render pixels each, as its Super Resolution's input kernel
-/// says); Crimson Desert at 3840x2160 (2026-10-09), 0.39479 x 0.39444, 2.5330 x 2.5352, 1/1516 x 1/852, 1/3840 x
-/// 1/2160 and 3840 x -2160.
-const RR2_ENC0_MV_WORDS: EngineMvWords = EngineMvWords { ratio: 51, inverse_ratio: 52, inverse_render: 53, inverse_working: 54, mv_scale: 56 };
-
-/// The same block in Crimson Desert's Super Resolution encoder (`rrlite_enc0_*`, 310.9, with Ray Reconstruction off;
-/// its hold, at NGX's luma kernel before it, has no `hiluma` input launch to read the units from): words 23, 24, 8, 32
-/// and 25. Probed at 3840x2160, DLSS Balanced (2026-10-09, `NEURAL_FORGE_PROBE_KERNEL`, 3000 launches): 0.39479 x
-/// 0.39444, 2.5330 x 2.5352, 1/1516 x 1/852, 1/3840 x 1/2160 and 3840 x -2160 on every launch: fractions of the frame
-/// with y up, 1516 x -852 render pixels each (the extents rule took them for render pixels, y down).
-const RRLITE_ENC0_MV_WORDS: EngineMvWords = EngineMvWords { ratio: 23, inverse_ratio: 24, inverse_render: 8, inverse_working: 32, mv_scale: 25 };
-
-/// Which engine kernel's parameters carry [`EngineMvWords`], by name, and what to call it in the log.
-fn engine_mv_words(name: &str) -> Option<(EngineMvWords, &'static str)> {
-    if name.starts_with("rr2_enc0") {
-        Some((RR2_ENC0_MV_WORDS, "Ray Reconstruction's parameters"))
-    } else if name.starts_with("rrlite_enc0_") {
-        Some((RRLITE_ENC0_MV_WORDS, "its Super Resolution encoder's parameters"))
-    } else {
-        None
-    }
-}
-
-/// What turns DLSS's motion vectors into render pixels as a DLSS engine kernel's launch says it, and the render size
-/// it says (the extent [`mv_units_scale`]'s answer is in): Ray Reconstruction from the start of a session runs no Super
-/// Resolution input kernel to read it from (issue #49), nor does Crimson Desert's Super Resolution (`rrlite_*`).
-/// `None` unless the kernel is one [`engine_mv_words`] knows and its words agree with each other: the ratio times its
-/// inverse 1, the ratio the working size's inverse over the render size's, and the render size whole pixels; so
-/// another parameter layout is never read as units.
-fn engine_mv_units_scale(name: &str, words: &[[u8; 8]]) -> Option<([f32; 2], (u32, u32), &'static str)> {
-    let (at, source) = engine_mv_words(name)?;
-    let pair = |at: usize| -> Option<[f32; 2]> {
-        let v = u64::from_le_bytes(*words.get(at)?);
-        Some([f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
-    };
-    let (ratio, inverse) = (pair(at.ratio)?, pair(at.inverse_ratio)?);
-    let (inv_render, inv_working) = (pair(at.inverse_render)?, pair(at.inverse_working)?);
-    let mut render = [0u32; 2];
-    for axis in 0..2 {
-        let (r, i, ir, iw) = (ratio[axis], inverse[axis], inv_render[axis], inv_working[axis]);
-        if ![r, i, ir, iw].iter().all(|v| v.is_finite() && *v > 0.0) || (r * i - 1.0).abs() > 1e-3 || (r - iw / ir).abs() > 1e-3 * r {
-            return None;
-        }
-        let size = 1.0 / ir;
-        if !(1.0..=16384.0).contains(&size) || (size - size.round()).abs() > 0.01 {
-            return None;
-        }
-        render[axis] = size.round() as u32;
-    }
-    Some((mv_units_product(pair(at.mv_scale)?, ratio)?, (render[0], render[1]), source))
-}
-
-/// What turns DLSS's motion vectors into output pixels at a hold after DLSS's output (`output`, from the render size
-/// `render`), from what an SR input launch said ([`mv_units_scale`]: `scale` turns them into the pixels of its colour
-/// input, of extent `at`). The hold works on the output, so the motion vectors' render pixels are scaled by output
-/// over render; without this the hold took them for render pixels, and Cyberpunk 2077's (fractions of the frame)
-/// moved its history by 1/1485 of the camera's motion (issue #49).
-///
-/// Ray Reconstruction's launches say nothing of the units, which are the game's, so a hold after it takes the last SR
-/// input launch's, carried to its render size by what they are: 1 (or -1, y up) is render pixels at any render size;
-/// anything else is proportional to it (the frame's fractions: the render size; output pixels: render over output). `None` for an
-/// empty extent.
-fn after_mv_units(scale: [f32; 2], at: (u32, u32), render: (u32, u32), output: (u32, u32)) -> Option<[f32; 2]> {
-    let (at, render, output) = ([at.0, at.1], [render.0, render.1], [output.0, output.1]);
-    if at.contains(&0) || render.contains(&0) || output.contains(&0) {
-        return None;
-    }
-    let mut units = [0.0f32; 2];
-    for axis in 0..2 {
-        let s = scale[axis];
-        // Render pixels with y up (a negative `MVScale`) stay -1 at any render size.
-        let in_render = if (s.abs() - 1.0).abs() < 1e-3 { s.signum() } else { s / at[axis] as f32 * render[axis] as f32 };
-        units[axis] = in_render * output[axis] as f32 / render[axis] as f32;
-    }
-    Some(units)
-}
-
-/// Input launches in a row with the reset word set after which it is not taken for the game's reset on that device
-/// ([`Tracker::reset_flag`]).
-const RESET_STREAK_MAX: u32 = 8;
-
-/// Which 8-byte word of a DLSS kernel's parameters holds the game's history reset, by kernel name
-/// ([`LaunchRefs::reset`]). Only where it was measured: the other families' words are not known.
-fn reset_word(name: &str) -> Option<usize> {
-    name.starts_with("hiluma_engine_input").then_some(HILUMA_RESET_WORD)
 }
 
 /// The variable that switches honouring the game's history reset off (`off`), for testing.
@@ -2208,27 +1227,6 @@ pub(crate) fn game_reset_honoured() -> bool {
 /// [`GAME_RESET_ENV`]'s value: on unless `off`.
 fn parse_game_reset(raw: Option<&str>) -> bool {
     raw.map(str::trim) != Some("off")
-}
-
-/// Which 8-byte word of a DLSS kernel's parameters holds the camera jitter, by kernel name.
-fn jitter_word(name: &str) -> Option<usize> {
-    if name.starts_with("hiluma_engine_input") {
-        Some(HILUMA_JITTER_WORD)
-    } else if name == "cuda_engine_input_kernel" {
-        Some(CUDA_ENGINE_PLAIN_JITTER_WORD)
-    } else if name.starts_with("cuda_engine_input_kernel_") {
-        Some(CUDA_ENGINE_JITTER_WORD)
-    } else if name.starts_with("rrlite_enc0_") {
-        Some(RRLITE_ENC0_JITTER_WORD)
-    } else {
-        None
-    }
-}
-
-/// A jitter word holds two finite floats within a pixel of the centre; anything else is not one
-/// (another parameter layout), and the frame goes without.
-fn jitter_plausible(v: u64) -> bool {
-    [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)].iter().all(|x| x.is_finite() && x.abs() <= 1.0)
 }
 
 /// The layouts the hold inside DLSS's buffer copies the motion vectors from (moved to
@@ -2447,8 +1445,8 @@ pub(crate) struct InlinePoint {
     /// vectors (the `mvhi` input kernels; Hogwarts Legacy), which the copy resamples to the colour
     /// input's ([`Self::mvec_scale`]).
     pub mvec_extent: (u32, u32),
-    /// What turns the motion vectors into the colour input's pixels as DLSS's input launch says it
-    /// ([`mv_units_scale`]); [`Self::mvec_scale`] falls back to the extents without it.
+    /// What turns the motion vectors into the colour input's pixels, from NGX's `MV.Scale`
+    /// ([`crate::ngx_ring::Record::mv_units`]); [`Self::mvec_scale`] falls back to the extents without one.
     pub mv_units: Option<[f32; 2]>,
     /// DLSS's depth at the hold, where its depth aspect can be copied (the native backend's depth
     /// copy): at the colour input's extent, in a layout [`depth_copy_layout`] takes.
@@ -2489,31 +1487,6 @@ impl InlinePoint {
             return [1.0, 1.0];
         }
         [self.desc.width as f32 / w as f32, self.desc.height as f32 / h as f32]
-    }
-}
-
-/// How a launch-bearing command buffer is treated at the submit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LaunchKind {
-    /// A launch reads the identified colour input: DLSS Super Resolution's buffer, the hold point.
-    Colour,
-    /// Every launch's parameters were read, they name registered views, and none of them is the
-    /// colour input (DLSS Frame Generation's buffers in GTA V): forwarded untouched.
-    Foreign,
-    /// Not decidable (a launch's parameters were not readable or name no registered view at all,
-    /// or no colour input is identified yet): held as before the distinction existed, so nothing
-    /// that worked stops working, and a handle form the scan misses cannot turn DLSS Super
-    /// Resolution's own buffer into a forwarded one.
-    Unknown,
-}
-
-impl LaunchRefs {
-    pub(crate) fn kind(&self, colour: Option<vk::Image>) -> LaunchKind {
-        match colour {
-            Some(c) if self.images.contains(&c) => LaunchKind::Colour,
-            Some(_) if !self.opaque && !self.images.is_empty() => LaunchKind::Foreign,
-            _ => LaunchKind::Unknown,
-        }
     }
 }
 
@@ -2584,42 +1557,12 @@ impl Tracker {
     pub(crate) fn forget_image(&mut self, image: vk::Image) {
         self.images.remove(&image);
         self.keys.retain(|k| k.2 != image);
-        let before = self.registered.len();
         self.registered.retain(|_, i| *i != image);
-        if self.kept.remove(&image) || self.registered.len() != before {
-            self.dirty = true;
-            self.unregistered_by_image += 1;
-        }
+        self.kept.remove(&image);
         self.committed.remove(&image);
         self.owners.remove(&image);
         self.launch_layouts.remove(&image);
         self.colour_barriers.remove(&image);
-        // Evidence naming a destroyed image is dropped; the rest settles again before it decides. Not
-        // for its depth image: a game rotating its depth images (Black Myth: Wukong with frame
-        // generation on, a new one every frame) would drop the evidence every frame; the depth is
-        // taken from the registered set instead ([`by_params`]).
-        let before = self.named.len();
-        self.named.retain(|n| ![n.colour, n.mvec].contains(&image));
-        self.named_seen.remove(&image);
-        for n in &mut self.named {
-            if n.exposure == Some(image) {
-                n.exposure = None;
-            }
-        }
-        if self.named.len() != before {
-            self.named_quiet = 0;
-        }
-        if self.named_pick.is_some_and(|n| [n.colour, n.mvec].contains(&image) || n.exposure == Some(image)) {
-            self.named_pick = None;
-            self.dirty = true;
-        }
-        if self.switched.is_some_and(|n| [n.colour, n.mvec].contains(&image) || n.exposure == Some(image)) {
-            self.switched = None;
-            self.dirty = true;
-        }
-        if self.streak.is_some_and(|(n, _)| [n.colour, n.mvec].contains(&image) || n.exposure == Some(image)) {
-            self.streak = None;
-        }
     }
 
     pub(crate) fn record_view(&mut self, view: vk::ImageView, image: vk::Image) {
@@ -2629,11 +1572,10 @@ impl Tracker {
     pub(crate) fn forget_view(&mut self, view: vk::ImageView) {
         self.views.remove(&view);
         self.keys.retain(|k| k.1 != view);
-        // The image stays registered ([`Self::kept`]): nothing changes for the identification.
+        // The image stays registered ([`Self::kept`]): its handles stay what launches name.
         if let Some(image) = self.registered.remove(&view) {
             if !self.registered.values().any(|i| *i == image) {
                 self.kept.insert(image);
-                self.unregistered_by_view += 1;
             }
         }
     }
@@ -2642,15 +1584,12 @@ impl Tracker {
     /// the handle or address it returned (what a kernel that reads the view is given).
     pub(crate) fn register(&mut self, view: vk::ImageView, key: Option<u64>) {
         if let Some(&image) = self.views.get(&view) {
-            let known = self.kept.remove(&image) || self.registered.values().any(|i| *i == image);
+            self.kept.remove(&image);
             if let Some(old) = self.registered.insert(view, image).filter(|&old| old != image) {
                 // A view handle reused for another image: the old image keeps its registration.
                 if !self.registered.values().any(|i| *i == old) {
                     self.kept.insert(old);
                 }
-            }
-            if !known {
-                self.dirty = true;
             }
             if let Some(key) = key.filter(|&k| k != 0) {
                 if !self.keys.iter().any(|k| k.0 == key) {
@@ -2660,28 +1599,20 @@ impl Tracker {
         }
     }
 
-    pub(crate) fn swapchain(&mut self, swapchain: vk::SwapchainKHR, extent: Option<(u32, u32)>) {
-        match extent {
-            Some(e) => self.swapchains.insert(swapchain, e),
-            None => self.swapchains.remove(&swapchain),
-        };
-        self.dirty = true;
-    }
-
     /// `vkCreateCuFunctionNVX` returned `function` for the kernel `name`.
     pub(crate) fn record_function(&mut self, function: vk::CuFunctionNVX, name: &str) {
-        self.functions.insert(function, (Kernel::of(name), name.to_string()));
+        self.functions.insert(function, name.to_string());
     }
 
     pub(crate) fn forget_function(&mut self, function: vk::CuFunctionNVX) {
         self.functions.remove(&function);
     }
 
-    /// Whether DLSS Ray Reconstruction runs: one of its kernels launched within the last [`SR_RECENT`]
-    /// launch-bearing submits. Then nothing is identified, so nothing is held: the model must not run on
-    /// Ray Reconstruction's noisy input, and runs after the upscaler instead ([`ray_reconstruction_running`]).
+    /// Whether DLSS Ray Reconstruction runs: the newest upscaling evaluate on this device is Ray Reconstruction's (NGX's
+    /// feature 13). Then nothing is identified, so nothing is held: the model must not run on Ray Reconstruction's
+    /// noisy input, and runs after the upscaler instead ([`ray_reconstruction_running`]).
     fn rr_running(&self) -> bool {
-        self.last_rr.is_some_and(|r| self.launch_submits.saturating_sub(r) < SR_RECENT)
+        self.rr
     }
 
     /// [`Self::launch_kernel`] without the kernel (its name unknown).
@@ -2690,65 +1621,22 @@ impl Tracker {
         self.launch_kernel(command_buffer, vk::CuFunctionNVX::null(), params);
     }
 
-    /// `vkCmdCuLaunchKernelNVX` of `function` recorded into `command_buffer`; `params` is the
-    /// launch's kernel parameter buffer when it could be read ([`launch_params`]), `None`
-    /// otherwise. Every 8-byte word of it is compared with the registered views' handles and
-    /// addresses. The buffer's first launch naming depth and motion vectors is kept as its input
-    /// launch ([`input_launch`]), with whether its kernel is SR's input kernel ([`Kernel`]).
+    /// `vkCmdCuLaunchKernelNVX` of `function` recorded into `command_buffer`; `params` is the launch's kernel parameter
+    /// buffer when it could be read ([`launch_params`]), `None` otherwise. Every 8-byte word of it is compared with the
+    /// registered views' handles and addresses. The buffer's first launch naming the colour input of a DLSS evaluate
+    /// that has not ended ([`crate::ngx_ring::evaluate_naming`]) ties the buffer to that evaluate; for Super Resolution
+    /// it is the hold point before the upscaler ([`Self::inline_at`]). The evaluate's later launches in the buffer, up
+    /// to its end, count the writes of its output: the last of as many as its last evaluate made
+    /// ([`Self::dlss_output`]) is the hold point after DLSS ([`Self::after_at`]).
     pub(crate) fn launch_kernel(&mut self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) {
-        let kernel = self.functions.get(&function).map(|(k, _)| *k);
         let before = Before { barriers: self.pending.get(&command_buffer).map_or(0, Vec::len), global: self.global_sync.get(&command_buffer).copied() };
-        {
-            let refs = self.launch.entry(command_buffer).or_default();
-            refs.before_first.get_or_insert(before);
-            refs.sr_launched |= kernel == Some(Kernel::SrInput);
-            if kernel == Some(Kernel::RayReconstruction) && refs.rr.len() < 4 && !refs.rr.contains(&function) {
-                refs.rr.push(function);
-            }
-        }
+        self.launch.entry(command_buffer).or_default().before_first.get_or_insert(before);
         let Some(bytes) = params else {
             self.launch.entry(command_buffer).or_default().opaque = true;
             return;
         };
-        if let Some((_, name)) = self.functions.get(&function) {
+        if let Some(name) = self.functions.get(&function) {
             probe_kernel(name, bytes);
-        }
-        if kernel == Some(Kernel::SrInput) {
-            probe_params(bytes);
-        }
-        // The camera jitter, from the first launch of the buffer whose kernel is known to carry it
-        // (SR's input kernels).
-        let at = self.functions.get(&function).and_then(|(_, name)| jitter_word(name));
-        if let Some(value) = at.and_then(|at| bytes.as_chunks::<8>().0.get(at)).map(|w| u64::from_le_bytes(*w)).filter(|&v| jitter_plausible(v)) {
-            let refs = self.launch.entry(command_buffer).or_default();
-            if refs.jitter.is_none() {
-                refs.jitter = Some(value);
-                self.learn_jitter(command_buffer, value);
-            }
-        }
-        // The motion vectors' units, from every SR input launch (they change with the render size); set below, with the
-        // extent of the colour input they are in.
-        let sr_mv_scale = self.functions.get(&function).and_then(|(_, name)| mv_units_scale(name, bytes.as_chunks::<8>().0));
-        // The same from Ray Reconstruction's first launch, or Crimson Desert's Super Resolution encoder, with the render
-        // size it is at: the only source while Ray Reconstruction runs from the start of a session (no Super Resolution
-        // input launch says it), and for Crimson Desert's Super Resolution (`rrlite_*`, no `hiluma` input launch).
-        if let Some((scale, at, source)) = self.functions.get(&function).and_then(|(_, name)| engine_mv_units_scale(name, bytes.as_chunks::<8>().0)) {
-            if self.mv_scale != Some(scale) || self.mv_scale_render != Some(at) {
-                crate::log!("[preupscale] DLSS's motion vectors are {} x {} render pixels at {}x{} ({source})", scale[0], scale[1], at.0, at.1);
-                self.mv_scale = Some(scale);
-                self.mv_scale_render = Some(at);
-            }
-        }
-        // The game's history reset, from the first launch of the buffer whose kernel is known to carry it.
-        let at = self.functions.get(&function).and_then(|(_, name)| reset_word(name));
-        if let Some(value) = at.and_then(|at| bytes.as_chunks::<8>().0.get(at)).map(|w| u64::from_le_bytes(*w)) {
-            if self.launch.get(&command_buffer).is_none_or(|r| r.reset.is_none()) {
-                let reset = self.reset_flag(value);
-                let refs = self.launch.entry(command_buffer).or_default();
-                refs.reset = Some(reset);
-                // A hold already recorded into this buffer went without it: the next hold starts afresh.
-                self.reset_latched |= reset && refs.reset_asked;
-            }
         }
         let mut named: Vec<vk::Image> = Vec::new();
         for word in bytes.as_chunks::<8>().0.iter() {
@@ -2769,288 +1657,55 @@ impl Tracker {
                 }
             }
         }
-        probe_rr(command_buffer, self.functions.get(&function).map(|(_, n)| n.as_str()), &named, &self.images);
-        // The SR input launch's units, together with the render size they are at (its colour input's extent, `None`
-        // where this launch does not read as SR's input form): a launch that does not say them leaves the last pair,
-        // which the hold after DLSS carries to the render size it runs at ([`after_mv_units`]).
-        if let Some(scale) = sr_mv_scale {
-            if self.mv_scale != Some(scale) {
-                crate::log!("[preupscale] DLSS's motion vectors are {} x {} of the colour input's pixels (its input kernel's parameters)", scale[0], scale[1]);
-            }
-            self.mv_scale = Some(scale);
-            self.mv_scale_render = match input_launch(&self.images, &named) {
-                Some(InputLaunch::Inputs { colour, .. }) => self.images.get(&colour).map(|d| (d.width, d.height)),
-                _ => None,
-            };
-        }
         if probe_image::enabled() {
-            self.last_launch = self.functions.get(&function).map(|(_, n)| (n.clone(), named.clone()));
+            self.last_launch = self.functions.get(&function).map(|n| (n.clone(), named.clone()));
         }
-        // DLSS's output: after the buffer's input launch, a launch naming a colour candidate larger than
-        // the input (the upscaled frame); the last such launch of the buffer is its output kernel.
-        if let Some(InputLaunch::Inputs { colour, .. }) = self.launch.get(&command_buffer).and_then(|r| r.input.clone()) {
-            let input = self.images.get(&colour).map(|d| (d.width, d.height));
-            let larger: Vec<vk::Image> = named
-                .iter()
-                .copied()
-                .filter(|i| *i != colour && self.images.get(i).is_some_and(|d| colour_candidate(d) && input.is_some_and(|(w, h)| d.width > w && d.height > h)))
-                .collect();
-            // DLSS's own output-size images are named by its earlier launches too, and the output kernel names
-            // them beside its output: Cyberpunk 2077's Super Resolution (`dltss_pwin_*`, 2026-11-10) keeps its
-            // history in two 2560x1440 RGBA16F images it alternates frame by frame, named by its input kernel
-            // and network and then by its output kernel ahead of the output, the image only the output kernel
-            // names. The output is one no other kernel of the buffer named before ([`LaunchRefs::named_by`]),
-            // where there is one; a hold on the history was never seen (issue #49).
-            let refs = self.launch.get(&command_buffer);
-            let own = |i: &vk::Image| refs.and_then(|r| r.named_by.iter().find(|(n, _)| n == i)).is_none_or(|(_, f)| *f == function);
-            let fresh: Vec<vk::Image> = larger.iter().copied().filter(own).collect();
-            let larger = if fresh.is_empty() { larger } else { fresh };
-            // Several (Hogwarts Legacy's Ray Reconstruction names an internal 3416x1922 image beside its
-            // 2560x1440 output): the one at the swapchain's extent, else the first.
-            let swapchain = self.swapchain_extent();
-            let out = larger.iter().copied().find(|i| self.images.get(i).is_some_and(|d| Some((d.width, d.height)) == swapchain)).or(larger.first().copied());
-            // NGX's output for this buffer's evaluate, where it names it: it replaces the rules' choice, which is kept
-            // for the check when the buffer is submitted.
-            let ngx_out = refs.and_then(|r| r.ngx).map(|n| n.output).filter(|o| *o != vk::Image::null() && self.images.contains_key(o));
-            let out = match ngx_out {
-                Some(o) => {
-                    if let Some(k) = out {
-                        self.launch.entry(command_buffer).or_default().kernel_output = Some(k);
-                    }
-                    named.contains(&o).then_some(o)
-                }
-                None => out,
-            };
-            if let Some(out) = out {
-                let refs = self.launch.entry(command_buffer).or_default();
-                refs.output = Some((function, out));
-                refs.count_output((function, out), 1);
+        let refs = self.launch.entry(command_buffer).or_default();
+        // The evaluate's end read since its last launch: the buffer's launches from here on are not its.
+        if let Some(r) = refs.ngx.filter(|_| !refs.ended) {
+            refs.ended = crate::ngx_ring::ended(r.seq);
+        }
+        let mut joined = None;
+        if refs.ngx.is_none() && !named.is_empty() {
+            if let Some(record) = crate::ngx_ring::evaluate_naming(&named) {
+                refs.ngx = Some(record);
+                joined = Some(record);
             }
         }
-        if let Some(o) = self.launch.get(&command_buffer).and_then(|r| r.output) {
-            probe_rr_state(
-                command_buffer,
-                self.functions.get(&function).map(|(_, n)| n.as_str()),
-                &format!("output {:?} swapchain {:?}", o, self.swapchain_extent()),
-            );
-        }
-        // This buffer's own output (image, inputs), when this launch is the learnt output kernel writing an
-        // output of the learnt kind ([`same_output`]).
-        let this = self.launch.get(&command_buffer).and_then(|r| match (r.output, r.input.clone()) {
-            (Some((f, image)), Some(InputLaunch::Inputs { colour, depth, mvec })) if f == function && named.contains(&image) => {
-                Some(DlssOutput { function, image, input: colour, depth, mvec, rr: r.input_rr || !r.rr.is_empty(), writes: r.writes_of(f, image) })
-            }
-            _ => None,
+        let open = refs.ngx.filter(|_| !refs.ended);
+        let write = open.filter(|r| r.output != vk::Image::null() && named.contains(&r.output)).map(|r| {
+            refs.output_writes += 1;
+            DlssOutput { image: r.output, input: r.colour, depth: r.depth, mvec: r.mvec, rr: r.is_rr(), writes: refs.output_writes }
         });
-        if let Some(o) = this.filter(|o| self.dlss_output.is_some_and(|l| same_output(&l, o, &self.images))) {
+        for image in named {
+            if !refs.images.contains(&image) {
+                refs.images.push(image);
+                refs.before_named.push((image, before));
+            }
+        }
+        if let Some(record) = joined {
+            crate::ngx_ring::note_matched(&record);
+        }
+        // The last write of DLSS's output as many as the evaluates before wrote it in.
+        if let Some(o) = write.filter(|o| self.dlss_output.is_some_and(|l| same_output(&l, o, &self.images))) {
             let frame = self.frame();
             let plan = placement::current(placement::Frame { rr: o.rr || frame.rr, ..frame });
             if plan.has(placement::Stage::Upscaled) {
                 self.after_at = Some((command_buffer, o, plan));
             }
         }
-        // The colour inputs identified so far (Ray Reconstruction's first launch, [`rr_input_launch`]).
-        let known: Vec<(vk::Image, vk::Image)> = self.named.iter().map(|n| (n.colour, n.mvec)).collect();
-        // A hold recorded before the launch that carries the camera jitter gets it only by prediction
-        // ([`Self::jitter_for_hold`]): whether none could be made now, though the device's input launches carry one.
-        if self.launch.get(&command_buffer).is_none_or(|r| r.input.is_none() && r.ngx.is_none()) && !named.is_empty() {
-            if let Some(record) = crate::ngx_ring::evaluate_naming(&named) {
-                self.take_ngx(command_buffer, &record);
-            }
-        }
-        let jitter_unpredictable = self.jitter_last.is_some_and(|last| self.jitter_stopped || !self.jitter_next.contains_key(&last));
-        let mut deferred_now = false;
-        let refs = self.launch.entry(command_buffer).or_default();
-        // Whether this launch is the buffer's first one read as an input launch.
-        let mut fresh_input = false;
-        if let Some(InputLaunch::Inputs { colour, .. }) = refs.input {
-            // A later launch naming the colour input with another candidate of its extent.
-            let extent = self.images.get(&colour).map(|d| (d.width, d.height));
-            if !refs.output_pair && named.contains(&colour) {
-                refs.output_pair =
-                    named.iter().any(|i| *i != colour && self.images.get(i).is_some_and(|d| colour_candidate(d) && Some((d.width, d.height)) == extent));
-            }
-        } else if refs.input.is_none() {
-            fresh_input = true;
-            refs.input = input_launch(&self.images, &named);
-            if let Some((_, name)) = self.functions.get(&function) {
-                refs.input = rrlite_game_mvec(name, &self.images, &named, refs.input.take());
-            }
-            // DLSS Ray Reconstruction's first launch may not read as SR's input form (Hogwarts Legacy's
-            // `cuda_dldn_engine_swin_enc0_kernel` names two R32_SFLOAT depth-like images, and its colour
-            // input is not at their extent): taken from the colour input and motion vectors it names, so
-            // its output can be learnt; as Ray Reconstruction's it is never evidence nor a hold point.
-            if kernel == Some(Kernel::RayReconstruction) && !matches!(refs.input, Some(InputLaunch::Inputs { .. })) {
-                if let Some(rr) = rr_input_launch(&self.images, &named, &known) {
-                    refs.input = Some(rr);
-                }
-            }
-            // NGX's record of this evaluate decides the inputs and whether it is Ray Reconstruction; the rules'
-            // result is checked against it.
-            let rr_by_kernel = kernel == Some(Kernel::RayReconstruction);
-            if let Some(ngx) = refs.ngx {
-                refs.input = crate::ngx_ring::decide_input(refs.input.take(), &ngx, |i| self.images.contains_key(&i));
-                crate::ngx_ring::check(crate::ngx_ring::Fact::RayReconstruction, rr_by_kernel == ngx.rr, || {
-                    format!(
-                        "kernel {:?}, NGX's feature {}",
-                        self.functions.get(&function).map(|(_, n)| n.as_str()),
-                        if ngx.rr { "Ray Reconstruction" } else { "Super Resolution" }
-                    )
-                });
-            }
-            if refs.ngx.is_none() && matches!(refs.input, Some(InputLaunch::Inputs { .. })) && kernel.is_some_and(|k| k == Kernel::SrInput) {
-                crate::ngx_ring::note_unmatched();
-            }
-            // Without a record the rules' reading is no identification (4.0: the NGX wrapper is required): the
-            // buffer is neither evidence nor a hold point, and the model runs after the upscaler.
-            if refs.ngx.is_none() && !crate::ngx_ring::rules_decide() {
-                refs.input = None;
-            }
-            let rr = refs.ngx.map_or(rr_by_kernel, |n| n.rr);
-            if let Some(InputLaunch::Inputs { mvec, .. }) = refs.input {
-                if !rr {
-                    self.current_mvec = Some(mvec);
-                }
-            }
-            if refs.input.is_some() {
-                refs.input_sr = match refs.ngx {
-                    Some(n) => Some(!n.rr),
-                    None => kernel.map(|k| k == Kernel::SrInput),
-                };
-                refs.input_rr = rr;
-            }
-            probe_rr_state(
-                command_buffer,
-                self.functions.get(&function).map(|(_, n)| n.as_str()),
-                &format!("input {:?} rr {} known {}", refs.input, refs.input_rr, known.len()),
-            );
-            // DLSS Super Resolution's input kernel by name: say once what it named, read as an input launch
-            // or not, so a new engine's input form (and every image beside the three used, a reactive or
-            // transparency mask among them) shows in the log.
-            let read_as = refs.input.clone();
-            let bit = if matches!(read_as, Some(InputLaunch::Inputs { .. })) { 64 } else { 4 };
-            if kernel == Some(Kernel::SrInput) && self.said_named & bit == 0 {
-                self.said_named |= bit;
-                let list: Vec<String> = named
-                    .iter()
-                    .map(|i| match self.images.get(i) {
-                        Some(d) => format!("{}x{} {:?} {}", d.width, d.height, d.format, usage_short(d.usage)),
-                        None => "unregistered".into(),
-                    })
-                    .collect();
-                let words: Vec<String> =
-                    bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).filter(|&v| v != 0).take(64).map(|v| format!("{v:#x}")).collect();
-                let mut keys: Vec<u64> = self.keys.iter().map(|k| k.0).collect();
-                keys.sort_unstable();
-                keys.dedup();
-                crate::log!(
-                    "[preupscale] DLSS's input kernel names {} registered image(s) ({}) and {} parameter word(s); read as {:?}; non-zero words [{}]; {} registered key(s), e.g. [{}]",
-                    named.len(),
-                    list.join(", "),
-                    bytes.len() / 8,
-                    read_as,
-                    words.join(" "),
-                    keys.len(),
-                    keys.iter().rev().take(24).map(|k| format!("{k:#x}")).collect::<Vec<_>>().join(" ")
-                );
-                crate::logging::flush();
-            }
-        }
-        let candidate = |i: &vk::Image| self.inputs.is_some_and(|n| n.colour.0 == *i || n.others.iter().flatten().any(|o| o.0 == *i));
-        let had_colour = refs.images.iter().any(candidate);
-        // The hold inside the buffer goes only before an input launch naming that colour image with
-        // depth and motion vectors (DLSS Super Resolution's input kernel): with DLSS Frame
-        // Generation on, Black Myth: Wukong's frame-generation buffers name the colour candidates
-        // too, and a hold recorded into each of them took every staging slot within a frame
-        // (2026-10-05).
-        let input_colour = match refs.input {
-            Some(InputLaunch::Inputs { colour, .. }) => Some(colour),
-            _ => None,
-        };
-        // Or this input launch's own colour image, with the identified motion vectors, when it is
-        // not a known candidate: Wukong's benchmark scene with frame generation on hands DLSS a new
-        // colour (and depth) image every frame, registered after the last identification.
-        let own_colour = match refs.input {
-            // Smaller than the output only: at DLAA, frame generation's launch has SR's shape at the
-            // output size.
-            Some(InputLaunch::Inputs { colour, mvec, .. })
-                if fresh_input
-                    && (refs.input_sr == Some(true) || self.inputs.is_some_and(|n| n.mvec.0 == mvec))
-                    && self.images.get(&colour).zip(self.inputs).is_some_and(|(d, n)| smaller(d.width, d.height, n.output)) =>
-            {
-                Some(colour)
-            }
-            _ => None,
-        };
-        // Diagnostics: the kernel of each buffer's first launch naming a colour candidate.
-        if !had_colour && named.iter().any(candidate) && self.said_first_kernels.len() < 8 {
-            let name = self.functions.get(&function).map_or("unnamed".to_string(), |(_, n)| n.clone());
-            let kind = match &refs.input {
-                Some(InputLaunch::Inputs { .. }) => "inputs",
-                Some(InputLaunch::Unusable) => "unusable",
-                Some(InputLaunch::Ambiguous { .. }) => "ambiguous",
-                None => "none",
-            };
-            let key = format!("{name} ({kind}, input launch of this buffer: {})", input_colour.is_some());
-            if !self.said_first_kernels.contains(&key) {
-                crate::log!("[preupscale] first launch naming a colour candidate: kernel {key}");
-                self.said_first_kernels.push(key);
-            }
-        }
-        // The hold goes at the buffer's first launch naming a colour candidate unless that launch is
-        // DLSS Frame Generation's by its kernel's name (`main_kernel` in Wukong's frame-generation
-        // buffers, which took every staging slot) and not an input launch naming that image.
-        let sr_kernel = !self.functions.get(&function).is_some_and(|(_, n)| fg_kernel_name(n));
-        let mut first_colour = if had_colour && !refs.hold_deferred {
-            None
-        } else if refs.hold_deferred {
-            // The hold put off to the input launch ([`LaunchRefs::hold_deferred`]): here, if this is it and its colour
-            // image is one the hold may take, as below.
-            input_colour.filter(|c| named.contains(c) && (candidate(c) || own_colour == Some(*c)))
-        } else {
-            named.iter().copied().find(candidate).filter(|c| input_colour == Some(*c) || sr_kernel).or(own_colour)
-        };
-        // A launch before the buffer's input launch (DLSS's auto-exposure, `cuda_luma_convert_kernel` in Cyberpunk
-        // 2077 on every second frame) where the camera jitter cannot be predicted (Cyberpunk's never repeats): the
-        // hold waits for the input launch, which carries the jitter. A hold without it loses the history's jitter
-        // step on that frame and the next and breaks the edit cache's chain (issue #49).
-        if first_colour.is_some_and(|c| input_colour != Some(c)) && refs.jitter.is_none() && jitter_unpredictable {
-            first_colour = None;
-            refs.hold_deferred = true;
-            deferred_now = true;
-        }
-        for image in named {
-            if !refs.images.contains(&image) {
-                refs.images.push(image);
-                refs.before_named.push((image, before));
-                refs.named_by.push((image, function));
-            }
-        }
-        if let Some(c) = first_colour.filter(|_| refs.hold_deferred) {
-            // What the buffer held at the input launch, not at the earlier launch: the hazards up to the hold.
-            refs.hold_deferred = false;
-            if let Some(entry) = refs.before_named.iter_mut().find(|(i, _)| *i == c) {
-                entry.1 = before;
-            }
-        }
-        if deferred_now && !self.jitter_deferred_said {
-            self.jitter_deferred_said = true;
-            crate::log!(
-                "[preupscale] the camera jitter does not repeat, so it cannot be predicted for a hold before DLSS's input launch: such holds go at the input launch, which carries it"
-            );
-        }
-        self.inline_at = first_colour.map(|c| (command_buffer, c));
+        self.inline_at = joined.filter(|r| !r.is_rr()).map(|r| (command_buffer, r));
         if crate::probe_ngx::enabled() {
-            self.probe_layout(function, bytes, input_colour);
+            self.probe_layout(function, bytes, open.map(|r| r.colour));
         }
     }
 
     /// With `NEURAL_FORGE_PROBE_NGX=1`: logs once per kernel and parameter-buffer size what each
     /// 8-byte word of the launch's parameters holds (docs/DLSS_KERNEL_CATALOGUE.md is built from
-    /// these lines). `colour` is the buffer's identified colour input, if any.
+    /// these lines). `colour` is the colour input of the buffer's evaluate, if any.
     fn probe_layout(&mut self, function: vk::CuFunctionNVX, bytes: &[u8], colour: Option<vk::Image>) {
         const MAX_LAYOUTS: usize = 96;
-        let name = self.functions.get(&function).map_or_else(|| "unnamed".to_string(), |(_, n)| n.clone());
+        let name = self.functions.get(&function).cloned().unwrap_or_else(|| "unnamed".to_string());
         let id = (name, bytes.len());
         if self.layouts_said.len() >= MAX_LAYOUTS || self.layouts_said.contains(&id) {
             return;
@@ -3083,10 +1738,8 @@ impl Tracker {
                 "exposure"
             } else if DEPTH_FORMATS.contains(&d.format) {
                 "depth"
-            } else if MVEC_FORMATS.contains(&d.format) {
+            } else if [vk::Format::R16G16_SFLOAT, vk::Format::R32G32_SFLOAT].contains(&d.format) {
                 "mvec"
-            } else if self.inputs.is_some_and(|n| (d.width, d.height) == n.output) {
-                "output-size"
             } else {
                 "image"
             };
@@ -3114,18 +1767,19 @@ impl Tracker {
         }
     }
 
-    /// Whether a hold should run inside `cb`, right before the launch just recorded, which is the
-    /// first of the buffer to name `colour` (a colour candidate): the inputs are identified (not on
-    /// the submit that identified them), the colour input is an RGBA16F or R11G11B10 image the layer
-    /// can transfer (`TRANSFER_SRC | TRANSFER_DST`) at the identified extent, its layout at that
+    /// Whether a hold should run inside `cb`, right before the launch just recorded, which is the first of the buffer
+    /// to name the colour input of `record`'s evaluate: the inputs are identified (not on the submit that identified
+    /// them), the colour input is an RGBA16F or R11G11B10 image the layer can transfer
+    /// (`TRANSFER_SRC | TRANSFER_DST`) at the identified extent, its layout at that
     /// point is known (the buffer's own barriers, else the committed state; an RGBA16F storage image
     /// no barrier was seen on is taken as `GENERAL`, as the split does), no render pass instance is
     /// suspended there, and the split in front of the buffer cannot take it: the split would be
     /// refused ([`Self::launch_hazard`]), or the colour input is not an RGBA16F image in `GENERAL`
     /// (the split reads and writes it as a storage image). A buffer the split can take (GTA V's)
     /// gets nothing.
-    pub(crate) fn inline_point(&self, cb: vk::CommandBuffer, colour: vk::Image) -> Result<InlinePoint, InlineRefusal> {
-        let inputs = self.inputs.ok_or(InlineRefusal::NotIdentified)?;
+    pub(crate) fn inline_point(&self, cb: vk::CommandBuffer, record: &crate::ngx_ring::Record) -> Result<InlinePoint, InlineRefusal> {
+        let identified = self.inputs.ok_or(InlineRefusal::NotIdentified)?;
+        let colour = record.colour;
         // Begun before this identification: the layouts its earlier commands left are not known.
         if self.identified || !self.recorded_watched.contains(&cb) {
             return Err(InlineRefusal::BegunBefore);
@@ -3141,9 +1795,12 @@ impl Tracker {
         if !desc.usage.contains(copyable) {
             return Err(InlineRefusal::Usage(desc.usage));
         }
-        if (desc.width, desc.height) != (inputs.colour.1.width, inputs.colour.1.height) {
-            return Err(InlineRefusal::Extent((desc.width, desc.height), (inputs.colour.1.width, inputs.colour.1.height)));
+        if (desc.width, desc.height) != (identified.colour.1.width, identified.colour.1.height) {
+            return Err(InlineRefusal::Extent((desc.width, desc.height), (identified.colour.1.width, identified.colour.1.height)));
         }
+        // The evaluate's own depth, motion vectors and exposure image; the identification's where its record names an
+        // image the layer did not see created.
+        let inputs = self.inputs_of(record).unwrap_or(identified);
         if self.rendering.get(&cb).is_some_and(|r| r.last_suspending || r.open_resume) {
             return Err(InlineRefusal::SuspendedRendering);
         }
@@ -3174,8 +1831,7 @@ impl Tracker {
             None if rgba16f && layout == vk::ImageLayout::GENERAL => return Err(InlineRefusal::LeftToSplit),
             None => Hazard::NotSplittable,
         };
-        // The inputs are refreshed on the next submit, not when an image is destroyed: an exposure
-        // input or motion vectors destroyed since are not copied from.
+        // An exposure input or motion vectors destroyed since the record was written are not copied from.
         let exposure_input = inputs.exposure_input.and_then(|(image, _)| self.images.get(&image).map(|d| (image, *d))).map(|(image, d)| {
             let known = self.layout_in(cb, image, false, d.usage.contains(vk::ImageUsageFlags::STORAGE));
             guessed.exposure = known.filter(|(_, set)| !set).map(|(l, _)| l);
@@ -3189,7 +1845,7 @@ impl Tracker {
         // DLSS's motion vectors, copied beside the colour input for the native backend's history: RG16F
         // at the colour input's extent or larger (high-resolution motion vectors, resampled to it), in
         // a layout known here (or GENERAL for a storage image).
-        let live_mvec = self.images.get(&inputs.mvec.0).copied().filter(|_| self.current_mvec == Some(inputs.mvec.0));
+        let live_mvec = self.images.get(&inputs.mvec.0).copied();
         let mvec_input = live_mvec.map(|d| {
             let image = inputs.mvec.0;
             let known = self.layout_in(cb, image, true, d.usage.contains(vk::ImageUsageFlags::STORAGE));
@@ -3224,13 +1880,20 @@ impl Tracker {
             exposure_input,
             mvec_input,
             mvec_extent,
-            mv_units: self.mv_scale,
+            mv_units: record.mv_units(),
             depth_input,
             identification: self.generation,
             hazard,
             hold: placement::Hold::ALL_BEFORE,
             guessed,
         })
+    }
+
+    /// DLSS's inputs as `record` names them, where its colour input, depth and motion vectors are images the layer saw
+    /// created on this device; its exposure image where it names one the layer saw created.
+    fn inputs_of(&self, record: &crate::ngx_ring::Record) -> Option<Inputs> {
+        let get = |i: vk::Image| (i != vk::Image::null()).then(|| self.images.get(&i).map(|d| (i, *d))).flatten();
+        Some(Inputs { colour: get(record.colour)?, depth: get(record.depth)?, mvec: get(record.mvec)?, exposure_input: get(record.exposure) })
     }
 
     /// `image`'s layout at this point of `cb` and whether `cb` set it: the buffer's own last barrier on it,
@@ -3325,12 +1988,12 @@ impl Tracker {
             return None;
         }
         let refs = self.launch.get(&cb);
-        let (bit, why) = if refs.is_some_and(|r| r.opaque && r.input.is_none()) {
-            (1, "its CUDA launches' parameters are not readable (not in CUDA's buffer form), so none of them is known to be DLSS's input launch")
-        } else if refs.is_some_and(|r| r.input.is_none()) {
-            (2, "none of its launches reads as DLSS's input launch (a colour image with depth and motion vectors)")
+        let (bit, why) = if refs.is_some_and(|r| r.opaque && r.ngx.is_none()) {
+            (1, "its CUDA launches' parameters are not readable (not in CUDA's buffer form), so none of them is matched to NGX's record of the evaluate")
+        } else if refs.is_some_and(|r| r.ngx.is_none()) {
+            (2, "none of its launches names the colour input of an NGX evaluate before that evaluate's end")
         } else {
-            (4, "its first launch naming a colour candidate was not taken as the hold point")
+            (4, "its first launch naming the evaluate's colour input was not taken as the hold point")
         };
         if self.said_untried & bit != 0 {
             return None;
@@ -3344,161 +2007,14 @@ impl Tracker {
         self.inline_in_use = Some(identification);
     }
 
+    /// What NGX's record of `cb`'s evaluate says of the frame, for a hold recorded into `cb` ([`DlssFrame::of`]);
+    /// nothing without one.
+    fn frame_of(&self, cb: vk::CommandBuffer) -> DlssFrame {
+        self.launch.get(&cb).and_then(|r| r.ngx).map_or_else(DlssFrame::default, |r| DlssFrame::of(&r))
+    }
+
     /// Takes the mark [`Self::launch_kernel`] left for the launch just recorded.
-    /// An input launch's reset word ([`reset_word`]) as the game's reset. Only 0 and 1 are one: any other value is
-    /// another parameter in that word, and no reset. A word set on more than [`RESET_STREAK_MAX`] input launches in a
-    /// row is no reset flag on this device (the game's resets are single frames: three in a GTA V benchmark run), and
-    /// is ignored from then on, logged once.
-    /// A buffer's first input launch with the NGX record of its evaluate ([`crate::ngx_ring`]): the camera jitter,
-    /// the game's reset and the motion vectors' units are taken from it, each checked against what the kernel's
-    /// parameters said; its images are kept for the inputs and the output ([`LaunchRefs::ngx`]).
-    fn take_ngx(&mut self, cb: vk::CommandBuffer, record: &crate::ngx_ring::Record) {
-        use crate::ngx_ring::{check, same_units, Fact};
-        let word = record.jitter_word();
-        let kernel_jitter = self.launch.get(&cb).and_then(|r| r.jitter);
-        if let Some(k) = kernel_jitter {
-            check(Fact::Jitter, k == word, || format!("rules {:?}, NGX {:?}", jitter_px(k), record.jitter));
-        }
-        if kernel_jitter != Some(word) {
-            self.launch.entry(cb).or_default().jitter = Some(word);
-            self.learn_jitter(cb, word);
-        }
-        let reset = self.reset_flag(u64::from(record.reset));
-        let refs = self.launch.entry(cb).or_default();
-        if let Some(k) = refs.reset {
-            check(Fact::Reset, k == record.reset, || format!("rules {k}, NGX {}", record.reset));
-        }
-        refs.reset = Some(reset);
-        self.reset_latched |= reset && refs.reset_asked;
-        refs.ngx = Some(record.images());
-        if let Some(units) = record.mv_units() {
-            if let Some(k) = self.mv_scale {
-                check(Fact::MvUnits, same_units(k, units), || {
-                    format!("rules {k:?} at {:?}, NGX {units:?} at {:?}", self.mv_scale_render, record.colour_extent)
-                });
-            }
-            if self.mv_scale != Some(units) {
-                crate::log!(
-                    "[ngx] DLSS's motion vectors are {} x {} render pixels at {}x{} (NGX's MV.Scale)",
-                    units[0],
-                    units[1],
-                    record.colour_extent.0,
-                    record.colour_extent.1
-                );
-            }
-            self.mv_scale = Some(units);
-            if record.colour_extent.0 > 0 && record.colour_extent.1 > 0 {
-                self.mv_scale_render = Some(record.colour_extent);
-            }
-        }
-        check(Fact::Hdr, record.hdr(), || "NGX says DLSS's colour input is not HDR (IsHDR clear); the encode treats it as scene-linear".to_string());
-    }
-
-    fn reset_flag(&mut self, value: u64) -> bool {
-        if self.reset_ignored {
-            return false;
-        }
-        match value {
-            0 => {
-                self.reset_streak = 0;
-                false
-            }
-            1 => {
-                self.reset_streak += 1;
-                if self.reset_streak <= RESET_STREAK_MAX {
-                    return true;
-                }
-                self.reset_ignored = true;
-                self.reset_latched = false;
-                crate::log!(
-                    "[preupscale] DLSS's reset word (word {HILUMA_RESET_WORD} of its input kernel's parameters) set on {} launches in a row: not a reset flag here; the game's reset is ignored from now",
-                    self.reset_streak
-                );
-                crate::logging::flush();
-                false
-            }
-            _ => false,
-        }
-    }
-
-    /// A buffer's camera jitter seen in a launch (`cb`'s first): checks the jitter predicted for a hold recorded
-    /// before it, and learns the sequence (the jitter seen before it is followed by this one).
-    fn learn_jitter(&mut self, cb: vk::CommandBuffer, value: u64) {
-        if let Some(p) = self.launch.get_mut(&cb).and_then(|r| r.predicted.take()) {
-            let (right, wrong) = &mut self.jitter_checks;
-            if p == value {
-                *right += 1;
-            } else {
-                *wrong += 1;
-            }
-            let (right, wrong) = (*right, *wrong);
-            if !self.jitter_stopped && wrong >= JITTER_WRONG_MAX && wrong * 8 > right {
-                self.jitter_stopped = true;
-                crate::log!("[preupscale] the predicted camera jitter was wrong {wrong} times in {}: the holds go without the jitter again", right + wrong);
-                crate::logging::flush();
-            } else if right + wrong == 1000 {
-                crate::log!("[preupscale] the predicted camera jitter was right {right} times in 1000");
-                crate::logging::flush();
-            }
-        }
-        if let Some(last) = self.jitter_last.filter(|&l| l != value) {
-            if self.jitter_next.len() >= JITTER_SEQUENCE_MAX && !self.jitter_next.contains_key(&last) {
-                self.jitter_next.clear();
-            }
-            self.jitter_next.insert(last, value);
-        }
-        self.jitter_last = Some(value);
-    }
-
-    /// The camera jitter for a hold recorded into `cb` now: the jitter a launch of `cb` already carried, or,
-    /// where the hold comes before that launch (Crimson Desert: NGX's `cuda_dldn_engine_luma_convert_kernel`
-    /// reads the colour input five launches before `rrlite_enc0_*` carries the jitter), the one that followed
-    /// the last jitter seen when the sequence went round before. The launch checks a predicted jitter when it
-    /// comes ([`Self::learn_jitter`]); `None` before the sequence went round once, and after too many wrong.
-    pub(crate) fn jitter_for_hold(&mut self, cb: vk::CommandBuffer) -> Option<u64> {
-        if let Some(v) = self.launch.get(&cb).and_then(|r| r.jitter) {
-            return Some(v);
-        }
-        if self.jitter_stopped {
-            return None;
-        }
-        let next = *self.jitter_next.get(&self.jitter_last?)?;
-        if !self.jitter_said {
-            self.jitter_said = true;
-            crate::log!("[preupscale] the hold comes before the launch that carries the camera jitter: predicted from the sequence seen, checked when that launch comes");
-            crate::logging::flush();
-        }
-        self.launch.entry(cb).or_default().predicted = Some(next);
-        Some(next)
-    }
-
-    /// Whether a hold recorded into `cb` now (before DLSS's upscaler) starts the history afresh for the game: its
-    /// input launch carried the reset, or a reset reached a buffer whose hold came before the launch carrying
-    /// it (latched for this one: unlike the jitter, a reset cannot be predicted). Consumes the latch.
-    pub(crate) fn reset_for_hold(&mut self, cb: vk::CommandBuffer) -> bool {
-        let refs = self.launch.entry(cb).or_default();
-        let own = match refs.reset {
-            Some(r) => r,
-            None => {
-                refs.reset_asked = true;
-                false
-            }
-        };
-        self.take_reset_latch() | own
-    }
-
-    /// A reset latched for the next hold ([`Self::reset_for_hold`]), consumed.
-    fn take_reset_latch(&mut self) -> bool {
-        std::mem::take(&mut self.reset_latched)
-    }
-
-    /// Whether `cb`'s input launch carried the game's reset, for a hold after DLSS's output in the same buffer
-    /// (the latch is the holds' before the upscaler).
-    fn reset_seen(&self, cb: vk::CommandBuffer) -> bool {
-        self.launch.get(&cb).and_then(|r| r.reset).unwrap_or(false)
-    }
-
-    pub(crate) fn take_inline_at(&mut self) -> Option<(vk::CommandBuffer, vk::Image)> {
+    pub(crate) fn take_inline_at(&mut self) -> Option<(vk::CommandBuffer, crate::ngx_ring::Record)> {
         self.inline_at.take()
     }
 
@@ -3519,10 +2035,10 @@ impl Tracker {
         self.dlss_output.and_then(|o| self.images.get(&o.image)).map_or((0, 0), |d| (d.width, d.height))
     }
 
-    /// The hold right after DLSS's output kernel just recorded into `cb` ([`placement`]): on DLSS's output
-    /// image (RGBA16F or R11G11B10, transferable, in a layout known here), with DLSS's motion vectors of
-    /// the same buffer at the render size (resampled up to the output's; [`InlinePoint::mvec_scale`] is
-    /// then output over render pixels) and no depth copy (the depth is at the render size), the exposure
+    /// The hold right after the launch just recorded into `cb`, the last of its evaluate to write DLSS's output
+    /// ([`placement`]): on DLSS's output image (RGBA16F or R11G11B10, transferable, in a layout known here), with
+    /// the evaluate's motion vectors at the render size (resampled up to the output's; [`InlinePoint::mvec_scale`]
+    /// is then output over render pixels) and no depth copy (the depth is at the render size), the exposure
     /// measured from the frame.
     pub(crate) fn after_point(&mut self) -> Option<InlinePoint> {
         let (cb, o, plan) = self.after_at.take()?;
@@ -3604,7 +2120,14 @@ impl Tracker {
             exposure_input: None,
             mvec_input,
             mvec_extent: mvec.map_or((0, 0), |d| (d.width, d.height)),
-            mv_units: self.mv_scale.zip(self.mv_scale_render).and_then(|(scale, at)| after_mv_units(scale, at, render, (desc.width, desc.height))),
+            // NGX's `MV.Scale` gives the colour input's pixels; the hold works on the output's.
+            mv_units: self
+                .launch
+                .get(&cb)
+                .and_then(|r| r.ngx)
+                .and_then(|r| r.mv_units())
+                .filter(|_| render.0 > 0 && render.1 > 0)
+                .map(|units| [units[0] * desc.width as f32 / render.0 as f32, units[1] * desc.height as f32 / render.1 as f32]),
             depth_input: None,
             // Its own identification: the output image's handle with the top bit set (never an input's).
             identification: o.image.as_raw() | (1 << 63),
@@ -3699,47 +2222,27 @@ impl Tracker {
             if let Some(c) = self.launch.get(secondary).cloned() {
                 let refs = self.launch.entry(primary).or_default();
                 refs.opaque |= c.opaque;
-                refs.sr_launched |= c.sr_launched;
                 if refs.before_first.is_none() {
                     refs.before_first = c.before_first.map(shift);
                 }
-                if refs.input.is_none() {
-                    refs.input = c.input.clone();
-                    refs.input_sr = c.input_sr;
-                    refs.input_rr = c.input_rr;
-                }
-                for f in c.rr {
-                    if refs.rr.len() < 4 && !refs.rr.contains(&f) {
-                        refs.rr.push(f);
+                // The secondary's evaluate, or more of the primary's: its launches follow the primary's so far.
+                match (refs.ngx, c.ngx) {
+                    (None, Some(_)) => {
+                        refs.ngx = c.ngx;
+                        refs.ended = c.ended;
+                        refs.output_writes = c.output_writes;
                     }
-                }
-                // The jitter of the first launch carrying one, in recording order.
-                if refs.jitter.is_none() {
-                    refs.jitter = c.jitter;
-                }
-                if refs.reset.is_none() {
-                    refs.reset = c.reset;
-                }
-                refs.reset_asked |= c.reset_asked;
-                if c.input.is_some() && c.input == refs.input {
-                    refs.output_pair |= c.output_pair;
-                    // The secondary's output kernel follows the input launch it was found after, and
-                    // comes after whatever the primary recorded so far: the last one.
-                    if c.output.is_some() {
-                        refs.output = c.output;
+                    (Some(a), Some(b)) if a.seq == b.seq => {
+                        refs.ended |= c.ended;
+                        refs.output_writes += c.output_writes;
                     }
-                    for (k, n) in c.output_writes {
-                        refs.count_output(k, n);
-                    }
+                    _ => {}
                 }
                 for image in c.images {
                     if !refs.images.contains(&image) {
                         refs.images.push(image);
                         let before = c.before_named.iter().find(|(i, _)| *i == image).map(|(_, b)| *b).or(c.before_first).unwrap_or_default();
                         refs.before_named.push((image, shift(before)));
-                        if let Some(by) = c.named_by.iter().find(|(i, _)| *i == image) {
-                            refs.named_by.push(*by);
-                        }
                     }
                 }
             }
@@ -3773,18 +2276,16 @@ impl Tracker {
     /// Whether barriers on `image` are recorded with `inputs` identified and `watch` the colour shape watched.
     fn watched_by(&self, inputs: Option<Inputs>, watch: Option<ColourWatch>, image: vk::Image) -> bool {
         let desc = self.images.get(&image);
-        // Every image of the colour input's shape: the input launch may name another one than the identified
-        // (`Self::retarget`; Remnant II and Expedition 33 alternate between several).
+        // Every image of the colour input's shape: an evaluate may name another one than the identified (Remnant II and
+        // Expedition 33 alternate between several).
         watch.is_some_and(|w| desc.is_some_and(|d| w.covers(d)))
             || inputs.is_some_and(|i| {
                 i.colour.0 == image
-                    || i.others.iter().flatten().any(|o| o.0 == image)
                     || i.depth.0 == image
                     || i.mvec.0 == image
-                    || i.exposure.iter().flatten().any(|e| e.0 == image)
                     || i.exposure_input.is_some_and(|e| e.0 == image)
-                    // Every depth image at the identified depth's extent: the input launch may name
-                    // another one than the identified (`Self::hold_depth`; GTA V Enhanced alternates two).
+                    // Every depth image at the identified depth's extent: an evaluate may name another one than the
+                    // identified (`Self::hold_depth`; GTA V Enhanced alternates two).
                     || desc.is_some_and(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == (i.depth.1.width, i.depth.1.height))
             })
     }
@@ -3887,8 +2388,8 @@ impl Tracker {
     ///
     /// Returns `(hazard, dump_hazard, depth_hazard)`, the last one a barrier on the depth image
     /// alone ([`Scan::depth_hazard`]). Every hold reads and writes the colour input and reads the
-    /// exposure input; only a dump also reads depth, the motion vectors and every 1x1 exposure
-    /// candidate, so a barrier on one of those alone stops only a dump. With DLSS Frame Generation
+    /// exposure input; only a dump also reads depth and the motion vectors, so a barrier on one of
+    /// those alone stops only a dump. With DLSS Frame Generation
     /// on, GTA V Enhanced copies depth and motion vectors for it inside the launch buffer, between
     /// `GENERAL -> GENERAL` barriers, right before SR's input launch (docs/PRE_UPSCALER_DESIGN.md,
     /// "When a submit is not split").
@@ -3906,7 +2407,7 @@ impl Tracker {
         }
         // Unknown inputs: every watched image counts as read by every hold.
         let held = |image: vk::Image| inputs.is_none_or(|i| i.colour.0 == image || i.exposure_input.is_some_and(|e| e.0 == image));
-        let dumped = |image: vk::Image| inputs.is_some_and(|i| i.depth.0 == image || i.mvec.0 == image || i.exposure.iter().flatten().any(|e| e.0 == image));
+        let dumped = |image: vk::Image| inputs.is_some_and(|i| i.depth.0 == image || i.mvec.0 == image);
         let Some(recorded) = self.pending.get(&cb) else { return (None, None, None) };
         let before = &recorded[..before.barriers.min(recorded.len())];
         (
@@ -3916,565 +2417,123 @@ impl Tracker {
         )
     }
 
-    /// The largest swapchain's extent.
-    fn swapchain_extent(&self) -> Option<(u32, u32)> {
-        self.swapchains.values().copied().max_by_key(|&(w, h)| u64::from(w) * u64::from(h))
-    }
-
-    /// Re-derives the inputs when the registered set or the swapchains changed. Returns a log line
-    /// when the identification changed.
+    /// Identifies DLSS's inputs from NGX's records: the newest upscaling evaluate whose colour input the layer saw created
+    /// on this device ([`crate::ngx_ring::newest`]), where its depth and motion vectors are such images too. Ray
+    /// Reconstruction's identifies nothing: its input is not held. A new identification is a new colour shape, motion
+    /// vectors or exposure image ([`Key`]); another colour image of the same shape, or another depth image, is the same
+    /// one. Called at every launch-bearing submit; returns a log line when the identification changed.
     pub(crate) fn refresh(&mut self) -> Option<String> {
-        if !std::mem::take(&mut self.dirty) {
-            return None;
+        let record = crate::ngx_ring::newest(|i| self.images.contains_key(&i));
+        let rr = record.is_some_and(|r| r.is_rr());
+        if rr {
+            note_ray_reconstruction();
         }
-        let registered = self.registered_set();
-        // What DLSS's own input kernel names, once settled; the size rule otherwise. Nothing while
-        // DLSS Ray Reconstruction runs ([`Self::rr_running`]).
-        let gate = !self.rr_running();
-        let size = identify(&registered, self.swapchain_extent()).filter(|_| gate);
-        self.candidates = match (&size, self.swapchain_extent().or_else(|| output_candidate(&registered))) {
-            (Some(_), Some(output)) => size_candidates(&registered, output),
-            _ => Vec::new(),
-        };
-        // The input kernel's choice among the size rule's candidates ([`Self::switched`]) only while
-        // its colour image still is one of them.
-        if crate::ngx_ring::rules_decide() && self.switched.is_some_and(|n| !self.is_candidate(n.colour)) {
-            self.switched = None;
-        }
-        let inputs = self
-            .switched
-            .filter(|_| gate)
-            .and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref()))
-            .or_else(|| self.named_pick.filter(|_| gate).and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref())))
-            .or(size.filter(|_| crate::ngx_ring::rules_decide()));
-        // The depth image is not part of what was identified: the model reads the colour input and
-        // the exposure only, and the depth's layout only gates a dump ([`Scan::dump_hazard`]). Black
-        // Myth: Wukong's benchmark with DLSS Frame Generation on hands DLSS a new depth image every
-        // frame (16 in rotation, the colour input, motion vectors and exposure fixed): re-identifying
-        // on it skipped every hold (the identifying submit is never held). A depth change alone is
-        // taken silently.
-        // Between one depth image's destruction and the next one's registration there is no depth
-        // image at the render extent, and neither rule identifies anything. While the colour input
-        // and motion vectors are still registered and DLSS Super Resolution runs, the inputs are
-        // kept: the gap is not a new identification either. The destroyed depth has no layout any
-        // more, so a dump cannot read it, and a hold never reads depth.
-        let depth_gap = |old: &Inputs| {
-            let alive = |image: vk::Image| registered.contains_key(&image.as_raw());
-            gate && alive(old.colour.0) && alive(old.mvec.0) && at(&registered, &DEPTH_FORMATS, old.colour.1.width, old.colour.1.height).is_none()
-        };
-        let gap_open = self.depth_gap.is_none_or(|since| self.launch_submits.saturating_sub(since) < SR_RECENT);
-        if inputs.is_none() && gap_open && self.inputs.is_some_and(|old| depth_gap(&old)) {
-            if self.depth_gap.is_none() {
-                self.depth_gap = Some(self.launch_submits);
-                self.depth_changes += 1;
-            }
-            // Looked at again at the next launch-bearing submit, until the gap closes or expires.
-            self.dirty = true;
-            return None;
-        }
-        if inputs.is_some() {
-            self.depth_gap = None;
-        }
-        let key = |i: Option<Inputs>| i.map(|i| (i.colour.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0)), i.exposure_input.map(|e| e.0)));
-        // The same inputs by the same rule: only the candidates beside them changed (a game creating
-        // and destroying render-size images every frame, Black Myth: Wukong with frame generation on:
-        // 97% of its log was this line). Taken silently, after the depth-only change below.
-        let unchanged = inputs.is_some() && key(inputs) == key(self.inputs) && inputs.map(|i| i.rule) == self.inputs.map(|i| i.rule);
-        if key(inputs) != key(self.inputs) {
+        let inputs = record.filter(|r| !r.is_rr()).and_then(|r| self.inputs_of(&r));
+        let key = inputs.map(|i| (ColourWatch::of(&i.colour.1), i.mvec.0, i.exposure_input.map(|e| e.0)));
+        let changed = key != self.key || rr != self.rr;
+        if key != self.key {
             // The colour shape watched: the new colour input's, else (nothing identified) the last one's.
             self.keep_watched_across(inputs, inputs.map(|i| ColourWatch::of(&i.colour.1)).or(self.colour_watch));
             self.recorded_watched.clear();
             self.colour_barriers.clear();
             self.identified = true;
             self.generation += 1;
-        } else if let (Some(new), Some(old)) = (inputs, self.inputs) {
-            if new.depth.0 != old.depth.0 {
-                self.inputs = inputs;
-                self.depth_changes += 1;
-                return None;
-            }
-        }
-        if unchanged && self.announced.is_some() {
-            self.inputs = inputs;
-            return None;
+            self.key = key;
         }
         self.inputs = inputs;
-        let line = match inputs {
-            Some(i) => format!(
-                "colour input: image {} ({}x{} {:?} {:?}){}, depth {} {:?}, motion vectors {} {:?}{}, exposure input {}{}; swapchain {:?}{}; {}",
+        self.rr = rr;
+        if !changed {
+            return None;
+        }
+        let line = match (inputs, record) {
+            (Some(i), _) => format!(
+                "colour input: image {} ({}x{} {:?} {:?}), depth {} {:?}, motion vectors {} {:?}, exposure input {}; from NGX's record of DLSS's evaluate",
                 hex(i.colour.0),
                 i.colour.1.width,
                 i.colour.1.height,
                 i.colour.1.format,
                 i.colour.1.usage,
-                if i.candidates > 1 {
-                    let mut others: Vec<String> = i.others.iter().flatten().map(|(image, d)| format!("{} {}x{}", hex(*image), d.width, d.height)).collect();
-                    let listed = 1 + others.len();
-                    if i.candidates > listed {
-                        others.push(format!("{} more", i.candidates - listed));
-                    }
-                    match i.rule {
-                        Rule::Size => format!(" (first of {} candidates; others {})", i.candidates, others.join(", ")),
-                        Rule::Params => format!(" (the size rule's other candidates: {})", others.join(", ")),
-                    }
-                } else {
-                    String::new()
-                },
                 hex(i.depth.0),
                 i.depth.1.format,
                 hex(i.mvec.0),
                 i.mvec.1.format,
-                if i.exposure.iter().any(Option::is_some) {
-                    let list: Vec<String> = i.exposure.iter().flatten().map(|(image, d)| format!("{} {:?}", hex(*image), d.format)).collect();
-                    format!(", 1x1 (exposure) {}", list.join(", "))
-                } else {
-                    String::new()
-                },
-                i.exposure_input.map_or_else(|| "none (no registered 1x1 R16_SFLOAT; measured from the frame)".to_string(), |(image, _)| hex(image)),
-                if i.exposure_named { " (named by the same command buffer)" } else { "" },
-                self.swapchain_extent(),
-                if i.output_from_swapchain || i.rule == Rule::Params {
-                    String::new()
-                } else {
-                    format!(", compared with the largest registered RGBA16F/R11G11B10 storage image ({}x{})", i.output.0, i.output.1)
-                },
-                match i.rule {
-                    Rule::Params => "identified by the input kernel's parameters (one launch names it with the depth and motion vectors)",
-                    Rule::Size => "identified by size",
-                }
+                i.exposure_input.map_or_else(|| "none (the game gives DLSS none; measured from the frame)".to_string(), |(image, _)| hex(image)),
             ),
-            None if !gate => {
-                format!("no DLSS input: DLSS Ray Reconstruction runs ({}); its input is not held, the model runs after the upscaler", self.rr_names.join(", "))
+            (None, Some(_)) if rr => {
+                "no DLSS input: DLSS Ray Reconstruction runs (NGX's record): its input is the noisy ray-traced frame with its guide buffers, so the model can't run before it; nothing is held, the model runs after the upscaler".to_string()
             }
-            None => format!("no DLSS input among {} registered views (swapchain {:?}); waiting", registered.len(), self.swapchain_extent()),
+            (None, Some(r)) => format!(
+                "no DLSS input: NGX's record names images this device did not see created (colour {}, depth {}, motion vectors {})",
+                hex(r.colour),
+                hex(r.depth),
+                hex(r.mvec)
+            ),
+            (None, None) => "no DLSS input: no NGX record of a DLSS evaluate on this device".to_string(),
         };
-        // A failed identification says why, with the registered set ([`diagnose`]), once per change
-        // of it, for the first [`MAX_DIAGNOSES`] changes; after those only the short line, once per
-        // change of the short line (the rule before the diagnosis existed).
-        let detailed = gate && inputs.is_none() && !registered.is_empty() && self.diagnoses < MAX_DIAGNOSES;
-        let line = if detailed { format!("{line}. {}", diagnose(&registered, self.swapchain_extent())) } else { line };
         if self.announced.as_deref() == Some(line.as_str()) {
             return None;
-        }
-        if detailed {
-            self.diagnoses += 1;
         }
         self.announced = Some(line.clone());
         Some(line)
     }
 
-    /// Gathers what the submit's launch-bearing buffers' input launches name ([`LaunchRefs::input`])
-    /// and, once that evidence has not changed for [`SETTLE_SUBMITS`] launch-bearing submits,
-    /// decides ([`Self::pick_named`]); a changed decision marks the inputs for [`Self::refresh`].
-    /// Called before it at every launch-bearing submit. Returns once-only log lines.
+    /// What the submit's launch-bearing buffers carry: DLSS's evaluates as NGX recorded them. An evaluate that ended
+    /// says how DLSS writes its output ([`DlssOutput`]), for the hold after it. Called before [`Self::refresh`] at every
+    /// launch-bearing submit. Returns the lines to log.
     pub(crate) fn observe(&mut self, batches: &[Vec<vk::CommandBuffer>]) -> Vec<String> {
         let mut lines = Vec::new();
-        // DLSS's output kernel and output image (`LaunchRefs::output`), learned once the same pair has
-        // been seen in OUTPUT_SETTLE submitted DLSS buffers in a row; logged on each change.
-        for cb in batches.iter().flatten() {
-            let Some(refs) = self.launch.get(cb) else { continue };
-            let Some((function, image)) = refs.output else { continue };
-            let Some(InputLaunch::Inputs { colour, depth, mvec }) = refs.input.clone() else { continue };
-            let seen =
-                DlssOutput { function, image, input: colour, depth, mvec, rr: refs.input_rr || !refs.rr.is_empty(), writes: refs.writes_of(function, image) };
-            // The learnt output written in more parts than learnt (Ray Reconstruction's working size changed): this
-            // buffer's hold went after the learnt count of parts, on a partly written output, before the rest could be
-            // seen. Dropped at once, so that is the only such frame; the new count is learnt as any output is.
-            if let Some(l) = self.dlss_output.filter(|l| seen.writes > l.writes && same_output(l, &DlssOutput { writes: l.writes, ..seen }, &self.images)) {
-                lines.push(format!(
-                    "DLSS's output is written in {} launches, not {}: no hold after it until that is learnt (one in this frame went after part of it)",
-                    seen.writes, l.writes
-                ));
-                self.dlss_output = None;
-            }
-            // By kernel and the images' kind, not their handles: Hogwarts Legacy's Ray Reconstruction
-            // alternates two output images (and inputs) frame by frame.
-            match &mut self.output_streak {
-                Some((o, n)) if same_output(o, &seen, &self.images) => *n += 1,
-                _ => self.output_streak = Some((seen, 1)),
-            }
-            if let Some((o, n)) = self.output_streak.filter(|(_, n)| *n >= OUTPUT_SETTLE) {
-                let _ = n;
-                if !self.dlss_output.is_some_and(|l| same_output(&l, &o, &self.images)) {
-                    self.dlss_output = Some(o);
-                    let name = |f: vk::CuFunctionNVX| self.functions.get(&f).map_or("unnamed".to_string(), |(_, n)| n.clone());
-                    let desc = |i: vk::Image| self.images.get(&i).map_or("unregistered".to_string(), |d| format!("{}x{} {:?}", d.width, d.height, d.format));
-                    lines.push(
-                        format!(
-                            "DLSS's output: image {} ({}), written by {} after its input launch on {} ({}; depth {}, motion vectors {}){}",
-                            hex(o.image),
-                            desc(o.image),
-                            name(o.function),
-                            hex(o.input),
-                            desc(o.input),
-                            hex(o.depth),
-                            hex(o.mvec),
-                            if o.rr { "; Ray Reconstruction" } else { "" }
-                        ) + &if o.writes > 1 { format!("; written in {} launches, the hold goes after the last", o.writes) } else { String::new() },
-                    );
-                }
-            }
-        }
         let mut any = false;
-        let mut changed = false;
-        // This submit's input launches, in submission order, for the switch below.
-        let mut evidence: Vec<Named> = Vec::new();
+        let mut evaluate = false;
         for cb in batches.iter().flatten() {
-            let Some(refs) = self.launch.get(cb) else { continue };
+            let Some(refs) = self.launch.get_mut(cb) else { continue };
             any = true;
-            match &refs.input {
-                // DLSS Ray Reconstruction's first launch has SR's shape (its colour input with depth and
-                // motion vectors) but is never evidence.
-                Some(InputLaunch::Inputs { .. }) if refs.input_rr => {}
-                Some(InputLaunch::Inputs { colour, depth, mvec }) => {
-                    let (colour, depth, mvec) = (*colour, *depth, *mvec);
-                    let mut exposure = refs.images.iter().filter(|i| self.images.get(i).is_some_and(exposure_like)).min_by_key(|i| i.as_raw()).copied();
-                    if let Some(ngx) = refs.ngx {
-                        if ngx.exposure != vk::Image::null() && self.images.contains_key(&ngx.exposure) {
-                            crate::ngx_ring::check(crate::ngx_ring::Fact::Exposure, exposure == Some(ngx.exposure), || {
-                                format!("rules {:?}, NGX {}", exposure.map(hex), hex(ngx.exposure))
-                            });
-                            exposure = Some(ngx.exposure);
-                        }
-                        if ngx.output != vk::Image::null() && refs.output.is_some_and(|(_, o)| o == ngx.output) {
-                            crate::ngx_ring::check(crate::ngx_ring::Fact::Output, refs.kernel_output.is_none_or(|k| k == ngx.output), || {
-                                format!("rules {:?}, NGX {}", refs.kernel_output.map(hex), hex(ngx.output))
-                            });
-                        }
-                    }
-                    evidence.push(Named::new(colour, depth, mvec, exposure));
-                    if let Some(n) = self.named.iter_mut().find(|n| n.colour == colour) {
-                        if n.exposure.is_none() && exposure.is_some() {
-                            n.exposure = exposure;
-                            changed = true;
-                        }
-                        if !n.output_pair && refs.output_pair {
-                            n.output_pair = true;
-                            changed = true;
-                        }
-                    } else if self.named.len() < MAX_NAMED {
-                        self.named.push(Named { output_pair: refs.output_pair, ..Named::new(colour, depth, mvec, exposure) });
-                        changed = true;
-                    }
-                }
-                Some(InputLaunch::Ambiguous { depth, colours }) if self.said_named & 1 == 0 => {
-                    self.said_named |= 1;
-                    let list: Vec<String> = colours.iter().map(|(i, d)| format!("{} {}x{} {:?}", hex(*i), d.width, d.height, d.format)).collect();
-                    lines.push(format!(
-                        "a CUDA launch names depth {} with several colour candidates at its extent, in parameter order ({}): not used to identify DLSS's colour input",
-                        hex(*depth),
-                        list.join(", ")
-                    ));
-                }
-                _ => {}
+            let Some(r) = refs.ngx else { continue };
+            evaluate = true;
+            if !refs.ended {
+                refs.ended = crate::ngx_ring::ended(r.seq);
             }
-        }
-        // A buffer whose input launch is not an entry's own but which names that entry's colour
-        // input: something besides an input kernel reads it.
-        for cb in batches.iter().flatten() {
-            let Some(refs) = self.launch.get(cb) else { continue };
-            let own = match &refs.input {
-                Some(InputLaunch::Inputs { colour, .. }) => Some(*colour),
-                _ => None,
-            };
-            for n in &mut self.named {
-                if !n.foreign && own != Some(n.colour) && refs.images.contains(&n.colour) {
-                    n.foreign = true;
-                    changed = true;
-                }
+            if !refs.ended || refs.output_writes == 0 {
+                continue;
             }
+            let seen = DlssOutput { image: r.output, input: r.colour, depth: r.depth, mvec: r.mvec, rr: r.is_rr(), writes: refs.output_writes };
+            if self.dlss_output.is_some_and(|l| same_output(&l, &seen, &self.images)) {
+                continue;
+            }
+            if let Some(l) = self.dlss_output.filter(|l| seen.writes > l.writes && same_output(l, &DlssOutput { writes: l.writes, ..seen }, &self.images)) {
+                lines.push(format!("DLSS's output is written in {} launches, not {}: a hold in this frame went after part of it", seen.writes, l.writes));
+            }
+            self.dlss_output = Some(seen);
+            let desc = |i: vk::Image| self.images.get(&i).map_or("unregistered".to_string(), |d| format!("{}x{} {:?}", d.width, d.height, d.format));
+            lines.push(format!(
+                "DLSS's output: image {} ({}), written by {} launch(es) of its evaluate on {} ({}; depth {}, motion vectors {}){}",
+                hex(seen.image),
+                desc(seen.image),
+                seen.writes,
+                hex(seen.input),
+                desc(seen.input),
+                hex(seen.depth),
+                hex(seen.mvec),
+                if seen.rr { "; Ray Reconstruction" } else { "" }
+            ));
         }
         if !any {
             return lines;
         }
-        // Whether DLSS Ray Reconstruction runs.
         self.launch_submits += 1;
-        let now = self.launch_submits;
-        // DLSS Super Resolution's input kernel launched, its inputs identified or not (by the kernel's name, or by what its
-        // parameters name where the name is not known): DLSS runs, it did not pause (`hand_back_at`).
-        if batches.iter().flatten().any(|cb| self.launch.get(cb).is_some_and(|r| r.sr_launched || matches!(r.input, Some(InputLaunch::Inputs { .. })))) {
-            self.last_sr_launch = Some(now);
+        // DLSS ran in this submit (`hand_back_at`), or CUDA launches ran that no record names.
+        if evaluate {
             note_sr_launch();
-        }
-        for cb in batches.iter().flatten() {
-            let Some(refs) = self.launch.get(cb) else { continue };
-            if !refs.rr.is_empty() {
-                self.last_rr = Some(now);
-            }
-            for f in &refs.rr {
-                if let Some((_, name)) = self.functions.get(f) {
-                    if self.rr_names.len() < 4 && !self.rr_names.contains(name) {
-                        self.rr_names.push(name.clone());
-                    }
-                }
-            }
-        }
-        // Evidence no input launch names any more is dropped: loading a save in Cyberpunk 2077 hands DLSS a new set of
-        // images while the old one stays alive (#49), and an entry for the old set kept forever made two
-        // evaluations of it, so none was chosen again, and with [`MAX_NAMED`] stale entries new evidence had no room.
-        for n in &evidence {
-            self.named_seen.insert(n.colour, now);
-        }
-        // Not while DLSS Ray Reconstruction runs: its buffers are never evidence, so every entry would age out
-        // (and Ray Reconstruction's own launch would lose the colour input and motion vectors it is read with,
-        // [`rr_input_launch`]). The entries count as seen until it stops, so Super Resolution is identified again
-        // at once then, and ages them from there.
-        if self.rr_running() {
-            for n in &self.named {
-                self.named_seen.insert(n.colour, now);
-            }
-        }
-        let seen = &self.named_seen;
-        let stale: Vec<vk::Image> = self.named.iter().map(|n| n.colour).filter(|c| seen.get(c).is_none_or(|&at| now.saturating_sub(at) >= SR_RECENT)).collect();
-        if !stale.is_empty() {
-            if self.named_dropped < MAX_DIAGNOSES {
-                self.named_dropped += 1;
-                let list: Vec<String> = stale.iter().map(|c| hex(*c)).collect();
-                lines.push(format!(
-                    "no input launch named colour input {} in {SR_RECENT} launch-bearing submits: dropped as evidence (the game hands DLSS other images, as after loading a save)",
-                    list.join(", ")
-                ));
-            }
-            self.named.retain(|n| !stale.contains(&n.colour));
-            self.named_seen.retain(|c, _| !stale.contains(c));
-            changed = true;
-            if self.named_pick.is_some_and(|n| stale.contains(&n.colour)) {
-                self.named_pick = None;
-                self.dirty = true;
-            }
-        }
-        let rr = self.rr_running();
-        if rr {
-            note_ray_reconstruction();
-        }
-        if rr != self.rr_gate {
-            self.rr_gate = rr;
-            self.dirty = true;
-            lines.push(if rr {
-                format!(
-                    "DLSS Ray Reconstruction runs ({} launched): its input is the noisy ray-traced frame with its guide buffers, so the model can't run before it; nothing is held, the model runs after the upscaler",
-                    self.rr_names.join(", ")
-                )
-            } else {
-                format!("DLSS Ray Reconstruction stopped (no launch in {SR_RECENT} launch-bearing submits): DLSS's input is identified again")
-            });
-        }
-        self.switch_by_evidence(&evidence, &mut lines);
-        self.named_quiet = if changed { 0 } else { self.named_quiet.saturating_add(1) };
-        // Decided when the evidence has just settled, and again when the registered set or the
-        // swapchains change after that (the output the colour input is compared with may move).
-        if self.named_quiet == SETTLE_SUBMITS || (self.named_quiet > SETTLE_SUBMITS && self.dirty) {
-            let pick = self.pick_named(&mut lines);
-            if pick != self.named_pick {
-                self.named_pick = pick;
-                self.dirty = true;
-            }
+        } else {
+            crate::ngx_ring::note_launches_without_record();
         }
         lines
     }
 
-    /// Overrides the size rule's choice among several colour candidates with the one DLSS's input
-    /// kernel names (`evidence`: this submit's input launches). With nothing identified yet, at
-    /// once; otherwise when the same other candidate is named by [`SWITCH_AFTER`] consecutive input
-    /// launches (one naming the colour input resets the count, so a game alternating between two
-    /// candidates never switches: [`Self::scan`] holds each submit with the one its buffer names).
-    /// Only the size rule's candidates (render-size, smaller than the output, with depth and motion
-    /// vectors at their extent) are switched between: a single candidate (GTA V) and DLAA (none)
-    /// are never affected.
-    fn switch_by_evidence(&mut self, evidence: &[Named], lines: &mut Vec<String>) {
-        if evidence.is_empty() || self.rr_running() {
-            return;
-        }
-        let Some(current) = self.inputs else {
-            // Evidence comes only from NGX's records in a game ([`crate::ngx_ring::rules_decide`]): the first one is
-            // the identification, whatever the size rule makes of the registered images.
-            if !crate::ngx_ring::rules_decide() {
-                self.switched = evidence.first().copied();
-                self.dirty = true;
-                return;
-            }
-            // The first identification: what the input kernel names among the size rule's
-            // candidates, rather than the lowest handle.
-            let registered = self.registered_set();
-            let Some(size) = identify(&registered, self.swapchain_extent()) else { return };
-            let all = size_candidates(&registered, size.output);
-            if let Some(n) = evidence.iter().find(|n| n.colour != size.colour.0 && all.iter().any(|c| c.0 == n.colour)) {
-                self.switched = Some(*n);
-                self.dirty = true;
-            }
-            return;
-        };
-        for n in evidence {
-            if n.colour == current.colour.0 {
-                self.streak = None;
-                continue;
-            }
-            if !self.is_candidate(n.colour) {
-                continue;
-            }
-            let count = match self.streak {
-                Some((s, k)) if s.colour == n.colour => k + 1,
-                _ => 1,
-            };
-            self.streak = Some((*n, count));
-            if count >= SWITCH_AFTER {
-                self.streak = None;
-                self.switched = Some(*n);
-                self.dirty = true;
-                lines.push(format!(
-                    "colour input switched to {} (DLSS's input kernel reads it; the {} had picked {})",
-                    hex(n.colour),
-                    match current.rule {
-                        Rule::Size => "size rule",
-                        Rule::Params => "input kernel's earlier parameters",
-                    },
-                    hex(current.colour.0)
-                ));
-                return;
-            }
-        }
-    }
-
-    /// Several entries whose buffers all name the same exposure image (`with`), with colour inputs of
-    /// one extent: one DLSS Super Resolution evaluation alternating its input between images, not
-    /// several evaluations (each evaluation has its own exposure input). Remnant II's Unreal Engine 5
-    /// alternates its input between two 1488x836 images (2026-10-08). The lowest handle;
-    /// [`Self::scan`] holds each submit with the input its buffer names ([`Self::retarget`]). Only
-    /// when the size rule identifies nothing (Remnant II's motion vectors are 1485x836): where it
-    /// does (Crimson Desert), its pick and [`Self::switch_by_evidence`] already follow the
-    /// alternation, and a new identification here would cost the identifying submit's hold.
-    fn one_evaluation(&self, with: &[Named]) -> Option<Named> {
-        if identify(&self.registered_set(), self.swapchain_extent()).is_some() {
-            return None;
-        }
-        let first = with.iter().min_by_key(|n| n.colour.as_raw())?;
-        let extent = |n: &Named| self.images.get(&n.colour).map(|d| (d.width, d.height));
-        (with.len() > 1 && extent(first).is_some() && with.iter().all(|n| n.exposure == first.exposure && extent(n) == extent(first))).then_some(*first)
-    }
-
-    /// Whether `image` is one of the size rule's colour candidates ([`Self::candidates`]).
-    fn is_candidate(&self, image: vk::Image) -> bool {
-        self.candidates.iter().any(|c| c.0 == image)
-    }
-
-    /// The registered images with their descriptions, keyed by raw handle (what [`identify`] reads).
-    fn registered_set(&self) -> BTreeMap<u64, (vk::Image, ImageDesc)> {
-        self.registered.values().chain(&self.kept).filter_map(|&image| self.images.get(&image).map(|d| (image.as_raw(), (image, *d)))).collect()
-    }
-
-    /// The evidence to identify by. An entry whose colour input is smaller than the output (the
-    /// swapchain; without one the largest registered RGBA16F/R11G11B10 storage image) counts as it
-    /// is: DLSS Frame Generation's launches never name a render-size frame beside the render-size
-    /// depth. An entry whose colour input is the output's size (DLAA, or frame generation at native
-    /// resolution, whose launch names the output-size frame beside output-size depth and motion
-    /// vectors) counts if its buffer also names a 1x1 R16_SFLOAT image: DLSS Super Resolution's
-    /// exposure input, which frame generation does not take. Without one (a game that gives DLSS no
-    /// exposure: Resident Evil Requiem at DLAA) it counts only with SR's own shape
-    /// ([`Named::sr_without_exposure`]): a later launch of its buffer names it with the output (SR's
-    /// output kernel), and no other launch-bearing buffer names it (FG's frame is read by FG's other
-    /// buffer too) — and only when exactly one such entry exists. Among several counted entries,
-    /// the only one whose buffer names the exposure; otherwise none, logged once, and the size rule
-    /// decides.
-    fn pick_named(&mut self, lines: &mut Vec<String>) -> Option<Named> {
-        let describe = |t: &Self, list: &[Named]| -> String {
-            let list: Vec<String> = list
-                .iter()
-                .map(|n| {
-                    let size = t.images.get(&n.colour).map_or_else(String::new, |d| format!(" {}x{}", d.width, d.height));
-                    format!("{}{size}{}", hex(n.colour), n.exposure.map_or_else(String::new, |e| format!(" with exposure {}", hex(e))))
-                })
-                .collect();
-            list.join(", ")
-        };
-        let output = self.swapchain_extent().or_else(|| output_candidate(&self.registered_set()));
-        let (mut counted, output_size): (Vec<Named>, Vec<Named>) =
-            self.named.iter().partition(|n| n.exposure.is_some() || self.images.get(&n.colour).zip(output).is_some_and(|(d, o)| smaller(d.width, d.height, o)));
-        // Output-size entries without an exposure image: SR's shape (DLAA, no exposure given to
-        // DLSS), counted when it is the only one; the rest (FG's frame) not used.
-        let (sr_like, refused): (Vec<Named>, Vec<Named>) = output_size.iter().partition(|n| n.sr_without_exposure());
-        if let [one] = sr_like[..] {
-            counted.push(one);
-            if self.said_named & 16 == 0 {
-                self.said_named |= 16;
-                lines.push(format!(
-                    "a CUDA launch names an output-size colour image with depth and motion vectors and its command buffer names no 1x1 R16_SFLOAT exposure ({}): taken as DLSS Super Resolution's input at DLAA, because a later launch of the same buffer names it with the output (SR's output kernel) and no other launch-bearing buffer names it; the exposure is measured from the frame",
-                    describe(self, &sr_like)
-                ));
-            }
-        } else if sr_like.len() > 1 && self.said_named & 32 == 0 {
-            self.said_named |= 32;
-            lines
-                .push(format!("several output-size colour images have SR's shape without a 1x1 R16_SFLOAT exposure ({}): none used", describe(self, &sr_like)));
-        }
-        let refused: Vec<Named> = if sr_like.len() > 1 { output_size.clone() } else { refused };
-        if !refused.is_empty() && self.said_named & 8 == 0 {
-            self.said_named |= 8;
-            let why: Vec<String> = refused
-                .iter()
-                .map(|n| {
-                    let mut reasons = Vec::new();
-                    if !n.output_pair {
-                        reasons.push("no later launch of its buffer names it with another output-size colour image");
-                    }
-                    if n.foreign {
-                        reasons.push("another launch-bearing buffer names it too");
-                    }
-                    if reasons.is_empty() {
-                        reasons.push("another output-size image has the same shape");
-                    }
-                    format!("{}: {}", hex(n.colour), reasons.join(", "))
-                })
-                .collect();
-            lines.push(format!(
-                "a CUDA launch names an output-size colour image with depth and motion vectors ({}), but its command buffer names no 1x1 R16_SFLOAT exposure: not DLSS Super Resolution's input (DLSS Frame Generation's frame, or SR without an exposure input); not used ({})",
-                describe(self, &refused),
-                why.join("; ")
-            ));
-        }
-        match counted[..] {
-            [] => None,
-            [one] => Some(one),
-            _ => {
-                let with: Vec<Named> = counted.iter().filter(|n| n.exposure.is_some()).copied().collect();
-                if let [one] = with[..] {
-                    if self.said_named & 2 == 0 {
-                        self.said_named |= 2;
-                        lines.push(format!(
-                            "input launches in different command buffers name different colour inputs ({}): {} chosen, the one whose buffer names the 1x1 R16_SFLOAT exposure",
-                            describe(self, &counted),
-                            hex(one.colour)
-                        ));
-                    }
-                    Some(one)
-                } else if let Some(one) = self.one_evaluation(&with) {
-                    if self.said_named & 128 == 0 {
-                        self.said_named |= 128;
-                        lines.push(format!(
-                            "input launches in different command buffers name different colour inputs ({}): one evaluation alternating its input (every buffer names the same 1x1 R16_SFLOAT exposure, the inputs share one extent), {} chosen; each submit is held with the input its buffer names",
-                            describe(self, &counted),
-                            hex(one.colour)
-                        ));
-                    }
-                    Some(one)
-                } else {
-                    if self.said_named & 4 == 0 {
-                        self.said_named |= 4;
-                        lines.push(format!(
-                            "input launches in different command buffers name different colour inputs ({}): none chosen by the input kernel's parameters, the size rule decides",
-                            describe(self, &counted)
-                        ));
-                    }
-                    None
-                }
-            }
-        }
-    }
-
-    /// Finds the first launch-bearing command buffer in a submit (`batches`: each batch's command
-    /// buffers, in order) and reads the watched images' layouts just before it: the committed ones
-    /// with the barriers of the buffers ahead of it in this submit applied on top, in submission
-    /// order. Nothing is committed here: the submit has not happened yet, and may fail
-    /// ([`Self::commit_submitted`]).
+    /// Finds the first command buffer in a submit (`batches`: each batch's command buffers, in order) whose launches
+    /// belong to DLSS's Super Resolution evaluate ([`LaunchRefs::sr`]) and reads the watched images' layouts just
+    /// before it: the committed ones with the barriers of the buffers ahead of it in this submit applied on top, in
+    /// submission order. Its inputs are its own evaluate's, as NGX's record names them. Nothing is committed here: the
+    /// submit has not happened yet, and may fail ([`Self::commit_submitted`]).
     pub(crate) fn scan(&mut self, batches: &[Vec<vk::CommandBuffer>]) -> Option<Scan> {
         if !self.armed() {
             return None;
@@ -4482,9 +2541,7 @@ impl Tracker {
         // What this submit's buffers so far would leave behind.
         let mut proposed: HashMap<vk::Image, (vk::ImageLayout, Option<u32>)> = HashMap::new();
         let mut found: Option<Scan> = None;
-        let mut any_foreign = false;
-        let mut held_kind = None;
-        let mut held_target: Option<(vk::Image, bool)> = None;
+        let mut any_launch = false;
         // A buffer up to and including the launch buffer was recorded (in part) before the current
         // identification ([`Self::recorded_watched`]): what it recorded on the inputs is not known.
         let mut recorded_before = false;
@@ -4493,37 +2550,14 @@ impl Tracker {
                 if found.is_none() && !self.recorded_watched.contains(&cb) {
                     recorded_before = true;
                 }
-                let colour = self.inputs.map(|i| i.colour.0);
-                // A buffer that launches DLSS Ray Reconstruction is never the hold point: forwarded.
-                let kind = self.launch.get(&cb).map(|r| if r.rr.is_empty() { r.kind(colour) } else { LaunchKind::Foreign });
-                // A buffer whose input launch names another of the size rule's candidates with the
-                // colour input's depth and motion vectors: DLSS reads that candidate this frame
-                // (a game alternating its input between images). Held with it as the target.
-                let retarget = (kind == Some(LaunchKind::Foreign)).then(|| self.retarget(cb)).flatten();
-                let kind = if retarget.is_some() { Some(LaunchKind::Colour) } else { kind };
-                if kind == Some(LaunchKind::Foreign) {
-                    any_foreign = true;
-                    // Counted only: whether a forwarded buffer reads another colour candidate.
-                    let other = self.inputs.and_then(|i| {
-                        let refs = self.launch.get(&cb)?;
-                        self.candidates.iter().map(|c| c.0).filter(|&c| c != i.colour.0).find(|c| refs.images.contains(c))
-                    });
-                    if let Some(other) = other {
-                        self.other_candidate_buffers += 1;
-                        self.other_named.get_or_insert(other);
-                    }
-                }
-                if found.is_none() && kind.is_some_and(|k| k != LaunchKind::Foreign) {
-                    held_kind = kind;
-                    held_target = retarget.or(self.inputs.map(|i| i.colour)).map(|c| (c.0, retarget.is_some()));
+                let refs = self.launch.get(&cb);
+                any_launch |= refs.is_some();
+                if let Some(record) = refs.and_then(LaunchRefs::sr).filter(|_| found.is_none()) {
                     let layout = |image: Option<vk::Image>| image.and_then(|i| proposed.get(&i).map(|p| p.0).or(self.committed.get(&i).copied()));
-                    // The depth this frame's hold reads ([`Self::hold_depth`]): GTA V Enhanced
-                    // alternates two depth images frame by frame, so the identified one is the previous
-                    // frame's on every other frame.
-                    let inputs = self.inputs.map(|i| {
-                        let colour = retarget.unwrap_or(i.colour);
-                        Inputs { colour, depth: self.hold_depth(cb, i.depth, self.before_launch(cb, colour.0), false), ..i }
-                    });
+                    // The depth this frame's hold reads ([`Self::hold_depth`]): GTA V Enhanced copies its depth into
+                    // the one DLSS reads inside the launch buffer.
+                    let inputs =
+                        self.inputs_of(&record).map(|i| Inputs { depth: self.hold_depth(cb, i.depth, self.before_launch(cb, i.colour.0), false), ..i });
                     let colour_owner = inputs.and_then(|i| proposed.get(&i.colour.0).and_then(|p| p.1).or(self.owners.get(&i.colour.0).copied()));
                     let (hazard, dump_hazard, depth_hazard) = self.launch_hazard(cb, inputs.as_ref());
                     self.probe_depth(cb, inputs.as_ref(), depth_hazard);
@@ -4533,9 +2567,8 @@ impl Tracker {
                         colour_layout: layout(inputs.map(|i| i.colour.0)),
                         inputs,
                         depth_layout: layout(inputs.map(|i| i.depth.0)),
-                        mvec_layout: layout(self.inputs.map(|i| i.mvec.0)),
-                        exposure_layouts: std::array::from_fn(|k| layout(self.inputs.and_then(|i| i.exposure[k]).map(|e| e.0))),
-                        exposure_input_layout: layout(self.inputs.and_then(|i| i.exposure_input).map(|e| e.0)),
+                        mvec_layout: layout(inputs.map(|i| i.mvec.0)),
+                        exposure_input_layout: layout(inputs.and_then(|i| i.exposure_input).map(|e| e.0)),
                         evaluation: self.evaluations,
                         identified_now: self.identified,
                         identification: self.generation,
@@ -4544,12 +2577,11 @@ impl Tracker {
                         dump_hazard,
                         depth_hazard,
                         colour_owner,
-                        jitter: self.launch.get(&cb).and_then(|r| r.jitter),
-                        reset: self.reset_seen(cb),
+                        frame: DlssFrame::of(&record),
                     });
                     // The colour image's layout at DLSS's launch buffer as this submission has it (what the
                     // split's check reads): the guess of the next hold recorded inside a buffer that does not
-                    // set it itself ([`Self::inline_point`]). For the candidate a retargeted buffer names too.
+                    // set it itself ([`Self::inline_point`]).
                     if let (Some(i), Some(l), false) = (inputs, found.as_ref().and_then(|s| s.colour_layout), self.identified) {
                         self.launch_layouts.insert(i.colour.0, l);
                     }
@@ -4569,24 +2601,13 @@ impl Tracker {
         if found.is_some() {
             self.evaluations += 1;
             self.identified = false;
-            if held_kind == Some(LaunchKind::Colour) {
-                self.named_colour_submits += 1;
-            }
-            if let Some((target, retargeted)) = held_target.filter(|_| held_kind == Some(LaunchKind::Colour)) {
-                self.retargeted_submits += u64::from(retargeted);
-                if retargeted {
-                    self.retarget_named.get_or_insert(target);
-                }
-                self.note_target(target);
-            }
-        } else if any_foreign {
+            self.evaluate_submits += 1;
+        } else if any_launch {
             self.foreign_submits += 1;
         }
         found
     }
 
-    /// The size rule's other candidate `cb`'s input launch names, with the colour input's depth and
-    /// motion vectors (so their layouts are watched), if any. Never DLSS Ray Reconstruction's launch.
     /// `NEURAL_FORGE_PROBE_DEPTH=1`: for the first 120 launch-bearing submits held, logs the
     /// identified and the named depth, their layouts, and the launch buffer's barriers on depth
     /// images (before the launch or not). Diagnostic only.
@@ -4636,7 +2657,7 @@ impl Tracker {
     }
 
     /// The depth a hold reads for DLSS this frame, at `identified`'s extent:
-    /// 1. the depth image the input launch names, where its layout is known and the buffer does not
+    /// 1. the depth image NGX's record of the buffer's evaluate names, where its layout is known and the buffer does not
     ///    write it before the launch (no barrier on it there that may follow a write): DLSS's own
     ///    input, final at the hold. Inside DLSS's buffer (`inside`: the copy is recorded at the launch
     ///    itself, after anything the buffer wrote) that is enough;
@@ -4647,17 +2668,14 @@ impl Tracker {
     ///    image is written after the hold, the source is final before it;
     /// 3. else the named one where its layout is known (its write before the launch then leaves the
     ///    hold without depth, `Scan::depth_hazard`);
-    /// 4. else the identified one.
+    /// 4. else `identified`.
     fn hold_depth(&self, cb: vk::CommandBuffer, identified: (vk::Image, ImageDesc), before: Option<usize>, inside: bool) -> (vk::Image, ImageDesc) {
         let extent = (identified.1.width, identified.1.height);
         let depth =
             |image: vk::Image| self.images.get(&image).filter(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == extent).map(|d| (image, *d));
         let recorded = self.pending.get(&cb).map_or(&[][..], Vec::as_slice);
         let recorded = &recorded[..before.unwrap_or(recorded.len()).min(recorded.len())];
-        let named = match self.launch.get(&cb).and_then(|r| r.input.as_ref()) {
-            Some(InputLaunch::Inputs { depth: d, .. }) => depth(*d),
-            _ => None,
-        };
+        let named = self.launch.get(&cb).and_then(|r| r.ngx).and_then(|r| depth(r.depth));
         let known = |image: vk::Image| self.committed.contains_key(&image) || recorded.iter().any(|s| s.image == image);
         let named = named.filter(|(d, _)| known(*d));
         let written = |image: vk::Image| recorded.iter().any(|s| s.image == image && s.may_follow_a_write());
@@ -4668,88 +2686,18 @@ impl Tracker {
         read.or(named).unwrap_or(identified)
     }
 
-    fn retarget(&self, cb: vk::CommandBuffer) -> Option<(vk::Image, ImageDesc)> {
-        let i = self.inputs?;
-        let refs = self.launch.get(&cb)?;
-        if refs.input_rr || !refs.rr.is_empty() {
-            return None;
-        }
-        let Some(InputLaunch::Inputs { colour, mvec, .. }) = refs.input else { return None };
-        // Any depth: a game may hand DLSS a new depth image every frame (Black Myth: Wukong with
-        // frame generation on). The motion vectors must be the identified ones, unless the launch is
-        // DLSS Super Resolution's input kernel by name: Wukong's benchmark scene names other motion
-        // vectors than the ones identified in its intro, whose colour image lives on.
-        if colour == i.colour.0 || (refs.input_sr != Some(true) && mvec != i.mvec.0) {
-            return None;
-        }
-        // A candidate of the size rule, or (a new image every frame, registered after the last
-        // identification) a colour candidate at the colour input's extent.
-        self.candidates.iter().find(|c| c.0 == colour).copied().or_else(|| {
-            self.images
-                .get(&colour)
-                .filter(|d| colour_candidate(d) && (d.width, d.height) == (i.colour.1.width, i.colour.1.height) && smaller(d.width, d.height, i.output))
-                .map(|d| (colour, *d))
-        })
-    }
-
-    /// Books a held submit's target colour image; logs (once) when it alternates.
-    fn note_target(&mut self, target: vk::Image) {
-        let now = self.evaluations;
-        if let Some(last) = self.last_target.filter(|&l| l != target) {
-            self.flips.push_back(now);
-            while self.flips.front().is_some_and(|&f| now.saturating_sub(f) >= ALTERNATION_WINDOW) {
-                self.flips.pop_front();
-            }
-            if self.flips.len() > ALTERNATION_FLIPS && self.alternation.is_none() {
-                self.alternation = Some((last, target));
-            }
-        }
-        self.last_target = Some(target);
-    }
-
-    /// A first-of-its-kind classification line, once per kind: a launch-bearing submit held because
-    /// a launch reads the colour input; one forwarded because its launches name other images only;
-    /// one held undecided (a launch's parameters could not be read, or no colour input yet: the rule
-    /// before the distinction). `undecided_before`: held-undecided submits before this scan.
-    fn classify_line(&mut self, scan: Option<&Scan>, undecided_before: u64) -> Option<String> {
-        let undecided = self.evaluations - self.named_colour_submits;
-        let (bit, line) = if scan.is_some() && self.named_colour_submits > 0 && self.said_kinds & 1 == 0 {
-            (1, "a launch-bearing submit reads DLSS's colour input (its registered handle is in a launch's parameters): DLSS Super Resolution's, the hold point".to_string())
+    /// A first-of-its-kind classification line, once per kind: a launch-bearing submit held because a buffer of it
+    /// carries DLSS Super Resolution's evaluate, and one forwarded because none does.
+    fn classify_line(&mut self, scan: Option<&Scan>) -> Option<String> {
+        let (bit, line) = if scan.is_some() && self.said_kinds & 1 == 0 {
+            (1, "a launch-bearing submit carries DLSS Super Resolution's evaluate (a launch names the colour input of NGX's record): the hold point")
         } else if scan.is_none() && self.foreign_submits > 0 && self.said_kinds & 2 == 0 {
-            (2, "a launch-bearing submit whose CUDA launches never name DLSS's colour input (DLSS Frame Generation's, or another NGX feature's) is forwarded untouched; only the one that reads it is held".to_string())
-        } else if scan.is_some() && undecided > undecided_before && self.inputs.is_some() && self.said_kinds & 4 == 0 {
-            (4, "a launch-bearing submit is held undecided: a launch's parameters were not readable (not in CUDA's buffer form), so it cannot be told from DLSS Super Resolution's".to_string())
-        } else if scan.is_some() && self.retargeted_submits > 0 && self.said_kinds & 16 == 0 {
-            (
-                16,
-                format!(
-                    "a launch-bearing buffer's input launch names another colour candidate ({}) with the colour input's depth and motion vectors: held with that candidate (DLSS's input kernel reads it this frame)",
-                    self.retarget_named.map_or_else(String::new, hex)
-                ),
-            )
-        } else if let Some((a, b)) = self.alternation.filter(|_| self.said_kinds & 32 == 0) {
-            (
-                32,
-                format!(
-                    "DLSS's input kernel alternates between colour candidates {} and {} (more than {ALTERNATION_FLIPS} changes in {ALTERNATION_WINDOW} held submits): each submit is held with the candidate its input launch names",
-                    hex(a),
-                    hex(b)
-                ),
-            )
-        } else if self.other_candidate_buffers > 0 && self.said_kinds & 8 == 0 {
-            (
-                8,
-                format!(
-                    "a forwarded launch-bearing buffer names another colour candidate ({}) and not the colour input {}: not held (counted in the tally)",
-                    self.other_named.map_or_else(String::new, hex),
-                    self.inputs.map_or_else(String::new, |i| hex(i.colour.0))
-                ),
-            )
+            (2, "a launch-bearing submit without DLSS Super Resolution's evaluate (DLSS Frame Generation's, Ray Reconstruction's, or launches no record names) is forwarded untouched")
         } else {
             return None;
         };
         self.said_kinds |= bit;
-        Some(line)
+        Some(line.to_string())
     }
 }
 
@@ -4790,8 +2738,6 @@ impl Tracking {
         tracking
     }
 
-    /// The camera jitter (x, y, render pixels) `cb`'s DLSS input launch was given, if read: for the
-    /// hold inside DLSS's buffer, whose job is made at the submit.
     /// A hold after DLSS's output was recorded ([`Tracker::after_recorded`]).
     pub(crate) fn after_recorded(&self) {
         self.lock().after_recorded();
@@ -4810,24 +2756,16 @@ impl Tracking {
         plans_before(&plan).then(|| placement::Hold::of(&plan, placement::Stage::Before, render, t.output_extent()))
     }
 
-    /// What a hold recorded into `cb` now, before the upscaler, is given of DLSS's frame: the camera jitter
-    /// ([`Tracker::jitter_for_hold`]) and the game's reset ([`Tracker::reset_for_hold`]).
+    /// What a hold recorded into `cb` now, before the upscaler, is given of DLSS's frame: the camera jitter and the
+    /// game's reset, from NGX's record of the buffer's evaluate (written before any of its launches).
     pub(crate) fn dlss_frame_of(&self, cb: vk::CommandBuffer) -> DlssFrame {
-        let mut t = self.lock();
-        DlssFrame { jitter: t.jitter_for_hold(cb).map(jitter_px), reset: t.reset_for_hold(cb) }
+        self.lock().frame_of(cb)
     }
 
-    /// What the split hold at the submit `scan` found is given of DLSS's frame: its launch's jitter and reset, and
-    /// a reset latched for the next hold ([`Tracker::reset_for_hold`]). Called where the hold runs.
-    pub(crate) fn split_dlss_frame(&self, scan: &Scan) -> DlssFrame {
-        let latched = self.lock().take_reset_latch();
-        DlssFrame { reset: scan.reset | latched, ..scan.dlss_frame() }
-    }
-
-    /// The same for a hold after DLSS's output kernel in `cb`: DLSS's output is not jittered (its jitter is
-    /// zero, known, so the edit cache keeps its interval there), and the reset is the buffer's input launch's.
+    /// The same for a hold after DLSS's output in `cb`: DLSS's output is not jittered (its jitter is zero, known,
+    /// so the edit cache keeps its interval there), and the reset is the evaluate's.
     pub(crate) fn dlss_frame_after(&self, cb: vk::CommandBuffer) -> DlssFrame {
-        DlssFrame { jitter: Some([0.0, 0.0]), reset: self.lock().reset_seen(cb) }
+        DlssFrame { jitter: Some([0.0, 0.0]), reset: self.lock().frame_of(cb).reset }
     }
 
     /// Whether `cb` has CUDA launches recorded (diagnostics: `NEURAL_FORGE_LOG_LAUNCH_QUEUES`).
@@ -4896,7 +2834,7 @@ impl Tracking {
 
     /// The hold point inside DLSS's buffer, if any, and a refusal's line to log once the lock is let go.
     fn before_point(t: &mut Tracker) -> (Option<InlinePoint>, Option<Said>) {
-        let Some((cb, colour)) = t.take_inline_at() else { return (None, None) };
+        let Some((cb, record)) = t.take_inline_at() else { return (None, None) };
         // No pass runs before the upscaler (they run after DLSS or at present): no hold here.
         let plan = placement::current(t.frame());
         if !plans_before(&plan) {
@@ -4905,11 +2843,11 @@ impl Tracking {
         t.inline_tried.insert(cb);
         let output = t.output_extent();
         let point = t
-            .inline_point(cb, colour)
+            .inline_point(cb, &record)
             .map(|p| InlinePoint { hold: placement::Hold::of(&plan, placement::Stage::Before, (p.desc.width, p.desc.height), output), ..p });
         match point {
             Ok(point) => (Some(point), None),
-            Err(refusal) => (None, t.note_inline_refusal(colour, refusal)),
+            Err(refusal) => (None, t.note_inline_refusal(record.colour, refusal)),
         }
     }
 
@@ -5058,28 +2996,17 @@ impl Tracking {
             let identified = line.is_some().then(|| t.inputs.map(|i| i.colour.0));
             self.watching.store(t.inputs.is_some() || t.colour_watch.is_some(), Ordering::Relaxed);
             self.extent.store(t.inputs.map_or(0, |i| u64::from(i.colour.1.width) << 32 | u64::from(i.colour.1.height)), Ordering::Relaxed);
-            let undecided_before = t.evaluations - t.named_colour_submits;
             let foreign_before = t.foreign_submits;
             let scan = t.scan(batches);
-            let kind_line = t.classify_line(scan.as_ref(), undecided_before);
+            let kind_line = t.classify_line(scan.as_ref());
             // Every 3000th forwarded one: the running counts.
             let tally = (t.foreign_submits != foreign_before && t.foreign_submits.is_multiple_of(3000)).then(|| {
                 format!(
-                    "launch-bearing submits: {} named the colour input{}, {} undecided, {} forwarded untouched (their launches never name the colour input){}; holds: {} split, {} inside DLSS's buffer; registered images: {} kept after their last view was destroyed, {} destroyed; {} depth-only changes",
-                    t.named_colour_submits,
-                    if t.retargeted_submits > 0 { format!(" ({} of them another candidate their input launch names)", t.retargeted_submits) } else { String::new() },
-                    t.evaluations - t.named_colour_submits,
+                    "launch-bearing submits: {} with DLSS Super Resolution's evaluate, {} forwarded untouched; holds: {} split, {} inside DLSS's buffer",
+                    t.evaluate_submits,
                     t.foreign_submits,
-                    if t.other_candidate_buffers > 0 {
-                        format!("; {} forwarded buffers named another colour candidate", t.other_candidate_buffers)
-                    } else {
-                        String::new()
-                    },
                     HOLDS_SPLIT.load(Ordering::Relaxed),
                     HOLDS_INSIDE.load(Ordering::Relaxed),
-                    t.unregistered_by_view,
-                    t.unregistered_by_image,
-                    t.depth_changes
                 )
             });
             self.rearm(&t);
@@ -7473,28 +5400,6 @@ impl Drop for PostOffEntry {
     }
 }
 
-/// `NEURAL_FORGE_PROBE_PARAMS=1`: logs every word of DLSS Super Resolution's input-kernel parameters
-/// (hex, and its two halves as f32) for the first 2000 launches, to find the per-frame scalars
-/// (the camera jitter) beside the documented ones (docs/DLSS_KERNEL_CATALOGUE.md).
-fn probe_params(bytes: &[u8]) {
-    static ON: LazyLock<bool> = LazyLock::new(|| neural_forge_protocol::env::flag("NEURAL_FORGE_PROBE_PARAMS"));
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    if !*ON || COUNT.fetch_add(1, Ordering::Relaxed) >= 2000 {
-        return;
-    }
-    let words: Vec<String> = bytes
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .enumerate()
-        .map(|(i, w)| {
-            let v = u64::from_le_bytes(*w);
-            format!("w{i}={v:016x}({},{})", f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32))
-        })
-        .collect();
-    crate::log!("[probe-params] {}", words.join(" "));
-}
-
 /// `NEURAL_FORGE_PROBE_KERNEL=<name prefix>`: logs the parameters of the first 3000 launches of kernels
 /// whose name starts with the prefix, as 4-byte words (hex and f32), for finding a field such as the
 /// camera jitter in a kernel the layer does not know yet. Diagnostic only.
@@ -7515,43 +5420,6 @@ fn probe_kernel(name: &str, bytes: &[u8]) {
         })
         .collect();
     crate::log!("[probe-kernel] {name} {}", words.join(" "));
-}
-
-/// `NEURAL_FORGE_PROBE_RR=<a,b,...>`: the kernel and the registered images it names (size, format, usage) of
-/// every launch whose kernel name contains one of the comma-separated parts (`1`: every launch), for the
-/// first 4000 such launches: how a DLSS engine spreads its inputs and output over its launches.
-fn probe_rr(cb: vk::CommandBuffer, name: Option<&str>, named: &[vk::Image], images: &HashMap<vk::Image, ImageDesc>) {
-    static PARTS: LazyLock<Option<Vec<String>>> = LazyLock::new(|| {
-        neural_forge_protocol::env::var("NEURAL_FORGE_PROBE_RR").filter(|v| !v.is_empty()).map(|v| v.split(',').map(str::to_string).collect())
-    });
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    let Some(parts) = PARTS.as_deref() else { return };
-    let wanted = parts.iter().any(|p| p == "1" || name.is_some_and(|n| n.contains(p.as_str())));
-    if !wanted || COUNT.fetch_add(1, Ordering::Relaxed) >= 4000 {
-        return;
-    }
-    let list: Vec<String> = named
-        .iter()
-        .map(|i| match images.get(i) {
-            Some(d) => format!("{} {}x{} {:?} {}", hex(*i), d.width, d.height, d.format, usage_short(d.usage)),
-            None => format!("{} unregistered", hex(*i)),
-        })
-        .collect();
-    crate::log!("[probe-rr] {} {} [{}]", hex(cb), name.unwrap_or("unnamed"), list.join("; "));
-}
-
-/// With `NEURAL_FORGE_PROBE_RR` set: what a matching launch left in its buffer's tracking (`state`).
-fn probe_rr_state(cb: vk::CommandBuffer, name: Option<&str>, state: &str) {
-    static PARTS: LazyLock<Option<Vec<String>>> = LazyLock::new(|| {
-        neural_forge_protocol::env::var("NEURAL_FORGE_PROBE_RR").filter(|v| !v.is_empty()).map(|v| v.split(',').map(str::to_string).collect())
-    });
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    let Some(parts) = PARTS.as_deref() else { return };
-    let wanted = parts.iter().any(|p| p == "1" || name.is_some_and(|n| n.contains(p.as_str())));
-    if !wanted || COUNT.fetch_add(1, Ordering::Relaxed) >= 4000 {
-        return;
-    }
-    crate::log!("[probe-rr-state] {} {} {state}", hex(cb), name.unwrap_or("unnamed"));
 }
 
 /// `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore`: dump even when DLSS's launch buffer synchronizes
@@ -8763,227 +6631,6 @@ pub(crate) fn write_dump_async(frame: DumpFrame, capture: Option<(neural_forge_p
 }
 
 #[cfg(test)]
-mod jitter_tests {
-    use super::*;
-
-    fn word(x: f32, y: f32) -> u64 {
-        u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32)
-    }
-
-    /// Each kernel family's jitter word, as found with `NEURAL_FORGE_PROBE_KERNEL`, and nothing for others.
-    #[test]
-    fn the_jitter_word_follows_the_kernel() {
-        assert_eq!(jitter_word("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel"), Some(3));
-        assert_eq!(jitter_word("cuda_engine_input_kernel_rel_hdr_mvdiff_mvhi"), Some(10));
-        assert_eq!(jitter_word("cuda_engine_input_kernel"), Some(9), "San Andreas's plain kernel");
-        assert_eq!(jitter_word("cuda_engine_input_kernelx"), None);
-        assert_eq!(jitter_word("rrlite_enc0_4x4_mvlo_hdr_folded"), Some(21));
-        assert_eq!(jitter_word("rrlite_enc1_4x4"), None);
-        assert_eq!(jitter_word("rr2_enc0_kernel"), None, "Ray Reconstruction is never held");
-        assert_eq!(jitter_word("rr2_enc1_kernel"), None);
-        assert_eq!(jitter_word("main_kernel"), None);
-    }
-
-    /// The game's history reset is word 4 of a 310.x SR input kernel's parameters (GTA V Enhanced), and no other
-    /// family's word is known.
-    #[test]
-    fn the_reset_word_is_hiluma_s_only() {
-        assert_eq!(reset_word("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel"), Some(4));
-        assert_eq!(reset_word("hiluma_engine_input_depthreg_mvhi_ldr_v1_rel"), Some(4));
-        assert_eq!(reset_word("hiluma_engine_output_depthinv_mvlo_hdr_v2_rel"), None, "the output kernel");
-        assert_eq!(reset_word("cuda_engine_input_kernel"), None);
-        assert_eq!(reset_word("cuda_engine_input_kernel_rel_hdr_mvdiff_mvhi"), None);
-        assert_eq!(reset_word("rrlite_enc0_4x4_mvlo_hdr_folded"), None);
-        assert_eq!(reset_word("rr2_enc0_kernel"), None);
-        assert_eq!(reset_word("main_kernel"), None);
-        assert!(parse_game_reset(None) && parse_game_reset(Some("")) && parse_game_reset(Some("on")) && parse_game_reset(Some("1")));
-        assert!(!parse_game_reset(Some("off")) && !parse_game_reset(Some(" off ")));
-    }
-
-    /// A 310.x SR input launch records the game's reset from its word 4 (its first launch carrying one; other
-    /// kernels none), and a hold in its buffer is given it; a hold recorded before the launch that carries it
-    /// goes without it, and the next hold starts afresh instead, once.
-    #[test]
-    fn the_input_launch_records_the_reset_and_a_hold_before_it_passes_it_to_the_next_hold() {
-        let mut t = Tracker::default();
-        let (input, other) = (vk::CuFunctionNVX::from_raw(0x9201), vk::CuFunctionNVX::from_raw(0x9202));
-        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
-        t.record_function(other, "cuda_dldn_engine_luma_convert_kernel");
-        // 31 words as GTA V's: the jitter at word 3, the reset at word 4.
-        let params = |reset: u64| -> Vec<u8> {
-            let mut words = [0u64; 31];
-            words[3] = word(-0.25, 0.125);
-            words[4] = reset;
-            words.iter().flat_map(|w| w.to_le_bytes()).collect()
-        };
-        let cb = |n: u64| vk::CommandBuffer::from_raw(0x7000 + n);
-        // An ordinary frame: recorded as no reset, and the hold is given none.
-        t.launch_kernel(cb(0), input, Some(&params(0)));
-        assert_eq!(t.launch[&cb(0)].reset, Some(false));
-        assert!(!t.reset_for_hold(cb(0)));
-        // A frame the game reset: recorded, given to every hold of the buffer (before and after DLSS's output).
-        t.launch_kernel(cb(1), input, Some(&params(1)));
-        assert_eq!((t.launch[&cb(1)].reset, t.launch[&cb(1)].jitter), (Some(true), Some(word(-0.25, 0.125))));
-        assert!(t.reset_for_hold(cb(1)));
-        assert!(t.reset_for_hold(cb(1)) && t.reset_seen(cb(1)));
-        assert!(!t.reset_for_hold(cb(0)), "nothing latched");
-        // The first launch carrying the word decides: a later one in the same buffer does not change it.
-        t.launch_kernel(cb(0), input, Some(&params(1)));
-        assert_eq!(t.launch[&cb(0)].reset, Some(false));
-        // Another kernel's word 4 is not read.
-        t.launch_kernel(cb(2), other, Some(&params(1)));
-        assert_eq!(t.launch[&cb(2)].reset, None);
-        // A hold before the launch carrying the reset: none for it; the launch latches it for the next hold, once.
-        t.launch_kernel(cb(3), other, Some(&params(0)));
-        assert!(!t.reset_for_hold(cb(3)));
-        t.launch_kernel(cb(3), input, Some(&params(1)));
-        assert!(!t.reset_seen(cb(0)) && !t.reset_seen(cb(2)));
-        assert!(t.reset_for_hold(cb(4)), "the next hold starts afresh (its own launch not seen yet)");
-        assert!(!t.reset_for_hold(cb(4)), "once");
-        t.launch_kernel(cb(5), input, Some(&params(0)));
-        assert!(!t.reset_for_hold(cb(5)));
-        // The same with the next hold's own launch seen: latched or its own, one reset.
-        t.launch_kernel(cb(6), other, Some(&params(0)));
-        assert!(!t.reset_for_hold(cb(6)));
-        t.launch_kernel(cb(6), input, Some(&params(1)));
-        t.launch_kernel(cb(7), input, Some(&params(0)));
-        assert!(t.reset_for_hold(cb(7)));
-        assert!(!t.reset_for_hold(cb(8)));
-        // A hold before a launch without the reset latches nothing.
-        t.launch_kernel(cb(9), other, Some(&params(0)));
-        assert!(!t.reset_for_hold(cb(9)));
-        t.launch_kernel(cb(9), input, Some(&params(0)));
-        assert!(!t.reset_for_hold(cb(10)));
-    }
-
-    /// Only 0 and 1 are the game's reset; a word set on more than 8 input launches in a row is no reset flag, and
-    /// is ignored on the device from then on (a latched reset with it).
-    #[test]
-    fn the_reset_word_takes_only_0_and_1_and_stops_when_set_on_too_many_launches_in_a_row() {
-        let mut t = Tracker::default();
-        let input = vk::CuFunctionNVX::from_raw(0x9301);
-        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
-        let params = |reset: u64| -> Vec<u8> {
-            let mut words = [0u64; 31];
-            words[4] = reset;
-            words.iter().flat_map(|w| w.to_le_bytes()).collect()
-        };
-        let mut n = 0u64;
-        let mut launch = |t: &mut Tracker, value: u64| {
-            n += 1;
-            let cb = vk::CommandBuffer::from_raw(0x8000 + n);
-            t.launch_kernel(cb, input, Some(&params(value)));
-            t.launch[&cb].reset
-        };
-        assert_eq!(launch(&mut t, 1), Some(true));
-        for other in [2, 0x3f80_0000, u64::MAX, 0x1_0000_0001] {
-            assert_eq!(launch(&mut t, other), Some(false), "{other:#x} is no reset flag");
-        }
-        // Single resets between ordinary frames: always honoured.
-        for _ in 0..20 {
-            assert_eq!(launch(&mut t, 0), Some(false));
-            assert_eq!(launch(&mut t, 1), Some(true));
-        }
-        // Eight in a row (counting the last one above) are honoured; a ninth means it is no reset flag.
-        assert_eq!(launch(&mut t, 0), Some(false));
-        for k in 0..8 {
-            assert_eq!(launch(&mut t, 1), Some(true), "launch {k} of the streak");
-        }
-        // A hold before the launch that carries the ninth: nothing latched for the next.
-        let cb = vk::CommandBuffer::from_raw(0x9000);
-        assert!(!t.reset_for_hold(cb));
-        t.launch_kernel(cb, input, Some(&params(1)));
-        assert_eq!(t.launch[&cb].reset, Some(false));
-        assert!(t.reset_ignored);
-        assert!(!t.reset_for_hold(vk::CommandBuffer::from_raw(0x9001)));
-        assert_eq!(launch(&mut t, 0), Some(false));
-        assert_eq!(launch(&mut t, 1), Some(false), "ignored from then on");
-    }
-
-    /// Crimson Desert's buffer: the hold is recorded at NGX's luma kernel, before `rrlite_enc0_*` carries the
-    /// frame's jitter. Once the jitter sequence went round, each hold gets the jitter that followed the last one
-    /// seen, and the launch after it confirms it. Another cycle costs one wrong prediction and is learnt the same
-    /// way; jitters in no fixed order make the predictions wrong, and after enough of them the holds go without
-    /// the jitter again.
-    #[test]
-    fn a_hold_before_the_jitter_s_launch_gets_the_jitter_that_follows_and_stops_when_wrong() {
-        let mut t = Tracker::default();
-        let (luma, enc0) = (vk::CuFunctionNVX::from_raw(0x9101), vk::CuFunctionNVX::from_raw(0x9102));
-        t.record_function(luma, "cuda_dldn_engine_luma_convert_kernel");
-        t.record_function(enc0, "rrlite_enc0_4x4_mvlo_hdr");
-        let halton = |i: u32, base: u32| {
-            let (mut f, mut r, mut i) = (1.0f32, 0.0f32, i);
-            while i > 0 {
-                f /= base as f32;
-                r += f * (i % base) as f32;
-                i /= base;
-            }
-            r - 0.5
-        };
-        let sequence: Vec<u64> = (1..=8).map(|i| word(halton(i, 2), halton(i, 3))).collect();
-        // The parameters as 8-byte words: the jitter at word 21.
-        let params = |words: &[u64]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
-        let enc0_params = |j: u64| {
-            let mut words = vec![0u64; 22];
-            words[21] = j;
-            params(&words)
-        };
-        // One frame: the hold at the luma kernel (its jitter as the hold would get it), then enc0 with the frame's.
-        let frame = |t: &mut Tracker, n: u64, j: u64| {
-            let buffer = vk::CommandBuffer::from_raw(0x5000 + n);
-            t.launch_kernel(buffer, luma, Some(&params(&[0; 4])));
-            let held = t.jitter_for_hold(buffer);
-            t.launch_kernel(buffer, enc0, Some(&enc0_params(j)));
-            held
-        };
-        let mut n = 0;
-        // The last jitter's successor is the first, seen when the sequence comes round: predictions from frame 9.
-        for k in 0..9 {
-            assert_eq!(frame(&mut t, n, sequence[k % 8]), None, "frame {k}: the sequence has not gone round yet");
-            n += 1;
-        }
-        for k in 9..33 {
-            assert_eq!(frame(&mut t, n, sequence[k % 8]), Some(sequence[k % 8]), "frame {k}: the jitter that followed");
-            n += 1;
-        }
-        assert_eq!(t.jitter_checks, (24, 0));
-        // A buffer whose launch carries the jitter before the hold: its own, as before.
-        let own = vk::CommandBuffer::from_raw(0x6000);
-        t.launch_kernel(own, enc0, Some(&enc0_params(sequence[3])));
-        assert_eq!(t.jitter_for_hold(own), Some(sequence[3]));
-        // Another cycle (the game's upscaling changed): one wrong prediction, then it is learnt.
-        let other: Vec<u64> = (1..=5).map(|i| word(halton(i + 20, 2), halton(i + 20, 3))).collect();
-        for k in 0..12 {
-            let held = frame(&mut t, n, other[k % 5]);
-            if k >= 6 {
-                assert_eq!(held, Some(other[k % 5]), "frame {k} of the new cycle");
-            }
-            n += 1;
-        }
-        assert_eq!(t.jitter_checks, (24 + 6, 1), "the change of cycle alone was wrong");
-        // Jitters in no fixed order: wrong predictions, then none.
-        let mut lcg = 12345u32;
-        for _ in 0..200 {
-            lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12345);
-            frame(&mut t, n, sequence[(lcg >> 16) as usize % 8]);
-            n += 1;
-        }
-        assert!(t.jitter_stopped && t.jitter_checks.1 >= JITTER_WRONG_MAX, "{:?}", t.jitter_checks);
-        assert_eq!(frame(&mut t, n, sequence[0]), None, "stopped");
-    }
-
-    /// A Halton jitter passes; a handle, an address or a NaN in that word does not.
-    #[test]
-    fn only_a_plausible_jitter_is_taken() {
-        assert!(jitter_plausible(word(-0.25, 0.1667)));
-        assert!(jitter_plausible(word(0.4688, -0.463)));
-        assert!(!jitter_plausible(word(1.5, 0.0)));
-        assert!(!jitter_plausible(word(f32::NAN, 0.0)));
-        assert!(!jitter_plausible(word(2560.0, 1440.0)));
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -9380,72 +7027,6 @@ mod tests {
         ImageDesc { width: w, height: h, format, usage, plain: true }
     }
 
-    /// Metro Last Light Redux's input launch (2026-10-23): the colour as an RGBA16F render target, the motion
-    /// vectors as an RGBA16F storage image, the depth as R32F, DLSS's output and two more storage images. Read as
-    /// such; with a second storage image at the render size, or the colour a storage image too, not read.
-    #[test]
-    fn four_channel_motion_vectors_beside_a_render_target_colour_are_read() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let transfer = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
-        let (rt, storage) = (transfer | vk::ImageUsageFlags::COLOR_ATTACHMENT, transfer | vk::ImageUsageFlags::STORAGE);
-        let mut images: HashMap<vk::Image, ImageDesc> = [
-            (0x100, desc(1485, 835, rgba, rt)),
-            (0x400, desc(2560, 1440, rgba, storage)),
-            (0x300, desc(1485, 835, rgba, storage)),
-            (0x200, desc(1485, 835, vk::Format::R32_SFLOAT, storage)),
-            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
-            (0x500, desc(640, 384, rgba, storage)),
-        ]
-        .into_iter()
-        .map(|(raw, d)| (img(raw), d))
-        .collect();
-        let named: Vec<vk::Image> = [0x100, 0x400, 0x300, 0x200, 0x610, 0x500].map(img).to_vec();
-        assert_eq!(input_launch(&images, &named), Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
-        let mut second = images.clone();
-        second.insert(img(0x310), desc(1485, 835, rgba, storage));
-        assert_eq!(input_launch(&second, &[named.clone(), vec![img(0x310)]].concat()), None, "two storage images: which is the motion?");
-        images.insert(img(0x100), desc(1485, 835, rgba, rt | vk::ImageUsageFlags::STORAGE));
-        assert_eq!(input_launch(&images, &named), None, "a storage colour: the usual rules, which want RG motion vectors");
-        assert!(MVEC_HOLD_FORMATS.contains(&rgba) && MVEC_HOLD_FORMATS[0] == vk::Format::R16G16_SFLOAT);
-    }
-
-    /// Cyberpunk 2077 under vkd3d-proton (#49, probed 2026-11-10): `hiluma_engine_input_depthinv_mvlo_hdr_v2_rel` names
-    /// the colour (1485x835 RGBA16F), DLSS's output, the motion vectors (1485x835 RGBA16F) and the depth (R32_UINT), every
-    /// image with the same usage. Read in parameter order, the colour first; a third RGBA16F image at the render size, a
-    /// second depth or differing usage leave it unread.
-    #[test]
-    fn same_usage_four_channel_inputs_are_read_in_parameter_order() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let all = vk::ImageUsageFlags::TRANSFER_SRC
-            | vk::ImageUsageFlags::TRANSFER_DST
-            | vk::ImageUsageFlags::SAMPLED
-            | vk::ImageUsageFlags::STORAGE
-            | vk::ImageUsageFlags::COLOR_ATTACHMENT;
-        let images: HashMap<vk::Image, ImageDesc> = [
-            (0x300, desc(1485, 835, rgba, all)),
-            (0x400, desc(2560, 1440, rgba, all)),
-            (0x100, desc(1485, 835, rgba, all)),
-            (0x200, desc(1485, 835, vk::Format::R32_UINT, all)),
-            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, all)),
-            (0x500, desc(640, 384, rgba, all)),
-        ]
-        .into_iter()
-        .map(|(raw, d)| (img(raw), d))
-        .collect();
-        // In parameter order, not by handle: the colour has the higher handle here.
-        let named: Vec<vk::Image> = [0x300, 0x400, 0x100, 0x200, 0x610, 0x610, 0x610, 0x500].map(img).to_vec();
-        assert_eq!(input_launch(&images, &named), Some(InputLaunch::Inputs { colour: img(0x300), depth: img(0x200), mvec: img(0x100) }));
-        let mut third = images.clone();
-        third.insert(img(0x310), desc(1485, 835, rgba, all));
-        assert_eq!(input_launch(&third, &[named.clone(), vec![img(0x310)]].concat()), None, "three: which two?");
-        let mut depths = images.clone();
-        depths.insert(img(0x210), desc(1485, 835, vk::Format::R32_SFLOAT, all));
-        assert_eq!(input_launch(&depths, &[named.clone(), vec![img(0x210)]].concat()), None, "two depths");
-        let mut differ = images.clone();
-        differ.insert(img(0x100), desc(1485, 835, rgba, all & !vk::ImageUsageFlags::COLOR_ATTACHMENT));
-        assert_eq!(input_launch(&differ, &named), None, "usage tells them apart: the render-target form's business");
-    }
-
     fn gta_registered() -> BTreeMap<u64, (vk::Image, ImageDesc)> {
         let rgba = vk::Format::R16G16B16A16_SFLOAT;
         let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
@@ -9466,47 +7047,8 @@ mod tests {
         .collect()
     }
 
-    #[test]
-    fn the_colour_input_is_identified_from_a_registered_set_like_gtas() {
-        let set = gta_registered();
-        let found = identify(&set, Some((2560, 1440))).expect("identified");
-        assert_eq!(found.colour.0, vk::Image::from_raw(0x100));
-        assert_eq!(found.depth.0, vk::Image::from_raw(0x200));
-        assert_eq!(found.mvec.0, vk::Image::from_raw(0x300));
-        assert_eq!(found.candidates, 1);
-        assert_eq!(found.exposure.map(|e| e.map(|e| e.0.as_raw())), [Some(0x600), Some(0x610), None, None], "the 1x1 float images, not the 5120x2880 R16F");
-        assert_eq!(found.exposure_input.map(|e| e.0.as_raw()), Some(0x610), "the exposure input is the 1x1 R16F, not NGX's RGBA32F");
-        let mut no_exposure = set.clone();
-        no_exposure.remove(&0x610);
-        let found = identify(&no_exposure, Some((2560, 1440))).expect("still identified");
-        assert_eq!(found.exposure_input, None, "no 1x1 R16F: no exposure input (the HDR modes then fail open)");
-        assert!(found.output_from_swapchain && found.output == (2560, 1440) && found.others == [None; MAX_OTHERS]);
-        let fallback = identify(&set, None).expect("no swapchain: compared with the largest RGBA16F storage image");
-        assert_eq!((fallback.colour.0, fallback.depth.0, fallback.mvec.0), (found.colour.0, found.depth.0, found.mvec.0));
-        assert_eq!((fallback.output, fallback.output_from_swapchain), ((2560, 1440), false));
-        assert_eq!(identify(&set, Some((1707, 960))), None, "DLAA: the render extent is the output's");
-        let mut no_mv = set.clone();
-        no_mv.remove(&0x300);
-        assert_eq!(identify(&no_mv, Some((2560, 1440))), None, "motion vectors are part of the signature");
-        let mut no_depth = set.clone();
-        no_depth.remove(&0x200);
-        assert_eq!(identify(&no_depth, Some((2560, 1440))), None);
-        // A second render-extent group (a preset change mid-run): the lowest handle wins, counted.
-        let mut two = set;
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        two.insert(0x50, (vk::Image::from_raw(0x50), desc(1490, 838, rgba, vk::ImageUsageFlags::STORAGE)));
-        two.insert(0x51, (vk::Image::from_raw(0x51), desc(1490, 838, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)));
-        two.insert(0x52, (vk::Image::from_raw(0x52), desc(1490, 838, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT)));
-        let found = identify(&two, Some((2560, 1440))).unwrap();
-        assert_eq!(
-            (found.colour.0, found.depth.0, found.mvec.0, found.candidates),
-            (vk::Image::from_raw(0x50), vk::Image::from_raw(0x51), vk::Image::from_raw(0x52), 2)
-        );
-    }
-
-    /// A tracker with `set` registered (view `raw + 1`, kernel handle `raw + 0x1000`) and, when
-    /// given, one swapchain.
-    fn tracker_with(set: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapchain: Option<(u32, u32)>) -> Tracker {
+    /// A tracker with `set` registered (view `raw + 1`, kernel handle `raw + 0x1000`).
+    fn tracker_with(set: &BTreeMap<u64, (vk::Image, ImageDesc)>) -> Tracker {
         let mut t = Tracker::default();
         for (&raw, &(image, d)) in set {
             let info = vk::ImageCreateInfo {
@@ -9521,266 +7063,165 @@ mod tests {
             t.record_view(vk::ImageView::from_raw(raw + 1), image);
             t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
         }
-        if let Some(e) = swapchain {
-            t.swapchain(vk::SwapchainKHR::from_raw(9), Some(e));
-        }
         t
     }
 
-    /// NGX's record of the evaluate (the wrapper's ring) is the source of truth for the buffer's input launch: its
-    /// motion vectors replace the rules' choice, its jitter and reset are the buffer's, its exposure image and
-    /// output are the evidence's; without a record the rules decide as before.
-    #[test]
-    fn the_ngx_record_decides_the_buffer_s_inputs_jitter_and_reset() {
-        use crate::ngx_ring::{self, tests::record_bytes};
-        let input = vk::CuFunctionNVX::from_raw(0x9301);
-        let record = |mvec: u64, reset: u32| {
-            ngx_ring::parse_record(&record_bytes(
-                1,
-                ngx_ring::FEATURE_SR,
-                1,
-                [0x100, mvec, 0x200, 0x400, 0x610],
-                [0.25, -0.5],
-                [1707.0, 960.0],
-                1.0,
-                1.0,
-                reset,
-            ))
-        };
-        // The rules' motion vectors are 0x300; NGX names 0x410 (registered): NGX's are used.
-        ngx_ring::inject(vec![record(0x410, 1)]);
-        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
-        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
-        t.refresh();
-        t.launch_kernel(cb(1), input, Some(&param_block(&[0x1100, 0x1200, 0x1300, 0x1410])));
-        let refs = &t.launch[&cb(1)];
-        assert_eq!(refs.input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x410) }));
-        assert_eq!(refs.jitter, Some(u64::from(0.25f32.to_bits()) | (u64::from((-0.5f32).to_bits()) << 32)));
-        assert_eq!(refs.reset, Some(true));
-        assert_eq!((refs.input_sr, refs.input_rr), (Some(true), false));
-        assert_eq!(t.mv_scale, Some([1707.0, 960.0]));
-        assert!(refs.ngx.is_some_and(|n| n.output == img(0x400) && n.exposure == img(0x610)));
-        // Ray Reconstruction by NGX's feature, whatever the kernel's name: never evidence, never held before.
-        let mut rr = record(0x300, 0);
-        rr.feature = ngx_ring::FEATURE_RR;
-        ngx_ring::inject(vec![rr]);
-        t.launch_kernel(cb(2), input, Some(&param_block(&[0x1100, 0x1200, 0x1300])));
-        assert!(t.launch[&cb(2)].input_rr);
-        // No record naming the colour input (a game outside a Neural Forge Proton): the rules' reading is no
-        // identification, so the buffer is neither evidence nor a hold point.
-        ngx_ring::inject(vec![]);
-        t.launch_kernel(cb(3), input, Some(&param_block(&[0x1100, 0x1200, 0x1300])));
-        assert_eq!(t.launch[&cb(3)].input, None);
-        assert!(t.launch[&cb(3)].ngx.is_none());
+    /// NGX's record of a Super Resolution evaluate (`seq`) on `[colour, mvec, depth, output, exposure]` (raw handles,
+    /// 0 for none), with a jitter of (0.25, -0.5), `MV.Scale` 1 and no reset.
+    fn sr_record(seq: u64, images: [u64; 5]) -> crate::ngx_ring::Record {
+        use crate::ngx_ring::{parse_record, tests::record_bytes, FEATURE_SR};
+        parse_record(&record_bytes(seq, FEATURE_SR, 1, images, [0.25, -0.5], [1.0, 1.0], 1.0, 1.0, 0))
     }
 
-    /// In a game the identification is NGX's record's: the size rule's pick is not taken, and the first buffer
-    /// with a record names the inputs every later hold works on (motion vectors 0x410, not the size rule's 0x300).
-    #[test]
-    fn in_a_game_the_inputs_come_from_ngx_s_record_only() {
-        use crate::ngx_ring::{self, tests::record_bytes};
-        let input = vk::CuFunctionNVX::from_raw(0x9301);
-        let rec =
-            ngx_ring::parse_record(&record_bytes(1, ngx_ring::FEATURE_SR, 1, [0x100, 0x410, 0x200, 0x400, 0x610], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 0));
-        ngx_ring::inject(vec![]);
-        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
-        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
-        let line = t.refresh();
-        assert!(t.inputs.is_none(), "no record: the size rule identifies nothing ({line:?})");
-        ngx_ring::inject(vec![rec]);
-        let mut held = None;
-        for k in 1..=40 {
-            t.launch_kernel(cb(k), input, Some(&param_block(&[0x1100, 0x1200, 0x1300, 0x1410, 0x1610])));
-            t.observe(&[vec![cb(k)]]);
-            t.refresh();
-            if let Some(scan) = t.submit_ok(&[vec![cb(k)]]).filter(|s| s.inputs.is_some()) {
-                held = Some(scan);
-                break;
-            }
-        }
-        let inputs = held.expect("a buffer with NGX's record is held").inputs.unwrap();
-        assert_eq!((inputs.colour.0.as_raw(), inputs.depth.0.as_raw(), inputs.mvec.0.as_raw()), (0x100, 0x200, 0x410));
+    /// GTA V's evaluate in [`gta_registered`]: colour 0x100, motion vectors 0x300, depth 0x200, output 0x400, exposure
+    /// 0x610.
+    fn gta_record(seq: u64) -> crate::ngx_ring::Record {
+        sr_record(seq, [0x100, 0x300, 0x200, 0x400, 0x610])
     }
 
-    /// (a) GTA V's registered set with its swapchain: the same inputs, line, scan target and
-    /// classification as before the relaxed rule (colour 0x100, depth 0x200, motion vectors 0x300,
-    /// one candidate, exposure input 0x610).
+    /// The newest Super Resolution evaluate identifies DLSS's inputs (its motion vectors, not another RG16F image),
+    /// and the buffer whose launch names its colour input before the evaluate's end is held with them; a launch
+    /// naming it after the end (DLSS Frame Generation reading the frame) is no evaluate's, and its buffer is
+    /// forwarded. DLSS runs while evaluates are submitted (`hand_back_at`).
     #[test]
-    fn gtas_set_keeps_its_identification_and_hold_target() {
-        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
+    fn the_newest_record_identifies_and_only_its_evaluate_s_buffer_is_held() {
+        crate::ngx_ring::inject(vec![]);
+        let mut t = tracker_with(&gta_registered());
+        assert_eq!(t.refresh(), None, "no record: nothing identified, nothing said");
+        assert!(t.inputs.is_none());
+        let rec = sr_record(1, [0x100, 0x410, 0x200, 0x400, 0x610]);
+        crate::ngx_ring::inject(vec![rec]);
         let line = t.refresh().expect("identified");
-        assert!(line.starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT"), "{line}");
-        assert!(!line.contains("candidates") && !line.contains("compared with"), "one candidate, the swapchain: {line}");
-        assert!(line.ends_with("exposure input 0x610; swapchain Some((2560, 1440)); identified by size"), "{line}");
+        assert!(line.starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT") && line.contains("motion vectors 0x410"), "{line}");
+        assert!(line.contains("exposure input 0x610"), "{line}");
+        assert_eq!(t.refresh(), None, "nothing changed");
+        let names = param_block(&[0x1100, 0x1200, 0x1410, 0x1610]);
+        t.launch(cb(1), Some(&param_block(&[0x1500])));
+        t.launch(cb(1), Some(&names));
+        assert_eq!(t.launch[&cb(1)].ngx, Some(rec));
+        let (scan, lines) = submit(&mut t, &[vec![cb(1)]]);
+        let scan = scan.expect("the evaluate's buffer is the hold point");
+        let i = scan.inputs.unwrap();
+        assert_eq!((i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw(), i.exposure_input.map(|e| e.0.as_raw())), (0x100, 0x200, 0x410, Some(0x610)));
+        assert_eq!(scan.frame, DlssFrame { jitter: Some([0.25, -0.5]), reset: false });
+        assert!(lines.iter().any(|l| l.contains("carries DLSS Super Resolution's evaluate")), "{lines:#?}");
+        assert!(sr_launches().is_some(), "DLSS runs");
+        // The evaluate ended: a launch naming its colour input after that is no evaluate's.
+        crate::ngx_ring::inject(vec![rec, crate::ngx_ring::end_of(&rec, 2)]);
+        t.launch(cb(2), Some(&names));
+        assert_eq!(t.launch[&cb(2)].ngx, None);
+        let (scan, _) = submit(&mut t, &[vec![cb(2)]]);
+        assert!(scan.is_none());
+        assert_eq!((t.evaluate_submits, t.foreign_submits), (1, 1));
+        // A launch with parameters the layer cannot read is matched to nothing either.
+        t.launch(cb(3), None);
+        assert!(submit(&mut t, &[vec![cb(3)]]).0.is_none());
+    }
+
+    /// DLSS Ray Reconstruction by NGX's feature: the newest evaluate being Ray Reconstruction's identifies nothing
+    /// and its buffer is never held before the upscaler; once Super Resolution's is the newest, its inputs are
+    /// identified again.
+    #[test]
+    fn ray_reconstruction_is_never_identified_or_held() {
+        let mut rr = gta_record(1);
+        rr.feature = crate::ngx_ring::FEATURE_RR;
+        crate::ngx_ring::inject(vec![rr]);
+        let mut t = tracker_with(&gta_registered());
         t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
-        t.launch(cb(2), Some(&param_block(&[0x1400, 0x1200])));
-        let scan = t.submit_ok(&[vec![cb(2), cb(1)]]).expect("SR's buffer is held");
-        assert_eq!((scan.batch, scan.index), (0, 1));
-        let inputs = scan.inputs.unwrap();
-        assert_eq!(
-            (inputs.colour.0.as_raw(), inputs.depth.0.as_raw(), inputs.mvec.0.as_raw(), inputs.candidates, inputs.exposure_input.map(|e| e.0.as_raw())),
-            (0x100, 0x200, 0x300, 1, Some(0x610))
-        );
-        assert_eq!((t.named_colour_submits, t.foreign_submits, t.other_candidate_buffers), (1, 0, 0));
-    }
-
-    /// (b) Two render-size colour candidates (Crimson Desert registers two or three): the lowest
-    /// handle is the colour input and a buffer naming it is held, as before. A buffer whose launches
-    /// name only the other one, but not as an input launch (no depth and motion vectors beside it),
-    /// stays forwarded, and is counted and logged once. One whose input launch names the other
-    /// candidate with the colour input's depth and motion vectors is held with that candidate.
-    #[test]
-    fn a_buffer_naming_another_candidate_is_forwarded_and_counted() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
-        let set: BTreeMap<u64, (vk::Image, ImageDesc)> = [
-            (0x100, desc(1516, 852, rgba, storage)),
-            (0x110, desc(1516, 852, rgba, storage)),
-            (0x200, desc(1516, 852, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)),
-            (0x300, desc(1516, 852, vk::Format::R16G16_SFLOAT, storage)),
-            (0x400, desc(2560, 1440, rgba, storage)),
-        ]
-        .into_iter()
-        .map(|(raw, d)| (raw, (vk::Image::from_raw(raw), d)))
-        .collect();
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        let line = t.refresh().unwrap();
-        assert!(line.starts_with("colour input: image 0x100 (1516x852") && line.contains("(first of 2 candidates; others 0x110 1516x852)"), "{line}");
-        // The other candidate named without depth and motion vectors: forwarded, counted.
-        t.launch(cb(1), Some(&param_block(&[0x1110, 0x1400])));
-        assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Foreign);
-        assert!(t.submit_ok(&[vec![cb(1)]]).is_none(), "naming another candidate only: not held");
-        assert_eq!((t.foreign_submits, t.other_candidate_buffers), (1, 1));
-        let first = t.classify_line(None, 0).expect("the forwarded kind");
-        assert!(first.starts_with("a launch-bearing submit whose CUDA launches never name"), "{first}");
-        let other = t.classify_line(None, 0).expect("then the other candidate, once");
-        assert!(other.contains("names another colour candidate (0x110) and not the colour input 0x100"), "{other}");
-        assert!(t.classify_line(None, 0).is_none());
-        // The colour input's buffer is held exactly as before; a buffer naming both is too.
+        assert!(t.take_inline_at().is_none(), "no hold inside Ray Reconstruction's buffer");
+        let (scan, lines) = submit(&mut t, &[vec![cb(1)]]);
+        assert!(scan.is_none() && t.inputs.is_none() && t.frame().rr);
+        assert!(lines.iter().any(|l| l.starts_with("no DLSS input: DLSS Ray Reconstruction runs")), "{lines:#?}");
+        assert!(ray_reconstruction_running(Instant::now()));
+        crate::ngx_ring::inject(vec![rr, crate::ngx_ring::end_of(&rr, 2), gta_record(3)]);
         t.launch(cb(2), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
-        assert!(t.submit_ok(&[vec![cb(2)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
-        t.launch(cb(3), Some(&param_block(&[0x1110, 0x1100])));
-        assert!(t.submit_ok(&[vec![cb(3)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
-        assert_eq!((t.named_colour_submits, t.other_candidate_buffers), (2, 1));
-        // An input launch naming the other candidate with the same depth and motion vectors: held
-        // with it as the target, not counted as forwarded.
-        // Its layout is tracked like the colour input's (a barrier in an earlier buffer of the
-        // submit).
-        t.launch(cb(4), Some(&param_block(&[0x1110, 0x1200, 0x1300])));
-        t.barrier(cb(5), ImageSync::to(vk::Image::from_raw(0x110), vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
-        let s = t.submit_ok(&[vec![cb(5), cb(4)]]).expect("held with the candidate its input launch names");
-        assert_eq!(s.inputs.map(|i| (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw())), Some((0x110, 0x200, 0x300)));
-        assert_eq!((s.index, s.colour_layout), (1, Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)));
-        assert_eq!((t.named_colour_submits, t.retargeted_submits, t.other_candidate_buffers), (3, 1, 1));
-        let undecided = t.evaluations - t.named_colour_submits;
-        assert!(t.classify_line(Some(&s), undecided).is_some_and(|l| l.starts_with("a launch-bearing submit reads DLSS's colour input")));
-        let held = t.classify_line(Some(&s), undecided).expect("the retarget, once");
-        assert!(held.starts_with("a launch-bearing buffer's input launch names another colour candidate (0x110)"), "{held}");
+        let (scan, _) = submit(&mut t, &[vec![cb(2)]]);
+        assert!(scan.is_some_and(|s| s.identified_now) && !t.frame().rr);
     }
 
-    /// (c) A Cyberpunk-2077-like set: no swapchain known on the device, depth D32_SFLOAT without
-    /// stencil, motion vectors RG32F, DLSS's output an R11G11B10 storage image. Identified against
-    /// the output-like image; without any larger one (DLAA) not.
+    /// A game handing DLSS another colour image of the same shape every frame (Remnant II, Expedition 33): every
+    /// buffer is held with its own evaluate's colour input, and the identification stays the first one.
     #[test]
-    fn without_a_swapchain_the_largest_output_like_image_is_the_comparison() {
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
-        let mk = |list: &[(u64, ImageDesc)]| -> BTreeMap<u64, (vk::Image, ImageDesc)> {
-            list.iter().map(|&(raw, d)| (raw, (vk::Image::from_raw(raw), d))).collect()
-        };
-        let inputs = [
-            (0x100, desc(1708, 960, vk::Format::R16G16B16A16_SFLOAT, storage)),
-            (0x200, desc(1708, 960, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)),
-            (0x300, desc(1708, 960, vk::Format::R32G32_SFLOAT, storage)),
-            (0x400, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
-            (0x500, desc(1708, 960, vk::Format::R8_UNORM, storage)),
-        ];
-        let mut set = inputs.to_vec();
-        set.push((0x600, desc(2560, 1440, vk::Format::B10G11R11_UFLOAT_PACK32, storage)));
-        let mut t = tracker_with(&mk(&set), None);
-        let line = t.refresh().expect("identified");
-        assert!(line.starts_with("colour input: image 0x100 (1708x960 R16G16B16A16_SFLOAT"), "{line}");
-        assert!(line.contains("depth 0x200 D32_SFLOAT, motion vectors 0x300 R32G32_SFLOAT"), "{line}");
-        assert!(
-            line.ends_with("swapchain None, compared with the largest registered RGBA16F/R11G11B10 storage image (2560x1440); identified by size"),
-            "{line}"
-        );
-        assert_eq!(t.inputs.map(|i| (i.output, i.output_from_swapchain, i.exposure_input.map(|e| e.0.as_raw()))), Some(((2560, 1440), false, Some(0x400))));
-        // An RGBA16F output does as well; a swapchain, once known, is what counts.
-        let mut rgba_out = inputs.to_vec();
-        rgba_out.push((0x600, desc(2560, 1440, vk::Format::R16G16B16A16_SFLOAT, storage)));
-        assert!(identify(&mk(&rgba_out), None).is_some_and(|i| i.colour.0.as_raw() == 0x100 && i.candidates == 1));
-        assert_eq!(identify(&mk(&rgba_out), Some((1708, 960))), None, "DLAA with a swapchain");
-        // DLAA without a swapchain: nothing larger than the colour input, nothing identified.
-        assert_eq!(identify(&mk(&inputs), None), None);
-        // A larger image of another format (NGX's R16F scratch) is not an output.
-        let mut scratch = inputs.to_vec();
-        scratch.push((0x700, desc(5120, 2880, vk::Format::R16_SFLOAT, storage)));
-        assert_eq!(identify(&mk(&scratch), None), None);
-    }
-
-    /// (d) Nothing qualifies: not identified, and the line says why, with the registered views
-    /// grouped (extent, format, usage, count), once per change of the set, capped in length and
-    /// in number.
-    #[test]
-    fn a_failed_identification_logs_the_registered_set_once_per_change() {
+    fn alternating_colour_inputs_are_each_held_with_their_own_image() {
         let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE;
-        // A colour input without STORAGE, a storage one without motion vectors beside it, depth.
-        let set: BTreeMap<u64, (vk::Image, ImageDesc)> = [
-            (0x100, desc(1708, 960, rgba, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT)),
-            (0x110, desc(1708, 960, rgba, storage)),
-            (0x200, desc(1708, 960, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)),
-            (0x300, desc(1708, 960, vk::Format::R16G16_UNORM, storage)),
-            (0x400, desc(2560, 1440, rgba, storage)),
-            (0x410, desc(2560, 1440, rgba, storage)),
-        ]
-        .into_iter()
-        .map(|(raw, d)| (raw, (vk::Image::from_raw(raw), d)))
-        .collect();
-        assert_eq!(identify(&set, None), None);
-        let mut t = tracker_with(&set, None);
-        let line = t.refresh().expect("the failure is logged");
-        assert!(line.starts_with("no DLSS input among 6 registered views (swapchain None); waiting. output: no swapchain known, largest RGBA16F/R11G11B10 storage image 2560x1440"), "{line}");
-        assert!(
-            line.contains("RGBA16F storage extents: 2560x1440 not smaller than the output, 1708x960 no R16G16/R32G32_SFLOAT motion vectors at this extent"),
-            "{line}"
-        );
-        assert!(line.contains("registered: 2560x1440 R16G16B16A16_SFLOAT storage x2, "), "{line}");
-        assert!(line.contains("1708x960 R16G16B16A16_SFLOAT sampled+colour x1") && line.contains("1708x960 D32_SFLOAT depth x1"), "{line}");
-        assert!(t.refresh().is_none(), "nothing changed");
-        // A change of the set (same count) is logged again.
-        t.forget_image(vk::Image::from_raw(0x300));
-        t.record_image(
-            vk::Image::from_raw(0x310),
-            &vk::ImageCreateInfo {
-                image_type: vk::ImageType::TYPE_2D,
-                extent: vk::Extent3D { width: 1708, height: 960, depth: 1 },
-                format: vk::Format::R16G16_SNORM,
-                usage: storage,
-                samples: vk::SampleCountFlags::TYPE_1,
-                ..Default::default()
-            },
-        );
-        t.record_view(vk::ImageView::from_raw(0x311), vk::Image::from_raw(0x310));
-        t.register(vk::ImageView::from_raw(0x311), None);
-        let again = t.refresh().expect("a changed set is logged again");
-        assert!(again.contains("R16G16_SNORM") && !again.contains("R16G16_UNORM"), "{again}");
-        // Long sets are cut at the cap.
-        let many: BTreeMap<u64, (vk::Image, ImageDesc)> =
-            (0..400u64).map(|k| (0x1000 + k, (vk::Image::from_raw(0x1000 + k), desc(100 + k as u32, 50, rgba, storage)))).collect();
-        let long = diagnose(&many, None);
-        assert!(long.len() <= DIAGNOSE_MAX && long.ends_with(" more)"), "{} bytes: ...{}", long.len(), &long[long.len().saturating_sub(40)..]);
-        // After MAX_DIAGNOSES detailed lines, only the short one (once per change of it).
-        let mut t = tracker_with(&set, None);
-        for k in 0..MAX_DIAGNOSES {
-            t.dirty = true;
-            t.announced = None;
-            assert!(t.refresh().unwrap().contains("registered: "), "detailed {k}");
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let mut set = gta_registered();
+        set.insert(0x110, (img(0x110), desc(1707, 960, rgba, storage)));
+        let mut t = tracker_with(&set);
+        let mut records = Vec::new();
+        for frame in 0..8u64 {
+            let colour = [0x100, 0x110][frame as usize % 2];
+            let rec = sr_record(2 * frame + 1, [colour, 0x300, 0x200, 0x400, 0x610]);
+            records.push(rec);
+            crate::ngx_ring::inject(records.clone());
+            t.begin(cb(1));
+            t.launch(cb(1), Some(&param_block(&[colour + 0x1000, 0x1200, 0x1300])));
+            records.push(crate::ngx_ring::end_of(&rec, 2 * frame + 2));
+            crate::ngx_ring::inject(records.clone());
+            let s = submit(&mut t, &[vec![cb(1)]]).0.expect("every evaluate's buffer is held");
+            assert_eq!(s.inputs.map(|i| i.colour.0.as_raw()), Some(colour), "frame {frame}");
+            assert_eq!(s.identified_now, frame == 0, "frame {frame}: identified once");
         }
-        t.dirty = true;
-        assert_eq!(t.refresh().as_deref(), Some("no DLSS input among 6 registered views (swapchain None); waiting"));
-        t.dirty = true;
-        assert!(t.refresh().is_none());
+        assert_eq!(t.generation, 1);
+    }
+
+    /// The hold after DLSS goes after the last of the launches that write DLSS's output, as many as the evaluates
+    /// between their record and their end wrote it in (Cyberpunk 2077's Ray Reconstruction: 12): learnt from an
+    /// evaluate that ended, then taken at that write. A later evaluate writing it in more parts says so and is
+    /// learnt again. The motion vectors' units there are NGX's `MV.Scale` carried to the output's pixels.
+    #[test]
+    fn the_hold_after_dlss_goes_after_the_evaluate_s_last_write_of_its_output() {
+        use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rr = |seq| parse_record(&record_bytes(seq, FEATURE_RR, 1, [0x100, 0x300, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        let mut t = tracker_with(&gta_registered());
+        let run = |t: &mut Tracker, records: Vec<crate::ngx_ring::Record>, c: vk::CommandBuffer, writes: usize| -> Vec<bool> {
+            inject(records);
+            t.begin(c);
+            t.launch(c, Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+            (0..writes)
+                .map(|_| {
+                    t.launch(c, Some(&param_block(&[0x1400])));
+                    t.after_at.take().is_some()
+                })
+                .collect()
+        };
+        let (a, b) = (rr(1), rr(3));
+        assert_eq!(run(&mut t, vec![a], cb(1), 3), [false; 3], "nothing learnt yet");
+        // Not ended at the submit: nothing learnt from it.
+        let (_, lines) = submit(&mut t, &[vec![cb(1)]]);
+        assert!(t.dlss_output.is_none(), "{lines:#?}");
+        inject(vec![a, end_of(&a, 2)]);
+        let (_, lines) = submit(&mut t, &[vec![cb(1)]]);
+        assert_eq!(t.dlss_output.map(|o| (o.image.as_raw(), o.writes, o.rr)), Some((0x400, 3, true)), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("DLSS's output: image 0x400") && l.contains("3 launch(es)")), "{lines:#?}");
+        // A launch naming the output after the evaluate's end is not one of its writes.
+        let writes = run(&mut t, vec![a, end_of(&a, 2), b], cb(2), 3);
+        assert_eq!(writes, [false, false, true], "after the third write");
+        let plan = placement::current(t.frame());
+        let point = t.after_point_at(cb(2), DlssOutput { writes: 3, ..t.dlss_output.unwrap() }, &plan).expect("a point on the output");
+        assert_eq!(point.mv_units, Some([2560.0, 1440.0]), "MV.Scale (render pixels per unit) in the output's pixels");
+        assert!(t.frame_of(cb(2)).reset, "the evaluate's reset");
+        inject(vec![a, end_of(&a, 2), b, end_of(&b, 4)]);
+        t.launch(cb(2), Some(&param_block(&[0x1400])));
+        assert!(t.after_at.is_none() && t.launch[&cb(2)].output_writes == 3, "after its end");
+        // Written in four parts this time: said, and learnt.
+        let c = rr(5);
+        run(&mut t, vec![c], cb(3), 4);
+        inject(vec![c, end_of(&c, 6)]);
+        let (_, lines) = submit(&mut t, &[vec![cb(3)]]);
+        assert!(lines.iter().any(|l| l.starts_with("DLSS's output is written in 4 launches, not 3")), "{lines:#?}");
+        assert_eq!(t.dlss_output.map(|o| o.writes), Some(4));
+    }
+
+    /// A game outside a Neural Forge Proton: its CUDA launches carry no record, nothing is held, and the status says
+    /// the wrapper is missing.
+    #[test]
+    fn without_records_nothing_is_held_and_the_missing_wrapper_is_said() {
+        let mut t = tracker_with(&gta_registered());
+        t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        let (scan, _) = submit(&mut t, &[vec![cb(1)]]);
+        assert!(scan.is_none() && t.inputs.is_none());
+        assert!(crate::ngx_ring::no_wrapper());
     }
 
     /// The process-wide post-path switch (for DLSS on another device than the swapchain, the case
@@ -9845,7 +7286,7 @@ mod tests {
             t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
             t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
         }
-        t.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
+        crate::ngx_ring::inject(vec![sr_record(1, [0x100, 0x300, 0x200, 0, 0])]);
         let line = t.refresh().expect("the identification is logged");
         assert!(line.starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT"), "{line}");
         assert!(t.refresh().is_none(), "nothing changed, nothing logged");
@@ -9854,7 +7295,7 @@ mod tests {
         t.barrier(cb(1), ImageSync::to(colour, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
         t.barrier(cb(2), ImageSync::to(colour, vk::ImageLayout::GENERAL));
         t.barrier(cb(2), ImageSync::to(vk::Image::from_raw(0x999), vk::ImageLayout::GENERAL));
-        t.launch(cb(5), None);
+        t.launch(cb(5), Some(&param_block(&[0x1100])));
         t.execute(cb(3), &[cb(5)]);
         let scan = t.submit_ok(&[vec![cb(1)], vec![cb(2), cb(3)]]).expect("launch-bearing");
         assert_eq!((scan.batch, scan.index), (1, 1));
@@ -9864,14 +7305,9 @@ mod tests {
         assert!(t.submit_ok(&[vec![cb(7)]]).is_none());
         t.begin(cb(3));
         assert!(t.submit_ok(&[vec![cb(3)]]).is_none(), "re-recorded: no longer launch-bearing");
-        // A destroyed input image changes the set: a destroyed depth image only after SR_RECENT
-        // launch-bearing submits without a new one (a game rotating its depth images has a moment
-        // without one, which is no new identification).
+        // A destroyed input image: the record names an image no longer there, so nothing is identified.
         t.forget_image(vk::Image::from_raw(0x200));
-        assert_eq!(t.refresh(), None);
-        assert!(t.inputs.is_some());
-        t.launch_submits += SR_RECENT;
-        assert!(t.refresh().unwrap().starts_with("no DLSS input among 2 registered views"));
+        assert!(t.refresh().unwrap().starts_with("no DLSS input: NGX's record names images this device did not see created"));
         assert!(t.inputs.is_none());
     }
 
@@ -9900,13 +7336,15 @@ mod tests {
             {
                 tr.record_image(vk::Image::from_raw(raw), &info(1707, 960, format));
                 tr.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
-                tr.register(vk::ImageView::from_raw(raw + 1), None);
+                tr.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x10_0000));
             }
-            tr.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
+            crate::ngx_ring::inject(vec![sr_record(base, [base, base + 0x200, base + 0x100, 0, 0])]);
         };
+        // A launch naming the colour input of either identification's record.
+        let names = param_block(&[0x10_1000, 0x10_5000]);
         let record = |c: vk::CommandBuffer| {
             t.begin(c);
-            t.launch(c, vk::CuFunctionNVX::null(), None);
+            t.launch(c, vk::CuFunctionNVX::null(), Some(&names));
         };
         register(0x1000);
         record(cb(1));
@@ -9918,7 +7356,7 @@ mod tests {
         assert!(!resubmitted.identified_now && resubmitted.colour_in_general());
         assert_eq!(resubmitted.hazard, Some(Hazard::RecordedBefore), "recorded before the identification: not held");
         // The hold inside DLSS's buffer refuses that buffer too (begun before): the line does not say it takes it.
-        assert_eq!(t.lock().inline_point(cb(1), img(0x1000)).err(), Some(InlineRefusal::BegunBefore));
+        assert_eq!(t.lock().inline_point(cb(1), &record_on(img(0x1000))).err(), Some(InlineRefusal::BegunBefore));
         let why = Hazard::RecordedBefore.why_inside();
         assert!(!why.contains("takes such buffers") && why.contains("only where DLSS's own buffer was begun since"), "{why}");
         record(cb(1));
@@ -9934,7 +7372,7 @@ mod tests {
         // A secondary recorded before the identification makes its primary so.
         t.begin(cb(4));
         t.execute(cb(4), &[cb(5)]);
-        t.launch(cb(4), vk::CuFunctionNVX::null(), None);
+        t.launch(cb(4), vk::CuFunctionNVX::null(), Some(&names));
         assert_eq!(t.submit_ok(&[vec![cb(4)]]).expect("launch-bearing").hazard, Some(Hazard::RecordedBefore));
         t.begin(cb(5));
         record(cb(4));
@@ -9944,6 +7382,7 @@ mod tests {
         // one was recorded before this one (only its barriers on the old inputs were kept).
         t.lock().forget_image(vk::Image::from_raw(0x1000));
         register(0x5000);
+        record(cb(1));
         let again = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert_eq!(again.inputs.map(|i| i.colour.0), Some(vk::Image::from_raw(0x5000)));
         assert!(again.identified_now && !again.colour_in_general());
@@ -9959,7 +7398,6 @@ mod tests {
         // Nothing is left watched-recorded once nothing is identified, so nothing stays armed for it.
         t.lock().forget_image(vk::Image::from_raw(0x5000));
         t.lock().forget_image(vk::Image::from_raw(0x5100));
-        t.lock().launch_submits += SR_RECENT;
         let _ = t.submit_ok(&[vec![cb(1)]]);
         assert!(t.lock().inputs.is_none() && t.lock().recorded_watched.is_empty());
     }
@@ -9969,6 +7407,8 @@ mod tests {
     #[test]
     fn tracking_stays_disarmed_without_launches_and_disarms_after_the_launch_buffer_is_reset() {
         let t = Tracking::default();
+        *t.lock() = tracker_with(&gta_registered());
+        crate::ngx_ring::inject(vec![gta_record(1)]);
         assert!(!t.armed());
         // A game without DLSS: buffers come and go, submits carry no launch.
         for k in 0..100 {
@@ -9980,12 +7420,12 @@ mod tests {
         assert!(t.submit_ok(&[vec![cb(1), cb(2)]]).is_none());
         assert_eq!(t.extent(), None);
         // DLSS records a launch: armed, and the submit carrying it is found.
-        t.launch(cb(7), vk::CuFunctionNVX::null(), None);
+        t.launch(cb(7), vk::CuFunctionNVX::null(), Some(&param_block(&[0x1100])));
         assert!(t.armed());
         assert!(t.submit_ok(&[vec![cb(6), cb(7)]]).is_some_and(|s| (s.batch, s.index) == (0, 1)));
         // A secondary's launch carries over to its primary.
         t.execute(cb(8), &[cb(7)]);
-        t.begin(cb(7));
+        t.free(&[cb(7)]);
         assert!(t.armed(), "the primary still carries the launch");
         t.free(&[cb(8)]);
         assert!(!t.armed(), "every launch buffer was reset or freed");
@@ -10053,79 +7493,6 @@ mod tests {
         }
     }
 
-    /// Cyberpunk 2077 (issue #49): on every second frame DLSS's auto-exposure (`cuda_luma_convert_kernel`) reads the
-    /// colour input before the input launch carries the frame's camera jitter, and the jitter never repeats, so none
-    /// can be predicted there. The hold then goes at the input launch, with the frame's own jitter, instead of at the
-    /// auto-exposure without one; where the jitter can be predicted (a sequence that goes round, Crimson Desert's)
-    /// it stays at the first launch naming the colour input.
-    #[test]
-    fn a_hold_waits_for_the_input_launch_when_the_jitter_cannot_be_predicted() {
-        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        let (mut t, _) = held_tracker_with(copyable);
-        let (luma, input) = (vk::CuFunctionNVX::from_raw(0xf2), vk::CuFunctionNVX::from_raw(0xf3));
-        t.record_function(luma, "cuda_luma_convert_kernel");
-        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
-        let word = |x: f32, y: f32| u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32);
-        let bytes = |words: &[u64]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
-        // The input kernel's parameters: the jitter at word 3, then colour, depth and motion vectors.
-        let input_params = |j: u64| bytes(&[0, 0, 0, j, 0, 0x1100, 0x1200, 0x1300]);
-        // One buffer: optionally the auto-exposure first, then the input launch; where the hold went, and its jitter.
-        let frame = |t: &mut Tracker, n: u64, exposure: bool, j: u64| {
-            let buffer = cb(n);
-            t.global(buffer, Hazard::MemoryBarrier);
-            let mut at = None;
-            if exposure {
-                t.launch_kernel(buffer, luma, Some(&bytes(&[0x1100])));
-                at = t.take_inline_at().map(|_| "auto-exposure");
-            }
-            t.launch_kernel(buffer, input, Some(&input_params(j)));
-            if let Some(b) = t.take_inline_at() {
-                assert_eq!(b, (buffer, colour()));
-                at = Some("input launch");
-            }
-            (at, t.jitter_for_hold(buffer))
-        };
-        // No jitter seen yet: nothing to wait for, the hold goes at the auto-exposure.
-        assert_eq!(frame(&mut t, 1, true, word(0.1, 0.2)).0, Some("auto-exposure"));
-        // A jitter that never repeats: the hold goes at the input launch, with that frame's jitter.
-        for n in 2..8 {
-            let j = word(0.01 * n as f32, -0.02 * n as f32);
-            assert_eq!(frame(&mut t, n, n % 2 == 0, j), (Some("input launch"), Some(j)), "frame {n}");
-        }
-        assert!(t.launch[&cb(2)].before_named.iter().any(|(i, _)| *i == colour()));
-        // A buffer whose input launch, after the auto-exposure, reads another colour image: one at the output size with
-        // depth and motion vectors of its own (DLSS Frame Generation's form), no colour candidate and not this launch's
-        // own render-size input. The hold put off is not given to that image.
-        for (raw, format) in [(0x110, vk::Format::R16G16B16A16_SFLOAT), (0x210, vk::Format::D32_SFLOAT_S8_UINT), (0x310, vk::Format::R16G16_SFLOAT)] {
-            let info = vk::ImageCreateInfo {
-                image_type: vk::ImageType::TYPE_2D,
-                extent: vk::Extent3D { width: 2560, height: 1440, depth: 1 },
-                format,
-                usage: copyable,
-                samples: vk::SampleCountFlags::TYPE_1,
-                ..Default::default()
-            };
-            t.record_image(vk::Image::from_raw(raw), &info);
-            t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
-            t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
-        }
-        let other = vk::CuFunctionNVX::from_raw(0xf4);
-        t.global(cb(30), Hazard::MemoryBarrier);
-        t.launch_kernel(cb(30), luma, Some(&bytes(&[0x1100])));
-        assert_eq!(t.take_inline_at(), None, "put off at the auto-exposure");
-        assert!(t.launch[&cb(30)].hold_deferred);
-        t.launch_kernel(cb(30), other, Some(&bytes(&[0x1110, 0x1210, 0x1310])));
-        assert_eq!(t.launch[&cb(30)].input, Some(InputLaunch::Inputs { colour: img(0x110), depth: img(0x210), mvec: img(0x310) }));
-        assert_eq!(t.take_inline_at(), None, "no hold on an image that is no colour candidate");
-        t.free(&[cb(30)]);
-        // A sequence that goes round (two jitters in turn): predicted at the auto-exposure, the hold stays there.
-        let (a, b) = (word(0.25, -0.25), word(-0.25, 0.25));
-        for n in 8..12 {
-            frame(&mut t, n, false, if n % 2 == 0 { a } else { b });
-        }
-        assert_eq!(frame(&mut t, 12, true, a), (Some("auto-exposure"), Some(a)), "predicted where the hold was recorded");
-    }
-
     /// A tracker with GTA's three inputs identified (colour 0x100, depth 0x200, motion vectors
     /// 0x300; registration keys `image + 0x1000`) and one launch-bearing submit behind it, so the
     /// next is not the identifying one. Buffers `cb(1)` to `cb(HELD_BEGUN)` were begun since: their
@@ -10149,7 +7516,7 @@ mod tests {
             t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
             t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
         }
-        t.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
+        crate::ngx_ring::inject(vec![sr_record(1, [0x100, 0x300, 0x200, 0, 0])]);
         t.refresh().expect("identified");
         let params = param_block(&[0x1100, 0x1200, 0x1300]);
         t.launch(cb(900), Some(&params));
@@ -10166,6 +7533,11 @@ mod tests {
 
     fn colour() -> vk::Image {
         vk::Image::from_raw(0x100)
+    }
+
+    /// The newest injected evaluate's record on `colour` (for a hold inside a buffer [`held_tracker`] launched in).
+    fn record_on(colour: vk::Image) -> crate::ngx_ring::Record {
+        crate::ngx_ring::Record { colour, ..crate::ngx_ring::newest(|_| true).unwrap_or_default() }
     }
     const GENERAL: vk::ImageLayout = vk::ImageLayout::GENERAL;
 
@@ -10283,14 +7655,14 @@ mod tests {
         };
         frame(&mut t, 1, 2, 3);
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::LeftToSplit), "nothing known of the launch's layout yet");
+        assert_eq!(t.inline_point(b, &c).err(), Some(InlineRefusal::LeftToSplit), "nothing known of the launch's layout yet");
         let scan = t.submit_ok(&[vec![cb(1), cb(2), cb(3)]]).expect("launch-bearing");
         assert_eq!(scan.colour_layout, Some(read_only));
         assert!(!scan.colour_in_general(), "the split refuses it");
         // The next frame, recorded in fresh buffers: held inside, with the launch's layout as the guess.
         frame(&mut t, 4, 5, 6);
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        let point = t.inline_point(b, c).expect("held inside the buffer");
+        let point = t.inline_point(b, &c).expect("held inside the buffer");
         assert_eq!((point.layout, point.guessed.colour, point.hazard), (read_only, Some(read_only), Hazard::NotSplittable));
         // GTA V's pattern (GENERAL at the launch): still the split's.
         let (mut t, params) = held_tracker_with(copyable);
@@ -10298,7 +7670,7 @@ mod tests {
             t.launch(cb(launch), Some(&params));
             t.barrier(cb(back), general_to_general(colour()));
             let (b, c) = t.take_inline_at().expect("first colour launch");
-            assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::LeftToSplit));
+            assert_eq!(t.inline_point(b, &c).err(), Some(InlineRefusal::LeftToSplit));
             assert!(t.submit_ok(&[vec![cb(launch), cb(back)]]).expect("launch-bearing").colour_in_general());
         }
     }
@@ -10344,37 +7716,6 @@ mod tests {
         t.barrier(cb(2), general_to_general(colour()));
         t.launch(cb(2), Some(&params));
         assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing").hazard, Some(Hazard::SameLayoutBarrier));
-        // An opaque launch (parameters unreadable): everything before the buffer's first launch.
-        let (mut t, _) = held_tracker();
-        t.global(cb(2), Hazard::MemoryBarrier);
-        t.launch(cb(2), None);
-        assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("held undecided").hazard, Some(Hazard::MemoryBarrier));
-    }
-
-    /// Cyberpunk 2077 with DLSS Frame Generation: Streamline copies the colour input and the depth
-    /// into fresh images in DLSS's buffer, the depth as `R32_SFLOAT`, and DLSS's input kernel names
-    /// those. Such a launch is DLSS's input launch, with the R32 image as its depth; a launch that
-    /// also names a real depth image keeps that one.
-    #[test]
-    fn a_depth_handed_over_as_an_r32_colour_image_is_dlss_depth() {
-        let desc = |format| ImageDesc { width: 1485, height: 835, format, usage: vk::ImageUsageFlags::STORAGE, plain: true };
-        let (colour, r32, mvec, d32) = (vk::Image::from_raw(0x10), vk::Image::from_raw(0x20), vk::Image::from_raw(0x30), vk::Image::from_raw(0x40));
-        let images: HashMap<vk::Image, ImageDesc> = [
-            (colour, desc(vk::Format::R16G16B16A16_SFLOAT)),
-            (r32, desc(vk::Format::R32_SFLOAT)),
-            (mvec, desc(vk::Format::R16G16_SFLOAT)),
-            (d32, desc(vk::Format::D32_SFLOAT)),
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(input_launch(&images, &[colour, r32, mvec]), Some(InputLaunch::Inputs { colour, depth: r32, mvec }));
-        assert_eq!(input_launch(&images, &[colour, r32, d32, mvec]), Some(InputLaunch::Inputs { colour, depth: d32, mvec }));
-        // An R32 image at another extent is not taken as the depth.
-        let mut other = images.clone();
-        other.insert(r32, ImageDesc { width: 640, height: 360, ..desc(vk::Format::R32_SFLOAT) });
-        assert_eq!(input_launch(&other, &[colour, r32, mvec]), None);
-        // No motion vectors: not an input launch.
-        assert_eq!(input_launch(&images, &[colour, r32]), None);
     }
 
     /// No hold goes inside a buffer begun before the identification: the layout its earlier commands
@@ -10387,13 +7728,13 @@ mod tests {
         let early = cb(HELD_BEGUN + 1);
         t.global(early, Hazard::MemoryBarrier);
         t.launch(early, Some(&params));
-        assert_eq!(t.take_inline_at(), Some((early, colour())));
-        assert_eq!(t.inline_point(early, colour()).err(), Some(InlineRefusal::BegunBefore), "recorded (in part) before the identification");
+        assert_eq!(t.take_inline_at().map(|(b, r)| (b, r.colour)), Some((early, colour())));
+        assert_eq!(t.inline_point(early, &record_on(colour())).err(), Some(InlineRefusal::BegunBefore), "recorded (in part) before the identification");
         t.begin(early);
         t.global(early, Hazard::MemoryBarrier);
         t.launch(early, Some(&params));
-        assert_eq!(t.take_inline_at(), Some((early, colour())));
-        assert_eq!(t.inline_point(early, colour()).ok().map(|p| p.hazard), Some(Hazard::MemoryBarrier), "begun since: held inside");
+        assert_eq!(t.take_inline_at().map(|(b, r)| (b, r.colour)), Some((early, colour())));
+        assert_eq!(t.inline_point(early, &record_on(colour())).ok().map(|p| p.hazard), Some(Hazard::MemoryBarrier), "begun since: held inside");
     }
 
     /// The hold goes inside DLSS's buffer exactly where the split is refused: Crimson Desert's and
@@ -10408,62 +7749,61 @@ mod tests {
         let (mut t, params) = held_tracker_with(copyable);
         t.global(cb(2), Hazard::MemoryBarrier);
         t.launch(cb(2), Some(&params));
-        assert_eq!(t.take_inline_at(), Some((cb(2), colour())));
-        let point = t.inline_point(cb(2), colour()).expect("held inside the buffer");
+        assert_eq!(t.take_inline_at().map(|(b, r)| (b, r.colour)), Some((cb(2), colour())));
+        let point = t.inline_point(cb(2), &record_on(colour())).expect("held inside the buffer");
         assert_eq!((point.colour, point.hazard), (colour(), Hazard::MemoryBarrier));
         assert_eq!((point.desc.width, point.desc.height), (1707, 960));
         // A later launch of the same buffer naming it again: no second point.
         t.launch(cb(2), Some(&params));
-        assert_eq!(t.take_inline_at(), None);
-        // A buffer whose launch names the colour input without depth and motion vectors (DLSS Frame
-        // Generation's, Black Myth: Wukong with frame generation on): not an input launch, no hold
-        // inside it. Its later input launch is not the first to name the colour input either.
-        let (fg, luma) = (vk::CuFunctionNVX::from_raw(0xf1), vk::CuFunctionNVX::from_raw(0xf2));
-        t.record_function(fg, "main_kernel");
-        t.record_function(luma, "cuda_luma_convert_kernel");
+        assert!(t.take_inline_at().is_none());
+        // A buffer whose launch names the colour input after the evaluate's end (DLSS Frame Generation's, Black Myth:
+        // Wukong with frame generation on): no evaluate's, no hold inside it.
+        let rec = record_on(colour());
+        crate::ngx_ring::inject(vec![rec, crate::ngx_ring::end_of(&rec, 2)]);
         t.global(cb(3), Hazard::MemoryBarrier);
-        t.launch_kernel(cb(3), fg, Some(&param_block(&[0x1100])));
-        assert_eq!(t.take_inline_at(), None);
+        t.launch(cb(3), Some(&param_block(&[0x1100])));
+        assert!(t.take_inline_at().is_none());
         t.launch(cb(3), Some(&params));
-        assert_eq!(t.take_inline_at(), None);
-        // DLSS Super Resolution's own kernel reading the colour input before its input kernel
-        // (Cyberpunk 2077's `cuda_luma_convert_kernel`): the hold goes there.
+        assert!(t.take_inline_at().is_none());
+        // The next evaluate's first launch naming the colour input, whatever else it names (Cyberpunk 2077's
+        // `cuda_luma_convert_kernel`, before the launch naming depth and motion vectors): the hold goes there.
+        crate::ngx_ring::inject(vec![rec, crate::ngx_ring::end_of(&rec, 2), sr_record(3, [0x100, 0x300, 0x200, 0, 0])]);
         t.global(cb(4), Hazard::MemoryBarrier);
-        t.launch_kernel(cb(4), luma, Some(&param_block(&[0x1100])));
-        assert_eq!(t.take_inline_at(), Some((cb(4), colour())));
+        t.launch(cb(4), Some(&param_block(&[0x1100])));
+        assert_eq!(t.take_inline_at().map(|(b, r)| (b, r.colour, r.seq)), Some((cb(4), colour(), 3)));
         // GTA V's pattern: nothing before the launch, the split holds it.
         let (mut t, params) = held_tracker_with(copyable);
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::LeftToSplit));
+        assert_eq!(t.inline_point(b, &c).err(), Some(InlineRefusal::LeftToSplit));
         // Barriers on depth only (GTA V with frame generation): the split holds it too.
         let (mut t, params) = held_tracker_with(copyable);
         t.barrier(cb(2), general_to_general(vk::Image::from_raw(0x200)));
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::LeftToSplit));
+        assert_eq!(t.inline_point(b, &c).err(), Some(InlineRefusal::LeftToSplit));
         // Not copyable (STORAGE only, an image created before the layer could add the transfer usages): nothing.
         let (mut t, params) = held_tracker();
         t.global(cb(2), Hazard::MemoryBarrier);
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::Usage(vk::ImageUsageFlags::STORAGE)));
+        assert_eq!(t.inline_point(b, &c).err(), Some(InlineRefusal::Usage(vk::ImageUsageFlags::STORAGE)));
         // Left in SHADER_READ_ONLY_OPTIMAL by the buffer's own barrier: held inside, moved to the
         // transfer layouts and back to that one; in a layout outside those the hold handles: nothing.
         let (mut t, params) = held_tracker_with(copyable);
         t.barrier(cb(2), ImageSync { old_layout: GENERAL, ..ImageSync::to(colour(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) });
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert_eq!(t.inline_point(b, c).ok().map(|p| p.layout), Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
+        assert_eq!(t.inline_point(b, &c).ok().map(|p| p.layout), Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
         let (mut t, params) = held_tracker_with(copyable);
         t.barrier(cb(2), ImageSync { old_layout: GENERAL, ..ImageSync::to(colour(), vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL) });
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert_eq!(t.inline_point(b, c).err(), Some(InlineRefusal::Layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)));
-        // A launch naming no colour candidate leaves no mark.
+        assert_eq!(t.inline_point(b, &c).err(), Some(InlineRefusal::Layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)));
+        // A launch naming no evaluate's colour input leaves no mark.
         let (mut t, _) = held_tracker_with(copyable);
         t.launch(cb(3), Some(&param_block(&[0x1200])));
-        assert_eq!(t.take_inline_at(), None);
+        assert!(t.take_inline_at().is_none());
     }
 
     /// The diagnostic modes' split hold waits on the host behind what is submitted in front of its capture:
@@ -10518,13 +7858,13 @@ mod tests {
         t.global(cb(2), Hazard::MemoryBarrier);
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        let point = t.inline_point(b, c).expect("held inside the buffer");
+        let point = t.inline_point(b, &c).expect("held inside the buffer");
         assert_eq!(point.guessed.colour, Some(L::GENERAL), "a storage image no barrier was seen on");
         let (mut t, params) = held_tracker_with(copyable);
         t.barrier(cb(2), ImageSync { old_layout: L::GENERAL, ..ImageSync::to(colour(), L::SHADER_READ_ONLY_OPTIMAL) });
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        let point = t.inline_point(b, c).expect("held inside the buffer");
+        let point = t.inline_point(b, &c).expect("held inside the buffer");
         assert_eq!((point.layout, point.guessed.colour), (L::SHADER_READ_ONLY_OPTIMAL, None), "set by the buffer's own barrier");
         // When a buffer runs.
         t.barrier(cb(7), ImageSync { old_layout: L::SHADER_READ_ONLY_OPTIMAL, ..ImageSync::to(colour(), L::GENERAL) });
@@ -10546,21 +7886,21 @@ mod tests {
         t.global(cb(2), Hazard::MemoryBarrier);
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        let point = t.inline_point(b, c).expect("held inside the buffer");
+        let point = t.inline_point(b, &c).expect("held inside the buffer");
         // GTA V's pattern before any hold inside was recorded: the split's.
         t.launch(cb(3), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert!(t.inline_point(b, c).is_err());
+        assert!(t.inline_point(b, &c).is_err());
         // Recorded: the same pattern is held inside now.
         t.inline_recorded(point.identification);
         t.launch(cb(4), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert_eq!(t.inline_point(b, c).ok().map(|p| p.hazard), Some(Hazard::HeldInside));
+        assert_eq!(t.inline_point(b, &c).ok().map(|p| p.hazard), Some(Hazard::HeldInside));
         // A hold inside recorded for another identification: the split's again.
         t.inline_recorded(point.identification + 1);
         t.launch(cb(5), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        assert!(t.inline_point(b, c).is_err());
+        assert!(t.inline_point(b, &c).is_err());
     }
 
     /// Motion vectors are in their own image's pixels: at the colour input's extent they are its pixels,
@@ -10585,286 +7925,6 @@ mod tests {
         assert_eq!(point((1708, 964)).mvec_scale(), [1.0, 1.0]);
         assert_eq!(point((2560, 1440)).mvec_scale(), [1708.0 / 2560.0, 964.0 / 1440.0]);
         assert_eq!(point((0, 0)).mvec_scale(), [1.0, 1.0]);
-    }
-
-    /// The motion vectors' units from a SR input launch's words 1 and 5 (#49), as three games give them: GTA V Enhanced
-    /// (render pixels), Hogwarts Legacy (output pixels at a 1708x964 render size) and Cyberpunk 2077 (fractions of
-    /// the frame at 1485x835). A launch's scale wins over the extents; other kernels and implausible words give none.
-    #[test]
-    fn the_input_launch_says_what_the_motion_vectors_are_measured_in() {
-        let word = |x: f32, y: f32| -> [u8; 8] { (u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32)).to_le_bytes() };
-        let words = |scale: (f32, f32), ratio: (f32, f32)| -> Vec<[u8; 8]> {
-            let mut w = vec![[0u8; 8]; 8];
-            w[1] = word(scale.0, scale.1);
-            w[5] = word(ratio.0, ratio.1);
-            w
-        };
-        let near =
-            |got: Option<[f32; 2]>, want: [f32; 2]| got.is_some_and(|g| (g[0] - want[0]).abs() < 0.01 * want[0] && (g[1] - want[1]).abs() < 0.01 * want[1]);
-        let input = "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel";
-        let gta = mv_units_scale(input, &words((1.7239056, 1.7224879), (0.5800781, 0.58055556)));
-        assert!(near(gta, [1.0, 1.0]), "{gta:?}");
-        let hogwarts = mv_units_scale("hiluma_engine_input_depthinv_mvhi_hdr_v2_rel", &words((1.0, 1.0), (0.6671875, 0.66736114)));
-        assert!(near(hogwarts, [1708.0 / 2560.0, 964.0 / 1440.0]), "{hogwarts:?}");
-        let cyberpunk = mv_units_scale(input, &words((2560.0, 1440.0), (0.5800781, 0.5798611)));
-        assert!(near(cyberpunk, [1485.0, 835.0]), "{cyberpunk:?}");
-        // y pointing up (a negative `MVScale`): the sign is kept, and the hold before DLSS is given it as it is.
-        let up = mv_units_scale(input, &words((1.7239056, -1.7224879), (0.5800781, 0.58055556)));
-        assert!(up.is_some_and(|u| (u[0] - 1.0).abs() < 0.01 && (u[1] + 1.0).abs() < 0.01), "{up:?}");
-        assert_eq!(mv_units_scale(input, &words((1.7239056, -1e9), (0.5800781, 0.58055556))), None, "too large either way");
-        assert_eq!(mv_units_scale("cuda_engine_input_kernel", &words((2560.0, 1440.0), (0.58, 0.58))), None, "another family");
-        assert_eq!(mv_units_scale(input, &words((f32::NAN, 1.0), (0.58, 0.58))), None);
-        assert_eq!(mv_units_scale(input, &words((1.0, 1.0), (0.0, 0.58))), None, "no ratio");
-        assert_eq!(mv_units_scale(input, &words((1e9, 1.0), (0.58, 0.58))), None, "too large");
-        assert_eq!(mv_units_scale(input, &[[0u8; 8]; 3]), None, "too few words");
-        let point = InlinePoint {
-            colour: vk::Image::null(),
-            desc: ImageDesc { width: 1485, height: 835, format: vk::Format::R16G16B16A16_SFLOAT, usage: vk::ImageUsageFlags::STORAGE, plain: true },
-            layout: vk::ImageLayout::GENERAL,
-            exposure_input: None,
-            mvec_input: None,
-            mvec_extent: (1485, 835),
-            mv_units: cyberpunk,
-            depth_input: None,
-            identification: 1,
-            hazard: Hazard::MemoryBarrier,
-            hold: placement::Hold::ALL_BEFORE,
-            guessed: Guessed::default(),
-        };
-        assert!(near(Some(point.mvec_scale()), [1485.0, 835.0]), "the launch's word over the extents' 1");
-        assert_eq!(InlinePoint { mv_units: up, ..point }.mvec_scale(), up.expect("y up"), "the hold takes the sign as the launch says it");
-        assert_eq!(InlinePoint { mv_units: None, ..point }.mvec_scale(), [1.0, 1.0]);
-    }
-
-    /// The motion vectors' units and the render size they are at are set together, from the SR input launch that says
-    /// them: a launch at a new render size whose words say none leaves the last pair (the hold after DLSS carries it to
-    /// the render size it runs at), not the old units with the new size.
-    #[test]
-    fn the_motion_vector_units_keep_the_render_size_they_were_read_at() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        let depth = vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
-        let set = set_of(&[
-            (0x100, desc(1485, 835, rgba, storage)),
-            (0x200, desc(1485, 835, vk::Format::D32_SFLOAT_S8_UINT, depth)),
-            (0x300, desc(1485, 835, vk::Format::R16G16_SFLOAT, storage)),
-            (0x110, desc(1280, 720, rgba, storage)),
-            (0x210, desc(1280, 720, vk::Format::D32_SFLOAT_S8_UINT, depth)),
-            (0x310, desc(1280, 720, vk::Format::R16G16_SFLOAT, storage)),
-        ]);
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        let input = vk::CuFunctionNVX::from_raw(0x9010);
-        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
-        let word = |x: f32, y: f32| u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32);
-        let launch = |t: &mut Tracker, c: vk::CommandBuffer, base: u64, scale: u64, ratio: u64| {
-            let words = [h(base), scale, h(base + 0x100), h(base + 0x200), 0, ratio, 0, 0];
-            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            t.launch_kernel(c, input, Some(&bytes));
-        };
-        // Cyberpunk 2077's units (fractions of the frame) at 1485x835.
-        launch(&mut t, cb(1), 0x100, word(2560.0, 1440.0), word(0.5800781, 0.5798611));
-        let scale = t.mv_scale.expect("learnt");
-        assert_eq!(t.mv_scale_render, Some((1485, 835)));
-        // At 1280x720 with words that say nothing: the pair stays.
-        launch(&mut t, cb(2), 0x110, word(f32::NAN, 1440.0), word(0.5, 0.5));
-        assert_eq!((t.mv_scale, t.mv_scale_render), (Some(scale), Some((1485, 835))));
-        // At 1280x720 saying them: both.
-        launch(&mut t, cb(3), 0x110, word(2560.0, 1440.0), word(0.5, 0.5));
-        assert_eq!((t.mv_scale, t.mv_scale_render), (Some([1280.0, 720.0]), Some((1280, 720))));
-    }
-
-    /// With Ray Reconstruction on from the start of a session no Super Resolution input launch says what the motion
-    /// vectors are measured in (issue #49): Ray Reconstruction's first launch does, in words 51 to 56 of its
-    /// parameters, as probed in Cyberpunk 2077 (fractions of the frame, working at 3840x2160 for a 2560x1440 output)
-    /// and Crimson Desert (y pointing up). The hold after it then moves its history by output pixels. Words that do
-    /// not agree with each other (another layout) give nothing.
-    #[test]
-    fn ray_reconstruction_s_first_launch_says_what_the_motion_vectors_are_measured_in() {
-        let word = |x: f32, y: f32| -> [u8; 8] { (u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32)).to_le_bytes() };
-        let words = |render: (f32, f32), working: (f32, f32), scale: (f32, f32)| -> Vec<[u8; 8]> {
-            let mut w = vec![[0u8; 8]; 136];
-            w[51] = word(render.0 / working.0, render.1 / working.1);
-            w[52] = word(working.0 / render.0, working.1 / render.1);
-            w[53] = word(1.0 / render.0, 1.0 / render.1);
-            w[54] = word(1.0 / working.0, 1.0 / working.1);
-            w[56] = word(scale.0, scale.1);
-            w
-        };
-        let near = |got: [f32; 2], want: [f32; 2]| (got[0] - want[0]).abs() < 1e-3 * want[0].abs() && (got[1] - want[1]).abs() < 1e-3 * want[1].abs();
-        let cyberpunk = words((1485.0, 835.0), (3840.0, 2160.0), (3840.0, 2160.0));
-        let (scale, at, _) = engine_mv_units_scale("rr2_enc0_kernel", &cyberpunk).expect("Cyberpunk 2077's words");
-        assert!(near(scale, [1485.0, 835.0]), "{scale:?}");
-        assert_eq!(at, (1485, 835));
-        let (scale, at, _) = engine_mv_units_scale("rr2_enc0_kernel", &words((1516.0, 852.0), (3840.0, 2160.0), (3840.0, -2160.0))).expect("Crimson Desert's");
-        assert!(near(scale, [1516.0, -852.0]), "y up: {scale:?}");
-        assert_eq!(at, (1516, 852));
-        assert_eq!(engine_mv_units_scale("rr2_enc1_kernel", &cyberpunk), None, "another kernel");
-        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &cyberpunk[..55]), None, "too few words");
-        let mut bad = cyberpunk.clone();
-        bad[52] = word(2.0, 2.0);
-        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &bad), None, "the ratio and its inverse disagree");
-        let mut bad = cyberpunk.clone();
-        bad[54] = word(1.0 / 2560.0, 1.0 / 1440.0);
-        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &bad), None, "the ratio and the sizes disagree");
-        let mut bad = words((1485.5, 835.0), (3840.0, 2160.0), (3840.0, 2160.0));
-        bad[56] = word(3840.0, 2160.0);
-        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &bad), None, "not a whole render size");
-        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &words((1485.0, 835.0), (3840.0, 2160.0), (f32::NAN, 2160.0))), None);
-        // In the tracker: a session whose first DLSS launches are Ray Reconstruction's learns the units from them, and
-        // the hold after its 2560x1440 output moves the history by output pixels (it took the extents' 1.72 before).
-        let mut t = Tracker::default();
-        let enc0 = vk::CuFunctionNVX::from_raw(0x9002);
-        t.record_function(enc0, "rr2_enc0_kernel");
-        let bytes: Vec<u8> = cyberpunk.iter().flatten().copied().collect();
-        t.launch_kernel(cb(1), enc0, Some(&bytes));
-        let (scale, at) = (t.mv_scale.expect("learnt"), t.mv_scale_render.expect("its render size"));
-        let units = after_mv_units(scale, at, (1485, 835), (2560, 1440)).expect("units");
-        assert!(near(units, [2560.0, 1440.0]), "{units:?}");
-    }
-
-    /// Crimson Desert's Super Resolution encoder names the game's motion vectors (RG32F) beside DLSS's own earlier ones
-    /// (RG16F, lower handles): the hold takes the game's. Other kernels keep the RG16F-first rule; two RG32F images at
-    /// the extent leave the rule's pick.
-    #[test]
-    fn crimson_desert_s_encoder_gives_the_game_s_motion_vectors_not_dlss_s_own() {
-        let storage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
-        let attach = storage | vk::ImageUsageFlags::COLOR_ATTACHMENT;
-        let mut images = HashMap::new();
-        images.insert(img(0x100), desc(2272, 1280, vk::Format::R16G16B16A16_SFLOAT, attach));
-        images
-            .insert(img(0x200), desc(2272, 1280, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT));
-        images.insert(img(0x500), desc(2272, 1280, vk::Format::R32G32_SFLOAT, attach));
-        for own in [0x300, 0x310, 0x320, 0x330] {
-            images.insert(img(own), desc(2272, 1280, vk::Format::R16G16_SFLOAT, attach));
-        }
-        // In the encoder's parameter order: colour, the game's motion vectors, DLSS's, the depth, DLSS's again.
-        let named = [img(0x100), img(0x500), img(0x310), img(0x200), img(0x300), img(0x320), img(0x330)];
-        let rule = input_launch(&images, &named);
-        assert_eq!(rule, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }), "RG16F first, lowest handle");
-        let enc0 = "rrlite_enc0_4x4_mvlo_hdr";
-        assert_eq!(
-            rrlite_game_mvec(enc0, &images, &named, rule.clone()),
-            Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x500) }),
-            "the game's RG32F"
-        );
-        assert_eq!(rrlite_game_mvec("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", &images, &named, rule.clone()), rule, "another kernel");
-        assert_eq!(rrlite_game_mvec(enc0, &images, &named, None), None);
-        assert_eq!(rrlite_game_mvec(enc0, &images, &named, Some(InputLaunch::Unusable)), Some(InputLaunch::Unusable));
-        images.insert(img(0x510), desc(2272, 1280, vk::Format::R32G32_SFLOAT, attach));
-        let two = [&named[..], &[img(0x510)]].concat();
-        assert_eq!(rrlite_game_mvec(enc0, &images, &two, input_launch(&images, &two)), rule, "two RG32F: which?");
-        images.insert(img(0x510), desc(1136, 640, vk::Format::R32G32_SFLOAT, attach));
-        assert_eq!(
-            rrlite_game_mvec(enc0, &images, &two, input_launch(&images, &two)).map(|i| matches!(i, InputLaunch::Inputs { mvec, .. } if mvec == img(0x500))),
-            Some(true),
-            "another extent is not counted"
-        );
-    }
-
-    /// Crimson Desert's Super Resolution (`rrlite_enc0_*`, Ray Reconstruction off) has no `hiluma` input launch: its
-    /// encoder's words 23, 24, 8, 32 and 25 say the motion vectors are fractions of the frame with y up (probed at
-    /// 3840x2160, DLSS Balanced: 1516 x -852 render pixels each). The hold before the upscaler takes that, not the
-    /// extents' 1 x 1 (y down); words that disagree give nothing.
-    #[test]
-    fn crimson_desert_s_super_resolution_encoder_says_what_the_motion_vectors_are_measured_in() {
-        let word = |x: f32, y: f32| -> [u8; 8] { (u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32)).to_le_bytes() };
-        let words = |render: (f32, f32), working: (f32, f32), scale: (f32, f32)| -> Vec<[u8; 8]> {
-            let mut w = vec![[0u8; 8]; 45];
-            w[21] = word(-0.25, 0.166_667);
-            w[23] = word(render.0 / working.0, render.1 / working.1);
-            w[24] = word(working.0 / render.0, working.1 / render.1);
-            w[8] = word(1.0 / render.0, 1.0 / render.1);
-            w[32] = word(1.0 / working.0, 1.0 / working.1);
-            w[25] = word(scale.0, scale.1);
-            w
-        };
-        let near = |got: [f32; 2], want: [f32; 2]| (got[0] - want[0]).abs() < 1e-3 * want[0].abs() && (got[1] - want[1]).abs() < 1e-3 * want[1].abs();
-        let crimson = words((1516.0, 852.0), (3840.0, 2160.0), (3840.0, -2160.0));
-        let name = "rrlite_enc0_4x4_mvlo_hdr_folded";
-        let (scale, at, _) = engine_mv_units_scale(name, &crimson).expect("Crimson Desert's words");
-        assert!(near(scale, [1516.0, -852.0]), "fractions of the frame, y up: {scale:?}");
-        assert_eq!(at, (1516, 852));
-        assert_eq!(engine_mv_units_scale("rrlite_enc1_4x4", &crimson), None, "another kernel");
-        assert_eq!(engine_mv_units_scale(name, &crimson[..32]), None, "too few words");
-        assert_eq!(mv_units_scale(name, &crimson), None, "not the hiluma layout");
-        let mut bad = crimson.clone();
-        bad[24] = word(2.0, 2.0);
-        assert_eq!(engine_mv_units_scale(name, &bad), None, "the ratio and its inverse disagree");
-        let mut bad = crimson.clone();
-        bad[32] = word(1.0 / 2560.0, 1.0 / 1440.0);
-        assert_eq!(engine_mv_units_scale(name, &bad), None, "the ratio and the sizes disagree");
-        let mut bad = crimson.clone();
-        bad[8] = word(1.0 / 1516.5, 1.0 / 852.0);
-        assert_eq!(engine_mv_units_scale(name, &bad), None, "not a whole render size");
-        // Ray Reconstruction's layout read from Super Resolution's words gives nothing (its words 51-56 are not there).
-        assert_eq!(engine_mv_units_scale("rr2_enc0_kernel", &crimson), None);
-        // In the tracker: the encoder's launch sets the units the next hold before the upscaler takes.
-        let mut t = Tracker::default();
-        let enc0 = vk::CuFunctionNVX::from_raw(0x9003);
-        t.record_function(enc0, name);
-        let bytes: Vec<u8> = crimson.iter().flatten().copied().collect();
-        t.launch_kernel(cb(1), enc0, Some(&bytes));
-        assert!(near(t.mv_scale.expect("learnt"), [1516.0, -852.0]));
-        assert_eq!(t.mv_scale_render, Some((1516, 852)));
-    }
-
-    /// A hold after DLSS's output works on the output: the motion vectors' units are carried into output pixels
-    /// (issue #49: Cyberpunk 2077's, fractions of the frame, moved the history by 1/1485 of the camera's motion). After
-    /// Ray Reconstruction, which says nothing of them, the last SR input launch's are carried to its render size by
-    /// what they are.
-    #[test]
-    fn after_dlss_motion_vector_units_are_output_pixels() {
-        let near = |a: Option<[f32; 2]>, b: [f32; 2]| a.is_some_and(|a| (a[0] - b[0]).abs() < 1e-2 && (a[1] - b[1]).abs() < 1e-2);
-        let (render, output) = ((1485, 835), (2560, 1440));
-        // Cyberpunk 2077: fractions of the frame (1485 x 835 render pixels each).
-        assert!(near(after_mv_units([1485.0, 835.0], render, render, output), [2560.0, 1440.0]));
-        // GTA V: render pixels.
-        assert!(near(after_mv_units([1.0, 1.0], render, render, output), [2560.0 / 1485.0, 1440.0 / 835.0]));
-        // Hogwarts Legacy: output pixels (0.667 render pixels each), on output-size motion vectors: 1.
-        assert!(near(after_mv_units([1708.0 / 2560.0, 964.0 / 1440.0], (1708, 964), (1708, 964), output), [1.0, 1.0]));
-        // Measured at another render size (Super Resolution before Ray Reconstruction was switched on): fractions of the
-        // frame are the new render size, render pixels stay 1, output pixels stay output pixels.
-        let rr = (1280, 720);
-        assert!(near(after_mv_units([1485.0, 835.0], render, rr, output), [2560.0, 1440.0]));
-        assert!(near(after_mv_units([1.0, 1.0], render, rr, output), [2.0, 2.0]));
-        assert!(near(after_mv_units([1708.0 / 2560.0, 964.0 / 1440.0], (1708, 964), rr, output), [1.0, 1.0]));
-        assert_eq!(after_mv_units([1.0, 1.0], render, (0, 0), output), None);
-        // y pointing up (a negative `MVScale`): the same with y's sign, render pixels too.
-        assert!(near(after_mv_units([1.0, -1.0], render, rr, output), [2.0, -2.0]));
-        assert!(near(after_mv_units([1485.0, -835.0], render, rr, output), [2560.0, -1440.0]));
-    }
-
-    /// The hold copies the identified motion vectors only while DLSS's latest input launch names them:
-    /// a game switching DLSS to new images (Hogwarts Legacy loading a save) names the new ones in its
-    /// launches before the identification follows, and the old ones, which DLSS no longer reads, are
-    /// not touched again (reading them hung the GPU on about half of all loads).
-    #[test]
-    fn motion_vectors_dlss_no_longer_reads_are_not_copied() {
-        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        let (mut t, params) = held_tracker_with(copyable);
-        let mvec = |t: &mut Tracker, b: vk::CommandBuffer, params: &[u8]| {
-            t.global(b, Hazard::MemoryBarrier);
-            t.launch(b, Some(params));
-            let (b, c) = t.take_inline_at().expect("first colour launch");
-            t.inline_point(b, c).expect("held inside the buffer").mvec_input.map(|a| a.image)
-        };
-        assert_eq!(mvec(&mut t, cb(2), &params), Some(vk::Image::from_raw(0x300)));
-        // New motion vectors of the same kind, named by the next input launch.
-        let info = vk::ImageCreateInfo {
-            image_type: vk::ImageType::TYPE_2D,
-            extent: vk::Extent3D { width: 1707, height: 960, depth: 1 },
-            format: vk::Format::R16G16_SFLOAT,
-            usage: copyable,
-            samples: vk::SampleCountFlags::TYPE_1,
-            ..Default::default()
-        };
-        t.record_image(vk::Image::from_raw(0x400), &info);
-        t.record_view(vk::ImageView::from_raw(0x401), vk::Image::from_raw(0x400));
-        t.register(vk::ImageView::from_raw(0x401), Some(0x1400));
-        let switched = param_block(&[0x1100, 0x1200, 0x1400]);
-        assert_eq!(mvec(&mut t, cb(3), &switched), None, "the old ones, while the identification has not followed");
-        // Back on the identified ones: copied again.
-        assert_eq!(mvec(&mut t, cb(4), &params), Some(vk::Image::from_raw(0x300)));
     }
 
     /// An implausible game exposure (Wukong's DLSS-internal 1x1 read 59,456) stops that
@@ -10968,7 +8028,7 @@ mod tests {
         t.launch(cb(5), Some(&param_block(&[packed(0x1200, 0x1100), 0x1300])));
         let refs = &t.launch[&cb(5)];
         assert_eq!(refs.images, vec![vk::Image::from_raw(0x200), vk::Image::from_raw(0x100), vk::Image::from_raw(0x300)]);
-        assert!(matches!(refs.input, Some(InputLaunch::Inputs { colour, .. }) if colour == vk::Image::from_raw(0x100)));
+        assert!(refs.ngx.is_some_and(|r| r.colour == vk::Image::from_raw(0x100)), "the packed colour handle matches the evaluate");
         // A word that is one 64-bit value is not split: a key equal to its low half is not named.
         let (mut t, _) = held_tracker();
         t.launch(cb(6), Some(&param_block(&[0x1100])));
@@ -10976,20 +8036,11 @@ mod tests {
     }
 
     /// Unreal Engine 5 (Black Myth: Wukong's benchmark): DLSS's colour input is a sampled, not storage,
-    /// `B10G11R11_UFLOAT` image. Its input kernel's parameters name it as the colour input; an
-    /// RGBA16F image that is only sampled still is not a candidate. The split cannot hold an
+    /// `B10G11R11_UFLOAT` image, as NGX's record names it. The split cannot hold an
     /// R11G11B10 input, so the hold goes inside the buffer even with nothing before the launch,
     /// in the layout the buffer's barrier left it in.
     #[test]
     fn a_sampled_r11g11b10_colour_input_is_identified_and_held_inside_the_buffer() {
-        let r11 = |usage| ImageDesc { width: 1488, height: 836, format: vk::Format::B10G11R11_UFLOAT_PACK32, usage, plain: true };
-        let rgba = |usage| ImageDesc { width: 1488, height: 836, format: vk::Format::R16G16B16A16_SFLOAT, usage, plain: true };
-        assert!(colour_candidate(&r11(vk::ImageUsageFlags::SAMPLED)));
-        assert!(colour_candidate(&r11(vk::ImageUsageFlags::STORAGE)));
-        assert!(!colour_candidate(&r11(vk::ImageUsageFlags::COLOR_ATTACHMENT)));
-        assert!(!colour_candidate(&rgba(vk::ImageUsageFlags::SAMPLED)));
-        assert!(colour_candidate(&rgba(vk::ImageUsageFlags::STORAGE)));
-
         let mut t = Tracker::default();
         let usage =
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
@@ -11010,14 +8061,11 @@ mod tests {
             t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
             t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
         }
-        t.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
         let params = param_block(&[0x1100, 0x1200, 0x1300]);
-        // Settle the identification by the input kernel's parameters.
-        for _ in 0..(SETTLE_SUBMITS + 4) {
-            t.launch(cb(900), Some(&params));
-            let _ = submit(&mut t, &[vec![cb(900)]]);
-            t.free(&[cb(900)]);
-        }
+        crate::ngx_ring::inject(vec![sr_record(1, [0x100, 0x300, 0x200, 0, 0])]);
+        t.launch(cb(900), Some(&params));
+        let _ = submit(&mut t, &[vec![cb(900)]]);
+        t.free(&[cb(900)]);
         let inputs = t.inputs.expect("identified");
         assert_eq!((inputs.colour.0, inputs.colour.1.format), (vk::Image::from_raw(0x100), vk::Format::B10G11R11_UFLOAT_PACK32));
         t.barrier(
@@ -11031,12 +8079,12 @@ mod tests {
         t.begin(cb(2));
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        let point = t.inline_point(b, c).expect("held inside the buffer");
+        let point = t.inline_point(b, &c).expect("held inside the buffer");
         assert_eq!((point.layout, point.hazard), (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, Hazard::NotSplittable));
         assert_eq!(point.mvec_input.map(|a| a.image), Some(vk::Image::from_raw(0x300)));
-        // The motion vectors destroyed before the inputs are refreshed: the hold copies nothing from them.
+        // The motion vectors destroyed since the record was written: the hold copies nothing from them.
         t.forget_image(vk::Image::from_raw(0x300));
-        let point = t.inline_point(b, c).expect("still held inside the buffer");
+        let point = t.inline_point(b, &c).expect("still held inside the buffer");
         assert!(point.mvec_input.is_none(), "a destroyed motion-vector image is copied from");
     }
 
@@ -11059,28 +8107,28 @@ mod tests {
             (0x300, desc(1488, 836, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)),
             (0x600, desc(1, 1, vk::Format::R16_SFLOAT, vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC)),
         ]);
-        let mut t = tracker_with(&set, Some((2560, 1440)));
+        let mut t = tracker_with(&set);
         let read_only = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         let rendered = |image: u64| ImageSync { old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, ..ImageSync::to(img(image), read_only) };
         // One frame: the game's buffer moves the image into SHADER_READ_ONLY (when `front`), DLSS's buffer, begun
         // since, names it. The hold inside DLSS's buffer is decided on at the launch, then the two are submitted.
-        let frame = |t: &mut Tracker, colour: u64, front: bool| -> Option<Result<InlinePoint, InlineRefusal>> {
+        let mut seq = 0;
+        let mut frame = |t: &mut Tracker, colour: u64, front: bool| -> Option<Result<InlinePoint, InlineRefusal>> {
+            seq += 1;
+            crate::ngx_ring::inject(vec![sr_record(seq, [colour, 0x300, 0x200, 0, 0x600])]);
             t.begin(cb(10));
             t.begin(cb(11));
             if front {
                 t.barrier(cb(10), rendered(colour));
             }
             t.launch(cb(11), Some(&param_block(&[h(colour), h(0x200), h(0x300), h(0x600)])));
-            let point = t.take_inline_at().map(|(b, c)| t.inline_point(b, c));
+            let point = t.take_inline_at().map(|(b, c)| t.inline_point(b, &c));
             let _ = submit(t, &[vec![cb(10), cb(11)]]);
             point
         };
         let cycle = [0x100, 0x110, 0x120];
-        for k in 0..(SETTLE_SUBMITS as usize + 8) {
-            frame(&mut t, cycle[k % 3], true);
-        }
-        let inputs = t.inputs.expect("identified by the input kernel's parameters");
-        assert_eq!((inputs.colour.0, inputs.rule), (img(0x100), Rule::Params));
+        frame(&mut t, cycle[0], true);
+        assert!(t.inputs.is_some_and(|i| i.colour.0 == img(0x100)), "identified by the record");
         // A full cycle since: each image's barrier was committed while watched.
         for colour in cycle {
             frame(&mut t, colour, true);
@@ -11089,22 +8137,34 @@ mod tests {
             let colour = cycle[k % 3];
             let point = frame(&mut t, colour, true).expect("a hold point").unwrap_or_else(|r| panic!("{colour:#x}: refused, {r:?}"));
             assert_eq!((point.colour, point.layout, point.hazard), (img(colour), read_only, Hazard::NotSplittable), "{colour:#x}");
-            assert_eq!(t.launch_layouts.get(&img(colour)), Some(&read_only), "{colour:#x}: its layout at DLSS's launch, retargeted or not");
+            assert_eq!(t.launch_layouts.get(&img(colour)), Some(&read_only), "{colour:#x}: its layout at DLSS's launch");
         }
         assert_eq!(t.colour_barriers.get(&img(0x110)).map(|b| b.1), Some(read_only), "barriers counted per image");
-        // The identified image is destroyed: the next identification follows the input kernel to another. No
-        // barrier is recorded from here on; what was committed on the others carries across.
+        assert_eq!(t.generation, 1, "another image of the same shape is no new identification");
+        // A new identification (other motion vectors) keeps what was committed on the images watched throughout. No
+        // barrier is recorded from here on.
         t.forget_image(img(0x100));
-        let before = t.generation;
-        let mut k = 0;
-        while t.generation == before || t.inputs.is_none() || t.identified {
-            frame(&mut t, [0x110, 0x120][k % 2], false);
-            k += 1;
-            assert!(k < 200, "identified again");
-        }
-        assert_eq!(t.inputs.map(|i| i.colour.0), Some(img(0x110)));
+        let mvec2 = desc(1488, 836, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED);
+        t.record_image(
+            img(0x310),
+            &vk::ImageCreateInfo {
+                image_type: vk::ImageType::TYPE_2D,
+                extent: vk::Extent3D { width: mvec2.width, height: mvec2.height, depth: 1 },
+                format: mvec2.format,
+                usage: mvec2.usage,
+                samples: vk::SampleCountFlags::TYPE_1,
+                ..Default::default()
+            },
+        );
+        crate::ngx_ring::inject(vec![sr_record(1000, [0x110, 0x310, 0x200, 0, 0x600])]);
+        let _ = submit(&mut t, &[vec![cb(11)]]);
+        assert_eq!((t.generation, t.inputs.map(|i| i.colour.0)), (2, Some(img(0x110))));
         for colour in [0x110, 0x120] {
-            let point = frame(&mut t, colour, false).expect("a hold point").unwrap_or_else(|r| panic!("{colour:#x}: refused, {r:?}"));
+            t.begin(cb(11));
+            crate::ngx_ring::inject(vec![sr_record(1001 + colour, [colour, 0x310, 0x200, 0, 0x600])]);
+            t.launch(cb(11), Some(&param_block(&[h(colour), h(0x200), h(0x600)])));
+            let (b, c) = t.take_inline_at().expect("a hold point");
+            let point = t.inline_point(b, &c).unwrap_or_else(|r| panic!("{colour:#x}: refused, {r:?}"));
             assert_eq!(point.layout, read_only, "{colour:#x}: committed before the identification changed");
         }
     }
@@ -11162,7 +8222,7 @@ mod tests {
         t.barrier(cb(2), rt_to_srv);
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
-        let point = t.inline_point(b, c).expect("held inside the buffer");
+        let point = t.inline_point(b, &c).expect("held inside the buffer");
         assert_eq!((point.layout, point.guessed.colour, point.hazard), (GENERAL, None, Hazard::SameLayoutBarrier));
         t.inline_tried.insert(cb(2));
         assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing").hazard, Some(Hazard::SameLayoutBarrier), "the split refuses it");
@@ -11170,7 +8230,7 @@ mod tests {
         // Launches whose parameters cannot be read: never a hold point, said once.
         t.barrier(cb(3), rt_to_srv);
         t.launch(cb(3), None);
-        assert_eq!(t.submit_ok(&[vec![cb(3)]]).expect("held undecided").hazard, Some(Hazard::SameLayoutBarrier));
+        assert!(t.submit_ok(&[vec![cb(3)]]).is_none(), "matched to no evaluate: no hold point");
         assert!(t.untried_line(cb(3)).is_some_and(|l| l.contains("not readable")));
         assert_eq!(t.untried_line(cb(3)), None, "once");
         // A buffer begun before the identification: refused, and no longer silently.
@@ -11185,14 +8245,14 @@ mod tests {
         let next = t.quiet_refusal_line(refusal, now + QUIET_REFUSALS_EVERY + Duration::from_secs(1)).expect("then with the counts");
         assert!(next.contains("2 buffer(s) begun before") && next.contains("in the last 6.0 s"), "{next}");
         t.launch(early, Some(&params));
-        assert_eq!(t.inline_point(early, colour()).err(), Some(refusal));
+        assert_eq!(t.inline_point(early, &record_on(colour())).err(), Some(refusal));
     }
 
     /// The depth a hold reads is the one this buffer's input launch names, with that image's own
     /// layout: GTA V Enhanced alternates two depth images, and the identified one holds the previous
     /// frame's depth on every other frame.
     #[test]
-    fn the_hold_reads_the_depth_its_input_launch_names() {
+    fn the_hold_reads_the_depth_its_evaluate_names() {
         let (mut t, params) = held_tracker();
         let other = vk::Image::from_raw(0x400);
         let info = vk::ImageCreateInfo {
@@ -11214,12 +8274,14 @@ mod tests {
         let _ = t.submit_ok(&[vec![cb(1)]]);
         let named_other = param_block(&[0x1100, 0x1400, 0x1300]);
         t.begin(cb(2));
+        crate::ngx_ring::inject(vec![sr_record(2, [0x100, 0x300, 0x400, 0, 0])]);
         t.launch(cb(2), Some(&named_other));
         let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
         assert_eq!(scan.inputs.map(|i| i.depth.0), Some(other));
         assert_eq!(scan.depth_layout, Some(read_only), "the named depth's own layout");
         // The next frame names the identified one again.
         t.begin(cb(2));
+        crate::ngx_ring::inject(vec![sr_record(3, [0x100, 0x300, 0x200, 0, 0])]);
         t.launch(cb(2), Some(&params));
         let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
         assert_eq!(scan.inputs.map(|i| i.depth.0), Some(vk::Image::from_raw(0x200)));
@@ -11261,6 +8323,7 @@ mod tests {
         t.begin(cb(2));
         t.barrier(cb(2), sync(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_READ));
         t.barrier(cb(2), sync(vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_READ));
+        crate::ngx_ring::inject(vec![sr_record(2, [0x100, 0x300, 0x500, 0, 0])]);
         t.launch(cb(2), Some(&names_ring));
         let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
         assert_eq!(scan.inputs.map(|i| i.depth.0), Some(frame_depth), "the copy's source, not DLSS's ring");
@@ -11268,13 +8331,14 @@ mod tests {
         // Written in the buffer before the launch: not the frame's final depth, and no depth this hold.
         t.begin(cb(2));
         t.barrier(cb(2), sync(vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ));
+        crate::ngx_ring::inject(vec![sr_record(3, [0x100, 0x300, 0x400, 0, 0])]);
         t.launch(cb(2), Some(&param_block(&[0x1100, 0x1400, 0x1300])));
         let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
         assert_eq!(scan.inputs.map(|i| i.depth.0), Some(frame_depth));
         assert_eq!(scan.depth_hazard, Some(Hazard::SameLayoutBarrier));
     }
 
-    /// The depth the input launch names wins over another depth image the buffer only reads before
+    /// The depth NGX's record names wins over another depth image the buffer only reads before
     /// the launch (a history depth some pass samples): the launch's own is final at the hold. The
     /// read one is taken only where the named one is written in the buffer first (GTA V's ring, the
     /// test above).
@@ -11306,6 +8370,7 @@ mod tests {
         };
         t.begin(cb(2));
         t.barrier(cb(2), read(history));
+        crate::ngx_ring::inject(vec![sr_record(2, [0x100, 0x300, 0x400, 0, 0])]);
         t.launch(cb(2), Some(&param_block(&[0x1100, 0x1400, 0x1300])));
         let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
         assert_eq!(scan.inputs.map(|i| i.depth.0), Some(own), "the launch's own depth, not the one read before it");
@@ -11366,7 +8431,7 @@ mod tests {
         t.barrier(cb(3), one(vk::ImageAspectFlags::DEPTH, GENERAL, GENERAL));
         t.barrier(cb(3), general_to_general(colour()));
         t.launch(cb(3), Some(&params));
-        let point = t.inline_point(cb(3), colour()).expect("held inside the buffer");
+        let point = t.inline_point(cb(3), &record_on(colour())).expect("held inside the buffer");
         assert_eq!(point.hazard, Hazard::SameLayoutBarrier, "the split refuses it");
         let read = point.depth_input.expect("the depth is read");
         assert_eq!((read.image, read.layout, read.readable), (depth, Some(GENERAL), true));
@@ -11425,7 +8490,7 @@ mod tests {
         t.barrier(cb(4), one(GENERAL, GENERAL));
         t.barrier(cb(4), general_to_general(colour()));
         t.launch(cb(4), Some(&params));
-        let point = t.inline_point(cb(4), colour()).expect("held inside the buffer");
+        let point = t.inline_point(cb(4), &record_on(colour())).expect("held inside the buffer");
         assert!(point.depth_input.is_none_or(|d| !d.readable), "the depth is not read: {:?}", point.depth_input);
         let _ = t.submit_ok(&[vec![cb(3), cb(4)]]);
         assert_eq!(t.layout_when_run(&[], depth), Some(ASPECTS_APART));
@@ -11665,7 +8730,7 @@ mod tests {
             t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
             t.register(vk::ImageView::from_raw(raw + 1), Some(handle));
         }
-        t.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
+        crate::ngx_ring::inject(vec![sr_record(1, [0x100, 0x500, 0x400, 0x200, 0])]);
         assert!(t.refresh().unwrap().starts_with("colour input: image 0x100 (1485x836"));
         (t, set.map(|s| s.4))
     }
@@ -11679,7 +8744,7 @@ mod tests {
         assert_eq!(t.describe_word(colour, c), "view:colour-in(1485x836,R16G16B16A16_SFLOAT)");
         assert_eq!(t.describe_word(depth, c), "view:depth(1485x836,D32_SFLOAT_S8_UINT)");
         assert_eq!(t.describe_word(mvec, c), "view:mvec(1485x836,R16G16_SFLOAT)");
-        assert_eq!(t.describe_word(sr_out, c), "view:output-size(2560x1440,R16G16B16A16_SFLOAT)");
+        assert_eq!(t.describe_word(sr_out, c), "view:image(2560x1440,R16G16B16A16_SFLOAT)");
         assert_eq!(t.describe_word(colour, None), "view:image(1485x836,R16G16B16A16_SFLOAT)");
         t.record_view(vk::ImageView::from_raw(0x701), vk::Image::from_raw(0x400));
         t.register(vk::ImageView::from_raw(0x701), Some(0x0140_1c00));
@@ -11692,10 +8757,10 @@ mod tests {
         assert_eq!(t.describe_word(0x7f12_3456_789a_bcde, c), "0x7f123456789abcde");
     }
 
-    /// DLSS Frame Generation's launch-bearing buffers (they read depth, motion vectors and the
-    /// output-size frame, never the render-size colour input) are forwarded; only Super
-    /// Resolution's buffer, whose input kernel names the colour input, is the hold point, wherever
-    /// the two sit in a submit or across submits.
+    /// DLSS Frame Generation's launch-bearing buffers (they read depth, motion vectors and the output-size frame, never
+    /// the render-size colour input) carry no Super Resolution evaluate and are forwarded; only Super Resolution's
+    /// buffer, whose launch names the colour input of NGX's record, is the hold point, wherever the two sit in a submit
+    /// or across submits.
     #[test]
     fn only_the_buffer_whose_launches_name_the_colour_input_is_held() {
         let (mut t, [colour, sr_out, fg_colour, depth, mvec]) = fg_tracker();
@@ -11706,8 +8771,8 @@ mod tests {
         t.launch(cb(2), Some(&param_block(&[fg_colour, depth, mvec])));
         t.launch(cb(2), Some(&param_block(&[sr_out])));
         t.launch(cb(3), Some(&param_block(&[fg_colour, sr_out])));
-        assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Colour);
-        assert_eq!(t.launch[&cb(2)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Foreign);
+        assert!(t.launch[&cb(1)].sr().is_some());
+        assert!(t.launch[&cb(2)].ngx.is_none() && t.launch[&cb(3)].ngx.is_none());
 
         // FG's submits on their own (another queue in GTA V): not held, counted.
         assert!(t.submit_ok(&[vec![cb(2)]]).is_none(), "frame generation's buffer is not the hold point");
@@ -11716,41 +8781,13 @@ mod tests {
         // An FG buffer first in the same submit: the split point is SR's buffer behind it.
         let scan = t.submit_ok(&[vec![cb(2)], vec![cb(7), cb(1)]]).expect("SR's buffer is held");
         assert_eq!((scan.batch, scan.index), (1, 1));
-        assert_eq!((t.named_colour_submits, t.evaluations, t.foreign_submits), (1, 1, 2));
+        assert_eq!((t.evaluate_submits, t.evaluations, t.foreign_submits), (1, 1, 2));
         // SR's buffer through a secondary carries its references to the primary.
         t.begin(cb(1));
         t.launch(cb(11), Some(&param_block(&[colour])));
         t.execute(cb(1), &[cb(11)]);
         assert!(t.submit_ok(&[vec![cb(3), cb(1)]]).is_some_and(|s| s.index == 1));
-        assert_eq!(t.named_colour_submits, 2);
-    }
-
-    /// Without readable parameters (another translation layer's launch form) or before the colour
-    /// input is identified, a launch-bearing buffer is held as it was before the distinction:
-    /// nothing that held before stops holding.
-    #[test]
-    fn unreadable_parameters_or_no_colour_input_keep_the_old_rule() {
-        let (mut t, [_, sr_out, ..]) = fg_tracker();
-        t.launch(cb(1), Some(&param_block(&[sr_out])));
-        t.launch(cb(1), None);
-        assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Unknown);
-        assert!(t.submit_ok(&[vec![cb(1)]]).is_some(), "an opaque launch could be SR's: held");
-        assert_eq!((t.named_colour_submits, t.foreign_submits), (0, 0));
-        let refs = LaunchRefs::default();
-        assert_eq!(refs.kind(None), LaunchKind::Unknown, "no colour input identified yet");
-        // A destroyed colour view drops its key: its handle no longer matches anything.
-        t.forget_view(vk::ImageView::from_raw(0x101));
-        assert!(t.keys.iter().all(|k| k.2 != vk::Image::from_raw(0x100)));
-        // Every registered view is a key: a launch naming only depth is someone else's, but a
-        // launch whose readable parameters name no registered view at all stays undecided (held),
-        // so a handle form the scan misses cannot turn Super Resolution's own buffer into a
-        // forwarded one.
-        let (mut t, [_, _, _, depth, _]) = fg_tracker();
-        t.launch(cb(5), Some(&param_block(&[depth])));
-        assert_eq!(t.launch[&cb(5)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Foreign);
-        t.launch(cb(6), Some(&param_block(&[0xdead_beef_0000])));
-        assert_eq!(t.launch[&cb(6)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Unknown);
-        assert!(t.submit_ok(&[vec![cb(6)]]).is_some(), "names nothing registered: held as before");
+        assert_eq!(t.evaluate_submits, 2);
     }
 
     #[test]
@@ -11846,383 +8883,9 @@ mod tests {
     fn submit(t: &mut Tracker, batches: &[Vec<vk::CommandBuffer>]) -> (Option<Scan>, Vec<String>) {
         let mut lines = t.observe(batches);
         lines.extend(t.refresh());
-        let undecided = t.evaluations - t.named_colour_submits;
         let scan = t.submit_ok(batches);
-        lines.extend(t.classify_line(scan.as_ref(), undecided));
+        lines.extend(t.classify_line(scan.as_ref()));
         (scan, lines)
-    }
-
-    fn identification_lines(lines: &[String]) -> Vec<&String> {
-        lines.iter().filter(|l| l.starts_with("colour input:") || l.starts_with("no DLSS input")).collect()
-    }
-
-    /// Hogwarts Legacy's DLSS Ray Reconstruction (310.0's `cuda_dldn_engine_*`, from `NEURAL_FORGE_PROBE_RR`,
-    /// 2026-10-19): its first launch names the colour input (1708x964) with motion vectors and two R32_SFLOAT
-    /// depth-like images at 1708x961, and its output kernel names an internal 3416x1922 image before the
-    /// 2560x1440 output. DLSS's output is learnt as the swapchain-size one, after the input launch read from
-    /// the colour input and motion vectors; the buffer is never evidence.
-    #[test]
-    fn hogwarts_ray_reconstruction_output_is_learnt_at_the_swapchain_extent() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let copy = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | copy;
-        let attachment = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT | copy;
-        // Two frames' images: the game alternates them (colour, motion vectors, output and the internal one).
-        let mut list = Vec::new();
-        for k in [0u64, 1] {
-            list.extend([
-                (0x100 + k, desc(1708, 964, rgba, storage | vk::ImageUsageFlags::COLOR_ATTACHMENT)),
-                (0x300 + k, desc(1708, 961, vk::Format::R16G16_SFLOAT, storage)),
-                (0x500 + k, desc(3416, 1922, rgba, storage)),
-                (0x420 + k, desc(2560, 1440, rgba, storage)),
-            ]);
-        }
-        list.extend([
-            (0x200, desc(1708, 961, vk::Format::R32_SFLOAT, attachment)),
-            (0x210, desc(1708, 961, vk::Format::R32_SFLOAT, attachment)),
-            (0x230, desc(1708, 961, vk::Format::B10G11R11_UFLOAT_PACK32, attachment)),
-            (0x240, desc(1708, 961, vk::Format::B10G11R11_UFLOAT_PACK32, attachment)),
-        ]);
-        let set = set_of(&list);
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        let (enc0, out) = (vk::CuFunctionNVX::from_raw(0x9001), vk::CuFunctionNVX::from_raw(0x9002));
-        t.record_function(enc0, "cuda_dldn_engine_swin_enc0_kernel");
-        t.record_function(out, "cuda_dldn_engine_multiscale_downsample_kernel");
-        let frame = |t: &mut Tracker, c: vk::CommandBuffer, k: u64| {
-            t.launch_kernel(c, enc0, Some(&param_block(&[h(0x100 + k), h(0x300 + k), h(0x200), h(0x210), h(0x230), h(0x240)])));
-            t.launch_kernel(c, out, Some(&param_block(&[h(0x500 + k), h(0x420 + k)])));
-        };
-        let mut lines = Vec::new();
-        for n in 0..OUTPUT_SETTLE {
-            let k = u64::from(n % 2);
-            frame(&mut t, cb(1), k);
-            assert_eq!(t.launch[&cb(1)].input, Some(InputLaunch::Inputs { colour: img(0x100 + k), depth: img(0x200), mvec: img(0x300 + k) }));
-            assert!(t.launch[&cb(1)].input_rr);
-            assert_eq!(t.launch[&cb(1)].output, Some((out, img(0x420 + k))), "the swapchain-size image, not the internal 3416x1922 one");
-            lines.extend(submit(&mut t, &[vec![cb(1)]]).1);
-            t.launch.remove(&cb(1));
-        }
-        let o = t.dlss_output.expect("DLSS's output is learnt although its images alternate");
-        assert_eq!((o.function, o.rr), (out, true));
-        assert!(t.named.is_empty(), "Ray Reconstruction's buffer is never evidence: {:?}", t.named);
-        assert_eq!(lines.iter().filter(|l| l.starts_with("DLSS's output: image")).count(), 1, "learnt once: {lines:#?}");
-        // The hold goes after each buffer's own output, with that buffer's inputs.
-        for k in [0u64, 1] {
-            frame(&mut t, cb(2), k);
-            let (c, at, _) = t.after_at.take().expect("a hold after DLSS's output");
-            assert_eq!((c, at.image, at.input, at.mvec), (cb(2), img(0x420 + k), img(0x100 + k), img(0x300 + k)));
-            t.launch.remove(&cb(2));
-        }
-    }
-
-    /// Every image as vkd3d-proton creates it for Cyberpunk 2077: the same usage whatever the image is for.
-    fn vkd3d_usage() -> vk::ImageUsageFlags {
-        vk::ImageUsageFlags::STORAGE
-            | vk::ImageUsageFlags::SAMPLED
-            | vk::ImageUsageFlags::COLOR_ATTACHMENT
-            | vk::ImageUsageFlags::TRANSFER_SRC
-            | vk::ImageUsageFlags::TRANSFER_DST
-    }
-
-    /// Cyberpunk 2077's DLSS Super Resolution (310.x transformer, `NEURAL_FORGE_PROBE_RR=1`, issue #49,
-    /// 2026-11-10): DLSS keeps its history in two 2560x1440 RGBA16F images it alternates frame by frame; its input
-    /// kernel names one, its network (`dltss_pwin_*`) the other, and its output kernel names both ahead of the
-    /// output, the image only it names. DLSS's output is learnt as that image; the swapchain-size rule alone took
-    /// the history the output kernel names first, so the hold after DLSS edited DLSS's history and the picture
-    /// never showed it ("After DLSS never shows anything").
-    #[test]
-    fn cyberpunk_super_resolution_output_is_the_image_only_its_output_kernel_names() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let u = vkd3d_usage();
-        let set = set_of(&[
-            (0x100, desc(1485, 835, rgba, u)),
-            (0x300, desc(1485, 835, rgba, u)),
-            (0x200, desc(1485, 835, vk::Format::R32_UINT, u)),
-            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, u)),
-            (0x410, desc(2560, 1440, rgba, u)),
-            (0x411, desc(2560, 1440, rgba, u)),
-            (0x500, desc(5120, 2880, vk::Format::R16_SFLOAT, u)),
-            (0x420, desc(2560, 1440, rgba, u)),
-        ]);
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        let (input, net, output) = (vk::CuFunctionNVX::from_raw(0x9001), vk::CuFunctionNVX::from_raw(0x9002), vk::CuFunctionNVX::from_raw(0x9003));
-        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
-        t.record_function(net, "dltss_pwin_enc0_layer");
-        t.record_function(output, "hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel");
-        let frame = |t: &mut Tracker, c: vk::CommandBuffer, k: u64| {
-            let (history, other) = (0x410 + k, 0x411 - k);
-            t.launch_kernel(c, input, Some(&param_block(&[h(0x100), h(history), h(0x300), h(0x200), h(0x610)])));
-            t.launch_kernel(c, net, Some(&param_block(&[h(other)])));
-            t.launch_kernel(c, output, Some(&param_block(&[h(0x100), h(other), h(0x500), h(0x300), h(0x200), h(0x610), h(history), h(0x420)])));
-        };
-        for n in 0..OUTPUT_SETTLE {
-            let k = u64::from(n % 2);
-            frame(&mut t, cb(1), k);
-            assert_eq!(t.launch[&cb(1)].input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
-            assert_eq!(t.launch[&cb(1)].output, Some((output, img(0x420))), "frame {n}: the image only the output kernel names, not DLSS's history");
-            submit(&mut t, &[vec![cb(1)]]);
-            t.launch.remove(&cb(1));
-        }
-        let o = t.dlss_output.expect("DLSS's output is learnt");
-        assert_eq!((o.function, o.image, o.input, o.mvec, o.rr, o.writes), (output, img(0x420), img(0x100), img(0x300), false, 1));
-    }
-
-    /// Cyberpunk 2077's DLSS Ray Reconstruction (310.x `rr2_*`, vkd3d-proton, `NEURAL_FORGE_PROBE_RR=1`, issue #49,
-    /// 2026-11-10): its first launch names five RGBA16F images at the render size (the colour input first, the
-    /// motion vectors second), two RG16F ones and two depth-like ones, all with the same usage, so neither SR's
-    /// input form nor the single-attachment rule reads it, and DLSS's output was never learnt: placement "After
-    /// DLSS" and Auto with Ray Reconstruction on fell back to the finished frame. It is read in parameter order. Then
-    /// Ray Reconstruction writes its 2560x1440 output in 12 parts (an `rr2_post_kernel` and an
-    /// `rr2_downsample_kernel_static_hdr` launch each, the latter naming the output and its alternating history):
-    /// the hold goes after the last part only, where the whole output is written.
-    #[test]
-    fn cyberpunk_ray_reconstruction_output_is_learnt_and_held_after_its_last_part() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let u = vkd3d_usage();
-        let set = set_of(&[
-            (0x600, desc(3840, 2160, rgba, u)),
-            (0x100, desc(1485, 835, rgba, u)),
-            (0x110, desc(1485, 835, vk::Format::R8G8B8A8_UNORM, u)),
-            (0x111, desc(1485, 835, vk::Format::R8G8B8A8_UNORM, u)),
-            (0x300, desc(1485, 835, rgba, u)),
-            (0x120, desc(1485, 835, rgba, u)),
-            (0x121, desc(1485, 835, rgba, u)),
-            (0x210, desc(1485, 835, vk::Format::R32_SFLOAT, u)),
-            (0x211, desc(1485, 835, vk::Format::R16_SFLOAT, u)),
-            (0x122, desc(1485, 835, rgba, u)),
-            (0x310, desc(1485, 835, vk::Format::R16G16_SFLOAT, u)),
-            (0x311, desc(1485, 835, vk::Format::R16G16_SFLOAT, u)),
-            (0x112, desc(1485, 835, vk::Format::R8G8B8A8_SNORM, u)),
-            (0x700, desc(1920, 1080, vk::Format::A2B10G10R10_UNORM_PACK32, u)),
-            (0x200, desc(1485, 835, vk::Format::R32_UINT, u)),
-            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, u)),
-            (0x420, desc(2560, 1440, rgba, u)),
-            (0x430, desc(2560, 1440, rgba, u)),
-            (0x431, desc(2560, 1440, rgba, u)),
-        ]);
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        let f = |raw: u64| vk::CuFunctionNVX::from_raw(raw);
-        let (histogram, enc0, post, down) = (f(0x9001), f(0x9002), f(0x9003), f(0x9004));
-        t.record_function(histogram, "rr2_histogram_auto_exposure_basic_kernel");
-        t.record_function(enc0, "rr2_enc0_kernel");
-        t.record_function(post, "rr2_post_kernel");
-        t.record_function(down, "rr2_downsample_kernel_static_hdr");
-        let enc0_names = [0x600, 0x100, 0x110, 0x111, 0x300, 0x120, 0x121, 0x210, 0x211, 0x122, 0x310, 0x311, 0x112, 0x700, 0x200];
-        let named: Vec<vk::Image> = enc0_names.iter().map(|&r| img(r)).collect();
-        assert_eq!(input_launch(&t.images, &named), Some(InputLaunch::Unusable), "two depth-like images: not SR's input form");
-        assert_eq!(rr_input_launch(&t.images, &named, &[]), Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x300) }));
-        // Ray Reconstruction switched on in a session that identified Super Resolution's inputs: those are taken.
-        assert_eq!(
-            rr_input_launch(&t.images, &named, &[(img(0x120), img(0x121))]),
-            Some(InputLaunch::Inputs { colour: img(0x120), depth: img(0x210), mvec: img(0x121) })
-        );
-        // A frame: the auto-exposure kernel on the colour input, the encoder, then 12 parts of the output. Returns
-        // after which part a hold after DLSS's output was asked for.
-        let frame = |t: &mut Tracker, c: vk::CommandBuffer, k: u64| -> Vec<u32> {
-            let mut held = Vec::new();
-            t.launch_kernel(c, histogram, Some(&param_block(&[h(0x100), h(0x610)])));
-            t.launch_kernel(c, enc0, Some(&param_block(&enc0_names.map(h))));
-            for part in 1..=12 {
-                t.launch_kernel(c, post, Some(&param_block(&[h(0x110), h(0x600), h(0x122), h(0x310), h(0x311), h(0x100)])));
-                t.launch_kernel(c, down, Some(&param_block(&[h(0x420), h(0x121), h(0x120), h(0x430 + k), h(0x431 - k)])));
-                if t.after_at.take().is_some() {
-                    held.push(part);
-                }
-            }
-            held
-        };
-        let mut lines = Vec::new();
-        for n in 0..OUTPUT_SETTLE {
-            let k = u64::from(n % 2);
-            assert!(frame(&mut t, cb(1), k).is_empty(), "frame {n}: nothing held before the output is learnt");
-            assert_eq!(t.launch[&cb(1)].input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x300) }));
-            assert!(t.launch[&cb(1)].input_rr);
-            assert_eq!(t.launch[&cb(1)].output, Some((down, img(0x420))), "the output, not the internal 3840x2160 image nor the history");
-            lines.extend(submit(&mut t, &[vec![cb(1)]]).1);
-            t.launch.remove(&cb(1));
-        }
-        let o = t.dlss_output.expect("Ray Reconstruction's output is learnt");
-        assert_eq!((o.function, o.image, o.input, o.mvec, o.rr, o.writes), (down, img(0x420), img(0x100), img(0x300), true, 12));
-        assert!(t.named.is_empty(), "Ray Reconstruction's buffer is never evidence: {:?}", t.named);
-        let learnt: Vec<&String> = lines.iter().filter(|l| l.starts_with("DLSS's output: image")).collect();
-        assert_eq!(learnt.len(), 1, "{lines:#?}");
-        assert!(learnt[0].ends_with("; Ray Reconstruction; written in 12 launches, the hold goes after the last"), "{}", learnt[0]);
-        // With the output learnt (and Ray Reconstruction running, Auto runs after DLSS), each frame is held once,
-        // after the 12th part, on its own output.
-        for k in [0u64, 1] {
-            assert_eq!(frame(&mut t, cb(2), k), vec![12], "frame {k}");
-            submit(&mut t, &[vec![cb(2)]]);
-            t.launch.remove(&cb(2));
-        }
-        // A buffer written in fewer parts than learnt (the render size changed) gets no hold on a partly written
-        // output; 8 such in a row are learnt as the new output.
-        // Returns after which parts a hold after DLSS's output was asked for.
-        let parts = |t: &mut Tracker, c: vk::CommandBuffer, n: u32| -> Vec<u32> {
-            t.launch_kernel(c, histogram, Some(&param_block(&[h(0x100), h(0x610)])));
-            t.launch_kernel(c, enc0, Some(&param_block(&enc0_names.map(h))));
-            let mut held = Vec::new();
-            for part in 1..=n {
-                t.launch_kernel(c, post, Some(&param_block(&[h(0x110), h(0x600), h(0x122), h(0x310), h(0x311), h(0x100)])));
-                t.launch_kernel(c, down, Some(&param_block(&[h(0x420), h(0x121), h(0x120), h(0x430), h(0x431)])));
-                if t.after_at.take().is_some() {
-                    held.push(part);
-                }
-            }
-            held
-        };
-        for n in 0..OUTPUT_SETTLE {
-            assert_eq!(parts(&mut t, cb(3), 6), Vec::<u32>::new(), "submit {n}");
-            submit(&mut t, &[vec![cb(3)]]);
-            t.launch.remove(&cb(3));
-        }
-        assert_eq!(t.dlss_output.map(|o| o.writes), Some(6));
-        assert_eq!(parts(&mut t, cb(3), 6), vec![6]);
-        submit(&mut t, &[vec![cb(3)]]);
-        t.launch.remove(&cb(3));
-        // A buffer written in more parts than learnt (16: the render size grew) is held after the learnt 6th, on a
-        // partly written output, before it can be known; its submit drops the learnt output at once, so that is the
-        // only such frame, and the next hold is after the 16th part once 16 are learnt.
-        assert_eq!(parts(&mut t, cb(3), 16), vec![6], "the first buffer in 16 parts");
-        let lines = submit(&mut t, &[vec![cb(3)]]).1;
-        t.launch.remove(&cb(3));
-        assert!(t.dlss_output.is_none(), "dropped at once: {lines:#?}");
-        assert!(lines.iter().any(|l| l.starts_with("DLSS's output is written in 16 launches, not 6")), "{lines:#?}");
-        for n in 1..OUTPUT_SETTLE {
-            assert_eq!(parts(&mut t, cb(3), 16), Vec::<u32>::new(), "submit {n}: no hold on a partly written output");
-            submit(&mut t, &[vec![cb(3)]]);
-            t.launch.remove(&cb(3));
-        }
-        assert_eq!(t.dlss_output.map(|o| o.writes), Some(16));
-        assert_eq!(parts(&mut t, cb(3), 16), vec![16]);
-    }
-
-    /// Ray Reconstruction's first launch whose colour input is known from Super Resolution and happens to be the first
-    /// of the RGBA16F images at the depth's extent, beside a guide buffer (albedo, specular, normals) of the same format
-    /// and usage: the motion vectors are the motion-vector image it names, not the guide buffer the parameter-order rule
-    /// would read as them. The parameter order gives them only with the colour, or where no motion-vector format is named.
-    #[test]
-    fn ray_reconstruction_guide_buffer_is_not_taken_for_motion_vectors() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let u = vkd3d_usage();
-        let set = set_of(&[
-            (0x100, desc(1485, 835, rgba, u)),
-            (0x120, desc(1485, 835, rgba, u)),
-            (0x210, desc(1485, 835, vk::Format::R32_SFLOAT, u)),
-            (0x300, desc(1485, 835, vk::Format::R16G16_SFLOAT, u)),
-            (0x900, desc(1485, 835, vk::Format::R16G16_SFLOAT, u)),
-        ]);
-        let t = tracker_with(&set, Some((2560, 1440)));
-        let named: Vec<vk::Image> = [0x100, 0x120, 0x210, 0x300].iter().map(|&r| img(r)).collect();
-        // The colour known from Super Resolution, its motion vectors not named by this launch.
-        assert_eq!(
-            rr_input_launch(&t.images, &named, &[(img(0x100), img(0x900))]),
-            Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x300) })
-        );
-        // Known with its motion vectors named: those.
-        let with_known: Vec<vk::Image> = named.iter().copied().chain([img(0x900)]).collect();
-        assert_eq!(
-            rr_input_launch(&t.images, &with_known, &[(img(0x100), img(0x900))]),
-            Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x900) })
-        );
-        // The colour from the parameter order: the second RGBA16F image, as in Cyberpunk 2077.
-        assert_eq!(rr_input_launch(&t.images, &named, &[]), Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x120) }));
-        // Known colour and no motion-vector format named: the parameter order is the last resort.
-        let no_rg: Vec<vk::Image> = [0x100, 0x120, 0x210].iter().map(|&r| img(r)).collect();
-        assert_eq!(
-            rr_input_launch(&t.images, &no_rg, &[(img(0x100), img(0x900))]),
-            Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x210), mvec: img(0x120) })
-        );
-        // A buffer read with motion vectors of another kind is another output: the hold after it waits until it is learnt.
-        let o = DlssOutput {
-            function: vk::CuFunctionNVX::from_raw(9),
-            image: img(0x100),
-            input: img(0x100),
-            depth: img(0x210),
-            mvec: img(0x300),
-            rr: true,
-            writes: 1,
-        };
-        assert!(same_output(&o, &DlssOutput { mvec: img(0x900), ..o }, &t.images), "other motion vectors of the same kind");
-        assert!(!same_output(&o, &DlssOutput { mvec: img(0x120), ..o }, &t.images), "a guide buffer's kind");
-    }
-
-    /// (a) GTA V with DLSS Frame Generation: SR's buffer (input kernel naming colour, depth and
-    /// motion vectors, then the network, the output kernel and the exposure copy) and FG's two
-    /// buffers (fg_tracker's shape: FG's output-size frame beside the render-size depth and motion
-    /// vectors, then the output). Identified by size at the first submit exactly as before, then by
-    /// the input kernel's parameters with the very same images (no re-identification, so no skipped
-    /// hold); SR's buffer is held every frame and FG's are forwarded, every frame.
-    #[test]
-    fn gtas_sr_and_fg_buffers_keep_their_inputs_and_hold_target_by_the_input_kernel() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        let mut set = gta_registered();
-        set.insert(0x420, (img(0x420), desc(2560, 1440, rgba, storage)));
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x500), h(0x700)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x610)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x420), h(0x200), h(0x300)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x400)])));
-        t.launch(cb(3), Some(&param_block(&[h(0x420), h(0x400)])));
-        assert_eq!(t.launch[&cb(1)].input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
-        assert_eq!(t.launch[&cb(2)].input, Some(InputLaunch::Unusable), "FG's frame is not at the depth's extent: no evidence");
-        assert_eq!(t.launch[&cb(3)].input, None, "no depth: not an input launch");
-        let mut lines = Vec::new();
-        for frame in 0..40 {
-            let (sr, l) = submit(&mut t, &[vec![cb(1)]]);
-            lines.extend(l);
-            let sr = sr.expect("SR's buffer is the hold point");
-            assert_eq!((sr.batch, sr.index, sr.identified_now), (0, 0, frame == 0), "frame {frame}: identified once, at the first submit");
-            let i = sr.inputs.unwrap();
-            assert_eq!(
-                (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw(), i.candidates, i.exposure_input.map(|e| e.0.as_raw())),
-                (0x100, 0x200, 0x300, 1, Some(0x610)),
-                "frame {frame}"
-            );
-            for fg in [cb(2), cb(3)] {
-                let (s, l) = submit(&mut t, &[vec![fg]]);
-                lines.extend(l);
-                assert!(s.is_none(), "frame {frame}: frame generation's buffers are forwarded");
-            }
-        }
-        assert_eq!((t.named_colour_submits, t.foreign_submits, t.evaluations), (40, 80, 40));
-        assert_eq!(
-            t.named,
-            vec![Named::new(img(0x100), img(0x200), img(0x300), Some(img(0x610)))],
-            "the output kernel names the larger output: no same-extent output pair (that is DLAA's)"
-        );
-        let ids = identification_lines(&lines);
-        assert_eq!(ids.len(), 2, "{lines:#?}");
-        assert!(
-            ids[0].starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT")
-                && ids[0].ends_with("exposure input 0x610; swapchain Some((2560, 1440)); identified by size"),
-            "{}",
-            ids[0]
-        );
-        assert!(ids[1].starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT") && !ids[1].contains("candidates"), "{}", ids[1]);
-        assert!(ids[1].ends_with("exposure input 0x610 (named by the same command buffer); swapchain Some((2560, 1440)); identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{}", ids[1]);
-        assert!(
-            lines.iter().all(|l| !l.contains("output-size colour image") && !l.contains("different colour inputs") && !l.contains("several colour candidates")),
-            "{lines:#?}"
-        );
-
-        // fg_tracker's own data: FG's first launch is not evidence, its buffers stay forwarded.
-        let (mut t, [colour, sr_out, fg_colour, depth, mvec]) = fg_tracker();
-        t.launch(cb(1), Some(&param_block(&[colour, depth, mvec])));
-        t.launch(cb(1), Some(&param_block(&[sr_out])));
-        t.launch(cb(2), Some(&param_block(&[fg_colour, depth, mvec])));
-        t.launch(cb(2), Some(&param_block(&[sr_out])));
-        t.launch(cb(3), Some(&param_block(&[fg_colour, sr_out])));
-        assert_eq!(t.launch[&cb(2)].input, Some(InputLaunch::Unusable));
-        for _ in 0..30 {
-            assert!(submit(&mut t, &[vec![cb(1)]]).0.is_some_and(|s| s.inputs.unwrap().colour.0 == img(0x100)));
-            assert!(submit(&mut t, &[vec![cb(2)]]).0.is_none());
-            assert!(submit(&mut t, &[vec![cb(3)]]).0.is_none());
-        }
-        assert_eq!((t.named.len(), t.inputs.map(|i| i.rule)), (1, Some(Rule::Params)));
-        assert_eq!((t.named_colour_submits, t.foreign_submits), (30, 60));
     }
 
     /// DLSS's launches recorded into a secondary that is executed into the submitted primary: the
@@ -12232,778 +8895,29 @@ mod tests {
     /// secondary's rendering left never reached the committed state.
     #[test]
     fn a_secondarys_jitter_output_and_attachment_layouts_carry_over_to_its_primary() {
-        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
-        assert!(t.refresh().is_some(), "identified by size");
-        let (input, output) = (vk::CuFunctionNVX::from_raw(0x9001), vk::CuFunctionNVX::from_raw(0x9002));
-        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
-        t.record_function(output, "hiluma_engine_output_kernel");
-        // Word 3 of a 310.x SR input kernel's parameters is the jitter (x low, y high).
-        let jitter = u64::from((-0.25f32).to_bits()) | (u64::from(0.1667f32.to_bits()) << 32);
+        use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_SR};
+        let mut t = tracker_with(&gta_registered());
+        let rec = parse_record(&record_bytes(1, FEATURE_SR, 1, [0x100, 0x300, 0x200, 0x400, 0], [-0.25, 0.1667], [1.0; 2], 1.0, 1.0, 1));
+        inject(vec![rec]);
+        assert!(t.refresh().is_some(), "identified by the record");
         let (primary, secondary) = (cb(1), cb(11));
         t.begin(primary);
         t.begin(secondary);
         t.attachments(secondary, &[(vk::ImageView::from_raw(0x101), vk::ImageLayout::GENERAL)]);
-        t.launch_kernel(secondary, input, Some(&param_block(&[h(0x100), jitter, h(0x200), h(0x300)])));
-        t.launch_kernel(secondary, output, Some(&param_block(&[h(0x100), h(0x400)])));
-        assert_eq!((t.launch[&secondary].jitter, t.launch[&secondary].output), (Some(jitter), Some((output, img(0x400)))));
+        t.launch(secondary, Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
+        t.launch(secondary, Some(&param_block(&[h(0x100), h(0x400)])));
+        assert_eq!((t.launch[&secondary].ngx, t.launch[&secondary].output_writes), (Some(rec), 1));
         t.execute(primary, &[secondary]);
         let refs = &t.launch[&primary];
-        assert_eq!(refs.input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
-        assert_eq!(refs.jitter, Some(jitter), "the secondary's jitter");
-        assert_eq!(refs.reset, Some(false), "the secondary's reset word (word 4: the depth handle in this block, no reset flag)");
-        assert_eq!(refs.output, Some((output, img(0x400))), "the secondary's output kernel and image");
+        assert_eq!((refs.ngx, refs.output_writes), (Some(rec), 1), "the secondary's evaluate and its write of the output");
         assert_eq!(t.attached.get(&primary), Some(&vec![(img(0x100), vk::ImageLayout::GENERAL)]), "the secondary's attachment layout");
-        for n in 0..OUTPUT_SETTLE {
+        inject(vec![rec, end_of(&rec, 2)]);
+        for n in 0..3 {
             let scan = submit(&mut t, &[vec![primary]]).0.expect("launch-bearing");
-            assert_eq!(scan.dlss_frame(), DlssFrame { jitter: Some([-0.25, 0.1667]), reset: false }, "submit {n}");
+            assert_eq!(scan.frame, DlssFrame { jitter: Some([-0.25, 0.1667]), reset: true }, "submit {n}");
             assert_eq!(t.committed.get(&img(0x100)), Some(&vk::ImageLayout::GENERAL), "submit {n}: committed from the primary");
         }
-        assert_eq!(t.dlss_output.map(|o| (o.function, o.image, o.input)), Some((output, img(0x400), img(0x100))), "DLSS's output is learnt from the primary");
-    }
-
-    /// The DLAA set (Resident Evil Requiem: `UpscalingQuality_DLSS=MaxQuality`, FG on): DLSS's colour
-    /// input, depth and motion vectors are all the swapchain's 2560x1440, beside a separate output
-    /// image and FG's own output-size frame.
-    fn dlaa_set() -> BTreeMap<u64, (vk::Image, ImageDesc)> {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
-        set_of(&[
-            (0x100, desc(2560, 1440, rgba, storage)),
-            (0x200, desc(2560, 1440, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)),
-            (0x300, desc(2560, 1440, vk::Format::R16G16_SFLOAT, storage)),
-            (0x400, desc(2560, 1440, rgba, storage)),
-            (0x500, desc(2560, 1440, rgba, storage)),
-            (0x600, desc(1, 1, vk::Format::R32G32B32A32_SFLOAT, storage)),
-            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
-            (0x700, desc(1280, 720, vk::Format::R8_UNORM, storage)),
-        ])
-    }
-
-    /// (b) DLAA with frame generation: the size rule refuses DLAA by design ("no DLSS input ...;
-    /// waiting", as on the rig), and the input kernel's parameters identify it once settled. FG's
-    /// launch names its output-size frame with the same depth and motion vectors, but its buffer
-    /// names no exposure image, so it does not count (logged once). Held from the submit after
-    /// identification on, FG forwarded; the hold is size-agnostic (no padding at 2560x1440).
-    #[test]
-    fn dlaa_is_identified_by_the_input_kernels_parameters_and_held() {
-        let mut t = tracker_with(&dlaa_set(), Some((2560, 1440)));
-        assert_eq!(identify(&dlaa_set(), Some((2560, 1440))), None, "the size rule refuses DLAA");
-        // SR: input kernel, network, output kernel (names input and output: only the first launch counts), exposure copy.
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x700)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x610)])));
-        // FG: its frame with depth and motion vectors, then the output.
-        t.launch(cb(2), Some(&param_block(&[h(0x500), h(0x200), h(0x300)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x400)])));
-        t.launch(cb(3), Some(&param_block(&[h(0x500), h(0x400), h(0x700)])));
-        assert_eq!(
-            t.launch[&cb(2)].input,
-            Some(InputLaunch::Inputs { colour: img(0x500), depth: img(0x200), mvec: img(0x300) }),
-            "FG's launch has SR's shape under DLAA"
-        );
-        let mut lines = Vec::new();
-        let mut first_held = None;
-        for frame in 0..40 {
-            let (sr, l) = submit(&mut t, &[vec![cb(1)]]);
-            lines.extend(l);
-            let sr = sr.expect("launch-bearing");
-            match sr.inputs {
-                None => assert!(first_held.is_none(), "frame {frame}: never un-identified"),
-                Some(i) => {
-                    assert_eq!(
-                        (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw(), i.rule, i.exposure_input.map(|e| e.0.as_raw())),
-                        (0x100, 0x200, 0x300, Rule::Params, Some(0x610))
-                    );
-                    if sr.identified_now {
-                        assert!(first_held.is_none());
-                    } else {
-                        assert!(sr.colour_in_general());
-                        first_held.get_or_insert(frame);
-                    }
-                }
-            }
-            for fg in [cb(2), cb(3)] {
-                let (s, l) = submit(&mut t, &[vec![fg]]);
-                lines.extend(l);
-                assert!(s.and_then(|s| s.inputs).is_none(), "frame {frame}: frame generation's buffer is never held with inputs");
-            }
-        }
-        // 16 quiet submits after the first: frame 5's second FG submit decides, frame 6 is the
-        // identifying (unheld) SR submit, frame 7 the first hold.
-        assert_eq!(first_held, Some(7));
-        assert_eq!(t.named_colour_submits, 40 - 6, "SR submits reading the colour input from the identifying one on");
-        let ids = identification_lines(&lines);
-        assert_eq!(ids.len(), 2, "{lines:#?}");
-        assert!(
-            ids[0].starts_with("no DLSS input among 8 registered views (swapchain Some((2560, 1440))); waiting. output: swapchain 2560x1440"),
-            "{}",
-            ids[0]
-        );
-        assert!(ids[0].contains("2560x1440 not smaller than the output"), "{}", ids[0]);
-        assert!(ids[1].starts_with("colour input: image 0x100 (2560x1440 R16G16B16A16_SFLOAT"), "{}", ids[1]);
-        assert!(ids[1].ends_with("exposure input 0x610 (named by the same command buffer); swapchain Some((2560, 1440)); identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{}", ids[1]);
-        let fg_line: Vec<&String> = lines.iter().filter(|l| l.contains("output-size colour image")).collect();
-        assert_eq!(fg_line.len(), 1, "{lines:#?}");
-        assert!(fg_line[0].contains("(0x500 2560x1440)"), "{}", fg_line[0]);
-        // The hold's sizes: no padding at 2560x1440 (or at 4K DLAA), and 4K RGBA16F fits a region.
-        assert_eq!((padded(2560, 1440), padded(3840, 2160)), ((2560, 1440), (3840, 2160)));
-        assert!(3840 * 2160 * TEXEL as usize <= neural_forge_protocol::MAX_FRAME);
-    }
-
-    /// (c) Frame generation alone never identifies: GTA V's FG buffers (fg_tracker's data, their
-    /// frame is not at the depth's extent), and FG at native resolution (frame, depth and motion
-    /// vectors all output-size, which has SR's shape) without SR, whose buffers name no exposure.
-    #[test]
-    fn frame_generation_buffers_alone_never_identify() {
-        let (mut t, [_, sr_out, fg_colour, depth, mvec]) = fg_tracker();
-        t.launch(cb(2), Some(&param_block(&[fg_colour, depth, mvec])));
-        t.launch(cb(2), Some(&param_block(&[sr_out])));
-        t.launch(cb(3), Some(&param_block(&[fg_colour, sr_out])));
-        for _ in 0..100 {
-            assert!(submit(&mut t, &[vec![cb(2)]]).0.is_none());
-            assert!(submit(&mut t, &[vec![cb(3)]]).0.is_none());
-        }
-        assert!(t.named.is_empty() && t.named_pick.is_none());
-        assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.rule)), Some((0x100, Rule::Size)), "the size rule's identification stays");
-        // Native resolution: no SR buffer at all.
-        let mut set = dlaa_set();
-        set.remove(&0x100);
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        t.launch(cb(2), Some(&param_block(&[h(0x500), h(0x200), h(0x300)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x400)])));
-        let mut lines = Vec::new();
-        for _ in 0..100 {
-            let (s, l) = submit(&mut t, &[vec![cb(2)]]);
-            lines.extend(l);
-            assert!(s.and_then(|s| s.inputs).is_none(), "FG's frame is never the colour input");
-        }
-        assert!(t.inputs.is_none() && t.named_pick.is_none());
-        assert_eq!(t.named.len(), 1, "seen, but not counted");
-        assert_eq!(lines.iter().filter(|l| l.contains("names no 1x1 R16_SFLOAT exposure")).count(), 1, "{lines:#?}");
-    }
-
-    /// Two buffers naming different colour inputs of one extent, both with the same exposure, where
-    /// the size rule finds nothing: one evaluation alternating its input (Remnant II), so the lower
-    /// handle is chosen by the parameters. Each with its own exposure (two evaluations), or of
-    /// different extents: none is chosen.
-    #[test]
-    fn one_evaluation_alternating_its_input_is_chosen_by_its_shared_exposure() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        let mut set = gta_registered();
-        set.insert(0x110, (img(0x110), desc(1707, 960, rgba, vk::ImageUsageFlags::STORAGE)));
-        set.insert(0x630, (img(0x630), desc(1, 1, vk::Format::R16_SFLOAT, storage)));
-        set.insert(0x120, (img(0x120), desc(1664, 936, rgba, vk::ImageUsageFlags::STORAGE)));
-        // Motion vectors a few pixels narrower than the colour input and depth (Remnant II: 1485x836
-        // against 1488x836), so the size rule finds nothing and the parameters decide.
-        set.insert(0x300, (img(0x300), desc(1704, 960, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT)));
-        // A second view at its own extent, with its own depth and motion vectors.
-        let set_second_view = |set: &mut BTreeMap<u64, (vk::Image, ImageDesc)>| {
-            set.insert(0x210, (img(0x210), desc(1664, 936, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)));
-            set.insert(0x310, (img(0x310), desc(1664, 936, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT)));
-        };
-        let run = |set: &BTreeMap<u64, (vk::Image, ImageDesc)>, buffers: &[&[u64]]| {
-            let mut t = tracker_with(set, Some((2560, 1440)));
-            for (k, words) in buffers.iter().enumerate() {
-                let words: Vec<u64> = words.iter().map(|&w| h(w)).collect();
-                t.launch(cb(k as u64 + 1), Some(&param_block(&words)));
-            }
-            let mut lines = Vec::new();
-            for _ in 0..40 {
-                for k in 0..buffers.len() {
-                    let (_, l) = submit(&mut t, &[vec![cb(k as u64 + 1)]]);
-                    lines.extend(l);
-                }
-            }
-            (t.named_pick.map(|n| n.colour.as_raw()), t.inputs.map(|i| (i.colour.0.as_raw(), i.rule)), lines)
-        };
-        // One exposure for both: chosen by the parameters, the lower handle.
-        let (pick, inputs, lines) = run(&set, &[&[0x110, 0x200, 0x300, 0x610], &[0x100, 0x200, 0x300, 0x610]]);
-        assert_eq!((pick, inputs), (Some(0x100), Some((0x100, Rule::Params))));
-        assert_eq!(lines.iter().filter(|l| l.contains("one evaluation alternating its input")).count(), 1, "{lines:#?}");
-        // An exposure each: two evaluations, none chosen by the parameters.
-        let (pick, _, lines) = run(&set, &[&[0x100, 0x200, 0x300, 0x610], &[0x110, 0x200, 0x300, 0x630]]);
-        assert_eq!(pick, None);
-        assert!(lines.iter().any(|l| l.contains("none chosen")), "{lines:#?}");
-        // One exposure, but inputs of different extents: none.
-        set_second_view(&mut set);
-        let (pick, _, lines) = run(&set, &[&[0x100, 0x200, 0x300, 0x610], &[0x120, 0x210, 0x310, 0x610]]);
-        assert!(lines.iter().any(|l| l.contains("none chosen")), "{lines:#?}");
-        assert_eq!(pick, None);
-    }
-
-    /// (d) One launch naming two colour candidates at the depth's extent: the first in parameter
-    /// order is the colour input (Cyberpunk 2077's case), also when its handle is the higher one.
-    /// Ambiguity between buffers falls back to the size rule and is logged once: two buffers naming
-    /// different colour inputs with neither (or both) naming the exposure.
-    #[test]
-    fn ambiguous_parameters_fall_back_to_the_size_rule_and_log_once() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let mut set = gta_registered();
-        set.insert(0x110, (img(0x110), desc(1707, 960, rgba, vk::ImageUsageFlags::STORAGE)));
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        t.launch(cb(1), Some(&param_block(&[h(0x110), h(0x100), h(0x200), h(0x300)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x610)])));
-        assert!(matches!(t.launch[&cb(1)].input, Some(InputLaunch::Inputs { colour, .. }) if colour == img(0x110)), "the first in parameter order");
-
-        // Two buffers, two colour inputs, no exposure named by either.
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x110), h(0x200), h(0x300)])));
-        let mut lines = Vec::new();
-        for _ in 0..40 {
-            for b in [cb(1), cb(2)] {
-                let (_, l) = submit(&mut t, &[vec![b]]);
-                lines.extend(l);
-            }
-        }
-        assert_eq!(t.named.len(), 2);
-        assert_eq!((t.named_pick, t.inputs.map(|i| (i.colour.0.as_raw(), i.rule))), (None, Some((0x100, Rule::Size))));
-        let said: Vec<&String> = lines.iter().filter(|l| l.contains("different colour inputs")).collect();
-        assert_eq!(said.len(), 1, "{lines:#?}");
-        assert!(said[0].contains("(0x100 1707x960, 0x110 1707x960): none chosen"), "{}", said[0]);
-        // With exactly one of them naming the exposure, that one is chosen.
-        t.launch(cb(1), Some(&param_block(&[h(0x610)])));
-        for _ in 0..20 {
-            for b in [cb(1), cb(2)] {
-                submit(&mut t, &[vec![b]]);
-            }
-        }
-        assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.rule)), Some((0x100, Rule::Params)));
-    }
-
-    /// (e) Crimson Desert's set (two render-size candidates, the lowest handle the one DLSS's buffer
-    /// names; multi frame generation with ~5 FG submits per frame): the same colour input and hold
-    /// target, by size first and by the input kernel's parameters once settled, without a
-    /// re-identification; the size rule's other candidate stays listed and counted as before.
-    #[test]
-    fn crimson_like_set_keeps_its_identification_and_hold_target() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
-        let set = set_of(&[
-            (0x100, desc(1516, 852, rgba, storage)),
-            (0x110, desc(1516, 852, rgba, storage)),
-            (0x200, desc(1516, 852, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)),
-            (0x300, desc(1516, 852, vk::Format::R16G16_SFLOAT, storage)),
-            (0x400, desc(2560, 1440, rgba, storage)),
-            (0x500, desc(2560, 1440, rgba, storage)),
-            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
-        ]);
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x400), h(0x610)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x500), h(0x200), h(0x300)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x400)])));
-        let mut lines = Vec::new();
-        for frame in 0..20 {
-            let (s, l) = submit(&mut t, &[vec![cb(1)]]);
-            lines.extend(l);
-            let s = s.expect("held");
-            assert_eq!(s.identified_now, frame == 0);
-            assert_eq!(s.inputs.map(|i| (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw())), Some((0x100, 0x200, 0x300)));
-            for _ in 0..5 {
-                let (s, l) = submit(&mut t, &[vec![cb(2)]]);
-                lines.extend(l);
-                assert!(s.is_none());
-            }
-        }
-        assert_eq!((t.named_colour_submits, t.foreign_submits, t.other_candidate_buffers), (20, 100, 0));
-        let ids = identification_lines(&lines);
-        assert_eq!(ids.len(), 2, "{lines:#?}");
-        assert!(ids[0].contains("(first of 2 candidates; others 0x110 1516x852)") && ids[0].ends_with("identified by size"), "{}", ids[0]);
-        assert!(
-            ids[1].starts_with("colour input: image 0x100 (1516x852") && ids[1].contains("(the size rule's other candidates: 0x110 1516x852)"),
-            "{}",
-            ids[1]
-        );
-        assert!(ids[1].ends_with("identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{}", ids[1]);
-        // A buffer naming only the other candidate is still forwarded and counted.
-        t.launch(cb(5), Some(&param_block(&[h(0x110), h(0x400)])));
-        assert!(submit(&mut t, &[vec![cb(5)]]).0.is_none());
-        assert_eq!(t.other_candidate_buffers, 1);
-    }
-
-    /// Crimson Desert's set as the rig logged it with this bug: three 1516x852 RGBA16F storage
-    /// candidates (0x100, 0x110, 0x120), depth and motion vectors at that extent, the output and
-    /// FG's output-size frame, DLSS's 1x1 exposure.
-    fn crimson3_set() -> BTreeMap<u64, (vk::Image, ImageDesc)> {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
-        set_of(&[
-            (0x100, desc(1516, 852, rgba, storage)),
-            (0x110, desc(1516, 852, rgba, storage)),
-            (0x120, desc(1516, 852, rgba, storage)),
-            (0x200, desc(1516, 852, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)),
-            (0x300, desc(1516, 852, vk::Format::R16G16_SFLOAT, storage)),
-            (0x400, desc(2560, 1440, rgba, storage)),
-            (0x500, desc(2560, 1440, rgba, storage)),
-            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
-        ])
-    }
-
-    /// Records SR's buffer `sr` reading `colour` (input kernel with depth and motion vectors, then
-    /// the output kernel and the exposure copy) and FG's buffer `cb(90)` (its output-size frame
-    /// beside depth and motion vectors, then the output).
-    fn crimson_frame(t: &mut Tracker, sr: vk::CommandBuffer, colour: u64) {
-        t.begin(sr);
-        t.launch(sr, Some(&param_block(&[h(colour), h(0x200), h(0x300)])));
-        t.launch(sr, Some(&param_block(&[h(0x400), h(0x610)])));
-        t.begin(cb(90));
-        t.launch(cb(90), Some(&param_block(&[h(0x500), h(0x200), h(0x300)])));
-        t.launch(cb(90), Some(&param_block(&[h(0x400)])));
-    }
-
-    /// The rig's bug: the size rule took the lowest handle (0x100) while DLSS Super Resolution's
-    /// input kernel reads another candidate, so almost nothing was held. Here an early input launch
-    /// named a third candidate once (a stale entry: the settled evidence names two colour inputs
-    /// and the parameters rule chooses none, as it must have on the rig), then SR reads `named`
-    /// every frame, with ~5 FG submits per frame. Every SR submit is held with `named` (by the
-    /// per-buffer target until the switch, then as the colour input), the switch is logged once,
-    /// and only the switching submit is the "just identified" one. For both the middle and the
-    /// highest handle.
-    #[test]
-    fn the_input_kernel_overrides_the_size_rules_pick_among_several_candidates() {
-        for (named, stale) in [(0x110, 0x120), (0x120, 0x110)] {
-            let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
-            let line = t.refresh().expect("identified by size");
-            assert!(
-                line.starts_with("colour input: image 0x100 (1516x852") && line.contains("(first of 3 candidates; others 0x110 1516x852, 0x120 1516x852)"),
-                "{line}"
-            );
-            assert!(t.inputs.unwrap().others.iter().flatten().any(|o| o.0 == img(named)));
-            // The stale input launch (one frame, a loading screen), then the steady state.
-            crimson_frame(&mut t, cb(1), stale);
-            submit(&mut t, &[vec![cb(1)]]);
-            let mut lines = Vec::new();
-            let mut identified_at = Vec::new();
-            for frame in 0..40 {
-                crimson_frame(&mut t, cb(1), named);
-                let (s, l) = submit(&mut t, &[vec![cb(1)]]);
-                lines.extend(l);
-                let s = s.expect("SR's buffer is the hold point");
-                assert_eq!(s.inputs.map(|i| (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw())), Some((named, 0x200, 0x300)), "frame {frame}");
-                if s.identified_now {
-                    identified_at.push(frame);
-                }
-                for _ in 0..5 {
-                    let (s, l) = submit(&mut t, &[vec![cb(90)]]);
-                    lines.extend(l);
-                    assert!(s.is_none(), "frame generation's buffers are forwarded");
-                }
-            }
-            let switch = format!("colour input switched to {} (DLSS's input kernel reads it; the size rule had picked 0x100)", hex(img(named)));
-            assert_eq!(lines.iter().filter(|l| **l == switch).count(), 1, "{lines:#?}");
-            assert!(
-                lines.iter().any(|l| l.contains("different colour inputs") && l.contains("none chosen")),
-                "the settled evidence alone chooses nothing here: {lines:#?}"
-            );
-            assert_eq!(identified_at, vec![SWITCH_AFTER as usize - 1], "re-identified once, at the switch (that one submit goes to DLSS untouched)");
-            let i = t.inputs.unwrap();
-            assert_eq!((i.colour.0.as_raw(), i.rule, i.exposure_input.map(|e| e.0.as_raw()), i.exposure_named), (named, Rule::Params, Some(0x610), true));
-            let ids = identification_lines(&lines);
-            assert!(ids.last().unwrap().starts_with(&format!("colour input: image {} (1516x852", hex(img(named)))), "{ids:#?}");
-            assert!(
-                ids.last().unwrap().ends_with("identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"),
-                "{ids:#?}"
-            );
-            assert_eq!((t.named_colour_submits, t.retargeted_submits, t.other_candidate_buffers), (41, 1 + SWITCH_AFTER as u64 - 1, 0));
-            assert!(t.alternation.is_none());
-        }
-    }
-
-    /// Black Myth: Wukong's benchmark with DLSS Frame Generation on destroys and re-creates the views
-    /// it hands DLSS every frame; the images live on. The identification must not change with the
-    /// views (it changed every frame, and the submit that identifies is never held): an image stays
-    /// registered after its last view is destroyed, until the image itself is.
-    #[test]
-    fn views_recreated_every_frame_keep_the_identification() {
-        let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
-        assert!(t.refresh().is_some_and(|l| l.starts_with("colour input: image 0x100 ")));
-        for frame in 0..10u64 {
-            // The colour input's only view goes, and a new one is created and registered.
-            let old = vk::ImageView::from_raw(if frame == 0 { 0x101 } else { 0x9000 + frame - 1 });
-            t.forget_view(old);
-            assert_eq!(t.refresh(), None, "frame {frame}: a destroyed view changes nothing");
-            assert_eq!(t.inputs.map(|i| i.colour.0), Some(img(0x100)));
-            let new = vk::ImageView::from_raw(0x9000 + frame);
-            t.record_view(new, img(0x100));
-            t.register(new, Some(0x5000 + frame));
-            assert_eq!(t.refresh(), None, "frame {frame}: re-registering a kept image changes nothing");
-        }
-        assert_eq!(t.unregistered_by_view, 10);
-        // The image itself destroyed: the next candidate.
-        t.forget_image(img(0x100));
-        assert!(t.refresh().is_some_and(|l| l.starts_with("colour input: image 0x110 ")));
-        assert_eq!(t.unregistered_by_image, 1);
-    }
-
-    /// Wukong's benchmark with frame generation on hands DLSS a new depth image every frame (the
-    /// colour input, motion vectors and exposure stay). A depth change alone is taken without
-    /// re-identifying: no log line, and the next submit is not the "just identified" one.
-    #[test]
-    fn a_new_depth_image_every_frame_is_not_a_new_identification() {
-        let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
-        assert!(t.refresh().is_some());
-        let generation = t.generation;
-        for frame in 0..16u64 {
-            let (old, new) = (if frame == 0 { 0x200 } else { 0x7000 + frame - 1 }, 0x7000 + frame);
-            t.forget_image(img(old));
-            // The gap before the next depth image is registered: nothing changes.
-            assert_eq!(t.refresh(), None, "frame {frame}: no depth image for a moment");
-            assert_eq!(t.inputs.map(|i| i.colour.0), Some(img(0x100)));
-            let info = vk::ImageCreateInfo {
-                image_type: vk::ImageType::TYPE_2D,
-                extent: vk::Extent3D { width: 1516, height: 852, depth: 1 },
-                format: vk::Format::D32_SFLOAT_S8_UINT,
-                usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                samples: vk::SampleCountFlags::TYPE_1,
-                ..Default::default()
-            };
-            t.record_image(img(new), &info);
-            t.record_view(vk::ImageView::from_raw(new + 1), img(new));
-            t.register(vk::ImageView::from_raw(new + 1), Some(new + 0x1000));
-            assert_eq!(t.refresh(), None, "frame {frame}");
-            let i = t.inputs.unwrap();
-            assert_eq!((i.colour.0, i.depth.0), (img(0x100), img(new)), "frame {frame}");
-        }
-        assert_eq!((t.generation, t.depth_changes), (generation, 32));
-        // The colour input destroyed is still a new identification.
-        t.forget_image(img(0x100));
-        assert!(t.refresh().is_some_and(|l| l.starts_with("colour input: image 0x110 ")));
-        assert_eq!(t.generation, generation + 1);
-    }
-
-    /// The input kernel's choice survives the depth image's rotation: the switch to the candidate
-    /// DLSS reads is kept when the depth it was seen with is destroyed and another one registered.
-    #[test]
-    fn the_switch_to_the_input_kernels_candidate_survives_a_new_depth_image() {
-        let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
-        assert!(t.refresh().is_some());
-        crimson_frame(&mut t, cb(1), 0x120);
-        submit(&mut t, &[vec![cb(1)]]);
-        for _ in 0..40 {
-            crimson_frame(&mut t, cb(1), 0x110);
-            submit(&mut t, &[vec![cb(1)]]);
-        }
-        assert_eq!(t.inputs.map(|i| i.colour.0), Some(img(0x110)));
-        t.forget_image(img(0x200));
-        let info = vk::ImageCreateInfo {
-            image_type: vk::ImageType::TYPE_2D,
-            extent: vk::Extent3D { width: 1516, height: 852, depth: 1 },
-            format: vk::Format::D32_SFLOAT_S8_UINT,
-            usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-            samples: vk::SampleCountFlags::TYPE_1,
-            ..Default::default()
-        };
-        t.record_image(img(0x7000), &info);
-        t.record_view(vk::ImageView::from_raw(0x7001), img(0x7000));
-        t.register(vk::ImageView::from_raw(0x7001), Some(0x8000));
-        assert_eq!(t.refresh(), None, "a new depth image is no new identification");
-        let i = t.inputs.unwrap();
-        assert_eq!((i.colour.0, i.depth.0), (img(0x110), img(0x7000)));
-    }
-
-    /// Crimson Desert loaded into the world from the title screen (2.0.6 regression run): ten
-    /// 1516x852 candidates, and in play DLSS's input kernel reads the eighth. With only the first
-    /// three kept beside the lowest handle it was never switched to and nothing was held; every
-    /// candidate is kept now, so each SR submit is held with it and the switch happens once. The
-    /// identification line still lists three others.
-    #[test]
-    fn the_input_kernel_is_followed_to_any_of_many_candidates() {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
-        let mut set = crimson3_set();
-        for k in 3..10u64 {
-            let handle = 0x100 + 0x10 * k;
-            set.insert(handle, (img(handle), desc(1516, 852, rgba, storage)));
-        }
-        let (named, stale) = (0x170, 0x110);
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        let line = t.refresh().expect("identified by size");
-        assert!(line.contains("(first of 10 candidates; others 0x110 1516x852, 0x120 1516x852, 0x130 1516x852, 6 more)"), "{line}");
-        crimson_frame(&mut t, cb(1), stale);
-        submit(&mut t, &[vec![cb(1)]]);
-        let mut lines = Vec::new();
-        for frame in 0..40 {
-            crimson_frame(&mut t, cb(1), named);
-            let (s, l) = submit(&mut t, &[vec![cb(1)]]);
-            lines.extend(l);
-            let s = s.expect("SR's buffer is the hold point");
-            assert_eq!(s.inputs.map(|i| i.colour.0.as_raw()), Some(named), "frame {frame}");
-            for _ in 0..5 {
-                let (s, l) = submit(&mut t, &[vec![cb(90)]]);
-                lines.extend(l);
-                assert!(s.is_none(), "frame generation's buffers are forwarded");
-            }
-        }
-        let switch = format!("colour input switched to {} (DLSS's input kernel reads it; the size rule had picked 0x100)", hex(img(named)));
-        assert_eq!(lines.iter().filter(|l| **l == switch).count(), 1, "{lines:#?}");
-        assert_eq!(t.inputs.unwrap().colour.0.as_raw(), named);
-        assert_eq!(t.other_candidate_buffers, 0);
-    }
-
-    /// With SR's buffer in the first launch-bearing submit (its evidence available when the first
-    /// identification happens), the colour input is what the input kernel names at once: no
-    /// lowest-handle identification first, no switch.
-    #[test]
-    fn the_first_identification_prefers_the_input_kernels_candidate() {
-        let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
-        let mut lines = Vec::new();
-        for frame in 0..20 {
-            crimson_frame(&mut t, cb(1), 0x110);
-            let (s, l) = submit(&mut t, &[vec![cb(1)]]);
-            lines.extend(l);
-            let s = s.expect("held");
-            assert_eq!((s.inputs.unwrap().colour.0.as_raw(), s.identified_now), (0x110, frame == 0), "frame {frame}");
-            for _ in 0..5 {
-                lines.extend(submit(&mut t, &[vec![cb(90)]]).1);
-            }
-        }
-        let ids = identification_lines(&lines);
-        assert_eq!(ids.len(), 1, "{ids:#?}");
-        assert!(
-            ids[0].starts_with("colour input: image 0x110 (1516x852") && ids[0].contains("(the size rule's other candidates: 0x100 1516x852, 0x120 1516x852)"),
-            "{}",
-            ids[0]
-        );
-        assert!(lines.iter().all(|l| !l.contains("switched")), "{lines:#?}");
-        assert_eq!((t.named_colour_submits, t.retargeted_submits), (20, 0));
-    }
-
-    /// A game that alternates DLSS's colour input between two candidates frame by frame: every SR
-    /// submit is held with the candidate its own input launch names, the colour input never
-    /// switches (each launch naming it resets the count), and the alternation is logged once. Both
-    /// with the identified colour input outside the pair and inside it.
-    #[test]
-    fn alternating_colour_inputs_are_each_held_with_their_own_image() {
-        for pair in [[0x110, 0x120], [0x100, 0x110]] {
-            let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
-            assert!(t.refresh().unwrap().starts_with("colour input: image 0x100"));
-            let mut lines = Vec::new();
-            for frame in 0..60 {
-                let colour = pair[frame % 2];
-                crimson_frame(&mut t, cb(1), colour);
-                let (s, l) = submit(&mut t, &[vec![cb(1)]]);
-                lines.extend(l);
-                let s = s.expect("every SR submit is held");
-                assert_eq!(s.inputs.map(|i| i.colour.0.as_raw()), Some(colour), "frame {frame}: held with the image its input launch names");
-                assert_eq!(s.identified_now, frame == 0, "frame {frame}: never re-identified after the first");
-                for _ in 0..5 {
-                    lines.extend(submit(&mut t, &[vec![cb(90)]]).1);
-                }
-            }
-            assert_eq!(t.inputs.unwrap().colour.0.as_raw(), 0x100, "{pair:x?}: no switch");
-            assert!(lines.iter().all(|l| !l.contains("switched")), "{lines:#?}");
-            let alternates: Vec<&String> = lines.iter().filter(|l| l.starts_with("DLSS's input kernel alternates between colour candidates")).collect();
-            assert_eq!(alternates.len(), 1, "{lines:#?}");
-            let expected_retargets = if pair[0] == 0x100 { 30 } else { 60 };
-            assert_eq!((t.named_colour_submits, t.retargeted_submits, t.other_candidate_buffers), (60, expected_retargets, 0), "{pair:x?}");
-        }
-    }
-
-    /// Resident Evil Requiem's registered set at DLAA (from the rig's log): four 2560x1440 RGBA16F
-    /// storage images (0x100 DLSS's colour input, 0x110 its output, 0x120 and 0x130 others), depth
-    /// and motion vectors at 2560x1440, eight 2560x1440 A2B10G10R10 storage images (the HDR10
-    /// frames FG works on), R8/RGBA8 sRGB images, FG's 1280x720 images, and **no 1x1 exposure
-    /// image**.
-    fn re_set() -> BTreeMap<u64, (vk::Image, ImageDesc)> {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
-        let mut list = vec![
-            (0x100, desc(2560, 1440, rgba, storage)),
-            (0x110, desc(2560, 1440, rgba, storage)),
-            (0x120, desc(2560, 1440, rgba, storage)),
-            (0x130, desc(2560, 1440, rgba, storage)),
-            (0x200, desc(2560, 1440, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)),
-            (0x300, desc(2560, 1440, vk::Format::R16G16_SFLOAT, storage)),
-            (0x500, desc(2560, 1440, vk::Format::R8_UNORM, storage)),
-            (0x510, desc(2560, 1440, vk::Format::R8G8B8A8_SRGB, vk::ImageUsageFlags::SAMPLED)),
-        ];
-        for k in 0..8 {
-            list.push((0x400 + k * 0x10, desc(2560, 1440, vk::Format::A2B10G10R10_UNORM_PACK32, storage)));
-        }
-        for k in 0..4 {
-            list.push((0x600 + k * 0x10, desc(1280, 720, if k % 2 == 0 { vk::Format::R8_UNORM } else { rgba }, storage)));
-        }
-        set_of(&list)
-    }
-
-    /// Records one frame's launches of an RE-like DLAA game without kernel names: SR (input kernel
-    /// with colour, depth and motion vectors; network on FG-size scratch; output kernel naming input
-    /// and output) in cb(1), and FG's two buffers: cb(2) naming its A2B10G10R10 frame with depth,
-    /// motion vectors and its 1280x720 images, cb(3) its frames and images.
-    fn re_launches(t: &mut Tracker) {
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x610), h(0x620)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x110), h(0x200), h(0x300)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x400), h(0x200), h(0x300), h(0x600), h(0x610)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x410), h(0x620)])));
-        t.launch(cb(3), Some(&param_block(&[h(0x400), h(0x410), h(0x630)])));
-    }
-
-    /// Runs `frames` frames of SR's cb(1) then FG's cb(2) and cb(3) (FG 3x). Returns the frame of
-    /// the first held SR submit and the lines logged; FG is never held with inputs.
-    fn run_frames(t: &mut Tracker, frames: usize) -> (Option<usize>, Vec<String>) {
-        let mut lines = Vec::new();
-        let mut first_held = None;
-        for frame in 0..frames {
-            let (sr, l) = submit(t, &[vec![cb(1)]]);
-            lines.extend(l);
-            if sr.is_some_and(|s| s.inputs.is_some() && !s.identified_now) {
-                first_held.get_or_insert(frame);
-            }
-            for fg in [cb(2), cb(3)] {
-                let (s, l) = submit(t, &[vec![fg]]);
-                lines.extend(l);
-                assert!(s.and_then(|s| s.inputs).is_none(), "frame {frame}: frame generation's buffer is never held with inputs");
-            }
-        }
-        (first_held, lines)
-    }
-
-    /// (f) Resident Evil Requiem-like DLAA without an exposure image: SR's buffer names no 1x1, so
-    /// the output-size entry counts only by SR's shape: its output kernel names the input with the
-    /// output, and no other buffer names it. Identified by the input kernel's parameters with no
-    /// exposure input (measured from the frame), held from frame 7; FG's buffers (A2B10G10R10
-    /// frames, 1280x720 images) are never evidence and never held. With FG naming an RGBA16F
-    /// output-size image with depth and motion vectors too (a HUD-less colour), that entry is refused
-    /// (its other buffer names it as well) and SR's is still chosen.
-    #[test]
-    fn re_like_dlaa_without_exposure_is_identified_by_srs_shape_and_fg_is_not() {
-        let set = re_set();
-        assert!(set.values().all(|(_, d)| !exposure_like(d)), "no 1x1 exposure image");
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        re_launches(&mut t);
-        assert_eq!(t.launch[&cb(2)].input, Some(InputLaunch::Unusable), "FG's frame is A2B10G10R10: not a colour candidate");
-        assert!(t.launch[&cb(1)].output_pair && !t.launch[&cb(2)].output_pair);
-        let (first_held, lines) = run_frames(&mut t, 40);
-        assert_eq!(first_held, Some(7));
-        let i = t.inputs.expect("identified");
-        assert_eq!((i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw(), i.rule, i.exposure_input), (0x100, 0x200, 0x300, Rule::Params, None));
-        assert_eq!(t.named, vec![Named { output_pair: true, ..Named::new(img(0x100), img(0x200), img(0x300), None) }]);
-        let ids = identification_lines(&lines);
-        assert!(ids.last().unwrap().contains("exposure input none (no registered 1x1 R16_SFLOAT; measured from the frame)"), "{}", ids.last().unwrap());
-        assert!(ids.last().unwrap().ends_with("identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"));
-        assert_eq!(lines.iter().filter(|l| l.contains("taken as DLSS Super Resolution's input at DLAA")).count(), 1, "{lines:#?}");
-        assert!(lines.iter().all(|l| !l.contains("not used")), "{lines:#?}");
-
-        // FG names an RGBA16F output-size image with depth and motion vectors (SR's input shape),
-        // and its other buffer names it too: refused, SR still chosen.
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        re_launches(&mut t);
-        t.launch(cb(2), Some(&param_block(&[h(0x120), h(0x130)])));
-        t.begin(cb(2));
-        t.launch(cb(2), Some(&param_block(&[h(0x120), h(0x200), h(0x300), h(0x600)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x120), h(0x130)])));
-        t.launch(cb(3), Some(&param_block(&[h(0x120), h(0x400)])));
-        assert!(matches!(t.launch[&cb(2)].input, Some(InputLaunch::Inputs { colour, .. }) if colour == img(0x120)));
-        assert!(t.launch[&cb(2)].output_pair, "FG's buffer has SR's whole shape here");
-        let (first_held, lines) = run_frames(&mut t, 40);
-        assert_eq!(first_held, Some(7));
-        assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.rule)), Some((0x100, Rule::Params)));
-        let fg = t.named.iter().find(|n| n.colour == img(0x120)).expect("FG's entry is seen");
-        assert!(fg.foreign && !fg.sr_without_exposure());
-        let refused: Vec<&String> = lines.iter().filter(|l| l.contains("not used")).collect();
-        assert_eq!(refused.len(), 1, "{lines:#?}");
-        assert!(refused[0].contains("0x120: another launch-bearing buffer names it too"), "{}", refused[0]);
-    }
-
-    /// (g) Frame generation alone at native resolution, with SR's whole shape (its launch names an
-    /// output-size RGBA16F frame with depth and motion vectors, a later launch that frame with
-    /// another output-size image), never identifies: its other buffer names the frame too.
-    #[test]
-    fn frame_generation_with_srs_shape_but_a_second_reader_never_identifies() {
-        let mut set = re_set();
-        set.remove(&0x100);
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        t.launch(cb(2), Some(&param_block(&[h(0x120), h(0x200), h(0x300)])));
-        t.launch(cb(2), Some(&param_block(&[h(0x120), h(0x130)])));
-        t.launch(cb(3), Some(&param_block(&[h(0x120), h(0x400)])));
-        let mut lines = Vec::new();
-        for _ in 0..60 {
-            for b in [cb(2), cb(3)] {
-                let (s, l) = submit(&mut t, &[vec![b]]);
-                lines.extend(l);
-                assert!(s.and_then(|s| s.inputs).is_none());
-            }
-        }
-        assert!(t.inputs.is_none() && t.named_pick.is_none());
-        assert_eq!(t.named.iter().map(|n| (n.output_pair, n.foreign)).collect::<Vec<_>>(), vec![(true, true)]);
-        assert_eq!(lines.iter().filter(|l| l.contains("another launch-bearing buffer names it too")).count(), 1, "{lines:#?}");
-    }
-
-    /// Kernel names as `vkCreateCuFunctionNVX` gives them (the probes of docs/DLSS_KERNEL_CATALOGUE.md and
-    /// Crimson Desert's with Ray Reconstruction on and off, 2026-10-09): Super Resolution's input kernels,
-    /// Ray Reconstruction's `rr2_*`, and everything else, Frame Generation's network and Crimson Desert's
-    /// `rrlite_*` Super Resolution included.
-    #[test]
-    fn kernels_are_told_apart_by_name() {
-        for sr in ["hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", "cuda_engine_input_kernel_rel_hdr_colvar_mvlo"] {
-            assert_eq!(Kernel::of(sr), Kernel::SrInput, "{sr}");
-        }
-        for rr in [
-            "rr2_enc0_kernel",
-            "rr2_enc4_kernel",
-            "rr2_dec0_kernel_1",
-            "rr2_post_kernel",
-            "rr2_downsample_kernel_static_hdr_no_transparency",
-            "rr2_pooled_history0_kernel",
-            "rr2_histogram_auto_exposure_basic_kernel",
-            "cuda_dldn_engine_swin_enc0_kernel",
-            "cuda_dldn_engine_swin_dec2_kernel",
-            "cuda_dldn_engine_hkpn_input_kernel_preset_1",
-            "cuda_dldn_engine_hkpn_output_kernel_transformer",
-        ] {
-            assert_eq!(Kernel::of(rr), Kernel::RayReconstruction, "{rr}");
-        }
-        for other in [
-            "rrlite_enc0_4x4_mvlo_hdr_folded",
-            "rrlite_post_0_0_mvlo_hdr_folded",
-            "cuda_dldn_engine_luma_convert_kernel",
-            "cuda_dldn_engine_reduce_sum_kernel",
-            "cuda_dldn_engine_auto_exposure_copy_kernel",
-            "custom_block0_conv0_kernel",
-            "custom_block0_convPre_kernel",
-            "custom_upsample_hf_kernel",
-            "k_initial_merge",
-            "k_central_block",
-            "Kernel_OutputPush",
-            "main_kernel",
-            "k_conv_fp16_nhwc",
-            "dltss_pwin_enc0_layer",
-            "hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel",
-            "cuda_copy_exposure_kernel",
-        ] {
-            assert_eq!(Kernel::of(other), Kernel::Other, "{other}");
-        }
-    }
-
-    /// Creates the kernels of `names` on `t` (handles 0x9000 + index) and returns their handles.
-    fn kernels(t: &mut Tracker, names: &[&str]) -> Vec<vk::CuFunctionNVX> {
-        names
-            .iter()
-            .enumerate()
-            .map(|(k, name)| {
-                let f = vk::CuFunctionNVX::from_raw(0x9000 + k as u64);
-                t.record_function(f, name);
-                f
-            })
-            .collect()
-    }
-
-    /// GTA V's registered set, a buffer whose first launch names the colour input, depth and motion vectors
-    /// (SR's whole shape) with the kernel `input`, then a launch naming the output, and Frame Generation's
-    /// buffers (`custom_block*`, `k_initial_merge`, `main_kernel`).
-    fn gta_with(input: &str) -> Tracker {
-        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
-        let f = kernels(&mut t, &[input, "custom_block0_convPre_kernel", "k_initial_merge", "main_kernel"]);
-        t.launch_kernel(cb(1), f[0], Some(&param_block(&[h(0x100), h(0x200), h(0x300), h(0x620)])));
-        t.launch_kernel(cb(1), f[0], Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
-        t.launch_kernel(cb(2), f[1], Some(&param_block(&[h(0x410), h(0x200), h(0x300)])));
-        t.launch_kernel(cb(2), f[2], Some(&param_block(&[h(0x410)])));
-        t.launch_kernel(cb(3), f[3], Some(&param_block(&[h(0x400), h(0x410)])));
-        t
+        assert_eq!(t.dlss_output.map(|o| (o.image, o.input, o.writes)), Some((img(0x400), img(0x100), 1)), "DLSS's output is learnt from the primary");
     }
 
     /// The post path serves a held game's frames only where every pass runs at present: `present`; `auto` and
@@ -13052,15 +8966,7 @@ mod tests {
         let mut t = Tracker::default();
         let t0 = Instant::now();
         assert!(!t.frame_at(t0).output, "no output learnt");
-        let o = DlssOutput {
-            function: vk::CuFunctionNVX::from_raw(9),
-            image: img(0x400),
-            input: img(0x100),
-            depth: img(0x200),
-            mvec: img(0x300),
-            rr: true,
-            writes: 1,
-        };
+        let o = DlssOutput { image: img(0x400), input: img(0x100), depth: img(0x200), mvec: img(0x300), rr: true, writes: 1 };
         t.dlss_output = Some(o);
         assert!(t.frame_at(t0).output);
         for _ in 0..AFTER_MISSES - 1 {
@@ -13080,113 +8986,6 @@ mod tests {
         t.dlss_output = Some(o);
         t.after_recorded();
         assert!(t.frame_at(t0).output, "a hold recorded ends the refusal");
-    }
-
-    /// DLSS Ray Reconstruction (Crimson Desert with it on): its first encoder names the colour input,
-    /// depth and motion vectors (SR's whole shape) and its guide buffers. Nothing is identified and no
-    /// buffer is held, the line says why once, and the post path is handed the model at once. Without
-    /// the names the same launches are held: the names are what keep Ray Reconstruction out. When the
-    /// game switches to Super Resolution, the inputs are identified within [`SR_RECENT`] submits.
-    #[test]
-    fn ray_reconstruction_is_never_identified_or_held() {
-        // Hogwarts Legacy's family, its encoder with Super Resolution's whole shape: never held either.
-        let mut t = gta_with("cuda_dldn_engine_swin_enc0_kernel");
-        let (first_held, lines) = run_frames(&mut t, 20);
-        assert_eq!(first_held, None, "a Ray Reconstruction (dldn) buffer was held");
-        assert!(lines.iter().any(|l| l.starts_with("DLSS Ray Reconstruction runs (cuda_dldn_engine_swin_enc0_kernel")), "{lines:#?}");
-
-        let mut t = gta_with("rr2_enc0_kernel");
-        assert!(t.launch[&cb(1)].input_rr);
-        let (first_held, lines) = run_frames(&mut t, 40);
-        assert_eq!(first_held, None, "a Ray Reconstruction buffer was held");
-        assert!(t.inputs.is_none() && t.named.is_empty() && t.named_pick.is_none(), "{:?}", t.named);
-        let rr: Vec<&String> = lines.iter().filter(|l| l.starts_with("DLSS Ray Reconstruction runs")).collect();
-        assert_eq!(rr.len(), 1, "{lines:#?}");
-        assert!(rr[0].contains("rr2_enc0_kernel launched"), "{}", rr[0]);
-        let ids = identification_lines(&lines);
-        assert!(ids.iter().all(|l| l.starts_with("no DLSS input: DLSS Ray Reconstruction runs")), "{ids:#?}");
-        assert!(ray_reconstruction_running(Instant::now()), "the post path is handed the model");
-        assert!(!post_off(false, None, None, Instant::now()));
-
-        // The game switches Ray Reconstruction off: Super Resolution's buffer from now on.
-        let rrlite = kernels(&mut t, &["rrlite_enc0_4x4_mvlo_hdr_folded"])[0];
-        t.begin(cb(1));
-        t.launch_kernel(cb(1), rrlite, Some(&param_block(&[h(0x100), h(0x200), h(0x300), h(0x620)])));
-        t.launch_kernel(cb(1), rrlite, Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
-        let (first_held, lines) = run_frames(&mut t, 40);
-        assert!(first_held.is_some_and(|f| f as u64 <= SR_RECENT), "held from frame {first_held:?}");
-        assert!(lines.iter().any(|l| l.starts_with("DLSS Ray Reconstruction stopped")), "{lines:#?}");
-        assert_eq!(t.inputs.map(|i| i.colour.0.as_raw()), Some(0x100));
-
-        // The same Ray Reconstruction launches without kernel names: SR's shape is taken.
-        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300), h(0x620)])));
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
-        let (first_held, _) = run_frames(&mut t, 10);
-        assert!(first_held.is_some(), "without names the shape rules alone hold it");
-    }
-
-    /// Super Resolution identified, then Ray Reconstruction for twice [`SR_RECENT`] launch-bearing submits (its
-    /// buffers are never evidence), then Super Resolution again: the evidence does not age while Ray Reconstruction
-    /// runs (no "dropped as evidence" line, which blames a save load, and Ray Reconstruction's own launch keeps the
-    /// inputs it is read with), and DLSS's input is identified again at the submit that sees it stopped.
-    #[test]
-    fn evidence_does_not_age_while_ray_reconstruction_runs() {
-        let mut t = gta_with("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
-        let (first_held, _) = run_frames(&mut t, 20);
-        assert!(first_held.is_some(), "Super Resolution is held");
-        let colours = |t: &Tracker| t.named.iter().map(|n| n.colour.as_raw()).collect::<Vec<u64>>();
-        assert_eq!(colours(&t), vec![0x100]);
-        let f = kernels(&mut t, &["rr2_enc0_kernel", "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel"]);
-        let record = |t: &mut Tracker, kernel: vk::CuFunctionNVX| {
-            t.begin(cb(1));
-            t.launch_kernel(cb(1), kernel, Some(&param_block(&[h(0x100), h(0x200), h(0x300), h(0x620)])));
-            t.launch_kernel(cb(1), kernel, Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
-        };
-        record(&mut t, f[0]);
-        let (held, lines) = run_frames(&mut t, 2 * SR_RECENT as usize);
-        assert_eq!(held, None, "Ray Reconstruction is never held");
-        assert!(lines.iter().any(|l| l.starts_with("DLSS Ray Reconstruction runs")), "{lines:#?}");
-        assert!(!lines.iter().any(|l| l.contains("dropped as evidence")), "{lines:#?}");
-        assert_eq!(colours(&t), vec![0x100], "the evidence is kept while Ray Reconstruction runs");
-        record(&mut t, f[1]);
-        let (mut stopped, mut held) = (None, None);
-        for frame in 0..2 * SR_RECENT as usize {
-            let (h, lines) = run_frames(&mut t, 1);
-            assert!(!lines.iter().any(|l| l.contains("dropped as evidence")), "frame {frame}: {lines:#?}");
-            if lines.iter().any(|l| l.starts_with("DLSS Ray Reconstruction stopped")) {
-                stopped = Some(frame);
-            }
-            if h.is_some() && held.is_none() {
-                held = Some(frame);
-            }
-        }
-        let stopped = stopped.expect("Ray Reconstruction is seen stopped");
-        // Identified at the submit that sees it stopped (which may be a Frame Generation buffer's), held from the next
-        // Super Resolution buffer after the identifying one.
-        assert!(held.is_some_and(|h| h > stopped && h <= stopped + 2), "held from frame {held:?}, stopped at {stopped}");
-        assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.rule)), Some((0x100, Rule::Params)));
-    }
-
-    /// Super Resolution under every name it is known by (GTA V's `hiluma_engine_input*`, NGX's
-    /// `cuda_engine_input_kernel*`, Crimson Desert's `rrlite_*` with Ray Reconstruction off), beside Frame
-    /// Generation's `custom_block*`/`k_initial_merge`/`main_kernel`: identified at the first submit and held
-    /// every frame after, Frame Generation forwarded, no Ray Reconstruction line. Names other than
-    /// `rr2_*` never stop a hold.
-    #[test]
-    fn super_resolution_is_held_whatever_its_kernels_are_called() {
-        for input in [
-            "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel",
-            "cuda_engine_input_kernel_rel_hdr_mvdiff_mvlo",
-            "rrlite_enc0_4x4_mvlo_hdr_folded",
-            "some_future_input_kernel",
-        ] {
-            let mut t = gta_with(input);
-            let (first_held, lines) = run_frames(&mut t, 20);
-            assert_eq!(first_held, Some(1), "{input}: held from the frame after the identification");
-            assert_eq!(t.inputs.map(|i| i.colour.0.as_raw()), Some(0x100), "{input}");
-            assert!(lines.iter().all(|l| !l.contains("Ray Reconstruction")), "{input}: {lines:#?}");
-        }
     }
 
     #[test]
@@ -13697,39 +9496,6 @@ mod tests {
         // Not in model mode, or with the post path serving every pass: never kept off.
         assert!(!session.post_kept_off(false, false, None, s(1.0)));
         assert!(!session.post_kept_off(true, true, None, s(1.0)));
-    }
-
-    /// DLSS Super Resolution's input kernel launching counts as DLSS running whatever its parameters name: by its name
-    /// (its inputs not identified, or its parameters not readable), or by what its parameters name where the name is
-    /// not known. A launch of another kernel naming nothing does not.
-    #[test]
-    fn super_resolution_launches_are_noted_identified_or_not() {
-        let sr = vk::CuFunctionNVX::from_raw(0x5100);
-        // By name, its parameters naming nothing registered: noted.
-        let mut t = Tracker::default();
-        t.record_function(sr, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
-        t.launch_kernel(cb(1), sr, Some(&param_block(&[0x9999])));
-        let _ = t.observe(&[vec![cb(1)]]);
-        assert_eq!(t.last_sr_launch, Some(t.launch_submits), "an unidentified Super Resolution launch");
-        // By name, its parameters unreadable: noted.
-        t.launch_kernel(cb(2), sr, None);
-        let _ = t.observe(&[vec![cb(2)]]);
-        assert_eq!(t.last_sr_launch, Some(t.launch_submits), "an opaque Super Resolution launch");
-        // In a secondary buffer executed by the primary submitted.
-        t.launch_kernel(cb(3), sr, None);
-        t.execute(cb(4), &[cb(3)]);
-        let _ = t.observe(&[vec![cb(4)]]);
-        assert_eq!(t.last_sr_launch, Some(t.launch_submits), "launched in a secondary");
-        // Another kernel naming nothing: not.
-        let mut t = Tracker::default();
-        t.launch(cb(1), Some(&param_block(&[0x9999])));
-        let _ = t.observe(&[vec![cb(1)]]);
-        assert_eq!(t.last_sr_launch, None);
-        // The kernel's name unknown, its parameters naming DLSS's inputs: noted, as before.
-        let (mut t, params) = held_tracker();
-        t.launch(cb(1), Some(&params));
-        let _ = t.observe(&[vec![cb(1)]]);
-        assert_eq!(t.last_sr_launch, Some(t.launch_submits), "identified inputs");
     }
 
     // ---- The HDR encode: a CPU reference and the GPU checks against it. ----
@@ -15439,111 +11205,6 @@ mod tests {
             for (i, m) in [(image, memory), (depth, depth_mem), (mvec, mvec_mem), (exp32, exp32_mem), (exp16, exp16_mem)] {
                 d.destroy_image(i, None);
                 d.free_memory(m, None);
-            }
-        }
-    }
-
-    /// Cyberpunk 2077's DLSS inputs under vkd3d-proton (#49) from `base`: colour, DLSS's output, motion vectors,
-    /// depth and exposure, every image with the same usage, each with view `raw + 1` registered under key `raw + key`.
-    fn cyberpunk_images(base: u64) -> Vec<(u64, ImageDesc)> {
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let all = vk::ImageUsageFlags::TRANSFER_SRC
-            | vk::ImageUsageFlags::TRANSFER_DST
-            | vk::ImageUsageFlags::SAMPLED
-            | vk::ImageUsageFlags::STORAGE
-            | vk::ImageUsageFlags::COLOR_ATTACHMENT;
-        vec![
-            (base, desc(1485, 835, rgba, all)),
-            (base + 0x10, desc(2560, 1440, rgba, all)),
-            (base + 0x20, desc(1485, 835, rgba, all)),
-            (base + 0x30, desc(1485, 835, vk::Format::R32_UINT, all)),
-            (base + 0x40, desc(1, 1, vk::Format::R16_SFLOAT, all)),
-        ]
-    }
-
-    fn create_registered(t: &mut Tracker, raw: u64, d: ImageDesc, key: u64) {
-        let info = vk::ImageCreateInfo {
-            image_type: vk::ImageType::TYPE_2D,
-            extent: vk::Extent3D { width: d.width, height: d.height, depth: 1 },
-            format: d.format,
-            usage: d.usage,
-            samples: vk::SampleCountFlags::TYPE_1,
-            ..Default::default()
-        };
-        t.record_image(img(raw), &info);
-        t.record_view(vk::ImageView::from_raw(raw + 1), img(raw));
-        t.register(vk::ImageView::from_raw(raw + 1), Some(key));
-    }
-
-    /// `frames` frames of Cyberpunk's DLSS buffer (re-recorded each frame) naming the set from `base` by keys
-    /// `raw + key`, in its parameter order (colour, output, motion vectors, depth, exposure); with `fg`, a DLSS Frame
-    /// Generation buffer after it naming the output with the motion vectors and depth.
-    fn cyberpunk_frames(t: &mut Tracker, base: u64, key: u64, fg: bool, frames: usize) -> Vec<String> {
-        let words = |offsets: &[u64]| -> Vec<u8> { param_block(&offsets.iter().map(|o| base + o + key).collect::<Vec<u64>>()) };
-        let mut lines = Vec::new();
-        for _ in 0..frames {
-            t.begin(cb(1));
-            t.launch(cb(1), Some(&words(&[0, 0x10, 0x20, 0x30, 0x40])));
-            lines.extend(submit(t, &[vec![cb(1)]]).1);
-            if fg {
-                t.begin(cb(2));
-                t.launch(cb(2), Some(&words(&[0x10, 0x20, 0x30])));
-                lines.extend(submit(t, &[vec![cb(2)]]).1);
-            }
-        }
-        lines
-    }
-
-    /// Loading a save in Cyberpunk 2077 (#49): DLSS's inputs are identified by the input kernel's parameters, then
-    /// the game hands DLSS a new set of images, with DLSS Frame Generation switched off or on again across the
-    /// loading screen. However the old set goes (destroyed, its handles and NVX keys reused by the new one, only its
-    /// views destroyed, or kept alive and no longer named), the new set is identified, load after load.
-    #[test]
-    fn cyberpunk_inputs_are_identified_again_after_a_save_load() {
-        #[derive(Debug, Clone, Copy)]
-        enum Old {
-            Destroyed,
-            Reused,
-            ViewsDestroyed,
-            Alive,
-        }
-        for old in [Old::Destroyed, Old::Reused, Old::ViewsDestroyed, Old::Alive] {
-            let mut t = Tracker::default();
-            let (mut base, mut key) = (0x100, 0x10_0000);
-            for (raw, d) in cyberpunk_images(base) {
-                create_registered(&mut t, raw, d, raw + key);
-            }
-            cyberpunk_frames(&mut t, base, key, true, 40);
-            assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.mvec.0.as_raw(), i.rule)), Some((0x100, 0x120, Rule::Params)), "{old:?}: before the load");
-            for load in 1..=6u64 {
-                let was = base;
-                if !matches!(old, Old::Reused) {
-                    (base, key) = (0x100 + load * 0x1000, 0x10_0000 * (load + 1));
-                }
-                for (raw, _) in cyberpunk_images(was) {
-                    match old {
-                        Old::Destroyed | Old::Reused => {
-                            t.forget_view(vk::ImageView::from_raw(raw + 1));
-                            t.forget_image(img(raw));
-                        }
-                        Old::ViewsDestroyed => t.forget_view(vk::ImageView::from_raw(raw + 1)),
-                        Old::Alive => {}
-                    }
-                }
-                for (raw, d) in cyberpunk_images(base) {
-                    create_registered(&mut t, raw, d, raw + key);
-                }
-                let fg = load % 2 == 0;
-                let lines = cyberpunk_frames(&mut t, base, key, fg, 120);
-                if matches!(old, Old::Alive | Old::ViewsDestroyed) {
-                    let dropped = format!("no input launch named colour input {} in {SR_RECENT}", hex(img(was)));
-                    assert_eq!(lines.iter().filter(|l| l.starts_with(&dropped)).count(), 1, "{old:?}, load {load}: {lines:#?}");
-                }
-                assert_eq!(
-                    t.inputs.map(|i| (i.colour.0.as_raw(), i.mvec.0.as_raw(), i.rule)),
-                    Some((base, base + 0x20, Rule::Params)),
-                    "{old:?}, load {load}, frame generation {fg}: {lines:#?}"
-                );
             }
         }
     }

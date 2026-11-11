@@ -93,8 +93,6 @@ pub fn status_text(header: &ShmHeader) -> String {
     line(format_args!("preupscale_misses={}", header.preupscale_misses.load(Ordering::Relaxed)));
     line(format_args!("ngx_records={}", header.ngx_records.load(Ordering::Relaxed)));
     line(format_args!("ngx_matched={}", header.ngx_matched.load(Ordering::Relaxed)));
-    line(format_args!("ngx_disagreements={}", header.ngx_disagreements.load(Ordering::Relaxed)));
-    line(format_args!("ngx_disagree_kinds={:#x}", header.ngx_disagree_kinds.load(Ordering::Relaxed)));
     line(format_args!("preupscale_network_gpu_ms={}", f32::from_bits(header.preupscale_network_gpu_ms_bits.load(Ordering::Relaxed))));
     line(format_args!("layer_measured_white={}", f32::from_bits(header.layer_measured_white_bits.load(Ordering::Relaxed))));
     line(format_args!("layer_composition_up={}", header.layer_composition_up.load(Ordering::Relaxed)));

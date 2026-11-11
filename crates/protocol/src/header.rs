@@ -717,14 +717,10 @@ pub struct ShmHeader {
 
     // --- v26 -----------------------------------------------------------------------------
     /// DLSS's own parameters from the NGX wrapper for Proton (the layer's `ngx_ring`), written by the layer:
-    /// records read from the wrapper's ring (saturating), DLSS input launches matched to their evaluate's record,
-    /// the checks on which the kernel rules disagreed with the record, and the facts that disagreed at least once
-    /// (one bit each, in the layer's `ngx_ring::FACTS` order: colour, depth, motion vectors, output, exposure
-    /// image, jitter, motion vector units, reset, ray reconstruction, HDR input). All 0 without a wrapper.
+    /// records read from the wrapper's ring and DLSS evaluates matched to the launch buffers that carry them
+    /// (saturating). Both 0 without a wrapper.
     pub ngx_records: AtomicU32,
     pub ngx_matched: AtomicU32,
-    pub ngx_disagreements: AtomicU32,
-    pub ngx_disagree_kinds: AtomicU32,
 }
 
 /// The most HUD regions (`hud_regions`).
@@ -844,7 +840,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2792, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2784, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, ngx_records) == 2776, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, settings_game) == 2552, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, running_game) == 2556, "layout changed -- bump SHM_VERSION");
@@ -1289,7 +1285,7 @@ impl ShmHeader {
         self.set_layer_reason("");
         self.set_game_name("");
         self.set_preupscale_reason("");
-        for n in [&self.ngx_records, &self.ngx_matched, &self.ngx_disagreements, &self.ngx_disagree_kinds] {
+        for n in [&self.ngx_records, &self.ngx_matched] {
             n.store(0, Ordering::Relaxed);
         }
 
@@ -3158,19 +3154,12 @@ mod tests {
         assert_eq!(crate::SHM_VERSION, 26);
         let at = std::mem::offset_of!(ShmHeader, ngx_records);
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_reason) + REASON_BYTES, at);
-        assert_eq!(
-            [
-                std::mem::offset_of!(ShmHeader, ngx_matched),
-                std::mem::offset_of!(ShmHeader, ngx_disagreements),
-                std::mem::offset_of!(ShmHeader, ngx_disagree_kinds)
-            ],
-            [at + 4, at + 8, at + 12]
-        );
-        assert_eq!(at + 16, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, ngx_matched), at + 4);
+        assert_eq!(at + 8, std::mem::size_of::<ShmHeader>());
         let h = ShmHeader::default();
-        h.ngx_disagreements.store(7, Ordering::Relaxed);
+        h.ngx_matched.store(7, Ordering::Relaxed);
         h.init_defaults();
-        assert_eq!(h.ngx_disagreements.load(Ordering::Relaxed), 0);
+        assert_eq!(h.ngx_matched.load(Ordering::Relaxed), 0);
     }
 
     /// v25 appends why no hold ran while DLSS's input is identified (`preupscale_reason`), after the sharpening: every

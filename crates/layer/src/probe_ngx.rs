@@ -262,7 +262,7 @@ struct State {
     /// The colour input among them: the pre-upscaler tracking's ([`note_identified_colour`]) once it identified
     /// one, else the probe's own size rule's ([`identify_colour`]).
     colour: Option<vk::Image>,
-    /// The colour input the pre-upscaler tracking identified (by DLSS's input kernel's parameters), if any.
+    /// The colour input the pre-upscaler tracking identified (from NGX's records), if any.
     tracked: Option<vk::Image>,
     /// The frame of the last first-time view registration.
     last_new_registration: Option<u64>,
@@ -351,7 +351,7 @@ impl State {
         self.colour = colour;
         match image {
             Some(c) => vec![format!(
-                "colour input: image {} ({}), as the pre-upscaler tracking identified it (DLSS's input kernel's parameters)",
+                "colour input: image {} ({}), as the pre-upscaler tracking identified it (NGX's record)",
                 hex(c),
                 self.interest.get(&c).map_or_else(|| "not registered".to_string(), ToString::to_string)
             )],

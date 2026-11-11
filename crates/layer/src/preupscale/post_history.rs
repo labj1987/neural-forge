@@ -245,8 +245,8 @@ pub(crate) fn note_reset(reset: Reset) {
         Reset::Stale(Stale::SceneCut(mean)) => {
             crate::log!("[native] after the upscaler: resetting the history (scene cut: the picture's luma changed by {mean} of 255 on average)")
         }
-        // Not given here: the game's reset is read from DLSS's input launch, which only the holds before the
-        // upscaler belong to.
+        // Not given here: the game's reset is read from NGX's record of a DLSS evaluate, which only the holds in DLSS's
+        // stream belong to.
         Reset::Stale(Stale::GameReset) => crate::log!("[native] after the upscaler: resetting the history (the game reset DLSS's history)"),
         // Not given here either: the hold guard belongs to the holds inside DLSS's buffer.
         Reset::Stale(Stale::Unsound) => crate::log!("[native] after the upscaler: resetting the history (the hold guard reset it on the GPU)"),

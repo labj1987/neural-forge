@@ -2,18 +2,19 @@
 //! (`crates/ngx-wrapper`, docs/PROTON_NGX.md) writes into `/dev/shm/neural-forge-ngx-<pid>.ring` in the same
 //! process, one per creation and evaluate of a DLSS feature.
 //!
-//! Where a record names DLSS's colour input, it is the source of truth for that buffer: the colour input, depth and
-//! motion vectors, the output, the exposure image, the camera jitter, the motion vectors' units, the game's reset,
-//! the pre-exposure and whether the feature is Ray Reconstruction. The rules that read DLSS's kernels
-//! (`preupscale.rs`) still run beside it: they are the fallback where there is no ring (no wrapper, a native game,
-//! `NEURAL_FORGE_NGX_RING=off`) and are checked against every record ([`check`]); disagreements are counted per
-//! fact, logged (the first few of each, then every 5 s) and published on the channel (`ngx_*` in `shmctl status`).
+//! The records are the only source of what DLSS works on (`preupscale.rs`): which images are its colour input, depth,
+//! motion vectors, output and exposure image, the camera jitter, the motion vectors' units, the game's reset, the
+//! pre-exposure, whether the colour input is HDR and whether the feature is Ray Reconstruction. A launch belongs to
+//! an evaluate when it names the evaluate's colour input between the evaluate's record and its end record
+//! ([`evaluate_naming`], [`ended`]). Without a ring (no wrapper, `NEURAL_FORGE_NGX_RING=off`) nothing is held before
+//! or after DLSS, and the status says so ([`no_wrapper`]). The counts of records read and of evaluates matched to
+//! launches are published on the channel (`ngx_*` in `shmctl status`).
 //!
 //! The ring's format and its writer's protocol are in `crates/ngx-wrapper/src/ring.rs`; [`tests`] check the
 //! offsets read here against it.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -70,22 +71,7 @@ pub(crate) struct Record {
     pub output_extent: (u32, u32),
 }
 
-/// What a buffer keeps of its evaluate's record ([`crate::preupscale::LaunchRefs::ngx`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Images {
-    pub colour: vk::Image,
-    pub depth: vk::Image,
-    pub mvec: vk::Image,
-    pub output: vk::Image,
-    pub exposure: vk::Image,
-    pub rr: bool,
-}
-
 impl Record {
-    pub(crate) fn images(&self) -> Images {
-        Images { colour: self.colour, depth: self.depth, mvec: self.mvec, output: self.output, exposure: self.exposure, rr: self.is_rr() }
-    }
-
     /// An evaluate (a creation names no colour input), not its end.
     pub(crate) fn is_evaluate(&self) -> bool {
         self.colour != vk::Image::null() && !self.end
@@ -107,11 +93,8 @@ impl Record {
     pub(crate) fn hdr(&self) -> bool {
         self.create_flags & FLAG_HDR != 0
     }
-    /// The jitter as `preupscale.rs` keeps it: x in the low, y in the high 32 bits.
-    pub(crate) fn jitter_word(&self) -> u64 {
-        u64::from(self.jitter[0].to_bits()) | (u64::from(self.jitter[1].to_bits()) << 32)
-    }
-    /// The motion vectors' units, when usable: finite, magnitude in [1e-3, 1e5].
+    /// What turns the motion vectors into the colour input's pixels (`MV.Scale`), when usable: finite, magnitude in
+    /// [1e-3, 1e5].
     pub(crate) fn mv_units(&self) -> Option<[f32; 2]> {
         self.mv_scale.iter().all(|s| s.is_finite() && (1e-3..=1e5).contains(&s.abs())).then_some(self.mv_scale)
     }
@@ -265,97 +248,15 @@ impl Ring {
     }
 }
 
-/// The facts a record is checked on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Fact {
-    Colour,
-    Depth,
-    Mvec,
-    Output,
-    Exposure,
-    Jitter,
-    MvUnits,
-    Reset,
-    RayReconstruction,
-    Hdr,
-}
-
-pub(crate) const FACTS: [Fact; 10] =
-    [Fact::Colour, Fact::Depth, Fact::Mvec, Fact::Output, Fact::Exposure, Fact::Jitter, Fact::MvUnits, Fact::Reset, Fact::RayReconstruction, Fact::Hdr];
-
-impl Fact {
-    fn index(self) -> usize {
-        FACTS.iter().position(|f| *f == self).expect("listed")
-    }
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Fact::Colour => "colour",
-            Fact::Depth => "depth",
-            Fact::Mvec => "motion vectors",
-            Fact::Output => "output",
-            Fact::Exposure => "exposure image",
-            Fact::Jitter => "jitter",
-            Fact::MvUnits => "motion vector units",
-            Fact::Reset => "reset",
-            Fact::RayReconstruction => "ray reconstruction",
-            Fact::Hdr => "HDR input",
-        }
-    }
-}
-
-/// Counters, process-wide (every device's tracker checks against the one ring).
+/// Counters, process-wide (every device's tracker reads the one ring).
 pub(crate) struct Counters {
     /// Records read.
     pub records: AtomicU64,
-    /// Input launches the record of their evaluate was found for.
+    /// Evaluates matched to the launch buffer that carries them ([`note_matched`]).
     pub matched: AtomicU64,
-    /// Launches the kernel rules read as DLSS's input launch, with a ring open and no record naming their colour
-    /// input ([`note_unmatched`]).
-    pub unmatched: AtomicU64,
-    /// Checks per [`Fact`] ([`check`]): the kernel rules got the same as the record, or not (or nothing).
-    pub agree: [AtomicU64; FACTS.len()],
-    pub disagree: [AtomicU64; FACTS.len()],
 }
 
-pub(crate) static COUNTERS: Counters = Counters {
-    records: AtomicU64::new(0),
-    matched: AtomicU64::new(0),
-    unmatched: AtomicU64::new(0),
-    agree: [const { AtomicU64::new(0) }; FACTS.len()],
-    disagree: [const { AtomicU64::new(0) }; FACTS.len()],
-};
-
-/// Disagreements logged one by one per fact before only the 5 s summary says them.
-const LOGGED_PER_FACT: u32 = 3;
-static LOGGED: [AtomicU32; FACTS.len()] = [const { AtomicU32::new(0) }; FACTS.len()];
-
-/// Counts whether the kernel rules agree with the record on `fact`; a disagreement is logged (the first few per
-/// fact) with `detail`.
-pub(crate) fn check(fact: Fact, agree: bool, detail: impl FnOnce() -> String) {
-    if agree {
-        COUNTERS.agree[fact.index()].fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    COUNTERS.disagree[fact.index()].fetch_add(1, Ordering::Relaxed);
-    if LOGGED[fact.index()].fetch_add(1, Ordering::Relaxed) < LOGGED_PER_FACT {
-        crate::log!("[ngx] the kernel rules and NGX disagree on the {}: {} (NGX's is used)", fact.name(), detail());
-        crate::logging::flush();
-    }
-}
-
-/// Total disagreements and the facts that had any (bit [`Fact`]'s index), for the channel.
-pub(crate) fn disagreements() -> (u64, u32) {
-    let mut total = 0;
-    let mut kinds = 0;
-    for (i, c) in COUNTERS.disagree.iter().enumerate() {
-        let n = c.load(Ordering::Relaxed);
-        total += n;
-        if n > 0 {
-            kinds |= 1 << i;
-        }
-    }
-    (total, kinds)
-}
+pub(crate) static COUNTERS: Counters = Counters { records: AtomicU64::new(0), matched: AtomicU64::new(0) };
 
 /// The recent evaluates kept for matching.
 const RECENT: usize = 64;
@@ -438,21 +339,7 @@ fn note(recent: &mut VecDeque<(Record, bool)>, r: Record) {
 
 fn summary() {
     let c = &COUNTERS;
-    let facts: Vec<String> = FACTS
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| c.agree[*i].load(Ordering::Relaxed) + c.disagree[*i].load(Ordering::Relaxed) > 0)
-        .map(|(i, f)| {
-            format!("{} {}/{}", f.name(), c.disagree[i].load(Ordering::Relaxed), c.agree[i].load(Ordering::Relaxed) + c.disagree[i].load(Ordering::Relaxed))
-        })
-        .collect();
-    crate::log!(
-        "[ngx] {} records, {} input launches matched to one, {} read as input launches by the rules alone; disagreements (of checks): {}",
-        c.records.load(Ordering::Relaxed),
-        c.matched.load(Ordering::Relaxed),
-        c.unmatched.load(Ordering::Relaxed),
-        if facts.is_empty() { "none checked".to_string() } else { facts.join(", ") }
-    );
+    crate::log!("[ngx] {} records, {} evaluates matched to the launches that carry them", c.records.load(Ordering::Relaxed), c.matched.load(Ordering::Relaxed));
 }
 
 fn lock() -> std::sync::MutexGuard<'static, State> {
@@ -462,7 +349,6 @@ fn lock() -> std::sync::MutexGuard<'static, State> {
 /// The newest Super Resolution or Ray Reconstruction evaluate whose colour input is one of `named` (a launch's
 /// images) and whose end was not read yet: NGX writes the record before it records the evaluate's launches, on the
 /// same thread, and its end after the last, so a launch naming the colour input between the two is this evaluate's.
-/// Counts the launch as matched while a ring is open.
 pub(crate) fn evaluate_naming(named: &[vk::Image]) -> Option<Record> {
     #[cfg(test)]
     if let Some(found) = injected(|recent| recent.iter().rev().find(|(r, ended)| !ended && named.contains(&r.colour)).map(|(r, _)| *r)) {
@@ -471,15 +357,35 @@ pub(crate) fn evaluate_naming(named: &[vk::Image]) -> Option<Record> {
     let mut s = lock();
     s.poll();
     s.ring.as_ref()?;
-    let found = s.recent.iter().rev().find(|(r, ended)| !ended && named.contains(&r.colour)).map(|(r, _)| *r);
-    if found.is_some() {
-        COUNTERS.matched.fetch_add(1, Ordering::Relaxed);
+    s.recent.iter().rev().find(|(r, ended)| !ended && named.contains(&r.colour)).map(|(r, _)| *r)
+}
+
+/// The newest upscaling evaluate whose colour input `known` accepts (an image of the asking device): what identifies
+/// DLSS's inputs there (`preupscale::Tracker::refresh`).
+pub(crate) fn newest(known: impl Fn(vk::Image) -> bool) -> Option<Record> {
+    #[cfg(test)]
+    if let Some(found) = injected(|recent| recent.iter().rev().find(|(r, _)| known(r.colour)).map(|(r, _)| *r)) {
+        return found;
     }
-    found
+    let mut s = lock();
+    s.poll();
+    s.recent.iter().rev().find(|(r, _)| known(r.colour)).map(|(r, _)| *r)
+}
+
+/// Said once per process: an evaluate's colour input is not HDR.
+static SAID_NOT_HDR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// An evaluate was matched to the launch buffer that carries it: counted, and said once when NGX was told its colour
+/// input is not HDR (IsHDR clear), which the encode does not treat apart.
+pub(crate) fn note_matched(record: &Record) {
+    COUNTERS.matched.fetch_add(1, Ordering::Relaxed);
+    if !record.hdr() && !SAID_NOT_HDR.swap(true, Ordering::Relaxed) {
+        crate::log!("[ngx] DLSS's colour input is not HDR (NGX's IsHDR flag is clear); the encode treats it as scene-linear all the same");
+        crate::logging::flush();
+    }
 }
 
 /// Whether the evaluate of record `seq` ended (its end record was read); an evaluate no longer kept ended long ago.
-#[cfg_attr(not(test), expect(dead_code, reason = "the tracker reads it from the next commit on"))]
 pub(crate) fn ended(seq: u64) -> bool {
     #[cfg(test)]
     if let Some(found) = injected(|recent| recent.iter().find(|(r, _)| r.seq == seq).is_none_or(|(_, ended)| *ended)) {
@@ -490,22 +396,12 @@ pub(crate) fn ended(seq: u64) -> bool {
     s.recent.iter().find(|(r, _)| r.seq == seq).is_none_or(|(_, ended)| *ended)
 }
 
-/// Whether the kernel rules may decide DLSS's inputs on their own. Never in a game: since 4.0 Neural Forge needs the
-/// NGX wrapper (a Neural Forge Proton), and the rules only check the records. In tests that inject no records the
-/// rules still decide, so they stay tested as that check.
-pub(crate) fn rules_decide() -> bool {
-    #[cfg(test)]
-    return INJECTED.with(|i| i.borrow().is_none());
-    #[cfg(not(test))]
-    false
-}
-
-/// Said once per process: DLSS runs but no record names its input (no wrapper, or a game outside a Neural Forge
-/// Proton).
+/// Said once per process: CUDA launches (DLSS's) run but no ring hands this process records (no wrapper, or a game
+/// outside a Neural Forge Proton).
 static SAID_NO_RING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether DLSS ran in this process without a record naming its input and no ring is open (a DLSS game not on the
-/// Neural Forge Proton): the status says so.
+/// Whether CUDA launches ran in this process while no ring is open (a DLSS game not on the Neural Forge Proton): the
+/// status says so.
 pub(crate) fn no_wrapper() -> bool {
     #[cfg(test)]
     return NO_RING_HERE.with(|n| n.get());
@@ -513,13 +409,19 @@ pub(crate) fn no_wrapper() -> bool {
     return SAID_NO_RING.load(Ordering::Relaxed) && lock().ring.is_none();
 }
 
-/// The kernel rules read a launch as DLSS's input launch and no record names its colour input: counted while a ring
-/// is open (a frame NGX did not evaluate, or one the rules took for DLSS's).
-pub(crate) fn note_unmatched() {
-    let open = lock().ring.is_some();
-    if open {
-        COUNTERS.unmatched.fetch_add(1, Ordering::Relaxed);
-    } else if !rules_decide() && {
+/// A launch-bearing submit carried no evaluate's launches: when no ring is open (after looking for it), DLSS runs
+/// without the NGX wrapper, and the model stays off (said once).
+pub(crate) fn note_launches_without_record() {
+    let open = {
+        let mut s = lock();
+        s.poll();
+        s.ring.is_some()
+    };
+    #[cfg(test)]
+    if INJECTED.with(|i| i.borrow().is_some()) {
+        return;
+    }
+    if !open && {
         #[cfg(test)]
         NO_RING_HERE.with(|n| n.set(true));
         !SAID_NO_RING.swap(true, Ordering::Relaxed)
@@ -546,34 +448,6 @@ pub(crate) fn latest_for(colour: vk::Image) -> Option<Record> {
 /// ([`Record::paper_white_factor`]); 1 without a record.
 pub(crate) fn paper_white_factor(colour: vk::Image) -> f32 {
     latest_for(colour).map_or(1.0, |r| r.paper_white_factor())
-}
-
-/// The input launch's inputs with a record: the record's colour, depth and motion vectors where all three are
-/// registered images (the rules' result `kernel` is checked against them), else the rules' result unchanged.
-pub(crate) fn decide_input(
-    kernel: Option<crate::preupscale::InputLaunch>,
-    record: &Images,
-    registered: impl Fn(vk::Image) -> bool,
-) -> Option<crate::preupscale::InputLaunch> {
-    use crate::preupscale::InputLaunch;
-    let ngx = [record.colour, record.depth, record.mvec];
-    if ngx.iter().any(|i| *i == vk::Image::null() || !registered(*i)) {
-        return kernel;
-    }
-    let (c, d, m) = match &kernel {
-        Some(InputLaunch::Inputs { colour, depth, mvec }) => (Some(*colour), Some(*depth), Some(*mvec)),
-        _ => (None, None, None),
-    };
-    let hex = |i: Option<vk::Image>| i.map_or("none".to_string(), |i| format!("{:#x}", i.as_raw()));
-    check(Fact::Colour, c == Some(record.colour), || format!("rules {} ({kernel:?}), NGX {:#x}", hex(c), record.colour.as_raw()));
-    check(Fact::Depth, d == Some(record.depth), || format!("rules {}, NGX {:#x}", hex(d), record.depth.as_raw()));
-    check(Fact::Mvec, m == Some(record.mvec), || format!("rules {}, NGX {:#x}", hex(m), record.mvec.as_raw()));
-    Some(InputLaunch::Inputs { colour: record.colour, depth: record.depth, mvec: record.mvec })
-}
-
-/// Whether two motion-vector unit pairs are the same within float rounding.
-pub(crate) fn same_units(a: [f32; 2], b: [f32; 2]) -> bool {
-    a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-3 * x.abs().max(y.abs()).max(1.0))
 }
 
 #[cfg(test)]
@@ -613,7 +487,6 @@ pub(crate) fn end_of(evaluate: &Record, seq: u64) -> Record {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::preupscale::InputLaunch;
 
     /// A record's bytes as the wrapper lays them out (`crates/ngx-wrapper/src/ring.rs`, whose test checks the same
     /// offsets).
@@ -676,7 +549,6 @@ pub(crate) mod tests {
         assert_eq!((r.jitter, r.mv_scale, r.pre_exposure, r.exposure_scale, r.reset), ([0.25, -0.5], [1920.0, 1080.0], 2.0, 0.5, true));
         assert_eq!((r.colour_extent, r.output_extent), ((1920, 1080), (3840, 2160)));
         assert!(r.hdr() && r.upscales() && r.is_evaluate() && !r.is_rr());
-        assert_eq!(r.jitter_word(), u64::from(0.25f32.to_bits()) | (u64::from((-0.5f32).to_bits()) << 32));
         assert_eq!(r.paper_white_factor(), 4.0, "pre-exposure 2 over exposure scale 0.5");
     }
 
@@ -748,8 +620,6 @@ pub(crate) mod tests {
         assert_eq!(r([1.0, -2160.0]), Some([1.0, -2160.0]), "negative y: up-pointing motion vectors");
         assert_eq!(r([0.0, 1.0]), None);
         assert_eq!(r([f32::INFINITY, 1.0]), None);
-        assert!(same_units([1485.0, 835.0], [1485.0004, 835.0]));
-        assert!(!same_units([1485.0, 835.0], [1920.0, 1080.0]));
     }
 
     /// A file as the wrapper leaves it: what is read, in order, and what is skipped.
@@ -803,28 +673,5 @@ pub(crate) mod tests {
         ring.poll(|r| got.push(r.seq));
         assert!(got.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn rec(colour: u64, depth: u64, mvec: u64) -> Images {
-        parse_record(&record_bytes(1, FEATURE_SR, 1, [colour, mvec, depth, 0x40, 0], [0.0; 2], [1.0; 2], 1.0, 1.0, 0)).images()
-    }
-
-    #[test]
-    fn the_record_decides_the_inputs_where_its_images_are_registered() {
-        let before = COUNTERS.disagree[Fact::Depth.index()].load(Ordering::Relaxed);
-        let rules = Some(InputLaunch::Inputs { colour: img(0x10), depth: img(0x99), mvec: img(0x30) });
-        let all = |_: vk::Image| true;
-        assert_eq!(
-            decide_input(rules.clone(), &rec(0x10, 0x20, 0x30), all),
-            Some(InputLaunch::Inputs { colour: img(0x10), depth: img(0x20), mvec: img(0x30) })
-        );
-        assert!(COUNTERS.disagree[Fact::Depth.index()].load(Ordering::Relaxed) > before, "the rules' other depth is a disagreement");
-        // The rules found nothing (an engine they do not know): the record still names them.
-        assert_eq!(decide_input(None, &rec(0x10, 0x20, 0x30), all), Some(InputLaunch::Inputs { colour: img(0x10), depth: img(0x20), mvec: img(0x30) }));
-        // An image the layer did not register (no view handle seen): the rules' result stands.
-        let not_mvec = |i: vk::Image| i != img(0x30);
-        assert_eq!(decide_input(rules.clone(), &rec(0x10, 0x20, 0x30), not_mvec), rules);
-        // A record without depth (a game that gives DLSS none): the rules.
-        assert_eq!(decide_input(rules.clone(), &rec(0x10, 0, 0x30), all), rules);
     }
 }
