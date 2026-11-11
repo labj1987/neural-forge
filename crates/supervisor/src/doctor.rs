@@ -840,11 +840,11 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
                 out.push(Finding::new(
                     CHECK,
                     Severity::Warning,
-                    format!("{} is switched on but does not run with a Neural Forge Proton: in a DLSS game the model then runs on the finished frame only", game.name),
+                    format!("{} is switched on but isn't on the Neural Forge Proton: if it uses DLSS, the model stays off in it", game.name),
                     evidence,
                     Some(format!(
-                        "In Steam, {}'s Properties > Compatibility: force a <version>-NeuralForge Proton (make one in the Setup tab first, then restart Steam).",
-                        game.name
+                        "Close Steam and switch {} off and on again in Neural Forge's Setup tab (or `neural-forge-cli enable {}`): that sets its Proton.",
+                        game.name, game.appid
                     )),
                 ));
             }

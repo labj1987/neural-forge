@@ -551,6 +551,10 @@ fn purge_in(steam_roots: &[crate::steam::Root], steam_running: bool) -> std::io:
             purged.removed.push(file);
         }
     }
+    // Every game's Proton Neural Forge chose goes back to what it was (`compat`), before the copies go.
+    for root in steam_roots.iter().filter(|r| !r.flatpak) {
+        crate::compat::switch_all_off(&root.path, steam_running).map_err(std::io::Error::other)?;
+    }
     // The Proton copies made for the NGX wrapper (`proton_tool`), and rings its wrapper left in /dev/shm where the
     // layer never opened them.
     // SAFETY: getuid has no preconditions.

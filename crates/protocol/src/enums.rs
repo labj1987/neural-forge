@@ -31,7 +31,7 @@ pub mod preupscale_state {
     /// after-the-upscaler path takes over 30 s after the last held frame.
     pub const PAUSED: u32 = 6;
     /// DLSS runs but the game is not on a Neural Forge Proton (NGX's wrapper hands the layer no records, 4.0): the
-    /// model runs on the finished frame.
+    /// model stays off (the finished frame only where that placement is chosen).
     pub const NO_WRAPPER: u32 = 7;
 }
 

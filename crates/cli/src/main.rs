@@ -443,6 +443,41 @@ fn target_for_enable(game: &neural_forge_supervisor::steam::Game, chosen: &str) 
 }
 
 /// `anti_cheat_ok`: switch on a game that ships anti-cheat (`enable --anti-cheat-ok`).
+/// The game's Proton after its launch options ([`neural_forge_supervisor::compat`]): a Neural Forge Proton when
+/// switched on (its copy made first, with the notice), the earlier one back when switched off.
+fn set_game_proton(game: &neural_forge_supervisor::steam::Game, on: bool) -> ExitCode {
+    use neural_forge_supervisor::{compat, proton_tool, steam};
+    let root = &game.root.path;
+    let running = steam::steam_running(std::path::Path::new("/proc"));
+    if on {
+        match compat::switch_on(root, &steam::libraries(root), &game.appid, &proton_tool::installed_wrapper(), running) {
+            Ok(done) => {
+                if done.made {
+                    println!("{}\n", proton_tool::NOTICE);
+                }
+                println!("{} runs with {} now (it ran with {}).", game.name, done.tool, done.previous.as_deref().unwrap_or("Steam's default Proton"));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}'s Proton was not changed: {e}. Without a Neural Forge Proton the model stays off in a DLSS game.", game.name);
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        match compat::switch_off(root, &game.appid, running) {
+            Ok(Some(previous)) => {
+                println!("{} runs with {} again.", game.name, if previous.is_empty() { "Steam's default Proton" } else { &previous });
+                ExitCode::SUCCESS
+            }
+            Ok(None) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
 fn cmd_set_game(query: &str, action: neural_forge_supervisor::steam::Action, anti_cheat_ok: bool) -> ExitCode {
     use neural_forge_supervisor::steam::{self, Action, FindError, Outcome};
     let roots = steam::roots();
@@ -501,11 +536,11 @@ fn cmd_set_game(query: &str, action: neural_forge_supervisor::steam::Action, ant
                 println!("{}: {:?} -> {:?}\n  in {} (previous copy: {})", game.name, edit.before, edit.after, edit.file.display(), edit.backup.display());
             }
             println!("Neural Forge is {verb} for {} ({})", game.name, game.appid);
-            ExitCode::SUCCESS
+            set_game_proton(game, verb == "on")
         }
         Outcome::Unchanged => {
             println!("Neural Forge was already {verb} for {} ({})", game.name, game.appid);
-            ExitCode::SUCCESS
+            set_game_proton(game, verb == "on")
         }
         Outcome::SteamRunning { manual } => {
             eprintln!("Steam is running, and would overwrite the change when it exits. Close Steam and run this again, or:");

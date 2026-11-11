@@ -482,7 +482,7 @@ pub(crate) fn note_unmatched() {
         !SAID_NO_RING.swap(true, Ordering::Relaxed)
     } {
         crate::log!(
-            "[ngx] DLSS game not on the Neural Forge Proton (NGX's wrapper hands this process no records): the model runs on the finished frame. Choose a Neural Forge Proton for the game (the Setup tab's Proton with DLSS parameters) for the placements before and after the upscaler"
+            "[ngx] this game uses DLSS but is not on the Neural Forge Proton (NGX's wrapper hands this process no records): the model stays off. Switch the game on in Neural Forge to set its Proton (Steam closed), or choose the finished frame as the placement"
         );
         crate::logging::flush();
     }

@@ -2522,9 +2522,42 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                         if let Some(switch) = row.upgrade() {
                             switch.set_sensitive(false);
                         }
+                        let proton_note: std::rc::Rc<std::cell::RefCell<Option<Result<String, String>>>> = std::rc::Rc::default();
                         glib::spawn_future_local(async move {
                             let (root, appid) = (game.root.path.clone(), game.appid.clone());
-                            let outcome = gio::spawn_blocking(move || steam::apply_now(&root, &appid, &action)).await;
+                            // The launch options, then the game's Proton (a Neural Forge copy when switched on, made now if
+                            // needed; the earlier one back when off): DLSS's placements need it.
+                            let outcome = gio::spawn_blocking(move || {
+                                let outcome = steam::apply_now(&root, &appid, &action);
+                                let proton = match (&outcome, on) {
+                                    (steam::Outcome::Changed(_) | steam::Outcome::Unchanged, true) => {
+                                        let running = steam::steam_running(std::path::Path::new("/proc"));
+                                        let w = neural_forge_supervisor::proton_tool::installed_wrapper();
+                                        Some(neural_forge_supervisor::compat::switch_on(&root, &steam::libraries(&root), &appid, &w, running).map(|d| {
+                                            format!(
+                                                "; it runs with {} now{}",
+                                                d.tool,
+                                                if d.made { " (a copy made for Neural Forge: restart Steam to see it)" } else { "" }
+                                            )
+                                        }))
+                                    }
+                                    (steam::Outcome::Changed(_) | steam::Outcome::Unchanged, false) => {
+                                        let running = steam::steam_running(std::path::Path::new("/proc"));
+                                        Some(neural_forge_supervisor::compat::switch_off(&root, &appid, running).map(|p| match p {
+                                            Some(p) if p.is_empty() => "; it runs with Steam's default Proton again".to_string(),
+                                            Some(p) => format!("; it runs with {p} again"),
+                                            None => String::new(),
+                                        }))
+                                    }
+                                    _ => None,
+                                };
+                                (outcome, proton)
+                            })
+                            .await
+                            .map(|(o, p)| {
+                                proton_note.replace(p);
+                                o
+                            });
                             let Some(row) = row.upgrade() else { return };
                             let revert = || {
                                 reverting.set(true);
@@ -2534,7 +2567,14 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                             match outcome {
                                 Ok(steam::Outcome::Changed(_) | steam::Outcome::Unchanged) => {
                                     let state = if on { "on" } else { "off" };
-                                    toasts.add_toast(toast(&format!("Neural Forge is {state} for {}", game.name)));
+                                    let note = match proton_note.take() {
+                                        Some(Ok(n)) => n,
+                                        Some(Err(e)) => format!(
+                                            ". Its Proton was not changed ({e}): in a DLSS game the model stays off until it runs with a Neural Forge Proton"
+                                        ),
+                                        None => String::new(),
+                                    };
+                                    toasts.add_toast(toast(&format!("Neural Forge is {state} for {}{note}", game.name)));
                                 }
                                 Ok(steam::Outcome::SteamRunning { manual }) => {
                                     revert();
@@ -3466,7 +3506,7 @@ fn preupscale_label(layer_active: bool, placement: u32, state: u32, width: u32, 
         HOLDING_BOTH => format!("before the upscaler and after DLSS, before the HUD{missed}"),
         WAITING => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
         PAUSED => format!("paused with the game's DLSS (a menu or loading screen): the model resumes with its next frame{missed}"),
-        NO_WRAPPER => "on the finished frame: this DLSS game is not on a Neural Forge Proton (Setup tab, Proton with DLSS parameters)".to_string(),
+        NO_WRAPPER => "off: this game uses DLSS but isn't on the Neural Forge Proton; switch it on in the Setup tab to set it (Steam closed)".to_string(),
         IDENTIFIED if reason.is_empty() => format!("after the upscaler: DLSS input identified, not holding{missed}"),
         IDENTIFIED => format!("after the upscaler: DLSS input identified, not holding{missed} -- {reason}"),
         _ => "after the upscaler".to_string(),

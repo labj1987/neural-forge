@@ -798,6 +798,13 @@ fn sibling(file: &Path, suffix: &str) -> PathBuf {
 /// each (beside its backups), taken in the files' sorted order so two holders never wait on each
 /// other. A lock that cannot be taken is skipped: its directory then cannot take the edit's
 /// temporary file either, and the write reports that.
+/// Holds `file`'s Neural Forge lock (its `.neural-forge.lock` sibling) until dropped.
+pub(crate) fn lock_file(file: &Path) -> Option<std::fs::File> {
+    let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(sibling(file, ".neural-forge.lock")).ok()?;
+    lock.lock().ok()?;
+    Some(lock)
+}
+
 fn lock_localconfigs(files: &[PathBuf]) -> Vec<std::fs::File> {
     files
         .iter()
@@ -810,7 +817,7 @@ fn lock_localconfigs(files: &[PathBuf]) -> Vec<std::fs::File> {
 }
 
 /// The backups and the atomic replace for one file, whose bytes read as `old` a moment ago.
-fn write_with_backups(file: &Path, old: &[u8], new: &[u8]) -> std::io::Result<PathBuf> {
+pub(crate) fn write_with_backups(file: &Path, old: &[u8], new: &[u8]) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(file)?.permissions().mode() & 0o7777;
     let orig = sibling(file, ".neural-forge.orig");

@@ -8613,7 +8613,10 @@ static NATIVE_POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
     let launch = sr_launches();
     let off = |since: Instant| now < hand_back_at(since, launch);
-    (lock(&POST_OFF_UNTIL).values().any(|&since| off(since)) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(off)) && !post_serves(now)
+    // A DLSS game without NGX's records (not on the Neural Forge Proton) keeps the model off too, unless the finished
+    // frame is chosen: there it would see the HUD and cost the most (4.0; the status and the doctor say why).
+    (lock(&POST_OFF_UNTIL).values().any(|&since| off(since)) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(off) || crate::ngx_ring::no_wrapper())
+        && !post_serves(now)
 }
 
 /// The process's latest hold, from whichever device made it ([`Session::note`]): when, its header state, whether
