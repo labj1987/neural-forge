@@ -1197,6 +1197,9 @@ pub(crate) struct LaunchRefs {
     pub before_named: Vec<(vk::Image, Before)>,
     /// How many of the evaluate's launches named its output ([`DlssOutput::writes`]).
     pub output_writes: u32,
+    /// A launch of DLSS Super Resolution's or Ray Reconstruction's kernels ([`dlss_game::dlss_kernel_name`]): with no
+    /// NGX record, a sign that DLSS runs without the wrapper ([`crate::ngx_ring::note_launches_without_record`]).
+    pub dlss_kernel: bool,
 }
 
 impl LaunchRefs {
@@ -1655,7 +1658,10 @@ impl Tracker {
             global: self.global_sync.get(&command_buffer).copied(),
             copies: self.copies.get(&command_buffer).map_or(0, Vec::len),
         };
-        self.launch.entry(command_buffer).or_default().before_first.get_or_insert(before);
+        let dlss_kernel = self.functions.get(&function).is_some_and(|n| dlss_game::dlss_kernel_name(n));
+        let entry = self.launch.entry(command_buffer).or_default();
+        entry.before_first.get_or_insert(before);
+        entry.dlss_kernel |= dlss_kernel;
         let Some(bytes) = params else {
             self.launch.entry(command_buffer).or_default().opaque = true;
             return;
@@ -2539,15 +2545,20 @@ impl Tracker {
         let mut lines = Vec::new();
         let mut any = false;
         let mut evaluate = false;
+        let mut dlss_kernel = false;
         for cb in batches.iter().flatten() {
             let Some(refs) = self.launch.get_mut(cb) else { continue };
             any = true;
+            dlss_kernel |= refs.dlss_kernel;
             let Some(r) = refs.ngx else { continue };
             evaluate = true;
             if !refs.ended {
                 refs.ended = crate::ngx_ring::ended(r.seq);
             }
-            if !refs.ended || refs.output_writes == 0 {
+            // A D3D11 evaluate's launches are all in the buffer once it is submitted (DXVK's worker records them after
+            // NVIDIA's call returned, and its end record says nothing of them): its writes are counted at the submit.
+            let done = refs.ended || r.api == crate::ngx_ring::API_D3D11;
+            if !done || refs.output_writes == 0 {
                 continue;
             }
             let seen = DlssOutput { image: r.output, input: r.colour, depth: r.depth, mvec: r.mvec, rr: r.is_rr(), writes: refs.output_writes };
@@ -2579,7 +2590,7 @@ impl Tracker {
         if evaluate {
             note_sr_launch();
         } else {
-            crate::ngx_ring::note_launches_without_record();
+            crate::ngx_ring::note_launches_without_record(dlss_kernel);
         }
         lines
     }
@@ -2828,6 +2839,8 @@ impl Tracking {
         // Model mode: whether the game uses DLSS, known before DLSS's first frame ([`dlss_game`]).
         if mode() == Mode::Model {
             dlss_game::watch();
+            // NGX's records, from the moment the wrapper makes its ring ([`crate::ngx_ring::watch`]).
+            crate::ngx_ring::watch();
         }
         tracking
     }
@@ -2956,7 +2969,6 @@ impl Tracking {
 
     /// `vkCreateCuFunctionNVX` created `function` for the kernel `name`.
     pub(crate) fn record_function(&self, function: vk::CuFunctionNVX, name: &str) {
-        crate::ngx_ring::note_cuda_function();
         if dlss_game::dlss_kernel_name(name) {
             dlss_game::note(&format!("its CUDA kernel {name} was created"));
         }
@@ -6533,7 +6545,7 @@ impl Session {
         let recent = |t: Option<Instant>| t.is_some_and(|t| now.saturating_duration_since(t) < RECENT);
         let paused = kept_off && !recent(launches.map(|r| r.last));
         if !recent(self.last_hold) && crate::ngx_ring::no_wrapper() {
-            return (neural_forge_protocol::enums::preupscale_state::NO_WRAPPER, String::new());
+            return (neural_forge_protocol::enums::preupscale_state::NO_WRAPPER, crate::ngx_ring::no_wrapper_reason());
         }
         status_of(recent(self.last_hold), recent(self.last_dlss), paused, refusal)
     }
@@ -6624,12 +6636,11 @@ static NATIVE_POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
     let launch = sr_launches();
     let off = |since: Instant| now < hand_back_at(since, launch);
-    // A DLSS game without NGX's records (not on the Neural Forge Proton) keeps the model off too, unless the finished
-    // frame is chosen: there it would see the HUD and cost the most (4.0; the status and the doctor say why).
-    (lock(&POST_OFF_UNTIL).values().any(|&since| off(since))
-        || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(off)
-        || crate::ngx_ring::no_wrapper()
-        || crate::ngx_ring::dlss_game())
+    // A DLSS game without NGX's records (not on the Neural Forge Proton) keeps the model off too while DLSS evaluates,
+    // unless the finished frame is chosen: there it would see the HUD and cost the most (the status and the doctor say
+    // why). A DLSS game that has not held yet keeps it off by the timed rules from the sign ([`pre_dlss_post_off`],
+    // through each device's [`Session::suppresses_post`]), never for good.
+    (lock(&POST_OFF_UNTIL).values().any(|&since| off(since)) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(off) || crate::ngx_ring::no_wrapper())
         && !post_serves(now)
 }
 
@@ -7393,15 +7404,43 @@ mod tests {
         assert_eq!(t.dlss_output.map(|o| o.writes), Some(4));
     }
 
+    /// A D3D11 evaluate (DXVK records its launches after NVIDIA's call returned, so its end record says nothing of them):
+    /// its writes of the output are counted while its buffer is recorded, and learnt at the buffer's submit.
+    #[test]
+    fn a_d3d11_evaluate_s_output_writes_are_counted_and_learnt_at_the_submit() {
+        use crate::ngx_ring::{inject, API_D3D11};
+        let rec = crate::ngx_ring::Record { api: API_D3D11, ..gta_record(1) };
+        let mut t = tracker_with(&gta_registered());
+        inject(vec![rec, crate::ngx_ring::end_of(&rec, 2)]);
+        t.begin(cb(1));
+        t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        t.launch(cb(1), Some(&param_block(&[0x1400])));
+        t.launch(cb(1), Some(&param_block(&[0x1400])));
+        assert_eq!(t.launch[&cb(1)].output_writes, 2, "its end record does not end it");
+        let (_, lines) = submit(&mut t, &[vec![cb(1)]]);
+        assert_eq!(t.dlss_output.map(|o| (o.image.as_raw(), o.writes)), Some((0x400, 2)), "{lines:#?}");
+    }
+
     /// A game outside a Neural Forge Proton: its CUDA launches carry no record, nothing is held, and the status says
-    /// the wrapper is missing.
+    /// the wrapper is missing once DLSS Super Resolution's kernels launch. Other CUDA launches (Frame Generation's) are
+    /// no sign: such a game gets the post-upscaler path by the timed rules.
     #[test]
     fn without_records_nothing_is_held_and_the_missing_wrapper_is_said() {
         let mut t = tracker_with(&gta_registered());
-        t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        let (fg, sr) = (vk::CuFunctionNVX::from_raw(0xf1), vk::CuFunctionNVX::from_raw(0xf2));
+        t.record_function(fg, "dlssg_flow_kernel");
+        t.record_function(sr, "hiluma_engine_input_kernel");
+        t.launch_kernel(cb(1), fg, Some(&param_block(&[0x1100, 0x1200, 0x1300])));
         let (scan, _) = submit(&mut t, &[vec![cb(1)]]);
         assert!(scan.is_none() && t.inputs.is_none());
+        assert!(!crate::ngx_ring::no_wrapper(), "Frame Generation's launches are no sign");
+        t.launch_kernel(cb(2), sr, Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        let (scan, _) = submit(&mut t, &[vec![cb(2)]]);
+        assert!(scan.is_none() && t.inputs.is_none());
         assert!(crate::ngx_ring::no_wrapper());
+        let (state, reason) = Session::default().status_at(false, None, Instant::now(), None);
+        assert_eq!(state, neural_forge_protocol::enums::preupscale_state::NO_WRAPPER);
+        assert!(reason.contains("neural-forge-ngx-"), "names the ring's path: {reason}");
     }
 
     /// The process-wide post-path switch (for DLSS on another device than the swapchain, the case

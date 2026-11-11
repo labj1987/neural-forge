@@ -22,9 +22,11 @@ first shipped them; their phase is kept as a subheading.
 - A DLSS game that does not run with a Neural Forge Proton keeps the model off: the Status tab, `doctor` and the
   game's log say why and how to fix it. Choose the finished frame as the placement to have the model there anyway.
   Games without DLSS run the model on the finished frame as before.
-- In a DLSS game the model never runs on the finished frame on its own any more (menus, loading screens before DLSS
-  starts), which at 4K built the network at the output size: behind hangs in GTA V Enhanced and video-memory
-  spills in Cyberpunk 2077 with Ray Reconstruction.
+- In a DLSS game the model no longer runs on the finished frame over the menus and loading screens before DLSS's
+  first frame, which at 4K built the network at the output size: behind hangs in GTA V Enhanced and video-memory
+  spills in Cyberpunk 2077 with Ray Reconstruction. A game that ships DLSS but does not upscale with it (DLSS off,
+  another upscaler, Frame Generation only, DLAA) still gets the model on the finished frame, after 5 minutes
+  without DLSS or 30 seconds of DLSS with no frame worked on.
 - `doctor` checks that the NGX wrapper is installed and forwards every function of your driver's NGX core, that
   each switched-on game is set to a Neural Forge Proton, and which copies were made from an older Proton than is
   installed now.

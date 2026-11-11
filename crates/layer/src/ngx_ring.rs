@@ -48,6 +48,8 @@ pub(crate) const RING_ENV: &str = "NEURAL_FORGE_NGX_RING";
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Record {
     pub seq: u64,
+    /// Milliseconds since the wrapper loaded, when the record was written.
+    pub t_ms: f64,
     /// The API (`api`'s low bits).
     pub api: u32,
     /// An end-of-evaluate record: written once NVIDIA's `EvaluateFeature` returned, with the evaluate's own fields.
@@ -146,6 +148,7 @@ pub(crate) fn parse_record(b: &[u8]) -> Record {
     let image = |at: usize| vk::Image::from_raw(u64_at(b, at));
     Record {
         seq: u64_at(b, 0),
+        t_ms: f64::from_bits(u64_at(b, 8)),
         api: u32_at(b, 16) & API_MASK,
         end: u32_at(b, 16) & KIND_END != 0,
         handle: u32_at(b, 20),
@@ -264,13 +267,45 @@ pub(crate) static COUNTERS: Counters = Counters { records: AtomicU64::new(0), ma
 /// The recent evaluates kept for matching.
 const RECENT: usize = 64;
 
+/// An evaluate kept for matching ([`State::recent`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Kept {
+    record: Record,
+    /// No launch belongs to it any more: its end record was read (D3D12, Vulkan), or, for D3D11, a later evaluate of its
+    /// feature was taken or it was given up ([`note`]).
+    ended: bool,
+    /// D3D11 only: a launch buffer took it ([`pick`]); its launches in that buffer go on counting until it ends.
+    taken: bool,
+}
+
+impl Kept {
+    fn new(record: Record) -> Self {
+        Kept { record, ended: false, taken: false }
+    }
+    fn open(&self) -> bool {
+        !self.ended
+    }
+    fn d3d11(&self) -> bool {
+        self.record.api == API_D3D11
+    }
+}
+
+/// D3D11 evaluates not yet taken kept open per feature: DXVK's worker records an evaluate's launches a frame or two
+/// after NGX's call. Older ones were skipped (the game evaluated without the launches reaching a submit) and would
+/// keep every later frame matched to an older record's jitter and reset.
+const D3D11_OPEN: usize = 3;
+
+/// How far (record time) a D3D11 evaluate not yet taken may lie behind its feature's newest before it is given up:
+/// several frames even at 30 fps.
+const D3D11_OPEN_MS: f64 = 250.0;
+
 struct State {
     ring: Option<Ring>,
     /// The last time the ring was looked for, while it is not open.
     looked: Option<Instant>,
     said: bool,
-    /// Super Resolution and Ray Reconstruction evaluates, oldest first, each with whether its end was read.
-    recent: VecDeque<(Record, bool)>,
+    /// Super Resolution and Ray Reconstruction evaluates, oldest first ([`Kept`]).
+    recent: VecDeque<Kept>,
     summary_at: Option<Instant>,
 }
 
@@ -327,19 +362,38 @@ impl State {
 }
 
 /// Keeps an upscaling evaluate in `recent`, or marks the newest open one an end record ends.
-fn note(recent: &mut VecDeque<(Record, bool)>, r: Record) {
+fn note(recent: &mut VecDeque<Kept>, r: Record) {
     if r.end {
         // A D3D11 evaluate's launches are recorded later, on DXVK's worker thread, after NVIDIA's call returned: its
         // end says nothing of them, so it stays open for matching (GTA San Andreas - The Definitive Edition,
         // 2026-11-11: one evaluate in thousands matched).
-        if let Some((_, ended)) = recent.iter_mut().rev().find(|(b, ended)| !*ended && b.ended_by(&r) && b.api & 0xffff != API_D3D11) {
-            *ended = true;
+        if let Some(k) = recent.iter_mut().rev().find(|k| k.open() && !k.d3d11() && k.record.ended_by(&r)) {
+            k.ended = true;
         }
     } else if r.is_evaluate() && r.upscales() {
         if recent.len() == RECENT {
             recent.pop_front();
         }
-        recent.push_back((r, false));
+        recent.push_back(Kept::new(r));
+        if r.api == API_D3D11 {
+            give_up_skipped_d3d11(recent, &r);
+        }
+    }
+}
+
+/// Ends the D3D11 evaluates of `newest`'s feature that no launch took and that lie too far behind it: more than
+/// [`D3D11_OPEN`] waiting, or older than [`D3D11_OPEN_MS`]. Matching takes the oldest open one, so an evaluate whose
+/// launches never came would otherwise hand every later frame an older record.
+fn give_up_skipped_d3d11(recent: &mut VecDeque<Kept>, newest: &Record) {
+    let mut waiting = 0;
+    for k in recent.iter_mut().rev() {
+        if !k.open() || !k.d3d11() || k.taken || (k.record.feature, k.record.handle) != (newest.feature, newest.handle) {
+            continue;
+        }
+        waiting += 1;
+        if waiting > D3D11_OPEN || newest.t_ms - k.record.t_ms > D3D11_OPEN_MS {
+            k.ended = true;
+        }
     }
 }
 
@@ -357,7 +411,7 @@ fn lock() -> std::sync::MutexGuard<'static, State> {
 /// same thread, and its end after the last, so a launch naming the colour input between the two is this evaluate's.
 pub(crate) fn evaluate_naming(named: &[vk::Image]) -> Option<Record> {
     #[cfg(test)]
-    if let Some(found) = injected(|recent| recent.iter().rev().find(|(r, ended)| !ended && named.contains(&r.colour)).map(|(r, _)| *r)) {
+    if let Some(found) = injected(|recent| pick(&mut recent.clone(), named)) {
         return found;
     }
     let mut s = lock();
@@ -367,27 +421,34 @@ pub(crate) fn evaluate_naming(named: &[vk::Image]) -> Option<Record> {
 }
 
 /// [`evaluate_naming`] over `recent`. A D3D11 evaluate's launches come later, on DXVK's worker thread, possibly after
-/// the next evaluate's record: the oldest open D3D11 evaluate naming the launch's colour input is its, and taking it
-/// closes it, so each is matched once and in order.
-fn pick(recent: &mut VecDeque<(Record, bool)>, named: &[vk::Image]) -> Option<Record> {
-    if let Some((r, _)) = recent.iter().rev().find(|(r, ended)| !ended && r.api != API_D3D11 && named.contains(&r.colour)) {
-        return Some(*r);
+/// the next evaluate's record: the oldest open D3D11 evaluate not yet taken that names the launch's colour input is
+/// its. Taking it marks it taken, not ended: the buffer's later launches are still its (they count the writes of its
+/// output); it ends when a later evaluate of its feature is taken. Each is taken once and in order.
+fn pick(recent: &mut VecDeque<Kept>, named: &[vk::Image]) -> Option<Record> {
+    if let Some(k) = recent.iter().rev().find(|k| k.open() && !k.d3d11() && named.contains(&k.record.colour)) {
+        return Some(k.record);
     }
-    let (r, ended) = recent.iter_mut().find(|(r, ended)| !*ended && r.api == API_D3D11 && named.contains(&r.colour))?;
-    *ended = true;
-    Some(*r)
+    let at = recent.iter().position(|k| k.open() && k.d3d11() && !k.taken && named.contains(&k.record.colour))?;
+    let taken = recent[at].record;
+    recent[at].taken = true;
+    for k in recent.iter_mut().take(at) {
+        if k.open() && k.d3d11() && (k.record.feature, k.record.handle) == (taken.feature, taken.handle) {
+            k.ended = true;
+        }
+    }
+    Some(taken)
 }
 
 /// The newest upscaling evaluate whose colour input `known` accepts (an image of the asking device): what identifies
 /// DLSS's inputs there (`preupscale::Tracker::refresh`).
 pub(crate) fn newest(known: impl Fn(vk::Image) -> bool) -> Option<Record> {
     #[cfg(test)]
-    if let Some(found) = injected(|recent| recent.iter().rev().find(|(r, _)| known(r.colour)).map(|(r, _)| *r)) {
+    if let Some(found) = injected(|recent| recent.iter().rev().find(|k| known(k.record.colour)).map(|k| k.record)) {
         return found;
     }
     let mut s = lock();
     s.poll();
-    s.recent.iter().rev().find(|(r, _)| known(r.colour)).map(|(r, _)| *r)
+    s.recent.iter().rev().find(|k| known(k.record.colour)).map(|k| k.record)
 }
 
 /// Said once per process: an evaluate's colour input is not HDR.
@@ -406,89 +467,137 @@ pub(crate) fn note_matched(record: &Record) {
 /// Whether the evaluate of record `seq` ended (its end record was read); an evaluate no longer kept ended long ago.
 pub(crate) fn ended(seq: u64) -> bool {
     #[cfg(test)]
-    if let Some(found) = injected(|recent| recent.iter().find(|(r, _)| r.seq == seq).is_none_or(|(_, ended)| *ended)) {
+    if let Some(found) = injected(|recent| recent.iter().find(|k| k.record.seq == seq).is_none_or(|k| k.ended)) {
         return found;
     }
     let mut s = lock();
     s.poll();
-    s.recent.iter().find(|(r, _)| r.seq == seq).is_none_or(|(_, ended)| *ended)
+    s.recent.iter().find(|k| k.record.seq == seq).is_none_or(|k| k.ended)
 }
 
-/// Said once per process: CUDA launches (DLSS's) run but no ring hands this process records (no wrapper, or a game
-/// outside a Neural Forge Proton).
+/// When DLSS Super Resolution's or Ray Reconstruction's kernels last launched in a submit with no ring open
+/// ([`note_launches_without_record`]): a DLSS game whose NGX hands this process no records.
+static NO_RING_LAUNCH: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Said once per process ([`note_launches_without_record`]).
 static SAID_NO_RING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether CUDA launches ran in this process while no ring is open (a DLSS game not on the Neural Forge Proton): the
-/// status says so.
+/// Whether this process is a DLSS game without NGX's records: DLSS Super Resolution's or Ray Reconstruction's kernels
+/// launched with no ring open, the last time less than [`crate::preupscale::PAUSE_HAND_BACK`] ago. The model stays off
+/// there (nothing tells the layer DLSS's images) and the status says why ([`no_wrapper_reason`]). Frame Generation's
+/// kernels do not count; a game whose DLSS stopped evaluating gets the post-upscaler path again by the timed rules.
 pub(crate) fn no_wrapper() -> bool {
     #[cfg(test)]
     return NO_RING_HERE.with(|n| n.get());
     #[cfg(not(test))]
-    return SAID_NO_RING.load(Ordering::Relaxed) && lock().ring.is_none();
-}
-
-/// A CUDA kernel was created in this process (`vkCreateCuFunctionNVX`: NGX loading a DLSS feature's kernels, at
-/// startup or when the game creates the feature, before DLSS's first frame).
-static CUDA_FUNCTIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// [`dlss_game`]'s signal from the CUDA kernels' creation.
-pub(crate) fn note_cuda_function() {
-    CUDA_FUNCTIONS.store(true, Ordering::Relaxed);
-}
-
-/// Whether this process is a DLSS game, from the earliest sign: NGX's wrapper opened its ring (when the game loads
-/// NGX), or NGX created CUDA kernels (a DLSS game not on the Neural Forge Proton). Such a game never gets the model on
-/// the finished frame unless that placement is chosen: before DLSS runs (menus, loading screens) it would build the
-/// network at the output size, at 4K the cost behind GTA V Enhanced's hangs and Cyberpunk 2077's video-memory spills
-/// (2026-11-11).
-pub(crate) fn dlss_game() -> bool {
-    // Process-wide signals: in tests (many trackers in one process) the finished frame is decided as before.
-    #[cfg(test)]
-    return false;
-    #[cfg(not(test))]
     {
-        if CUDA_FUNCTIONS.load(Ordering::Relaxed) {
-            return true;
-        }
-        let mut s = lock();
-        s.poll();
-        s.ring.is_some()
+        let recent = lock_no_ring().is_some_and(|t| t.elapsed() < crate::preupscale::PAUSE_HAND_BACK);
+        recent && lock().ring.is_none()
     }
 }
 
-/// A launch-bearing submit carried no evaluate's launches: when no ring is open (after looking for it), DLSS runs
-/// without the NGX wrapper, and the model stays off (said once).
-pub(crate) fn note_launches_without_record() {
+#[cfg(not(test))]
+fn lock_no_ring() -> Option<Instant> {
+    *NO_RING_LAUNCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether Proton was told to load Neural Forge's NGX wrapper: `WINEDLLOVERRIDES` (Proton's DLL overrides, in the
+/// game's environment) gives `_nvngx` the builtin (`b`), as a Neural Forge Proton copy's `proton` script does.
+pub(crate) fn wrapper_overridden(overrides: &str) -> bool {
+    overrides.split(';').any(|entry| {
+        let (names, mode) = entry.split_once('=').unwrap_or((entry, ""));
+        mode.trim().starts_with('b') && names.split(',').any(|n| n.trim().eq_ignore_ascii_case("_nvngx"))
+    })
+}
+
+/// Why DLSS's records are missing, for the status and the log: the game is on a Neural Forge Proton
+/// ([`wrapper_overridden`]) but the wrapper made no ring at `path`, or it is not on one.
+pub(crate) fn no_ring_text(overridden: bool, path: Option<&std::path::Path>) -> String {
+    let at = path.map_or_else(|| format!("{RING_ENV}=off"), |p| p.display().to_string());
+    if overridden {
+        format!(
+            "the game runs on a Neural Forge Proton (Proton loads its NGX wrapper) but no record of DLSS reached the layer ({at}): the wrapper did not start its ring, or something removed it. The model stays off; the wrapper's own log (NEURAL_FORGE_NGX_LOG=Z:\\tmp\\ngx.log in the launch options) says why"
+        )
+    } else {
+        format!(
+            "this game uses DLSS but is not on the Neural Forge Proton (no record of DLSS at {at}): the model stays off. Switch the game on in Neural Forge to set its Proton (Steam closed), or choose the finished frame as the placement"
+        )
+    }
+}
+
+/// [`no_ring_text`] for this process.
+pub(crate) fn no_wrapper_reason() -> String {
+    let overridden = std::env::var("WINEDLLOVERRIDES").is_ok_and(|o| wrapper_overridden(&o));
+    no_ring_text(overridden, configured().as_deref())
+}
+
+/// A launch-bearing submit carried no evaluate's launches. With `dlss` (one of the launches was of DLSS Super
+/// Resolution's or Ray Reconstruction's kernels, [`crate::preupscale::dlss_game::dlss_kernel_name`]) and no ring open,
+/// DLSS runs without the NGX wrapper's records: the model stays off ([`no_wrapper`]), said once. Frame Generation's
+/// and other CUDA launches are no sign.
+pub(crate) fn note_launches_without_record(dlss: bool) {
+    #[cfg(test)]
+    if INJECTED.with(|i| i.borrow().is_some()) {
+        return;
+    }
+    if !dlss {
+        return;
+    }
     let open = {
         let mut s = lock();
         s.poll();
         s.ring.is_some()
     };
-    #[cfg(test)]
-    if INJECTED.with(|i| i.borrow().is_some()) {
+    if open {
         return;
     }
-    if !open && {
-        #[cfg(test)]
-        NO_RING_HERE.with(|n| n.set(true));
-        !SAID_NO_RING.swap(true, Ordering::Relaxed)
-    } {
-        crate::log!(
-            "[ngx] this game uses DLSS but is not on the Neural Forge Proton (NGX's wrapper hands this process no records): the model stays off. Switch the game on in Neural Forge to set its Proton (Steam closed), or choose the finished frame as the placement"
-        );
+    *NO_RING_LAUNCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+    #[cfg(test)]
+    NO_RING_HERE.with(|n| n.set(true));
+    if !SAID_NO_RING.swap(true, Ordering::Relaxed) {
+        crate::log!("[ngx] {}", no_wrapper_reason());
         crate::logging::flush();
+    }
+}
+
+/// Starts the thread that opens the ring as soon as the wrapper creates it, once per process (from the first
+/// device's creation): the file is removed once mapped, so nothing else (a purge's sweep of dead games' rings) can
+/// take it from the game, and the records from NGX's first evaluate on are read. Looks every 500 ms for the first 3
+/// minutes, then every 5 s, until it is open.
+pub(crate) fn watch() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if configured().is_none() || STARTED.set(()).is_err() {
+        return;
+    }
+    let started = Instant::now();
+    let spawned = std::thread::Builder::new().name("nf-ngx-ring".into()).spawn(move || loop {
+        {
+            let mut s = lock();
+            if s.ring.is_some() {
+                break;
+            }
+            s.looked = None;
+            s.poll();
+            if s.ring.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(if started.elapsed() < Duration::from_secs(180) { Duration::from_millis(500) } else { Duration::from_secs(5) });
+    });
+    if let Err(e) = spawned {
+        crate::log!("[ngx] could not start the thread that opens NGX's ring: {e}");
     }
 }
 
 /// The newest evaluate on `colour`, without counting.
 pub(crate) fn latest_for(colour: vk::Image) -> Option<Record> {
     #[cfg(test)]
-    if let Some(found) = injected(|recent| recent.iter().rev().find(|(r, _)| r.colour == colour).map(|(r, _)| *r)) {
+    if let Some(found) = injected(|recent| recent.iter().rev().find(|k| k.record.colour == colour).map(|k| k.record)) {
         return found;
     }
     let mut s = lock();
     s.poll();
-    s.recent.iter().rev().find(|(r, _)| r.colour == colour).map(|(r, _)| *r)
+    s.recent.iter().rev().find(|k| k.record.colour == colour).map(|k| k.record)
 }
 
 /// The paper white's factor for a hold on `colour` that encodes with the game's exposure as it is
@@ -513,7 +622,7 @@ pub(crate) fn inject(records: Vec<Record>) {
 
 /// `f` on the injected records as the ring would keep them ([`note`]), when a test injected any.
 #[cfg(test)]
-fn injected<R>(f: impl FnOnce(&VecDeque<(Record, bool)>) -> R) -> Option<R> {
+fn injected<R>(f: impl FnOnce(&VecDeque<Kept>) -> R) -> Option<R> {
     INJECTED.with(|i| {
         i.borrow().as_ref().map(|records| {
             let mut recent = VecDeque::new();
@@ -622,7 +731,7 @@ pub(crate) mod tests {
         let second = Record { seq: 11, ..begin };
         note(&mut recent, second);
         note(&mut recent, end_of(&begin, 12));
-        assert_eq!(recent.iter().map(|(r, e)| (r.seq, *e)).collect::<Vec<_>>(), vec![(9, false), (11, true)], "the newest open one ends first");
+        assert_eq!(recent.iter().map(|k| (k.record.seq, k.ended)).collect::<Vec<_>>(), vec![(9, false), (11, true)], "the newest open one ends first");
     }
 
     /// A launch belongs to an evaluate only between its record and its end: one naming the colour input after the
@@ -723,18 +832,75 @@ pub(crate) mod tests {
     }
 
     /// DXVK records a D3D11 evaluate's launches later, after the next record may have come: the oldest open D3D11
-    /// evaluate naming the colour input is the launch's, taken once; D3D12's newest open one, kept for its other
-    /// launches.
+    /// evaluate naming the colour input is the launch's, taken once and kept open (its later launches count its output
+    /// writes) until a later one of its feature is taken; D3D12's newest open one, kept for its other launches.
     #[test]
     fn d3d11_evaluates_are_taken_in_order_once_each() {
         let rec = |seq: u64, api: u32| Record { seq, api, feature: FEATURE_SR, colour: vk::Image::from_raw(0x10), ..Record::default() };
-        let mut recent: VecDeque<(Record, bool)> = [rec(1, API_D3D11), rec(2, API_D3D11)].into_iter().map(|r| (r, false)).collect();
+        let mut recent: VecDeque<Kept> = [rec(1, API_D3D11), rec(2, API_D3D11)].into_iter().map(Kept::new).collect();
         let named = [vk::Image::from_raw(0x10)];
         assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(1));
+        assert!(!recent[0].ended && recent[0].taken, "taken, not ended: the buffer's later launches are its");
         assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(2));
+        assert!(recent[0].ended && !recent[1].ended, "the next one taken ends it");
         assert_eq!(pick(&mut recent, &named), None, "each once");
-        let mut d3d12: VecDeque<(Record, bool)> = [rec(3, 12), rec(4, 12)].into_iter().map(|r| (r, false)).collect();
+        let mut d3d12: VecDeque<Kept> = [rec(3, 12), rec(4, 12)].into_iter().map(Kept::new).collect();
         assert_eq!(pick(&mut d3d12, &named).map(|r| r.seq), Some(4));
         assert_eq!(pick(&mut d3d12, &named).map(|r| r.seq), Some(4), "kept open for the buffer's other launches");
+    }
+
+    fn d3d11(seq: u64, t_ms: f64) -> Record {
+        Record { seq, t_ms, api: API_D3D11, feature: FEATURE_SR, colour: vk::Image::from_raw(0x10), ..Record::default() }
+    }
+
+    /// An evaluate whose launches never reach a submit (skipped) is given up once [`D3D11_OPEN`] newer ones wait or it
+    /// lies [`D3D11_OPEN_MS`] behind: matching then takes the current frames' records again instead of staying behind.
+    #[test]
+    fn a_skipped_d3d11_evaluate_is_given_up() {
+        let named = [vk::Image::from_raw(0x10)];
+        let mut recent = VecDeque::new();
+        // Frame 1's launches come; frame 2's never do; frames 3.. come one frame late.
+        note(&mut recent, d3d11(1, 0.0));
+        assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(1));
+        for seq in 2..=5 {
+            note(&mut recent, d3d11(seq, 16.0 * seq as f64));
+        }
+        assert!(recent.iter().find(|k| k.record.seq == 2).unwrap().ended, "more than D3D11_OPEN waiting");
+        assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(3));
+        note(&mut recent, d3d11(6, 96.0));
+        assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(4));
+        // The game's frames stall for longer than D3D11_OPEN_MS: what waited is given up.
+        note(&mut recent, d3d11(7, 96.0 + D3D11_OPEN_MS + 1.0));
+        assert!(recent.iter().filter(|k| k.record.seq < 7).all(|k| k.ended || k.taken), "{recent:?}");
+        assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(7));
+        assert!(recent.iter().filter(|k| k.record.seq < 7).all(|k| k.ended));
+    }
+
+    /// A buffer that takes an evaluate whose launches are another buffer's (the launches of one evaluate split over two
+    /// buffers): the next frame's record goes early, the frame after finds none open and the matching is back in step
+    /// with the frame after that.
+    #[test]
+    fn a_double_take_falls_back_in_step() {
+        let named = [vk::Image::from_raw(0x10)];
+        let mut recent = VecDeque::new();
+        note(&mut recent, d3d11(1, 0.0));
+        note(&mut recent, d3d11(2, 16.0));
+        assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(1));
+        assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(2), "frame 1's second buffer takes frame 2's record");
+        assert_eq!(pick(&mut recent, &named), None, "frame 2's launches find none: missed, not shifted");
+        note(&mut recent, d3d11(3, 32.0));
+        assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(3), "in step again");
+    }
+
+    #[test]
+    fn the_wrapper_override_is_read_from_wines_dll_overrides() {
+        assert!(wrapper_overridden("steam.exe=b;dotnetfx35.exe=b;_nvngx=b;Z:\\usr\\lib\\nvidia\\wine\\_nvngx=n"));
+        assert!(wrapper_overridden("d3d11,dxgi,_nvngx=b,n"));
+        assert!(!wrapper_overridden("steam.exe=b;nvngx=n;d3d11=n"));
+        assert!(!wrapper_overridden(""));
+        let on = no_ring_text(true, Some(std::path::Path::new("/dev/shm/neural-forge-ngx-42.ring")));
+        let off = no_ring_text(false, Some(std::path::Path::new("/dev/shm/neural-forge-ngx-42.ring")));
+        assert!(on.contains("/dev/shm/neural-forge-ngx-42.ring") && on.contains("runs on a Neural Forge Proton"), "{on}");
+        assert!(off.contains("/dev/shm/neural-forge-ngx-42.ring") && off.contains("not on the Neural Forge Proton"), "{off}");
     }
 }

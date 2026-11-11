@@ -69,7 +69,12 @@ says what to do.
 
 - **"off: this game uses DLSS but isn't on the Neural Forge Proton".** Close Steam, switch the game
   off and on again in the Setup tab (or **Make copy** under **Proton with DLSS parameters**), and
-  restart Steam.
+  restart Steam. If the line says the game *is* on a Neural Forge Proton but no record of DLSS reached
+  the layer, run **Diagnose**: the copy's NGX wrapper is outdated or did not load.
+- **The model runs on the finished frame in a DLSS game.** DLSS is not upscaling there: switched off,
+  another upscaler, Frame Generation only, or DLAA. Loading screens and menus before DLSS's first frame
+  stay untouched; the finished frame takes over after 5 minutes without DLSS, or 30 s of DLSS with no
+  frame worked on.
 - **"waiting for DLSS Super Resolution".** The game is not using DLSS Super Resolution (native
   resolution counts as not); the model runs on the finished frame.
 - **"DLSS input identified, not holding".** The reason follows on the same line; the model runs on

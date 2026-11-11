@@ -68,7 +68,11 @@ last frame, which already has the model's edit, under the menu). The model then 
 network loaded, and runs again on the game's first frame after the menu; the Model placement line says "paused
 with the game's DLSS". It moves to the finished frame when the game goes on calling DLSS for 30 s with no frame
 worked on before the upscaler (DLAA, or a DLSS input Neural Forge no longer recognises), or sends DLSS nothing for
-5 minutes (DLSS switched off for another upscaler).
+5 minutes (DLSS switched off for another upscaler, or only Frame Generation on). The same two rules apply from the
+start in a game that ships DLSS: its loading screens and menus before DLSS's first frame go untouched, and it gets
+the model on the finished frame only once DLSS has not upscaled for 5 minutes, or has for 30 s with nothing held.
+Frame Generation alone does not count as DLSS here. A DLSS game that is not on the Neural Forge Proton keeps the
+model off while DLSS upscales, unless the placement puts it on the finished frame.
 
 The game's own **DLSS Frame Generation** works with the model before the upscaler and after DLSS.
 Generated frames are built from enhanced frames, and the model runs once per real frame.

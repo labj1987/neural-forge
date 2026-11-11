@@ -3671,7 +3671,10 @@ fn preupscale_label(layer_active: bool, placement: u32, state: u32, width: u32, 
         HOLDING_BOTH => format!("before the upscaler and after DLSS, before the HUD{missed}"),
         WAITING => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
         PAUSED => format!("paused with the game's DLSS (a menu or loading screen): the model resumes with its next frame{missed}"),
-        NO_WRAPPER => "off: this game uses DLSS but isn't on the Neural Forge Proton; switch it on in the Setup tab to set it (Steam closed)".to_string(),
+        NO_WRAPPER if reason.is_empty() => {
+            "off: this game uses DLSS but isn't on the Neural Forge Proton; switch it on in the Setup tab to set it (Steam closed)".to_string()
+        }
+        NO_WRAPPER => format!("off: {reason}"),
         IDENTIFIED if reason.is_empty() => format!("after the upscaler: DLSS input identified, not holding{missed}"),
         IDENTIFIED => format!("after the upscaler: DLSS input identified, not holding{missed} -- {reason}"),
         _ => "after the upscaler".to_string(),
@@ -3832,6 +3835,13 @@ mod preupscale_label_tests {
         assert_eq!(preupscale_label(true, 0, 1, 1485, 836, 85, ""), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
         assert_eq!(preupscale_label(true, 0, 3, 2560, 1440, 0, ""), "after DLSS, before the HUD: holding DLSS's 2560x1440 output");
         assert_eq!(preupscale_label(true, 0, 4, 2560, 1440, 2, ""), "before the upscaler and after DLSS, before the HUD, 2 frames missed");
+        let no_wrapper = neural_forge_protocol::enums::preupscale_state::NO_WRAPPER;
+        assert!(preupscale_label(true, 0, no_wrapper, 0, 0, 0, "").contains("isn't on the Neural Forge Proton"));
+        assert_eq!(
+            preupscale_label(true, 0, no_wrapper, 0, 0, 0, "the layer's own reason"),
+            "off: the layer's own reason",
+            "the layer's reason when it gives one"
+        );
     }
 
     /// Placement "At present" (#49): the model runs on the finished frame by choice, not while waiting for DLSS.

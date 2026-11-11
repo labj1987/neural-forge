@@ -80,8 +80,12 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
 
 A summary every 5 s logs the records read and the evaluates matched to the buffers that carry them; `shmctl status`
 shows them as `ngx_records` and `ngx_matched`. Without a ring (no wrapper, `NEURAL_FORGE_NGX_RING=off`) nothing is held
-before or after DLSS: as soon as CUDA launches run without one, the log and the status say the game is not on the
-Neural Forge Proton, and the model runs on the finished frame only where the placement puts it there.
+before or after DLSS: as soon as DLSS Super Resolution's or Ray Reconstruction's kernels launch without one, the log
+and the status say the game is not on the Neural Forge Proton (or, when `WINEDLLOVERRIDES` shows the wrapper was asked
+for, that it is on one but no ring reached the layer, with the ring's path), and the model stays off while they launch;
+it runs on the finished frame only where the placement puts it there. Frame Generation's launches are no sign. The
+layer looks for the ring from its first device's creation on (a thread, every 500 ms for 3 minutes, then every 5 s)
+and removes the file once mapped, so nothing else can take a live game's ring.
 
 ## The Proton copy (`crates/supervisor/src/proton_tool.rs`, `neural-forge-cli proton-tool`, the Setup tab)
 

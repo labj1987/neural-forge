@@ -14,8 +14,13 @@
 //!   Read by a thread of its own ([`watch`]), never on a game thread.
 //! - DLSS's CUDA kernels created through `VK_NVX_binary_import` ([`dlss_kernel_name`]), on any device.
 //!
-//! A game that ships DLSS but runs another upscaler gets the post path by the existing hand-back rules counted from
-//! the sign: 5 minutes without any Super Resolution launch, 30 s of launches with nothing held.
+//! The sign only delays the post path; it never keeps it off for good. Counted from the sign, by the hand-back rules
+//! keyed on DLSS Super Resolution's and Ray Reconstruction's evaluates as NGX's records name them
+//! ([`super::hand_back_at`]): a game that ships DLSS but does not evaluate it (DLSS switched off, another upscaler,
+//! Frame Generation only) gets the post path after 5 minutes without an evaluate, one whose evaluates are never held
+//! (DLAA, every frame refused) after 30 s of them. Frame Generation's kernels are no sign and no evaluate. A DLSS game
+//! without NGX's records (not on the Neural Forge Proton) keeps the model off while DLSS's kernels launch
+//! ([`crate::ngx_ring::no_wrapper`]), and the status says why.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};

@@ -4165,9 +4165,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         crate::log!(
                             "[preupscale] {}",
                             if suppressed {
-                                "the model runs in the game's frame (before the upscaler or after DLSS), or the game's DLSS has not started yet; the post-upscaler compose is off while frames are held"
+                                "the model runs in the game's frame (before the upscaler or after DLSS), the game's DLSS has not started yet, or DLSS upscales without NGX's records (not on the Neural Forge Proton); the post-upscaler compose is off"
                             } else {
-                                "the post-upscaler compose runs: no DLSS frame held for 30 s while DLSS still launched (DLAA, its input not held), for 5 minutes without any DLSS launch (switched off), or never; or every pass is placed at present"
+                                "the post-upscaler compose runs: no DLSS frame held for 30 s while DLSS still upscaled (DLAA, its input not held), 5 minutes without any DLSS Super Resolution or Ray Reconstruction evaluate (DLSS off, another upscaler, Frame Generation only), or no DLSS at all; or every pass is placed at present"
                             }
                         );
                         crate::logging::flush();
