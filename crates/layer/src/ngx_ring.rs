@@ -447,12 +447,31 @@ pub(crate) fn evaluate_naming(named: &[vk::Image]) -> Option<Record> {
     found
 }
 
+/// Whether the kernel rules may decide DLSS's inputs on their own. Never in a game: since 4.0 Neural Forge needs the
+/// NGX wrapper (a Neural Forge Proton), and the rules only check the records. In tests that inject no records the
+/// rules still decide, so they stay tested as that check.
+pub(crate) fn rules_decide() -> bool {
+    #[cfg(test)]
+    return INJECTED.with(|i| i.borrow().is_none());
+    #[cfg(not(test))]
+    false
+}
+
+/// Said once per process: DLSS runs but no record names its input (no wrapper, or a game outside a Neural Forge
+/// Proton).
+static SAID_NO_RING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The kernel rules read a launch as DLSS's input launch and no record names its colour input: counted while a ring
 /// is open (a frame NGX did not evaluate, or one the rules took for DLSS's).
 pub(crate) fn note_unmatched() {
     let open = lock().ring.is_some();
     if open {
         COUNTERS.unmatched.fetch_add(1, Ordering::Relaxed);
+    } else if !rules_decide() && !SAID_NO_RING.swap(true, Ordering::Relaxed) {
+        crate::log!(
+            "[ngx] DLSS runs, but NGX's wrapper hands this process no records: the model runs only after the upscaler. Run the game with a Neural Forge Proton (the Setup tab's Proton with DLSS parameters)"
+        );
+        crate::logging::flush();
     }
 }
 

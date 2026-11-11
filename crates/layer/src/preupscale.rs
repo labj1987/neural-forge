@@ -2901,6 +2901,11 @@ impl Tracker {
             if refs.ngx.is_none() && matches!(refs.input, Some(InputLaunch::Inputs { .. })) && kernel.is_some_and(|k| k == Kernel::SrInput) {
                 crate::ngx_ring::note_unmatched();
             }
+            // Without a record the rules' reading is no identification (4.0: the NGX wrapper is required): the
+            // buffer is neither evidence nor a hold point, and the model runs after the upscaler.
+            if refs.ngx.is_none() && !crate::ngx_ring::rules_decide() {
+                refs.input = None;
+            }
             let rr = refs.ngx.map_or(rr_by_kernel, |n| n.rr);
             if let Some(InputLaunch::Inputs { mvec, .. }) = refs.input {
                 if !rr {
@@ -3933,7 +3938,7 @@ impl Tracker {
         };
         // The input kernel's choice among the size rule's candidates ([`Self::switched`]) only while
         // its colour image still is one of them.
-        if self.switched.is_some_and(|n| !self.is_candidate(n.colour)) {
+        if crate::ngx_ring::rules_decide() && self.switched.is_some_and(|n| !self.is_candidate(n.colour)) {
             self.switched = None;
         }
         let inputs = self
@@ -3941,7 +3946,7 @@ impl Tracker {
             .filter(|_| gate)
             .and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref()))
             .or_else(|| self.named_pick.filter(|_| gate).and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref())))
-            .or(size);
+            .or(size.filter(|_| crate::ngx_ring::rules_decide()));
         // The depth image is not part of what was identified: the model reads the colour input and
         // the exposure only, and the depth's layout only gates a dump ([`Scan::dump_hazard`]). Black
         // Myth: Wukong's benchmark with DLSS Frame Generation on hands DLSS a new depth image every
@@ -4281,6 +4286,13 @@ impl Tracker {
             return;
         }
         let Some(current) = self.inputs else {
+            // Evidence comes only from NGX's records in a game ([`crate::ngx_ring::rules_decide`]): the first one is
+            // the identification, whatever the size rule makes of the registered images.
+            if !crate::ngx_ring::rules_decide() {
+                self.switched = evidence.first().copied();
+                self.dirty = true;
+                return;
+            }
             // The first identification: what the input kernel names among the size rule's
             // candidates, rather than the lowest handle.
             let registered = self.registered_set();
@@ -9548,11 +9560,40 @@ mod tests {
         ngx_ring::inject(vec![rr]);
         t.launch_kernel(cb(2), input, Some(&param_block(&[0x1100, 0x1200, 0x1300])));
         assert!(t.launch[&cb(2)].input_rr);
-        // No record naming the colour input: the rules, as before.
+        // No record naming the colour input (a game outside a Neural Forge Proton): the rules' reading is no
+        // identification, so the buffer is neither evidence nor a hold point.
         ngx_ring::inject(vec![]);
         t.launch_kernel(cb(3), input, Some(&param_block(&[0x1100, 0x1200, 0x1300])));
-        assert_eq!(t.launch[&cb(3)].input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
+        assert_eq!(t.launch[&cb(3)].input, None);
         assert!(t.launch[&cb(3)].ngx.is_none());
+    }
+
+    /// In a game the identification is NGX's record's: the size rule's pick is not taken, and the first buffer
+    /// with a record names the inputs every later hold works on (motion vectors 0x410, not the size rule's 0x300).
+    #[test]
+    fn in_a_game_the_inputs_come_from_ngx_s_record_only() {
+        use crate::ngx_ring::{self, tests::record_bytes};
+        let input = vk::CuFunctionNVX::from_raw(0x9301);
+        let rec =
+            ngx_ring::parse_record(&record_bytes(1, ngx_ring::FEATURE_SR, 1, [0x100, 0x410, 0x200, 0x400, 0x610], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 0));
+        ngx_ring::inject(vec![]);
+        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
+        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
+        let line = t.refresh();
+        assert!(t.inputs.is_none(), "no record: the size rule identifies nothing ({line:?})");
+        ngx_ring::inject(vec![rec]);
+        let mut held = None;
+        for k in 1..=40 {
+            t.launch_kernel(cb(k), input, Some(&param_block(&[0x1100, 0x1200, 0x1300, 0x1410, 0x1610])));
+            t.observe(&[vec![cb(k)]]);
+            t.refresh();
+            if let Some(scan) = t.submit_ok(&[vec![cb(k)]]).filter(|s| s.inputs.is_some()) {
+                held = Some(scan);
+                break;
+            }
+        }
+        let inputs = held.expect("a buffer with NGX's record is held").inputs.unwrap();
+        assert_eq!((inputs.colour.0.as_raw(), inputs.depth.0.as_raw(), inputs.mvec.0.as_raw()), (0x100, 0x200, 0x410));
     }
 
     /// (a) GTA V's registered set with its swapchain: the same inputs, line, scan target and
