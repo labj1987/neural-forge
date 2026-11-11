@@ -6,11 +6,16 @@
 //! reserved so far (u64). Record `n` (0-based) lives in slot `n % count` after the header. A writer reserves `n`
 //! with an atomic add, sets the slot's `seq` to 0, writes the fields, then sets `seq` to `n + 1` (release); a
 //! reader takes a slot only while its `seq` reads `n + 1` before and after copying it.
+//!
+//! Each evaluate writes two records: one before NVIDIA's `EvaluateFeature` is called (before NGX records any of the
+//! evaluate's launches) and, once that call returned, the same record again with [`KIND_END`] in `api`. Every CUDA
+//! launch NGX recorded for the evaluate lies between the two on the evaluate's thread, so the layer knows which
+//! launches belong to it (the last one writing the output among them).
 
 /// The file's first 8 bytes.
 pub const MAGIC: [u8; 8] = *b"NFNGXRG1";
-/// The format's version ([`Header::version`]).
-pub const VERSION: u32 = 1;
+/// The format's version ([`Header::version`]). 2: the end-of-evaluate records ([`KIND_END`]).
+pub const VERSION: u32 = 2;
 /// Records per file.
 pub const SLOTS: u32 = 1024;
 /// Bytes before the first record.
@@ -24,6 +29,11 @@ pub const FILE_BYTES: usize = HEADER_BYTES + SLOTS as usize * RECORD_BYTES;
 pub const API_VULKAN: u32 = 1;
 pub const API_D3D11: u32 = 11;
 pub const API_D3D12: u32 = 12;
+/// [`Record::api`]'s low 16 bits are the API; the high bits the record's kind.
+pub const API_MASK: u32 = 0xffff;
+/// [`Record::api`]'s kind bit of an end-of-evaluate record: written once NVIDIA's `EvaluateFeature` returned, with
+/// every other field as the evaluate's own record had them (`seq`, `t_ms` and `thread` its own).
+pub const KIND_END: u32 = 1 << 16;
 
 /// The file header.
 #[repr(C)]
@@ -37,8 +47,8 @@ pub struct Header {
     pub next: core::sync::atomic::AtomicU64,
 }
 
-/// One NGX call: an evaluate (`create_flags` from the feature's creation), or a creation (`seq` as for an evaluate,
-/// `feature` set, images 0).
+/// One NGX call: an evaluate (`create_flags` from the feature's creation) and its end ([`KIND_END`]), or a creation
+/// (`seq` as for an evaluate, `feature` set, images 0).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Record {
@@ -46,7 +56,7 @@ pub struct Record {
     pub seq: u64,
     /// Milliseconds since the wrapper loaded.
     pub t_ms: f64,
-    /// [`API_VULKAN`], [`API_D3D11`] or [`API_D3D12`].
+    /// [`API_VULKAN`], [`API_D3D11`] or [`API_D3D12`], with [`KIND_END`] set on an end-of-evaluate record.
     pub api: u32,
     /// NGX's handle id (not unique across features: Super Resolution and Frame Generation may both be 1).
     pub handle: u32,
@@ -114,5 +124,15 @@ mod tests {
         for (got, want) in at {
             assert_eq!(got, want);
         }
+    }
+
+    /// The kind bit leaves the API readable, and no API code has it.
+    #[test]
+    fn the_end_kind_is_apart_from_the_api() {
+        for api in [API_VULKAN, API_D3D11, API_D3D12] {
+            assert_eq!(api & !API_MASK, 0);
+            assert_eq!((api | KIND_END) & API_MASK, api);
+        }
+        assert_eq!(KIND_END & API_MASK, 0);
     }
 }

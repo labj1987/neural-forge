@@ -22,9 +22,13 @@ use ash::vk::Handle;
 
 /// The file's first 8 bytes, version, and sizes (`crates/ngx-wrapper/src/ring.rs`).
 pub(crate) const MAGIC: [u8; 8] = *b"NFNGXRG1";
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 pub(crate) const HEADER_BYTES: usize = 32;
 pub(crate) const RECORD_BYTES: usize = 128;
+
+/// `api`'s kind bit of an end-of-evaluate record (`crates/ngx-wrapper/src/ring.rs`: `KIND_END`), and the API's bits.
+pub(crate) const KIND_END: u32 = 1 << 16;
+pub(crate) const API_MASK: u32 = 0xffff;
 
 /// NGX's feature numbers.
 pub(crate) const FEATURE_SR: u32 = 1;
@@ -40,7 +44,13 @@ pub(crate) const RING_ENV: &str = "NEURAL_FORGE_NGX_RING";
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Record {
     pub seq: u64,
+    /// The API (`api`'s low bits).
     pub api: u32,
+    /// An end-of-evaluate record: written once NVIDIA's `EvaluateFeature` returned, with the evaluate's own fields.
+    pub end: bool,
+    /// NGX's handle id and the calling thread: with the feature and the images, what ties an end to its evaluate.
+    pub handle: u32,
+    pub thread: u32,
     pub feature: u32,
     pub create_flags: u32,
     pub colour: vk::Image,
@@ -76,9 +86,16 @@ impl Record {
         Images { colour: self.colour, depth: self.depth, mvec: self.mvec, output: self.output, exposure: self.exposure, rr: self.is_rr() }
     }
 
-    /// An evaluate (a creation names no colour input).
+    /// An evaluate (a creation names no colour input), not its end.
     pub(crate) fn is_evaluate(&self) -> bool {
-        self.colour != vk::Image::null()
+        self.colour != vk::Image::null() && !self.end
+    }
+    /// Whether `end` is this evaluate's end record: written after it, for the same feature, handle, thread and images.
+    pub(crate) fn ended_by(&self, end: &Record) -> bool {
+        end.end
+            && end.seq > self.seq
+            && (end.feature, end.handle, end.thread) == (self.feature, self.handle, self.thread)
+            && [end.colour, end.mvec, end.depth, end.output, end.exposure] == [self.colour, self.mvec, self.depth, self.output, self.exposure]
     }
     pub(crate) fn is_rr(&self) -> bool {
         self.feature == FEATURE_RR
@@ -143,7 +160,10 @@ pub(crate) fn parse_record(b: &[u8]) -> Record {
     let image = |at: usize| vk::Image::from_raw(u64_at(b, at));
     Record {
         seq: u64_at(b, 0),
-        api: u32_at(b, 16),
+        api: u32_at(b, 16) & API_MASK,
+        end: u32_at(b, 16) & KIND_END != 0,
+        handle: u32_at(b, 20),
+        thread: u32_at(b, 124),
         feature: u32_at(b, 24),
         create_flags: u32_at(b, 28),
         colour: image(32),
@@ -345,7 +365,8 @@ struct State {
     /// The last time the ring was looked for, while it is not open.
     looked: Option<Instant>,
     said: bool,
-    recent: VecDeque<Record>,
+    /// Super Resolution and Ray Reconstruction evaluates, oldest first, each with whether its end was read.
+    recent: VecDeque<(Record, bool)>,
     summary_at: Option<Instant>,
 }
 
@@ -390,12 +411,7 @@ impl State {
         let recent = &mut self.recent;
         ring.poll(|r| {
             COUNTERS.records.fetch_add(1, Ordering::Relaxed);
-            if r.is_evaluate() && r.upscales() {
-                if recent.len() == RECENT {
-                    recent.pop_front();
-                }
-                recent.push_back(r);
-            }
+            note(recent, r);
         });
         if self.summary_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
             if self.summary_at.is_some() {
@@ -403,6 +419,20 @@ impl State {
             }
             self.summary_at = Some(Instant::now());
         }
+    }
+}
+
+/// Keeps an upscaling evaluate in `recent`, or marks the newest open one an end record ends.
+fn note(recent: &mut VecDeque<(Record, bool)>, r: Record) {
+    if r.end {
+        if let Some((_, ended)) = recent.iter_mut().rev().find(|(b, ended)| !*ended && b.ended_by(&r)) {
+            *ended = true;
+        }
+    } else if r.is_evaluate() && r.upscales() {
+        if recent.len() == RECENT {
+            recent.pop_front();
+        }
+        recent.push_back((r, false));
     }
 }
 
@@ -430,21 +460,34 @@ fn lock() -> std::sync::MutexGuard<'static, State> {
 }
 
 /// The newest Super Resolution or Ray Reconstruction evaluate whose colour input is one of `named` (a launch's
-/// images): NGX writes the record before it records the evaluate's launches, on the same thread, so the newest one
-/// is this launch's. Counts the input launch as matched or not while a ring is open.
+/// images) and whose end was not read yet: NGX writes the record before it records the evaluate's launches, on the
+/// same thread, and its end after the last, so a launch naming the colour input between the two is this evaluate's.
+/// Counts the launch as matched while a ring is open.
 pub(crate) fn evaluate_naming(named: &[vk::Image]) -> Option<Record> {
     #[cfg(test)]
-    if let Some(found) = INJECTED.with(|i| i.borrow().as_ref().map(|recs| recs.iter().rev().find(|r| named.contains(&r.colour)).copied())) {
+    if let Some(found) = injected(|recent| recent.iter().rev().find(|(r, ended)| !ended && named.contains(&r.colour)).map(|(r, _)| *r)) {
         return found;
     }
     let mut s = lock();
     s.poll();
     s.ring.as_ref()?;
-    let found = s.recent.iter().rev().find(|r| named.contains(&r.colour)).copied();
+    let found = s.recent.iter().rev().find(|(r, ended)| !ended && named.contains(&r.colour)).map(|(r, _)| *r);
     if found.is_some() {
         COUNTERS.matched.fetch_add(1, Ordering::Relaxed);
     }
     found
+}
+
+/// Whether the evaluate of record `seq` ended (its end record was read); an evaluate no longer kept ended long ago.
+#[cfg_attr(not(test), expect(dead_code, reason = "the tracker reads it from the next commit on"))]
+pub(crate) fn ended(seq: u64) -> bool {
+    #[cfg(test)]
+    if let Some(found) = injected(|recent| recent.iter().find(|(r, _)| r.seq == seq).is_none_or(|(_, ended)| *ended)) {
+        return found;
+    }
+    let mut s = lock();
+    s.poll();
+    s.recent.iter().find(|(r, _)| r.seq == seq).is_none_or(|(_, ended)| *ended)
 }
 
 /// Whether the kernel rules may decide DLSS's inputs on their own. Never in a game: since 4.0 Neural Forge needs the
@@ -491,12 +534,12 @@ pub(crate) fn note_unmatched() {
 /// The newest evaluate on `colour`, without counting.
 pub(crate) fn latest_for(colour: vk::Image) -> Option<Record> {
     #[cfg(test)]
-    if let Some(found) = INJECTED.with(|i| i.borrow().as_ref().map(|recs| recs.iter().rev().find(|r| r.colour == colour).copied())) {
+    if let Some(found) = injected(|recent| recent.iter().rev().find(|(r, _)| r.colour == colour).map(|(r, _)| *r)) {
         return found;
     }
     let mut s = lock();
     s.poll();
-    s.recent.iter().rev().find(|r| r.colour == colour).copied()
+    s.recent.iter().rev().find(|(r, _)| r.colour == colour).map(|(r, _)| *r)
 }
 
 /// The paper white's factor for a hold on `colour` that encodes with the game's exposure as it is
@@ -541,10 +584,30 @@ thread_local! {
     static INJECTED: std::cell::RefCell<Option<Vec<Record>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Makes this thread's lookups see `records` as the ring's (tests run each on its own thread).
+/// Makes this thread's lookups see `records` as the ring's, in order (tests run each on its own thread).
 #[cfg(test)]
 pub(crate) fn inject(records: Vec<Record>) {
     INJECTED.with(|i| *i.borrow_mut() = Some(records));
+}
+
+/// `f` on the injected records as the ring would keep them ([`note`]), when a test injected any.
+#[cfg(test)]
+fn injected<R>(f: impl FnOnce(&VecDeque<(Record, bool)>) -> R) -> Option<R> {
+    INJECTED.with(|i| {
+        i.borrow().as_ref().map(|records| {
+            let mut recent = VecDeque::new();
+            for r in records {
+                note(&mut recent, *r);
+            }
+            f(&recent)
+        })
+    })
+}
+
+/// The end record of `evaluate` ([`Record::ended_by`]), as the wrapper writes it after NVIDIA's call returned.
+#[cfg(test)]
+pub(crate) fn end_of(evaluate: &Record, seq: u64) -> Record {
+    Record { seq, end: true, ..*evaluate }
 }
 
 #[cfg(test)]
@@ -608,7 +671,7 @@ pub(crate) mod tests {
         let b = record_bytes(7, FEATURE_SR, 0x4b, [0x10, 0x20, 0x30, 0x40, 0x50], [0.25, -0.5], [1920.0, 1080.0], 2.0, 0.5, 1);
         let r = parse_record(&b);
         assert_eq!(r.seq, 7);
-        assert_eq!((r.api, r.feature, r.create_flags), (12, FEATURE_SR, 0x4b));
+        assert_eq!((r.api, r.end, r.feature, r.create_flags), (12, false, FEATURE_SR, 0x4b));
         assert_eq!([r.colour, r.mvec, r.depth, r.output, r.exposure], [img(0x10), img(0x20), img(0x30), img(0x40), img(0x50)]);
         assert_eq!((r.jitter, r.mv_scale, r.pre_exposure, r.exposure_scale, r.reset), ([0.25, -0.5], [1920.0, 1080.0], 2.0, 0.5, true));
         assert_eq!((r.colour_extent, r.output_extent), ((1920, 1080), (3840, 2160)));
@@ -617,15 +680,55 @@ pub(crate) mod tests {
         assert_eq!(r.paper_white_factor(), 4.0, "pre-exposure 2 over exposure scale 0.5");
     }
 
+    /// An end record: the kind bit read apart from the API, and tied to its evaluate by feature, handle, thread and
+    /// images; a later evaluate's end, or another thread's, does not end it.
+    #[test]
+    fn an_end_record_ends_its_own_evaluate() {
+        let mut b = record_bytes(9, FEATURE_SR, 1, [0x10, 0x20, 0x30, 0x40, 0], [0.0; 2], [1.0; 2], 1.0, 1.0, 0);
+        b[20..24].copy_from_slice(&3u32.to_le_bytes());
+        b[124..128].copy_from_slice(&77u32.to_le_bytes());
+        let begin = parse_record(&b);
+        assert_eq!((begin.handle, begin.thread, begin.end), (3, 77, false));
+        let mut e = b;
+        e[0..8].copy_from_slice(&10u64.to_le_bytes());
+        e[16..20].copy_from_slice(&(12 | KIND_END).to_le_bytes());
+        let end = parse_record(&e);
+        assert_eq!((end.api, end.end), (12, true));
+        assert!(!end.is_evaluate() && begin.ended_by(&end));
+        assert!(!begin.ended_by(&Record { thread: 78, ..end }), "another thread's");
+        assert!(!begin.ended_by(&Record { colour: img(0x11), ..end }), "another evaluate's");
+        assert!(!Record { seq: 11, ..begin }.ended_by(&end), "written before it");
+        let mut recent = VecDeque::new();
+        note(&mut recent, begin);
+        let second = Record { seq: 11, ..begin };
+        note(&mut recent, second);
+        note(&mut recent, end_of(&begin, 12));
+        assert_eq!(recent.iter().map(|(r, e)| (r.seq, *e)).collect::<Vec<_>>(), vec![(9, false), (11, true)], "the newest open one ends first");
+    }
+
+    /// A launch belongs to an evaluate only between its record and its end: one naming the colour input after the
+    /// end (DLSS Frame Generation reading the frame) matches none.
+    #[test]
+    fn a_launch_matches_only_an_evaluate_that_has_not_ended() {
+        let begin = parse_record(&record_bytes(1, FEATURE_SR, 1, [0x10, 0x20, 0x30, 0x40, 0], [0.0; 2], [1.0; 2], 1.0, 1.0, 0));
+        inject(vec![begin]);
+        assert_eq!(evaluate_naming(&[img(0x10)]).map(|r| r.seq), Some(1));
+        assert!(!ended(1));
+        inject(vec![begin, end_of(&begin, 2)]);
+        assert_eq!(evaluate_naming(&[img(0x10)]), None);
+        assert!(ended(1) && ended(5), "ended, and one not kept counts as ended");
+        assert_eq!(latest_for(img(0x10)).map(|r| r.seq), Some(1), "its parameters stay readable");
+    }
+
     #[test]
     fn the_header_is_checked() {
         assert_eq!(parse_header(&header(4, 0)), Ok(4));
         let mut wrong = header(4, 0);
         wrong[0] = b'X';
         assert!(parse_header(&wrong).is_err());
-        let mut v2 = header(4, 0);
-        v2[8] = 2;
-        assert!(parse_header(&v2).unwrap_err().contains("version 2"));
+        let mut v1 = header(4, 0);
+        v1[8] = 1;
+        assert!(parse_header(&v1).unwrap_err().contains("version 1"), "a wrapper without end records");
         assert!(parse_header(&header(4, 0)[..HEADER_BYTES + RECORD_BYTES]).is_err(), "shorter than its slots");
     }
 

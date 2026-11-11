@@ -1,12 +1,13 @@
 //! The watched NGX exports: creation, evaluation and release of a feature, for D3D11, D3D12 and Vulkan. Each reads
 //! what it needs through the parameter object NGX itself hands out, writes a record, and calls NVIDIA's function
-//! with the caller's arguments.
+//! with the caller's arguments; an evaluate writes its record again, marked as its end, once NVIDIA's function
+//! returned (`ring::KIND_END`).
 
 use core::ffi::{c_char, c_void};
 use std::fmt::Write as _;
 use std::sync::Mutex;
 
-use crate::ring::{Record, API_D3D11, API_D3D12, API_VULKAN};
+use crate::ring::{Record, API_D3D11, API_D3D12, API_VULKAN, KIND_END};
 use crate::win::{log, logging, publish, target};
 
 /// NGX's `NVSDK_NGX_Parameter` (an MSVC C++ object): its getters' vtable slots. MSVC groups overloads and lays
@@ -305,7 +306,8 @@ unsafe fn create(api: Api, feature: i32, p: *mut Parameter, out: *mut *mut NgxHa
     ));
 }
 
-unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) {
+/// Writes the evaluate's record and returns it, for its end ([`evaluated`]).
+unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Record {
     let found = {
         let mut list = FEATURES.lock().unwrap_or_else(|e| e.into_inner());
         list.iter_mut().find(|f| f.handle == handle as usize).map(|f| {
@@ -369,6 +371,13 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) {
             rec.create_flags
         ));
     }
+    rec
+}
+
+/// NVIDIA's `EvaluateFeature` returned: the evaluate's record again, as its end. NGX recorded every launch of the
+/// evaluate in between, on this thread.
+fn evaluated(rec: Record) {
+    publish(Record { api: rec.api | KIND_END, ..rec });
 }
 
 unsafe fn release(api: Api, handle: *mut NgxHandle) {
@@ -411,8 +420,10 @@ macro_rules! hooks {
         /// NGX's contract.
         #[no_mangle]
         pub unsafe extern "C" fn $evaluate(cmd: *mut c_void, handle: *const NgxHandle, p: *mut Parameter, callback: *mut c_void) -> u32 {
-            evaluate($api, handle, p);
-            real::<EvaluateFn>(stringify!($evaluate))(cmd, handle, p, callback)
+            let rec = evaluate($api, handle, p);
+            let r = real::<EvaluateFn>(stringify!($evaluate))(cmd, handle, p, callback);
+            evaluated(rec);
+            r
         }
         /// # Safety
         /// NGX's contract.
