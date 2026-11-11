@@ -4,7 +4,37 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
-## 3.14.0 — 2026-11-10
+## 4.0.0 — 2026-11-11
+
+**DLSS games need a Neural Forge Proton, and Neural Forge reads what the game gives DLSS**
+
+- Neural Forge no longer works out from DLSS's kernels which images are DLSS's input, motion vectors, depth, output
+  and exposure, or how the motion vectors are measured, the camera jitter, a reset of the game's history, or
+  whether Ray Reconstruction runs. A **Neural Forge copy of Proton** hands it exactly what the game gives DLSS, by
+  name, in every DLSS game: Direct3D 12, Direct3D 11 and Vulkan. Games whose engine Neural Forge did not know now
+  work the same way as the tested ones.
+- Switching a game on (Setup tab, or `neural-forge-cli enable`) with Steam closed now also sets the game's Proton to
+  a Neural Forge copy of the Proton it runs with (GE-Proton, Proton-CachyOS, Valve's Proton or Proton Experimental),
+  making the copy first: `<version>-NeuralForge` next to the original in Steam's compatibilitytools.d, no extra
+  space on the same drive. Restart Steam after a copy was made. Switching the game off, and uninstalling, put back
+  the Proton it had. The Setup tab's **Proton with DLSS parameters** makes, updates and removes copies;
+  `neural-forge-cli proton-tool` does the same.
+- A DLSS game that does not run with a Neural Forge Proton keeps the model off: the Status tab, `doctor` and the
+  game's log say why and how to fix it. Choose the finished frame as the placement to have the model there anyway.
+  Games without DLSS run the model on the finished frame as before.
+- In a DLSS game the model never runs on the finished frame on its own any more (menus, loading screens before DLSS
+  starts), which at 4K built the network at the output size: behind hangs in GTA V Enhanced and video-memory
+  spills in Cyberpunk 2077 with Ray Reconstruction.
+- `doctor` checks that the NGX wrapper is installed and forwards every function of your driver's NGX core, that
+  each switched-on game is set to a Neural Forge Proton, and which copies were made from an older Proton than is
+  installed now.
+- Games that hand DLSS different images frame by frame (GTA V Enhanced rotates its motion vectors, depth and
+  exposure image) keep the model and its history on every frame.
+- Online games with anti-cheat may refuse the changed module: use the Neural Forge Proton for single-player games.
+  `PROTON_NO_NEURAL_FORGE_NGX=1` in a game's launch options runs it without the wrapper.
+
+**Everything 3.14.0 was going to bring** (never released on its own)
+
 
 **The model before the upscaler in more games**
 
