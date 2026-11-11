@@ -1709,6 +1709,23 @@ mod tests {
         assert!(v.iter().any(|x| x.check == "ngx-ring" && x.summary.contains("ring version 1")), "{v:#?}");
     }
 
+    /// A running game whose copy still holds the wrapper of the ring version before (no subrects) is said; one of the
+    /// version this layer reads is not.
+    #[test]
+    fn a_ring_of_the_version_before_is_reported() {
+        let f = quiet();
+        write(&f.roots.data_dir.join(crate::proton_tool::WRAPPER), "MZ");
+        let ring = f.roots.ring_dir.join(format!("neural-forge-ngx-{}.ring", std::process::id()));
+        write(&ring, "NFNGXRG1\x02\0\0\0");
+        let v = check_proton(&f.roots);
+        let found = v.iter().find(|x| x.check == "ngx-ring").expect("reported");
+        assert!(found.summary.contains("ring version 2") && found.summary.contains("reads version 3"), "{found:#?}");
+        let mut current = b"NFNGXRG1".to_vec();
+        current.extend(crate::proton_tool::RING_VERSION.to_le_bytes());
+        std::fs::write(&ring, current).unwrap();
+        assert!(!check_proton(&f.roots).iter().any(|x| x.check == "ngx-ring"), "the version read");
+    }
+
     fn one<'a>(findings: &'a [Finding], check: &str) -> &'a Finding {
         let found = find(findings, check);
         assert_eq!(found.len(), 1, "{check}: {findings:#?}");

@@ -23,14 +23,15 @@
 
 /// The file's first 8 bytes.
 pub const MAGIC: [u8; 8] = *b"NFNGXRG1";
-/// The format's version ([`Header::version`]). 2: the end-of-evaluate records ([`KIND_END`]).
-pub const VERSION: u32 = 2;
+/// The format's version ([`Header::version`]). 2: the end-of-evaluate records ([`KIND_END`]). 3: the inputs' and the
+/// output's subrect bases and the feature's output size ([`Record::colour_base`] on), 168-byte records.
+pub const VERSION: u32 = 3;
 /// Records per file.
 pub const SLOTS: u32 = 1024;
 /// Bytes before the first record.
 pub const HEADER_BYTES: usize = 32;
-/// Bytes per record.
-pub const RECORD_BYTES: usize = 128;
+/// Bytes per record (a multiple of 8: every slot's `seq` is an aligned u64).
+pub const RECORD_BYTES: usize = 168;
 /// The whole file.
 pub const FILE_BYTES: usize = HEADER_BYTES + SLOTS as usize * RECORD_BYTES;
 
@@ -89,12 +90,23 @@ pub struct Record {
     pub exposure_scale: f32,
     /// `Reset`.
     pub reset: i32,
-    /// `DLSS.Render.Subrect.Dimensions` (0 if not given), the colour input's and the output's extents.
+    /// `DLSS.Render.Subrect.Dimensions` (0 if not given; a creation: its `Width`/`Height`), the colour input's and
+    /// the output's extents.
     pub render: [u32; 2],
     pub colour_extent: [u32; 2],
     pub output_extent: [u32; 2],
     /// The calling thread (Windows thread id).
     pub thread: u32,
+    /// Where in each image DLSS's rectangle starts (0 if not given): `DLSS.Input.Color.Subrect.Base.X/Y`,
+    /// `DLSS.Input.MV.Subrect.Base.X/Y`, `DLSS.Input.Depth.Subrect.Base.X/Y`, `DLSS.Output.Subrect.Base.X/Y`.
+    /// The inputs' rectangles are `render` wide and high (DLSS reads nothing of them outside it).
+    pub colour_base: [u32; 2],
+    pub mvec_base: [u32; 2],
+    pub depth_base: [u32; 2],
+    pub output_base: [u32; 2],
+    /// The feature's output size, `OutWidth`/`OutHeight` at its creation (0 if not known): the rectangle DLSS writes
+    /// at `output_base`.
+    pub output_size: [u32; 2],
 }
 
 #[cfg(test)]
@@ -108,6 +120,7 @@ mod tests {
         assert_eq!(size_of::<Header>(), HEADER_BYTES);
         assert_eq!(offset_of!(Header, next), 24);
         assert_eq!(size_of::<Record>(), RECORD_BYTES);
+        assert_eq!(RECORD_BYTES % 8, 0, "every slot's seq is an aligned u64");
         let at = [
             (offset_of!(Record, seq), 0),
             (offset_of!(Record, t_ms), 8),
@@ -129,6 +142,11 @@ mod tests {
             (offset_of!(Record, colour_extent), 108),
             (offset_of!(Record, output_extent), 116),
             (offset_of!(Record, thread), 124),
+            (offset_of!(Record, colour_base), 128),
+            (offset_of!(Record, mvec_base), 136),
+            (offset_of!(Record, depth_base), 144),
+            (offset_of!(Record, output_base), 152),
+            (offset_of!(Record, output_size), 160),
         ];
         for (got, want) in at {
             assert_eq!(got, want);

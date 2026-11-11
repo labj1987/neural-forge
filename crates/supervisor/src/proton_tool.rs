@@ -33,8 +33,9 @@ pub const MIN_WINE_MAJOR: u32 = 10;
 /// Where the wrapper's rings are (`/dev/shm/neural-forge-ngx-<pid>.ring`, the game's Linux pid).
 pub const RING_DIR: &str = "/dev/shm";
 /// The ring format this Neural Forge's layer reads (`crates/ngx-wrapper/src/ring.rs` `VERSION`, the layer's
-/// `ngx_ring::VERSION`): a ring of another version comes from a copy with an older wrapper.
-pub const RING_VERSION: u32 = 2;
+/// `ngx_ring::VERSION`): a ring of another version comes from a copy with an older wrapper. 3: DLSS's subrect (4.0's
+/// wrapper writes 2).
+pub const RING_VERSION: u32 = 3;
 /// The first 8 bytes of a ring.
 const RING_MAGIC: &[u8; 8] = b"NFNGXRG1";
 
@@ -746,6 +747,13 @@ pub fn installed_wrapper() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `doctor` reports a ring of another version than the layer reads: the same number.
+    #[test]
+    fn the_ring_version_is_the_layers() {
+        let layer = include_str!("../../layer/src/ngx_ring.rs");
+        assert!(layer.contains(&format!("pub(crate) const VERSION: u32 = {RING_VERSION};")));
+    }
 
     const VALVE: &str = "        self.nvidia_wine_dll_dir = find_nvidia_wine_dll_dir()\n        if self.nvidia_wine_dll_dir:\n            self.env[\"NVIDIA_WINE_DLL_DIR\"] = self.nvidia_wine_dll_dir\n\n        if \"PROTON_LOG\" in self.env:\n";
 
