@@ -2608,3 +2608,60 @@ frames to the steady game took about a minute: the holds kept the build in use f
 Tests (`vram_guard`): `a_spill_that_slows_the_game_to_a_few_fps_still_steps_down` (four holds a second, one a second,
 two slow frames five seconds apart, 1.7 s near the budget; not with a gigabyte of room, not on stale samples; fails
 without the fix); `native::tests::a_step_down_nobody_asks_for_is_applied_when_the_network_is_idle`.
+
+## Loading screens before DLSS's first frame (#59, 2026-11-11)
+
+**What happened.** Before the first held frame nothing kept the after-the-upscaler path off, so with Placement Auto it
+took a DLSS game's loading screens and menus: it built the network at the output size and ran it there. In GTA V
+Enhanced at 4K (FG 4x, FrameLimit 120) that build came on the first loading screen, 40-60 s before DLSS's first frame;
+in the three launches of eleven where it came before the game created its last two Vulkan devices (NGX's: `asks for
+family 0 x1, family 1 x1`) the game's main loop stopped within a second of those devices and its watchdog closed it at
+`+0x12c6eb` (docs/LESSONS.md, "The +0x12c6eb crash"); in the eight where those devices came first it passed. In
+Cyberpunk 2077 at 4K with Ray Reconstruction the post path ran at 4K on the main menu, again for Ray Reconstruction's
+first frames during the benchmark's loading (no hold after DLSS was recorded yet, so every pass was "at present"), and
+held the network while the holds after DLSS waited (`the network is serving the after-the-upscaler path`); its 4K
+buffers stayed allocated beside the holds', the card spilled (the network at 563 ms a frame), and the VRAM guard
+paused the network. After the pause the game ran at 28-29 fps instead of 55-65: the holds after DLSS missed
+(paused), so after a second Ray Reconstruction's frames went to the post path again, which captured every 4K HDR10
+frame, echoed it through the server unchanged and waited for it, on the present thread, with no network to run.
+
+**The change.**
+
+1. `dlss_game`: whether the process is a DLSS game, known before DLSS's first frame. A thread started with the first
+   tracked device in model mode reads `/proc/self/maps` (every 0.5 s for three minutes, then every 5 s, until a sign)
+   for DLSS's libraries: `nvngx_dlss.dll`, `nvngx_dlssd.dll`, `sl.dlss.dll`, `sl.dlss_d.dll`, a native
+   `libnvidia-ngx-dlss*.so` (Frame Generation's own are no sign). Wine maps a PE image's headers from its file, so the
+   path is there as soon as the DLL is loaded. A DLSS kernel created through `vkCreateCuFunctionNVX` (Super
+   Resolution's or Ray Reconstruction's names) is a sign too, later. In GTA V the DLL sign is logged between the
+   game's first and second devices, long before its loading screen.
+2. `pre_dlss_post_off`: in a DLSS game no device of which has held a frame yet, the post path stays off (status
+   `PAUSED`) until the hand-back rules counted from the sign: `HAND_BACK` of Super Resolution launching with nothing
+   held, `PAUSE_HAND_BACK` with no launch at all (a game that ships DLSS and runs another upscaler gets the post path
+   after 5 minutes). Once a frame was held the existing rules apply. The post path serving every pass (placement
+   present, `post_serves`) is never kept off.
+3. `post_serves`: Ray Reconstruction hands the frames to the post path only once it has run for
+   `RAY_RECONSTRUCTION_SETTLE` (2 s; its first frames come before the hold after DLSS can be recorded) and while no hold
+   after DLSS was recorded or tried within a second (`note_after_dlss_tried`: a hold after DLSS that got its resources
+   and asked for the network, and missed for the network's sake: the post path had it, the guard paused it, a build).
+4. `native_post::release_idle`: the post path's buffers (proxy, answer, SDR picture, histories, optical flow) are freed
+   between its requests once the holds took the network over (`Loader::holds_took_over`: a hold asked a second or more
+   after the post path's last frame, none running), as they already were while the guard pauses. Its own frames wait
+   for their work; after one that did not finish in time (`stalled`) nothing is freed. The network's build at the post
+   path's size is replaced by the holds' at their first request, as before.
+5. While the VRAM guard has this device's network paused, the post path captures nothing (`Session::network_paused`),
+   as when the model is unavailable.
+
+Tests: `a_dlss_game_gets_no_post_path_before_dlss_first_frame`, `ray_reconstruction_hands_the_post_path_its_frames_only_once_settled`,
+`native_post::tests::the_buffers_go_once_the_holds_take_the_network_over` (each fails with its fix reverted),
+`dlss_game::tests` (the libraries and kernel names).
+
+**Measured** (RTX 5070, the desktop at 3840x2160 144 Hz VRR HDR):
+
+- GTA V Enhanced, FG 4x, FrameLimit 120, 3 launches: two benchmark results (4.0x, 36 fps real, 140-144 displayed, no
+  hang, no Xid); `nvngx_dlss.dll is loaded` logged between the game's first and second devices, the network built only
+  for the holds (2228x1253), no post path at any point. The third launch never started the game (Rockstar's launcher;
+  seen with the model off too).
+- Cyberpunk 2077, HDR10, Ray Reconstruction on (`game-sweep --only cyberpunk-rr`), 1 run: `nvngx_dlssd.dll is loaded`
+  at start, no post path on the menus or loading, one build at 3840x2160 for the holds after DLSS, no VRAM guard step,
+  58-65 fps presented through the benchmark (the 28-29 fps after a pause was not reproduced: no pause). The sweep's own
+  verdict failed on reading the channel status (its CLI), not on the game.

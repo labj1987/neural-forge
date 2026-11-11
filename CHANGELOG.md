@@ -108,6 +108,21 @@ first shipped them; their phase is kept as a subheading.
   network under such a frame would crash the game); while it waits, no new frame takes the network, so a game that
   keeps handing it frames still gets the pause. Measured: the game back at 65-69 fps seconds after the pause was
   decided, steady from there.
+- In a game that uses DLSS, the model no longer runs on the finished frame over the loading screens and menus before
+  DLSS's first frame (with Placement on Auto): they go untouched, and the model starts with DLSS. Neural Forge knows
+  the game uses DLSS from its DLSS libraries (or DLSS's kernels) as the game starts. Before, the model was built at
+  the output size for the first loading screen and run over it; in GTA V Enhanced at 4K this ended in the game's
+  own hang detector closing the game when that happened before the game had set up DLSS (3 of 6 launches in one
+  test), and in Cyberpunk 2077 at 4K with Ray Reconstruction it filled the video memory, so the model was paused
+  and the game ran at half its frame rate. A game that ships DLSS but runs another upscaler gets the model on the
+  finished frame after 5 minutes without DLSS, or 30 seconds of DLSS frames the model cannot work on. Placement
+  set to the finished frame (present) is unchanged.
+- When the model moves from the finished frame to the game's frame (DLSS starts, or resumes after a menu), the
+  finished-frame path's buffers are freed at once instead of staying in video memory beside the game's.
+- With Ray Reconstruction, the model no longer jumps to the finished frame for the first moments of DLSS or while
+  it waits for the network: it stays in the game's frame after DLSS. While the video memory guard has the network
+  paused, the finished-frame path no longer copies every frame for nothing (Cyberpunk 2077 at 4K ran at 28-29 fps
+  instead of 55-65 after such a pause).
 
 **Seeing why the model does not run before the upscaler**
 

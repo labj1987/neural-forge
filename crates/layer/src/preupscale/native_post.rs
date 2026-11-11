@@ -668,18 +668,8 @@ fn serve(
             last_request = Instant::now();
             process(device, instance, physical, import, loader, view, gpu, slot, seq, &mut frames);
         }
-        // Paused by the VRAM guard: this path's buffers at the output size go too, so the game gets all of Neural
-        // Forge's memory back; built again by the first request after the resume.
-        if loader.paused() && gpu.slots.iter().any(Option::is_some) {
-            for s in 0..gpu.slots.len() {
-                if let Some(old) = gpu.slots[s].take() {
-                    // SAFETY: nothing pending (every request waits for its own work).
-                    unsafe { old.destroy(device, gpu.flow.device()) };
-                }
-                gpu.history[s].skipped();
-            }
-            gpu.bound = None;
-            crate::log!("[native] VRAM guard: the after-the-upscaler path's buffers are freed until the network resumes");
+        if let Some(why) = release_idle(device, loader, gpu) {
+            crate::log!("[native] {why}");
             crate::logging::flush();
         }
         hdr.server_heartbeat.fetch_add(1, Ordering::Relaxed);
@@ -690,6 +680,43 @@ fn serve(
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+/// Frees this path's buffers between its requests when nothing needs them ([`serve`]), and says why. Paused by the VRAM
+/// guard: they go so the game gets all of Neural Forge's memory back; built again by the first request after the resume.
+/// The same once the holds took the network over (DLSS started after its loading screens or menus, or came back after a
+/// pause, [`Loader::holds_took_over`]): they are not needed while the holds run, and kept they sat in VRAM beside the
+/// holds' (Cyberpunk 2077 at 4K with Ray Reconstruction spilled, #59). Never after a frame that did not finish in time
+/// (`gpu.stalled`): its work may still use them.
+fn release_idle(device: &ash::Device, loader: &Loader, gpu: &mut Gpu) -> Option<&'static str> {
+    if gpu.stalled || gpu.slots.iter().all(Option::is_none) {
+        return None;
+    }
+    let why = if loader.paused() {
+        "VRAM guard: the after-the-upscaler path's buffers are freed until the network resumes"
+    } else if loader.holds_took_over() {
+        "the holds in the game's frame took the network over: the after-the-upscaler path's buffers are freed"
+    } else {
+        return None;
+    };
+    // SAFETY: nothing pending: every request waits for its own work, and one that did not (stalled) returned above.
+    unsafe { free_slots(device, gpu) };
+    Some(why)
+}
+
+/// Frees every slot's buffers ([`serve`]); the next request builds them again, its history afresh.
+///
+/// # Safety
+/// Nothing of `gpu`'s is pending.
+unsafe fn free_slots(device: &ash::Device, gpu: &mut Gpu) {
+    for s in 0..gpu.slots.len() {
+        if let Some(old) = gpu.slots[s].take() {
+            // SAFETY: nothing pending (the caller's contract).
+            unsafe { old.destroy(device, gpu.flow.device()) };
+        }
+        gpu.history[s].skipped();
+    }
+    gpu.bound = None;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2586,6 +2613,34 @@ mod tests {
     /// The shipped after-the-upscaler frame (3.7.0, no history), as `NEURAL_FORGE_POST_MOTION=none` must
     /// keep it bit for bit: the answers and lanes of a one-pass and a three-pass frame with the Model tab's
     /// defaults and with an intensity and conditioning, pinned from 3.7.0's shaders.
+    /// Once the holds took the network over, this path's buffers are freed between its requests; not while it is the
+    /// one running frames. Fails without the release (the buffers stayed until a VRAM guard pause).
+    #[test]
+    fn the_buffers_go_once_the_holds_take_the_network_over() {
+        let Some(mut rig) = Rig::new() else { return };
+        let loader = Loader::idle_for_test();
+        rig.frame(&picture(1), &[Conditioning::default()]);
+        assert!(rig.gpu.slots[Slot::Primary.index()].is_some(), "a frame builds its slot's buffers");
+        // This path ran a frame just now; no hold since.
+        loader.stamp_for_test(0, 10_000, false);
+        assert_eq!(release_idle(&rig.device, &loader, &mut rig.gpu), None);
+        assert!(rig.gpu.slots[Slot::Primary.index()].is_some(), "kept while this path runs the frames");
+        // A hold asked within the path switch of this path's last frame: the paths may still be trading.
+        loader.stamp_for_test(10_500, 10_000, false);
+        assert_eq!(release_idle(&rig.device, &loader, &mut rig.gpu), None);
+        // A frame of this path running now.
+        loader.stamp_for_test(12_000, 10_000, true);
+        assert_eq!(release_idle(&rig.device, &loader, &mut rig.gpu), None);
+        // The holds asked a second or more after this path's last frame: freed.
+        loader.stamp_for_test(11_000, 10_000, false);
+        assert!(release_idle(&rig.device, &loader, &mut rig.gpu).is_some_and(|w| w.contains("took the network over")));
+        assert!(rig.gpu.slots.iter().all(Option::is_none), "every slot's buffers are freed");
+        assert_eq!(release_idle(&rig.device, &loader, &mut rig.gpu), None, "nothing left to free");
+        // The next frame builds them again and runs.
+        rig.frame(&picture(2), &[Conditioning::default()]);
+        assert!(rig.gpu.slots[Slot::Primary.index()].is_some());
+    }
+
     #[test]
     fn the_shipped_frame_stays_bit_for_bit() {
         let Some(mut rig) = Rig::new() else { return };
