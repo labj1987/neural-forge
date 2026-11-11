@@ -31,6 +31,9 @@ pub(crate) const RECORD_BYTES: usize = 128;
 pub(crate) const KIND_END: u32 = 1 << 16;
 pub(crate) const API_MASK: u32 = 0xffff;
 
+/// [`Record::api`] of a D3D11 evaluate (the wrapper's `ring::API_D3D11`).
+pub(crate) const API_D3D11: u32 = 11;
+
 /// NGX's feature numbers.
 pub(crate) const FEATURE_SR: u32 = 1;
 pub(crate) const FEATURE_RR: u32 = 13;
@@ -326,7 +329,10 @@ impl State {
 /// Keeps an upscaling evaluate in `recent`, or marks the newest open one an end record ends.
 fn note(recent: &mut VecDeque<(Record, bool)>, r: Record) {
     if r.end {
-        if let Some((_, ended)) = recent.iter_mut().rev().find(|(b, ended)| !*ended && b.ended_by(&r)) {
+        // A D3D11 evaluate's launches are recorded later, on DXVK's worker thread, after NVIDIA's call returned: its
+        // end says nothing of them, so it stays open for matching (GTA San Andreas - The Definitive Edition,
+        // 2026-11-11: one evaluate in thousands matched).
+        if let Some((_, ended)) = recent.iter_mut().rev().find(|(b, ended)| !*ended && b.ended_by(&r) && b.api & 0xffff != API_D3D11) {
             *ended = true;
         }
     } else if r.is_evaluate() && r.upscales() {
@@ -357,7 +363,19 @@ pub(crate) fn evaluate_naming(named: &[vk::Image]) -> Option<Record> {
     let mut s = lock();
     s.poll();
     s.ring.as_ref()?;
-    s.recent.iter().rev().find(|(r, ended)| !ended && named.contains(&r.colour)).map(|(r, _)| *r)
+    pick(&mut s.recent, named)
+}
+
+/// [`evaluate_naming`] over `recent`. A D3D11 evaluate's launches come later, on DXVK's worker thread, possibly after
+/// the next evaluate's record: the oldest open D3D11 evaluate naming the launch's colour input is its, and taking it
+/// closes it, so each is matched once and in order.
+fn pick(recent: &mut VecDeque<(Record, bool)>, named: &[vk::Image]) -> Option<Record> {
+    if let Some((r, _)) = recent.iter().rev().find(|(r, ended)| !ended && r.api != API_D3D11 && named.contains(&r.colour)) {
+        return Some(*r);
+    }
+    let (r, ended) = recent.iter_mut().find(|(r, ended)| !*ended && r.api == API_D3D11 && named.contains(&r.colour))?;
+    *ended = true;
+    Some(*r)
 }
 
 /// The newest upscaling evaluate whose colour input `known` accepts (an image of the asking device): what identifies
@@ -702,5 +720,21 @@ pub(crate) mod tests {
         ring.poll(|r| got.push(r.seq));
         assert!(got.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// DXVK records a D3D11 evaluate's launches later, after the next record may have come: the oldest open D3D11
+    /// evaluate naming the colour input is the launch's, taken once; D3D12's newest open one, kept for its other
+    /// launches.
+    #[test]
+    fn d3d11_evaluates_are_taken_in_order_once_each() {
+        let rec = |seq: u64, api: u32| Record { seq, api, feature: FEATURE_SR, colour: vk::Image::from_raw(0x10), ..Record::default() };
+        let mut recent: VecDeque<(Record, bool)> = [rec(1, API_D3D11), rec(2, API_D3D11)].into_iter().map(|r| (r, false)).collect();
+        let named = [vk::Image::from_raw(0x10)];
+        assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(1));
+        assert_eq!(pick(&mut recent, &named).map(|r| r.seq), Some(2));
+        assert_eq!(pick(&mut recent, &named), None, "each once");
+        let mut d3d12: VecDeque<(Record, bool)> = [rec(3, 12), rec(4, 12)].into_iter().map(|r| (r, false)).collect();
+        assert_eq!(pick(&mut d3d12, &named).map(|r| r.seq), Some(4));
+        assert_eq!(pick(&mut d3d12, &named).map(|r| r.seq), Some(4), "kept open for the buffer's other launches");
     }
 }
