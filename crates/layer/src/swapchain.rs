@@ -22,6 +22,11 @@ pub struct SwapchainState {
     /// here is exactly what `VkPresentInfoKHR::pImageIndices[i]` refers to. Fetched
     /// once at creation (see `device::NeuralForgeDeviceInfo::fetch_swapchain_images`).
     pub images: Vec<vk::Image>,
+    /// What its HDR verdict is made from (`crate::hdr_verdict`); the first HDR metadata is added when it comes.
+    pub hdr: crate::hdr_verdict::Facts,
+    /// [`Self::hdr`]'s verdict, made when it changes; empty for a swapchain that is not the game's own (too small,
+    /// another process's, not on the NVIDIA GPU), which publishes none.
+    pub hdr_text: String,
 }
 
 /// Decides when the layer may engage on a swapchain: only once the game itself has been
@@ -233,8 +238,27 @@ pub fn detect_hdr_kind(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u3
 /// that does not say so, which the compositor then shows as sRGB (#51: Stellar Blade and Indiana Jones under
 /// gamescope with HDR on in the game; gamescope logged the metadata, the layer only sRGB swapchains).
 pub fn hdr_metadata_line(format: vk::Format, color_space: vk::ColorSpaceKHR, m: &vk::HdrMetadataEXT) -> String {
+    let primaries = primaries_name(m);
+    let ten_bit = matches!(format, vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32);
+    let what = match detect_hdr_kind(format, color_space) {
+        hdr_kind::PQ10 => "the swapchain is HDR10 (PQ), as the metadata says",
+        hdr_kind::LINEAR_FP16 => "the swapchain is linear FP16",
+        _ if ten_bit && color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR => {
+            "the application created this swapchain as sRGB: its frames are SDR, or PQ-encoded HDR10 the swapchain does not declare \
+             (then shown as sRGB); either way it is not an HDR10 swapchain to the layer, which presents it untouched"
+        }
+        _ => "the swapchain's colour space is not HDR10",
+    };
+    format!(
+        "HDR metadata for a {format:?} {color_space:?} swapchain: {primaries} primaries, mastering luminance {:.4}-{:.0} nits, MaxCLL {:.0}, MaxFALL {:.0}; {what}",
+        m.min_luminance, m.max_luminance, m.max_content_light_level, m.max_frame_average_light_level
+    )
+}
+
+/// The metadata's display primaries by name ("BT.2020", "Display P3", "BT.709"), else in numbers.
+pub fn primaries_name(m: &vk::HdrMetadataEXT) -> String {
     let near = |p: vk::XYColorEXT, x: f32, y: f32| (p.x - x).abs() < 0.005 && (p.y - y).abs() < 0.005;
-    let primaries = if near(m.display_primary_red, 0.708, 0.292) && near(m.display_primary_green, 0.170, 0.797) && near(m.display_primary_blue, 0.131, 0.046) {
+    if near(m.display_primary_red, 0.708, 0.292) && near(m.display_primary_green, 0.170, 0.797) && near(m.display_primary_blue, 0.131, 0.046) {
         "BT.2020".to_string()
     } else if near(m.display_primary_red, 0.680, 0.320) && near(m.display_primary_green, 0.265, 0.690) && near(m.display_primary_blue, 0.150, 0.060) {
         "Display P3".to_string()
@@ -250,21 +274,7 @@ pub fn hdr_metadata_line(format: vk::Format, color_space: vk::ColorSpaceKHR, m: 
             m.display_primary_blue.x,
             m.display_primary_blue.y
         )
-    };
-    let ten_bit = matches!(format, vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32);
-    let what = match detect_hdr_kind(format, color_space) {
-        hdr_kind::PQ10 => "the swapchain is HDR10 (PQ), as the metadata says",
-        hdr_kind::LINEAR_FP16 => "the swapchain is linear FP16",
-        _ if ten_bit && color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR => {
-            "the application created this swapchain as sRGB: its frames are SDR, or PQ-encoded HDR10 the swapchain does not declare \
-             (then shown as sRGB); either way it is not an HDR10 swapchain to the layer, which presents it untouched"
-        }
-        _ => "the swapchain's colour space is not HDR10",
-    };
-    format!(
-        "HDR metadata for a {format:?} {color_space:?} swapchain: {primaries} primaries, mastering luminance {:.4}-{:.0} nits, MaxCLL {:.0}, MaxFALL {:.0}; {what}",
-        m.min_luminance, m.max_luminance, m.max_content_light_level, m.max_frame_average_light_level
-    )
+    }
 }
 
 #[cfg(test)]
