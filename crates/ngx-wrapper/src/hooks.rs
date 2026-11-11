@@ -71,8 +71,10 @@ struct Image {
 
 type Com = *mut *const *const c_void;
 
+/// The function in slot `slot` of the COM object `obj`'s vtable.
 unsafe fn method<F: Copy>(obj: Com, slot: usize) -> F {
-    core::mem::transmute_copy(&*(**obj).add(slot))
+    let vtable: *const *const c_void = *obj;
+    core::mem::transmute_copy(&*vtable.add(slot))
 }
 
 #[repr(C)]
