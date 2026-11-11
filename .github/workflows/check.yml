@@ -252,6 +252,7 @@ jobs:
           python3 scripts/test_cache_replay.py
           python3 scripts/gen_third_party_crates.py --self-test
           python3 scripts/check_pins.py --self-test
+          python3 scripts/check_proton_scripts.py --self-test
           bash scripts/gta-bench.sh --self-test
           bash scripts/build-ngx-wrapper.sh --self-test
           bash scripts/game-sweep.sh --self-test

@@ -16,12 +16,23 @@ pub struct Marker {
     pub source_version: String,
     /// The SHA-256 of the wrapper in the copy.
     pub wrapper_sha256: String,
+    /// How many files of the copy were hard links to the source when it was made (`linked=`), and the fingerprint
+    /// of them (`link_fingerprint=`); absent in a copy made before they were recorded, and 0 files where the
+    /// source is on another filesystem (a full copy).
+    pub linked: Option<u64>,
+    pub link_fingerprint: String,
 }
 
 impl Marker {
     pub fn parse(text: &str) -> Self {
         let field = |k: &str| text.lines().find_map(|l| l.strip_prefix(k).map(str::to_string)).unwrap_or_default();
-        Self { source: field("source=").into(), source_version: field("source_version="), wrapper_sha256: field("wrapper_sha256=") }
+        Self {
+            source: field("source=").into(),
+            source_version: field("source_version="),
+            wrapper_sha256: field("wrapper_sha256="),
+            linked: field("linked=").parse().ok(),
+            link_fingerprint: field("link_fingerprint="),
+        }
     }
 
     /// The marker of the copy in `dir`; `None` when `dir` is no copy.
@@ -62,10 +73,38 @@ pub fn stale_notice(copy_dir: &Path) -> Option<String> {
     ))
 }
 
-/// [`stale_notice`] for each copy named by Steam's `STEAM_COMPAT_TOOL_PATHS` (a `:`-separated list of the compat
-/// tool folders the game runs with).
-pub fn stale_notices(tool_paths: &str) -> Vec<String> {
-    tool_paths.split(':').filter(|p| !p.is_empty()).filter_map(|p| stale_notice(Path::new(p))).collect()
+/// The Proton folders a game process runs with: Steam's `STEAM_COMPAT_TOOL_PATHS` (a `:`-separated list of the compat
+/// tool folders), and the folders Wine's own libraries were loaded from, read from `maps` (`/proc/self/maps`: a
+/// Proton's `files/lib/wine/x86_64-unix/ntdll.so` is mapped in every Wine process, and says which copy it is
+/// whatever environment reached the process).
+pub fn running_proton_dirs(tool_paths: Option<&str>, maps: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = tool_paths.into_iter().flat_map(|p| p.split(':')).filter(|p| !p.is_empty()).map(PathBuf::from).collect();
+    for line in maps.lines() {
+        // `address perms offset dev inode   path`: the path is what follows the fifth field.
+        let mut rest = line;
+        let mut fields = 0;
+        while fields < 5 {
+            rest = rest.trim_start();
+            let Some(end) = rest.find(char::is_whitespace) else { break };
+            rest = &rest[end..];
+            fields += 1;
+        }
+        let path = rest.trim_start();
+        if fields == 5 && path.starts_with('/') {
+            if let Some(at) = path.find("/files/lib") {
+                let dir = PathBuf::from(&path[..at]);
+                if !out.contains(&dir) {
+                    out.push(dir);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [`stale_notice`] for each copy among [`running_proton_dirs`].
+pub fn launch_notices(tool_paths: Option<&str>, maps: &str) -> Vec<String> {
+    running_proton_dirs(tool_paths, maps).iter().filter_map(|d| stale_notice(d)).collect()
 }
 
 #[cfg(test)]
@@ -116,6 +155,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Lines as a running Wine process has them (read from Proton Experimental's `/proc/PID/maps` on 2026-11-11): the
+    /// path follows padding and has spaces in it.
+    #[test]
+    fn a_wine_process_s_maps_name_its_proton_folder_spaces_included() {
+        let maps = "00010000-00026000 r--p 00000000 00:32 8711809                            /mnt/Storage/Steam/steamapps/common/Proton - Experimental/files/lib/wine/x86_64-windows/apisetschema.dll\n\
+                    7ffff7a00000-7ffff7a28000 r--p 00000000 00:32 1                          /home/alex/.local/share/Steam/compatibilitytools.d/GE-Proton11-12-NeuralForge/files/lib64/wine/x86_64-unix/ntdll.so\n";
+        assert_eq!(
+            running_proton_dirs(None, maps),
+            vec![
+                PathBuf::from("/mnt/Storage/Steam/steamapps/common/Proton - Experimental"),
+                PathBuf::from("/home/alex/.local/share/Steam/compatibilitytools.d/GE-Proton11-12-NeuralForge")
+            ]
+        );
+    }
+
     #[test]
     fn the_launch_notice_names_the_copy_and_the_fix_only_for_a_stale_copy() {
         let d = scratch("notice");
@@ -130,8 +184,21 @@ mod tests {
         assert_eq!(stale_notice(&current), None);
         assert_eq!(stale_notice(&other), None, "not a copy");
         let paths = format!("{}::{}:{}", other.display(), stale.display(), current.display());
-        assert_eq!(stale_notices(&paths), vec![line]);
-        assert!(stale_notices("").is_empty());
+        assert_eq!(launch_notices(Some(&paths), ""), vec![line.clone()]);
+        assert!(launch_notices(Some(""), "").is_empty() && launch_notices(None, "").is_empty());
+        // Without Steam's variable: the copy Wine's libraries were loaded from, named once however many are mapped.
+        let maps = format!(
+            "7f0000000000-7f0000100000 r--p 00000000 08:01 1234                      {0}/files/lib/wine/x86_64-unix/ntdll.so\n\
+             7f0000100000-7f0000200000 r-xp 00100000 08:01 1234                      {0}/files/lib/wine/x86_64-unix/ntdll.so\n\
+             7f0000300000-7f0000400000 r--p 00000000 08:01 99                        /usr/lib/libc.so.6\n\
+             7f0000500000-7f0000600000 rw-p 00000000 00:00 0                         [heap]\n\
+             7f0000700000-7f0000800000 r--p 00000000 08:01 5                         {1}/files/lib/wine/x86_64-unix/ntdll.so\n",
+            stale.display(),
+            current.display()
+        );
+        assert_eq!(running_proton_dirs(None, &maps), vec![stale.clone(), current.clone()]);
+        assert_eq!(launch_notices(None, &maps), vec![line.clone()]);
+        assert_eq!(launch_notices(Some(&stale.display().to_string()), &maps), vec![line], "named by both: once");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

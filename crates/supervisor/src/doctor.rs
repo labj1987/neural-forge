@@ -883,6 +883,15 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
                     Some("Nothing to do. For a newer Proton, switch the game off, choose that Proton for it in Steam, and switch it on again.".into()),
                 ));
             }
+            if !proton_tool::source_changed(t) && !proton_tool::source_gone(t) && proton_tool::links_changed(t) {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Warning,
+                    format!("{} shares files with {} that Steam changed in place since the copy was made: it no longer matches the version it records", t.name, t.source.display()),
+                    t.dir.display().to_string(),
+                    Some("Close Steam, then make it again in the Setup tab (or `neural-forge-cli proton-tool create` for its source): the copy then holds the source's current files.".into()),
+                ));
+            }
         }
         for game in crate::steam::games(std::slice::from_ref(root)).iter().filter(|g| enabled_options(g).is_some()) {
             let mapped = proton_tool::mapped_tool(&root.path, &game.appid).filter(|m| !m.is_empty());

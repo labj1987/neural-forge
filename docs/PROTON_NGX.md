@@ -171,6 +171,22 @@ running game uses (a process whose executable or arguments lie in it) is neither
   or a `-NeuralForge` name whose folder is gone; never another tool with that suffix) off it, then removes only marked
   copies (and what a stopped copy left, `.<name>.tmp`).
 
+- **Hard links.** A copy shares most files with its source (same inode), so Steam updating the source in place changes
+  the copy's files too. The marker records the shared files at the time (`linked=` and `link_fingerprint=`: a
+  SHA-256 over each hard-linked file's path, device, inode, size and modification time); `doctor` compares and warns
+  when they differ while the source's version is unchanged (the Proton was rewritten in place), with Make again as the
+  fix. A copy made before this was recorded, and a copy made across filesystems (full copies, `linked=0`), is not
+  checked and says nothing.
+
+**NGX updater (`nvngx_update.exe`).** Since driver R620 NVIDIA's `nvidia/wine` folder also ships `nvngx_update.exe`,
+NGX's over-the-air updater, and Proton (e3cff01d, PR #10340) and proton-cachyos now copy it into the prefix's
+`system32` next to `_nvngx.dll` and `nvngx.dll`. Copying does not run it: NVIDIA's core starts the updater under Wine
+only when `PROTON_ENABLE_NGX_UPDATER=1` is set, which Proton does not do. Tested on 620.70.06 with Cyberpunk 2077 in a
+Neural Forge copy of patched Proton Experimental: the updater never ran, `ProgramData/NVIDIA/NGX/models` stayed empty,
+and no DLSS file in the prefix or the game folder changed. The wrapper works the same either way. A game that sets
+`PROTON_ENABLE_NGX_UPDATER=1` lets NGX download newer snippets into `ProgramData/NVIDIA/NGX/models`. Neural Forge does
+not depend on which DLSS snippet versions NGX loads.
+
 Proton links many of a prefix's `system32` files to the Proton that last ran it; a removed copy's prefixes are set up
 again by the next Proton a game runs with.
 
@@ -185,7 +201,8 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
 - GE-Proton releases about three times a month (GE-Proton11-1 2026-06-24 to 11-12 2026-11-03: twelve). A copy is made
   again in seconds. The wrapper needs Wine 10 or newer (`ProcessWineUnixPid`), nothing else of the Wine version.
 - What can break: Valve rewrites the `NVIDIA_WINE_DLL_DIR` block (its TODO says the copies into `system32` go once
-  NGXCore's `NGXPath` is set): the patch then refuses, and the anchor needs updating. NVIDIA adds an export to its core:
+  NGXCore's `NGXPath` is set): the patch then refuses, and the anchor needs updating. `scripts/check_proton_scripts.py` (weekly, `proton-script-check.yml`) runs
+  the patch on the newest Proton Experimental and proton-cachyos scripts and keeps one standing issue open while it does not apply. NVIDIA adds an export to its core:
   the wrapper lacks it and NGX's loader may refuse the core, so the game runs without DLSS. NVIDIA's core lacks one of
   the wrapper's exports (an older driver): a passthrough one answers `NVSDK_NGX_Result_Fail`, a hooked one fails the
   wrapper's load, so the game runs without DLSS (see "Exports the core lacks"). `build-ngx-wrapper.sh` compares the

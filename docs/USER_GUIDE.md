@@ -273,7 +273,7 @@ unchanged. Your original Proton is not changed. Then:
 A copy whose original has changed since (a new GE-Proton in a "Latest" folder, a Proton Experimental update) is out of
 date: it keeps the older Proton's files, so a fix the new version brings is missing from it. The Status tab says so
 (**Proton copies out of date**: the copy, its two versions and the games that run with it), the game's layer log gets a
-`[proton]` line at launch (`NEURAL_FORGE_LOG`, see Files), `doctor` reports it, and the Setup tab marks it with
+`[proton]` line at launch (`NEURAL_FORGE_LOG`, see Files), `doctor` reports it (and warns when Steam changed a Proton's files in place after a copy was made from it), and the Setup tab marks it with
 **Make again** (`proton-tool update`; so is a copy that holds another NGX wrapper than the installed Neural Forge): with
 Steam closed it makes the copy again (a new version under its new name, its games moved over and the old copy
 removed), or puts the new wrapper in place. A copy whose original was deleted (ProtonUp replaced it with a newer
