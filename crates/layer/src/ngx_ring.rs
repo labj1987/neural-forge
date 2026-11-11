@@ -464,7 +464,10 @@ static SAID_NO_RING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// Whether DLSS ran in this process without a record naming its input and no ring is open (a DLSS game not on the
 /// Neural Forge Proton): the status says so.
 pub(crate) fn no_wrapper() -> bool {
-    SAID_NO_RING.load(Ordering::Relaxed) && lock().ring.is_none()
+    #[cfg(test)]
+    return NO_RING_HERE.with(|n| n.get());
+    #[cfg(not(test))]
+    return SAID_NO_RING.load(Ordering::Relaxed) && lock().ring.is_none();
 }
 
 /// The kernel rules read a launch as DLSS's input launch and no record names its colour input: counted while a ring
@@ -473,7 +476,11 @@ pub(crate) fn note_unmatched() {
     let open = lock().ring.is_some();
     if open {
         COUNTERS.unmatched.fetch_add(1, Ordering::Relaxed);
-    } else if !rules_decide() && !SAID_NO_RING.swap(true, Ordering::Relaxed) {
+    } else if !rules_decide() && {
+        #[cfg(test)]
+        NO_RING_HERE.with(|n| n.set(true));
+        !SAID_NO_RING.swap(true, Ordering::Relaxed)
+    } {
         crate::log!(
             "[ngx] DLSS game not on the Neural Forge Proton (NGX's wrapper hands this process no records): the model runs on the finished frame. Choose a Neural Forge Proton for the game (the Setup tab's Proton with DLSS parameters) for the placements before and after the upscaler"
         );
@@ -528,6 +535,8 @@ pub(crate) fn same_units(a: [f32; 2], b: [f32; 2]) -> bool {
 
 #[cfg(test)]
 thread_local! {
+    /// [`no_wrapper`] for this test's thread (the process-wide flag would leak between tests).
+    static NO_RING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Records a test hands this thread's tracker instead of a ring ([`inject`]).
     static INJECTED: std::cell::RefCell<Option<Vec<Record>>> = const { std::cell::RefCell::new(None) };
 }
