@@ -4,6 +4,23 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.1.0 — 2026-11-11
+
+**The model works on exactly what DLSS uses, and outdated Proton copies show up**
+
+- Games that render into part of a larger image (many Unreal Engine games, Hogwarts Legacy and GTA San Andreas –
+  The Definitive Edition among them) now get the model on exactly the part DLSS uses, with their motion vectors. In
+  Hogwarts Legacy at 4K the model now also gets the motion vectors, which it missed before. This also removes the
+  thin line that could appear at the right or bottom edge of the picture in such games.
+- Neural Forge's Proton copies need the new NGX wrapper for this; Neural Forge puts it into every copy when it is
+  installed or started. A copy with the old wrapper keeps the model off before the upscaler, and `doctor` says so.
+- A Neural Forge Proton copy older than the Proton it was made from (Proton Experimental updates often) is now shown
+  on the Status tab with the games that use it, marked on the Setup tab next to **Make again**, and noted in the
+  game's log when it starts. `doctor` also warns when Steam has changed a copy's source files in place.
+- `doctor` and **Save report** list the DLSS files each game loaded in its last run and has installed, with their
+  versions (the game's own, an NVIDIA over-the-air update, or the driver's), so bug reports show which DLSS a game
+  really ran.
+
 ## 4.0.0 — 2026-11-11
 
 **DLSS games need a Neural Forge Proton, and Neural Forge reads what the game gives DLSS**
