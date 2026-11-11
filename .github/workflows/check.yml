@@ -360,6 +360,10 @@ jobs:
                   CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked -p "$package" &&
                   CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked --release -p "$package")
           done
+          # The NGX wrapper is its own workspace too: its build script and host tests land in target/.
+          (cd crates/ngx-wrapper &&
+              CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked -p neural-forge-ngx-wrapper &&
+              CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked --release -p neural-forge-ngx-wrapper)
           rm -rf target/debug/incremental target/release/incremental
           if find target -maxdepth 3 \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \
                   -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' \) | grep .; then
