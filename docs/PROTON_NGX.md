@@ -151,7 +151,17 @@ running game uses (a process whose executable or arguments lie in it) is neither
   `config.vdf` is edited; a `config.vdf` without a `CompatToolMapping` block gets one.
 - **Updates.** When the source changes (a new GE-Proton in a "Latest" folder, a Proton Experimental update), the copy
   is listed as outdated, and `proton-tool update` (or Make again) makes a copy of the new version; with Steam closed,
-  every game set to the old copy is moved to the new one and the old copy is removed. When Neural Forge itself is
+  every game set to the old copy is moved to the new one and the old copy is removed. The copy's name holds the
+  source's version name, so a new version is a new name (the games' `CompatToolMapping` moves with it); the same
+  name (a wrapper-only update) is made again in place. **One check, four places:** `proton_copy::newer_source`
+  (`crates/protocol/src/proton_copy.rs`: the copy's marker names its source and the source's version then; the
+  source's version now is its `version` file's second word) is behind `proton_tool::source_changed`, `doctor`, the
+  Status tab's **Proton copies out of date** group and Setup's Make again (`compat_tool::stale_copies` adds the
+  games set to each copy), and the layer's launch notice. At launch only the layer runs (the launch options are
+  environment variables), so it reads Steam's `STEAM_COMPAT_TOOL_PATHS` (the compat tool folders the game runs with),
+  and for a copy among them whose source has another version than its marker names, logs once per process
+  (`proton_notice.rs`): `[proton] this game runs with <copy>, made from <old> but <source> has <new> now: close Steam
+  and use Make again ...`. Nothing is logged when the source is unreachable from the game's container or gone. When Neural Forge itself is
   installed or updated (the app at start, `install --appdir`), each copy whose marker names another wrapper
   (`wrapper_sha256=`) gets the installed one; `doctor` warns about a copy that still holds another. A copy whose
   source folder is gone (ProtonUp replaced GE-Proton11-12 with 11-13) is not outdated: it holds its own files and keeps

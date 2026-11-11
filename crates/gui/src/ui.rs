@@ -837,6 +837,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let setup_page = build_setup_page(&shm, &toasts);
 
     let status_page = adw::PreferencesPage::new();
+    status_page.add(&build_stale_proton_group());
     status_page.add(&build_telemetry_group(&shm));
     let status_group = build_status_group(&shm, &toasts);
     status_page.add(&status_group);
@@ -2684,18 +2685,21 @@ struct ProtonScan {
     root: Option<std::path::PathBuf>,
     sources: Vec<neural_forge_supervisor::proton_tool::Source>,
     tools: Vec<(neural_forge_supervisor::proton_tool::Tool, bool)>,
+    /// The copies older than their source (`compat_tool::stale_copies`, the check `doctor` makes).
+    stale: Vec<neural_forge_supervisor::compat_tool::StaleCopy>,
 }
 
 fn scan_protons() -> ProtonScan {
     use neural_forge_supervisor::{proton_tool, steam};
     let Some(root) = steam::roots().into_iter().find(|r| !r.flatpak).map(|r| r.path) else {
-        return ProtonScan { root: None, sources: Vec::new(), tools: Vec::new() };
+        return ProtonScan { root: None, sources: Vec::new(), tools: Vec::new(), stale: Vec::new() };
     };
     let libraries = steam::libraries(&root);
     let tools: Vec<(proton_tool::Tool, bool)> = proton_tool::tools(&root).into_iter().map(|t| (t.clone(), proton_tool::outdated(&t))).collect();
     // A source whose current copy exists is not offered again.
     let sources = proton_tool::sources(&root, &libraries).into_iter().filter(|s| !tools.iter().any(|(t, _)| t.name == s.tool_name())).collect();
-    ProtonScan { root: Some(root), sources, tools }
+    let stale = neural_forge_supervisor::compat_tool::stale_copies(&root);
+    ProtonScan { root: Some(root), sources, tools, stale }
 }
 
 /// "Proton with DLSS's parameters": copies of installed Protons that load the NGX wrapper
@@ -2726,8 +2730,10 @@ fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                 let row = adw::ActionRow::new();
                 row.set_use_markup(false);
                 row.set_title(&tool.name);
-                row.set_subtitle(&if *outdated {
-                    format!("from {}; it or Neural Forge's NGX wrapper has changed since: close Steam and make it again", tool.source.display())
+                row.set_subtitle(&if let Some(stale) = scan.stale.iter().find(|s| s.tool.name == tool.name) {
+                    format!("Out of date: {}. Close Steam and make it again: its games move to the new copy", stale.describe())
+                } else if *outdated {
+                    format!("from {}; Neural Forge's NGX wrapper has changed since: close Steam and make it again", tool.source.display())
                 } else {
                     format!("from {}", tool.source.display())
                 });
@@ -3386,6 +3392,47 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         });
     }
 
+    group
+}
+
+/// The Status tab's notice for Neural Forge Proton copies older than the Proton they were made from
+/// (`compat_tool::stale_copies`, the check `doctor` makes): one row per copy naming it, its source and the games
+/// that run with it. Hidden while every copy is current; read again every 30 s on a worker.
+fn build_stale_proton_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Proton copies out of date");
+    group.set_description(Some("A game running with one of these keeps the older Proton's files. Close Steam and use Make again in the Setup tab."));
+    group.set_visible(false);
+    let rows: std::rc::Rc<std::cell::RefCell<Vec<adw::ActionRow>>> = std::rc::Rc::default();
+    every(&group, std::time::Duration::from_secs(30), move |group| {
+        let (group, rows) = (group.clone(), rows.clone());
+        glib::spawn_future_local(async move {
+            let Ok(stale) = gio::spawn_blocking(|| {
+                neural_forge_supervisor::steam::roots()
+                    .into_iter()
+                    .find(|r| !r.flatpak)
+                    .map(|r| neural_forge_supervisor::compat_tool::stale_copies(&r.path))
+                    .unwrap_or_default()
+            })
+            .await
+            else {
+                return;
+            };
+            for row in rows.borrow_mut().drain(..) {
+                group.remove(&row);
+            }
+            for copy in &stale {
+                let row = adw::ActionRow::new();
+                row.set_use_markup(false);
+                row.set_title(&copy.tool.name);
+                row.set_subtitle(&copy.describe());
+                row.add_css_class("warning");
+                group.add(&row);
+                rows.borrow_mut().push(row);
+            }
+            group.set_visible(!stale.is_empty());
+        });
+    });
     group
 }
 

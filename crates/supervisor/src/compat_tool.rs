@@ -266,6 +266,44 @@ pub fn forget_copies(root: &Path, steam_running: bool) -> Result<Vec<String>, St
     Ok(apps)
 }
 
+/// A Neural Forge copy whose source Proton changed since the copy was made ([`proton_tool::source_changed`], the
+/// check `doctor` makes too), with what the Status and Setup tabs say about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleCopy {
+    pub tool: Tool,
+    /// The source's version now (the copy's is `tool.source_version`).
+    pub now: String,
+    /// The games Steam runs with the copy: their names, else their app ids.
+    pub games: Vec<String>,
+}
+
+impl StaleCopy {
+    /// One line for the user: the copy, its source's two versions and the games that run with it.
+    pub fn describe(&self) -> String {
+        let games = if self.games.is_empty() { "no game is set to it".to_string() } else { format!("used by {}", self.games.join(", ")) };
+        format!("made from {}, but {} has {} now; {games}", self.tool.source_version, self.tool.source.display(), self.now)
+    }
+}
+
+/// The copies in `root` that are older than their source Proton, each with the games set to it.
+pub fn stale_copies(root: &Path) -> Vec<StaleCopy> {
+    let stale: Vec<(Tool, String)> = proton_tool::tools(root).into_iter().filter_map(|t| proton_tool::newer_source_version(&t).map(|now| (t, now))).collect();
+    if stale.is_empty() {
+        return Vec::new();
+    }
+    let known = crate::steam::games(&[crate::steam::Root { path: root.to_path_buf(), flatpak: false }]);
+    stale
+        .into_iter()
+        .map(|(tool, now)| {
+            let games = games_on(root, |n| n == tool.name)
+                .into_iter()
+                .map(|appid| known.iter().find(|g| g.appid == appid).map_or_else(|| format!("app {appid}"), |g| g.name.clone()))
+                .collect();
+            StaleCopy { tool, now, games }
+        })
+        .collect()
+}
+
 /// What [`update`] did with one copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Updated {
@@ -518,6 +556,40 @@ mod tests {
         let fresh = update_in(&root, libs, &t, &w, false, &procs).unwrap();
         assert_eq!(fresh.to, t.name);
         assert!(!proton_tool::wrapper_changed(&proton_tool::tools(&root)[0], &w));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A copy is stale exactly when its source's version moved on, and names the games set to it; a copy of a source
+    /// that is gone, or one that is current, is not listed. Making it again keeps the games on a copy.
+    #[test]
+    fn stale_copies_name_their_games_and_a_remake_clears_them() {
+        let (root, lib, w) = steam("stale");
+        let libs = std::slice::from_ref(&lib);
+        fake_app(&root, "1091500", "GTA V", None);
+        switch_on(&root, libs, "1091500", &w, false).unwrap().unwrap();
+        assert!(stale_copies(&root).is_empty(), "current");
+        let source = root.join("compatibilitytools.d/Proton-GE Latest");
+        fake_proton(&source, "GE-Proton11-13");
+        let stale = stale_copies(&root);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(
+            (stale[0].tool.name.as_str(), stale[0].now.as_str(), stale[0].games.clone()),
+            ("GE-Proton11-12-NeuralForge", "GE-Proton11-13", vec!["GTA V".to_string()])
+        );
+        let line = stale[0].describe();
+        assert!(line.contains("GE-Proton11-12") && line.contains("GE-Proton11-13") && line.contains("GTA V") && line.contains("Proton-GE Latest"), "{line}");
+        // The same check `doctor` and Make again use.
+        assert!(proton_tool::source_changed(&stale[0].tool));
+        // The Proton the layer is told about at launch is this copy, and it says the same.
+        assert!(neural_forge_protocol::proton_copy::stale_notice(&stale[0].tool.dir).is_some());
+        let procs = root.join("proc");
+        std::fs::create_dir_all(&procs).unwrap();
+        let done = update_in(&root, libs, &stale[0].tool, &w, false, &procs).unwrap();
+        assert_eq!((done.to.as_str(), done.moved.clone()), ("GE-Proton11-13-NeuralForge", vec!["1091500".to_string()]));
+        assert!(stale_copies(&root).is_empty());
+        // A source that is gone is no stale copy: it keeps working.
+        std::fs::remove_dir_all(&source).unwrap();
+        assert!(stale_copies(&root).is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

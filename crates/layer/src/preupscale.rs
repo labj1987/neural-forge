@@ -2870,6 +2870,8 @@ impl Tracking {
     pub(crate) fn new_for(device: vk::Device) -> Arc<Self> {
         let tracking = Arc::new(Self { device: device.as_raw(), ..Self::default() });
         lock(&TRACKING).insert(device, tracking.clone());
+        // A Proton copy older than its source says so in the log, once.
+        crate::proton_notice::note_once();
         // Model mode: whether the game uses DLSS, known before DLSS's first frame ([`dlss_game`]).
         if mode() == Mode::Model {
             dlss_game::watch();

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 /// The copy's name: the source's version name and this.
 pub const SUFFIX: &str = "-NeuralForge";
 /// In a copy: what it was made from (`source=`, `source_version=`, `wrapper_sha256=`, `wine=`).
-pub const MARKER: &str = "neural-forge-proton.txt";
+pub use neural_forge_protocol::proton_copy::MARKER;
 /// The wrapper in Neural Forge's install (under the data dir).
 pub const WRAPPER: &str = "lib/neural-forge/proton/_nvngx.dll";
 /// Where Wine's 64-bit builtin DLLs live in a Proton tree.
@@ -82,12 +82,6 @@ fn sanitize(name: &str) -> String {
     s.trim_matches('-').to_string()
 }
 
-/// `dir/version`'s second word.
-fn version_of(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("version")).ok()?;
-    text.split_whitespace().nth(1).map(str::to_string)
-}
-
 fn display_of(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join("compatibilitytool.vdf")).ok()?;
     let at = text.find("\"display_name\"")? + "\"display_name\"".len();
@@ -106,11 +100,9 @@ fn internal_names(dir: &Path) -> Option<Vec<String>> {
 }
 
 fn source_at(dir: &Path) -> Option<Source> {
-    if !dir.join("proton").is_file() || dir.join(MARKER).exists() {
-        return None;
-    }
+    let version = neural_forge_protocol::proton_copy::source_version(dir)?;
     let base = dir.file_name()?.to_string_lossy().into_owned();
-    Some(Source { dir: dir.to_path_buf(), version: version_of(dir).unwrap_or_else(|| base.clone()), display: display_of(dir).unwrap_or(base) })
+    Some(Source { dir: dir.to_path_buf(), version, display: display_of(dir).unwrap_or(base) })
 }
 
 /// `root`'s `compatibilitytools.d`.
@@ -197,14 +189,13 @@ fn tool_at(dir: &Path) -> Option<Tool> {
     if dir.is_symlink() {
         return None;
     }
-    let text = std::fs::read_to_string(dir.join(MARKER)).ok()?;
-    let field = |k: &str| text.lines().find_map(|l| l.strip_prefix(k).map(str::to_string)).unwrap_or_default();
+    let marker = neural_forge_protocol::proton_copy::Marker::read(dir)?;
     Some(Tool {
         name: dir.file_name()?.to_string_lossy().into_owned(),
         dir: dir.to_path_buf(),
-        source: field("source=").into(),
-        source_version: field("source_version="),
-        wrapper_sha256: field("wrapper_sha256="),
+        source: marker.source,
+        source_version: marker.source_version,
+        wrapper_sha256: marker.wrapper_sha256,
     })
 }
 
@@ -228,7 +219,14 @@ pub fn leftovers(root: &Path) -> Vec<PathBuf> {
 /// update): the copy is made again from it. A source that is gone (ProtonUp replaced GE-Proton11-12 with 11-13 in
 /// its own folder) is no change: the copy holds its own files (hard links) and keeps working ([`source_gone`]).
 pub fn source_changed(tool: &Tool) -> bool {
-    source_at(&tool.source).is_some_and(|s| s.version != tool.source_version)
+    newer_source_version(tool).is_some()
+}
+
+/// The version `tool`'s source has now when it is not the one the copy was made from: the one check behind
+/// [`source_changed`], `doctor`, the Status and Setup tabs and the notice the layer logs at a game's launch
+/// (`neural_forge_protocol::proton_copy`).
+pub fn newer_source_version(tool: &Tool) -> Option<String> {
+    neural_forge_protocol::proton_copy::newer_source(&tool.source, &tool.source_version)
 }
 
 /// Whether the Proton `tool` was made from is no longer installed. The copy keeps working as it is; it is only
