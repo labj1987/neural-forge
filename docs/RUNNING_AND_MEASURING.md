@@ -414,6 +414,7 @@ and summarises engage/disengage transitions and the frame rate.
 | `[preupscale] launch-bearing submits: N named the colour input, N undecided, N forwarded untouched; holds: N split, N inside DLSS's buffer` | every 3000 forwarded submits | Frame generation's submits being left alone; how many frames were actually held, by each hold (a submit that names the colour input may still be refused). |
 | `[preupscale] no hold inside DLSS's buffer (identification N): <why>; colour input 0x… WxH FORMAT USAGE` | once per identification and reason | Why a launch naming the colour input got no hold inside its buffer (missing transfer usage, format, extent, layout, a suspended render pass, or left to the split). |
 | `[hotkey] watching N keyboard(s) through evdev` / `watching XInput2 raw keys on :0` / `no way to read the keyboard here ...` | first poll | Which keyboard backend the toggle key uses. |
+| `[layer] HDR: <conclusion> (swapchain FORMAT COLOUR_SPACE; surface offers ...; HDR metadata ...; gamescope WSI: yes\|no; Proton: Wayland on\|off\|unset, HDR on\|off\|unset)` | when the game's HDR verdict changes (a game-size swapchain created, its first HDR metadata) | The HDR verdict (`crates/layer/src/hdr_verdict.rs`): whether the game presents HDR10, and when not, whether its surface offered HDR at all and which switch is missing. |
 | `[layer] fence wait timed out after 5s at <site> ...` | on a timeout | A driver stall without device loss; a breadcrumb dump follows. |
 
 ### `neural-forge-cli shmctl status`
@@ -436,6 +437,7 @@ The `# live status` block:
 | `preupscale_extent`, `preupscale_hold_ms`, `preupscale_misses` | DLSS's render size, the last hold's CPU time, and holds whose answer did not make it. |
 | `layer_measured_white`, `layer_composition_up` | The white meter, whether the compose is up. |
 | `capture_request`, `capture_result`, `capture_path` | A capture waiting for the game, and what became of the latest one: written, failed or cancelled, why, and its files. |
+| `hdr_verdict` | The layer's HDR verdict for the game's swapchain (the `[layer] HDR:` line), then `; desktop:` and the desktop's HDR state per display, read from GNOME (`org.gnome.Mutter.DisplayConfig`'s `color-mode`) or KDE Plasma (`kscreen-doctor -j`); "no game swapchain seen yet" before a game made one. |
 
 The `# settings` block lists every live setting by name; `shmctl set NAME VALUE` and
 `shmctl toggle NAME` change them.
@@ -488,10 +490,13 @@ of play at DLSS Frame Generation 4x, "everything is working beautifully" (HARDWA
    ```
 
 4. Run the checks in section 1.
-5. Commit, then tag `vX.Y.Z` and push the tag. `.github/workflows/release.yml` runs on `v*` tags:
+5. For a release that changes the layer (above all `preupscale`): the game sweep on the test machine with the
+   release build (section 11). Every run must pass; a game whose placement changed on purpose gets its
+   `data/games.toml` entry updated, and every game that passed gets its `verified` and `verified_on`.
+6. Commit, then tag `vX.Y.Z` and push the tag. `.github/workflows/release.yml` runs on `v*` tags:
    tests, the shader check, the smoke test, then builds the AppImage and its `.zsync` and publishes
    the release. The build fails rather than publish without the `.zsync`.
-6. Deploy the release to the test machine and confirm the installed hashes (section 2).
+7. Deploy the release to the test machine and confirm the installed hashes (section 2).
 
 ## 10. Reverse-engineering toolkit
 
@@ -525,3 +530,52 @@ Notes:
   once.
 - **Neither Ghidra MCP server needs a GUI.** `rea` and `ghidra` appear in `claude mcp list` from any
   directory.
+
+## 11. The pre-release game sweep
+
+`scripts/game-sweep.sh` runs the tested games installed on the test machine, one after another, each through
+its unattended route, and prints a pass/fail table. What it runs is `scripts/game-sweep.toml` (one `[[run]]` per
+run: the game's app id, its route, its arguments, how long to watch, HDR and Ray Reconstruction, and the game
+settings the run sets); what each run must show comes from the game's entry in `data/games.toml` (its placement,
+or `placement_rr` with Ray Reconstruction on; HDR10 for a run with `hdr = true`, SDR otherwise). The work is
+done by `crates/supervisor/examples/game_sweep.rs`, which the script builds; its unit tests run in `cargo test`.
+
+```bash
+# on the test machine, in tmux; the release build under test in place of the installed layer:
+scripts/game-sweep.sh --layer target/release/libneural_forge_layer.so --cli target/release/neural-forge-cli
+scripts/game-sweep.sh --dry-run            # each run's launch options, settings edits and expectations
+scripts/game-sweep.sh --only cyberpunk,gta # some runs
+```
+
+Routes:
+
+- `steam`: Steam starts the game (`steam steam://rungameid/<appid>`), with the Proton Steam maps it to. The
+  launch options carry Neural Forge (`NEURAL_FORGE_ENABLE=1`, the game's executables), the run's log
+  (`NEURAL_FORGE_LOG`), `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` for an HDR run, and the run's arguments
+  after `%command%` (Cyberpunk 2077: `--launcher-skip -skipStartScreen -benchmark`, its built-in benchmark, which
+  quits when done). Steam rewrites its config when it exits, so the sweep shuts Steam down, writes the options,
+  starts Steam with the session's environment (`systemd-run --user`, so `environment.d`'s variables apply as at
+  login), and at the end shuts it down, puts every account's `localconfig.vdf` back byte for byte and starts it
+  again if it was running.
+- `gta-bench`: GTA V Enhanced's built-in benchmark through `scripts/gta-bench.sh` (section 3), one launch, with
+  the session's `DXVK_NVAPI_*` frame-generation variables passed on.
+
+A run's game settings (`edit_file`: Cyberpunk 2077's `UserSettings.json` for 3840x2160, HDR10 PQ and Ray
+Reconstruction; GTA's `settings.xml` for 3840x2160) are set from the file as found before each run and put back
+byte for byte afterwards. `--layer` puts a build in place of the installed layer for the sweep and the channel
+directory (`/tmp/neural-forge-$UID`) aside, so that build makes its own; both are put back, the layer
+hash-checked. All of this also happens after an error or Ctrl-C; `restore:` lines say what was put back.
+
+While a game runs the sweep reads `neural-forge-cli shmctl status` every 5 s (`--cli`: the build's CLI, which reads
+its channel version) and stops after the run's `seconds` in the expected placement, when the game quits by itself,
+or after `timeout` without the placement; then it ends every process of the game's prefix. A run passes when the
+expected `preupscale_state` was reached and the edit cache counted holds (the model ran in the game's frame), it
+did not end refused (`preupscale_state=5`), `preupscale_misses` is 0, no device was lost, the log has no `[panic]`,
+the kernel logged no `NVRM: Xid` since the run began, and the HDR verdict says HDR10 for an HDR run and SDR
+otherwise. Each run's layer log, its status samples (`<label>.samples`) and `results.txt` go to `--out` (default
+`~/nf-sweep/<unix time>`).
+
+It takes the GPU lock for the whole sweep (`--lock`, default `$NF_GPU_LOCK`, else `~/scratch/gpu.lock`, an
+`flock`), waiting while another run holds it, and refuses to start while the Neural Forge window or one of its
+games is open. A parent that holds the lock already sets `NF_GPU_LOCK_HELD=1`; the sweep passes that to
+`gta-bench.sh`. Runs take 3 to 8 minutes each.
