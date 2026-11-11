@@ -989,10 +989,13 @@ const AFTER_MISSES: u32 = 8;
 /// layout first seen a few frames late, or a game still loading, does not keep the passes away for good.
 const AFTER_RETRY: Duration = Duration::from_secs(5);
 
-/// The identification's images ([`Tracker::refresh`]): what changes it, so a new frame of the same evaluate on another
-/// colour image of the same shape (a game alternating DLSS's input between images: Remnant II, Expedition 33) is no
-/// new identification; each buffer is held with its own evaluate's colour input ([`Tracker::scan`]).
-type Key = (ColourWatch, vk::Image, Option<vk::Image>);
+/// The identification ([`Tracker::refresh`]): the shapes of DLSS's colour input, motion vectors and exposure image,
+/// which [`Tracker::watched_by`] watches every image of. A new frame of the same evaluate on another image of the same
+/// shapes is no new identification (a game alternating DLSS's input between images: Remnant II, Expedition 33; GTA V
+/// Enhanced's rotating motion vectors and exposure; 007 First Light handing DLSS brand-new colour and motion-vector
+/// images every 0.4 s after a load, whose holds were refused for a frame or two at each, #49); each buffer is held
+/// with its own evaluate's images ([`Tracker::scan`]).
+type Key = (ColourWatch, ColourWatch, Option<ColourWatch>);
 
 /// The most identifications [`Tracker::seen_keys`] keeps.
 const SEEN_KEYS: usize = 64;
@@ -1116,6 +1119,8 @@ pub(crate) struct Tracker {
     /// the split's check reads there. Kept across identifications as the committed layouts are
     /// ([`Self::keep_watched_across`]).
     launch_layouts: HashMap<vk::Image, vk::ImageLayout>,
+    /// The exposure image the evaluates on each colour input name, and whether they name more than one ([`Self::scan`]).
+    exposure_names: HashMap<vk::Image, (vk::Image, bool)>,
     /// The last launch's kernel name and the registered images it named, kept only for
     /// `NEURAL_FORGE_PROBE_IMAGE` ([`probe_image`]).
     last_launch: Option<(String, Vec<vk::Image>)>,
@@ -1579,7 +1584,6 @@ impl Tracker {
 
     pub(crate) fn forget_image(&mut self, image: vk::Image) {
         self.images.remove(&image);
-        self.seen_keys.retain(|k| k.1 != image && k.2 != Some(image));
         self.keys.retain(|k| k.2 != image);
         self.registered.retain(|_, i| *i != image);
         self.kept.remove(&image);
@@ -2472,9 +2476,9 @@ impl Tracker {
 
     /// Identifies DLSS's inputs from NGX's records: the newest upscaling evaluate whose colour input the layer saw created
     /// on this device ([`crate::ngx_ring::newest`]), where its depth and motion vectors are such images too. Ray
-    /// Reconstruction's identifies nothing: its input is not held. A new identification is a new colour shape, motion
-    /// vectors or exposure image ([`Key`]); another colour image of the same shape, or another depth image, is the same
-    /// one. Called at every launch-bearing submit; returns a log line when the identification changed.
+    /// Reconstruction's identifies nothing: its input is not held. A new identification is a new shape of the colour
+    /// input, motion vectors or exposure image ([`Key`]); other images of the same shapes, or another depth image, are
+    /// the same one. Called at every launch-bearing submit; returns a log line when the identification changed.
     pub(crate) fn refresh(&mut self) -> Option<String> {
         let record = crate::ngx_ring::newest(|i| self.images.contains_key(&i));
         let rr = record.is_some_and(|r| r.is_rr());
@@ -2482,7 +2486,7 @@ impl Tracker {
             note_ray_reconstruction();
         }
         let inputs = record.filter(|r| !r.is_rr()).and_then(|r| self.inputs_of(&r));
-        let key = inputs.map(|i| (ColourWatch::of(&i.colour.1), i.mvec.0, i.exposure_input.map(|e| e.0)));
+        let key = inputs.map(|i| (ColourWatch::of(&i.colour.1), ColourWatch::of(&i.mvec.1), i.exposure_input.map(|e| ColourWatch::of(&e.1))));
         // Back to images identified before (a rotation): the same identification, its tracking kept.
         let rotation = key.is_some() && self.key.is_some() && self.seen_keys.contains(&key.expect("checked"));
         if let Some(k) = key.filter(|k| !self.seen_keys.contains(k)) {
@@ -2619,6 +2623,7 @@ impl Tracker {
                 let refs = self.launch.get(&cb);
                 any_launch |= refs.is_some();
                 if let Some(record) = refs.and_then(LaunchRefs::sr).filter(|_| found.is_none()) {
+                    let rotating = self.note_exposure_name(&record);
                     let layout = |image: Option<vk::Image>| image.and_then(|i| proposed.get(&i).map(|p| p.0).or(self.committed.get(&i).copied()));
                     // The inputs this frame's hold in front of the buffer reads: where the buffer copies into one DLSS
                     // reads before the launch, the copy's source ([`Self::copy_source`], [`Self::hold_depth`]). GTA V
@@ -2628,12 +2633,17 @@ impl Tracker {
                         let same = |named: (vk::Image, ImageDesc)| {
                             self.copy_source(cb, named, before, |d| (d.width, d.height, d.format) == (named.1.width, named.1.height, named.1.format))
                         };
-                        Inputs {
-                            depth: self.hold_depth(cb, i.depth, before, false),
-                            mvec: same(i.mvec).unwrap_or(i.mvec),
-                            exposure_input: i.exposure_input.map(|e| same(e).unwrap_or(e)),
-                            ..i
-                        }
+                        // An exposure image the buffer copies into before the launch has no exposure in front of it,
+                        // and neither has the copy's source: GTA V Enhanced's ring read 751, 13096, NaN and negative
+                        // values there and its source about -2 (not an exposure), the history reset at almost every hold
+                        // and the frame flashed green (2026-11-11). The hold measures the exposure from the frame instead.
+                        // Nor has one of several the evaluates on one colour input name in turn (GTA V Enhanced's
+                        // four): those are DLSS's own copies, made inside its buffer, and hold no exposure in front of
+                        // it (751, 13096, NaN, -2.2 read: the frame flashed green and white, 2026-11-11).
+                        let exposure_input = i.exposure_input.filter(|&e| !rotating && same(e).is_none());
+                        let held = Inputs { depth: self.hold_depth(cb, i.depth, before, false), mvec: same(i.mvec).unwrap_or(i.mvec), exposure_input, ..i };
+                        say_hold_inputs(&i, &held);
+                        held
                     });
                     let colour_owner = inputs.and_then(|i| proposed.get(&i.colour.0).and_then(|p| p.1).or(self.owners.get(&i.colour.0).copied()));
                     let (hazard, dump_hazard, depth_hazard) = self.launch_hazard(cb, inputs.as_ref());
@@ -2766,6 +2776,29 @@ impl Tracker {
         }
         let read = recorded.iter().rev().filter(|s| s.old_layout == s.new_layout && !s.may_follow_a_write()).find_map(|s| depth(s.image));
         read.or(named).unwrap_or(identified)
+    }
+
+    /// Notes the exposure image `record`'s evaluate names on its colour input ([`Self::exposure_names`]); whether
+    /// evaluates on that colour input have named more than one. Said once per colour input when they start to.
+    fn note_exposure_name(&mut self, record: &crate::ngx_ring::Record) -> bool {
+        if record.exposure == vk::Image::null() {
+            return false;
+        }
+        if self.exposure_names.len() > 64 && !self.exposure_names.contains_key(&record.colour) {
+            self.exposure_names.clear();
+        }
+        let (first, rotating) = self.exposure_names.entry(record.colour).or_insert((record.exposure, false));
+        if !*rotating && *first != record.exposure {
+            *rotating = true;
+            crate::log!(
+                "[preupscale] DLSS's evaluates on colour input {} name different exposure images ({} and {}): copies made inside its buffer; the exposure is measured from the frame",
+                hex(record.colour),
+                hex(*first),
+                hex(record.exposure)
+            );
+            crate::logging::flush();
+        }
+        *rotating
     }
 
     /// The image buffer `cb` copies into `named` before its launch (within the copies `before` counts, or all of
@@ -6583,6 +6616,35 @@ pub(crate) fn post_off(engaged: bool, last_hold: Option<Instant>, launches: Opti
     engaged && last_hold.is_some_and(|t| now < hand_back_at(t, launches))
 }
 
+/// The first holds of a process say which images they read for DLSS's depth and motion vectors: the evaluate's own
+/// (`named`), or the source of the launch buffer's copy into them (`held`, [`Tracker::copy_source`]). Bounded: the
+/// first [`SAID_HOLD_INPUTS`] holds.
+fn say_hold_inputs(named: &Inputs, held: &Inputs) {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= SAID_HOLD_INPUTS {
+        return;
+    }
+    let what = |n: (vk::Image, ImageDesc), h: (vk::Image, ImageDesc)| {
+        if n.0 == h.0 {
+            format!("{} (the evaluate's)", hex(n.0))
+        } else {
+            format!("{} ({}x{} {:?}, the source of the copy into the evaluate's {})", hex(h.0), h.1.width, h.1.height, h.1.format, hex(n.0))
+        }
+    };
+    crate::log!(
+        "[preupscale] hold reads depth {}, motion vectors {}, exposure {}",
+        what(named.depth, held.depth),
+        what(named.mvec, held.mvec),
+        match (named.exposure_input, held.exposure_input) {
+            (_, Some(e)) => hex(e.0),
+            (Some(n), None) => format!("measured from the frame (the buffer copies into the evaluate's {} before the launch)", hex(n.0)),
+            (None, None) => "none".to_string(),
+        }
+    );
+}
+
+const SAID_HOLD_INPUTS: u64 = 12;
+
 /// Whether the post path stays off at `now` in a DLSS game that has not held a frame yet: `sign` is when the process
 /// was first seen to be one ([`dlss_game`]), `None` once a frame was held or with no sign. Its loading screens and
 /// menus before DLSS's first frame go untouched: the post path built the network at the output size on them and ran it
@@ -7597,16 +7659,16 @@ mod tests {
         record(cb(4));
         t.execute(cb(4), &[cb(5)]);
         assert_eq!(t.submit_ok(&[vec![cb(4)]]).expect("launch-bearing").hazard, None);
-        // A re-identification (DLSS's inputs re-created) starts over: a buffer recorded under the old
-        // one was recorded before this one (only its barriers on the old inputs were kept).
+        // DLSS's inputs re-created with the same shapes (007 First Light after a load, #49): the same identification,
+        // every image of those shapes being watched throughout, so a buffer recorded before is not refused for it.
         t.lock().forget_image(vk::Image::from_raw(0x1000));
         register(0x5000);
         record(cb(1));
         let again = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert_eq!(again.inputs.map(|i| i.colour.0), Some(vk::Image::from_raw(0x5000)));
-        assert!(again.identified_now && !again.colour_in_general());
-        let stale = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
-        assert!(stale.colour_in_general() && stale.hazard == Some(Hazard::RecordedBefore), "recorded under the old identification: not held");
+        assert!(!again.identified_now, "the same shapes: no new identification");
+        let later = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
+        assert_ne!(later.hazard, Some(Hazard::RecordedBefore), "recorded while its images' shapes were watched");
         record(cb(1));
         let held = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert!(held.colour_in_general() && held.hazard.is_none());
@@ -8379,6 +8441,36 @@ mod tests {
         assert!(generations[4..].iter().all(|&g| g == generations[3]), "no new identification once round: {generations:?}");
     }
 
+    /// 007 First Light after a load (#49): DLSS gets a brand-new colour input and motion-vector image every 0.4 s,
+    /// never one seen before. Images of the same shapes are the same identification, so no hold is refused as begun
+    /// before it (each new image was a new identification, and a frame or two showed the game's own picture).
+    #[test]
+    fn brand_new_images_of_the_same_shapes_are_the_same_identification() {
+        let rg = vk::Format::R16G16_SFLOAT;
+        let colour_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let mut set = vec![(0x200, desc(1488, 836, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT))];
+        for k in 0..6u64 {
+            set.push((0x100 + 0x10 * k, desc(1488, 836, vk::Format::R16G16B16A16_SFLOAT, colour_usage)));
+            set.push((0x300 + k, desc(1488, 836, rg, vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)));
+        }
+        let mut t = tracker_with(&set_of(&set));
+        let mut generations = Vec::new();
+        for k in 0..6u64 {
+            let (colour, mvec) = (0x100 + 0x10 * k, 0x300 + k);
+            crate::ngx_ring::inject(vec![sr_record(k + 1, [colour, mvec, 0x200, 0, 0])]);
+            t.begin(cb(11));
+            t.launch(cb(11), Some(&param_block(&[h(colour), h(0x200), h(mvec)])));
+            let (scan, _) = submit(&mut t, &[vec![cb(11)]]);
+            generations.push(t.generation);
+            let scan = scan.expect("launch-bearing");
+            assert_eq!(scan.inputs.map(|i| (i.colour.0, i.mvec.0)), Some((img(colour), img(mvec))), "each frame's own images");
+            if k > 0 {
+                assert_ne!(scan.hazard, Some(Hazard::RecordedBefore), "frame {k}: not refused as begun before a new identification");
+            }
+        }
+        assert!(generations.iter().all(|&g| g == generations[0]), "one identification: {generations:?}");
+    }
+
     #[test]
     fn every_image_of_the_colour_input_s_shape_has_its_layout_known_across_identifications() {
         let r11 = vk::Format::B10G11R11_UFLOAT_PACK32;
@@ -8426,8 +8518,8 @@ mod tests {
         }
         assert_eq!(t.colour_barriers.get(&img(0x110)).map(|b| b.1), Some(read_only), "barriers counted per image");
         assert_eq!(t.generation, 1, "another image of the same shape is no new identification");
-        // A new identification (other motion vectors) keeps what was committed on the images watched throughout. No
-        // barrier is recorded from here on.
+        // Other motion vectors of the same shape: still the same identification, with what was committed on the images
+        // watched throughout. No barrier is recorded from here on.
         t.forget_image(img(0x100));
         let mvec2 = desc(1488, 836, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED);
         t.record_image(
@@ -8443,7 +8535,7 @@ mod tests {
         );
         crate::ngx_ring::inject(vec![sr_record(1000, [0x110, 0x310, 0x200, 0, 0x600])]);
         let _ = submit(&mut t, &[vec![cb(11)]]);
-        assert_eq!((t.generation, t.inputs.map(|i| i.colour.0)), (2, Some(img(0x110))));
+        assert_eq!((t.generation, t.inputs.map(|i| i.colour.0)), (1, Some(img(0x110))));
         for colour in [0x110, 0x120] {
             t.begin(cb(11));
             crate::ngx_ring::inject(vec![sr_record(1001 + colour, [colour, 0x310, 0x200, 0, 0x600])]);
@@ -8654,9 +8746,18 @@ mod tests {
             t.record_view(vk::ImageView::from_raw(raw + 1), i);
             t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
         }
+        // GTA V Enhanced's exposure images: 1x1 R16F, the ring DLSS reads filled by a copy in the launch buffer.
+        let (frame_exposure, ring_exposure) = (image(0xa00), image(0xb00));
+        for i in [frame_exposure, ring_exposure] {
+            t.record_image(i, &vk::ImageCreateInfo { extent: vk::Extent3D { width: 1, height: 1, depth: 1 }, ..info(vk::Format::R16_SFLOAT) });
+            t.record_view(vk::ImageView::from_raw(i.as_raw() + 1), i);
+            t.register(vk::ImageView::from_raw(i.as_raw() + 1), Some(i.as_raw() + 0x1000));
+        }
+        // Identified with its exposure image, so the exposure ring is watched as the depth and motion vectors are.
+        crate::ngx_ring::inject(vec![sr_record(1, [0x100, 0x800, 0x500, 0, 0xb00])]);
         let _ = t.refresh();
         // Earlier frames left all of them in GENERAL.
-        for i in [frame_depth, ring_depth, frame_mvec, ring_mvec, sampled_mvec] {
+        for i in [frame_depth, ring_depth, frame_mvec, ring_mvec, sampled_mvec, frame_exposure, ring_exposure] {
             t.barrier(cb(1), ImageSync::to(i, GENERAL));
         }
         let _ = t.submit_ok(&[vec![cb(1)]]);
@@ -8674,13 +8775,15 @@ mod tests {
         t.copy(cb(2), frame_mvec, ring_mvec);
         t.barrier(cb(2), sync(frame_mvec, transfer, shader));
         t.barrier(cb(2), sync(sampled_mvec, shader, transfer));
-        crate::ngx_ring::inject(vec![sr_record(2, [0x100, 0x800, 0x500, 0, 0])]);
-        t.launch(cb(2), Some(&param_block(&[0x1100, 0x1500, 0x1800])));
+        t.copy(cb(2), frame_exposure, ring_exposure);
+        crate::ngx_ring::inject(vec![sr_record(2, [0x100, 0x800, 0x500, 0, 0xb00])]);
+        t.launch(cb(2), Some(&param_block(&[0x1100, 0x1500, 0x1800, 0x1b00])));
         // A copy into the ring after the launch (the next frame's, recorded ahead) is not this launch's.
         t.copy(cb(2), sampled_mvec, ring_mvec);
         let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
         let inputs = scan.inputs.expect("identified");
         assert_eq!((inputs.depth.0, inputs.mvec.0), (frame_depth, frame_mvec), "the copies' sources, not DLSS's rings");
+        assert_eq!(inputs.exposure_input, None, "an exposure image the buffer copies into: measured, neither the ring nor the copy's source");
         assert_eq!((scan.depth_layout, scan.mvec_layout), (Some(GENERAL), Some(GENERAL)));
         assert_eq!((scan.depth_hazard, scan.hazard), (None, None));
         // Without the copies the record's own are read, whatever else the buffer reads (a copy from the frame's motion
@@ -8689,11 +8792,21 @@ mod tests {
         t.barrier(cb(2), sync(frame_depth, shader, transfer));
         t.barrier(cb(2), sync(frame_mvec, shader, transfer));
         t.copy(cb(2), frame_mvec, sampled_mvec);
-        crate::ngx_ring::inject(vec![sr_record(3, [0x100, 0x800, 0x500, 0, 0])]);
-        t.launch(cb(2), Some(&param_block(&[0x1100, 0x1500, 0x1800])));
+        crate::ngx_ring::inject(vec![sr_record(3, [0x100, 0x800, 0x500, 0, 0xb00])]);
+        t.launch(cb(2), Some(&param_block(&[0x1100, 0x1500, 0x1800, 0x1b00])));
         let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
         let inputs = scan.inputs.expect("identified");
         assert_eq!((inputs.depth.0, inputs.mvec.0), (ring_depth, ring_mvec));
+        assert_eq!(inputs.exposure_input.map(|e| e.0), Some(ring_exposure), "nothing copied into it, the one exposure named so far");
+        // An evaluate on the same colour input naming another exposure image: they rotate, and none holds an exposure
+        // in front of DLSS's buffer, from now on.
+        for (seq, exposure) in [(4, 0xa00), (5, 0xb00)] {
+            t.begin(cb(2));
+            crate::ngx_ring::inject(vec![sr_record(seq, [0x100, 0x800, 0x500, 0, exposure])]);
+            t.launch(cb(2), Some(&param_block(&[0x1100, 0x1500, 0x1800, exposure + 0x1000])));
+            let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+            assert_eq!(scan.inputs.expect("identified").exposure_input, None, "exposure {exposure:#x}: measured");
+        }
     }
 
     /// The depth NGX's record names wins over another depth image the buffer only reads before

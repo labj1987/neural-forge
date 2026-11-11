@@ -47,6 +47,11 @@ first shipped them; their phase is kept as a subheading.
   stale with auto-exposure on; it no longer keeps a game's first D3D12 device alive for the whole session.
 - GTA San Andreas - The Definitive Edition (Direct3D 11): an evaluate whose work never reached the GPU no longer
   leaves every later frame matched to an older one's camera jitter, and DLSS's output there is learnt.
+- GTA V Enhanced no longer flashes green and white with the model on: its exposure images are copies DLSS's own
+  buffer makes, which hold no exposure where the model reads them; the exposure is measured from the frame there.
+  The edit cache carries the model's change between frames again (a few % rejected, not all of it).
+- A game that hands DLSS brand-new images after a load (007 First Light) keeps the model on them without a frame or
+  two of the game's own picture at each.
 - Games that hand DLSS different images frame by frame (GTA V Enhanced rotates its motion vectors, depth and
   exposure image) keep the model and its history on every frame.
 - Online games with anti-cheat may refuse the changed module: use the Neural Forge Proton for single-player games.
