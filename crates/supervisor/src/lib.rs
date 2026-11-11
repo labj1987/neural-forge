@@ -14,6 +14,7 @@ pub mod install;
 pub mod launch_options;
 pub mod model;
 pub mod model_shape;
+pub mod ngx_versions;
 pub mod paths;
 pub mod presets;
 pub mod profiles;

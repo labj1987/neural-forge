@@ -309,6 +309,7 @@ unsafe fn create(api: Api, feature: i32, p: *mut Parameter, out: *mut *mut NgxHa
         log(&format!("CREATE {} feature={feature}({}) result={result:#x}: failed", api.name(), feature_name(feature as u32)));
         return;
     }
+    crate::modules::note_loaded();
     let handle = if out.is_null() { core::ptr::null_mut() } else { *out };
     let id = if handle.is_null() { 0 } else { (*handle).id };
     if !handle.is_null() {

@@ -285,6 +285,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
     }
     out.extend(check_steam(roots));
     out.extend(check_proton(roots));
+    out.extend(check_ngx_versions(roots));
     out.extend(check_xid(roots));
     out.extend(check_input_group(roots));
     out.extend(check_session_log(roots, events.as_deref().map_err(|e| e.kind()), session.as_deref()));
@@ -809,6 +810,26 @@ fn steam_launch_state(games: &[crate::steam::Game]) -> Option<LaunchOptionState>
 /// The first launch options of `game` that switch Neural Forge on, from any account.
 fn enabled_options(game: &crate::steam::Game) -> Option<String> {
     crate::steam::launch_options(&game.root.path, &game.appid).into_iter().filter_map(|a| a.options).find(|o| crate::launch_options::is_enabled(o))
+}
+
+/// The NGX file versions ([`crate::ngx_versions`]): the driver's core, what each game loaded in its last run (the
+/// wrapper's record), and the NGX DLLs present in each switched-on game's folder and prefix. Always a note: it is
+/// there so a bug report shows an over-the-air update, a game's own update or the pinned Frame Generation DLL.
+fn check_ngx_versions(roots: &Roots) -> Vec<Finding> {
+    use crate::ngx_versions as nv;
+    let games = crate::steam::games(&roots.steam_roots);
+    let on: Vec<&crate::steam::Game> = games.iter().filter(|g| g.unsupported().is_none() && enabled_options(g).is_some()).collect();
+    let dirs: Vec<&Path> = roots.driver_lib_dirs.iter().map(PathBuf::as_path).collect();
+    let core = crate::proton_tool::driver_core(&dirs);
+    let records = nv::read_records(&roots.state_dir, std::time::SystemTime::now());
+    let dirs: Vec<(PathBuf, PathBuf)> = on.iter().map(|g| (g.dir(), g.library.join("steamapps/compatdata").join(&g.appid).join("pfx/drive_c"))).collect();
+    let files: Vec<nv::GameFiles> =
+        on.iter().zip(&dirs).map(|(g, (game_dir, drive_c))| nv::GameFiles { name: &g.name, appid: &g.appid, game_dir, drive_c }).collect();
+    let summary = match records.len() {
+        0 => "NGX versions: no game has recorded its loaded DLSS files yet".to_string(),
+        n => format!("NGX versions: {n} game(s) recorded their loaded DLSS files"),
+    };
+    vec![Finding::new("ngx-versions", Severity::Info, summary, nv::render(core.as_deref(), &records, &files), None)]
 }
 
 /// Since 4.0 the layer works only in games run with a Neural Forge Proton (`proton_tool`): the NGX wrapper must be
