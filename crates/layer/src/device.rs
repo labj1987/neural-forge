@@ -160,6 +160,9 @@ pub struct NeuralForgeDeviceInfo {
     /// (present passes through unmodified) whenever it is, rather than panicking.
     instance: Option<Arc<ash::Instance>>,
     surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
+    /// The next layer's `vkGetPhysicalDeviceSurfaceFormatsKHR`: whether a game swapchain's surface offered HDR
+    /// (`crate::hdr_verdict`).
+    surface_formats: Option<vk::PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>,
     physical_device: vk::PhysicalDevice,
     /// False on any non-NVIDIA physical device: Neural Rendering is an NGX feature and the model server
     /// only ever creates its own device on an NVIDIA GPU, so on anything else there is nothing for
@@ -254,11 +257,21 @@ impl ProbeNext {
     }
 }
 
+/// The next layer's surface queries, resolved when the instance was created: the capabilities (which usage a
+/// swapchain may get) and the formats (whether its surface offers HDR, `crate::hdr_verdict`).
+#[derive(Clone, Copy, Default)]
+pub struct SurfaceQueries {
+    pub caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
+    pub formats: Option<vk::PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>,
+}
+
 #[derive(Default)]
 struct State {
     swapchains: HashMap<vk::SwapchainKHR, SwapchainState>,
     /// Swapchains whose first HDR metadata was logged (`set_hdr_metadata_ext`).
     hdr_metadata_seen: HashSet<vk::SwapchainKHR>,
+    /// The last HDR verdict logged (`crate::hdr_verdict`): a recreated swapchain with the same one logs nothing.
+    hdr_verdict_logged: String,
     /// Per swapchain: when the layer may engage (see `swapchain::Warmup`), and how long the
     /// layer spent in that swapchain's previous present.
     warmup: HashMap<vk::SwapchainKHR, (swapchain::Warmup, std::time::Duration)>,
@@ -1542,7 +1555,7 @@ impl NeuralForgeDeviceInfo {
 
     pub fn new(
         instance: Option<Arc<ash::Instance>>,
-        surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
+        surface: SurfaceQueries,
         physical_device: vk::PhysicalDevice,
         device: Arc<ash::Device>,
         next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
@@ -1713,7 +1726,8 @@ impl NeuralForgeDeviceInfo {
             _loader_data: loader_data,
             device,
             instance,
-            surface_caps,
+            surface_caps: surface.caps,
+            surface_formats: surface.formats,
             physical_device,
             nvidia,
             next_create_swapchain_khr: create,
@@ -2354,6 +2368,15 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // diagnostics identify a legal render-to-swapchain transfer without touching
         // the application's creation or recording path.
         let images = self.fetch_swapchain_images(swapchain);
+        // The HDR verdict's facts, for a game's own swapchain: what its surface offered is asked once, here.
+        let game_swapchain =
+            self.nvidia && crate::ownership::eligible() && swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height);
+        let surface = if game_swapchain {
+            crate::hdr_verdict::surface_offers(self.surface_formats, self.physical_device, create_info.surface)
+        } else {
+            crate::hdr_verdict::Surface::Unknown
+        };
+        let hdr = crate::hdr_verdict::Facts::new(create_info.image_format, create_info.image_color_space, surface);
         let state = SwapchainState {
             format: create_info.image_format,
             color_space: create_info.image_color_space,
@@ -2363,6 +2386,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             pass_through,
             image_usage,
             images,
+            hdr_text: if game_swapchain { hdr.verdict() } else { String::new() },
+            hdr,
         };
         crate::log!(
             "[layer] swapchain {:?} {}x{} fmt={:?} colour_space={:?} hdr={}{} pass_through={} images={}",
@@ -2388,6 +2413,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         );
         let mut layer_state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.tracker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).swapchain_images.extend(state.images.iter().copied());
+        if !state.hdr_text.is_empty() && state.hdr_text != layer_state.hdr_verdict_logged {
+            crate::log!("[layer] HDR: {}", state.hdr_text);
+            layer_state.hdr_verdict_logged.clone_from(&state.hdr_text);
+        }
         layer_state.swapchains.insert(swapchain, state);
         // Explicit flush, same reasoning as `new()`'s -- a one-time-per-swapchain
         // milestone, not the per-frame hot path.
@@ -2972,15 +3001,27 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let lines: Vec<String> = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = &mut *state;
-            swapchains
-                .iter()
-                .zip(metadata)
-                .filter(|(s, _)| state.hdr_metadata_seen.insert(**s))
-                .map(|(s, m)| match state.swapchains.get(s) {
-                    Some(sc) => format!("[layer] swapchain {s:?}: {}", swapchain::hdr_metadata_line(sc.format, sc.color_space, m)),
-                    None => format!("[layer] HDR metadata for swapchain {s:?}, which the layer did not see created"),
-                })
-                .collect()
+            let mut lines = Vec::new();
+            for (s, m) in swapchains.iter().zip(metadata) {
+                if !state.hdr_metadata_seen.insert(*s) {
+                    continue;
+                }
+                let Some(sc) = state.swapchains.get_mut(s) else {
+                    lines.push(format!("[layer] HDR metadata for swapchain {s:?}, which the layer did not see created"));
+                    continue;
+                };
+                lines.push(format!("[layer] swapchain {s:?}: {}", swapchain::hdr_metadata_line(sc.format, sc.color_space, m)));
+                // The verdict changes with the first metadata (a game whose HDR setting is on sends it).
+                if !sc.hdr_text.is_empty() {
+                    sc.hdr.metadata = Some(crate::hdr_verdict::metadata(m));
+                    sc.hdr_text = sc.hdr.verdict();
+                    if sc.hdr_text != state.hdr_verdict_logged {
+                        lines.push(format!("[layer] HDR: {}", sc.hdr_text));
+                        state.hdr_verdict_logged.clone_from(&sc.hdr_text);
+                    }
+                }
+            }
+            lines
         };
         for line in &lines {
             crate::log!("{line}");
@@ -3877,6 +3918,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let Some(sw) = state.swapchains.get(&sc) else { continue };
                 // What the status shows as the game's output (HDR or SDR), whatever is done with it below.
                 state.shm.publish_hdr_detected(sw.hdr_kind);
+                state.shm.publish_hdr_verdict(&sw.hdr_text);
                 let Some(&image) = sw.images.get(image_index as usize) else { continue };
                 let supported = swapchain::is_supported_format(sw.format, sw.color_space);
                 // An HDR10 swapchain's frames take the HDR path (docs/NATIVE_BACKEND.md, "HDR on the finished

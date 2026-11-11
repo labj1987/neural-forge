@@ -88,8 +88,18 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, the HUD group: finding the HUD and HUD regions on the finished frame, and the Sharpening group: adaptive sharpening (CAS) and Clarity on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
-| Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
-| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on), the launch option to copy by hand for a game you pick, and **Proton with DLSS parameters** (below). |
+| Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
+| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on; a tested game says where the model runs in it), the launch option to copy by hand for a game you pick, **Proton with DLSS parameters** (below) and **Uninstall…** (see [Uninstall](#uninstall)). |
+
+**The HDR verdict** (the Status tab's HDR line, `hdr_verdict=` in `neural-forge-cli shmctl status`, Save report and the
+game's log as `[layer] HDR: ...`) says in one line whether the game presents HDR and, when it does not, why:
+"game outputs HDR10"; "game outputs SDR; HDR10 was available" (the game's own HDR setting is off); "game asked for
+SDR although HDR metadata was sent" (the game's HDR setting is on but its window is SDR) or "game outputs SDR",
+each followed by why the window had no HDR when it had none (gamescope without `--hdr-enabled`, Proton without
+`PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`, or the desktop's HDR off). In brackets follow the window's format and
+colour space, whether its surface offered an HDR colour space, the first HDR metadata the game sent, whether
+gamescope's layer is loaded and Proton's two HDR switches; after them the desktop's HDR state per display, where
+GNOME or KDE Plasma can tell (a gamescope session says so).
 
 Before the upscaler the network runs on every frame while the camera is still and on every second
 frame while it moves; the frame in between reuses its last result, moved with the game's motion and
@@ -285,11 +295,18 @@ settings win over built-in ones, and an update never changes your files.
 
 ## Tested games
 
-Each game was run on the test machine (RTX 5070, 2560x1440, Proton) with its own settings as found:
+Each game was run on the test machine (RTX 5070, 2560x1440 or 3840x2160, Proton) with its own settings as found:
 DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. In each one the model
 ran with no missed frames and no GPU fault. GTA V Enhanced (`FrameLimit` 120), Cyberpunk 2077, Red Dead
 Redemption 2 and Crimson Desert were run again at 3840x2160, the last three with the game's HDR (HDR10) on
 (Proton-GE with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`); GTA V has no HDR.
+
+The same facts, with the version each game was last seen working in and its known issues, are built into the app:
+the Status tab's **Tested game** line shows the running game's, the Setup tab's games list says where the model runs
+in each tested game, `neural-forge-cli games --tested` lists them all and `neural-forge-cli games --tested GAME` shows
+one game's setup notes. Diagnose says when the model runs somewhere else in a tested game than it did in testing.
+Users have reported the model before the upscaler, inside DLSS's buffer, in Stellar Blade, Indiana Jones and the
+Great Circle and Clair Obscur: Expedition 33 (#51); the list carries them too.
 
 | Game | Engine, API | DLSS used | Where the model runs |
 |---|---|---|---|
@@ -395,7 +412,7 @@ the code (`crates/`, `scripts/`).
 The CLI is installed as `~/.local/share/neural-forge/bin/neural-forge-cli`; add that folder to your
 `PATH`, or call it by that path, for the commands in this guide.
 
-`neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID]`, `games`,
+`neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID] [--trace FILE]`, `games [--tested [GAME]]`,
 `enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]`, `disable GAME`, `config`, `import-binaries DIR`,
 `extract-model DIR [--network full|small]`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`,
 `proton-tool [list|create SOURCE|update|remove NAME]` for the Proton copies (above),
@@ -428,6 +445,14 @@ Valve's VAC) cannot be seen.
 
 ## Uninstall
 
+**Uninstall…** at the bottom of the Setup tab removes everything Neural Forge put on the computer, after a
+confirmation that lists it: what `neural-forge-cli uninstall --purge` removes (below), Neural Forge's own Proton
+builds (the `*-NeuralForge` folders in Steam's `compatibilitytools.d`), and the AppImage file it runs from. With
+Steam running, the launch options cannot be changed: close Steam first, or the games that keep Neural Forge's
+variables are listed afterwards with the options to set by hand (the variables do nothing without the layer). The
+app quits when it is done. Deleting only the AppImage file does not uninstall Neural Forge: the layer it installed
+under `~/.local/share/neural-forge` stays, and games switched on keep loading it.
+
 `neural-forge-cli uninstall` removes the files it installed (files you changed are kept). The
 games you switched on keep Neural Forge's variables in their launch options, which do nothing without
 the layer.
@@ -436,7 +461,8 @@ variables out of every game's Steam launch options (your own options stay), in e
 and removes the files it keeps next to each account's `localconfig.vdf` (`.neural-forge.orig` and
 `.neural-forge.bak`, its copies of that file, and `.neural-forge.lock`). Steam must be closed for
 that: while it runs, or while a game's options cannot be changed safely, the purge removes nothing and
-names each game with the launch options to set by hand instead. Then it removes the config,
+names each game with the launch options to set by hand instead. Then it removes Neural Forge's Proton builds
+(`compatibilitytools.d/*-NeuralForge`), the config,
 everything under `~/.local/share/neural-forge` (the model, an imported DLL, captures),
 `~/.local/state/neural-forge`, `/tmp/neural-forge-$UID` and the Proton copies it made (choose another Proton for
 the games that used one).
@@ -464,6 +490,12 @@ the games that used one).
 
 ## More troubleshooting
 
+- **HDR does not come on.** Read the HDR verdict (above) on the Status tab while the game runs. Where it says the
+  window offered no HDR colour space, the game could not choose HDR whatever its settings: on a desktop with HDR on,
+  Proton offers it with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` in the launch options (Proton-GE or a Proton
+  with its Wayland driver), and gamescope with `--hdr-enabled`. Where it says HDR10 was available, switch on the
+  game's own HDR setting. Where HDR metadata was sent but the window is SDR and HDR10 was available, the game
+  itself chose SDR; attach Save report to an issue.
 - **The model does not run.** The Status tab's Model placement line, or Diagnose, gives the reason:
   no model extracted, a missing device feature, or a failed build (retried on its own). The full
   layer log (`NEURAL_FORGE_LOG=/path` in the launch options) has the `[native]` lines.

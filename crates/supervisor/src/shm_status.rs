@@ -41,7 +41,7 @@ pub fn preupscale_state_name(v: u32) -> &'static str {
 pub fn look(cfg: &crate::Config) -> (String, String) {
     let path = crate::channel_path(cfg);
     match neural_forge_protocol::mapping::open_existing(&path) {
-        Ok(Some(mapping)) => (status_text(mapping.header()), mapping.header().game_name()),
+        Ok(Some(mapping)) => (status_text_with(mapping.header(), crate::desktop_hdr::read().as_deref()), mapping.header().game_name()),
         Ok(None) => (format!("no channel at {path}: no game and no Neural Forge window has opened it since the computer started\n"), String::new()),
         Err(e) => (format!("channel not readable: {e}: {path}\n"), String::new()),
     }
@@ -49,6 +49,22 @@ pub fn look(cfg: &crate::Config) -> (String, String) {
 
 /// `header`'s live status fields, then its settings (`ShmHeader::persisted_settings`).
 pub fn status_text(header: &ShmHeader) -> String {
+    status_text_with(header, None)
+}
+
+/// The HDR verdict as one line: the layer's (`ShmHeader::hdr_verdict`) and the desktop's output state
+/// (`crate::desktop_hdr::read`), when known.
+pub fn hdr_line(header: &ShmHeader, desktop: Option<&str>) -> String {
+    let game = header.hdr_verdict();
+    let game = if game.is_empty() { "no game swapchain seen yet".to_string() } else { game };
+    match desktop {
+        Some(d) => format!("{game}; desktop: {d}"),
+        None => game,
+    }
+}
+
+/// [`status_text`] with the desktop's HDR state (`crate::desktop_hdr::read`) in the `hdr_verdict` line.
+pub fn status_text_with(header: &ShmHeader, desktop: Option<&str>) -> String {
     let mut s = String::new();
     // Writing to a `String` cannot fail.
     let mut line = |args: std::fmt::Arguments| {
@@ -87,6 +103,7 @@ pub fn status_text(header: &ShmHeader) -> String {
             _ => "unknown",
         }
     }));
+    line(format_args!("hdr_verdict={}", hdr_line(header, desktop)));
     line(format_args!("device_lost_at={}", header.device_lost_at.load(Ordering::Relaxed)));
     line(format_args!("preupscale_extent={}x{}", header.preupscale_width.load(Ordering::Relaxed), header.preupscale_height.load(Ordering::Relaxed)));
     line(format_args!("preupscale_hold_ms={}", f32::from_bits(header.preupscale_hold_ms_bits.load(Ordering::Relaxed))));
@@ -200,6 +217,14 @@ mod tests {
         assert!(lines.contains(&"edit_cache: refresh_holds=30 cached_holds=29 rejected=12.34% gpu_ms=0.250"), "{text}");
         assert!(lines.contains(&"scene_cuts=3"), "{text}");
         assert!(lines.contains(&"swapchain_hdr=2 (HDR10, PQ: presented untouched)"), "{text}");
+        assert!(lines.contains(&"hdr_verdict=no game swapchain seen yet"), "{text}");
+        header.set_hdr_verdict("game outputs HDR10 (swapchain A2B10G10R10_UNORM_PACK32 HDR10_ST2084_EXT)");
+        let with = status_text_with(&header, Some("GNOME: HDMI-1 HDR on (BT.2100)"));
+        assert!(
+            with.lines()
+                .any(|l| l == "hdr_verdict=game outputs HDR10 (swapchain A2B10G10R10_UNORM_PACK32 HDR10_ST2084_EXT); desktop: GNOME: HDMI-1 HDR on (BT.2100)"),
+            "{with}"
+        );
         header.hdr_active.store(neural_forge_protocol::enums::hdr_kind::PQ10, Ordering::Relaxed);
         assert!(status_text(&header).lines().any(|l| l == "swapchain_hdr=2 (HDR10, PQ: the network runs on an SDR-mapped copy)"));
         assert!(lines.contains(&"intensity=1"), "{text}");

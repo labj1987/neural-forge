@@ -127,7 +127,7 @@ pub struct Roots {
 }
 
 /// Runs `program` with `args`, its standard output on success. Killed after `timeout`.
-fn run_command(program: &str, args: &[&str], timeout: std::time::Duration) -> CommandOutput {
+pub(crate) fn run_command(program: &str, args: &[&str], timeout: std::time::Duration) -> CommandOutput {
     use std::io::Read;
     use std::process::Stdio;
     let mut child = match std::process::Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
@@ -265,6 +265,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
             out.extend(check_device_lost(Some(hdr), session.as_deref()));
             out.extend(check_cannot_run(Some(hdr), session.as_deref()));
             out.extend(check_native_status(hdr));
+            out.extend(check_game_compat(hdr));
         }
         Err(e) => {
             out.push(Finding::new(
@@ -715,6 +716,48 @@ fn check_attached(roots: &Roots, hdr: &neural_forge_protocol::ShmHeader, manifes
         return Finding::new(CHECK, Severity::Ok, format!("{game}'s layer attached to the channel since it was created ({frames} frames)"), evidence, None);
     }
     check_never_attached(roots, manifest_ok, evidence)
+}
+
+/// The game on the channel against its entry in the tested games (`crate::compat`): its setup notes, and whether
+/// the model runs where it ran in testing. Nothing without a game.
+fn check_game_compat(hdr: &neural_forge_protocol::ShmHeader) -> Option<Finding> {
+    const CHECK: &str = "tested-game";
+    let name = hdr.game_name();
+    let scope = hdr.running_game.load(Ordering::Relaxed);
+    if name.is_empty() && scope == 0 {
+        return None;
+    }
+    let shown = if name.is_empty() { format!("Steam app {scope}") } else { name.clone() };
+    let Some(game) = crate::compat::for_header(hdr) else {
+        return Some(Finding::new(
+            CHECK,
+            Severity::Info,
+            format!("{shown} is not among the tested games: where the model runs in it is not known yet"),
+            format!("{} games in the built-in list (`neural-forge-cli games --tested`)", crate::compat::games().len()),
+            None,
+        ));
+    };
+    let evidence = game.details().trim_end().to_string();
+    let notes = (!game.notes.is_empty()).then(|| game.notes.join(" "));
+    let state = hdr.preupscale_state.load(Ordering::Relaxed);
+    let expected: Vec<crate::compat::Placement> = [Some(game.placement), game.placement_rr].into_iter().flatten().collect();
+    // Only a game running now, with the Placement setting on Auto, is compared: a setting that moves the model, or
+    // a closed game's last state, says nothing about the game; nor does waiting for DLSS or a pause with it (a menu, a
+    // loading screen).
+    let comparable = layer_alive(hdr)
+        && hdr.placement.load(Ordering::Relaxed) == neural_forge_protocol::enums::placement::AUTO
+        && state != neural_forge_protocol::enums::preupscale_state::WAITING
+        && state != neural_forge_protocol::enums::preupscale_state::PAUSED;
+    if comparable && !expected.iter().any(|p| p.preupscale_state() == state) {
+        return Some(Finding::new(
+            CHECK,
+            Severity::Warning,
+            format!("{}: the model runs {} now, but in testing it ran {}", game.name, crate::shm_status::preupscale_state_name(state), game.placement_text()),
+            evidence,
+            Some(notes.unwrap_or_else(|| "Check the game's DLSS settings (Super Resolution on), then attach Save report to a bug report.".into())),
+        ));
+    }
+    Some(Finding::new(CHECK, Severity::Ok, format!("{} is a tested game. {}", game.name, game.status_line()), evidence, notes))
 }
 
 /// No game's layer has attached: the likely causes, most likely first, and the fix for the first.
@@ -1633,6 +1676,42 @@ mod tests {
         assert_eq!(v[0].severity, Severity::Ok);
         assert!(check_compute_capability(&Gpus::Missing).is_empty());
         assert_eq!(check_compute_capability(&Gpus::Failed("exit status: 9".into()))[0].severity, Severity::Info);
+    }
+
+    #[test]
+    fn the_game_on_the_channel_is_checked_against_the_tested_games() {
+        use neural_forge_protocol::enums::preupscale_state;
+        let hdr = neural_forge_protocol::ShmHeader::default();
+        hdr.init_defaults();
+        assert!(check_game_compat(&hdr).is_none(), "no game, nothing to say");
+        hdr.set_game_name("Unknown.exe");
+        let f = check_game_compat(&hdr).unwrap();
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.summary.starts_with("Unknown.exe is not among the tested games"), "{}", f.summary);
+        hdr.set_game_name("Cyberpunk2077.exe");
+        hdr.running_game.store(1091500, Ordering::Relaxed);
+        let f = check_game_compat(&hdr).unwrap();
+        assert_eq!(f.severity, Severity::Ok);
+        assert!(f.summary.starts_with("Cyberpunk 2077 is a tested game. Tested in "), "{}", f.summary);
+        // Running now on the finished frame, though tested before the upscaler and after DLSS: a warning.
+        hdr.preupscale_state.store(preupscale_state::IDENTIFIED, Ordering::Relaxed);
+        let beat = std::sync::atomic::AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while beat.load(Ordering::Relaxed) {
+                    hdr.layer_heartbeat.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            let f = check_game_compat(&hdr).unwrap();
+            assert_eq!(f.severity, Severity::Warning, "{}", f.summary);
+            assert!(f.summary.contains("the model runs DLSS input identified, not holding now, but in testing it ran before the upscaler"), "{}", f.summary);
+            hdr.preupscale_state.store(preupscale_state::HOLDING_AFTER, Ordering::Relaxed);
+            assert_eq!(check_game_compat(&hdr).unwrap().severity, Severity::Ok, "after DLSS is its Ray Reconstruction placement");
+            hdr.preupscale_state.store(preupscale_state::WAITING, Ordering::Relaxed);
+            assert_eq!(check_game_compat(&hdr).unwrap().severity, Severity::Ok, "waiting (a menu) is not compared");
+            beat.store(false, Ordering::Relaxed);
+        });
     }
 
     #[test]

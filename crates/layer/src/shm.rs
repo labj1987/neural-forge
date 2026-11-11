@@ -717,6 +717,15 @@ impl ShmClient {
         hdr.hdr_detected.store(kind, Ordering::Relaxed);
     }
 
+    /// The HDR verdict of the swapchain presented (`ShmHeader::hdr_verdict`, `crate::hdr_verdict`), written only when
+    /// it differs from the channel's; an empty one (not a game's swapchain) is not published.
+    pub fn publish_hdr_verdict(&self, text: &str) {
+        let Some(hdr) = self.header() else { return };
+        if !text.is_empty() && hdr.hdr_verdict() != text {
+            hdr.set_hdr_verdict(text);
+        }
+    }
+
     /// What the layer does with the swapchain's HDR (`ShmHeader::hdr_active`, `enums::hdr_kind`): `PQ10` while
     /// it presents an HDR10 swapchain through the HDR path, `NONE` otherwise.
     pub fn publish_hdr_active(&self, kind: u32) {

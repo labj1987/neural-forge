@@ -915,7 +915,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     toasts.set_child(Some(&toolbar_view));
 
     // Developer aid: `NEURAL_FORGE_GUI_OPEN=<tab id>` (model/composition/debug/status/setup) selects
-    // that tab at startup, and `NEURAL_FORGE_GUI_OPEN=passes` opens the per-pass dialog, so either can be
+    // that tab at startup, `NEURAL_FORGE_GUI_OPEN=passes` opens the per-pass dialog and `uninstall` the Setup tab's
+    // Uninstall confirmation (`build_uninstall_group`), so each can be
     // screenshotted where synthetic input cannot reliably reach a page navigated to after the window opens.
     match neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
         Some("passes") => {
@@ -924,6 +925,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
             glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || open_pass_dialog(&shm, view.upcast_ref()));
         }
         Some(tab @ ("model" | "composition" | "debug" | "status" | "setup")) => view_stack.set_visible_child_name(tab),
+        Some("uninstall") => view_stack.set_visible_child_name("setup"),
         _ => {}
     }
 
@@ -2275,7 +2277,18 @@ struct ScannedGame {
     anti_cheat: Vec<&'static str>,
 }
 
-/// A game row's subtitle: its appid, library and target (or why it has none), and its anti-cheat.
+/// The Tested game row: the game's line from the tested games and its setup notes (the tooltip), or that it is not
+/// among them, or that no game has attached.
+fn tested_label(game: &str, facts: Option<&neural_forge_supervisor::compat::Game>) -> (String, Option<String>) {
+    match facts {
+        Some(f) => (format!("{}: {}", f.name, f.status_line()), (!f.notes.is_empty()).then(|| f.notes.join("\n"))),
+        None if game.is_empty() => ("no game attached yet".to_string(), None),
+        None => (format!("{game} is not among the tested games: where the model runs in it is not known yet"), None),
+    }
+}
+
+/// A game row's subtitle: its appid, library and target (or why it has none), its anti-cheat, and where the model ran
+/// in it in testing.
 fn game_subtitle(game: &neural_forge_supervisor::steam::Game, target: &str, chosen: bool, anti_cheat: &[&str]) -> String {
     let detail = match (game.unsupported(), target.is_empty()) {
         (Some(why), _) => format!("cannot be switched on: {why}"),
@@ -2286,7 +2299,11 @@ fn game_subtitle(game: &neural_forge_supervisor::steam::Game, target: &str, chos
         [] => String::new(),
         found => format!(" · anti-cheat: {}", neural_forge_supervisor::anti_cheat::list(found)),
     };
-    format!("{} · {} · {detail}{anti_cheat}", game.appid, game.library.display())
+    let tested = match neural_forge_supervisor::compat::find(game.appid.parse().ok(), "") {
+        Some(f) => format!(" · tested: {}", f.placement.describe()),
+        None => String::new(),
+    };
+    format!("{} · {} · {detail}{anti_cheat}{tested}", game.appid, game.library.display())
 }
 
 /// Asks before switching on a game whose folder ships `anti_cheat`: "Switch On Anyway" runs
@@ -2533,7 +2550,7 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                                     (steam::Outcome::Changed(_) | steam::Outcome::Unchanged, true) => {
                                         let running = steam::steam_running(std::path::Path::new("/proc"));
                                         let w = neural_forge_supervisor::proton_tool::installed_wrapper();
-                                        Some(neural_forge_supervisor::compat::switch_on(&root, &steam::libraries(&root), &appid, &w, running).map(|d| {
+                                        Some(neural_forge_supervisor::compat_tool::switch_on(&root, &steam::libraries(&root), &appid, &w, running).map(|d| {
                                             format!(
                                                 "; it runs with {} now{}",
                                                 d.tool,
@@ -2543,7 +2560,7 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                                     }
                                     (steam::Outcome::Changed(_) | steam::Outcome::Unchanged, false) => {
                                         let running = steam::steam_running(std::path::Path::new("/proc"));
-                                        Some(neural_forge_supervisor::compat::switch_off(&root, &appid, running).map(|p| match p {
+                                        Some(neural_forge_supervisor::compat_tool::switch_off(&root, &appid, running).map(|p| match p {
                                             Some(p) if p.is_empty() => "; it runs with Steam's default Proton again".to_string(),
                                             Some(p) => format!("; it runs with {p} again"),
                                             None => String::new(),
@@ -2634,6 +2651,7 @@ fn build_setup_page(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
     page.add(&games_group);
     page.add(&launch_group);
     page.add(&build_proton_group(toasts));
+    page.add(&build_uninstall_group());
     let fill = std::rc::Rc::new(move |scan: &SteamScan| {
         fill_games(scan);
         fill_launch(scan);
@@ -2802,6 +2820,126 @@ fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     });
     *refill.borrow_mut() = Some(rescan.clone());
     rescan();
+    group
+}
+
+/// The confirmation's text for Uninstall: everything it removes, what it cannot while Steam runs, and that deleting
+/// the AppImage alone leaves Neural Forge installed.
+fn uninstall_body(steam_running: bool, appimage: Option<&std::path::Path>) -> String {
+    let mut s = String::from(
+        "This removes everything Neural Forge put on this computer:\n\
+         \u{2022} the Vulkan layer every game loads, the app and the command-line tool\n\
+         \u{2022} your settings, profiles and per-game settings\n\
+         \u{2022} the extracted model and the imported NVIDIA DLL, captures and logs\n\
+         \u{2022} Neural Forge's own Proton builds (the *-NeuralForge tools in Steam)\n\
+         \u{2022} Neural Forge's part of every game's Steam launch options (your own options stay)\n",
+    );
+    if let Some(file) = appimage {
+        s.push_str(&format!("\u{2022} this AppImage file, {}\n", file.display()));
+    }
+    if steam_running {
+        s.push_str(
+            "\nSteam is running, so the launch options cannot be changed now (Steam writes its own copy back when it \
+             exits). Close Steam first to have them cleaned; otherwise the games are listed afterwards, with the options \
+             to set by hand. Neural Forge's variables do nothing once the layer is gone.\n",
+        );
+    }
+    s.push_str(
+        "\nDeleting only the AppImage file does not uninstall Neural Forge: the layer it installed stays, and the games \
+         switched on keep loading it. Games using a Neural Forge Proton build need another Proton chosen in their \
+         Properties afterwards.",
+    );
+    s
+}
+
+/// What Uninstall did, for the closing dialog.
+fn uninstall_result(purged: &neural_forge_supervisor::install::Purged, appimage_kept: Option<&std::path::Path>) -> String {
+    let mut s = format!("Removed {} files and folders.", purged.removed.len());
+    if !purged.switched_off.is_empty() {
+        s.push_str(&format!("\n\nSwitched off in the launch options of: {}.", purged.switched_off.join(", ")));
+    }
+    if !purged.left.is_empty() {
+        s.push_str("\n\nThese games still have Neural Forge's variables in their launch options (harmless without the layer):\n");
+        s.push_str(&purged.left.join("\n"));
+    }
+    if let Some(file) = appimage_kept {
+        s.push_str(&format!("\n\nDelete {} too: starting it again installs Neural Forge again.", file.display()));
+    } else {
+        s.push_str("\n\nIf you start Neural Forge from another AppImage file, delete it too: starting it installs Neural Forge again.");
+    }
+    s
+}
+
+/// The Uninstall group (Setup tab): one destructive button, a confirmation saying what goes, then the result; the app
+/// quits afterwards (its files are gone).
+fn build_uninstall_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Uninstall");
+    let row = adw::ActionRow::new();
+    row.set_title("Uninstall Neural Forge");
+    row.set_subtitle("Remove the layer, settings, model, Proton builds and launch options it added, and this AppImage");
+    let button = gtk4::Button::with_label("Uninstall…");
+    button.add_css_class("destructive-action");
+    button.set_valign(gtk4::Align::Center);
+    row.add_suffix(&button);
+    group.add(&row);
+    // Developer aid, as `NEURAL_FORGE_GUI_OPEN=passes`: `NEURAL_FORGE_GUI_OPEN=uninstall` opens the confirmation (only
+    // that: nothing is removed without pressing Uninstall in it), for a screenshot.
+    if neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() == Some("uninstall") {
+        let button = button.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(700), move || button.emit_clicked());
+    }
+    button.connect_clicked(|button| {
+        let appimage = std::env::var_os("APPIMAGE").map(std::path::PathBuf::from).filter(|p| p.is_file());
+        let steam_running = neural_forge_supervisor::steam::steam_running(std::path::Path::new("/proc"));
+        let parent = button.root().and_downcast::<gtk4::Window>();
+        let dialog = adw::AlertDialog::builder()
+            .heading("Uninstall Neural Forge?")
+            .body(uninstall_body(steam_running, appimage.as_deref()))
+            .default_response("cancel")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("uninstall", "Uninstall");
+        dialog.set_response_appearance("uninstall", adw::ResponseAppearance::Destructive);
+        let button = button.clone();
+        dialog.choose(parent.clone().as_ref(), None::<&gio::Cancellable>, move |response| {
+            if response != "uninstall" {
+                return;
+            }
+            button.set_sensitive(false);
+            let parent = parent.clone();
+            glib::spawn_future_local(async move {
+                let target = appimage.clone();
+                let done = gio::spawn_blocking(move || {
+                    neural_forge_supervisor::install::purge_with(neural_forge_supervisor::install::Leftovers::Report, target.as_deref())
+                })
+                .await;
+                let (heading, body, uninstalled) = match done {
+                    Ok(Ok(purged)) => {
+                        let kept = appimage.filter(|f| f.exists());
+                        ("Neural Forge is uninstalled", uninstall_result(&purged, kept.as_deref()), true)
+                    }
+                    Ok(Err(e)) => {
+                        ("Uninstall stopped", format!("{e}\n\nWhat was removed before this stays removed; press Uninstall again once it is fixed."), false)
+                    }
+                    Err(_) => ("Uninstall stopped", "The uninstall failed unexpectedly.".to_string(), false),
+                };
+                let result = adw::AlertDialog::builder().heading(heading).body(body).build();
+                result.add_response("close", if uninstalled { "Quit" } else { "Close" });
+                let app_window = parent.clone();
+                result.choose(parent.as_ref(), None::<&gio::Cancellable>, move |_| {
+                    if uninstalled {
+                        if let Some(app) = app_window.and_then(|w| w.application()) {
+                            app.quit();
+                        }
+                    } else {
+                        button.set_sensitive(true);
+                    }
+                });
+            });
+        });
+    });
     group
 }
 
@@ -3028,8 +3166,31 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     // after it (everything else). Read-only; there is no setting for it.
     let preupscale_row = adw::ActionRow::new();
     preupscale_row.set_title("Model placement");
+    // The running game's entry in the tested games (`neural_forge_supervisor::compat`): where the model ran in it
+    // in testing and the version that was, with its setup notes in the tooltip.
+    let tested_row = adw::ActionRow::new();
+    tested_row.set_title("Tested game");
+    // The HDR verdict: what the game asked for and why (the layer's), and the desktop's HDR state.
+    let hdr_row = adw::ActionRow::new();
+    hdr_row.set_title("HDR");
     group.add(&layer_row);
     group.add(&preupscale_row);
+    group.add(&tested_row);
+    group.add(&hdr_row);
+
+    // The desktop's HDR state asks the compositor (a D-Bus call): on a worker, every 30 s.
+    let desktop: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::default();
+    {
+        let desktop = std::rc::Rc::clone(&desktop);
+        every(&hdr_row, std::time::Duration::from_secs(30), move |_| {
+            let desktop = std::rc::Rc::clone(&desktop);
+            glib::spawn_future_local(async move {
+                if let Ok(state) = gio::spawn_blocking(neural_forge_supervisor::desktop_hdr::read).await {
+                    *desktop.borrow_mut() = state;
+                }
+            });
+        });
+    }
 
     let shm_for_timer = std::sync::Arc::clone(shm);
     // Liveness is read from the heartbeat, not `layer_attached`: a closed game never clears it.
@@ -3038,6 +3199,10 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     every(&layer_row, SECOND, move |layer_row| {
         let preupscale_row = &preupscale_for_timer;
         let hdr = shm_for_timer.header();
+        let (tested, notes) = tested_label(hdr.game_name().as_str(), neural_forge_supervisor::compat::for_header(hdr));
+        tested_row.set_subtitle(&tested);
+        tested_row.set_tooltip_text(notes.as_deref());
+        hdr_row.set_subtitle(&neural_forge_supervisor::shm_status::hdr_line(hdr, desktop.borrow().as_deref()));
         // A header laid out by another build is refused at open (see `Shm::open`), so the
         // version needs no check here.
         let layer_active = live.alive(hdr);
@@ -3441,7 +3606,7 @@ fn connect_save_report(button: &gtk4::Button, shm: &std::sync::Arc<neural_forge_
         let button = button.clone();
         button.set_sensitive(false);
         glib::spawn_future_local(async move {
-            let saved = gio::spawn_blocking(move || neural_forge_supervisor::report::save(&status, &game, None)).await;
+            let saved = gio::spawn_blocking(move || neural_forge_supervisor::report::save(&status, &game, None, None)).await;
             button.set_sensitive(true);
             match saved {
                 Ok(Ok(path)) => {
@@ -3782,5 +3947,34 @@ mod telemetry_tests {
         assert_eq!(telemetry_ceiling(&[s(Some(16.7), None)].into()), 20.0, "60 fps");
         assert_eq!(telemetry_ceiling(&[s(Some(19.5), None)].into()), 40.0, "close to a step goes to the next");
         assert_eq!(telemetry_ceiling(&[s(Some(250.0), None)].into()), 80.0, "a stall is capped");
+    }
+}
+
+#[cfg(test)]
+mod uninstall_tests {
+    use super::{uninstall_body, uninstall_result};
+
+    #[test]
+    fn the_confirmation_says_what_goes_and_what_an_appimage_delete_leaves() {
+        let file = std::path::Path::new("/home/u/AppImages/neural-forge.AppImage");
+        let body = uninstall_body(false, Some(file));
+        assert!(body.contains("*-NeuralForge") && body.contains("this AppImage file, /home/u/AppImages/neural-forge.AppImage"), "{body}");
+        assert!(body.contains("Deleting only the AppImage file does not uninstall Neural Forge"), "{body}");
+        assert!(!body.contains("Steam is running"));
+        assert!(uninstall_body(true, None).contains("Steam is running, so the launch options cannot be changed now"));
+    }
+
+    #[test]
+    fn the_result_lists_what_steam_kept() {
+        let purged = neural_forge_supervisor::install::Purged {
+            switched_off: vec!["Some Game (1)".into()],
+            left: vec!["app 2: Steam is running, ...; its launch options without Neural Forge: `%command%`".into()],
+            removed: vec!["/a".into(), "/b".into()],
+            ..Default::default()
+        };
+        let text = uninstall_result(&purged, None);
+        assert!(text.starts_with("Removed 2 files and folders."), "{text}");
+        assert!(text.contains("Switched off in the launch options of: Some Game (1).") && text.contains("app 2: Steam is running"), "{text}");
+        assert!(uninstall_result(&purged, Some(std::path::Path::new("/x.AppImage"))).contains("Delete /x.AppImage too"));
     }
 }

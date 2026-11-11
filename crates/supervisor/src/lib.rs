@@ -5,7 +5,9 @@
 pub mod anti_cheat;
 pub mod appinfo;
 pub mod compat;
+pub mod compat_tool;
 pub mod config;
+pub mod desktop_hdr;
 pub mod doctor;
 pub mod game_settings;
 pub mod install;

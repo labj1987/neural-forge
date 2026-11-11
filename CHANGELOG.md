@@ -130,6 +130,39 @@ first shipped them; their phase is kept as a subheading.
   or as SDR (sRGB). A game with HDR switched on whose window is still SDR is either drawing SDR or putting HDR10
   code into an SDR window, which Neural Forge leaves untouched.
 
+**What to expect in a game, and HDR at a glance**
+
+- The Status tab says whether the running game is one Neural Forge is tested in, where the model ran in it (with
+  and without Ray Reconstruction) and in which version, with the game's setup notes and known issues as the line's
+  tooltip. The Setup tab's games list says where the model runs in each tested game, and
+  `neural-forge-cli games --tested [GAME]` lists them or shows one game's notes. Diagnose (and
+  `neural-forge-cli doctor`) says when the model runs somewhere else in a tested game than it did in testing.
+- A new HDR line on the Status tab says in plain words whether the game presents HDR and, when it does not, why:
+  the game's HDR setting is off although HDR10 was available, or the game asked for SDR although it sent HDR
+  metadata because its window offered no HDR (gamescope without `--hdr-enabled`, Proton without
+  `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`, or the desktop's HDR off), with the window's format and colour
+  space and the desktop's HDR state per display (GNOME, KDE Plasma). `neural-forge-cli shmctl status`
+  (`hdr_verdict=`), Save report and the game's log (`[layer] HDR:`) say the same.
+
+**Uninstall from the app**
+
+- The Setup tab has **Uninstall…**: after a confirmation that lists what goes, it removes everything Neural Forge
+  put on the computer (the layer, the app, settings, the model and imported DLL, captures, logs, Neural Forge's
+  part of every game's launch options), Neural Forge's own Proton builds and the AppImage file it runs from, then
+  quits. With Steam running the launch options cannot be changed; the games that keep Neural Forge's variables
+  are listed with the options to set by hand. Deleting only the AppImage file does not uninstall Neural Forge:
+  the layer stays installed. `neural-forge-cli uninstall --purge` now removes Neural Forge's Proton builds too.
+
+**Bug reports that can be answered the first time**
+
+- Save report now also names the tested game and its entry (where the model should run, its known issues), and
+  the HDR verdict with the desktop's HDR state. `neural-forge-cli report --trace FILE` adds a trace the game's
+  layer recorded, when you are asked for one.
+- Save report lists every game switched on with the Proton Steam runs it with and whether that is a Neural Forge
+  Proton, and how many DLSS records the running game's Neural Forge Proton handed over.
+- The bug report form asks whether the game is set to the Neural Forge Proton, for the store, the DLSS features
+  that are on and the HDR line, next to the Save report zip, so the first reply can be a fix instead of questions.
+
 **Diagnosing crashes**
 
 - If Neural Forge itself fails inside a game, the game's log (`NEURAL_FORGE_LOG`) now ends with a `[panic]` line

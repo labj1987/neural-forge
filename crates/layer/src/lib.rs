@@ -25,6 +25,7 @@ mod dump;
 mod entry_points;
 mod gpu_timer;
 mod hdr_present;
+mod hdr_verdict;
 mod hotkey;
 mod loader_data;
 mod logging;
@@ -69,6 +70,9 @@ use device::NeuralForgeDeviceInfo;
 struct InstanceContext {
     instance: Arc<ash::Instance>,
     surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
+    /// The next layer's surface-formats query: whether a swapchain's surface offered an HDR colour space
+    /// (`hdr_verdict`).
+    surface_formats: Option<vk::PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>,
     /// Which `vkGetPhysicalDeviceMemoryProperties2` the application's instance may call (the VRAM log).
     properties2: vram::Properties2,
     /// The application's `VkApplicationInfo::api_version` (0 without one): the network needs 1.3
@@ -1214,6 +1218,11 @@ impl Layer for NeuralForgeLayer {
             next_get_instance_proc_addr(instance.handle(), c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR".as_ptr())
                 .map(|p| std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(p))
         };
+        // SAFETY: as above; the name matches the PFN type.
+        let surface_formats = unsafe {
+            next_get_instance_proc_addr(instance.handle(), c"vkGetPhysicalDeviceSurfaceFormatsKHR".as_ptr())
+                .map(|p| std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(p))
+        };
         // SAFETY: the application's create info, valid for the call; its application info is null or valid.
         let mut api_version = unsafe { create_info.p_application_info.as_ref() }.map_or(0, |app| app.api_version);
         if RAISED_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&instance.handle()) {
@@ -1221,7 +1230,14 @@ impl Layer for NeuralForgeLayer {
         }
         let surface_maintenance = swapchain_maintenance::take_instance(instance.handle());
         NeuralForgeInstanceHooks {
-            ctx: Some(InstanceContext { instance, surface_caps, properties2: vram::Properties2::of(create_info), api_version, surface_maintenance }),
+            ctx: Some(InstanceContext {
+                instance,
+                surface_caps,
+                surface_formats,
+                properties2: vram::Properties2::of(create_info),
+                api_version,
+                surface_maintenance,
+            }),
         }
     }
 
@@ -1243,7 +1259,7 @@ impl Layer for NeuralForgeLayer {
             instance.as_ref().is_some_and(|ctx| core_1_1(ctx.api_version, unsafe { ctx.instance.get_physical_device_properties(physical_device) }.api_version));
         NeuralForgeDeviceInfo::new(
             instance.as_ref().map(|ctx| ctx.instance.clone()),
-            instance.and_then(|ctx| ctx.surface_caps),
+            device::SurfaceQueries { caps: instance.as_ref().and_then(|ctx| ctx.surface_caps), formats: instance.as_ref().and_then(|ctx| ctx.surface_formats) },
             physical_device,
             device,
             next_get_device_proc_addr,
@@ -1373,6 +1389,7 @@ mod instance_table_tests {
             ctx: Some(InstanceContext {
                 instance: instance.clone(),
                 surface_caps: None,
+                surface_formats: None,
                 properties2: vram::Properties2::None,
                 api_version: 0,
                 surface_maintenance: Default::default(),
@@ -1624,6 +1641,7 @@ mod device_link_tests {
         let ctx = InstanceContext {
             instance: instance.clone(),
             surface_caps: None,
+            surface_formats: None,
             properties2: vram::Properties2::None,
             api_version: 0,
             surface_maintenance: Default::default(),
@@ -1695,6 +1713,7 @@ mod device_link_tests {
             ctx: Some(InstanceContext {
                 instance: instance.clone(),
                 surface_caps: None,
+                surface_formats: None,
                 properties2: vram::Properties2::None,
                 api_version: 0,
                 surface_maintenance: Default::default(),

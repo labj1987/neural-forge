@@ -1,0 +1,54 @@
+# The pre-release game sweep's runs (scripts/game-sweep.sh; docs/RUNNING_AND_MEASURING.md, "The pre-release game
+# sweep"). What each run expects comes from data/games.toml: the game's placement (placement_rr with
+# ray_reconstruction = true) and HDR10 with hdr = true, SDR otherwise.
+#
+# One [[run]] per run:
+#   label        a name for the run's files (letters, digits, - and _)
+#   appid        the game's Steam app id (it must be in data/games.toml; a game not installed is skipped)
+#   route        "steam": started by Steam with the run's launch options (Neural Forge on, the run's log, Proton's
+#                HDR switches with hdr = true, args after %command%); "gta-bench": scripts/gta-bench.sh
+#   args         the game's arguments after %command% (an unattended benchmark)
+#   seconds      how long to watch once the expected placement is reached (default 90), or until the game exits
+#   timeout      how long to wait for the placement (default 600)
+#   hdr          run with HDR: PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1, the game's HDR setting in edits
+#   ray_reconstruction   expect the game's Ray Reconstruction placement (set it on in edits)
+#   edit_file, edit_kind, edits   game settings for the run, restored afterwards byte for byte: the file relative to
+#                the game's Proton user folder (compatdata/<appid>/pfx/drive_c/users/steamuser), "json-option"
+#                (Cyberpunk 2077's UserSettings.json option names) or "xml-value" (<Name value="..."/>), NAME=VALUE
+#
+# Every run is at 3840x2160 (the test machine's desktop); games with HDR run with it on.
+
+[[run]]
+label = "cyberpunk"
+appid = 1091500
+route = "steam"
+args = "--launcher-skip -skipStartScreen -benchmark"
+seconds = 60
+timeout = 420
+hdr = true
+edit_file = "AppData/Local/CD Projekt Red/Cyberpunk 2077/UserSettings.json"
+edit_kind = "json-option"
+edits = ["Resolution=3840x2160", "HDRModes=HDR10_PQ", "DLSS_D=false"]
+
+[[run]]
+label = "cyberpunk-rr"
+appid = 1091500
+route = "steam"
+args = "--launcher-skip -skipStartScreen -benchmark"
+seconds = 60
+timeout = 420
+hdr = true
+ray_reconstruction = true
+edit_file = "AppData/Local/CD Projekt Red/Cyberpunk 2077/UserSettings.json"
+edit_kind = "json-option"
+edits = ["Resolution=3840x2160", "HDRModes=HDR10_PQ", "DLSS_D=true"]
+
+[[run]]
+label = "gta"
+appid = 3240220
+route = "gta-bench"
+seconds = 60
+timeout = 480
+edit_file = "Documents/Rockstar Games/GTAV Enhanced/settings.xml"
+edit_kind = "xml-value"
+edits = ["ScreenWidth=3840", "ScreenHeight=2160"]

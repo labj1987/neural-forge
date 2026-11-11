@@ -117,6 +117,19 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   portal and falls back to light: set `ADW_DEBUG_COLOR_SCHEME=prefer-dark`, and look at every image
   before committing it.
 
+## Tested games and the sweep
+
+- `data/games.toml` is the per-game compatibility list the app is built with (`crates/supervisor/src/compat.rs`):
+  each tested game's engine, API, DLSS features, where the model runs with Ray Reconstruction off and on, its
+  HDR route, setup notes and the version it was last verified in. The Status and Setup tabs, `games --tested`,
+  `doctor`, Save report and the game sweep read it. A newly tested game gets an entry (and a row in the user guide's
+  "Tested games"); a change that moves the model elsewhere in a game updates its entry in the same commit.
+- Before a release that touches the layer (above all `preupscale`), run the game sweep on the test machine with
+  the release build: `scripts/game-sweep.sh --layer <build>/libneural_forge_layer.so --cli <build>/neural-forge-cli`
+  (docs/RUNNING_AND_MEASURING.md, section 11), in tmux; it takes the GPU lock and puts back what it changes. Every
+  run must pass (each run holds the GPU lock only while it runs); record the passing games' `verified`/`verified_on` in `data/games.toml`. Runs are at the test
+  machine's desktop resolution (3840x2160), with HDR for games that have it.
+
 ## Test builds
 
 - A fix for an issue someone else reported goes to them before it reaches `main`: push it on its own branch,
