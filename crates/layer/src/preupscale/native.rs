@@ -294,6 +294,15 @@ impl LoaderState {
             return (None, wake);
         };
         if self.opened_for == Some(target) && !self.built.is_empty() && self.built_sizes() == sizes {
+            // A path takes the current build while the other path's request for another set of sizes waits for the
+            // loader thread: that request is dropped, or the thread would free this build under the frame recorded
+            // with it now (Cyberpunk 2077 resuming from its pause menu: the after-the-upscaler path asked for the
+            // output size, a hold recorded into DLSS's buffer took the render-size build an instant later, the
+            // thread rebuilt, and the GPU faulted reading the freed build: Xid 13, device lost; #59). The other
+            // path asks again when it next runs, which `claim_post` keeps off while holds run.
+            if self.wanted.as_deref().is_some_and(|w| w != sizes) {
+                self.wanted = None;
+            }
             return (Some(self.built.clone()), wake);
         }
         if self.wanted.as_deref() != Some(sizes) {

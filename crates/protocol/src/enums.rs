@@ -23,6 +23,10 @@ pub mod preupscale_state {
     /// `ShmHeader::preupscale_reason` says why (the last reason the split hold or the hold inside DLSS's
     /// buffer gave). The model runs after the upscaler meanwhile, as with [`WAITING`].
     pub const IDENTIFIED: u32 = 5;
+    /// The game stopped calling DLSS a moment ago (a pause menu, a map, a loading screen) after holds ran the model
+    /// before the upscaler or after DLSS: nothing runs it now (the after-the-upscaler path is kept off for the
+    /// hand-back, 30 s), and it runs again on DLSS's next frame, with the network still loaded.
+    pub const PAUSED: u32 = 6;
 }
 
 /// Which of the networks `extract-model` writes the layer runs (`ShmHeader::network`, the Network

@@ -335,11 +335,6 @@ fn scheduled() -> &'static [(u32, Duration, u32)] {
     &AT
 }
 
-/// Whether `NEURAL_FORGE_CACHE_DUMP_AT` is set (the resumes are then logged).
-pub(crate) fn scheduled_any() -> bool {
-    !scheduled().is_empty()
-}
-
 /// Reads and removes the trigger file, if there is one. A file that is not a request is removed
 /// too (and said why).
 pub(crate) fn take_trigger_file(path: &std::path::Path) -> Option<u32> {

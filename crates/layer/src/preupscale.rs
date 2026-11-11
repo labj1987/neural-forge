@@ -252,8 +252,62 @@ pub(crate) const RECENT: Duration = Duration::from_millis(500);
 /// post-upscaler path stays off (frames are presented as DLSS made them). Covers loading screens,
 /// where DLSS does not run: handing back to the post path there rebuilt the model at the
 /// output size and back at every loading screen (twice per screen, at 4K near full VRAM). Loading screens do not need
-/// the model. Longer than this without DLSS (switched off, DLAA) and the post path runs as before.
+/// the model. Longer than this without DLSS while DLSS Super Resolution's kernels still launch (DLAA, inputs no
+/// longer identified) and the post path runs as before. With no Super Resolution launch at all since DLSS's last
+/// frame the game paused DLSS (a pause menu, a map, a loading screen): [`PAUSE_HAND_BACK`].
 pub(crate) const HAND_BACK: Duration = Duration::from_secs(30);
+
+/// [`HAND_BACK`] while DLSS Super Resolution has not launched at all since its last frame: the game paused it (a
+/// pause menu over the last frame, which already carries the model's edit, #49). Handing those frames to the post
+/// path after 30 s ran the network a second time over the menu (at the output size: 49 ms a frame at 4K), rebuilt it
+/// at the output size and back at the render size on resume (the model off for over a second, and on a 12 GB card at
+/// 4K the VRAM guard paused it for good after the first long pause). A game whose DLSS was switched off for another
+/// upscaler gets the post path after this.
+pub(crate) const PAUSE_HAND_BACK: Duration = Duration::from_secs(300);
+
+/// DLSS Super Resolution's input-kernel launches a device of the process saw, identified or not ([`note_sr_launch`]):
+/// when the current run of them began (launches less than [`RECENT`] apart) and the last one.
+static SR_LAUNCHES: Mutex<Option<SrLaunches>> = Mutex::new(None);
+
+/// A run of DLSS Super Resolution's launches ([`SR_LAUNCHES`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SrLaunches {
+    pub since: Instant,
+    pub last: Instant,
+}
+
+impl SrLaunches {
+    /// The run after a launch at `now`.
+    fn after(run: Option<Self>, now: Instant) -> Self {
+        match run {
+            Some(r) if now.saturating_duration_since(r.last) < RECENT => Self { last: now, ..r },
+            _ => Self { since: now, last: now },
+        }
+    }
+}
+
+/// A launch-bearing submit carried DLSS Super Resolution's input launch (its inputs identified or not).
+fn note_sr_launch() {
+    let mut run = lock(&SR_LAUNCHES);
+    *run = Some(SrLaunches::after(*run, Instant::now()));
+}
+
+fn sr_launches() -> Option<SrLaunches> {
+    *lock(&SR_LAUNCHES)
+}
+
+/// When the post path gets the frames back after DLSS's last frame at `last`: [`HAND_BACK`] after Super Resolution
+/// went on launching without its input held (DLAA, inputs no longer identified: a run of launches that goes on more
+/// than [`RECENT`] past `last`, counted from `last` or from the run's start if it began later), else
+/// [`PAUSE_HAND_BACK`] after `last` (DLSS paused: a pause menu, a loading screen). A run that begins as the game
+/// resumes is DLSS coming back, and its input is held again within a few frames: it hands nothing back for
+/// [`HAND_BACK`] (handing back at the resume rebuilt the network for the post path under the first holds, #59).
+pub(crate) fn hand_back_at(last: Instant, launches: Option<SrLaunches>) -> Instant {
+    match launches.filter(|r| r.last.saturating_duration_since(last) > RECENT) {
+        Some(r) => r.since.max(last) + HAND_BACK,
+        None => last + PAUSE_HAND_BACK,
+    }
+}
 
 /// The largest value of the game's exposure image the HDR encode trusts. Measured exposures:
 /// GTA V 0.15-0.34, Crimson Desert 0.02-0.06, Cyberpunk 2077 2.7-3.3; Wukong's DLSS-internal 1x1
@@ -4025,6 +4079,10 @@ impl Tracker {
         // Whether DLSS Ray Reconstruction runs.
         self.launch_submits += 1;
         let now = self.launch_submits;
+        // DLSS Super Resolution launched (identified or not): DLSS runs, it did not pause (`hand_back_at`).
+        if batches.iter().flatten().any(|cb| self.launch.get(cb).is_some_and(|r| matches!(r.input, Some(InputLaunch::Inputs { .. })))) {
+            note_sr_launch();
+        }
         for cb in batches.iter().flatten() {
             let Some(refs) = self.launch.get(cb) else { continue };
             if !refs.rr.is_empty() {
@@ -7411,7 +7469,7 @@ impl Session {
     /// ([`post_off`]).
     pub(crate) fn suppresses_post(&self) -> bool {
         let now = Instant::now();
-        mode() == Mode::Model && post_off(self.engaged, self.last_dlss, now) && !post_serves(now)
+        mode() == Mode::Model && post_off(self.engaged, self.last_dlss, sr_launches(), now) && !post_serves(now)
     }
 
     /// How many launch-bearing submits with DLSS's inputs identified reached the hold point
@@ -7426,8 +7484,9 @@ impl Session {
         if self.last_dlss.is_none_or(|t| t.elapsed() >= CAPTURE_GAP) {
             self.resumes += 1;
             self.resumed_at = Some(Instant::now());
-            if neural_forge_protocol::env::is_set("NEURAL_FORGE_CAPTURE_AT") || cache_dump::scheduled_any() {
-                crate::log!("[preupscale] DLSS frames resumed (#{}) after {} ms", self.resumes, self.last_dlss.map_or(0, |t| t.elapsed().as_millis()));
+            // Always: a pause menu or loading screen and how long it kept DLSS paused (#49).
+            if let Some(gap) = self.last_dlss.map(|t| t.elapsed()) {
+                crate::log!("[preupscale] DLSS frames resumed (#{}) after {} ms", self.resumes, gap.as_millis());
             }
         }
         self.last_dlss = Some(Instant::now());
@@ -7467,7 +7526,7 @@ impl Session {
     /// presents on (no swapchain on the DLSS device, identified against an output-like image) must
     /// not get the model twice, before DLSS on one device and after it on the other.
     fn share_post_off(&self) {
-        self.post_off.set(post_off_until(mode() == Mode::Model, self.engaged, self.last_dlss));
+        self.post_off.set(post_off_since(mode() == Mode::Model, self.engaged, self.last_dlss));
     }
 
     /// Whether a hold happened within [`RECENT`].
@@ -8324,7 +8383,10 @@ impl Session {
         }
         let (w, h) = self.last_hold_extent.filter(|_| self.holding()).or(extent).unwrap_or((0, 0));
         let dlss = self.last_dlss.is_some_and(|t| t.elapsed() < RECENT);
-        let (state, reason) = with_last_refusal(|last| status_of(self.holding(), dlss, last.as_ref()));
+        // DLSS stopped after holds ran (a pause menu): the post path is kept off, so nothing runs the model until DLSS's
+        // next frame. Not "waiting for DLSS input", which reads as the model having moved after the upscaler (#49).
+        let paused = self.suppresses_post();
+        let (state, reason) = with_last_refusal(|last| status_of(self.holding(), dlss, paused, last.as_ref()));
         shm.publish_preupscale_state(state, self.last_hold_native, w, h);
         publish_reason(shm, &reason);
     }
@@ -8333,10 +8395,14 @@ impl Session {
 /// The pre-upscaler status of a device that is `holding` (a hold within [`RECENT`]) or not, with DLSS seen running
 /// with its inputs identified within [`RECENT`] (`dlss`, [`Session::saw_dlss`]), and `refusal` the last reason a frame
 /// was not held: the state and the reason the header gets. DLSS identified with no hold is every frame refused, which
-/// is not the same as no DLSS at all ("waiting for DLSS input", #51): `IDENTIFIED`, with the reason.
-fn status_of(holding: bool, dlss: bool, refusal: Option<&Refusal>) -> (u32, String) {
+/// is not the same as no DLSS at all ("waiting for DLSS input", #51): `IDENTIFIED`, with the reason. With neither, a
+/// device whose holds keep the post path off (`paused`, [`Session::suppresses_post`]: DLSS stopped within [`HAND_BACK`])
+/// is `PAUSED`: the model resumes with DLSS (#49).
+fn status_of(holding: bool, dlss: bool, paused: bool, refusal: Option<&Refusal>) -> (u32, String) {
     if !holding && dlss {
         (neural_forge_protocol::enums::preupscale_state::IDENTIFIED, refusal.map(Refusal::text).unwrap_or_default())
+    } else if !holding && paused {
+        (neural_forge_protocol::enums::preupscale_state::PAUSED, String::new())
     } else {
         (hold_state(holding), String::new())
     }
@@ -8351,26 +8417,26 @@ fn publish_reason(shm: &ShmClient, reason: &str) {
 }
 
 /// Whether the post-upscaler path stays off at `now` in model mode: a hold on the device has run
-/// the model (`engaged`) and DLSS ran within [`HAND_BACK`] (`last_dlss`).
-pub(crate) fn post_off(engaged: bool, last_dlss: Option<Instant>, now: Instant) -> bool {
-    engaged && last_dlss.is_some_and(|t| now.saturating_duration_since(t) < HAND_BACK)
+/// the model (`engaged`) and the hand-back after DLSS's last frame (`last_dlss`, [`hand_back_at`] with Super
+/// Resolution's `launches`) has not come.
+pub(crate) fn post_off(engaged: bool, last_dlss: Option<Instant>, launches: Option<SrLaunches>, now: Instant) -> bool {
+    engaged && last_dlss.is_some_and(|t| now < hand_back_at(t, launches))
 }
 
-/// Until when each device that holds DLSS's input keeps the post path off ([`post_off`] as of its
-/// last DLSS submit or hold), by session ([`PostOffEntry`]), read by every device of the process; a
-/// device that does not has no entry. Per device: one device's state never overwrites another's.
+/// The last DLSS frame of each device that holds DLSS's input ([`post_off`] from it), by session ([`PostOffEntry`]),
+/// read by every device of the process; a device that does not has no entry. Per device: one device's state never
+/// overwrites another's.
 static POST_OFF_UNTIL: Mutex<BTreeMap<u64, Instant>> = Mutex::new(BTreeMap::new());
 
-/// [`POST_OFF_UNTIL`]'s value for a device in model mode (`model`): [`post_off`] at any `now` is
-/// `now` before it.
-fn post_off_until(model: bool, engaged: bool, last_dlss: Option<Instant>) -> Option<Instant> {
-    last_dlss.filter(|_| model && engaged).map(|t| t + HAND_BACK)
+/// [`POST_OFF_UNTIL`]'s value for a device in model mode (`model`): its last DLSS frame once it has held.
+fn post_off_since(model: bool, engaged: bool, last_dlss: Option<Instant>) -> Option<Instant> {
+    last_dlss.filter(|_| model && engaged)
 }
 
-/// Keeps the post path off for [`HAND_BACK`] from now, for the native backend's hold inside DLSS's
+/// Keeps the post path off for the hand-back from now ([`hand_back_at`]), for the native backend's hold inside DLSS's
 /// buffer. That hold needs the device's state, which the post path holds while its frame waits on
 /// the GPU, and the GPU waits at the hold: with the post path on, the hold never gets the state, so
-/// it never engages the device the way [`post_off_until`] wants. The network is the same one either
+/// it never engages the device the way [`post_off_since`] wants. The network is the same one either
 /// path would use, so nothing is lost by not waiting for that.
 ///
 /// Its own slot: [`POST_OFF_UNTIL`] is rewritten from the session's state at every hold and present,
@@ -8378,10 +8444,10 @@ fn post_off_until(model: bool, engaged: bool, last_dlss: Option<Instant>) -> Opt
 /// 2026-10-07: the post path started, then the GPU faulted when the holds took over).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn keep_post_off() {
-    *lock(&NATIVE_POST_OFF_UNTIL) = Some(Instant::now() + HAND_BACK);
+    *lock(&NATIVE_POST_OFF_UNTIL) = Some(Instant::now());
 }
 
-/// Until when the native backend's hold inside DLSS's buffer keeps the post path off ([`keep_post_off`]).
+/// When the native backend's hold inside DLSS's buffer last kept the post path off ([`keep_post_off`]).
 static NATIVE_POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Whether some device of the process keeps the post path off at `now` (its [`Session`]
@@ -8389,7 +8455,9 @@ static NATIVE_POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// own [`Session::suppresses_post`]; it matters when DLSS runs on another device than the swapchain
 /// (only ever set in model mode).
 pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
-    (lock(&POST_OFF_UNTIL).values().any(|&until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)) && !post_serves(now)
+    let launch = sr_launches();
+    let off = |since: Instant| now < hand_back_at(since, launch);
+    (lock(&POST_OFF_UNTIL).values().any(|&since| off(since)) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(off)) && !post_serves(now)
 }
 
 /// The process's latest hold, from whichever device made it ([`Session::note`]): when, its header state, whether
@@ -9489,12 +9557,15 @@ mod tests {
         let t0 = Instant::now();
         for engaged in [false, true] {
             for last in [None, Some(t0)] {
-                let until = post_off_until(true, engaged, last);
-                for ms in [0, 1, 29_999, 30_000, 30_001, 60_000] {
-                    let now = t0 + Duration::from_millis(ms);
-                    assert_eq!(until.is_some_and(|u| now < u), post_off(engaged, last, now), "engaged {engaged}, last {last:?}, +{ms} ms");
+                let since = post_off_since(true, engaged, last);
+                for launch in [None, Some(SrLaunches { since: t0, last: t0 + Duration::from_secs(5) })] {
+                    for ms in [0, 1, 29_999, 30_000, 30_001, 60_000, 299_999, 300_001] {
+                        let now = t0 + Duration::from_millis(ms);
+                        let shared = since.is_some_and(|s| now < hand_back_at(s, launch));
+                        assert_eq!(shared, post_off(engaged, last, launch, now), "engaged {engaged}, last {last:?}, launch {launch:?}, +{ms} ms");
+                    }
                 }
-                assert_eq!(post_off_until(false, engaged, last), None, "only model mode turns the post path off");
+                assert_eq!(post_off_since(false, engaged, last), None, "only model mode turns the post path off");
             }
         }
     }
@@ -9893,13 +9964,18 @@ mod tests {
     fn dlss_identified_with_every_frame_refused_is_not_waiting_for_dlss_input() {
         use neural_forge_protocol::enums::preupscale_state::{IDENTIFIED, WAITING};
         let split = Refusal::Text("the colour input was last transitioned out of GENERAL; not holding".into());
-        assert_eq!(status_of(false, false, Some(&split)), (WAITING, String::new()), "no DLSS lately: waiting");
-        assert_eq!(status_of(false, true, Some(&split)), (IDENTIFIED, "the colour input was last transitioned out of GENERAL; not holding".into()));
-        assert_eq!(status_of(false, true, None), (IDENTIFIED, String::new()), "identified, no reason noted yet");
-        assert_ne!(status_of(true, true, Some(&split)).0, IDENTIFIED);
-        assert!(status_of(true, true, Some(&split)).1.is_empty(), "holding: no reason");
+        assert_eq!(status_of(false, false, false, Some(&split)), (WAITING, String::new()), "no DLSS lately: waiting");
+        assert_eq!(status_of(false, true, false, Some(&split)), (IDENTIFIED, "the colour input was last transitioned out of GENERAL; not holding".into()));
+        assert_eq!(status_of(false, true, false, None), (IDENTIFIED, String::new()), "identified, no reason noted yet");
+        assert_ne!(status_of(true, true, false, Some(&split)).0, IDENTIFIED);
+        assert!(status_of(true, true, false, Some(&split)).1.is_empty(), "holding: no reason");
+        // DLSS stopped after holds (a pause menu, #49): paused, not waiting, and no reason; DLSS or a hold wins.
+        use neural_forge_protocol::enums::preupscale_state::PAUSED;
+        assert_eq!(status_of(false, false, true, Some(&split)), (PAUSED, String::new()));
+        assert_eq!(status_of(false, true, true, None).0, IDENTIFIED, "DLSS runs again: not paused");
+        assert_ne!(status_of(true, false, true, None).0, PAUSED, "holding: not paused");
         let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::COLOR_ATTACHMENT;
-        let (_, inside) = status_of(false, true, Some(&Refusal::Inside(InlineRefusal::Usage(usage))));
+        let (_, inside) = status_of(false, true, false, Some(&Refusal::Inside(InlineRefusal::Usage(usage))));
         assert!(inside.starts_with("no hold inside DLSS's buffer: the colour input's usage") && inside.contains("TRANSFER_DST"), "{inside}");
         // Through the header.
         let header = neural_forge_protocol::ShmHeader::default();
@@ -9930,7 +10006,7 @@ mod tests {
         header.apply_model.store(0, Ordering::Relaxed);
         assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), None);
         assert_eq!(last_refusal_text().as_deref(), Some(MODEL_OFF));
-        assert_eq!(with_last_refusal(|last| status_of(false, true, last.as_ref())), (IDENTIFIED, MODEL_OFF.to_string()));
+        assert_eq!(with_last_refusal(|last| status_of(false, true, false, last.as_ref())), (IDENTIFIED, MODEL_OFF.to_string()));
         header.apply_model.store(1, Ordering::Relaxed);
         assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), Some(false), "on again: held");
         // No pass before the upscaler: every pass at present, or after DLSS with its output learnt (without it, After
@@ -12796,7 +12872,7 @@ mod tests {
         let ids = identification_lines(&lines);
         assert!(ids.iter().all(|l| l.starts_with("no DLSS input: DLSS Ray Reconstruction runs")), "{ids:#?}");
         assert!(ray_reconstruction_running(Instant::now()), "the post path is handed the model");
-        assert!(!post_off(false, None, Instant::now()));
+        assert!(!post_off(false, None, None, Instant::now()));
 
         // The game switches Ray Reconstruction off: Super Resolution's buffer from now on.
         let rrlite = kernels(&mut t, &["rrlite_enc0_4x4_mvlo_hdr_folded"])[0];
@@ -13264,31 +13340,33 @@ mod tests {
     // ---- The hand-back window. ----
 
     /// The post-upscaler hand-back: once a hold on a device has run the model, the post path
-    /// stays off until DLSS has not run for HAND_BACK, so a loading screen (no DLSS for a few to
-    /// ~20 s) never hands back, while DLSS switched off does after HAND_BACK. A device that never
+    /// stays off until DLSS has not run for HAND_BACK while Super Resolution still launches (DLAA, its input no
+    /// longer identified), so a loading screen (no DLSS for a few to ~20 s) never hands back. A device that never
     /// got that far is never affected.
     #[test]
     fn the_post_path_takes_over_only_after_hand_back_without_dlss() {
         let t0 = Instant::now();
         let s = |secs: f32| t0 + Duration::from_secs_f32(secs);
+        // Super Resolution keeps launching after t0 without its input held.
+        let launching = Some(SrLaunches { since: t0.checked_sub(Duration::from_secs(60)).unwrap_or(t0), last: s(40.0) });
         // Never held: the post path runs, DLSS or not.
-        assert!(!post_off(false, Some(t0), t0));
-        assert!(!post_off(false, None, t0));
+        assert!(!post_off(false, Some(t0), launching, t0));
+        assert!(!post_off(false, None, launching, t0));
         // Held, and DLSS was last seen at t0 (the game went to a loading screen).
-        assert!(post_off(true, Some(t0), s(0.6)), "0.6 s into a loading screen (the old 500 ms hand-back)");
-        assert!(post_off(true, Some(t0), s(20.0)), "a long loading screen");
-        assert!(post_off(true, Some(t0), s(HAND_BACK.as_secs_f32() - 0.01)));
-        assert!(!post_off(true, Some(t0), s(HAND_BACK.as_secs_f32() + 0.01)), "DLSS off for longer than HAND_BACK: the post path resumes");
-        assert!(!post_off(true, None, t0));
+        assert!(post_off(true, Some(t0), launching, s(0.6)), "0.6 s into a loading screen (the old 500 ms hand-back)");
+        assert!(post_off(true, Some(t0), launching, s(20.0)), "a long loading screen");
+        assert!(post_off(true, Some(t0), launching, s(HAND_BACK.as_secs_f32() - 0.01)));
+        assert!(!post_off(true, Some(t0), launching, s(HAND_BACK.as_secs_f32() + 0.01)), "DLSS off for longer than HAND_BACK: the post path resumes");
+        assert!(!post_off(true, None, launching, t0));
         // A clock read before the last DLSS submit (another thread's) is not "long ago".
-        assert!(post_off(true, Some(s(1.0)), t0));
+        assert!(post_off(true, Some(s(1.0)), launching, t0));
 
         // Through a Session: holds and DLSS submits refresh the window; skipped holds count too.
         let header = Box::new(neural_forge_protocol::ShmHeader::default());
         let shm = ShmClient::test_over_header(&header);
         let mut session = Session::default();
         session.saw_dlss();
-        assert!(!post_off(session.engaged, session.last_dlss, Instant::now()), "not before the first hold ran the network");
+        assert!(!post_off(session.engaged, session.last_dlss, None, Instant::now()), "not before the first hold ran the network");
         let skipped = HoldResult { miss: Some("the native network is still loading"), waits_consumed: true, native: true, ..Default::default() };
         session.note(&shm, &skipped, Duration::from_millis(1), (64, 64));
         assert!(!session.engaged, "a hold that did not run the network does not engage the device");
@@ -13298,7 +13376,40 @@ mod tests {
         assert!(session.engaged);
         assert_eq!(header.preupscale_state.load(Ordering::Relaxed), 2, "holding");
         let last = session.last_dlss.expect("a hold is a DLSS submit");
-        assert!(post_off(session.engaged, session.last_dlss, last + Duration::from_secs(10)));
+        assert!(post_off(session.engaged, session.last_dlss, None, last + Duration::from_secs(10)));
+    }
+
+    /// A pause menu (#49): the game stops launching DLSS altogether. The post path stays off for PAUSE_HAND_BACK, not
+    /// HAND_BACK: Cyberpunk 2077's menu shows the last frame (with the model's edit) under its menu, and handing it to
+    /// the post path after 30 s ran the network over the menu at the output size and rebuilt it there and back. Super
+    /// Resolution launching again (inputs not held: DLAA, a new set not yet identified) hands back after HAND_BACK as
+    /// before; a launch within RECENT of the last frame is that frame's own and does not count.
+    #[test]
+    fn a_pause_without_any_dlss_launch_keeps_the_post_path_off_longer() {
+        let t0 = Instant::now();
+        let s = |secs: f32| t0 + Duration::from_secs_f32(secs);
+        let run = |since: f32, last: f32| Some(SrLaunches { since: s(since), last: s(last) });
+        // Nothing launched since the last held frame (the run that ended with it, or none at all): paused.
+        for launch in [None, run(0.0, 0.0), run(0.0, 0.2)] {
+            assert!(post_off(true, Some(t0), launch, s(HAND_BACK.as_secs_f32() + 1.0)), "paused, 31 s: off ({launch:?})");
+            assert!(post_off(true, Some(t0), launch, s(PAUSE_HAND_BACK.as_secs_f32() - 0.01)), "paused: off until PAUSE_HAND_BACK");
+            assert!(!post_off(true, Some(t0), launch, s(PAUSE_HAND_BACK.as_secs_f32() + 0.01)), "DLSS gone for good: the post path runs");
+        }
+        // Super Resolution goes on launching without its input held (DLAA): HAND_BACK from the last held frame.
+        assert!(!post_off(true, Some(t0), run(0.0, 40.0), s(HAND_BACK.as_secs_f32() + 1.0)));
+        assert_eq!(hand_back_at(t0, run(0.0, 40.0)), t0 + HAND_BACK);
+        // The game resumes after 41 s in its pause menu: the run that begins there hands nothing back at once (#59),
+        // only after HAND_BACK of launches with the input never held.
+        let resumed = run(41.0, 41.3);
+        assert!(post_off(true, Some(t0), resumed, s(41.3)), "the first frames after the menu");
+        assert_eq!(hand_back_at(t0, resumed), s(41.0) + HAND_BACK);
+        assert_eq!(hand_back_at(t0, None), t0 + PAUSE_HAND_BACK);
+        // The run: launches under RECENT apart continue it, a gap starts another.
+        let r = SrLaunches::after(None, t0);
+        let r = SrLaunches::after(Some(r), s(0.1));
+        assert_eq!((r.since, r.last), (t0, s(0.1)));
+        let r = SrLaunches::after(Some(r), s(5.0));
+        assert_eq!((r.since, r.last), (s(5.0), s(5.0)));
     }
 
     // ---- The HDR encode: a CPU reference and the GPU checks against it. ----
