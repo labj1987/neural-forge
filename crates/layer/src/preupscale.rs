@@ -990,6 +990,9 @@ const AFTER_RETRY: Duration = Duration::from_secs(5);
 /// new identification; each buffer is held with its own evaluate's colour input ([`Tracker::scan`]).
 type Key = (ColourWatch, vk::Image, Option<vk::Image>);
 
+/// The most identifications [`Tracker::seen_keys`] keeps.
+const SEEN_KEYS: usize = 64;
+
 /// Per-device tracking state. Every hook that feeds it only does map operations under the lock.
 #[derive(Default)]
 pub(crate) struct Tracker {
@@ -1011,6 +1014,10 @@ pub(crate) struct Tracker {
     /// The identification: DLSS's inputs as the newest Super Resolution evaluate on this device names them.
     inputs: Option<Inputs>,
     key: Option<Key>,
+    /// The identifications made since their images were created ([`Tracker::refresh`]): a game that rotates DLSS's
+    /// motion vectors, depth or exposure image frame by frame (GTA V Enhanced: four pairs and as many exposure
+    /// images, 2026-11-11) comes back to one of these, which is no new identification; at most [`SEEN_KEYS`].
+    seen_keys: Vec<Key>,
     /// What the last identification log line said, so a change is logged once.
     announced: Option<String>,
     /// Command buffers with a `vkCmdCuLaunchKernelNVX` recorded since their last begin (directly or
@@ -1556,6 +1563,7 @@ impl Tracker {
 
     pub(crate) fn forget_image(&mut self, image: vk::Image) {
         self.images.remove(&image);
+        self.seen_keys.retain(|k| k.1 != image && k.2 != Some(image));
         self.keys.retain(|k| k.2 != image);
         self.registered.retain(|_, i| *i != image);
         self.kept.remove(&image);
@@ -2430,8 +2438,16 @@ impl Tracker {
         }
         let inputs = record.filter(|r| !r.is_rr()).and_then(|r| self.inputs_of(&r));
         let key = inputs.map(|i| (ColourWatch::of(&i.colour.1), i.mvec.0, i.exposure_input.map(|e| e.0)));
-        let changed = key != self.key || rr != self.rr;
-        if key != self.key {
+        // Back to images identified before (a rotation): the same identification, its tracking kept.
+        let rotation = key.is_some() && self.key.is_some() && self.seen_keys.contains(&key.expect("checked"));
+        if let Some(k) = key.filter(|k| !self.seen_keys.contains(k)) {
+            if self.seen_keys.len() == SEEN_KEYS {
+                self.seen_keys.remove(0);
+            }
+            self.seen_keys.push(k);
+        }
+        let changed = (key != self.key && !rotation) || rr != self.rr;
+        if key != self.key && !rotation {
             // The colour shape watched: the new colour input's, else (nothing identified) the last one's.
             self.keep_watched_across(inputs, inputs.map(|i| ColourWatch::of(&i.colour.1)).or(self.colour_watch));
             self.recorded_watched.clear();
@@ -8094,6 +8110,39 @@ mod tests {
     /// identified one (before: "the colour input's layout at DLSS's launch is unknown" for the others, frames
     /// flickering through unprocessed). When the identified image is destroyed and another is identified, what was
     /// known of the images watched throughout is kept: the next hold on one needs no new barrier on it.
+    /// GTA V Enhanced hands DLSS four depth/motion-vector pairs and exposure images in turn (2026-11-11): once each
+    /// was seen, going round them is no new identification, so the holds are not skipped frame after frame.
+    #[test]
+    fn rotating_motion_vectors_and_exposure_images_are_one_identification() {
+        let rg = vk::Format::R16G16_SFLOAT;
+        let mut set = vec![(
+            0x100,
+            desc(
+                1488,
+                836,
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+            ),
+        )];
+        for k in 0..4u64 {
+            set.push((0x200 + k, desc(1488, 836, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)));
+            set.push((0x300 + k, desc(1488, 836, rg, vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)));
+            set.push((0x600 + k, desc(1, 1, vk::Format::R16_SFLOAT, vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC)));
+        }
+        let mut t = tracker_with(&set_of(&set));
+        let mut generations = Vec::new();
+        for frame in 0..12u64 {
+            let k = frame % 4;
+            crate::ngx_ring::inject(vec![sr_record(frame + 1, [0x100, 0x300 + k, 0x200 + k, 0, 0x600 + k])]);
+            t.begin(cb(11));
+            t.launch(cb(11), Some(&param_block(&[h(0x100), h(0x200 + k), h(0x300 + k), h(0x600 + k)])));
+            let _ = submit(&mut t, &[vec![cb(11)]]);
+            generations.push(t.generation);
+            assert_eq!(t.inputs.map(|i| i.mvec.0), Some(img(0x300 + k)), "each frame's own motion vectors");
+        }
+        assert!(generations[4..].iter().all(|&g| g == generations[3]), "no new identification once round: {generations:?}");
+    }
+
     #[test]
     fn every_image_of_the_colour_input_s_shape_has_its_layout_known_across_identifications() {
         let r11 = vk::Format::B10G11R11_UFLOAT_PACK32;
