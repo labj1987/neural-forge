@@ -2386,6 +2386,9 @@ pub(crate) const MODEL_OFF: &str = "the model is switched off (F11 or the app)";
 /// the upscaler (at present, or after DLSS once its output is learnt; the state is then 5 only while no hold after
 /// DLSS runs either).
 pub(crate) const NO_PASS_BEFORE: &str = "the Placement setting runs no pass before the upscaler";
+/// Why no hold runs: the VRAM guard paused the network (the device at its VRAM budget, the network spilled to system
+/// memory); it resumes once there is room again (`preupscale::vram_guard`).
+pub(crate) const VRAM_PAUSED: &str = "the network is paused: too little video memory for it (VRAM guard); it resumes once there is room";
 /// Why no hold runs: the device cannot run the network (both holds give the same reason).
 pub(crate) const NATIVE_UNAVAILABLE: &str = "the native backend is not available on this device; frames go to DLSS untouched";
 
@@ -8104,6 +8107,11 @@ impl Session {
             self.last_hold_native = result.native;
             self.last_hold_extent = Some(extent);
             self.last_dlss = Some(now);
+        } else if let Some(why) = result.miss {
+            // A hold that ran and held nothing: its miss is why (the VRAM guard's pause, the network still loading, ...).
+            // Without it the status read "identified, not holding" with no reason while the guard had the network
+            // paused (Cyberpunk 2077 at 4K with Ray Reconstruction, #59).
+            note_refusal(Refusal::Text(why.into()));
         }
         if result.native && result.evaluated {
             self.engaged = true;
@@ -10012,6 +10020,39 @@ mod tests {
         assert!(shm.preupscale_reason_is(&header.preupscale_reason()));
         publish_reason(&shm, "");
         assert_eq!(header.preupscale_reason(), "");
+    }
+
+    /// A hold that runs and holds nothing gives the status its reason (#59): with the VRAM guard's pause in Cyberpunk 2077 at
+    /// 4K with Ray Reconstruction the status was "identified, not holding" with an empty reason. The next held frame
+    /// clears it.
+    #[test]
+    fn a_hold_that_missed_is_why_nothing_is_held() {
+        use neural_forge_protocol::enums::preupscale_state::IDENTIFIED;
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.init_defaults();
+        let shm = ShmClient::test_over_header(&header);
+        let mut session = Session::default();
+        session.note(
+            &shm,
+            &HoldResult { wrote_back: true, waits_consumed: true, native: true, evaluated: true, ..Default::default() },
+            Duration::ZERO,
+            (16, 8),
+        );
+        assert_eq!(last_refusal_text(), None);
+        // The guard paused the network: the holds after DLSS still run, and miss.
+        session.note(&shm, &HoldResult { native: true, miss: Some(VRAM_PAUSED), ..Default::default() }, Duration::ZERO, (16, 8));
+        assert_eq!(last_refusal_text().as_deref(), Some(VRAM_PAUSED));
+        // No frame held lately, DLSS running: identified, with the guard's reason.
+        let now = Instant::now();
+        session.last_hold = now.checked_sub(RECENT * 4);
+        session.last_dlss = Some(now);
+        let (state, reason) = with_last_refusal(|last| session.status_at(false, None, now, last.as_ref()));
+        assert_eq!((state, reason.as_str()), (IDENTIFIED, VRAM_PAUSED));
+        publish_reason(&shm, &reason);
+        assert!(header.preupscale_reason().contains("too little video memory"), "{}", header.preupscale_reason());
+        // A frame held again: no reason.
+        session.note(&shm, &HoldResult { wrote_back: true, ..Default::default() }, Duration::ZERO, (16, 8));
+        assert_eq!(last_refusal_text(), None);
     }
 
     /// The status's reason is why no hold runs now (#51): the model switched off (the split hold's gate) or a

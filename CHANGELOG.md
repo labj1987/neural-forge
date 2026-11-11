@@ -115,7 +115,8 @@ first shipped them; their phase is kept as a subheading.
   line now says "DLSS input identified, not holding" and why, instead of "waiting for DLSS Super Resolution" as if
   the game did not use DLSS: a reason it found in the game, or that the model is switched off or the Placement
   setting runs no pass before the upscaler. `neural-forge-cli shmctl status` and **Save report** show the same
-  state and reason (`preupscale_state=5`, `preupscale_reason=`).
+  state and reason (`preupscale_state=5`, `preupscale_reason=`). When the video memory guard has paused the network,
+  the reason says so (too little video memory for it; it resumes once there is room) instead of being empty.
 - The game's log says once each why a frame was not worked on inside DLSS's command buffer (missing copy usage, the
   input's format, size or layout, a render pass left open across DLSS), with the image it was. The reasons that
   said nothing before (DLSS's command buffer recorded before its input was found, DLSS's work not readable, the

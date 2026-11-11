@@ -4392,7 +4392,7 @@ unsafe fn native_hold(
             crate::logging::flush();
         }
         result.miss = Some(if loader.paused() {
-            "the network is paused: too little VRAM for it (VRAM guard)"
+            super::VRAM_PAUSED
         } else if loader.failed().is_some() {
             "the native network could not be loaded or built"
         } else if loader.waiting_for_holds(reserved) {

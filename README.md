@@ -132,6 +132,8 @@ each game's launch options only Neural Forge's part is included).
   (native resolution counts as not); the model runs on the finished frame instead.
 - **"DLSS input identified, not holding".** Neural Forge found the frame DLSS upscales but cannot hold it,
   and says why on the same line; the model runs on the finished frame. Attach **Save report**'s zip to an issue.
+  "The network is paused: too little video memory" means the video memory guard paused the model; it resumes
+  once there is room (see [Known issues](#known-issues)).
 - **Something looks wrong.** Press F11 to compare. `NEURAL_FORGE_PREUPSCALE=off` in the launch
   options keeps the network from loading at all.
 - **F11 does nothing.** Add yourself to the `input` group (see [Usage](#usage)).
