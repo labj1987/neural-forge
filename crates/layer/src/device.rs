@@ -1030,6 +1030,11 @@ fn record_inline_hold(
         inline_tally(why);
         return Err(Recorded::Skipped);
     }
+    // The hold after DLSS's output is there and asks for the network: the post path keeps off its frames even when
+    // this one misses (`preupscale::post_serves`).
+    if stage == crate::preupscale::placement::Stage::Upscaled {
+        crate::preupscale::note_after_dlss_tried();
+    }
     // A cache dump: armed holds read the colour input as it is (the staging image can always be copied from).
     let arm = session.cache_dump_arm(shm, true, true);
     let seen = session.seen();
@@ -4160,7 +4165,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         crate::log!(
                             "[preupscale] {}",
                             if suppressed {
-                                "the model runs in the game's frame (before the upscaler or after DLSS); the post-upscaler compose is off while frames are held"
+                                "the model runs in the game's frame (before the upscaler or after DLSS), or the game's DLSS has not started yet; the post-upscaler compose is off while frames are held"
                             } else {
                                 "the post-upscaler compose runs: no DLSS frame held for 30 s while DLSS still launched (DLAA, its input not held), for 5 minutes without any DLSS launch (switched off), or never; or every pass is placed at present"
                             }
@@ -4239,7 +4244,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         }
                     }
                 }
-                if shm.model_known_unavailable() {
+                // Paused by the VRAM guard: nothing would compose either, until the guard steps up again.
+                let network_paused = self.preupscale.is_some() && preupscale.network_paused();
+                if shm.model_known_unavailable() || network_paused {
                     // Nothing composes this session; a capture still shows what is presented.
                     drop(hold_guard);
                     if let Some(instance) = &self.instance {
@@ -4265,7 +4272,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         }
                     }
                     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    static SAID_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if network_paused {
+                        if !SAID_PAUSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            crate::log!("[layer] the post-upscaler compose captures nothing while the VRAM guard has the network paused");
+                            crate::logging::flush();
+                        }
+                    } else if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         crate::log!("[layer] present skipped: the model server reported the model permanently unavailable for this session");
                         crate::logging::flush();
                     }

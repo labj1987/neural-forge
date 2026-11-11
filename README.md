@@ -142,6 +142,8 @@ included).
   (native resolution counts as not); the model runs on the finished frame instead.
 - **"DLSS input identified, not holding".** Neural Forge found the frame DLSS upscales but cannot hold it,
   and says why on the same line; the model runs on the finished frame. Attach **Save report**'s zip to an issue.
+  "The network is paused: too little video memory" means the video memory guard paused the model; it resumes
+  once there is room (see [Known issues](#known-issues)).
 - **HDR does not come on.** The Status tab's HDR line says what the game asked for and why, and whether the
   desktop's HDR is on: "game asked for SDR although HDR metadata was sent" with "the window offered no HDR colour
   space" means the game could not get HDR (under Proton add `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` to its

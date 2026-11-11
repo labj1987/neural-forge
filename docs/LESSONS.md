@@ -1238,6 +1238,20 @@ logs, Streamline's own log and the game's memory read while it ran.
   sysctl stays 0.
 - **Not reproduced on 3.8.5 with the mitigation off:** none of the 34 organic launches of this
   investigation (Neural Forge on and off, the runner and Steam) stalled, exited early or got stuck.
+- **2026-11-11, on the fix-51 branch (#59):** 11 GTA launches at 4K with FG (`matrix.sh fg4x-4k`, FrameLimit 120)
+  alternating 316960d and 9abe95d: 3 watchdog exits at +0x12c6eb, all 9abe95d (3 of 6; 316960d 0 of 5), no Xid,
+  no hold in any of them (316960d's change only acts with holds outstanding). The layer logs separate them
+  exactly: in all 3 the after-the-upscaler path engaged on GTA's first loading screen and built the network at
+  3840x2160 with 1.2 GB in use (`vram 1170 -> 2554`) before the game created its last two Vulkan devices (`asks for
+  family 0 x1, family 1 x1`, NGX's); the main loop stopped within a second of those devices and never presented
+  again. In all 8 that passed those devices came before the post path engaged (`vram 3723 -> 5074`). Which build
+  got the early order looked like the game's own timing. Open: what blocks the game there.
+- **Fixed the same day:** a DLSS game gets no after-the-upscaler path before DLSS's first frame (docs/PRE_UPSCALER_DESIGN.md,
+  "Loading screens before DLSS's first frame"): the layer knows GTA uses DLSS from `nvngx_dlss.dll` in its mappings,
+  logged before the game's second device, and the network is first built for the holds' 2228x1253. With it, 3 launches at 4K FG 4x: 2 benchmark results (4.0x, no hang, no Xid), the sign logged between the game's first
+  and second devices, no 3840x2160 build at all; the third never got past Rockstar's launcher (the game did not start,
+  as also seen with the model off).
+  What blocked the game when the 4K build came first stays unknown: it no longer happens.
 - **Fix in the runner:** it reads the dumps a failed launch wrote and names the watchdog and its stage, copies
   `Xid` lines from the kernel log, notices a game that stopped presenting (MangoHud's per-frame log stops
   growing) and saves each game thread's state and wait channel, and launches again (`--tries`, default 3).

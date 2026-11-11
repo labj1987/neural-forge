@@ -467,6 +467,12 @@ impl Claims {
     }
 }
 
+/// [`Loader::holds_took_over`] for the last hold's and the last after-the-upscaler frame's stamps (ms since [`epoch_ms`]'s
+/// start; 0 never) and whether that path is running a frame now.
+fn took_over(last_pre: u64, last_post: u64, post_busy: bool) -> bool {
+    !post_busy && last_post != 0 && last_pre.saturating_sub(last_post) >= PATH_SWITCH_MS
+}
+
 /// The holds' clock for the history's gap rule (`HistoryGap::MAX_GAP`): the time now, or in a test the
 /// rig's stopped clock ([`stop_clock`]), so that how long the test machine takes between two holds does not
 /// decide whether the second one has the first one's history.
@@ -720,6 +726,45 @@ impl Loader {
 
     pub(crate) fn release_post(&self) {
         self.claims.release_post();
+    }
+
+    /// Tests: a loader on no device (its worker idles: nothing is asked of it).
+    #[cfg(test)]
+    pub(crate) fn idle_for_test() -> Self {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical: vk::PhysicalDevice::null(),
+            frame_family: 0,
+            family: 0,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+            shared: None,
+            bda_ext: false,
+        };
+        Self::start(vk::Device::null(), setup, Arc::default(), true)
+    }
+
+    /// Tests: the claims' stamps (the last hold's, the after-the-upscaler path's last frame's) and whether that path runs one.
+    #[cfg(test)]
+    pub(crate) fn stamp_for_test(&self, last_pre: u64, last_post: u64, post_busy: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.claims.last_pre.store(last_pre, SeqCst);
+        self.claims.last_post.store(last_post, SeqCst);
+        self.claims.post_busy.store(post_busy, SeqCst);
+    }
+
+    /// The holds took the network over from the after-the-upscaler path: a hold asked for it [`PATH_SWITCH_MS`] or more
+    /// after that path's last frame, which is not running. That path's buffers at its own size are not needed then
+    /// (`native_post`), and kept they sat in VRAM beside the holds' (#59).
+    pub(crate) fn holds_took_over(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        took_over(self.claims.last_pre.load(SeqCst), self.claims.last_post.load(SeqCst), self.claims.post_busy.load(SeqCst))
     }
 
     /// The after-the-upscaler frame holding the claim did not finish in time: its work (on `fence`)
@@ -4392,7 +4437,7 @@ unsafe fn native_hold(
             crate::logging::flush();
         }
         result.miss = Some(if loader.paused() {
-            "the network is paused: too little VRAM for it (VRAM guard)"
+            super::VRAM_PAUSED
         } else if loader.failed().is_some() {
             "the native network could not be loaded or built"
         } else if loader.waiting_for_holds(reserved) {
