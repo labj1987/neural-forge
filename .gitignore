@@ -26,3 +26,6 @@ release-notes.md
 # The layer framework's own build output, and the headers scripts/vk-layer-codegen.sh links in
 /third_party/vk-layer-for-rust/target/
 /third_party/vk-layer-for-rust/third_party/
+
+# The NGX wrapper builds in place without CARGO_TARGET_DIR
+/crates/ngx-wrapper/target/

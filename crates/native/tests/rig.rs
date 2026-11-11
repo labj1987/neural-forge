@@ -158,6 +158,9 @@ fn open_network<'a>(g: &'a Gpu, model: &Path, chain: bool) -> Drained<'a> {
         chain,
         fence_timeout_ms: 5000,
         init_dispatchable: None,
+        queue_lock: None,
+        queue_user: std::ptr::null_mut(),
+        buffer_device_address_ext: false,
     };
     // SAFETY: the device was made with device_extend; the compute family's queue 0 is the network's alone.
     Drained { net: unsafe { Network::open(&open) }.expect("open"), device: &g.device }

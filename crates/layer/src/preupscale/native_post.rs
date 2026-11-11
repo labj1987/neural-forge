@@ -257,6 +257,8 @@ struct PostLut {
 /// The per-request GPU objects.
 struct Gpu {
     queue: vk::Queue,
+    /// `queue` is the application's, shared: its submits hold this lock (`crate::shared_queue`).
+    shared: Option<&'static crate::shared_queue::SharedQueue>,
     set_layout: vk::DescriptorSetLayout,
     layouts: [vk::PipelineLayout; 2],
     pipelines: [vk::Pipeline; 2],
@@ -347,7 +349,8 @@ impl FlowState {
     }
 
     /// A submit of the flow's failed: both queues (this thread's alone) drain, so nothing of the flow is
-    /// pending, and `zero` runs from here on.
+    /// pending, and `zero` runs from here on. Never on a queue shared with the application: no after-the-upscaler
+    /// server runs there (`Session::ensure_post_server`); if one ever does, this wait needs that queue's lock.
     fn give_up(&mut self, device: &ash::Device, compute: vk::Queue, why: &str) {
         if let Self::Ready(fd) = std::mem::replace(self, Self::Off) {
             // SAFETY: both queues are this thread's alone.
@@ -451,6 +454,7 @@ impl Gpu {
         unsafe {
             step(0)?;
             g.gpu.queue = device.get_device_queue(setup.family, setup.post_index);
+            g.gpu.shared = setup.shared;
             crate::loader_data::initialize_queue(device.handle(), g.gpu.queue).ok()?;
             let binding = |n: u32| {
                 vk::DescriptorSetLayoutBinding::default()
@@ -533,6 +537,7 @@ impl Gpu {
     fn empty(setup: Setup) -> Self {
         Self {
             queue: vk::Queue::null(),
+            shared: None,
             set_layout: vk::DescriptorSetLayout::null(),
             layouts: [vk::PipelineLayout::null(); 2],
             pipelines: [vk::Pipeline::null(); 2],
@@ -663,18 +668,8 @@ fn serve(
             last_request = Instant::now();
             process(device, instance, physical, import, loader, view, gpu, slot, seq, &mut frames);
         }
-        // Paused by the VRAM guard: this path's buffers at the output size go too, so the game gets all of Neural
-        // Forge's memory back; built again by the first request after the resume.
-        if loader.paused() && gpu.slots.iter().any(Option::is_some) {
-            for s in 0..gpu.slots.len() {
-                if let Some(old) = gpu.slots[s].take() {
-                    // SAFETY: nothing pending (every request waits for its own work).
-                    unsafe { old.destroy(device, gpu.flow.device()) };
-                }
-                gpu.history[s].skipped();
-            }
-            gpu.bound = None;
-            crate::log!("[native] VRAM guard: the after-the-upscaler path's buffers are freed until the network resumes");
+        if let Some(why) = release_idle(device, loader, gpu) {
+            crate::log!("[native] {why}");
             crate::logging::flush();
         }
         hdr.server_heartbeat.fetch_add(1, Ordering::Relaxed);
@@ -685,6 +680,43 @@ fn serve(
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+/// Frees this path's buffers between its requests when nothing needs them ([`serve`]), and says why. Paused by the VRAM
+/// guard: they go so the game gets all of Neural Forge's memory back; built again by the first request after the resume.
+/// The same once the holds took the network over (DLSS started after its loading screens or menus, or came back after a
+/// pause, [`Loader::holds_took_over`]): they are not needed while the holds run, and kept they sat in VRAM beside the
+/// holds' (Cyberpunk 2077 at 4K with Ray Reconstruction spilled, #59). Never after a frame that did not finish in time
+/// (`gpu.stalled`): its work may still use them.
+fn release_idle(device: &ash::Device, loader: &Loader, gpu: &mut Gpu) -> Option<&'static str> {
+    if gpu.stalled || gpu.slots.iter().all(Option::is_none) {
+        return None;
+    }
+    let why = if loader.paused() {
+        "VRAM guard: the after-the-upscaler path's buffers are freed until the network resumes"
+    } else if loader.holds_took_over() {
+        "the holds in the game's frame took the network over: the after-the-upscaler path's buffers are freed"
+    } else {
+        return None;
+    };
+    // SAFETY: nothing pending: every request waits for its own work, and one that did not (stalled) returned above.
+    unsafe { free_slots(device, gpu) };
+    Some(why)
+}
+
+/// Frees every slot's buffers ([`serve`]); the next request builds them again, its history afresh.
+///
+/// # Safety
+/// Nothing of `gpu`'s is pending.
+unsafe fn free_slots(device: &ash::Device, gpu: &mut Gpu) {
+    for s in 0..gpu.slots.len() {
+        if let Some(old) = gpu.slots[s].take() {
+            // SAFETY: nothing pending (the caller's contract).
+            unsafe { old.destroy(device, gpu.flow.device()) };
+        }
+        gpu.history[s].skipped();
+    }
+    gpu.bound = None;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -788,6 +820,10 @@ fn process(
     // The model server's per-stage times, as the `[sync]` line and the Status tab read them: the whole frame on
     // the GPU, waited for, counts as the evaluate; nothing is uploaded or read back separately.
     if evaluated {
+        // The VRAM guard judges a spill by the network's time: this path's frames count too (the frame waited for, on
+        // the GPU), or a game whose network runs only here, at the output size, was never stepped down however far
+        // it spilled (Cyberpunk 2077 at 4K with Ray Reconstruction and path tracing: 1-8 fps).
+        loader.note_gpu_ms(t.elapsed().as_secs_f32() * 1000.0);
         let ms = |v: f32| v.to_bits();
         hdr.server_upload_ms_bits.store(ms(0.0), Ordering::Relaxed);
         hdr.server_eval_ms_bits.store(ms(t.elapsed().as_secs_f32() * 1000.0), Ordering::Relaxed);
@@ -1470,7 +1506,13 @@ unsafe fn evaluate(
         submit = submit.wait_semaphores(std::slice::from_ref(sem)).wait_dst_stage_mask(&wait_stages);
     }
     // SAFETY: the fence is the layer's own and idle; the queue is this thread's alone.
-    let submitted = unsafe { device.reset_fences(&[gpu.fence]).and_then(|()| device.queue_submit(gpu.queue, &[submit], gpu.fence)) };
+    let submitted = unsafe {
+        device.reset_fences(&[gpu.fence]).and_then(|()| {
+            // The application's queue when shared (`crate::shared_queue`): the submit under its lock, the wait after it not.
+            let _shared = gpu.shared.map(|q| q.guard());
+            device.queue_submit(gpu.queue, &[submit], gpu.fence)
+        })
+    };
     if crate::note_vk(device.handle(), submitted).is_err() {
         if waits.is_some() {
             // The flow ran (or runs) with nothing waiting for it: its queue drains, and the flow is not used again.
@@ -1573,7 +1615,13 @@ unsafe fn convert_hdr10(device: &ash::Device, gpu: &mut Gpu, s: usize, proxy_reg
     }
     let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
     // SAFETY: the fence is the layer's own and idle; the queue is this thread's alone.
-    let submitted = unsafe { device.reset_fences(&[gpu.fence]).and_then(|()| device.queue_submit(gpu.queue, &[submit], gpu.fence)) };
+    let submitted = unsafe {
+        device.reset_fences(&[gpu.fence]).and_then(|()| {
+            // The application's queue when shared (`crate::shared_queue`): the submit under its lock, the wait after it not.
+            let _shared = gpu.shared.map(|q| q.guard());
+            device.queue_submit(gpu.queue, &[submit], gpu.fence)
+        })
+    };
     if crate::note_vk(device.handle(), submitted).is_err() {
         return false;
     }
@@ -1619,7 +1667,10 @@ unsafe fn flow_submits(device: &ash::Device, gpu: &Gpu, s: usize) -> Result<vk::
         device.end_command_buffer(fd.upload).map_err(|e| format!("{e:?}"))?;
         session.record_flow(device, fd)?;
         let upload = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&fd.upload)).signal_semaphores(std::slice::from_ref(&fd.uploaded));
-        device.queue_submit(gpu.queue, &[upload], vk::Fence::null()).map_err(|e| format!("the upload's submit: {e:?}"))?;
+        {
+            let _shared = gpu.shared.map(|q| q.guard());
+            device.queue_submit(gpu.queue, &[upload], vk::Fence::null()).map_err(|e| format!("the upload's submit: {e:?}"))?;
+        }
         session.uploaded();
         let stage = [vk::PipelineStageFlags::ALL_COMMANDS];
         let flow = vk::SubmitInfo::default()
@@ -2058,6 +2109,8 @@ mod tests {
             post_index: 0,
             properties2: crate::vram::Properties2::None,
             flow: None,
+            shared: None,
+            bda_ext: false,
         };
         // Objects that exist when each step fails (the sets and the command buffer go with their pools).
         let before = [0, 0, 1, 2, 3, 4, 5, 6, 6, 7, 7];
@@ -2099,6 +2152,8 @@ mod tests {
             post_index: 0,
             properties2: crate::vram::Properties2::None,
             flow: None,
+            shared: None,
+            bda_ext: false,
         };
         const W: u32 = 16;
         const H: u32 = 16;
@@ -2292,6 +2347,8 @@ mod tests {
             post_index: 0,
             properties2: crate::vram::Properties2::None,
             flow: None,
+            shared: None,
+            bda_ext: false,
         };
         let table = |generation: u64, size: usize| Arc::new(super::super::colour::Lut { generation, cube: neural_forge_protocol::cube::Cube::identity(size) });
         // SAFETY: a live test device whose queue 0 of `family` exists; nothing is submitted.
@@ -2391,10 +2448,16 @@ mod tests {
                 post_index: 0,
                 properties2: crate::vram::Properties2::None,
                 flow: None,
+                shared: None,
+                bda_ext: false,
             };
             // SAFETY: a live test device; every object below is destroyed in Drop after the device idles.
             unsafe {
                 let gpu = Gpu::new(&device, setup).expect("the server's objects build");
+                // The tests start from no history (`none`) whatever the process default; `Rig::with` picks one.
+                let mut gpu = gpu;
+                gpu.motion = Motion::None;
+                gpu.flow = FlowState::Off;
                 let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
                 let features = super::super::own_host_buffer_with(&device, &instance, physical, u64::from(FW * FH) * 64, usage).unwrap();
                 let head = super::super::own_host_buffer_with(&device, &instance, physical, u64::from(FW * FH) * 16, usage).unwrap();
@@ -2550,6 +2613,34 @@ mod tests {
     /// The shipped after-the-upscaler frame (3.7.0, no history), as `NEURAL_FORGE_POST_MOTION=none` must
     /// keep it bit for bit: the answers and lanes of a one-pass and a three-pass frame with the Model tab's
     /// defaults and with an intensity and conditioning, pinned from 3.7.0's shaders.
+    /// Once the holds took the network over, this path's buffers are freed between its requests; not while it is the
+    /// one running frames. Fails without the release (the buffers stayed until a VRAM guard pause).
+    #[test]
+    fn the_buffers_go_once_the_holds_take_the_network_over() {
+        let Some(mut rig) = Rig::new() else { return };
+        let loader = Loader::idle_for_test();
+        rig.frame(&picture(1), &[Conditioning::default()]);
+        assert!(rig.gpu.slots[Slot::Primary.index()].is_some(), "a frame builds its slot's buffers");
+        // This path ran a frame just now; no hold since.
+        loader.stamp_for_test(0, 10_000, false);
+        assert_eq!(release_idle(&rig.device, &loader, &mut rig.gpu), None);
+        assert!(rig.gpu.slots[Slot::Primary.index()].is_some(), "kept while this path runs the frames");
+        // A hold asked within the path switch of this path's last frame: the paths may still be trading.
+        loader.stamp_for_test(10_500, 10_000, false);
+        assert_eq!(release_idle(&rig.device, &loader, &mut rig.gpu), None);
+        // A frame of this path running now.
+        loader.stamp_for_test(12_000, 10_000, true);
+        assert_eq!(release_idle(&rig.device, &loader, &mut rig.gpu), None);
+        // The holds asked a second or more after this path's last frame: freed.
+        loader.stamp_for_test(11_000, 10_000, false);
+        assert!(release_idle(&rig.device, &loader, &mut rig.gpu).is_some_and(|w| w.contains("took the network over")));
+        assert!(rig.gpu.slots.iter().all(Option::is_none), "every slot's buffers are freed");
+        assert_eq!(release_idle(&rig.device, &loader, &mut rig.gpu), None, "nothing left to free");
+        // The next frame builds them again and runs.
+        rig.frame(&picture(2), &[Conditioning::default()]);
+        assert!(rig.gpu.slots[Slot::Primary.index()].is_some());
+    }
+
     #[test]
     fn the_shipped_frame_stays_bit_for_bit() {
         let Some(mut rig) = Rig::new() else { return };

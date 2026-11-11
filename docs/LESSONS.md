@@ -1188,7 +1188,7 @@ pass feedback. Measured in GTA V Enhanced at 1440p, FG 4x, Preset C, mods off, p
 
 ## October 19: placement, model resolution and history after the upscaler (3.8.0)
 
-- **A history after the upscaler does not steady the edit.** Measured with `pan` (2492x1370, 60 frames;
+- **A history after the upscaler does not steady the edit** (superseded on November 10: the score below is the edit's change, which rewards following the grain; the picture's change favours the optical-flow history, now the default). Measured with `pan` (2492x1370, 60 frames;
   the edit's change between frames over its size): none 0.314, the previous output at the same pixel 0.355,
   reprojected by the GPU's optical flow 0.324 while panning at 6 px/frame; 0.249 against 0.296 on a still
   frame. Blending toward the network's own previous answer makes it change more, and the flow only brings
@@ -1238,6 +1238,20 @@ logs, Streamline's own log and the game's memory read while it ran.
   sysctl stays 0.
 - **Not reproduced on 3.8.5 with the mitigation off:** none of the 34 organic launches of this
   investigation (Neural Forge on and off, the runner and Steam) stalled, exited early or got stuck.
+- **2026-11-11, on the fix-51 branch (#59):** 11 GTA launches at 4K with FG (`matrix.sh fg4x-4k`, FrameLimit 120)
+  alternating 316960d and 9abe95d: 3 watchdog exits at +0x12c6eb, all 9abe95d (3 of 6; 316960d 0 of 5), no Xid,
+  no hold in any of them (316960d's change only acts with holds outstanding). The layer logs separate them
+  exactly: in all 3 the after-the-upscaler path engaged on GTA's first loading screen and built the network at
+  3840x2160 with 1.2 GB in use (`vram 1170 -> 2554`) before the game created its last two Vulkan devices (`asks for
+  family 0 x1, family 1 x1`, NGX's); the main loop stopped within a second of those devices and never presented
+  again. In all 8 that passed those devices came before the post path engaged (`vram 3723 -> 5074`). Which build
+  got the early order looked like the game's own timing. Open: what blocks the game there.
+- **Fixed the same day:** a DLSS game gets no after-the-upscaler path before DLSS's first frame (docs/PRE_UPSCALER_DESIGN.md,
+  "Loading screens before DLSS's first frame"): the layer knows GTA uses DLSS from `nvngx_dlss.dll` in its mappings,
+  logged before the game's second device, and the network is first built for the holds' 2228x1253. With it, 3 launches at 4K FG 4x: 2 benchmark results (4.0x, no hang, no Xid), the sign logged between the game's first
+  and second devices, no 3840x2160 build at all; the third never got past Rockstar's launcher (the game did not start,
+  as also seen with the model off).
+  What blocked the game when the 4K build came first stays unknown: it no longer happens.
 - **Fix in the runner:** it reads the dumps a failed launch wrote and names the watchdog and its stage, copies
   `Xid` lines from the kernel log, notices a game that stopped presenting (MangoHud's per-frame log stops
   growing) and saves each game thread's state and wait channel, and launches again (`--tries`, default 3).
@@ -1642,6 +1656,265 @@ bench-iq's log-luma Laplacian energy in the face, relative to the model off.
   when it adds less.
 
 Not built. A face pass would also need a detector with a licence that fits (SCRFD's weights are non-commercial).
+
+## November 10: a history on the finished frame after all (3.14.0, issue #49)
+
+- **What:** a user saw the whole picture flicker with the model at present (Cyberpunk 2077 at 2048x1536, Placement
+  "At present", working scale 0.5). Their two screen recordings, measured frame by frame: with the camera still,
+  32-pixel blocks of the picture changed 2-4 levels of 255 per frame with the model on against 0.2-0.8 with it
+  toggled off. That is large soft patches, not frames alternating between edited and unedited (frame n was never
+  closer to n+2 than to n+1).
+- **The October 19 decision was measured on the wrong quantity.** It scored the history by the *edit's* change between
+  frames. On a grainy frame a picture that holds steady needs an edit that changes (it cancels part of the grain),
+  so that score preferred no history. Scored by the *picture's* change (`pan` with grain 0.3, the reporter's
+  settings, NATIVE_BACKEND.md "Measured again"), the optical-flow history cuts the patch flicker the model adds
+  in motion from +0.214 to +0.022 at working scale 1, and zero motion takes it below the input's own on a still frame.
+  The edit keeps its size and moving edges keep no trail. A fixed seed with the history changed nothing. Working
+  scale 0.5 doubles the flicker in every mode.
+- **Taken:** `zero` is the default after the upscaler. `flow` was the default first and hung GTA V Enhanced at the
+  start of its benchmark, 3 of 3 launches: the optical flow's extension and queue are added to every device the
+  game creates, its frame generation's included; `zero` adds nothing and ran normally (62.1 / 250.0 fps). The Status tab says
+  "at present, on the finished frame" when the Placement setting puts the model there, rather than "waiting for
+  DLSS Super Resolution".
+- **Lesson:** for temporal stability, measure what is shown (the composited picture, motion-compensated, against the
+  original's own change), never a difference that is meant to change.
+
+## November 10: #51, a crash with no last words and a frame the game already exposed
+
+- **Indiana Jones and the Great Circle crashed with no Xid** on the 3.14.0 test build, which gives DLSS's possible
+  colour inputs copy usage at creation. The last line the reporter had, `hold inside DLSS's command buffer
+  available ...`, is written at device creation, not by a hold, and it was the last one only because the log is
+  written by a thread with a queue and a release build aborts on a panic without a word: whatever was queued,
+  and any panic message, was lost. Now a panic hook writes the panic with its place and the breadcrumbs and waits
+  for it (`[panic] ...`), the first hold recorded into DLSS's buffer, the first such hold read back after its
+  buffer ran and the first split hold each get a flushed line, and the start-up line says nothing is held yet.
+- **The added usage and id Tech's heaps.** id Tech places and aliases its render targets in its own memory by the
+  requirements it learns; a driver may give an image with `TRANSFER_SRC | TRANSFER_DST` other ones (a different
+  compression layout). The usage is now kept only where the requirements are the same, judged once per create
+  info by the application's own `vkGetDeviceImageMemoryRequirements` query or by creating the image both ways.
+  Whether this was Indiana's crash is not known (no log reached the layer's last lines); the next log will say:
+  a `[panic]` line, an `adding ... changes its memory requirements` line, or neither.
+- **Clair Obscur: Expedition 33's white fog** with Model brightness on Game. Unreal Engine 5 hands DLSS its colour
+  pre-exposed (near display brightness) with its eye-adaptation texel (0.0078-0.019 in the reporter's log) and the
+  pre-exposure as an NGX parameter, which a Vulkan layer under Proton does not see. Multiplying the texel in, as
+  is right for GTA V (scene-referred, median about 6, exposure 0.15-0.34), put the frame 7-9 stops below the
+  network's brightness, and the decode multiplied the network's change back up by as much: fog (and, likely, the
+  line at the right edge, which went with it under Auto). Auto lifted it at most 16x (4 stops), so at high
+  strengths some fog stayed. Now the auto-exposure measures beside the game's exposure on every hold (only its state, the picture
+  unchanged: GTA V's holds stay bit for bit), and a frame the game's exposure puts more than 5 stops below the
+  key while the frame itself is within 3 stops of it, 30 holds in a row, is measured from the frame for that
+  identification, without the 16x bound. Crimson Desert's daytime frame (about 3.7 stops below with its exposure,
+  which is why Auto exists) stays under the 5 stops, and a dark scene-referred frame fails the second test.
+  A review found the 30 holds (half a second) too short and the switch for good: GTA V walking from daylight (`e`
+  0.15) into a tunnel (luma 0.1) is as far below while its eye adaptation lags, and would have stayed measured.
+  The test now needs 2.5 s with the game's exposure held within half a stop (a lagging adaptation moves it; UE's
+  texel does not, within a scene), reads the game's texel on beside the measured `e`, and goes back to it after
+  2.5 s under 4 stops.
+- **The line down the right edge** was not traced to an input subrect: the layer reads no render size from DLSS's
+  launch parameters (DLSS_KERNEL_CATALOGUE.md lists words that may hold it, measured only where the image was the
+  render size), so it cannot feed the network less than the image. The reporter saw it go with Auto; it should go
+  with the fog. If it stays, `NEURAL_FORGE_PROBE_PARAMS=1` would show whether DLSS is given 1485x835 inside the
+  1488x836 image.
+
+## November 10: two vkd3d-proton games the hold missed (#51)
+
+A user's RTX 5060 Ti logs from two Unreal Engine games, both identified and neither held:
+
+- **Expedition 33 (UE5)** hands DLSS its input in one of several images of one shape in turn. The layer watched
+  only the image it had identified, so the hold inside DLSS's buffer knew the layout of one and refused the
+  others, and every re-identification threw away what it knew of all of them: frames flickered through unedited.
+  Lesson: track every image that can be DLSS's input this frame, by shape, the way the depth already was, and do
+  not throw away knowledge that was recorded continuously (PRE_UPSCALER_DESIGN.md, "Inputs that cycle through
+  images of one shape"). Its refusal counted barriers on another image than the one refused, never reset: a
+  diagnostic must describe the thing it names.
+- **Stellar Blade (UE4)** has a same-layout barrier on DLSS's input inside DLSS's buffer, which the split rightly
+  refuses and the hold inside is built for, yet the log showed only the split's refusal: the hold inside had
+  refusals that said nothing (a buffer begun before the identification, a launch whose parameters cannot be read,
+  its own early skips). Lesson: every path that drops a frame says so, counted where it is ordinary, so the next
+  log answers the question (PRE_UPSCALER_DESIGN.md, "A same-layout barrier before DLSS's launch, and silent
+  refusals"). Splitting ahead of the barrier was not done: proving nothing before it writes the input would need
+  hooks on every draw.
+
+## November 10 (later): Stellar Blade was held all along (#51)
+
+- **What:** the user's full logs, read line by line, show the hold inside DLSS's buffer running in Stellar Blade from
+  its first seconds (`held 263, ran 263` every 5 s). The "same-layout barrier ... not holding" line both the user and
+  the earlier analysis went by was the split's, said once; the line after it said the hold inside took the buffer.
+  The real fault was further down: every hold's history was reset by the hold guard, because barriers on the depth
+  aspect alone (`GENERAL -> GENERAL`) were tracked as leaving the depth's aspects apart.
+- **Lessons:** read the whole log, not the lines someone quoted, before deciding what a game does; the counts and
+  the "resetting the history" lines were there. A diagnostic line must not state the frame's fate when another path
+  decides it ("frames go to DLSS untouched" from the split while the hold inside holds them). And a barrier that
+  keeps a layout is not a transition, on one aspect as on the whole image (PRE_UPSCALER_DESIGN.md, "Stellar Blade is
+  held inside DLSS's buffer; its depth's one-aspect barriers dropped the history").
+
+## November 10: Cyberpunk 2077 before the upscaler again, and DLSS's motion-vector unit (3.14.0, issue #49)
+
+- **What:** a user's Cyberpunk 2077 never got the model before the upscaler ("waiting for DLSS input"). On the rig the
+  game's current version names, in its SR input launch (`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`), the colour
+  (1485x835 RGBA16F, parameter 21), DLSS's output (22), the motion vectors as a second 1485x835 **RGBA16F** image (23;
+  RG16F in October) and the depth as R32_UINT (24). vkd3d-proton gives every image the same usage, so Metro's
+  four-channel rule (colour a render target, motion vectors storage) could not tell them apart and nothing was
+  identified. Now two same-usage RGBA16F images at the depth's extent are read in parameter order, colour first.
+  A dump of four holds confirmed it: the frame, a smooth camera-rotation field, inverted depth.
+- **The motion vectors' unit:** Cyberpunk's are fractions of the frame (consecutive colour inputs line up when
+  warped by 1485 times their value, not 1), while the hold assumed pixels, so the network's history would barely have
+  moved. Word 1 of the input kernel's parameters times word 5 is the factor into the colour input's pixels in all
+  three games measured: GTA V 1.724 x 0.580 = 1, Hogwarts Legacy 1 x 0.667 = 0.667 (the value measured in October
+  from aligned frames), Cyberpunk 2560 x 0.580 = 1485. The hold inside DLSS's buffer now takes it from the launch,
+  the extents rule only without one. The split hold (GTA) is unchanged.
+- **Measured:** Cyberpunk's benchmark, 1440p, DLSS Auto, FG 3x: about 2,600 holds inside DLSS's buffer per run, 0
+  misses, the log says 1485 x 835, no Xid.
+
+## November 10: Cyberpunk 2077 after DLSS: Ray Reconstruction's motion-vector unit (3.14.0, issue #49)
+
+- **What:** with Ray Reconstruction on from the start of a session (the reporter's normal case) no Super Resolution
+  input launch ever says what the motion vectors are measured in, so the hold after Ray Reconstruction's output fell
+  back to the extents and moved its history by 1/1485 of the camera's motion.
+- **The source:** `rr2_enc0_kernel`'s parameters (1088 bytes, `NEURAL_FORGE_PROBE_NGX=1`) hold the same block as Super
+  Resolution's `rrlite_enc0_*` (words 23-25, 8, 32 there): word 51 the render size over the size Ray Reconstruction
+  works at, 52 its inverse, 53 one over the render size, 54 one over that working size, 56 `MVScale` carried to that
+  size. Cyberpunk 2077 at 2560x1440: Ray Reconstruction works at 3840x2160 and downsamples to the output itself;
+  word 56 is 3840 x 2160 and word 51 0.3867, so 1485 x 835 render pixels per unit, what its Super Resolution's word
+  1 times word 5 says. Crimson Desert's (October probe) has 3840 x -2160 there: the sign is kept (y up). The words
+  are read only when they agree with each other (ratio times inverse 1, the ratio the sizes' quotient, a whole render
+  size); Frame Generation's `Kernel_InputMvecProcessing` was no source (its scale word is 1 x 1 in Cyberpunk).
+- **Measured:** cache dumps of four holds after DLSS, with Ray Reconstruction off and on from the session's start:
+  `mvec_scale` 2560 x 1440 in both, and consecutive frames warped by the motion vectors line up best at exactly that
+  scale (mean error 0.0036-0.0039 at 1x against 0.0078-0.0086 at 0.9x and 1.1x and 0.028-0.030 without motion;
+  `~/scratch/issue49/tools/mvcheck.py`).
+- **Found on the way:** every cache dump of the hold after DLSS ended at its second hold ("a DLSS frame between two
+  armed holds went unheld", 0 of 4): the hold counted the DLSS frame when it was recorded, and the submit of the
+  same buffer counted it again on its way to the split path (which still runs for a buffer holding only the hold
+  after DLSS). A buffer carrying any recorded hold is now counted once; two holds in one frame (passes both before
+  and after DLSS) end a dump with their own reason.
+
+## November 10: Red Dead Redemption 2 (Vulkan) before the upscaler (3.14.0, issue #49)
+
+- **What kept the model out:** three refusals in a row, each found from the game's own log on the rig. (1) The
+  instance asks for Vulkan 1.1 (and 1.0 for a second one); the network needs a 1.3 instance. The layer now creates
+  such an instance for 1.3 (drivers keep an older application's behaviour; DXVK and vkd3d-proton ask for 1.3
+  themselves), falling back to the game's request if refused. (2) The device enables VK_EXT_buffer_device_address,
+  which excludes the core feature the network asked for; the network now enables the extension's feature instead
+  (the kernels' PhysicalStorageBufferAddresses allows either), allocates without the core-only
+  VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT and takes addresses through vkGetBufferDeviceAddressEXT. (3) The game asks for
+  all 8 queues of the compute-only family; the graphics family stays out (its Xid history). The network now shares
+  the application's last compute-only queue (`shared_queue`): the application's submit, wait-idle, sparse-bind,
+  present and label calls on it and the network's own submits (Rust, and the C++ side through a lock callback) take
+  one re-entrant lock around the bare driver call only, so it is always the innermost lock.
+- **A freeze found on the way:** with the queue shared, the after-the-upscaler server's frames (waited for at the
+  present) ran behind the game's own work on that queue, which waits on what the game does after that present: the
+  game froze at its loading screen, no Xid. A first suspicion (the lock held across the whole submit hook, taking the
+  hold's lock inside) was real and fixed, but not the cause. The finished frame stays off on a shared queue; the
+  holds record into DLSS's buffer on the graphics queue and never wait on the shared one.
+- **Measured:** RDR2, 1440p, DLSS Quality, Story mode in the world (launched through Steam with its Proton-GE): the
+  hold inside DLSS's buffer from the second frame (the learned launch layout, SHADER_READ_ONLY_OPTIMAL), 0 misses over
+  90 s, hold 0.8-1.4 ms, 81 fps against 125 without the model, no Xid.
+- **A flicker the user saw while watching:** with the hold inside DLSS's buffer running, 46% of RDR2's frames were
+  skipped ("every slot is in use": 8 slots, and RDR2 keeps about 15 one-time-submit DLSS buffers recorded ahead), so
+  edited and unedited frames alternated: on a still scene the presented frame's 32-pixel blocks changed 0.794 per
+  frame against 0.055 with the model off. 32 slots (and 32 hold pools on the network's side, made only when used):
+  every frame held, 0.149-0.150 against 0.106 off on a still scene, no alternation.
+- **Testing lesson:** launch games for tests through Steam (or with exactly the Proton Steam maps them to). A direct
+  launch with another Proton broke the game's Rockstar launcher for the user.
+
+## November 10: Crimson Desert's motion vectors before the upscaler (3.14.0)
+
+- **The lead:** Ray Reconstruction's parameters say Crimson Desert's motion vectors are fractions of the frame with y
+  up; its Super Resolution encoder (`rrlite_enc0_*`, the hold at NGX's luma kernel before it) had no unit source, so
+  the hold used the extents rule (1 x 1, y down).
+- **What was really wrong:** the encoder names, at the render size, the game's motion vectors (R32G32_SFLOAT,
+  parameter 12, the image Frame Generation's `Kernel_InputMvecProcessing` reads) and four RG16F images of DLSS's own
+  (16, 35-37). `input_launch`'s RG16F-first rule took one of DLSS's. Cache dumps (4K, DLSS Balanced, 2272x1280
+  render, a camera pan) showed it: the dumped vectors changed only every second hold, and lined up with the picture
+  at about 0.4 of their value (DLSS's working size is 5760x3240 there: 0.394), so the history moved by the wrong
+  amount and a frame late every other frame. The hold now takes the encoder's one RG32F image at the colour's extent
+  (`rrlite_game_mvec`).
+- **The unit:** the encoder carries the same block as `rr2_enc0_kernel` (words 23, 24, 8, 32 and 25: the render over
+  the working size, its inverse, both sizes' inverses, `MVScale` at the working size), read with the same
+  consistency checks: 5760 x -3240 times 0.3944 = 2272 x -1280 render pixels per unit.
+- **Measured** (three dumps of 10 holds each with the game's vectors, mean warp error of the previous frame through
+  them): pan 0.091 at 2272 x -1280 against 0.148 at the old 1 x 1, 0.150 with no motion, 0.120 with y down and
+  0.116-0.117 at 0.9x and 1.1x; walk 0.049 against 0.083 (0.054 at 0.9x and 1.1x); a pitch (image moved down 18-21 px a
+  hold, vectors 0.014 x 1280 = 18 px) 0.056 against 0.106, 0.107 with y down. Some vectors overflow RG16F in the
+  hold's copy (up to 119 pixels a frame become infinite); the model's answer stayed finite (read since as leaving the
+  frame, below).
+- **Lesson:** a "which image is the motion vectors" rule that picks by format and handle is a guess wherever the
+  engine names its own history beside the game's input; a dump whose vectors repeat on alternate holds is the sign.
+
+## November 10: a review of the #49 and #51 changes before 3.14.0
+
+Ten findings of a code review of the branch, each checked against the code and fixed with a test that fails without
+the fix (none reached a release):
+
+- **Ray Reconstruction's motion vectors:** the parameter-order rule (Cyberpunk's: colour the first RGBA16F image at
+  the depth's extent, motion vectors the second) gave the motion vectors whenever the colour happened to be that
+  first image, however it was found; beside a guide buffer of the same format (albedo, specular, normals) the guide
+  buffer became the motion vectors. It gives them now only with the colour, or where no motion-vector format is
+  named (`ray_reconstruction_guide_buffer_is_not_taken_for_motion_vectors`). An output whose motion vectors change
+  kind is another output, learnt again before the hold after it runs.
+- **Evidence and Ray Reconstruction:** the ageing of stale evidence (save loads) ran while Ray Reconstruction ran,
+  whose buffers are never evidence: after 64 submits everything was dropped with a line blaming a save load, and
+  Ray Reconstruction's own launch lost the inputs it is read with. Evidence does not age while it runs
+  (`evidence_does_not_age_while_ray_reconstruction_runs`).
+- **An output written in more parts than learnt** (Ray Reconstruction's working size changed): the hold went after
+  the learnt count, on a partly written output, for 8 frames until the new count was learnt. The learnt output is
+  dropped at the first such submit, so one frame at most.
+- **Two holds in one DLSS buffer** (passes before and after DLSS) counted the frame twice when recorded, the same
+  fault the split path's count had: the edit cache saw a gap and a dump's arm check never fired. Counted once per
+  buffer (`two_holds_in_one_dlss_buffer_count_its_frame_once`).
+- **The hold put off to the input launch** for its jitter took that launch's colour image without the checks the
+  first launch gets (a colour candidate, or the launch's own render-size input): a Frame-Generation-shaped launch's
+  output-size image could get it.
+- **The motion vectors' unit and the render size it is at** are set together now; a launch that said no unit took
+  the new size beside the old unit. A unit of -1 (render pixels, y up) stays -1 at another render size after
+  DLSS. The hold before the upscaler takes a negative y as it is, through to the native shaders (checked on
+  lavapipe: vectors (2, -4) at a scale of (0.5, -0.25) read the same pixel as (2, 4) at (0.5, 0.25)).
+- **A same-layout barrier on one aspect of the depth** keeps the layout only where the layout tracked there is the
+  one it names (or none is tracked); one naming another layout leaves the aspects apart.
+- **The split's refusal line for a buffer recorded before the identification** no longer says the hold inside takes
+  it: that hold refuses a DLSS buffer begun before the identification.
+- **Hogwarts Legacy's Ray Reconstruction** (`cuda_dldn_engine_swin_enc0_kernel`, 952 bytes) has no unit source: the
+  one probe line (October, `~/nf-spike/runs/hl-rr-on`) shows its render size (1707x960 and 1708x961), padded and
+  working sizes (1728x992, 3416x1922) and factors of 2 and 0.5 between them, and matrices, but no word that reads
+  as `MVScale` and no second launch to check one against. Not added; the user guide says the unit there is assumed.
+- **Lesson:** a rule found for one game's shape (the parameter order) must say how sure it is of its own premise
+  before it outranks a general one; and every new ageing or counting rule needs the question "and while Ray
+  Reconstruction runs?" asked of it.
+
+## November 10: Crimson Desert's Xid 32 at start, and its motion vectors that are not finite (#51)
+
+- **The freeze:** one Crimson Desert launch (4K, HDR through Proton-GE's Wayland driver, the #51 development build,
+  the patched open module nvidia-ogkm 620.70.06) stayed black and logged two `Xid 32` lines 27 s after start, on a
+  copy-engine channel of the game's (`intr1 00000008 HCE_DBG0 00001b00/00001b04`); an identical launch right after
+  was clean. NVIDIA's catalogue has Xid 32 as a PBDMA error, an invalid or corrupted push buffer stream (a driver
+  error, memory or bus corruption); nothing public decodes the HCE registers. The layer's log stopped at the
+  identification of DLSS's inputs, before any hold: nothing is recorded into a game's buffers before "game is
+  rendering steadily; engaging", which comes seconds later. What the layer had done by then is what it does at
+  every start: the instance raised from Vulkan 1.0 to 1.3, a sixth queue of the compute family for the network's
+  loading, the network's extensions and features on the device, transfer usage added to two-channel float images
+  where their memory requirements stay the same, and the NVX handle and CUDA-launch tracking. No copy-engine work
+  of its own.
+- **Reproduced?** No. Interleaved launches of the same route, each through the start and about a minute of play:
+  three each of the development build, the installed 3.13.0 and Neural Forge disabled
+  (`NEURAL_FORGE_DISABLE=1`), all nine into the game (the GPU busy, the layer holding where on), none with an Xid; the kernel log has no other Xid for Crimson Desert since the 620.70.06 module was
+  built (November 7), over at least 17 launches today (the kernel's
+  emulation notices name each process), with and without the layer. One fault in all of them, before the layer
+  did anything to the frame, is not Neural Forge's on this evidence; if it comes back, the same comparison with
+  more launches of the layer off is the test.
+- **Motion vectors that are not finite:** the hold inside DLSS's buffer blits Crimson Desert's R32G32_SFLOAT
+  motion vectors into its RG16F staging image (`record_copy_in`). A few are NaN every frame (2-10 at 4K in a pan and
+  a walk), and in an earlier session up to 119 a frame were past the half's range and became infinite in the copy.
+  The network's own read of either already found no history there, but the edit cache's motion pass read both as
+  zero motion and carried the history as if nothing there had moved. It now reads an infinite vector as the
+  largest finite half of its sign and a NaN one as the largest finite half: each leaves the frame, so the chain is
+  lost there, with no NaN reaching the staleness field; the replay tool reads them the same way. With the nearest
+  surface's vector, a texel takes a non-finite vector only where it is the nearest depth around it (15 of 58 in
+  both dumps). The edit cache's replay of both dumps did not move (err, p99.5 and kept the same to the last digit
+  shown). RG16F vectors (GTA V) are copied as they are and RGBA16F ones (Metro Last Light Redux) blitted half to
+  half, so only RG32F narrows; the reading covers a non-finite vector from any of them.
+- **Lesson:** a game's motion vectors can hold values no conversion keeps (NaN, beyond the half's range); every
+  reader of the copy must agree on what such a vector means, and "no history" is the one that cannot smear.
 
 ## Deliberately not done, or left open
 

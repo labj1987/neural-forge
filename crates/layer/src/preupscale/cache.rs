@@ -1513,6 +1513,49 @@ mod tests {
         assert_eq!((c[STAT_STILL], c[STAT_MOTION_N]), (0, 0), "nothing counted for the cadence");
     }
 
+    /// On the GPU: a vector of the hold's RG16F copy that is infinite (a game's RG32F vector past the half's range,
+    /// as Crimson Desert's are on up to 119 texels a frame at 4K) or not a number (a few of Crimson Desert's every
+    /// frame) leaves the frame, so the chain is lost there (NaN: no history), as the network's own read of it has
+    /// none; it was read as zero motion, which carried the history as if nothing there had moved. The finite
+    /// vectors around them are as they were.
+    #[test]
+    fn a_vector_that_is_not_finite_leaves_the_frame_rather_than_standing_still() {
+        let Some(rig) = Rig::new(16, 8) else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (w, h) = (rig.w as usize, rig.h as usize);
+        let n = w * h;
+        let depth: Vec<u8> = (0..n).flat_map(|_| 0.5f32.to_le_bytes()).collect();
+        Rig::write(&rig.depth, &depth);
+        // Packed halves, x in the low half: +inf x, -inf y, NaN x, NaN y, (1, 1); zero motion elsewhere.
+        let mut words = vec![0u32; n];
+        let (pos_x, neg_y, nan_x, nan_y, one) = (2 * w + 3, 4 * w + 5, 4 * w + 7, 6 * w + 2, 4 * w + 9);
+        words[pos_x] = 0x0000_7c00;
+        words[neg_y] = 0xfc00_0000;
+        words[nan_x] = 0x0000_7e00;
+        words[nan_y] = 0x7e00_0000;
+        words[one] = 0x3c00_3c00;
+        let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
+        Rig::write(&rig.mvec, &bytes);
+        for scale in [[1.0, 1.0], [2272.0, -1280.0]] {
+            let push = rig.pass.push(F_CHAINED | F_FRESH, 1, scale, 3.0);
+            // SAFETY: recording into the rig's buffers; the set was bound.
+            rig.one_shot(|cmd| unsafe { rig.pass.record_motion(&rig.gpu.3, cmd, &push, rig.acc.buffer) });
+            let acc = rig.read_f32(rig.acc.buffer, 2 * n);
+            let at = |i: usize| (acc[2 * i], acc[2 * i + 1]);
+            for i in [pos_x, neg_y, nan_x, nan_y] {
+                let (x, y) = at(i);
+                assert!(x.is_nan() && y.is_nan(), "scale {scale:?}: the vector at {i} has no history: ({x}, {y})");
+            }
+            if scale == [1.0, 1.0] {
+                assert_eq!(at(one), (1.0, 1.0), "a finite vector is as it was (in its own unit)");
+            }
+            let still = (0..n).filter(|i| ![pos_x, neg_y, nan_x, nan_y, one].contains(i)).all(|i| at(i) == (0.0, 0.0));
+            assert!(still, "scale {scale:?}: zero motion elsewhere");
+        }
+    }
+
     /// A handle the last bind named comes back for another object once that one is destroyed (the split hold
     /// makes a view of the colour input every hold, and a destroyed view's handle is the next one's): the set
     /// is written again when what the handles name changed ([`Bindings::made`]), and only then. Bound to a

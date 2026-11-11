@@ -4,6 +4,250 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.0.0 — 2026-11-11
+
+**DLSS games need a Neural Forge Proton, and Neural Forge reads what the game gives DLSS**
+
+- Neural Forge no longer works out from DLSS's kernels which images are DLSS's input, motion vectors, depth, output
+  and exposure, or how the motion vectors are measured, the camera jitter, a reset of the game's history, or
+  whether Ray Reconstruction runs. A **Neural Forge copy of Proton** hands it exactly what the game gives DLSS, by
+  name, in every DLSS game: Direct3D 12, Direct3D 11 and Vulkan. Games whose engine Neural Forge did not know now
+  work the same way as the tested ones.
+- Switching a game on (Setup tab, or `neural-forge-cli enable`) with Steam closed now also sets the game's Proton to
+  a Neural Forge copy of the Proton it runs with (GE-Proton, Proton-CachyOS, Valve's Proton or Proton Experimental),
+  making the copy first: `<version>-NeuralForge` next to the original in Steam's compatibilitytools.d, no extra
+  space on the same drive. Restart Steam after a copy was made. Switching the game off, and uninstalling, put back
+  the Proton it had. The Setup tab's **Proton with DLSS parameters** makes, updates and removes copies;
+  `neural-forge-cli proton-tool` does the same.
+- A DLSS game that does not run with a Neural Forge Proton keeps the model off: the Status tab, `doctor` and the
+  game's log say why and how to fix it. Choose the finished frame as the placement to have the model there anyway.
+  Games without DLSS run the model on the finished frame as before.
+- In a DLSS game the model no longer runs on the finished frame over the menus and loading screens before DLSS's
+  first frame, which at 4K built the network at the output size: behind hangs in GTA V Enhanced and video-memory
+  spills in Cyberpunk 2077 with Ray Reconstruction. A game that ships DLSS but does not upscale with it (DLSS off,
+  another upscaler, Frame Generation only, DLAA) still gets the model on the finished frame, after 5 minutes
+  without DLSS or 30 seconds of DLSS with no frame worked on.
+- `doctor` checks that the NGX wrapper is installed and forwards every function of your driver's NGX core, that
+  each switched-on game is set to a Neural Forge Proton, and which copies were made from an older Proton than is
+  installed now.
+- Neural Forge Proton copies are made from Proton 10 or newer (Wine 10+); Proton 8 and 9 are refused, because the
+  NGX wrapper cannot find the game's process there. A Proton chosen for a game that is not installed is refused
+  instead of being replaced with another, Valve's Protons are found by Steam's own name for them ("Proton 9.0
+  (Beta)" folders included), and switching on a native Linux game no longer forces Proton on it.
+- Updating Neural Forge puts its new NGX wrapper into every existing copy. **Make again** (`proton-tool update`)
+  moves the old copy's games to the new copy and removes the old one, with Steam closed; a copy a running game uses
+  is never replaced or removed, and a replaced copy is swapped in in one step.
+- `uninstall --purge` takes every game off Neural Forge's Proton copies, even ones it has no record of, and removes
+  only copies it made. The NGX wrapper's ring files are made only in games Neural Forge is on for, and those of
+  games that are gone are removed when Neural Forge starts; a running game's is never touched.
+- With an older driver whose NGX core lacks some functions, only those report failure; DLSS is unavailable only if
+  the core lacks one of the ten Neural Forge watches. `doctor` compares the wrapper with your driver's core both
+  ways and reports copies on an old Wine or with another wrapper.
+- Fixed possible crashes in the NGX wrapper after a failed DLSS feature creation and from an exposure image left
+  stale with auto-exposure on; it no longer keeps a game's first D3D12 device alive for the whole session.
+- GTA San Andreas - The Definitive Edition (Direct3D 11): an evaluate whose work never reached the GPU no longer
+  leaves every later frame matched to an older one's camera jitter, and DLSS's output there is learnt.
+- GTA V Enhanced no longer flashes green and white with the model on: its exposure images are copies DLSS's own
+  buffer makes, which hold no exposure where the model reads them; the exposure is measured from the frame there.
+  The edit cache carries the model's change between frames again (a few % rejected, not all of it).
+- A game that hands DLSS brand-new images after a load (007 First Light) keeps the model on them without a frame or
+  two of the game's own picture at each.
+- Games that hand DLSS different images frame by frame (GTA V Enhanced rotates its motion vectors, depth and
+  exposure image) keep the model and its history on every frame.
+- Online games with anti-cheat may refuse the changed module: use the Neural Forge Proton for single-player games.
+  `PROTON_NO_NEURAL_FORGE_NGX=1` in a game's launch options runs it without the wrapper.
+
+**Everything 3.14.0 was going to bring** (never released on its own)
+
+
+**The model before the upscaler in more games**
+
+- Native Vulkan games whose DLSS input is created without copy usage (Indiana Jones and the Great Circle) can now
+  have the model before the upscaler: Neural Forge gives the images that may be DLSS's input the usage it needs to
+  work on them inside DLSS's own command buffer. Before, every frame of such a game went to DLSS untouched and the
+  model ran on the finished frame.
+- Games whose frame moves DLSS's colour input out of the general layout in a command buffer just before DLSS's own
+  (and back after it) no longer fall between both ways of holding the frame, which left every frame unedited.
+- Images whose memory needs would change with the copy usage Neural Forge adds are created exactly as the game
+  asks: an engine that places its images in its own memory (id Tech, Indiana Jones and the Great Circle) relies on
+  those needs. The game's log says so once, with the numbers.
+- Games that hand DLSS a frame they already brightened, with a very small exposure value beside it (Clair Obscur:
+  Expedition 33), no longer get a white fog over the picture and a line down its right edge with Model brightness
+  on Game: after about two and a half seconds in which the game's exposure stays steady and would make the
+  model's picture far too dark, Neural Forge measures the brightness from the frame instead and says so in the
+  game's log (`the colour input looks pre-exposed`); once that has passed for as long, it goes back to the game's
+  exposure (`no longer looks pre-exposed`). A game walking from daylight into a dark interior, whose eye
+  adaptation catches up over a second or two, keeps its own exposure.
+- Games that hand DLSS their frame in one of several images in turn (Clair Obscur: Expedition 33) now have the
+  model on every frame. Before, only the frames in one of those images were worked on, and the others flickered
+  through unedited while the camera moved.
+- In Stellar Blade the model before the upscaler now carries its result from frame to frame. Its frames were
+  already worked on inside DLSS's command buffer, but the way the game marks its depth buffer made Neural Forge
+  throw the model's history away on every frame, so each frame was worked on afresh.
+
+- Cyberpunk 2077 has the model before the upscaler again (with Placement on Auto). A game update hands DLSS its
+  motion vectors in a four-channel image, which Neural Forge did not recognise, so every frame went to DLSS
+  untouched and the model ran on the finished frame.
+- When a game replaces DLSS's input images while the old ones stay alive (a loaded save can do that), Neural Forge
+  now finds the new input again. Before, the old images' traces could keep it waiting for DLSS's input until the
+  game was restarted.
+- In games that give DLSS their motion vectors as fractions of the frame rather than in pixels (Cyberpunk 2077),
+  the model's history now follows the motion. Neural Forge reads the motion vectors' unit from what the game tells
+  DLSS instead of assuming pixels; before, the history barely moved with the picture.
+- Crimson Desert (Ray Reconstruction off): the model's history before the upscaler now follows the motion. It read
+  one of DLSS's own internal motion-vector images instead of the game's, which moved the history by less than half
+  of the camera's motion and a frame late on every second frame; it now reads the game's motion vectors, in the
+  unit and direction the game gives DLSS (fractions of the frame, y pointing up).
+- In Cyberpunk 2077 the model before the upscaler now knows the camera's sub-pixel jitter on every frame. On every
+  second frame it went without, so its history lost the jitter's step on two frames in a row and could not carry the
+  model's edit from one frame to the next.
+- Placement "After DLSS" works in Cyberpunk 2077. With Ray Reconstruction off, the model was put on an internal
+  image of DLSS instead of its output, so nothing changed on screen (and DLSS's own history was disturbed); it now
+  works on the picture DLSS hands the game, and its history there follows the motion.
+- With Ray Reconstruction on in Cyberpunk 2077 (with or without path tracing), Placement Auto and "After DLSS" now
+  run the model right after DLSS, on its denoised, upscaled picture. Before, Neural Forge did not find Ray
+  Reconstruction's output and the model fell back to the finished frame, HUD included. Ray Reconstruction writes its
+  picture in several parts, and the model now waits for the last one. The model's history there follows the motion
+  also when Ray Reconstruction is on from the start of the game (it reads the motion vectors' unit from Ray
+  Reconstruction itself); before, it barely moved with the picture.
+
+- Red Dead Redemption 2 (Vulkan) has the model before the upscaler with DLSS on. Three things kept the model out of
+  it, and every Vulkan game like it: its instance asks for Vulkan 1.1 (Neural Forge now creates it for 1.3, which
+  the model needs; `NEURAL_FORGE_RAISE_VULKAN=off` keeps the game's), it uses the older buffer-address extension
+  (the model now uses that one's feature), and it takes every compute queue of the GPU (the model now shares one of
+  the game's, with every use of it synchronized; `NEURAL_FORGE_SHARE_QUEUE=off` turns that off). Where the queue is
+  shared, the model runs before the upscaler only, not on the finished frame.
+- Games that record many of DLSS's command buffers ahead (Red Dead Redemption 2 about 15) no longer get every other
+  frame without the model, which flickered: the hold inside DLSS's buffer now has room for 32.
+
+**A steadier picture on the finished frame**
+
+- A Vulkan swapchain that carries a single-GPU device-group description is no longer left untouched: the model can
+  work on its finished frame (Red Dead Redemption 2's Vulkan renderer makes one; there the model runs before the
+  upscaler only, see above).
+- With the model on the finished frame (no DLSS, or the Placement setting "At present"), it now carries its result
+  from frame to frame, as it does before the upscaler. Before, every frame was worked on afresh, and on grainy or
+  noisy pictures (film grain in Cyberpunk 2077) large soft patches of the picture flickered.
+  `NEURAL_FORGE_POST_MOTION=none` brings the old behaviour back. A working scale below 1 makes this flicker
+  stronger.
+
+**Pause menus and loading screens**
+
+- A pause menu (Cyberpunk 2077's Esc menu) no longer moves the model to the finished frame after 30 seconds. The
+  menu shows the last frame, which already carries the model's edit; after half a minute the model ran over the
+  menu a second time, at the output size (about 50 ms a frame at 4K), and was rebuilt for it and rebuilt again on
+  resume, so the model was gone for one to six seconds after each long pause, and on a 12 GB card at 4K the video
+  memory guard turned it off for the rest of the game. While the game sends DLSS nothing at all, the model now stays
+  where it was for 5 minutes, and runs again on the first frame after the menu. A game that goes on calling DLSS
+  with no frame worked on before the upscaler (DLAA, or a DLSS input Neural Forge no longer recognises) gets the
+  model on the finished frame 30 seconds after the last frame worked on, and the Status tab never says paused
+  meanwhile; one switched to another upscaler, after 5 minutes.
+- While DLSS is paused that way, the Status tab's Model placement line says "paused with the game's DLSS (a menu
+  or loading screen): the model resumes with its next frame" (`preupscale_state=6`) instead of "after the upscaler:
+  waiting for DLSS Super Resolution", which read as if the model had moved. The game's log says when DLSS frames
+  resume and after how long.
+- Fixed a GPU crash (Xid 13, device lost) when the game came back from a pause menu at the moment the model moved
+  from the finished frame back to before the upscaler: the network could be rebuilt for the finished frame under a
+  frame that had just been recorded with the old build.
+- The video memory guard now pauses the network when it runs out of video memory in a game it slows to a few frames
+  a second (Cyberpunk 2077 at 4K with Ray Reconstruction and path tracing on a 12 GB card: 0.1-7 fps with the network
+  at 0.4-1.7 s a frame, and no pause ever). Four things kept it out: it needed five network frames within a second
+  to judge, which such a game never delivered; the network's frames on the finished frame were never timed for it;
+  the device's memory reading stayed a little under the budget the driver reports (217 MiB) while the network was
+  over fifty times slower than its best; and once it had decided to pause, the pause waited for the next frame to
+  use the network, which never came, because the layer stops working on a game below 15 fps, so the network kept the
+  memory the game needed. Now two slow frames within five seconds are enough, both places time the network, a
+  network ten times slower than its best counts within 512 MiB of the budget, and the decided pause is applied once
+  no frame has used the network for six seconds and none that did can still be running on the GPU (closing the
+  network under such a frame would crash the game); while it waits, no new frame takes the network, so a game that
+  keeps handing it frames still gets the pause. Measured: the game back at 65-69 fps seconds after the pause was
+  decided, steady from there.
+- In a game that uses DLSS, the model no longer runs on the finished frame over the loading screens and menus before
+  DLSS's first frame (with Placement on Auto): they go untouched, and the model starts with DLSS. Neural Forge knows
+  the game uses DLSS from its DLSS libraries (or DLSS's kernels) as the game starts. Before, the model was built at
+  the output size for the first loading screen and run over it; in GTA V Enhanced at 4K this ended in the game's
+  own hang detector closing the game when that happened before the game had set up DLSS (3 of 6 launches in one
+  test), and in Cyberpunk 2077 at 4K with Ray Reconstruction it filled the video memory, so the model was paused
+  and the game ran at half its frame rate. A game that ships DLSS but runs another upscaler gets the model on the
+  finished frame after 5 minutes without DLSS, or 30 seconds of DLSS frames the model cannot work on. Placement
+  set to the finished frame (present) is unchanged.
+- When the model moves from the finished frame to the game's frame (DLSS starts, or resumes after a menu), the
+  finished-frame path's buffers are freed at once instead of staying in video memory beside the game's.
+- With Ray Reconstruction, the model no longer jumps to the finished frame for the first moments of DLSS or while
+  it waits for the network: it stays in the game's frame after DLSS. While the video memory guard has the network
+  paused, the finished-frame path no longer copies every frame for nothing (Cyberpunk 2077 at 4K ran at 28-29 fps
+  instead of 55-65 after such a pause).
+
+**Seeing why the model does not run before the upscaler**
+
+- When Neural Forge finds the frame a game hands to DLSS but cannot work on it, the Status tab's Model placement
+  line now says "DLSS input identified, not holding" and why, instead of "waiting for DLSS Super Resolution" as if
+  the game did not use DLSS: a reason it found in the game, or that the model is switched off or the Placement
+  setting runs no pass before the upscaler. `neural-forge-cli shmctl status` and **Save report** show the same
+  state and reason (`preupscale_state=5`, `preupscale_reason=`). When the video memory guard has paused the network,
+  the reason says so (too little video memory for it; it resumes once there is room) instead of being empty.
+- The game's log says once each why a frame was not worked on inside DLSS's command buffer (missing copy usage, the
+  input's format, size or layout, a render pass left open across DLSS), with the image it was. The reasons that
+  said nothing before (DLSS's command buffer recorded before its input was found, DLSS's work not readable, the
+  work inside DLSS's buffer not set up yet) are now counted in the log every few seconds, and the log says when a
+  frame refused before DLSS's buffer was not tried inside it either, and why.
+- The log's periodic count of DLSS submissions now also says how many frames were actually worked on, by each way
+  of holding them, instead of only how many named DLSS's input.
+- Where a frame cannot be worked on in front of DLSS's command buffer but is worked on inside it, the log no longer
+  says "not holding, frames go to DLSS untouched": it says the work inside DLSS's buffer takes such frames, and
+  which lines say whether it does.
+- The game's log now says when a game sends HDR metadata for its window, and whether the window was created as HDR10
+  or as SDR (sRGB). A game with HDR switched on whose window is still SDR is either drawing SDR or putting HDR10
+  code into an SDR window, which Neural Forge leaves untouched.
+
+**What to expect in a game, and HDR at a glance**
+
+- The Status tab says whether the running game is one Neural Forge is tested in, where the model ran in it (with
+  and without Ray Reconstruction) and in which version, with the game's setup notes and known issues as the line's
+  tooltip. The Setup tab's games list says where the model runs in each tested game, and
+  `neural-forge-cli games --tested [GAME]` lists them or shows one game's notes. Diagnose (and
+  `neural-forge-cli doctor`) says when the model runs somewhere else in a tested game than it did in testing.
+- A new HDR line on the Status tab says in plain words whether the game presents HDR and, when it does not, why:
+  the game's HDR setting is off although HDR10 was available, or the game asked for SDR although it sent HDR
+  metadata because its window offered no HDR (gamescope without `--hdr-enabled`, Proton without
+  `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`, or the desktop's HDR off), with the window's format and colour
+  space and the desktop's HDR state per display (GNOME, KDE Plasma). `neural-forge-cli shmctl status`
+  (`hdr_verdict=`), Save report and the game's log (`[layer] HDR:`) say the same.
+
+**Uninstall from the app**
+
+- The Setup tab has **Uninstall…**: after a confirmation that lists what goes, it removes everything Neural Forge
+  put on the computer (the layer, the app, settings, the model and imported DLL, captures, logs, Neural Forge's
+  part of every game's launch options), Neural Forge's own Proton builds and the AppImage file it runs from, then
+  quits. With Steam running the launch options cannot be changed; the games that keep Neural Forge's variables
+  are listed with the options to set by hand. Deleting only the AppImage file does not uninstall Neural Forge:
+  the layer stays installed. `neural-forge-cli uninstall --purge` now removes Neural Forge's Proton builds too.
+
+**Bug reports that can be answered the first time**
+
+- Save report now also names the tested game and its entry (where the model should run, its known issues), and
+  the HDR verdict with the desktop's HDR state. `neural-forge-cli report --trace FILE` adds a trace the game's
+  layer recorded, when you are asked for one.
+- Save report lists every game switched on with the Proton Steam runs it with and whether that is a Neural Forge
+  Proton, and how many DLSS records the running game's Neural Forge Proton handed over.
+- The bug report form asks whether the game is set to the Neural Forge Proton, for the store, the DLSS features
+  that are on and the HDR line, next to the Save report zip, so the first reply can be a fix instead of questions.
+
+**Diagnosing crashes**
+
+- If Neural Forge itself fails inside a game, the game's log (`NEURAL_FORGE_LOG`) now ends with a `[panic]` line
+  saying what failed and where, instead of stopping at whatever was last written.
+- The log says when the model's work was first put into DLSS's own command buffer and when that work first ran,
+  and when the first frame was worked on before DLSS otherwise, each written out at once, so a crash can be
+  placed before or after them. The line at start-up that said the hold inside DLSS's command buffer is
+  "available" now also says nothing is held yet.
+
+**Captures**
+
+- While the model runs after DLSS (with Ray Reconstruction, or the Placement "After DLSS"), the Debug tab's Capture
+  row and the capture's message now say that both images are the presented frame with the model's edit, as they
+  already did before the upscaler.
+
 ## 3.13.0 — 2026-11-09
 
 This release fixes what a full review of Neural Forge found.

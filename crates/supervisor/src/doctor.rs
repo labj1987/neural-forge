@@ -121,10 +121,15 @@ pub struct Roots {
     pub launch_option_state: Option<LaunchOptionState>,
     /// The Steam installations ([`crate::steam::roots`]): their games and launch options.
     pub steam_roots: Vec<crate::steam::Root>,
+    /// The library folders NVIDIA's driver may keep `nvidia/wine/_nvngx.dll` in
+    /// ([`crate::proton_tool::DRIVER_LIB_DIRS`]).
+    pub driver_lib_dirs: Vec<PathBuf>,
+    /// Where the NGX wrapper's rings are ([`crate::proton_tool::RING_DIR`]).
+    pub ring_dir: PathBuf,
 }
 
 /// Runs `program` with `args`, its standard output on success. Killed after `timeout`.
-fn run_command(program: &str, args: &[&str], timeout: std::time::Duration) -> CommandOutput {
+pub(crate) fn run_command(program: &str, args: &[&str], timeout: std::time::Duration) -> CommandOutput {
     use std::io::Read;
     use std::process::Stdio;
     let mut child = match std::process::Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
@@ -219,6 +224,8 @@ impl Roots {
             journalctl: cached_command("journalctl"),
             launch_option_state: None,
             steam_roots: crate::steam::roots(),
+            driver_lib_dirs: crate::proton_tool::DRIVER_LIB_DIRS.iter().map(PathBuf::from).collect(),
+            ring_dir: crate::proton_tool::RING_DIR.into(),
         }
     }
 
@@ -261,6 +268,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
             out.extend(check_device_lost(Some(hdr), session.as_deref()));
             out.extend(check_cannot_run(Some(hdr), session.as_deref()));
             out.extend(check_native_status(hdr));
+            out.extend(check_game_compat(hdr));
         }
         Err(e) => {
             out.push(Finding::new(
@@ -276,6 +284,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
         }
     }
     out.extend(check_steam(roots));
+    out.extend(check_proton(roots));
     out.extend(check_xid(roots));
     out.extend(check_input_group(roots));
     out.extend(check_session_log(roots, events.as_deref().map_err(|e| e.kind()), session.as_deref()));
@@ -712,6 +721,48 @@ fn check_attached(roots: &Roots, hdr: &neural_forge_protocol::ShmHeader, manifes
     check_never_attached(roots, manifest_ok, evidence)
 }
 
+/// The game on the channel against its entry in the tested games (`crate::compat`): its setup notes, and whether
+/// the model runs where it ran in testing. Nothing without a game.
+fn check_game_compat(hdr: &neural_forge_protocol::ShmHeader) -> Option<Finding> {
+    const CHECK: &str = "tested-game";
+    let name = hdr.game_name();
+    let scope = hdr.running_game.load(Ordering::Relaxed);
+    if name.is_empty() && scope == 0 {
+        return None;
+    }
+    let shown = if name.is_empty() { format!("Steam app {scope}") } else { name.clone() };
+    let Some(game) = crate::compat::for_header(hdr) else {
+        return Some(Finding::new(
+            CHECK,
+            Severity::Info,
+            format!("{shown} is not among the tested games: where the model runs in it is not known yet"),
+            format!("{} games in the built-in list (`neural-forge-cli games --tested`)", crate::compat::games().len()),
+            None,
+        ));
+    };
+    let evidence = game.details().trim_end().to_string();
+    let notes = (!game.notes.is_empty()).then(|| game.notes.join(" "));
+    let state = hdr.preupscale_state.load(Ordering::Relaxed);
+    let expected: Vec<crate::compat::Placement> = [Some(game.placement), game.placement_rr].into_iter().flatten().collect();
+    // Only a game running now, with the Placement setting on Auto, is compared: a setting that moves the model, or
+    // a closed game's last state, says nothing about the game; nor does waiting for DLSS or a pause with it (a menu, a
+    // loading screen).
+    let comparable = layer_alive(hdr)
+        && hdr.placement.load(Ordering::Relaxed) == neural_forge_protocol::enums::placement::AUTO
+        && state != neural_forge_protocol::enums::preupscale_state::WAITING
+        && state != neural_forge_protocol::enums::preupscale_state::PAUSED;
+    if comparable && !expected.iter().any(|p| p.preupscale_state() == state) {
+        return Some(Finding::new(
+            CHECK,
+            Severity::Warning,
+            format!("{}: the model runs {} now, but in testing it ran {}", game.name, crate::shm_status::preupscale_state_name(state), game.placement_text()),
+            evidence,
+            Some(notes.unwrap_or_else(|| "Check the game's DLSS settings (Super Resolution on), then attach Save report to a bug report.".into())),
+        ));
+    }
+    Some(Finding::new(CHECK, Severity::Ok, format!("{} is a tested game. {}", game.name, game.status_line()), evidence, notes))
+}
+
 /// No game's layer has attached: the likely causes, most likely first, and the fix for the first.
 fn check_never_attached(roots: &Roots, manifest_ok: bool, evidence: String) -> Finding {
     const CHECK: &str = "layer-attached";
@@ -758,6 +809,192 @@ fn steam_launch_state(games: &[crate::steam::Game]) -> Option<LaunchOptionState>
 /// The first launch options of `game` that switch Neural Forge on, from any account.
 fn enabled_options(game: &crate::steam::Game) -> Option<String> {
     crate::steam::launch_options(&game.root.path, &game.appid).into_iter().filter_map(|a| a.options).find(|o| crate::launch_options::is_enabled(o))
+}
+
+/// Since 4.0 the layer works only in games run with a Neural Forge Proton (`proton_tool`): the NGX wrapper must be
+/// installed and match the driver's NGX core both ways ([`compare_exports`]); each copy must be on Wine 10 or newer
+/// and hold the installed wrapper; each switched-on game (but a native Linux one) must be set to such a Proton; and a
+/// running game's ring must be of the version the layer reads.
+fn check_proton(roots: &Roots) -> Vec<Finding> {
+    use crate::proton_tool;
+    const CHECK: &str = "proton";
+    let mut out = Vec::new();
+    let wrapper = roots.data_dir.join(proton_tool::WRAPPER);
+    let ours = match std::fs::read(&wrapper) {
+        Ok(b) => proton_tool::pe_export_names(&b),
+        Err(_) => {
+            return vec![Finding::new(
+                CHECK,
+                Severity::Failure,
+                "the NGX wrapper for Proton is not installed: no game can hand Neural Forge DLSS's parameters",
+                wrapper.display().to_string(),
+                Some("Install Neural Forge again from its AppImage (the Setup tab or `neural-forge-cli install --appdir`).".into()),
+            )]
+        }
+    };
+    let dirs: Vec<&Path> = roots.driver_lib_dirs.iter().map(PathBuf::as_path).collect();
+    match proton_tool::driver_core(&dirs) {
+        None if !dirs.is_empty() => out.push(Finding::new(
+            CHECK,
+            Severity::Failure,
+            "NVIDIA's NGX core for Proton (nvidia/wine/_nvngx.dll) is not installed with the driver: DLSS does not run under Proton",
+            dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", "),
+            Some("Install the NVIDIA driver's full package (its Wine NGX files), then restart the game.".into()),
+        )),
+        None => {}
+        Some(core) => out.extend(compare_exports(&core, ours.as_deref())),
+    }
+    let digest = std::fs::read(&wrapper).ok().map(|b| crate::install::digest(&b));
+    for root in roots.steam_roots.iter().filter(|r| !r.flatpak) {
+        let tools = proton_tool::tools(&root.path);
+        for t in &tools {
+            if let Err(why) = proton_tool::unix_pid_support(&t.dir) {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Failure,
+                    format!("{} cannot hand Neural Forge DLSS's parameters: {why}", t.name),
+                    t.dir.display().to_string(),
+                    Some("Remove it in the Setup tab (or `neural-forge-cli proton-tool remove`) and make a copy of Proton 10 or newer.".into()),
+                ));
+            }
+            if digest.as_ref().is_some_and(|d| *d != t.wrapper_sha256) {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Warning,
+                    format!("{} holds another NGX wrapper than this Neural Forge's: games run with it may not hand the layer DLSS's parameters", t.name),
+                    format!("{}: wrapper {} (installed: {})", t.dir.display(), short(&t.wrapper_sha256), short(digest.as_deref().unwrap_or_default())),
+                    Some("Start Neural Forge (or run `neural-forge-cli install --appdir` or `neural-forge-cli proton-tool update`): that puts the new wrapper in every copy.".into()),
+                ));
+            }
+            if proton_tool::source_changed(t) {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Info,
+                    format!("{} was made from an older {} than is installed now", t.name, t.source.display()),
+                    t.dir.display().to_string(),
+                    Some("Close Steam, then make it again in the Setup tab (or `neural-forge-cli proton-tool update`): its games move to the new copy.".into()),
+                ));
+            } else if proton_tool::source_gone(t) {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Info,
+                    format!("{} was made from {}, which is no longer installed: the copy keeps working as it is", t.name, t.source.display()),
+                    t.dir.display().to_string(),
+                    Some("Nothing to do. For a newer Proton, switch the game off, choose that Proton for it in Steam, and switch it on again.".into()),
+                ));
+            }
+        }
+        for game in crate::steam::games(std::slice::from_ref(root)).iter().filter(|g| enabled_options(g).is_some()) {
+            let mapped = proton_tool::mapped_tool(&root.path, &game.appid).filter(|m| !m.is_empty());
+            if mapped.is_none() && crate::steam::installed_build(game) == crate::steam::Build::Linux {
+                // A native Linux game runs without Proton: the wrapper does not apply.
+                continue;
+            }
+            let ok = mapped.as_ref().is_some_and(|m| tools.iter().any(|t| &t.name == m));
+            let evidence = format!("{} ({}): {}", game.name, game.appid, mapped.as_deref().unwrap_or("Steam's default Proton"));
+            if ok {
+                out.push(Finding::new(CHECK, Severity::Ok, format!("{} runs with a Neural Forge Proton", game.name), evidence, None));
+            } else {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Warning,
+                    format!("{} is switched on but isn't on the Neural Forge Proton: if it uses DLSS, the model stays off in it", game.name),
+                    evidence,
+                    Some(format!(
+                        "Close Steam and switch {} off and on again in Neural Forge's Setup tab (or `neural-forge-cli enable {}`): that sets its Proton.",
+                        game.name, game.appid
+                    )),
+                ));
+            }
+        }
+    }
+    // A running game's ring the layer did not open: a wrapper of another ring version (an older copy).
+    for (path, pid, version) in proton_tool::open_rings(&roots.ring_dir) {
+        if version == Some(proton_tool::RING_VERSION) {
+            continue;
+        }
+        out.push(Finding::new(
+            "ngx-ring",
+            Severity::Warning,
+            format!(
+                "a running game (process {pid}) has an NGX wrapper that writes {}, and this Neural Forge's layer reads version {}: it gets no DLSS parameters",
+                version.map_or("something that is not a ring".to_string(), |v| format!("ring version {v}")),
+                proton_tool::RING_VERSION
+            ),
+            path.display().to_string(),
+            Some("Close the game, start Neural Forge (it puts its wrapper in every copy), then start the game again.".into()),
+        ));
+    }
+    out
+}
+
+fn short(digest: &str) -> &str {
+    digest.get(..12).unwrap_or(digest)
+}
+
+/// The wrapper's exports (`ours`, `None` when unreadable) against NVIDIA's core at `core`, both ways: a function the
+/// wrapper implements itself ([`crate::proton_tool::HOOKED`]) missing from the core stops the wrapper loading (a
+/// failure); another missing one is answered with NGX's failure code (a warning); a core function the wrapper does
+/// not export never reaches the core (a failure: NGX may need it).
+fn compare_exports(core: &Path, ours: Option<&[String]>) -> Vec<Finding> {
+    use crate::proton_tool::HOOKED;
+    const CHECK: &str = "proton";
+    let theirs = std::fs::read(core).ok().and_then(|b| crate::proton_tool::pe_export_names(&b)).unwrap_or_default();
+    let (Some(ours), false) = (ours, theirs.is_empty()) else {
+        return vec![Finding::new(
+            CHECK,
+            Severity::Failure,
+            "the NGX wrapper's or the driver's NGX core's functions could not be read: games under a Neural Forge Proton may run without DLSS",
+            core.display().to_string(),
+            Some("Install Neural Forge again from its AppImage, and check the driver's nvidia/wine/_nvngx.dll.".into()),
+        )];
+    };
+    let list = |names: &[&String]| names.iter().take(8).map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+    // The wrapper's own `DllMain` is exported by the toolchain; it is the DLL's entry point, not an NGX function.
+    let not_forwarded: Vec<&String> = theirs.iter().filter(|n| !ours.contains(n)).collect();
+    let (hooked_gone, stubbed): (Vec<&String>, Vec<&String>) =
+        ours.iter().filter(|n| n.as_str() != "DllMain" && !theirs.contains(n)).partition(|n| HOOKED.contains(&n.as_str()));
+    let mut out = Vec::new();
+    if !hooked_gone.is_empty() {
+        out.push(Finding::new(
+            CHECK,
+            Severity::Failure,
+            format!("this driver's NGX core lacks {} function(s) the NGX wrapper watches: the wrapper does not load, and games under a Neural Forge Proton run without DLSS", hooked_gone.len()),
+            format!("{}: {}", core.display(), list(&hooked_gone)),
+            Some("Update Neural Forge; until then use the driver version it was released with.".into()),
+        ));
+    }
+    if !stubbed.is_empty() {
+        out.push(Finding::new(
+            CHECK,
+            Severity::Warning,
+            format!("this driver's NGX core lacks {} function(s) the NGX wrapper forwards: a game that calls one gets NGX's failure code", stubbed.len()),
+            format!("{}: {}", core.display(), list(&stubbed)),
+            Some("Update Neural Forge for this driver, or use the driver version it was released with.".into()),
+        ));
+    }
+    if !not_forwarded.is_empty() {
+        out.push(Finding::new(
+            CHECK,
+            Severity::Failure,
+            format!(
+                "this driver's NGX core has {} function(s) the NGX wrapper does not forward: games under a Neural Forge Proton may run without DLSS",
+                not_forwarded.len()
+            ),
+            format!("{}: {}", core.display(), list(&not_forwarded)),
+            Some("Update Neural Forge; until then use the driver version it was released with.".into()),
+        ));
+    }
+    if out.is_empty() {
+        out.push(Finding::new(
+            CHECK,
+            Severity::Ok,
+            format!("the NGX wrapper forwards all {} of the driver's NGX core's functions, and the core has every one it exports", theirs.len()),
+            core.display().to_string(),
+            None,
+        ));
+    }
+    out
 }
 
 /// The Steam installations and every installed game's Neural Forge state. A Flatpak-only Steam is
@@ -1317,6 +1554,8 @@ mod tests {
             journalctl: Box::new(move |_| journal.clone()),
             launch_option_state: None,
             steam_roots: Vec::new(),
+            driver_lib_dirs: Vec::new(),
+            ring_dir: dir.join("shm"),
         };
         Fixture { dir, roots }
     }
@@ -1337,6 +1576,106 @@ mod tests {
 
     fn find<'a>(findings: &'a [Finding], check: &str) -> Vec<&'a Finding> {
         findings.iter().filter(|f| f.check == check).collect()
+    }
+
+    /// 4.0 needs the NGX wrapper installed and matching the driver's NGX core: a missing wrapper, or a core with a
+    /// function the wrapper does not forward, is a failure; one it fully forwards is fine.
+    #[test]
+    fn the_ngx_wrapper_must_be_installed_and_forward_the_driver_s_core() {
+        let mut f = fixture(CommandOutput::Missing, CommandOutput::Missing);
+        let missing = check_proton(&f.roots);
+        assert_eq!((missing[0].check, missing[0].severity), ("proton", Severity::Failure));
+        assert!(missing[0].summary.contains("not installed"), "{}", missing[0].summary);
+        // The test binary itself as both DLLs: not PE32+ exports, so the core reads as unreadable (a failure).
+        let wrapper = f.roots.data_dir.join(crate::proton_tool::WRAPPER);
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, b"MZ").unwrap();
+        let lib = f.dir.join("lib");
+        std::fs::create_dir_all(lib.join("nvidia/wine")).unwrap();
+        std::fs::write(lib.join("nvidia/wine/_nvngx.dll"), b"MZ").unwrap();
+        f.roots.driver_lib_dirs = vec![lib.clone()];
+        let unreadable = check_proton(&f.roots);
+        assert_eq!(unreadable[0].severity, Severity::Failure, "{unreadable:?}");
+        std::fs::remove_file(lib.join("nvidia/wine/_nvngx.dll")).unwrap();
+        let no_core = check_proton(&f.roots);
+        assert!(no_core[0].summary.contains("not installed with the driver"), "{no_core:?}");
+    }
+
+    /// A minimal PE32+ exporting `names`.
+    fn pe(names: &[&str]) -> Vec<u8> {
+        let mut b = vec![0u8; 0x2000];
+        b[..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        b[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
+        let opt = 0x98;
+        b[opt..opt + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        b[opt + 112..opt + 116].copy_from_slice(&0x1000u32.to_le_bytes());
+        let sh = opt + 240;
+        b[sh + 8..sh + 12].copy_from_slice(&0x1e00u32.to_le_bytes());
+        b[sh + 12..sh + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[sh + 20..sh + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        b[0x200 + 24..0x200 + 28].copy_from_slice(&(names.len() as u32).to_le_bytes());
+        b[0x200 + 32..0x200 + 36].copy_from_slice(&0x1040u32.to_le_bytes());
+        let mut at = 0x600;
+        for (k, name) in names.iter().enumerate() {
+            b[0x240 + 4 * k..0x244 + 4 * k].copy_from_slice(&((at - 0x200 + 0x1000) as u32).to_le_bytes());
+            b[at..at + name.len()].copy_from_slice(name.as_bytes());
+            at += name.len() + 1;
+        }
+        b
+    }
+
+    /// Both directions: a core function the wrapper does not forward and a watched one the core lacks are failures; a
+    /// forwarded one the core lacks is a warning (the wrapper answers it with NGX's failure code).
+    #[test]
+    fn the_wrapper_and_the_core_are_compared_both_ways() {
+        let f = quiet();
+        let core = f.dir.join("core.dll");
+        let hooked: Vec<&str> = crate::proton_tool::HOOKED.to_vec();
+        let ours: Vec<String> = hooked.iter().chain(&["NVSDK_NGX_A", "NVSDK_NGX_B"]).map(|s| s.to_string()).collect();
+        std::fs::write(&core, pe(&[hooked.as_slice(), &["NVSDK_NGX_A", "NVSDK_NGX_C"]].concat())).unwrap();
+        let v = compare_exports(&core, Some(&ours));
+        let by = |sev| v.iter().filter(|f| f.severity == sev).collect::<Vec<_>>();
+        assert_eq!(by(Severity::Warning).len(), 1, "{v:#?}");
+        assert!(by(Severity::Warning)[0].evidence.ends_with(": NVSDK_NGX_B") && by(Severity::Warning)[0].summary.contains("failure code"));
+        assert_eq!(by(Severity::Failure).len(), 1, "{v:#?}");
+        assert!(by(Severity::Failure)[0].evidence.ends_with(": NVSDK_NGX_C") && by(Severity::Failure)[0].summary.contains("does not forward"));
+        std::fs::write(&core, pe(&hooked[1..])).unwrap();
+        let v = compare_exports(&core, Some(&ours[..hooked.len()]));
+        assert_eq!((v.len(), v[0].severity), (1, Severity::Failure), "{v:#?}");
+        assert!(v[0].summary.contains("does not load") && v[0].evidence.ends_with(hooked[0]), "{v:#?}");
+        std::fs::write(&core, pe(&hooked)).unwrap();
+        let v = compare_exports(&core, Some(&ours[..hooked.len()]));
+        assert_eq!((v.len(), v[0].severity), (1, Severity::Ok), "{v:#?}");
+        // The wrapper's own DllMain export is its entry point, not an NGX function the core should have.
+        let with_entry: Vec<String> = ours[..hooked.len()].iter().cloned().chain(["DllMain".to_string()]).collect();
+        let v = compare_exports(&core, Some(&with_entry));
+        assert_eq!((v.len(), v[0].severity), (1, Severity::Ok), "{v:#?}");
+        assert_eq!(compare_exports(&core, None)[0].severity, Severity::Failure, "an unreadable wrapper");
+    }
+
+    /// A copy on old Wine, a copy holding another wrapper, a copy whose source is gone and a running game's ring of
+    /// another version are each said.
+    #[test]
+    fn copies_and_rings_that_cannot_work_are_reported() {
+        let mut f = quiet();
+        let wrapper = f.roots.data_dir.join(crate::proton_tool::WRAPPER);
+        write(&wrapper, "MZ new");
+        let steam = f.dir.join("steam");
+        let copy = steam.join("compatibilitytools.d/GE-Proton9-27-NeuralForge");
+        write(&copy.join(crate::proton_tool::MARKER), "source=/nowhere\nsource_version=GE-Proton9-27\nwrapper_sha256=0123456789abcdef\n");
+        write(&copy.join("files/lib/wine/x86_64-unix/ntdll.so"), "\0wine-9.0\0");
+        f.roots.steam_roots = vec![crate::steam::Root { path: steam, flatpak: false }];
+        write(&f.roots.ring_dir.join(format!("neural-forge-ngx-{}.ring", std::process::id())), "NFNGXRG1\x01\0\0\0");
+        let v = check_proton(&f.roots);
+        let has = |sev, text: &str| v.iter().any(|x| x.severity == sev && x.summary.contains(text));
+        assert!(has(Severity::Failure, "GE-Proton9-27-NeuralForge cannot hand Neural Forge DLSS's parameters: it is built on Wine 9.0"), "{v:#?}");
+        assert!(has(Severity::Warning, "holds another NGX wrapper"), "{v:#?}");
+        assert!(has(Severity::Info, "which is no longer installed: the copy keeps working"), "{v:#?}");
+        assert!(!has(Severity::Info, "was made from an older"), "a source that is gone is not a newer one: {v:#?}");
+        assert!(v.iter().any(|x| x.check == "ngx-ring" && x.summary.contains("ring version 1")), "{v:#?}");
     }
 
     fn one<'a>(findings: &'a [Finding], check: &str) -> &'a Finding {
@@ -1516,6 +1855,42 @@ mod tests {
         assert_eq!(v[0].severity, Severity::Ok);
         assert!(check_compute_capability(&Gpus::Missing).is_empty());
         assert_eq!(check_compute_capability(&Gpus::Failed("exit status: 9".into()))[0].severity, Severity::Info);
+    }
+
+    #[test]
+    fn the_game_on_the_channel_is_checked_against_the_tested_games() {
+        use neural_forge_protocol::enums::preupscale_state;
+        let hdr = neural_forge_protocol::ShmHeader::default();
+        hdr.init_defaults();
+        assert!(check_game_compat(&hdr).is_none(), "no game, nothing to say");
+        hdr.set_game_name("Unknown.exe");
+        let f = check_game_compat(&hdr).unwrap();
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.summary.starts_with("Unknown.exe is not among the tested games"), "{}", f.summary);
+        hdr.set_game_name("Cyberpunk2077.exe");
+        hdr.running_game.store(1091500, Ordering::Relaxed);
+        let f = check_game_compat(&hdr).unwrap();
+        assert_eq!(f.severity, Severity::Ok);
+        assert!(f.summary.starts_with("Cyberpunk 2077 is a tested game. Tested in "), "{}", f.summary);
+        // Running now on the finished frame, though tested before the upscaler and after DLSS: a warning.
+        hdr.preupscale_state.store(preupscale_state::IDENTIFIED, Ordering::Relaxed);
+        let beat = std::sync::atomic::AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while beat.load(Ordering::Relaxed) {
+                    hdr.layer_heartbeat.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            let f = check_game_compat(&hdr).unwrap();
+            assert_eq!(f.severity, Severity::Warning, "{}", f.summary);
+            assert!(f.summary.contains("the model runs DLSS input identified, not holding now, but in testing it ran before the upscaler"), "{}", f.summary);
+            hdr.preupscale_state.store(preupscale_state::HOLDING_AFTER, Ordering::Relaxed);
+            assert_eq!(check_game_compat(&hdr).unwrap().severity, Severity::Ok, "after DLSS is its Ray Reconstruction placement");
+            hdr.preupscale_state.store(preupscale_state::WAITING, Ordering::Relaxed);
+            assert_eq!(check_game_compat(&hdr).unwrap().severity, Severity::Ok, "waiting (a menu) is not compared");
+            beat.store(false, Ordering::Relaxed);
+        });
     }
 
     #[test]

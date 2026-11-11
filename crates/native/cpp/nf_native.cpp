@@ -281,7 +281,7 @@ static std::string invalidSizes(const uint32_t* sizes, uint32_t count) {
 }
 
 // Hold slots nf_native_record_graph_at serves (nf_native_hold_slots; the layer's slots per device).
-constexpr uint32_t kHoldPools = 16;
+constexpr uint32_t kHoldPools = 32;
 
 // A warm-up whose counter chain timed out: the build falls back to barriers and runs again.
 struct WarmUpChainTimeout : std::runtime_error {
@@ -582,7 +582,7 @@ struct NfNative {
 
 extern "C" {
 
-uint32_t nf_native_abi_version(void) { return 6; }
+uint32_t nf_native_abi_version(void) { return 7; }
 
 uint32_t nf_native_hold_slots(void) { return kHoldPools; }
 
@@ -630,12 +630,14 @@ uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance inst
     InstanceFns fns(gipa, instance);
     const std::vector<std::string> supported = deviceExtensions(fns, physical);
     for (uint32_t i = 0; i < in->enabledExtensionCount; ++i) x->extensionNames.push_back(in->ppEnabledExtensionNames[i]);
-    // VK_EXT_buffer_device_address excludes VK_KHR_buffer_device_address and the core feature the
-    // network's kernels need (VUID-VkDeviceCreateInfo-ppEnabledExtensionNames-03328, -pNext-04748).
+    // VK_EXT_buffer_device_address excludes VK_KHR_buffer_device_address and the core feature
+    // (VUID-VkDeviceCreateInfo-ppEnabledExtensionNames-03328, -pNext-04748). With it (Red Dead Redemption 2, #49) the
+    // network uses the extension's own feature instead: it allows the kernels' PhysicalStorageBufferAddresses as the
+    // core one does, and the network then allocates without VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT (core only) and takes
+    // addresses through vkGetBufferDeviceAddressEXT (NfNativeOpen::buffer_device_address_ext).
+    bool bdaExt = false;
     for (const char* have : x->extensionNames)
-      if (!strcmp(have, VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME))
-        throw std::runtime_error("the application enables VK_EXT_buffer_device_address, which excludes the buffer device "
-                                 "address the network needs");
+      if (!strcmp(have, VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) bdaExt = true;
     auto addExtension = [&](const char* name) {
       for (const char* have : x->extensionNames)
         if (!strcmp(have, name)) return;
@@ -654,6 +656,18 @@ uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance inst
       return find(head, type);
     };
     for (const Need& need : kNeeds) {
+      if (bdaExt && !strcmp(need.name, "bufferDeviceAddress")) {
+        VkBaseOutStructure* ext = copied(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT);
+        if (!ext) {
+          x->nodes.emplace_back(new char[sizeof(VkPhysicalDeviceBufferDeviceAddressFeaturesEXT)]());
+          ext = reinterpret_cast<VkBaseOutStructure*>(x->nodes.back().get());
+          ext->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT;
+          ext->pNext = static_cast<VkBaseOutStructure*>(head);
+          head = ext;
+        }
+        flag(ext, offsetof(VkPhysicalDeviceBufferDeviceAddressFeaturesEXT, bufferDeviceAddress)) = VK_TRUE;
+        continue;
+      }
       if (VkBaseOutStructure* aggregate = need.aggregate ? copied(need.aggregate) : nullptr) {
         flag(aggregate, need.aggregateOffset) = VK_TRUE;
         continue;
@@ -730,7 +744,8 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
     nr::Kernels::setChainEnabled(open->chain != 0 && !g_fellBack.load());
     n->context = std::make_unique<vk::Context>(open->gipa, open->instance, open->physical, open->device, open->queue_family,
                                                open->queue_index, n->fenceTimeoutNs, open->init_dispatchable, open->init_user,
-                                               open->frame_family);
+                                               open->frame_family, open->buffer_device_address_ext != 0, open->queue_lock,
+                                               open->queue_user);
     if (!open->model || (open->model->tensor_count && !open->model->tensors)) throw std::runtime_error("no model");
     std::vector<nr::Tensor> records(open->model->tensor_count);
     for (size_t i = 0; i < records.size(); ++i) {

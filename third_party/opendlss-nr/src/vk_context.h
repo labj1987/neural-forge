@@ -88,8 +88,13 @@ class Context {
   // application's, where the recorded graph runs): every buffer is created VK_SHARING_MODE_CONCURRENT over both.
   Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
           uint32_t queueFamily, uint32_t queueIndex, uint64_t waitTimeoutNs, InitDispatchable initDispatchable = nullptr,
-          void* initUser = nullptr, uint32_t sharedFamily = VK_QUEUE_FAMILY_IGNORED);
+          void* initUser = nullptr, uint32_t sharedFamily = VK_QUEUE_FAMILY_IGNORED, bool bufferDeviceAddressExt = false,
+          void (*queueLock)(void* user, int lock) = nullptr, void* queueLockUser = nullptr);
   void initDispatchable(void* object) const { if (initDispatchable_) initDispatchable_(initUser_, device_, object); }
+  // A queue shared with the application (Neural Forge, #49): `lock(user, 1)` before and `lock(user, 0)` after every
+  // vkQueueSubmit and vkQueueWaitIdle on it (QueueGuard), never around a fence wait.
+  using QueueLock = void (*)(void* user, int lock);
+  void setQueueLock(QueueLock lock, void* user) { queueLock_ = lock; queueLockUser_ = user; }
   ~Context();
   uint32_t queueFamily() const { return queueFamily_; }
   uint32_t queueIndex() const { return queueIndex_; }
@@ -194,6 +199,9 @@ class Context {
   VkInstance instance_ = VK_NULL_HANDLE;
   VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
   bool validation_ = false;
+  // The device has VK_EXT_buffer_device_address's feature, not the core one (Neural Forge, #49): memory is allocated
+  // without VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, and addresses come from vkGetBufferDeviceAddressEXT.
+  bool bdaExt_ = false;
   VkPhysicalDevice physical_ = VK_NULL_HANDLE;
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;
@@ -213,6 +221,16 @@ class Context {
   bool owned_ = true;
   uint64_t waitTimeoutNs_ = 0;
   InitDispatchable initDispatchable_ = nullptr;
+  QueueLock queueLock_ = nullptr;
+  void* queueLockUser_ = nullptr;
+  // Holds the queue's lock (setQueueLock) for its scope; nothing without one.
+  struct QueueGuard {
+    const Context& c;
+    explicit QueueGuard(const Context& context) : c(context) { if (c.queueLock_) c.queueLock_(c.queueLockUser_, 1); }
+    ~QueueGuard() { if (c.queueLock_) c.queueLock_(c.queueLockUser_, 0); }
+    QueueGuard(const QueueGuard&) = delete;
+    QueueGuard& operator=(const QueueGuard&) = delete;
+  };
   uint32_t sharedFamily_ = VK_QUEUE_FAMILY_IGNORED;
   void* initUser_ = nullptr;        // 0: unbounded waits (the tool); otherwise every wait is bounded
   VkFence waitFence_ = VK_NULL_HANDLE;

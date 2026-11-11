@@ -1,7 +1,14 @@
 //! The after-the-upscaler path's history (docs/NATIVE_BACKEND.md, "History after the upscaler"): what the
-//! native backend's frames there blend toward, selected for measurement by [`MOTION_ENV`].
+//! native backend's frames there blend toward ([`MOTION_ENV`]).
 //!
-//! - `none` (the default): no history, every frame a first frame with a fixed seed, bit for bit as 3.7.0.
+//! - `zero` (the default, 3.14.0): each pass's previous output at the same pixel (zero motion), see below.
+//! - `flow`: as `zero`, with the history reprojected by the GPU's optical flow (`VK_NV_optical_flow`,
+//!   `super::post_flow`); `zero` where the device has none. Not the default: it adds the optical flow's extension,
+//!   feature and a queue to the game's devices, and GTA V Enhanced hung at the start of its benchmark with them added
+//!   to the devices its frame generation creates (2026-11-10).
+//! - `none`: no history, every frame a first frame with a fixed seed, bit for bit as 3.7.0 (the default
+//!   before 3.14.0: without a history the network's answer to a grainy or noisy frame changes from frame to
+//!   frame in large soft patches, issue #49, docs/LESSONS.md "November 10").
 //! - `zero`: each pass's previous output at the same pixel (zero motion), the pre-upscaler composite's blend
 //!   toward it, rejected per pixel where the frame changed there by more than [`REJECT_ENV`]'s threshold since
 //!   the previous frame (`native_post_preprocess.comp`), and reset as a whole on a scene cut (the
@@ -9,8 +16,6 @@
 //!   or format change, a request that did not reach the network (the effect off, the model not ready), a gap
 //!   of more than [`HistoryGap::MAX_GAP`] or another network. The seed counts frames since the last reset,
 //!   as before the upscaler.
-//! - `flow`: as `zero`, with the history reprojected by the GPU's optical flow (`VK_NV_optical_flow`,
-//!   `super::post_flow`); `zero` where the device has none.
 //!
 //! The idea of the per-pixel rejection comes from uzbekunknown/dlss-nr-on-intel (Apache-2.0,
 //! `notes/phase72-preset-b.md`, "Flicker", and the daemon's `History` with `STALE = 0.12`); ideas only.
@@ -20,7 +25,7 @@ use std::time::Instant;
 
 use neural_forge_protocol::history::{HistoryGap, Stale};
 
-/// The selector: `none`, `zero` or `flow`. Read once, logged once.
+/// The selector: `zero` (the default), `flow` or `none`. Read once, logged once.
 pub(crate) const MOTION_ENV: &str = "NEURAL_FORGE_POST_MOTION";
 
 /// The per-pixel rejection threshold: the largest channel difference (0 to 1 of the 8-bit proxy's scale)
@@ -52,21 +57,24 @@ impl Motion {
     }
 }
 
-/// [`MOTION_ENV`]'s value: unset or empty is `none`.
+/// [`MOTION_ENV`]'s value: unset or empty is `zero`.
 pub(crate) fn parse_motion(raw: Option<&str>) -> Result<Motion, String> {
     match raw.map(str::trim) {
-        None | Some("" | "none") => Ok(Motion::None),
-        Some("zero") => Ok(Motion::Zero),
+        None | Some("" | "zero") => Ok(Motion::Zero),
         Some("flow") => Ok(Motion::Flow),
+        Some("none") => Ok(Motion::None),
         Some(other) => Err(other.to_string()),
     }
 }
 
-/// This process's [`Motion`] ([`parse_motion`]); `none` when the value is not one of the three. Logged once
-/// when it is not the default.
+/// This process's [`Motion`] ([`parse_motion`]); the default when the value is not one of the three. Logged
+/// once.
 pub(crate) fn motion() -> Motion {
     static MOTION: LazyLock<Motion> = LazyLock::new(|| match parse_motion(neural_forge_protocol::env::var(MOTION_ENV).as_deref()) {
-        Ok(Motion::None) => Motion::None,
+        Ok(Motion::None) => {
+            crate::log!("[native] after the upscaler: no history ({MOTION_ENV}=none)");
+            Motion::None
+        }
         Ok(m) => {
             crate::log!(
                 "[native] after the upscaler: history with {} ({MOTION_ENV}), rejection above {} ({REJECT_ENV})",
@@ -76,8 +84,8 @@ pub(crate) fn motion() -> Motion {
             m
         }
         Err(other) => {
-            crate::log!("[native] {MOTION_ENV}={other:?} is not none, zero or flow; no history after the upscaler");
-            Motion::None
+            crate::log!("[native] {MOTION_ENV}={other:?} is not zero, flow or none; the default, zero motion");
+            Motion::Zero
         }
     });
     *MOTION
@@ -237,8 +245,8 @@ pub(crate) fn note_reset(reset: Reset) {
         Reset::Stale(Stale::SceneCut(mean)) => {
             crate::log!("[native] after the upscaler: resetting the history (scene cut: the picture's luma changed by {mean} of 255 on average)")
         }
-        // Not given here: the game's reset is read from DLSS's input launch, which only the holds before the
-        // upscaler belong to.
+        // Not given here: the game's reset is read from NGX's record of a DLSS evaluate, which only the holds in DLSS's
+        // stream belong to.
         Reset::Stale(Stale::GameReset) => crate::log!("[native] after the upscaler: resetting the history (the game reset DLSS's history)"),
         // Not given here either: the hold guard belongs to the holds inside DLSS's buffer.
         Reset::Stale(Stale::Unsound) => crate::log!("[native] after the upscaler: resetting the history (the hold guard reset it on the GPU)"),
@@ -253,8 +261,8 @@ mod tests {
 
     #[test]
     fn the_selector_and_the_threshold_parse() {
-        assert_eq!(parse_motion(None), Ok(Motion::None));
-        assert_eq!(parse_motion(Some("")), Ok(Motion::None));
+        assert_eq!(parse_motion(None), Ok(Motion::Zero), "the default (#49)");
+        assert_eq!(parse_motion(Some("")), Ok(Motion::Zero));
         assert_eq!(parse_motion(Some("none")), Ok(Motion::None));
         assert_eq!(parse_motion(Some(" zero ")), Ok(Motion::Zero));
         assert_eq!(parse_motion(Some("flow")), Ok(Motion::Flow));

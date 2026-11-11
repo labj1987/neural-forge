@@ -145,8 +145,10 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   sequence-locked capture result the layer publishes: request id, state (running, written, failed,
   cancelled), reason, pairs written and composed, the files' paths (5.7).
 - **Pre-upscaler status (v9):** `preupscale_state` (`enums::preupscale_state`: off, waiting for DLSS
-  input, holding), `preupscale_width`/`height`, `preupscale_hold_ms`, `preupscale_misses`,
-  `native_running` (v13).
+  input, holding before the upscaler, after DLSS or both, and DLSS identified but every frame refused),
+  `preupscale_width`/`height`, `preupscale_hold_ms`, `preupscale_misses`, `native_running` (v13), and
+  `preupscale_reason` (v25, 2580: why no hold ran while DLSS is identified, the last refusal of either hold;
+  empty in every other state).
 - **Device loss (v16):** `device_lost_at`.
 - **Edit cache (v17):** `preupscale_dump_request` (cleared by `init_defaults` and when a game's layer
   starts a session on the channel, so a request left for an earlier game never fires on the next),
@@ -204,7 +206,8 @@ be private.
 | 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended; then the colour of the edit (`edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`, `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`) and `pass_colour[10]` (override bits `EDIT_SATURATION` 128, `EDIT_CONTRAST` 256, `EDIT_DETAIL` 512); then `placement`, `pass_placement[10]` (override bit `PLACEMENT` 1024), `hud_detect`, `hud_region_count` and `hud_region[8]` | 3.8.0 |
 | 22 | `preupscale_brightness` and `preupscale_exposure` (what the network sees before the upscaler: its brightness and where the exposure comes from) and `preupscale_network_gpu_ms` (the network's GPU time on its last hold) appended | 3.8.10 |
 | 23 | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection` and `edit_highlight_protection` (the Oklab protections of each pass's result against its input) appended | 3.10.0 |
-| 24 | `settings_game` (whose settings the header holds: all games or one game's) and `running_game` (the game whose layer holds the channel), then `sharpen_cas`, `clarity_strength`, `clarity_radius`, `clarity_midtones` and `clarity_edges` (the sharpening of the finished frame: FidelityFX CAS and Clarity) appended | unreleased |
+| 24 | `settings_game` (whose settings the header holds: all games or one game's) and `running_game` (the game whose layer holds the channel), then `sharpen_cas`, `clarity_strength`, `clarity_radius`, `clarity_midtones` and `clarity_edges` (the sharpening of the finished frame: FidelityFX CAS and Clarity) appended | 3.12.0 |
+| 25 | `preupscale_reason` (why no hold ran while DLSS's input is identified; `preupscale_state` 5, `IDENTIFIED`) appended | 3.14.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.
@@ -217,10 +220,10 @@ flowchart TD
     mode -- yes --> none["No network loaded:<br/>frames presented untouched"]
     mode -- "no (default: model)" --> nvx{"Device has<br/>VK_NVX_image_view_handle?"}
     nvx -- no --> post
-    nvx -- yes --> dlss{"DLSS SR input identified<br/>and a submit reads it?"}
-    dlss -- "no (no DLSS, native)" --> post
+    nvx -- yes --> dlss{"NGX's record of a DLSS SR evaluate<br/>and a submit carries it?"}
+    dlss -- "no (no DLSS, no Neural Forge Proton)" --> post
     dlss -- yes --> pre["Before the upscaler:<br/>hold the DLSS submit"]
-    pre --> handback{"No DLSS submit<br/>for 30 s?"}
+    pre --> handback{"No frame held for 30 s<br/>while DLSS launches,<br/>or no DLSS for 5 min?"}
     handback -- yes --> post
 ```
 
@@ -232,10 +235,12 @@ hooked-command list, the resolved entry points and every hot path are exactly 1.
 (`lib.rs::probe_command_tests`) and the smoke test's `off` pass guard that. A device without NVX
 never gets the tracking either.
 
-Once a device has held a DLSS submit, the after-the-upscaler compose stays off for that device
-until no DLSS submit has been seen for 30 s (`preupscale::HAND_BACK`). Loading screens, where
-DLSS does not run, are presented untouched instead of switching paths (see
-[LESSONS.md](LESSONS.md), "The stuck NGX feature").
+Once a device has held a DLSS submit, the after-the-upscaler compose stays off for that device until the
+hand-back (`preupscale::hand_back_at`, 4.7): 30 s after the last held frame while DLSS's evaluates go on being
+submitted (`preupscale::HAND_BACK`: inputs not identified, every frame refused), 5 minutes
+after it while the game sends DLSS nothing at all (`PAUSE_HAND_BACK`). Loading screens and pause menus, where DLSS
+does not run, are presented untouched instead of switching paths (see [LESSONS.md](LESSONS.md), "The stuck NGX
+feature").
 
 ## 4. Before the upscaler (2.0)
 
@@ -264,72 +269,51 @@ CUDA kernels: `vkCmdCuLaunchKernelNVX`, on image views registered with
 - `vkCreateImage` / `vkCreateImageView`: the layer records extent, format and usage.
 - The NVX registration calls: the layer records every registered view and the handle or address
   it got back.
-- `vkCreateCuFunctionNVX` / `vkDestroyCuFunctionNVX`: the layer records each kernel's name and
-  what it is (`preupscale::Kernel`: DLSS SR's input kernel, Ray Reconstruction's `rr2_*`, `cuda_dldn_engine_swin_*` and `cuda_dldn_engine_hkpn_*`, other).
+- `vkCreateCuFunctionNVX` / `vkDestroyCuFunctionNVX`: the layer records each kernel's name, for the probes' lines
+  only.
 - `vkCmdCuLaunchKernelNVX`: marks the command buffer as launch-bearing (also through
-  `vkCmdExecuteCommands`), with which kernels it launches. When the launch's parameters use CUDA's
-  "extra" buffer form (what vkd3d-proton uses), the layer reads that parameter buffer (never writes
-  it; at most 4 KiB) and notes which registered handles appear among its 8-byte words.
+  `vkCmdExecuteCommands`). When the launch's parameters use CUDA's "extra" buffer form (vkd3d-proton's, and NGX's
+  own in Vulkan games), the layer reads that parameter buffer (never writes it; at most 4 KiB) and notes which
+  registered handles appear among its 8-byte words: that is how a buffer is matched to NGX's record of its evaluate
+  (4.3).
 - Image barriers on the watched images, committed in submission order, so the layer knows their
-  layout at a submit.
+  layout at a submit. Watched are DLSS's inputs, every depth image at the depth's extent and every
+  image of the colour input's extent and format (still while nothing is identified, so a game handing
+  DLSS several images in turn has a layout for each). A new identification keeps what was recorded on
+  an image watched before and after it, and drops the rest.
 
 On a device with NVX but no DLSS, the per-command-buffer and per-submit hooks cost one atomic
 read.
 
-### 4.3 Identification
+### 4.3 Identification: NGX's records
 
-At a launch-bearing submit (`Tracker::observe`, then `Tracker::refresh`), two rules, the first
-winning (PRE_UPSCALER_DESIGN.md, "Identification by the input kernel's parameters (DLAA)"), behind
-one precondition:
+Everything about DLSS's evaluates comes from the records Neural Forge's NGX wrapper writes in a Neural Forge Proton
+(`ngx_ring.rs`, [PROTON_NGX.md](PROTON_NGX.md)): which images are the colour input, depth, motion vectors, output and
+exposure image, the camera jitter, the motion vectors' units (`MV.Scale`), the game's reset, and whether the feature is
+Ray Reconstruction. Nothing is inferred from DLSS's kernels; until 4.0 it was (the rules are history in
+PRE_UPSCALER_DESIGN.md and LESSONS.md).
 
-- **DLSS Ray Reconstruction must not be running** (PRE_UPSCALER_DESIGN.md, "DLSS Ray
-  Reconstruction"). Its input is the noisy ray-traced frame. While one of its kernels (`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`)
-  launched within the last 64 launch-bearing submits, nothing is identified; a buffer launching
-  one is never the hold point or evidence, whatever its shape. The model then runs right after
-  DLSS's output kernel (the hold after DLSS, NATIVE_BACKEND.md, "Where the model runs") where DLSS's
-  output is learnt and the placement allows it, else the post path runs it after the upscaler at
-  once. Logged on each change: `DLSS Ray Reconstruction runs (...)` and
-  `DLSS Ray Reconstruction stopped`. Super Resolution needs no kernel name (Crimson Desert's is
-  `rrlite_*`, GTA V's `hiluma_engine_input*`).
-
-- **By the input kernel's parameters** (`Rule::Params`). A command buffer's first launch that names a
-  registered depth image and a 2-channel float image is read as DLSS SR's input kernel. If it names
-  exactly one depth image and exactly one `RGBA16F`/`R11G11B10` storage image at the depth's extent,
-  that image is the colour input, with that depth and those motion vectors. It need not be smaller
-  than the output, so DLAA is found. The extent condition keeps DLSS Frame Generation out, because
-  FG's launch names its output-size frame beside the render-size depth. An output-size candidate
-  (DLAA, or FG at native resolution) counts if its buffer also names the 1x1 `R16_SFLOAT`
-  exposure image, which SR takes and FG does not; without one (a game that gives DLSS no exposure)
-  only with SR's own shape: a later launch of the same buffer names it with another output-size
-  image (SR's output kernel), no other launch-bearing buffer names it, and it is the only such
-  entry. The decision waits for 16 launch-bearing submits
-  without new evidence, so both SR's and FG's buffers have been seen. Ambiguity (two candidates in
-  one launch, or different colour inputs from different buffers that the exposure does not settle)
-  is logged once, and the size rule decides. One exception (3.1.2): when the size rule finds
-  nothing, and every such entry's buffer names the same exposure image and the inputs share one
-  extent, they are one evaluation alternating its input (Remnant II, whose motion vectors are 3
-  pixels narrower than its colour input); the lowest handle is chosen and each submit is held with
-  the input its buffer names. Only an `RGBA16F` colour input is held.
-- **By size** (`Rule::Size`, `preupscale::identify`), the fallback: the registered `RGBA16F` storage image (2D, single sample) whose extent equals
-  a registered depth image's (any depth format: `D32_SFLOAT`, `D32_SFLOAT_S8_UINT`,
-  `D24_UNORM_S8_UINT`, ...) and a registered motion-vector image's (`RG16F`, else `RG32F`), and is
-  smaller than the output. The output is the device's largest swapchain; on a device with no
-  swapchain (DLSS on another device than the one that presents, or views registered before the
-  swapchain exists) it is the largest registered `RGBA16F`/`R11G11B10` storage image. "Smaller" is
-  what rules out DLAA. Several candidates: the lowest handle is the colour input; the others are
-  only logged, and a forwarded buffer that names one of them is counted (PRE_UPSCALER_DESIGN.md,
-  "Several colour candidates (2.0.1)").
-- The identification line ends with `identified by the input kernel's parameters (...)` or
-  `identified by size`. When both rules pick the same images (GTA V, Crimson Desert), the switch
-  from size to parameters is no re-identification: nothing is skipped and the hold target stays.
-- **Exposure input:** the 1x1 `R16_SFLOAT` image the input kernel's buffer names, else the
-  registered one (not for an output-size input whose buffer names none).
-- Without a readable exposure input the exposure is measured from the frame (4.6).
-- With DLAA the model works on the full output-size frame every frame (as costly as the 1.x path on
-  every frame). The hold, encode and decode do not depend on the size.
-- When nothing qualifies, the line says why: the output used, the first failed condition for every
-  `RGBA16F` storage extent, and the registered views grouped by extent, format and usage (at most
-  1500 bytes, for the first 16 changes of the set per device).
+- **Which buffer is an evaluate's.** The wrapper writes a record before NVIDIA's `EvaluateFeature` runs and an end
+  record after it returns. A command buffer belongs to an evaluate when one of its launches names the evaluate's colour
+  input between the two; its later launches up to the end are the evaluate's. A launch naming the colour input after
+  the end (DLSS Frame Generation reading the frame) belongs to none, and a launch whose parameters cannot be read is
+  matched to nothing.
+- **The identification** (at every launch-bearing submit, `Tracker::refresh`): the newest Super Resolution evaluate
+  whose colour input, depth and motion vectors are images of the device. A new colour shape, other motion vectors or
+  another exposure image is a new identification; another colour image of the same shape (a game handing DLSS its
+  input in one of several images) or another depth image is not, and each buffer is held with its own evaluate's
+  images.
+- **DLSS Ray Reconstruction** (NGX's feature 13) is never held before the upscaler: its input is the noisy ray-traced
+  frame. While the newest evaluate is Ray Reconstruction's nothing is identified, and the model runs right after DLSS's
+  output (the hold after DLSS, NATIVE_BACKEND.md, "Where the model runs") where the placement allows it, else the post
+  path runs it after the upscaler.
+- **DLSS's output** for the hold after DLSS: the record's output image, and as many writes of it as the last evaluate
+  that ended had between its record and its end; the hold goes after that many.
+- **Exposure input:** the record's `ExposureTexture`; without one the exposure is measured from the frame (4.6).
+- With DLAA the model works on the full output-size frame every frame. The hold, encode and decode do not depend on the
+  size.
+- Without records (no wrapper, `NEURAL_FORGE_NGX_RING=off`) nothing is held before or after DLSS; as soon as CUDA
+  launches run without a ring the log and the status say the game is not on the Neural Forge Proton.
 - While any device of the process holds, the post-upscaler compose stays off on every device
   (`preupscale::post_off_by_any_device`), so a game whose DLSS runs on a device without the
   swapchain does not get the model twice; unless every pass is placed at present
@@ -342,13 +326,9 @@ The next one is.
 ### 4.4 Which submits are held (frame generation)
 
 DLSS Frame Generation also runs as CUDA kernels, in two more command buffers per real frame on
-another queue. Each launch-bearing buffer is classified (`LaunchRefs::kind`):
-
-| Kind | Rule | Action |
-|---|---|---|
-| Colour | a launch's parameters name the identified colour input | held (the split point) |
-| Foreign | every launch readable, naming registered views, never the colour input; or a launch of DLSS Ray Reconstruction (`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`) | forwarded untouched (DLSS FG's, Ray Reconstruction's, other NGX features') |
-| Unknown | an unreadable launch, parameters naming no registered view, or a launch before identification | held, as before the fix (only with inputs identified) |
+another queue. Only a buffer carrying a Super Resolution evaluate (`LaunchRefs::sr`, 4.3) is held; every other
+launch-bearing buffer (DLSS Frame Generation's, Ray Reconstruction's, launches no record names) is forwarded
+untouched.
 
 Before this rule, the layer held FG's submits too and ran the model three times per real frame,
 twice on the wrong input: 22.4 real / 67.1 shown fps. After it: 53.0 / 159
@@ -389,15 +369,14 @@ sequenceDiagram
    comparison under it marks the frame as a cut in the native pass's state buffer.
 3. **The network** (`N`, `preupscale/native.rs`): `native_preprocess.comp` builds the network's input
    lanes from the encoded frame, the previous answer reprojected with the motion vectors and the
-   camera jitter (read from DLSS's input-kernel parameters), and the Model tab's settings; the graph
+   camera jitter (NGX's record of the evaluate), and the Model tab's settings; the graph
    recorded for this extent runs the network; `native_composite.comp` applies the style operator and
    intensity and keeps the answer as the next frame's history. The history is reset after a frame
    that went to DLSS untouched, after 500 ms without a frame, on another extent, after a frame
    whose exposure was unusable, or on a scene cut (the frame `C` marked; read by both shaders on the
    same frame, for every pass; a cut on a cached hold resets the next network frame instead), when the
    exposure the encode used changed by more than a stop since the previous network frame (both shaders,
-   the same frame), and when the game resets DLSS's history (word 4 of the 310.x input kernel's parameters; DLSSNR_PARAMETERS.md,
-   "History reset").
+   the same frame), and when the game resets DLSS's history (the record's `Reset`).
 4. **Write back and decode** (`W`): the decode shader inverts the encode and writes the colour input
    in place, cropping the padding, keeping the original pixel (all three channels, so no hue turns)
    where the encoded input's peak channel was clamped and keeping the original alpha; a closing
@@ -414,8 +393,8 @@ the layer's image: nothing is copied into slot 0, the after-the-upscaler path's.
 
 **Inside DLSS's command buffer** (`preupscale/inline.rs`). Some games record their frame and DLSS
 in one command buffer (Crimson Desert), so there is no submit to split. There the layer records the
-whole hold into DLSS's buffer as it is recorded, at the input kernel's launch (or right after DLSS's
-output kernel for the passes placed after DLSS): the colour input (and its motion vectors, exposure and
+whole hold into DLSS's buffer as it is recorded, at the evaluate's first launch naming the colour input (or right
+after the evaluate's last write of its output for the passes placed after DLSS): the colour input (and its motion vectors, exposure and
 depth) copied to staging images, the same `C`/`N`/`W` as the split hold with the network's graph
 recorded straight into the buffer, the staging image copied back, and the application's compute
 state (pipeline, descriptor sets or descriptor-buffer offsets, push constants) bound again
@@ -475,7 +454,19 @@ texel would be copied into, so the encode and the decode of a hold use the very 
 0.6 is calibrated on GTA V's own exposure (within -21% / +27% of it on both E1b dumps). The source
 is logged once per identification: `[preupscale] exposure: the game's 1x1 R16F` or `[preupscale]
 exposure: measured from the frame (auto)`, and the 300-hold summary ends with `exposure median=...
-(auto|game)`.
+(auto|game)`. Where the game gives an exposure the auto-exposure runs too, writing only its state
+(`relative` 2, `hdr::AutoUse::Observe`): `Session::check_exposure` compares the frame's measured target with
+the game's `e`, and when the game's puts the frame more than 5 stops below the key while the frame as given is
+within 3 stops of it, on every hold for 2.5 s of the holds' clock (and 30 holds at least; a hold under 4 stops,
+or a gap of over 500 ms, starts the run over) with the game's `e` held within half a stop meanwhile, the colour
+input is taken for one the game already exposed (Clair Obscur: Expedition 33, #51): that identification's holds
+measure `e` from the frame, not bounded by the game's (`[preupscale] the colour input looks pre-exposed: ...`).
+The game's texel is still copied in and kept in the exposure buffer's high half (`relative` 3,
+`hdr::AutoUse::Beside`), and the same run the other way (under 4 stops, or the frame as given more than 3 stops
+from the key, for 2.5 s; a hold past 5 stops starts it over) hands the frame back to the game's `e` (`... no
+longer looks pre-exposed: ...`). Each direction is logged at most once a minute, the changes left out counted.
+The steadiness is what tells a scene-referred game whose eye adaptation lags (GTA V walking from daylight, `e`
+0.15, into a tunnel of luma 0.1: as far below for a second or so) from a pre-exposed one: its `e` moves.
 
 ### 4.7 Failures and the hand-back
 
@@ -485,8 +476,27 @@ exposure: measured from the frame (auto)`, and the 300-hold summary ends with `e
   network running" or "... not running: <why>"). Failed builds are retried after 0.5, 1 and 2 s, the
   4th attempt closes and reopens the network, then every 30 s (`neural_forge_protocol::rebuild`).
 - **Counter-chain timeout:** the graph is rebuilt with barriers and the history reset.
-- **Hand-back.** Once a device has held, the after-the-upscaler path stays off on it until no DLSS
-  submit has been seen for 30 s (`HAND_BACK`), so loading screens are presented untouched.
+- **Hand-back.** Once a device has held, the after-the-upscaler path stays off on it until the hand-back
+  (`preupscale::hand_back_at`), counted from the last held frame (`Session::last_hold`): 30 s (`HAND_BACK`) while
+  DLSS's evaluates go on being submitted with no frame held, held or not (`Tracker::observe`, `note_sr_launch`):
+  inputs not identified, every frame refused (counted from the start of that run of evaluates when it began later, so a resume
+  is not one); else 5 minutes (`PAUSE_HAND_BACK`): a game that stops calling DLSS altogether is in a pause menu or a
+  loading screen, whose picture (Cyberpunk 2077: the last frame under the menu) already carries the edit. Only then
+  is the status `PAUSED` (6) (`Session::status_at`: no Super Resolution launch within `RECENT`); while DLSS launches
+  it is `IDENTIFIED` with the reason, or `WAITING`. Loading screens and menus are presented untouched, and the
+  network is not rebuilt at the output size and back (#49).
+- **Nothing freed under a frame in flight.** The loader thread closes the network or frees a build only while no
+  frame that used it may still run (`native::Claims::in_flight`, checked under the loader's lock right before):
+  no hold recorded into DLSS's buffers, no split hold whose fence is pending or whose work no fence covers (until
+  `FENCE_WAIT_TIMEOUT` after its submit), no after-the-upscaler frame running or stalled with its fence unsignalled.
+  The VRAM guard's idle step (`LoaderState::apply_idle_step`) also needs both paths quiet (`Claims::unused`, as for
+  lending the network to another device): a frame whose 5 s wait timed out can still run after `IDLE_STEP`, and
+  closing the network under it is a copy-engine read of freed memory (Xid 31, #59). While a step down is pending and
+  other holds may still run, no hold takes the build (`Loader::ready_sizes`), so holds that keep coming cannot keep
+  the step from being applied.
+- **A pending rebuild yields to a path on the current build.** When one path takes the current build while the
+  other path's request for another set of sizes waits for the loader thread, the request is dropped
+  (`LoaderState::want_sizes`), so the thread never frees a build under a frame just recorded with it.
 
 ### 4.8 Timings, 1440p Balanced (render 1485x836, padded 1486x836)
 
@@ -509,15 +519,22 @@ trip; PRE_UPSCALER_DESIGN.md, "Hand-off latency").
 **Depth.** With the edit cache on, every native hold copies DLSS's depth into a device-local buffer of
 the layer's at the render extent (`native::DepthCopy`), as the first command of `C`, timed alone
 (`depth_copy_gpu_ms` in the `[preupscale]` summary line); with it off nothing of depth is copied. Which
-depth (`Tracker::hold_depth`): the one the input launch names, where its layout is known and the launch
+depth (`Tracker::hold_depth`): for the split hold, the source of a copy the launch buffer makes into the
+one the input launch names before the launch (`vkCmdCopyImage`/`vkCmdCopyImage2` into a watched image are
+tracked per buffer, `Tracker::copy_source`); else the named one, where its layout is known and the launch
 buffer does not write it before the launch; else a depth image the launch buffer synchronizes reads of
-before the launch (the frame's depth it copies into DLSS's own); else the named one; else the
-identified one. A depth/stencil image after a barrier on one of its aspects only is not copied until
+before the launch (the frame's depth it copies into DLSS's own, as far as barriers tell); else the named
+one; else the identified one. The split hold reads the motion vectors and the exposure image the same
+way: the source of the launch buffer's copy into the named one before the launch, of the same shape,
+else the named one. A depth/stencil image after a barrier on one of its aspects only is not copied until
 a barrier on both says where they are, and the split hold copies only from the layouts
 `depth_copy_layout` takes, as the hold inside DLSS's buffer. GTA V Enhanced
 alternates two depth images frame by frame and copies the frame's one into a ring of three that
-DLSS reads, inside the launch buffer: the identified image held the previous frame's depth on every
-other hold, and the ring's image is written after the hold. The split hold copies the chosen
+DLSS reads, inside the launch buffer, and its motion vectors (one image) likewise into a ring of three,
+with no barrier on the rings' images there: the identified image held the previous frame's depth on every
+other hold, and the ring's image is written after the hold. Once the rings' layouts were known from
+earlier frames, 4.0's split hold read the named ring images, three frames old, and the edit cache
+rejected all of a cached hold's history (2026-11-11). The split hold copies the chosen
 image's depth aspect; the hold inside DLSS's buffer copies it into its staging buffer there (in a
 layout `depth_copy_layout` takes) and its `C`, in the same buffer, copies that over. The texels stay raw, tagged
 with the game's format: 4 bytes (D32, D24 with its top byte, depth handed over as R32), or 2 for D16.
@@ -526,8 +543,20 @@ ownership transfer, a write in its source access; `Scan::depth_hazard`) leaves t
 depth instead of stopping it. Every depth image at the identified depth's extent has its barriers
 tracked. `NEURAL_FORGE_PROBE_DEPTH=1` logs the first 120 held buffers' depth choice and barriers.
 While the pre-upscaler path and the edit cache are on, depth images get `TRANSFER_SRC` added at
-creation, as RG16F images do (`wants_copyable`; `NEURAL_FORGE_EDIT_CACHE=off` adds it to RG16F images
-only, `NEURAL_FORGE_PREUPSCALE=off` creates every image as asked).
+creation, as RG16F images do (`added_usage`; `NEURAL_FORGE_EDIT_CACHE=off` adds it to RG16F images
+only, `NEURAL_FORGE_PREUPSCALE=off` creates every image as asked). Colour candidates (2D single-sample
+RGBA16F or B10G11R11 images with `SAMPLED` or `STORAGE`) get `TRANSFER_SRC | TRANSFER_DST`, which the
+hold inside DLSS's buffer copies its colour input with: a native Vulkan game creates its images with the
+usage it needs and nothing more (Indiana Jones and the Great Circle, #51). Never an image whose memory
+is shared, and only where the added usage leaves the image's memory requirements (size, alignment, memory
+types) as they would have been (`added_usage.rs`): an engine that places its images in its own heaps (id Tech)
+sizes and aliases them by those numbers. Each create info is judged once (a chain of one
+`VkImageFormatListCreateInfo`, vkd3d-proton's placed resources, by its view formats too; one with any other
+`pNext` chain each time): by the application's own `vkGetDeviceImageMemoryRequirements` query for it where it makes one, else by creating
+the image both ways, comparing and destroying the one not kept (Vulkan 1.0 calls only). On a difference the
+image is created as asked, which the log says once per format and usage with both sets of numbers
+(`[preupscale] adding ... changes its memory requirements (as asked: ...; with it: ...)`). The
+memory-requirements queries by create info are answered for the create info the image is made with.
 
 **The cache dump** (`preupscale::cache_dump`) writes K consecutive model-mode holds for the offline
 replay of the edit cache (`scripts/cache_replay.py`). Requests: `neural-forge-cli shmctl dump-cache
@@ -859,7 +888,8 @@ stop when the window closes; liveness everywhere is one rule (the heartbeat move
 the Setup tab reads Steam on a worker thread.
 Saved settings live in `~/.config/neural-forge/config.ini` as `set_<name>=` (all games) and
 `games.ini` (each game's own, 7.3), and are applied by the layer when its session on the channel starts. Status comes from heartbeats and counters, refreshed once a
-second; the Status tab's "Model placement" line is `preupscale_state` with the extent, misses and
+second; the Status tab's "Model placement" line is `preupscale_state` with the extent, misses (with state 5,
+`IDENTIFIED`, the reason no hold runs: `preupscale_reason`) and
 the layer's status line (`layer_reason`; a device that cannot run the network is published there as
 "device cannot run the network: <first missing>" when the layer opens the channel).
 
@@ -979,6 +1009,12 @@ is the newer write and stays. Each bound row learns its setting's name from its 
 Everything fails open: a missing model, a network that will not build, a late answer, an
 unsupported swapchain, a submit the layer cannot split, or a Vulkan error means the frame goes on
 untouched. Every fence wait the layer can hit is bounded (5 s, `FENCE_WAIT_TIMEOUT`); a timeout is
-logged once with a breadcrumb trail (`crates/layer/src/breadcrumbs.rs`). `VK_ERROR_DEVICE_LOST`
+logged once with a breadcrumb trail (`crates/layer/src/breadcrumbs.rs`). The layer is built with
+`panic = "abort"`; from the first device it works on, its panic hook (`logging::install_panic_hook`) writes
+`[panic] the layer panicked on thread '...' at <file:line:col>: <message>; ...` with the breadcrumb trail into
+the log and waits for it to be written (straight to the file when the log's writer thread does not answer, or
+is the one that panicked) before the standard hook and the abort. The first split hold that wrote back, the
+first hold recorded into DLSS's buffer and the first such hold read back once its buffer ran are each logged
+once and flushed, so a crash can be placed before or after them. `VK_ERROR_DEVICE_LOST`
 latches the layer off and stamps the header's `device_lost_at`, so the Status tab and `doctor`
 can say so without a log; the state log records it too.

@@ -281,32 +281,24 @@ committed in submission order. `NEURAL_FORGE_PROBE_NGX` still controls the probe
 
 ### Identification
 
-Since the change in "Identification by the input kernel's parameters (DLAA)" (end of this
-document), the colour input is first what DLSS Super Resolution's own input kernel names in its
-parameters, together with depth and motion vectors. That rule also finds DLAA's output-size input.
-The size rule below is the fallback, used before the parameters have settled, when they are
-unreadable or ambiguous, and when no launch has the input kernel's shape. The identification line
-ends with `; identified by the input kernel's parameters (...)` or `; identified by size`.
+Since 4.0 DLSS's inputs, output, exposure image, camera jitter, motion vectors' units, reset and whether it is Ray
+Reconstruction come only from the records Neural Forge's NGX wrapper writes in a Neural Forge Proton (PROTON_NGX.md,
+"What the layer does with the records"; ARCHITECTURE.md 4.3). A command buffer is an evaluate's when one of its
+launches names the evaluate's colour input between the evaluate's record and its end record; only Super Resolution's
+is held, at its submit or inside it at that launch. The identification (what is watched for layouts) is the newest
+Super Resolution record whose images the device created, logged once per change:
+`[preupscale] colour input: image 0x... (1707x960 R16G16B16A16_SFLOAT ...), depth ..., motion vectors ..., exposure input 0x...; from NGX's record of DLSS's evaluate`
+(`exposure input none (...)`: the exposure is measured from the frame). Without records nothing is held.
 
-The size rule: at a launch-bearing submit, when the registered set or the swapchains changed, the colour input is
-the registered RGBA16F storage image (2D, single-sample) whose extent equals a registered depth
-image's, with a registered RG16F (since 2.0.1 also RG32F) image of the same extent, and smaller than
-the largest swapchain (DLAA is refused that way; since 2.0.1, on a device with no swapchain, smaller
-than the largest registered RGBA16F/R11G11B10 storage image, see "Several colour candidates
-(2.0.1)"). Several candidates: lowest handles. DLSS's **exposure input** is the
-registered 1x1 `R16_SFLOAT` image (lowest handle if there are several; NGX's own 1x1 RGBA32F images,
-which are not transfer sources, are never it). Logged once per change:
-`[preupscale] colour input: image 0x... (1707x960 R16G16B16A16_SFLOAT ...), depth ..., motion vectors ..., exposure input 0x...`
-(`exposure input none (no registered 1x1 R16_SFLOAT; measured from the frame)` when missing) or
-`[preupscale] no DLSS input among N registered views ...; waiting`. Without an exposure input,
-model and roundtrip modes held nothing until the auto-exposure ("Auto-exposure when the game gives
-DLSS none (RE Requiem)", end of this document); since then the exposure is measured from the
-frame. Neither rule identifies anything while DLSS Ray Reconstruction runs ("DLSS Ray
-Reconstruction", end of this document); otherwise neither depends on kernel names.
+Until 4.0 the layer inferred all of this from DLSS's kernels: the size rule and the input kernel's parameters
+described in the sections after this one ("Several colour candidates (2.0.1)", "Identification by the input kernel's
+parameters (DLAA)", "DLSS Ray Reconstruction", ...). Those sections are the history of that work.
 
 ### The hold
 
-At `vkQueueSubmit`/`vkQueueSubmit2`, the first command buffer marked launch-bearing is the hold
+At `vkQueueSubmit`/`vkQueueSubmit2`### The hold
+
+At `vkQueueSubmit`/`vkQueueSubmit2`, the first command buffer carrying DLSS Super Resolution's evaluate is the hold
 point (one hold per call, one at a time per device: the device's state lock is held throughout).
 The call is re-issued through the next layer as: the batches before the launch batch plus, if the
 launch buffer is not first in its batch, the buffers before it with the batch's wait semaphores
@@ -368,7 +360,8 @@ Not split, each with its own once-per-session log line:
 - **A buffer recorded before the inputs were identified** (`Hazard::RecordedBefore`): the launch
   buffer, a buffer ahead of it in the same call, or a secondary executed into one of them was begun
   before the current identification (`Tracker::recorded_watched`). Barriers are recorded only while
-  inputs are watched, and a new identification drops what was recorded, so what such a buffer does
+  inputs are watched, and a new identification drops what was recorded on the images it did not
+  watch throughout ("Inputs that cycle through images of one shape"), so what such a buffer does
   to the inputs is not known: a D3D12 command list executed again without being recorded again, or
   one recorded ahead on another thread while the submit that identified the inputs went out, can
   carry a transition or a same-layout barrier before DLSS's launch. Before, only the identifying
@@ -487,8 +480,13 @@ did not run.
 
 **Layouts the buffer did not set.** The copies in name each input's layout at the hold point. Where the
 buffer itself set it before that point (a barrier on the image, or its use as an attachment), that is what
-it is. Otherwise it is taken from what the buffers submitted so far left, or `GENERAL` for a storage image
-never seen in a barrier (`Tracker::inline_point`, `Guessed`): a guess, since vkd3d-proton records several
+it is. Otherwise, for the colour input, it is taken from the layout that image had at DLSS's launch buffer in the last
+submission held with it (`launch_layouts`, per image: what the split's check reads in its own submission), and for the others and
+before such a submission from what the buffers submitted so far left, or `GENERAL` for a storage image
+never seen in a barrier (`Tracker::inline_point`, `Guessed`). Taking the end of the last submission for the
+colour input left a game that moves it out of `GENERAL` in a buffer in front of DLSS's and back after it
+refused by both paths every frame: the recording handed the frame to the split on `GENERAL`, and the split
+refused it on the layout in front of the launch. Either way a guess, since vkd3d-proton records several
 command lists in parallel and submits them later, and a buffer submitted in between can leave another
 layout. Each guess is checked when the buffer is submitted, against what the buffers in front of it in
 that submission and the ones submitted before leave (`Tracker::layout_when_run`, `Inline::check`). A
@@ -551,6 +549,11 @@ state. Outside `GENERAL` it is moved to `TRANSFER_SRC_OPTIMAL` for the copy in, 
 (`NEAREST`, same extent) to the RGBA16F staging image and back, when the device can blit both
 formats. Such inputs are held here even with nothing in the buffer before the launch
 (`Hazard::NotSplittable`): the split reads and writes the colour input as an RGBA16F storage image.
+The copies need `TRANSFER_SRC | TRANSFER_DST` on the colour input, which the layer adds to every colour
+candidate it sees created (`added_usage`; a native Vulkan game asks for none, #51). Every refusal of a
+hold inside the buffer at a launch naming the colour input (no transfer usage, format, extent, layout,
+a suspended render pass, left to the split) is logged once per identification and kind
+(`InlineRefusal`).
 
 **One hold per identification (3.1.4).** Once a hold inside DLSS's buffer has been recorded for an
 identification (`Tracker::inline_recorded`), a buffer the split could take is held inside too
@@ -581,6 +584,109 @@ waits on (`VUID-vkSetEvent-event-09543`); events cannot be set from another queu
 hold into the buffer needs neither the events nor the queue: the extra queue `vkCreateDevice` got for
 it is gone (the network's loader keeps its own two, which are separate), and the hold's GPU tests run
 under the validation layer with nothing to report and nothing filtered.
+
+### Inputs that cycle through images of one shape (Expedition 33, 3.14.0, #51)
+
+Clair Obscur: Expedition 33 (Unreal Engine 5 under vkd3d-proton, RTX 5060 Ti) hands DLSS its colour input in one
+of several 1488x836 `B10G11R11` images in turn, as Remnant II alternates between two. The input kernel's
+parameters identify the lowest handle ("one evaluation alternating its input"), and `Tracker::retarget` holds
+each frame with the image its buffer names. Only the identified image was watched, though, so for the others the
+hold inside DLSS's buffer knew no layout: every frame on another image was refused with "the colour input's
+layout at DLSS's launch is unknown" and went to DLSS unedited, flickering through while the camera moved. The
+layout learnt at DLSS's launch was kept for the identified image only, and every new identification (the
+reporter's log names many; destroying the identified image is one way to one) dropped what was known of all of
+them.
+
+Now (`Tracker::colour_watch`, `watched_by`, `keep_watched_across`):
+
+- Every 2D single-sample image of the identified colour input's extent and format is watched, as every depth
+  image at the depth's extent already was, and stays watched while nothing is identified (until a colour input
+  of another shape is). Its barriers and attachments are recorded and committed like the inputs'.
+- The layout at DLSS's launch is learnt per image (`launch_layouts`), for a retargeted submit too.
+- A new identification keeps what was recorded on an image watched before and after it (committed layout,
+  owner, launch layout, its barriers in buffers not yet submitted) and drops the rest: an image watched
+  throughout had every barrier on it seen. Buffers begun before the identification stay `RecordedBefore` (and
+  `BegunBefore` for the hold inside): what they recorded on newly watched images was not seen.
+- The refusal on an unknown layout now counts the barriers on the refused image itself since this
+  identification (it counted those on the identified image, never reset), or says it is not watched.
+
+Not done: taking `GENERAL` for a `B10G11R11` image no barrier was seen on, as the split does for an `RGBA16F`
+storage image. Nothing shows Expedition 33's are in `GENERAL` (its refusals say barriers on them were seen), and a
+guess on an image whose layout is unknown at the submit too is the one the hold guard cannot check. Nor is the
+layout of one image guessed from another of its shape.
+
+### A same-layout barrier before DLSS's launch, and silent refusals (Stellar Blade, 3.14.0, #51)
+
+Stellar Blade (Unreal Engine 4 under vkd3d-proton, same user) records a same-layout barrier on a DLSS input in
+DLSS's own buffer before its input launch (vkd3d-proton's render target to shader resource). The split refuses
+that buffer (`Hazard::SameLayoutBarrier`), and it is the hold inside's to take: recorded at the launch, after the
+barrier, in the layout the barrier set (the test of that stream gets a hold point from `inline_point`). The
+user's log had only the split's refusal and a status that stayed waiting: when the hold inside does not run,
+several of its paths said nothing. Now:
+
+- `inline_point`'s ordinary refusals (`BegunBefore`: the buffer was begun before the current identification;
+  `NotIdentified`) are counted and logged with the counts, at the first and then at most every 5 s
+  (`no hold inside DLSS's buffer in the last N s: ...`), and are the status's reason. Once per identification
+  would log them at every identification of a game identified again and again.
+- What `Inline::record_outcome` returns before the hold is asked (the compute state not noted yet, or noted only
+  from after the buffer began; every slot in use; staging images waiting for earlier holds; no hold guard for a
+  guessed layout; holds stopped) is counted in the `inside DLSS's buffer, last N s` tally with the closure's own
+  outcomes.
+- A launch buffer the split refuses in which no hold inside was decided on says why, once per reason
+  (`Tracker::untried_line`): its launches' parameters are not readable (an opaque launch is never an input launch,
+  so the buffer has no hold point; the split still takes it as "held undecided"), none reads as DLSS's input
+  launch, or its first launch naming a colour candidate was not taken.
+
+Not done: splitting in front of such a buffer when nothing before the barrier in it writes the colour input.
+Showing that takes every command recorded before the barrier (draws, dispatches, copies, clears, render passes),
+which the layer hooks only for the probe; hooking every draw costs every game and was not measured; and the
+barrier is the game's own statement that a producer must be finished, which the split does not run ahead of
+("When a submit is not split"). Without the user's log it is not known which of the paths above stopped the hold
+inside; the lines to ask for are the `[preupscale]` lines of a normal run (`no hold inside DLSS's buffer`,
+`inside DLSS's buffer, last`, `the hold inside DLSS's buffer was not tried`, `held undecided`, `holding inside
+DLSS's command buffer`, `noting the application's compute state`, `colour input:`), and with
+`NEURAL_FORGE_PROBE_NGX=1` the `[probe-ngx] seq cb=` lines of DLSS's buffer (what is recorded before the barrier,
+the first launch's kernel) and `cmdbuf stats after frame`.
+
+### Stellar Blade is held inside DLSS's buffer; its depth's one-aspect barriers dropped the history (#51)
+
+The user's full logs (3.14.0 test build 117) showed what the earlier section could not: Stellar Blade is held. After
+the split's one refusal line ("same-layout barrier ... not holding"), `holding inside DLSS's command buffer ...
+why not the split: SameLayoutBarrier` follows, and the tally says `held 263, ran 263` every 5 s (about 52 holds a
+second; 3597 holds inside against 1 split in the run). The split's line was read as the frame's fate. With the
+hold inside on, that line now says the hold inside takes such buffers and which lines say whether it holds
+(`Hazard::why_inside`); for a buffer recorded before the identification, that the hold inside takes it only where
+DLSS's own buffer was begun since (it refuses one begun before, `InlineRefusal::BegunBefore`).
+
+What did go wrong: every hold's history was dropped. The log had `an input of a hold inside DLSS's buffer was read
+as GENERAL ... but it is 2147418113 when the buffer runs` on both of the game's D32_SFLOAT_S8_UINT depth images,
+and `resetting the history (the hold guard reset it on the GPU ...)` 3813 times in that run. 2147418113 is
+`ASPECTS_APART`, the tracking's mark for a depth/stencil image whose aspects may be in different layouts after a
+barrier on one aspect. vkd3d-proton records barriers on the depth aspect alone (a D3D12 barrier on the depth
+plane), and every one of them in the probe run is `GENERAL -> GENERAL`. Such a barrier moves neither aspect, but it
+was tracked as leaving them apart: the hold read the depth as `GENERAL` (what the last submission left), the guard
+compared that with `ASPECTS_APART` at the submit, and reset the network's history every frame. In a buffer that
+records such a barrier before the launch, the depth was not read at all (`ASPECTS_APART` is no layout to copy
+from).
+
+Now (`ImageSync::keeps_layout`, `ImageSync::layout_after`): a barrier on one aspect of a depth/stencil image that
+keeps its layout records no layout, where the layout tracked at that point of the buffer (its own barriers, else
+the committed state) is the one the barrier names, or none is tracked (the other aspect's layout is then still
+unknown, and an image without a known layout is not read). The layout before it stands, in the buffer
+(`layout_in`), at the submit (`layout_when_run`, the guard's check), in the commit and in the scan's proposed
+layouts. One that names another layout than the tracked one (a render pass's final layout the tracking did not
+follow, a buffer recorded before the identification) says only where that aspect is: the aspects are apart, as
+after a barrier on one aspect that does transition it, until a barrier on both; kept as tracked, the hold would
+copy the depth in the wrong layout and its guard compare against the same wrong state
+(`a_one_aspect_barrier_contradicting_the_tracked_layout_leaves_the_aspects_apart`). Hazards and the depth the hold reads (`hold_depth`) still see the barrier
+as recorded. Test: `a_same_layout_barrier_on_one_aspect_of_the_depth_moves_no_layout` (the depth unreadable and
+apart without the change).
+
+The probe excerpt the user sent ("colour input not identified before the first launch ... untouched: 544") said
+nothing about the colour input: the probe's own size rule wants an RGBA16F storage image, and Stellar Blade's
+input had no storage usage until the layer added it, so the probe had identified nothing. The probe now follows
+the tracking's identification (`probe_ngx::note_identified_colour`), and its sequences print a barrier's aspect
+when it is one of depth and stencil (`(depth only)`).
 
 ### The HDR encode and decode (model, roundtrip)
 
@@ -683,8 +789,16 @@ What to look for in the launch log (`grep -F '[preupscale]'`):
 - Dump mode: `[preupscale] dump of the DLSS input (WxH, frame N) written to <dir>: colour.rgba16f, depth.r32f, mvec.rg16f, colour-preview.png, meta.json`.
 
 `neural-forge-cli shmctl status` shows `preupscale_state` (0 off, 1 waiting for DLSS input,
-2 holding), `preupscale_extent`, `preupscale_hold_ms` (the last hold's CPU time) and
-`preupscale_misses` (shared-memory protocol 9).
+2 holding before the upscaler, 3 holding after DLSS, 4 both, 5 DLSS input identified but every frame
+refused), `preupscale_reason` (with 5: why no hold runs now: the last refusal of the split hold or of the hold
+inside DLSS's buffer, as the layer log's `[preupscale]` lines say each once: `no hold inside DLSS's buffer
+(identification N): ...` for the latter, the reason itself for the split; or, where nothing refused one, "the model
+is switched off (F11 or the app)" from either hold's switch check, or "the Placement setting runs no pass before
+the upscaler" from either hold's plan (`plans_before`). Each replaces the older reason and a held frame clears it,
+so the reason is never one that no longer applies; empty otherwise, protocol 25), `preupscale_extent`, `preupscale_hold_ms` (the last hold's CPU time) and
+`preupscale_misses` (shared-memory protocol 9). State 5 tells a game whose DLSS the layer found but
+cannot hold (Indiana Jones and the Great Circle before its colour input got transfer usage, #51) from one
+without DLSS (1); the model runs after the upscaler in both.
 
 ### Not verified without NVX hardware
 
@@ -1673,8 +1787,8 @@ What changed:
 - **Post path off process-wide.** If DLSS runs on a device without the swapchain, the hold happens
   on that device. The present (and the post-upscaler compose) happens on the other one, whose
   session never saw DLSS. That would have applied the model twice and rebuilt the helper's feature
-  between the two sizes every frame. While a device holds, its post-path deadline (`post_off`, 30 s
-  after the last DLSS submit) is now shared through `preupscale::post_off_by_any_device`, and every
+  between the two sizes every frame. While a device holds, its post-path deadline (`post_off`: the
+  hand-back after the last held frame, `hand_back_at`) is now shared through `preupscale::post_off_by_any_device`, and every
   device's present honours it. With `NEURAL_FORGE_PREUPSCALE=off` it is never set. For a single
   device (GTA) it equals that device's own rule (`the_shared_post_off_deadline_matches_the_holding_devices_own`).
 
@@ -1734,7 +1848,7 @@ What changed (`Tracker::switch_by_evidence`, `Tracker::retarget`):
   it this frame)`, and, if the target changes more than 4 times in 60 held submits, `DLSS's input
   kernel alternates between colour candidates 0x... and 0x... (...): each submit is held with the
   candidate its input launch names`. The tally counts them:
-  `N held reading the colour input (M of them another candidate their input launch names)`.
+  `N named the colour input (M of them another candidate their input launch names)`.
 - **Scope.** Only among the size rule's candidates (render-size RGBA16F storage images smaller than
   the output, with depth and motion vectors at their extent). GTA V (one candidate) and DLAA (no
   size-rule candidate) never switch or retarget. A buffer naming another candidate without an input
@@ -1808,7 +1922,16 @@ input, depth and motion vectors.
   colour input, depth and motion vectors. The layer also records the 1x1 `R16_SFLOAT` image the same
   buffer names, if any. GTA's SR buffer ends with `cuda_copy_exposure_kernel` on DLSS's 1x1
   exposure input. The evidence is kept per colour image (at most 4) and dropped when one of its
-  images is destroyed.
+  images is destroyed, or when no input launch has named its colour image for 64 launch-bearing
+  submits (`SR_RECENT`; logged: `no input launch named colour input 0x... in 64 launch-bearing
+  submits: dropped as evidence`); not while Ray Reconstruction runs, whose buffers are never evidence: the entries
+  count as seen until it stops, so Super Resolution is identified again at once then, and Ray Reconstruction's own
+  first launch keeps the colour input and motion vectors it is read with (`rr_input_launch`). Loading a save in
+  Cyberpunk 2077 (#49) can hand DLSS a new set of
+  images while the old set stays registered (alive, or only its views destroyed): the old entry stayed
+  forever beside the new one, two evaluations with an exposure each, so none was chosen, the size
+  rule (which Cyberpunk's RGBA16F motion vectors never meet) found nothing, and the status stayed
+  "waiting for DLSS input" until the game was restarted.
 - **Settling.** A decision is taken only after 16 launch-bearing submits without new evidence
   (`SETTLE_SUBMITS`), and again when the registered set or the swapchains change after that. With
   FG there are 2 (GTA 3x) to about 5 (Crimson Desert 6x) FG submits per real frame. So a few real
@@ -2324,3 +2447,213 @@ trails behind the characters, and the grain on the rock during the heal effect i
 (the history resets only across the loading pauses, 500 ms or more without a frame). Crimson Desert
 with Ray Reconstruction off: `motion vectors copied from GENERAL`, 174.2 fps in game (3.1.4:
 174.6), no Xid.
+
+## Pause menus (Cyberpunk 2077, #49 and #59, 2026-11-11)
+
+**What the game does.** Cyberpunk 2077's Esc menu stops calling DLSS altogether: no Super Resolution launch at all
+while it is open, presents go on at the full rate, and the menu draws over a blurred copy of the last frame, which
+already carries the model's edit (the hold changed DLSS's input). The game frees its render targets in the menu and
+makes new ones on resume: the first frames after it name a new colour input, depth and motion vectors, and the
+inputs are identified again within about 0.3 s (`no DLSS input among 42 registered views` in the menu, then `colour
+input: image ...`). The inventory and the map stop DLSS too.
+
+**What 3.14.0's test build did** (RTX 5070, 4K output, render 1920x1080, Placement Auto, Ray Reconstruction off):
+
+- Under 30 s in the menu: the frames presented untouched (right), the Status line "after the upscaler: waiting for
+  DLSS Super Resolution" (wrong: nothing ran), and on resume the network ran on the first held frame (history reset:
+  `13227 ms since the last frame`).
+- 30 s or more: the hand-back gave the menu to the post path, which ran the network over the menu at the output size
+  (`server=48.7ms` at 3840x2160 with the default model resolution: the menu at about 20 fps), on top of the edit
+  already in the frame, after a rebuild at 3840x2160 (`network built for 3840x2160 ... in 307 ms`). On resume the
+  holds waited for the post path's last frame (`the network is serving the after-the-upscaler path`, one second) and
+  for a rebuild at 1920x1080: the model was off for 1.2 s after a 44 s pause, and in later runs 3-6 s. On the 12 GB
+  card the 3840x2160 build ended at the VRAM budget, the VRAM guard paused the network, and it never came back (the
+  game had grown into the memory: 4 minutes later still paused).
+- With the reporter's model resolution after the upscaler (50%) the post path's size equals the render size: no
+  rebuild, only the second pass over the menu.
+- 40 pause/resume cycles (3 s and 36-40 s) on the reporter's build with the reporter's settings, and 17 on the next
+  build: no Xid. The reporter's crash (#59: Xid 31, copy engine reading unmapped memory, 4090 + 5080) was not
+  reproduced here.
+- One crash was: with a first version of the change below that handed back at the resume itself (the first Super
+  Resolution launches after the menu counted as "DLSS runs, its input not held"), the post path asked for its
+  3840x2160 build as the holds came back, a hold took the 1920x1080 build an instant later, and the loader thread
+  rebuilt under it: Xid 13 (SM MMU faults), device lost, `building the network for 3840x2160 failed: waited failed:
+  -4`.
+
+**The change.**
+
+1. `hand_back_at`: 30 s after the last held frame only while Super Resolution goes on launching without its input
+   held (a run of launches under `RECENT` apart reaching more than `RECENT` past the last held frame, counted from
+   the run's start when it began later); with no launch at all, 5 minutes (`PAUSE_HAND_BACK`). DLAA and a set of
+   inputs no longer identified hand back as before; a menu or loading screen keeps the network where it is.
+2. `PAUSED` (`preupscale_state` 6): no hold lately, no DLSS frame within `RECENT`, the post path kept off (since the
+   review below: no Super Resolution launch within `RECENT` either). The GUI
+   says "paused with the game's DLSS (a menu or loading screen): the model resumes with its next frame"; captures
+   meanwhile read the presented frame as both images, as while holding.
+3. `LoaderState::want_sizes`: a path taking the current build drops the other path's pending request for another
+   set of sizes, so the loader thread never frees a build a frame was just recorded with.
+4. `DLSS frames resumed (#N) after N ms` is always logged (it was only with `NEURAL_FORGE_CAPTURE_AT`).
+
+**Measured after it** (same rig and save, default settings): 4 pauses of 40 s and 20 of 3 s, 24 cycles: no post
+path, no rebuild, VRAM 10.8-10.9 GB throughout, no Xid; the network runs on the first DLSS frame after the menu
+(10-35 ms after `DLSS frames resumed`). The history still starts afresh there (the 500 ms rule): the scene is the
+same, but the game's render targets are new and a stale history after a cut the game does not flag would ghost.
+
+Not done: running the model over the menu on the finished frame, as the reporter suggested. The frame under the
+menu already has the edit; a second pass doubles it, changes the menu's text, costs a frame of the network at the
+output size, and needs the network at that size (a rebuild, or both sizes built: on the 12 GB card at 4K that does
+not fit). Where the game's queue is shared with the network (Red Dead Redemption 2) the post path cannot run at
+all.
+
+Tests: `a_pause_without_any_dlss_launch_keeps_the_post_path_off_longer` (the menu, DLAA, the resume, the run of
+launches), `the_post_path_takes_over_only_after_hand_back_without_dlss` and
+`the_shared_post_off_deadline_matches_the_holding_devices_own` (with launches),
+`dlss_identified_with_every_frame_refused_is_not_waiting_for_dlss_input` (the `PAUSED` status),
+`a_path_taking_the_current_build_drops_the_other_paths_pending_rebuild`, the GUI's `says_paused_while_the_game_pauses_dlss`.
+
+**Review fixes (2026-11-11).** A review of the change found three places where the code did not do what this section
+and the user guide say:
+
+1. Only Super Resolution launches whose parameters named DLSS's inputs (`InputLaunch::Inputs`) were noted as DLSS
+   running: a game whose inputs stopped being identified after holds ran (no launch read as inputs any more) kept the
+   model off for 5 minutes, the status "paused" while the game played. Now every launch of the input kernel known by
+   its name (`LaunchRefs::sr_launched`, in a secondary buffer too) counts, besides a launch read as inputs where the
+   name is not known.
+2. The 30 s ran from the last frame with DLSS's inputs identified (`last_dlss`), which every refused frame refreshes:
+   DLAA, identified and refused every frame, never handed back. Now it runs from the last held frame
+   (`Session::last_hold`), and `PAUSED` needs no Super Resolution launch within `RECENT` (`Session::status_at`): while
+   DLSS launches, the status is `IDENTIFIED` with the reason or `WAITING`.
+3. The loader thread's idle step (below) checked only the holds recorded into DLSS's buffers and the 6 s since a path
+   last took the network. A frame can still run after that: an after-the-upscaler frame whose 5 s fence wait timed
+   out (its claim kept until the fence signals), a split hold with its fence pending or with no fence after it (taken
+   as running for `FENCE_WAIT_TIMEOUT` after its submit). Closing the network under one is the copy engine reading
+   freed memory, #59's Xid 31. The idle step now needs what lending the network to another device needs
+   (`Claims::unused`), and the loader thread checks again under its lock, right before it closes the network or frees
+   a build for a rebuild, that nothing is in flight (`LoaderState::frees_now`); it waits (logged once after 5 s) until
+   it is.
+
+Tests: `the_post_path_takes_over_30_s_after_the_last_held_frame_unless_dlss_sends_nothing` (unidentified launches,
+DLAA, a menu, no launches, the resume; the status in each), `super_resolution_launches_are_noted_identified_or_not`,
+`native::tests::frames_still_in_flight_keep_the_idle_step_and_the_free_off`; each fails with its fix reverted.
+
+4. Found on the rig while checking 3: with the stricter idle step, a game whose holds after DLSS kept coming (Cyberpunk
+   2077 at 4K with Ray Reconstruction and path tracing: a hold every 0.4 s at 7 fps) never had its decided pause
+   applied, by either path: a hold asking for the network applies a step only with no other hold outstanding, and
+   one was always outstanding; the idle step needs 6 s without a path taking the network. The game stayed at 7 fps
+   for 5 minutes with the pause decided. Now, while a step down is pending and other holds may still run, no hold
+   takes the build (`Loader::ready_sizes`): the outstanding ones drain, and the next hold to ask (or the loader
+   thread) applies the step. Test: `a_pending_step_down_stops_new_holds_until_the_outstanding_ones_drain` (fails
+   without it).
+
+**Measured after the review fixes** (RTX 5070, 3840x2160 HDR10 PQ, the desktop at 4K 144 Hz HDR, the same save):
+
+- Default settings (Ray Reconstruction off, render 1920x1080): 8 pauses of 3 s and 2 of 40 s, each with the status
+  `PAUSED` in the menu and holding again after it; the network ran on the first DLSS frame after each menu (the
+  history reset 8-10 ms after `DLSS frames resumed`, 41 s gaps included), no rebuild, no post path, VRAM 10.95-10.97 GB
+  in play throughout, no Xid.
+- Ray Reconstruction and path tracing: the pause decided at 1.35 s a frame (best 31 ms) and applied by the loader
+  thread 4 s later (`no frame has used the network for 6 s`), the network closed, and the game at 65-69 fps in play
+  for the 5 minutes after, no Xid (the kernel logged an NVRM out-of-memory mapping message during the spill, before
+  the pause). Before fix 4 the same run stayed at 6-9 fps with the pause decided and never applied.
+- On the main menu (no DLSS) for more than 5 minutes the post path took over as designed, built at 3840x2160, and
+  the holds rebuilt at 1920x1080 on resume (8 s later); that run's game then ran at about 52 fps against 82-116
+  without the 5-minute wait, at the VRAM budget. Not changed here.
+
+**Checked 2026-11-11** (the sweep's `cyberpunk-rr`: 4K HDR10, Ray Reconstruction on, path tracing off, the network
+after DLSS at 3840x2160): a run the guard paused had ended with `preupscale_state=5` and an empty reason; a hold that
+ran and missed now gives its reason (`a_hold_that_missed_is_why_nothing_is_held`). Whether the guard pauses too
+eagerly there, 3 runs. Two (launched directly and through Steam) had no post path before the holds: the network at
+31-33 ms throughout, the device at its budget the whole run (the probe: 10558-10633 of 10633 MiB), 55-65 fps
+presented with 1% lows of 15-18, and no step. The run that paused had the post path run the network at 3840x2160 on the main menu,
+then come back during the benchmark's loading (Ray Reconstruction's 1 s window lapsed) and alternate with the
+holds; the network went to 562.7 ms a frame (best 31.0 ms) at 10533 of 10543 MiB with the game at 15 fps (1% low
+1.4 fps), and the guard paused it: a spill, not a slow stretch. The thresholds stay.
+
+### The VRAM guard in the same game at 4K with Ray Reconstruction and path tracing
+
+Before (rrpt runs, RTX 5070 12 GB, 3840x2160 HDR10, Auto: after DLSS, the network at 3840x2160, 32 ms a frame in
+the menus): in play the game ran at 0.1-8 fps with bursts of 60-70 (the layer stops working below 15 fps, the game
+recovers, the holds return), the network at 311-1741 ms a frame, and no `VRAM guard` line at all. With
+`NEURAL_FORGE_PROBE_VRAM=1` (added for this, kept as a diagnostic):
+
+1. Five samples within one second were needed for a judgement; the holds came 1-5 per 5 s. Fix: the last five are
+   kept for up to 5 s (`SLOW_WINDOW`), and two or more within it all above `SPILL_ABS_MS` are a judgement, once the
+   build is past its first `WARMUP` frames (a slower GPU's first frames after a build are no spill:
+   `two_slow_frames_right_after_a_build_are_no_spill`).
+2. The after-the-upscaler path's frames were never timed for the guard (`native_post`), and in this game the network
+   served that path whenever Ray Reconstruction's 1 s window lapsed between slow frames. Fix: each of its frames
+   reports its time.
+3. With 1 and 2 the guard decided to pause (`the network took 353.7 ms a frame (best 31.0 ms) ... 10390 of 10470
+   MiB`), but the decision is applied where a path asks for the network (`want_sizes`), and none did: the game stayed
+   at 9 fps for minutes with the network open (`spill since 144 s`, the probe). Fix: `LoaderState::apply_idle_step`,
+   the loader thread applies a decided step down once no path took the network for `IDLE_STEP` (the fence wait plus a
+   second) and nothing that used it may still run (`Claims::unused`: review fix 3 above).
+4. Another run had the network at 1.7 s a frame (best 31 ms) with the reading 217 MiB under the budget (10189 of
+   10406 MiB), outside `OVER_MARGIN_MIB` (128). Fix: a network ten times slower than its best (or over 500 ms) counts
+   as spilled within 512 MiB of the budget (`SEVERE_MARGIN_MIB`); slow with more room than that stays a slow GPU.
+
+After (rrpt5): 6.7 fps in play, the step down decided 3 s after the network's frames went over 350 ms, applied by the
+loader thread when the frames stopped using it (`no frame has used the network for 6 s; the step down (Paused) is
+applied now`), the network closed, and the game at 67.7-70.7 fps for the rest of the run, no Xid. From the first slow
+frames to the steady game took about a minute: the holds kept the build in use for 29 s after the decision.
+
+Tests (`vram_guard`): `a_spill_that_slows_the_game_to_a_few_fps_still_steps_down` (four holds a second, one a second,
+two slow frames five seconds apart, 1.7 s near the budget; not with a gigabyte of room, not on stale samples; fails
+without the fix); `native::tests::a_step_down_nobody_asks_for_is_applied_when_the_network_is_idle`.
+
+## Loading screens before DLSS's first frame (#59, 2026-11-11)
+
+**What happened.** Before the first held frame nothing kept the after-the-upscaler path off, so with Placement Auto it
+took a DLSS game's loading screens and menus: it built the network at the output size and ran it there. In GTA V
+Enhanced at 4K (FG 4x, FrameLimit 120) that build came on the first loading screen, 40-60 s before DLSS's first frame;
+in the three launches of eleven where it came before the game created its last two Vulkan devices (NGX's: `asks for
+family 0 x1, family 1 x1`) the game's main loop stopped within a second of those devices and its watchdog closed it at
+`+0x12c6eb` (docs/LESSONS.md, "The +0x12c6eb crash"); in the eight where those devices came first it passed. In
+Cyberpunk 2077 at 4K with Ray Reconstruction the post path ran at 4K on the main menu, again for Ray Reconstruction's
+first frames during the benchmark's loading (no hold after DLSS was recorded yet, so every pass was "at present"), and
+held the network while the holds after DLSS waited (`the network is serving the after-the-upscaler path`); its 4K
+buffers stayed allocated beside the holds', the card spilled (the network at 563 ms a frame), and the VRAM guard
+paused the network. After the pause the game ran at 28-29 fps instead of 55-65: the holds after DLSS missed
+(paused), so after a second Ray Reconstruction's frames went to the post path again, which captured every 4K HDR10
+frame, echoed it through the server unchanged and waited for it, on the present thread, with no network to run.
+
+**The change.**
+
+1. `dlss_game`: whether the process is a DLSS game, known before DLSS's first frame. A thread started with the first
+   tracked device in model mode reads `/proc/self/maps` (every 0.5 s for three minutes, then every 5 s, until a sign)
+   for DLSS's libraries: `nvngx_dlss.dll`, `nvngx_dlssd.dll`, `sl.dlss.dll`, `sl.dlss_d.dll`, a native
+   `libnvidia-ngx-dlss*.so` (Frame Generation's own are no sign). Wine maps a PE image's headers from its file, so the
+   path is there as soon as the DLL is loaded. A DLSS kernel created through `vkCreateCuFunctionNVX` (Super
+   Resolution's or Ray Reconstruction's names) is a sign too, later. In GTA V the DLL sign is logged between the
+   game's first and second devices, long before its loading screen.
+2. `pre_dlss_post_off`: in a DLSS game no device of which has held a frame yet, the post path stays off (status
+   `PAUSED`) until the hand-back rules counted from the sign: `HAND_BACK` of Super Resolution launching with nothing
+   held, `PAUSE_HAND_BACK` with no launch at all (a game that ships DLSS and runs another upscaler gets the post path
+   after 5 minutes). Once a frame was held the existing rules apply. The post path serving every pass (placement
+   present, `post_serves`) is never kept off.
+3. `post_serves`: Ray Reconstruction hands the frames to the post path only once it has run for
+   `RAY_RECONSTRUCTION_SETTLE` (2 s; its first frames come before the hold after DLSS can be recorded) and while no hold
+   after DLSS was recorded or tried within a second (`note_after_dlss_tried`: a hold after DLSS that got its resources
+   and asked for the network, and missed for the network's sake: the post path had it, the guard paused it, a build).
+4. `native_post::release_idle`: the post path's buffers (proxy, answer, SDR picture, histories, optical flow) are freed
+   between its requests once the holds took the network over (`Loader::holds_took_over`: a hold asked a second or more
+   after the post path's last frame, none running), as they already were while the guard pauses. Its own frames wait
+   for their work; after one that did not finish in time (`stalled`) nothing is freed. The network's build at the post
+   path's size is replaced by the holds' at their first request, as before.
+5. While the VRAM guard has this device's network paused, the post path captures nothing (`Session::network_paused`),
+   as when the model is unavailable.
+
+Tests: `a_dlss_game_gets_no_post_path_before_dlss_first_frame`, `ray_reconstruction_hands_the_post_path_its_frames_only_once_settled`,
+`native_post::tests::the_buffers_go_once_the_holds_take_the_network_over` (each fails with its fix reverted),
+`dlss_game::tests` (the libraries and kernel names).
+
+**Measured** (RTX 5070, the desktop at 3840x2160 144 Hz VRR HDR):
+
+- GTA V Enhanced, FG 4x, FrameLimit 120, 3 launches: two benchmark results (4.0x, 36 fps real, 140-144 displayed, no
+  hang, no Xid); `nvngx_dlss.dll is loaded` logged between the game's first and second devices, the network built only
+  for the holds (2228x1253), no post path at any point. The third launch never started the game (Rockstar's launcher;
+  seen with the model off too).
+- Cyberpunk 2077, HDR10, Ray Reconstruction on (`game-sweep --only cyberpunk-rr`), 1 run: `nvngx_dlssd.dll is loaded`
+  at start, no post path on the menus or loading, one build at 3840x2160 for the holds after DLSS, no VRAM guard step,
+  58-65 fps presented through the benchmark (the 28-29 fps after a pause was not reproduced: no pause). The sweep's own
+  verdict failed on reading the channel status (its CLI), not on the game.

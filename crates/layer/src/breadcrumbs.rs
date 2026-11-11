@@ -77,6 +77,12 @@ pub fn trail() -> String {
     ring.trail()
 }
 
+/// [`trail`] without waiting: `None` while the ring's lock is held (the panic hook's, whose thread may hold
+/// it) or poisoned.
+pub fn try_trail() -> Option<String> {
+    RING.try_lock().ok().map(|ring| ring.trail())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

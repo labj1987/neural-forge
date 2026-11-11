@@ -22,6 +22,11 @@ pub struct SwapchainState {
     /// here is exactly what `VkPresentInfoKHR::pImageIndices[i]` refers to. Fetched
     /// once at creation (see `device::NeuralForgeDeviceInfo::fetch_swapchain_images`).
     pub images: Vec<vk::Image>,
+    /// What its HDR verdict is made from (`crate::hdr_verdict`); the first HDR metadata is added when it comes.
+    pub hdr: crate::hdr_verdict::Facts,
+    /// [`Self::hdr`]'s verdict, made when it changes; empty for a swapchain that is not the game's own (too small,
+    /// another process's, not on the NVIDIA GPU), which publishes none.
+    pub hdr_text: String,
 }
 
 /// Decides when the layer may engage on a swapchain: only once the game itself has been
@@ -223,6 +228,81 @@ pub fn detect_hdr_kind(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u3
         hdr_kind::PQ10
     } else {
         hdr_kind::NONE
+    }
+}
+
+/// The line logged for the first HDR metadata (`vkSetHdrMetadataEXT`) an application sends for a swapchain it
+/// created with `format` in `color_space`. The metadata says nothing of how the frames are encoded; the colour
+/// space does. A 10-bit swapchain declared sRGB that gets HDR10 metadata is either SDR (the metadata sent anyway:
+/// DXVK and vkd3d-proton forward a game's `SetHDRMetaData` whatever its colour space) or PQ code in a swapchain
+/// that does not say so, which the compositor then shows as sRGB (#51: Stellar Blade and Indiana Jones under
+/// gamescope with HDR on in the game; gamescope logged the metadata, the layer only sRGB swapchains).
+pub fn hdr_metadata_line(format: vk::Format, color_space: vk::ColorSpaceKHR, m: &vk::HdrMetadataEXT) -> String {
+    let primaries = primaries_name(m);
+    let ten_bit = matches!(format, vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32);
+    let what = match detect_hdr_kind(format, color_space) {
+        hdr_kind::PQ10 => "the swapchain is HDR10 (PQ), as the metadata says",
+        hdr_kind::LINEAR_FP16 => "the swapchain is linear FP16",
+        _ if ten_bit && color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR => {
+            "the application created this swapchain as sRGB: its frames are SDR, or PQ-encoded HDR10 the swapchain does not declare \
+             (then shown as sRGB); either way it is not an HDR10 swapchain to the layer, which presents it untouched"
+        }
+        _ => "the swapchain's colour space is not HDR10",
+    };
+    format!(
+        "HDR metadata for a {format:?} {color_space:?} swapchain: {primaries} primaries, mastering luminance {:.4}-{:.0} nits, MaxCLL {:.0}, MaxFALL {:.0}; {what}",
+        m.min_luminance, m.max_luminance, m.max_content_light_level, m.max_frame_average_light_level
+    )
+}
+
+/// The metadata's display primaries by name ("BT.2020", "Display P3", "BT.709"), else in numbers.
+pub fn primaries_name(m: &vk::HdrMetadataEXT) -> String {
+    let near = |p: vk::XYColorEXT, x: f32, y: f32| (p.x - x).abs() < 0.005 && (p.y - y).abs() < 0.005;
+    if near(m.display_primary_red, 0.708, 0.292) && near(m.display_primary_green, 0.170, 0.797) && near(m.display_primary_blue, 0.131, 0.046) {
+        "BT.2020".to_string()
+    } else if near(m.display_primary_red, 0.680, 0.320) && near(m.display_primary_green, 0.265, 0.690) && near(m.display_primary_blue, 0.150, 0.060) {
+        "Display P3".to_string()
+    } else if near(m.display_primary_red, 0.640, 0.330) && near(m.display_primary_green, 0.300, 0.600) && near(m.display_primary_blue, 0.150, 0.060) {
+        "BT.709".to_string()
+    } else {
+        format!(
+            "r ({:.3}, {:.3}) g ({:.3}, {:.3}) b ({:.3}, {:.3})",
+            m.display_primary_red.x,
+            m.display_primary_red.y,
+            m.display_primary_green.x,
+            m.display_primary_green.y,
+            m.display_primary_blue.x,
+            m.display_primary_blue.y
+        )
+    }
+}
+
+#[cfg(test)]
+mod hdr_metadata_tests {
+    use super::*;
+
+    fn bt2020() -> vk::HdrMetadataEXT<'static> {
+        vk::HdrMetadataEXT {
+            display_primary_red: vk::XYColorEXT { x: 0.708, y: 0.292 },
+            display_primary_green: vk::XYColorEXT { x: 0.17, y: 0.797 },
+            display_primary_blue: vk::XYColorEXT { x: 0.131, y: 0.046 },
+            white_point: vk::XYColorEXT { x: 0.3127, y: 0.329 },
+            max_luminance: 1000.0,
+            min_luminance: 0.001,
+            max_content_light_level: 1000.0,
+            max_frame_average_light_level: 400.0,
+            ..Default::default()
+        }
+    }
+
+    /// #51: gamescope logged BT.2020 metadata from Stellar Blade while the layer saw only sRGB swapchains.
+    #[test]
+    fn hdr10_metadata_on_an_srgb_swapchain_says_the_swapchain_is_not_hdr10() {
+        let line = hdr_metadata_line(vk::Format::A2B10G10R10_UNORM_PACK32, vk::ColorSpaceKHR::SRGB_NONLINEAR, &bt2020());
+        assert!(line.starts_with("HDR metadata for a A2B10G10R10_UNORM_PACK32 SRGB_NONLINEAR swapchain: BT.2020 primaries"), "{line}");
+        assert!(line.contains("created this swapchain as sRGB") && line.contains("untouched"), "{line}");
+        let pq = hdr_metadata_line(vk::Format::A2B10G10R10_UNORM_PACK32, vk::ColorSpaceKHR::HDR10_ST2084_EXT, &bt2020());
+        assert!(pq.contains("is HDR10 (PQ)") && pq.contains("1000 nits"), "{pq}");
     }
 }
 

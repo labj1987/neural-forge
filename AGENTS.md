@@ -4,10 +4,11 @@ Repository: https://github.com/labj1987/neural-forge
 
 Read [docs/PHASE1.md](docs/PHASE1.md) for the current namespace, installation contract and
 target-ownership rules. Benchmarks run with `scripts/gta-bench.sh`
-([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)) at 2560x1440, 288 Hz, VRR (the desktop's HDR as
-it is set; HDR in the game only when asked for), the default test configuration; 4K runs are made when a change needs
-them, with video memory sampled (the 12 GB card runs GTA with frame generation at 4K since the VRAM guard and the shared
-activations, near its limit); the old Phase 1 plan is in
+([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)) at 3840x2160, 144 Hz, VRR on the maintainer's desktop,
+which stays at that mode with HDR on (never change the display mode for a test; set the game's own resolution), the
+default test configuration since 2026-11-10. Games that have HDR are tested with their HDR on; video memory is sampled
+(the 12 GB card is near its limit at 4K with frame generation, and full with Ray Reconstruction). Every release is
+checked in Cyberpunk 2077, GTA V Enhanced, Red Dead Redemption 2 and Crimson Desert; the old Phase 1 plan is in
 [docs/history/phase1-benchmark-plan.md](docs/history/phase1-benchmark-plan.md). The former app name was dlssnr; upstream DLSS5VKLayer remains a
 separate application and must not be modified or uninstalled by this project.
 
@@ -116,6 +117,20 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   portal and falls back to light: set `ADW_DEBUG_COLOR_SCHEME=prefer-dark`, and look at every image
   before committing it.
 
+## Tested games and the sweep
+
+- `data/games.toml` is the per-game compatibility list the app is built with (`crates/supervisor/src/compat.rs`):
+  each tested game's engine, API, DLSS features, where the model runs with Ray Reconstruction off and on, its
+  HDR route, setup notes and the version it was last verified in. The Status and Setup tabs, `games --tested`,
+  `doctor`, Save report and the game sweep read it. A newly tested game gets an entry (and a row in the user guide's
+  "Tested games"); a change that moves the model elsewhere in a game updates its entry in the same commit.
+- Before a release that touches the layer (above all `preupscale`), run the game sweep on the test machine with
+  the release build: `scripts/game-sweep.sh --layer <build>/libneural_forge_layer.so --cli <build>/neural-forge-cli`
+  (docs/RUNNING_AND_MEASURING.md, section 11), in tmux; it takes the GPU lock and puts back what it changes. Every
+  run must pass (each run holds the GPU lock only while it runs), and each is recorded (`vw`, `--vw`): a run passes
+  only when the recording flags nothing and its contact sheet looks right against the model off; log numbers alone never pass; record the passing games' `verified`/`verified_on` in `data/games.toml`. Runs are at the test
+  machine's desktop resolution (3840x2160), with HDR for games that have it.
+
 ## Test builds
 
 - A fix for an issue someone else reported goes to them before it reaches `main`: push it on its own branch,
@@ -155,7 +170,12 @@ second frame in motion with the edit cache carrying it between (docs/ARCHITECTUR
 the layer (`crates/native`, `crates/layer/src/preupscale/native.rs`; docs/NATIVE_BACKEND.md); the
 2.x Windows helper and everything around it (runners, Wine prefix, DMA-BUF, NGX) are removed and
 not to be brought back. Do not lower model resolution or turn the model off by default without
-explicit user authorization.
+explicit user authorization. The one Windows-side piece is the NGX wrapper for Proton (`crates/ngx-wrapper`,
+docs/PROTON_NGX.md): it never runs NGX or the network, it forwards NVIDIA's NGX core unchanged and records the
+parameters the game gives DLSS for the layer (`ngx_ring.rs`). It ships only inside Proton copies made on the user's
+machine (`proton_tool.rs`), never as a published Proton build. Its records are the layer's only source of what DLSS
+works on: do not bring back rules that infer DLSS's images, jitter, units, reset or Ray Reconstruction from its
+kernels.
 
 Do not reapply the reverted capture/composition fence changes. Validate actual GPU
 operations and measure before and after every performance change. The matched comparator
@@ -169,32 +189,31 @@ Current target-machine evidence and unresolved Vulkan errors are in
 ## Pre-upscaler path
 
 Since 2.0 the model runs **before** DLSS Super Resolution by default (`crates/layer/src/preupscale.rs`,
-docs/PRE_UPSCALER_DESIGN.md): on a device with `VK_NVX_image_view_handle`, the layer identifies
-DLSS's registered colour input, holds the game's DLSS submit, runs the network on the
-render-resolution frame (every frame while the camera is still, every second frame in motion with the
-edit cache carrying it between; with DLSS's motion vectors and the jitter for the history) and
-writes the answer back before DLSS runs. Games that record their frame in DLSS's own command buffer
-are held inside it: the whole hold is recorded into that buffer, and the application's compute state
-is bound again after it (`preupscale/inline.rs`, `preupscale/restore.rs`). The colour input is
-what DLSS's own input kernel's parameters name with depth and motion vectors (which also finds DLAA's
-output-size input), with the older size rule as the fallback (docs/PRE_UPSCALER_DESIGN.md,
-"Identification by the input kernel's parameters (DLAA)"). DLSS Ray
-Reconstruction is never held: its input is the noisy ray-traced frame, so while its kernels
-(`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`; names from `vkCreateCuFunctionNVX`)
-launch nothing is identified and the model runs after the upscaler ("DLSS
-Ray Reconstruction"). Only that positive sign gates: Super Resolution needs no kernel name (Crimson
-Desert's is `rrlite_*`, and `custom_block*`/`k_initial_merge` are Frame Generation's); without a readable exposure image the
-exposure is measured from the frame ("Auto-exposure when the game gives DLSS none"). Everything else (no NVX, no DLSS, native)
-keeps the post-upscaler path. Only the launch-bearing command buffer whose
-kernel parameters name the identified colour input is held, so DLSS Frame Generation's submits go
-through untouched (docs/PRE_UPSCALER_DESIGN.md, "DLSS Frame Generation"). `NEURAL_FORGE_PREUPSCALE=off` is the
-rollback switch: since 3.0 it also loads no network (the native backend needs a mode on), so the post path
-presents every frame untouched; the A/B with the model on the finished frame is `placement=present`.
-`dump`, `identity` and `roundtrip` are diagnostics. Rule: with
-`NEURAL_FORGE_PREUPSCALE=off` the post path must stay byte-identical to 1.1.0 (the hooked-command
-list is the default set, no NVX entry points resolved, nothing of `preupscale` reachable), and a
-device without NVX must not get the tracking under the default either; the tests in
-`lib.rs::probe_command_tests` and the smoke test's `off` pass guard this.
+docs/PRE_UPSCALER_DESIGN.md): on a device with `VK_NVX_image_view_handle`, the layer holds the game's DLSS submit,
+runs the network on the render-resolution frame (every frame while the camera is still, every second frame in motion
+with the edit cache carrying it between; with DLSS's motion vectors and the jitter for the history) and writes the
+answer back before DLSS runs. Games that record their frame in DLSS's own command buffer are held inside it: the whole
+hold is recorded into that buffer, and the application's compute state is bound again after it
+(`preupscale/inline.rs`, `preupscale/restore.rs`).
+
+Everything about DLSS comes from NGX's records (`ngx_ring.rs`, docs/PROTON_NGX.md): the NGX wrapper writes one before
+NVIDIA's `EvaluateFeature` and an end record after it returns. A command buffer belongs to an evaluate when one of
+its launches names the evaluate's colour input (the registered views' handles in the launch's parameters) between the
+two; Super Resolution's is the hold point (the split in front of it, or inside it at that launch), and the images,
+exposure, jitter, `MV.Scale` and reset of a hold are its record's. The identification (the images watched for their
+layouts) is the newest Super Resolution record on the device. DLSS Ray Reconstruction (NGX's feature 13) is never held
+before the upscaler: its input is the noisy ray-traced frame, so the model runs after DLSS's output there (the hold
+after DLSS goes after the evaluate's last write of its output, as many writes as the last ended evaluate made) or on
+the finished frame. DLSS Frame Generation's buffers carry no Super Resolution evaluate and go through untouched. No
+rule reads DLSS's kernels (names or parameter words) to decide anything: without records (no Neural Forge Proton,
+`NEURAL_FORGE_NGX_RING=off`) nothing is held before or after DLSS, and the status says the wrapper is missing.
+Everything else (no NVX, no DLSS, native) keeps the post-upscaler path. `NEURAL_FORGE_PREUPSCALE=off` is the rollback
+switch: since 3.0 it also loads no network (the native backend needs a mode on), so the post path presents every
+frame untouched; the A/B with the model on the finished frame is `placement=present`. `dump`, `identity` and
+`roundtrip` are diagnostics. Rule: with `NEURAL_FORGE_PREUPSCALE=off` the post path must stay byte-identical to 1.1.0
+(the hooked-command list is the default set, no NVX entry points resolved, nothing of `preupscale` reachable), and a
+device without NVX must not get the tracking under the default either; the tests in `lib.rs::probe_command_tests` and
+the smoke test's `off` pass guard this.
 
 ## Historical evidence
 

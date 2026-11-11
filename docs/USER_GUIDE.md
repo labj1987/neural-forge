@@ -24,7 +24,9 @@ extracted (a DLL without the small one), the other one runs.
 When the game and other programs leave too little video memory for the network, the driver would move
 part of it to system memory, where it runs many times slower. Instead the network pauses and frames go
 to DLSS untouched. The small network is no way out: it needs only about 45 MiB less video memory than the
-full one. The network comes back once the memory has had room for it for 10 s (and no sooner than 30 s
+full one. The guard needs only a couple of slow network frames, so it also steps in when a game slows to a few
+frames a second (a pause decided while the game is too slow for the model to run is applied after 6 s). The
+network comes back once the memory has had room for it for 10 s (and no sooner than 30 s
 after the pause, longer when pauses repeat). While paused, Neural Forge holds no video memory. The Status
 tab's Model placement line says when the network is paused.
 
@@ -61,6 +63,17 @@ layer picks the place for each game by itself:
   the model resolution must be 100% (below it the frame is presented untouched). A float16 (scRGB) or
   10-bit SDR swapchain is presented untouched, and captures of an HDR frame are refused.
 
+In a pause menu, a map or a loading screen many games stop calling DLSS (Cyberpunk 2077's Esc menu shows the
+last frame, which already has the model's edit, under the menu). The model then stays where it is, with its
+network loaded, and runs again on the game's first frame after the menu; the Model placement line says "paused
+with the game's DLSS". It moves to the finished frame when the game goes on calling DLSS for 30 s with no frame
+worked on before the upscaler (DLAA, or a DLSS input Neural Forge no longer recognises), or sends DLSS nothing for
+5 minutes (DLSS switched off for another upscaler, or only Frame Generation on). The same two rules apply from the
+start in a game that ships DLSS: its loading screens and menus before DLSS's first frame go untouched, and it gets
+the model on the finished frame only once DLSS has not upscaled for 5 minutes, or has for 30 s with nothing held.
+Frame Generation alone does not count as DLSS here. A DLSS game that is not on the Neural Forge Proton keeps the
+model off while DLSS upscales, unless the placement puts it on the finished frame.
+
 The game's own **DLSS Frame Generation** works with the model before the upscaler and after DLSS.
 Generated frames are built from enhanced frames, and the model runs once per real frame.
 
@@ -79,8 +92,18 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, the HUD group: finding the HUD and HUD regions on the finished frame, and the Sharpening group: adaptive sharpening (CAS) and Clarity on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
-| Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
-| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on), and the launch option to copy by hand for a game you pick. |
+| Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
+| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on; a tested game says where the model runs in it), the launch option to copy by hand for a game you pick, **Proton with DLSS parameters** (below) and **Uninstall…** (see [Uninstall](#uninstall)). |
+
+**The HDR verdict** (the Status tab's HDR line, `hdr_verdict=` in `neural-forge-cli shmctl status`, Save report and the
+game's log as `[layer] HDR: ...`) says in one line whether the game presents HDR and, when it does not, why:
+"game outputs HDR10"; "game outputs SDR; HDR10 was available" (the game's own HDR setting is off); "game asked for
+SDR although HDR metadata was sent" (the game's HDR setting is on but its window is SDR) or "game outputs SDR",
+each followed by why the window had no HDR when it had none (gamescope without `--hdr-enabled`, Proton without
+`PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`, or the desktop's HDR off). In brackets follow the window's format and
+colour space, whether its surface offered an HDR colour space, the first HDR metadata the game sent, whether
+gamescope's layer is loaded and Proton's two HDR switches; after them the desktop's HDR state per display, where
+GNOME or KDE Plasma can tell (a gamescope session says so).
 
 Before the upscaler the network runs on every frame while the camera is still and on every second
 frame while it moves; the frame in between reuses its last result, moved with the game's motion and
@@ -108,16 +131,16 @@ GrimsVerk's runtime research).
 
 **Passes** (1 to 10, default 1) runs the model that many times over each frame, before or after the
 upscaler: every pass after the first works on the previous pass's picture. Each pass costs about as much
-GPU time as the first, and the effect builds up with every pass. In GTA V Enhanced at 1440p with frame
-generation 4x (real frames per second, pass 4 of the built-in benchmark, one run each; the small
-network's one pass is from 2026-10-19, the rest from 2026-10-28):
+GPU time as the first, and the effect builds up with every pass. In GTA V Enhanced at 3840x2160 (DLSS
+Balanced) with frame generation 4x on an RTX 5070 (real frames per second, pass 4 of the built-in benchmark,
+one run each, 2026-11-10; 58.1 with the model off):
 
 | Network | 1 pass | 2 passes | 3 passes |
 |---|---|---|---|
-| Small | 74.3 | 60.4 | 52.8 |
-| Full | 62.1 | 50.7 | |
+| Small | 41.0 | 33.6 | 28.3 |
+| Full | 36.7 | 27.4 | |
 
-Two passes of the small network cost about as much as one pass of the full network, and look
+Two passes of the small network cost a little more than one pass of the full network, and look
 over-processed: grittier stone and noisier roads. Each pass keeps its own history, so the passes do not
 blend toward each other's pictures over time. **Per-pass settings** (Edit…) let each pass use its own
 intensity, local tone, local structure, skin structure, style, auto mask, model resolution, colour of the
@@ -130,16 +153,17 @@ values keep more of the pass's own input, so the passes add less to each other.
 **Balanced** (58%), **Performance** (50%) or **Ultra Performance** (33.3%). Below Full the model works on a
 downscaled copy of the frame and its change is brought back to full size, following the frame's own edges,
 so the frame keeps its own detail; the model costs less GPU time and memory but adds less detail of its own.
-Before the upscaler the frame is already small (1486x836 in GTA V at 1440p) and the smaller sizes keep
-little of the model's detail; after DLSS, on the full output (with Ray Reconstruction), Performance keeps
-most of it for about 30 fps more (see [MEASURED_RESULTS.md](MEASURED_RESULTS.md)). Full is the frame exactly as
+Before the upscaler the frame is already small (2228x1253 in GTA V at 4K with DLSS Balanced, 1486x836 at
+1440p) and the smaller sizes keep little of the model's detail; after DLSS, on the full output (with Ray
+Reconstruction), Performance keeps most of it for about a fifth more frames (Crimson Desert at 4K: 84 against
+70 fps shown; see [MEASURED_RESULTS.md](MEASURED_RESULTS.md)). Full is the frame exactly as
 without the setting. Each pass can have its own model resolution in the per-pass settings: a pass works
 on the previous pass's full-size picture at its own size. Changing it starts the model's history afresh
 and shows a moment of untouched frames while the model is prepared for the new size.
 
 **Model brightness** (Model tab) sets how bright the picture the model works on is, before the upscaler and
 after DLSS; the game's own brightness is kept either way, because the picture is brought back exactly
-afterwards. **Game** (the default) uses the exposure the game gives DLSS (measured from the frame instead where a game's is always 0, or too small to use). **Auto** measures it from the frame, within half
+afterwards. **Game** (the default) uses the exposure the game gives DLSS (measured from the frame instead where a game's is always 0, or too small to use, or, for as long as it does, where the game hands DLSS a frame it already brightened and its steady exposure would make the model's picture far too dark: Clair Obscur: Expedition 33; the layer log says so with `the colour input looks pre-exposed`, and `no longer looks pre-exposed` when it goes back). **Auto** measures it from the frame, within half
 to 16 times the game's own so night stays night, for games that give the model a very dark picture: in daytime
 Crimson Desert's has a median brightness of 0.14 of white with Game and 0.50 with Auto. How the model treats the
 shadows changes with it, so compare the two in the game. **Model
@@ -203,8 +227,8 @@ midtones** (0.5) keeps it off the darkest and brightest parts (0 evenly, 1 midto
 protection** (0.5) stops the blur at strong brightness edges so they do not grow bright or dark halos. The
 **HUD regions** apply: nothing inside a Keep region, the strength's share inside a Soften one (Find the HUD
 does not apply here). Clarity does not use the game's depth: on the presented frame there is none to use.
-GPU time a presented frame at 1440p on an RTX 5070: 0.29 ms for CAS, 0.33 ms for Clarity at radius 16 (0.43 ms at
-64), 0.37 ms for both; most of it is copying the frame out and back. It is paid on every presented frame, so with
+GPU time a presented frame at 3840x2160 on an RTX 5070: 0.69 ms for CAS, 0.86 ms for Clarity at radius 16 (1.05 ms
+at 64), 0.94 ms for both (at 2560x1440: 0.28, 0.32, 0.43 and 0.37 ms); most of it is copying the frame out and back. It is paid on every presented frame, so with
 frame generation 4x four times a rendered frame. `neural-forge-cli shmctl set sharpen_cas 0.5` (and
 `clarity_strength`, `clarity_radius`, `clarity_midtones`, `clarity_edges`) does the same from a terminal, and
 a game can have its own sharpening like any other setting ([Settings for one game](#settings-for-one-game)); `NEURAL_FORGE_SHARPEN` overrides it for one launch, for comparisons. A capture (the Debug tab's Capture button) shows the frame
@@ -219,6 +243,41 @@ Capture button (and `shmctl capture`) saves the next presented frame before and 
 Forge's composition and says what happened: where the files are and whether the effect changed the
 frame, or why nothing was written; clicking again while it waits cancels it, and a request no game
 takes is withdrawn after 5 seconds.
+
+### Proton with DLSS parameters
+
+To run the model before or after DLSS the layer needs what the game gave DLSS: its input and output images, the camera
+jitter, how the motion vectors are measured, a reset, the exposure. Games run with a **Neural Forge copy of Proton**
+hand the layer exactly that, by name (docs/PROTON_NGX.md). A DLSS game without one keeps the model off (the status
+and `doctor` say so), unless you choose the finished frame as the placement; games without DLSS run on the finished
+frame as before.
+
+**Switching a game on sets its Proton.** With Steam closed, switching a game on in the Setup tab (or `neural-forge-cli
+enable GAME`) also sets the game's Steam compatibility tool to a Neural Forge copy of the Proton it runs with (of
+Steam's default, else Proton Experimental), making the copy first if there is none; switching it off (or `uninstall
+--purge`) puts back the Proton it had. A Proton chosen for the game that is not installed is refused, never replaced
+with another; a native Linux game keeps running without Proton. Copies are made from Proton 10 or newer (Wine 10+):
+the wrapper finds the game's process through Wine's `ProcessWineUnixPid`, which Proton 8 and 9 lack. Neural Forge edits Steam's `config/config.vdf` for this the way ProtonPlus and
+ProtonUp-Qt do, only while Steam is closed, with a backup beside it. Restart Steam after a new copy was made.
+
+The Setup tab also lists your installed Protons (GE-Proton, Proton-CachyOS, Valve's Proton and Proton Experimental) with
+**Make copy**. The copy is made next to the original in Steam's `compatibilitytools.d`, named `<version>-NeuralForge`
+(`GE-Proton11-12-NeuralForge`); on the same drive it takes no space (hard links). It differs from the original in one
+thing: NVIDIA's NGX core (`_nvngx.dll`) is reached through Neural Forge's small wrapper, which passes every DLSS call on
+unchanged. Your original Proton is not changed. Then:
+
+1. Restart Steam (it lists new Protons when it starts).
+2. In the game's Properties > Compatibility, tick "Force the use of a specific Steam Play compatibility tool" and
+   choose the copy.
+
+A copy whose original has changed since (a new GE-Proton in a "Latest" folder, a Proton Experimental update), or that
+holds another NGX wrapper than the installed Neural Forge, is marked with **Make again** (`proton-tool update`): with
+Steam closed it makes the copy again (a new version under its new name, its games moved over and the old copy
+removed), or puts the new wrapper in place. A copy whose original was deleted (ProtonUp replaced it with a newer
+version) keeps working as it is. Updating Neural Forge puts its wrapper into every copy by itself. A copy a
+running game uses is never replaced or removed. `PROTON_NO_NEURAL_FORGE_NGX=1 %command%` in a game's launch options turns the wrapper off for
+that game while it keeps the copy. Online games with anti-cheat may refuse a changed module: use the copy for
+single-player games. From the CLI: `neural-forge-cli proton-tool list|create SOURCE|update|remove NAME`.
 
 ### Settings for one game
 
@@ -245,9 +304,18 @@ settings win over built-in ones, and an update never changes your files.
 
 ## Tested games
 
-Each game was run on the test machine (RTX 5070, 2560x1440, Proton) with its own settings as found:
+Each game was run on the test machine (RTX 5070, 2560x1440 or 3840x2160, Proton) with its own settings as found:
 DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. In each one the model
-ran with no missed frames and no GPU fault.
+ran with no missed frames and no GPU fault. GTA V Enhanced (`FrameLimit` 120), Cyberpunk 2077, Red Dead
+Redemption 2 and Crimson Desert were run again at 3840x2160, the last three with the game's HDR (HDR10) on
+(Proton-GE with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`); GTA V has no HDR.
+
+The same facts, with the version each game was last seen working in and its known issues, are built into the app:
+the Status tab's **Tested game** line shows the running game's, the Setup tab's games list says where the model runs
+in each tested game, `neural-forge-cli games --tested` lists them all and `neural-forge-cli games --tested GAME` shows
+one game's setup notes. Diagnose says when the model runs somewhere else in a tested game than it did in testing.
+Users have reported the model before the upscaler, inside DLSS's buffer, in Stellar Blade, Indiana Jones and the
+Great Circle and Clair Obscur: Expedition 33 (#51); the list carries them too.
 
 | Game | Engine, API | DLSS used | Where the model runs |
 |---|---|---|---|
@@ -261,8 +329,13 @@ ran with no missed frames and no GPU fault.
 | Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | Before the upscaler, inside DLSS's buffer |
 | Remnant II | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Before the upscaler, inside DLSS's buffer |
 | Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Ray Reconstruction, Frame Generation | After DLSS with Ray Reconstruction on; before the upscaler, inside DLSS's buffer, with it off |
+| Cyberpunk 2077 | REDengine 4, DX12 | Super Resolution, Ray Reconstruction, path tracing, Frame Generation 3x (its built-in benchmark) | After DLSS with Ray Reconstruction on; before the upscaler, inside DLSS's buffer, with it off; After DLSS on request either way |
+| Red Dead Redemption 2 | RAGE, Vulkan | Super Resolution (Quality) | Before the upscaler, inside DLSS's buffer, on a compute queue shared with the game; not on the finished frame |
 
 Setup notes for these games:
+
+- **Red Dead Redemption 2** runs on Vulkan (Settings > Graphics > Advanced > Graphics API). Start it through Steam as
+  usual (its Rockstar launcher checks Steam). The model runs only before the upscaler there, so turn DLSS on.
 
 - **GTA San Andreas - The Definitive Edition** resets its Frame Rate setting to 60 at every launch,
   whatever its settings files say (a game bug). Set it to Unlocked in Options > Graphics each time.
@@ -311,7 +384,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_LOG_TIME=1` | layer | Testing aid: timestamp every log line. |
 | `NEURAL_FORGE_SHM`, `NEURAL_FORGE_UID` | all | The shared-memory file, and the uid its directory is named after. Normally left alone. |
 | `NEURAL_FORGE_PROBE_NGX=1` | layer | Testing aid: log the game's DLSS work as it reaches Vulkan ([PRE_UPSCALER_PROBE.md](PRE_UPSCALER_PROBE.md)). |
-| `NEURAL_FORGE_PROBE_PARAMS=1`, `NEURAL_FORGE_PROBE_KERNEL=<name>` | layer | Testing aids: log every word of DLSS's input-kernel parameters, or of a named kernel's. |
+| `NEURAL_FORGE_PROBE_KERNEL=<name>` | layer | Testing aid: log every word of a named kernel's parameters. |
 | `NEURAL_FORGE_LOG_LAUNCH_QUEUES=1` | layer | Testing aid: log which queue each DLSS launch is submitted on. |
 | `NEURAL_FORGE_CAPTURE_AT=N:MS[:FRAMES][,...]` | layer | Testing aid: capture the presented frame (or FRAMES consecutive frames) MS milliseconds after DLSS's frames resumed (after a gap) for the Nth time; 1 is the first frames. Several entries, separated by commas, are each taken once. |
 | `NEURAL_FORGE_CACHE_DUMP_AT=N:MS[:K][,...]` | layer | Testing aid: dump K (default 16) consecutive holds before the upscaler for `scripts/cache_replay.py`, at the same moments `NEURAL_FORGE_CAPTURE_AT` names. `neural-forge-cli shmctl dump-cache [--holds K]` asks for one now. |
@@ -322,12 +395,14 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_NATIVE_NO_HISTORY=1` | layer | Testing aid: every network frame without history, as after a reset. |
 | `NEURAL_FORGE_PREUPSCALE_TRANSFER=aces\|linear` | layer | Testing aids: `aces` encodes the picture before the upscaler with RTX Remix's transfer (an ACES curve, and on the way back the model's change scaled by each pixel's own ratio, with Remix's highlight recovery); `linear` leaves out the sRGB curve (the network sees linear values, and the edit cache decodes the same way). `srgb` is the default. |
 | `NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS=off` | layer | Testing aid: before the upscaler (and on an HDR10 finished frame), apply the model's change to the brightest highlights too: no keeping of clipped values, no fade near the top, no highlight recovery with `aces`. |
-| `NEURAL_FORGE_PREUPSCALE_PICK=N` | layer | Testing aid: take the Nth colour candidate where DLSS's input launch names several. |
 | `NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES=N`, `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore` | layer | Testing aids for `NEURAL_FORGE_PREUPSCALE=dump`: consecutive frames per dump (default 1); dump even where DLSS's buffer synchronises depth or motion vectors. |
-| `NEURAL_FORGE_PROBE_DEPTH=1`, `NEURAL_FORGE_PROBE_RR=<a,b,...>\|1` | layer | Testing aids: log the depth choice and barriers of the first 120 holds; log the images of the launches whose kernel names match (first 4000). |
+| `NEURAL_FORGE_PROBE_DEPTH=1` | layer | Testing aid: log the depth choice and barriers of the first 120 holds. |
 | `NEURAL_FORGE_PROBE_IMAGE=<kernel>[+],...` | layer | Testing aid: copy the images a named CUDA launch reads, before it (or after it with `+`), once, into `captures/probe-<ms>/`. |
 | `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` | layer | Gives every network activation its own allocation again instead of sharing memory by lifetime (more video memory, same result). |
-| `NEURAL_FORGE_POST_MOTION=none\|zero\|flow`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | Testing aids: after the upscaler, give the model a history: its previous output at the same pixel (`zero`) or where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; `zero` elsewhere), not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and dropped on a scene cut. Default `none`: no history (measured, neither is steadier than none). |
+| `NEURAL_FORGE_POST_MOTION=zero\|flow\|none`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | After the upscaler (the finished frame), the model's history: its previous output at the same pixel (`zero`, the default), where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; it adds that extension and one optical-flow queue to the game's devices, which hung GTA V Enhanced), or none (`none`: every frame on its own, which flickers in large soft patches on grainy or noisy frames). The history is not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and is dropped on a scene cut. |
+| `NEURAL_FORGE_RAISE_VULKAN=off` | layer | A game whose Vulkan instance asks for a version below 1.3 (Red Dead Redemption 2 asks for 1.1) gets one created for 1.3, which the model needs; `off` creates it as the game asks (the model then cannot run in that game). |
+| `NEURAL_FORGE_SHARE_QUEUE=off` | layer | A game that takes every compute queue of the GPU (Red Dead Redemption 2) gets one of them shared with the model, every use of it synchronized; the model then runs before the upscaler only. `off`: no model on such a game. |
+| `NEURAL_FORGE_PROBE_VRAM=1` | layer | Diagnostics: the video memory guard logs what it sees once a second (the device's memory use and budget, the network's recent times and its best). |
 | `NEURAL_FORGE_FAIL_CREATE=N[@K]`, `NEURAL_FORGE_NATIVE_FAIL=chain`, `NEURAL_FORGE_NATIVE_FAIL=vram` | layer | Testing aids: let K network builds through, then fail the next N; report one counter-chain timeout; or have the video memory guard pause the network at its 600th and 900th frame, as if it did not fit. |
 | `NEURAL_FORGE_GUI_OPEN=<tab>` | GUI | Testing aid: open a tab (`model`, `composition`, `debug`, `status`, `setup`, or `passes` for the per-pass dialog) at start, for screenshots. |
 | `NEURAL_FORGE_BENCH=1`, `NEURAL_FORGE_REQUIRE_VULKAN=1`, `NEURAL_FORGE_TEST_DISPLAY=:N` | layer tests | Testing aids: run the hot-path GPU benchmark; fail instead of skipping when no Vulkan device exists; run the present-fence test on a real swapchain in an X server (an Xvfb's display). |
@@ -336,15 +411,20 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_NATIVE_RIG`, `NEURAL_FORGE_NATIVE_MODEL`, `NEURAL_FORGE_NATIVE_HEADS`, `NEURAL_FORGE_NATIVE_PROFILE=1` | native tests | Testing aids: run the network tests on a dumped frame, with a model folder, saving or comparing output heads, and timing each kernel. |
 | `NEURAL_FORGE_NR_NO_FUSE_PRE=1`, `_NO_FUSE_POOL=1`, `_NO_FUSE_UPRES=1`, `_NO_FUSE_POST=1`, `_NO_PTX_MLP=1`, `NEURAL_FORGE_NR_CHAIN=0`, `_VIT_CHAIN=0`, `_CHAIN_MASK=N`, `_DEFER_MAX=N`, `_PTX_GEMM=0`, `_PTX_GEMMT=0`, `_PTX_GEMMV=0`, `_PTX_QKV=0`, `_PTX_FFN=0`, `_PTX_ATTN=0`, `_PTX_BLOCK32=0`, `_SPLITK=N`, `_ATTN_STREAM=N` | network | Testing aids: turn off one of the network's fused kernels or PTX kernel families, or change how its launches are chained and split (`third_party/opendlss-nr/src/nr_graph.cpp`, `kernels.cpp`). A switch takes `1` or `0` and a number a whole number; anything else is reported once on the game's standard error and ignored. `NEURAL_FORGE_NR_VALIDATION=1` and `NEURAL_FORGE_NR_DEBUG=1` apply only to the network's own standalone Vulkan context (its tools), not inside a game. |
 | `NEURAL_FORGE_SMOKE_SO=/path` | `scripts/smoke-test.sh` | Test this layer library instead of building the debug one. |
+| `PROTON_NO_NEURAL_FORGE_NGX=1` | a Proton copy's `proton` script | The game runs without the NGX wrapper (NVIDIA's core directly), as with the original Proton. |
+| `NEURAL_FORGE_NGX_RING=off\|/path` | layer | `off`: the layer reads no NGX records, so nothing is held before or after DLSS (as without the wrapper). A path: read that ring file (left in place) instead of this process's. |
+| `NEURAL_FORGE_NGX_LOG=Z:\path\ngx.log` | NGX wrapper (a Windows path) | One line per DLSS creation, evaluate (every named image, the jitter, motion vector scale, exposure and reset) and release. Off by default. |
+| `NEURAL_FORGE_NGX_CORE=C:\path\_nvngx.dll` | NGX wrapper | Load NVIDIA's core from here instead of `NVIDIA_WINE_DLL_DIR`. |
 
 ## CLI
 
 The CLI is installed as `~/.local/share/neural-forge/bin/neural-forge-cli`; add that folder to your
 `PATH`, or call it by that path, for the commands in this guide.
 
-`neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID]`, `games`,
+`neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID] [--trace FILE]`, `games [--tested [GAME]]`,
 `enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]`, `disable GAME`, `config`, `import-binaries DIR`,
 `extract-model DIR [--network full|small]`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`,
+`proton-tool [list|create SOURCE|update|remove NAME]` for the Proton copies (above),
 `game-settings list|show GAME|set GAME NAME VALUE|clear GAME [NAME]` for a game's own settings, and
 `shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--view V]|capture --cancel|dump-cache [--holds K]|reset|lut FILE|none`
 for the live settings. `doctor`, `report` and `shmctl status` only look: they create and change nothing.
@@ -368,8 +448,19 @@ Valve's VAC) cannot be seen.
 | `~/.local/share/neural-forge/` | The installed layer and GUI, the extracted model (`model/`), an imported DLL (`binaries/`), captures (`captures/`). |
 | `~/.local/state/neural-forge/layer.log` | The layer's session log: state changes and errors only, never per frame (kept to 256 KiB, the previous one as `layer.log.1`). Diagnose and the report read it. |
 | `/tmp/neural-forge-$UID/shm.bin` | The shared memory the layer and the GUI talk through. |
+| `~/.local/share/neural-forge/lib/neural-forge/proton/_nvngx.dll` | The NGX wrapper the Proton copies get. |
+| `<Steam>/compatibilitytools.d/<version>-NeuralForge/` | A Proton copy (`neural-forge-proton.txt` in it says what it was made from). |
+| `/dev/shm/neural-forge-ngx-<pid>.ring` | The wrapper's records for one game process; the layer removes the file when it opens it. |
 
 ## Uninstall
+
+**Uninstall…** at the bottom of the Setup tab removes everything Neural Forge put on the computer, after a
+confirmation that lists it: what `neural-forge-cli uninstall --purge` removes (below), Neural Forge's own Proton
+builds (the `*-NeuralForge` folders in Steam's `compatibilitytools.d`), and the AppImage file it runs from. With
+Steam running, the launch options cannot be changed: close Steam first, or the games that keep Neural Forge's
+variables are listed afterwards with the options to set by hand (the variables do nothing without the layer). The
+app quits when it is done. Deleting only the AppImage file does not uninstall Neural Forge: the layer it installed
+under `~/.local/share/neural-forge` stays, and games switched on keep loading it.
 
 `neural-forge-cli uninstall` removes the files it installed (files you changed are kept). The
 games you switched on keep Neural Forge's variables in their launch options, which do nothing without
@@ -379,17 +470,23 @@ variables out of every game's Steam launch options (your own options stay), in e
 and removes the files it keeps next to each account's `localconfig.vdf` (`.neural-forge.orig` and
 `.neural-forge.bak`, its copies of that file, and `.neural-forge.lock`). Steam must be closed for
 that: while it runs, or while a game's options cannot be changed safely, the purge removes nothing and
-names each game with the launch options to set by hand instead. Then it removes the config,
+names each game with the launch options to set by hand instead. Then it removes Neural Forge's Proton builds
+(`compatibilitytools.d/*-NeuralForge`), the config,
 everything under `~/.local/share/neural-forge` (the model, an imported DLL, captures),
-`~/.local/state/neural-forge` and `/tmp/neural-forge-$UID`.
+`~/.local/state/neural-forge`, `/tmp/neural-forge-$UID` and the Proton copies it made (choose another Proton for
+the games that used one).
 
 ## More known issues
 
 - **Each DLSS game needs a test run before it is claimed:** engines hand DLSS its inputs in
   different ways, and several broke an assumption the first time. See [Tested games](#tested-games).
-- **The model after DLSS is tested in two games** (Crimson Desert and Hogwarts Legacy, with Ray
-  Reconstruction). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
-  much lower frame rate (36 against 120 fps shown in Crimson Desert).
+- **The model after DLSS is tested in three games** (Crimson Desert and Hogwarts Legacy with Ray
+  Reconstruction; Cyberpunk 2077 with and without it). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
+  much lower frame rate (14 against 70 fps shown in Crimson Desert at 4K with Ray Reconstruction).
+- **Hogwarts Legacy with Ray Reconstruction:** its Ray Reconstruction does not say what unit its motion vectors
+  are in (Cyberpunk 2077's does), so the model after DLSS takes them as render pixels, as their size suggests, or
+  in the unit Super Resolution gave if it ran earlier in the session. Neither has been checked against the picture
+  in this game: if the model's history drags or smears behind moving things there, set Placement to Finished frame.
 - **HDR on the finished frame:** HDR10 is handled (above) and tested in Crimson Desert; float16
   (scRGB) swapchains are presented untouched, and HDR frames cannot be captured.
 - **Comparing with NVIDIA's own DLSS 5 in a game that ships it:** Proton's dxvk-nvapi 0.9.3 or newer passes
@@ -402,9 +499,29 @@ everything under `~/.local/share/neural-forge` (the model, an imported DLL, capt
 
 ## More troubleshooting
 
+- **HDR does not come on.** Read the HDR verdict (above) on the Status tab while the game runs. Where it says the
+  window offered no HDR colour space, the game could not choose HDR whatever its settings: on a desktop with HDR on,
+  Proton offers it with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` in the launch options (Proton-GE or a Proton
+  with its Wayland driver), and gamescope with `--hdr-enabled`. Where it says HDR10 was available, switch on the
+  game's own HDR setting. Where HDR metadata was sent but the window is SDR and HDR10 was available, the game
+  itself chose SDR; attach Save report to an issue.
 - **The model does not run.** The Status tab's Model placement line, or Diagnose, gives the reason:
   no model extracted, a missing device feature, or a failed build (retried on its own). The full
   layer log (`NEURAL_FORGE_LOG=/path` in the launch options) has the `[native]` lines.
+- **Model placement says "DLSS input identified, not holding".** The layer found the frame the game hands
+  to DLSS but could not hold it, so the model runs on the finished frame; the reason follows on the same
+  line (`preupscale_state=5` and `preupscale_reason=` in `neural-forge-cli shmctl status`). "The model is switched
+  off" (F11 or the app) and "the Placement setting runs no pass before the upscaler" are your own choices, not a
+  problem. The layer log
+  says each reason once: `[preupscale] no hold inside DLSS's buffer (identification N): <why>; colour input ...`
+  when the hold inside DLSS's own command buffer refuses the frame, and `[preupscale] <why>; not holding` when
+  the hold that splits the game's submission does. Attach **Save report**'s zip and that log to an issue.
+- **The game crashes with Neural Forge on.** Run it with `NEURAL_FORGE_LOG=/path` (and `NEURAL_FORGE_LOG_TIME=1`)
+  in the launch options and attach that log. If Neural Forge itself failed, its last line starts with
+  `[panic]` and says where. Otherwise the last milestone lines say how far it got: `first hold recorded into
+  DLSS's command buffer` (the model's work was put into the game's own DLSS work), `the first hold recorded into
+  DLSS's command buffer ran` (that work ran on the GPU), or `first split hold written back`. A
+  `hold inside DLSS's command buffer available on this device` line alone means nothing was held yet.
 - **Steam overlay problems.** The layer leaves the overlay's own small swapchain alone, and only the
   executables in `NEURAL_FORGE_TARGET_EXE` (which switching a game on sets) can use Neural Forge.
 - **"Installing the layer for Steam games failed: refusing to overwrite ..."** A file Neural Forge

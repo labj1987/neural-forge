@@ -26,6 +26,13 @@
 //    goes into the high 16 bits for the CPU's plausibility check; an unusable game e leaves the adapted
 //    one as it is. The state keeps the adapted e unbounded either way, so the bound does not slow the
 //    adaptation.
+//    With `relative` 2 (observe: the game's exposure is used as it is) only the state is written: the
+//    exposure buffer keeps the game's texel, and the CPU compares the frame's measured target with it
+//    (a colour input the game already exposed, Session::check_exposure).
+//    With `relative` 3 (a colour input the game already exposed: the capture copied the game's texel in, as
+//    for 1) the e written is the adapted one, unbounded, and the game's own e goes into the high 16 bits, so
+//    that the CPU keeps comparing the two and hands the frame back to the game's exposure once the frame is
+//    no longer far below it.
 //
 // The CPU reference is `preupscale::hdr::auto_exposure_reference`; constants must match.
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -67,7 +74,8 @@ layout(push_constant) uniform Params {
   float key;   // the exposed luma the log-average maps to
   float rate;  // per-frame adaptation towards the target, in log2 space
   uint pass;   // 0 histogram, 1 resolve
-  uint relative; // 1: within LIFT_LO_LOG2..LIFT_HI_LOG2 of the game's e in the exposure buffer
+  uint relative; // 1: within LIFT_LO_LOG2..LIFT_HI_LOG2 of the game's e in the exposure buffer; 2: state only;
+                 // 3: unbounded, the game's e kept in the high half
 } p;
 
 shared uint s_count[BINS];
@@ -161,10 +169,13 @@ void resolve() {
   u_state.log2_e = log2_e;
   u_state.valid = 1u;
   u_state.samples = total;
+  if (p.relative == 2u) {
+    return;
+  }
   if (p.relative != 0u) {
     float game = unpackHalf2x16(u_exposure.bits).x;
     float used = log2_e;
-    if (game > 1e-6 && game < 65504.0) {
+    if (p.relative == 1u && game > 1e-6 && game < 65504.0) {
       used = clamp(log2_e, log2(game) + LIFT_LO_LOG2, log2(game) + LIFT_HI_LOG2);
       used = clamp(used, MIN_LOG2_E, MAX_LOG2_E);
     }

@@ -478,10 +478,10 @@ of the layer's own, waited for (bounded). Anything else is echoed, as the helper
 the heartbeat and `helper_state` keep the layer's `helper_alive` true. The regions are imported as host
 memory where the device allows (staged copies otherwise).
 
-- **History, selectable**: there are no motion vectors after the upscaler. By default
-  (`NEURAL_FORGE_POST_MOTION=none`) every frame is a first frame, with a fixed seed (a changing seed with
-  nothing blending frames would shimmer). `zero` and `flow` give the path a history (zero motion, or the
-  GPU's optical flow, as the helper's NGX had): "History after the upscaler" below.
+- **History**: there are no motion vectors after the upscaler. By default (`NEURAL_FORGE_POST_MOTION=zero`,
+  since 3.14.0) each frame blends toward the previous output at the same pixel; `flow` reprojects it by the GPU's
+  optical flow (as the helper's NGX had), and `none` makes every frame a first frame with a fixed seed: "History
+  after the upscaler" below.
 - **Never both paths at once**: the pre-upscaler hold and this server share the network's frame state; each
   refuses for a second after the other used it (`Loader::claim_pre`, `claim_post`).
 - **A helper process that is running wins**: the server does not start if the helper's heartbeat moves.
@@ -724,6 +724,16 @@ is out of scope).
     `PROTON_ENABLE_HDR=1` (its HDR option on, `bUseHDRDisplayOutput=True`, the desktop in bt2100): the swapchain stays
     A2B10G10R10 in the sRGB colour space. The layer does not touch surface formats; the model before the upscaler is
     the same with 8-bit and 10-bit output (a change of 12 of 255, detail x1.14).
+  - **Cyberpunk 2077 (issue #49, 2026-11-10).** On every second frame NGX's auto-exposure (`cuda_luma_convert_kernel`,
+    three `cuda_reduce_sum_kernel`, `cuda_auto_exposure_copy_kernel`) reads the colour input before
+    `hiluma_engine_input_*` carries the jitter, and Cyberpunk's jitter never repeats (3000 launches probed, 3000
+    different values), so nothing can be predicted: half the holds logged "held without the jitter", which also cost
+    the next frame its jitter step (no previous jitter) and broke the edit cache's chain on each. Where a hold would
+    come before the launch carrying the jitter and none can be predicted, it now goes at that input launch
+    (`LaunchRefs::hold_deferred`; logged once, "the camera jitter does not repeat"). DLSS's auto-exposure then reads
+    the frame before the model, as a game's own exposure always is. Where prediction works (Crimson Desert) the hold
+    stays at the first launch reading the colour input. Measured: every hold with its jitter (no "held without the
+    jitter" in a benchmark run, it was 106 of 212 in 5 s).
 - **Fixed on the way:**
   - The after-the-upscaler path kept its claim on the network when the network was not built at its size,
     so the paths fought over the build. The claim is now always released.
@@ -937,16 +947,18 @@ against the effect off at 0.931%):
 passes); flicker does not move beyond the run-to-run noise. No value is clearly better, so 1 stays the
 default.
 
-## History after the upscaler (selectable, 2026-10-19)
+## History after the upscaler (2026-10-19; `zero` the default since 3.14.0)
 
-Without a history every frame after the upscaler is a first frame, which costs temporal stability
-(shimmer). `NEURAL_FORGE_POST_MOTION` selects one, for measurement (read once, logged once). `none` stays the
-default: measured, neither history is steadier than none ("Measured" below), so it is a testing aid:
+Without a history every frame after the upscaler is a first frame, which costs temporal stability: the
+network's answer to a grainy or noisy frame changes from frame to frame in large soft patches (issue #49,
+Cyberpunk 2077 with the model at present). `NEURAL_FORGE_POST_MOTION` selects the history (read once, logged
+once). `zero` is the default since 3.14.0 ("Measured again" below); 3.8.0 to 3.13.0 shipped `none` on a
+measurement that scored the wrong quantity ("Measured" below):
 
 | Value | History |
 |---|---|
-| `none` (default) | None: lanes 7-9 copy the proxy, seed 0, no blend. Bit for bit as 3.7.0 (`the_shipped_frame_stays_bit_for_bit` pins the answers and lanes from 3.7.0's shaders). |
-| `zero` | Each pass's previous output at the same pixel. |
+| `none` | None: lanes 7-9 copy the proxy, seed 0, no blend. Bit for bit as 3.7.0 (`the_shipped_frame_stays_bit_for_bit` pins the answers and lanes from 3.7.0's shaders). |
+| `zero` (default) | Each pass's previous output at the same pixel. |
 | `flow` | Each pass's previous output where the GPU's optical flow (`VK_NV_optical_flow`) says the pixel was, read with the pre-upscaler preprocess's five-tap Catmull-Rom filter. `zero` where the device has no optical flow (logged once, with the reason). |
 
 With a history the after-the-upscaler shaders do what the pre-upscaler ones do with theirs:
@@ -971,7 +983,13 @@ grew) starts afresh. What gets no history:
 **The optical flow** (`post_flow`). With `flow` selected, `create_device` adds the extension, its
 `opticalFlow` feature and one queue of the family flagged `QUEUE_OPTICAL_FLOW_BIT_NV` (family 5 on the RTX
 5070, its only queue), where the device has all three and the application does not use that family itself;
-a request with them that the driver refuses is made again without. The RTX 5070's driver offers output grids
+a request with them that the driver refuses is made again without. That is every NVIDIA device the native
+backend extends, also in a game whose model runs only before the upscaler (which pass will run is not known when
+the device is created), and that is why `flow` is not the default: GTA V Enhanced hung at the start of its
+benchmark with them added to the devices its frame generation creates (2026-11-10; 3 of 3 launches, the same build
+with `zero` ran at 62.1 / 250.0 fps). Each device creation logs one `[native]` line on
+it: added (with the family), not added and why (no extension, feature or family; the application uses that
+family itself; the application chains its own optical-flow features), or refused and created without. The RTX 5070's driver offers output grids
 of 1x1, 2x2 and 4x4 for 32x32 to 8192x8192, inputs `B8G8R8A8_UNORM`, `R8_UNORM` and NV12, vectors
 `R16G16_S10_5_NV` (queried 2026-10-19). Per slot and frame size a session at the proxy's size with the 4x4
 grid, performance level fast: two input images used in turn (the proxy's four bytes copied in as they are,
@@ -1009,6 +1027,29 @@ the pan (`flow` is close to `none` while moving, where `zero` is worse). Neither
 steadier than none, even on a still frame, where `zero` is the exact previous output: the network's answer
 blended toward its own previous answer changes more from frame to frame, not less. The default stays `none`
 and both histories stay a testing aid.
+
+**Measured again** (RTX 5070, 2026-11-10, issue #49; `pan` at 2048x1536 with film grain 0.3, still and at 6 px/frame,
+24-frame series with the reporter's settings: placement At present, style 1, working scale 0.5 or 1). The 2026-10-19
+number is the *edit's* change between frames. On a grainy frame a steadier picture has to change its edit more (the
+edit cancels part of the grain), so that number rewards an edit that follows the noise. What a viewer sees is the
+*picture's* change. Here: the motion-compensated frame-to-frame change of 32x32-pixel block means of the composited
+frame, minus the original's (the flicker the model adds in large patches; 0.284-0.287 of 255 is the grain's own):
+
+| Case | `none` | `zero` | `flow` |
+|---|---|---|---|
+| Still, working scale 1 | +0.082 | -0.049 | |
+| Still, working scale 0.5 | +0.118 | -0.020 | +0.034 |
+| 6 px/frame, working scale 1 | +0.214 | +0.070 | **+0.022** |
+| 6 px/frame, working scale 0.5 | +0.256 | +0.197 | +0.150 |
+
+`flow` adds a tenth of `none`'s patch flicker in motion and none on a still frame; the edit stays as large (13.05
+against 13.29 of 255 at scale 1, moving) and moving edges show no trail. Per pixel, the grain dominates: the
+composited frame changes 3-7% more than the original with every setting. A fixed seed with a history (tried: the
+seed counting frames is the one difference from `none`'s noise) changed nothing. A lower working scale doubles
+the flicker with every history. `flow` was made the default first; it hung GTA V Enhanced (the optical flow's
+extension and queue added to the game's devices, "The optical flow" above), and in Cyberpunk 2077 and Red Dead
+Redemption 2 the game uses the optical-flow family itself, so they ran `zero` anyway. So `zero` is the default from
+3.14.0: a third of `none`'s added flicker in motion, none on a still frame, nothing added to the game's devices.
 
 ## Model resolution before the upscaler (3.8.0, 2026-10-19)
 

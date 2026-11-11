@@ -80,6 +80,8 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: clippy, rustfmt
+          # The NGX wrapper for Proton (crates/ngx-wrapper) is a Windows DLL.
+          targets: x86_64-pc-windows-gnu
 
       - name: Toolchain matches rust-toolchain.toml
         env:
@@ -96,7 +98,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
             libvulkan1 mesa-vulkan-drivers vulkan-tools vulkan-validationlayers spirv-tools \
-            zsync desktop-file-utils patch python3-numpy python3-pil libclang-dev
+            zsync desktop-file-utils patch python3-numpy python3-pil libclang-dev gcc-mingw-w64-x86-64
 
       # Only lavapipe, never whatever other ICD the runner image happens to carry.
       - name: Select the lavapipe Vulkan driver
@@ -219,6 +221,16 @@ jobs:
           cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
           cargo test --locked --workspace --all-features -- --test-threads=1
 
+      # The NGX wrapper for Proton is its own workspace too (docs/PROTON_NGX.md): its record layout's tests on Linux,
+      # clippy for its Windows target, and the stamped DLL the AppImage ships (build-ngx-wrapper.sh).
+      - name: NGX wrapper clippy, tests and build
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          (cd crates/ngx-wrapper && cargo fmt --check && cargo test --locked \
+            && cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings)
+          bash scripts/build-ngx-wrapper.sh
+
       # The framework's generated sources are what its generator gives from the pinned headers.
       - name: Layer framework's generated code matches its generator
         run: bash scripts/vk-layer-codegen.sh --check
@@ -241,6 +253,8 @@ jobs:
           python3 scripts/gen_third_party_crates.py --self-test
           python3 scripts/check_pins.py --self-test
           bash scripts/gta-bench.sh --self-test
+          bash scripts/build-ngx-wrapper.sh --self-test
+          bash scripts/game-sweep.sh --self-test
 
       - name: Shader sources match committed SPIR-V
         run: python3 scripts/check_shaders.py
@@ -346,6 +360,10 @@ jobs:
                   CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked -p "$package" &&
                   CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked --release -p "$package")
           done
+          # The NGX wrapper is its own workspace too: its build script and host tests land in target/.
+          (cd crates/ngx-wrapper &&
+              CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked -p neural-forge-ngx-wrapper &&
+              CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked --release -p neural-forge-ngx-wrapper)
           rm -rf target/debug/incremental target/release/incremental
           if find target -maxdepth 3 \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \
                   -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' \) | grep .; then

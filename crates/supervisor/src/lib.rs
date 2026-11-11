@@ -4,7 +4,10 @@
 
 pub mod anti_cheat;
 pub mod appinfo;
+pub mod compat;
+pub mod compat_tool;
 pub mod config;
+pub mod desktop_hdr;
 pub mod doctor;
 pub mod game_settings;
 pub mod install;
@@ -14,6 +17,7 @@ pub mod model_shape;
 pub mod paths;
 pub mod presets;
 pub mod profiles;
+pub mod proton_tool;
 pub mod report;
 pub mod shm_status;
 pub mod steam;

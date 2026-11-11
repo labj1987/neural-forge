@@ -449,9 +449,116 @@ pub fn verify_edit(old: &[u8], new: &[u8], path: &[&str], value: &str) -> bool {
     with_string(&old_tree, path, value).is_some_and(|expected| expected == new_tree) && new_tree.string_at(path) == Some(value)
 }
 
+/// Removes the block at `path` (its key and everything to its closing brace, with the lines they stand on when
+/// nothing else shares them), touching nothing else. `Ok(None)` when there is no such block.
+pub fn remove_block(text: &[u8], path: &[&str]) -> Result<Option<Vec<u8>>, Error> {
+    let root = parse_spanned(text)?;
+    let mut block = &root;
+    for key in &path[..path.len().saturating_sub(1)] {
+        match block.get(key).map(|e| &e.value) {
+            Some(SpannedValue::Block { inner, .. }) => block = inner,
+            _ => return Ok(None),
+        }
+    }
+    let Some(entry) = path.last().and_then(|k| block.get(k)) else { return Ok(None) };
+    let SpannedValue::Block { close, .. } = &entry.value else { return err(format!("{:?} is a value, not a block", entry.key)) };
+    let (mut start, mut end) = (entry.key_span.start, close + 1);
+    let line_start = text[..start].iter().rposition(|&c| c == b'\n').map_or(0, |p| p + 1);
+    if text[line_start..start].iter().all(|&c| c == b' ' || c == b'\t') {
+        start = line_start;
+        let rest = &text[end..];
+        let to_eol = rest.iter().position(|&c| c == b'\n').map_or(rest.len(), |p| p + 1);
+        if rest[..to_eol].iter().all(|&c| c.is_ascii_whitespace()) {
+            end += to_eol;
+        }
+    }
+    Ok(Some(splice(text, start..end, b"")))
+}
+
+/// Adds an empty block named `path`'s last key to its parent block (which must exist), laid out like the parent's
+/// entries, touching nothing else. Refused when the parent already has an entry of that name.
+pub fn insert_block(text: &[u8], path: &[&str]) -> Result<Vec<u8>, Error> {
+    let Some((last, parents)) = path.split_last() else { return err("an empty path".into()) };
+    if parents.is_empty() {
+        return err("refusing to add a top-level block".into());
+    }
+    let root = parse_spanned(text)?;
+    let (mut block, mut close) = (&root, usize::MAX);
+    for key in parents {
+        match block.get(key).map(|e| &e.value) {
+            Some(SpannedValue::Block { inner, close: c }) => (block, close) = (inner, *c),
+            _ => return err(format!("cannot create {}: {key:?} not found", path.join(" > "))),
+        }
+    }
+    if block.get(last).is_some() {
+        return err(format!("{last:?} is there already"));
+    }
+    let layout = Layout::of(text, block, close);
+    let (indent, eol) = (&layout.indent, layout.eol);
+    let entry = format!("{indent}{}{eol}{indent}{{{eol}{indent}}}", quote(last));
+    Ok(insert_before_close(text, close, &entry, &layout))
+}
+
+/// [`insert_block`]'s self-check: `new` parses into `old`'s tree with one empty block appended at `path`.
+pub fn verify_insert_block(old: &[u8], new: &[u8], path: &[&str]) -> bool {
+    fn with(block: &Block, path: &[&str]) -> Option<Block> {
+        let (first, rest) = path.split_first()?;
+        let mut out = block.clone();
+        if rest.is_empty() {
+            out.0.push(Entry { key: first.to_string(), value: Value::Block(Block::default()), condition: None });
+        } else {
+            let at = out.0.iter().position(|e| e.key.eq_ignore_ascii_case(first))?;
+            let Value::Block(inner) = &out.0[at].value else { return None };
+            out.0[at].value = Value::Block(with(inner, rest)?);
+        }
+        Some(out)
+    }
+    let (Ok(old_tree), Ok(new_tree)) = (parse(old), parse(new)) else { return false };
+    with(&old_tree, path).is_some_and(|expected| expected == new_tree)
+}
+
+/// [`remove_block`]'s self-check: `new` parses into `old`'s tree without the block at `path`, nothing else changed.
+pub fn verify_removal(old: &[u8], new: &[u8], path: &[&str]) -> bool {
+    fn without(block: &Block, path: &[&str]) -> Option<Block> {
+        let (first, rest) = path.split_first()?;
+        let mut out = block.clone();
+        let at = out.0.iter().position(|e| e.key.eq_ignore_ascii_case(first))?;
+        if rest.is_empty() {
+            out.0.remove(at);
+        } else {
+            let Value::Block(inner) = &out.0[at].value else { return None };
+            out.0[at].value = Value::Block(without(inner, rest)?);
+        }
+        Some(out)
+    }
+    let (Ok(old_tree), Ok(new_tree)) = (parse(old), parse(new)) else { return false };
+    without(&old_tree, path).is_some_and(|expected| expected == new_tree)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_block_is_inserted_at_its_siblings_indentation() {
+        let text = "\"a\"\n{\n\t\"s\"\n\t{\n\t\t\"x\"\t\t\"1\"\n\t}\n}\n";
+        let new = insert_block(text.as_bytes(), &["a", "s", "m"]).unwrap();
+        assert_eq!(String::from_utf8(new.clone()).unwrap(), "\"a\"\n{\n\t\"s\"\n\t{\n\t\t\"x\"\t\t\"1\"\n\t\t\"m\"\n\t\t{\n\t\t}\n\t}\n}\n");
+        assert!(verify_insert_block(text.as_bytes(), &new, &["a", "s", "m"]));
+        let (filled, _) = set_string(&new, &["a", "s", "m", "k"], "v").unwrap();
+        assert_eq!(String::from_utf8(filled).unwrap(), "\"a\"\n{\n\t\"s\"\n\t{\n\t\t\"x\"\t\t\"1\"\n\t\t\"m\"\n\t\t{\n\t\t\t\"k\"\t\t\"v\"\n\t\t}\n\t}\n}\n");
+        assert!(insert_block(text.as_bytes(), &["a", "s"]).is_err(), "never a second block of a name");
+        assert!(insert_block(text.as_bytes(), &["a", "q", "m"]).is_err(), "only into a parent that is there");
+    }
+
+    #[test]
+    fn a_block_is_removed_with_its_lines() {
+        let text = "\"a\"\n{\n\t\"m\"\n\t{\n\t\t\"1\"\n\t\t{\n\t\t\t\"name\"\t\t\"x\"\n\t\t}\n\t\t\"2\"\n\t\t{\n\t\t\t\"name\"\t\t\"y\"\n\t\t}\n\t}\n}\n";
+        let new = remove_block(text.as_bytes(), &["a", "m", "1"]).unwrap().unwrap();
+        assert_eq!(String::from_utf8(new.clone()).unwrap(), "\"a\"\n{\n\t\"m\"\n\t{\n\t\t\"2\"\n\t\t{\n\t\t\t\"name\"\t\t\"y\"\n\t\t}\n\t}\n}\n");
+        assert!(verify_removal(text.as_bytes(), &new, &["a", "m", "1"]));
+        assert_eq!(remove_block(text.as_bytes(), &["a", "m", "3"]).unwrap(), None);
+    }
 
     const SAMPLE: &str = "\"UserLocalConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t\t\"apps\"\n\t\t\t\t{\n\t\t\t\t\t\"1091500\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"MANGOHUD=1 WINEDLLOVERRIDES=\\\"dxgi=n,b\\\" %command%\"\n\t\t\t\t\t\t\"Playtime\"\t\t\"100\"\n\t\t\t\t\t}\n\t\t\t\t\t\"489830\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"Playtime\"\t\t\"7\"\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\t\"friends\"\n\t{\n\t\t\"x\"\t\t\"1\"\n\t}\n}\n";
 

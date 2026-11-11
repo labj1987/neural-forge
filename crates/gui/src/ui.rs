@@ -602,7 +602,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let (working_scale, set_working_scale) = bind_float(&shm, Some("working_scale"), |h| &h.working_scale_bits);
     let working_scale_row = spin_row_scaled(
         "Model resolution after the upscaler",
-        "Percent of the frame the model works at; lower is faster and softer",
+        "Percent of the frame the model works at; lower is faster, softer and flickers more",
         working_scale,
         "working_scale",
         5.0,
@@ -915,7 +915,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     toasts.set_child(Some(&toolbar_view));
 
     // Developer aid: `NEURAL_FORGE_GUI_OPEN=<tab id>` (model/composition/debug/status/setup) selects
-    // that tab at startup, and `NEURAL_FORGE_GUI_OPEN=passes` opens the per-pass dialog, so either can be
+    // that tab at startup, `NEURAL_FORGE_GUI_OPEN=passes` opens the per-pass dialog and `uninstall` the Setup tab's
+    // Uninstall confirmation (`build_uninstall_group`), so each can be
     // screenshotted where synthetic input cannot reliably reach a page navigated to after the window opens.
     match neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
         Some("passes") => {
@@ -924,6 +925,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
             glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || open_pass_dialog(&shm, view.upcast_ref()));
         }
         Some(tab @ ("model" | "composition" | "debug" | "status" | "setup")) => view_stack.set_visible_child_name(tab),
+        Some("uninstall") => view_stack.set_visible_child_name("setup"),
         _ => {}
     }
 
@@ -2275,7 +2277,18 @@ struct ScannedGame {
     anti_cheat: Vec<&'static str>,
 }
 
-/// A game row's subtitle: its appid, library and target (or why it has none), and its anti-cheat.
+/// The Tested game row: the game's line from the tested games and its setup notes (the tooltip), or that it is not
+/// among them, or that no game has attached.
+fn tested_label(game: &str, facts: Option<&neural_forge_supervisor::compat::Game>) -> (String, Option<String>) {
+    match facts {
+        Some(f) => (format!("{}: {}", f.name, f.status_line()), (!f.notes.is_empty()).then(|| f.notes.join("\n"))),
+        None if game.is_empty() => ("no game attached yet".to_string(), None),
+        None => (format!("{game} is not among the tested games: where the model runs in it is not known yet"), None),
+    }
+}
+
+/// A game row's subtitle: its appid, library and target (or why it has none), its anti-cheat, and where the model ran
+/// in it in testing.
 fn game_subtitle(game: &neural_forge_supervisor::steam::Game, target: &str, chosen: bool, anti_cheat: &[&str]) -> String {
     let detail = match (game.unsupported(), target.is_empty()) {
         (Some(why), _) => format!("cannot be switched on: {why}"),
@@ -2286,7 +2299,11 @@ fn game_subtitle(game: &neural_forge_supervisor::steam::Game, target: &str, chos
         [] => String::new(),
         found => format!(" · anti-cheat: {}", neural_forge_supervisor::anti_cheat::list(found)),
     };
-    format!("{} · {} · {detail}{anti_cheat}", game.appid, game.library.display())
+    let tested = match neural_forge_supervisor::compat::find(game.appid.parse().ok(), "") {
+        Some(f) => format!(" · tested: {}", f.placement.describe()),
+        None => String::new(),
+    };
+    format!("{} · {} · {detail}{anti_cheat}{tested}", game.appid, game.library.display())
 }
 
 /// Asks before switching on a game whose folder ships `anti_cheat`: "Switch On Anyway" runs
@@ -2522,9 +2539,45 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                         if let Some(switch) = row.upgrade() {
                             switch.set_sensitive(false);
                         }
+                        let proton_note: std::rc::Rc<std::cell::RefCell<Option<Result<String, String>>>> = std::rc::Rc::default();
                         glib::spawn_future_local(async move {
                             let (root, appid) = (game.root.path.clone(), game.appid.clone());
-                            let outcome = gio::spawn_blocking(move || steam::apply_now(&root, &appid, &action)).await;
+                            // The launch options, then the game's Proton (a Neural Forge copy when switched on, made now if
+                            // needed; the earlier one back when off): DLSS's placements need it.
+                            let outcome = gio::spawn_blocking(move || {
+                                let outcome = steam::apply_now(&root, &appid, &action);
+                                let proton = match (&outcome, on) {
+                                    (steam::Outcome::Changed(_) | steam::Outcome::Unchanged, true) => {
+                                        let running = steam::steam_running(std::path::Path::new("/proc"));
+                                        let w = neural_forge_supervisor::proton_tool::installed_wrapper();
+                                        Some(neural_forge_supervisor::compat_tool::switch_on(&root, &steam::libraries(&root), &appid, &w, running).map(|d| {
+                                            match d {
+                                                None => "; a native Linux game: it runs without Proton".to_string(),
+                                                Some(d) => format!(
+                                                    "; it runs with {} now{}",
+                                                    d.tool,
+                                                    if d.made { " (a copy made for Neural Forge: restart Steam to see it)" } else { "" }
+                                                ),
+                                            }
+                                        }))
+                                    }
+                                    (steam::Outcome::Changed(_) | steam::Outcome::Unchanged, false) => {
+                                        let running = steam::steam_running(std::path::Path::new("/proc"));
+                                        Some(neural_forge_supervisor::compat_tool::switch_off(&root, &appid, running).map(|p| match p {
+                                            Some(p) if p.is_empty() => "; it runs with Steam's default Proton again".to_string(),
+                                            Some(p) => format!("; it runs with {p} again"),
+                                            None => String::new(),
+                                        }))
+                                    }
+                                    _ => None,
+                                };
+                                (outcome, proton)
+                            })
+                            .await
+                            .map(|(o, p)| {
+                                proton_note.replace(p);
+                                o
+                            });
                             let Some(row) = row.upgrade() else { return };
                             let revert = || {
                                 reverting.set(true);
@@ -2534,7 +2587,14 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                             match outcome {
                                 Ok(steam::Outcome::Changed(_) | steam::Outcome::Unchanged) => {
                                     let state = if on { "on" } else { "off" };
-                                    toasts.add_toast(toast(&format!("Neural Forge is {state} for {}", game.name)));
+                                    let note = match proton_note.take() {
+                                        Some(Ok(n)) => n,
+                                        Some(Err(e)) => format!(
+                                            ". Its Proton was not changed ({e}): in a DLSS game the model stays off until it runs with a Neural Forge Proton"
+                                        ),
+                                        None => String::new(),
+                                    };
+                                    toasts.add_toast(toast(&format!("Neural Forge is {state} for {}{note}", game.name)));
                                 }
                                 Ok(steam::Outcome::SteamRunning { manual }) => {
                                     revert();
@@ -2593,6 +2653,8 @@ fn build_setup_page(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
     let (launch_group, fill_launch) = build_launch_option_group();
     page.add(&games_group);
     page.add(&launch_group);
+    page.add(&build_proton_group(toasts));
+    page.add(&build_uninstall_group());
     let fill = std::rc::Rc::new(move |scan: &SteamScan| {
         fill_games(scan);
         fill_launch(scan);
@@ -2614,6 +2676,285 @@ fn build_setup_page(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
     scan(None);
     refresh.connect_clicked(move |button| scan(Some(button.clone())));
     page
+}
+
+/// What the Proton group lists: copies can be made from `sources`; `tools` are the copies, each with whether its
+/// source changed since.
+struct ProtonScan {
+    root: Option<std::path::PathBuf>,
+    sources: Vec<neural_forge_supervisor::proton_tool::Source>,
+    tools: Vec<(neural_forge_supervisor::proton_tool::Tool, bool)>,
+}
+
+fn scan_protons() -> ProtonScan {
+    use neural_forge_supervisor::{proton_tool, steam};
+    let Some(root) = steam::roots().into_iter().find(|r| !r.flatpak).map(|r| r.path) else {
+        return ProtonScan { root: None, sources: Vec::new(), tools: Vec::new() };
+    };
+    let libraries = steam::libraries(&root);
+    let tools: Vec<(proton_tool::Tool, bool)> = proton_tool::tools(&root).into_iter().map(|t| (t.clone(), proton_tool::outdated(&t))).collect();
+    // A source whose current copy exists is not offered again.
+    let sources = proton_tool::sources(&root, &libraries).into_iter().filter(|s| !tools.iter().any(|(t, _)| t.name == s.tool_name())).collect();
+    ProtonScan { root: Some(root), sources, tools }
+}
+
+/// "Proton with DLSS's parameters": copies of installed Protons that load the NGX wrapper
+/// (`neural_forge_supervisor::proton_tool`), made and removed here, with the notice (Alex 2026-11-10: a clear
+/// notice, nothing blocked).
+fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+    use neural_forge_supervisor::proton_tool;
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Proton with DLSS parameters");
+    group.set_description(Some(proton_tool::NOTICE));
+    let rows: std::rc::Rc<std::cell::RefCell<Vec<adw::ActionRow>>> = std::rc::Rc::default();
+    type Refill = std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>;
+    let refill: Refill = std::rc::Rc::default();
+    let fill = {
+        let (group, rows, toasts, refill) = (group.clone(), rows.clone(), toasts.clone(), refill.clone());
+        move |scan: ProtonScan| {
+            for row in rows.borrow_mut().drain(..) {
+                group.remove(&row);
+            }
+            let Some(root) = scan.root else {
+                let row = adw::ActionRow::new();
+                row.set_title("No native Steam installation found");
+                group.add(&row);
+                rows.borrow_mut().push(row);
+                return;
+            };
+            for (tool, outdated) in &scan.tools {
+                let row = adw::ActionRow::new();
+                row.set_use_markup(false);
+                row.set_title(&tool.name);
+                row.set_subtitle(&if *outdated {
+                    format!("from {}; it or Neural Forge's NGX wrapper has changed since: close Steam and make it again", tool.source.display())
+                } else {
+                    format!("from {}", tool.source.display())
+                });
+                if *outdated {
+                    let again = gtk4::Button::with_label("Make again");
+                    again.set_valign(gtk4::Align::Center);
+                    let (root, tool, toasts, refill) = (root.clone(), tool.clone(), toasts.clone(), refill.clone());
+                    again.connect_clicked(move |b| {
+                        b.set_sensitive(false);
+                        let (root, tool, toasts, refill) = (root.clone(), tool.clone(), toasts.clone(), refill.clone());
+                        glib::spawn_future_local(async move {
+                            let done = gio::spawn_blocking(move || {
+                                use neural_forge_supervisor::{compat_tool, steam};
+                                let running = steam::steam_running(std::path::Path::new("/proc"));
+                                compat_tool::update(&root, &steam::libraries(&root), &tool, &proton_tool::installed_wrapper(), running).map(|u| {
+                                    if u.to == u.from {
+                                        format!("Made {} again", u.to)
+                                    } else {
+                                        let kept = u.kept.map(|k| format!("; {} is kept: {k}", u.from)).unwrap_or_else(|| format!("; removed {}", u.from));
+                                        format!("Made {}, its games moved to it{kept}. Restart Steam to see it", u.to)
+                                    }
+                                })
+                            })
+                            .await;
+                            toasts.add_toast(toast(
+                                &done.unwrap_or_else(|_| Err("the worker stopped".into())).unwrap_or_else(|e| format!("Could not make the copy: {e}")),
+                            ));
+                            if let Some(f) = refill.borrow().clone() {
+                                f();
+                            }
+                        });
+                    });
+                    row.add_suffix(&again);
+                }
+                let remove = gtk4::Button::with_label("Remove");
+                remove.set_valign(gtk4::Align::Center);
+                remove.add_css_class("destructive-action");
+                let (root_r, name, toasts_r, refill_r) = (root.clone(), tool.name.clone(), toasts.clone(), refill.clone());
+                remove.connect_clicked(move |b| {
+                    b.set_sensitive(false);
+                    let (root, name, toasts, refill) = (root_r.clone(), name.clone(), toasts_r.clone(), refill_r.clone());
+                    glib::spawn_future_local(async move {
+                        let done = gio::spawn_blocking(move || {
+                            proton_tool::remove(&root, &name).map(|t| format!("Removed {}: games set to it need another Proton in Steam", t.name))
+                        })
+                        .await;
+                        toasts.add_toast(toast(
+                            &done.unwrap_or_else(|_| Err("the worker stopped".into())).unwrap_or_else(|e| format!("Could not remove it: {e}")),
+                        ));
+                        if let Some(f) = refill.borrow().clone() {
+                            f();
+                        }
+                    });
+                });
+                row.add_suffix(&remove);
+                group.add(&row);
+                rows.borrow_mut().push(row);
+            }
+            for source in &scan.sources {
+                let row = adw::ActionRow::new();
+                row.set_use_markup(false);
+                row.set_title(&source.display);
+                row.set_subtitle(&format!("{} in {}", source.version, source.dir.display()));
+                let make = gtk4::Button::with_label("Make copy");
+                make.set_valign(gtk4::Align::Center);
+                make.set_tooltip_text(Some(&format!("Make {} (see the notice above)", source.tool_name())));
+                // A Proton the wrapper cannot run under (Wine older than 10) says why instead of offering a copy.
+                if let Err(why) = neural_forge_supervisor::proton_tool::unix_pid_support(&source.dir) {
+                    make.set_sensitive(false);
+                    row.set_subtitle(&format!("{} in {}: cannot be copied, {why}", source.version, source.dir.display()));
+                }
+                let (root_m, source, toasts_m, refill_m) = (root.clone(), source.clone(), toasts.clone(), refill.clone());
+                make.connect_clicked(move |b| {
+                    b.set_sensitive(false);
+                    let (root, source, toasts, refill) = (root_m.clone(), source.clone(), toasts_m.clone(), refill_m.clone());
+                    glib::spawn_future_local(async move {
+                        let done = gio::spawn_blocking(move || {
+                            proton_tool::create(&root, &source, &proton_tool::installed_wrapper())
+                                .map(|m| format!("Made {}: restart Steam, then choose it for a game in its Properties > Compatibility", m.tool.name))
+                        })
+                        .await;
+                        toasts.add_toast(toast(
+                            &done.unwrap_or_else(|_| Err("the worker stopped".into())).unwrap_or_else(|e| format!("Could not make the copy: {e}")),
+                        ));
+                        if let Some(f) = refill.borrow().clone() {
+                            f();
+                        }
+                    });
+                });
+                row.add_suffix(&make);
+                group.add(&row);
+                rows.borrow_mut().push(row);
+            }
+        }
+    };
+    let fill = std::rc::Rc::new(fill);
+    let rescan: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+        let fill = fill.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(scan) = gio::spawn_blocking(scan_protons).await {
+                fill(scan);
+            }
+        });
+    });
+    *refill.borrow_mut() = Some(rescan.clone());
+    rescan();
+    group
+}
+
+/// The confirmation's text for Uninstall: everything it removes, what it cannot while Steam runs, and that deleting
+/// the AppImage alone leaves Neural Forge installed.
+fn uninstall_body(steam_running: bool, appimage: Option<&std::path::Path>) -> String {
+    let mut s = String::from(
+        "This removes everything Neural Forge put on this computer:\n\
+         \u{2022} the Vulkan layer every game loads, the app and the command-line tool\n\
+         \u{2022} your settings, profiles and per-game settings\n\
+         \u{2022} the extracted model and the imported NVIDIA DLL, captures and logs\n\
+         \u{2022} Neural Forge's own Proton builds (the *-NeuralForge tools in Steam)\n\
+         \u{2022} Neural Forge's part of every game's Steam launch options (your own options stay)\n",
+    );
+    if let Some(file) = appimage {
+        s.push_str(&format!("\u{2022} this AppImage file, {}\n", file.display()));
+    }
+    if steam_running {
+        s.push_str(
+            "\nSteam is running, so the launch options cannot be changed now (Steam writes its own copy back when it \
+             exits). Close Steam first to have them cleaned; otherwise the games are listed afterwards, with the options \
+             to set by hand. Neural Forge's variables do nothing once the layer is gone.\n",
+        );
+    }
+    s.push_str(
+        "\nDeleting only the AppImage file does not uninstall Neural Forge: the layer it installed stays, and the games \
+         switched on keep loading it. Games using a Neural Forge Proton build need another Proton chosen in their \
+         Properties afterwards.",
+    );
+    s
+}
+
+/// What Uninstall did, for the closing dialog.
+fn uninstall_result(purged: &neural_forge_supervisor::install::Purged, appimage_kept: Option<&std::path::Path>) -> String {
+    let mut s = format!("Removed {} files and folders.", purged.removed.len());
+    if !purged.switched_off.is_empty() {
+        s.push_str(&format!("\n\nSwitched off in the launch options of: {}.", purged.switched_off.join(", ")));
+    }
+    if !purged.left.is_empty() {
+        s.push_str("\n\nThese games still have Neural Forge's variables in their launch options (harmless without the layer):\n");
+        s.push_str(&purged.left.join("\n"));
+    }
+    if let Some(file) = appimage_kept {
+        s.push_str(&format!("\n\nDelete {} too: starting it again installs Neural Forge again.", file.display()));
+    } else {
+        s.push_str("\n\nIf you start Neural Forge from another AppImage file, delete it too: starting it installs Neural Forge again.");
+    }
+    s
+}
+
+/// The Uninstall group (Setup tab): one destructive button, a confirmation saying what goes, then the result; the app
+/// quits afterwards (its files are gone).
+fn build_uninstall_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Uninstall");
+    let row = adw::ActionRow::new();
+    row.set_title("Uninstall Neural Forge");
+    row.set_subtitle("Remove the layer, settings, model, Proton builds and launch options it added, and this AppImage");
+    let button = gtk4::Button::with_label("Uninstall…");
+    button.add_css_class("destructive-action");
+    button.set_valign(gtk4::Align::Center);
+    row.add_suffix(&button);
+    group.add(&row);
+    // Developer aid, as `NEURAL_FORGE_GUI_OPEN=passes`: `NEURAL_FORGE_GUI_OPEN=uninstall` opens the confirmation (only
+    // that: nothing is removed without pressing Uninstall in it), for a screenshot.
+    if neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() == Some("uninstall") {
+        let button = button.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(700), move || button.emit_clicked());
+    }
+    button.connect_clicked(|button| {
+        let appimage = std::env::var_os("APPIMAGE").map(std::path::PathBuf::from).filter(|p| p.is_file());
+        let steam_running = neural_forge_supervisor::steam::steam_running(std::path::Path::new("/proc"));
+        let parent = button.root().and_downcast::<gtk4::Window>();
+        let dialog = adw::AlertDialog::builder()
+            .heading("Uninstall Neural Forge?")
+            .body(uninstall_body(steam_running, appimage.as_deref()))
+            .default_response("cancel")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("uninstall", "Uninstall");
+        dialog.set_response_appearance("uninstall", adw::ResponseAppearance::Destructive);
+        let button = button.clone();
+        dialog.choose(parent.clone().as_ref(), None::<&gio::Cancellable>, move |response| {
+            if response != "uninstall" {
+                return;
+            }
+            button.set_sensitive(false);
+            let parent = parent.clone();
+            glib::spawn_future_local(async move {
+                let target = appimage.clone();
+                let done = gio::spawn_blocking(move || {
+                    neural_forge_supervisor::install::purge_with(neural_forge_supervisor::install::Leftovers::Report, target.as_deref())
+                })
+                .await;
+                let (heading, body, uninstalled) = match done {
+                    Ok(Ok(purged)) => {
+                        let kept = appimage.filter(|f| f.exists());
+                        ("Neural Forge is uninstalled", uninstall_result(&purged, kept.as_deref()), true)
+                    }
+                    Ok(Err(e)) => {
+                        ("Uninstall stopped", format!("{e}\n\nWhat was removed before this stays removed; press Uninstall again once it is fixed."), false)
+                    }
+                    Err(_) => ("Uninstall stopped", "The uninstall failed unexpectedly.".to_string(), false),
+                };
+                let result = adw::AlertDialog::builder().heading(heading).body(body).build();
+                result.add_response("close", if uninstalled { "Quit" } else { "Close" });
+                let app_window = parent.clone();
+                result.choose(parent.as_ref(), None::<&gio::Cancellable>, move |_| {
+                    if uninstalled {
+                        if let Some(app) = app_window.and_then(|w| w.application()) {
+                            app.quit();
+                        }
+                    } else {
+                        button.set_sensitive(true);
+                    }
+                });
+            });
+        });
+    });
+    group
 }
 
 /// One sample of the graph's two series: how long a frame took and how much of it the model's network took on
@@ -2839,8 +3180,31 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     // after it (everything else). Read-only; there is no setting for it.
     let preupscale_row = adw::ActionRow::new();
     preupscale_row.set_title("Model placement");
+    // The running game's entry in the tested games (`neural_forge_supervisor::compat`): where the model ran in it
+    // in testing and the version that was, with its setup notes in the tooltip.
+    let tested_row = adw::ActionRow::new();
+    tested_row.set_title("Tested game");
+    // The HDR verdict: what the game asked for and why (the layer's), and the desktop's HDR state.
+    let hdr_row = adw::ActionRow::new();
+    hdr_row.set_title("HDR");
     group.add(&layer_row);
     group.add(&preupscale_row);
+    group.add(&tested_row);
+    group.add(&hdr_row);
+
+    // The desktop's HDR state asks the compositor (a D-Bus call): on a worker, every 30 s.
+    let desktop: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::default();
+    {
+        let desktop = std::rc::Rc::clone(&desktop);
+        every(&hdr_row, std::time::Duration::from_secs(30), move |_| {
+            let desktop = std::rc::Rc::clone(&desktop);
+            glib::spawn_future_local(async move {
+                if let Ok(state) = gio::spawn_blocking(neural_forge_supervisor::desktop_hdr::read).await {
+                    *desktop.borrow_mut() = state;
+                }
+            });
+        });
+    }
 
     let shm_for_timer = std::sync::Arc::clone(shm);
     // Liveness is read from the heartbeat, not `layer_attached`: a closed game never clears it.
@@ -2849,6 +3213,10 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     every(&layer_row, SECOND, move |layer_row| {
         let preupscale_row = &preupscale_for_timer;
         let hdr = shm_for_timer.header();
+        let (tested, notes) = tested_label(hdr.game_name().as_str(), neural_forge_supervisor::compat::for_header(hdr));
+        tested_row.set_subtitle(&tested);
+        tested_row.set_tooltip_text(notes.as_deref());
+        hdr_row.set_subtitle(&neural_forge_supervisor::shm_status::hdr_line(hdr, desktop.borrow().as_deref()));
         // A header laid out by another build is refused at open (see `Shm::open`), so the
         // version needs no check here.
         let layer_active = live.alive(hdr);
@@ -2862,10 +3230,12 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         });
         let label = preupscale_label(
             layer_active,
+            hdr.placement.load(Ordering::Relaxed),
             hdr.preupscale_state.load(Ordering::Relaxed),
             hdr.preupscale_width.load(Ordering::Relaxed),
             hdr.preupscale_height.load(Ordering::Relaxed),
             hdr.preupscale_misses.load(Ordering::Relaxed),
+            &hdr.preupscale_reason(),
         );
         // The layer's own status line: the model running, or why it is not.
         let layer_reason = if layer_active { hdr.layer_reason() } else { String::new() };
@@ -3098,11 +3468,11 @@ fn open_folder(dir: &std::path::Path, parent: Option<gtk4::Window>, toasts: &adw
 const CAPTURE_TAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const CAPTURE_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// What the capture button's row says, from the channel: whether frames are held before the upscaler
-/// now, where a capture has no frame without the model's edit (see the button's tooltip).
-fn capture_subtitle(holding: bool) -> &'static str {
-    if holding {
-        "The model runs before the upscaler now: both images will be the presented frame, which already has its edit"
+/// What the capture button's row says, from the channel: whether the model edits the game's own frame now
+/// ([`edits_in_game_frame`]), where a capture has no frame without the model's edit (see the button's tooltip).
+fn capture_subtitle(in_game_frame: bool) -> &'static str {
+    if in_game_frame {
+        "The model runs in the game's frame now (before the upscaler or after DLSS): both images will be the presented frame, which already has its edit"
     } else {
         "Saves the next frame as two PNGs: the game's frame and Neural Forge's result"
     }
@@ -3110,6 +3480,16 @@ fn capture_subtitle(holding: bool) -> &'static str {
 
 /// The Debug page's captures: the same one-frame request as `neural-forge-cli shmctl capture`, and the
 /// folder the layer writes them to.
+/// Whether `preupscale_state` says the model edits the game's own frame: holding before the upscaler, after DLSS,
+/// or both. The layer then keeps the after-the-upscaler compose off (`Session::suppresses_post`: the plan has a
+/// stage in the game's frame, holds engaged it and DLSS ran lately) and reads the presented frame back as both
+/// images of a capture. Waiting for DLSS input, DLSS identified but not held, and off run the model at present.
+fn edits_in_game_frame(state: u32) -> bool {
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH, PAUSED};
+    // Paused with DLSS (#49) the post path is still kept off: the layer captures the presented frame as both images.
+    matches!(state, HOLDING | HOLDING_AFTER | HOLDING_BOTH | PAUSED)
+}
+
 fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Captures");
@@ -3123,9 +3503,10 @@ fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapp
     // it (`neural_forge_protocol::capture`), which the toast reports.
     capture_button.set_tooltip_text(Some(
         "Saves the next frame the game presents as <time>-original.png (the game's frame) and \
-         <time>-composited.png (what Neural Forge presented). While the model runs before the upscaler \
-         (a DLSS game), the layer has no frame without the model's edit when the game presents, so both \
-         images are the presented frame. HDR and 10-bit games cannot be captured.",
+         <time>-composited.png (what Neural Forge presented). While the model runs in the game's frame \
+         (before the upscaler or after DLSS, in a DLSS game), the layer has no frame without the model's \
+         edit when the game presents, so both images are the presented frame. HDR and 10-bit games \
+         cannot be captured.",
     ));
     capture_row.add_suffix(&capture_button);
     group.add(&capture_row);
@@ -3216,13 +3597,13 @@ fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapp
         });
     }
 
-    // Holding before the upscaler: from the channel, while the layer's heartbeat is fresh.
+    // The model in the game's frame: from the channel, while the layer's heartbeat is fresh.
     let shm = std::sync::Arc::clone(shm);
     let live = Liveness::default();
     every(&capture_row, SECOND, move |capture_row| {
         let hdr = shm.header();
-        let holding = hdr.preupscale_state.load(Ordering::Relaxed) == neural_forge_protocol::enums::preupscale_state::HOLDING;
-        capture_row.set_subtitle(capture_subtitle(live.alive(hdr) && holding));
+        let in_game_frame = edits_in_game_frame(hdr.preupscale_state.load(Ordering::Relaxed));
+        capture_row.set_subtitle(capture_subtitle(live.alive(hdr) && in_game_frame));
     });
     group
 }
@@ -3239,7 +3620,7 @@ fn connect_save_report(button: &gtk4::Button, shm: &std::sync::Arc<neural_forge_
         let button = button.clone();
         button.set_sensitive(false);
         glib::spawn_future_local(async move {
-            let saved = gio::spawn_blocking(move || neural_forge_supervisor::report::save(&status, &game, None)).await;
+            let saved = gio::spawn_blocking(move || neural_forge_supervisor::report::save(&status, &game, None, None)).await;
             button.set_sensitive(true);
             match saved {
                 Ok(Ok(path)) => {
@@ -3288,16 +3669,28 @@ fn finding_row(finding: &neural_forge_supervisor::doctor::Finding) -> adw::Actio
 
 /// The Status page's one line on the pre-upscaler path, from the header's `preupscale_*` fields
 /// (`neural_forge_protocol::enums::preupscale_state`). `layer_active`: the layer's heartbeat is
-/// fresh; otherwise the fields are a closed game's leftovers.
-fn preupscale_label(layer_active: bool, state: u32, width: u32, height: u32, misses: u32) -> String {
-    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH, WAITING};
+/// fresh; otherwise the fields are a closed game's leftovers. `reason`: why no hold runs while DLSS's input is
+/// identified (`preupscale_reason`, with `IDENTIFIED`). `placement`: the Model placement setting; "At present"
+/// runs the model on the finished frame by choice, so the line says that rather than "waiting" for DLSS (#49).
+fn preupscale_label(layer_active: bool, placement: u32, state: u32, width: u32, height: u32, misses: u32, reason: &str) -> String {
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH, IDENTIFIED, NO_WRAPPER, PAUSED, WAITING};
     let missed = if misses == 0 { String::new() } else { format!(", {misses} frame{} missed", if misses == 1 { "" } else { "s" }) };
     match state {
         _ if !layer_active => "no game running".to_string(),
+        _ if placement == neural_forge_protocol::enums::placement::PRESENT && !matches!(state, HOLDING | HOLDING_AFTER | HOLDING_BOTH) => {
+            "at present, on the finished frame (the Model placement setting)".to_string()
+        }
         HOLDING => format!("before the upscaler: holding DLSS's {width}x{height} input{missed}"),
         HOLDING_AFTER => format!("after DLSS, before the HUD: holding DLSS's {width}x{height} output{missed}"),
         HOLDING_BOTH => format!("before the upscaler and after DLSS, before the HUD{missed}"),
         WAITING => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
+        PAUSED => format!("paused with the game's DLSS (a menu or loading screen): the model resumes with its next frame{missed}"),
+        NO_WRAPPER if reason.is_empty() => {
+            "off: this game uses DLSS but isn't on the Neural Forge Proton; switch it on in the Setup tab to set it (Steam closed)".to_string()
+        }
+        NO_WRAPPER => format!("off: {reason}"),
+        IDENTIFIED if reason.is_empty() => format!("after the upscaler: DLSS input identified, not holding{missed}"),
+        IDENTIFIED => format!("after the upscaler: DLSS input identified, not holding{missed} -- {reason}"),
         _ => "after the upscaler".to_string(),
     }
 }
@@ -3448,25 +3841,82 @@ mod preupscale_label_tests {
 
     #[test]
     fn says_where_the_model_runs_in_one_line() {
-        assert_eq!(preupscale_label(false, 2, 1485, 836, 3), "no game running");
-        assert_eq!(preupscale_label(true, 0, 0, 0, 0), "after the upscaler");
-        assert_eq!(preupscale_label(true, 1, 0, 0, 0), "after the upscaler: waiting for DLSS Super Resolution");
-        assert_eq!(preupscale_label(true, 2, 1485, 836, 0), "before the upscaler: holding DLSS's 1485x836 input");
-        assert_eq!(preupscale_label(true, 2, 1485, 836, 1), "before the upscaler: holding DLSS's 1485x836 input, 1 frame missed");
-        assert_eq!(preupscale_label(true, 1, 1485, 836, 85), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
-        assert_eq!(preupscale_label(true, 3, 2560, 1440, 0), "after DLSS, before the HUD: holding DLSS's 2560x1440 output");
-        assert_eq!(preupscale_label(true, 4, 2560, 1440, 2), "before the upscaler and after DLSS, before the HUD, 2 frames missed");
+        assert_eq!(preupscale_label(false, 0, 2, 1485, 836, 3, ""), "no game running");
+        assert_eq!(preupscale_label(true, 0, 0, 0, 0, 0, ""), "after the upscaler");
+        assert_eq!(preupscale_label(true, 0, 1, 0, 0, 0, ""), "after the upscaler: waiting for DLSS Super Resolution");
+        assert_eq!(preupscale_label(true, 0, 2, 1485, 836, 0, ""), "before the upscaler: holding DLSS's 1485x836 input");
+        assert_eq!(preupscale_label(true, 0, 2, 1485, 836, 1, ""), "before the upscaler: holding DLSS's 1485x836 input, 1 frame missed");
+        assert_eq!(preupscale_label(true, 0, 1, 1485, 836, 85, ""), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
+        assert_eq!(preupscale_label(true, 0, 3, 2560, 1440, 0, ""), "after DLSS, before the HUD: holding DLSS's 2560x1440 output");
+        assert_eq!(preupscale_label(true, 0, 4, 2560, 1440, 2, ""), "before the upscaler and after DLSS, before the HUD, 2 frames missed");
+        let no_wrapper = neural_forge_protocol::enums::preupscale_state::NO_WRAPPER;
+        assert!(preupscale_label(true, 0, no_wrapper, 0, 0, 0, "").contains("isn't on the Neural Forge Proton"));
+        assert_eq!(
+            preupscale_label(true, 0, no_wrapper, 0, 0, 0, "the layer's own reason"),
+            "off: the layer's own reason",
+            "the layer's reason when it gives one"
+        );
+    }
+
+    /// Placement "At present" (#49): the model runs on the finished frame by choice, not while waiting for DLSS.
+    #[test]
+    fn says_at_present_when_the_setting_puts_it_there() {
+        let present = neural_forge_protocol::enums::placement::PRESENT;
+        for state in [0, 1, 5] {
+            assert_eq!(preupscale_label(true, present, state, 0, 0, 0, "why"), "at present, on the finished frame (the Model placement setting)");
+        }
+        assert_eq!(preupscale_label(false, present, 1, 0, 0, 0, ""), "no game running");
+        assert_eq!(preupscale_label(true, 2, 1, 0, 0, 0, ""), "after the upscaler: waiting for DLSS Super Resolution");
+    }
+
+    /// DLSS runs with its input identified but every frame is refused (#51): the line says so, and why.
+    #[test]
+    fn says_why_an_identified_dlss_input_is_not_held() {
+        let why = "no hold inside DLSS's buffer: the colour input is 1920x1080, the identified one 1280x720";
+        assert_eq!(preupscale_label(true, 0, 5, 1280, 720, 0, why), format!("after the upscaler: DLSS input identified, not holding -- {why}"));
+        assert_eq!(
+            preupscale_label(true, 0, 5, 1280, 720, 2, why),
+            format!("after the upscaler: DLSS input identified, not holding, 2 frames missed -- {why}")
+        );
+        assert_eq!(preupscale_label(true, 0, 5, 1280, 720, 0, ""), "after the upscaler: DLSS input identified, not holding");
+        assert_eq!(preupscale_label(false, 0, 5, 1280, 720, 0, why), "no game running");
+        assert_eq!(preupscale_label(true, 0, 1, 0, 0, 0, why), "after the upscaler: waiting for DLSS Super Resolution", "the reason belongs to state 5 only");
+    }
+
+    /// The game paused DLSS after holds (a pause menu, #49): the line says the model resumes with it, not that it moved
+    /// after the upscaler.
+    #[test]
+    fn says_paused_while_the_game_pauses_dlss() {
+        let paused = neural_forge_protocol::enums::preupscale_state::PAUSED;
+        assert_eq!(
+            preupscale_label(true, 0, paused, 1188, 891, 0, ""),
+            "paused with the game's DLSS (a menu or loading screen): the model resumes with its next frame"
+        );
+        assert_eq!(preupscale_label(false, 0, paused, 1188, 891, 0, ""), "no game running");
     }
 }
 
 #[cfg(test)]
 mod capture_tests {
-    use super::capture_subtitle;
+    use super::{capture_subtitle, edits_in_game_frame};
 
     #[test]
     fn the_capture_row_says_when_there_is_no_before_image() {
-        assert!(capture_subtitle(true).contains("before the upscaler"));
+        assert!(capture_subtitle(true).contains("before the upscaler or after DLSS"));
         assert!(capture_subtitle(false).contains("two PNGs"));
+    }
+
+    /// Holding before the upscaler, after DLSS or both, the presented frame already has the model's edit and the
+    /// layer captures it as both images; waiting, DLSS identified but not held, and off capture before and after.
+    #[test]
+    fn a_capture_has_no_before_image_exactly_while_the_model_edits_the_game_frame() {
+        use neural_forge_protocol::enums::preupscale_state::*;
+        for state in [HOLDING, HOLDING_AFTER, HOLDING_BOTH, PAUSED] {
+            assert!(edits_in_game_frame(state), "state {state}");
+        }
+        for state in [OFF, WAITING, IDENTIFIED, 99] {
+            assert!(!edits_in_game_frame(state), "state {state}");
+        }
     }
 }
 
@@ -3521,5 +3971,34 @@ mod telemetry_tests {
         assert_eq!(telemetry_ceiling(&[s(Some(16.7), None)].into()), 20.0, "60 fps");
         assert_eq!(telemetry_ceiling(&[s(Some(19.5), None)].into()), 40.0, "close to a step goes to the next");
         assert_eq!(telemetry_ceiling(&[s(Some(250.0), None)].into()), 80.0, "a stall is capped");
+    }
+}
+
+#[cfg(test)]
+mod uninstall_tests {
+    use super::{uninstall_body, uninstall_result};
+
+    #[test]
+    fn the_confirmation_says_what_goes_and_what_an_appimage_delete_leaves() {
+        let file = std::path::Path::new("/home/u/AppImages/neural-forge.AppImage");
+        let body = uninstall_body(false, Some(file));
+        assert!(body.contains("*-NeuralForge") && body.contains("this AppImage file, /home/u/AppImages/neural-forge.AppImage"), "{body}");
+        assert!(body.contains("Deleting only the AppImage file does not uninstall Neural Forge"), "{body}");
+        assert!(!body.contains("Steam is running"));
+        assert!(uninstall_body(true, None).contains("Steam is running, so the launch options cannot be changed now"));
+    }
+
+    #[test]
+    fn the_result_lists_what_steam_kept() {
+        let purged = neural_forge_supervisor::install::Purged {
+            switched_off: vec!["Some Game (1)".into()],
+            left: vec!["app 2: Steam is running, ...; its launch options without Neural Forge: `%command%`".into()],
+            removed: vec!["/a".into(), "/b".into()],
+            ..Default::default()
+        };
+        let text = uninstall_result(&purged, None);
+        assert!(text.starts_with("Removed 2 files and folders."), "{text}");
+        assert!(text.contains("Switched off in the launch options of: Some Game (1).") && text.contains("app 2: Steam is running"), "{text}");
+        assert!(uninstall_result(&purged, Some(std::path::Path::new("/x.AppImage"))).contains("Delete /x.AppImage too"));
     }
 }

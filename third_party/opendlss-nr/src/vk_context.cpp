@@ -186,8 +186,13 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device
 
 Context::Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
                  uint32_t queueFamily, uint32_t queueIndex, uint64_t waitTimeoutNs, InitDispatchable initDispatchable,
-                 void* initUser, uint32_t sharedFamily) {
+                 void* initUser, uint32_t sharedFamily, bool bufferDeviceAddressExt, void (*queueLock)(void* user, int lock),
+                 void* queueLockUser) {
   initDispatchable_ = initDispatchable;
+  bdaExt_ = bufferDeviceAddressExt;
+  // Before anything can submit: a constructor that fails part-way releases what it made, and that waits on the queue.
+  queueLock_ = queueLock;
+  queueLockUser_ = queueLockUser;
   sharedFamily_ = sharedFamily == queueFamily ? VK_QUEUE_FAMILY_IGNORED : sharedFamily;
   initUser_ = initUser;
   volkInitializeCustom(getInstanceProcAddr);
@@ -198,6 +203,8 @@ Context::Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance insta
   // A device created at an API version below 1.3 has only the extension spellings of these.
   if (!vkCmdPipelineBarrier2) vkCmdPipelineBarrier2 = vkCmdPipelineBarrier2KHR;
   if (!vkGetBufferDeviceAddress) vkGetBufferDeviceAddress = vkGetBufferDeviceAddressKHR;
+  // volk's table is process-wide, but one network runs per process (nf_native_open).
+  if (bdaExt_) vkGetBufferDeviceAddress = vkGetBufferDeviceAddressEXT;
   if (!vkResetQueryPool) vkResetQueryPool = vkResetQueryPoolEXT;
   if (!vkCmdPipelineBarrier2 || !vkGetBufferDeviceAddress || !vkCreateCudaModuleNV || !vkCmdCudaLaunchKernelNV)
     throw std::runtime_error("the device does not expose the functions the network needs");
@@ -404,7 +411,7 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
     VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
     allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocateInfo.pNext = &allocateFlags;
+    allocateInfo.pNext = bdaExt_ ? nullptr : &allocateFlags;
     allocateInfo.allocationSize = requirements.size;
     allocateInfo.memoryTypeIndex = findMemoryType(
         requirements.memoryTypeBits,
@@ -434,7 +441,7 @@ VkDeviceMemory Context::allocateDeviceMemory(VkDeviceSize size, uint32_t memoryT
   VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
   allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
   VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  allocateInfo.pNext = &allocateFlags;
+  allocateInfo.pNext = bdaExt_ ? nullptr : &allocateFlags;
   allocateInfo.allocationSize = size;
   allocateInfo.memoryTypeIndex = findMemoryType(memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -681,7 +688,10 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
   submit.pCommandBuffers = &commands;
   if (waitTimeoutNs_ && wait) {
     VK_CHECK(vkResetFences(device_, 1, &waitFence_));
-    VK_CHECK(vkQueueSubmit(queue_, 1, &submit, waitFence_));
+    {
+      QueueGuard guard(*this);
+      VK_CHECK(vkQueueSubmit(queue_, 1, &submit, waitFence_));
+    }
     const VkResult waited = vkWaitForFences(device_, 1, &waitFence_, VK_TRUE, waitTimeoutNs_);
     // A timed-out buffer may still run: it is leaked, not freed, and so is everything it may use.
     if (waited == VK_TIMEOUT) {
@@ -692,9 +702,15 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
     vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
     return;
   }
-  VK_CHECK(vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE));
+  {
+    QueueGuard guard(*this);
+    VK_CHECK(vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE));
+  }
   if (wait) {
-    VK_CHECK(vkQueueWaitIdle(queue_));
+    {
+      QueueGuard guard(*this);
+      VK_CHECK(vkQueueWaitIdle(queue_));
+    }
     vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
   }
 }
@@ -706,13 +722,17 @@ void Context::discardCommands(VkCommandBuffer commands) {
 
 void Context::waitIdle() {
   if (!waitTimeoutNs_) {
+    QueueGuard guard(*this);
     VK_CHECK(vkQueueWaitIdle(queue_));
     return;
   }
   if (stalled_) throw std::runtime_error("the network's queue stalled earlier; it takes no more work");
   // An empty submit's fence signals once everything before it on the queue has completed.
   VK_CHECK(vkResetFences(device_, 1, &waitFence_));
-  VK_CHECK(vkQueueSubmit(queue_, 0, nullptr, waitFence_));
+  {
+    QueueGuard guard(*this);
+    VK_CHECK(vkQueueSubmit(queue_, 0, nullptr, waitFence_));
+  }
   const VkResult waited = vkWaitForFences(device_, 1, &waitFence_, VK_TRUE, waitTimeoutNs_);
   if (waited == VK_TIMEOUT) {
     stalled_ = true;

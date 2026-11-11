@@ -37,6 +37,9 @@ mod ffi {
         pub fence_timeout_ms: u32,
         pub init_dispatchable: Option<InitDispatchable>,
         pub init_user: *mut c_void,
+        pub queue_lock: Option<QueueLock>,
+        pub queue_user: *mut c_void,
+        pub buffer_device_address_ext: u32,
     }
 
     extern "C" {
@@ -94,10 +97,14 @@ const MESSAGE: usize = 512;
 
 /// The hold slots [`Network::record_graph_at`] serves (`kHoldPools` in nf_native.cpp, which
 /// `nf_native_hold_slots` reports: a test holds the two equal).
-pub const HOLD_SLOTS: u32 = 16;
+pub const HOLD_SLOTS: u32 = 32;
 
 /// Sets the loader's dispatch pointer on a dispatchable object the network got from below the loader.
 pub type InitDispatchable = unsafe extern "C" fn(user: *mut c_void, device: vk::Device, object: *mut c_void);
+
+/// Called with 1 before and 0 after every `vkQueueSubmit` and `vkQueueWaitIdle` on the network's queue when that queue
+/// is the application's, shared ([`OpenInfo::queue_lock`]).
+pub type QueueLock = unsafe extern "C" fn(user: *mut c_void, lock: i32);
 
 fn message(buf: &[c_char]) -> String {
     // SAFETY: the C side always NUL-terminates within the buffer (snprintf), and the buffer starts zeroed.
@@ -250,6 +257,13 @@ pub struct OpenInfo<'a> {
     pub fence_timeout_ms: u32,
     /// Inside a layer: called on the network's queue and every command buffer it allocates.
     pub init_dispatchable: Option<InitDispatchable>,
+    /// The network's queue is the application's, shared: this lock (with `queue_user`) is held around every submit
+    /// and queue wait on it. `None`: the queue is the network's alone.
+    pub queue_lock: Option<QueueLock>,
+    pub queue_user: *mut c_void,
+    /// The device was created with `VK_EXT_buffer_device_address` ([`device_extend`] then enables its feature, not the
+    /// core one): the network allocates and takes addresses the extension's way.
+    pub buffer_device_address_ext: bool,
 }
 
 /// Why [`Network::open`] failed.
@@ -309,6 +323,9 @@ impl Network {
             fence_timeout_ms: info.fence_timeout_ms,
             init_dispatchable: info.init_dispatchable,
             init_user: std::ptr::null_mut(),
+            queue_lock: info.queue_lock,
+            queue_user: info.queue_user,
+            buffer_device_address_ext: u32::from(info.buffer_device_address_ext),
         };
         let mut err = [0 as c_char; MESSAGE];
         let mut stalled = 0;
@@ -578,8 +595,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn abi_version_is_6() {
-        assert_eq!(abi_version(), 6);
+    fn abi_version_is_7() {
+        assert_eq!(abi_version(), 7);
     }
 
     /// The graph's first command zeroes the counters every execution of it shares (the chaining and split-K

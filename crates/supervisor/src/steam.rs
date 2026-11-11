@@ -468,6 +468,47 @@ pub fn target_exes(game: &Game) -> Vec<String> {
     TargetFinder::new(std::slice::from_ref(game)).target_exes(game)
 }
 
+/// Which build of a game Steam installed ([`installed_build`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Build {
+    /// The Windows build: Steam runs it with a Proton.
+    Windows,
+    /// A native Linux build: Steam runs it without Proton (unless a Proton is chosen for the game).
+    Linux,
+    /// Neither could be told.
+    Unknown,
+}
+
+/// Which build of `game` is installed: the launch entries Steam's app cache marks for one system whose executable
+/// is in the game's folder (Steam installs one system's depots), else the folder itself (Windows executables, or
+/// ELF executables at its top and none).
+pub fn installed_build(game: &Game) -> Build {
+    let launches = crate::appinfo::launches_for(&game.root.path, &[&game.appid]).remove(&game.appid).unwrap_or_default();
+    installed_build_with(game, &launches)
+}
+
+fn installed_build_with(game: &Game, launches: &[crate::appinfo::Launch]) -> Build {
+    let dir = game.dir();
+    let present = |l: &&crate::appinfo::Launch| {
+        let rel = l.executable.replace('\\', "/");
+        let rel = rel.trim_start_matches("./");
+        relative_inside(rel) && dir.join(rel).is_file()
+    };
+    let only = |os: &str| launches.iter().filter(|l| !l.oslist.trim().is_empty() && l.for_os(os) && l.for_branch(&game.branch)).any(|l| present(&l));
+    match (only("windows"), only("linux")) {
+        (true, false) => return Build::Windows,
+        (false, true) => return Build::Linux,
+        _ => {}
+    }
+    let exes = !all_exes(&dir).is_empty();
+    let elves = std::fs::read_dir(&dir).is_ok_and(|entries| entries.flatten().any(|e| elf_executable(&e.path())));
+    match (exes, elves) {
+        (true, false) => Build::Windows,
+        (false, true) => Build::Linux,
+        _ => Build::Unknown,
+    }
+}
+
 /// The games whose install folder holds an executable named `exe` (ignoring case), best first: a
 /// game whose [`target_exes`] name it, else the one holding it least deep, searched up to four
 /// folders deep (`Game/Binaries/Win64/Game-Win64-Shipping.exe` is four). Several games tied for
@@ -798,6 +839,13 @@ fn sibling(file: &Path, suffix: &str) -> PathBuf {
 /// each (beside its backups), taken in the files' sorted order so two holders never wait on each
 /// other. A lock that cannot be taken is skipped: its directory then cannot take the edit's
 /// temporary file either, and the write reports that.
+/// Holds `file`'s Neural Forge lock (its `.neural-forge.lock` sibling) until dropped.
+pub(crate) fn lock_file(file: &Path) -> Option<std::fs::File> {
+    let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(sibling(file, ".neural-forge.lock")).ok()?;
+    lock.lock().ok()?;
+    Some(lock)
+}
+
 fn lock_localconfigs(files: &[PathBuf]) -> Vec<std::fs::File> {
     files
         .iter()
@@ -810,7 +858,7 @@ fn lock_localconfigs(files: &[PathBuf]) -> Vec<std::fs::File> {
 }
 
 /// The backups and the atomic replace for one file, whose bytes read as `old` a moment ago.
-fn write_with_backups(file: &Path, old: &[u8], new: &[u8]) -> std::io::Result<PathBuf> {
+pub(crate) fn write_with_backups(file: &Path, old: &[u8], new: &[u8]) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(file)?.permissions().mode() & 0o7777;
     let orig = sibling(file, ".neural-forge.orig");
@@ -1410,5 +1458,37 @@ mod tests {
         assert_eq!(options_in(&home.0.join("userdata/2/config/localconfig.vdf"), "3240220").as_deref(), Some("%command%"));
         // No account at all.
         assert!(matches!(apply(&home.0.join("nowhere"), "3240220", &enable(), false), Outcome::Failed { .. }));
+    }
+
+    /// The installed build is the one whose launch entry's executable is there; without launch entries, the folder's
+    /// executables tell.
+    #[test]
+    fn the_installed_build_is_told_by_its_executables() {
+        use crate::appinfo::Launch;
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new("build");
+        let g = |dir: &str| Game {
+            appid: "1".into(),
+            name: dir.into(),
+            installdir: dir.into(),
+            library: s.0.clone(),
+            root: Root { path: s.0.clone(), flatpak: false },
+            branch: String::new(),
+        };
+        let launch = |exe: &str, os: &str| Launch { executable: exe.into(), oslist: os.into(), beta_keys: Vec::new() };
+        let both = [launch("bin\\Game.exe", "windows"), launch("game.sh", "linux")];
+        write(&s.0.join("steamapps/common/Win/bin/Game.exe"), "MZ");
+        write(&s.0.join("steamapps/common/Lin/game.sh"), "#!/bin/sh");
+        assert_eq!(installed_build_with(&g("Win"), &both), Build::Windows);
+        assert_eq!(installed_build_with(&g("Lin"), &both), Build::Linux);
+        // No launch entries: the folder.
+        assert_eq!(installed_build_with(&g("Win"), &[]), Build::Windows);
+        let elf = s.0.join("steamapps/common/Elf/game.x86_64");
+        write(&elf, "\x7fELF....");
+        std::fs::set_permissions(&elf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(installed_build_with(&g("Elf"), &[]), Build::Linux);
+        write(&s.0.join("steamapps/common/Elf/Game.exe"), "MZ");
+        assert_eq!(installed_build_with(&g("Elf"), &[]), Build::Unknown, "both kinds: not told");
+        assert_eq!(installed_build_with(&g("Gone"), &[]), Build::Unknown);
     }
 }

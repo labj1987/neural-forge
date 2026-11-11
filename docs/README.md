@@ -7,7 +7,7 @@ Every document in this folder, one line each. New to the project: read
 Older documents are kept as they were written, with a dated note at the top where something in
 them is no longer true. Up to 2.0.10 the model ran in a Windows helper under Wine through NVIDIA's
 NGX runtime; 3.0 removed the helper, so what older documents say about it, the runners, the
-Wine prefix or NGX is history. When a document and the code disagree, the code wins; when two documents
+Wine prefix or NGX is history (the NGX wrapper for Proton only watches NGX: PROTON_NGX.md). When a document and the code disagree, the code wins; when two documents
 disagree, the more recent measurement wins.
 
 ## For users
@@ -24,6 +24,9 @@ disagree, the more recent measurement wins.
 - [NATIVE_BACKEND.md](NATIVE_BACKEND.md): how the network moved into the layer for 3.0 (OpenDLSS-NR,
   the model directory and its extractor, the device setup, the hold inside DLSS's buffer), and every
   measurement against NVIDIA's runtime through the 2.x helper.
+- [PROTON_NGX.md](PROTON_NGX.md): the NGX wrapper for Proton (a builtin `_nvngx.dll` that forwards NVIDIA's core
+  and records what the game gives DLSS), its ring, how the layer places and runs its holds from the records alone,
+  the Proton copies the app makes, licences and maintenance.
 - [PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md): the 2.0 design for running the model before
   DLSS Super Resolution, and the full record of its experiments (E1-E3, hand-off latency, 4K,
   robustness, frame generation).
@@ -86,7 +89,8 @@ disagree, the more recent measurement wins.
 - [RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md): building, deploying to a test machine, the
   unattended GTA benchmark, the pan reproducer and agreement metric, the diagnostic modes and
   probe, reading the logs and `shmctl status`, validation
-  layers, checking the picture by eye, the release checklist, and the reverse-engineering toolkit
+  layers, checking the picture by eye, the release checklist, the reverse-engineering toolkit, and the
+  pre-release game sweep (`scripts/game-sweep.sh`, the games in `data/games.toml`)
   installed on the test machine.
 - [RE_TOOLKIT.md](RE_TOOLKIT.md): agent-driven reverse-engineering tools surveyed (what each attaches
   to, headless or GUI, licence) and why each was or was not installed.

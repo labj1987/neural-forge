@@ -43,8 +43,10 @@ use super::{lock, Aux, InlinePoint};
 
 /// Slots per device: DLSS's buffers recorded with a hold whose holds may still run. A slot is free again only
 /// once its buffer cannot be submitted again unchanged: re-recorded, reset, freed, or its pool reset or
-/// destroyed; never by time.
-pub(crate) const MAX_SLOTS: usize = 8;
+/// destroyed; never by time. Red Dead Redemption 2 keeps about 15 of DLSS's one-time-submit buffers recorded ahead
+/// (8 slots held 54% of its frames and the rest went to DLSS unedited, flickering, #49): 32, as many as the network's
+/// hold pools ([`neural_forge_native::HOLD_SLOTS`]), which are made only once a slot is used.
+pub(crate) const MAX_SLOTS: usize = 32;
 
 /// The timestamps a hold writes into its slot's pool: after the copy in, after the capture, after the
 /// network, after the write-back.
@@ -397,6 +399,8 @@ pub(crate) struct Inline {
     /// The hold's buffers were submitted on more than one queue: no more holds are recorded (their work
     /// shares the stage's resources and must run one after another).
     stopped: AtomicBool,
+    /// The first hold recorded into one of DLSS's buffers on this device was said ([`Self::record_outcome`]).
+    first_recorded: AtomicBool,
     said: Mutex<HashSet<String>>,
     /// The shared memory's header once the device's state opened it ([`watch_switch`]): the model's
     /// switch (F11, the GUI), read at every launch so nothing is recorded while it is off.
@@ -456,13 +460,16 @@ impl Inline {
             harvest: Mutex::new(Vec::new()),
             outstanding,
             stopped: AtomicBool::new(false),
+            first_recorded: AtomicBool::new(false),
             said: Mutex::new(HashSet::new()),
             switch: AtomicPtr::new(std::ptr::null_mut()),
             restore: Arc::new(super::restore::Tracker::new(restore)),
         });
         lock(&INLINES).insert(device.handle(), inline.clone());
+        // Said apart from the first hold actually recorded ("first hold recorded into DLSS's command buffer"):
+        // this line comes at device creation, before anything is identified or held.
         crate::log!(
-            "[preupscale] hold inside DLSS's command buffer available: recorded into it, on family {app_family} (NEURAL_FORGE_INLINE=off turns it off)"
+            "[preupscale] hold inside DLSS's command buffer available on this device (family {app_family}); nothing is held yet (NEURAL_FORGE_INLINE=off turns it off)"
         );
         crate::logging::flush();
         inline
@@ -471,6 +478,13 @@ impl Inline {
     /// The game's graphics family, where DLSS's buffers (and so the holds) run.
     pub(crate) fn app_family(&self) -> u32 {
         self.app_family
+    }
+
+    /// [`Self::say_once`] for a reason the hold is not recorded: also the status's last refusal
+    /// ([`super::note_refusal`]).
+    fn refuse(&self, what: String) {
+        super::note_refusal(super::Refusal::Text(what.clone().into()));
+        self.say_once(what);
     }
 
     fn say_once(&self, what: String) {
@@ -568,8 +582,13 @@ impl Inline {
     /// Whether `cb` carries a hold before the upscaler (the split path then leaves it alone; one carrying only
     /// the hold after DLSS's output is still split in front of).
     pub(crate) fn owns_before(&self, cb: vk::CommandBuffer) -> bool {
+        self.owns_at(cb, Some(Stage::Before))
+    }
+
+    /// Whether `cb` carries a recorded hold at `stage`, or at any stage for `None`.
+    pub(crate) fn owns_at(&self, cb: vk::CommandBuffer, stage: Option<Stage>) -> bool {
         let s = lock(&self.slots);
-        s.by_cb.get(&cb).is_some_and(|slots| slots.iter().any(|&i| s.slots[i].stage == Stage::Before && s.slots[i].meta.is_some()))
+        s.by_cb.get(&cb).is_some_and(|slots| slots.iter().any(|&i| stage.is_none_or(|st| s.slots[i].stage == st) && s.slots[i].meta.is_some()))
     }
 
     /// Whether the model is switched off (F11, the GUI, `shmctl set enabled 0`), as far as known: before
@@ -764,15 +783,22 @@ impl Inline {
     /// calls [`Ctx::open`], and returns the hold's [`Meta`] once recorded, or why it did not
     /// ([`Recorded::Skipped`] for what passes, [`Recorded::Refused`] for what stays).
     pub(crate) fn record_outcome(&self, cb: vk::CommandBuffer, point: InlinePoint, hold: impl FnOnce(&mut Ctx) -> Result<Meta, Recorded>) -> Recorded {
-        // Switched off: nothing to hold for.
+        // What returns before the hold is asked is counted in the device's tally of the holds inside (#51: Stellar
+        // Blade's log said nothing of why no hold was recorded).
+        let tally = crate::device::inline_tally;
+        // Switched off: nothing to hold for, and the status says so.
         if self.model_switched_off() {
+            super::note_not_held(super::MODEL_OFF);
+            tally("skipped (the model is switched off)");
             return Recorded::Skipped;
         }
         if self.stopped.load(Ordering::Relaxed) {
+            tally("refused (no more holds are recorded: DLSS's buffers go to more than one queue)");
             return Recorded::Refused;
         }
         if point.guessed.colour.is_some() && self.verdicts.is_none() {
             // Its layout could not be checked when the buffer is submitted.
+            tally("skipped (the colour input's layout is a guess, and the hold guard that checks it is not available)");
             return Recorded::Skipped;
         }
         let stage = if point.hold.stage == Stage::Upscaled { Stage::Upscaled } else { Stage::Before };
@@ -781,11 +807,13 @@ impl Inline {
         let (index, staging, queries, readback, outstanding, mut cache_dump) = {
             let mut s = lock(&self.slots);
             if s.simultaneous.contains(&cb) {
-                self.say_once("a DLSS buffer recorded with SIMULTANEOUS_USE is not held inside".into());
+                tally("refused (SIMULTANEOUS_USE)");
+                self.refuse("a DLSS buffer recorded with SIMULTANEOUS_USE is not held inside".into());
                 return Recorded::Refused;
             }
             if s.secondary.contains(&cb) {
-                self.say_once("DLSS is recorded in a secondary command buffer; it is not held inside".into());
+                tally("refused (a secondary command buffer)");
+                self.refuse("DLSS is recorded in a secondary command buffer; it is not held inside".into());
                 return Recorded::Refused;
             }
             // The hold's dispatches, copies and blits run on DLSS's graphics queue: a buffer of another
@@ -793,7 +821,8 @@ impl Inline {
             match s.pool_of.get(&cb).and_then(|p| s.pool_family.get(p)).copied() {
                 Some(family) if family == self.app_family => {}
                 family => {
-                    self.say_once(match family {
+                    tally("refused (not the graphics family's pool)");
+                    self.refuse(match family {
                         Some(f) => format!("DLSS is recorded for queue family {f}, not the graphics family {}; it is not held inside", self.app_family),
                         None => "DLSS's command buffer comes from a pool the layer did not see created; it is not held inside".to_string(),
                     });
@@ -802,25 +831,30 @@ impl Inline {
             }
             // One hold per stage in a buffer: a second launch at the same point adds none.
             if s.by_cb.get(&cb).is_some_and(|slots| slots.iter().any(|&i| s.slots[i].stage == stage)) {
+                tally("skipped (the buffer has a hold of this stage already)");
                 return Recorded::Skipped;
             }
             if convert && !self.blit_r11g11b10 {
-                self.say_once(format!("the colour input is {:?} and the device cannot blit it to RGBA16F; not holding", point.desc.format));
+                tally("refused (the colour input cannot be blitted to RGBA16F)");
+                self.refuse(format!("the colour input is {:?} and the device cannot blit it to RGBA16F; not holding", point.desc.format));
                 return Recorded::Refused;
             }
             // The application's compute state must be put back after the hold: noted from the first hold
             // point on, for buffers begun after it.
             if !self.restore.activate() {
                 self.say_once("noting the application's compute state from here on, for the hold inside DLSS's buffer".into());
+                tally("skipped (the application's compute state is noted from here on)");
                 return Recorded::Skipped;
             }
             if !self.restore.with(cb, |s| s.complete()) {
+                tally("skipped (the buffer was begun before the application's compute state was noted)");
                 return Recorded::Skipped;
             }
             let unrestorable =
                 self.restore.with(cb, |s| s.unrestorable().or(s.needs_missing(&self.restore.fns).then_some("a binding command the layer cannot repeat")));
             if let Some(why) = unrestorable {
-                self.say_once(format!("a DLSS buffer is not held inside: its compute state cannot be put back after the hold ({why})"));
+                tally("skipped (the application's compute state cannot be put back)");
+                self.refuse(format!("a DLSS buffer is not held inside: its compute state cannot be put back after the hold ({why})"));
                 return Recorded::Skipped;
             }
             let index = match s.slots.iter().position(|sl| sl.owner.is_none()) {
@@ -828,13 +862,15 @@ impl Inline {
                 None if s.slots.len() < MAX_SLOTS => {
                     // SAFETY: the device is live.
                     let Some(slot) = (unsafe { self.build_slot() }) else {
-                        self.say_once("a slot for the hold inside DLSS's buffer could not be built; not holding there".into());
+                        tally("refused (no slot could be built)");
+                        self.refuse("a slot for the hold inside DLSS's buffer could not be built; not holding there".into());
                         return Recorded::Refused;
                     };
                     s.slots.push(slot);
                     s.slots.len() - 1
                 }
                 None => {
+                    tally("skipped (every slot is in use)");
                     self.say_busy(&s);
                     return Recorded::Skipped;
                 }
@@ -844,6 +880,7 @@ impl Inline {
             let others = s.outstanding(stage, None);
             if s.staging[k].is_none_or(|st| st.extent != extent) {
                 if others > 0 {
+                    tally("skipped (the staging images are built for the new extent once earlier holds ran)");
                     return Recorded::Skipped;
                 }
                 if let Some(old) = s.staging[k].take() {
@@ -853,7 +890,8 @@ impl Inline {
                 // SAFETY: the device is live.
                 s.staging[k] = unsafe { self.build_staging(extent) };
                 if s.staging[k].is_none() {
-                    self.say_once(format!("staging images of {}x{} could not be built; that buffer is not held inside", extent.0, extent.1));
+                    tally("refused (no staging images)");
+                    self.refuse(format!("staging images of {}x{} could not be built; that buffer is not held inside", extent.0, extent.1));
                     return Recorded::Refused;
                 }
             }
@@ -968,6 +1006,17 @@ impl Inline {
                 slot.recorded = Some(Instant::now());
                 s.by_cb.entry(cb).or_default().push(index);
                 drop(s);
+                if !self.first_recorded.swap(true, Ordering::Relaxed) {
+                    // Flushed at once: a crash from here on (the game submitting the buffer) still shows it.
+                    crate::log!(
+                        "[preupscale] first hold recorded into DLSS's command buffer on this device: {}x{} {:?}, {}; it runs when the game submits that buffer",
+                        extent.0,
+                        extent.1,
+                        point.desc.format,
+                        if stage == Stage::Upscaled { "after DLSS's output" } else { "before the upscaler" }
+                    );
+                    crate::logging::flush();
+                }
                 self.say_once(format!(
                     "holding inside DLSS's command buffer, {} ({:?} in {:?}{}; why not the split: {:?}; motion vectors {})",
                     match stage {
@@ -1991,6 +2040,7 @@ mod tests {
                 exposure_input: aux(self.exposure, vk::Format::R16_SFLOAT),
                 paper_white: 2.5,
                 lift_exposure: false,
+                pre_exposed: false,
                 identification: 1,
             };
             let mut submit = |_: crate::preupscale::Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
@@ -2050,6 +2100,7 @@ mod tests {
                 exposure_input: aux(self.exposure, vk::Format::R16_SFLOAT),
                 mvec_input: aux(self.mvec, vk::Format::R16G16_SFLOAT),
                 mvec_extent: (W, H),
+                mv_units: None,
                 depth_input: None,
                 identification: 1,
                 hazard: Hazard::MemoryBarrier,
@@ -2090,6 +2141,7 @@ mod tests {
                     exposure_input: ctx.point.exposure_input,
                     paper_white: 2.5,
                     lift_exposure: false,
+                    pre_exposed: false,
                     identification: 1,
                 };
                 let res = session.res_inline(crate::preupscale::placement::Stage::Before).as_mut().expect("ensured");
@@ -2541,16 +2593,29 @@ mod tests {
         inline.switch.store(&mut *header, Ordering::Release);
         let real = rig.buffer();
         rig.begin(real);
+        crate::preupscale::note_refusal(crate::preupscale::Refusal::Text("an older refusal".into()));
         assert_eq!(inline.record_outcome(real, rig.point(), copies_only), Recorded::Skipped, "switched off");
+        assert_eq!(crate::preupscale::last_refusal_text().as_deref(), Some(crate::preupscale::MODEL_OFF), "the status says why, over the older refusal");
         header.apply_model.store(1, Ordering::Relaxed);
         assert_eq!(inline.record_outcome(real, rig.point(), copies_only), Recorded::Held, "switched on again");
         // A second launch at the same stage in that buffer adds no hold, and that passes.
         assert_eq!(inline.record_outcome(real, rig.point(), copies_only), Recorded::Skipped, "this stage is held in it already");
         assert_eq!(inline.outstanding.load(Ordering::SeqCst), 1, "one hold may run");
+        // What the split path asks: a hold before the upscaler, and none after DLSS's output yet; then that one too.
+        assert!(inline.owns_before(real) && inline.owns_at(real, None) && !inline.owns_at(real, Some(Stage::Upscaled)));
+        let mut after = rig.point();
+        after.hold.stage = Stage::Upscaled;
+        let after_only = |ctx: &mut Ctx| {
+            // SAFETY: the test's buffer, recording on this thread.
+            unsafe { ctx.open() };
+            Ok(Meta::empty(Stage::Upscaled))
+        };
+        assert_eq!(inline.record_outcome(real, after, after_only), Recorded::Held, "the hold after DLSS's output");
+        assert!(inline.owns_at(real, Some(Stage::Upscaled)));
         rig.end(real);
         // Its pool reset: the slot is free for another buffer, and nothing may run any more.
         inline.reset_pool(rig.pool, false);
-        assert!(!inline.owns(real));
+        assert!(!inline.owns(real) && !inline.owns_at(real, None));
         assert_eq!(inline.outstanding.load(Ordering::SeqCst), 0);
         inline.switch.store(std::ptr::null_mut(), Ordering::Release);
         // A buffer whose compute state cannot be put back is not held.
@@ -2558,6 +2623,34 @@ mod tests {
         inline.restore.with(real, |s| s.refuse("a test"));
         assert_eq!(inline.record_outcome(real, rig.point(), copies_only), Recorded::Skipped);
         rig.end(real);
+    }
+
+    /// Passes both before and after DLSS: two holds recorded into one DLSS buffer count its frame once
+    /// ([`Session::saw_dlss_inline`], as `device.rs` records each hold), so the edit cache sees consecutive holds
+    /// and a cache dump's arm check fires; the buffer begun again for the next frame counts that one.
+    #[test]
+    fn two_holds_in_one_dlss_buffer_count_its_frame_once() {
+        let Some(rig) = Rig::open(false) else { return };
+        let inline = &rig.inline;
+        let mut session = Session::default();
+        let real = rig.buffer();
+        let mut after = rig.point();
+        after.hold.stage = Stage::Upscaled;
+        for frame in 1..=2u64 {
+            rig.begin(real);
+            for (point, stage) in [(rig.point(), Stage::Before), (after, Stage::Upscaled)] {
+                let outcome = inline.record_outcome(real, point, |ctx| {
+                    session.saw_dlss_inline(inline, ctx.cb);
+                    // SAFETY: the test's buffer, recording on this thread.
+                    unsafe { ctx.open() };
+                    Ok(Meta::empty(stage))
+                });
+                assert_eq!(outcome, Recorded::Held, "frame {frame}, {stage:?}");
+            }
+            rig.end(real);
+            assert_eq!(session.seen(), frame, "one count per frame");
+        }
+        inline.reset_pool(rig.pool, false);
     }
 
     /// Held buffers about to go to a second queue stop the holds before the next layer has them, and from then

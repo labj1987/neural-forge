@@ -44,16 +44,58 @@ body:
   id: game
   attributes:
     label: Game
-    description: The game, its store, and whether its DLSS (Super Resolution, Frame Generation, Ray Reconstruction) is on.
-    placeholder: GTA V Enhanced (Steam), DLSS Quality + Frame Generation 4x
+    description: The game's name and version (or the date of its last update). `neural-forge-cli games --tested` lists the games Neural Forge is tested in.
+    placeholder: GTA V Enhanced, update of 2026-11-04
   validations:
     required: true
+- type: dropdown
+  id: store
+  attributes:
+    label: Store and launcher
+    options:
+    - Steam
+    - Steam, in gamescope (Steam Deck, Bazzite, Game Mode)
+    - GOG or Epic, through Heroic
+    - Lutris or Bottles
+    - Something else (say which under "What happened")
+  validations:
+    required: true
+- type: dropdown
+  id: neural-forge-proton
+  attributes:
+    label: The game is set to the Neural Forge Proton (Status tab shows it)
+    description: The game's Properties > Compatibility in Steam names the Proton it runs with; Neural Forge's own end in "-NeuralForge". The Status tab says so while the game runs ("isn't on the Neural Forge Proton" when it is not), and Save report lists every game's.
+    options:
+    - Yes, a -NeuralForge Proton
+    - No (another Proton, or the game is not on Steam)
+    - I don't know
+  validations:
+    required: true
+- type: checkboxes
+  id: dlss
+  attributes:
+    label: DLSS features on in the game
+    description: Tick every one the game has switched on while the problem shows.
+    options:
+    - label: Super Resolution (an upscaling mode)
+    - label: DLAA (Super Resolution at native resolution)
+    - label: Ray Reconstruction
+    - label: Frame Generation (with the multiplier under "What happened" if it has one)
+    - label: The game's own DLSS 5 Neural Rendering (turn it off for Neural Forge)
 - type: input
   id: placement
   attributes:
     label: Model placement
-    description: The **Model placement** line on the Status tab while the problem shows.
+    description: The **Model placement** line on the Status tab while the problem shows (and the **Tested game** line under it, if the game is a tested one).
     placeholder: before the upscaler, 1708x960
+  validations:
+    required: true
+- type: input
+  id: hdr
+  attributes:
+    label: HDR
+    description: The **HDR** line on the Status tab while the game runs (or `hdr_verdict=` from `neural-forge-cli shmctl status`), and whether the game's own HDR setting is on.
+    placeholder: 'game outputs HDR10 (...); desktop: GNOME: DP-1 HDR on. The game''s HDR setting is on.'
   validations:
     required: true
 - type: dropdown
@@ -110,7 +152,7 @@ body:
   id: report
   attributes:
     label: Save report zip
-    description: Press **Save report** on the Status tab (or run `neural-forge-cli report`) right after the problem, and drag the zip from your desktop here. Personal names are removed; it has no NVIDIA files in it.
+    description: Press **Save report** on the Status tab (or run `neural-forge-cli report`) right after the problem, with the game still running if you can, and drag the zip from your desktop here. It holds the layer's log, the live status, your settings, the game's entry in the tested games and the HDR verdict; personal names are removed and it has no NVIDIA files in it. If you were asked for a trace, add it with `neural-forge-cli report --trace FILE`.
   validations:
     required: true
 - type: textarea

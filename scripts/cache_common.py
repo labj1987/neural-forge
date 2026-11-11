@@ -151,7 +151,10 @@ class Dump:
         f = self.frames[k]
         files = f["files"]
         mvec_valid = f.get("mvec_valid", True) is not False
-        mv = self._read(files["mvec"], "<f2", 2) * np.array(self.mvec_scale, F32)
+        # As preupscale_cache_motion.comp's half_vector: a vector that is not a number is the largest finite
+        # half and an infinite one the largest of its sign, so each leaves the frame (the chain is lost there).
+        raw = self._read(files["mvec"], "<f2", 2).astype(F32)
+        mv = np.nan_to_num(raw, nan=65504.0, posinf=65504.0, neginf=-65504.0) * np.array(self.mvec_scale, F32)
         if not mvec_valid:
             mv = np.zeros_like(mv)
         depth_valid = f.get("depth_valid", True) is not False

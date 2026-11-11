@@ -34,8 +34,8 @@ fn usage_text() -> &'static str {
          \x20 uninstall [--purge]  remove unchanged tracked installed files; --purge also\n\
          \x20                     takes Neural Forge out of every game's Steam launch\n\
          \x20                     options (not while Steam runs) and removes its copies\n\
-         \x20                     of localconfig.vdf, config, data (the DLL, the model),\n\
-         \x20                     state and /tmp/neural-forge-$UID\n\
+         \x20                     of localconfig.vdf, its Proton builds, config, data\n\
+         \x20                     (the DLL, the model), state and /tmp/neural-forge-$UID\n\
          \x20 shmctl <sub>         raw status/set/toggle/capture against a running\n\
          \x20                     instance's live SHM header (see `shmctl help`)\n\
          \x20 profile <sub>        save/load/list/delete named settings profiles\n\
@@ -45,6 +45,9 @@ fn usage_text() -> &'static str {
          \x20                     `game-settings help`)\n\
          \x20 games                list installed Steam games and whether Neural Forge\n\
          \x20                     is on in their launch options\n\
+         \x20 games --tested [GAME] list the tested games (where the model runs, HDR,\n\
+         \x20                     known issues, the version last seen working), or\n\
+         \x20                     one game's facts\n\
          \x20 enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]\n\
          \x20                     turn Neural Forge on in GAME's Steam launch options for\n\
          \x20                     the game's own executable (found from Steam's data;\n\
@@ -53,10 +56,15 @@ fn usage_text() -> &'static str {
          \x20                     name; Steam must be closed, else the string to paste is shown.\n\
          \x20                     A game that ships anti-cheat needs --anti-cheat-ok\n\
          \x20 disable GAME         take Neural Forge back out of GAME's launch options\n\
-         \x20 report [--appid ID]  write a diagnostic report zip to the desktop (home, user\n\
+         \x20 report [--appid ID] [--trace FILE]\n\
+         \x20                     write a diagnostic report zip to the desktop (home, user\n\
          \x20                     and host names redacted; it lists your installed Steam\n\
          \x20                     games and their library folders); ID: the game's Steam\n\
-         \x20                     app id, for its Proton version"
+         \x20                     app id, for its Proton version; FILE: a trace the layer\n\
+         \x20                     recorded (NEURAL_FORGE_TRACE)\n\
+         \x20 proton-tool [list|create SOURCE|update|remove NAME]\n\
+         \x20                     make a copy of an installed Proton that hands Neural\n\
+         \x20                     Forge DLSS's own parameters (see `proton-tool --help`)"
 }
 
 fn profile_usage() {
@@ -176,11 +184,15 @@ fn cmd_profile(args: &[String]) -> ExitCode {
 }
 
 /// Writes the diagnostic report (`neural_forge_supervisor::report`) and prints where it went.
-fn cmd_report(appid: Option<&str>) -> ExitCode {
+fn cmd_report(appid: Option<&str>, trace: Option<&str>) -> ExitCode {
     let cfg = Config::load();
     // The channel looked at the way `shmctl status` looks at it (read-only), for the same text.
     let (status, game) = neural_forge_supervisor::shm_status::look(&cfg);
-    match neural_forge_supervisor::report::save(&status, &game, appid) {
+    if let Some(trace) = trace.filter(|t| !std::path::Path::new(t).is_file()) {
+        eprintln!("report: {trace} is not a file");
+        return ExitCode::from(2);
+    }
+    match neural_forge_supervisor::report::save(&status, &game, appid, trace.map(std::path::Path::new)) {
         Ok(path) => {
             println!("wrote {}", path.display());
             ExitCode::SUCCESS
@@ -255,10 +267,29 @@ fn cmd_doctor() -> ExitCode {
 }
 
 fn cmd_install(appdir: &str) -> ExitCode {
+    use neural_forge_supervisor::{proton_tool, steam};
     match neural_forge_supervisor::install::install(std::path::Path::new(appdir)) {
         Ok(report) => {
             println!("Installed Neural Forge. CLI: {}", report.cli_path.display());
-            ExitCode::SUCCESS
+            // Every Neural Forge Proton gets the wrapper just installed.
+            let mut failed = false;
+            for root in steam::roots().into_iter().filter(|r| !r.flatpak) {
+                for (name, done) in proton_tool::refresh_wrappers(&root.path, &proton_tool::installed_wrapper()) {
+                    match done {
+                        Ok(true) => println!("{name}: has the new NGX wrapper"),
+                        Ok(false) => {}
+                        Err(e) => {
+                            failed = true;
+                            eprintln!("{name}: the new NGX wrapper could not be put in: {e}");
+                        }
+                    }
+                }
+            }
+            if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(e) => {
             eprintln!("install failed: {e}");
@@ -408,9 +439,50 @@ fn cmd_games() -> ExitCode {
             found if found.is_empty() => String::new(),
             found => format!("  [anti-cheat: {}]", neural_forge_supervisor::anti_cheat::list(&found)),
         };
-        println!("{:>8}  {:<3}  {}  ({})  {target}{anti_cheat}", game.appid, on, game.name, game.library.display());
+        let tested = match neural_forge_supervisor::compat::find(game.appid.parse().ok(), "") {
+            Some(facts) => format!("  [tested: {}]", facts.placement.describe()),
+            None => String::new(),
+        };
+        println!("{:>8}  {:<3}  {}  ({})  {target}{anti_cheat}{tested}", game.appid, on, game.name, game.library.display());
     }
     ExitCode::SUCCESS
+}
+
+/// `games --tested [GAME]`: the built-in compatibility facts (`neural_forge_supervisor::compat`).
+fn cmd_tested(query: Option<&str>) -> ExitCode {
+    use neural_forge_supervisor::compat;
+    let games = compat::games();
+    let Some(query) = query else {
+        println!("{:>8}  {:<40}  {:<6}  where the model runs; last verified", "appid", "game", "HDR");
+        for g in games {
+            let id = g.steam_appid.map_or_else(|| "-".to_string(), |id| id.to_string());
+            println!("{id:>8}  {:<40}  {:<6}  {}; {}", g.name, g.hdr.key(), g.placement_text(), g.verified_text());
+        }
+        println!("\n`neural-forge-cli games --tested GAME` shows a game's setup notes and known issues.");
+        return ExitCode::SUCCESS;
+    };
+    let q = query.trim().to_lowercase();
+    let found: Vec<&compat::Game> = match q.parse::<u32>() {
+        Ok(id) => games.iter().filter(|g| g.steam_appid == Some(id)).collect(),
+        Err(_) => match games.iter().find(|g| g.name.to_lowercase() == q) {
+            Some(exact) => vec![exact],
+            None => games.iter().filter(|g| g.name.to_lowercase().contains(&q)).collect(),
+        },
+    };
+    match found.as_slice() {
+        [one] => {
+            print!("{}", one.details());
+            ExitCode::SUCCESS
+        }
+        [] => {
+            eprintln!("{query:?} is not a tested game; `neural-forge-cli games --tested` lists them");
+            ExitCode::FAILURE
+        }
+        many => {
+            eprintln!("{query:?} names {} tested games: {}", many.len(), many.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(", "));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// The target to enable `game` with: `chosen` (remembered in config.ini for the game; `auto`
@@ -440,6 +512,45 @@ fn target_for_enable(game: &neural_forge_supervisor::steam::Game, chosen: &str) 
 }
 
 /// `anti_cheat_ok`: switch on a game that ships anti-cheat (`enable --anti-cheat-ok`).
+/// The game's Proton after its launch options ([`neural_forge_supervisor::compat`]): a Neural Forge Proton when
+/// switched on (its copy made first, with the notice), the earlier one back when switched off.
+fn set_game_proton(game: &neural_forge_supervisor::steam::Game, on: bool) -> ExitCode {
+    use neural_forge_supervisor::{compat_tool, proton_tool, steam};
+    let root = &game.root.path;
+    let running = steam::steam_running(std::path::Path::new("/proc"));
+    if on {
+        match compat_tool::switch_on(root, &steam::libraries(root), &game.appid, &proton_tool::installed_wrapper(), running) {
+            Ok(None) => {
+                println!("{} is a native Linux game: it runs without Proton, so its Proton is left as it is.", game.name);
+                ExitCode::SUCCESS
+            }
+            Ok(Some(done)) => {
+                if done.made {
+                    println!("{}\n", proton_tool::NOTICE);
+                }
+                println!("{} runs with {} now (it ran with {}).", game.name, done.tool, done.previous.as_deref().unwrap_or("Steam's default Proton"));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}'s Proton was not changed: {e}. Without a Neural Forge Proton the model stays off in a DLSS game.", game.name);
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        match compat_tool::switch_off(root, &game.appid, running) {
+            Ok(Some(previous)) => {
+                println!("{} runs with {} again.", game.name, if previous.is_empty() { "Steam's default Proton" } else { &previous });
+                ExitCode::SUCCESS
+            }
+            Ok(None) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
 fn cmd_set_game(query: &str, action: neural_forge_supervisor::steam::Action, anti_cheat_ok: bool) -> ExitCode {
     use neural_forge_supervisor::steam::{self, Action, FindError, Outcome};
     let roots = steam::roots();
@@ -498,11 +609,11 @@ fn cmd_set_game(query: &str, action: neural_forge_supervisor::steam::Action, ant
                 println!("{}: {:?} -> {:?}\n  in {} (previous copy: {})", game.name, edit.before, edit.after, edit.file.display(), edit.backup.display());
             }
             println!("Neural Forge is {verb} for {} ({})", game.name, game.appid);
-            ExitCode::SUCCESS
+            set_game_proton(game, verb == "on")
         }
         Outcome::Unchanged => {
             println!("Neural Forge was already {verb} for {} ({})", game.name, game.appid);
-            ExitCode::SUCCESS
+            set_game_proton(game, verb == "on")
         }
         Outcome::SteamRunning { manual } => {
             eprintln!("Steam is running, and would overwrite the change when it exits. Close Steam and run this again, or:");
@@ -538,6 +649,8 @@ enum Command {
     Profile(Vec<String>),
     GameSettings(Vec<String>),
     Games,
+    /// `games --tested [GAME]`: the built-in compatibility facts, all or one game's.
+    Tested(Option<String>),
     Enable {
         game: String,
         target_exe: String,
@@ -545,10 +658,23 @@ enum Command {
         anti_cheat_ok: bool,
     },
     Disable(String),
-    /// The Steam app id, when given.
-    Report(Option<String>),
+    /// The Steam app id and a trace file to include, when given.
+    Report {
+        appid: Option<String>,
+        trace: Option<String>,
+    },
+    ProtonTool(ProtonToolCmd),
     /// `--help`/`-h`: the whole usage (`None`) or one command's.
     Help(Option<String>),
+}
+
+/// `proton-tool`'s subcommands.
+#[derive(Debug, PartialEq, Eq)]
+enum ProtonToolCmd {
+    List,
+    Create(String),
+    Update,
+    Remove(String),
 }
 
 /// Why a command line was refused: printed with the matching usage, exit code 2.
@@ -645,7 +771,12 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
                 Err(err(format!("unexpected arguments: {}", rest.join(" "))))
             }
         }
-        "games" => none(Command::Games),
+        "games" => match rest.as_slice() {
+            [] => Ok(Command::Games),
+            ["--tested"] => Ok(Command::Tested(None)),
+            ["--tested", words @ ..] if words.iter().all(|w| !w.starts_with('-')) => Ok(Command::Tested(Some(words.join(" ")))),
+            [other, ..] => Err(err(format!("unexpected argument {other:?}"))),
+        },
         "enable" | "disable" => {
             let mut words = Vec::new();
             let mut target_exe = String::new();
@@ -672,13 +803,34 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
             let game = words.join(" ");
             Ok(if command == "enable" { Command::Enable { game, target_exe, anti_cheat_ok } } else { Command::Disable(game) })
         }
-        "report" => match rest.as_slice() {
-            [] => Ok(Command::Report(None)),
-            ["--appid", id] if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => Ok(Command::Report(Some((*id).to_string()))),
-            ["--appid", id] => Err(err(format!("--appid takes a Steam app id (digits), got {id:?}"))),
-            ["--appid"] => Err(err("--appid takes a Steam app id".into())),
-            ["--appid", _, extra @ ..] => Err(unexpected(extra)),
-            [other, ..] => Err(err(format!("unknown option {other:?}"))),
+        "report" => {
+            let (mut appid, mut trace) = (None, None);
+            let mut words = rest.iter();
+            while let Some(word) = words.next() {
+                match *word {
+                    "--appid" if appid.is_none() => match words.next() {
+                        Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => appid = Some((*id).to_string()),
+                        Some(id) => return Err(err(format!("--appid takes a Steam app id (digits), got {id:?}"))),
+                        None => return Err(err("--appid takes a Steam app id".into())),
+                    },
+                    "--trace" if trace.is_none() => match words.next() {
+                        Some(file) if !file.is_empty() => trace = Some((*file).to_string()),
+                        _ => return Err(err("--trace takes the trace file (NEURAL_FORGE_TRACE's)".into())),
+                    },
+                    "--appid" | "--trace" => return Err(err(format!("{word} is given twice"))),
+                    other if other.starts_with('-') => return Err(err(format!("unknown option {other:?}"))),
+                    other => return Err(err(format!("unexpected argument {other:?}"))),
+                }
+            }
+            Ok(Command::Report { appid, trace })
+        }
+        "proton-tool" => match rest.as_slice() {
+            [] | ["list"] => Ok(Command::ProtonTool(ProtonToolCmd::List)),
+            ["update"] => Ok(Command::ProtonTool(ProtonToolCmd::Update)),
+            ["create", source @ ..] if !source.is_empty() => Ok(Command::ProtonTool(ProtonToolCmd::Create(source.join(" ")))),
+            ["remove", name @ ..] if !name.is_empty() => Ok(Command::ProtonTool(ProtonToolCmd::Remove(name.join(" ")))),
+            ["create" | "remove"] => Err(err(format!("{} takes a name", rest[0]))),
+            _ => Err(err(format!("unexpected arguments: {}", rest.join(" ")))),
         },
         _ => unreachable!("command_usage knows every command"),
     }
@@ -695,15 +847,29 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "extract-model" => "usage: neural-forge-cli extract-model DIR [--network full|small]\n  write the model directory from nvngx_dlssnr.dll (DIR holds it, or is the DLL): every network\n  the DLL carries, replacing what was extracted before. Build 310.9.16 carries two: full, the\n  71-block network every build has (stronger shading and depth), and small, 31 blocks (faster,\n  subtler); older builds have only full. --network extracts only that one and leaves the other\n  as it is. Which one runs is the Network setting (the Setup tab, `shmctl set network 0|1`; full\n  by default); a game already running switches to a newly chosen one at once, and picks up a\n  newly extracted model when it next starts",
         "install" => "usage: neural-forge-cli install --appdir DIR\n  install an extracted AppImage AppDir into persistent user storage",
         "uninstall" => {
-            "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also takes Neural Forge out of\n  every game's Steam launch options (it refuses, removing nothing, while Steam runs)\n  and removes its copies of each account's localconfig.vdf, config, data (the DLL,\n  the model), state and /tmp/neural-forge-$UID"
+            "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also takes Neural Forge out of\n  every game's Steam launch options (it refuses, removing nothing, while Steam runs)\n  and removes its copies of each account's localconfig.vdf, its own Proton builds\n  (compatibilitytools.d/*-NeuralForge, putting back each game's earlier Proton), config, data (the DLL, the model), state and\n  /tmp/neural-forge-$UID"
         }
-        "games" => "usage: neural-forge-cli games\n  list installed Steam games (appid, Neural Forge on/off, name, library, the executable\n  Neural Forge targets, and the anti-cheat the game's folder ships)",
+        "games" => "usage: neural-forge-cli games [--tested [GAME]]\n  list installed Steam games (appid, Neural Forge on/off, name, library, the executable\n  Neural Forge targets, the anti-cheat the game's folder ships, and whether it is a tested\n  game). --tested lists the tested games instead: where the model runs (with and without\n  Ray Reconstruction), HDR and the version each was last seen working in; with GAME (an\n  appid, or a part of a name) every fact about that game, its setup notes and known issues",
         "enable" => {
             "usage: neural-forge-cli enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]\n  turn Neural Forge on in GAME's Steam launch options, keeping the options already there,\n  with NEURAL_FORGE_TARGET_EXE set to the game's own executable, so no launcher or helper\n  can take the effect. The executable is found from Steam's data and the game's folder;\n  --target-exe names it instead and is remembered for GAME (also when the GUI switches it\n  on); --target-exe auto forgets it. GAME is an appid, an exact name or a unique part of a\n  name. Steam must be closed (it rewrites its settings on exit); otherwise the launch\n  options to paste are printed. A game whose folder ships anti-cheat (Easy Anti-Cheat,\n  BattlEye and others) is only switched on with --anti-cheat-ok: Neural Forge does not hide\n  its layer, and the anti-cheat may refuse the game or ban the account."
         }
         "disable" => "usage: neural-forge-cli disable GAME\n  take Neural Forge back out of GAME's Steam launch options (see `enable --help`)",
         "report" => {
-            "usage: neural-forge-cli report [--appid ID]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game and its Proton -- found from the game the channel names, or\n  from ID, its Steam app id -- and the doctor's findings, which list your installed Steam\n  games and their library folders, and of a game's launch options only Neural Forge's\n  part), config.ini, the model's manifest, the layer's logs,\n  this boot's GPU fault (Xid) lines, the channel's status and the newest capture pair.\n  The home directory, user name and host name are replaced with ~, <user> and <host>;\n  nothing is uploaded"
+            "usage: neural-forge-cli report [--appid ID] [--trace FILE]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game and its Proton -- found from the game the channel names, or\n  from ID, its Steam app id -- whether it is a tested game, the HDR verdict with the\n  desktop's HDR state, and the doctor's findings, which list your installed Steam\n  games and their library folders, and of a game's launch options only Neural Forge's\n  part), config.ini, the model's manifest, the layer's logs,\n  this boot's GPU fault (Xid) lines, the channel's status, the game's entry in the\n  tested games and the newest capture pair. --trace adds a trace file the layer\n  recorded (NEURAL_FORGE_TRACE's; also taken from that variable when it is set here).\n  The home directory, user name and host name are replaced with ~, <user> and <host>;\n  nothing is uploaded"
+        }
+        "proton-tool" => {
+            "usage: neural-forge-cli proton-tool [list | create SOURCE | update | remove NAME]\n  \
+             list: the Protons a copy can be made from and the copies Neural Forge made (outdated ones marked).\n  \
+             create SOURCE: copy the installed Proton SOURCE (its name in Steam, its version name or its folder)\n  \
+             into Steam's compatibilitytools.d as <version>-NeuralForge: hard links on the same drive, with\n  \
+             Neural Forge's NGX wrapper as _nvngx.dll so the layer reads DLSS's own parameters. Restart Steam,\n  \
+             then choose it per game in Properties > Compatibility. PROTON_NO_NEURAL_FORGE_NGX=1 in a game's\n  \
+             launch options turns the wrapper off for that game. Only a Proton built on Wine 10 or newer\n  \
+             (Proton 10 or newer, GE-Proton10 or newer) can be copied.\n  \
+             update: make every outdated copy again from its source's current version, with the installed\n  \
+             NGX wrapper. A copy of a new version gets a new name: with Steam closed, the games set to the\n  \
+             old copy are moved to the new one and the old copy is removed (never one a running game uses).\n  \
+             remove NAME: delete a copy Neural Forge made (not while a game runs with it)"
         }
         "shmctl" => "",
         "profile" => "",
@@ -722,7 +888,105 @@ fn print_help(command: Option<&str>) {
     }
 }
 
+/// `proton-tool` ([`neural_forge_supervisor::proton_tool`]) on the native Steam root.
+fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
+    use neural_forge_supervisor::{proton_tool, steam};
+    let Some(root) = steam::roots().into_iter().find(|r| !r.flatpak) else {
+        eprintln!("no native Steam installation found (the Flatpak build cannot load the layer)");
+        return ExitCode::FAILURE;
+    };
+    let root = &root.path;
+    let libraries = steam::libraries(root);
+    let wrapper = proton_tool::installed_wrapper();
+    match sub {
+        ProtonToolCmd::List => {
+            println!("Protons a copy can be made from:");
+            for s in proton_tool::sources(root, &libraries) {
+                // A Proton the wrapper cannot run under is listed with why, not offered.
+                let refused = proton_tool::unix_pid_support(&s.dir).err().map(|why| format!(" -- cannot be copied: {why}")).unwrap_or_default();
+                println!("  {} ({}) in {}{refused}", s.display, s.version, s.dir.display());
+            }
+            println!("Copies made by Neural Forge:");
+            for t in proton_tool::tools(root) {
+                println!("  {}{} from {}", t.name, if proton_tool::outdated(&t) { " (outdated: `proton-tool update`)" } else { "" }, t.source.display());
+            }
+            ExitCode::SUCCESS
+        }
+        ProtonToolCmd::Create(query) => {
+            let sources = proton_tool::sources(root, &libraries);
+            let q = query.to_lowercase();
+            let names = |s: &proton_tool::Source| {
+                [s.display.to_lowercase(), s.version.to_lowercase(), s.dir.file_name().map_or(String::new(), |n| n.to_string_lossy().to_lowercase())]
+            };
+            let hits: Vec<&proton_tool::Source> = sources.iter().filter(|s| names(s).contains(&q)).collect();
+            let [source] = hits.as_slice() else {
+                eprintln!("{} Proton(s) match {query:?}; `proton-tool list` shows their names", hits.len());
+                return ExitCode::FAILURE;
+            };
+            println!("{}\n", proton_tool::NOTICE);
+            match proton_tool::create(root, source, &wrapper) {
+                Ok(made) => {
+                    let copied = if made.copied > 0 { format!(" ({} MB copied: another drive)", made.copied >> 20) } else { String::new() };
+                    let verb = if made.replaced { "Made again:" } else { "Made" };
+                    println!(
+                        "{verb} {} from {}{copied}. Restart Steam, then choose it per game in Properties > Compatibility.",
+                        made.tool.name, source.display
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("could not make the copy: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProtonToolCmd::Update => {
+            let mut failed = false;
+            let running = steam::steam_running(std::path::Path::new("/proc"));
+            for t in proton_tool::tools(root).into_iter().filter(proton_tool::outdated) {
+                match neural_forge_supervisor::compat_tool::update(root, &libraries, &t, &wrapper, running) {
+                    Ok(done) if done.to == done.from => println!("{}: made again (its source's current version, the installed NGX wrapper)", t.name),
+                    Ok(done) => {
+                        println!("{}: made {} from the current version", t.name, done.to);
+                        if !done.moved.is_empty() {
+                            println!("  moved to it: app {}", done.moved.join(", app "));
+                        }
+                        match done.kept {
+                            Some(why) => {
+                                failed = true;
+                                eprintln!("  {} is kept: {why}", t.name);
+                            }
+                            None => println!("  removed {}", t.name),
+                        }
+                    }
+                    Err(e) => {
+                        failed = true;
+                        eprintln!("{}: {e}", t.name);
+                    }
+                }
+            }
+            if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        ProtonToolCmd::Remove(name) => match proton_tool::remove(root, &name) {
+            Ok(t) => {
+                println!("Removed {}. Games set to it need another Proton chosen in Steam.", t.name);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
 fn main() -> ExitCode {
+    // Rings of games that are gone (the layer never opened them): never a running game's.
+    neural_forge_supervisor::proton_tool::sweep_dead_rings(std::path::Path::new(neural_forge_supervisor::proton_tool::RING_DIR));
     // `args_os`: `args()` panics on an argument that is not valid UTF-8 (a path, say).
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     let command = match parse(&args) {
@@ -746,11 +1010,13 @@ fn main() -> ExitCode {
         Command::Profile(args) => cmd_profile(&args),
         Command::GameSettings(args) => game_settings::run(&args),
         Command::Games => cmd_games(),
+        Command::Tested(game) => cmd_tested(game.as_deref()),
         Command::Enable { game, target_exe, anti_cheat_ok } => {
             cmd_set_game(&game, neural_forge_supervisor::steam::Action::Enable { target_exe }, anti_cheat_ok)
         }
         Command::Disable(game) => cmd_set_game(&game, neural_forge_supervisor::steam::Action::Disable, false),
-        Command::Report(appid) => cmd_report(appid.as_deref()),
+        Command::Report { appid, trace } => cmd_report(appid.as_deref(), trace.as_deref()),
+        Command::ProtonTool(sub) => cmd_proton_tool(sub),
         Command::Help(command) => {
             print_help(command.as_deref());
             ExitCode::SUCCESS
@@ -772,6 +1038,20 @@ mod tests {
         assert!(!overview.contains("default: small"), "extract-model has no choice of default: it writes every network");
         assert!(overview.contains("every network the DLL carries"), "{overview}");
         assert!(command_usage("extract-model").unwrap().contains("every network\n  the DLL carries"));
+    }
+
+    #[test]
+    fn proton_tool_takes_a_subcommand() {
+        assert_eq!(parse_str("proton-tool"), Ok(Command::ProtonTool(ProtonToolCmd::List)));
+        assert_eq!(parse_str("proton-tool create Proton-GE Latest"), Ok(Command::ProtonTool(ProtonToolCmd::Create("Proton-GE Latest".into()))));
+        assert_eq!(
+            parse_str("proton-tool remove GE-Proton11-12-NeuralForge"),
+            Ok(Command::ProtonTool(ProtonToolCmd::Remove("GE-Proton11-12-NeuralForge".into())))
+        );
+        assert_eq!(parse_str("proton-tool update"), Ok(Command::ProtonTool(ProtonToolCmd::Update)));
+        assert!(parse_str("proton-tool create").is_err());
+        assert!(parse_str("proton-tool wipe").is_err());
+        assert_eq!(parse_str("proton-tool --help"), Ok(Command::Help(Some("proton-tool".into()))));
     }
 
     #[test]
@@ -831,8 +1111,14 @@ mod tests {
         assert_eq!(parse_str("profile load gta"), Ok(Command::Profile(vec!["load".into(), "gta".into()])));
         assert_eq!(parse_str("profile"), Ok(Command::Profile(vec![])));
         assert_eq!(parse_str("shmctl set intensity 0.5"), Ok(Command::Shmctl(vec!["set".into(), "intensity".into(), "0.5".into()])));
-        assert_eq!(parse_str("report"), Ok(Command::Report(None)));
-        assert_eq!(parse_str("report --appid 3240220"), Ok(Command::Report(Some("3240220".into()))));
+        assert_eq!(parse_str("report"), Ok(Command::Report { appid: None, trace: None }));
+        assert_eq!(parse_str("report --appid 3240220"), Ok(Command::Report { appid: Some("3240220".into()), trace: None }));
+        assert_eq!(
+            parse_str("report --trace /tmp/cp.nftrace --appid 1091500"),
+            Ok(Command::Report { appid: Some("1091500".into()), trace: Some("/tmp/cp.nftrace".into()) })
+        );
+        assert!(parse_str("report --trace").is_err());
+        assert!(parse_str("report --appid 1 --appid 2").is_err());
         assert_eq!(parse_str("report --help"), Ok(Command::Help(Some("report".into()))));
         assert_eq!(parse_str("shmctl capture --frames 3"), Ok(Command::Shmctl(vec!["capture".into(), "--frames".into(), "3".into()])));
     }
@@ -859,6 +1145,9 @@ mod tests {
     fn game_commands_parse() {
         assert_eq!(parse_str("games"), Ok(Command::Games));
         assert!(parse_str("games now").is_err());
+        assert_eq!(parse_str("games --tested"), Ok(Command::Tested(None)));
+        assert_eq!(parse_str("games --tested red dead"), Ok(Command::Tested(Some("red dead".into()))));
+        assert!(parse_str("games --tested --all").is_err());
         assert_eq!(parse_str("enable 3240220"), Ok(Command::Enable { game: "3240220".into(), target_exe: String::new(), anti_cheat_ok: false }));
         assert_eq!(
             parse_str("enable grand theft auto --target-exe GTA5_Enhanced.exe"),

@@ -16,6 +16,7 @@
 //! filter additionally excludes small overlays. See docs/HARDWARE_VALIDATION.md for
 //! presentation-validation failures still under review.
 
+mod added_usage;
 mod breadcrumbs;
 mod capture;
 mod composition;
@@ -24,15 +25,18 @@ mod dump;
 mod entry_points;
 mod gpu_timer;
 mod hdr_present;
+mod hdr_verdict;
 mod hotkey;
 mod loader_data;
 mod logging;
+mod ngx_ring;
 mod ownership;
 mod present_sync;
 mod preupscale;
 mod probe_ngx;
 mod probe_seq;
 mod series;
+mod shared_queue;
 mod sharpen;
 mod shm;
 mod surface_usage;
@@ -66,6 +70,9 @@ use device::NeuralForgeDeviceInfo;
 struct InstanceContext {
     instance: Arc<ash::Instance>,
     surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
+    /// The next layer's surface-formats query: whether a swapchain's surface offered an HDR colour space
+    /// (`hdr_verdict`).
+    surface_formats: Option<vk::PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>,
     /// Which `vkGetPhysicalDeviceMemoryProperties2` the application's instance may call (the VRAM log).
     properties2: vram::Properties2,
     /// The application's `VkApplicationInfo::api_version` (0 without one): the network needs 1.3
@@ -356,6 +363,63 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
             None => return LayerResult::Handled(Err(vk::Result::ERROR_INITIALIZATION_FAILED)),
         };
         let allocator = allocator.map_or(std::ptr::null(), |allocator| allocator as *const _);
+        // The network needs an instance created for Vulkan 1.3 (`neural_forge_native::device_supported`); a game asking
+        // for less (Red Dead Redemption 2 asks for 1.1, #49) gets one where the loader offers 1.3, with the rest of its
+        // application info as it is. Drivers keep the behaviour an older application relies on whatever the version
+        // asked for; DXVK and vkd3d-proton ask for 1.3 themselves. Refused, the instance is created as asked.
+        // SAFETY: the application's create info, valid for the call; its application info is null or valid.
+        let asked = unsafe { create_info.p_application_info.as_ref() }.copied();
+        // No version query first: below a layer `vkEnumerateInstanceVersion` need not resolve; a loader or driver
+        // without 1.3 refuses the creation, and the instance is then created as asked.
+        // Only where the network may run: the layer engaged in this process and its native path on.
+        let raised_info =
+            (layer_enabled() && ownership::eligible() && preupscale::active() && raise_wanted() && asked.map_or(0, |a| a.api_version) < vk::API_VERSION_1_3)
+                .then(|| vk::ApplicationInfo { api_version: vk::API_VERSION_1_3, ..asked.unwrap_or_default() });
+        let raised = raised_info.as_ref().map(|app| vk::InstanceCreateInfo { p_application_info: app, ..*create_info });
+        if let Some(raised) = &raised {
+            // SAFETY: the framework's request, whose chain is the loader's.
+            let link = unsafe { InstanceLink::find(create_info) };
+            let result = self.create_instance_as(raised, create_instance, allocator, p_instance);
+            if result == vk::Result::SUCCESS {
+                // SAFETY: written by the successful call.
+                let created = unsafe { *p_instance };
+                let mut raised = RAISED_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !raised.contains(&created) {
+                    raised.push(created);
+                }
+                log!(
+                    "[native] the application's instance asks for Vulkan {}.{}: created for Vulkan 1.3, which the network needs (NEURAL_FORGE_RAISE_VULKAN=off keeps the application's)",
+                    vk::api_version_major(asked.map_or(0, |a| a.api_version).max(vk::API_VERSION_1_0)),
+                    vk::api_version_minor(asked.map_or(0, |a| a.api_version).max(vk::API_VERSION_1_0))
+                );
+                return LayerResult::Handled(Ok(()));
+            }
+            log!("[native] creating the instance for Vulkan 1.3 was refused ({result:?}); creating it as the application asks");
+            if let Some(link) = &link {
+                link.restore();
+            }
+        }
+        let result = self.create_instance_as(create_info, create_instance, allocator, p_instance);
+        if result == vk::Result::SUCCESS {
+            // A handle reused after a raised instance was destroyed is not raised.
+            // SAFETY: written by the successful call.
+            let created = unsafe { *p_instance };
+            RAISED_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|i| *i != created);
+        }
+        LayerResult::Handled(result.result())
+    }
+}
+
+impl NeuralForgeGlobalHooks {
+    /// [`GlobalHooks::create_instance`] with `create_info` (the application's, or it raised to Vulkan 1.3): the layer's
+    /// instance extensions where it can, else as asked.
+    fn create_instance_as(
+        &self,
+        create_info: &vk::InstanceCreateInfo,
+        create_instance: vk::PFN_vkCreateInstance,
+        allocator: *const vk::AllocationCallbacks,
+        p_instance: *mut vk::Instance,
+    ) -> vk::Result {
         // SAFETY: the application's list of `enabled_extension_count` names.
         let requested = unsafe { swapchain_maintenance::extension_names(create_info.pp_enabled_extension_names, create_info.enabled_extension_count) };
         // What `swapchainMaintenance1` on the device depends on, for the layer's present fences
@@ -375,7 +439,7 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
                 swapchain_maintenance::note_instance(unsafe { *p_instance }, swapchain_maintenance::InstanceSupport::of(&enabled));
                 let added: Vec<_> = additions.iter().map(|n| n.to_string_lossy()).collect();
                 log!("[present] instance extensions added for the layer's present fences: {}", added.join(", "));
-                return LayerResult::Handled(Ok(()));
+                return vk::Result::SUCCESS;
             }
             log!("[present] creating the instance with {additions:?} was refused ({result:?}); creating it as requested");
             // The layer below advanced the link in place: the next attempt starts from the framework's.
@@ -391,8 +455,18 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
             // SAFETY: written by the successful call.
             swapchain_maintenance::note_instance(unsafe { *p_instance }, swapchain_maintenance::InstanceSupport::of(&requested));
         }
-        LayerResult::Handled(result.result())
+        result
     }
+}
+
+/// Instances the layer created for Vulkan 1.3 where the application asked for less ([`GlobalHooks::create_instance`]):
+/// their recorded API version is 1.3 (`create_instance_info` sees the application's create info).
+static RAISED_INSTANCES: Mutex<Vec<vk::Instance>> = Mutex::new(Vec::new());
+
+/// `NEURAL_FORGE_RAISE_VULKAN=off`: instances as the application asks. Read once.
+fn raise_wanted() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_RAISE_VULKAN").as_deref() != Some("off"));
+    *ON
 }
 
 /// The loader's `VkLayerInstanceCreateInfo` (`vk_layer.h`) with `function == VK_LAYER_LINK_INFO`: the
@@ -510,8 +584,12 @@ struct ExtraQueues<'a> {
     /// The first family the application requests with graphics and compute: where DLSS runs.
     app_family: u32,
     family: u32,
-    /// The first of the new queues' indices.
+    /// The first of the new queues' indices: the network's loading queue.
     index: u32,
+    /// The after-the-upscaler frames' queue (the second new one; the same one when shared).
+    post_index: u32,
+    /// Both are a queue of the application's, shared ([`shared_queue`]): no family had room for two more.
+    shared: Option<&'static shared_queue::SharedQueue>,
     /// The application's requests (borrowed with its create info) and the new ones.
     infos: Vec<vk::DeviceQueueCreateInfo<'a>>,
     /// Backs the extended `pQueuePriorities`.
@@ -558,9 +636,32 @@ fn extra_queues<'a>(families: &[vk::QueueFamilyProperties], infos: &[vk::DeviceQ
                 (priorities, 0)
             }
         };
-        return Some(ExtraQueues { app_family, family, index, infos: extended, _priorities: priorities });
+        return Some(ExtraQueues { app_family, family, index, post_index: index + 1, shared: None, infos: extended, _priorities: priorities });
     }
     None
+}
+
+/// Where [`extra_queues`] found no room: one of the application's own compute-only queues, shared
+/// ([`shared_queue::choose`]), with the application's requests unchanged. `None` with
+/// `NEURAL_FORGE_SHARE_QUEUE=off` or no such queue.
+fn shared_queues<'a>(families: &[vk::QueueFamilyProperties], infos: &[vk::DeviceQueueCreateInfo<'a>]) -> Option<ExtraQueues<'a>> {
+    if !shared_queue::allowed() {
+        return None;
+    }
+    let app_family = infos
+        .iter()
+        .find(|q| families.get(q.queue_family_index as usize).is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)))?
+        .queue_family_index;
+    let (family, index) = shared_queue::choose(families, infos)?;
+    Some(ExtraQueues {
+        app_family,
+        family,
+        index,
+        post_index: index,
+        shared: Some(shared_queue::SharedQueue::new(family, index)),
+        infos: infos.to_vec(),
+        _priorities: Vec::new(),
+    })
 }
 
 /// The family to add the optical-flow queue in (`preupscale::post_flow::queue_family`), from what the
@@ -730,6 +831,8 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         if !(layer_enabled() && ownership::eligible()) {
             return LayerResult::Unhandled;
         }
+        // From the first device the layer works on, a panic leaves its message in the log (`logging`).
+        logging::install_panic_hook();
         let Some(instance) = self.ctx.clone() else {
             return LayerResult::Unhandled;
         };
@@ -887,9 +990,15 @@ impl NeuralForgeInstanceHooks {
             if native {
                 let gipa = layer_device_link.pfnNextGetInstanceProcAddr;
                 // Two more: the network's loading, and the after-the-upscaler path's frames.
-                match extra_queues(&families, app_queues, 2) {
-                    None => log!("[native] no compute queue to spare for the network's loading; native backend off on this device"),
-                    Some(ExtraQueues { app_family: frame_family, family, index, infos: queues, .. }) => {
+                match extra_queues(&families, app_queues, 2).or_else(|| shared_queues(&families, app_queues)) {
+                    None => log!(
+                        "[native] no compute queue to spare for the network's loading{}; native backend off on this device",
+                        if shared_queue::allowed() { " and none of the application's to share" } else { " (NEURAL_FORGE_SHARE_QUEUE=off)" }
+                    ),
+                    Some(ExtraQueues { app_family: frame_family, family, index, post_index, shared, infos: queues, .. }) => {
+                        if shared.is_some() {
+                            log!("[native] no compute queue to spare: the network shares the application's queue {index} of family {family}, every submit to it locked (NEURAL_FORGE_SHARE_QUEUE=off turns it off)");
+                        }
                         let mut with = *info;
                         with.queue_create_info_count = queues.len() as u32;
                         with.p_queue_create_infos = queues.as_ptr();
@@ -941,9 +1050,11 @@ impl NeuralForgeInstanceHooks {
                                         frame_family,
                                         family,
                                         index,
-                                        post_index: index + 1,
+                                        post_index,
                                         properties2: instance.properties2,
                                         flow,
+                                        shared,
+                                        bda_ext: requests_extension(info, c"VK_EXT_buffer_device_address"),
                                     };
                                     NATIVE_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().insert(device, setup);
                                     log!("[native] device created with the network's extensions and features, loading queue {index} of family {family}");
@@ -1107,11 +1218,26 @@ impl Layer for NeuralForgeLayer {
             next_get_instance_proc_addr(instance.handle(), c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR".as_ptr())
                 .map(|p| std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(p))
         };
+        // SAFETY: as above; the name matches the PFN type.
+        let surface_formats = unsafe {
+            next_get_instance_proc_addr(instance.handle(), c"vkGetPhysicalDeviceSurfaceFormatsKHR".as_ptr())
+                .map(|p| std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(p))
+        };
         // SAFETY: the application's create info, valid for the call; its application info is null or valid.
-        let api_version = unsafe { create_info.p_application_info.as_ref() }.map_or(0, |app| app.api_version);
+        let mut api_version = unsafe { create_info.p_application_info.as_ref() }.map_or(0, |app| app.api_version);
+        if RAISED_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&instance.handle()) {
+            api_version = api_version.max(vk::API_VERSION_1_3);
+        }
         let surface_maintenance = swapchain_maintenance::take_instance(instance.handle());
         NeuralForgeInstanceHooks {
-            ctx: Some(InstanceContext { instance, surface_caps, properties2: vram::Properties2::of(create_info), api_version, surface_maintenance }),
+            ctx: Some(InstanceContext {
+                instance,
+                surface_caps,
+                surface_formats,
+                properties2: vram::Properties2::of(create_info),
+                api_version,
+                surface_maintenance,
+            }),
         }
     }
 
@@ -1133,7 +1259,7 @@ impl Layer for NeuralForgeLayer {
             instance.as_ref().is_some_and(|ctx| core_1_1(ctx.api_version, unsafe { ctx.instance.get_physical_device_properties(physical_device) }.api_version));
         NeuralForgeDeviceInfo::new(
             instance.as_ref().map(|ctx| ctx.instance.clone()),
-            instance.and_then(|ctx| ctx.surface_caps),
+            device::SurfaceQueries { caps: instance.as_ref().and_then(|ctx| ctx.surface_caps), formats: instance.as_ref().and_then(|ctx| ctx.surface_formats) },
             physical_device,
             device,
             next_get_device_proc_addr,
@@ -1263,6 +1389,7 @@ mod instance_table_tests {
             ctx: Some(InstanceContext {
                 instance: instance.clone(),
                 surface_caps: None,
+                surface_formats: None,
                 properties2: vram::Properties2::None,
                 api_version: 0,
                 surface_maintenance: Default::default(),
@@ -1514,6 +1641,7 @@ mod device_link_tests {
         let ctx = InstanceContext {
             instance: instance.clone(),
             surface_caps: None,
+            surface_formats: None,
             properties2: vram::Properties2::None,
             api_version: 0,
             surface_maintenance: Default::default(),
@@ -1585,6 +1713,7 @@ mod device_link_tests {
             ctx: Some(InstanceContext {
                 instance: instance.clone(),
                 surface_caps: None,
+                surface_formats: None,
                 properties2: vram::Properties2::None,
                 api_version: 0,
                 surface_maintenance: Default::default(),
@@ -1636,6 +1765,36 @@ mod extra_queue_tests {
         assert_eq!(unsafe { std::slice::from_raw_parts(q.infos[1].p_queue_priorities, 2) }, &[1.0, 1.0]);
         // No graphics family requested: nothing to add beside.
         assert!(extra_queues(&families, &app[1..], 1).is_none());
+    }
+    /// Red Dead Redemption 2 (Vulkan, RTX 5070, 2026-11-10) asks for family 0 x1, family 2 x8 and family 1 x2: no
+    /// compute-only family has room, so the network shares the application's last queue of family 2, both its uses on
+    /// it, with the application's requests unchanged (#49).
+    #[test]
+    fn with_no_room_the_application_s_last_compute_queue_is_shared() {
+        let families = [family(GRAPHICS, 16), family(vk::QueueFlags::TRANSFER, 2), family(COMPUTE, 8)];
+        let priorities = [1.0f32; 8];
+        let app = [
+            vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&priorities[..1]),
+            vk::DeviceQueueCreateInfo::default().queue_family_index(2).queue_priorities(&priorities),
+            vk::DeviceQueueCreateInfo::default().queue_family_index(1).queue_priorities(&priorities[..2]),
+        ];
+        assert!(extra_queues(&families, &app, 2).is_none(), "no room");
+        let q = shared_queues(&families, &app).expect("a queue to share");
+        assert_eq!((q.app_family, q.family, q.index, q.post_index), (0, 2, 7, 7));
+        let shared = q.shared.expect("shared");
+        assert_eq!((shared.family, shared.index), (2, 7));
+        assert_eq!(q.infos.len(), 3, "the application's requests as they were");
+        assert!(q
+            .infos
+            .iter()
+            .zip(&app)
+            .all(|(a, b)| (a.queue_family_index, a.queue_count, a.p_queue_priorities) == (b.queue_family_index, b.queue_count, b.p_queue_priorities)));
+        // With room the network keeps queues of its own.
+        let fewer = [app[0], vk::DeviceQueueCreateInfo::default().queue_family_index(2).queue_priorities(&priorities[..6])];
+        let own = extra_queues(&families, &fewer, 2).expect("two to spare");
+        assert!(own.shared.is_none() && (own.index, own.post_index) == (6, 7));
+        // No graphics family requested: nothing.
+        assert!(shared_queues(&families, &app[1..]).is_none());
     }
 }
 

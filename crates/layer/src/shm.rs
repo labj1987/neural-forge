@@ -633,6 +633,18 @@ impl ShmClient {
         hdr.native_running.store(u32::from(state == 2 && native), Ordering::Relaxed);
         hdr.preupscale_width.store(width, Ordering::Relaxed);
         hdr.preupscale_height.store(height, Ordering::Relaxed);
+        self.publish_ngx();
+    }
+
+    /// Why no hold ran while DLSS's input is identified (`preupscale_state::IDENTIFIED`), or empty.
+    pub fn publish_preupscale_reason(&self, reason: &str) {
+        let Some(hdr) = self.header() else { return };
+        hdr.set_preupscale_reason(reason);
+    }
+
+    /// Whether the header already says `reason` ([`Self::publish_preupscale_reason`]); true without a header.
+    pub fn preupscale_reason_is(&self, reason: &str) -> bool {
+        self.header().is_none_or(|hdr| hdr.preupscale_reason() == reason)
     }
 
     /// The last hold's CPU milliseconds and the running count of answers over budget.
@@ -640,6 +652,15 @@ impl ShmClient {
         let Some(hdr) = self.header() else { return };
         hdr.preupscale_hold_ms_bits.store(hold_ms.to_bits(), Ordering::Relaxed);
         hdr.preupscale_misses.store(misses, Ordering::Relaxed);
+    }
+
+    /// The NGX ring's counters ([`crate::ngx_ring::COUNTERS`]).
+    pub fn publish_ngx(&self) {
+        let Some(hdr) = self.header() else { return };
+        let c = &crate::ngx_ring::COUNTERS;
+        let sat = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        hdr.ngx_records.store(sat(c.records.load(Ordering::Relaxed)), Ordering::Relaxed);
+        hdr.ngx_matched.store(sat(c.matched.load(Ordering::Relaxed)), Ordering::Relaxed);
     }
 
     /// `debug_view` (0 before the mapping is open).
@@ -694,6 +715,15 @@ impl ShmClient {
     pub fn publish_hdr_detected(&self, kind: u32) {
         let Some(hdr) = self.header() else { return };
         hdr.hdr_detected.store(kind, Ordering::Relaxed);
+    }
+
+    /// The HDR verdict of the swapchain presented (`ShmHeader::hdr_verdict`, `crate::hdr_verdict`), written only when
+    /// it differs from the channel's; an empty one (not a game's swapchain) is not published.
+    pub fn publish_hdr_verdict(&self, text: &str) {
+        let Some(hdr) = self.header() else { return };
+        if !text.is_empty() && hdr.hdr_verdict() != text {
+            hdr.set_hdr_verdict(text);
+        }
     }
 
     /// What the layer does with the swapchain's HDR (`ShmHeader::hdr_active`, `enums::hdr_kind`): `PQ10` while
