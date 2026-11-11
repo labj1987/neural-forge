@@ -255,7 +255,9 @@ frame as before.
 **Switching a game on sets its Proton.** With Steam closed, switching a game on in the Setup tab (or `neural-forge-cli
 enable GAME`) also sets the game's Steam compatibility tool to a Neural Forge copy of the Proton it runs with (of
 Steam's default, else Proton Experimental), making the copy first if there is none; switching it off (or `uninstall
---purge`) puts back the Proton it had. Neural Forge edits Steam's `config/config.vdf` for this the way ProtonPlus and
+--purge`) puts back the Proton it had. A Proton chosen for the game that is not installed is refused, never replaced
+with another; a native Linux game keeps running without Proton. Copies are made from Proton 10 or newer (Wine 10+):
+the wrapper finds the game's process through Wine's `ProcessWineUnixPid`, which Proton 8 and 9 lack. Neural Forge edits Steam's `config/config.vdf` for this the way ProtonPlus and
 ProtonUp-Qt do, only while Steam is closed, with a backup beside it. Restart Steam after a new copy was made.
 
 The Setup tab also lists your installed Protons (GE-Proton, Proton-CachyOS, Valve's Proton and Proton Experimental) with
@@ -268,9 +270,11 @@ unchanged. Your original Proton is not changed. Then:
 2. In the game's Properties > Compatibility, tick "Force the use of a specific Steam Play compatibility tool" and
    choose the copy.
 
-A copy whose original has changed since (a new GE-Proton in a "Latest" folder, a Proton Experimental update) is marked
-with **Make again**: that makes a copy of the new version under its new name; choose it for your games, then
-**Remove** the old one. `PROTON_NO_NEURAL_FORGE_NGX=1 %command%` in a game's launch options turns the wrapper off for
+A copy whose original has changed since (a new GE-Proton in a "Latest" folder, a Proton Experimental update), or that
+holds another NGX wrapper than the installed Neural Forge, is marked with **Make again** (`proton-tool update`): with
+Steam closed it makes the copy again (a new version under its new name, its games moved over and the old copy
+removed), or puts the new wrapper in place. Updating Neural Forge puts its wrapper into every copy by itself. A copy a
+running game uses is never replaced or removed. `PROTON_NO_NEURAL_FORGE_NGX=1 %command%` in a game's launch options turns the wrapper off for
 that game while it keeps the copy. Online games with anti-cheat may refuse a changed module: use the copy for
 single-player games. From the CLI: `neural-forge-cli proton-tool list|create SOURCE|update|remove NAME`.
 

@@ -30,6 +30,23 @@ first shipped them; their phase is kept as a subheading.
 - `doctor` checks that the NGX wrapper is installed and forwards every function of your driver's NGX core, that
   each switched-on game is set to a Neural Forge Proton, and which copies were made from an older Proton than is
   installed now.
+- Neural Forge Proton copies are made from Proton 10 or newer (Wine 10+); Proton 8 and 9 are refused, because the
+  NGX wrapper cannot find the game's process there. A Proton chosen for a game that is not installed is refused
+  instead of being replaced with another, Valve's Protons are found by Steam's own name for them ("Proton 9.0
+  (Beta)" folders included), and switching on a native Linux game no longer forces Proton on it.
+- Updating Neural Forge puts its new NGX wrapper into every existing copy. **Make again** (`proton-tool update`)
+  moves the old copy's games to the new copy and removes the old one, with Steam closed; a copy a running game uses
+  is never replaced or removed, and a replaced copy is swapped in in one step.
+- `uninstall --purge` takes every game off Neural Forge's Proton copies, even ones it has no record of, and removes
+  only copies it made. The NGX wrapper's ring files are made only in games Neural Forge is on for, and those of
+  games that are gone are removed when Neural Forge starts; a running game's is never touched.
+- With an older driver whose NGX core lacks some functions, only those report failure; DLSS is unavailable only if
+  the core lacks one of the ten Neural Forge watches. `doctor` compares the wrapper with your driver's core both
+  ways and reports copies on an old Wine or with another wrapper.
+- Fixed possible crashes in the NGX wrapper after a failed DLSS feature creation and from an exposure image left
+  stale with auto-exposure on; it no longer keeps a game's first D3D12 device alive for the whole session.
+- GTA San Andreas - The Definitive Edition (Direct3D 11): an evaluate whose work never reached the GPU no longer
+  leaves every later frame matched to an older one's camera jitter, and DLSS's output there is learnt.
 - Games that hand DLSS different images frame by frame (GTA V Enhanced rotates its motion vectors, depth and
   exposure image) keep the model and its history on every frame.
 - Online games with anti-cheat may refuse the changed module: use the Neural Forge Proton for single-player games.

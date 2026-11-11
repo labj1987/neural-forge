@@ -18,7 +18,8 @@ NVIDIA's own runtime. Read [Legal](#legal) before you use it.
 - An NVIDIA RTX 40-series or newer GPU with a Vulkan driver that offers `VK_NV_cuda_kernel_launch`,
   `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2` and `VK_EXT_shader_float8` (tested with
   615.71.09, 615.78.08 and 620.70.06). On other GPUs the layer does nothing.
-- Steam with Proton-GE, Proton-CachyOS or Proton Experimental, and 64-bit games. Flatpak Steam cannot
+- Steam with Proton 10 or newer (GE-Proton10+, Proton-CachyOS, Valve's Proton 10/11 or Proton Experimental:
+  the Neural Forge Proton is made from it), and 64-bit games. Native Linux games run without Proton. Flatpak Steam cannot
   see the layer: use your distribution's package.
 - Your own `nvngx_dlssnr.dll` (from a game that ships it, or NVIDIA's SDK), once. It is not shipped
   here.
