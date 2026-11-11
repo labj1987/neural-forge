@@ -2551,11 +2551,14 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                                         let running = steam::steam_running(std::path::Path::new("/proc"));
                                         let w = neural_forge_supervisor::proton_tool::installed_wrapper();
                                         Some(neural_forge_supervisor::compat_tool::switch_on(&root, &steam::libraries(&root), &appid, &w, running).map(|d| {
-                                            format!(
-                                                "; it runs with {} now{}",
-                                                d.tool,
-                                                if d.made { " (a copy made for Neural Forge: restart Steam to see it)" } else { "" }
-                                            )
+                                            match d {
+                                                None => "; a native Linux game: it runs without Proton".to_string(),
+                                                Some(d) => format!(
+                                                    "; it runs with {} now{}",
+                                                    d.tool,
+                                                    if d.made { " (a copy made for Neural Forge: restart Steam to see it)" } else { "" }
+                                                ),
+                                            }
                                         }))
                                     }
                                     (steam::Outcome::Changed(_) | steam::Outcome::Unchanged, false) => {
@@ -2724,23 +2727,29 @@ fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                 row.set_use_markup(false);
                 row.set_title(&tool.name);
                 row.set_subtitle(&if *outdated {
-                    format!("from {}, which has changed since: make it again, choose the new copy for your games, then remove this one", tool.source.display())
+                    format!("from {}; it or Neural Forge's NGX wrapper has changed since: close Steam and make it again", tool.source.display())
                 } else {
                     format!("from {}", tool.source.display())
                 });
                 if *outdated {
                     let again = gtk4::Button::with_label("Make again");
                     again.set_valign(gtk4::Align::Center);
-                    let (root, source, toasts, refill) = (root.clone(), tool.source.clone(), toasts.clone(), refill.clone());
+                    let (root, tool, toasts, refill) = (root.clone(), tool.clone(), toasts.clone(), refill.clone());
                     again.connect_clicked(move |b| {
                         b.set_sensitive(false);
-                        let (root, source, toasts, refill) = (root.clone(), source.clone(), toasts.clone(), refill.clone());
+                        let (root, tool, toasts, refill) = (root.clone(), tool.clone(), toasts.clone(), refill.clone());
                         glib::spawn_future_local(async move {
                             let done = gio::spawn_blocking(move || {
-                                let libs = neural_forge_supervisor::steam::libraries(&root);
-                                let s = proton_tool::sources(&root, &libs).into_iter().find(|s| s.dir == source).ok_or("its source is gone".to_string())?;
-                                proton_tool::create(&root, &s, &proton_tool::installed_wrapper())
-                                    .map(|m| format!("Made {}: restart Steam to see it", m.tool.name))
+                                use neural_forge_supervisor::{compat_tool, steam};
+                                let running = steam::steam_running(std::path::Path::new("/proc"));
+                                compat_tool::update(&root, &steam::libraries(&root), &tool, &proton_tool::installed_wrapper(), running).map(|u| {
+                                    if u.to == u.from {
+                                        format!("Made {} again", u.to)
+                                    } else {
+                                        let kept = u.kept.map(|k| format!("; {} is kept: {k}", u.from)).unwrap_or_else(|| format!("; removed {}", u.from));
+                                        format!("Made {}, its games moved to it{kept}. Restart Steam to see it", u.to)
+                                    }
+                                })
                             })
                             .await;
                             toasts.add_toast(toast(
