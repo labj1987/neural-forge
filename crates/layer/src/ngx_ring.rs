@@ -409,6 +409,35 @@ pub(crate) fn no_wrapper() -> bool {
     return SAID_NO_RING.load(Ordering::Relaxed) && lock().ring.is_none();
 }
 
+/// A CUDA kernel was created in this process (`vkCreateCuFunctionNVX`: NGX loading a DLSS feature's kernels, at
+/// startup or when the game creates the feature, before DLSS's first frame).
+static CUDA_FUNCTIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`dlss_game`]'s signal from the CUDA kernels' creation.
+pub(crate) fn note_cuda_function() {
+    CUDA_FUNCTIONS.store(true, Ordering::Relaxed);
+}
+
+/// Whether this process is a DLSS game, from the earliest sign: NGX's wrapper opened its ring (when the game loads
+/// NGX), or NGX created CUDA kernels (a DLSS game not on the Neural Forge Proton). Such a game never gets the model on
+/// the finished frame unless that placement is chosen: before DLSS runs (menus, loading screens) it would build the
+/// network at the output size, at 4K the cost behind GTA V Enhanced's hangs and Cyberpunk 2077's video-memory spills
+/// (2026-11-11).
+pub(crate) fn dlss_game() -> bool {
+    // Process-wide signals: in tests (many trackers in one process) the finished frame is decided as before.
+    #[cfg(test)]
+    return false;
+    #[cfg(not(test))]
+    {
+        if CUDA_FUNCTIONS.load(Ordering::Relaxed) {
+            return true;
+        }
+        let mut s = lock();
+        s.poll();
+        s.ring.is_some()
+    }
+}
+
 /// A launch-bearing submit carried no evaluate's launches: when no ring is open (after looking for it), DLSS runs
 /// without the NGX wrapper, and the model stays off (said once).
 pub(crate) fn note_launches_without_record() {

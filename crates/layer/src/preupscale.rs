@@ -2883,6 +2883,7 @@ impl Tracking {
 
     /// `vkCreateCuFunctionNVX` created `function` for the kernel `name`.
     pub(crate) fn record_function(&self, function: vk::CuFunctionNVX, name: &str) {
+        crate::ngx_ring::note_cuda_function();
         self.lock().record_function(function, name);
     }
 
@@ -6504,7 +6505,10 @@ pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
     let off = |since: Instant| now < hand_back_at(since, launch);
     // A DLSS game without NGX's records (not on the Neural Forge Proton) keeps the model off too, unless the finished
     // frame is chosen: there it would see the HUD and cost the most (4.0; the status and the doctor say why).
-    (lock(&POST_OFF_UNTIL).values().any(|&since| off(since)) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(off) || crate::ngx_ring::no_wrapper())
+    (lock(&POST_OFF_UNTIL).values().any(|&since| off(since))
+        || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(off)
+        || crate::ngx_ring::no_wrapper()
+        || crate::ngx_ring::dlss_game())
         && !post_serves(now)
 }
 
