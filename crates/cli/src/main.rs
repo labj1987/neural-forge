@@ -267,10 +267,29 @@ fn cmd_doctor() -> ExitCode {
 }
 
 fn cmd_install(appdir: &str) -> ExitCode {
+    use neural_forge_supervisor::{proton_tool, steam};
     match neural_forge_supervisor::install::install(std::path::Path::new(appdir)) {
         Ok(report) => {
             println!("Installed Neural Forge. CLI: {}", report.cli_path.display());
-            ExitCode::SUCCESS
+            // Every Neural Forge Proton gets the wrapper just installed.
+            let mut failed = false;
+            for root in steam::roots().into_iter().filter(|r| !r.flatpak) {
+                for (name, done) in proton_tool::refresh_wrappers(&root.path, &proton_tool::installed_wrapper()) {
+                    match done {
+                        Ok(true) => println!("{name}: has the new NGX wrapper"),
+                        Ok(false) => {}
+                        Err(e) => {
+                            failed = true;
+                            eprintln!("{name}: the new NGX wrapper could not be put in: {e}");
+                        }
+                    }
+                }
+            }
+            if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(e) => {
             eprintln!("install failed: {e}");
@@ -501,7 +520,11 @@ fn set_game_proton(game: &neural_forge_supervisor::steam::Game, on: bool) -> Exi
     let running = steam::steam_running(std::path::Path::new("/proc"));
     if on {
         match compat_tool::switch_on(root, &steam::libraries(root), &game.appid, &proton_tool::installed_wrapper(), running) {
-            Ok(done) => {
+            Ok(None) => {
+                println!("{} is a native Linux game: it runs without Proton, so its Proton is left as it is.", game.name);
+                ExitCode::SUCCESS
+            }
+            Ok(Some(done)) => {
                 if done.made {
                     println!("{}\n", proton_tool::NOTICE);
                 }
@@ -841,10 +864,12 @@ fn command_usage(command: &str) -> Option<&'static str> {
              into Steam's compatibilitytools.d as <version>-NeuralForge: hard links on the same drive, with\n  \
              Neural Forge's NGX wrapper as _nvngx.dll so the layer reads DLSS's own parameters. Restart Steam,\n  \
              then choose it per game in Properties > Compatibility. PROTON_NO_NEURAL_FORGE_NGX=1 in a game's\n  \
-             launch options turns the wrapper off for that game.\n  \
-             update: make every outdated copy again from its source's current version (a copy of a new\n  \
-             version gets a new name; choose it for the game again, then remove the old one).\n  \
-             remove NAME: delete a copy Neural Forge made"
+             launch options turns the wrapper off for that game. Only a Proton built on Wine 10 or newer\n  \
+             (Proton 10 or newer, GE-Proton10 or newer) can be copied.\n  \
+             update: make every outdated copy again from its source's current version, with the installed\n  \
+             NGX wrapper. A copy of a new version gets a new name: with Steam closed, the games set to the\n  \
+             old copy are moved to the new one and the old copy is removed (never one a running game uses).\n  \
+             remove NAME: delete a copy Neural Forge made (not while a game runs with it)"
         }
         "shmctl" => "",
         "profile" => "",
@@ -915,17 +940,26 @@ fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
         }
         ProtonToolCmd::Update => {
             let mut failed = false;
+            let running = steam::steam_running(std::path::Path::new("/proc"));
             for t in proton_tool::tools(root).into_iter().filter(proton_tool::outdated) {
-                let source = proton_tool::sources(root, &libraries).into_iter().find(|s| s.dir == t.source);
-                match source.map(|s| proton_tool::create(root, &s, &wrapper)) {
-                    Some(Ok(made)) => println!("{}: made {} from the current version", t.name, made.tool.name),
-                    Some(Err(e)) => {
+                match neural_forge_supervisor::compat_tool::update(root, &libraries, &t, &wrapper, running) {
+                    Ok(done) if done.to == done.from => println!("{}: made again (its source's current version, the installed NGX wrapper)", t.name),
+                    Ok(done) => {
+                        println!("{}: made {} from the current version", t.name, done.to);
+                        if !done.moved.is_empty() {
+                            println!("  moved to it: app {}", done.moved.join(", app "));
+                        }
+                        match done.kept {
+                            Some(why) => {
+                                failed = true;
+                                eprintln!("  {} is kept: {why}", t.name);
+                            }
+                            None => println!("  removed {}", t.name),
+                        }
+                    }
+                    Err(e) => {
                         failed = true;
                         eprintln!("{}: {e}", t.name);
-                    }
-                    None => {
-                        failed = true;
-                        eprintln!("{}: its source {} is gone; remove it with `proton-tool remove`", t.name, t.source.display());
                     }
                 }
             }
@@ -949,6 +983,8 @@ fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Rings of games that are gone (the layer never opened them): never a running game's.
+    neural_forge_supervisor::proton_tool::sweep_dead_rings(std::path::Path::new(neural_forge_supervisor::proton_tool::RING_DIR));
     // `args_os`: `args()` panics on an argument that is not valid UTF-8 (a path, say).
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     let command = match parse(&args) {

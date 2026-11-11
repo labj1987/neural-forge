@@ -18,6 +18,8 @@ fn main() {
     // Keep the persistent layer copy (what Steam games load) in step with this
     // AppImage on every launch, so an updated AppImage never runs against a stale layer.
     let install_error = auto_install();
+    // Rings the NGX wrapper left for games that are gone (the layer never opened them): never a running game's.
+    neural_forge_supervisor::proton_tool::sweep_dead_rings(std::path::Path::new(neural_forge_supervisor::proton_tool::RING_DIR));
 
     app.connect_activate(move |app| {
         if let Some(window) = app.windows().first() {
@@ -42,6 +44,17 @@ fn auto_install() -> Option<String> {
         Ok(report) => {
             if report.changed {
                 eprintln!("neural-forge: installed the layer to {}", report.root.display());
+            }
+            // Every Neural Forge Proton gets the wrapper just installed (a no-op when they have it).
+            use neural_forge_supervisor::{proton_tool, steam};
+            for root in steam::roots().into_iter().filter(|r| !r.flatpak) {
+                for (name, done) in proton_tool::refresh_wrappers(&root.path, &proton_tool::installed_wrapper()) {
+                    match done {
+                        Ok(true) => eprintln!("neural-forge: {name} has the new NGX wrapper"),
+                        Ok(false) => {}
+                        Err(e) => eprintln!("neural-forge: {name}: the new NGX wrapper could not be put in: {e}"),
+                    }
+                }
             }
             None
         }
