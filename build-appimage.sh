@@ -67,6 +67,9 @@ bash scripts/fetch-native-tools.sh
 echo "==> cargo build --release (protocol/layer/native/gui/cli)"
 cargo build --release --locked
 
+# The NGX wrapper for Proton (docs/PROTON_NGX.md): a Windows DLL, stamped as a Wine builtin.
+bash scripts/build-ngx-wrapper.sh "${CARGO_TARGET_DIR:-target}/ngx-wrapper/_nvngx.dll"
+
 # ── AppDir layout ─────────────────────────────────────────────────────
 rm -rf "$BUILD_DIR"
 mkdir -p "$APPDIR/usr/bin" \
@@ -80,6 +83,8 @@ RELEASE="${CARGO_TARGET_DIR:-target}/release"
 cp "$RELEASE/$NAME"                                 "$APPDIR/usr/bin/"
 cp "$RELEASE/$NAME-cli"                             "$APPDIR/usr/bin/"
 cp "$RELEASE/$LIB"                                  "$APPDIR/usr/lib/$LIBDIR/"
+mkdir -p "$APPDIR/usr/lib/$LIBDIR/proton"
+cp "${CARGO_TARGET_DIR:-target}/ngx-wrapper/_nvngx.dll" "$APPDIR/usr/lib/$LIBDIR/proton/"
 sed "s#\./libneural_forge_layer\.so#../../../lib/$LIBDIR/$LIB#" \
     "data/$MANIFEST" > "$APPDIR/usr/share/vulkan/implicit_layer.d/$MANIFEST"
 cp data/io.github.labj1987.NeuralForge.desktop                               "$APPDIR/usr/share/applications/"
@@ -105,6 +110,13 @@ mkdir -p "$DOCDIR/third_party/opendlss-nr" "$DOCDIR/third_party/vk-layer-for-rus
 cp -r third_party/optiscaler "$DOCDIR/third_party/"
 cp third_party/opendlss-nr/{LICENSE,NOTICE,UPSTREAM.md} "$DOCDIR/third_party/opendlss-nr/"
 cp third_party/vk-layer-for-rust/{LICENSE,UPSTREAM.md} "$DOCDIR/third_party/vk-layer-for-rust/"
+# The NGX wrapper links the mingw-w64 runtime and libgcc (GCC Runtime Library Exception) statically: their
+# notices from the build machine's packages.
+mkdir -p "$DOCDIR/third_party/mingw-w64"
+for pkg in mingw-w64-common gcc-mingw-w64-base; do
+    [ -f "/usr/share/doc/$pkg/copyright" ] || { echo "missing /usr/share/doc/$pkg/copyright (the NGX wrapper's runtime notices)" >&2; exit 1; }
+    cp "/usr/share/doc/$pkg/copyright" "$DOCDIR/third_party/mingw-w64/$pkg.copyright"
+done
 
 # Top-level AppImage requirements
 cp data/io.github.labj1987.NeuralForge.desktop "$APPDIR/"

@@ -1,0 +1,26 @@
+# Neural Forge's NGX wrapper for Proton: a Windows DLL (`_nvngx.dll`, x86_64-pc-windows-gnu), its own workspace like
+# third_party/vk-layer-for-rust, so the Linux workspace never builds it. Built and stamped as a Wine builtin by
+# scripts/build-ngx-wrapper.sh; see docs/PROTON_NGX.md.
+[package]
+name = "neural-forge-ngx-wrapper"
+version = "3.14.0"
+edition = "2021"
+authors = ["Linnard Alex Brown Jr."]
+license = "AGPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "_nvngx"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+strip = true
+lto = true
+
+[profile.dev]
+panic = "abort"
