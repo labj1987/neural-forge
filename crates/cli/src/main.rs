@@ -902,7 +902,9 @@ fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
         ProtonToolCmd::List => {
             println!("Protons a copy can be made from:");
             for s in proton_tool::sources(root, &libraries) {
-                println!("  {} ({}) in {}", s.display, s.version, s.dir.display());
+                // A Proton the wrapper cannot run under is listed with why, not offered.
+                let refused = proton_tool::unix_pid_support(&s.dir).err().map(|why| format!(" -- cannot be copied: {why}")).unwrap_or_default();
+                println!("  {} ({}) in {}{refused}", s.display, s.version, s.dir.display());
             }
             println!("Copies made by Neural Forge:");
             for t in proton_tool::tools(root) {

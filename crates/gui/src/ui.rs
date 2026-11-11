@@ -2794,6 +2794,11 @@ fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                 let make = gtk4::Button::with_label("Make copy");
                 make.set_valign(gtk4::Align::Center);
                 make.set_tooltip_text(Some(&format!("Make {} (see the notice above)", source.tool_name())));
+                // A Proton the wrapper cannot run under (Wine older than 10) says why instead of offering a copy.
+                if let Err(why) = neural_forge_supervisor::proton_tool::unix_pid_support(&source.dir) {
+                    make.set_sensitive(false);
+                    row.set_subtitle(&format!("{} in {}: cannot be copied, {why}", source.version, source.dir.display()));
+                }
                 let (root_m, source, toasts_m, refill_m) = (root.clone(), source.clone(), toasts.clone(), refill.clone());
                 make.connect_clicked(move |b| {
                     b.set_sensitive(false);
