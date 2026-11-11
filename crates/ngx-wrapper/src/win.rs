@@ -5,8 +5,9 @@ use std::io::Write;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::exports::{HOOKED, PASSTHROUGH, PASSTHROUGH_TARGETS};
+use crate::exports::{missing_export, HOOKED, PASSTHROUGH, PASSTHROUGH_TARGETS};
 use crate::ring::{self, Header, Record};
+use crate::rules::{self, Resolution};
 
 pub(crate) type Handle = *mut c_void;
 
@@ -191,7 +192,8 @@ pub(crate) fn target(name: &str) -> *const c_void {
     HOOKED.iter().position(|h| *h == name).map_or(core::ptr::null(), |i| HOOK_TARGETS[i].load(Ordering::Acquire))
 }
 
-/// Loads NVIDIA's core and resolves every export; `Err` if it cannot be loaded or lacks one of them.
+/// Loads NVIDIA's core and resolves every export: `Err` if it cannot be loaded or lacks an export the wrapper hooks;
+/// a passthrough export it lacks jumps to [`missing_export`] (named in the returned text, for the log).
 fn resolve(this: Handle) -> Result<String, String> {
     let path = core_path();
     let wpath = wide(&path);
@@ -202,32 +204,37 @@ fn resolve(this: Handle) -> Result<String, String> {
     if core == this {
         return Err(format!("{path} resolved to this wrapper (the full-path native override is missing)"));
     }
-    let mut missing = Vec::new();
     let lookup = |name: &str| -> *const c_void {
         let cname: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
         unsafe { GetProcAddress(core, cname.as_ptr()) }
     };
+    let stubbed = match rules::resolution(|name| !lookup(name).is_null()) {
+        Resolution::MissingHooked(missing) => return Err(format!("NVIDIA's NGX core {path} lacks {}", missing.join(", "))),
+        Resolution::Ok { stubbed } => stubbed,
+    };
     for (i, name) in PASSTHROUGH.iter().enumerate() {
         let p = lookup(name);
-        if p.is_null() {
-            missing.push(*name);
-        }
-        unsafe { (*core::ptr::addr_of_mut!(PASSTHROUGH_TARGETS))[i] = p as usize };
+        let p = if p.is_null() { missing_export as *const () as usize } else { p as usize };
+        unsafe { (*core::ptr::addr_of_mut!(PASSTHROUGH_TARGETS))[i] = p };
     }
     for (i, name) in HOOKED.iter().enumerate() {
-        let p = lookup(name);
-        if p.is_null() {
-            missing.push(*name);
-        }
-        HOOK_TARGETS[i].store(p as *mut c_void, Ordering::Release);
+        HOOK_TARGETS[i].store(lookup(name) as *mut c_void, Ordering::Release);
     }
-    if missing.is_empty() {
-        Ok(format!("{} at {core:p}", module_path(core)))
-    } else {
-        Err(format!("NVIDIA's NGX core {path} lacks {}", missing.join(", ")))
+    let mut text = format!("{} at {core:p}", module_path(core));
+    if !stubbed.is_empty() {
+        text += &format!("; lacks {} (answered with NVSDK_NGX_Result_Fail)", stubbed.join(", "));
     }
+    Ok(text)
 }
 
+/// Loads NVIDIA's core and resolves the exports here, under the loader lock, which Microsoft's DllMain guidance
+/// advises against (`LoadLibrary` from `DllMain`). It is sound here: the passthrough exports are bare jumps through
+/// the resolved pointers, so they must be set before any export can be called, and no other point comes before
+/// that; Wine's loader lock is recursive, so the nested load of NVIDIA's core (and its own `DllMain`) runs on this
+/// thread without waiting; the core is loaded by its full path, overridden native, so it cannot be this module again
+/// (checked: [`resolve`] refuses a load that returns this module); and nothing here waits on another thread.
+/// The ring is opened here too, only where the layer is on ([`rules::ring_wanted`]).
+///
 /// # Safety
 /// Called by the Windows loader.
 #[no_mangle]
@@ -241,7 +248,11 @@ pub unsafe extern "system" fn DllMain(this: Handle, reason: u32, _reserved: *mut
     let exe = module_path(core::ptr::null_mut());
     match resolve(this) {
         Ok(core) => {
-            let ring = open_ring();
+            let ring = if rules::ring_wanted(|name| std::env::var(name).ok()) {
+                open_ring()
+            } else {
+                Err("not created: the Neural Forge layer is not on in this process (NEURAL_FORGE_ENABLE)".into())
+            };
             log(&format!("Neural Forge NGX wrapper {} in {exe} as {}; NVIDIA's core {core}; ring {ring:?}", env!("CARGO_PKG_VERSION"), module_path(this)));
             1
         }

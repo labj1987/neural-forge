@@ -1,7 +1,8 @@
 //! NVIDIA's `_nvngx.dll` exports (driver 620.70, 75 names; the ordinals are their alphabetical order, which the
 //! linker gives these too: `scripts/build-ngx-wrapper.sh` checks both against the driver's DLL when it is installed).
 //! The ones Neural Forge watches are in `hooks.rs`; every other one is a jump through the pointer resolved from
-//! NVIDIA's core at load ([`crate::resolve`]).
+//! NVIDIA's core at load (`win.rs`, `resolve`), or to [`missing_export`] when the core lacks it
+//! ([`crate::rules::resolution`]).
 
 /// Exports forwarded untouched.
 macro_rules! passthrough {
@@ -9,6 +10,7 @@ macro_rules! passthrough {
         /// Their names, for resolving.
         pub(crate) const PASSTHROUGH: &[&str] = &[$(stringify!($name)),*];
         /// Their targets in NVIDIA's core, in [`PASSTHROUGH`]'s order.
+        #[cfg(windows)]
         pub(crate) static mut PASSTHROUGH_TARGETS: [usize; PASSTHROUGH.len()] = [0; PASSTHROUGH.len()];
         passthrough!(@each 0usize; $($name)*);
     };
@@ -66,9 +68,22 @@ pub(crate) const HOOKED: &[&str] = &[
     "NVSDK_NGX_VULKAN_ReleaseFeature",
 ];
 
+/// What a passthrough export NVIDIA's core lacks jumps to: `NVSDK_NGX_Result_Fail`, as NGX answers a call it cannot
+/// serve. It takes no arguments, which is safe for every export's signature: on x64 Windows the caller passes
+/// arguments in registers and its own stack space and cleans up after the call (no callee-popped arguments).
+pub extern "C" fn missing_export() -> u32 {
+    crate::rules::NGX_RESULT_FAIL
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_export_fails() {
+        assert_eq!(missing_export(), 0xBAD0_0000);
+        assert!(!crate::rules::ngx_succeeded(missing_export()));
+    }
 
     #[test]
     fn every_export_once() {

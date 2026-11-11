@@ -15,7 +15,7 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
                         Neural Forge's builtin _nvngx.dll (crates/ngx-wrapper)
                               │ forwards all 75 exports to NVIDIA's core, loaded from NVIDIA_WINE_DLL_DIR
                               │ a record per CreateFeature, two per EvaluateFeature (before and after NVIDIA's call)
-                              │                                    ──► /dev/shm/neural-forge-ngx-<pid>.ring
+                              │   (only with NEURAL_FORGE_ENABLE=1) ──► /dev/shm/neural-forge-ngx-<pid>.ring
                               ▼
             vkCmdCuLaunchKernelNVX ──► VK_LAYER_neuralforge_neural: ngx_ring.rs reads the ring
                                         records = the only source of what DLSS works on
@@ -35,15 +35,38 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   (`server/mapping.c`), which `scripts/build-ngx-wrapper.sh` writes after the build, as `winebuild --builtin` does.
 - **Loading NVIDIA's core.** The wrapper loads `Z:<NVIDIA_WINE_DLL_DIR>/_nvngx.dll` by its full path. A full-path key
   is looked up before the base name, so the override `Z:\...\nvidia\wine\_nvngx=n` keeps that one native; without it
-  Wine hands the wrapper back to itself. NVIDIA's snippets (`nvngx_dlss.dll` and the others) load as before.
+  Wine hands the wrapper back to itself (the wrapper checks: a load that returns its own module refuses the load).
+  NVIDIA's snippets (`nvngx_dlss.dll` and the others) load as before.
+- **Exports the core lacks.** The wrapper hooks ten exports: `NVSDK_NGX_{D3D11,D3D12,VULKAN}_{CreateFeature,
+  EvaluateFeature,ReleaseFeature}` and `NVSDK_NGX_VULKAN_CreateFeature1` (`exports.rs`, `HOOKED`). It calls NVIDIA's
+  function of each, so a core without one of them fails the wrapper's load, and NGX reports itself unavailable: the
+  game runs without DLSS rather than with a half-forwarded core. Every other export is a jump through the pointer
+  resolved at load; one the core lacks (an older driver) jumps to a stub that returns `NVSDK_NGX_Result_Fail`
+  (`0xBAD00000`), as NGX answers a call it cannot serve, and the log names it. The stub takes no arguments, which is
+  safe whatever the export's signature: on x64 Windows the caller passes arguments in registers and its own stack
+  space and cleans up after the call.
+- **Loading the core from `DllMain`.** The wrapper loads NVIDIA's core and resolves the exports in its `DllMain`,
+  under the loader lock, which Microsoft's guidance for `DllMain` advises against. It is needed and safe here: the
+  passthrough exports are bare jumps through the resolved pointers, so they must be set before any export can be
+  called, and nothing else runs before that; Wine's loader lock is recursive, so the nested load (and the core's own
+  `DllMain`) runs on the same thread without waiting; the core is loaded by its full path with a native override,
+  so it cannot be the wrapper again (checked); and the wrapper's `DllMain` waits on no other thread.
 - **What it records.** For D3D12 the `ID3D12Resource`s become VkImages through vkd3d-proton's
   `ID3D12DXVKInteropDevice1::GetVulkanResourceInfo1` (and the layout DLSS reads them in through
   `GetVulkanImageLayout`); for D3D11 through DXVK's `IDXGIVkInteropSurface::GetVulkanImageInfo`; Vulkan games hand
   NGX `NVSDK_NGX_Resource_VK` with the VkImage. winevulkan passes VkImage handles through unwrapped, so they are the
-  handles the layer saw at `vkCreateImage`. Per evaluate: `Color`, `MotionVectors`, `Depth`, `Output`,
+  handles the layer saw at `vkCreateImage`. The interop device is asked for per resource and released after the
+  lookup, so the wrapper keeps no device alive and a game that makes a new device is asked through the new one.
+  Per evaluate: `Color`, `MotionVectors`, `Depth`, `Output`,
   `ExposureTexture`, `Jitter.Offset`, `MV.Scale`, `DLSS.Pre.Exposure`, `DLSS.Exposure.Scale`, `Reset`, the render
   subrect, the extents, and the feature (Super Resolution 1, Frame Generation 11, Ray Reconstruction 13) with its
   creation flags (`IsHDR`, `MVLowRes`, `MVJittered`, `DepthInverted`, `AutoExposure`).
+  Looking an image up calls into the resource the parameter names, so the wrapper does it only for parameters
+  NVIDIA's own call reads, which the game must keep alive: the images only for Super Resolution and Ray
+  Reconstruction (the features the layer uses; Frame Generation's records carry none), and `ExposureTexture` not
+  with `AutoExposure` (DLSS ignores it then, so a game may leave it pointing at a freed resource). The other images
+  the text log lists are logged as their bare pointers. A creation NVIDIA failed (`NVSDK_NGX_FAILED`) is logged
+  only: its handle out-parameter is not NVIDIA's then, and is not read.
 - **The ring.** `crates/ngx-wrapper/src/ring.rs` (version 2): a 32-byte header, 1024 slots of 128 bytes. A writer reserves a slot
   with an atomic add, zeroes its `seq`, writes it, then sets `seq` to its number; the reader takes a slot only while
   `seq` reads the same before and after copying it. The file is named by the Linux pid (the wrapper asks Wine with
@@ -53,6 +76,20 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   before NVIDIA's `EvaluateFeature` is called, so before NGX records any of the evaluate's launches, on the same
   thread; once the call returned, the wrapper writes the same record again with `KIND_END` (bit 16 of `api`; the API is
   the low 16 bits). Every launch of the evaluate lies between the two.
+- **Only where the layer is on.** The wrapper is in every game a Neural Forge Proton runs, but it creates the ring
+  only with `NEURAL_FORGE_ENABLE=1` (the layer's `enable_environment`), without `NEURAL_FORGE_DISABLE=1`, and not with
+  `NEURAL_FORGE_NGX_RING=off`: the layer is the ring's only reader and the one that removes the file, so in any
+  other game the file would stay in `/dev/shm` until `uninstall --purge`.
+- **Why `/dev/shm`.** Both sides need one path without talking to each other. Wine maps `Z:\dev\shm` to the host's
+  `/dev/shm`, and Steam's pressure-vessel container shares the host's `/dev/shm` in every runtime, so the layer
+  (inside the container) and the wrapper (Wine in the same container) see the same file. `XDG_RUNTIME_DIR` is not
+  reliably the same path or directory inside the Steam runtime, so it is not used.
+- **A stalled slot.** If the layer reads nothing (not loaded, or slow to poll), the writer laps the ring: 1024
+  slots, records overwritten oldest first, the file never grows. The reader takes record `n` only when its slot's
+  `seq` reads `n + 1`; a slot whose `seq` is still 0 (its writer between reserving and finishing) stops the reader
+  there until the next poll, and once the writer has reserved 1024 records past it, the reader jumps ahead and the
+  slot's record is lost, never misread. A slot overwritten while copied fails the `seq` check after the copy and is
+  skipped. Writers never wait on the reader.
 
 ## What the layer does with the records (`crates/layer/src/ngx_ring.rs`, `preupscale.rs`)
 
@@ -112,9 +149,11 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
   again in seconds. The wrapper does not depend on the Wine version.
 - What can break: Valve rewrites the `NVIDIA_WINE_DLL_DIR` block (its TODO says the copies into `system32` go once
   NGXCore's `NGXPath` is set): the patch then refuses, and the anchor needs updating. NVIDIA adds an export to its core:
-  the wrapper lacks it and NGX's loader may refuse the core, so the game runs without DLSS. `build-ngx-wrapper.sh`
-  compares the wrapper's exports (names and ordinals) with the driver's DLL wherever one is installed; a check in
-  `doctor` against the user's driver is still to do. NGX starts verifying the loaded image instead of the file: the
+  the wrapper lacks it and NGX's loader may refuse the core, so the game runs without DLSS. NVIDIA's core lacks one of
+  the wrapper's exports (an older driver): a passthrough one answers `NVSDK_NGX_Result_Fail`, a hooked one fails the
+  wrapper's load, so the game runs without DLSS (see "Exports the core lacks"). `build-ngx-wrapper.sh` compares the
+  wrapper's exports (names and ordinals) with the driver's DLL wherever one is installed; a check in `doctor`
+  against the user's driver is still to do. NGX starts verifying the loaded image instead of the file: the
   wrapper approach stops working (the fallback would be the in-memory export patch spike 1 used, from a builtin every
   game loads).
 
