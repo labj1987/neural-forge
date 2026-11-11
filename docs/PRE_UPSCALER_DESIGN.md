@@ -1795,8 +1795,8 @@ What changed:
 - **Post path off process-wide.** If DLSS runs on a device without the swapchain, the hold happens
   on that device. The present (and the post-upscaler compose) happens on the other one, whose
   session never saw DLSS. That would have applied the model twice and rebuilt the helper's feature
-  between the two sizes every frame. While a device holds, its post-path deadline (`post_off`, 30 s
-  after the last DLSS submit) is now shared through `preupscale::post_off_by_any_device`, and every
+  between the two sizes every frame. While a device holds, its post-path deadline (`post_off`: the
+  hand-back after the last held frame, `hand_back_at`) is now shared through `preupscale::post_off_by_any_device`, and every
   device's present honours it. With `NEURAL_FORGE_PREUPSCALE=off` it is never set. For a single
   device (GTA) it equals that device's own rule (`the_shared_post_off_deadline_matches_the_holding_devices_own`).
 
@@ -2494,7 +2494,8 @@ input: image ...`). The inventory and the map stop DLSS too.
    held (a run of launches under `RECENT` apart reaching more than `RECENT` past the last held frame, counted from
    the run's start when it began later); with no launch at all, 5 minutes (`PAUSE_HAND_BACK`). DLAA and a set of
    inputs no longer identified hand back as before; a menu or loading screen keeps the network where it is.
-2. `PAUSED` (`preupscale_state` 6): no hold lately, no DLSS frame within `RECENT`, the post path kept off. The GUI
+2. `PAUSED` (`preupscale_state` 6): no hold lately, no DLSS frame within `RECENT`, the post path kept off (since the
+   review below: no Super Resolution launch within `RECENT` either). The GUI
    says "paused with the game's DLSS (a menu or loading screen): the model resumes with its next frame"; captures
    meanwhile read the presented frame as both images, as while holding.
 3. `LoaderState::want_sizes`: a path taking the current build drops the other path's pending request for another
@@ -2518,6 +2519,31 @@ launches), `the_post_path_takes_over_only_after_hand_back_without_dlss` and
 `dlss_identified_with_every_frame_refused_is_not_waiting_for_dlss_input` (the `PAUSED` status),
 `a_path_taking_the_current_build_drops_the_other_paths_pending_rebuild`, the GUI's `says_paused_while_the_game_pauses_dlss`.
 
+**Review fixes (2026-11-11).** A review of the change found three places where the code did not do what this section
+and the user guide say:
+
+1. Only Super Resolution launches whose parameters named DLSS's inputs (`InputLaunch::Inputs`) were noted as DLSS
+   running: a game whose inputs stopped being identified after holds ran (no launch read as inputs any more) kept the
+   model off for 5 minutes, the status "paused" while the game played. Now every launch of the input kernel known by
+   its name (`LaunchRefs::sr_launched`, in a secondary buffer too) counts, besides a launch read as inputs where the
+   name is not known.
+2. The 30 s ran from the last frame with DLSS's inputs identified (`last_dlss`), which every refused frame refreshes:
+   DLAA, identified and refused every frame, never handed back. Now it runs from the last held frame
+   (`Session::last_hold`), and `PAUSED` needs no Super Resolution launch within `RECENT` (`Session::status_at`): while
+   DLSS launches, the status is `IDENTIFIED` with the reason or `WAITING`.
+3. The loader thread's idle step (below) checked only the holds recorded into DLSS's buffers and the 6 s since a path
+   last took the network. A frame can still run after that: an after-the-upscaler frame whose 5 s fence wait timed
+   out (its claim kept until the fence signals), a split hold with its fence pending or with no fence after it (taken
+   as running for `FENCE_WAIT_TIMEOUT` after its submit). Closing the network under one is the copy engine reading
+   freed memory, #59's Xid 31. The idle step now needs what lending the network to another device needs
+   (`Claims::unused`), and the loader thread checks again under its lock, right before it closes the network or frees
+   a build for a rebuild, that nothing is in flight (`LoaderState::frees_now`); it waits (logged once after 5 s) until
+   it is.
+
+Tests: `the_post_path_takes_over_30_s_after_the_last_held_frame_unless_dlss_sends_nothing` (unidentified launches,
+DLAA, a menu, no launches, the resume; the status in each), `super_resolution_launches_are_noted_identified_or_not`,
+`native::tests::frames_still_in_flight_keep_the_idle_step_and_the_free_off`; each fails with its fix reverted.
+
 ### The VRAM guard in the same game at 4K with Ray Reconstruction and path tracing
 
 Before (rrpt runs, RTX 5070 12 GB, 3840x2160 HDR10, Auto: after DLSS, the network at 3840x2160, 32 ms a frame in
@@ -2526,15 +2552,17 @@ recovers, the holds return), the network at 311-1741 ms a frame, and no `VRAM gu
 `NEURAL_FORGE_PROBE_VRAM=1` (added for this, kept as a diagnostic):
 
 1. Five samples within one second were needed for a judgement; the holds came 1-5 per 5 s. Fix: the last five are
-   kept for up to 5 s (`SLOW_WINDOW`), and two or more within it all above `SPILL_ABS_MS` are a judgement.
+   kept for up to 5 s (`SLOW_WINDOW`), and two or more within it all above `SPILL_ABS_MS` are a judgement, once the
+   build is past its first `WARMUP` frames (a slower GPU's first frames after a build are no spill:
+   `two_slow_frames_right_after_a_build_are_no_spill`).
 2. The after-the-upscaler path's frames were never timed for the guard (`native_post`), and in this game the network
    served that path whenever Ray Reconstruction's 1 s window lapsed between slow frames. Fix: each of its frames
    reports its time.
 3. With 1 and 2 the guard decided to pause (`the network took 353.7 ms a frame (best 31.0 ms) ... 10390 of 10470
    MiB`), but the decision is applied where a path asks for the network (`want_sizes`), and none did: the game stayed
    at 9 fps for minutes with the network open (`spill since 144 s`, the probe). Fix: `LoaderState::apply_idle_step`,
-   the loader thread applies a decided step down once no hold recorded with the build may run and no path took the
-   network for `IDLE_STEP` (the fence wait plus a second).
+   the loader thread applies a decided step down once no path took the network for `IDLE_STEP` (the fence wait plus a
+   second) and nothing that used it may still run (`Claims::unused`: review fix 3 above).
 4. Another run had the network at 1.7 s a frame (best 31 ms) with the reading 217 MiB under the budget (10189 of
    10406 MiB), outside `OVER_MARGIN_MIB` (128). Fix: a network ten times slower than its best (or over 500 ms) counts
    as spilled within 512 MiB of the budget (`SEVERE_MARGIN_MIB`); slow with more room than that stays a slow GPU.

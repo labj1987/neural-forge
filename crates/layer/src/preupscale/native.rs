@@ -231,18 +231,30 @@ struct LoaderState {
 }
 
 /// How long no path may have taken the network before the loader thread applies a step down of the VRAM guard itself:
-/// longer than any wait of the layer's, so no frame that used the network can still run.
+/// longer than any wait of the layer's. A frame whose wait timed out may still run after it, which [`Claims::unused`]
+/// tells.
 const IDLE_STEP: std::time::Duration = std::time::Duration::from_secs(crate::FENCE_WAIT_TIMEOUT.as_secs() + 1);
 
 impl LoaderState {
     /// A step down the VRAM guard decided is applied where the paths ask for the network ([`Self::want_sizes`]); while
     /// the spill stalls the game, no path may ask again: below 15 fps the layer stops working on its frames, and the
     /// network kept the video memory the game needed (Cyberpunk 2077 at 4K with Ray Reconstruction and path tracing
-    /// stayed at 9 fps for minutes with the step decided). With no hold recorded with the build (`holds`) and no path
-    /// having taken it for [`IDLE_STEP`], the loader thread applies it (and closes the network for a pause).
-    fn apply_idle_step(&mut self, holds: usize, now: Instant) -> Option<super::vram_guard::Level> {
+    /// stayed at 9 fps for minutes with the step decided). With no path having taken it for [`IDLE_STEP`] and nothing that
+    /// used it in flight ([`Claims::unused`]), the loader thread applies it (and closes the network for a pause).
+    fn apply_idle_step(&mut self, claims: &Claims, now: Instant) -> Option<super::vram_guard::Level> {
         let idle = self.last_use.is_none_or(|t| now.saturating_duration_since(t) >= IDLE_STEP);
-        (holds == 0 && idle && self.guard.step_down_pending()).then(|| self.guard.apply()).flatten()
+        // Neither path uses the network (`Loader::unused`, as for a lend): besides the holds recorded into DLSS's buffers,
+        // a split hold's work (its fence pending, or none covering it), an after-the-upscaler frame running, or one whose
+        // wait timed out and whose fence has not signalled. A frame taken more than IDLE_STEP ago can still run then, and
+        // closing the network under it was a copy-engine read of freed memory (Xid 31, #59).
+        let unused = || claims.unused(claims.last_pre.load(std::sync::atomic::Ordering::SeqCst));
+        (idle && self.guard.step_down_pending() && unused()).then(|| self.guard.apply()).flatten()
+    }
+
+    /// Whether the loader thread may close the network or free its builds now: nothing is open or built, or no frame that
+    /// uses them may still run ([`Claims::in_flight`]).
+    fn frees_now(&self, claims: &Claims) -> bool {
+        (self.network.is_none() && self.built.is_empty()) || !claims.in_flight()
     }
 
     /// Whether the loader thread has work: the network is not open yet, the graph is to fall back to
@@ -341,29 +353,36 @@ pub(crate) struct Loader {
     setup: Setup,
     /// The device's handle: its entry in [`LOADERS`].
     device: u64,
-    /// Who uses the network's frame (activations, counters), which the two paths share: the last
-    /// pre-upscaler hold and the last after-the-upscaler frame (ms since [`epoch_ms`]'s start), and
-    /// whether the latter is running now ([`Self::claim_post`], [`Self::claim_pre`]).
+    /// Who may be using the network now, which both paths and the loader thread read ([`Claims`]).
+    claims: Arc<Claims>,
+    /// Tests: what records "the network" into a hold's buffer, in place of the graph (no network on lavapipe).
+    #[cfg(test)]
+    test_graph: Option<TestGraph>,
+}
+
+/// Who may be using the network's frame (activations, counters) and builds, which the two paths share and the loader
+/// thread checks before it frees a build or closes the network ([`Claims::in_flight`], [`Claims::unused`]).
+#[derive(Default)]
+struct Claims {
+    /// The last pre-upscaler hold and the last after-the-upscaler frame (ms since [`epoch_ms`]'s start), and
+    /// whether the latter is running now ([`Loader::claim_post`], [`Loader::claim_pre`]).
     last_pre: std::sync::atomic::AtomicU64,
     last_post: std::sync::atomic::AtomicU64,
     post_busy: std::sync::atomic::AtomicBool,
     /// The fence of the pre-upscaler path's last submitted hold while it has not been waited on
-    /// ([`Self::pre_submitted`]): the after-the-upscaler path does not take the network (whose build
+    /// ([`Loader::pre_submitted`]): the after-the-upscaler path does not take the network (whose build
     /// for another size would free what that hold runs) until it has signalled.
     pre_inflight: Mutex<Option<InFlight>>,
     /// Until when (ms since [`epoch_ms`]'s start) a pre-upscaler hold's work that no fence covers may
-    /// still run ([`Self::pre_unfenced`]): the after-the-upscaler path keeps off the network till then.
+    /// still run ([`Loader::pre_unfenced`]): the after-the-upscaler path keeps off the network till then.
     pre_unfenced_until: std::sync::atomic::AtomicU64,
     /// The after-the-upscaler frame that did not finish in time, still holding the claim
-    /// ([`Self::post_stalled`]): released once its fence signals.
+    /// ([`Loader::post_stalled`]): released once its fence signals.
     post_inflight: Mutex<Option<InFlight>>,
     /// Holds recorded into DLSS's command buffers that may still run (`super::inline`): they read the
-    /// current build, so nothing rebuilds it ([`Self::ready_sizes`], [`Self::fall_back`]) and the
-    /// after-the-upscaler path does not take the network ([`Self::pre_running`]) while there are any.
+    /// current build, so nothing rebuilds it ([`Loader::ready_sizes`], [`Loader::fall_back`]) and the
+    /// after-the-upscaler path does not take the network ([`Claims::pre_running`]) while there are any.
     holds: Arc<std::sync::atomic::AtomicUsize>,
-    /// Tests: what records "the network" into a hold's buffer, in place of the graph (no network on lavapipe).
-    #[cfg(test)]
-    test_graph: Option<TestGraph>,
 }
 
 /// [`Loader::test_graph`].
@@ -389,6 +408,62 @@ impl InFlight {
         // `post_stalled`); vkGetFenceStatus needs no external synchronization.
         let status = unsafe { (self.status)(self.device, self.fence) };
         status == vk::Result::NOT_READY
+    }
+}
+
+impl Claims {
+    /// More than `reserved` holds recorded (or being recorded) into DLSS's buffers may still run ([`Loader::holds_beyond`]).
+    fn holds_beyond(&self, reserved: usize) -> bool {
+        self.holds.load(std::sync::atomic::Ordering::SeqCst) > reserved
+    }
+
+    fn release_post(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.last_post.store(epoch_ms(), SeqCst);
+        self.post_busy.store(false, SeqCst);
+    }
+
+    /// Releases a stalled after-the-upscaler claim whose frame has finished since.
+    fn post_finished(&self) {
+        let mut stalled = self.post_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stalled.is_some_and(|f| !f.running()) {
+            *stalled = None;
+            drop(stalled);
+            self.release_post();
+        }
+    }
+
+    /// Whether a pre-upscaler hold's work may still use the network: a split hold's (its fence), or one
+    /// recorded into DLSS's buffers.
+    fn pre_running(&self) -> bool {
+        if self.holds_beyond(0) {
+            return true;
+        }
+        let mut inflight = self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inflight.is_some_and(|f| !f.running()) {
+            *inflight = None;
+        }
+        inflight.is_some()
+    }
+
+    /// Whether work that uses the network may still run on the GPU, or a frame is using it now: a hold recorded into
+    /// DLSS's buffers, a split hold whose fence has not signalled or whose work no fence covers (until
+    /// [`crate::FENCE_WAIT_TIMEOUT`] after its submit), an after-the-upscaler frame running, or one that did not finish
+    /// in time and whose fence has not signalled since ([`Loader::post_stalled`]). Nothing frees a build or closes the
+    /// network while it is so: the GPU would read freed memory (Xid 31, #59).
+    fn in_flight(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.post_finished();
+        let stalled = self.post_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some();
+        self.pre_running() || self.post_busy.load(SeqCst) || stalled || epoch_ms() < self.pre_unfenced_until.load(SeqCst)
+    }
+
+    /// Neither path uses the network: nothing [`Self::in_flight`], and neither path ran for [`PATH_SWITCH_MS`] (`last_pre`
+    /// the last hold's stamp).
+    fn unused(&self, last_pre: u64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let quiet = |at: u64| epoch_ms().saturating_sub(at) >= PATH_SWITCH_MS;
+        !self.in_flight() && quiet(last_pre) && quiet(self.last_post.load(SeqCst))
     }
 }
 
@@ -517,6 +592,10 @@ static NETWORK_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// The longest a build waits for the game to stop loading ([`Loader::work`]).
 const LOADING_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How often the loader thread looks again whether a frame still uses the network it is to close or rebuild
+/// ([`LoaderState::frees_now`]).
+const IN_FLIGHT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// How often the loader thread checks the VRAM budget for the guard ([`super::vram_guard`]) while it has no other work.
 const GUARD_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -550,13 +629,7 @@ impl Loader {
             pending: Mutex::new(Some((device, setup))),
             setup,
             device: device.as_raw(),
-            last_pre: Default::default(),
-            last_post: Default::default(),
-            post_busy: Default::default(),
-            pre_inflight: Mutex::new(None),
-            pre_unfenced_until: Default::default(),
-            post_inflight: Mutex::new(None),
-            holds,
+            claims: Arc::new(Claims { holds, ..Default::default() }),
             #[cfg(test)]
             test_graph: None,
         }
@@ -590,7 +663,7 @@ impl Loader {
     /// recorded counts itself from before it asks for the network (`inline::Inline::record_outcome`), and passes
     /// 1 here, so only the others keep a rebuild off.
     fn holds_beyond(&self, reserved: usize) -> bool {
-        self.holds.load(std::sync::atomic::Ordering::SeqCst) > reserved
+        self.claims.holds_beyond(reserved)
     }
 
     /// The network is to be rebuilt, and waits for the holds recorded into DLSS's buffers with the current
@@ -631,57 +704,48 @@ impl Loader {
     /// [`Self::release_post`] once its work completed.
     pub(crate) fn claim_post(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
-        if epoch_ms().saturating_sub(self.last_pre.load(SeqCst)) < PATH_SWITCH_MS || self.pre_running() || epoch_ms() < self.pre_unfenced_until.load(SeqCst) {
+        if epoch_ms().saturating_sub(self.claims.last_pre.load(SeqCst)) < PATH_SWITCH_MS
+            || self.claims.pre_running()
+            || epoch_ms() < self.claims.pre_unfenced_until.load(SeqCst)
+        {
             return false;
         }
-        self.post_busy.store(true, SeqCst);
-        if epoch_ms().saturating_sub(self.last_pre.load(SeqCst)) < PATH_SWITCH_MS {
-            self.post_busy.store(false, SeqCst);
+        self.claims.post_busy.store(true, SeqCst);
+        if epoch_ms().saturating_sub(self.claims.last_pre.load(SeqCst)) < PATH_SWITCH_MS {
+            self.claims.post_busy.store(false, SeqCst);
             return false;
         }
         true
     }
 
     pub(crate) fn release_post(&self) {
-        use std::sync::atomic::Ordering::SeqCst;
-        self.last_post.store(epoch_ms(), SeqCst);
-        self.post_busy.store(false, SeqCst);
+        self.claims.release_post();
     }
 
     /// The after-the-upscaler frame holding the claim did not finish in time: its work (on `fence`)
     /// may still use the network's buffers, so the claim is kept until that fence signals (checked by
     /// [`Self::claim_pre`]). The fence stays alive: a stalled server destroys nothing.
     pub(crate) fn post_stalled(&self, device: &ash::Device, fence: vk::Fence) {
-        *self.post_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(InFlight::of(device, fence));
-    }
-
-    /// Releases a stalled after-the-upscaler claim whose frame has finished since.
-    fn post_finished(&self) {
-        let mut stalled = self.post_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if stalled.is_some_and(|f| !f.running()) {
-            *stalled = None;
-            drop(stalled);
-            self.release_post();
-        }
+        *self.claims.post_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(InFlight::of(device, fence));
     }
 
     /// A pre-upscaler hold's work went to the queue and no fence could be put after it: the network is
     /// taken as in use for as long as any wait of the layer's is bounded ([`crate::FENCE_WAIT_TIMEOUT`]).
     pub(crate) fn pre_unfenced(&self) {
         let until = epoch_ms() + crate::FENCE_WAIT_TIMEOUT.as_millis() as u64;
-        self.pre_unfenced_until.fetch_max(until, std::sync::atomic::Ordering::SeqCst);
+        self.claims.pre_unfenced_until.fetch_max(until, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The pre-upscaler path submitted a hold whose work `fence` covers.
     pub(crate) fn pre_submitted(&self, device: &ash::Device, fence: vk::Fence) {
-        *self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(InFlight::of(device, fence));
+        *self.claims.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(InFlight::of(device, fence));
     }
 
     /// The pre-upscaler path's work on `fence` has completed (the fence was waited on, or nothing on it is
     /// pending), and the fence may be reset or destroyed from here on: forgotten if it is the one noted. Only
     /// that one: the hold's other resources (`Session::res_inline`, `res_after`) note fences of their own.
     pub(crate) fn pre_idle(&self, fence: vk::Fence) {
-        let mut inflight = self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inflight = self.claims.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if inflight.is_some_and(|f| f.fence == fence) {
             *inflight = None;
         }
@@ -690,31 +754,18 @@ impl Loader {
     /// The fence noted by [`Self::pre_submitted`] and not forgotten yet.
     #[cfg(test)]
     pub(crate) fn pre_fence(&self) -> Option<vk::Fence> {
-        self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).map(|f| f.fence)
-    }
-
-    /// Whether a pre-upscaler hold's work may still use the network: a split hold's (its fence), or one
-    /// recorded into DLSS's buffers.
-    fn pre_running(&self) -> bool {
-        if self.holds_out() {
-            return true;
-        }
-        let mut inflight = self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if inflight.is_some_and(|f| !f.running()) {
-            *inflight = None;
-        }
-        inflight.is_some()
+        self.claims.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).map(|f| f.fence)
     }
 
     /// The pre-upscaler path may submit a frame now (the after-the-upscaler path is not running one and
     /// has not for a second). Notes the hold either way, which keeps the other path off.
     pub(crate) fn claim_pre(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
-        self.last_pre.store(epoch_ms(), SeqCst);
-        self.post_finished();
+        self.claims.last_pre.store(epoch_ms(), SeqCst);
+        self.claims.post_finished();
         // A path that never ran (0) has nothing to switch away from.
-        let last_post = self.last_post.load(SeqCst);
-        !self.post_busy.load(SeqCst) && (last_post == 0 || epoch_ms().saturating_sub(last_post) >= PATH_SWITCH_MS)
+        let last_post = self.claims.last_post.load(SeqCst);
+        !self.claims.post_busy.load(SeqCst) && (last_post == 0 || epoch_ms().saturating_sub(last_post) >= PATH_SWITCH_MS)
     }
 
     /// Notes this loader as `device`'s, so a loader of another device of the process can ask it to lend the
@@ -740,10 +791,10 @@ impl Loader {
         let uses = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).uses;
         // The after-the-upscaler path checks the last hold before it takes the network: it waits now.
         let stamp = epoch_ms();
-        let before = self.last_pre.swap(stamp, SeqCst);
+        let before = self.claims.last_pre.swap(stamp, SeqCst);
         let refuse = || {
             // Not lent: the stamp goes back (unless a hold stamped since), so the other path is not kept off.
-            let _ = self.last_pre.compare_exchange(stamp, before, SeqCst, SeqCst);
+            let _ = self.claims.last_pre.compare_exchange(stamp, before, SeqCst, SeqCst);
             false
         };
         if !self.unused(before) {
@@ -763,14 +814,7 @@ impl Loader {
 
     /// Neither path uses the network ([`Self::lend`]'s condition), `last_pre` the last hold's stamp.
     fn unused(&self, last_pre: u64) -> bool {
-        use std::sync::atomic::Ordering::SeqCst;
-        self.post_finished();
-        let now = epoch_ms();
-        let quiet = |at: u64| now.saturating_sub(at) >= PATH_SWITCH_MS;
-        let stalled = self.post_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some();
-        !(self.holds_out() || self.pre_running() || self.post_busy.load(SeqCst) || stalled || now < self.pre_unfenced_until.load(SeqCst))
-            && quiet(last_pre)
-            && quiet(self.last_post.load(SeqCst))
+        self.claims.unused(last_pre)
     }
 
     /// The device is being destroyed: no other device's loader reaches this one from here on ([`Self::ask_owner`]
@@ -802,8 +846,8 @@ impl Loader {
     fn spawn(&self) {
         let Some((device, setup)) = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else { return };
         let shared = self.shared.clone();
-        let holds = self.holds.clone();
-        let worker = std::thread::Builder::new().name("nf-native-load".into()).spawn(move || Self::work(&shared, device, setup, &holds)).ok();
+        let claims = self.claims.clone();
+        let worker = std::thread::Builder::new().name("nf-native-load".into()).spawn(move || Self::work(&shared, device, setup, &claims)).ok();
         if worker.is_none() {
             crate::log!("[native] could not start the loader thread; frames go to DLSS untouched");
             note_failure("the loader thread could not be started");
@@ -861,7 +905,7 @@ impl Loader {
         Ok((network, running))
     }
 
-    fn work(shared: &(Mutex<LoaderState>, Condvar), device: vk::Device, setup: Setup, holds: &std::sync::atomic::AtomicUsize) {
+    fn work(shared: &(Mutex<LoaderState>, Condvar), device: vk::Device, setup: Setup, claims: &Claims) {
         let (lock, wake) = shared;
         // This device's VRAM readings for the build lines (it outlives this thread: `Drop` joins it).
         let vram = crate::vram::probe(setup.gipa, setup.instance, setup.physical, setup.properties2);
@@ -871,14 +915,17 @@ impl Loader {
             crate::log!("[native] {}: the next {} network builds will fail on purpose", FailInject::ENV, f.remaining());
         }
         let (mut loading_since, mut said_loading, mut said_waited): (Option<Instant>, bool, bool) = (None, false, false);
+        // Since when a close or rebuild has waited for frames still using the network ([`LoaderState::frees_now`]), and
+        // whether that was said.
+        let (mut in_flight_since, mut said_in_flight): (Option<Instant>, bool) = (None, false);
         let mut last_tick = Instant::now();
         let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             // Lent to another device's loader ([`Loader::lend`]): closed, its builds gone, and nothing asked
             // for until a path here asks again. SAFETY of the close: `lend` asked only with nothing of it in use.
             if std::mem::take(&mut state.lend) {
-                // A path took it after the lend was decided, or a hold recorded with it may still run: kept.
-                if state.uses != state.lend_uses || holds.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                // A path took it after the lend was decided, or a frame that used it may still run: kept.
+                if state.uses != state.lend_uses || claims.in_flight() {
                     crate::log!("[native] the network stays on this device: a path here took it as it was being lent");
                     crate::logging::flush();
                     continue;
@@ -926,16 +973,30 @@ impl Loader {
                     crate::logging::flush();
                     state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                if let Some(level) = state.apply_idle_step(holds.load(std::sync::atomic::Ordering::SeqCst), Instant::now()) {
+                if let Some(level) = state.apply_idle_step(claims, Instant::now()) {
                     crate::log!("[native] VRAM guard: no frame has used the network for {} s; the step down ({level:?}) is applied now", IDLE_STEP.as_secs());
                     crate::logging::flush();
                 }
                 continue;
             }
+            // Nothing below closes the network or frees a build while a frame that used it may still run on the GPU
+            // (the copy engine read freed memory: Xid 31, #59): checked again here, under the lock, whatever asked for
+            // the work. A frame that never finishes keeps the network as it is.
+            if !state.frees_now(claims) {
+                let since = *in_flight_since.get_or_insert_with(Instant::now);
+                if !said_in_flight && since.elapsed() >= crate::FENCE_WAIT_TIMEOUT {
+                    said_in_flight = true;
+                    crate::log!("[native] the network's rebuild or close waits for a frame that still uses it on the GPU");
+                    crate::logging::flush();
+                }
+                state = wake.wait_timeout(state, IN_FLIGHT_POLL).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+                continue;
+            }
+            in_flight_since = None;
             // Paused by the VRAM guard: the network is closed, its memory given back to the game. SAFETY of the
             // close: the pause is applied only where a switch of the setting is ([`LoaderState::want_sizes`]), or here
-            // with no hold recorded with the build and no path having taken it for longer than any wait of the layer's
-            // ([`LoaderState::apply_idle_step`]).
+            // once nothing may still use the build and no path has taken it for longer than any wait of the layer's
+            // ([`LoaderState::apply_idle_step`]); and nothing is in flight now ([`LoaderState::frees_now`]).
             if state.pausing() {
                 let n = state.network.take();
                 state.built = Vec::new();
@@ -5174,15 +5235,15 @@ mod tests {
         };
         let loader = Loader::start(vk::Device::null(), setup, Arc::default(), true);
         // No hold for longer than the path switch: the post path may claim.
-        loader.last_pre.store(0, std::sync::atomic::Ordering::SeqCst);
+        loader.claims.last_pre.store(0, std::sync::atomic::Ordering::SeqCst);
         let _ = epoch_ms();
         std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
         assert!(loader.claim_post());
         loader.release_post();
-        loader.last_post.store(0, std::sync::atomic::Ordering::SeqCst);
+        loader.claims.last_post.store(0, std::sync::atomic::Ordering::SeqCst);
         loader.pre_unfenced();
         assert!(!loader.claim_post(), "unfenced work may still use the network");
-        loader.pre_unfenced_until.store(epoch_ms().saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
+        loader.claims.pre_unfenced_until.store(epoch_ms().saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
         assert!(loader.claim_post(), "once a frame can no longer be running");
         loader.release_post();
     }
@@ -5213,22 +5274,22 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
         let _ = epoch_ms();
         std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
-        let unused = || loader.unused(loader.last_pre.load(SeqCst));
+        let unused = || loader.unused(loader.claims.last_pre.load(SeqCst));
         assert!(unused(), "nothing ran");
         holds.store(1, SeqCst);
         assert!(!unused(), "a hold in DLSS's buffers may still run");
         holds.store(0, SeqCst);
-        loader.post_busy.store(true, SeqCst);
+        loader.claims.post_busy.store(true, SeqCst);
         assert!(!unused(), "an after-the-upscaler frame runs");
         loader.release_post();
         assert!(!unused(), "within a path switch of it");
-        loader.last_post.store(0, SeqCst);
-        loader.last_pre.store(epoch_ms(), SeqCst);
+        loader.claims.last_post.store(0, SeqCst);
+        loader.claims.last_pre.store(epoch_ms(), SeqCst);
         assert!(!unused(), "within a path switch of a hold");
-        loader.last_pre.store(0, SeqCst);
+        loader.claims.last_pre.store(0, SeqCst);
         assert!(unused());
         assert!(!loader.lend(), "no network open here: nothing to lend");
-        assert_eq!(loader.last_pre.load(SeqCst), 0, "a refused lend leaves the hold's stamp as it was: the other path is not kept off");
+        assert_eq!(loader.claims.last_pre.load(SeqCst), 0, "a refused lend leaves the hold's stamp as it was: the other path is not kept off");
     }
 
     /// While the network is being lent to another device, neither path takes it, and each use is counted (a
@@ -5262,8 +5323,8 @@ mod tests {
         assert_eq!(loader.shared.0.lock().unwrap().uses, 1);
         loader.shared.0.lock().unwrap().lend = false;
         // The after-the-upscaler path claimed (busy) before the lend's stamp: the lend sees it.
-        loader.last_pre.store(0, SeqCst);
-        loader.last_post.store(0, SeqCst);
+        loader.claims.last_pre.store(0, SeqCst);
+        loader.claims.last_post.store(0, SeqCst);
         let _ = epoch_ms();
         std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
         assert!(loader.claim_post());
@@ -5311,22 +5372,107 @@ mod tests {
     }
 
     /// A step down decided while no path takes the network (the spill stalls the game, the layer stops working on its
-    /// frames) is applied by the loader thread once none has for IDLE_STEP and no hold recorded with the build may run;
+    /// frames) is applied by the loader thread once none has for IDLE_STEP and nothing that used the build may run;
     /// not before, and not with holds outstanding; a step up is left to the paths.
     #[test]
     fn a_step_down_nobody_asks_for_is_applied_when_the_network_is_idle() {
         use super::super::vram_guard::Level;
+        let claims = quiet_claims();
         let now = Instant::now();
+        let mut s = spilled_state(now);
+        s.last_use = Some(now);
+        assert_eq!(s.apply_idle_step(&claims, now + Duration::from_secs(2)), None, "a path took it 2 s ago");
+        claims.holds.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP), None, "a hold recorded with the build may run");
+        claims.holds.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP), Some(Level::Paused));
+        assert!(s.pausing() && s.wants_work(), "the loader thread closes the network");
+        assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP * 2), None, "nothing pending any more");
+    }
+
+    /// Frames that took the network more than IDLE_STEP ago may still run (#59's Xid 31: the copy engine read the
+    /// network's freed memory): an after-the-upscaler frame whose fence wait timed out (its claim kept until the fence
+    /// signals), a split hold submitted with no fence after it (until FENCE_WAIT_TIMEOUT after the submit) or with its
+    /// fence pending, and an after-the-upscaler frame running now each keep the idle step off, and the loader thread
+    /// frees no build while any of them is in flight. Once each is over, the step is applied.
+    #[test]
+    fn frames_still_in_flight_keep_the_idle_step_and_the_free_off() {
+        use super::super::vram_guard::Level;
+        use std::sync::atomic::Ordering::SeqCst;
+        let claims = quiet_claims();
+        let now = Instant::now();
+        let later = now + IDLE_STEP;
+        let mut s = spilled_state(now);
+        s.last_use = Some(now);
+        assert!(s.frees_now(&claims), "nothing in flight");
+        // An after-the-upscaler frame whose wait timed out: its fence has not signalled.
+        *claims.post_inflight.lock().unwrap() = Some(fake_in_flight());
+        claims.post_busy.store(true, SeqCst);
+        FENCE_PENDING.store(true, SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, later), None, "a stalled after-the-upscaler frame may still run");
+        assert!(!s.frees_now(&claims));
+        // Its fence signals: the claim is released, but that frame ran just now (within a path switch).
+        FENCE_PENDING.store(false, SeqCst);
+        assert!(!claims.in_flight(), "the stalled frame finished");
+        assert!(claims.post_inflight.lock().unwrap().is_none() && !claims.post_busy.load(SeqCst));
+        claims.last_post.store(0, SeqCst);
+        // A split hold with no fence after its work: in use until FENCE_WAIT_TIMEOUT after its submit.
+        claims.pre_unfenced_until.store(epoch_ms() + crate::FENCE_WAIT_TIMEOUT.as_millis() as u64, SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, later), None, "an unfenced split hold may still run");
+        assert!(!s.frees_now(&claims));
+        claims.pre_unfenced_until.store(epoch_ms().saturating_sub(1), SeqCst);
+        // A split hold whose fence is pending.
+        *claims.pre_inflight.lock().unwrap() = Some(fake_in_flight());
+        FENCE_PENDING.store(true, SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, later), None, "a split hold's fence is pending");
+        assert!(!s.frees_now(&claims));
+        FENCE_PENDING.store(false, SeqCst);
+        // An after-the-upscaler frame running now.
+        claims.post_busy.store(true, SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, later), None, "an after-the-upscaler frame runs");
+        assert!(!s.frees_now(&claims));
+        claims.post_busy.store(false, SeqCst);
+        // Nothing in flight: the free may go ahead, and the step is applied.
+        assert!(s.frees_now(&claims));
+        assert_eq!(s.apply_idle_step(&claims, later), Some(Level::Paused));
+        // With nothing open or built there is nothing to free, whatever runs.
+        claims.post_busy.store(true, SeqCst);
+        s.built.clear();
+        s.network = None;
+        assert!(s.frees_now(&claims));
+    }
+
+    /// Claims with neither path having run for longer than a path switch.
+    fn quiet_claims() -> Claims {
+        let _ = epoch_ms();
+        std::thread::sleep(Duration::from_millis(PATH_SWITCH_MS + 5));
+        let claims = Claims::default();
+        assert!(claims.unused(0) && !claims.in_flight());
+        claims
+    }
+
+    /// The full network built at 4K, with a step down to a pause decided (the build ended at the budget).
+    fn spilled_state(now: Instant) -> LoaderState {
         let mut s = LoaderState { opened: true, opened_for: Some(network::FULL), running: network::FULL, ..Default::default() };
         s.built = vec![built((3840, 2160), 1, network::FULL)];
         assert!(s.guard.built(network::FULL, Some(1500), (3840, 2160), Some((8000, 8010)), network::FULL, false, now).is_some());
         assert!(s.guard.step_down_pending());
-        s.last_use = Some(now);
-        assert_eq!(s.apply_idle_step(0, now + Duration::from_secs(2)), None, "a path took it 2 s ago");
-        assert_eq!(s.apply_idle_step(1, now + IDLE_STEP), None, "a hold recorded with the build may run");
-        assert_eq!(s.apply_idle_step(0, now + IDLE_STEP), Some(Level::Paused));
-        assert!(s.pausing() && s.wants_work(), "the loader thread closes the network");
-        assert_eq!(s.apply_idle_step(0, now + IDLE_STEP * 2), None, "nothing pending any more");
+        s
+    }
+
+    /// Whether [`fake_in_flight`]'s fences are pending (one test uses them).
+    static FENCE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// A submission whose fence reads as pending while [`FENCE_PENDING`] is set (no device: the status is the stand-in's).
+    fn fake_in_flight() -> InFlight {
+        unsafe extern "system" fn status(_: vk::Device, _: vk::Fence) -> vk::Result {
+            if FENCE_PENDING.load(std::sync::atomic::Ordering::SeqCst) {
+                vk::Result::NOT_READY
+            } else {
+                vk::Result::SUCCESS
+            }
+        }
+        InFlight { device: vk::Device::null(), status, fence: vk::Fence::from_raw(0x51) }
     }
 
     /// #59: the after-the-upscaler path asks for its size (the loader thread is woken to rebuild), and a hold takes the

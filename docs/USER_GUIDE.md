@@ -66,8 +66,9 @@ layer picks the place for each game by itself:
 In a pause menu, a map or a loading screen many games stop calling DLSS (Cyberpunk 2077's Esc menu shows the
 last frame, which already has the model's edit, under the menu). The model then stays where it is, with its
 network loaded, and runs again on the game's first frame after the menu; the Model placement line says "paused
-with the game's DLSS". It moves to the finished frame only when the game goes on calling DLSS for 30 s without its
-input being worked on (DLAA), or sends DLSS nothing for 5 minutes (DLSS switched off for another upscaler).
+with the game's DLSS". It moves to the finished frame when the game goes on calling DLSS for 30 s with no frame
+worked on before the upscaler (DLAA, or a DLSS input Neural Forge no longer recognises), or sends DLSS nothing for
+5 minutes (DLSS switched off for another upscaler).
 
 The game's own **DLSS Frame Generation** works with the model before the upscaler and after DLSS.
 Generated frames are built from enhanced frames, and the model runs once per real frame.

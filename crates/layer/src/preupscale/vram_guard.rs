@@ -280,12 +280,13 @@ impl Guard {
             let fresh = self.samples.back().is_some_and(|&(t, _)| now.duration_since(t) <= SLOW_WINDOW);
             // Five samples give a median; a game the spill stalls may deliver fewer (a few network frames over seconds,
             // each well over a second in Cyberpunk 2077 with path tracing at 4K): two or more all above SPILL_ABS_MS are
-            // as clear, and their smallest is taken.
+            // as clear, and their smallest is taken. Not among the first WARMUP frames after a build: those warm the
+            // clocks and caches, and two of them over SPILL_ABS_MS on a slower GPU are no spill.
             let times: Vec<f32> = self.samples.iter().map(|&(_, ms)| ms).collect();
             let window = match times.len() {
                 _ if !fresh => None,
                 n if n >= WINDOW_MIN => Some(median(&mut times.clone())),
-                n if n >= 2 && times.iter().all(|&ms| ms > SPILL_ABS_MS) => times.iter().copied().reduce(f32::min),
+                n if n >= 2 && self.seen > WARMUP && times.iter().all(|&ms| ms > SPILL_ABS_MS) => times.iter().copied().reduce(f32::min),
                 _ => None,
             };
             let slow = window.is_some_and(|m| m > SPILL_ABS_MS || self.best_ms.is_some_and(|b| m > b * SPILL_FACTOR));
@@ -473,6 +474,28 @@ mod tests {
             g.gpu_ms(311.0, t(base, k * 250));
         }
         assert!(g.tick(Some((7990, 8000)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, 7000)).is_none(), "stale samples");
+    }
+
+    /// The first frames after a build warm the clocks and caches (WARMUP): two of them over SPILL_ABS_MS at the budget
+    /// (a slower GPU's first frames at 4K) are no spill, however long they are the only ones; once the build is past
+    /// its warm-up, two such frames are.
+    #[test]
+    fn two_slow_frames_right_after_a_build_are_no_spill() {
+        let base = Instant::now();
+        let mut g = Guard::default();
+        g.built(FULL, Some(1500), (3840, 2160), Some((5000, 8000)), FULL, false, base);
+        g.gpu_ms(400.0, t(base, 100));
+        g.gpu_ms(400.0, t(base, 600));
+        let stepped = (0..5).any(|k| g.tick(Some((7990, 8000)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, 700 + k * 1000)).is_some());
+        assert!(!stepped, "the build's first two frames");
+        // Past the warm-up (frames at the build's own pace), two slow frames are a spill again.
+        for k in 0..WARMUP as u64 {
+            g.gpu_ms(30.0, t(base, 5000 + k * 16));
+        }
+        g.gpu_ms(400.0, t(base, 11_000));
+        g.gpu_ms(400.0, t(base, 11_500));
+        let stepped = (0..5).any(|k| g.tick(Some((7990, 8000)), Some(FULL), Some((3840, 2160)), FULL, false, t(base, 11_600 + k * 1000)).is_some());
+        assert!(stepped, "two slow frames after the warm-up");
     }
 
     /// The 1 GiB case: at its budget but as fast as ever, the network is left as it is; and a GPU that is
