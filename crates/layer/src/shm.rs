@@ -633,6 +633,7 @@ impl ShmClient {
         hdr.native_running.store(u32::from(state == 2 && native), Ordering::Relaxed);
         hdr.preupscale_width.store(width, Ordering::Relaxed);
         hdr.preupscale_height.store(height, Ordering::Relaxed);
+        self.publish_ngx();
     }
 
     /// Why no hold ran while DLSS's input is identified (`preupscale_state::IDENTIFIED`), or empty.
@@ -651,6 +652,18 @@ impl ShmClient {
         let Some(hdr) = self.header() else { return };
         hdr.preupscale_hold_ms_bits.store(hold_ms.to_bits(), Ordering::Relaxed);
         hdr.preupscale_misses.store(misses, Ordering::Relaxed);
+    }
+
+    /// The NGX ring's counters ([`crate::ngx_ring::COUNTERS`]).
+    pub fn publish_ngx(&self) {
+        let Some(hdr) = self.header() else { return };
+        let c = &crate::ngx_ring::COUNTERS;
+        let sat = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        let (total, kinds) = crate::ngx_ring::disagreements();
+        hdr.ngx_records.store(sat(c.records.load(Ordering::Relaxed)), Ordering::Relaxed);
+        hdr.ngx_matched.store(sat(c.matched.load(Ordering::Relaxed)), Ordering::Relaxed);
+        hdr.ngx_disagreements.store(sat(total), Ordering::Relaxed);
+        hdr.ngx_disagree_kinds.store(kinds, Ordering::Relaxed);
     }
 
     /// `debug_view` (0 before the mapping is open).

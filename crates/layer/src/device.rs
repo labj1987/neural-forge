@@ -1038,6 +1038,7 @@ fn record_inline_hold(
         pre_exposed: session.pre_exposed_measured(point.identification),
         identification: point.identification,
     };
+    let target = target.with_ngx_exposure();
     let res = session.res_inline(stage).as_mut().expect("ensured above");
     // SAFETY: `res` was built on this device for this extent and the graphics family DLSS's buffer runs on;
     // the buffer is being recorded on this thread.
@@ -2132,6 +2133,7 @@ impl NeuralForgeDeviceInfo {
             pre_exposed: session.pre_exposed_measured(scan.identification),
             identification: scan.identification,
         };
+        let target = target.with_ngx_exposure();
         let loader = session.native.as_ref().filter(|_| native);
         let dlss = tracking.split_dlss_frame(&scan);
         let seen = session.seen();

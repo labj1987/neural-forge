@@ -28,6 +28,7 @@ mod hdr_present;
 mod hotkey;
 mod loader_data;
 mod logging;
+mod ngx_ring;
 mod ownership;
 mod present_sync;
 mod preupscale;

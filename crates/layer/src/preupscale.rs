@@ -1977,6 +1977,11 @@ pub(crate) struct LaunchRefs {
     /// The buffer's first launch naming the colour input came before its input launch, and the camera jitter
     /// could not be predicted there: the hold goes at the input launch instead ([`Tracker::launch_kernel`]).
     pub hold_deferred: bool,
+    /// The images of the NGX evaluate this buffer's input launch belongs to, from the NGX wrapper's ring
+    /// ([`crate::ngx_ring`]): the source of truth for the buffer where present.
+    pub ngx: Option<crate::ngx_ring::Images>,
+    /// The output the kernel rules chose ([`Self::output`] holds NGX's where there is a record), for the check.
+    pub kernel_output: Option<vk::Image>,
 }
 
 impl LaunchRefs {
@@ -2804,6 +2809,18 @@ impl Tracker {
             // 2560x1440 output): the one at the swapchain's extent, else the first.
             let swapchain = self.swapchain_extent();
             let out = larger.iter().copied().find(|i| self.images.get(i).is_some_and(|d| Some((d.width, d.height)) == swapchain)).or(larger.first().copied());
+            // NGX's output for this buffer's evaluate, where it names it: it replaces the rules' choice, which is kept
+            // for the check when the buffer is submitted.
+            let ngx_out = refs.and_then(|r| r.ngx).map(|n| n.output).filter(|o| *o != vk::Image::null() && self.images.contains_key(o));
+            let out = match ngx_out {
+                Some(o) => {
+                    if let Some(k) = out {
+                        self.launch.entry(command_buffer).or_default().kernel_output = Some(k);
+                    }
+                    named.contains(&o).then_some(o)
+                }
+                None => out,
+            };
             if let Some(out) = out {
                 let refs = self.launch.entry(command_buffer).or_default();
                 refs.output = Some((function, out));
@@ -2836,6 +2853,11 @@ impl Tracker {
         let known: Vec<(vk::Image, vk::Image)> = self.named.iter().map(|n| (n.colour, n.mvec)).collect();
         // A hold recorded before the launch that carries the camera jitter gets it only by prediction
         // ([`Self::jitter_for_hold`]): whether none could be made now, though the device's input launches carry one.
+        if self.launch.get(&command_buffer).is_none_or(|r| r.input.is_none() && r.ngx.is_none()) && !named.is_empty() {
+            if let Some(record) = crate::ngx_ring::evaluate_naming(&named) {
+                self.take_ngx(command_buffer, &record);
+            }
+        }
         let jitter_unpredictable = self.jitter_last.is_some_and(|last| self.jitter_stopped || !self.jitter_next.contains_key(&last));
         let mut deferred_now = false;
         let refs = self.launch.entry(command_buffer).or_default();
@@ -2863,14 +2885,31 @@ impl Tracker {
                     refs.input = Some(rr);
                 }
             }
+            // NGX's record of this evaluate decides the inputs and whether it is Ray Reconstruction; the rules'
+            // result is checked against it.
+            let rr_by_kernel = kernel == Some(Kernel::RayReconstruction);
+            if let Some(ngx) = refs.ngx {
+                refs.input = crate::ngx_ring::decide_input(refs.input.take(), &ngx, |i| self.images.contains_key(&i));
+                crate::ngx_ring::check(crate::ngx_ring::Fact::RayReconstruction, rr_by_kernel == ngx.rr, || {
+                    format!(
+                        "kernel {:?}, NGX's feature {}",
+                        self.functions.get(&function).map(|(_, n)| n.as_str()),
+                        if ngx.rr { "Ray Reconstruction" } else { "Super Resolution" }
+                    )
+                });
+            }
+            let rr = refs.ngx.map_or(rr_by_kernel, |n| n.rr);
             if let Some(InputLaunch::Inputs { mvec, .. }) = refs.input {
-                if kernel != Some(Kernel::RayReconstruction) {
+                if !rr {
                     self.current_mvec = Some(mvec);
                 }
             }
             if refs.input.is_some() {
-                refs.input_sr = kernel.map(|k| k == Kernel::SrInput);
-                refs.input_rr = kernel == Some(Kernel::RayReconstruction);
+                refs.input_sr = match refs.ngx {
+                    Some(n) => Some(!n.rr),
+                    None => kernel.map(|k| k == Kernel::SrInput),
+                };
+                refs.input_rr = rr;
             }
             probe_rr_state(
                 command_buffer,
@@ -3302,6 +3341,51 @@ impl Tracker {
     /// another parameter in that word, and no reset. A word set on more than [`RESET_STREAK_MAX`] input launches in a
     /// row is no reset flag on this device (the game's resets are single frames: three in a GTA V benchmark run), and
     /// is ignored from then on, logged once.
+    /// A buffer's first input launch with the NGX record of its evaluate ([`crate::ngx_ring`]): the camera jitter,
+    /// the game's reset and the motion vectors' units are taken from it, each checked against what the kernel's
+    /// parameters said; its images are kept for the inputs and the output ([`LaunchRefs::ngx`]).
+    fn take_ngx(&mut self, cb: vk::CommandBuffer, record: &crate::ngx_ring::Record) {
+        use crate::ngx_ring::{check, same_units, Fact};
+        let word = record.jitter_word();
+        let kernel_jitter = self.launch.get(&cb).and_then(|r| r.jitter);
+        if let Some(k) = kernel_jitter {
+            check(Fact::Jitter, k == word, || format!("rules {:?}, NGX {:?}", jitter_px(k), record.jitter));
+        }
+        if kernel_jitter != Some(word) {
+            self.launch.entry(cb).or_default().jitter = Some(word);
+            self.learn_jitter(cb, word);
+        }
+        let reset = self.reset_flag(u64::from(record.reset));
+        let refs = self.launch.entry(cb).or_default();
+        if let Some(k) = refs.reset {
+            check(Fact::Reset, k == record.reset, || format!("rules {k}, NGX {}", record.reset));
+        }
+        refs.reset = Some(reset);
+        self.reset_latched |= reset && refs.reset_asked;
+        refs.ngx = Some(record.images());
+        if let Some(units) = record.mv_units() {
+            if let Some(k) = self.mv_scale {
+                check(Fact::MvUnits, same_units(k, units), || {
+                    format!("rules {k:?} at {:?}, NGX {units:?} at {:?}", self.mv_scale_render, record.colour_extent)
+                });
+            }
+            if self.mv_scale != Some(units) {
+                crate::log!(
+                    "[ngx] DLSS's motion vectors are {} x {} render pixels at {}x{} (NGX's MV.Scale)",
+                    units[0],
+                    units[1],
+                    record.colour_extent.0,
+                    record.colour_extent.1
+                );
+            }
+            self.mv_scale = Some(units);
+            if record.colour_extent.0 > 0 && record.colour_extent.1 > 0 {
+                self.mv_scale_render = Some(record.colour_extent);
+            }
+        }
+        check(Fact::Hdr, record.hdr(), || "NGX says DLSS's colour input is not HDR (IsHDR clear); the encode treats it as scene-linear".to_string());
+    }
+
     fn reset_flag(&mut self, value: u64) -> bool {
         if self.reset_ignored {
             return false;
@@ -4036,7 +4120,20 @@ impl Tracker {
                 Some(InputLaunch::Inputs { .. }) if refs.input_rr => {}
                 Some(InputLaunch::Inputs { colour, depth, mvec }) => {
                     let (colour, depth, mvec) = (*colour, *depth, *mvec);
-                    let exposure = refs.images.iter().filter(|i| self.images.get(i).is_some_and(exposure_like)).min_by_key(|i| i.as_raw()).copied();
+                    let mut exposure = refs.images.iter().filter(|i| self.images.get(i).is_some_and(exposure_like)).min_by_key(|i| i.as_raw()).copied();
+                    if let Some(ngx) = refs.ngx {
+                        if ngx.exposure != vk::Image::null() && self.images.contains_key(&ngx.exposure) {
+                            crate::ngx_ring::check(crate::ngx_ring::Fact::Exposure, exposure == Some(ngx.exposure), || {
+                                format!("rules {:?}, NGX {}", exposure.map(hex), hex(ngx.exposure))
+                            });
+                            exposure = Some(ngx.exposure);
+                        }
+                        if ngx.output != vk::Image::null() && refs.output.is_some_and(|(_, o)| o == ngx.output) {
+                            crate::ngx_ring::check(crate::ngx_ring::Fact::Output, refs.kernel_output.is_none_or(|k| k == ngx.output), || {
+                                format!("rules {:?}, NGX {}", refs.kernel_output.map(hex), hex(ngx.output))
+                            });
+                        }
+                    }
                     evidence.push(Named::new(colour, depth, mvec, exposure));
                     if let Some(n) = self.named.iter_mut().find(|n| n.colour == colour) {
                         if n.exposure.is_none() && exposure.is_some() {
@@ -6162,6 +6259,19 @@ pub(crate) struct Target {
     pub identification: u64,
 }
 
+impl Target {
+    /// With NGX's pre-exposure and exposure scale for this colour input ([`crate::ngx_ring::paper_white_factor`]) in
+    /// the paper white, where the encode uses the game's exposure as it is ([`hdr::AutoUse::Observe`]): DLSS divides
+    /// the colour input by the pre-exposure and multiplies the exposure image's value by the scale. The encode and
+    /// the decode read the same paper white, so the write-back stays the encode's exact inverse.
+    pub(crate) fn with_ngx_exposure(mut self) -> Self {
+        if ExposureSource::auto_use(&self) == hdr::AutoUse::Observe {
+            self.paper_white *= crate::ngx_ring::paper_white_factor(self.colour);
+        }
+        self
+    }
+}
+
 /// Where the HDR encode's exposure value comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExposureSource {
@@ -8176,6 +8286,7 @@ impl Session {
             }
         }
         shm.publish_preupscale_hold(s.last_hold_ms, s.misses);
+        shm.publish_ngx();
         if result.native {
             let gpu = s.cache_gpu_published.or_else(|| s.cache_gpu_ms.last().copied());
             shm.publish_cache(s.refresh_holds, s.cached_holds, s.last_rejected, gpu);
@@ -9393,6 +9504,52 @@ mod tests {
             t.swapchain(vk::SwapchainKHR::from_raw(9), Some(e));
         }
         t
+    }
+
+    /// NGX's record of the evaluate (the wrapper's ring) is the source of truth for the buffer's input launch: its
+    /// motion vectors replace the rules' choice, its jitter and reset are the buffer's, its exposure image and
+    /// output are the evidence's; without a record the rules decide as before.
+    #[test]
+    fn the_ngx_record_decides_the_buffer_s_inputs_jitter_and_reset() {
+        use crate::ngx_ring::{self, tests::record_bytes};
+        let input = vk::CuFunctionNVX::from_raw(0x9301);
+        let record = |mvec: u64, reset: u32| {
+            ngx_ring::parse_record(&record_bytes(
+                1,
+                ngx_ring::FEATURE_SR,
+                1,
+                [0x100, mvec, 0x200, 0x400, 0x610],
+                [0.25, -0.5],
+                [1707.0, 960.0],
+                1.0,
+                1.0,
+                reset,
+            ))
+        };
+        // The rules' motion vectors are 0x300; NGX names 0x410 (registered): NGX's are used.
+        ngx_ring::inject(vec![record(0x410, 1)]);
+        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
+        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
+        t.refresh();
+        t.launch_kernel(cb(1), input, Some(&param_block(&[0x1100, 0x1200, 0x1300, 0x1410])));
+        let refs = &t.launch[&cb(1)];
+        assert_eq!(refs.input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x410) }));
+        assert_eq!(refs.jitter, Some(u64::from(0.25f32.to_bits()) | (u64::from((-0.5f32).to_bits()) << 32)));
+        assert_eq!(refs.reset, Some(true));
+        assert_eq!((refs.input_sr, refs.input_rr), (Some(true), false));
+        assert_eq!(t.mv_scale, Some([1707.0, 960.0]));
+        assert!(refs.ngx.is_some_and(|n| n.output == img(0x400) && n.exposure == img(0x610)));
+        // Ray Reconstruction by NGX's feature, whatever the kernel's name: never evidence, never held before.
+        let mut rr = record(0x300, 0);
+        rr.feature = ngx_ring::FEATURE_RR;
+        ngx_ring::inject(vec![rr]);
+        t.launch_kernel(cb(2), input, Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        assert!(t.launch[&cb(2)].input_rr);
+        // No record naming the colour input: the rules, as before.
+        ngx_ring::inject(vec![]);
+        t.launch_kernel(cb(3), input, Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        assert_eq!(t.launch[&cb(3)].input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
+        assert!(t.launch[&cb(3)].ngx.is_none());
     }
 
     /// (a) GTA V's registered set with its swapchain: the same inputs, line, scan target and

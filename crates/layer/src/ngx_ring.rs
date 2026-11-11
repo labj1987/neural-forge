@@ -1,0 +1,685 @@
+//! DLSS's own parameters, as NGX was given them: the records Neural Forge's NGX wrapper for Proton
+//! (`crates/ngx-wrapper`, docs/PROTON_NGX.md) writes into `/dev/shm/neural-forge-ngx-<pid>.ring` in the same
+//! process, one per creation and evaluate of a DLSS feature.
+//!
+//! Where a record names DLSS's colour input, it is the source of truth for that buffer: the colour input, depth and
+//! motion vectors, the output, the exposure image, the camera jitter, the motion vectors' units, the game's reset,
+//! the pre-exposure and whether the feature is Ray Reconstruction. The rules that read DLSS's kernels
+//! (`preupscale.rs`) still run beside it: they are the fallback where there is no ring (no wrapper, a native game,
+//! `NEURAL_FORGE_NGX_RING=off`) and are checked against every record ([`check`]); disagreements are counted per
+//! fact, logged (the first few of each, then every 5 s) and published on the channel (`ngx_*` in `shmctl status`).
+//!
+//! The ring's format and its writer's protocol are in `crates/ngx-wrapper/src/ring.rs`; [`tests`] check the
+//! offsets read here against it.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use ash::vk;
+use ash::vk::Handle;
+
+/// The file's first 8 bytes, version, and sizes (`crates/ngx-wrapper/src/ring.rs`).
+pub(crate) const MAGIC: [u8; 8] = *b"NFNGXRG1";
+pub(crate) const VERSION: u32 = 1;
+pub(crate) const HEADER_BYTES: usize = 32;
+pub(crate) const RECORD_BYTES: usize = 128;
+
+/// NGX's feature numbers.
+pub(crate) const FEATURE_SR: u32 = 1;
+pub(crate) const FEATURE_RR: u32 = 13;
+
+/// `DLSS.Feature.Create.Flags`' IsHDR bit.
+pub(crate) const FLAG_HDR: u32 = 1;
+
+/// The environment variable: `off` reads no ring; a path reads that file instead of this process's.
+pub(crate) const RING_ENV: &str = "NEURAL_FORGE_NGX_RING";
+
+/// One record ([`parse_record`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Record {
+    pub seq: u64,
+    pub api: u32,
+    pub feature: u32,
+    pub create_flags: u32,
+    pub colour: vk::Image,
+    pub mvec: vk::Image,
+    pub depth: vk::Image,
+    pub output: vk::Image,
+    pub exposure: vk::Image,
+    /// Render pixels.
+    pub jitter: [f32; 2],
+    /// What turns the motion vectors into render pixels (`MV.Scale`).
+    pub mv_scale: [f32; 2],
+    /// 0 when the game gave none.
+    pub pre_exposure: f32,
+    pub exposure_scale: f32,
+    pub reset: bool,
+    pub colour_extent: (u32, u32),
+    pub output_extent: (u32, u32),
+}
+
+/// What a buffer keeps of its evaluate's record ([`crate::preupscale::LaunchRefs::ngx`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Images {
+    pub colour: vk::Image,
+    pub depth: vk::Image,
+    pub mvec: vk::Image,
+    pub output: vk::Image,
+    pub exposure: vk::Image,
+    pub rr: bool,
+}
+
+impl Record {
+    pub(crate) fn images(&self) -> Images {
+        Images { colour: self.colour, depth: self.depth, mvec: self.mvec, output: self.output, exposure: self.exposure, rr: self.is_rr() }
+    }
+
+    /// An evaluate (a creation names no colour input).
+    pub(crate) fn is_evaluate(&self) -> bool {
+        self.colour != vk::Image::null()
+    }
+    pub(crate) fn is_rr(&self) -> bool {
+        self.feature == FEATURE_RR
+    }
+    /// Super Resolution or Ray Reconstruction: the features whose colour input the hold works on.
+    pub(crate) fn upscales(&self) -> bool {
+        matches!(self.feature, FEATURE_SR | FEATURE_RR)
+    }
+    pub(crate) fn hdr(&self) -> bool {
+        self.create_flags & FLAG_HDR != 0
+    }
+    /// The jitter as `preupscale.rs` keeps it: x in the low, y in the high 32 bits.
+    pub(crate) fn jitter_word(&self) -> u64 {
+        u64::from(self.jitter[0].to_bits()) | (u64::from(self.jitter[1].to_bits()) << 32)
+    }
+    /// The motion vectors' units, when usable: finite, magnitude in [1e-3, 1e5].
+    pub(crate) fn mv_units(&self) -> Option<[f32; 2]> {
+        self.mv_scale.iter().all(|s| s.is_finite() && (1e-3..=1e5).contains(&s.abs())).then_some(self.mv_scale)
+    }
+    /// What the HDR encode's paper white is multiplied by so the game's exposure applies to the scene as DLSS
+    /// would: the colour input is the scene times the pre-exposure, and DLSS multiplies the exposure image's value
+    /// by the exposure scale. 1 when the game gives neither.
+    pub(crate) fn paper_white_factor(&self) -> f32 {
+        let pre = if self.pre_exposure.is_finite() && self.pre_exposure > 0.0 { self.pre_exposure } else { 1.0 };
+        let scale = if self.exposure_scale.is_finite() && self.exposure_scale > 0.0 { self.exposure_scale } else { 1.0 };
+        let f = pre / scale;
+        if f.is_finite() && (1e-4..=1e4).contains(&f) {
+            f
+        } else {
+            1.0
+        }
+    }
+}
+
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"))
+}
+fn u64_at(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
+}
+fn f32_at(b: &[u8], at: usize) -> f32 {
+    f32::from_bits(u32_at(b, at))
+}
+
+/// The header's slot count, if `b` starts with a ring header this build reads.
+pub(crate) fn parse_header(b: &[u8]) -> Result<u32, String> {
+    if b.len() < HEADER_BYTES || b[..8] != MAGIC {
+        return Err("not an NGX ring".into());
+    }
+    let (version, record, slots) = (u32_at(b, 8), u32_at(b, 12), u32_at(b, 16));
+    if version != VERSION || record as usize != RECORD_BYTES {
+        return Err(format!("ring version {version} with {record}-byte records; this layer reads version {VERSION}"));
+    }
+    if slots == 0 || b.len() < HEADER_BYTES + slots as usize * RECORD_BYTES {
+        return Err(format!("ring of {slots} slots in {} bytes", b.len()));
+    }
+    Ok(slots)
+}
+
+/// One record's bytes.
+pub(crate) fn parse_record(b: &[u8]) -> Record {
+    let image = |at: usize| vk::Image::from_raw(u64_at(b, at));
+    Record {
+        seq: u64_at(b, 0),
+        api: u32_at(b, 16),
+        feature: u32_at(b, 24),
+        create_flags: u32_at(b, 28),
+        colour: image(32),
+        mvec: image(40),
+        depth: image(48),
+        output: image(56),
+        exposure: image(64),
+        jitter: [f32_at(b, 72), f32_at(b, 76)],
+        mv_scale: [f32_at(b, 80), f32_at(b, 84)],
+        pre_exposure: f32_at(b, 88),
+        exposure_scale: f32_at(b, 92),
+        reset: u32_at(b, 96) != 0,
+        colour_extent: (u32_at(b, 108), u32_at(b, 112)),
+        output_extent: (u32_at(b, 116), u32_at(b, 120)),
+    }
+}
+
+/// A mapped ring and how far it was read.
+struct Ring {
+    base: *const u8,
+    len: usize,
+    slots: u64,
+    read: u64,
+}
+
+// SAFETY: the mapping is read-only and lives as long as the process (never unmapped).
+unsafe impl Send for Ring {}
+
+impl Ring {
+    /// Maps `path` read-only and removes the file (the mapping stays; the wrapper keeps its own): nothing is left in
+    /// `/dev/shm` once the game exits.
+    fn open(path: &std::path::Path, unlink: bool) -> Result<Ring, String> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let len = file.metadata().map_err(|e| e.to_string())?.len() as usize;
+        if len < HEADER_BYTES {
+            return Err(format!("{len} bytes"));
+        }
+        // SAFETY: a shared read-only mapping of a file this process opened; never unmapped.
+        let base = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
+        if base == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: `len` bytes were just mapped.
+        let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
+        let slots = match parse_header(bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                // SAFETY: mapped above, not used after.
+                unsafe { libc::munmap(base, len) };
+                return Err(e);
+            }
+        };
+        if unlink {
+            let _ = std::fs::remove_file(path);
+        }
+        let mut ring = Ring { base: base as *const u8, len, slots: u64::from(slots), read: 0 };
+        // Only what is written from now: a ring found late (a layer loaded after the wrapper wrote) starts at its end.
+        ring.read = ring.reserved();
+        Ok(ring)
+    }
+
+    fn reserved(&self) -> u64 {
+        // SAFETY: the header's `next` is an aligned u64 inside the mapping, written atomically by the wrapper.
+        unsafe { (*(self.base.add(24) as *const AtomicU64)).load(Ordering::Acquire) }
+    }
+
+    /// The records written since the last poll, oldest first. A slot whose writer has not finished is waited for on
+    /// the next poll; slots overwritten before they were read are skipped.
+    fn poll(&mut self, mut each: impl FnMut(Record)) {
+        let next = self.reserved();
+        if next.saturating_sub(self.read) > self.slots {
+            self.read = next - self.slots;
+        }
+        while self.read < next {
+            let n = self.read;
+            let at = HEADER_BYTES + (n % self.slots) as usize * RECORD_BYTES;
+            debug_assert!(at + RECORD_BYTES <= self.len);
+            // SAFETY: the slot lies inside the mapping; `seq` is its aligned first u64.
+            let seq = unsafe { &*(self.base.add(at) as *const AtomicU64) };
+            let before = seq.load(Ordering::Acquire);
+            if before != n + 1 {
+                if before > n + 1 {
+                    // Overwritten already: skip it.
+                    self.read += 1;
+                    continue;
+                }
+                break; // still being written
+            }
+            let mut copy = [0u8; RECORD_BYTES];
+            // SAFETY: as above; a volatile copy of memory another thread writes, checked by `seq` after.
+            unsafe { std::ptr::copy_nonoverlapping(self.base.add(at), copy.as_mut_ptr(), RECORD_BYTES) };
+            std::sync::atomic::fence(Ordering::Acquire);
+            if seq.load(Ordering::Acquire) == before {
+                each(parse_record(&copy));
+            }
+            self.read += 1;
+        }
+    }
+}
+
+/// The facts a record is checked on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fact {
+    Colour,
+    Depth,
+    Mvec,
+    Output,
+    Exposure,
+    Jitter,
+    MvUnits,
+    Reset,
+    RayReconstruction,
+    Hdr,
+}
+
+pub(crate) const FACTS: [Fact; 10] =
+    [Fact::Colour, Fact::Depth, Fact::Mvec, Fact::Output, Fact::Exposure, Fact::Jitter, Fact::MvUnits, Fact::Reset, Fact::RayReconstruction, Fact::Hdr];
+
+impl Fact {
+    fn index(self) -> usize {
+        FACTS.iter().position(|f| *f == self).expect("listed")
+    }
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Fact::Colour => "colour",
+            Fact::Depth => "depth",
+            Fact::Mvec => "motion vectors",
+            Fact::Output => "output",
+            Fact::Exposure => "exposure image",
+            Fact::Jitter => "jitter",
+            Fact::MvUnits => "motion vector units",
+            Fact::Reset => "reset",
+            Fact::RayReconstruction => "ray reconstruction",
+            Fact::Hdr => "HDR input",
+        }
+    }
+}
+
+/// Counters, process-wide (every device's tracker checks against the one ring).
+pub(crate) struct Counters {
+    /// Records read.
+    pub records: AtomicU64,
+    /// Input launches the record of their evaluate was found for.
+    pub matched: AtomicU64,
+    /// Input launches with a ring open and no record naming their images.
+    pub unmatched: AtomicU64,
+    /// Checks per [`Fact`] ([`check`]): the kernel rules got the same as the record, or not (or nothing).
+    pub agree: [AtomicU64; FACTS.len()],
+    pub disagree: [AtomicU64; FACTS.len()],
+}
+
+pub(crate) static COUNTERS: Counters = Counters {
+    records: AtomicU64::new(0),
+    matched: AtomicU64::new(0),
+    unmatched: AtomicU64::new(0),
+    agree: [const { AtomicU64::new(0) }; FACTS.len()],
+    disagree: [const { AtomicU64::new(0) }; FACTS.len()],
+};
+
+/// Disagreements logged one by one per fact before only the 5 s summary says them.
+const LOGGED_PER_FACT: u32 = 3;
+static LOGGED: [AtomicU32; FACTS.len()] = [const { AtomicU32::new(0) }; FACTS.len()];
+
+/// Counts whether the kernel rules agree with the record on `fact`; a disagreement is logged (the first few per
+/// fact) with `detail`.
+pub(crate) fn check(fact: Fact, agree: bool, detail: impl FnOnce() -> String) {
+    if agree {
+        COUNTERS.agree[fact.index()].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    COUNTERS.disagree[fact.index()].fetch_add(1, Ordering::Relaxed);
+    if LOGGED[fact.index()].fetch_add(1, Ordering::Relaxed) < LOGGED_PER_FACT {
+        crate::log!("[ngx] the kernel rules and NGX disagree on the {}: {} (NGX's is used)", fact.name(), detail());
+        crate::logging::flush();
+    }
+}
+
+/// Total disagreements and the facts that had any (bit [`Fact`]'s index), for the channel.
+pub(crate) fn disagreements() -> (u64, u32) {
+    let mut total = 0;
+    let mut kinds = 0;
+    for (i, c) in COUNTERS.disagree.iter().enumerate() {
+        let n = c.load(Ordering::Relaxed);
+        total += n;
+        if n > 0 {
+            kinds |= 1 << i;
+        }
+    }
+    (total, kinds)
+}
+
+/// The recent evaluates kept for matching.
+const RECENT: usize = 64;
+
+struct State {
+    ring: Option<Ring>,
+    /// The last time the ring was looked for, while it is not open.
+    looked: Option<Instant>,
+    said: bool,
+    recent: VecDeque<Record>,
+    summary_at: Option<Instant>,
+}
+
+static STATE: Mutex<State> = Mutex::new(State { ring: None, looked: None, said: false, recent: VecDeque::new(), summary_at: None });
+
+/// How often a missing ring is looked for again (the wrapper creates it when NGX loads, after the game's device).
+const LOOK_EVERY: Duration = Duration::from_secs(1);
+
+fn configured() -> Option<std::path::PathBuf> {
+    match neural_forge_protocol::env::var(RING_ENV).as_deref().map(str::trim) {
+        Some("off") => None,
+        Some(p) if !p.is_empty() => Some(p.into()),
+        _ => Some(format!("/dev/shm/neural-forge-ngx-{}.ring", std::process::id()).into()),
+    }
+}
+
+impl State {
+    fn poll(&mut self) {
+        if self.ring.is_none() {
+            let Some(path) = configured() else { return };
+            if self.looked.is_some_and(|t| t.elapsed() < LOOK_EVERY) {
+                return;
+            }
+            self.looked = Some(Instant::now());
+            if !path.exists() {
+                return;
+            }
+            match Ring::open(&path, neural_forge_protocol::env::var(RING_ENV).is_none()) {
+                Ok(ring) => {
+                    crate::log!("[ngx] reading DLSS's parameters from NGX's wrapper ({})", path.display());
+                    crate::logging::flush();
+                    self.ring = Some(ring);
+                }
+                Err(e) if !self.said => {
+                    self.said = true;
+                    crate::log!("[ngx] {} is not usable: {e}", path.display());
+                }
+                Err(_) => {}
+            }
+        }
+        let Some(ring) = self.ring.as_mut() else { return };
+        let recent = &mut self.recent;
+        ring.poll(|r| {
+            COUNTERS.records.fetch_add(1, Ordering::Relaxed);
+            if r.is_evaluate() && r.upscales() {
+                if recent.len() == RECENT {
+                    recent.pop_front();
+                }
+                recent.push_back(r);
+            }
+        });
+        if self.summary_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            if self.summary_at.is_some() {
+                summary();
+            }
+            self.summary_at = Some(Instant::now());
+        }
+    }
+}
+
+fn summary() {
+    let c = &COUNTERS;
+    let facts: Vec<String> = FACTS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| c.agree[*i].load(Ordering::Relaxed) + c.disagree[*i].load(Ordering::Relaxed) > 0)
+        .map(|(i, f)| {
+            format!("{} {}/{}", f.name(), c.disagree[i].load(Ordering::Relaxed), c.agree[i].load(Ordering::Relaxed) + c.disagree[i].load(Ordering::Relaxed))
+        })
+        .collect();
+    crate::log!(
+        "[ngx] {} records, {} input launches matched, {} not; disagreements (of checks): {}",
+        c.records.load(Ordering::Relaxed),
+        c.matched.load(Ordering::Relaxed),
+        c.unmatched.load(Ordering::Relaxed),
+        if facts.is_empty() { "none checked".to_string() } else { facts.join(", ") }
+    );
+}
+
+fn lock() -> std::sync::MutexGuard<'static, State> {
+    STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The newest Super Resolution or Ray Reconstruction evaluate whose colour input is one of `named` (a launch's
+/// images): NGX writes the record before it records the evaluate's launches, on the same thread, so the newest one
+/// is this launch's. Counts the input launch as matched or not while a ring is open.
+pub(crate) fn evaluate_naming(named: &[vk::Image]) -> Option<Record> {
+    #[cfg(test)]
+    if let Some(found) = INJECTED.with(|i| i.borrow().as_ref().map(|recs| recs.iter().rev().find(|r| named.contains(&r.colour)).copied())) {
+        return found;
+    }
+    let mut s = lock();
+    s.poll();
+    s.ring.as_ref()?;
+    let found = s.recent.iter().rev().find(|r| named.contains(&r.colour)).copied();
+    if found.is_some() {
+        COUNTERS.matched.fetch_add(1, Ordering::Relaxed);
+    } else {
+        COUNTERS.unmatched.fetch_add(1, Ordering::Relaxed);
+    }
+    found
+}
+
+/// The newest evaluate on `colour`, without counting.
+pub(crate) fn latest_for(colour: vk::Image) -> Option<Record> {
+    #[cfg(test)]
+    if let Some(found) = INJECTED.with(|i| i.borrow().as_ref().map(|recs| recs.iter().rev().find(|r| r.colour == colour).copied())) {
+        return found;
+    }
+    let mut s = lock();
+    s.poll();
+    s.recent.iter().rev().find(|r| r.colour == colour).copied()
+}
+
+/// The paper white's factor for a hold on `colour` that encodes with the game's exposure as it is
+/// ([`Record::paper_white_factor`]); 1 without a record.
+pub(crate) fn paper_white_factor(colour: vk::Image) -> f32 {
+    latest_for(colour).map_or(1.0, |r| r.paper_white_factor())
+}
+
+/// The input launch's inputs with a record: the record's colour, depth and motion vectors where all three are
+/// registered images (the rules' result `kernel` is checked against them), else the rules' result unchanged.
+pub(crate) fn decide_input(
+    kernel: Option<crate::preupscale::InputLaunch>,
+    record: &Images,
+    registered: impl Fn(vk::Image) -> bool,
+) -> Option<crate::preupscale::InputLaunch> {
+    use crate::preupscale::InputLaunch;
+    let ngx = [record.colour, record.depth, record.mvec];
+    if ngx.iter().any(|i| *i == vk::Image::null() || !registered(*i)) {
+        return kernel;
+    }
+    let (c, d, m) = match &kernel {
+        Some(InputLaunch::Inputs { colour, depth, mvec }) => (Some(*colour), Some(*depth), Some(*mvec)),
+        _ => (None, None, None),
+    };
+    let hex = |i: Option<vk::Image>| i.map_or("none".to_string(), |i| format!("{:#x}", i.as_raw()));
+    check(Fact::Colour, c == Some(record.colour), || format!("rules {} ({kernel:?}), NGX {:#x}", hex(c), record.colour.as_raw()));
+    check(Fact::Depth, d == Some(record.depth), || format!("rules {}, NGX {:#x}", hex(d), record.depth.as_raw()));
+    check(Fact::Mvec, m == Some(record.mvec), || format!("rules {}, NGX {:#x}", hex(m), record.mvec.as_raw()));
+    Some(InputLaunch::Inputs { colour: record.colour, depth: record.depth, mvec: record.mvec })
+}
+
+/// Whether two motion-vector unit pairs are the same within float rounding.
+pub(crate) fn same_units(a: [f32; 2], b: [f32; 2]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-3 * x.abs().max(y.abs()).max(1.0))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Records a test hands this thread's tracker instead of a ring ([`inject`]).
+    static INJECTED: std::cell::RefCell<Option<Vec<Record>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Makes this thread's lookups see `records` as the ring's (tests run each on its own thread).
+#[cfg(test)]
+pub(crate) fn inject(records: Vec<Record>) {
+    INJECTED.with(|i| *i.borrow_mut() = Some(records));
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::preupscale::InputLaunch;
+
+    /// A record's bytes as the wrapper lays them out (`crates/ngx-wrapper/src/ring.rs`, whose test checks the same
+    /// offsets).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_bytes(
+        seq: u64,
+        feature: u32,
+        flags: u32,
+        images: [u64; 5],
+        jitter: [f32; 2],
+        mv: [f32; 2],
+        pre: f32,
+        scale: f32,
+        reset: u32,
+    ) -> [u8; RECORD_BYTES] {
+        let mut b = [0u8; RECORD_BYTES];
+        b[0..8].copy_from_slice(&seq.to_le_bytes());
+        b[16..20].copy_from_slice(&12u32.to_le_bytes());
+        b[24..28].copy_from_slice(&feature.to_le_bytes());
+        b[28..32].copy_from_slice(&flags.to_le_bytes());
+        for (k, i) in images.iter().enumerate() {
+            b[32 + 8 * k..40 + 8 * k].copy_from_slice(&i.to_le_bytes());
+        }
+        for (k, v) in jitter.iter().chain(&mv).chain([&pre, &scale]).enumerate() {
+            b[72 + 4 * k..76 + 4 * k].copy_from_slice(&v.to_bits().to_le_bytes());
+        }
+        b[96..100].copy_from_slice(&reset.to_le_bytes());
+        for (k, v) in [1920u32, 1080, 1920, 1080, 3840, 2160].iter().enumerate() {
+            b[100 + 4 * k..104 + 4 * k].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    fn header(slots: u32, next: u64) -> Vec<u8> {
+        let mut b = vec![0u8; HEADER_BYTES + slots as usize * RECORD_BYTES];
+        b[..8].copy_from_slice(&MAGIC);
+        b[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        b[12..16].copy_from_slice(&(RECORD_BYTES as u32).to_le_bytes());
+        b[16..20].copy_from_slice(&slots.to_le_bytes());
+        b[24..32].copy_from_slice(&next.to_le_bytes());
+        b
+    }
+
+    fn put(file: &mut [u8], slots: u32, n: u64, rec: [u8; RECORD_BYTES]) {
+        let at = HEADER_BYTES + (n % u64::from(slots)) as usize * RECORD_BYTES;
+        file[at..at + RECORD_BYTES].copy_from_slice(&rec);
+    }
+
+    fn img(v: u64) -> vk::Image {
+        vk::Image::from_raw(v)
+    }
+
+    #[test]
+    fn a_record_reads_back_field_for_field() {
+        let b = record_bytes(7, FEATURE_SR, 0x4b, [0x10, 0x20, 0x30, 0x40, 0x50], [0.25, -0.5], [1920.0, 1080.0], 2.0, 0.5, 1);
+        let r = parse_record(&b);
+        assert_eq!(r.seq, 7);
+        assert_eq!((r.api, r.feature, r.create_flags), (12, FEATURE_SR, 0x4b));
+        assert_eq!([r.colour, r.mvec, r.depth, r.output, r.exposure], [img(0x10), img(0x20), img(0x30), img(0x40), img(0x50)]);
+        assert_eq!((r.jitter, r.mv_scale, r.pre_exposure, r.exposure_scale, r.reset), ([0.25, -0.5], [1920.0, 1080.0], 2.0, 0.5, true));
+        assert_eq!((r.colour_extent, r.output_extent), ((1920, 1080), (3840, 2160)));
+        assert!(r.hdr() && r.upscales() && r.is_evaluate() && !r.is_rr());
+        assert_eq!(r.jitter_word(), u64::from(0.25f32.to_bits()) | (u64::from((-0.5f32).to_bits()) << 32));
+        assert_eq!(r.paper_white_factor(), 4.0, "pre-exposure 2 over exposure scale 0.5");
+    }
+
+    #[test]
+    fn the_header_is_checked() {
+        assert_eq!(parse_header(&header(4, 0)), Ok(4));
+        let mut wrong = header(4, 0);
+        wrong[0] = b'X';
+        assert!(parse_header(&wrong).is_err());
+        let mut v2 = header(4, 0);
+        v2[8] = 2;
+        assert!(parse_header(&v2).unwrap_err().contains("version 2"));
+        assert!(parse_header(&header(4, 0)[..HEADER_BYTES + RECORD_BYTES]).is_err(), "shorter than its slots");
+    }
+
+    #[test]
+    fn unusable_exposure_values_leave_the_paper_white() {
+        let r = |pre: f32, scale: f32| parse_record(&record_bytes(1, FEATURE_SR, 0, [1, 2, 3, 4, 0], [0.0; 2], [1.0; 2], pre, scale, 0)).paper_white_factor();
+        assert_eq!(r(0.0, 0.0), 1.0, "not given");
+        assert_eq!(r(f32::NAN, 1.0), 1.0);
+        assert_eq!(r(1e9, 1.0), 1.0, "implausible");
+        assert_eq!(r(0.5, 1.0), 0.5);
+    }
+
+    #[test]
+    fn mv_units_need_a_plausible_scale() {
+        let r = |mv: [f32; 2]| parse_record(&record_bytes(1, FEATURE_SR, 0, [1, 2, 3, 4, 0], [0.0; 2], mv, 1.0, 1.0, 0)).mv_units();
+        assert_eq!(r([1920.0, 1080.0]), Some([1920.0, 1080.0]));
+        assert_eq!(r([1.0, -2160.0]), Some([1.0, -2160.0]), "negative y: up-pointing motion vectors");
+        assert_eq!(r([0.0, 1.0]), None);
+        assert_eq!(r([f32::INFINITY, 1.0]), None);
+        assert!(same_units([1485.0, 835.0], [1485.0004, 835.0]));
+        assert!(!same_units([1485.0, 835.0], [1920.0, 1080.0]));
+    }
+
+    /// A file as the wrapper leaves it: what is read, in order, and what is skipped.
+    #[test]
+    fn polling_reads_finished_slots_in_order() {
+        let dir = std::env::temp_dir().join(format!("nf-ngx-ring-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ring");
+        let slots = 4;
+        let mut file = header(slots, 0);
+        std::fs::write(&path, &file).unwrap();
+        let mut ring = Ring::open(&path, false).unwrap();
+        let mut got = Vec::new();
+        ring.poll(|r| got.push(r.seq));
+        assert!(got.is_empty());
+        // Three records, the third still being written (seq 0).
+        for n in 0..3u64 {
+            put(&mut file, slots, n, record_bytes(if n == 2 { 0 } else { n + 1 }, FEATURE_SR, 0, [n + 1, 0, 0, 0, 0], [0.0; 2], [1.0; 2], 1.0, 1.0, 0));
+        }
+        file[24..32].copy_from_slice(&3u64.to_le_bytes());
+        std::fs::write(&path, &file).unwrap();
+        ring.poll(|r| got.push(r.seq));
+        assert_eq!(got, vec![1, 2], "the slot being written waits");
+        put(&mut file, slots, 2, record_bytes(3, FEATURE_SR, 0, [3, 0, 0, 0, 0], [0.0; 2], [1.0; 2], 1.0, 1.0, 0));
+        std::fs::write(&path, &file).unwrap();
+        ring.poll(|r| got.push(r.seq));
+        assert_eq!(got, vec![1, 2, 3]);
+        // The writer laps the reader: 10 reserved, slots hold 7..10; 4..6 are gone.
+        for n in 3..10u64 {
+            put(&mut file, slots, n, record_bytes(n + 1, FEATURE_SR, 0, [n + 1, 0, 0, 0, 0], [0.0; 2], [1.0; 2], 1.0, 1.0, 0));
+        }
+        file[24..32].copy_from_slice(&10u64.to_le_bytes());
+        std::fs::write(&path, &file).unwrap();
+        ring.poll(|r| got.push(r.seq));
+        assert_eq!(got, vec![1, 2, 3, 7, 8, 9, 10]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_ring_opened_late_starts_at_its_end() {
+        let dir = std::env::temp_dir().join(format!("nf-ngx-ring-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ring");
+        let mut file = header(4, 2);
+        put(&mut file, 4, 0, record_bytes(1, FEATURE_SR, 0, [1, 0, 0, 0, 0], [0.0; 2], [1.0; 2], 1.0, 1.0, 0));
+        put(&mut file, 4, 1, record_bytes(2, FEATURE_SR, 0, [2, 0, 0, 0, 0], [0.0; 2], [1.0; 2], 1.0, 1.0, 0));
+        std::fs::write(&path, &file).unwrap();
+        let mut ring = Ring::open(&path, true).unwrap();
+        assert!(!path.exists(), "the file is removed once mapped");
+        let mut got = Vec::new();
+        ring.poll(|r| got.push(r.seq));
+        assert!(got.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn rec(colour: u64, depth: u64, mvec: u64) -> Images {
+        parse_record(&record_bytes(1, FEATURE_SR, 1, [colour, mvec, depth, 0x40, 0], [0.0; 2], [1.0; 2], 1.0, 1.0, 0)).images()
+    }
+
+    #[test]
+    fn the_record_decides_the_inputs_where_its_images_are_registered() {
+        let before = COUNTERS.disagree[Fact::Depth.index()].load(Ordering::Relaxed);
+        let rules = Some(InputLaunch::Inputs { colour: img(0x10), depth: img(0x99), mvec: img(0x30) });
+        let all = |_: vk::Image| true;
+        assert_eq!(
+            decide_input(rules.clone(), &rec(0x10, 0x20, 0x30), all),
+            Some(InputLaunch::Inputs { colour: img(0x10), depth: img(0x20), mvec: img(0x30) })
+        );
+        assert!(COUNTERS.disagree[Fact::Depth.index()].load(Ordering::Relaxed) > before, "the rules' other depth is a disagreement");
+        // The rules found nothing (an engine they do not know): the record still names them.
+        assert_eq!(decide_input(None, &rec(0x10, 0x20, 0x30), all), Some(InputLaunch::Inputs { colour: img(0x10), depth: img(0x20), mvec: img(0x30) }));
+        // An image the layer did not register (no view handle seen): the rules' result stands.
+        let not_mvec = |i: vk::Image| i != img(0x30);
+        assert_eq!(decide_input(rules.clone(), &rec(0x10, 0x20, 0x30), not_mvec), rules);
+        // A record without depth (a game that gives DLSS none): the rules.
+        assert_eq!(decide_input(rules.clone(), &rec(0x10, 0, 0x30), all), rules);
+    }
+}
