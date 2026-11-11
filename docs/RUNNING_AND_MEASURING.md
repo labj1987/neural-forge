@@ -571,8 +571,12 @@ its channel version) and stops after the run's `seconds` in the expected placeme
 or after `timeout` without the placement; then it ends every process of the game's prefix. A run passes when the
 expected `preupscale_state` was reached and the edit cache counted holds (the model ran in the game's frame), it
 did not end refused (`preupscale_state=5`), `preupscale_misses` is 0, no device was lost, the log has no `[panic]`,
-the kernel logged no `NVRM: Xid` since the run began, and the HDR verdict says HDR10 for an HDR run and SDR
-otherwise. Each run's layer log, its status samples (`<label>.samples`) and `results.txt` go to `--out` (default
+the kernel logged no `NVRM: Xid` since the run began, the HDR verdict says HDR10 for an HDR run and SDR
+otherwise, and the picture is right: every run is recorded for 10 s once at its placement (`vw record`, `--vw`,
+default `~/scratch/vw/bin/vw`) and `vw analyze` must flag nothing (a colour flash: frames tinted against their
+neighbours, frames alternating between two states, black frames, freezes); the table's `picture` column says
+`ok` or `FAIL`. Log numbers alone never pass a run: look at each run's contact sheet (`<label>-vw/sheet.jpg`)
+against the game with the model off as well. `--no-record` makes no recording, and every run then fails. Each run's layer log, its status samples (`<label>.samples`) and `results.txt` go to `--out` (default
 `~/nf-sweep/<unix time>`).
 
 Each run takes the GPU lock (`--lock`, default `$NF_GPU_LOCK`, else `~/scratch/gpu.lock`, an `flock`; waiting

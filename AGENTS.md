@@ -127,7 +127,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Before a release that touches the layer (above all `preupscale`), run the game sweep on the test machine with
   the release build: `scripts/game-sweep.sh --layer <build>/libneural_forge_layer.so --cli <build>/neural-forge-cli`
   (docs/RUNNING_AND_MEASURING.md, section 11), in tmux; it takes the GPU lock and puts back what it changes. Every
-  run must pass (each run holds the GPU lock only while it runs); record the passing games' `verified`/`verified_on` in `data/games.toml`. Runs are at the test
+  run must pass (each run holds the GPU lock only while it runs), and each is recorded (`vw`, `--vw`): a run passes
+  only when the recording flags nothing and its contact sheet looks right against the model off; log numbers alone never pass; record the passing games' `verified`/`verified_on` in `data/games.toml`. Runs are at the test
   machine's desktop resolution (3840x2160), with HDR for games that have it.
 
 ## Test builds

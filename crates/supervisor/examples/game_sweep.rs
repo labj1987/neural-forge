@@ -251,6 +251,8 @@ struct Outcome {
     misses: String,
     hdr: String,
     faults: String,
+    /// The recording's verdict ([`picture_verdict`]): "ok", the flags, or why there is none.
+    picture: String,
     failures: Vec<String>,
 }
 
@@ -646,9 +648,17 @@ struct Options {
     out: PathBuf,
     lock: PathBuf,
     dry_run: bool,
+    /// The screen recorder and analyser (`vw`: `vw record OUT SECONDS`, `vw analyze VIDEO --out DIR`), whose verdict
+    /// every run needs to pass ([`picture_verdict`]); `None` with `--no-record`, and every run then fails.
+    vw: Option<PathBuf>,
 }
 
-const USAGE: &str = "usage: game-sweep [--config FILE] [--only LABEL,...] [--layer SO] [--cli PATH] [--out DIR] [--lock FILE] [--dry-run]\n\
+/// How long each run is recorded once its placement was reached, and how long after reaching it.
+const RECORD_SECONDS: u64 = 10;
+const RECORD_AFTER: u64 = 10;
+
+const USAGE: &str =
+    "usage: game-sweep [--config FILE] [--only LABEL,...] [--layer SO] [--cli PATH] [--out DIR] [--lock FILE] [--vw PATH|--no-record] [--dry-run]\n\
                      \x20      game-sweep --self-test";
 
 fn parse_args() -> Result<Options, String> {
@@ -663,6 +673,7 @@ fn parse_args() -> Result<Options, String> {
         out: home.join(format!("nf-sweep/{stamp}")),
         lock: std::env::var_os("NF_GPU_LOCK").map_or_else(|| home.join("scratch/gpu.lock"), PathBuf::from),
         dry_run: false,
+        vw: Some(home.join("scratch/vw/bin/vw")),
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -675,6 +686,8 @@ fn parse_args() -> Result<Options, String> {
             "--out" => o.out = PathBuf::from(value()?),
             "--lock" => o.lock = PathBuf::from(value()?),
             "--dry-run" => o.dry_run = true,
+            "--vw" => o.vw = Some(PathBuf::from(value()?)),
+            "--no-record" => o.vw = None,
             "--help" | "-h" => return Err(String::new()),
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -749,6 +762,12 @@ fn sweep(o: &Options) -> Result<bool, String> {
             println!("  expects {} and {:?}", p.run.placement().map_or("?", Placement::describe), p.run.hdr_expect());
         }
         return Ok(true);
+    }
+    if let Some(vw) = o.vw.as_ref().filter(|v| !v.is_file()) {
+        return Err(format!(
+            "no screen recorder at {} (--vw PATH; every run is recorded and passes only with a clean picture; --no-record fails every run)",
+            vw.display()
+        ));
     }
     if !o.cli.is_file() {
         return Err(format!("no CLI at {} (--cli: the build's neural-forge-cli, which reads the channel of the layer under test)", o.cli.display()));
@@ -850,7 +869,15 @@ fn sweep(o: &Options) -> Result<bool, String> {
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter(|l| l.contains("NVRM: Xid")).collect::<Vec<_>>().join("\n"))
                 .unwrap_or_default();
-            Ok(evaluate(p.run.placement().unwrap_or(p.facts.placement), p.run.hdr_expect(), &samples, &log, &xid))
+            let mut outcome = evaluate(p.run.placement().unwrap_or(p.facts.placement), p.run.hdr_expect(), &samples, &log, &xid);
+            match picture_verdict(o, p) {
+                Ok(v) => outcome.picture = v,
+                Err(e) => {
+                    outcome.picture = "FAIL".into();
+                    outcome.failures.push(format!("the picture: {e}"));
+                }
+            }
+            Ok(outcome)
         })();
         let put_back = restore.put_back();
         drop(lock);
@@ -868,12 +895,12 @@ fn sweep(o: &Options) -> Result<bool, String> {
     }
     let mut table = String::new();
     table.push_str(&format!(
-        "{:<14} {:<32} {:<18} {:<14} {:>12} {:>6} {:<18} {:<8} result\n",
-        "run", "game", "expected", "reached", "holds", "misses", "HDR", "faults"
+        "{:<14} {:<32} {:<18} {:<14} {:>12} {:>6} {:<18} {:<8} {:<8} result\n",
+        "run", "game", "expected", "reached", "holds", "misses", "HDR", "faults", "picture"
     ));
     for (p, expect, out) in &rows {
         table.push_str(&format!(
-            "{:<14} {:<32} {:<18} {:<14} {:>12} {:>6} {:<18} {:<8} {}\n",
+            "{:<14} {:<32} {:<18} {:<14} {:>12} {:>6} {:<18} {:<8} {:<8} {}\n",
             p.run.label,
             p.facts.name,
             format!("{}{}", short_state(expect.preupscale_state()), if p.run.hdr { ", HDR10" } else { ", SDR" }),
@@ -882,6 +909,7 @@ fn sweep(o: &Options) -> Result<bool, String> {
             out.misses,
             out.hdr,
             out.faults,
+            out.picture,
             if out.failures.is_empty() { "pass" } else { "FAIL" }
         ));
     }
@@ -939,6 +967,7 @@ fn status(cli: &Path, secs: u64) -> Option<Sample> {
 /// timeout passes without the placement.
 fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bool) -> Vec<Sample> {
     let mut samples = Vec::new();
+    let mut recorded = false;
     let want = p.run.placement().unwrap_or(p.facts.placement).preupscale_state();
     let mut reached: Option<Instant> = None;
     let mut seen = false;
@@ -974,6 +1003,10 @@ fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bo
         } else {
             gone_since = None;
         }
+        if !recorded && reached.is_some_and(|r| r.elapsed() >= Duration::from_secs(RECORD_AFTER.min(p.run.seconds))) {
+            recorded = true;
+            record(o, p);
+        }
         if reached.is_some_and(|r| r.elapsed() >= Duration::from_secs(p.run.seconds)) {
             break;
         }
@@ -983,6 +1016,52 @@ fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bo
         }
     }
     samples
+}
+
+/// The run's recording ([`RECORD_SECONDS`] of the screen, while the game is at its placement).
+fn video(o: &Options, p: &Prepared) -> PathBuf {
+    o.out.join(format!("{}.mp4", p.run.label))
+}
+
+/// Records the screen for the run ([`video`]) with `vw record`.
+fn record(o: &Options, p: &Prepared) {
+    let Some(vw) = &o.vw else { return };
+    let out = video(o, p);
+    let _ = std::fs::remove_file(&out);
+    match Command::new(vw).arg("record").arg(&out).arg(RECORD_SECONDS.to_string()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status() {
+        Ok(s) if s.success() => println!("  {}: recorded {} s ({})", p.run.label, RECORD_SECONDS, out.display()),
+        Ok(s) => println!("  {}: vw record failed ({s})", p.run.label),
+        Err(e) => println!("  {}: vw record: {e}", p.run.label),
+    }
+}
+
+/// The run's picture: `vw analyze` over its recording, and the flags it raised (a colour flash, frames alternating
+/// between two states, black frames, freezes). "ok" only with none; the contact sheet (`<label>-vw/sheet.jpg`) is
+/// there to be looked at as well, against the model off.
+fn picture_verdict(o: &Options, p: &Prepared) -> Result<String, String> {
+    let Some(vw) = &o.vw else { return Err("not recorded (--no-record)".into()) };
+    let video = video(o, p);
+    if !video.is_file() {
+        return Err("not recorded (the placement was never reached, or vw record failed)".into());
+    }
+    let dir = o.out.join(format!("{}-vw", p.run.label));
+    let analysed = Command::new(vw).arg("analyze").arg(&video).arg("--out").arg(&dir).stdin(Stdio::null()).output().map_err(|e| format!("vw analyze: {e}"))?;
+    if !analysed.status.success() {
+        return Err(format!("vw analyze failed: {}", String::from_utf8_lossy(&analysed.stderr).trim()));
+    }
+    let summary = std::fs::read_to_string(dir.join("summary.json")).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let flags = vw_flags(&summary).ok_or("vw's summary has no flags")?;
+    if flags.is_empty() {
+        Ok("ok".into())
+    } else {
+        Err(flags.join("; "))
+    }
+}
+
+/// The `flags` list of a `vw analyze` summary.json (strings), if it has one.
+fn vw_flags(summary: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(summary).ok()?;
+    Some(v.get("flags")?.as_array()?.iter().filter_map(|f| f.as_str().map(str::to_string)).collect())
 }
 
 fn run_steam(o: &Options, p: &Prepared, env: &[(String, String)]) -> Vec<Sample> {
@@ -1095,6 +1174,17 @@ mod tests {
         assert_eq!((s.layer_frames, s.state, s.misses, s.holds), (4535, 2, 0, 59));
         assert!(s.hdr.starts_with("game outputs HDR10"));
         assert!(parse_status("no channel at /tmp/x\n", 0).is_none());
+    }
+
+    /// vw's verdict: its flags, none for a clean picture, and nothing from a summary without them.
+    #[test]
+    fn the_recordings_flags_are_read() {
+        assert_eq!(vw_flags(r#"{"frames": 480, "flags": []}"#), Some(vec![]));
+        let flagged = vw_flags(r#"{"flags": ["COLOUR_FLASH: 31 frames tinted against their neighbours", "BLACK: 2 black frames"]}"#).unwrap();
+        assert_eq!(flagged.len(), 2);
+        assert!(flagged[0].starts_with("COLOUR_FLASH"));
+        assert_eq!(vw_flags(r#"{"frames": 480}"#), None);
+        assert_eq!(vw_flags("not json"), None);
     }
 
     #[test]
