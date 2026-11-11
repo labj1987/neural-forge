@@ -120,4 +120,12 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
 - A scratch prefix under the copy: `WinVerifyTrust(C:\windows\system32\_nvngx.dll)` = 0, `LoadLibrary` of that path
   returns the wrapper (its `EvaluateFeature` in the wrapper's module), NVIDIA's core loaded from
   `Z:\run\host\usr\lib\x86_64-linux-gnu\nvidia\wine\_nvngx.dll`, no export missing.
-- Games (2026-11-10, RTX 5070, driver 620.70, 3840x2160): see MEASURED_RESULTS.md, "NGX wrapper".
+- The wrapper costs nothing measurable (2026-11-10, RTX 5070, driver 620.70, 4K, the 3.14 layer, wrapper vs the same
+  Proton without it): Cyberpunk 2077 benchmark with the layer off 120.2 vs 120.6 fps, on 69.3 vs 69.0; GTA V Enhanced
+  fg4x-4k real 36.3 / 35.7 vs 36.1 / 35.9; Crimson Desert (Ray Reconstruction, HDR) within its scene noise.
+- The layer from the records alone (2026-11-11, 4K, one run each): Cyberpunk 2077 RR off held before the upscaler,
+  benchmark 90.9 fps; RR on held after DLSS, 58.3 fps; Crimson Desert RR, HDR, after DLSS ~63 fps; Red Dead
+  Redemption 2 (Vulkan NGX, launched through Steam with the game switched on by `neural-forge-cli enable`, which set its
+  Proton and put it back on `disable`) held before the upscaler, 71 fps; GTA San Andreas - The Definitive Edition
+  (D3D11 through DXVK) held before the upscaler, ~50 fps. Crimson Desert with DLSS off in its own settings: the model on
+  the finished frame (13.5 fps, as before); with DLSS on and no wrapper: the model off, 104 fps, the log says why.
