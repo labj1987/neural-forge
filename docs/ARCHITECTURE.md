@@ -220,8 +220,8 @@ flowchart TD
     mode -- yes --> none["No network loaded:<br/>frames presented untouched"]
     mode -- "no (default: model)" --> nvx{"Device has<br/>VK_NVX_image_view_handle?"}
     nvx -- no --> post
-    nvx -- yes --> dlss{"DLSS SR input identified<br/>and a submit reads it?"}
-    dlss -- "no (no DLSS, native)" --> post
+    nvx -- yes --> dlss{"NGX's record of a DLSS SR evaluate<br/>and a submit carries it?"}
+    dlss -- "no (no DLSS, no Neural Forge Proton)" --> post
     dlss -- yes --> pre["Before the upscaler:<br/>hold the DLSS submit"]
     pre --> handback{"No frame held for 30 s<br/>while DLSS launches,<br/>or no DLSS for 5 min?"}
     handback -- yes --> post
@@ -236,8 +236,8 @@ hooked-command list, the resolved entry points and every hot path are exactly 1.
 never gets the tracking either.
 
 Once a device has held a DLSS submit, the after-the-upscaler compose stays off for that device until the
-hand-back (`preupscale::hand_back_at`, 4.7): 30 s after the last held frame while DLSS Super Resolution's input
-kernel goes on launching (`preupscale::HAND_BACK`: DLAA, inputs no longer identified, every frame refused), 5 minutes
+hand-back (`preupscale::hand_back_at`, 4.7): 30 s after the last held frame while DLSS's evaluates go on being
+submitted (`preupscale::HAND_BACK`: inputs not identified, every frame refused), 5 minutes
 after it while the game sends DLSS nothing at all (`PAUSE_HAND_BACK`). Loading screens and pause menus, where DLSS
 does not run, are presented untouched instead of switching paths (see [LESSONS.md](LESSONS.md), "The stuck NGX
 feature").
@@ -269,12 +269,13 @@ CUDA kernels: `vkCmdCuLaunchKernelNVX`, on image views registered with
 - `vkCreateImage` / `vkCreateImageView`: the layer records extent, format and usage.
 - The NVX registration calls: the layer records every registered view and the handle or address
   it got back.
-- `vkCreateCuFunctionNVX` / `vkDestroyCuFunctionNVX`: the layer records each kernel's name and
-  what it is (`preupscale::Kernel`: DLSS SR's input kernel, Ray Reconstruction's `rr2_*`, `cuda_dldn_engine_swin_*` and `cuda_dldn_engine_hkpn_*`, other).
+- `vkCreateCuFunctionNVX` / `vkDestroyCuFunctionNVX`: the layer records each kernel's name, for the probes' lines
+  only.
 - `vkCmdCuLaunchKernelNVX`: marks the command buffer as launch-bearing (also through
-  `vkCmdExecuteCommands`), with which kernels it launches. When the launch's parameters use CUDA's
-  "extra" buffer form (what vkd3d-proton uses), the layer reads that parameter buffer (never writes
-  it; at most 4 KiB) and notes which registered handles appear among its 8-byte words.
+  `vkCmdExecuteCommands`). When the launch's parameters use CUDA's "extra" buffer form (vkd3d-proton's, and NGX's
+  own in Vulkan games), the layer reads that parameter buffer (never writes it; at most 4 KiB) and notes which
+  registered handles appear among its 8-byte words: that is how a buffer is matched to NGX's record of its evaluate
+  (4.3).
 - Image barriers on the watched images, committed in submission order, so the layer knows their
   layout at a submit. Watched are DLSS's inputs, every depth image at the depth's extent and every
   image of the colour input's extent and format (still while nothing is identified, so a game handing
@@ -284,60 +285,35 @@ CUDA kernels: `vkCmdCuLaunchKernelNVX`, on image views registered with
 On a device with NVX but no DLSS, the per-command-buffer and per-submit hooks cost one atomic
 read.
 
-### 4.3 Identification
+### 4.3 Identification: NGX's records
 
-At a launch-bearing submit (`Tracker::observe`, then `Tracker::refresh`), two rules, the first
-winning (PRE_UPSCALER_DESIGN.md, "Identification by the input kernel's parameters (DLAA)"), behind
-one precondition:
+Everything about DLSS's evaluates comes from the records Neural Forge's NGX wrapper writes in a Neural Forge Proton
+(`ngx_ring.rs`, [PROTON_NGX.md](PROTON_NGX.md)): which images are the colour input, depth, motion vectors, output and
+exposure image, the camera jitter, the motion vectors' units (`MV.Scale`), the game's reset, and whether the feature is
+Ray Reconstruction. Nothing is inferred from DLSS's kernels; until 4.0 it was (the rules are history in
+PRE_UPSCALER_DESIGN.md and LESSONS.md).
 
-- **DLSS Ray Reconstruction must not be running** (PRE_UPSCALER_DESIGN.md, "DLSS Ray
-  Reconstruction"). Its input is the noisy ray-traced frame. While one of its kernels (`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`)
-  launched within the last 64 launch-bearing submits, nothing is identified; a buffer launching
-  one is never the hold point or evidence, whatever its shape. The model then runs right after
-  DLSS's output kernel (the hold after DLSS, NATIVE_BACKEND.md, "Where the model runs") where DLSS's
-  output is learnt and the placement allows it, else the post path runs it after the upscaler at
-  once. Logged on each change: `DLSS Ray Reconstruction runs (...)` and
-  `DLSS Ray Reconstruction stopped`. Super Resolution needs no kernel name (Crimson Desert's is
-  `rrlite_*`, GTA V's `hiluma_engine_input*`).
-
-- **By the input kernel's parameters** (`Rule::Params`). A command buffer's first launch that names a
-  registered depth image and a 2-channel float image is read as DLSS SR's input kernel. If it names
-  exactly one depth image and exactly one `RGBA16F`/`R11G11B10` storage image at the depth's extent,
-  that image is the colour input, with that depth and those motion vectors. It need not be smaller
-  than the output, so DLAA is found. The extent condition keeps DLSS Frame Generation out, because
-  FG's launch names its output-size frame beside the render-size depth. An output-size candidate
-  (DLAA, or FG at native resolution) counts if its buffer also names the 1x1 `R16_SFLOAT`
-  exposure image, which SR takes and FG does not; without one (a game that gives DLSS no exposure)
-  only with SR's own shape: a later launch of the same buffer names it with another output-size
-  image (SR's output kernel), no other launch-bearing buffer names it, and it is the only such
-  entry. The decision waits for 16 launch-bearing submits
-  without new evidence, so both SR's and FG's buffers have been seen. Ambiguity (two candidates in
-  one launch, or different colour inputs from different buffers that the exposure does not settle)
-  is logged once, and the size rule decides. One exception (3.1.2): when the size rule finds
-  nothing, and every such entry's buffer names the same exposure image and the inputs share one
-  extent, they are one evaluation alternating its input (Remnant II, whose motion vectors are 3
-  pixels narrower than its colour input); the lowest handle is chosen and each submit is held with
-  the input its buffer names. Only an `RGBA16F` colour input is held.
-- **By size** (`Rule::Size`, `preupscale::identify`), the fallback: the registered `RGBA16F` storage image (2D, single sample) whose extent equals
-  a registered depth image's (any depth format: `D32_SFLOAT`, `D32_SFLOAT_S8_UINT`,
-  `D24_UNORM_S8_UINT`, ...) and a registered motion-vector image's (`RG16F`, else `RG32F`), and is
-  smaller than the output. The output is the device's largest swapchain; on a device with no
-  swapchain (DLSS on another device than the one that presents, or views registered before the
-  swapchain exists) it is the largest registered `RGBA16F`/`R11G11B10` storage image. "Smaller" is
-  what rules out DLAA. Several candidates: the lowest handle is the colour input; the others are
-  only logged, and a forwarded buffer that names one of them is counted (PRE_UPSCALER_DESIGN.md,
-  "Several colour candidates (2.0.1)").
-- The identification line ends with `identified by the input kernel's parameters (...)` or
-  `identified by size`. When both rules pick the same images (GTA V, Crimson Desert), the switch
-  from size to parameters is no re-identification: nothing is skipped and the hold target stays.
-- **Exposure input:** the 1x1 `R16_SFLOAT` image the input kernel's buffer names, else the
-  registered one (not for an output-size input whose buffer names none).
-- Without a readable exposure input the exposure is measured from the frame (4.6).
-- With DLAA the model works on the full output-size frame every frame (as costly as the 1.x path on
-  every frame). The hold, encode and decode do not depend on the size.
-- When nothing qualifies, the line says why: the output used, the first failed condition for every
-  `RGBA16F` storage extent, and the registered views grouped by extent, format and usage (at most
-  1500 bytes, for the first 16 changes of the set per device).
+- **Which buffer is an evaluate's.** The wrapper writes a record before NVIDIA's `EvaluateFeature` runs and an end
+  record after it returns. A command buffer belongs to an evaluate when one of its launches names the evaluate's colour
+  input between the two; its later launches up to the end are the evaluate's. A launch naming the colour input after
+  the end (DLSS Frame Generation reading the frame) belongs to none, and a launch whose parameters cannot be read is
+  matched to nothing.
+- **The identification** (at every launch-bearing submit, `Tracker::refresh`): the newest Super Resolution evaluate
+  whose colour input, depth and motion vectors are images of the device. A new colour shape, other motion vectors or
+  another exposure image is a new identification; another colour image of the same shape (a game handing DLSS its
+  input in one of several images) or another depth image is not, and each buffer is held with its own evaluate's
+  images.
+- **DLSS Ray Reconstruction** (NGX's feature 13) is never held before the upscaler: its input is the noisy ray-traced
+  frame. While the newest evaluate is Ray Reconstruction's nothing is identified, and the model runs right after DLSS's
+  output (the hold after DLSS, NATIVE_BACKEND.md, "Where the model runs") where the placement allows it, else the post
+  path runs it after the upscaler.
+- **DLSS's output** for the hold after DLSS: the record's output image, and as many writes of it as the last evaluate
+  that ended had between its record and its end; the hold goes after that many.
+- **Exposure input:** the record's `ExposureTexture`; without one the exposure is measured from the frame (4.6).
+- With DLAA the model works on the full output-size frame every frame. The hold, encode and decode do not depend on the
+  size.
+- Without records (no wrapper, `NEURAL_FORGE_NGX_RING=off`) nothing is held before or after DLSS; as soon as CUDA
+  launches run without a ring the log and the status say the game is not on the Neural Forge Proton.
 - While any device of the process holds, the post-upscaler compose stays off on every device
   (`preupscale::post_off_by_any_device`), so a game whose DLSS runs on a device without the
   swapchain does not get the model twice; unless every pass is placed at present
@@ -350,13 +326,9 @@ The next one is.
 ### 4.4 Which submits are held (frame generation)
 
 DLSS Frame Generation also runs as CUDA kernels, in two more command buffers per real frame on
-another queue. Each launch-bearing buffer is classified (`LaunchRefs::kind`):
-
-| Kind | Rule | Action |
-|---|---|---|
-| Colour | a launch's parameters name the identified colour input | held (the split point) |
-| Foreign | every launch readable, naming registered views, never the colour input; or a launch of DLSS Ray Reconstruction (`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`) | forwarded untouched (DLSS FG's, Ray Reconstruction's, other NGX features') |
-| Unknown | an unreadable launch, parameters naming no registered view, or a launch before identification | held, as before the fix (only with inputs identified) |
+another queue. Only a buffer carrying a Super Resolution evaluate (`LaunchRefs::sr`, 4.3) is held; every other
+launch-bearing buffer (DLSS Frame Generation's, Ray Reconstruction's, launches no record names) is forwarded
+untouched.
 
 Before this rule, the layer held FG's submits too and ran the model three times per real frame,
 twice on the wrong input: 22.4 real / 67.1 shown fps. After it: 53.0 / 159
@@ -397,15 +369,14 @@ sequenceDiagram
    comparison under it marks the frame as a cut in the native pass's state buffer.
 3. **The network** (`N`, `preupscale/native.rs`): `native_preprocess.comp` builds the network's input
    lanes from the encoded frame, the previous answer reprojected with the motion vectors and the
-   camera jitter (read from DLSS's input-kernel parameters), and the Model tab's settings; the graph
+   camera jitter (NGX's record of the evaluate), and the Model tab's settings; the graph
    recorded for this extent runs the network; `native_composite.comp` applies the style operator and
    intensity and keeps the answer as the next frame's history. The history is reset after a frame
    that went to DLSS untouched, after 500 ms without a frame, on another extent, after a frame
    whose exposure was unusable, or on a scene cut (the frame `C` marked; read by both shaders on the
    same frame, for every pass; a cut on a cached hold resets the next network frame instead), when the
    exposure the encode used changed by more than a stop since the previous network frame (both shaders,
-   the same frame), and when the game resets DLSS's history (word 4 of the 310.x input kernel's parameters; DLSSNR_PARAMETERS.md,
-   "History reset").
+   the same frame), and when the game resets DLSS's history (the record's `Reset`).
 4. **Write back and decode** (`W`): the decode shader inverts the encode and writes the colour input
    in place, cropping the padding, keeping the original pixel (all three channels, so no hue turns)
    where the encoded input's peak channel was clamped and keeping the original alpha; a closing
@@ -422,8 +393,8 @@ the layer's image: nothing is copied into slot 0, the after-the-upscaler path's.
 
 **Inside DLSS's command buffer** (`preupscale/inline.rs`). Some games record their frame and DLSS
 in one command buffer (Crimson Desert), so there is no submit to split. There the layer records the
-whole hold into DLSS's buffer as it is recorded, at the input kernel's launch (or right after DLSS's
-output kernel for the passes placed after DLSS): the colour input (and its motion vectors, exposure and
+whole hold into DLSS's buffer as it is recorded, at the evaluate's first launch naming the colour input (or right
+after the evaluate's last write of its output for the passes placed after DLSS): the colour input (and its motion vectors, exposure and
 depth) copied to staging images, the same `C`/`N`/`W` as the split hold with the network's graph
 recorded straight into the buffer, the staging image copied back, and the application's compute
 state (pipeline, descriptor sets or descriptor-buffer offsets, push constants) bound again
@@ -507,9 +478,8 @@ The steadiness is what tells a scene-referred game whose eye adaptation lags (GT
 - **Counter-chain timeout:** the graph is rebuilt with barriers and the history reset.
 - **Hand-back.** Once a device has held, the after-the-upscaler path stays off on it until the hand-back
   (`preupscale::hand_back_at`), counted from the last held frame (`Session::last_hold`): 30 s (`HAND_BACK`) while
-  DLSS Super Resolution's input kernel goes on launching with no frame held, its inputs identified or not (by the
-  kernel's name, or by what its parameters name: `Tracker::observe`, `note_sr_launch`): DLAA, inputs no longer
-  identified, every frame refused (counted from the start of that run of launches when it began later, so a resume
+  DLSS's evaluates go on being submitted with no frame held, held or not (`Tracker::observe`, `note_sr_launch`):
+  inputs not identified, every frame refused (counted from the start of that run of evaluates when it began later, so a resume
   is not one); else 5 minutes (`PAUSE_HAND_BACK`): a game that stops calling DLSS altogether is in a pause menu or a
   loading screen, whose picture (Cyberpunk 2077: the last frame under the menu) already carries the edit. Only then
   is the status `PAUSED` (6) (`Session::status_at`: no Super Resolution launch within `RECENT`); while DLSS launches

@@ -281,32 +281,24 @@ committed in submission order. `NEURAL_FORGE_PROBE_NGX` still controls the probe
 
 ### Identification
 
-Since the change in "Identification by the input kernel's parameters (DLAA)" (end of this
-document), the colour input is first what DLSS Super Resolution's own input kernel names in its
-parameters, together with depth and motion vectors. That rule also finds DLAA's output-size input.
-The size rule below is the fallback, used before the parameters have settled, when they are
-unreadable or ambiguous, and when no launch has the input kernel's shape. The identification line
-ends with `; identified by the input kernel's parameters (...)` or `; identified by size`.
+Since 4.0 DLSS's inputs, output, exposure image, camera jitter, motion vectors' units, reset and whether it is Ray
+Reconstruction come only from the records Neural Forge's NGX wrapper writes in a Neural Forge Proton (PROTON_NGX.md,
+"What the layer does with the records"; ARCHITECTURE.md 4.3). A command buffer is an evaluate's when one of its
+launches names the evaluate's colour input between the evaluate's record and its end record; only Super Resolution's
+is held, at its submit or inside it at that launch. The identification (what is watched for layouts) is the newest
+Super Resolution record whose images the device created, logged once per change:
+`[preupscale] colour input: image 0x... (1707x960 R16G16B16A16_SFLOAT ...), depth ..., motion vectors ..., exposure input 0x...; from NGX's record of DLSS's evaluate`
+(`exposure input none (...)`: the exposure is measured from the frame). Without records nothing is held.
 
-The size rule: at a launch-bearing submit, when the registered set or the swapchains changed, the colour input is
-the registered RGBA16F storage image (2D, single-sample) whose extent equals a registered depth
-image's, with a registered RG16F (since 2.0.1 also RG32F) image of the same extent, and smaller than
-the largest swapchain (DLAA is refused that way; since 2.0.1, on a device with no swapchain, smaller
-than the largest registered RGBA16F/R11G11B10 storage image, see "Several colour candidates
-(2.0.1)"). Several candidates: lowest handles. DLSS's **exposure input** is the
-registered 1x1 `R16_SFLOAT` image (lowest handle if there are several; NGX's own 1x1 RGBA32F images,
-which are not transfer sources, are never it). Logged once per change:
-`[preupscale] colour input: image 0x... (1707x960 R16G16B16A16_SFLOAT ...), depth ..., motion vectors ..., exposure input 0x...`
-(`exposure input none (no registered 1x1 R16_SFLOAT; measured from the frame)` when missing) or
-`[preupscale] no DLSS input among N registered views ...; waiting`. Without an exposure input,
-model and roundtrip modes held nothing until the auto-exposure ("Auto-exposure when the game gives
-DLSS none (RE Requiem)", end of this document); since then the exposure is measured from the
-frame. Neither rule identifies anything while DLSS Ray Reconstruction runs ("DLSS Ray
-Reconstruction", end of this document); otherwise neither depends on kernel names.
+Until 4.0 the layer inferred all of this from DLSS's kernels: the size rule and the input kernel's parameters
+described in the sections after this one ("Several colour candidates (2.0.1)", "Identification by the input kernel's
+parameters (DLAA)", "DLSS Ray Reconstruction", ...). Those sections are the history of that work.
 
 ### The hold
 
-At `vkQueueSubmit`/`vkQueueSubmit2`, the first command buffer marked launch-bearing is the hold
+At `vkQueueSubmit`/`vkQueueSubmit2`### The hold
+
+At `vkQueueSubmit`/`vkQueueSubmit2`, the first command buffer carrying DLSS Super Resolution's evaluate is the hold
 point (one hold per call, one at a time per device: the device's state lock is held throughout).
 The call is re-issued through the next layer as: the batches before the launch batch plus, if the
 launch buffer is not first in its batch, the buffers before it with the batch's wait semaphores

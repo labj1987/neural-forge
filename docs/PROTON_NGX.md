@@ -1,9 +1,10 @@
 # DLSS's own parameters through Proton: the NGX wrapper
 
-The layer works out DLSS's colour input, depth, motion vectors, output, exposure, camera jitter, motion vector units
-and reset from the CUDA kernels DLSS launches (`preupscale.rs`, PRE_UPSCALER_DESIGN.md). Every new engine has needed new
-rules there. The game itself hands NGX all of these by name, in the same process, on the Windows side of Proton. This
-document is how Neural Forge reads them there, and how the layer uses them.
+The layer needs DLSS's colour input, depth, motion vectors, output, exposure, camera jitter, motion vector units and
+reset to place and run its holds (`preupscale.rs`). The game hands NGX all of these by name, in the same process, on
+the Windows side of Proton. This document is how Neural Forge reads them there, and how the layer uses them: the
+records are its only source of them. Until 4.0 the layer inferred them from the CUDA kernels DLSS launches, with rules
+that every new engine needed changed (PRE_UPSCALER_DESIGN.md and LESSONS.md keep that history).
 
 ## How it fits together
 
@@ -13,10 +14,11 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
                                               ▼
                         Neural Forge's builtin _nvngx.dll (crates/ngx-wrapper)
                               │ forwards all 75 exports to NVIDIA's core, loaded from NVIDIA_WINE_DLL_DIR
-                              │ one record per Create/EvaluateFeature ──► /dev/shm/neural-forge-ngx-<pid>.ring
+                              │ a record per CreateFeature, two per EvaluateFeature (before and after NVIDIA's call)
+                              │                                    ──► /dev/shm/neural-forge-ngx-<pid>.ring
                               ▼
             vkCmdCuLaunchKernelNVX ──► VK_LAYER_neuralforge_neural: ngx_ring.rs reads the ring
-                                        record = source of truth; kernel rules = fallback and cross-check
+                                        records = the only source of what DLSS works on
 ```
 
 - **Where NGX is loaded.** Proton copies NVIDIA's `_nvngx.dll` and `nvngx.dll` from the driver's `nvidia/wine`
@@ -42,40 +44,44 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   `ExposureTexture`, `Jitter.Offset`, `MV.Scale`, `DLSS.Pre.Exposure`, `DLSS.Exposure.Scale`, `Reset`, the render
   subrect, the extents, and the feature (Super Resolution 1, Frame Generation 11, Ray Reconstruction 13) with its
   creation flags (`IsHDR`, `MVLowRes`, `MVJittered`, `DepthInverted`, `AutoExposure`).
-- **The ring.** `crates/ngx-wrapper/src/ring.rs`: a 32-byte header, 1024 slots of 128 bytes. A writer reserves a slot
+- **The ring.** `crates/ngx-wrapper/src/ring.rs` (version 2): a 32-byte header, 1024 slots of 128 bytes. A writer reserves a slot
   with an atomic add, zeroes its `seq`, writes it, then sets `seq` to its number; the reader takes a slot only while
   `seq` reads the same before and after copying it. The file is named by the Linux pid (the wrapper asks Wine with
   `NtQueryInformationProcess(ProcessWineUnixPid)`; `Z:\proc\self` would name the wineserver, which opens files for
   Wine), which the layer gets from `getpid()`. The layer maps it read-only and removes the
-  file, so nothing is left behind; `uninstall --purge` removes rings no layer opened. The record is written before
-  NGX records the evaluate's launches, on the same thread, so the newest record naming a launch's images is that
-  launch's evaluate.
+  file, so nothing is left behind; `uninstall --purge` removes rings no layer opened. An evaluate's record is written
+  before NVIDIA's `EvaluateFeature` is called, so before NGX records any of the evaluate's launches, on the same
+  thread; once the call returned, the wrapper writes the same record again with `KIND_END` (bit 16 of `api`; the API is
+  the low 16 bits). Every launch of the evaluate lies between the two.
 
-## What the layer does with a record (`crates/layer/src/ngx_ring.rs`)
+## What the layer does with the records (`crates/layer/src/ngx_ring.rs`, `preupscale.rs`)
 
-At a command buffer's first launch naming registered images, the newest Super Resolution or Ray Reconstruction record
-whose colour input is among them belongs to that buffer:
-
-- **Inputs:** the record's colour input, depth and motion vectors, where all three are registered images; the input
-  rules' result is checked against them.
-- **Ray Reconstruction:** by NGX's feature, not by kernel names: such a buffer is never evidence and never held before
-  the upscaler, as before.
-- **Jitter, reset, motion vector units:** the record's `Jitter.Offset`, `Reset` (through the same reset filter as the
-  kernel's word) and `MV.Scale` (with the colour input's extent).
-- **Output and exposure image:** the record's output replaces the rules' choice where the output kernel names it; its
-  exposure image is the evidence's.
+- **Which buffer is an evaluate's.** A command buffer belongs to an evaluate when one of its launches names (through
+  the registered views' handles) the colour input of a Super Resolution or Ray Reconstruction evaluate whose end
+  record has not been read: the newest such evaluate. Its later launches up to the evaluate's end are the evaluate's
+  too; a launch naming the colour input after the end (DLSS Frame Generation reading the frame) is not. A launch whose
+  parameters the layer cannot read is matched to nothing.
+- **The identification.** The newest Super Resolution evaluate whose colour input, depth and motion vectors are images
+  of the device: those images (and every image of the colour input's extent and format, and every depth image of the
+  depth's extent) are watched for their layouts. Another colour image of the same shape is the same identification;
+  each buffer is held with its own evaluate's images.
+- **Where the holds go.** Super Resolution's buffer is the hold point: the split in front of it, or the hold inside it
+  at its first launch naming the colour input. Ray Reconstruction's (by NGX's feature) is never held before the
+  upscaler. The hold after DLSS goes after the evaluate's last launch naming its output: as many as the last evaluate
+  that ended had between its record and its end.
+- **Jitter, reset, motion vector units:** the record's `Jitter.Offset`, `Reset` and `MV.Scale` (carried to the output's
+  pixels for the hold after DLSS).
+- **Exposure image:** the record's `ExposureTexture`; without one the exposure is measured from the frame.
 - **Pre-exposure:** where the encode uses the game's exposure as it is, the paper white is multiplied by
   `DLSS.Pre.Exposure / DLSS.Exposure.Scale` (the colour input is the scene times the pre-exposure; DLSS scales the
   exposure image's value). Encode and decode read the same paper white, so the write-back stays exact.
-- **HDR:** `IsHDR` is checked: a game handing DLSS a display-referred input would show as a disagreement (the encode
-  has no path for one yet).
+- **HDR:** a record with `IsHDR` clear is said once in the log (the encode has no path for a display-referred input
+  yet).
 
-Every check counts an agreement or a disagreement per fact. The first three disagreements of each are logged
-(`[ngx] the kernel rules and NGX disagree on the ...`), a summary every 5 s (records read, input launches matched to a
-record, launches the rules alone read as DLSS's input launch, and each fact's disagreements of its checks), and `shmctl status` shows `ngx_records`, `ngx_matched`, `ngx_disagreements` and `ngx_disagree_kinds`
-(bits in the order colour, depth, motion vectors, output, exposure image, jitter, motion vector units, reset, ray
-reconstruction, HDR input). Without a ring (no wrapper, a native game, `NEURAL_FORGE_NGX_RING=off`) everything is as
-before.
+A summary every 5 s logs the records read and the evaluates matched to the buffers that carry them; `shmctl status`
+shows them as `ngx_records` and `ngx_matched`. Without a ring (no wrapper, `NEURAL_FORGE_NGX_RING=off`) nothing is held
+before or after DLSS: as soon as CUDA launches run without one, the log and the status say the game is not on the
+Neural Forge Proton, and the model runs on the finished frame only where the placement puts it there.
 
 ## The Proton copy (`crates/supervisor/src/proton_tool.rs`, `neural-forge-cli proton-tool`, the Setup tab)
 

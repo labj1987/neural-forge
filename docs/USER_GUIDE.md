@@ -232,10 +232,10 @@ takes is withdrawn after 5 seconds.
 
 ### Proton with DLSS parameters
 
-On its own the layer works out what DLSS was given (its input and output images, the camera jitter, how the motion
-vectors are measured, a reset, the exposure) from the kernels DLSS launches; a new game engine can need new rules there.
-Games run with a **Neural Forge copy of Proton** hand the layer what the game gave DLSS itself, by name, and the
-layer's own rules are kept as the fallback and checked against it (docs/PROTON_NGX.md).
+To run the model before or after DLSS the layer needs what the game gave DLSS: its input and output images, the camera
+jitter, how the motion vectors are measured, a reset, the exposure. Games run with a **Neural Forge copy of Proton**
+hand the layer exactly that, by name (docs/PROTON_NGX.md). A DLSS game without one keeps the model off before and
+after DLSS; the finished-frame placement still works.
 
 The Setup tab lists your installed Protons (GE-Proton, Proton-CachyOS, Valve's Proton and Proton Experimental) with
 **Make copy**. The copy is made next to the original in Steam's `compatibilitytools.d`, named `<version>-NeuralForge`
@@ -351,7 +351,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_LOG_TIME=1` | layer | Testing aid: timestamp every log line. |
 | `NEURAL_FORGE_SHM`, `NEURAL_FORGE_UID` | all | The shared-memory file, and the uid its directory is named after. Normally left alone. |
 | `NEURAL_FORGE_PROBE_NGX=1` | layer | Testing aid: log the game's DLSS work as it reaches Vulkan ([PRE_UPSCALER_PROBE.md](PRE_UPSCALER_PROBE.md)). |
-| `NEURAL_FORGE_PROBE_PARAMS=1`, `NEURAL_FORGE_PROBE_KERNEL=<name>` | layer | Testing aids: log every word of DLSS's input-kernel parameters, or of a named kernel's. |
+| `NEURAL_FORGE_PROBE_KERNEL=<name>` | layer | Testing aid: log every word of a named kernel's parameters. |
 | `NEURAL_FORGE_LOG_LAUNCH_QUEUES=1` | layer | Testing aid: log which queue each DLSS launch is submitted on. |
 | `NEURAL_FORGE_CAPTURE_AT=N:MS[:FRAMES][,...]` | layer | Testing aid: capture the presented frame (or FRAMES consecutive frames) MS milliseconds after DLSS's frames resumed (after a gap) for the Nth time; 1 is the first frames. Several entries, separated by commas, are each taken once. |
 | `NEURAL_FORGE_CACHE_DUMP_AT=N:MS[:K][,...]` | layer | Testing aid: dump K (default 16) consecutive holds before the upscaler for `scripts/cache_replay.py`, at the same moments `NEURAL_FORGE_CAPTURE_AT` names. `neural-forge-cli shmctl dump-cache [--holds K]` asks for one now. |
@@ -362,9 +362,8 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_NATIVE_NO_HISTORY=1` | layer | Testing aid: every network frame without history, as after a reset. |
 | `NEURAL_FORGE_PREUPSCALE_TRANSFER=aces\|linear` | layer | Testing aids: `aces` encodes the picture before the upscaler with RTX Remix's transfer (an ACES curve, and on the way back the model's change scaled by each pixel's own ratio, with Remix's highlight recovery); `linear` leaves out the sRGB curve (the network sees linear values, and the edit cache decodes the same way). `srgb` is the default. |
 | `NEURAL_FORGE_PREUPSCALE_HIGHLIGHTS=off` | layer | Testing aid: before the upscaler (and on an HDR10 finished frame), apply the model's change to the brightest highlights too: no keeping of clipped values, no fade near the top, no highlight recovery with `aces`. |
-| `NEURAL_FORGE_PREUPSCALE_PICK=N` | layer | Testing aid: take the Nth colour candidate where DLSS's input launch names several. |
 | `NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES=N`, `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore` | layer | Testing aids for `NEURAL_FORGE_PREUPSCALE=dump`: consecutive frames per dump (default 1); dump even where DLSS's buffer synchronises depth or motion vectors. |
-| `NEURAL_FORGE_PROBE_DEPTH=1`, `NEURAL_FORGE_PROBE_RR=<a,b,...>\|1` | layer | Testing aids: log the depth choice and barriers of the first 120 holds; log the images of the launches whose kernel names match (first 4000). |
+| `NEURAL_FORGE_PROBE_DEPTH=1` | layer | Testing aid: log the depth choice and barriers of the first 120 holds. |
 | `NEURAL_FORGE_PROBE_IMAGE=<kernel>[+],...` | layer | Testing aid: copy the images a named CUDA launch reads, before it (or after it with `+`), once, into `captures/probe-<ms>/`. |
 | `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` | layer | Gives every network activation its own allocation again instead of sharing memory by lifetime (more video memory, same result). |
 | `NEURAL_FORGE_POST_MOTION=zero\|flow\|none`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | After the upscaler (the finished frame), the model's history: its previous output at the same pixel (`zero`, the default), where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; it adds that extension and one optical-flow queue to the game's devices, which hung GTA V Enhanced), or none (`none`: every frame on its own, which flickers in large soft patches on grainy or noisy frames). The history is not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and is dropped on a scene cut. |
@@ -380,7 +379,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_NR_NO_FUSE_PRE=1`, `_NO_FUSE_POOL=1`, `_NO_FUSE_UPRES=1`, `_NO_FUSE_POST=1`, `_NO_PTX_MLP=1`, `NEURAL_FORGE_NR_CHAIN=0`, `_VIT_CHAIN=0`, `_CHAIN_MASK=N`, `_DEFER_MAX=N`, `_PTX_GEMM=0`, `_PTX_GEMMT=0`, `_PTX_GEMMV=0`, `_PTX_QKV=0`, `_PTX_FFN=0`, `_PTX_ATTN=0`, `_PTX_BLOCK32=0`, `_SPLITK=N`, `_ATTN_STREAM=N` | network | Testing aids: turn off one of the network's fused kernels or PTX kernel families, or change how its launches are chained and split (`third_party/opendlss-nr/src/nr_graph.cpp`, `kernels.cpp`). A switch takes `1` or `0` and a number a whole number; anything else is reported once on the game's standard error and ignored. `NEURAL_FORGE_NR_VALIDATION=1` and `NEURAL_FORGE_NR_DEBUG=1` apply only to the network's own standalone Vulkan context (its tools), not inside a game. |
 | `NEURAL_FORGE_SMOKE_SO=/path` | `scripts/smoke-test.sh` | Test this layer library instead of building the debug one. |
 | `PROTON_NO_NEURAL_FORGE_NGX=1` | a Proton copy's `proton` script | The game runs without the NGX wrapper (NVIDIA's core directly), as with the original Proton. |
-| `NEURAL_FORGE_NGX_RING=off\|/path` | layer | `off`: the layer reads no NGX records and works from DLSS's kernels alone (for an A/B). A path: read that ring file (left in place) instead of this process's. |
+| `NEURAL_FORGE_NGX_RING=off\|/path` | layer | `off`: the layer reads no NGX records, so nothing is held before or after DLSS (as without the wrapper). A path: read that ring file (left in place) instead of this process's. |
 | `NEURAL_FORGE_NGX_LOG=Z:\path\ngx.log` | NGX wrapper (a Windows path) | One line per DLSS creation, evaluate (every named image, the jitter, motion vector scale, exposure and reset) and release. Off by default. |
 | `NEURAL_FORGE_NGX_CORE=C:\path\_nvngx.dll` | NGX wrapper | Load NVIDIA's core from here instead of `NVIDIA_WINE_DLL_DIR`. |
 

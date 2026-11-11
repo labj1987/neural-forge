@@ -25,7 +25,7 @@ disagree, the more recent measurement wins.
   the model directory and its extractor, the device setup, the hold inside DLSS's buffer), and every
   measurement against NVIDIA's runtime through the 2.x helper.
 - [PROTON_NGX.md](PROTON_NGX.md): the NGX wrapper for Proton (a builtin `_nvngx.dll` that forwards NVIDIA's core
-  and records what the game gives DLSS), its ring, how the layer uses the records with its kernel rules as fallback,
+  and records what the game gives DLSS), its ring, how the layer places and runs its holds from the records alone,
   the Proton copies the app makes, licences and maintenance.
 - [PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md): the 2.0 design for running the model before
   DLSS Super Resolution, and the full record of its experiments (E1-E3, hand-off latency, 4K,

@@ -159,8 +159,9 @@ not to be brought back. Do not lower model resolution or turn the model off by d
 explicit user authorization. The one Windows-side piece is the NGX wrapper for Proton (`crates/ngx-wrapper`,
 docs/PROTON_NGX.md): it never runs NGX or the network, it forwards NVIDIA's NGX core unchanged and records the
 parameters the game gives DLSS for the layer (`ngx_ring.rs`). It ships only inside Proton copies made on the user's
-machine (`proton_tool.rs`), never as a published Proton build, and every layer decision it feeds keeps the kernel rules
-as the fallback.
+machine (`proton_tool.rs`), never as a published Proton build. Its records are the layer's only source of what DLSS
+works on: do not bring back rules that infer DLSS's images, jitter, units, reset or Ray Reconstruction from its
+kernels.
 
 Do not reapply the reverted capture/composition fence changes. Validate actual GPU
 operations and measure before and after every performance change. The matched comparator
@@ -174,32 +175,31 @@ Current target-machine evidence and unresolved Vulkan errors are in
 ## Pre-upscaler path
 
 Since 2.0 the model runs **before** DLSS Super Resolution by default (`crates/layer/src/preupscale.rs`,
-docs/PRE_UPSCALER_DESIGN.md): on a device with `VK_NVX_image_view_handle`, the layer identifies
-DLSS's registered colour input, holds the game's DLSS submit, runs the network on the
-render-resolution frame (every frame while the camera is still, every second frame in motion with the
-edit cache carrying it between; with DLSS's motion vectors and the jitter for the history) and
-writes the answer back before DLSS runs. Games that record their frame in DLSS's own command buffer
-are held inside it: the whole hold is recorded into that buffer, and the application's compute state
-is bound again after it (`preupscale/inline.rs`, `preupscale/restore.rs`). The colour input is
-what DLSS's own input kernel's parameters name with depth and motion vectors (which also finds DLAA's
-output-size input), with the older size rule as the fallback (docs/PRE_UPSCALER_DESIGN.md,
-"Identification by the input kernel's parameters (DLAA)"). DLSS Ray
-Reconstruction is never held: its input is the noisy ray-traced frame, so while its kernels
-(`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`; names from `vkCreateCuFunctionNVX`)
-launch nothing is identified and the model runs after the upscaler ("DLSS
-Ray Reconstruction"). Only that positive sign gates: Super Resolution needs no kernel name (Crimson
-Desert's is `rrlite_*`, and `custom_block*`/`k_initial_merge` are Frame Generation's); without a readable exposure image the
-exposure is measured from the frame ("Auto-exposure when the game gives DLSS none"). Everything else (no NVX, no DLSS, native)
-keeps the post-upscaler path. Only the launch-bearing command buffer whose
-kernel parameters name the identified colour input is held, so DLSS Frame Generation's submits go
-through untouched (docs/PRE_UPSCALER_DESIGN.md, "DLSS Frame Generation"). `NEURAL_FORGE_PREUPSCALE=off` is the
-rollback switch: since 3.0 it also loads no network (the native backend needs a mode on), so the post path
-presents every frame untouched; the A/B with the model on the finished frame is `placement=present`.
-`dump`, `identity` and `roundtrip` are diagnostics. Rule: with
-`NEURAL_FORGE_PREUPSCALE=off` the post path must stay byte-identical to 1.1.0 (the hooked-command
-list is the default set, no NVX entry points resolved, nothing of `preupscale` reachable), and a
-device without NVX must not get the tracking under the default either; the tests in
-`lib.rs::probe_command_tests` and the smoke test's `off` pass guard this.
+docs/PRE_UPSCALER_DESIGN.md): on a device with `VK_NVX_image_view_handle`, the layer holds the game's DLSS submit,
+runs the network on the render-resolution frame (every frame while the camera is still, every second frame in motion
+with the edit cache carrying it between; with DLSS's motion vectors and the jitter for the history) and writes the
+answer back before DLSS runs. Games that record their frame in DLSS's own command buffer are held inside it: the whole
+hold is recorded into that buffer, and the application's compute state is bound again after it
+(`preupscale/inline.rs`, `preupscale/restore.rs`).
+
+Everything about DLSS comes from NGX's records (`ngx_ring.rs`, docs/PROTON_NGX.md): the NGX wrapper writes one before
+NVIDIA's `EvaluateFeature` and an end record after it returns. A command buffer belongs to an evaluate when one of
+its launches names the evaluate's colour input (the registered views' handles in the launch's parameters) between the
+two; Super Resolution's is the hold point (the split in front of it, or inside it at that launch), and the images,
+exposure, jitter, `MV.Scale` and reset of a hold are its record's. The identification (the images watched for their
+layouts) is the newest Super Resolution record on the device. DLSS Ray Reconstruction (NGX's feature 13) is never held
+before the upscaler: its input is the noisy ray-traced frame, so the model runs after DLSS's output there (the hold
+after DLSS goes after the evaluate's last write of its output, as many writes as the last ended evaluate made) or on
+the finished frame. DLSS Frame Generation's buffers carry no Super Resolution evaluate and go through untouched. No
+rule reads DLSS's kernels (names or parameter words) to decide anything: without records (no Neural Forge Proton,
+`NEURAL_FORGE_NGX_RING=off`) nothing is held before or after DLSS, and the status says the wrapper is missing.
+Everything else (no NVX, no DLSS, native) keeps the post-upscaler path. `NEURAL_FORGE_PREUPSCALE=off` is the rollback
+switch: since 3.0 it also loads no network (the native backend needs a mode on), so the post path presents every
+frame untouched; the A/B with the model on the finished frame is `placement=present`. `dump`, `identity` and
+`roundtrip` are diagnostics. Rule: with `NEURAL_FORGE_PREUPSCALE=off` the post path must stay byte-identical to 1.1.0
+(the hooked-command list is the default set, no NVX entry points resolved, nothing of `preupscale` reachable), and a
+device without NVX must not get the tracking under the default either; the tests in `lib.rs::probe_command_tests` and
+the smoke test's `off` pass guard this.
 
 ## Historical evidence
 
