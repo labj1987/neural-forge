@@ -289,7 +289,8 @@ pub(crate) struct Counters {
     pub records: AtomicU64,
     /// Input launches the record of their evaluate was found for.
     pub matched: AtomicU64,
-    /// Input launches with a ring open and no record naming their images.
+    /// Launches the kernel rules read as DLSS's input launch, with a ring open and no record naming their colour
+    /// input ([`note_unmatched`]).
     pub unmatched: AtomicU64,
     /// Checks per [`Fact`] ([`check`]): the kernel rules got the same as the record, or not (or nothing).
     pub agree: [AtomicU64; FACTS.len()],
@@ -416,7 +417,7 @@ fn summary() {
         })
         .collect();
     crate::log!(
-        "[ngx] {} records, {} input launches matched, {} not; disagreements (of checks): {}",
+        "[ngx] {} records, {} input launches matched to one, {} read as input launches by the rules alone; disagreements (of checks): {}",
         c.records.load(Ordering::Relaxed),
         c.matched.load(Ordering::Relaxed),
         c.unmatched.load(Ordering::Relaxed),
@@ -442,10 +443,17 @@ pub(crate) fn evaluate_naming(named: &[vk::Image]) -> Option<Record> {
     let found = s.recent.iter().rev().find(|r| named.contains(&r.colour)).copied();
     if found.is_some() {
         COUNTERS.matched.fetch_add(1, Ordering::Relaxed);
-    } else {
-        COUNTERS.unmatched.fetch_add(1, Ordering::Relaxed);
     }
     found
+}
+
+/// The kernel rules read a launch as DLSS's input launch and no record names its colour input: counted while a ring
+/// is open (a frame NGX did not evaluate, or one the rules took for DLSS's).
+pub(crate) fn note_unmatched() {
+    let open = lock().ring.is_some();
+    if open {
+        COUNTERS.unmatched.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The newest evaluate on `colour`, without counting.

@@ -71,8 +71,8 @@ whose colour input is among them belongs to that buffer:
   has no path for one yet).
 
 Every check counts an agreement or a disagreement per fact. The first three disagreements of each are logged
-(`[ngx] the kernel rules and NGX disagree on the ...`), a summary every 5 s (`[ngx] N records, M input launches
-matched ...`), and `shmctl status` shows `ngx_records`, `ngx_matched`, `ngx_disagreements` and `ngx_disagree_kinds`
+(`[ngx] the kernel rules and NGX disagree on the ...`), a summary every 5 s (records read, input launches matched to a
+record, launches the rules alone read as DLSS's input launch, and each fact's disagreements of its checks), and `shmctl status` shows `ngx_records`, `ngx_matched`, `ngx_disagreements` and `ngx_disagree_kinds`
 (bits in the order colour, depth, motion vectors, output, exposure image, jitter, motion vector units, reset, ray
 reconstruction, HDR input). Without a ring (no wrapper, a native game, `NEURAL_FORGE_NGX_RING=off`) everything is as
 before.

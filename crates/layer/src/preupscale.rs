@@ -2898,6 +2898,9 @@ impl Tracker {
                     )
                 });
             }
+            if refs.ngx.is_none() && matches!(refs.input, Some(InputLaunch::Inputs { .. })) && kernel.is_some_and(|k| k == Kernel::SrInput) {
+                crate::ngx_ring::note_unmatched();
+            }
             let rr = refs.ngx.map_or(rr_by_kernel, |n| n.rr);
             if let Some(InputLaunch::Inputs { mvec, .. }) = refs.input {
                 if !rr {
