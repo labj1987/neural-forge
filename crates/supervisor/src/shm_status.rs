@@ -29,6 +29,7 @@ pub fn preupscale_state_name(v: u32) -> &'static str {
         HOLDING_BOTH => "holding before the upscaler and after DLSS",
         IDENTIFIED => "DLSS input identified, not holding",
         PAUSED => "paused with DLSS (a menu or loading screen); the model resumes with it",
+        NO_WRAPPER => "DLSS game not on the Neural Forge Proton: running on the finished frame",
         _ => "unknown",
     }
 }

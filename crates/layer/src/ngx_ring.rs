@@ -461,6 +461,12 @@ pub(crate) fn rules_decide() -> bool {
 /// Proton).
 static SAID_NO_RING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether DLSS ran in this process without a record naming its input and no ring is open (a DLSS game not on the
+/// Neural Forge Proton): the status says so.
+pub(crate) fn no_wrapper() -> bool {
+    SAID_NO_RING.load(Ordering::Relaxed) && lock().ring.is_none()
+}
+
 /// The kernel rules read a launch as DLSS's input launch and no record names its colour input: counted while a ring
 /// is open (a frame NGX did not evaluate, or one the rules took for DLSS's).
 pub(crate) fn note_unmatched() {
@@ -469,7 +475,7 @@ pub(crate) fn note_unmatched() {
         COUNTERS.unmatched.fetch_add(1, Ordering::Relaxed);
     } else if !rules_decide() && !SAID_NO_RING.swap(true, Ordering::Relaxed) {
         crate::log!(
-            "[ngx] DLSS runs, but NGX's wrapper hands this process no records: the model runs only after the upscaler. Run the game with a Neural Forge Proton (the Setup tab's Proton with DLSS parameters)"
+            "[ngx] DLSS game not on the Neural Forge Proton (NGX's wrapper hands this process no records): the model runs on the finished frame. Choose a Neural Forge Proton for the game (the Setup tab's Proton with DLSS parameters) for the placements before and after the upscaler"
         );
         crate::logging::flush();
     }

@@ -121,6 +121,9 @@ pub struct Roots {
     pub launch_option_state: Option<LaunchOptionState>,
     /// The Steam installations ([`crate::steam::roots`]): their games and launch options.
     pub steam_roots: Vec<crate::steam::Root>,
+    /// The library folders NVIDIA's driver may keep `nvidia/wine/_nvngx.dll` in
+    /// ([`crate::proton_tool::DRIVER_LIB_DIRS`]).
+    pub driver_lib_dirs: Vec<PathBuf>,
 }
 
 /// Runs `program` with `args`, its standard output on success. Killed after `timeout`.
@@ -219,6 +222,7 @@ impl Roots {
             journalctl: cached_command("journalctl"),
             launch_option_state: None,
             steam_roots: crate::steam::roots(),
+            driver_lib_dirs: crate::proton_tool::DRIVER_LIB_DIRS.iter().map(PathBuf::from).collect(),
         }
     }
 
@@ -276,6 +280,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
         }
     }
     out.extend(check_steam(roots));
+    out.extend(check_proton(roots));
     out.extend(check_xid(roots));
     out.extend(check_input_group(roots));
     out.extend(check_session_log(roots, events.as_deref().map_err(|e| e.kind()), session.as_deref()));
@@ -758,6 +763,94 @@ fn steam_launch_state(games: &[crate::steam::Game]) -> Option<LaunchOptionState>
 /// The first launch options of `game` that switch Neural Forge on, from any account.
 fn enabled_options(game: &crate::steam::Game) -> Option<String> {
     crate::steam::launch_options(&game.root.path, &game.appid).into_iter().filter_map(|a| a.options).find(|o| crate::launch_options::is_enabled(o))
+}
+
+/// Since 4.0 the layer works only in games run with a Neural Forge Proton (`proton_tool`): the NGX wrapper must be
+/// installed, export every name of the driver's NGX core, and each switched-on game must be set to such a Proton.
+fn check_proton(roots: &Roots) -> Vec<Finding> {
+    use crate::proton_tool;
+    const CHECK: &str = "proton";
+    let mut out = Vec::new();
+    let wrapper = roots.data_dir.join(proton_tool::WRAPPER);
+    let ours = match std::fs::read(&wrapper) {
+        Ok(b) => proton_tool::pe_export_names(&b),
+        Err(_) => {
+            return vec![Finding::new(
+                CHECK,
+                Severity::Failure,
+                "the NGX wrapper for Proton is not installed: no game can hand Neural Forge DLSS's parameters",
+                wrapper.display().to_string(),
+                Some("Install Neural Forge again from its AppImage (the Setup tab or `neural-forge-cli install --appdir`).".into()),
+            )]
+        }
+    };
+    let dirs: Vec<&Path> = roots.driver_lib_dirs.iter().map(PathBuf::as_path).collect();
+    match proton_tool::driver_core(&dirs) {
+        None if !dirs.is_empty() => out.push(Finding::new(
+            CHECK,
+            Severity::Failure,
+            "NVIDIA's NGX core for Proton (nvidia/wine/_nvngx.dll) is not installed with the driver: DLSS does not run under Proton",
+            dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", "),
+            Some("Install the NVIDIA driver's full package (its Wine NGX files), then restart the game.".into()),
+        )),
+        None => {}
+        Some(core) => {
+            let theirs = std::fs::read(&core).ok().and_then(|b| proton_tool::pe_export_names(&b)).unwrap_or_default();
+            let missing: Vec<&String> = theirs.iter().filter(|n| !ours.as_ref().is_some_and(|o| o.contains(n))).collect();
+            if missing.is_empty() && !theirs.is_empty() {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Ok,
+                    format!("the NGX wrapper forwards all {} of the driver's NGX core's functions", theirs.len()),
+                    core.display().to_string(),
+                    None,
+                ));
+            } else {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Failure,
+                    format!(
+                        "this driver's NGX core has {} function(s) the NGX wrapper does not forward: games under a Neural Forge Proton may run without DLSS",
+                        if theirs.is_empty() { "unreadable".to_string() } else { missing.len().to_string() }
+                    ),
+                    format!("{}: {}", core.display(), missing.iter().take(8).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")),
+                    Some("Update Neural Forge; until then use the driver version it was released with.".into()),
+                ));
+            }
+        }
+    }
+    for root in roots.steam_roots.iter().filter(|r| !r.flatpak) {
+        let tools = proton_tool::tools(&root.path);
+        for t in tools.iter().filter(|t| proton_tool::outdated(t)) {
+            out.push(Finding::new(
+                CHECK,
+                Severity::Info,
+                format!("{} was made from an older {} than is installed now", t.name, t.source.display()),
+                t.dir.display().to_string(),
+                Some("Make it again in the Setup tab (or `neural-forge-cli proton-tool update`), then choose the new copy for your games.".into()),
+            ));
+        }
+        for game in crate::steam::games(std::slice::from_ref(root)).iter().filter(|g| enabled_options(g).is_some()) {
+            let mapped = proton_tool::mapped_tool(&root.path, &game.appid);
+            let ok = mapped.as_ref().is_some_and(|m| tools.iter().any(|t| &t.name == m));
+            let evidence = format!("{} ({}): {}", game.name, game.appid, mapped.as_deref().unwrap_or("Steam's default Proton"));
+            if ok {
+                out.push(Finding::new(CHECK, Severity::Ok, format!("{} runs with a Neural Forge Proton", game.name), evidence, None));
+            } else {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Warning,
+                    format!("{} is switched on but does not run with a Neural Forge Proton: in a DLSS game the model then runs on the finished frame only", game.name),
+                    evidence,
+                    Some(format!(
+                        "In Steam, {}'s Properties > Compatibility: force a <version>-NeuralForge Proton (make one in the Setup tab first, then restart Steam).",
+                        game.name
+                    )),
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// The Steam installations and every installed game's Neural Forge state. A Flatpak-only Steam is
@@ -1317,6 +1410,7 @@ mod tests {
             journalctl: Box::new(move |_| journal.clone()),
             launch_option_state: None,
             steam_roots: Vec::new(),
+            driver_lib_dirs: Vec::new(),
         };
         Fixture { dir, roots }
     }
@@ -1337,6 +1431,29 @@ mod tests {
 
     fn find<'a>(findings: &'a [Finding], check: &str) -> Vec<&'a Finding> {
         findings.iter().filter(|f| f.check == check).collect()
+    }
+
+    /// 4.0 needs the NGX wrapper installed and matching the driver's NGX core: a missing wrapper, or a core with a
+    /// function the wrapper does not forward, is a failure; one it fully forwards is fine.
+    #[test]
+    fn the_ngx_wrapper_must_be_installed_and_forward_the_driver_s_core() {
+        let mut f = fixture(CommandOutput::Missing, CommandOutput::Missing);
+        let missing = check_proton(&f.roots);
+        assert_eq!((missing[0].check, missing[0].severity), ("proton", Severity::Failure));
+        assert!(missing[0].summary.contains("not installed"), "{}", missing[0].summary);
+        // The test binary itself as both DLLs: not PE32+ exports, so the core reads as unreadable (a failure).
+        let wrapper = f.roots.data_dir.join(crate::proton_tool::WRAPPER);
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, b"MZ").unwrap();
+        let lib = f.dir.join("lib");
+        std::fs::create_dir_all(lib.join("nvidia/wine")).unwrap();
+        std::fs::write(lib.join("nvidia/wine/_nvngx.dll"), b"MZ").unwrap();
+        f.roots.driver_lib_dirs = vec![lib.clone()];
+        let unreadable = check_proton(&f.roots);
+        assert_eq!(unreadable[0].severity, Severity::Failure, "{unreadable:?}");
+        std::fs::remove_file(lib.join("nvidia/wine/_nvngx.dll")).unwrap();
+        let no_core = check_proton(&f.roots);
+        assert!(no_core[0].summary.contains("not installed with the driver"), "{no_core:?}");
     }
 
     fn one<'a>(findings: &'a [Finding], check: &str) -> &'a Finding {

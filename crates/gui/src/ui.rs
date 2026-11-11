@@ -3454,7 +3454,7 @@ fn finding_row(finding: &neural_forge_supervisor::doctor::Finding) -> adw::Actio
 /// identified (`preupscale_reason`, with `IDENTIFIED`). `placement`: the Model placement setting; "At present"
 /// runs the model on the finished frame by choice, so the line says that rather than "waiting" for DLSS (#49).
 fn preupscale_label(layer_active: bool, placement: u32, state: u32, width: u32, height: u32, misses: u32, reason: &str) -> String {
-    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH, IDENTIFIED, PAUSED, WAITING};
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH, IDENTIFIED, NO_WRAPPER, PAUSED, WAITING};
     let missed = if misses == 0 { String::new() } else { format!(", {misses} frame{} missed", if misses == 1 { "" } else { "s" }) };
     match state {
         _ if !layer_active => "no game running".to_string(),
@@ -3466,6 +3466,7 @@ fn preupscale_label(layer_active: bool, placement: u32, state: u32, width: u32, 
         HOLDING_BOTH => format!("before the upscaler and after DLSS, before the HUD{missed}"),
         WAITING => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
         PAUSED => format!("paused with the game's DLSS (a menu or loading screen): the model resumes with its next frame{missed}"),
+        NO_WRAPPER => "on the finished frame: this DLSS game is not on a Neural Forge Proton (Setup tab, Proton with DLSS parameters)".to_string(),
         IDENTIFIED if reason.is_empty() => format!("after the upscaler: DLSS input identified, not holding{missed}"),
         IDENTIFIED => format!("after the upscaler: DLSS input identified, not holding{missed} -- {reason}"),
         _ => "after the upscaler".to_string(),

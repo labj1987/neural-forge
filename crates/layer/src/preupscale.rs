@@ -8540,6 +8540,9 @@ impl Session {
     fn status_at(&self, kept_off: bool, launches: Option<SrLaunches>, now: Instant, refusal: Option<&Refusal>) -> (u32, String) {
         let recent = |t: Option<Instant>| t.is_some_and(|t| now.saturating_duration_since(t) < RECENT);
         let paused = kept_off && !recent(launches.map(|r| r.last));
+        if !recent(self.last_hold) && crate::ngx_ring::no_wrapper() {
+            return (neural_forge_protocol::enums::preupscale_state::NO_WRAPPER, String::new());
+        }
         status_of(recent(self.last_hold), recent(self.last_dlss), paused, refusal)
     }
 }

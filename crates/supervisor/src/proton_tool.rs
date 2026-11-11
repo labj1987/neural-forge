@@ -298,6 +298,62 @@ pub fn remove(root: &Path, name: &str) -> Result<Tool, String> {
     Ok(tool)
 }
 
+/// The names a PE DLL exports (PE32+ only), from its export directory; `None` when the file is not one.
+pub fn pe_export_names(b: &[u8]) -> Option<Vec<String>> {
+    let u16_at = |at: usize| -> Option<u16> { Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?)) };
+    let u32_at = |at: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?)) };
+    if b.get(..2)? != b"MZ" {
+        return None;
+    }
+    let pe = u32_at(0x3c)? as usize;
+    if b.get(pe..pe + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let sections = u16_at(pe + 6)? as usize;
+    let opt_size = u16_at(pe + 20)? as usize;
+    let opt = pe + 24;
+    if u16_at(opt)? != 0x20b {
+        return None;
+    }
+    let export_rva = u32_at(opt + 112)?;
+    let table = opt + opt_size;
+    // A relative address as a file offset, through the section that holds it.
+    let offset = |rva: u32| -> Option<usize> {
+        (0..sections).find_map(|k| {
+            let sh = table + k * 40;
+            let (vsize, va, raw) = (u32_at(sh + 8)?, u32_at(sh + 12)?, u32_at(sh + 20)?);
+            (rva >= va && rva < va + vsize.max(1)).then(|| (rva - va + raw) as usize)
+        })
+    };
+    if export_rva == 0 {
+        return Some(Vec::new());
+    }
+    let dir = offset(export_rva)?;
+    let (count, names) = (u32_at(dir + 24)? as usize, offset(u32_at(dir + 32)?)?);
+    let mut out = Vec::with_capacity(count);
+    for k in 0..count.min(65536) {
+        let at = offset(u32_at(names + 4 * k)?)?;
+        let end = at + b.get(at..)?.iter().position(|&c| c == 0)?;
+        out.push(String::from_utf8_lossy(&b[at..end]).into_owned());
+    }
+    Some(out)
+}
+
+/// NVIDIA's NGX core for Proton in the driver's `nvidia/wine` folder, where the driver puts it.
+pub fn driver_core(sys_lib_dirs: &[&Path]) -> Option<PathBuf> {
+    sys_lib_dirs.iter().map(|d| d.join("nvidia/wine/_nvngx.dll")).find(|p| p.is_file())
+}
+
+/// The library folders the driver's `nvidia/wine` may be in (Debian/Ubuntu, Fedora/openSUSE, Arch).
+pub const DRIVER_LIB_DIRS: [&str; 3] = ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib"];
+
+/// Which Proton Steam runs `appid` with (`config.vdf`'s `CompatToolMapping`), if one is chosen for it.
+pub fn mapped_tool(root: &Path, appid: &str) -> Option<String> {
+    let text = std::fs::read(root.join("config/config.vdf")).ok()?;
+    let tree = crate::vdf::parse(&text).ok()?;
+    tree.string_at(&["InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping", appid, "name"]).map(str::to_string)
+}
+
 /// The installed wrapper.
 pub fn installed_wrapper() -> PathBuf {
     Path::new(&crate::paths::data_dir()).join(WRAPPER)
@@ -392,6 +448,47 @@ mod tests {
         assert_eq!(remove(&root, "GE-Proton11-12-NeuralForge").unwrap().name, "GE-Proton11-12-NeuralForge");
         assert!(remove(&root, "Proton-GE Latest").is_err(), "never a tool that is not ours");
         assert!(src.join("proton").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn export_names_are_read_from_a_pe_file() {
+        // A minimal PE32+ with one section and an export directory naming two functions.
+        let mut b = vec![0u8; 0x400];
+        b[..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        b[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
+        let opt = 0x98;
+        b[opt..opt + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        b[opt + 112..opt + 116].copy_from_slice(&0x1000u32.to_le_bytes());
+        let sh = opt + 240;
+        b[sh + 8..sh + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        b[sh + 12..sh + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[sh + 20..sh + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        let dir = 0x200;
+        b[dir + 24..dir + 28].copy_from_slice(&2u32.to_le_bytes());
+        b[dir + 32..dir + 36].copy_from_slice(&0x1040u32.to_le_bytes());
+        b[0x240..0x244].copy_from_slice(&0x1060u32.to_le_bytes());
+        b[0x244..0x248].copy_from_slice(&0x1070u32.to_le_bytes());
+        b[0x260..0x263].copy_from_slice(b"Abc");
+        b[0x270..0x273].copy_from_slice(b"Xyz");
+        assert_eq!(pe_export_names(&b), Some(vec!["Abc".to_string(), "Xyz".to_string()]));
+        assert_eq!(pe_export_names(b"not a dll"), None);
+    }
+
+    #[test]
+    fn the_chosen_proton_is_read_from_config_vdf() {
+        let root = scratch("mapping");
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config/config.vdf"),
+            "\"InstallConfigStore\"\n{\n\"Software\"\n{\n\"Valve\"\n{\n\"Steam\"\n{\n\"CompatToolMapping\"\n{\n\"1091500\"\n{\n\"name\"\t\t\"GE-Proton11-12-NeuralForge\"\n}\n}\n}\n}\n}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(mapped_tool(&root, "1091500").as_deref(), Some("GE-Proton11-12-NeuralForge"));
+        assert_eq!(mapped_tool(&root, "1"), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
