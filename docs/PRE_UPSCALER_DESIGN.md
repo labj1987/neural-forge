@@ -2567,6 +2567,16 @@ DLAA, a menu, no launches, the resume; the status in each), `super_resolution_la
   the holds rebuilt at 1920x1080 on resume (8 s later); that run's game then ran at about 52 fps against 82-116
   without the 5-minute wait, at the VRAM budget. Not changed here.
 
+**Checked 2026-11-11** (the sweep's `cyberpunk-rr`: 4K HDR10, Ray Reconstruction on, path tracing off, the network
+after DLSS at 3840x2160): a run the guard paused had ended with `preupscale_state=5` and an empty reason; a hold that
+ran and missed now gives its reason (`a_hold_that_missed_is_why_nothing_is_held`). Whether the guard pauses too
+eagerly there, 3 runs. Two (launched directly and through Steam) had no post path before the holds: the network at
+31-33 ms throughout, the device at its budget the whole run (the probe: 10558-10633 of 10633 MiB), 55-65 fps
+presented with 1% lows of 15-18, and no step. The run that paused had the post path run the network at 3840x2160 on the main menu,
+then come back during the benchmark's loading (Ray Reconstruction's 1 s window lapsed) and alternate with the
+holds; the network went to 562.7 ms a frame (best 31.0 ms) at 10533 of 10543 MiB with the game at 15 fps (1% low
+1.4 fps), and the guard paused it: a spill, not a slow stretch. The thresholds stay.
+
 ### The VRAM guard in the same game at 4K with Ray Reconstruction and path tracing
 
 Before (rrpt runs, RTX 5070 12 GB, 3840x2160 HDR10, Auto: after DLSS, the network at 3840x2160, 32 ms a frame in
