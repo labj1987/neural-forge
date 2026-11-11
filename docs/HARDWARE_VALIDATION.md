@@ -1594,3 +1594,37 @@ game's HDR10 metadata whatever the swapchain's colour space, and makes an HDR10 
 Neural Forge. The desktop's colour mode was found at "default" afterwards (monitors.xml has bt2100) and was set back
 to bt2100 at 2560x1440@288.001+vrr (a nested gamescope does not change the desktop's modes; what reset it was
 not found).
+
+## 2026-11-10: performance numbers at 4K, Cyberpunk 2077 and Crimson Desert with HDR (#51)
+
+The user-facing numbers (MEASURED_RESULTS.md, the user guide) were taken again at 3840x2160, the desktop at
+3840x2160@144 VRR with HDR (bt2100), with the fix-51 layer at 2695948 (eb263ff only adds a guard for motion vectors
+that are not finite), RTX 5070, driver 620.70.06; the 1440p sections stay, marked as 1440p. One run each.
+
+- **GTA V Enhanced**, built-in benchmark pass 4, DLSS Balanced (2228x1253), frame generation 4x with Preset C,
+  `FrameLimit` 120: off 58.1 real / 233.3 shown (10.3 GB), full network 36.7 / 147.5 (13.1 ms, 11.8 GB), small
+  41.0 / 165.0 (7.6 ms, 11.8 GB). Passes: small 2 passes 33.6 (15.5 ms), 3 passes 28.3 (22.5 ms), full 2 passes 27.4
+  (25.6 ms). Frame generation off: off 79.0, small 51.3 (6.8 ms), full 44.9 (11.9 ms). Every run at the full model
+  resolution (`network built for 2228x1253`), no missed frames, no Xid.
+- **Crimson Desert**, 4K HDR10 (Proton-GE, `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`, swapchain
+  `A2B10G10R10_UNORM_PACK32 HDR10_ST2084_EXT`), DLSS Balanced (2272x1280), dynamic frame generation, 60 s in the world,
+  presents per second from the layer's `[present]` lines. Ray Reconstruction: model off 105, full 70 (32.6 ms), small
+  79 (19.4 ms), Quality 81 (17.8 ms), Performance 84 (10.2 ms), Ultra Performance 87 (5.9 ms), finished frame 14;
+  video memory peak 11.1-11.8 GB with the model on. Without it: Auto (before the upscaler) 102 (12.9 ms, 16.9 holds a
+  second), After DLSS 68 (34.2 ms), finished frame 15, model off 124. No missed frames, no fence timeout, no Xid.
+- **Cyberpunk 2077** `-benchmark`, 4K, HDR10 PQ in UserSettings.json (restored byte for byte after each run), Proton-GE
+  with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`: the layer logs `colour_space=HDR10_ST2084_EXT hdr=2` and the game's
+  BT.2020 metadata (MaxCLL 500) on the desktop, no gamescope needed. Ray Reconstruction off: before the upscaler on
+  1920x1080, held = ran, no misses, 9.8 ms, 113.5 fps off / 89.8 on (benchmark average). Ray Reconstruction on: after
+  DLSS on 3840x2160, held = ran, no misses, 32 ms, 115.0 off / 53.3 and 44.7 on; the card's memory is full (11.8 GB)
+  and the game drops to 15-17 fps for stretches. Path tracing as well: 67.2 off, 11 on: the game ran short of video
+  memory (frames of seconds; the network's median rose to 311 ms in the run without a recording) and the layer
+  passed most frames untouched as "not presenting steadily". The network's memory pause did not engage here.
+- Screen recordings (vw, 4K content mode) with the model on and off: no alternation and no flicker flags
+  (alternation mean below 0.001); the model's picture is neither washed out nor blown out (fewer clipped pixels than
+  with the model off, the same colours). Captures (`shmctl capture`) refuse HDR frames, so the on/off picture check is
+  from the recordings. gpu-screen-recorder gets no CUDA context while the game fills the card (Ray Reconstruction at
+  4K), and its CPU encoder also failed there, so those runs have no recording; a recording made while path tracing ran
+  was what first pushed that game over the memory limit.
+- Sharpening cost (`sharpen::tests::cost_at_1440p_and_effect_on_a_still_frame`, NVIDIA ICD, a 3840x2160 frame from the
+  recording): CAS 0.69 ms, Clarity r16 0.86, r64 1.05, both 0.94 (1440p again: 0.28, 0.32, 0.43, 0.37).

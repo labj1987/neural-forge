@@ -108,16 +108,16 @@ GrimsVerk's runtime research).
 
 **Passes** (1 to 10, default 1) runs the model that many times over each frame, before or after the
 upscaler: every pass after the first works on the previous pass's picture. Each pass costs about as much
-GPU time as the first, and the effect builds up with every pass. In GTA V Enhanced at 1440p with frame
-generation 4x (real frames per second, pass 4 of the built-in benchmark, one run each; the small
-network's one pass is from 2026-10-19, the rest from 2026-10-28):
+GPU time as the first, and the effect builds up with every pass. In GTA V Enhanced at 3840x2160 (DLSS
+Balanced) with frame generation 4x on an RTX 5070 (real frames per second, pass 4 of the built-in benchmark,
+one run each, 2026-11-10; 58.1 with the model off):
 
 | Network | 1 pass | 2 passes | 3 passes |
 |---|---|---|---|
-| Small | 74.3 | 60.4 | 52.8 |
-| Full | 62.1 | 50.7 | |
+| Small | 41.0 | 33.6 | 28.3 |
+| Full | 36.7 | 27.4 | |
 
-Two passes of the small network cost about as much as one pass of the full network, and look
+Two passes of the small network cost a little more than one pass of the full network, and look
 over-processed: grittier stone and noisier roads. Each pass keeps its own history, so the passes do not
 blend toward each other's pictures over time. **Per-pass settings** (Edit…) let each pass use its own
 intensity, local tone, local structure, skin structure, style, auto mask, model resolution, colour of the
@@ -130,9 +130,10 @@ values keep more of the pass's own input, so the passes add less to each other.
 **Balanced** (58%), **Performance** (50%) or **Ultra Performance** (33.3%). Below Full the model works on a
 downscaled copy of the frame and its change is brought back to full size, following the frame's own edges,
 so the frame keeps its own detail; the model costs less GPU time and memory but adds less detail of its own.
-Before the upscaler the frame is already small (1486x836 in GTA V at 1440p) and the smaller sizes keep
-little of the model's detail; after DLSS, on the full output (with Ray Reconstruction), Performance keeps
-most of it for about 30 fps more (see [MEASURED_RESULTS.md](MEASURED_RESULTS.md)). Full is the frame exactly as
+Before the upscaler the frame is already small (2228x1253 in GTA V at 4K with DLSS Balanced, 1486x836 at
+1440p) and the smaller sizes keep little of the model's detail; after DLSS, on the full output (with Ray
+Reconstruction), Performance keeps most of it for about a fifth more frames (Crimson Desert at 4K: 84 against
+70 fps shown; see [MEASURED_RESULTS.md](MEASURED_RESULTS.md)). Full is the frame exactly as
 without the setting. Each pass can have its own model resolution in the per-pass settings: a pass works
 on the previous pass's full-size picture at its own size. Changing it starts the model's history afresh
 and shows a moment of untouched frames while the model is prepared for the new size.
@@ -203,8 +204,8 @@ midtones** (0.5) keeps it off the darkest and brightest parts (0 evenly, 1 midto
 protection** (0.5) stops the blur at strong brightness edges so they do not grow bright or dark halos. The
 **HUD regions** apply: nothing inside a Keep region, the strength's share inside a Soften one (Find the HUD
 does not apply here). Clarity does not use the game's depth: on the presented frame there is none to use.
-GPU time a presented frame at 1440p on an RTX 5070: 0.29 ms for CAS, 0.33 ms for Clarity at radius 16 (0.43 ms at
-64), 0.37 ms for both; most of it is copying the frame out and back. It is paid on every presented frame, so with
+GPU time a presented frame at 3840x2160 on an RTX 5070: 0.69 ms for CAS, 0.86 ms for Clarity at radius 16 (1.05 ms
+at 64), 0.94 ms for both (at 2560x1440: 0.28, 0.32, 0.43 and 0.37 ms); most of it is copying the frame out and back. It is paid on every presented frame, so with
 frame generation 4x four times a rendered frame. `neural-forge-cli shmctl set sharpen_cas 0.5` (and
 `clarity_strength`, `clarity_radius`, `clarity_midtones`, `clarity_edges`) does the same from a terminal, and
 a game can have its own sharpening like any other setting ([Settings for one game](#settings-for-one-game)); `NEURAL_FORGE_SHARPEN` overrides it for one launch, for comparisons. A capture (the Debug tab's Capture button) shows the frame
@@ -247,7 +248,9 @@ settings win over built-in ones, and an update never changes your files.
 
 Each game was run on the test machine (RTX 5070, 2560x1440, Proton) with its own settings as found:
 DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. In each one the model
-ran with no missed frames and no GPU fault.
+ran with no missed frames and no GPU fault. GTA V Enhanced (`FrameLimit` 120), Cyberpunk 2077, Red Dead
+Redemption 2 and Crimson Desert were run again at 3840x2160, the last three with the game's HDR (HDR10) on
+(Proton-GE with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`); GTA V has no HDR.
 
 | Game | Engine, API | DLSS used | Where the model runs |
 |---|---|---|---|
@@ -396,7 +399,7 @@ everything under `~/.local/share/neural-forge` (the model, an imported DLL, capt
   different ways, and several broke an assumption the first time. See [Tested games](#tested-games).
 - **The model after DLSS is tested in three games** (Crimson Desert and Hogwarts Legacy with Ray
   Reconstruction; Cyberpunk 2077 with and without it). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
-  much lower frame rate (36 against 120 fps shown in Crimson Desert).
+  much lower frame rate (14 against 70 fps shown in Crimson Desert at 4K with Ray Reconstruction).
 - **Hogwarts Legacy with Ray Reconstruction:** its Ray Reconstruction does not say what unit its motion vectors
   are in (Cyberpunk 2077's does), so the model after DLSS takes them as render pixels, as their size suggests, or
   in the unit Super Resolution gave if it ran earlier in the session. Neither has been checked against the picture
