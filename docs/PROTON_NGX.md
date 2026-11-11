@@ -58,26 +58,30 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   handles the layer saw at `vkCreateImage`. The interop device is asked for per resource and released after the
   lookup, so the wrapper keeps no device alive and a game that makes a new device is asked through the new one.
   Per evaluate: `Color`, `MotionVectors`, `Depth`, `Output`,
-  `ExposureTexture`, `Jitter.Offset`, `MV.Scale`, `DLSS.Pre.Exposure`, `DLSS.Exposure.Scale`, `Reset`, the render
-  subrect, the extents, and the feature (Super Resolution 1, Frame Generation 11, Ray Reconstruction 13) with its
-  creation flags (`IsHDR`, `MVLowRes`, `MVJittered`, `DepthInverted`, `AutoExposure`).
+  `ExposureTexture`, `Jitter.Offset`, `MV.Scale`, `DLSS.Pre.Exposure`, `DLSS.Exposure.Scale`, `Reset`, the extents,
+  DLSS's subrect (`DLSS.Render.Subrect.Dimensions`, and where the rectangle starts in each image:
+  `DLSS.Input.Color.Subrect.Base`, `DLSS.Input.MV.Subrect.Base`, `DLSS.Input.Depth.Subrect.Base` and
+  `DLSS.Output.Subrect.Base`, X and Y, which NVIDIA's SDK helpers set with `SetUI`; 0 when not given), the feature's
+  output size from its creation (`OutWidth`/`OutHeight`), and the feature (Super Resolution 1, Frame Generation 11,
+  Ray Reconstruction 13) with its creation flags (`IsHDR`, `MVLowRes`, `MVJittered`, `DepthInverted`, `AutoExposure`).
   Looking an image up calls into the resource the parameter names, so the wrapper does it only for parameters
   NVIDIA's own call reads, which the game must keep alive: the images only for Super Resolution and Ray
   Reconstruction (the features the layer uses; Frame Generation's records carry none), and `ExposureTexture` not
   with `AutoExposure` (DLSS ignores it then, so a game may leave it pointing at a freed resource). The other images
   the text log lists are logged as their bare pointers. A creation NVIDIA failed (`NVSDK_NGX_FAILED`) is logged
   only: its handle out-parameter is not NVIDIA's then, and is not read.
-- **The ring.** `crates/ngx-wrapper/src/ring.rs` (version 2): a 32-byte header, 1024 slots of 128 bytes. A writer reserves a slot
-  with an atomic add, zeroes its `seq`, writes it, then sets `seq` to its number; the reader takes a slot only while
-  `seq` reads the same before and after copying it. The file is named by the Linux pid (the wrapper asks Wine with
-  `NtQueryInformationProcess(ProcessWineUnixPid)`; `Z:\proc\self` would name the wineserver, which opens files for
-  Wine), which the layer gets from `getpid()`. The layer maps it read-only and removes the
-  file, so nothing is left behind. A ring no layer opened is removed once its game is gone: when Neural Forge (the app
-  or the CLI) starts, and by `uninstall --purge`; never a running process's (`proton_tool::sweep_dead_rings`).
-  `doctor` reports a running game's ring of another version than the layer reads (a copy with an older wrapper). An evaluate's record is written
-  before NVIDIA's `EvaluateFeature` is called, so before NGX records any of the evaluate's launches, on the same
-  thread; once the call returned, the wrapper writes the same record again with `KIND_END` (bit 16 of `api`; the API is
-  the low 16 bits). Every launch of the evaluate lies between the two.
+- **The ring.** `crates/ngx-wrapper/src/ring.rs` (version 3, since the subrect fields; 4.0's wrapper writes version 2):
+  a 32-byte header, 1024 slots of 168 bytes. A writer reserves a slot with an atomic add, zeroes its `seq`, writes it,
+  then sets `seq` to its number; the reader takes a slot only while `seq` reads the same before and after copying it.
+  The file is named by the Linux pid (the wrapper asks Wine with `NtQueryInformationProcess(ProcessWineUnixPid)`;
+  `Z:\proc\self` would name the wineserver, which opens files for Wine), which the layer gets from `getpid()`. The layer
+  maps it read-only and removes the file, so nothing is left behind. A ring no layer opened is removed once its game is
+  gone: when Neural Forge (the app or the CLI) starts, and by `uninstall --purge`; never a running process's
+  (`proton_tool::sweep_dead_rings`). `doctor` reports a running game's ring of another version than the layer reads (a
+  copy with an older wrapper). An evaluate's record is written before NVIDIA's `EvaluateFeature` is called, so before
+  NGX records any of the evaluate's launches, on the same thread; once the call returned, the wrapper writes the same
+  record again with `KIND_END` (bit 16 of `api`; the API is the low 16 bits). Every launch of the evaluate lies between
+  the two.
 - **Only where the layer is on.** The wrapper is in every game a Neural Forge Proton runs, but it creates the ring
   only with `NEURAL_FORGE_ENABLE=1` (the layer's `enable_environment`), without `NEURAL_FORGE_DISABLE=1`, and not with
   `NEURAL_FORGE_NGX_RING=off`: the layer is the ring's only reader and the one that removes the file, so in any
@@ -114,6 +118,20 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
 - **Pre-exposure:** where the encode uses the game's exposure as it is, the paper white is multiplied by
   `DLSS.Pre.Exposure / DLSS.Exposure.Scale` (the colour input is the scene times the pre-exposure; DLSS scales the
   exposure image's value). Encode and decode read the same paper white, so the write-back stays exact.
+- **Subrect:** a game may hand DLSS larger images than it renders and say which part to read: the render size
+  (`DLSS.Render.Subrect.Dimensions`) at each input's base. Unreal Engine does (its scene textures are rounded up and
+  kept at the largest size asked for; Expedition 33 gave 1485x835 of a 1488x836 colour input, #51). The hold before the
+  upscaler then works on that rectangle alone (`ngx_ring::Record::crop`): it copies the colour input's rectangle from
+  its base, the motion vectors' and the depth's from theirs, runs the network and keeps its history at that size, and
+  writes back over the rectangle only, so nothing DLSS does not read is fed to the network or written. The split hold
+  works on the whole image, so it refuses such frames (`Hazard::Subrect`) and the hold inside DLSS's buffer takes them.
+  A rectangle outside the colour input refuses the hold; motion vectors or depth whose rectangle leaves their image are
+  not read. Their rectangle is the render size where the feature was created with `MVLowRes` or they are as large as the
+  colour input (Hogwarts Legacy's 2562x1441 motion vectors for a 2564x1444 colour input), else (high-resolution ones)
+  the feature's output size, at their base. The hold after DLSS works on the output's rectangle (the feature's output
+  size at `DLSS.Output.Subrect.Base`), with the render-size motion vectors from their base. A new rectangle size
+  (dynamic resolution) builds the hold's resources for it, as a new colour input size does. The log says the subrect
+  once per feature (`[ngx] DLSS (...) is given part of its inputs: ...`).
 - **HDR:** a record with `IsHDR` clear is said once in the log (the encode has no path for a display-referred input
   yet).
 

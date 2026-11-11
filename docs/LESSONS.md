@@ -1714,7 +1714,8 @@ Not built. A face pass would also need a detector with a licence that fits (SCRF
   launch parameters (DLSS_KERNEL_CATALOGUE.md lists words that may hold it, measured only where the image was the
   render size), so it cannot feed the network less than the image. The reporter saw it go with Auto; it should go
   with the fog. If it stays, `NEURAL_FORGE_PROBE_PARAMS=1` would show whether DLSS is given 1485x835 inside the
-  1488x836 image.
+  1488x836 image. (Later, November 11: the NGX records give the subrect, and the hold works on the rendered
+  rectangle alone; see "November 11: DLSS's subrect".)
 
 ## November 10: two vkd3d-proton games the hold missed (#51)
 
@@ -1915,6 +1916,41 @@ the fix (none reached a release):
   half, so only RG32F narrows; the reading covers a non-finite vector from any of them.
 - **Lesson:** a game's motion vectors can hold values no conversion keeps (NaN, beyond the half's range); every
   reader of the copy must agree on what such a vector means, and "no history" is the one that cannot smear.
+
+## November 11: DLSS's subrect (ring version 3)
+
+- **What was missing.** The NGX wrapper wrote `DLSS.Render.Subrect.Dimensions` into its records since 4.0, but the
+  layer never read it, nor where the rectangle starts in each image (`DLSS.Input.{Color,MV,Depth}.Subrect.Base`,
+  `DLSS.Output.Subrect.Base`, which the wrapper did not read). The hold worked on the whole colour input. Idea from
+  chooidos's OptiScaler fix (3zwr1/AMD-NR---OptiScaler PR #61): read the game's subrect and work on that alone; no
+  code taken from it.
+- **Who uses one.** Of the installed DLSS games, Cyberpunk 2077, GTA V Enhanced, Red Dead Redemption 2 and Crimson
+  Desert give DLSS the whole images (their wrapper logs: render size = colour input, every base 0). Hogwarts Legacy
+  (Unreal Engine 4) at 3840x2160 with DLSS Quality renders 2562x1441 into a 2564x1444 colour input (and 1707x960 into
+  1708x964 at 2560x1440), with render-size motion vectors in an image of exactly 2562x1441 (created with MVLowRes).
+  GTA San Andreas - The Definitive Edition (Unreal Engine 4, D3D11 through DXVK) at 4K renders 2228x1253 into a
+  2228x1256 colour input, with 3840x2160 motion vectors (high-resolution).
+  Unreal rounds its scene textures up and keeps them at the largest size asked for; Expedition 33 (#51) gave
+  1485x835 of 1488x836.
+- **What it did.** The network ran on the 2 columns and 3 rows DLSS never reads, whatever they held, and DLSS read
+  the network's answer next to them: the network's edges mixed them in. That is the likely cause of the line down
+  the right edge (above): 3 columns there in Expedition 33. And because Hogwarts' motion vectors (2562x1441) were
+  smaller than the colour input, 4.0 copied none of them at 4K: its holds had no motion for the history.
+- **Now.** The layer reads the render size and the bases (`ngx_ring::Record::crop`); the hold inside DLSS's buffer
+  copies the colour input's rectangle from its base, the motion vectors and depth from theirs, runs the network and
+  keeps its history at the rectangle's size, and writes back over the rectangle only. The split works on the whole
+  image, so it refuses such frames (`Hazard::Subrect`). Hogwarts Legacy, 4K, DLSS Quality, through Steam with this
+  build (2026-11-11): `[ngx] DLSS (Super Resolution, handle 1) is given part of its inputs: 2562x1441 of the
+  2564x1444 colour input`, `resources of the hold inside DLSS's buffer for 2562x1441 built`, held inside on every
+  frame with the motion vectors copied, 4328 holds, no miss, network 16.2 ms; the recording of its menu scene (the
+  character select) shows no edge line and nothing wrong at the right or bottom edge. Its HDR did not reach the window
+  on Proton Experimental's copy (no HDR colour space offered), so that run was SDR. GTA San Andreas DE, which the split held
+  before, is now held inside DLSS's buffer (D3D11 through DXVK) at 2228x1253, about 49 holds a second, no miss, the
+  motion vectors resampled from 3840x2160; in play the picture is right against the model switched off in the same
+  run. Its last two output rows are a little brighter with the model on and off alike: DLSS's or the game's, not the
+  hold's.
+- **Rule.** A game may hand DLSS larger images than it renders: read everything the game gives DLSS about which part
+  it reads, and never feed the network, or write, pixels DLSS does not read.
 
 ## Deliberately not done, or left open
 
