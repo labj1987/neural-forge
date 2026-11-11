@@ -38,7 +38,8 @@ chmod +x neural-forge-*-x86_64.AppImage && ./neural-forge-*-x86_64.AppImage
 ```
 
 Each start installs or updates the Vulkan layer under `~/.local/share/neural-forge` and
-`~/.local/share/vulkan/implicit_layer.d`. Nothing needs root.
+`~/.local/share/vulkan/implicit_layer.d`. Nothing needs root. To remove Neural Forge, use **Uninstall…** on the
+Setup tab: deleting only the AppImage file leaves the layer installed, and games keep loading it.
 
 Then extract the model on the Setup tab with **Extract from DLL**, or:
 

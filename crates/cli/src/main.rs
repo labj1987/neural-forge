@@ -34,8 +34,8 @@ fn usage_text() -> &'static str {
          \x20 uninstall [--purge]  remove unchanged tracked installed files; --purge also\n\
          \x20                     takes Neural Forge out of every game's Steam launch\n\
          \x20                     options (not while Steam runs) and removes its copies\n\
-         \x20                     of localconfig.vdf, config, data (the DLL, the model),\n\
-         \x20                     state and /tmp/neural-forge-$UID\n\
+         \x20                     of localconfig.vdf, its Proton builds, config, data\n\
+         \x20                     (the DLL, the model), state and /tmp/neural-forge-$UID\n\
          \x20 shmctl <sub>         raw status/set/toggle/capture against a running\n\
          \x20                     instance's live SHM header (see `shmctl help`)\n\
          \x20 profile <sub>        save/load/list/delete named settings profiles\n\
@@ -768,7 +768,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "extract-model" => "usage: neural-forge-cli extract-model DIR [--network full|small]\n  write the model directory from nvngx_dlssnr.dll (DIR holds it, or is the DLL): every network\n  the DLL carries, replacing what was extracted before. Build 310.9.16 carries two: full, the\n  71-block network every build has (stronger shading and depth), and small, 31 blocks (faster,\n  subtler); older builds have only full. --network extracts only that one and leaves the other\n  as it is. Which one runs is the Network setting (the Setup tab, `shmctl set network 0|1`; full\n  by default); a game already running switches to a newly chosen one at once, and picks up a\n  newly extracted model when it next starts",
         "install" => "usage: neural-forge-cli install --appdir DIR\n  install an extracted AppImage AppDir into persistent user storage",
         "uninstall" => {
-            "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also takes Neural Forge out of\n  every game's Steam launch options (it refuses, removing nothing, while Steam runs)\n  and removes its copies of each account's localconfig.vdf, config, data (the DLL,\n  the model), state and /tmp/neural-forge-$UID"
+            "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also takes Neural Forge out of\n  every game's Steam launch options (it refuses, removing nothing, while Steam runs)\n  and removes its copies of each account's localconfig.vdf, its own Proton builds\n  (compatibilitytools.d/*-NeuralForge), config, data (the DLL, the model), state and\n  /tmp/neural-forge-$UID"
         }
         "games" => "usage: neural-forge-cli games [--tested [GAME]]\n  list installed Steam games (appid, Neural Forge on/off, name, library, the executable\n  Neural Forge targets, the anti-cheat the game's folder ships, and whether it is a tested\n  game). --tested lists the tested games instead: where the model runs (with and without\n  Ray Reconstruction), HDR and the version each was last seen working in; with GAME (an\n  appid, or a part of a name) every fact about that game, its setup notes and known issues",
         "enable" => {
