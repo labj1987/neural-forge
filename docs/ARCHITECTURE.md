@@ -519,15 +519,22 @@ trip; PRE_UPSCALER_DESIGN.md, "Hand-off latency").
 **Depth.** With the edit cache on, every native hold copies DLSS's depth into a device-local buffer of
 the layer's at the render extent (`native::DepthCopy`), as the first command of `C`, timed alone
 (`depth_copy_gpu_ms` in the `[preupscale]` summary line); with it off nothing of depth is copied. Which
-depth (`Tracker::hold_depth`): the one the input launch names, where its layout is known and the launch
+depth (`Tracker::hold_depth`): for the split hold, the source of a copy the launch buffer makes into the
+one the input launch names before the launch (`vkCmdCopyImage`/`vkCmdCopyImage2` into a watched image are
+tracked per buffer, `Tracker::copy_source`); else the named one, where its layout is known and the launch
 buffer does not write it before the launch; else a depth image the launch buffer synchronizes reads of
-before the launch (the frame's depth it copies into DLSS's own); else the named one; else the
-identified one. A depth/stencil image after a barrier on one of its aspects only is not copied until
+before the launch (the frame's depth it copies into DLSS's own, as far as barriers tell); else the named
+one; else the identified one. The split hold reads the motion vectors and the exposure image the same
+way: the source of the launch buffer's copy into the named one before the launch, of the same shape,
+else the named one. A depth/stencil image after a barrier on one of its aspects only is not copied until
 a barrier on both says where they are, and the split hold copies only from the layouts
 `depth_copy_layout` takes, as the hold inside DLSS's buffer. GTA V Enhanced
 alternates two depth images frame by frame and copies the frame's one into a ring of three that
-DLSS reads, inside the launch buffer: the identified image held the previous frame's depth on every
-other hold, and the ring's image is written after the hold. The split hold copies the chosen
+DLSS reads, inside the launch buffer, and its motion vectors (one image) likewise into a ring of three,
+with no barrier on the rings' images there: the identified image held the previous frame's depth on every
+other hold, and the ring's image is written after the hold. Once the rings' layouts were known from
+earlier frames, 4.0's split hold read the named ring images, three frames old, and the edit cache
+rejected all of a cached hold's history (2026-11-11). The split hold copies the chosen
 image's depth aspect; the hold inside DLSS's buffer copies it into its staging buffer there (in a
 layout `depth_copy_layout` takes) and its `C`, in the same buffer, copies that over. The texels stay raw, tagged
 with the game's format: 4 bytes (D32, D24 with its top byte, depth handed over as R32), or 2 for D16.

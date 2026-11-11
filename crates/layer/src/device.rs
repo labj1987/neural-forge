@@ -2468,6 +2468,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         regions: &[vk::ImageCopy],
     ) -> LayerResult<()> {
         crate::probe_ngx::on_cmd_transfer(command_buffer, "copy", Some((src, src_layout)), Some((dst, dst_layout)));
+        if let Some(t) = self.preupscale.as_ref() {
+            t.copy(command_buffer, src, dst);
+        }
         self.observe_swapchain_write("copy", command_buffer, src, src_layout, dst, dst_layout, regions.len(), TapWrite::from_copy(regions));
         LayerResult::Unhandled
     }
@@ -3618,6 +3621,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             Some((info.src_image, info.src_image_layout)),
             Some((info.dst_image, info.dst_image_layout)),
         );
+        if let Some(t) = self.preupscale.as_ref() {
+            t.copy(command_buffer, info.src_image, info.dst_image);
+        }
         LayerResult::Unhandled
     }
 
