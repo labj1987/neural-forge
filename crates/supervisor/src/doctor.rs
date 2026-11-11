@@ -942,8 +942,10 @@ fn compare_exports(core: &Path, ours: Option<&[String]>) -> Vec<Finding> {
         )];
     };
     let list = |names: &[&String]| names.iter().take(8).map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+    // The wrapper's own `DllMain` is exported by the toolchain; it is the DLL's entry point, not an NGX function.
     let not_forwarded: Vec<&String> = theirs.iter().filter(|n| !ours.contains(n)).collect();
-    let (hooked_gone, stubbed): (Vec<&String>, Vec<&String>) = ours.iter().filter(|n| !theirs.contains(n)).partition(|n| HOOKED.contains(&n.as_str()));
+    let (hooked_gone, stubbed): (Vec<&String>, Vec<&String>) =
+        ours.iter().filter(|n| n.as_str() != "DllMain" && !theirs.contains(n)).partition(|n| HOOKED.contains(&n.as_str()));
     let mut out = Vec::new();
     if !hooked_gone.is_empty() {
         out.push(Finding::new(
@@ -1638,6 +1640,10 @@ mod tests {
         assert!(v[0].summary.contains("does not load") && v[0].evidence.ends_with(hooked[0]), "{v:#?}");
         std::fs::write(&core, pe(&hooked)).unwrap();
         let v = compare_exports(&core, Some(&ours[..hooked.len()]));
+        assert_eq!((v.len(), v[0].severity), (1, Severity::Ok), "{v:#?}");
+        // The wrapper's own DllMain export is its entry point, not an NGX function the core should have.
+        let with_entry: Vec<String> = ours[..hooked.len()].iter().cloned().chain(["DllMain".to_string()]).collect();
+        let v = compare_exports(&core, Some(&with_entry));
         assert_eq!((v.len(), v[0].severity), (1, Severity::Ok), "{v:#?}");
         assert_eq!(compare_exports(&core, None)[0].severity, Severity::Failure, "an unreadable wrapper");
     }
