@@ -234,10 +234,17 @@ takes is withdrawn after 5 seconds.
 
 To run the model before or after DLSS the layer needs what the game gave DLSS: its input and output images, the camera
 jitter, how the motion vectors are measured, a reset, the exposure. Games run with a **Neural Forge copy of Proton**
-hand the layer exactly that, by name (docs/PROTON_NGX.md). A DLSS game without one keeps the model off before and
-after DLSS; the finished-frame placement still works.
+hand the layer exactly that, by name (docs/PROTON_NGX.md). A DLSS game without one keeps the model off (the status
+and `doctor` say so), unless you choose the finished frame as the placement; games without DLSS run on the finished
+frame as before.
 
-The Setup tab lists your installed Protons (GE-Proton, Proton-CachyOS, Valve's Proton and Proton Experimental) with
+**Switching a game on sets its Proton.** With Steam closed, switching a game on in the Setup tab (or `neural-forge-cli
+enable GAME`) also sets the game's Steam compatibility tool to a Neural Forge copy of the Proton it runs with (of
+Steam's default, else Proton Experimental), making the copy first if there is none; switching it off (or `uninstall
+--purge`) puts back the Proton it had. Neural Forge edits Steam's `config/config.vdf` for this the way ProtonPlus and
+ProtonUp-Qt do, only while Steam is closed, with a backup beside it. Restart Steam after a new copy was made.
+
+The Setup tab also lists your installed Protons (GE-Proton, Proton-CachyOS, Valve's Proton and Proton Experimental) with
 **Make copy**. The copy is made next to the original in Steam's `compatibilitytools.d`, named `<version>-NeuralForge`
 (`GE-Proton11-12-NeuralForge`); on the same drive it takes no space (hard links). It differs from the original in one
 thing: NVIDIA's NGX core (`_nvngx.dll`) is reached through Neural Forge's small wrapper, which passes every DLSS call on

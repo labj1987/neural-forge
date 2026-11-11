@@ -92,10 +92,12 @@ A game whose folder ships anti-cheat (Easy Anti-Cheat, BattlEye and others) asks
 on. Neural Forge does not hide its layer from anti-cheat: the game may refuse to start or go online
 with it, and the anti-cheat can ban the account, most of all in online play.
 
-Optionally, the Setup tab's **Proton with DLSS parameters** makes a copy of your GE-Proton, Proton-CachyOS or
-Proton Experimental (`<version>-NeuralForge`, no extra space on the same drive) that lets Neural Forge read what the
-game hands DLSS directly instead of working it out. Restart Steam and choose the copy in the game's Properties >
-Compatibility; your own Proton is not changed. Use it for single-player games: anti-cheat may refuse it.
+DLSS games need a **Neural Forge copy of Proton** (`<version>-NeuralForge`, made from your GE-Proton, Proton-CachyOS
+or Proton Experimental, no extra space on the same drive): switching a game on with Steam closed sets it as the game's
+Proton for you (the Setup tab's **Proton with DLSS parameters** manages the copies). It lets Neural Forge read what the
+game hands DLSS by name. Without it the model stays off in a DLSS game (the Status tab says why); games without DLSS
+run on the finished frame. Restart Steam after a copy is made; your own Proton is not changed. Use it for single-player
+games: anti-cheat may refuse it.
 
 After an update, restart the game: the layer and the app must be the same version.
 
