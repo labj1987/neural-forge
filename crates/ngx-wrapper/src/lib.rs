@@ -11,6 +11,7 @@
 
 pub mod exports;
 pub mod ring;
+pub mod rules;
 
 #[cfg(windows)]
 mod hooks;

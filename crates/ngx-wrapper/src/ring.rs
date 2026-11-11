@@ -1,11 +1,20 @@
 //! The record format the wrapper writes and the Neural Forge layer reads (`crates/layer/src/ngx_ring.rs` parses the
 //! same bytes; both sides test the offsets). One file per process, `/dev/shm/neural-forge-ngx-<pid>.ring` (the
 //! Linux pid, which the layer gets from `getpid()` and the wrapper from Wine's `ProcessWineUnixPid`), mapped by both.
+//! `/dev/shm` because both sides reach it without agreeing on anything else: Wine maps `Z:\dev\shm` to the host's,
+//! and Steam's pressure-vessel container shares the host's `/dev/shm` in every runtime; `XDG_RUNTIME_DIR` is not
+//! reliably the same directory inside the Steam runtime. The wrapper creates the file only where the layer is on
+//! ([`crate::rules::ring_wanted`]); the layer removes it once mapped.
 //!
 //! Header (32 bytes): magic `NFNGXRG1`, version, record size, record count, pid, then the number of records
 //! reserved so far (u64). Record `n` (0-based) lives in slot `n % count` after the header. A writer reserves `n`
 //! with an atomic add, sets the slot's `seq` to 0, writes the fields, then sets `seq` to `n + 1` (release); a
 //! reader takes a slot only while its `seq` reads `n + 1` before and after copying it.
+//!
+//! Writers never wait on the reader. With no reader, or a slow one, the writer laps it, overwriting the oldest
+//! records (the file never grows). A slot whose `seq` is still 0 (its writer between reserving and finishing) stops
+//! the reader there until its next poll; once the writer has reserved [`SLOTS`] records past it, the reader jumps
+//! ahead and that record is lost, never misread. A slot overwritten while being copied fails the `seq` check.
 //!
 //! Each evaluate writes two records: one before NVIDIA's `EvaluateFeature` is called (before NGX records any of the
 //! evaluate's launches) and, once that call returned, the same record again with [`KIND_END`] in `api`. Every CUDA
