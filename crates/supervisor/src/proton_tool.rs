@@ -259,7 +259,9 @@ fn wine_version_in(b: &[u8]) -> Option<(u32, u32)> {
     while let Some(k) = b.get(from..)?.windows(5).position(|w| w == b"wine-") {
         let at = from + k;
         from = at + 5;
-        if at > 0 && b[at - 1] != 0 {
+        // Not inside a longer word (`libwine-`): ntdll.so's string can follow table bytes rather than a NUL (GE-Proton11's
+        // `wine-11.0 (Staging)` follows 0x80).
+        if at > 0 && (b[at - 1].is_ascii_alphanumeric() || matches!(b[at - 1], b'-' | b'_' | b'.' | b'/')) {
             continue;
         }
         let Some((major, dot)) = number(at + 5) else { continue };
@@ -860,6 +862,7 @@ mod tests {
         assert!(tools(&root).is_empty() && leftovers(&root).is_empty(), "nothing is left of a refused copy");
         assert_eq!(wine_version_in(b"\0wine-10.12\0"), Some((10, 12)));
         assert_eq!(wine_version_in(b"libwine-1.0\0wine-x\0"), None, "only a string that starts with it");
+        assert_eq!(wine_version_in(b"\x08\x80\x80wine-11.0 (Staging)\0"), Some((11, 0)), "GE-Proton11-12: after table bytes, not a NUL");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
