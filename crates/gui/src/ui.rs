@@ -2593,6 +2593,7 @@ fn build_setup_page(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
     let (launch_group, fill_launch) = build_launch_option_group();
     page.add(&games_group);
     page.add(&launch_group);
+    page.add(&build_proton_group(toasts));
     let fill = std::rc::Rc::new(move |scan: &SteamScan| {
         fill_games(scan);
         fill_launch(scan);
@@ -2614,6 +2615,154 @@ fn build_setup_page(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
     scan(None);
     refresh.connect_clicked(move |button| scan(Some(button.clone())));
     page
+}
+
+/// What the Proton group lists: copies can be made from `sources`; `tools` are the copies, each with whether its
+/// source changed since.
+struct ProtonScan {
+    root: Option<std::path::PathBuf>,
+    sources: Vec<neural_forge_supervisor::proton_tool::Source>,
+    tools: Vec<(neural_forge_supervisor::proton_tool::Tool, bool)>,
+}
+
+fn scan_protons() -> ProtonScan {
+    use neural_forge_supervisor::{proton_tool, steam};
+    let Some(root) = steam::roots().into_iter().find(|r| !r.flatpak).map(|r| r.path) else {
+        return ProtonScan { root: None, sources: Vec::new(), tools: Vec::new() };
+    };
+    let libraries = steam::libraries(&root);
+    let tools: Vec<(proton_tool::Tool, bool)> = proton_tool::tools(&root).into_iter().map(|t| (t.clone(), proton_tool::outdated(&t))).collect();
+    // A source whose current copy exists is not offered again.
+    let sources = proton_tool::sources(&root, &libraries).into_iter().filter(|s| !tools.iter().any(|(t, _)| t.name == s.tool_name())).collect();
+    ProtonScan { root: Some(root), sources, tools }
+}
+
+/// "Proton with DLSS's parameters": copies of installed Protons that load the NGX wrapper
+/// (`neural_forge_supervisor::proton_tool`), made and removed here, with the notice (Alex 2026-11-10: a clear
+/// notice, nothing blocked).
+fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+    use neural_forge_supervisor::proton_tool;
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Proton with DLSS parameters");
+    group.set_description(Some(proton_tool::NOTICE));
+    let rows: std::rc::Rc<std::cell::RefCell<Vec<adw::ActionRow>>> = std::rc::Rc::default();
+    type Refill = std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>;
+    let refill: Refill = std::rc::Rc::default();
+    let fill = {
+        let (group, rows, toasts, refill) = (group.clone(), rows.clone(), toasts.clone(), refill.clone());
+        move |scan: ProtonScan| {
+            for row in rows.borrow_mut().drain(..) {
+                group.remove(&row);
+            }
+            let Some(root) = scan.root else {
+                let row = adw::ActionRow::new();
+                row.set_title("No native Steam installation found");
+                group.add(&row);
+                rows.borrow_mut().push(row);
+                return;
+            };
+            for (tool, outdated) in &scan.tools {
+                let row = adw::ActionRow::new();
+                row.set_use_markup(false);
+                row.set_title(&tool.name);
+                row.set_subtitle(&if *outdated {
+                    format!("from {}, which has changed since: make it again, choose the new copy for your games, then remove this one", tool.source.display())
+                } else {
+                    format!("from {}", tool.source.display())
+                });
+                if *outdated {
+                    let again = gtk4::Button::with_label("Make again");
+                    again.set_valign(gtk4::Align::Center);
+                    let (root, source, toasts, refill) = (root.clone(), tool.source.clone(), toasts.clone(), refill.clone());
+                    again.connect_clicked(move |b| {
+                        b.set_sensitive(false);
+                        let (root, source, toasts, refill) = (root.clone(), source.clone(), toasts.clone(), refill.clone());
+                        glib::spawn_future_local(async move {
+                            let done = gio::spawn_blocking(move || {
+                                let libs = neural_forge_supervisor::steam::libraries(&root);
+                                let s = proton_tool::sources(&root, &libs).into_iter().find(|s| s.dir == source).ok_or("its source is gone".to_string())?;
+                                proton_tool::create(&root, &s, &proton_tool::installed_wrapper())
+                                    .map(|m| format!("Made {}: restart Steam to see it", m.tool.name))
+                            })
+                            .await;
+                            toasts.add_toast(toast(
+                                &done.unwrap_or_else(|_| Err("the worker stopped".into())).unwrap_or_else(|e| format!("Could not make the copy: {e}")),
+                            ));
+                            if let Some(f) = refill.borrow().clone() {
+                                f();
+                            }
+                        });
+                    });
+                    row.add_suffix(&again);
+                }
+                let remove = gtk4::Button::with_label("Remove");
+                remove.set_valign(gtk4::Align::Center);
+                remove.add_css_class("destructive-action");
+                let (root_r, name, toasts_r, refill_r) = (root.clone(), tool.name.clone(), toasts.clone(), refill.clone());
+                remove.connect_clicked(move |b| {
+                    b.set_sensitive(false);
+                    let (root, name, toasts, refill) = (root_r.clone(), name.clone(), toasts_r.clone(), refill_r.clone());
+                    glib::spawn_future_local(async move {
+                        let done = gio::spawn_blocking(move || {
+                            proton_tool::remove(&root, &name).map(|t| format!("Removed {}: games set to it need another Proton in Steam", t.name))
+                        })
+                        .await;
+                        toasts.add_toast(toast(
+                            &done.unwrap_or_else(|_| Err("the worker stopped".into())).unwrap_or_else(|e| format!("Could not remove it: {e}")),
+                        ));
+                        if let Some(f) = refill.borrow().clone() {
+                            f();
+                        }
+                    });
+                });
+                row.add_suffix(&remove);
+                group.add(&row);
+                rows.borrow_mut().push(row);
+            }
+            for source in &scan.sources {
+                let row = adw::ActionRow::new();
+                row.set_use_markup(false);
+                row.set_title(&source.display);
+                row.set_subtitle(&format!("{} in {}", source.version, source.dir.display()));
+                let make = gtk4::Button::with_label("Make copy");
+                make.set_valign(gtk4::Align::Center);
+                make.set_tooltip_text(Some(&format!("Make {} (see the notice above)", source.tool_name())));
+                let (root_m, source, toasts_m, refill_m) = (root.clone(), source.clone(), toasts.clone(), refill.clone());
+                make.connect_clicked(move |b| {
+                    b.set_sensitive(false);
+                    let (root, source, toasts, refill) = (root_m.clone(), source.clone(), toasts_m.clone(), refill_m.clone());
+                    glib::spawn_future_local(async move {
+                        let done = gio::spawn_blocking(move || {
+                            proton_tool::create(&root, &source, &proton_tool::installed_wrapper())
+                                .map(|m| format!("Made {}: restart Steam, then choose it for a game in its Properties > Compatibility", m.tool.name))
+                        })
+                        .await;
+                        toasts.add_toast(toast(
+                            &done.unwrap_or_else(|_| Err("the worker stopped".into())).unwrap_or_else(|e| format!("Could not make the copy: {e}")),
+                        ));
+                        if let Some(f) = refill.borrow().clone() {
+                            f();
+                        }
+                    });
+                });
+                row.add_suffix(&make);
+                group.add(&row);
+                rows.borrow_mut().push(row);
+            }
+        }
+    };
+    let fill = std::rc::Rc::new(fill);
+    let rescan: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+        let fill = fill.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(scan) = gio::spawn_blocking(scan_protons).await {
+                fill(scan);
+            }
+        });
+    });
+    *refill.borrow_mut() = Some(rescan.clone());
+    rescan();
+    group
 }
 
 /// One sample of the graph's two series: how long a frame took and how much of it the model's network took on

@@ -56,7 +56,10 @@ fn usage_text() -> &'static str {
          \x20 report [--appid ID]  write a diagnostic report zip to the desktop (home, user\n\
          \x20                     and host names redacted; it lists your installed Steam\n\
          \x20                     games and their library folders); ID: the game's Steam\n\
-         \x20                     app id, for its Proton version"
+         \x20                     app id, for its Proton version\n\
+         \x20 proton-tool [list|create SOURCE|update|remove NAME]\n\
+         \x20                     make a copy of an installed Proton that hands Neural\n\
+         \x20                     Forge DLSS's own parameters (see `proton-tool --help`)"
 }
 
 fn profile_usage() {
@@ -547,8 +550,18 @@ enum Command {
     Disable(String),
     /// The Steam app id, when given.
     Report(Option<String>),
+    ProtonTool(ProtonToolCmd),
     /// `--help`/`-h`: the whole usage (`None`) or one command's.
     Help(Option<String>),
+}
+
+/// `proton-tool`'s subcommands.
+#[derive(Debug, PartialEq, Eq)]
+enum ProtonToolCmd {
+    List,
+    Create(String),
+    Update,
+    Remove(String),
 }
 
 /// Why a command line was refused: printed with the matching usage, exit code 2.
@@ -680,6 +693,14 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
             ["--appid", _, extra @ ..] => Err(unexpected(extra)),
             [other, ..] => Err(err(format!("unknown option {other:?}"))),
         },
+        "proton-tool" => match rest.as_slice() {
+            [] | ["list"] => Ok(Command::ProtonTool(ProtonToolCmd::List)),
+            ["update"] => Ok(Command::ProtonTool(ProtonToolCmd::Update)),
+            ["create", source @ ..] if !source.is_empty() => Ok(Command::ProtonTool(ProtonToolCmd::Create(source.join(" ")))),
+            ["remove", name @ ..] if !name.is_empty() => Ok(Command::ProtonTool(ProtonToolCmd::Remove(name.join(" ")))),
+            ["create" | "remove"] => Err(err(format!("{} takes a name", rest[0]))),
+            _ => Err(err(format!("unexpected arguments: {}", rest.join(" ")))),
+        },
         _ => unreachable!("command_usage knows every command"),
     }
 }
@@ -695,7 +716,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "extract-model" => "usage: neural-forge-cli extract-model DIR [--network full|small]\n  write the model directory from nvngx_dlssnr.dll (DIR holds it, or is the DLL): every network\n  the DLL carries, replacing what was extracted before. Build 310.9.16 carries two: full, the\n  71-block network every build has (stronger shading and depth), and small, 31 blocks (faster,\n  subtler); older builds have only full. --network extracts only that one and leaves the other\n  as it is. Which one runs is the Network setting (the Setup tab, `shmctl set network 0|1`; full\n  by default); a game already running switches to a newly chosen one at once, and picks up a\n  newly extracted model when it next starts",
         "install" => "usage: neural-forge-cli install --appdir DIR\n  install an extracted AppImage AppDir into persistent user storage",
         "uninstall" => {
-            "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also takes Neural Forge out of\n  every game's Steam launch options (it refuses, removing nothing, while Steam runs)\n  and removes its copies of each account's localconfig.vdf, config, data (the DLL,\n  the model), state and /tmp/neural-forge-$UID"
+            "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also takes Neural Forge out of\n  every game's Steam launch options (it refuses, removing nothing, while Steam runs)\n  and removes its copies of each account's localconfig.vdf, config, data (the DLL,\n  the model), state, /tmp/neural-forge-$UID and the Proton copies `proton-tool` made"
         }
         "games" => "usage: neural-forge-cli games\n  list installed Steam games (appid, Neural Forge on/off, name, library, the executable\n  Neural Forge targets, and the anti-cheat the game's folder ships)",
         "enable" => {
@@ -704,6 +725,18 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "disable" => "usage: neural-forge-cli disable GAME\n  take Neural Forge back out of GAME's Steam launch options (see `enable --help`)",
         "report" => {
             "usage: neural-forge-cli report [--appid ID]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game and its Proton -- found from the game the channel names, or\n  from ID, its Steam app id -- and the doctor's findings, which list your installed Steam\n  games and their library folders, and of a game's launch options only Neural Forge's\n  part), config.ini, the model's manifest, the layer's logs,\n  this boot's GPU fault (Xid) lines, the channel's status and the newest capture pair.\n  The home directory, user name and host name are replaced with ~, <user> and <host>;\n  nothing is uploaded"
+        }
+        "proton-tool" => {
+            "usage: neural-forge-cli proton-tool [list | create SOURCE | update | remove NAME]\n  \
+             list: the Protons a copy can be made from and the copies Neural Forge made (outdated ones marked).\n  \
+             create SOURCE: copy the installed Proton SOURCE (its name in Steam, its version name or its folder)\n  \
+             into Steam's compatibilitytools.d as <version>-NeuralForge: hard links on the same drive, with\n  \
+             Neural Forge's NGX wrapper as _nvngx.dll so the layer reads DLSS's own parameters. Restart Steam,\n  \
+             then choose it per game in Properties > Compatibility. PROTON_NO_NEURAL_FORGE_NGX=1 in a game's\n  \
+             launch options turns the wrapper off for that game.\n  \
+             update: make every outdated copy again from its source's current version (a copy of a new\n  \
+             version gets a new name; choose it for the game again, then remove the old one).\n  \
+             remove NAME: delete a copy Neural Forge made"
         }
         "shmctl" => "",
         "profile" => "",
@@ -719,6 +752,91 @@ fn print_help(command: Option<&str>) {
         Some("profile") => profile_usage(),
         Some("game-settings") => game_settings::usage(),
         Some(command) => eprintln!("{}", command_usage(command).unwrap_or_default()),
+    }
+}
+
+/// `proton-tool` ([`neural_forge_supervisor::proton_tool`]) on the native Steam root.
+fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
+    use neural_forge_supervisor::{proton_tool, steam};
+    let Some(root) = steam::roots().into_iter().find(|r| !r.flatpak) else {
+        eprintln!("no native Steam installation found (the Flatpak build cannot load the layer)");
+        return ExitCode::FAILURE;
+    };
+    let root = &root.path;
+    let libraries = steam::libraries(root);
+    let wrapper = proton_tool::installed_wrapper();
+    match sub {
+        ProtonToolCmd::List => {
+            println!("Protons a copy can be made from:");
+            for s in proton_tool::sources(root, &libraries) {
+                println!("  {} ({}) in {}", s.display, s.version, s.dir.display());
+            }
+            println!("Copies made by Neural Forge:");
+            for t in proton_tool::tools(root) {
+                println!("  {}{} from {}", t.name, if proton_tool::outdated(&t) { " (outdated: `proton-tool update`)" } else { "" }, t.source.display());
+            }
+            ExitCode::SUCCESS
+        }
+        ProtonToolCmd::Create(query) => {
+            let sources = proton_tool::sources(root, &libraries);
+            let q = query.to_lowercase();
+            let names = |s: &proton_tool::Source| {
+                [s.display.to_lowercase(), s.version.to_lowercase(), s.dir.file_name().map_or(String::new(), |n| n.to_string_lossy().to_lowercase())]
+            };
+            let hits: Vec<&proton_tool::Source> = sources.iter().filter(|s| names(s).contains(&q)).collect();
+            let [source] = hits.as_slice() else {
+                eprintln!("{} Proton(s) match {query:?}; `proton-tool list` shows their names", hits.len());
+                return ExitCode::FAILURE;
+            };
+            println!("{}\n", proton_tool::NOTICE);
+            match proton_tool::create(root, source, &wrapper) {
+                Ok(made) => {
+                    let copied = if made.copied > 0 { format!(" ({} MB copied: another drive)", made.copied >> 20) } else { String::new() };
+                    let verb = if made.replaced { "Made again:" } else { "Made" };
+                    println!(
+                        "{verb} {} from {}{copied}. Restart Steam, then choose it per game in Properties > Compatibility.",
+                        made.tool.name, source.display
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("could not make the copy: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProtonToolCmd::Update => {
+            let mut failed = false;
+            for t in proton_tool::tools(root).into_iter().filter(proton_tool::outdated) {
+                let source = proton_tool::sources(root, &libraries).into_iter().find(|s| s.dir == t.source);
+                match source.map(|s| proton_tool::create(root, &s, &wrapper)) {
+                    Some(Ok(made)) => println!("{}: made {} from the current version", t.name, made.tool.name),
+                    Some(Err(e)) => {
+                        failed = true;
+                        eprintln!("{}: {e}", t.name);
+                    }
+                    None => {
+                        failed = true;
+                        eprintln!("{}: its source {} is gone; remove it with `proton-tool remove`", t.name, t.source.display());
+                    }
+                }
+            }
+            if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        ProtonToolCmd::Remove(name) => match proton_tool::remove(root, &name) {
+            Ok(t) => {
+                println!("Removed {}. Games set to it need another Proton chosen in Steam.", t.name);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
@@ -751,6 +869,7 @@ fn main() -> ExitCode {
         }
         Command::Disable(game) => cmd_set_game(&game, neural_forge_supervisor::steam::Action::Disable, false),
         Command::Report(appid) => cmd_report(appid.as_deref()),
+        Command::ProtonTool(sub) => cmd_proton_tool(sub),
         Command::Help(command) => {
             print_help(command.as_deref());
             ExitCode::SUCCESS
@@ -772,6 +891,20 @@ mod tests {
         assert!(!overview.contains("default: small"), "extract-model has no choice of default: it writes every network");
         assert!(overview.contains("every network the DLL carries"), "{overview}");
         assert!(command_usage("extract-model").unwrap().contains("every network\n  the DLL carries"));
+    }
+
+    #[test]
+    fn proton_tool_takes_a_subcommand() {
+        assert_eq!(parse_str("proton-tool"), Ok(Command::ProtonTool(ProtonToolCmd::List)));
+        assert_eq!(parse_str("proton-tool create Proton-GE Latest"), Ok(Command::ProtonTool(ProtonToolCmd::Create("Proton-GE Latest".into()))));
+        assert_eq!(
+            parse_str("proton-tool remove GE-Proton11-12-NeuralForge"),
+            Ok(Command::ProtonTool(ProtonToolCmd::Remove("GE-Proton11-12-NeuralForge".into())))
+        );
+        assert_eq!(parse_str("proton-tool update"), Ok(Command::ProtonTool(ProtonToolCmd::Update)));
+        assert!(parse_str("proton-tool create").is_err());
+        assert!(parse_str("proton-tool wipe").is_err());
+        assert_eq!(parse_str("proton-tool --help"), Ok(Command::Help(Some("proton-tool".into()))));
     }
 
     #[test]

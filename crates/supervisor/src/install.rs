@@ -137,7 +137,7 @@ pub struct InstallReport {
     pub cli_path: PathBuf,
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(crate) fn digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     // Lowercase hex, as Python's hexdigest() writes it (sha2 0.11's output has no LowerHex).
@@ -549,6 +549,25 @@ fn purge_in(steam_roots: &[crate::steam::Root], steam_running: bool) -> std::io:
         for file in steam::our_localconfig_siblings(&root.path) {
             std::fs::remove_file(&file)?;
             purged.removed.push(file);
+        }
+    }
+    // The Proton copies made for the NGX wrapper (`proton_tool`), and rings its wrapper left in /dev/shm where the
+    // layer never opened them.
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    for root in steam_roots {
+        for tool in crate::proton_tool::tools(&root.path) {
+            std::fs::remove_dir_all(&tool.dir)?;
+            purged.removed.push(tool.dir);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/dev/shm") {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("neural-forge-ngx-") && name.ends_with(".ring") && e.metadata().is_ok_and(|m| std::os::unix::fs::MetadataExt::uid(&m) == uid) {
+                let _ = std::fs::remove_file(e.path());
+                purged.removed.push(e.path());
+            }
         }
     }
 
