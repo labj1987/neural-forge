@@ -125,7 +125,8 @@ pub fn source_for(root: &Path, libraries: &[PathBuf], appid: &str) -> Result<Sou
 }
 
 /// Sets `appid`'s Proton to a Neural Forge copy: the game's own Proton's copy (made now when there is none, made
-/// again when its source changed, its wrapper renewed when Neural Forge's changed), or the one already chosen.
+/// again when its source changed, its wrapper renewed when Neural Forge's changed), or the one already chosen (kept
+/// as it is, its wrapper renewed, when its source is gone: it holds its own files).
 /// `Ok(None)` for a native Linux game with no Proton chosen: it runs without Proton, where the wrapper does not
 /// apply. Refused while Steam runs, and for a game whose installed build cannot be told. The game's earlier choice
 /// is recorded (before `config.vdf` is edited) for [`switch_off`].
@@ -246,9 +247,13 @@ fn games_on(root: &Path, tool: impl Fn(&str) -> bool) -> Vec<String> {
 /// Takes every game still set to one of Neural Forge's copies (one the user chose by hand, or whose record is
 /// lost) off it before the copies go (uninstall --purge): its entry removed, so Steam's default applies. The
 /// games. Refused while Steam runs and a game is on a copy.
+///
+/// A copy is one of [`proton_tool::tools`] (marked as Neural Forge's), or a `-NeuralForge` name whose folder is no
+/// longer there (removed already); never another tool that exists under such a name.
 pub fn forget_copies(root: &Path, steam_running: bool) -> Result<Vec<String>, String> {
     let names: Vec<String> = proton_tool::tools(root).into_iter().map(|t| t.name).collect();
-    let apps = games_on(root, |n| names.iter().any(|m| m == n) || n.ends_with(proton_tool::SUFFIX));
+    let dir = proton_tool::tools_dir(root);
+    let apps = games_on(root, |n| names.iter().any(|m| m == n) || (n.ends_with(proton_tool::SUFFIX) && !dir.join(n).exists()));
     if apps.is_empty() {
         return Ok(apps);
     }
@@ -274,7 +279,8 @@ pub struct Updated {
     pub kept: Option<String>,
 }
 
-/// Updates `tool` (`proton-tool update`, Make again): the new wrapper put in when only that changed; else the copy
+/// Updates `tool` (`proton-tool update`, Make again): the new wrapper put in when only that changed, or when its
+/// source is gone (the copy keeps working as it is); else the copy
 /// made again from its source's current version, and when that is a new name, every game set to the old copy
 /// moved to the new one and the old copy removed (both only while Steam is closed, and never a copy a game runs
 /// with).
@@ -452,6 +458,36 @@ mod tests {
         assert_eq!(current(&root, "1091500"), None);
         assert_eq!(current(&root, "0").as_deref(), Some("proton_experimental"), "the rest stays");
         assert!(forget_copies(&root, false).unwrap().is_empty());
+        // A foreign tool with the suffix that exists stays; a suffix name whose folder is gone is ours, removed.
+        std::fs::create_dir_all(root.join("compatibilitytools.d/Other-NeuralForge")).unwrap();
+        edit(&root, |old| set_name(old, "10", "Other-NeuralForge")).unwrap();
+        edit(&root, |old| set_name(old, "20", "Gone-NeuralForge")).unwrap();
+        assert_eq!(forget_copies(&root, false).unwrap(), ["20"]);
+        assert_eq!(current(&root, "10").as_deref(), Some("Other-NeuralForge"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A copy whose source folder was deleted (ProtonUp replaced GE-Proton11-12 with 11-13) keeps working: switching
+    /// a game on and updating keep it and renew its wrapper, never refuse.
+    #[test]
+    fn a_copy_whose_source_is_gone_is_kept() {
+        let (root, lib, w) = steam("gone");
+        let libs = std::slice::from_ref(&lib);
+        switch_on(&root, libs, "1091500", &w, false).unwrap().unwrap();
+        let t = proton_tool::tools(&root).remove(0);
+        std::fs::remove_dir_all(root.join("compatibilitytools.d/Proton-GE Latest")).unwrap();
+        assert!(proton_tool::source_gone(&t) && !proton_tool::source_changed(&t));
+        std::fs::write(&w, [std::fs::read(&w).unwrap(), vec![1]].concat()).unwrap();
+        let on = switch_on(&root, libs, "1091500", &w, false).unwrap().unwrap();
+        assert_eq!((on.tool.as_str(), on.made), ("GE-Proton11-12-NeuralForge", false));
+        assert!(!proton_tool::wrapper_changed(&proton_tool::tools(&root)[0], &w), "the wrapper renewed");
+        std::fs::write(&w, [std::fs::read(&w).unwrap(), vec![2]].concat()).unwrap();
+        let procs = root.join("proc");
+        std::fs::create_dir_all(&procs).unwrap();
+        let t = proton_tool::tools(&root).remove(0);
+        let up = update_in(&root, libs, &t, &w, false, &procs).unwrap();
+        assert_eq!((up.from.as_str(), up.to.as_str(), up.kept), (t.name.as_str(), t.name.as_str(), None));
+        assert!(t.dir.is_dir() && !proton_tool::wrapper_changed(&proton_tool::tools(&root)[0], &w));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

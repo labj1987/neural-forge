@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ash::vk;
 use ash::vk::Handle;
@@ -314,6 +314,31 @@ static STATE: Mutex<State> = Mutex::new(State { ring: None, looked: None, said: 
 /// How often a missing ring is looked for again (the wrapper creates it when NGX loads, after the game's device).
 const LOOK_EVERY: Duration = Duration::from_secs(1);
 
+/// When this process started: `/proc/self/stat`'s start time (clock ticks after boot) after `/proc/stat`'s `btime`.
+fn process_start() -> Option<SystemTime> {
+    static START: std::sync::OnceLock<Option<SystemTime>> = std::sync::OnceLock::new();
+    *START.get_or_init(|| {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let btime = std::fs::read_to_string("/proc/stat").ok()?.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())?;
+        // SAFETY: sysconf has no preconditions.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        start_from(&stat, btime, u64::try_from(hz).ok()?)
+    })
+}
+
+/// The start time in a `/proc/<pid>/stat` line (field 22, counted after the command name in parentheses, which may
+/// hold spaces and parentheses itself) as a wall-clock time, given the boot time and the clock ticks per second.
+fn start_from(stat: &str, btime: u64, hz: u64) -> Option<SystemTime> {
+    let ticks: u64 = stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()?;
+    (hz > 0).then(|| UNIX_EPOCH + Duration::from_secs(btime) + Duration::from_millis(ticks.saturating_mul(1000) / hz))
+}
+
+/// Whether a ring last changed at `modified` predates a process started at `started` (`btime` is whole seconds:
+/// a second's slack).
+fn stale(modified: SystemTime, started: SystemTime) -> bool {
+    modified + Duration::from_secs(1) < started
+}
+
 fn configured() -> Option<std::path::PathBuf> {
     match neural_forge_protocol::env::var(RING_ENV).as_deref().map(str::trim) {
         Some("off") => None,
@@ -332,6 +357,18 @@ impl State {
             self.looked = Some(Instant::now());
             if !path.exists() {
                 return;
+            }
+            // A ring older than this process was left by an earlier one with the same pid: never read, the wrapper
+            // replaces it with its own.
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            if let (None, Some(m), Some(s)) = (neural_forge_protocol::env::var(RING_ENV), modified, process_start()) {
+                if stale(m, s) {
+                    if !self.said {
+                        self.said = true;
+                        crate::log!("[ngx] {} is older than this process (left by an earlier one with its pid): waiting for the wrapper's", path.display());
+                    }
+                    return;
+                }
             }
             match Ring::open(&path, neural_forge_protocol::env::var(RING_ENV).is_none()) {
                 Ok(ring) => {
@@ -902,5 +939,20 @@ pub(crate) mod tests {
         let off = no_ring_text(false, Some(std::path::Path::new("/dev/shm/neural-forge-ngx-42.ring")));
         assert!(on.contains("/dev/shm/neural-forge-ngx-42.ring") && on.contains("runs on a Neural Forge Proton"), "{on}");
         assert!(off.contains("/dev/shm/neural-forge-ngx-42.ring") && off.contains("not on the Neural Forge Proton"), "{off}");
+    }
+
+    /// The start time is read past a command name with spaces and parentheses; a ring from before it is stale, one
+    /// made since (or within the boot time's second) is not.
+    #[test]
+    fn a_ring_older_than_the_process_is_stale() {
+        let stat = "4242 (Game (x) .exe) S 1 4242 4242 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 8 0 12345 1000 50";
+        let started = start_from(stat, 1_000_000, 100).unwrap();
+        assert_eq!(started, UNIX_EPOCH + Duration::from_millis(1_000_000_000 + 123_450));
+        assert_eq!(start_from("1 (x) S 1", 1, 100), None);
+        assert_eq!(start_from(stat, 1, 0), None);
+        assert!(stale(started - Duration::from_secs(5), started));
+        assert!(!stale(started - Duration::from_millis(500), started));
+        assert!(!stale(started + Duration::from_secs(5), started));
+        assert!(process_start().is_some_and(|s| s <= SystemTime::now()));
     }
 }

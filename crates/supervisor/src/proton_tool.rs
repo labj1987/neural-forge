@@ -42,7 +42,8 @@ const RING_MAGIC: &[u8; 8] = b"NFNGXRG1";
 pub const NOTICE: &str = "Neural Forge makes a copy of this Proton next to it, named with \u{201c}-NeuralForge\u{201d}. On the same drive the copy \
 takes no extra space (hard links). It differs in one thing: games run with it load Neural Forge's small NGX wrapper in place of NVIDIA's \
 _nvngx.dll, which passes every DLSS call on unchanged and lets Neural Forge read what the game gives DLSS (its images, camera jitter, \
-motion vectors and exposure). Your Proton is not changed. Restart Steam, then choose the copy for a game in its Properties > Compatibility. \
+motion vectors and exposure). Your Proton is not changed. Switching a game on makes the copy and sets it for the game automatically \
+(Steam must be closed): there is nothing to choose by hand. \
 Online games with anti-cheat may refuse a changed module: use the copy for single-player games. Remove it here at any time.";
 
 /// An installed Proton a copy can be made from.
@@ -224,9 +225,16 @@ pub fn leftovers(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Whether `tool`'s source changed since it was made (a new GE-Proton in a "Latest" folder, a Proton Experimental
-/// update), or is gone: the copy is made again from it.
+/// update): the copy is made again from it. A source that is gone (ProtonUp replaced GE-Proton11-12 with 11-13 in
+/// its own folder) is no change: the copy holds its own files (hard links) and keeps working ([`source_gone`]).
 pub fn source_changed(tool: &Tool) -> bool {
-    source_at(&tool.source).is_some_and(|s| s.version != tool.source_version) || !tool.source.join("proton").is_file()
+    source_at(&tool.source).is_some_and(|s| s.version != tool.source_version)
+}
+
+/// Whether the Proton `tool` was made from is no longer installed. The copy keeps working as it is; it is only
+/// never made again from a newer version.
+pub fn source_gone(tool: &Tool) -> bool {
+    !tool.source.join("proton").is_file()
 }
 
 /// Whether `tool` holds another wrapper than `wrapper` (Neural Forge was updated since it was made): its
@@ -372,15 +380,25 @@ fn link_tree(from: &Path, to: &Path) -> std::io::Result<u64> {
     Ok(copied)
 }
 
-/// Writes `content` as a new file at `path` (removing what is there first: it may be a hard link to the source).
+/// Writes `content` as a new file at `path`: written to `<name>.tmp` beside it, then renamed over it in one step, so
+/// a reader sees the old file or the new one, never a part, and a hard link to the source at `path` is replaced,
+/// never written through.
 fn write_new(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    match std::fs::remove_file(path) {
+    let mut name = path.file_name().ok_or_else(|| std::io::Error::other("no file name"))?.to_os_string();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    match std::fs::remove_file(&tmp) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    std::fs::write(path, content)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    let written = std::fs::write(&tmp, content)
+        .and_then(|()| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// The processes under `proc_root` running from `dir` (their executable, or an argument naming a path in it: the
@@ -961,5 +979,23 @@ mod tests {
         left.sort();
         assert_eq!(left, [format!("neural-forge-ngx-{me}.ring"), "neural-forge-ngx-x.ring".into(), "other.ring".into()]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file is replaced in one step through `<name>.tmp`: a hard link to the source at its path is replaced, never
+    /// written through, and no `.tmp` is left.
+    #[test]
+    fn write_new_replaces_a_hard_link_atomically() {
+        let d = std::env::temp_dir().join(format!("neural-forge-write-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (src, dst) = (d.join("source.dll"), d.join("_nvngx.dll"));
+        std::fs::write(&src, "nvidia").unwrap();
+        std::fs::hard_link(&src, &dst).unwrap();
+        std::fs::write(d.join("_nvngx.dll.tmp"), "stale").unwrap();
+        write_new(&dst, b"wrapper", 0o644).unwrap();
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), "nvidia", "the source is untouched");
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "wrapper");
+        assert!(!d.join("_nvngx.dll.tmp").exists());
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

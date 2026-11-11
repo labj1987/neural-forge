@@ -273,7 +273,8 @@ unchanged. Your original Proton is not changed. Then:
 A copy whose original has changed since (a new GE-Proton in a "Latest" folder, a Proton Experimental update), or that
 holds another NGX wrapper than the installed Neural Forge, is marked with **Make again** (`proton-tool update`): with
 Steam closed it makes the copy again (a new version under its new name, its games moved over and the old copy
-removed), or puts the new wrapper in place. Updating Neural Forge puts its wrapper into every copy by itself. A copy a
+removed), or puts the new wrapper in place. A copy whose original was deleted (ProtonUp replaced it with a newer
+version) keeps working as it is. Updating Neural Forge puts its wrapper into every copy by itself. A copy a
 running game uses is never replaced or removed. `PROTON_NO_NEURAL_FORGE_NGX=1 %command%` in a game's launch options turns the wrapper off for
 that game while it keeps the copy. Online games with anti-cheat may refuse a changed module: use the copy for
 single-player games. From the CLI: `neural-forge-cli proton-tool list|create SOURCE|update|remove NAME`.

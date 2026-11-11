@@ -874,6 +874,14 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
                     t.dir.display().to_string(),
                     Some("Close Steam, then make it again in the Setup tab (or `neural-forge-cli proton-tool update`): its games move to the new copy.".into()),
                 ));
+            } else if proton_tool::source_gone(t) {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Info,
+                    format!("{} was made from {}, which is no longer installed: the copy keeps working as it is", t.name, t.source.display()),
+                    t.dir.display().to_string(),
+                    Some("Nothing to do. For a newer Proton, switch the game off, choose that Proton for it in Steam, and switch it on again.".into()),
+                ));
             }
         }
         for game in crate::steam::games(std::slice::from_ref(root)).iter().filter(|g| enabled_options(g).is_some()) {
@@ -1648,7 +1656,8 @@ mod tests {
         assert_eq!(compare_exports(&core, None)[0].severity, Severity::Failure, "an unreadable wrapper");
     }
 
-    /// A copy on old Wine, a copy holding another wrapper and a running game's ring of another version are each said.
+    /// A copy on old Wine, a copy holding another wrapper, a copy whose source is gone and a running game's ring of
+    /// another version are each said.
     #[test]
     fn copies_and_rings_that_cannot_work_are_reported() {
         let mut f = quiet();
@@ -1664,7 +1673,8 @@ mod tests {
         let has = |sev, text: &str| v.iter().any(|x| x.severity == sev && x.summary.contains(text));
         assert!(has(Severity::Failure, "GE-Proton9-27-NeuralForge cannot hand Neural Forge DLSS's parameters: it is built on Wine 9.0"), "{v:#?}");
         assert!(has(Severity::Warning, "holds another NGX wrapper"), "{v:#?}");
-        assert!(has(Severity::Info, "was made from an older"), "{v:#?}");
+        assert!(has(Severity::Info, "which is no longer installed: the copy keeps working"), "{v:#?}");
+        assert!(!has(Severity::Info, "was made from an older"), "a source that is gone is not a newer one: {v:#?}");
         assert!(v.iter().any(|x| x.check == "ngx-ring" && x.summary.contains("ring version 1")), "{v:#?}");
     }
 

@@ -1591,6 +1591,7 @@ impl Tracker {
         self.owners.remove(&image);
         self.launch_layouts.remove(&image);
         self.colour_barriers.remove(&image);
+        self.exposure_names.retain(|c, (e, _)| *c != image && *e != image);
     }
 
     pub(crate) fn record_view(&mut self, view: vk::ImageView, image: vk::Image) {
@@ -11729,5 +11730,19 @@ mod tests {
                 d.free_memory(m, None);
             }
         }
+    }
+
+    /// A destroyed image leaves no exposure name behind, as colour input or as the exposure named: a new image with
+    /// its handle starts afresh.
+    #[test]
+    fn forgetting_an_image_forgets_its_exposure_names() {
+        let mut t = Tracker::default();
+        let i = vk::Image::from_raw;
+        t.exposure_names.insert(i(1), (i(2), false));
+        t.exposure_names.insert(i(3), (i(4), true));
+        t.exposure_names.insert(i(5), (i(6), false));
+        t.forget_image(i(1));
+        t.forget_image(i(4));
+        assert_eq!(t.exposure_names.keys().copied().collect::<Vec<_>>(), [i(5)]);
     }
 }

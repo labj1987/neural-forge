@@ -153,9 +153,13 @@ running game uses (a process whose executable or arguments lie in it) is neither
   is listed as outdated, and `proton-tool update` (or Make again) makes a copy of the new version; with Steam closed,
   every game set to the old copy is moved to the new one and the old copy is removed. When Neural Forge itself is
   installed or updated (the app at start, `install --appdir`), each copy whose marker names another wrapper
-  (`wrapper_sha256=`) gets the installed one; `doctor` warns about a copy that still holds another.
-- **Purge.** `uninstall --purge` puts back each recorded game's Proton, takes any other game still set to a copy off it,
-  then removes only marked copies (and what a stopped copy left, `.<name>.tmp`).
+  (`wrapper_sha256=`) gets the installed one; `doctor` warns about a copy that still holds another. A copy whose
+  source folder is gone (ProtonUp replaced GE-Proton11-12 with 11-13) is not outdated: it holds its own files and keeps
+  working, switching a game on and `update` only renew its wrapper, and `doctor` notes it.
+- **Purge.** `uninstall --purge` is refused before it changes anything while a game runs with a copy (the games are
+  named). Otherwise it puts back each recorded game's Proton, takes any other game still set to a copy (a marked one,
+  or a `-NeuralForge` name whose folder is gone; never another tool with that suffix) off it, then removes only marked
+  copies (and what a stopped copy left, `.<name>.tmp`).
 
 Proton links many of a prefix's `system32` files to the Proton that last ran it; a removed copy's prefixes are set up
 again by the next Proton a game runs with.

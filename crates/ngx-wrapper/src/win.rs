@@ -15,6 +15,7 @@ pub(crate) type Handle = *mut c_void;
 extern "system" {
     fn LoadLibraryW(name: *const u16) -> Handle;
     fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
+    fn DeleteFileW(name: *const u16) -> i32;
     fn CreateFileW(name: *const u16, access: u32, share: u32, security: *mut c_void, disposition: u32, flags: u32, template: Handle) -> Handle;
     fn CreateFileMappingW(file: Handle, security: *mut c_void, protect: u32, size_high: u32, size_low: u32, name: *const u16) -> Handle;
     fn MapViewOfFile(mapping: Handle, access: u32, offset_high: u32, offset_low: u32, bytes: usize) -> *mut c_void;
@@ -118,6 +119,9 @@ fn open_ring() -> Result<String, String> {
     let path = format!("Z:\\dev\\shm\\neural-forge-ngx-{pid}.ring");
     let name = wide(&path);
     unsafe {
+        // A file left at this name by an earlier process with the same pid goes first: the layer takes only a ring
+        // made since its process started, and a new file is one.
+        DeleteFileW(name.as_ptr());
         let file = CreateFileW(
             name.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
