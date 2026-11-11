@@ -523,6 +523,9 @@ pub(crate) const COMMANDS: &[VulkanCommand] = &[
     VulkanCommand::CmdWaitEvents,
     VulkanCommand::CmdWaitEvents2,
     VulkanCommand::CmdBeginRendering,
+    // Copies into DLSS's inputs inside its launch buffer ([`Tracker::copy_source`]); vkd3d-proton copies with
+    // `vkCmdCopyImage2` (`vkCmdCopyImage` is hooked for the render tap).
+    VulkanCommand::CmdCopyImage2,
     // Each pool's queue family: the hold inside DLSS's buffer is only recorded into a buffer of
     // DLSS's graphics family ([`inline::Inline::record_outcome`]).
     VulkanCommand::CreateCommandPool,
@@ -1036,6 +1039,10 @@ pub(crate) struct Tracker {
     /// Barriers recorded into each command buffer for the watched images, in recording order,
     /// awaiting submission.
     pending: HashMap<vk::CommandBuffer, Vec<ImageSync>>,
+    /// Image copies recorded into each command buffer whose destination is a watched image, in recording order:
+    /// (source, destination). A hold in front of DLSS's buffer reads the source of a copy that buffer makes into
+    /// an input before its launch ([`Self::copy_source`]).
+    copies: HashMap<vk::CommandBuffer, Vec<(vk::Image, vk::Image)>>,
     /// The watched images' layouts as of the last successful submission (submission order, not
     /// recording order): only [`Self::commit_submitted`] writes it, for command buffers the next
     /// layer accepted.
@@ -1257,11 +1264,13 @@ pub(crate) const MVEC_COPY_LAYOUTS: [vk::ImageLayout; 4] =
 
 /// What a command buffer held at the point a launch was recorded into it: how many of its
 /// barriers on watched images come before the launch ([`Tracker`]'s `pending` list is in recording
-/// order), and the global synchronization recorded by then.
+/// order), the global synchronization recorded by then, and how many of its copies into watched
+/// images ([`Tracker`]'s `copies`, in recording order).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Before {
     pub barriers: usize,
     pub global: Option<Hazard>,
+    pub copies: usize,
 }
 
 /// Why [`Tracker::inline_point`] records no hold inside DLSS's buffer at a launch naming the colour input.
@@ -1637,7 +1646,11 @@ impl Tracker {
     /// to its end, count the writes of its output: the last of as many as its last evaluate made
     /// ([`Self::dlss_output`]) is the hold point after DLSS ([`Self::after_at`]).
     pub(crate) fn launch_kernel(&mut self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) {
-        let before = Before { barriers: self.pending.get(&command_buffer).map_or(0, Vec::len), global: self.global_sync.get(&command_buffer).copied() };
+        let before = Before {
+            barriers: self.pending.get(&command_buffer).map_or(0, Vec::len),
+            global: self.global_sync.get(&command_buffer).copied(),
+            copies: self.copies.get(&command_buffer).map_or(0, Vec::len),
+        };
         self.launch.entry(command_buffer).or_default().before_first.get_or_insert(before);
         let Some(bytes) = params else {
             self.launch.entry(command_buffer).or_default().opaque = true;
@@ -2149,6 +2162,7 @@ impl Tracker {
     fn armed(&self) -> bool {
         !self.launch.is_empty()
             || !self.pending.is_empty()
+            || !self.copies.is_empty()
             || !self.global_sync.is_empty()
             || !self.rendering.is_empty()
             || !self.attached.is_empty()
@@ -2168,6 +2182,7 @@ impl Tracker {
         for cb in command_buffers {
             self.launch.remove(cb);
             self.pending.remove(cb);
+            self.copies.remove(cb);
             self.global_sync.remove(cb);
             self.event_waits.remove(cb);
             self.rendering.remove(cb);
@@ -2201,6 +2216,14 @@ impl Tracker {
         }
     }
 
+    /// `vkCmdCopyImage` or `vkCmdCopyImage2` from `src` into `dst` recorded into `command_buffer`: kept where `dst` is
+    /// watched ([`Self::copy_source`]).
+    pub(crate) fn copy(&mut self, command_buffer: vk::CommandBuffer, src: vk::Image, dst: vk::Image) {
+        if self.watched(dst) {
+            self.copies.entry(command_buffer).or_default().push((src, dst));
+        }
+    }
+
     /// Whether any of `cbs` waits on an event ([`Self::event_waits`]).
     pub(crate) fn waits_on_event(&self, cbs: &[vk::CommandBuffer]) -> bool {
         cbs.iter().any(|cb| self.event_waits.contains(cb))
@@ -2225,8 +2248,12 @@ impl Tracker {
                 self.recorded_watched.remove(&primary);
             }
             // Where the secondary's recording starts in the primary's.
-            let base = Before { barriers: self.pending.get(&primary).map_or(0, Vec::len), global: self.global_sync.get(&primary).copied() };
-            let shift = |b: Before| Before { barriers: base.barriers + b.barriers, global: base.global.or(b.global) };
+            let base = Before {
+                barriers: self.pending.get(&primary).map_or(0, Vec::len),
+                global: self.global_sync.get(&primary).copied(),
+                copies: self.copies.get(&primary).map_or(0, Vec::len),
+            };
+            let shift = |b: Before| Before { barriers: base.barriers + b.barriers, global: base.global.or(b.global), copies: base.copies + b.copies };
             if let Some(c) = self.launch.get(secondary).cloned() {
                 let refs = self.launch.entry(primary).or_default();
                 refs.opaque |= c.opaque;
@@ -2256,6 +2283,9 @@ impl Tracker {
             }
             if let Some(inherited) = self.pending.get(secondary).filter(|p| !p.is_empty()).cloned() {
                 self.pending.entry(primary).or_default().extend(inherited);
+            }
+            if let Some(inherited) = self.copies.get(secondary).filter(|c| !c.is_empty()).cloned() {
+                self.copies.entry(primary).or_default().extend(inherited);
             }
             if let Some(hazard) = self.global_sync.get(secondary).copied() {
                 self.global(primary, hazard);
@@ -2575,10 +2605,21 @@ impl Tracker {
                 any_launch |= refs.is_some();
                 if let Some(record) = refs.and_then(LaunchRefs::sr).filter(|_| found.is_none()) {
                     let layout = |image: Option<vk::Image>| image.and_then(|i| proposed.get(&i).map(|p| p.0).or(self.committed.get(&i).copied()));
-                    // The depth this frame's hold reads ([`Self::hold_depth`]): GTA V Enhanced copies its depth into
-                    // the one DLSS reads inside the launch buffer.
-                    let inputs =
-                        self.inputs_of(&record).map(|i| Inputs { depth: self.hold_depth(cb, i.depth, self.before_launch(cb, i.colour.0), false), ..i });
+                    // The inputs this frame's hold in front of the buffer reads: where the buffer copies into one DLSS
+                    // reads before the launch, the copy's source ([`Self::copy_source`], [`Self::hold_depth`]). GTA V
+                    // Enhanced copies its depth and motion vectors into the ones DLSS reads inside the launch buffer.
+                    let inputs = self.inputs_of(&record).map(|i| {
+                        let before = self.before_launch(cb, i.colour.0);
+                        let same = |named: (vk::Image, ImageDesc)| {
+                            self.copy_source(cb, named, before, |d| (d.width, d.height, d.format) == (named.1.width, named.1.height, named.1.format))
+                        };
+                        Inputs {
+                            depth: self.hold_depth(cb, i.depth, before, false),
+                            mvec: same(i.mvec).unwrap_or(i.mvec),
+                            exposure_input: i.exposure_input.map(|e| same(e).unwrap_or(e)),
+                            ..i
+                        }
+                    });
                     let colour_owner = inputs.and_then(|i| proposed.get(&i.colour.0).and_then(|p| p.1).or(self.owners.get(&i.colour.0).copied()));
                     let (hazard, dump_hazard, depth_hazard) = self.launch_hazard(cb, inputs.as_ref());
                     self.probe_depth(cb, inputs.as_ref(), depth_hazard);
@@ -2672,31 +2713,36 @@ impl Tracker {
 
     /// How many of `cb`'s recorded barriers come before the launch that first names `colour` (before
     /// its first launch when none names it), as [`Self::launch_hazard`] counts them.
-    fn before_launch(&self, cb: vk::CommandBuffer, colour: vk::Image) -> Option<usize> {
+    fn before_launch(&self, cb: vk::CommandBuffer, colour: vk::Image) -> Option<Before> {
         let refs = self.launch.get(&cb)?;
-        refs.before_named.iter().find(|(i, _)| *i == colour).map(|(_, b)| *b).or(refs.before_first).map(|b| b.barriers)
+        refs.before_named.iter().find(|(i, _)| *i == colour).map(|(_, b)| *b).or(refs.before_first)
     }
 
     /// The depth a hold reads for DLSS this frame, at `identified`'s extent:
-    /// 1. the depth image NGX's record of the buffer's evaluate names, where its layout is known and the buffer does not
-    ///    write it before the launch (no barrier on it there that may follow a write): DLSS's own
-    ///    input, final at the hold. Inside DLSS's buffer (`inside`: the copy is recorded at the launch
-    ///    itself, after anything the buffer wrote) that is enough;
-    /// 2. else a depth image the buffer synchronizes reads of before the launch (a same-layout barrier
-    ///    after reads only, within the first `before` barriers, or all of them): the frame's depth
-    ///    that the buffer copies into the one DLSS names. GTA V Enhanced copies its depth, one of two it
-    ///    alternates between, into a ring of three DLSS reads, inside the launch buffer: the ring's
-    ///    image is written after the hold, the source is final before it;
-    /// 3. else the named one where its layout is known (its write before the launch then leaves the
+    /// 1. in front of the buffer (`inside` false), the source of the buffer's copy before the launch into the depth
+    ///    image NGX's record names ([`Self::copy_source`]): the frame's depth. GTA V Enhanced copies its depth, one of
+    ///    two it alternates between, into a ring of three DLSS reads, inside the launch buffer, with no barrier on the
+    ///    ring's image there: the ring's image (its layout known from frames before) is written after the hold and
+    ///    held the depth of three frames back, the source is final before it;
+    /// 2. the named one, where its layout is known and the buffer does not write it before the launch (no barrier on
+    ///    it there that may follow a write): DLSS's own input, final at the hold. Inside DLSS's buffer (`inside`: the
+    ///    copy is recorded at the launch itself, after anything the buffer wrote) that is enough;
+    /// 3. else a depth image the buffer synchronizes reads of before the launch (a same-layout barrier
+    ///    after reads only, within the barriers `before` counts, or all of them): the frame's depth
+    ///    that the buffer copies into the one DLSS names, as far as the barriers tell;
+    /// 4. else the named one where its layout is known (its write before the launch then leaves the
     ///    hold without depth, `Scan::depth_hazard`);
-    /// 4. else `identified`.
-    fn hold_depth(&self, cb: vk::CommandBuffer, identified: (vk::Image, ImageDesc), before: Option<usize>, inside: bool) -> (vk::Image, ImageDesc) {
+    /// 5. else `identified`.
+    fn hold_depth(&self, cb: vk::CommandBuffer, identified: (vk::Image, ImageDesc), before: Option<Before>, inside: bool) -> (vk::Image, ImageDesc) {
         let extent = (identified.1.width, identified.1.height);
-        let depth =
-            |image: vk::Image| self.images.get(&image).filter(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == extent).map(|d| (image, *d));
-        let recorded = self.pending.get(&cb).map_or(&[][..], Vec::as_slice);
-        let recorded = &recorded[..before.unwrap_or(recorded.len()).min(recorded.len())];
+        let is_depth = |d: &ImageDesc| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == extent;
+        let depth = |image: vk::Image| self.images.get(&image).filter(|d| is_depth(d)).map(|d| (image, *d));
         let named = self.launch.get(&cb).and_then(|r| r.ngx).and_then(|r| depth(r.depth));
+        if let Some(source) = named.filter(|_| !inside).and_then(|n| self.copy_source(cb, n, before, is_depth)) {
+            return source;
+        }
+        let recorded = self.pending.get(&cb).map_or(&[][..], Vec::as_slice);
+        let recorded = &recorded[..before.map_or(recorded.len(), |b| b.barriers).min(recorded.len())];
         let known = |image: vk::Image| self.committed.contains_key(&image) || recorded.iter().any(|s| s.image == image);
         let named = named.filter(|(d, _)| known(*d));
         let written = |image: vk::Image| recorded.iter().any(|s| s.image == image && s.may_follow_a_write());
@@ -2705,6 +2751,25 @@ impl Tracker {
         }
         let read = recorded.iter().rev().filter(|s| s.old_layout == s.new_layout && !s.may_follow_a_write()).find_map(|s| depth(s.image));
         read.or(named).unwrap_or(identified)
+    }
+
+    /// The image buffer `cb` copies into `named` before its launch (within the copies `before` counts, or all of
+    /// them), the last such, where `shape` takes its description: the frame's input the buffer copies into the one
+    /// DLSS reads, final before the buffer, where `named` is written after a hold in front of it. GTA V Enhanced copies
+    /// its frame's depth and motion vectors (one image) into rings of three DLSS reads inside the launch buffer; a hold
+    /// that read the ring's image had the inputs of three frames back, and the edit cache rejected all of a cached
+    /// hold's history (2026-11-11).
+    fn copy_source(
+        &self,
+        cb: vk::CommandBuffer,
+        named: (vk::Image, ImageDesc),
+        before: Option<Before>,
+        shape: impl Fn(&ImageDesc) -> bool,
+    ) -> Option<(vk::Image, ImageDesc)> {
+        let copies = self.copies.get(&cb).map_or(&[][..], Vec::as_slice);
+        let copies = &copies[..before.map_or(copies.len(), |b| b.copies).min(copies.len())];
+        let (src, _) = copies.iter().rev().find(|(src, dst)| *dst == named.0 && *src != named.0)?;
+        self.images.get(src).filter(|d| shape(d)).map(|d| (*src, *d))
     }
 
     /// A first-of-its-kind classification line, once per kind: a launch-bearing submit held because a buffer of it
@@ -2972,6 +3037,16 @@ impl Tracking {
         if let Some(hazard) = global {
             t.global(command_buffer, hazard);
         }
+        self.rearm(&t);
+    }
+
+    /// An image copy ([`Tracker::copy`]), while inputs are watched.
+    pub(crate) fn copy(&self, command_buffer: vk::CommandBuffer, src: vk::Image, dst: vk::Image) {
+        if !self.watching.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut t = self.lock();
+        t.copy(command_buffer, src, dst);
         self.rearm(&t);
     }
 
@@ -8394,6 +8469,79 @@ mod tests {
         let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
         assert_eq!(scan.inputs.map(|i| i.depth.0), Some(frame_depth));
         assert_eq!(scan.depth_hazard, Some(Hazard::SameLayoutBarrier));
+    }
+
+    /// GTA V Enhanced's launch buffer with frame generation on, once DLSS's rings are known (a probe of the launch buffer,
+    /// 2026-11-11): before the input launch, the frame's depth and the frame's motion vectors are copied into the ring
+    /// images the record names, between read-only `GENERAL -> GENERAL` barriers on the sources and with none on the
+    /// rings, whose layout is known from frames before. A hold in front of the buffer reads the copies' sources: the
+    /// rings' images are written after it (they held the inputs of three frames back, and the edit cache rejected
+    /// all of a cached hold's history). An image only read before the launch is not one, nor a copy after it.
+    #[test]
+    fn the_hold_reads_the_depth_and_motion_vectors_the_launch_buffer_copies_from_into_known_rings() {
+        let (mut t, _) = held_tracker();
+        let info = |format| vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D { width: 1707, height: 960, depth: 1 },
+            format,
+            usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        let image = vk::Image::from_raw;
+        let (frame_depth, ring_depth, frame_mvec, ring_mvec, sampled_mvec) = (image(0x400), image(0x500), image(0x700), image(0x800), image(0x900));
+        for (i, format) in [
+            (frame_depth, vk::Format::D32_SFLOAT_S8_UINT),
+            (ring_depth, vk::Format::D32_SFLOAT_S8_UINT),
+            (frame_mvec, vk::Format::R16G16_SFLOAT),
+            (ring_mvec, vk::Format::R16G16_SFLOAT),
+            (sampled_mvec, vk::Format::R16G16_SFLOAT),
+        ] {
+            let raw = i.as_raw();
+            t.record_image(i, &info(format));
+            t.record_view(vk::ImageView::from_raw(raw + 1), i);
+            t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
+        }
+        let _ = t.refresh();
+        // Earlier frames left all of them in GENERAL.
+        for i in [frame_depth, ring_depth, frame_mvec, ring_mvec, sampled_mvec] {
+            t.barrier(cb(1), ImageSync::to(i, GENERAL));
+        }
+        let _ = t.submit_ok(&[vec![cb(1)]]);
+        let sync = |i: vk::Image, src: vk::AccessFlags, dst: vk::AccessFlags| ImageSync {
+            src_access: u64::from(src.as_raw()),
+            dst_access: u64::from(dst.as_raw()),
+            ..general_to_general(i)
+        };
+        let (shader, transfer) = (vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_READ);
+        t.begin(cb(2));
+        t.barrier(cb(2), sync(frame_depth, shader, transfer));
+        t.copy(cb(2), frame_depth, ring_depth);
+        t.barrier(cb(2), sync(frame_depth, transfer, shader));
+        t.barrier(cb(2), sync(frame_mvec, shader, transfer));
+        t.copy(cb(2), frame_mvec, ring_mvec);
+        t.barrier(cb(2), sync(frame_mvec, transfer, shader));
+        t.barrier(cb(2), sync(sampled_mvec, shader, transfer));
+        crate::ngx_ring::inject(vec![sr_record(2, [0x100, 0x800, 0x500, 0, 0])]);
+        t.launch(cb(2), Some(&param_block(&[0x1100, 0x1500, 0x1800])));
+        // A copy into the ring after the launch (the next frame's, recorded ahead) is not this launch's.
+        t.copy(cb(2), sampled_mvec, ring_mvec);
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        let inputs = scan.inputs.expect("identified");
+        assert_eq!((inputs.depth.0, inputs.mvec.0), (frame_depth, frame_mvec), "the copies' sources, not DLSS's rings");
+        assert_eq!((scan.depth_layout, scan.mvec_layout), (Some(GENERAL), Some(GENERAL)));
+        assert_eq!((scan.depth_hazard, scan.hazard), (None, None));
+        // Without the copies the record's own are read, whatever else the buffer reads (a copy from the frame's motion
+        // vectors into another image among them).
+        t.begin(cb(2));
+        t.barrier(cb(2), sync(frame_depth, shader, transfer));
+        t.barrier(cb(2), sync(frame_mvec, shader, transfer));
+        t.copy(cb(2), frame_mvec, sampled_mvec);
+        crate::ngx_ring::inject(vec![sr_record(3, [0x100, 0x800, 0x500, 0, 0])]);
+        t.launch(cb(2), Some(&param_block(&[0x1100, 0x1500, 0x1800])));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        let inputs = scan.inputs.expect("identified");
+        assert_eq!((inputs.depth.0, inputs.mvec.0), (ring_depth, ring_mvec));
     }
 
     /// The depth NGX's record names wins over another depth image the buffer only reads before
