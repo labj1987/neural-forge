@@ -1,0 +1,236 @@
+# Neural Forge's per-game compatibility facts: what each tested game uses, where the model runs in it and
+# what to know first. Built into the app (the Status tab, `neural-forge-cli games`, `doctor` and Save report
+# read it) and used by the pre-release sweep (`scripts/game-sweep.sh`, scripts/game-sweep.toml) as what to
+# expect. docs/USER_GUIDE.md's "Tested games" table says the same in prose.
+#
+# One [[game]] table per game:
+#   name          the game's name as its store shows it
+#   steam_appid   its Steam app id (omit for a game outside Steam)
+#   exe           the executables Neural Forge targets (NEURAL_FORGE_TARGET_EXE)
+#   engine, api   the engine and the graphics API it runs on under Proton (DX11, DX12, Vulkan)
+#   dlss          the DLSS features it was run with
+#   placement     where the model runs with the default Placement (Auto), Ray Reconstruction off:
+#                 "before" (before the upscaler, in front of DLSS's command buffer), "before-inside" (before the
+#                 upscaler, inside DLSS's command buffer), "after-dlss" (on DLSS's output, before the HUD) or
+#                 "finished-frame" (on the presented frame)
+#   placement_rr  the same with DLSS Ray Reconstruction on (omit when the game has none)
+#   hdr           "hdr10" (the game can present HDR10), "none" (SDR only) or "unknown"
+#   hdr_route     how HDR reaches the screen under Proton (omit for "none")
+#   notes         setup steps and known issues, one sentence each
+#   verified, verified_on  the Neural Forge version and the date it was last seen working in (omit when not
+#                 recorded: the game was tested before this list began)
+#   verified_by   who ran it: "test machine" (the project's RTX 5070) or "user report (#issue)"
+
+[[game]]
+name = "GTA V Enhanced"
+steam_appid = 3240220
+exe = ["PlayGTAV.exe", "GTA5_Enhanced.exe", "GTA5_Enhanced_BE.exe"]
+engine = "RAGE"
+api = "DX12"
+dlss = "Super Resolution, Frame Generation 4x"
+placement = "before"
+hdr = "none"
+notes = []
+verified = "3.14.0"
+verified_on = "2026-11-10"
+verified_by = "test machine"
+
+[[game]]
+name = "Crimson Desert"
+steam_appid = 3321460
+exe = ["CrimsonDesert.exe", "pers.exe"]
+engine = "BlackSpace"
+api = "DX12"
+dlss = "Ray Reconstruction, dynamic Frame Generation"
+placement = "before-inside"
+placement_rr = "after-dlss"
+hdr = "hdr10"
+hdr_route = "The game's HDR setting, with PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 in its launch options (Proton-GE) or in gamescope with HDR on."
+notes = ["It compiles shaders on its first launch after a Neural Forge update; the effect starts once it is in the world."]
+verified = "3.14.0"
+verified_on = "2026-11-10"
+verified_by = "test machine"
+
+[[game]]
+name = "GTA San Andreas - The Definitive Edition"
+steam_appid = 1547000
+exe = ["PlayGTASanAndreas.exe", "SanAndreas.exe"]
+engine = "Unreal Engine 4"
+api = "DX12"
+dlss = "Super Resolution"
+placement = "before"
+hdr = "none"
+notes = [
+  "It resets its Frame Rate setting to 60 at every launch (a game bug): set it to Unlocked in Options > Graphics each time.",
+  "Its HDR option leaves the picture SDR, also in gamescope with HDR on (the game's own behaviour).",
+]
+verified_by = "test machine"
+
+[[game]]
+name = "Metro Last Light Redux"
+steam_appid = 287390
+exe = ["metro.exe"]
+engine = "4A Engine"
+api = "DX12"
+dlss = "Super Resolution (the game's own DLSS 5 NR off)"
+placement = "before-inside"
+hdr = "unknown"
+notes = ["Turn the game's own DLSS 5 Neural Rendering off, or the frame gets both."]
+verified_by = "test machine"
+
+[[game]]
+name = "God of War (2018)"
+steam_appid = 1593500
+exe = ["GoW.exe"]
+engine = "Santa Monica Studio"
+api = "DX11"
+dlss = "Super Resolution"
+placement = "before"
+hdr = "unknown"
+notes = []
+verified_by = "test machine"
+
+[[game]]
+name = "Marvel's Spider-Man Remastered"
+steam_appid = 1817070
+exe = ["Spider-Man.exe"]
+engine = "Insomniac"
+api = "DX12"
+dlss = "Super Resolution, Frame Generation"
+placement = "before"
+hdr = "unknown"
+notes = ["It starts with DLAA-like dynamic resolution, V-Sync on and frame generation off: set Upscale Quality to a fixed mode, Frame Generation to DLSS Frame Generation and V-Sync off (Settings > Display and Graphics)."]
+verified_by = "test machine"
+
+[[game]]
+name = "Shadow Warrior 3: Definitive Edition"
+steam_appid = 1036890
+exe = ["SW3.exe"]
+engine = "Unreal Engine 4"
+api = "DX12"
+dlss = "Super Resolution"
+placement = "before"
+hdr = "unknown"
+notes = [
+  "Its NVIDIA DLSS option is greyed out while FidelityFX CAS is on (Settings > Video): set CAS to Off.",
+  "Its first launch benchmarks the machine and picks the Low preset under Proton: set Overall Quality yourself.",
+]
+verified_by = "test machine"
+
+[[game]]
+name = "Lords of the Fallen (2023)"
+steam_appid = 1501750
+exe = ["LOTF2.exe", "LOTF2-Win64-Shipping.exe"]
+engine = "Unreal Engine 5"
+api = "DX12"
+dlss = "Super Resolution, Frame Generation (launch option -DLSSFG)"
+placement = "before-inside"
+hdr = "unknown"
+notes = ["Frame Generation has no menu option since patch 1.009: add -DLSSFG after %command% in its launch options."]
+verified_by = "test machine"
+
+[[game]]
+name = "Remnant II"
+steam_appid = 1282100
+exe = ["Remnant2.exe", "Remnant2-Win64-Shipping.exe"]
+engine = "Unreal Engine 5"
+api = "DX12"
+dlss = "Super Resolution, Frame Generation"
+placement = "before-inside"
+hdr = "unknown"
+notes = []
+verified_by = "test machine"
+
+[[game]]
+name = "Hogwarts Legacy"
+steam_appid = 990080
+exe = ["HogwartsLegacy.exe"]
+engine = "Unreal Engine 4"
+api = "DX12"
+dlss = "Super Resolution, Ray Reconstruction, Frame Generation"
+placement = "before-inside"
+placement_rr = "after-dlss"
+hdr = "hdr10"
+hdr_route = "The game's HDR setting in its menu (saved in its cloud-synced options, not its .ini), with PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 (Proton-GE) or in gamescope with HDR on."
+notes = ["Its Ray Reconstruction switch turns itself off at every start: switch it on again in Display Options."]
+verified = "3.14.0"
+verified_on = "2026-11-10"
+verified_by = "test machine"
+
+[[game]]
+name = "Cyberpunk 2077"
+steam_appid = 1091500
+exe = ["Cyberpunk2077.exe"]
+engine = "REDengine 4"
+api = "DX12"
+dlss = "Super Resolution, Ray Reconstruction, path tracing, Frame Generation 3x"
+placement = "before-inside"
+placement_rr = "after-dlss"
+hdr = "hdr10"
+hdr_route = "The game's HDR setting (HDR10 PQ), with PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 (Proton-GE) or in gamescope with HDR on."
+notes = ["Its built-in benchmark (launch options: %command% --launcher-skip -skipStartScreen -benchmark) runs unattended."]
+verified = "3.14.0"
+verified_on = "2026-11-10"
+verified_by = "test machine"
+
+[[game]]
+name = "Red Dead Redemption 2"
+steam_appid = 1174180
+exe = ["RDR2.exe"]
+engine = "RAGE"
+api = "Vulkan"
+dlss = "Super Resolution (Quality)"
+placement = "before-inside"
+hdr = "hdr10"
+hdr_route = "The game's HDR setting on its Vulkan renderer, with PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 (Proton-GE) or in gamescope with HDR on."
+notes = [
+  "It runs on Vulkan (Settings > Graphics > Advanced > Graphics API); start it through Steam as usual (its Rockstar launcher checks Steam).",
+  "The model runs only before the upscaler there (it shares a compute queue with the game), so turn DLSS on.",
+]
+verified = "3.14.0"
+verified_on = "2026-11-10"
+verified_by = "test machine"
+
+[[game]]
+name = "Stellar Blade"
+steam_appid = 3489700
+exe = ["SB-Win64-Shipping.exe"]
+engine = "Unreal Engine 4"
+api = "DX12"
+dlss = "Super Resolution"
+placement = "before-inside"
+hdr = "hdr10"
+hdr_route = "The game's HDR setting; in gamescope it created an SDR (sRGB) window while sending HDR metadata (#51), so check the HDR line in the game's log or on the Status tab."
+notes = []
+verified = "3.14.0 test build"
+verified_on = "2026-11-10"
+verified_by = "user report (#51)"
+
+[[game]]
+name = "Indiana Jones and the Great Circle"
+steam_appid = 2677660
+exe = ["TheGreatCircle.exe"]
+engine = "id Tech 7"
+api = "Vulkan"
+dlss = "Super Resolution"
+placement = "before-inside"
+hdr = "hdr10"
+hdr_route = "The game's HDR setting; in gamescope it created an SDR (sRGB) window while sending HDR metadata (#51), so check the HDR line in the game's log or on the Status tab."
+notes = []
+verified = "3.14.0 test build"
+verified_on = "2026-11-10"
+verified_by = "user report (#51)"
+
+[[game]]
+name = "Clair Obscur: Expedition 33"
+steam_appid = 1903340
+exe = ["SandFall-Win64-Shipping.exe"]
+engine = "Unreal Engine 5"
+api = "DX12"
+dlss = "Super Resolution"
+placement = "before-inside"
+hdr = "unknown"
+notes = ["It hands DLSS an already brightened frame; Neural Forge measures the brightness from the frame then (the game's log says \"the colour input looks pre-exposed\")."]
+verified = "3.14.0 test build"
+verified_on = "2026-11-10"
+verified_by = "user report (#51)"

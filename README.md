@@ -122,8 +122,10 @@ Every setting, the other placements and all environment variables: [docs/USER_GU
 
 Start with **Diagnose** on the Status tab (or `neural-forge-cli doctor`): it checks the install, GPU,
 driver, video memory, GPU faults, the last game's log and your launch options, and says what to do.
-To report a bug, attach the zip **Save report** writes to your desktop (personal names are removed, and of
-each game's launch options only Neural Forge's part is included).
+To report a bug, use the issue form and attach the zip **Save report** writes to your desktop, ideally with the
+game still running: it holds the layer's log, the live status, your settings, the game's entry in the tested games
+and the HDR verdict (personal names are removed, and of each game's launch options only Neural Forge's part is
+included).
 
 - **No effect in game.** Check the launch option, that the model is extracted, and give the game 5 s
   of play. The Status tab's Model placement line says where the model runs, or why it does not.
@@ -131,6 +133,11 @@ each game's launch options only Neural Forge's part is included).
   (native resolution counts as not); the model runs on the finished frame instead.
 - **"DLSS input identified, not holding".** Neural Forge found the frame DLSS upscales but cannot hold it,
   and says why on the same line; the model runs on the finished frame. Attach **Save report**'s zip to an issue.
+- **HDR does not come on.** The Status tab's HDR line says what the game asked for and why, and whether the
+  desktop's HDR is on: "game asked for SDR although HDR metadata was sent" with "the window offered no HDR colour
+  space" means the game could not get HDR (under Proton add `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` to its
+  launch options, or start gamescope with `--hdr-enabled`); "HDR10 was available" means the game's own HDR
+  setting is off.
 - **Something looks wrong.** Press F11 to compare. `NEURAL_FORGE_PREUPSCALE=off` in the launch
   options keeps the network from loading at all.
 - **F11 does nothing.** Add yourself to the `input` group (see [Usage](#usage)).

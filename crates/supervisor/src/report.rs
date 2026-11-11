@@ -5,8 +5,11 @@
 //! Members: `summary.txt` (version, GPU, driver, compute capability, kernel, session type, the
 //! game's Proton tool, the doctor's findings), `config.ini`, each extracted network's
 //! `model/<network>/manifest.json` (never the weights), the layer's state-dir logs (`layer.log`, `layer.log.1`), the kernel's Xid lines, the
-//! live channel's status (`neural-forge-cli shmctl status`'s text) and the newest capture pair.
-//! Logs keep their last [`LOG_CAP`] bytes.
+//! live channel's status (`neural-forge-cli shmctl status`'s text), the game's entry in the tested games
+//! (`game-compat.txt`, `crate::compat`), and the newest capture pair. `summary.txt` also carries the HDR verdict (the
+//! layer's, with the desktop's output state) and the tested game's line. A trace of the game's DLSS work
+//! (`NEURAL_FORGE_TRACE`'s file, when the reporter names one: `report --trace FILE`, or the variable set where the
+//! report is made) goes in as it is, up to [`TRACE_CAP`]. Logs keep their last [`LOG_CAP`] bytes.
 //!
 //! Every text member, and every member's name, is redacted before it is written ([`Redactor`]): the
 //! home directory becomes `~`, the user name `<user>` and the host name `<host>`. The doctor's
@@ -30,6 +33,9 @@ use std::path::{Path, PathBuf};
 
 /// The most of each log the report keeps: its end, where the failure is.
 pub const LOG_CAP: u64 = 4 << 20;
+
+/// The largest trace file the report takes; a larger one is named in `summary.txt` instead.
+pub const TRACE_CAP: u64 = 64 << 20;
 
 /// Where the report reads its files from.
 #[derive(Debug, Clone)]
@@ -81,6 +87,12 @@ pub struct Inputs<'a> {
     pub steam_appid: Option<&'a str>,
     /// `$XDG_SESSION_TYPE`.
     pub session_type: &'a str,
+    /// The game's executable as the channel names it, for its entry in the tested games; empty when unknown.
+    pub exe: &'a str,
+    /// The HDR verdict: the layer's (`hdr_verdict=` of the channel status) and the desktop's output state.
+    pub hdr: &'a str,
+    /// A trace file to include (`NEURAL_FORGE_TRACE`'s recording), when one is named.
+    pub trace: Option<&'a Path>,
     /// GPU, driver and compute capability: [`probe_system`] or the caller's own.
     pub system: SystemInfo,
 }
@@ -357,7 +369,9 @@ pub fn summary(sources: &Sources, inputs: &Inputs, created: u64) -> String {
          kernel: {}\n\
          session type: {}\n\
          game: {}\n\
-         Proton: {proton}\n\n\
+         Proton: {proton}\n\
+         tested game: {}\n\
+         HDR: {}\n\n\
          Findings:\n",
         env!("CARGO_PKG_VERSION"),
         or_unknown(&inputs.system.gpu),
@@ -366,6 +380,12 @@ pub fn summary(sources: &Sources, inputs: &Inputs, created: u64) -> String {
         or_unknown(&kernel),
         or_unknown(inputs.session_type),
         if inputs.game.trim().is_empty() { "none named" } else { inputs.game.trim() },
+        match crate::compat::find(inputs.steam_appid.and_then(|a| a.trim().parse().ok()), inputs.exe) {
+            Some(g) => format!("{} -- {}", g.name, g.status_line()),
+            None if inputs.steam_appid.is_none() && inputs.exe.trim().is_empty() => "no game named".to_string(),
+            None => "not in the list (game-compat.txt)".to_string(),
+        },
+        or_unknown(inputs.hdr),
     );
     match inputs.findings {
         Some(findings) if !findings.trim().is_empty() => {
@@ -400,6 +420,23 @@ pub fn collect(sources: &Sources, inputs: &Inputs, redactor: &Redactor, created:
         members.push(Member { name: "xid.txt".into(), data: data.into_bytes(), text: true });
     }
     members.push(Member { name: "channel-status.txt".into(), data: inputs.channel_status.as_bytes().to_vec(), text: true });
+    if inputs.steam_appid.is_some() || !inputs.exe.trim().is_empty() {
+        members.push(Member { name: "game-compat.txt".into(), data: crate::compat::report_text(inputs.steam_appid, inputs.exe).into_bytes(), text: true });
+    }
+    if let Some(trace) = inputs.trace {
+        let file = trace.file_name().map_or_else(|| "trace".to_string(), |n| n.to_string_lossy().into_owned());
+        match std::fs::metadata(trace) {
+            Ok(m) if m.len() <= TRACE_CAP => {
+                if let Ok(data) = std::fs::read(trace) {
+                    members.push(Member { name: format!("trace/{file}"), data, text: false });
+                }
+            }
+            Ok(m) => members[0].data.extend_from_slice(
+                format!("trace: {} is {} MiB, more than the report takes; attach it separately\n", trace.display(), m.len() >> 20).as_bytes(),
+            ),
+            Err(e) => members[0].data.extend_from_slice(format!("trace: {} cannot be read: {e}\n", trace.display()).as_bytes()),
+        }
+    }
     if let Some(pair) = newest_capture_pair(&sources.captures_dir) {
         for (name, path) in pair {
             if let Ok(data) = std::fs::read(&path) {
@@ -435,7 +472,7 @@ pub fn write_report(out_dir: &Path, sources: &Sources, inputs: &Inputs, redactor
 /// executable); without `steam_appid`, the app id for its Proton is looked up from it.
 ///
 /// The external commands (`nvidia-smi`, `journalctl`) run once each, with the doctor's time limit.
-pub fn save(channel_status: &str, game: &str, steam_appid: Option<&str>) -> std::io::Result<PathBuf> {
+pub fn save(channel_status: &str, game: &str, steam_appid: Option<&str>, trace: Option<&Path>) -> std::io::Result<PathBuf> {
     let mut sources = Sources::from_env();
     let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     let doctor_roots = crate::doctor::Roots::system();
@@ -463,6 +500,8 @@ pub fn save(channel_status: &str, game: &str, steam_appid: Option<&str>) -> std:
         crate::doctor::CommandOutput::Ran(out) => Some(out),
         _ => None,
     };
+    let hdr = hdr_line(channel_status, crate::desktop_hdr::read().as_deref());
+    let env_trace = std::env::var_os("NEURAL_FORGE_TRACE").map(PathBuf::from);
     let inputs = Inputs {
         findings: Some(&findings),
         xid_lines: Some(&xid_lines),
@@ -470,11 +509,30 @@ pub fn save(channel_status: &str, game: &str, steam_appid: Option<&str>) -> std:
         game: &game_line,
         steam_appid: steam_appid.or(found_appid.as_deref()),
         session_type: &session_type,
+        exe: game,
+        hdr: &hdr,
+        trace: trace.or(env_trace.as_deref()),
         system: probe_system(&sources.proc_root, compute.as_deref()),
     };
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let out_dir = desktop_dir(&sources.config_home, &sources.home);
     write_report(&out_dir, &sources, &inputs, &Redactor::from_env(&sources.home), created)
+}
+
+/// The HDR line for `summary.txt`: the channel status's `hdr_verdict=` value, with the desktop's state added where the
+/// status does not already carry it (`shmctl status` does, the GUI's status text does not).
+pub fn hdr_line(channel_status: &str, desktop: Option<&str>) -> String {
+    let verdict = channel_status.lines().find_map(|l| l.strip_prefix("hdr_verdict=")).unwrap_or("").trim();
+    match desktop {
+        Some(d) if !verdict.contains("; desktop: ") => {
+            if verdict.is_empty() {
+                format!("not known (no channel); desktop: {d}")
+            } else {
+                format!("{verdict}; desktop: {d}")
+            }
+        }
+        _ => verdict.to_string(),
+    }
 }
 
 /// A minimal zip writer: local headers, the central directory and the end record; deflate or store.
@@ -682,6 +740,9 @@ mod tests {
             game: "GTA5_Enhanced.exe",
             steam_appid: None,
             session_type: "wayland",
+            exe: "GTA5_Enhanced.exe",
+            hdr: "game outputs SDR (swapchain B8G8R8A8_UNORM SRGB_NONLINEAR); desktop: GNOME: HDMI-1 HDR off",
+            trace: None,
             system: SystemInfo { gpu: "NVIDIA GeForce RTX 5070".into(), driver: "615.78.08".into(), compute_capability: "12.0".into() },
         }
     }
@@ -729,11 +790,15 @@ mod tests {
                 "layer.log.1",
                 "xid.txt",
                 "channel-status.txt",
+                "game-compat.txt",
                 "captures/1000-original.png",
                 "captures/1000-composited.png"
             ]
         );
         let get = |name: &str| String::from_utf8_lossy(&members.iter().find(|(n, ..)| n == name).unwrap().2).into_owned();
+        assert!(get("summary.txt").contains("tested game: GTA V Enhanced -- Tested in "), "{}", get("summary.txt"));
+        assert!(get("summary.txt").contains("HDR: game outputs SDR (swapchain B8G8R8A8_UNORM SRGB_NONLINEAR); desktop: GNOME: HDMI-1 HDR off\n"));
+        assert!(get("game-compat.txt").starts_with("GTA V Enhanced\n  Steam app id: 3240220\n"), "{}", get("game-compat.txt"));
         for (name, method, data) in &members {
             let text = String::from_utf8_lossy(data);
             if name.ends_with(".png") {
@@ -763,7 +828,7 @@ mod tests {
         match std::process::Command::new("python3").args(["-I", "-c", check]).arg(&path).output() {
             Ok(out) => {
                 assert!(out.status.success(), "python3 zipfile: {}", String::from_utf8_lossy(&out.stderr));
-                assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "10");
+                assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "11");
             }
             Err(_) => eprintln!("no python3: skipping the zipfile check"),
         }
@@ -777,12 +842,23 @@ mod tests {
         let mut i = inputs("channel not open: unavailable\n", None, None);
         i.system = SystemInfo::default();
         i.game = "";
+        i.exe = "";
+        i.hdr = "";
         i.session_type = "";
         let members = collect(&s, &i, &Redactor::new(&[], "", ""), 1);
         let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["summary.txt", "channel-status.txt"]);
         let summary = String::from_utf8(members[0].data.clone()).unwrap();
-        for line in ["GPU: unknown", "driver: unknown", "compute capability: unknown", "kernel: unknown", "session type: unknown", "game: none named"] {
+        for line in [
+            "GPU: unknown",
+            "driver: unknown",
+            "compute capability: unknown",
+            "kernel: unknown",
+            "session type: unknown",
+            "game: none named",
+            "tested game: no game named",
+            "HDR: unknown",
+        ] {
             assert!(summary.contains(line), "{line} in\n{summary}");
         }
         assert!(summary.contains("Proton: unknown (the game's Steam app id is not known)"));
@@ -854,6 +930,35 @@ mod tests {
         assert_eq!(composited.1, dir.join("series-150/000001-composited.png"));
         set_age(&dir.join("100-original.png"), 10);
         assert_eq!(newest_capture_pair(&dir).unwrap()[0].0, "captures/100-original.png");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_trace_goes_in_as_it_is_and_the_hdr_line_gets_the_desktop() {
+        let root = scratch("trace");
+        let s = fixture(&root);
+        let trace = root.join("cp.nftrace");
+        write(&trace, b"NFTRACE\x00\x01/home/alex");
+        let mut i = inputs("", None, None);
+        i.trace = Some(&trace);
+        let members = collect(&s, &i, &Redactor::new(&[], "alex", ""), 0);
+        let t = members.iter().find(|m| m.name == "trace/cp.nftrace").expect("the trace member");
+        assert!(!t.text && t.data == b"NFTRACE\x00\x01/home/alex", "stored as it is");
+        let missing = root.join("absent.nftrace");
+        i.trace = Some(&missing);
+        let members = collect(&s, &i, &Redactor::new(&[], "nobody", ""), 0);
+        assert!(String::from_utf8_lossy(&members[0].data).contains("absent.nftrace cannot be read"));
+        assert_eq!(
+            hdr_line("x=1\nhdr_verdict=game outputs HDR10 (swapchain A)\n", Some("GNOME: HDMI-1 HDR on")),
+            "game outputs HDR10 (swapchain A); desktop: GNOME: HDMI-1 HDR on"
+        );
+        assert_eq!(
+            hdr_line("hdr_verdict=game outputs SDR; desktop: KDE: DP-1 HDR off\n", Some("GNOME")),
+            "game outputs SDR; desktop: KDE: DP-1 HDR off",
+            "said once"
+        );
+        assert_eq!(hdr_line("no channel\n", Some("GNOME: HDMI-1 HDR on")), "not known (no channel); desktop: GNOME: HDMI-1 HDR on");
+        assert_eq!(hdr_line("no channel\n", None), "");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
