@@ -1270,7 +1270,12 @@ impl Loader {
             return None;
         }
         let holds_out = self.holds_beyond(reserved);
-        if holds_out && !st.serves(sizes, choice) {
+        // A step down the VRAM guard decided waits for the holds recorded with the build: no new hold takes it meanwhile,
+        // or holds that come on and on keep it from ever being applied (Cyberpunk 2077 at 4K with Ray Reconstruction and
+        // path tracing: a hold after DLSS every 0.4 s at 7 fps for minutes, the step decided and never applied). Once the
+        // outstanding holds are done with, the next path to ask applies it, or the loader thread does
+        // ([`LoaderState::apply_idle_step`]).
+        if holds_out && (!st.serves(sizes, choice) || st.guard.step_down_pending()) {
             return None;
         }
         let (built, woken) = st.want_sizes(sizes, choice, !holds_out);
@@ -5473,6 +5478,50 @@ mod tests {
             }
         }
         InFlight { device: vk::Device::null(), status, fence: vk::Fence::from_raw(0x51) }
+    }
+
+    /// A step down decided while holds recorded with the build may still run: no further hold takes the build (they kept
+    /// coming every 0.4 s in Cyberpunk 2077 with path tracing, and the step was never applied); once only the asking hold
+    /// is left, the step is applied there and nothing is served.
+    #[test]
+    fn a_pending_step_down_stops_new_holds_until_the_outstanding_ones_drain() {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical: vk::PhysicalDevice::null(),
+            frame_family: 0,
+            family: 0,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+            shared: None,
+            bda_ext: false,
+        };
+        use std::sync::atomic::Ordering::SeqCst;
+        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader = Loader::for_test(setup, vec![built((3840, 2160), 1, network::FULL)], holds.clone(), Box::new(|_, _| {}));
+        let size = [(3840, 2160)];
+        // Another hold outstanding, nothing decided: the build is served as before.
+        holds.store(2, SeqCst);
+        assert!(loader.ready_sizes(&size, network::FULL, 1).is_some());
+        // The build ended at the budget: a pause is decided.
+        {
+            let mut st = loader.shared.0.lock().unwrap();
+            assert!(st.guard.built(network::FULL, Some(1500), (3840, 2160), Some((8000, 8010)), network::FULL, false, Instant::now()).is_some());
+            assert!(st.guard.step_down_pending());
+        }
+        let uses = loader.shared.0.lock().unwrap().uses;
+        assert!(loader.ready_sizes(&size, network::FULL, 1).is_none(), "a step down waits: no new hold on the build");
+        assert_eq!(loader.shared.0.lock().unwrap().uses, uses, "not taken");
+        assert!(!loader.paused(), "not applied under the other hold");
+        // The other hold is done with: the asking one applies the pause, and nothing is served.
+        holds.store(1, SeqCst);
+        assert!(loader.ready_sizes(&size, network::FULL, 1).is_none());
+        assert!(loader.paused());
     }
 
     /// #59: the after-the-upscaler path asks for its size (the loader thread is woken to rebuild), and a hold takes the

@@ -521,7 +521,9 @@ The steadiness is what tells a scene-referred game whose eye adaptation lags (GT
   `FENCE_WAIT_TIMEOUT` after its submit), no after-the-upscaler frame running or stalled with its fence unsignalled.
   The VRAM guard's idle step (`LoaderState::apply_idle_step`) also needs both paths quiet (`Claims::unused`, as for
   lending the network to another device): a frame whose 5 s wait timed out can still run after `IDLE_STEP`, and
-  closing the network under it is a copy-engine read of freed memory (Xid 31, #59).
+  closing the network under it is a copy-engine read of freed memory (Xid 31, #59). While a step down is pending and
+  other holds may still run, no hold takes the build (`Loader::ready_sizes`), so holds that keep coming cannot keep
+  the step from being applied.
 - **A pending rebuild yields to a path on the current build.** When one path takes the current build while the
   other path's request for another set of sizes waits for the loader thread, the request is dropped
   (`LoaderState::want_sizes`), so the thread never frees a build under a frame just recorded with it.

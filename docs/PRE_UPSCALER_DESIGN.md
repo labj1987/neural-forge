@@ -2544,6 +2544,29 @@ Tests: `the_post_path_takes_over_30_s_after_the_last_held_frame_unless_dlss_send
 DLAA, a menu, no launches, the resume; the status in each), `super_resolution_launches_are_noted_identified_or_not`,
 `native::tests::frames_still_in_flight_keep_the_idle_step_and_the_free_off`; each fails with its fix reverted.
 
+4. Found on the rig while checking 3: with the stricter idle step, a game whose holds after DLSS kept coming (Cyberpunk
+   2077 at 4K with Ray Reconstruction and path tracing: a hold every 0.4 s at 7 fps) never had its decided pause
+   applied, by either path: a hold asking for the network applies a step only with no other hold outstanding, and
+   one was always outstanding; the idle step needs 6 s without a path taking the network. The game stayed at 7 fps
+   for 5 minutes with the pause decided. Now, while a step down is pending and other holds may still run, no hold
+   takes the build (`Loader::ready_sizes`): the outstanding ones drain, and the next hold to ask (or the loader
+   thread) applies the step. Test: `a_pending_step_down_stops_new_holds_until_the_outstanding_ones_drain` (fails
+   without it).
+
+**Measured after the review fixes** (RTX 5070, 3840x2160 HDR10 PQ, the desktop at 4K 144 Hz HDR, the same save):
+
+- Default settings (Ray Reconstruction off, render 1920x1080): 8 pauses of 3 s and 2 of 40 s, each with the status
+  `PAUSED` in the menu and holding again after it; the network ran on the first DLSS frame after each menu (the
+  history reset 8-10 ms after `DLSS frames resumed`, 41 s gaps included), no rebuild, no post path, VRAM 10.95-10.97 GB
+  in play throughout, no Xid.
+- Ray Reconstruction and path tracing: the pause decided at 1.35 s a frame (best 31 ms) and applied by the loader
+  thread 4 s later (`no frame has used the network for 6 s`), the network closed, and the game at 65-69 fps in play
+  for the 5 minutes after, no Xid (the kernel logged an NVRM out-of-memory mapping message during the spill, before
+  the pause). Before fix 4 the same run stayed at 6-9 fps with the pause decided and never applied.
+- On the main menu (no DLSS) for more than 5 minutes the post path took over as designed, built at 3840x2160, and
+  the holds rebuilt at 1920x1080 on resume (8 s later); that run's game then ran at about 52 fps against 82-116
+  without the 5-minute wait, at the VRAM budget. Not changed here.
+
 ### The VRAM guard in the same game at 4K with Ray Reconstruction and path tracing
 
 Before (rrpt runs, RTX 5070 12 GB, 3840x2160 HDR10, Auto: after DLSS, the network at 3840x2160, 32 ms a frame in

@@ -105,8 +105,9 @@ first shipped them; their phase is kept as a subheading.
   memory the game needed. Now two slow frames within five seconds are enough, both places time the network, a
   network ten times slower than its best counts within 512 MiB of the budget, and the decided pause is applied once
   no frame has used the network for six seconds and none that did can still be running on the GPU (closing the
-  network under such a frame would crash the game). Measured: the game back at 68 fps about a minute after the spill
-  began, steady from there.
+  network under such a frame would crash the game); while it waits, no new frame takes the network, so a game that
+  keeps handing it frames still gets the pause. Measured: the game back at 65-69 fps seconds after the pause was
+  decided, steady from there.
 
 **Seeing why the model does not run before the upscaler**
 
