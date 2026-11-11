@@ -814,7 +814,8 @@ fn enabled_options(game: &crate::steam::Game) -> Option<String> {
 
 /// The NGX file versions ([`crate::ngx_versions`]): the driver's core, what each game loaded in its last run (the
 /// wrapper's record), and the NGX DLLs present in each switched-on game's folder and prefix. Always a note: it is
-/// there so a bug report shows an over-the-air update, a game's own update or the pinned Frame Generation DLL.
+/// there so a bug report shows which DLSS files a game runs: an over-the-air update, a game's own update or a DLL the user
+/// replaced.
 fn check_ngx_versions(roots: &Roots) -> Vec<Finding> {
     use crate::ngx_versions as nv;
     let games = crate::steam::games(&roots.steam_roots);

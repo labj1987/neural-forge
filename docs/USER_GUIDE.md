@@ -434,7 +434,7 @@ for the live settings. `doctor`, `report` and `shmctl status` only look: they cr
 `doctor` (and the `summary.txt` of **Save report**) lists the **NGX versions**: the file version of NVIDIA's NGX core
 from the driver, of every NGX file a game loaded in its last run with the folder it was loaded from (the game's own,
 the NGX models folder an over-the-air update fills, the driver's), and of the NGX files present in each switched-on
-game's folder and Proton prefix. A DLSS update by the game or NVIDIA, or the pinned Frame Generation DLL, shows there.
+game's folder and Proton prefix. A DLSS update by the game or NVIDIA, or a DLSS file you replaced yourself, shows there.
 The loaded files are recorded by the wrapper once a game has created a DLSS feature, so a game that was not started
 with Neural Forge on since this version has none yet.
 `neural-forge-cli help [COMMAND]` (or `COMMAND --help`) has the details; an unknown or misspelt

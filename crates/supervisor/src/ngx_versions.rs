@@ -1,7 +1,7 @@
 //! The NGX file versions in `doctor` and the report: NVIDIA's core, the DLSS snippets a game loads (`nvngx_dlss.dll`
 //! Super Resolution, `nvngx_dlssg.dll` Frame Generation, `nvngx_dlssd.dll` Ray Reconstruction, `nvngx_dlssnr.dll`
 //! Neural Rendering, ...), the wrapper. They come from two places, so over-the-air updates, a game's own update and
-//! the pinned Frame Generation DLL all show in a bug report:
+//! a DLL the user replaced all show in a bug report:
 //!
 //! - what the game loaded in its last run: the NGX wrapper (`crates/ngx-wrapper/src/modules.rs`, which has the file
 //!   format) writes `$XDG_STATE_HOME/neural-forge/ngx-modules/<exe>.txt` after a feature is created, with every loaded
