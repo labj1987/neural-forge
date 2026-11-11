@@ -24,7 +24,9 @@ extracted (a DLL without the small one), the other one runs.
 When the game and other programs leave too little video memory for the network, the driver would move
 part of it to system memory, where it runs many times slower. Instead the network pauses and frames go
 to DLSS untouched. The small network is no way out: it needs only about 45 MiB less video memory than the
-full one. The network comes back once the memory has had room for it for 10 s (and no sooner than 30 s
+full one. The guard needs only a couple of slow network frames, so it also steps in when a game slows to a few
+frames a second (a pause decided while the game is too slow for the model to run is applied after 6 s). The
+network comes back once the memory has had room for it for 10 s (and no sooner than 30 s
 after the pause, longer when pauses repeat). While paused, Neural Forge holds no video memory. The Status
 tab's Model placement line says when the network is paused.
 
@@ -61,6 +63,12 @@ layer picks the place for each game by itself:
   the model resolution must be 100% (below it the frame is presented untouched). A float16 (scRGB) or
   10-bit SDR swapchain is presented untouched, and captures of an HDR frame are refused.
 
+In a pause menu, a map or a loading screen many games stop calling DLSS (Cyberpunk 2077's Esc menu shows the
+last frame, which already has the model's edit, under the menu). The model then stays where it is, with its
+network loaded, and runs again on the game's first frame after the menu; the Model placement line says "paused
+with the game's DLSS". It moves to the finished frame only when the game goes on calling DLSS for 30 s without its
+input being worked on (DLAA), or sends DLSS nothing for 5 minutes (DLSS switched off for another upscaler).
+
 The game's own **DLSS Frame Generation** works with the model before the upscaler and after DLSS.
 Generated frames are built from enhanced frames, and the model runs once per real frame.
 
@@ -79,7 +87,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, the HUD group: finding the HUD and HUD regions on the finished frame, and the Sharpening group: adaptive sharpening (CAS) and Clarity on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
-| Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, DLSS's input found but not held and why, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
+| Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
 | Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on), and the launch option to copy by hand for a game you pick. |
 
 Before the upscaler the network runs on every frame while the camera is still and on every second
@@ -338,6 +346,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_POST_MOTION=zero\|flow\|none`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | After the upscaler (the finished frame), the model's history: its previous output at the same pixel (`zero`, the default), where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; it adds that extension and one optical-flow queue to the game's devices, which hung GTA V Enhanced), or none (`none`: every frame on its own, which flickers in large soft patches on grainy or noisy frames). The history is not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and is dropped on a scene cut. |
 | `NEURAL_FORGE_RAISE_VULKAN=off` | layer | A game whose Vulkan instance asks for a version below 1.3 (Red Dead Redemption 2 asks for 1.1) gets one created for 1.3, which the model needs; `off` creates it as the game asks (the model then cannot run in that game). |
 | `NEURAL_FORGE_SHARE_QUEUE=off` | layer | A game that takes every compute queue of the GPU (Red Dead Redemption 2) gets one of them shared with the model, every use of it synchronized; the model then runs before the upscaler only. `off`: no model on such a game. |
+| `NEURAL_FORGE_PROBE_VRAM=1` | layer | Diagnostics: the video memory guard logs what it sees once a second (the device's memory use and budget, the network's recent times and its best). |
 | `NEURAL_FORGE_FAIL_CREATE=N[@K]`, `NEURAL_FORGE_NATIVE_FAIL=chain`, `NEURAL_FORGE_NATIVE_FAIL=vram` | layer | Testing aids: let K network builds through, then fail the next N; report one counter-chain timeout; or have the video memory guard pause the network at its 600th and 900th frame, as if it did not fit. |
 | `NEURAL_FORGE_GUI_OPEN=<tab>` | GUI | Testing aid: open a tab (`model`, `composition`, `debug`, `status`, `setup`, or `passes` for the per-pass dialog) at start, for screenshots. |
 | `NEURAL_FORGE_BENCH=1`, `NEURAL_FORGE_REQUIRE_VULKAN=1`, `NEURAL_FORGE_TEST_DISPLAY=:N` | layer tests | Testing aids: run the hot-path GPU benchmark; fail instead of skipping when no Vulkan device exists; run the present-fence test on a real swapchain in an X server (an Xvfb's display). |

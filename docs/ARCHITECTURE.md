@@ -503,8 +503,16 @@ The steadiness is what tells a scene-referred game whose eye adaptation lags (GT
   network running" or "... not running: <why>"). Failed builds are retried after 0.5, 1 and 2 s, the
   4th attempt closes and reopens the network, then every 30 s (`neural_forge_protocol::rebuild`).
 - **Counter-chain timeout:** the graph is rebuilt with barriers and the history reset.
-- **Hand-back.** Once a device has held, the after-the-upscaler path stays off on it until no DLSS
-  submit has been seen for 30 s (`HAND_BACK`), so loading screens are presented untouched.
+- **Hand-back.** Once a device has held, the after-the-upscaler path stays off on it until the hand-back
+  (`preupscale::hand_back_at`): 30 s (`HAND_BACK`) after the last held DLSS frame while DLSS Super Resolution's
+  input kernel goes on launching without its input held (DLAA, inputs no longer identified; counted from the start
+  of that run of launches when it began later, so a resume is not one), else 5 minutes (`PAUSE_HAND_BACK`): a game
+  that stops calling DLSS altogether is in a pause menu or a loading screen, whose picture (Cyberpunk 2077: the last
+  frame under the menu) already carries the edit. Meanwhile the status is `PAUSED` (6). Loading screens and menus are
+  presented untouched, and the network is not rebuilt at the output size and back (#49).
+- **A pending rebuild yields to a path on the current build.** When one path takes the current build while the
+  other path's request for another set of sizes waits for the loader thread, the request is dropped
+  (`LoaderState::want_sizes`), so the thread never frees a build under a frame just recorded with it.
 
 ### 4.8 Timings, 1440p Balanced (render 1485x836, padded 1486x836)
 

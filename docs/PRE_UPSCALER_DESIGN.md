@@ -2455,3 +2455,95 @@ trails behind the characters, and the grain on the rock during the heal effect i
 (the history resets only across the loading pauses, 500 ms or more without a frame). Crimson Desert
 with Ray Reconstruction off: `motion vectors copied from GENERAL`, 174.2 fps in game (3.1.4:
 174.6), no Xid.
+
+## Pause menus (Cyberpunk 2077, #49 and #59, 2026-11-11)
+
+**What the game does.** Cyberpunk 2077's Esc menu stops calling DLSS altogether: no Super Resolution launch at all
+while it is open, presents go on at the full rate, and the menu draws over a blurred copy of the last frame, which
+already carries the model's edit (the hold changed DLSS's input). The game frees its render targets in the menu and
+makes new ones on resume: the first frames after it name a new colour input, depth and motion vectors, and the
+inputs are identified again within about 0.3 s (`no DLSS input among 42 registered views` in the menu, then `colour
+input: image ...`). The inventory and the map stop DLSS too.
+
+**What 3.14.0's test build did** (RTX 5070, 4K output, render 1920x1080, Placement Auto, Ray Reconstruction off):
+
+- Under 30 s in the menu: the frames presented untouched (right), the Status line "after the upscaler: waiting for
+  DLSS Super Resolution" (wrong: nothing ran), and on resume the network ran on the first held frame (history reset:
+  `13227 ms since the last frame`).
+- 30 s or more: the hand-back gave the menu to the post path, which ran the network over the menu at the output size
+  (`server=48.7ms` at 3840x2160 with the default model resolution: the menu at about 20 fps), on top of the edit
+  already in the frame, after a rebuild at 3840x2160 (`network built for 3840x2160 ... in 307 ms`). On resume the
+  holds waited for the post path's last frame (`the network is serving the after-the-upscaler path`, one second) and
+  for a rebuild at 1920x1080: the model was off for 1.2 s after a 44 s pause, and in later runs 3-6 s. On the 12 GB
+  card the 3840x2160 build ended at the VRAM budget, the VRAM guard paused the network, and it never came back (the
+  game had grown into the memory: 4 minutes later still paused).
+- With the reporter's model resolution after the upscaler (50%) the post path's size equals the render size: no
+  rebuild, only the second pass over the menu.
+- 40 pause/resume cycles (3 s and 36-40 s) on the reporter's build with the reporter's settings, and 17 on the next
+  build: no Xid. The reporter's crash (#59: Xid 31, copy engine reading unmapped memory, 4090 + 5080) was not
+  reproduced here.
+- One crash was: with a first version of the change below that handed back at the resume itself (the first Super
+  Resolution launches after the menu counted as "DLSS runs, its input not held"), the post path asked for its
+  3840x2160 build as the holds came back, a hold took the 1920x1080 build an instant later, and the loader thread
+  rebuilt under it: Xid 13 (SM MMU faults), device lost, `building the network for 3840x2160 failed: waited failed:
+  -4`.
+
+**The change.**
+
+1. `hand_back_at`: 30 s after the last held frame only while Super Resolution goes on launching without its input
+   held (a run of launches under `RECENT` apart reaching more than `RECENT` past the last held frame, counted from
+   the run's start when it began later); with no launch at all, 5 minutes (`PAUSE_HAND_BACK`). DLAA and a set of
+   inputs no longer identified hand back as before; a menu or loading screen keeps the network where it is.
+2. `PAUSED` (`preupscale_state` 6): no hold lately, no DLSS frame within `RECENT`, the post path kept off. The GUI
+   says "paused with the game's DLSS (a menu or loading screen): the model resumes with its next frame"; captures
+   meanwhile read the presented frame as both images, as while holding.
+3. `LoaderState::want_sizes`: a path taking the current build drops the other path's pending request for another
+   set of sizes, so the loader thread never frees a build a frame was just recorded with.
+4. `DLSS frames resumed (#N) after N ms` is always logged (it was only with `NEURAL_FORGE_CAPTURE_AT`).
+
+**Measured after it** (same rig and save, default settings): 4 pauses of 40 s and 20 of 3 s, 24 cycles: no post
+path, no rebuild, VRAM 10.8-10.9 GB throughout, no Xid; the network runs on the first DLSS frame after the menu
+(10-35 ms after `DLSS frames resumed`). The history still starts afresh there (the 500 ms rule): the scene is the
+same, but the game's render targets are new and a stale history after a cut the game does not flag would ghost.
+
+Not done: running the model over the menu on the finished frame, as the reporter suggested. The frame under the
+menu already has the edit; a second pass doubles it, changes the menu's text, costs a frame of the network at the
+output size, and needs the network at that size (a rebuild, or both sizes built: on the 12 GB card at 4K that does
+not fit). Where the game's queue is shared with the network (Red Dead Redemption 2) the post path cannot run at
+all.
+
+Tests: `a_pause_without_any_dlss_launch_keeps_the_post_path_off_longer` (the menu, DLAA, the resume, the run of
+launches), `the_post_path_takes_over_only_after_hand_back_without_dlss` and
+`the_shared_post_off_deadline_matches_the_holding_devices_own` (with launches),
+`dlss_identified_with_every_frame_refused_is_not_waiting_for_dlss_input` (the `PAUSED` status),
+`a_path_taking_the_current_build_drops_the_other_paths_pending_rebuild`, the GUI's `says_paused_while_the_game_pauses_dlss`.
+
+### The VRAM guard in the same game at 4K with Ray Reconstruction and path tracing
+
+Before (rrpt runs, RTX 5070 12 GB, 3840x2160 HDR10, Auto: after DLSS, the network at 3840x2160, 32 ms a frame in
+the menus): in play the game ran at 0.1-8 fps with bursts of 60-70 (the layer stops working below 15 fps, the game
+recovers, the holds return), the network at 311-1741 ms a frame, and no `VRAM guard` line at all. With
+`NEURAL_FORGE_PROBE_VRAM=1` (added for this, kept as a diagnostic):
+
+1. Five samples within one second were needed for a judgement; the holds came 1-5 per 5 s. Fix: the last five are
+   kept for up to 5 s (`SLOW_WINDOW`), and two or more within it all above `SPILL_ABS_MS` are a judgement.
+2. The after-the-upscaler path's frames were never timed for the guard (`native_post`), and in this game the network
+   served that path whenever Ray Reconstruction's 1 s window lapsed between slow frames. Fix: each of its frames
+   reports its time.
+3. With 1 and 2 the guard decided to pause (`the network took 353.7 ms a frame (best 31.0 ms) ... 10390 of 10470
+   MiB`), but the decision is applied where a path asks for the network (`want_sizes`), and none did: the game stayed
+   at 9 fps for minutes with the network open (`spill since 144 s`, the probe). Fix: `LoaderState::apply_idle_step`,
+   the loader thread applies a decided step down once no hold recorded with the build may run and no path took the
+   network for `IDLE_STEP` (the fence wait plus a second).
+4. Another run had the network at 1.7 s a frame (best 31 ms) with the reading 217 MiB under the budget (10189 of
+   10406 MiB), outside `OVER_MARGIN_MIB` (128). Fix: a network ten times slower than its best (or over 500 ms) counts
+   as spilled within 512 MiB of the budget (`SEVERE_MARGIN_MIB`); slow with more room than that stays a slow GPU.
+
+After (rrpt5): 6.7 fps in play, the step down decided 3 s after the network's frames went over 350 ms, applied by the
+loader thread when the frames stopped using it (`no frame has used the network for 6 s; the step down (Paused) is
+applied now`), the network closed, and the game at 67.7-70.7 fps for the rest of the run, no Xid. From the first slow
+frames to the steady game took about a minute: the holds kept the build in use for 29 s after the decision.
+
+Tests (`vram_guard`): `a_spill_that_slows_the_game_to_a_few_fps_still_steps_down` (four holds a second, one a second,
+two slow frames five seconds apart, 1.7 s near the budget; not with a gigabyte of room, not on stale samples; fails
+without the fix); `native::tests::a_step_down_nobody_asks_for_is_applied_when_the_network_is_idle`.
