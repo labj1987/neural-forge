@@ -78,6 +78,17 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   before NVIDIA's `EvaluateFeature` is called, so before NGX records any of the evaluate's launches, on the same
   thread; once the call returned, the wrapper writes the same record again with `KIND_END` (bit 16 of `api`; the API is
   the low 16 bits). Every launch of the evaluate lies between the two.
+- **The NGX versions.** After a feature is created (`modules.rs`, `note_loaded`) the wrapper lists the process's
+  modules (`K32EnumProcessModules`, which Wine serves), keeps `_nvngx.dll` and `nvngx*.dll` (itself, NVIDIA's core, the
+  snippets `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `nvngx_dlssd.dll`, `nvngx_dlssnr.dll`, ...), whatever path each was
+  loaded from, and reads each file's `VS_FIXEDFILEINFO` version through `version.dll` (loaded when needed, not
+  imported). It logs them when the text log is on and, in a game the layer is on in, writes
+  `$XDG_STATE_HOME/neural-forge/ngx-modules/<exe>.txt` (the format is in `modules.rs`; a run replaces the file, and it
+  is rewritten only when the set of paths changes). `doctor` and the report (`ngx_versions.rs`) show that record with
+  how long ago it was written, and the NGX DLLs present in each switched-on game's folder, its prefix's
+  `ProgramData/NVIDIA/NGX` and `system32`, and the driver's core, with their versions read from the PE resources on
+  the Linux side (`model::dll_file_version`: headers and resource section only). The record is for a bug report's
+  sake: nothing reads it to decide anything.
 - **Only where the layer is on.** The wrapper is in every game a Neural Forge Proton runs, but it creates the ring
   only with `NEURAL_FORGE_ENABLE=1` (the layer's `enable_environment`), without `NEURAL_FORGE_DISABLE=1`, and not with
   `NEURAL_FORGE_NGX_RING=off`: the layer is the ring's only reader and the one that removes the file, so in any

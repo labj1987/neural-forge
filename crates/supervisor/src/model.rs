@@ -313,6 +313,33 @@ fn file_version(resources: &Resources) -> Option<[u16; 4]> {
     Some([(ms >> 16) as u16, ms as u16, (ls >> 16) as u16, ls as u16])
 }
 
+/// The file version (`VS_FIXEDFILEINFO`) of the PE32+ DLL at `path`, reading its headers and its resource section only
+/// (the DLSS DLLs are tens of megabytes): the resource section is read into a zeroed buffer at its own file offset, so
+/// the offsets the resource walk computes hold, and the rest of the buffer is never touched.
+pub fn dll_file_version(path: &Path) -> Result<[u16; 4], ModelError> {
+    use std::io::{Read, Seek, SeekFrom};
+    const HEAD: usize = 4096;
+    const RSRC_CAP: usize = 64 << 20;
+    let io = |e: std::io::Error| pe_err(format!("{}: {e}", path.display()));
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    let len = file.metadata().map_err(io)?.len() as usize;
+    let mut head = vec![0u8; len.min(HEAD)];
+    file.read_exact(&mut head).map_err(io)?;
+    let probe = Resources::parse(&head)?;
+    let (raw, raw_size) = probe
+        .sections
+        .iter()
+        .find(|(_, _, raw, raw_size)| (*raw as usize..(*raw as usize).saturating_add(*raw_size as usize)).contains(&probe.root))
+        .map(|(_, _, raw, raw_size)| (*raw as usize, *raw_size as usize))
+        .ok_or_else(|| pe_err("resource directory outside every section"))?;
+    let end = raw.checked_add(raw_size).filter(|end| *end <= len && raw_size <= RSRC_CAP).ok_or_else(|| pe_err("resource section outside the file"))?;
+    let mut image = vec![0u8; end.max(head.len())];
+    image[..head.len()].copy_from_slice(&head);
+    file.seek(SeekFrom::Start(raw as u64)).map_err(io)?;
+    file.read_exact(&mut image[raw..end]).map_err(io)?;
+    file_version(&Resources::parse(&image)?).ok_or_else(|| pe_err("no version resource"))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tensor<'a> {
     pub name: String,
@@ -1047,6 +1074,23 @@ mod tests {
         image[section + 20..section + 24].copy_from_slice(&0x400u32.to_le_bytes());
         image.extend(rsrc);
         image
+    }
+
+    #[test]
+    fn dll_file_version_reads_only_the_headers_and_the_resource_section() {
+        let dir = scratch("dll-file-version");
+        let path = dir.join("nvngx_dlss.dll");
+        let mut image = dll(&[1, 2, 3], [310, 4, 0, 7]);
+        // Megabytes of other sections in front of the resources do not matter: pad the file after them.
+        image.extend(std::iter::repeat_n(0xAB, 1 << 20));
+        std::fs::write(&path, &image).unwrap();
+        assert_eq!(dll_file_version(&path).unwrap(), [310, 4, 0, 7]);
+        std::fs::write(&path, &image[..0x500]).unwrap();
+        assert!(dll_file_version(&path).is_err(), "a truncated resource section is refused");
+        std::fs::write(&path, b"not a pe").unwrap();
+        assert!(dll_file_version(&path).is_err());
+        assert!(dll_file_version(&dir.join("missing.dll")).is_err());
+        std::fs::remove_dir_all(&*dir).unwrap();
     }
 
     fn scratch(tag: &str) -> crate::paths::tests::ScratchDir {

@@ -431,6 +431,12 @@ The CLI is installed as `~/.local/share/neural-forge/bin/neural-forge-cli`; add 
 `game-settings list|show GAME|set GAME NAME VALUE|clear GAME [NAME]` for a game's own settings, and
 `shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--view V]|capture --cancel|dump-cache [--holds K]|reset|lut FILE|none`
 for the live settings. `doctor`, `report` and `shmctl status` only look: they create and change nothing.
+`doctor` (and the `summary.txt` of **Save report**) lists the **NGX versions**: the file version of NVIDIA's NGX core
+from the driver, of every NGX file a game loaded in its last run with the folder it was loaded from (the game's own,
+the NGX models folder an over-the-air update fills, the driver's), and of the NGX files present in each switched-on
+game's folder and Proton prefix. A DLSS update by the game or NVIDIA, or the pinned Frame Generation DLL, shows there.
+The loaded files are recorded by the wrapper once a game has created a DLSS feature, so a game that was not started
+with Neural Forge on since this version has none yet.
 `neural-forge-cli help [COMMAND]` (or `COMMAND --help`) has the details; an unknown or misspelt
 argument prints the usage and exits with status 2.
 
