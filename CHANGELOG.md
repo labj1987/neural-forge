@@ -8,8 +8,8 @@ first shipped them; their phase is kept as a subheading.
 
 **10-bit SDR games get the model, and a trace for games that stall with the NGX wrapper**
 
-- Games that present a 10-bit SDR picture (common under gamescope, for example Stellar Blade) now get the model on
-  the finished frame instead of being presented untouched. The model sees the frame's 8-bit picture and its change is
+- Games that present a 10-bit SDR picture (common under gamescope with HDR on) now get the model on the finished
+  frame instead of being presented untouched. The model sees the frame's 8-bit picture and its change is
   put back onto the 10-bit frame, so pixels it leaves alone keep their full precision.
 - New `NEURAL_FORGE_NGX_TRACE=/path/to/trace.txt` launch option: Neural Forge's NGX wrapper then logs every DLSS call
   with its thread and timing, and how it loaded, and keeps the last lines even if the game crashes. It is meant for

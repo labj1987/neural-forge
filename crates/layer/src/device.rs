@@ -4123,8 +4123,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let proxy_format = swapchain::proxy_format_for(sw.format, sw.color_space);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
                 let srgb = swapchain::is_srgb(sw.format);
-                // Whether the frame can be read back for a capture (`crate::series`, 8-bit PNGs): never an HDR10
-                // one (refused above).
+                // Whether the frame can be read back for a capture (`crate::series`, 8-bit PNGs): never a 10-bit
+                // one, HDR10 or SDR (refused above).
                 let readable = sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && !ten_bit;
                 // The sharpening reads and writes the swapchain's image itself: an admitted swapchain's (a pass-through
                 // one's frames come from its render source, which is not sharpened).
@@ -4132,7 +4132,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     sharpen_target = Some(SharpenTarget {
                         swapchain: sc,
                         queue_family,
-                        frame: crate::sharpen::Frame { image, layout: vk::ImageLayout::PRESENT_SRC_KHR, width, height, bgr: bgr_order, ten_bit },
+                        frame: crate::sharpen::Frame { image, layout: vk::ImageLayout::PRESENT_SRC_KHR, width, height, bgr: bgr_order, ten_bit, bt2020: pq10 },
                     });
                 }
                 let (capture_image, capture_layout) = match tap {
