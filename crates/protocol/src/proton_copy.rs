@@ -16,11 +16,34 @@ pub struct Marker {
     pub source_version: String,
     /// The SHA-256 of the wrapper in the copy.
     pub wrapper_sha256: String,
-    /// How many files of the copy were hard links to the source when it was made (`linked=`), and the fingerprint
-    /// of them (`link_fingerprint=`); absent in a copy made before they were recorded, and 0 files where the
-    /// source is on another filesystem (a full copy).
+    /// How many files of the copy were hard links to the source when it was made (`linked=`), and those files
+    /// (`link_file=<path>\t<size>\t<mtime>` lines: relative path, byte size, modification time as `secs.nanos`);
+    /// absent in a copy made before they were recorded, and 0 files where the source is on another filesystem (a
+    /// full copy).
     pub linked: Option<u64>,
-    pub link_fingerprint: String,
+    pub link_files: Vec<LinkedFile>,
+}
+
+/// One hard-linked file of a copy as it was when the copy was made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedFile {
+    pub path: String,
+    pub size: u64,
+    pub mtime: String,
+}
+
+impl LinkedFile {
+    /// The marker line (without the newline).
+    pub fn line(&self) -> String {
+        format!("link_file={}\t{}\t{}", self.path, self.size, self.mtime)
+    }
+
+    fn parse(rest: &str) -> Option<Self> {
+        let mut f = rest.rsplitn(3, '\t');
+        let mtime = f.next()?.to_string();
+        let size = f.next()?.parse().ok()?;
+        Some(Self { path: f.next()?.to_string(), size, mtime })
+    }
 }
 
 impl Marker {
@@ -31,7 +54,7 @@ impl Marker {
             source_version: field("source_version="),
             wrapper_sha256: field("wrapper_sha256="),
             linked: field("linked=").parse().ok(),
-            link_fingerprint: field("link_fingerprint="),
+            link_files: text.lines().filter_map(|l| l.strip_prefix("link_file=").and_then(LinkedFile::parse)).collect(),
         }
     }
 
