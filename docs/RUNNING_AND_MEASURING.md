@@ -584,10 +584,23 @@ otherwise, and the picture is right: every run is recorded for 10 s once at its 
 10 s of `vw replay save`, `record_after` seconds after the placement was reached; the recorder's log is
 `<label>.mp4.log`). A run with `recorder = "cpu"` (Cyberpunk 2077 with Ray Reconstruction: the GPU encoder's
 ~310 MiB left the model too little at 4K and the VRAM guard paused it) encodes on the CPU (`VW_ENCODER=cpu`,
-1920x1080, about 20 MiB), which keeps about 115 of 150 frames a second. and `vw analyze` must flag nothing (a colour flash: frames tinted against their
+1920x1080, about 20 MiB), which keeps about 115 of 150 frames a second) and `vw analyze` must flag nothing (a colour flash: frames tinted against their
 neighbours, frames alternating between two states, black frames, freezes); the table's `picture` column says
 `ok` or `FAIL`. Log numbers alone never pass a run: look at each run's contact sheet (`<label>-vw/sheet.jpg`)
-against the game with the model off as well. `--no-record` makes no recording, and every run then fails. Each run's layer log, its status samples (`<label>.samples`) and `results.txt` go to `--out` (default
+against the game with the model off as well. `--no-record` makes no recording, and every run then fails.
+
+Known false flags (look at the frames before calling one; never pass a flag without that):
+
+- Cyberpunk 2077 with Ray Reconstruction at 4K (CPU recorder): `COLOUR_FLASH` of 6-10 levels on the pool hall's
+  red lamp near the end of the benchmark. The same red peak is in every recording of that moment, with and without
+  Ray Reconstruction; the GPU recorder at about 85 game frames a second sees it as a smooth peak (4.7 levels, under
+  the limit of 6), while at about 48 game frames a second (Ray Reconstruction) it is one game frame's step of about
+  10 levels that the colour-flash test, counted in recorded frames, takes for a flash. Seen in the 4.1.1 sweep,
+  whose change never reaches Cyberpunk 2077 (vkd3d-proton does not call `vkCmdBindDescriptorSets2`).
+- A single `CONTENT_FREEZE` of 150-160 ms at a benchmark's scene change that does not come back in a second run
+  over the same moment is the game's own hitch; one that comes back is a finding.
+
+Each run's layer log, its status samples (`<label>.samples`) and `results.txt` go to `--out` (default
 `~/nf-sweep/<unix time>`).
 
 Each run takes the GPU lock (`--lock`, default `$NF_GPU_LOCK`, else `~/scratch/gpu.lock`, an `flock`; waiting
