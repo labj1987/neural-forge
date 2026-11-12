@@ -11,6 +11,10 @@ NVIDIA's own runtime. Read [Legal](#legal) before you use it.
 |---|---|---|
 | ![Model tab with the per-game Settings for bar, the switch, style, strength preset and its values](screenshots/settings.png) | ![Setup tab with the model, the network choice and the Steam games with a switch each and where each was tested](screenshots/setup.png) | ![Status tab while Hogwarts Legacy runs: the model before the upscaler, the frame rate and the graph of frame time and the model's GPU time](screenshots/status.png) |
 
+| Composition | Debug | Setup: Proton copies and Uninstall |
+|---|---|---|
+| ![Composition tab: colour trust, ratio smoothing, ghost guard, apply model edit and hold frame](screenshots/composition.png) | ![Debug tab: compare mode, split, zoom and swap, the debug view, the edit cache and scene cuts](screenshots/debug.png) | ![End of the Setup tab: installed Protons with Make copy (and why Proton 8 and 9 cannot be copied), and Uninstall Neural Forge](screenshots/setup-proton.png) |
+
 ## Requirements
 
 - x86_64 Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40 or later), GTK 4.12 and
