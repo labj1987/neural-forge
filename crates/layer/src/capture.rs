@@ -5319,10 +5319,19 @@ mod tests {
         rig.hdr().reversible_mode.store(neural_forge_protocol::enums::reversible_mode::NEUTWO_REPLACE, AtomicOrdering::Relaxed);
         let frame = |k: usize| -> Vec<u8> { test_game_frame(w, h).chunks(4).flat_map(|p| [p[0].wrapping_add(k as u8 * 3), p[1], p[2], 255]).collect() };
         let mut seen = false;
+        let mut seen_unsent = false;
         for k in 0..40usize {
             rig.answering.store(!(20..=21).contains(&k), AtomicOrdering::Relaxed);
             rig.upload(&frame(k));
             let presented = rig.present();
+            if k == 22 && presented {
+                // Frame 21 could not be sent (the answer to 20 was still out): kept on the GPU as it was, shown now.
+                let shown = rig.read_back();
+                let want = frame(21);
+                let worst = shown.iter().zip(&want).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap_or(0);
+                assert!(worst <= 2, "the unsent frame 21 came back changed (worst {worst})");
+                seen_unsent = true;
+            }
             if k == 21 && presented {
                 let shown = rig.read_back();
                 let want = frame(20);
@@ -5333,6 +5342,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(seen, "present 21 was not delayed");
+        assert!(seen_unsent, "present 22 was not delayed");
         rig.finish();
     }
 
@@ -5941,6 +5951,183 @@ mod tests {
             instance.destroy_instance(None);
         }
         Some(out)
+    }
+
+    /// The delayed present across its paths (the model on a second GPU): zero-copy, then the CPU pairs (zero-copy
+    /// refused), then zero-copy again, with an answer withheld and a stall of the game. Every present shows the frame
+    /// before it, or, where the delay starts again (the first present, each switch of path, the stall), its own frame
+    /// once.
+    #[test]
+    fn the_delayed_present_keeps_its_cadence_across_paths_and_stalls() {
+        let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_entry, instance, physical_device, device, queue, queue_family, supported)) = test_device_with_external_memory_host() else {
+            eprintln!("the_delayed_present_keeps_its_cadence_across_paths_and_stalls: no Vulkan device, skipping");
+            return;
+        };
+        if !supported {
+            unsafe {
+                device.destroy_device(None);
+                instance.destroy_instance(None);
+            }
+            eprintln!("the_delayed_present_keeps_its_cadence_across_paths_and_stalls: no VK_EXT_external_memory_host, skipping");
+            return;
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_NO_ZERO_COPY.store(false, AtomicOrdering::Relaxed);
+                crate::preupscale::offload::set_active_for_test(false);
+            }
+        }
+        let _reset = Reset;
+        crate::preupscale::offload::set_active_for_test(true);
+        let path = scratch_path("delayed-paths");
+        let _cleanup = RemoveScratch(path.clone());
+        let (width, height) = (16u32, 16u32);
+        let frame_bytes = (width * height * 4) as usize;
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path));
+        let hdr_ptr = shm.test_header_ptr();
+        let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+        hdr.model_interval.store(1, AtomicOrdering::Relaxed);
+        hdr.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
+        hdr.white_point_source.store(neural_forge_protocol::enums::white_point_source::MANUAL, AtomicOrdering::Relaxed);
+        let proxy_region = shm.proxy_region(Slot::Primary).unwrap().0 as usize;
+        let answer_region = shm.answer_region(Slot::Primary).unwrap().0 as usize;
+        let (stop, withhold) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (stop_clone, withhold_clone) = (Arc::clone(&stop), Arc::clone(&withhold));
+        let first_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
+        let server = std::thread::spawn(move || {
+            // SAFETY: the mapping outlives this thread (joined below).
+            let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+            let mut last_seen = first_seen;
+            while !stop_clone.load(AtomicOrdering::Relaxed) {
+                hdr.server_heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
+                if req != 0 && req != last_seen {
+                    last_seen = req;
+                    if withhold_clone.swap(false, AtomicOrdering::Relaxed) {
+                        continue;
+                    }
+                    std::sync::atomic::fence(AtomicOrdering::Acquire);
+                    // SAFETY: both regions hold the frame; the layer reads neither while the request is out.
+                    unsafe { std::ptr::copy_nonoverlapping(proxy_region as *const u8, answer_region as *mut u8, frame_bytes) };
+                    hdr.answered_w.store(hdr.width.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+                    hdr.answered_h.store(hdr.height.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+                    std::sync::atomic::fence(AtomicOrdering::Release);
+                    hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_micros(300));
+            }
+        });
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
+        let mut s = RunState::default();
+        let (mut own, mut previous, mut starts_allowed) = (0, 0, 1);
+        let mut own_at = Vec::new();
+        for k in 0..120usize {
+            match k {
+                30 => {
+                    TEST_NO_ZERO_COPY.store(true, AtomicOrdering::Relaxed);
+                    starts_allowed += 1;
+                }
+                50 => withhold.store(true, AtomicOrdering::Relaxed),
+                70 => {
+                    TEST_NO_ZERO_COPY.store(false, AtomicOrdering::Relaxed);
+                    starts_allowed += 1;
+                }
+                90 => {
+                    std::thread::sleep(Duration::from_millis(300));
+                    starts_allowed += 1;
+                }
+                _ => {}
+            }
+            upload_present_src(&device, &mem_props, queue, pool, image, width, height, &flat(width, height, colour_of(k)));
+            // SAFETY: `image` is this test's own, PRESENT_SRC_KHR; one thread.
+            let sem = unsafe {
+                run(
+                    &device,
+                    &instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    image,
+                    width,
+                    height,
+                    neural_forge_protocol::enums::proxy_format::RGBA8,
+                    false,
+                    ScratchSource::default(),
+                    &mut s.pipeline,
+                    &mut s.direct,
+                    &mut true,
+                    &mut s.gpu_compose,
+                    &mut shm,
+                    &mut s.original_scratch,
+                    &mut s.model_scratch,
+                    &mut s.inflight,
+                    &mut s.bootstrap_complete,
+                    &mut s.answer_scratch,
+                    &mut s.raw_answer_base,
+                    &mut s.raw_answer_generation,
+                    &mut s.last_answer,
+                    &mut s.last_answer_dims,
+                    &mut s.last_answer_encoded,
+                )
+            };
+            if let Some(sem) = sem {
+                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+                let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+                unsafe {
+                    device
+                        .queue_submit(
+                            queue,
+                            &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                            wait_fence,
+                        )
+                        .unwrap();
+                    device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                    device.destroy_fence(wait_fence, None);
+                }
+            }
+            let shown = read_back_present_src(&device, &mem_props, queue, pool, image, width, height);
+            if k == 0 {
+                // The first present opens the channel: nothing is delayed yet.
+                continue;
+            }
+            if near(&shown, colour_of(k - 1), 3) {
+                previous += 1;
+            } else {
+                assert!(near(&shown, colour_of(k), 3), "present {k} shows {:?}: neither frame {k} nor the frame before it", &shown[..4]);
+                own += 1;
+                own_at.push(k);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // CPU path: its pairs were freed when the zero-copy path came back.
+        assert!(s.inflight[0].kept_cpu.iter().all(|k| k.original.is_empty()), "the CPU pairs are freed on the zero-copy path");
+        assert!(own <= starts_allowed, "{own} presents showed their own frame (at {own_at:?}); the delay starts only {starts_allowed} times");
+        assert!(previous >= 110, "only {previous} of 120 presents showed the frame before them");
+        stop.store(true, AtomicOrdering::Relaxed);
+        server.join().unwrap();
+        unsafe {
+            device.device_wait_idle().unwrap();
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy_pipeline(s.pipeline.take(), &device);
+            for slot in std::mem::take(&mut s.direct) {
+                destroy_direct_capture(slot, &device);
+            }
+            if let Some(gpu) = s.gpu_compose.take() {
+                gpu.destroy(&device);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
     }
 
     /// The synchronous present's zero-copy compose (direct capture, answer region imported,
