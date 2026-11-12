@@ -3,7 +3,7 @@
 # scripts/build-ngx-wrapper.sh; see docs/PROTON_NGX.md.
 [package]
 name = "neural-forge-ngx-wrapper"
-version = "4.1.0"
+version = "4.1.1"
 edition = "2021"
 authors = ["Linnard Alex Brown Jr."]
 license = "AGPL-3.0-or-later"

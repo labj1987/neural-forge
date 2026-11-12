@@ -42,6 +42,10 @@ impl EntryPoints {
         } else {
             original
         };
+        // Binds of nothing with a null layout, dropped before NVIDIA's driver reads the layout (`noop_bind`): in
+        // every process the layer works in, on devices that have the command.
+        let original =
+            unsafe { crate::noop_bind::intercept(device, CStr::from_ptr(name).to_bytes(), original, crate::layer_enabled() && crate::ownership::eligible()) };
         unsafe { Self::intercept(name, original) }
     }
     /// `vkGetImageViewHandle64NVX` is newer than the pinned ash and `vulkan-layer`, so the
@@ -119,6 +123,7 @@ impl EntryPoints {
             unsafe {
                 crate::device::destroy_private_resources(device);
             }
+            unsafe { crate::noop_bind::forget(device) };
             if crate::probe_ngx::enabled() || crate::preupscale::active() {
                 crate::probe_ngx::forget_device(device);
             }

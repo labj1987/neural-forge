@@ -4,6 +4,14 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.1.1 — 2026-11-12
+
+**GTA San Andreas – The Definitive Edition no longer hangs at the menu**
+
+- On NVIDIA cards, GTA San Andreas – The Definitive Edition could freeze at the menu when Rockstar's Social Club
+  overlay started, then close about two minutes later. A call the game's renderer makes that does nothing, but that
+  NVIDIA's driver mishandles, is now skipped, so the game keeps running.
+
 ## 4.1.0 — 2026-11-11
 
 **The model works on exactly what DLSS uses, and outdated Proton copies show up**
