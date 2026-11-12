@@ -160,6 +160,9 @@ pub(crate) enum Status {
     /// Ended because a frame did not finish in time: the device's work may still be running, so nothing
     /// starts on it again.
     Stalled = 3,
+    /// The model on a second GPU ([`super::offload`]) could not start or was given up (a failed setup, a lost device,
+    /// frames too slow): the network runs on the game's GPU from now on.
+    Unavailable = 4,
 }
 
 impl Status {
@@ -168,6 +171,7 @@ impl Status {
             1 => Self::Serving,
             2 => Self::Retry,
             3 => Self::Stalled,
+            4 => Self::Unavailable,
             _ => Self::Starting,
         }
     }
@@ -193,49 +197,156 @@ impl PostServer {
         loader: Arc<Loader>,
         view: ShmView,
     ) -> Option<Self> {
+        Self::spawn(move |q, st| {
+            work(&device, &instance, physical, setup, import, &loader, view, q, st, None);
+        })
+    }
+
+    /// [`Self::start`] on a device of another GPU ([`super::offload`]), made on the worker's thread for `choice` on the
+    /// game's instance (`game`: the game's device's setup and handle). The worker ends with [`Status::Unavailable`]
+    /// when the device cannot be made, stalls, is lost or is too slow: the caller then runs the network on the game's
+    /// GPU.
+    pub(crate) fn start_offload(instance: ash::Instance, game: Setup, game_device: vk::Device, choice: super::offload::Choice, view: ShmView) -> Option<Self> {
+        Self::spawn(move |q, st| {
+            let end = |s: Status| st.store(s as u8, Ordering::Release);
+            // SAFETY: the game's instance and device outlive this thread (joined in Drop, before the device's teardown).
+            let off = match unsafe { super::offload::Offload::create(&instance, game, game_device, &choice) } {
+                Ok(off) => off,
+                Err(why) => {
+                    crate::log!("[offload] the model stays on the game's GPU: {why}");
+                    crate::logging::flush();
+                    return end(Status::Unavailable);
+                }
+            };
+            // Barriers between the network's launches, never counter chaining: chained launches spin on the GPU waiting for
+            // each other, and beside another context on the same GPU (the game's, in the `same` test) the frame never
+            // finished (2560x1440 on an RTX 5070: no answer in 20 s; with barriers 21 ms).
+            let loader = Arc::new(Loader::start(off.device.handle(), off.setup, Arc::default(), false));
+            loader.register(off.device.handle());
+            let standin = if off.standin {
+                // SAFETY: the device just made, with the queue family its setup names.
+                match unsafe { super::offload::Standin::new(&off.device, &instance, off.physical, off.setup.family) } {
+                    Some(s) => Some(s),
+                    None => {
+                        crate::log!("[offload] the stand-in's objects could not be made; the model stays on the game's GPU");
+                        loader.retire();
+                        drop(loader);
+                        // SAFETY: nothing of the device's is alive (the loader never opened the network).
+                        unsafe { off.destroy() };
+                        return end(Status::Unavailable);
+                    }
+                }
+            } else {
+                None
+            };
+            let extra = Offloaded { standin, name: off.name.clone() };
+            let stalled = work(&off.device, &instance, off.physical, off.setup, off.import, &loader, view, q, st, Some(extra));
+            loader.retire();
+            loader.stop_worker();
+            drop(loader);
+            if stalled {
+                // Its work may still run: the device is left as it is (the process's end frees it).
+                crate::log!("[offload] the other GPU stopped answering; its device is left to the process's end");
+            } else {
+                // SAFETY: the server and the network are gone, nothing pending.
+                unsafe { off.destroy() };
+            }
+        })
+    }
+
+    fn spawn(body: impl FnOnce(&AtomicBool, &AtomicU8) + Send + 'static) -> Option<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let status = Arc::new(AtomicU8::new(Status::Starting as u8));
         let (q, st) = (quit.clone(), status.clone());
-        let worker = std::thread::Builder::new()
-            .name("nf-native-post".into())
-            .spawn(move || {
-                let end = |s: Status| st.store(s as u8, Ordering::Release);
-                let Some(claim) = OWNER.claim(ash::vk::Handle::as_raw(device.handle()).max(1)) else {
-                    crate::log!("[native] another device's server is answering the after-the-upscaler requests: it keeps them");
-                    return end(Status::Retry);
-                };
-                let hdr = view.header();
-                let before = hdr.server_heartbeat.load(Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(300));
-                if hdr.server_heartbeat.load(Ordering::Relaxed) != before {
-                    crate::log!("[native] something else is answering the after-the-upscaler requests: it keeps them");
-                    drop(claim);
-                    return end(Status::Retry);
-                }
-                // SAFETY: the device and the queue the setup names are live for this thread's life (joined in Drop,
-                // before the device's teardown frees anything).
-                let Some(mut gpu) = (unsafe { Gpu::new(&device, setup) }) else {
-                    crate::log!("[native] the after-the-upscaler path's pipelines could not be built; it stays untouched for now");
-                    drop(claim);
-                    return end(Status::Retry);
-                };
-                crate::log!("[native] answering the after-the-upscaler path's requests on queue {} of family {}", setup.post_index, setup.family);
-                crate::logging::flush();
-                end(Status::Serving);
-                serve(&device, &instance, physical, import, &loader, view, &q, &mut gpu);
-                let stalled = gpu.stalled;
-                // SAFETY: `serve` returns with nothing of `gpu` pending (or stalled, and then nothing is freed).
-                unsafe { gpu.destroy(&device) };
-                drop(claim);
-                end(if stalled { Status::Stalled } else { Status::Retry });
-            })
-            .ok()?;
+        let worker = std::thread::Builder::new().name("nf-native-post".into()).spawn(move || body(&q, &st)).ok()?;
         Some(Self { quit, status, worker: Some(worker) })
     }
 
     pub(crate) fn status(&self) -> Status {
         Status::from_u8(self.status.load(Ordering::Acquire))
     }
+}
+
+/// What a server on another GPU adds ([`PostServer::start_offload`]).
+struct Offloaded {
+    standin: Option<super::offload::Standin>,
+    name: String,
+}
+
+/// The server's worker: takes the channel ([`Owner`]), checks that nothing outside the process answers it (its
+/// heartbeat stands still), builds its pipelines and serves. Whether a frame stalled (the device's work may still run).
+#[allow(clippy::too_many_arguments)]
+fn work(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    setup: Setup,
+    import: bool,
+    loader: &Loader,
+    view: ShmView,
+    q: &AtomicBool,
+    st: &AtomicU8,
+    offloaded: Option<Offloaded>,
+) -> bool {
+    let end = |s: Status| st.store(s as u8, Ordering::Release);
+    let Some(claim) = OWNER.claim(ash::vk::Handle::as_raw(device.handle()).max(1)) else {
+        crate::log!("[native] another device's server is answering the after-the-upscaler requests: it keeps them");
+        end(Status::Retry);
+        return false;
+    };
+    let hdr = view.header();
+    let before = hdr.server_heartbeat.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(300));
+    if hdr.server_heartbeat.load(Ordering::Relaxed) != before {
+        crate::log!("[native] something else is answering the after-the-upscaler requests: it keeps them");
+        drop(claim);
+        end(Status::Retry);
+        return false;
+    }
+    // SAFETY: the device and the queue the setup names are live for this thread's life (joined in Drop,
+    // before the device's teardown frees anything).
+    let Some(mut gpu) = (unsafe { Gpu::new(device, setup) }) else {
+        crate::log!("[native] the after-the-upscaler path's pipelines could not be built; it stays untouched for now");
+        drop(claim);
+        end(Status::Retry);
+        return false;
+    };
+    let offload = offloaded.is_some();
+    if let Some(o) = offloaded {
+        gpu.standin = o.standin;
+        gpu.slow = Some(super::offload::SlowRule::default());
+        crate::log!("[offload] answering the after-the-upscaler path's requests on {}", o.name);
+    } else {
+        crate::log!("[native] answering the after-the-upscaler path's requests on queue {} of family {}", setup.post_index, setup.family);
+    }
+    crate::logging::flush();
+    end(Status::Serving);
+    if offload {
+        super::offload::set_active(true);
+    }
+    serve(device, instance, physical, import, loader, view, q, &mut gpu);
+    if offload {
+        super::offload::set_active(false);
+    }
+    let stalled = gpu.stalled;
+    let gave_up = gpu.give_up.take();
+    if let Some(why) = &gave_up {
+        crate::log!("[offload] back to the game's GPU: {why}");
+        crate::logging::flush();
+    }
+    // SAFETY: `serve` returns with nothing of `gpu` pending (or stalled, and then nothing is freed).
+    unsafe { gpu.destroy(device) };
+    drop(claim);
+    end(if stalled || gave_up.is_some() {
+        if offload {
+            Status::Unavailable
+        } else {
+            Status::Stalled
+        }
+    } else {
+        Status::Retry
+    });
+    stalled
 }
 
 impl Drop for PostServer {
@@ -302,6 +413,11 @@ struct Gpu {
     /// Tests: a flow field (grid, S10.5 vectors) the preprocess reads instead of the GPU's.
     #[cfg(test)]
     synthetic_flow: Option<(u32, Vec<u32>)>,
+    /// On another GPU with `NEURAL_FORGE_OFFLOAD_STANDIN`: the copy that runs in place of the network ([`super::offload`]).
+    standin: Option<super::offload::Standin>,
+    /// On another GPU: the rule that gives it up when its frames are too slow, and why it was given up (the server ends).
+    slow: Option<super::offload::SlowRule>,
+    give_up: Option<String>,
 }
 
 /// What [`Gpu::sets`] point at.
@@ -562,6 +678,9 @@ impl Gpu {
             setup,
             #[cfg(test)]
             synthetic_flow: None,
+            standin: None,
+            slow: None,
+            give_up: None,
         }
     }
 
@@ -592,6 +711,9 @@ impl Gpu {
             }
             if let Some(Some(h)) = self.hdr.take() {
                 h.destroy(device);
+            }
+            if let Some(s) = self.standin.take() {
+                s.destroy(device);
             }
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
@@ -648,7 +770,7 @@ fn serve(
     let mut last = first_seen(hdr);
     let mut frames: u64 = 0;
     let mut last_request = Instant::now();
-    while !quit.load(Ordering::Relaxed) && !gpu.stalled {
+    while !quit.load(Ordering::Relaxed) && !gpu.stalled && gpu.give_up.is_none() {
         if !view.usable() {
             // The process let the channel go (it stopped presenting): another game's layer may own
             // it now, and its requests are not this server's. Picked up again once this process
@@ -764,41 +886,71 @@ fn process(
     // this size would keep the pre-upscaler path off it for good), except after a frame that did not
     // finish in time: its work may still use the network, so the claim stays until its fence signals
     // (`Loader::post_stalled`, checked by the pre-upscaler path's claim).
-    let evaluated = wanted && loader.claim_post() && {
-        // The Network setting: a switch frees the current build here, once this path's previous frame
-        // was waited for (`evaluate` waits for each) and the other path is kept off by the claim.
-        let ok = loader.ready(width, height, hdr.network_choice()).is_some_and(|built| {
-            // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
-            unsafe {
-                evaluate(
-                    device,
-                    instance,
-                    physical,
-                    import,
-                    Some(loader),
-                    (view.regions(slot).0, view.regions(slot).1, view.capacity()),
-                    gpu,
-                    slot,
-                    &built,
-                    width,
-                    height,
-                    format == proxy_format::BGRA8,
-                    pq10,
-                    &passes,
-                    feedback,
-                    &colour,
-                    lut.as_ref(),
-                    &hud,
-                )
+    let standin = gpu.standin.is_some();
+    let evaluated = if standin {
+        // The stand-in on another GPU (`NEURAL_FORGE_OFFLOAD_STANDIN`): the frame copied in and back out there. An HDR10
+        // frame's copy would be its raw words, no SDR answer: echoed below as on any failure.
+        wanted && pq10.is_none() && {
+            let mut stalled = false;
+            let regions = (view.regions(slot).0, view.regions(slot).1, view.capacity());
+            let queue = gpu.queue;
+            // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now, and the
+            // stand-in's last copy was waited for.
+            let copied = unsafe { gpu.standin.as_mut().expect("checked").run(device, instance, physical, queue, import, regions, bytes as u64, &mut stalled) };
+            gpu.stalled |= stalled;
+            if let Some((copy_in, copy_out)) = copied {
+                super::offload::STATS.copy_in_us.fetch_add(copy_in.as_micros() as u64, Ordering::Relaxed);
+                super::offload::STATS.copy_out_us.fetch_add(copy_out.as_micros() as u64, Ordering::Relaxed);
             }
-        });
-        if gpu.stalled {
-            loader.post_stalled(device, gpu.fence);
-        } else {
-            loader.release_post();
+            copied.is_some()
         }
-        ok
+    } else {
+        wanted && loader.claim_post() && {
+            // The Network setting: a switch frees the current build here, once this path's previous frame
+            // was waited for (`evaluate` waits for each) and the other path is kept off by the claim.
+            let ok = loader.ready(width, height, hdr.network_choice()).is_some_and(|built| {
+                // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
+                unsafe {
+                    evaluate(
+                        device,
+                        instance,
+                        physical,
+                        import,
+                        Some(loader),
+                        (view.regions(slot).0, view.regions(slot).1, view.capacity()),
+                        gpu,
+                        slot,
+                        &built,
+                        width,
+                        height,
+                        format == proxy_format::BGRA8,
+                        pq10,
+                        &passes,
+                        feedback,
+                        &colour,
+                        lut.as_ref(),
+                        &hud,
+                    )
+                }
+            });
+            if gpu.stalled {
+                loader.post_stalled(device, gpu.fence);
+            } else {
+                loader.release_post();
+            }
+            ok
+        }
     };
+    if evaluated && gpu.slow.is_some() {
+        super::offload::STATS.server_frames.fetch_add(1, Ordering::Relaxed);
+        super::offload::STATS.server_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    if let Some(why) = gpu.slow.as_mut().and_then(|r| r.note(if evaluated { t.elapsed() } else { Duration::ZERO })) {
+        gpu.give_up = Some(why);
+    }
+    if gpu.stalled && gpu.slow.is_some() && gpu.give_up.is_none() {
+        gpu.give_up = Some("a frame did not finish in time on the other GPU (or its device was lost)".into());
+    }
     if !evaluated {
         // The effect off, the model not ready, a failed frame: the next frame starts afresh.
         gpu.history[slot.index()].skipped();
