@@ -1443,7 +1443,8 @@ on SMPTE ST 2084 and the BT.2020/BT.709 matrices of ITU-R BT.2087 (`crate::hdr_p
   each 10-bit sRGB code taken to 8 bits (`sdr10_word`, exact), and `compose_hdr.comp` puts the change back in linear
   light, out = sRGB(EOTF(base) + EOTF(answer) - EOTF(picture)) at 10 bits, the frame's word where the answer equals
   the picture, no shoulder or highlight rules (nothing was compressed). The same size, pipelined and pass-through
-  rules as HDR10 apply; `NEURAL_FORGE_HDR_PRESENT=off` does not affect it. A pass-through HDR10 swapchain (one the
+  rules as HDR10 apply; `NEURAL_FORGE_HDR_PRESENT=off` does not affect it. Sharpening takes BT.709 luma for it
+  (BT.2020 only for HDR10). Known limitation: PQ code in a swapchain declared sRGB is taken as SDR (it already shows wrong). A pass-through HDR10 swapchain (one the
   layer could not admit) is never composed onto from its render source. `NEURAL_FORGE_HDR_PRESENT=off` leaves
   HDR10 out, as before (a testing aid).
 - **Capture** (`capture::run`): the frame is copied raw (one packed word a pixel) into the proxy region as

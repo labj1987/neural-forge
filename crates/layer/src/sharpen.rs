@@ -120,8 +120,10 @@ pub(crate) struct Frame {
     pub height: u32,
     /// Blue first in the words (BGRA8, A2R10G10B10).
     pub bgr: bool,
-    /// Ten bits a channel (HDR10's A2B10G10R10 / A2R10G10B10); else eight.
+    /// Ten bits a channel (A2B10G10R10 / A2R10G10B10: HDR10 or 10-bit SDR); else eight.
     pub ten_bit: bool,
+    /// BT.2020 primaries (HDR10), for the luma weights; else BT.709 (8-bit and 10-bit SDR).
+    pub bt2020: bool,
 }
 
 /// The shader's push constants (field for field).
@@ -167,7 +169,7 @@ impl Push {
         let sigma = r as f32 / 2.0;
         Push {
             dims: [frame.width, frame.height, phase, regions],
-            flags: [u32::from(frame.bgr) | (u32::from(frame.ten_bit) << 1), u32::from(s.cas > 0.0), u32::from(s.clarity > 0.0), 0],
+            flags: [u32::from(frame.bgr) | (u32::from(frame.ten_bit) << 1) | (u32::from(frame.bt2020) << 2), u32::from(s.cas > 0.0), u32::from(s.clarity > 0.0), 0],
             cas: [cas_peak(s.cas), 0.0, 0.0, 0.0],
             clarity: [s.clarity, r as f32, s.midtones.clamp(0.0, 1.0), edge_stop(s.edges)],
             misc: [region_feather(frame.height), 1.0 / (2.0 * sigma * sigma), 0.0, 0.0],
