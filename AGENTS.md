@@ -4,10 +4,10 @@ Repository: https://github.com/labj1987/neural-forge
 
 Read [docs/PHASE1.md](docs/PHASE1.md) for the current namespace, installation contract and
 target-ownership rules. Benchmarks run with `scripts/gta-bench.sh`
-([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)) at 3840x2160, 144 Hz, VRR on the maintainer's desktop,
-which stays at that mode with HDR on (never change the display mode for a test; set the game's own resolution), the
-default test configuration since 2026-11-10. Games that have HDR are tested with their HDR on; video memory is sampled
-(the 12 GB card is near its limit at 4K with frame generation, and full with Ray Reconstruction). Every release is
+([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)) with the game's own resolution at 2560x1440 (since
+2026-11-12: at 4K the 12 GB card runs out of video memory with Ray Reconstruction and the model after DLSS) on the
+maintainer's desktop, which stays at 3840x2160, 144 Hz, VRR with HDR on (never change the display mode for a test;
+set the game's own resolution). Games that have HDR are tested with their HDR on; video memory is sampled. Every release is
 checked in Cyberpunk 2077, GTA V Enhanced, Red Dead Redemption 2 and Crimson Desert; the old Phase 1 plan is in
 [docs/history/phase1-benchmark-plan.md](docs/history/phase1-benchmark-plan.md). The former app name was dlssnr; upstream DLSS5VKLayer remains a
 separate application and must not be modified or uninstalled by this project.
@@ -128,8 +128,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   the release build: `scripts/game-sweep.sh --layer <build>/libneural_forge_layer.so --cli <build>/neural-forge-cli`
   (docs/RUNNING_AND_MEASURING.md, section 11), in tmux; it takes the GPU lock and puts back what it changes. Every
   run must pass (each run holds the GPU lock only while it runs), and each is recorded (`vw`, `--vw`): a run passes
-  only when the recording flags nothing and its contact sheet looks right against the model off; log numbers alone never pass; record the passing games' `verified`/`verified_on` in `data/games.toml`. Runs are at the test
-  machine's desktop resolution (3840x2160), with HDR for games that have it.
+  only when the recording flags nothing and its contact sheet looks right against the model off; log numbers alone never pass; record the passing games' `verified`/`verified_on` in `data/games.toml`. Runs set the game's own
+  resolution to 2560x1440 (the desktop stays at 3840x2160), with HDR for games that have it.
 
 ## Test builds
 

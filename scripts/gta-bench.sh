@@ -181,11 +181,34 @@ def vdf_block(text, path):
     return out
 
 
+def vdf_pairs(block):
+    """The entries directly in `block` (vdf_block's list), in order: (key, value) for a string value, (key, None) for
+    a nested block. Keys and values are told apart by position, so a value that reads like a key is still a value."""
+    out, k = [], 0
+    block = block or []
+    while k < len(block):
+        s, brace, depth = block[k]
+        if brace or depth != 0 or k + 1 >= len(block):
+            k += 1
+            continue
+        nxt, nbrace, _ = block[k + 1]
+        if nbrace == "{":
+            out.append((s, None))
+            k += 2
+            while k < len(block) and not (block[k][1] == "}" and block[k][2] == 0):
+                k += 1
+            k += 1
+        else:
+            out.append((s, nxt))
+            k += 2
+    return out
+
+
 def vdf_value(block, key):
     """The string value of `key` directly in `block` (vdf_block's list), else None."""
-    for k, (s, brace, depth) in enumerate(block or []):
-        if not brace and depth == 0 and s.lower() == key.lower() and k + 1 < len(block) and not block[k + 1][1]:
-            return block[k + 1][0]
+    for k, v in vdf_pairs(block):
+        if k.lower() == key.lower() and v is not None:
+            return v
     return None
 
 
@@ -193,12 +216,13 @@ def steam_libraries(root):
     """`root` and every library in its steamapps/libraryfolders.vdf, in order, without repeats."""
     out = [root]
     try:
-        folders = vdf_block(open(os.path.join(root, "steamapps/libraryfolders.vdf"), errors="replace").read(), ["libraryfolders"]) or []
+        text = open(os.path.join(root, "steamapps/libraryfolders.vdf"), errors="replace").read()
     except OSError:
-        folders = []
-    for k, (s, brace, depth) in enumerate(folders):
-        if not brace and depth == 1 and s.lower() == "path" and k + 1 < len(folders):
-            out.append(folders[k + 1][0])
+        text = ""
+    for key, value in vdf_pairs(vdf_block(text, ["libraryfolders"])):
+        path = vdf_value(vdf_block(text, ["libraryfolders", key]), "path") if value is None else None
+        if path:
+            out.append(path)
     seen, uniq = set(), []
     for lib in out:
         key = os.path.realpath(lib)
@@ -301,6 +325,9 @@ def self_test():
         config("gone")
         assert mapped_proton(root, [root], "3240220")[1].endswith("not in " + os.path.join(root, "compatibilitytools.d"))
         assert "no Proton chosen" in mapped_proton(root, [root], "4000")[1]
+        # Keys and values by position: a value that reads "name" is not the key, a nested block is not a value.
+        assert vdf_pairs(vdf_block('"a"\n{\n "x" "name"\n "name" "real"\n "b" { "name" "inner" }\n}\n', ["a"])) == [("x", "name"), ("name", "real"), ("b", None)]
+        assert vdf_value(vdf_block('"a" { "b" { "name" "inner" } }', ["a"]), "name") is None
         # A // inside a string is not a comment; a // comment is skipped.
         assert vdf_value(vdf_block('"a" // note\n{\n "path" "//srv/x" // c\n}\n', ["a"]), "path") == "//srv/x"
         # No entry for the game: Steam's default for every game ("0").

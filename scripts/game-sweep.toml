@@ -10,10 +10,12 @@
 #                the run's log, Proton's HDR switches with hdr = true, then these arguments
 #   seconds      how long to watch once the expected placement is reached (default 90), or until the game exits
 #   timeout      how long to wait for the placement (default 600)
-#   record_after when the 10 s recording starts, in seconds after the placement was reached (default 10): inside
-#                one scene, not across the benchmark's own loading screens (record_after + 10 <= seconds)
+#   record_after when the 10 s recording starts, in seconds after the placement was reached (default 10): usually
+#                inside one scene, not across the benchmark's own loading screens (the time from the launch to the
+#                placement varies, so the scene is not certain); record_after + 10 <= seconds
 #   recorder     "gpu" (default) or "cpu": the CPU encoder (about 20 MiB of video memory instead of 310, but fewer
-#                frames kept) only where the GPU encoder leaves the model too little video memory
+#                frames kept, which vw's thresholds were not set with) only where the GPU encoder leaves the model too
+#                little video memory
 #   frame_generation   the game runs with frame generation (its settings as found or edits): the run fails when
 #                the layer's presents per rendered frame say it is off
 #   hdr          run with HDR: PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1, the game's HDR setting in edits
@@ -22,47 +24,46 @@
 #                the game's Proton user folder (compatdata/<appid>/pfx/drive_c/users/steamuser), "json-option"
 #                (Cyberpunk 2077's UserSettings.json option names) or "xml-value" (<Name value="..."/>), NAME=VALUE
 #
-# Every run is at 3840x2160 (the test machine's desktop); games with HDR run with it on.
+# Every run sets the game's own resolution to 2560x1440 (the desktop stays at 3840x2160; at 4K the 12 GB card ran out
+# of video memory with Ray Reconstruction); games with HDR run with it on.
 
 [[run]]
 label = "cyberpunk"
 appid = 1091500
 args = "--launcher-skip -skipStartScreen -benchmark"
 seconds = 60
-# 22 s after the placement: the sunlit street after the bar, clear of the bar-door exit (about 13-16 s in, where
-# the game once stalled 156 ms) and of the pool hall's red lamp under Ray Reconstruction (about 15 s in).
+# 22 s after the placement: usually the street after the bar, past the bar-door exit (the time from the launch to the
+# placement varies, so the scene is not certain).
 record_after = 22
 frame_generation = true
 timeout = 420
 hdr = true
 edit_file = "AppData/Local/CD Projekt Red/Cyberpunk 2077/UserSettings.json"
 edit_kind = "json-option"
-edits = ["Resolution=3840x2160", "HDRModes=HDR10_PQ", "DLSS_D=false"]
+edits = ["Resolution=2560x1440", "HDRModes=HDR10_PQ", "DLSS_D=false"]
 
 [[run]]
 label = "cyberpunk-rr"
 appid = 1091500
 args = "--launcher-skip -skipStartScreen -benchmark"
 seconds = 60
-# 22 s after the placement: the sunlit street after the bar, clear of the bar-door exit (about 13-16 s in, where
-# the game once stalled 156 ms) and of the pool hall's red lamp under Ray Reconstruction (about 15 s in).
+# 22 s after the placement: usually the street after the bar, past the bar-door exit (the time from the launch to the
+# placement varies, so the scene is not certain).
 record_after = 22
 frame_generation = true
 timeout = 420
 hdr = true
 ray_reconstruction = true
-# 4K with Ray Reconstruction and the model after DLSS leaves no room for the GPU encoder's ~310 MiB.
-recorder = "cpu"
 edit_file = "AppData/Local/CD Projekt Red/Cyberpunk 2077/UserSettings.json"
 edit_kind = "json-option"
-edits = ["Resolution=3840x2160", "HDRModes=HDR10_PQ", "DLSS_D=true"]
+edits = ["Resolution=2560x1440", "HDRModes=HDR10_PQ", "DLSS_D=true"]
 
 [[run]]
 label = "gta"
 appid = 3240220
 args = "-benchmark -benchmarkIterations 1 -benchmarkFrameTimes"
-# Passes 0-3 are about 9 s each with a black loading screen between them; pass 4 (about 115 s) starts about 56 s
-# after the placement is reached, so the recording is made in it.
+# Passes 0-3 are about 9 s each with a black loading screen between them; pass 4 (about 115 s) usually starts about
+# 56 s after the placement is reached, so the recording is made in it (the run fails if the model isn't holding).
 seconds = 100
 record_after = 80
 frame_generation = true
@@ -71,4 +72,4 @@ edit_file = "Documents/Rockstar Games/GTAV Enhanced/settings.xml"
 edit_kind = "xml-value"
 # FrameLimit 120 keeps frame generation on through the loading screens (docs/LESSONS.md, "Frame generation in the
 # benchmark"); gameplay renders under 120, so pass 4 is untouched.
-edits = ["ScreenWidth=3840", "ScreenHeight=2160", "FrameLimit=120"]
+edits = ["ScreenWidth=2560", "ScreenHeight=1440", "FrameLimit=120"]

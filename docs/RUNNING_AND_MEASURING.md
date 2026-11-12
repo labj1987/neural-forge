@@ -562,10 +562,11 @@ each run the sweep shuts Steam down, writes the options, starts Steam with the s
 (`systemd-run --user`, so `environment.d`'s variables apply as at login), runs the game, then shuts Steam down
 again, puts every account's `localconfig.vdf` back byte for byte and starts it again if it was running.
 
-A run's game settings (`edit_file`: Cyberpunk 2077's `UserSettings.json` for 3840x2160, HDR10 PQ and Ray
-Reconstruction; GTA's `settings.xml` for 3840x2160 and `FrameLimit` 120, which keeps its frame generation on, see
-LESSONS.md) are set from the file as found before each run and put back byte for byte afterwards. `--layer` puts a
-build in place of the installed layer for each run and the channel directory (`/tmp/neural-forge-$UID`) aside, so
+A run's game settings (`edit_file`: Cyberpunk 2077's `UserSettings.json` for 2560x1440, HDR10 PQ and Ray
+Reconstruction; GTA's `settings.xml` for 2560x1440 and `FrameLimit` 120, which keeps its frame generation on, see
+LESSONS.md) are the game's own resolution: the desktop stays at 3840x2160 (at 4K the 12 GB card ran out of video
+memory with Ray Reconstruction and the model after DLSS; 1440p since 2026-11-12). They are set from the file as found before each run and put back byte for byte
+afterwards. `--layer` puts a build in place of the installed layer for each run and the channel directory (`/tmp/neural-forge-$UID`) aside, so
 that build makes its own; both are put back, the layer hash-checked. All of this also happens after an error or
 Ctrl-C; `restore:` lines say what was put back. A panic aborts the sweep (the workspace builds with
 `panic = "abort"`) and puts nothing back: the files as found are in `<out>/<label>/` (`localconfig/`,
@@ -577,35 +578,31 @@ or after `timeout` without the placement; then it ends every process of the game
 
 - the expected `preupscale_state` was reached and the edit cache counted holds (the model ran in the game's frame);
 - it kept the placement: after reaching it, at most one status sample (5 s) is neither holding nor the game's own
-  pause (`preupscale_state=6`, a menu or loading screen); the table's `lost` column counts them. The VRAM guard
-  pausing the model counts as lost (states 1 and 5 with its reason);
+  pause (`preupscale_state=6`, a menu or loading screen); the table's `lost` column counts them. Another placement
+  (after DLSS falling back to before the upscaler) and the VRAM guard pausing the model (states 1 and 5 with its
+  reason) count as lost;
 - with `frame_generation = true`, the layer's presents per DLSS evaluate (`layer_frames` over `ngx_matched`, over
-  the samples that hold) are at least 1.5: the `FG` column (`x3.0` with Cyberpunk 2077's 3x, `x1.0` when it is off);
+  the samples that hold, each 5 s with at least 25 evaluates) are at least 1.5: the `FG` column (`x3.0` with
+  Cyberpunk 2077's 3x, `x1.0` when it is off, `-` when not measured or above 4.5, which is not believed);
 - `preupscale_misses` is 0, no device was lost, the log has no `[panic]`, the kernel logged no `NVRM: Xid` since the
   run began, and the HDR verdict says HDR10 for an HDR run and SDR otherwise;
-- the picture is right. Every run is recorded for 10 s, `record_after` seconds after the placement was reached
+- the picture is right, judged with the model running: every status sample over the recording holds the run's
+  placement (not even the game's pause) and holds grow over it, and the game did not exit while it was made. Every
+  run is recorded for 10 s, `record_after` seconds after the placement was reached
   (`--vw`, default `~/scratch/vw/bin/vw`: `vw replay start` before the game, so the recorder has its video memory
   first, with its files in `<out>/recorder`; then the last 10 s of `vw replay save`, made on a thread while the
-  sampling goes on; the recorder's log is `<label>.mp4.log`). A run is not started when the recorder does not
-  start. A run with `recorder = "cpu"` (Cyberpunk 2077 with Ray Reconstruction: the GPU encoder's ~310 MiB left the
-  model too little at 4K and the VRAM guard paused it) encodes on the CPU (`VW_ENCODER=cpu`, 1920x1080, about
-  20 MiB), which keeps about 115 of 150 frames a second; it does not by itself keep the model running there (see
-  `lost`). `vw analyze` must flag nothing (a colour flash: frames tinted against their neighbours, frames
+  sampling goes on; the recorder's log is `<label>.mp4.log`). The sweep refuses to start while another GPU Screen
+  Recorder runs (a second one fails to capture), and a run is not started when its recorder does not start. A run
+  with `recorder = "cpu"` encodes on the CPU (`VW_ENCODER=cpu`, 1920x1080, about 20 MiB of video memory against the
+  GPU encoder's ~310 MiB), which keeps only about 115 of 150 frames a second, fewer than vw's thresholds were set
+  with: only for a run where the GPU encoder leaves the model too little video memory (none at 1440p). `vw analyze` must flag nothing (a colour flash: frames tinted against their neighbours, frames
   alternating between two states, black frames, freezes); the table's `picture` column says `ok` or `FAIL`. Log
   numbers alone never pass a run: look at each run's contact sheet (`<label>-vw/sheet.jpg`) against the game with
   the model off as well. `--no-record` makes no recording, and every run then fails.
 
-The recording windows keep clear of what is known in the benchmarks: GTA's is in pass 4 (`record_after` 80; passes
-0-3 have black loading screens between them), Cyberpunk 2077's on the sunlit street after the bar (`record_after`
-22).
-
-A known false flag (look at the frames before calling one; never pass a flag without that): Cyberpunk 2077 with
-Ray Reconstruction at 4K, recorded with the CPU recorder, about 15 s after the placement was reached (frames 559-561
-and 730-731 of 1163 in a recording that started 10 s after it): `COLOUR_FLASH` of 6.3-9.2 levels on the pool
-hall's red lamp. The same red peak is in every recording of that moment; the GPU recorder at about 85 content
-frames a second sees it as a smooth peak (4.7 levels, under the limit of 6), while at about 48 content frames a
-second it is a step of about 10 levels in one frame, which the colour-flash test, counted in recorded frames, takes
-for a flash. Only that: a flag over 10 levels, elsewhere, or at a higher frame rate is a finding.
+The recording windows are usually clear of what is known in the benchmarks (the time from the launch to the
+placement varies, so not always): GTA's is in pass 4 (`record_after` 80; passes 0-3 have black loading screens
+between them), Cyberpunk 2077's on the street after the bar (`record_after` 22).
 
 Each run's layer log, its status samples (`<label>.samples`) and `results.txt` go to `--out` (default
 `~/nf-sweep/<unix time>`).
