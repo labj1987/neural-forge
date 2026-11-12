@@ -95,6 +95,8 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Status | **Proton copies out of date** (shown only when a Neural Forge Proton copy is older than the Proton it was made from: the copy, both versions and the games that run with it; see [Proton with DLSS parameters](#proton-with-dlss-parameters)), Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
 | Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on; a tested game says where the model runs in it), the launch option to copy by hand for a game you pick, **Proton with DLSS parameters** (below) and **Uninstall…** (see [Uninstall](#uninstall)). |
 
+![Status tab, lower half, while Hogwarts Legacy runs: where the model ran in the game in testing, the HDR verdict saying why the game presents SDR and how to offer it HDR, the model, reset and profiles, and Diagnosis](../screenshots/status-details.png)
+
 **The HDR verdict** (the Status tab's HDR line, `hdr_verdict=` in `neural-forge-cli shmctl status`, Save report and the
 game's log as `[layer] HDR: ...`) says in one line whether the game presents HDR and, when it does not, why:
 "game outputs HDR10"; "game outputs SDR; HDR10 was available" (the game's own HDR setting is off); "game asked for
@@ -243,6 +245,8 @@ Capture button (and `shmctl capture`) saves the next presented frame before and 
 Forge's composition and says what happened: where the files are and whether the effect changed the
 frame, or why nothing was written; clicking again while it waits cancels it, and a request no game
 takes is withdrawn after 5 seconds.
+
+![Debug tab, scrolled to the end: the debug view, the edit cache and scene cuts, and Captures with the Capture button and the captures folder](../screenshots/captures.png)
 
 ### Proton with DLSS parameters
 
@@ -470,6 +474,8 @@ Steam running, the launch options cannot be changed: close Steam first, or the g
 variables are listed afterwards with the options to set by hand (the variables do nothing without the layer). The
 app quits when it is done. Deleting only the AppImage file does not uninstall Neural Forge: the layer it installed
 under `~/.local/share/neural-forge` stays, and games switched on keep loading it.
+
+![The Uninstall confirmation: everything it removes, what happens to the launch options while Steam runs, and that deleting only the AppImage does not uninstall](../screenshots/uninstall.png)
 
 `neural-forge-cli uninstall` removes the files it installed (files you changed are kept). The
 games you switched on keep Neural Forge's variables in their launch options, which do nothing without
