@@ -44,7 +44,12 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   resolved at load; one the core lacks (an older driver) jumps to a stub that returns `NVSDK_NGX_Result_Fail`
   (`0xBAD00000`), as NGX answers a call it cannot serve, and the log names it. The stub takes no arguments, which is
   safe whatever the export's signature: on x64 Windows the caller passes arguments in registers and its own stack
-  space and cleans up after the call.
+  space and cleans up after the call. Since 4.2.0 such an export is also taken out of the wrapper's export table at
+  load (its address set to 0, `pe.rs`; Wine's `find_ordinal_export` answers that with `STATUS_PROCEDURE_NOT_FOUND`),
+  so `GetProcAddress` finds it missing, as it would in NVIDIA's core, and a caller that checks for an entry point
+  takes the same path as without the wrapper (#51: the reporter's driver, 615.71, is older than the 620.70 export
+  list). Only a caller that bound it before the wrapper's `DllMain` ended (none: NGX is loaded with `LoadLibrary`)
+  would meet the stub.
 - **Loading the core from `DllMain`.** The wrapper loads NVIDIA's core and resolves the exports in its `DllMain`,
   under the loader lock, which Microsoft's guidance for `DllMain` advises against. It is needed and safe here: the
   passthrough exports are bare jumps through the resolved pointers, so they must be set before any export can be

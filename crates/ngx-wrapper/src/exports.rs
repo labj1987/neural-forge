@@ -90,7 +90,8 @@ pub(crate) const HOOKED: &[&str] = &[
 ];
 
 /// What a passthrough export NVIDIA's core lacks jumps to: `NVSDK_NGX_Result_Fail`, as NGX answers a call it cannot
-/// serve. It takes no arguments, which is safe for every export's signature: on x64 Windows the caller passes
+/// serve. (The export is also taken out of the export table at load, `win::hide_exports`, so only a caller that bound
+/// it before could reach this.) It takes no arguments, which is safe for every export's signature: on x64 Windows the caller passes
 /// arguments in registers and its own stack space and cleans up after the call (no callee-popped arguments).
 pub extern "C" fn missing_export() -> u32 {
     crate::rules::NGX_RESULT_FAIL
