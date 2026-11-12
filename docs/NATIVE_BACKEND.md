@@ -1678,8 +1678,10 @@ whose answer does not come within the present's budget (the frame then is not se
 proxy region), or that was not captured, is shown as it was kept in its turn (`GpuCompose::show_kept`), so no frame is
 dropped or repeated. The present waits for the answer, so the frame rate is bounded by the other GPU's time per frame.
 Where the delay starts (the first present, and after a stall: a frame kept more than 250 ms before the next present
-is not shown) that present shows its own frame and the next shows it again, composed: one repeat, inherent to
-starting a delay. Leaving the path (the model back on this GPU, frame hold) drops the kept frame (the stream steps
+is not shown, and this present's frame is kept and sent as a first one's) that present shows its own frame and the
+next shows it again, composed: one repeat, inherent to starting a delay. A frame that could be captured but was not
+is not kept (`keeps_frame`): with nothing waiting the synchronous present takes it, else the frame waiting is shown and
+the next present starts again, so a capture that keeps failing never leaves the stream late without the model. Leaving the path (the model back on this GPU, frame hold, the effect off) drops the kept frame (the stream steps
 over one frame, as a flush of it would, since the frame it replaced is then not shown) and frees the pairs. Every
 present the keep writes to is ordered before the present: the compose or the show that follows it signals the present
 semaphore, or the keep itself does, or its fence is waited. The keeps and the show are in the compose's waits at
@@ -1691,11 +1693,15 @@ offloaded. The white meter reads the proxy region after each capture, as the syn
 cannot be made or lacks a requirement; the server's pipelines cannot be built there; the network has not run there
 for 30 s while frames came (`ServerRule::missed`: a build that fails, the VRAM guard's pause); a frame takes over a
 second (`ServerRule::ran`, after the first 10 frames of a build); or more than 30 of the last 120 sent frames come back
-later than three present intervals (`LateRule`, judged at the present; not in the `same` test, where the other device
-shares the game's GPU). A frame that does not finish (`FENCE_WAIT_TIMEOUT`, or a lost device) ends serving with
+later than both three present intervals and 100 ms, or 5 in a row get no answer within the present's budget
+(`LateRule`, judged at the present and decided as soon as that is so; not in the `same` test, where the other device
+shares the game's GPU). The 100 ms floor: the present does not see what the network would cost the game's GPU, and a
+second GPU at 40 ms a frame against a 120 fps game still beats running it after the game's frame on one GPU. The
+give-up is for the process (`offload::given_up`): every device runs the network on its own GPU from then on. A frame that does not finish (`FENCE_WAIT_TIMEOUT`, or a lost device) ends serving with
 `Status::Stalled`: the worker waits for it, and only once it finished (or the device is lost) frees the server, the
 network and the shared regions' imports and turns `Unavailable`; asked to quit meanwhile it waits 5 s more and else
-leaves the network and the device to the process's end (drain before free). The state is on the Status tab's line
+leaves the network and the device to the process's end (drain before free). While it waits the Status tab and
+`doctor` say the second GPU stalled (`State::Stalled`). The state is on the Status tab's line
 (`layer_reason`) and in `doctor` (`offload`). `NEURAL_FORGE_OFFLOAD_STANDIN=1` (tests only) runs a copy in and out of
 the other GPU in place of the network, for a GPU that cannot run it; with it, `NEURAL_FORGE_OFFLOAD_TEST_STALL=<frame>`
 makes that frame wait 8 s on the GPU for a host-set event (a stall that finishes), and
