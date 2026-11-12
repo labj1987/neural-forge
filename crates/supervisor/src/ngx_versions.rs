@@ -4,8 +4,9 @@
 //! a DLL the user replaced all show in a bug report:
 //!
 //! - what the game loaded in its last run: the NGX wrapper (`crates/ngx-wrapper/src/modules.rs`, which has the file
-//!   format) writes `$XDG_STATE_HOME/neural-forge/ngx-modules/<exe>.txt` after a feature is created, with every loaded
-//!   NGX module's path and file version, wherever it was loaded from; [`parse_record`] reads it;
+//!   format) writes `<state_dir>/ngx-modules/<app id>-<exe>.txt` (a path hash for `<app id>` outside Steam) after a
+//!   feature is created, with every loaded NGX module's path and file version, wherever it was loaded from;
+//!   [`parse_record`] reads it;
 //! - the files present: every `nvngx*.dll` in each switched-on game's folder and in its prefix's NGX folder
 //!   (`ProgramData/NVIDIA/NGX`, where over-the-air updates land) and `system32`, and the driver's core, each with its
 //!   version read from the PE resources ([`crate::model::dll_file_version`]; no code of the DLL runs).
