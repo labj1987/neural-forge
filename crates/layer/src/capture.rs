@@ -596,7 +596,10 @@ unsafe fn delayed_present(
             match shm.poll_async_request(SLOT) {
                 Some(true) => {
                     let ours = shm.answered_dims().is_none_or(|d| (d.0, d.1) == (req.dims.0, req.dims.1));
-                    if ours && req.dims == dims && (!pq10 || shm.answer_evaluated(SLOT)) {
+                    // A frame posted longer ago than the budget (the game stalled between two presents: a loading
+                    // screen, a pause) would show an old picture once: dropped, this present goes out live.
+                    let fresh = req.posted.elapsed() <= SYNC_BUDGET;
+                    if ours && fresh && req.dims == dims && (!pq10 || shm.answer_evaluated(SLOT)) {
                         STATS.round_trip_us.fetch_add(req.posted.elapsed().as_micros() as u64, Relaxed);
                         STATS.round_trips.fetch_add(1, Relaxed);
                         previous = Some(req);
