@@ -197,11 +197,11 @@ model ran before the upscaler. `scripts/bench-report.py --self-test` checks its 
   `--fg` names a run where it did not engage and leaves it out of `--mean`. Whether frame generation
   works and how the game feels is the maintainer's check, playing.
 
-**4K runs.** GTA renders at the desktop's size under Proton, so switch the host's desktop to
-3840x2160 at scale 1.0 first, temporarily, with GNOME's `gdctl set` (not persistent), and set
-`ScreenWidth`, `ScreenHeight` and `RefreshRate` in GTA's `settings.xml`. Afterwards put both back
-and check: `gdctl show` for the desktop, and `sha256sum` of `settings.xml` against the value taken
-before the change. Remove any backup made for the test.
+**Resolution.** Never change the desktop's display mode for a run (it stays at 3840x2160, 144 Hz, VRR,
+HDR); set the game's own resolution instead: `ScreenWidth` and `ScreenHeight` in GTA's `settings.xml`
+(the game sweep sets 2560x1440 and puts the file back; `gta-bench.sh` uses the file as found), checked
+afterwards with `sha256sum` against the value taken before. The layer's log names the size the game
+renders at (`DLSS's output: image ... (2560x1440 ...)`); check it after a change.
 
 **Flicker and added detail.** `NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<frames>` makes the layer
 capture `<frames>` consecutive presented frames as a series, `<ms>` after the `<resume>`-th time
@@ -562,12 +562,13 @@ each run the sweep shuts Steam down, writes the options, starts Steam with the s
 (`systemd-run --user`, so `environment.d`'s variables apply as at login), runs the game, then shuts Steam down
 again, puts every account's `localconfig.vdf` back byte for byte and starts it again if it was running.
 
-A run's game settings (`edit_file`: Cyberpunk 2077's `UserSettings.json` for 2560x1440, HDR10 PQ and Ray
-Reconstruction; GTA's `settings.xml` for 2560x1440 and `FrameLimit` 120, which keeps its frame generation on, see
-LESSONS.md) are the game's own resolution: the desktop stays at 3840x2160 (at 4K the 12 GB card ran out of video
-memory with Ray Reconstruction and the model after DLSS; 1440p since 2026-11-12). They are set from the file as found before each run and put back byte for byte
-afterwards. `--layer` puts a build in place of the installed layer for each run and the channel directory (`/tmp/neural-forge-$UID`) aside, so
-that build makes its own; both are put back, the layer hash-checked. All of this also happens after an error or
+Each run sets the game's own resolution to 2560x1440 and leaves the desktop at 3840x2160 (since 2026-11-12: at 4K
+the 12 GB card ran out of video memory with Ray Reconstruction and the model after DLSS; LESSONS.md). The run's game
+settings (`edit_file`: Cyberpunk 2077's `UserSettings.json` for the resolution, HDR10 PQ and Ray Reconstruction;
+GTA's `settings.xml` for the resolution and `FrameLimit` 120, which keeps its frame generation on, see LESSONS.md)
+are set from the file as found before each run and put back byte for byte afterwards. `--layer` puts a build in
+place of the installed layer for each run and the channel directory (`/tmp/neural-forge-$UID`) aside, so that build
+makes its own; both are put back, the layer hash-checked. All of this also happens after an error or
 Ctrl-C; `restore:` lines say what was put back. A panic aborts the sweep (the workspace builds with
 `panic = "abort"`) and puts nothing back: the files as found are in `<out>/<label>/` (`localconfig/`,
 `<settings file>.as-found`, `libneural_forge_layer.so.as-found`).
@@ -588,17 +589,18 @@ or after `timeout` without the placement; then it ends every process of the game
   run began, and the HDR verdict says HDR10 for an HDR run and SDR otherwise;
 - the picture is right, judged with the model running: every status sample over the recording holds the run's
   placement (not even the game's pause) and holds grow over it, and the game did not exit while it was made. Every
-  run is recorded for 10 s, `record_after` seconds after the placement was reached
-  (`--vw`, default `~/scratch/vw/bin/vw`: `vw replay start` before the game, so the recorder has its video memory
-  first, with its files in `<out>/recorder`; then the last 10 s of `vw replay save`, made on a thread while the
-  sampling goes on; the recorder's log is `<label>.mp4.log`). The sweep refuses to start while another GPU Screen
-  Recorder runs (a second one fails to capture), and a run is not started when its recorder does not start. A run
-  with `recorder = "cpu"` encodes on the CPU (`VW_ENCODER=cpu`, 1920x1080, about 20 MiB of video memory against the
-  GPU encoder's ~310 MiB), which keeps only about 115 of 150 frames a second, fewer than vw's thresholds were set
-  with: only for a run where the GPU encoder leaves the model too little video memory (none at 1440p). `vw analyze` must flag nothing (a colour flash: frames tinted against their neighbours, frames
-  alternating between two states, black frames, freezes); the table's `picture` column says `ok` or `FAIL`. Log
-  numbers alone never pass a run: look at each run's contact sheet (`<label>-vw/sheet.jpg`) against the game with
-  the model off as well. `--no-record` makes no recording, and every run then fails.
+  run is recorded for 10 s, `record_after` seconds after the placement was reached (`--vw`, default
+  `~/scratch/vw/bin/vw`: `vw replay start` before the game, so the recorder has its video memory first, with its
+  files in `<out>/recorder`; then the last 10 s of `vw replay save`, made on a thread while the sampling goes on;
+  the recorder's log is `<label>.mp4.log`). The sweep refuses to start while another GPU Screen Recorder runs (a
+  second one fails to capture), and a run is not started when its recorder does not start. A run with `recorder =
+  "cpu"` encodes on the CPU (`VW_ENCODER=cpu`, 1920x1080, about 20 MiB of video memory against the GPU encoder's
+  ~310 MiB), which keeps only about 115 of 150 frames a second, fewer than vw's thresholds were set with: only for a
+  run where the GPU encoder leaves the model too little video memory (none at 1440p). `vw analyze` must flag nothing
+  (a colour flash: frames tinted against their neighbours, frames alternating between two states, black frames,
+  freezes); the table's `picture` column says `ok` or `FAIL`. Log numbers alone never pass a run: look at each run's
+  contact sheet (`<label>-vw/sheet.jpg`) against the game with the model off as well. `--no-record` makes no
+  recording, and every run then fails.
 
 The recording windows are usually clear of what is known in the benchmarks (the time from the launch to the
 placement varies, so not always): GTA's is in pass 4 (`record_after` 80; passes 0-3 have black loading screens

@@ -291,7 +291,8 @@ const FG_MAX_RATIO: f64 = 4.5;
 const FG_MIN_EVALUATES: u64 = 25;
 
 /// Whether `state` keeps the run's placement: the state it expects (`want`), or the game's own pause (a menu, a
-/// loading screen), after which the model resumes where it was. Another placement (after DLSS falling back to before
+/// loading screen, and also a DLSS game before DLSS's first frame, with nothing held yet), after which the model
+/// resumes where it was. Another placement (after DLSS falling back to before
 /// the upscaler, or both) is not the one the run tests.
 fn kept(state: u32, want: u32) -> bool {
     state == want || state == preupscale_state::PAUSED
@@ -304,8 +305,10 @@ fn frame_generation_ratio(samples: &[Sample], want: u32) -> Option<f64> {
     let (mut frames, mut evaluates) = (0u64, 0u64);
     for w in samples.windows(2) {
         let n = w[1].ngx_matched.saturating_sub(w[0].ngx_matched);
-        if w[0].state == want && w[1].state == want && n >= FG_MIN_EVALUATES {
-            frames += w[1].layer_frames.saturating_sub(w[0].layer_frames);
+        let f = w[1].layer_frames.saturating_sub(w[0].layer_frames);
+        // An interval above the cap is left out (a loading screen's presents counted against a few evaluates).
+        if w[0].state == want && w[1].state == want && n >= FG_MIN_EVALUATES && (f as f64) <= FG_MAX_RATIO * n as f64 {
+            frames += f;
             evaluates += n;
         }
     }
@@ -364,9 +367,10 @@ fn evaluate(expect: Placement, hdr: HdrExpect, fg_expected: bool, window: Option
         o.lost = "-".into();
     }
     if let Some((from, to)) = window {
-        // The samples taken over the recording (the one after its end covers its last seconds).
-        let over: Vec<&Sample> = samples.iter().filter(|s| s.secs > from && s.secs <= to + 5).collect();
-        let before = samples.iter().rev().find(|s| s.secs <= from);
+        // The samples taken over the recording: from the one at its start to the one after its end, which covers its
+        // last seconds (so the placement may be demanded up to 5 s past the end).
+        let over: Vec<&Sample> = samples.iter().filter(|s| s.secs >= from && s.secs <= to + 5).collect();
+        let before = samples.iter().rev().find(|s| s.secs < from);
         if over.is_empty() {
             o.failures.push("no status sample over the recording".into());
         } else if let Some(s) = over.iter().find(|s| s.state != want) {
@@ -385,7 +389,7 @@ fn evaluate(expect: Placement, hdr: HdrExpect, fg_expected: bool, window: Option
     if fg_expected && ratio.is_none_or(|r| r < FG_MIN_RATIO) {
         o.failures.push(format!(
             "frame generation is off (presents per rendered frame while holding: {}); the run expects it on",
-            ratio.map_or("not measured".into(), |r| format!("{r:.2}"))
+            ratio.map_or("not measured, or not believed (above 4.5)".into(), |r| format!("{r:.2}"))
         ));
     }
     if o.holds.is_empty() {
@@ -496,9 +500,9 @@ fn sweep_options(existing: &str, exe: &[String], log: &Path, hdr: bool, args: &s
     out.join(" ")
 }
 
-/// A switch on a command line: `-x`, `--x`, not a negative number.
+/// A switch on a command line: `-x`, `--x`, not a negative number (`-5`, `-.5`).
 fn is_switch(t: &str) -> bool {
-    t.starts_with('-') && t.len() > 1 && t.parse::<f64>().is_err()
+    t.strip_prefix('-').and_then(|r| r.chars().next()).is_some_and(|c| !c.is_ascii_digit() && c != '.')
 }
 
 /// Command-line tokens as units: each switch with the values after it, a leading value on its own.
@@ -912,8 +916,8 @@ fn sweep(o: &Options) -> Result<bool, String> {
     if Command::new("pgrep").args(["-x", "neural-forge"]).stdout(Stdio::null()).status().is_ok_and(|s| s.success()) {
         return Err("the Neural Forge window is open: close it first (it keeps the channel of the installed version)".into());
     }
-    if let Some(vw) = &o.vw {
-        Recorder::none_running(vw)?;
+    if o.vw.is_some() {
+        Recorder::none_running()?;
     }
     let env = session_env();
     let held = std::env::var_os("NF_GPU_LOCK_HELD").is_some() || std::env::var_os("NF_GPU_LOCKED").is_some();
@@ -1104,8 +1108,6 @@ fn status(cli: &Path, secs: u64) -> Option<Sample> {
     parse_status(&String::from_utf8_lossy(&out.stdout), secs)
 }
 
-/// Watches a run: status every 5 s until it has held its placement for the run's seconds, the game exits, or the
-/// timeout passes without the placement.
 /// What a run's watch saw: the status samples, the recording's span (seconds since the launch) and whether the game
 /// was gone while it was being made.
 #[derive(Debug, Default)]
@@ -1115,6 +1117,8 @@ struct Watched {
     exited_while_recording: bool,
 }
 
+/// Watches a run: status every 5 s until it has held its placement for the run's seconds, the game exits, or the
+/// timeout passes without the placement.
 fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bool) -> Watched {
     let mut samples = Vec::new();
     let mut window = None;
@@ -1202,22 +1206,15 @@ struct Recorder {
 }
 
 impl Recorder {
-    /// Before the first run: a GPU Screen Recorder already running (a second one fails to capture). One `vw replay`
-    /// left behind in its default folder (~/scratch/vw) is stopped and given a few seconds to exit; any other is an
-    /// error, the sweep does not stop what it did not start.
-    fn none_running(vw: &Path) -> Result<(), String> {
-        let running = || Command::new("pgrep").args(["-x", "gpu-screen-reco"]).stdout(Stdio::null()).status().is_ok_and(|s| s.success());
-        if !running() {
-            return Ok(());
-        }
-        let _ = Command::new(vw).args(["replay", "stop"]).env_remove("VW_DIR").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
-        for _ in 0..20 {
-            if !running() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        Err("a GPU Screen Recorder is running (a second one fails to capture): stop it first".into())
+    /// Before the first run: a GPU Screen Recorder already running is an error (a second one fails to capture). The
+    /// sweep does not stop it: it is someone else's (a recording another test is making).
+    fn none_running() -> Result<(), String> {
+        let found =
+            Command::new("pgrep").args(["-a", "-x", "gpu-screen-reco"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let Some(line) = found.lines().next() else { return Ok(()) };
+        let pid = line.split_whitespace().next().unwrap_or("?");
+        let out = line.split(" -o ").nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("?");
+        Err(format!("a GPU Screen Recorder is running (pid {pid}, writing {out}); a second one fails to capture: wait for it or stop it first"))
     }
 
     /// `None` with `--no-record`; an error (the run is not made) when the recorder does not start.
@@ -1479,7 +1476,7 @@ mod tests {
     fn only_the_runs_own_placement_is_kept() {
         use preupscale_state::*;
         let sdr = "game outputs SDR (x)";
-        let finished = [sample(10, OFF, 0, 0, sdr), sample(15, OFF, 0, 0, sdr), sample(20, PAUSED, 0, 0, sdr), sample(25, OFF, 0, 0, sdr)];
+        let finished = [sample(10, OFF, 0, 0, sdr), sample(15, PAUSED, 0, 0, sdr), sample(20, OFF, 0, 0, sdr), sample(25, OFF, 0, 0, sdr)];
         let o = evaluate(Placement::FinishedFrame, HdrExpect::Sdr, false, Some((20, 30)), &finished, "", "");
         assert!(o.failures.is_empty(), "{:?}", o.failures);
         assert_eq!(o.lost, "0");
@@ -1502,7 +1499,7 @@ mod tests {
         let o = evaluate(Placement::Before, HdrExpect::Sdr, false, Some((45, 55)), &paused, "", "");
         assert!(o.failures.iter().any(|f| f.starts_with("the recording was not made with the model at its placement (50 s")), "{:?}", o.failures);
         // At the placement but nothing held.
-        let idle = run([HOLDING; 5], [10, 60, 60, 60, 60]);
+        let idle = run([HOLDING; 5], [60, 60, 60, 60, 60]);
         let o = evaluate(Placement::Before, HdrExpect::Sdr, false, Some((45, 55)), &idle, "", "");
         assert!(o.failures.iter().any(|f| f.contains("holds did not grow")), "{:?}", o.failures);
         assert!(evaluate(Placement::Before, HdrExpect::Sdr, false, Some((90, 100)), &fine, "", "").failures.iter().any(|f| f.starts_with("no status sample")));
@@ -1561,6 +1558,7 @@ mod tests {
             sweep_options("%command% -benchmarkIterations 3 -x", &exe, log, false, "-benchmarkIterations 1 -offset -5"),
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' %command% -benchmarkIterations 1 -x -offset -5"
         );
+        assert!(is_switch("-x") && is_switch("--launcher-skip") && !is_switch("-5") && !is_switch("-.5") && !is_switch("-") && !is_switch("5"));
         // A switch and its value are one unit: `1` is kept although another `1` is there already.
         let gta = vec!["PlayGTAV.exe".to_string()];
         assert_eq!(

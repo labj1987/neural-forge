@@ -1982,6 +1982,18 @@ the fix (none reached a release):
 - **Rule.** A game may hand DLSS larger images than it renders: read everything the game gives DLSS about which part
   it reads, and never feed the network, or write, pixels DLSS does not read.
 
+## November 12: the game sweep leaves 4K for 1440p
+
+- **Found (4.1.1 sweep, RTX 5070 12 GB):** at 3840x2160 Cyberpunk 2077 with Ray Reconstruction and the model after
+  DLSS leaves no room. The network built at 10141 of a 10481 MiB budget; GPU Screen Recorder's encoder (~310 MiB)
+  then got no CUDA context ("out of memory"), and started before the game it left the model too little, so the VRAM
+  guard paused it. With a 17 MiB CPU recorder the model still ran only about 50 s: the game's own memory grows on
+  the benchmark's street, the network took 137.8 ms a frame at the budget (10399 of 10404 MiB) and the guard paused
+  it for the rest of the run.
+- **Decision (2026-11-12):** game tests set the games' own resolution to 2560x1440 (the desktop stays at 3840x2160);
+  4K to be looked at again later. The same 12 GB limit applies to 4.1.0: the guard and the after-DLSS network are
+  unchanged.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

@@ -4,10 +4,10 @@ Repository: https://github.com/labj1987/neural-forge
 
 Read [docs/PHASE1.md](docs/PHASE1.md) for the current namespace, installation contract and
 target-ownership rules. Benchmarks run with `scripts/gta-bench.sh`
-([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)) with the game's own resolution at 2560x1440 (since
-2026-11-12: at 4K the 12 GB card runs out of video memory with Ray Reconstruction and the model after DLSS) on the
-maintainer's desktop, which stays at 3840x2160, 144 Hz, VRR with HDR on (never change the display mode for a test;
-set the game's own resolution). Games that have HDR are tested with their HDR on; video memory is sampled. Every release is
+([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)) on the maintainer's desktop, which stays at
+3840x2160, 144 Hz, VRR with HDR on: never change the display mode for a test, set the game's own resolution. The
+game sweep sets it to 2560x1440 (since 2026-11-12: at 4K the 12 GB card runs out of video memory with Ray
+Reconstruction and the model after DLSS); `gta-bench.sh` sets none and uses GTA's `settings.xml` as found. Games that have HDR are tested with their HDR on; video memory is sampled. Every release is
 checked in Cyberpunk 2077, GTA V Enhanced, Red Dead Redemption 2 and Crimson Desert; the old Phase 1 plan is in
 [docs/history/phase1-benchmark-plan.md](docs/history/phase1-benchmark-plan.md). The former app name was dlssnr; upstream DLSS5VKLayer remains a
 separate application and must not be modified or uninstalled by this project.
