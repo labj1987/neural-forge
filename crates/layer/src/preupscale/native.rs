@@ -4653,6 +4653,8 @@ unsafe fn native_hold(
         // SAFETY: nothing of the detector is pending (`wait_idle` above), or its set is not written now; the
         // encoded view and the native pass's state buffer are live.
         unsafe { s.bind(device, hdr_ref.encoded_view(), native.state_buffer(), [hdr_ref.id(), native.id()]) };
+        // The thumbnail is DLSS's rectangle's alone (a new size has nothing to compare with).
+        s.set_region(format_of(target));
     }
     native.gap.note_format(format_of(target));
     // A frame of another network than the history's (the Network setting switched) resets the history

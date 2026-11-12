@@ -2217,10 +2217,16 @@ impl Tracker {
         }
         let mvec = self.images.get(&o.mvec).copied();
         // The motion vectors' rectangle: with a subrect, the one the hold before the upscaler reads (MVLowRes first,
-        // [`crate::ngx_ring::Record::mvec_rect`]), where it fits their image.
-        let mvec_rect = mvec.and_then(|d| match record.filter(|_| subrect) {
-            Some(r) => r.mvec_rect(input, (d.width, d.height)),
-            None => Some(crate::ngx_ring::Rect::whole((d.width, d.height))),
+        // [`crate::ngx_ring::Record::mvec_rect`]), where it fits their image. With the colour input's extent unknown but
+        // DLSS's render size known and not their image's, the same rule on the render size (none where it does not fit:
+        // the vectors are dropped rather than the whole image resampled over a rectangle DLSS does not read).
+        let mvec_rect = mvec.and_then(|d| {
+            let extent = (d.width, d.height);
+            match record {
+                Some(r) if subrect => r.mvec_rect(input, extent),
+                Some(r) if input == (0, 0) && r.render.0 > 0 && r.render.1 > 0 && r.render != extent => r.mvec_rect(r.render, extent),
+                _ => Some(crate::ngx_ring::Rect::whole(extent)),
+            }
         });
         let mvec_input = mvec.map(|d| {
             let known = layout_of(o.mvec, &d);
@@ -4841,7 +4847,7 @@ unsafe fn record_capture(
                 // Unbuilt where it measures (the caller builds it first), the exposure buffer would keep the 0
                 // it was cleared to, and nothing would be written back. Where it only observes, unbuilt
                 // records nothing.
-                pass.record_auto_exposure(device, cmd, ExposureSource::auto_use(target));
+                pass.record_auto_exposure(device, cmd, native::format_of(target), ExposureSource::auto_use(target));
                 pass.record_encode(device, cmd, proxy, target.paper_white);
             }
             None => {
@@ -7577,7 +7583,8 @@ mod tests {
         let point = at(&mut t, crate::ngx_ring::Record { create_flags: hi.create_flags | crate::ngx_ring::FLAG_MV_LOW_RES, ..hi }).expect("a point");
         assert_eq!(point.mvec_extent, (1280, 720), "MVLowRes: the render size");
         // A colour input the layer does not track: the record's extent says what DLSS reads; with neither known, the
-        // whole images (no rectangle made up from the render size alone).
+        // output whole, and the motion vectors' rectangle from the render size where that is known and not their image's
+        // (none where it does not fit).
         let untracked = DlssOutput { input: img(0x9900), writes: 3, ..t.dlss_output.unwrap() };
         let at_untracked = |t: &mut Tracker, r| {
             t.launch.get_mut(&cb(2)).expect("launched").ngx = Some(r);
@@ -7586,8 +7593,26 @@ mod tests {
         let full = crate::ngx_ring::Record { render: (1707, 960), colour_extent: (1707, 960), mvec_base: (0, 0), ..whole };
         let point = at_untracked(&mut t, full).expect("a point");
         assert_eq!((point.offsets, point.mvec_extent), (Offsets::default(), (1707, 960)), "the record's extent: the whole images");
+        let low = full.create_flags | crate::ngx_ring::FLAG_MV_LOW_RES;
+        let point = at_untracked(&mut t, crate::ngx_ring::Record { render: (1600, 900), colour_extent: (0, 0), mvec_base: (2, 1), create_flags: low, ..full })
+            .expect("a point");
+        assert_eq!(
+            (point.offsets, point.mvec_extent),
+            (Offsets { mvec: (2, 1), ..Offsets::default() }, (1600, 900)),
+            "no extent known, MVLowRes: the render size of the motion vectors at their base"
+        );
         let point = at_untracked(&mut t, crate::ngx_ring::Record { render: (1600, 900), colour_extent: (0, 0), mvec_base: (2, 1), ..full }).expect("a point");
-        assert_eq!((point.offsets, point.mvec_extent), (Offsets::default(), (1707, 960)), "no extent known: the whole images");
+        assert_eq!(
+            (point.offsets.mvec, point.mvec_extent),
+            ((2, 1), (1705, 959)),
+            "no extent known, high-resolution vectors and no output size: what their image holds from their base"
+        );
+        let point = at_untracked(&mut t, crate::ngx_ring::Record { render: (1706, 960), colour_extent: (0, 0), mvec_base: (2, 1), create_flags: low, ..full })
+            .expect("a point");
+        assert_eq!(point.mvec_extent, (0, 0), "the render size does not fit at their base: no motion vectors");
+        assert!(point.mvec_input.is_some_and(|a| !a.readable), "and not read");
+        let point = at_untracked(&mut t, crate::ngx_ring::Record { render: (0, 0), colour_extent: (0, 0), mvec_base: (0, 0), ..full }).expect("a point");
+        assert_eq!((point.offsets, point.mvec_extent), (Offsets::default(), (1707, 960)), "nothing known: the whole images");
         t.launch.get_mut(&cb(2)).expect("launched").ngx = Some(whole);
         assert!(t.frame_of(cb(2)).reset, "the evaluate's reset");
         inject(vec![a, end_of(&a, 2), b, end_of(&b, 4)]);
@@ -11012,13 +11037,18 @@ mod tests {
 
     /// Runs one auto-exposure hold (roundtrip mode, no exposure image) on `texels` and returns it.
     fn auto_hold(gpu: &Gpu, res: &mut Resources, image: vk::Image, w: u32, h: u32, identification: u64) -> HoldResult {
+        auto_hold_in(gpu, res, image, (w, h), None, identification)
+    }
+
+    /// [`auto_hold`] with DLSS's subrect: `region` at the image's corner ([`Target::region`]).
+    fn auto_hold_in(gpu: &Gpu, res: &mut Resources, image: vk::Image, (w, h): (u32, u32), region: Option<(u32, u32)>, identification: u64) -> HoldResult {
         let target = Target {
             colour: image,
             width: w,
             height: h,
             depth: None,
             depth_buffer: None,
-            region: None,
+            region,
             mvec: None,
             mvec_scale: [1.0, 1.0],
             exposure: [None; MAX_EXPOSURE],
@@ -11094,6 +11124,15 @@ mod tests {
         // A new identification starts over: the target at once.
         let reset = auto_hold(&gpu, &mut res, image, w, h, identification + 1).auto_exposure.unwrap();
         assert!((reset.log2_e - reset.target_log2_e).abs() < 1e-6 && (reset.log2_e - after.log2_e).abs() > 1.5, "{reset:?} after {after:?}");
+        // DLSS's subrect: only the rectangle at the corner is measured, never the padding around it (here far brighter).
+        let (rw, rh) = (120u32, 70u32);
+        let inside = frame(rw, rh, sky);
+        let padded = frame(w, h, |x, y| if x < rw && y < rh { sky(x, y) } else { grey(5000.0) });
+        gpu.upload(image, w, h, &padded);
+        let got = auto_hold_in(&gpu, &mut res, image, (w, h), Some((rw, rh)), identification + 2).auto_exposure.unwrap();
+        let want = hdr::auto_exposure_reference(&inside, rw, rh, None);
+        assert_eq!(got.samples, want.samples, "the rectangle's samples alone");
+        assert!((got.log2_e - want.log2_e).abs() < 0.01, "the rectangle's exposure: GPU {} vs CPU {}", got.log2_e, want.log2_e);
         finish(&gpu, res, &[(image, memory)]);
     }
 

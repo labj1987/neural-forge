@@ -56,15 +56,42 @@ pub fn dir(var: impl Fn(&str) -> Option<String>) -> Option<String> {
 /// location is not known here.
 pub fn unix_home_from_wine(nt: &str) -> Option<String> {
     let rest = nt.strip_prefix(r"\??\").unwrap_or(nt);
-    let rest = if rest.len() >= 2 && rest[..2].eq_ignore_ascii_case("z:") {
+    // Bytes, not `rest[..n]`: a slice inside a multi-byte character panics. The ASCII prefix matched, so `[n..]` is a boundary.
+    let starts = |prefix: &str| rest.as_bytes().get(..prefix.len()).is_some_and(|b| b.eq_ignore_ascii_case(prefix.as_bytes()));
+    let rest = if starts("z:") {
         &rest[2..]
-    } else if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("unix") {
+    } else if starts("unix") {
         &rest[4..]
     } else {
         return None;
     };
     let path = rest.replace('\\', "/");
     path.starts_with('/').then_some(path)
+}
+
+/// The Windows-form path of the state directory ([`dir`]) the wrapper creates and writes in. With `XDG_STATE_HOME` or
+/// `HOME` (Unix paths) it is `Z:` and the path, as ever. Without them it comes from `WINEHOMEDIR`: for `\??\Z:\...`
+/// the same `Z:` path; for `\??\unix\...` or a home on another drive it is the NT path itself, `\\?\` and the rest
+/// of `WINEHOMEDIR` and `\.local\state\neural-forge\ngx-modules`, which needs no `Z:` drive. `None` when none names a path.
+pub fn win_dir(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let set = |name: &str| var(name).filter(|v| !v.is_empty());
+    if set("XDG_STATE_HOME").is_some() || set("HOME").is_some() {
+        return dir(var).map(|d| format!("Z:{d}").replace('/', "\\"));
+    }
+    let wine = set("WINEHOMEDIR")?;
+    let rest = wine.strip_prefix(r"\??\").unwrap_or(&wine);
+    let bytes = rest.as_bytes();
+    if bytes.get(..2).is_some_and(|b| b.eq_ignore_ascii_case(b"z:")) {
+        return dir(var).map(|d| format!("Z:{d}").replace('/', "\\"));
+    }
+    let drive = bytes.get(1) == Some(&b':') && bytes.first().is_some_and(u8::is_ascii_alphabetic);
+    let unix = bytes.get(..5).is_some_and(|b| b.eq_ignore_ascii_case(b"unix\\"));
+    let home = rest.trim_end_matches('\\');
+    // Something must follow the drive or `unix` (a bare `C:` or `unix` is no home).
+    if !(drive && home.len() > 2 || unix && home.len() > 4) {
+        return None;
+    }
+    Some(format!(r"\\?\{home}\.local\state\neural-forge\ngx-modules"))
 }
 
 /// The id the file is kept under for the game: the Steam app id Steam puts in the game's environment (`SteamAppId`,
@@ -254,9 +281,7 @@ mod win {
             return;
         }
         let exe = module_path(core::ptr::null_mut());
-        let Some(dir) = dir(var) else { return };
-        let win = |p: &str| format!("Z:{p}").replace('/', "\\");
-        let dir = win(&dir);
+        let Some(dir) = win_dir(var) else { return };
         let written = std::fs::create_dir_all(&dir).is_ok()
             && std::fs::write(format!("{dir}\\{}", state_file_name(&exe, var)), render(env!("CARGO_PKG_VERSION"), &exe, &modules)).is_ok();
         if !written {
@@ -279,6 +304,24 @@ mod win {
             let version = file_version(&kernel32).unwrap_or_default();
             assert!(version.split('.').count() == 4 && version.split('.').all(|n| n.parse::<u32>().is_ok()), "{kernel32}: {version:?}");
             assert_eq!(file_version(r"C:\windows\system32\no-such-file.dll"), None);
+        }
+
+        /// Under Wine: a directory made and written through the `\\?\unix\...` NT form (no drive needed) is the Unix
+        /// directory, and the `Z:` form of the same path reads it back.
+        #[test]
+        fn writes_through_the_unix_nt_path() {
+            let unix_home = format!("/tmp/nf-ngx-wrapper-test-{}", std::process::id());
+            let nt_home = format!(r"\??\unix{}", unix_home.replace('/', "\\"));
+            let var = |name: &str| (name == "WINEHOMEDIR").then(|| nt_home.clone());
+            let dir = win_dir(var).unwrap();
+            assert!(dir.starts_with(r"\\?\unix\tmp\"), "{dir}");
+            let name = state_file_name(r"C:\g\game.exe", var);
+            let result = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(format!("{dir}\\{name}"), "ok"));
+            let z_home = format!("Z:{unix_home}").replace('/', "\\");
+            let back = std::fs::read_to_string(format!(r"{z_home}\.local\state\neural-forge\ngx-modules\{name}"));
+            let _ = std::fs::remove_dir_all(&z_home);
+            result.unwrap();
+            assert_eq!(back.unwrap(), "ok");
         }
 
         /// Under Wine, with the process's real environment (Wine passes no `HOME`; run it with `env -u HOME -u
@@ -347,6 +390,33 @@ mod tests {
         assert_eq!(unix_home_from_wine(r"\??\C:\users\steamuser"), None);
         assert_eq!(unix_home_from_wine(r"\??\Z:"), None);
         assert_eq!(unix_home_from_wine(r"\??\unix"), None);
+    }
+
+    /// A multi-byte character where the two- or four-byte prefix check ends must not panic (`rest[..2]` did).
+    #[test]
+    fn non_ascii_wine_home_does_not_panic() {
+        for nt in [r"\??\é\home", r"\??\ü", "é", r"\??\日本語\home", r"\??\uniñ\x", r"\??\Zé:\x", ""] {
+            assert_eq!(unix_home_from_wine(nt), None, "{nt}");
+            assert_eq!(win_dir(env(&[("WINEHOMEDIR", nt)])), None, "{nt}");
+        }
+        assert_eq!(unix_home_from_wine(r"\??\Z:\home\élodie").as_deref(), Some("/home/élodie"));
+        assert_eq!(unix_home_from_wine(r"\??\unix\home\日本").as_deref(), Some("/home/日本"));
+    }
+
+    /// The directory the wrapper writes through: `Z:` as ever, the NT path for `unix` and for another drive.
+    #[test]
+    fn windows_form_of_the_state_directory() {
+        let w = |pairs: &[(&str, &str)]| win_dir(env(pairs));
+        assert_eq!(w(&[("XDG_STATE_HOME", "/s/")]).as_deref(), Some(r"Z:\s\neural-forge\ngx-modules"));
+        assert_eq!(w(&[("HOME", "/h")]).as_deref(), Some(r"Z:\h\.local\state\neural-forge\ngx-modules"));
+        assert_eq!(w(&[("WINEHOMEDIR", r"\??\Z:\home\alex")]).as_deref(), Some(r"Z:\home\alex\.local\state\neural-forge\ngx-modules"));
+        assert_eq!(w(&[("WINEHOMEDIR", r"\??\z:\home\alex"), ("HOME", "/h")]).as_deref(), Some(r"Z:\h\.local\state\neural-forge\ngx-modules"));
+        assert_eq!(w(&[("WINEHOMEDIR", r"\??\unix\home\a b\")]).as_deref(), Some(r"\\?\unix\home\a b\.local\state\neural-forge\ngx-modules"));
+        assert_eq!(w(&[("WINEHOMEDIR", r"\??\D:\users\alex")]).as_deref(), Some(r"\\?\D:\users\alex\.local\state\neural-forge\ngx-modules"));
+        assert_eq!(w(&[("WINEHOMEDIR", r"\??\C:")]), None);
+        assert_eq!(w(&[("WINEHOMEDIR", r"\??\unix")]), None);
+        assert_eq!(w(&[("WINEHOMEDIR", r"\??\Z:")]), None);
+        assert_eq!(w(&[]), None);
     }
 
     /// Executables of the same name in two games keep two records: by Steam app id, else by path.

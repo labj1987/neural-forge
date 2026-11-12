@@ -1966,10 +1966,16 @@ the fix (none reached a release):
   not read; only the rectangle is written back. Motion vectors are replicated, not zeroed: the padding continues the
   edge's content, so it moves with the edge; zero would make the edge's copy look static while its colour changes,
   a false disocclusion next to the rectangle. A new rectangle size is a format change of the history
-  (`native::format_of` reads `Target::region`): one reset, no rebuild. Cost: the network runs at the whole extent
-  (Hogwarts Legacy: 2564x1444 instead of 2562x1441, 0.3% more pixels; at a low dynamic-resolution step it runs over
-  the whole image for a smaller rectangle). The scene-cut detector and the measured exposure read the whole staging
-  image, padding included.
+  (`native::format_of` reads `Target::region`): one reset, no rebuild. Cost: the network runs over the padding too.
+- **Working extent, not the whole image (review, November 11).** Working at the colour input's whole extent ran the
+  network, the edit cache, the scene-cut detector and the depth over the whole image for any rectangle: a 1920x1080
+  rectangle in a 3840x2160 image cost 4x the pixels and far more VRAM. Each stage now works at the high-water mark of
+  the rectangles held in that image (`inline::working_extent`): rounded up to 64 pixels, within the image, only
+  growing while the image's extent stays, so a smaller rectangle never rebuilds and a larger one rebuilds once
+  (Hogwarts Legacy's 2562x1441 of 2564x1444 still works at the whole image). The padding fills from the rectangle to
+  the working extent. The scene-cut detector and the measured exposure read the rectangle alone (`Target::region`,
+  `ScenePass::set_region`): they had read the padding, so the replicated edge weighed in the comparison and the
+  histogram. A new region size leaves the detector nothing to compare with.
 - **The motion vectors' rectangle** follows the feature's MVLowRes flag first (`Record::mvec_rect`): with it the
   render size, without it the feature's output size where that fits their image; the size of their image decides only
   after that. The hold after DLSS takes the same rectangle.

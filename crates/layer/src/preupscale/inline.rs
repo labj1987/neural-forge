@@ -73,7 +73,7 @@ pub(crate) fn enabled() -> bool {
     *ON
 }
 
-/// The images and buffer one stage's holds work in, at the colour input's extent: the colour input
+/// The images and buffer one stage's holds work in, at the stage's working extent ([`working_extent`]): the colour input
 /// (RGBA16F, what the hold reads and writes), DLSS's exposure (1x1 R16F), its motion vectors (RG16F) and
 /// depth (4 bytes a texel at most). Shared by every hold of the stage: their buffers run on DLSS's queue,
 /// one after another.
@@ -251,6 +251,9 @@ struct Slots {
     secondary: HashSet<vk::CommandBuffer>,
     /// Each stage's staging images.
     staging: [Option<Staging>; 2],
+    /// Each stage's working extent ([`working_extent`]): the colour input's extent it is for, and the high-water mark
+    /// of the rectangles held there, rounded up to [`WORKING_STEP`] and within the image.
+    marks: [Option<Mark>; 2],
     /// The queue the last buffer carrying a hold was submitted on.
     queue: Option<vk::Queue>,
     /// Once the holds stopped for a second queue ([`Inline::stopped`]): a fence after the last submission
@@ -268,6 +271,27 @@ struct Slots {
 
 fn stage_index(stage: Stage) -> usize {
     usize::from(stage == Stage::Upscaled)
+}
+
+/// A stage's working extent: the colour input's extent it is for, and the extent ([`working_extent`]).
+type Mark = ((u32, u32), (u32, u32));
+
+/// The working extent grows in steps of this many pixels: a rectangle that grows a little at a time (dynamic
+/// resolution) rebuilds the hold's resources once per step at most.
+pub(crate) const WORKING_STEP: u32 = 64;
+
+/// The extent a stage's holds work at (the staging images and the network's resources) for the rectangle `rect` of
+/// a colour input of `image`, given the stage's last `mark` (the image's extent, the working extent): the largest
+/// rectangle held in this image so far, each side rounded up to [`WORKING_STEP`] and within the image. It only grows
+/// while the image stays the same, so a rectangle that shrinks builds nothing again; a larger one builds once. A
+/// 1920x1080 rectangle in a 3840x2160 image (DLSS's subrect) works at 1920x1088, not the image's 4x the pixels.
+pub(crate) fn working_extent(mark: Option<Mark>, image: (u32, u32), rect: (u32, u32)) -> (u32, u32) {
+    let up = |v: u32, max: u32| v.div_ceil(WORKING_STEP).saturating_mul(WORKING_STEP).min(max.max(v)).max(1);
+    let want = (up(rect.0, image.0), up(rect.1, image.1));
+    match mark {
+        Some((at, m)) if at == image => (m.0.max(want.0), m.1.max(want.1)),
+        _ => want,
+    }
 }
 
 impl Slots {
@@ -811,11 +835,13 @@ impl Inline {
             return Recorded::Skipped;
         }
         let stage = if point.hold.stage == Stage::Upscaled { Stage::Upscaled } else { Stage::Before };
-        // The staging images (and the network's resources, built for the held point's extent) are the whole
-        // image's: a rectangle (DLSS's subrect) that changes size inside it builds nothing again. The rectangle is
-        // copied to their corner and its edge replicated over the rest ([`record_copy_in`]).
-        let extent = point.image;
+        // The staging images (and the network's resources, built for the held point's extent) are at the stage's
+        // working extent ([`working_extent`]): the largest rectangle (DLSS's subrect) held in this image so far,
+        // rounded up, so a rectangle that shrinks inside it builds nothing again, and a small rectangle in a large
+        // image does not run the network over the whole image. The rectangle is copied to their corner and its edge
+        // replicated over the rest ([`record_copy_in`]).
         let rect = (point.desc.width, point.desc.height);
+        let extent: (u32, u32);
         let convert = point.desc.format != vk::Format::R16G16B16A16_SFLOAT;
         let (index, staging, queries, readback, outstanding, mut cache_dump) = {
             let mut s = lock(&self.slots);
@@ -888,8 +914,10 @@ impl Inline {
                     return Recorded::Skipped;
                 }
             };
-            // The stage's staging images at this extent: built again only once no hold of the stage may run.
+            // The stage's staging images at its working extent: built again only once no hold of the stage may run.
             let k = stage_index(stage);
+            extent = working_extent(s.marks[k], point.image, rect);
+            s.marks[k] = Some((point.image, extent));
             let others = s.outstanding(stage, None);
             if s.staging[k].is_none_or(|st| st.extent != extent) {
                 if others > 0 {
@@ -3025,9 +3053,8 @@ mod tests {
     /// staging images whole, then writes a constant over the staging colour. Returns the staging colour (RGBA16F), motion
     /// vectors (RG16F) and depth (f32) as the hold saw them, the colour input after it, the staging images' id and the
     /// extent the held point gave the hold (what the network's resources are built for).
-    fn subrect_hold(rig: &mut Rig, images: (vk::Image, vk::Image, vk::Image), rect: (u32, u32)) -> SubrectSeen {
-        let (colour, mvec, depth) = images;
-        let (cw, ch) = SUBRECT_IMAGE;
+    fn subrect_hold(rig: &mut Rig, images: SubrectImages, rect: (u32, u32)) -> SubrectSeen {
+        let (colour, mvec, depth, (cw, ch)) = images;
         // The game's images as they are before every hold.
         let texels = |each: &dyn Fn(u32, u32) -> Vec<u8>| -> Vec<u8> { (0..ch).flat_map(|y| (0..cw).flat_map(move |x| each(x, y))).collect() };
         rig.upload_image(colour, (cw, ch), &texels(&|x, y| subrect_colour(x, y).iter().flat_map(|v| v.to_le_bytes()).collect()));
@@ -3083,18 +3110,25 @@ mod tests {
         }
         rig.end(cb);
         rig.submit(&[cb]);
+        // Begun again (the buffer ran): its hold can no longer run, and the next may build the staging images again.
+        rig.begin(cb);
+        rig.end(cb);
         let staging = lock(&rig.inline.slots).staging[0].expect("built");
-        assert_eq!(staging.extent, (cw, ch), "the staging images are the colour input's whole extent");
+        let (sw, sh) = staging.extent;
+        assert_eq!(staging.extent, held_extent.get(), "the staging images are at the held extent");
         // SAFETY: mapped; the buffer ran.
         let read = |k: usize, n: u32| -> Vec<u16> { unsafe { std::slice::from_raw_parts(rig.hosts[k].ptr.cast::<u16>(), n as usize) }.to_vec() };
         // SAFETY: as above.
-        let depths: Vec<f32> = unsafe { std::slice::from_raw_parts(rig.hosts[seen_depth].ptr.cast::<f32>(), (cw * ch) as usize) }.to_vec();
-        (read(seen, cw * ch * 4), read(seen_mv, cw * ch * 2), depths, read(back, cw * ch * 4), staging.id, held_extent.get())
+        let depths: Vec<f32> = unsafe { std::slice::from_raw_parts(rig.hosts[seen_depth].ptr.cast::<f32>(), (sw * sh) as usize) }.to_vec();
+        (read(seen, sw * sh * 4), read(seen_mv, sw * sh * 2), depths, read(back, cw * ch * 4), staging.id, held_extent.get(), (cw, ch))
     }
 
-    /// What [`subrect_hold`] read back: the staging colour, motion vectors and depth, the colour input after the hold,
-    /// the staging images' id and the held extent.
-    type SubrectSeen = (Vec<u16>, Vec<u16>, Vec<f32>, Vec<u16>, u64, (u32, u32));
+    /// What [`subrect_hold`] read back: the staging colour, motion vectors and depth (at the held extent), the colour
+    /// input after the hold, the staging images' id, the held extent and the colour input's extent.
+    /// The subrect rig's colour input, motion vectors and depth, and their extent.
+    type SubrectImages = (vk::Image, vk::Image, vk::Image, (u32, u32));
+
+    type SubrectSeen = (Vec<u16>, Vec<u16>, Vec<f32>, Vec<u16>, u64, (u32, u32), (u32, u32));
 
     /// The subrect rig's colour input, motion vectors and depth (R32F), larger than the rig's W x H: each texel holds
     /// its own position (colour: x, y, 0.5, 1; motion vectors: x, y; depth: 100 x + y).
@@ -3105,24 +3139,26 @@ mod tests {
         [half(x as f32), half(y as f32), half(0.5), half(1.0)]
     }
 
-    fn subrect_rig() -> Option<(Rig, (vk::Image, vk::Image, vk::Image))> {
+    fn subrect_rig(size: (u32, u32)) -> Option<(Rig, SubrectImages)> {
         let mut rig = Rig::open(false)?;
-        let (cw, ch) = SUBRECT_IMAGE;
+        let (cw, ch) = size;
         let (rgba, rg, r32) = (vk::Format::R16G16B16A16_SFLOAT, vk::Format::R16G16_SFLOAT, vk::Format::R32_SFLOAT);
         let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
         let colour = rig.image(rgba, (cw, ch), usage | vk::ImageUsageFlags::STORAGE);
         let mvec = rig.image(rg, (cw, ch), usage);
         let depth = rig.image(r32, (cw, ch), usage);
-        Some((rig, (colour, mvec, depth)))
+        Some((rig, (colour, mvec, depth, size)))
     }
 
-    /// Checks one [`subrect_hold`] of `rect`: the colour input changed inside the rectangle alone; the staging images
-    /// hold the rectangle at their corner, each input from its own base, and outside it the rectangle's edge
-    /// replicated (its last column to the right, its last row below, the corner its corner pixel).
-    fn check_subrect(got: &SubrectSeen, rect: (u32, u32)) {
-        let (colour, vectors, depths, after, _, held) = got;
-        let (cw, ch) = SUBRECT_IMAGE;
-        assert_eq!(*held, (cw, ch), "the hold (and the network's resources) work at the colour input's whole extent");
+    /// Checks one [`subrect_hold`] of `rect`, held at `working` (the staging images' and the network's extent): the
+    /// colour input changed inside the rectangle alone; the staging images hold the rectangle at their corner, each
+    /// input from its own base, and outside it, up to the working extent, the rectangle's edge replicated (its last
+    /// column to the right, its last row below, the corner its corner pixel).
+    fn check_subrect(got: &SubrectSeen, rect: (u32, u32), working: (u32, u32)) {
+        let (colour, vectors, depths, after, _, held, (cw, ch)) = got;
+        let (cw, ch) = (*cw, *ch);
+        assert_eq!(*held, working, "the hold (and the network's resources) work at the working extent for {rect:?}");
+        let (sw, sh) = working;
         for y in 0..ch {
             for x in 0..cw {
                 let i = ((y * cw + x) * 4) as usize;
@@ -3131,9 +3167,9 @@ mod tests {
                 assert_eq!(after[i..i + 4], want, "the colour input at ({x}, {y}) after the hold of {rect:?} (inside the rectangle: {inside})");
             }
         }
-        for y in 0..ch {
-            for x in 0..cw {
-                let i = (y * cw + x) as usize;
+        for y in 0..sh {
+            for x in 0..sw {
+                let i = (y * sw + x) as usize;
                 // The rectangle's pixel this staging pixel shows: itself inside it, its edge outside.
                 let (rx, ry) = (x.min(rect.0 - 1), y.min(rect.1 - 1));
                 assert_eq!(colour[4 * i..4 * i + 4], subrect_colour(rx + 3, ry + 2), "the network's colour at ({x}, {y}) for {rect:?}");
@@ -3150,8 +3186,8 @@ mod tests {
     /// outside it stays as the game left it, and the network never reads a pixel DLSS does not.
     #[test]
     fn a_subrect_hold_reads_and_writes_its_rectangle_alone() {
-        let Some((mut rig, images)) = subrect_rig() else { return };
-        check_subrect(&subrect_hold(&mut rig, images, (W, H)), (W, H));
+        let Some((mut rig, images)) = subrect_rig(SUBRECT_IMAGE) else { return };
+        check_subrect(&subrect_hold(&mut rig, images, (W, H)), (W, H), SUBRECT_IMAGE);
     }
 
     /// Dynamic resolution inside a fixed colour input: a rectangle of another size builds neither the staging images nor
@@ -3159,15 +3195,51 @@ mod tests {
     /// replicates its own edge.
     #[test]
     fn a_subrect_that_changes_size_builds_nothing_again() {
-        let Some((mut rig, images)) = subrect_rig() else { return };
+        let Some((mut rig, images)) = subrect_rig(SUBRECT_IMAGE) else { return };
         let first = subrect_hold(&mut rig, images, (W, H));
-        check_subrect(&first, (W, H));
+        check_subrect(&first, (W, H), SUBRECT_IMAGE);
         // Each fits every input's rectangle in its image (the largest: the motion vectors' at (5, 1), the depth's at (0, 4)).
         for rect in [(W - 6, H - 3), (W + 2, H - 5), (W - 1, H + 1), (W + 2, H + 1)] {
             let got = subrect_hold(&mut rig, images, rect);
-            check_subrect(&got, rect);
+            // The image is within one step of the working extent: that is the image's whole extent.
+            check_subrect(&got, rect, SUBRECT_IMAGE);
             assert_eq!(got.4, first.4, "the staging images were built again for the rectangle {rect:?}");
         }
+    }
+
+    /// A small rectangle in a large colour input (DLSS's subrect: 1920x1080 in a 3840x2160 image) is held at its
+    /// working extent, not the image's: the largest rectangle so far, rounded up to [`WORKING_STEP`] and within the
+    /// image. A rectangle that grows past it builds the staging images (and the network's resources) once more; one
+    /// that shrinks, or grows within it, builds nothing. The padding replicates the rectangle's edge up to the working
+    /// extent.
+    #[test]
+    fn a_subrect_is_held_at_its_high_water_mark() {
+        const IMAGE: (u32, u32) = (150, 140);
+        let Some((mut rig, images)) = subrect_rig(IMAGE) else { return };
+        let mut id = None;
+        // Each rectangle, the working extent it is held at and whether that builds the staging images again (every
+        // rectangle fits each input's base: the motion vectors' at (5, 1), the depth's at (0, 4)).
+        let steps = [
+            ((60, 30), (64, 64), true),
+            ((40, 20), (64, 64), false),
+            ((70, 30), (128, 64), true),
+            ((50, 50), (128, 64), false),
+            ((60, 61), (128, 64), false),
+            ((100, 100), (128, 128), true),
+            ((20, 10), (128, 128), false),
+            ((145, 136), IMAGE, true),
+            ((30, 30), IMAGE, false),
+        ];
+        for (rect, working, builds) in steps {
+            let got = subrect_hold(&mut rig, images, rect);
+            check_subrect(&got, rect, working);
+            assert_eq!(id != Some(got.4), builds, "the staging images built again for {rect:?}: {builds} expected");
+            id = Some(got.4);
+        }
+        assert_eq!(working_extent(None, (3840, 2160), (1920, 1080)), (1920, 1088));
+        assert_eq!(working_extent(Some(((3840, 2160), (1920, 1088))), (3840, 2160), (1280, 720)), (1920, 1088), "never shrinks");
+        assert_eq!(working_extent(Some(((3840, 2160), (1920, 1088))), (2560, 1440), (1280, 720)), (1280, 768), "another image starts afresh");
+        assert_eq!(working_extent(None, (3840, 2160), (3840, 2160)), (3840, 2160), "the whole image is held as before");
     }
 
     fn whole(w: u32, h: u32) -> vk::BufferImageCopy {

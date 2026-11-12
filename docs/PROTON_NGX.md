@@ -91,7 +91,7 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   file, and it is rewritten only when the set of paths changes). `<app id>` is Steam's `SteamAppId` (else
   `SteamGameId`), else `x` and a hash of the executable's path, so games whose executables share a name keep apart.
   Wine does not pass `HOME` into the game's Windows environment (it gives `WINEHOMEDIR`, `\??\Z:\home\<user>`), so
-  without `XDG_STATE_HOME` the wrapper takes the home from there, the same directory the supervisor uses. `doctor`
+  without `XDG_STATE_HOME` the wrapper takes the home from there, the same directory the supervisor uses. It writes through `Z:` for a `Z:` home, and through the NT path (`\\?\unix\home\<user>\.local\state\...`, or the other drive's) for a `\??\unix\...` or other-drive `WINEHOMEDIR`, so it needs no `Z:` drive. `doctor`
   and the report (`ngx_versions.rs`) show that record with how long ago it was written, and the NGX DLLs present in each switched-on game's folder, its prefix's
   `ProgramData/NVIDIA/NGX` and `system32`, and the driver's core, with their versions read from the PE resources on
   the Linux side (`model::dll_file_version`: headers and resource section only). The record is for a bug report's
@@ -136,18 +136,22 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   (`DLSS.Render.Subrect.Dimensions`) at each input's base. Unreal Engine does (its scene textures are rounded up and
   kept at the largest size asked for; Expedition 33 gave 1485x835 of a 1488x836 colour input, #51). The hold before the
   upscaler then works on that rectangle alone (`ngx_ring::Record::crop`): it copies the colour input's rectangle from
-  its base, the motion vectors' and the depth's from theirs, to the corner of staging images of the colour input's whole
-  extent, fills the rest of them with the rectangle's edge (last column, then last row, replicated; motion vectors and
-  depth too), runs the network there, and writes back over the rectangle only, so nothing DLSS does not read is fed to
-  the network or written. The split hold
+  its base, the motion vectors' and the depth's from theirs, to the corner of staging images of the stage's working
+  extent (the largest rectangle held in that image so far, rounded up to 64 pixels and within the image: a 1920x1080
+  rectangle of a 3840x2160 image works at 1920x1088, not on 4x the pixels), fills the rest of them with the rectangle's
+  edge (last column, then last row, replicated; motion vectors and depth too), runs the network there, and writes back
+  over the rectangle only, so nothing DLSS does not read is fed to the network or written. The scene-cut detector and
+  the measured exposure read the rectangle alone, not the padding (a new rectangle size has no thumbnail to compare
+  with). The split hold
   works on the whole image, so it refuses such frames (`Hazard::Subrect`) and the hold inside DLSS's buffer takes them.
   A rectangle outside the colour input refuses the hold; motion vectors or depth whose rectangle leaves their image are
   not read. Their rectangle is the render size where the feature was created with `MVLowRes` or they are as large as the
   colour input (Hogwarts Legacy's 2562x1441 motion vectors for a 2564x1444 colour input), else (high-resolution ones)
   the feature's output size, at their base. The hold after DLSS works on the output's rectangle (the feature's output
-  size at `DLSS.Output.Subrect.Base`), with the render-size motion vectors from their base. A new rectangle size
-  inside the same image (dynamic resolution) builds nothing again; it resets the network's history (its pixels stand
-  for other points of the screen). A new image size builds the hold's resources for it. The log says the subrect
+  size at `DLSS.Output.Subrect.Base`), with the render-size motion vectors from their base (also where the colour
+  input's extent is unknown but the render size is known: none where it does not fit their image). A smaller rectangle
+  inside the same image (dynamic resolution) builds nothing again, and a larger one only once it grows past the working
+  extent; a new size resets the network's history (its pixels stand for other points of the screen). A new image size builds the hold's resources for it. The log says the subrect
   once per feature (`[ngx] DLSS (...) is given part of its inputs: ...`).
 - **HDR:** a record with `IsHDR` clear is said once in the log (the encode has no path for a display-referred input
   yet).

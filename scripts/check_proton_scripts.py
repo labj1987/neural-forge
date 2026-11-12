@@ -29,11 +29,13 @@ through the GitHub API ($GITHUB_TOKEN raises its rate limit) and runs the patch 
 """
 import contextlib
 import hashlib
+import http.client
 import io
 import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -117,7 +119,10 @@ def report(results):
             "`proton_tool::patch_proton_script` has to move to it (docs/PROTON_NGX.md).",
         ]
     text = "\n".join(lines) + "\n"
-    return text + f"\n<!-- report-sha256: {hashlib.sha256(text.encode()).hexdigest()} -->\n", not bad
+    # The hash covers the repos and their failures only, not the branch names: a new dated cachyos_* branch with the
+    # same failure is the same report and must not reopen an issue closed by hand.
+    failures = "\n".join(sorted(f"{repo}: {outcome}" for repo, _ref, outcome in bad))
+    return text + f"\n<!-- report-sha256: {hashlib.sha256(failures.encode()).hexdigest()} -->\n", not bad
 
 
 def marker(body):
@@ -138,6 +143,10 @@ def decide(state, issue_state, old_body, new_body):
         return ["edit"] if issue_state == "OPEN" else ["edit", "reopen"]
     if state == "current" and issue_state == "OPEN":
         return ["edit", "close"]
+    if state == "current" and issue_state == "CLOSED" and not same:
+        # Silent edit, no reopen: the body then holds the good report's hash, so the same failure coming back later
+        # is a change of the report and reopens the issue.
+        return ["edit"]
     return []
 
 
@@ -177,9 +186,11 @@ def main():
 def is_network(e):
     """Whether `e` is a failure to reach upstream (retry later) rather than one of the check itself."""
     if isinstance(e, urllib.error.HTTPError):
-        rate_limited = e.code == 403 and (e.headers or {}).get("X-RateLimit-Remaining") == "0"
+        headers = e.headers or {}
+        rate_limited = e.code == 403 and (headers.get("X-RateLimit-Remaining") == "0" or headers.get("Retry-After") is not None)
         return e.code >= 500 or e.code == 429 or rate_limited
-    return isinstance(e, (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError))
+    # URLError, socket.timeout, ConnectionError and ssl.SSLError are OSErrors; a dropped connection mid-read is an HTTPException.
+    return isinstance(e, (http.client.HTTPException, OSError))
 
 
 def run():
@@ -205,6 +216,12 @@ def exit_code_tests():
         (ConnectionResetError("reset"), NETWORK),
         (urllib.error.HTTPError("u", 502, "bad gateway", {}, None), NETWORK),
         (urllib.error.HTTPError("u", 403, "rate limited", hdr, None), NETWORK),
+        (urllib.error.HTTPError("u", 403, "secondary limit", {"Retry-After": "60"}, None), NETWORK),
+        (http.client.IncompleteRead(b"x"), NETWORK),
+        (http.client.RemoteDisconnected("closed"), NETWORK),
+        (ssl.SSLError("handshake"), NETWORK),
+        (OSError("network unreachable"), NETWORK),
+        (urllib.error.HTTPError("u", 403, "forbidden", {}, None), TOOL),
         (urllib.error.HTTPError("u", 404, "not found", {}, None), TOOL),
         (urllib.error.HTTPError("u", 401, "bad credentials", {}, None), TOOL),
         (KeyError("name"), TOOL),
@@ -259,7 +276,14 @@ def self_test():
     assert decide("broken", "CLOSED", other, text) == ["edit", "reopen"]
     assert decide("broken", "CLOSED", "a body without a hash", text) == ["edit", "reopen"]
     assert decide("current", "OPEN", text, report(good)[0]) == ["edit", "close"]
-    assert decide("current", "CLOSED", text, report(good)[0]) == [] and decide("current", "none", "", report(good)[0]) == []
+    assert decide("current", "CLOSED", text, report(good)[0]) == ["edit"], "closed + current + a different report: silent edit, no reopen"
+    assert decide("current", "CLOSED", report(good)[0], report(good)[0]) == [] and decide("current", "none", "", report(good)[0]) == []
+    # The hash ignores branch names: a new dated branch with the same failure is the same report.
+    fail = "fail proton: the proton script's NVIDIA_WINE_DLL_DIR block was found 0 times, not once"
+    r1 = report(good[:1] + [("CachyOS/proton-cachyos", "cachyos_11.0_20261014/main", fail)])[0]
+    r2 = report(good[:1] + [("CachyOS/proton-cachyos", "cachyos_11.0_20261101/main", fail)])[0]
+    assert r1 != r2 and marker(r1) == marker(r2) and decide("broken", "CLOSED", r1, r2) == []
+    assert marker(r1) != marker(report(good)[0])
     # Exit codes: a network failure is 2 (retry, quiet), a failure of the check itself 1, a missing release branch 10.
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         exit_code_tests()
