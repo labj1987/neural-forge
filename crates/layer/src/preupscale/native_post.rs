@@ -314,7 +314,7 @@ fn work(
     let offload = offloaded.is_some();
     if let Some(o) = offloaded {
         gpu.standin = o.standin;
-        gpu.slow = Some(super::offload::SlowRule::default());
+        gpu.slow = Some(super::offload::ServerRule::default());
         crate::log!("[offload] answering the after-the-upscaler path's requests on {}", o.name);
     } else {
         crate::log!("[native] answering the after-the-upscaler path's requests on queue {} of family {}", setup.post_index, setup.family);
@@ -415,8 +415,9 @@ struct Gpu {
     synthetic_flow: Option<(u32, Vec<u32>)>,
     /// On another GPU with `NEURAL_FORGE_OFFLOAD_STANDIN`: the copy that runs in place of the network ([`super::offload`]).
     standin: Option<super::offload::Standin>,
-    /// On another GPU: the rule that gives it up when its frames are too slow, and why it was given up (the server ends).
-    slow: Option<super::offload::SlowRule>,
+    /// On another GPU: the rule that gives it up (a hung frame, the network not running), and why it was given up (the
+    /// server ends).
+    slow: Option<super::offload::ServerRule>,
     give_up: Option<String>,
 }
 
@@ -771,6 +772,12 @@ fn serve(
     let mut frames: u64 = 0;
     let mut last_request = Instant::now();
     while !quit.load(Ordering::Relaxed) && !gpu.stalled && gpu.give_up.is_none() {
+        if gpu.slow.is_some() {
+            if let Some(why) = super::offload::take_give_up() {
+                gpu.give_up = Some(why);
+                break;
+            }
+        }
         if !view.usable() {
             // The process let the channel go (it stopped presenting): another game's layer may own
             // it now, and its requests are not this server's. Picked up again once this process
@@ -887,6 +894,8 @@ fn process(
     // finish in time: its work may still use the network, so the claim stays until its fence signals
     // (`Loader::post_stalled`, checked by the pre-upscaler path's claim).
     let standin = gpu.standin.is_some();
+    // The build the frame ran with (the stand-in has none: 1).
+    let mut generation = 1;
     let evaluated = if standin {
         // The stand-in on another GPU (`NEURAL_FORGE_OFFLOAD_STANDIN`): the frame copied in and back out there. An HDR10
         // frame's copy would be its raw words, no SDR answer: echoed below as on any failure.
@@ -909,6 +918,7 @@ fn process(
             // The Network setting: a switch frees the current build here, once this path's previous frame
             // was waited for (`evaluate` waits for each) and the other path is kept off by the claim.
             let ok = loader.ready(width, height, hdr.network_choice()).is_some_and(|built| {
+                generation = built.generation;
                 // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
                 unsafe {
                     evaluate(
@@ -945,8 +955,18 @@ fn process(
         super::offload::STATS.server_frames.fetch_add(1, Ordering::Relaxed);
         super::offload::STATS.server_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
-    if let Some(why) = gpu.slow.as_mut().and_then(|r| r.note(if evaluated { t.elapsed() } else { Duration::ZERO })) {
-        gpu.give_up = Some(why);
+    if let Some(rule) = gpu.slow.as_mut() {
+        let why = if evaluated {
+            rule.ran(generation, t.elapsed())
+        } else if wanted {
+            let reason = loader.failed().or_else(|| loader.paused().then(|| "paused by the VRAM guard".to_string()));
+            rule.missed(Instant::now(), reason.as_deref())
+        } else {
+            None
+        };
+        if why.is_some() {
+            gpu.give_up = why;
+        }
     }
     if gpu.stalled && gpu.slow.is_some() && gpu.give_up.is_none() {
         gpu.give_up = Some("a frame did not finish in time on the other GPU (or its device was lost)".into());

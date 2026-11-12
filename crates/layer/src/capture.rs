@@ -634,6 +634,8 @@ unsafe fn delayed_present(
     let dims = (width, height, proxy_format);
     // 1. The previous present's frame: its answer, waited for within the budget (the other GPU had a whole frame).
     let pending = inflight[SLOT.index()].delayed.take();
+    let arrived = std::time::Instant::now();
+    let mut round_trip = None;
     let mut answered = false;
     let mut fits = false;
     if pending.is_some_and(|r| r.sent) {
@@ -644,6 +646,7 @@ unsafe fn delayed_present(
                     answered = true;
                     let req = pending.expect("checked");
                     fits = shm.answered_dims().is_none_or(|d| (d.0, d.1) == (req.dims.0, req.dims.1)) && (!pq10 || shm.answer_evaluated(SLOT));
+                    round_trip = Some(req.posted.elapsed());
                     if fits {
                         STATS.round_trip_us.fetch_add(req.posted.elapsed().as_micros() as u64, Relaxed);
                         STATS.round_trips.fetch_add(1, Relaxed);
@@ -657,6 +660,15 @@ unsafe fn delayed_present(
     } else if shm.has_pending_request(SLOT) {
         // A late answer to a request whose frame was shown without it lands here and is dropped (polling it ends it).
         let _ = shm.poll_async_request(SLOT);
+    }
+    // Judged where the game waits: a frame late against the present interval counts toward giving the other GPU up.
+    // Not in the `same` test, where the other device shares the game's GPU: it is as slow as the network there.
+    if let Some(req) = pending.filter(|r| r.sent && crate::preupscale::offload::Choice::current() != crate::preupscale::offload::Choice::Same) {
+        let late = crate::preupscale::offload::LateRule::is_late(round_trip, arrived.saturating_duration_since(req.posted));
+        let verdict = crate::preupscale::offload::LATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().note(late);
+        if let Some(why) = verdict {
+            crate::preupscale::offload::give_up(why);
+        }
     }
     let previous = previous_frame(pending, answered, fits, dims, pending.map_or(std::time::Duration::ZERO, |r| r.posted.elapsed()));
     // 2. This frame, kept in the other pair; captured and sent only when the server is done with the proxy region.

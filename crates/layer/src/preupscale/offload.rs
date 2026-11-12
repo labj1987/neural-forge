@@ -28,13 +28,21 @@ use ash::vk;
 
 use super::native::Setup;
 
-/// A frame of the network on the other GPU slower than this sends the network back to the game's GPU: the present
-/// waits at most 250 ms for an answer (`capture::SYNC_BUDGET`), so a slower one is never shown.
-pub(crate) const TOO_SLOW: Duration = Duration::from_millis(250);
-/// How many frames in a row may be [`TOO_SLOW`] before the fall-back (the first frames after a build are slow).
-pub(crate) const SLOW_FRAMES: u32 = 30;
-/// A single frame slower than this falls back at once (vkDaedalus's rule for its second GPU: a second).
+/// The frames the present judges the other GPU over ([`LateRule`]), and how many of them may come late.
+pub(crate) const LATE_WINDOW: usize = 120;
+pub(crate) const LATE_ALLOWED: usize = 30;
+/// A frame is late when its answer takes longer than this many present intervals from its request (the game's own
+/// time between presents; the present waits for the rest, so at 3 the game's frame rate falls to a third), or does not
+/// come within the present's budget. Not 1: a second GPU somewhat slower than the game's frame still beats running the
+/// network on the game's GPU after the game's own frame; this catches one far too slow for it.
+pub(crate) const LATE_INTERVALS: u32 = 3;
+/// A single frame of the other GPU slower than this falls back at once (vkDaedalus's rule for its second GPU: a
+/// second), except the first frames after a build ([`WARM_FRAMES`]: the driver compiles and the first copies map).
 pub(crate) const HUNG: Duration = Duration::from_secs(1);
+pub(crate) const WARM_FRAMES: u32 = 10;
+/// The network not running on the other GPU for this long while frames come (it could not be built, the VRAM guard
+/// paused it) falls back: the frames meanwhile go out without the model.
+pub(crate) const NOT_RUNNING: Duration = Duration::from_secs(30);
 
 /// Which device runs the network (`NEURAL_FORGE_OFFLOAD_GPU`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +150,11 @@ pub(crate) fn active() -> bool {
 }
 
 pub(crate) fn set_active(on: bool) {
+    if on {
+        // A server starting afresh is judged afresh.
+        *LATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        take_give_up();
+    }
     ACTIVE.store(on, Ordering::Release);
 }
 
@@ -769,30 +782,80 @@ impl Standin {
     }
 }
 
-/// The rule for falling back to the game's GPU on slow frames: [`SLOW_FRAMES`] in a row slower than [`TOO_SLOW`], or
-/// one slower than [`HUNG`].
+/// The other GPU's frames as the server sees them: one over [`HUNG`] after the first [`WARM_FRAMES`] of a build, or
+/// none run for [`NOT_RUNNING`] while frames come, falls back.
 #[derive(Default)]
-pub(crate) struct SlowRule {
-    in_a_row: u32,
+pub(crate) struct ServerRule {
+    /// The build the frames ran with, and how many ran with it.
+    generation: u64,
+    warm: u32,
+    not_running_since: Option<std::time::Instant>,
 }
 
-impl SlowRule {
-    /// Notes a frame's time; why to fall back, once the rule says so.
-    pub(crate) fn note(&mut self, took: Duration) -> Option<String> {
-        if took >= HUNG {
-            return Some(format!("a frame took {took:.0?} on the other GPU"));
+impl ServerRule {
+    /// Notes a frame the network ran on (`generation`: the build's), and how long it took; why to fall back.
+    pub(crate) fn ran(&mut self, generation: u64, took: Duration) -> Option<String> {
+        self.not_running_since = None;
+        if generation != self.generation {
+            self.generation = generation;
+            self.warm = 0;
         }
-        if took >= TOO_SLOW {
-            self.in_a_row += 1;
-            if self.in_a_row >= SLOW_FRAMES {
-                return Some(format!("{SLOW_FRAMES} frames in a row took more than {TOO_SLOW:?} on the other GPU (the last {took:.0?})"));
-            }
-        } else {
-            self.in_a_row = 0;
-        }
-        None
+        self.warm = self.warm.saturating_add(1);
+        (self.warm > WARM_FRAMES && took >= HUNG).then(|| format!("a frame took {took:.0?} on the other GPU"))
+    }
+
+    /// Notes a frame the model was wanted for that the network did not run on (`why`: the loader's reason, if any), at
+    /// `now`; why to fall back.
+    pub(crate) fn missed(&mut self, now: std::time::Instant, why: Option<&str>) -> Option<String> {
+        let since = *self.not_running_since.get_or_insert(now);
+        (now.saturating_duration_since(since) >= NOT_RUNNING)
+            .then(|| format!("the network has not run on the other GPU for {NOT_RUNNING:?}{}", why.map_or(String::new(), |w| format!(" ({w})"))))
     }
 }
+
+/// The other GPU's frames as the present sees them: more than [`LATE_ALLOWED`] of the last [`LATE_WINDOW`] sent frames
+/// late ([`LATE_INTERVALS`]) falls back. Judged where the game waits, so a second GPU too slow for the game's frame rate
+/// is caught whatever its own times are.
+#[derive(Default)]
+pub(crate) struct LateRule {
+    window: std::collections::VecDeque<bool>,
+}
+
+impl LateRule {
+    /// Whether a frame is late: `answer` its request-to-answer time (`None`: none came in the budget), `interval` the time
+    /// between its present and the next.
+    pub(crate) fn is_late(answer: Option<Duration>, interval: Duration) -> bool {
+        answer.is_none_or(|a| a > interval * LATE_INTERVALS)
+    }
+
+    /// Notes a sent frame; why to fall back.
+    pub(crate) fn note(&mut self, late: bool) -> Option<String> {
+        if self.window.len() == LATE_WINDOW {
+            self.window.pop_front();
+        }
+        self.window.push_back(late);
+        let n = self.window.iter().filter(|&&l| l).count();
+        (self.window.len() == LATE_WINDOW && n > LATE_ALLOWED).then(|| {
+            format!("{n} of the last {LATE_WINDOW} frames came back from the other GPU later than {LATE_INTERVALS} frame intervals: it is too slow for this frame rate")
+        })
+    }
+}
+
+/// The present's verdict on the other GPU ([`LateRule`]), for the server to end on.
+static GIVE_UP: Mutex<Option<String>> = Mutex::new(None);
+
+/// The present gives the other GPU up (`why`); the server ends at its next turn.
+pub(crate) fn give_up(why: String) {
+    GIVE_UP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(why);
+}
+
+/// Takes the present's verdict ([`give_up`]).
+pub(crate) fn take_give_up() -> Option<String> {
+    GIVE_UP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+}
+
+/// The present side's rule (one per process: one swapchain is the primary).
+pub(crate) static LATE: Mutex<Option<LateRule>> = Mutex::new(None);
 
 #[cfg(test)]
 mod tests {
@@ -858,16 +921,50 @@ mod tests {
     }
 
     #[test]
-    fn slow_frames_fall_back_only_in_a_row_or_once_hung() {
-        let mut rule = SlowRule::default();
-        for _ in 0..SLOW_FRAMES - 1 {
-            assert!(rule.note(TOO_SLOW).is_none());
+    fn a_hung_frame_falls_back_except_while_a_build_warms_up() {
+        let mut rule = ServerRule::default();
+        for _ in 0..WARM_FRAMES {
+            assert!(rule.ran(1, HUNG * 3).is_none(), "the first frames of a build may be slow");
         }
-        assert!(rule.note(Duration::from_millis(5)).is_none(), "a fast frame starts the count over");
-        for _ in 0..SLOW_FRAMES - 1 {
-            assert!(rule.note(TOO_SLOW).is_none());
+        assert!(rule.ran(1, Duration::from_millis(20)).is_none());
+        assert!(rule.ran(1, HUNG).is_some());
+        let mut rule = ServerRule::default();
+        for _ in 0..WARM_FRAMES + 1 {
+            assert!(rule.ran(1, Duration::from_millis(20)).is_none());
         }
-        assert!(rule.note(TOO_SLOW).is_some());
-        assert!(SlowRule::default().note(HUNG).is_some());
+        assert!(rule.ran(2, HUNG * 2).is_none(), "a new build warms up again");
+    }
+
+    #[test]
+    fn frames_the_network_never_runs_on_fall_back_after_a_while() {
+        let mut rule = ServerRule::default();
+        let t0 = std::time::Instant::now();
+        assert!(rule.missed(t0, None).is_none());
+        assert!(rule.missed(t0 + NOT_RUNNING / 2, Some("the network could not be built")).is_none());
+        let why = rule.missed(t0 + NOT_RUNNING, Some("paused: too little VRAM")).expect("gives up");
+        assert!(why.contains("too little VRAM"));
+        let mut rule = ServerRule::default();
+        assert!(rule.missed(t0, None).is_none());
+        assert!(rule.ran(1, Duration::from_millis(5)).is_none());
+        assert!(rule.missed(t0 + NOT_RUNNING, None).is_none(), "a frame that ran starts the count over");
+    }
+
+    #[test]
+    fn late_frames_fall_back_by_their_share_of_the_window() {
+        let i = Duration::from_millis(10);
+        assert!(!LateRule::is_late(Some(Duration::from_millis(15)), i));
+        assert!(!LateRule::is_late(Some(Duration::from_millis(25)), i));
+        assert!(LateRule::is_late(Some(Duration::from_millis(35)), i));
+        assert!(LateRule::is_late(None, i));
+        // A GPU at 60-240 ms a frame against a 16 ms game: every frame late.
+        let mut rule = LateRule::default();
+        let gave_up = (0..LATE_WINDOW).filter_map(|_| rule.note(LateRule::is_late(Some(Duration::from_millis(60)), Duration::from_millis(16)))).count();
+        assert_eq!(gave_up, 1, "decided once the window is full");
+        // Alternating on time and late: half the window, over the allowance.
+        let mut rule = LateRule::default();
+        assert!((0..LATE_WINDOW).filter_map(|k| rule.note(k % 2 == 0)).next().is_some());
+        // A few late frames (a hitch) do not.
+        let mut rule = LateRule::default();
+        assert!((0..LATE_WINDOW * 3).all(|k| rule.note(k % 10 == 0).is_none()));
     }
 }
