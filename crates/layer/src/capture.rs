@@ -533,6 +533,8 @@ struct DelayedRequest {
     sent: bool,
     /// Kept on the CPU ([`delayed_present_cpu`], `Inflight::kept_cpu`), not in the compose's GPU pairs.
     cpu: bool,
+    /// The size of the proxy it was sent as (its answer's: the Model resolution's), which the server echoes.
+    proxy: (u32, u32),
 }
 
 /// A frame the CPU delayed present kept ([`delayed_present_cpu`]): the frame as captured, the proxy it was sent as when
@@ -637,7 +639,7 @@ fn take_previous(
                 Some(true) => {
                     answered = true;
                     let req = pending.expect("checked");
-                    fits = shm.answered_dims().is_none_or(|d| (d.0, d.1) == (req.dims.0, req.dims.1)) && (!pq10 || shm.answer_evaluated(SLOT));
+                    fits = shm.answered_dims().is_none_or(|d| (d.0, d.1) == req.proxy) && (!pq10 || shm.answer_evaluated(SLOT));
                     round_trip = Some(req.posted.elapsed());
                     if fits {
                         STATS.round_trip_us.fetch_add(req.posted.elapsed().as_micros() as u64, Relaxed);
@@ -901,7 +903,8 @@ unsafe fn delayed_present(
     if kept {
         inflight[SLOT.index()].dims = Some(dims);
         inflight[SLOT.index()].proxy_dims = None;
-        inflight[SLOT.index()].delayed = Some(DelayedRequest { dims, parity, encoded, posted: std::time::Instant::now(), sent: posted, cpu: false });
+        inflight[SLOT.index()].delayed =
+            Some(DelayedRequest { dims, parity, encoded, posted: std::time::Instant::now(), sent: posted, cpu: false, proxy: (width, height) });
     }
     let result = match result {
         Some(r) => r,
@@ -1120,7 +1123,8 @@ unsafe fn delayed_present_cpu(
         let sent = inflight[SLOT.index()].kept_cpu[parity].sent;
         inflight[SLOT.index()].dims = Some(dims);
         inflight[SLOT.index()].proxy_dims = (sent != (width, height)).then_some(sent);
-        inflight[SLOT.index()].delayed = Some(DelayedRequest { dims, parity, encoded, posted: std::time::Instant::now(), sent: posted, cpu: true });
+        inflight[SLOT.index()].delayed =
+            Some(DelayedRequest { dims, parity, encoded, posted: std::time::Instant::now(), sent: posted, cpu: true, proxy: sent });
     }
     let result = result
         .unwrap_or(Delayed::Untouched(if matches!(previous, Previous::Answer(_) | Previous::Raw(_)) { reason::NOT_COMPOSED } else { reason::NO_ANSWER }, None));
@@ -3681,7 +3685,7 @@ pub(crate) unsafe fn import_host_buffer(
 mod tests {
 
     fn kept(parity: usize, sent: bool, dims: (u32, u32, u32)) -> DelayedRequest {
-        DelayedRequest { dims, parity, encoded: false, posted: std::time::Instant::now(), sent, cpu: false }
+        DelayedRequest { dims, parity, encoded: false, posted: std::time::Instant::now(), sent, cpu: false, proxy: (dims.0, dims.1) }
     }
 
     /// The delayed present (the model on a second GPU): the previous frame is composed with its answer, shown as it was
