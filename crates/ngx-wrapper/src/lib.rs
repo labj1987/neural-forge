@@ -11,6 +11,7 @@
 
 pub mod exports;
 pub mod modules;
+pub mod pe;
 pub mod ring;
 pub mod rules;
 pub mod trace;
