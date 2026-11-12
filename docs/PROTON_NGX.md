@@ -201,10 +201,11 @@ running game uses (a process whose executable or arguments lie in it) is neither
   copies (and what a stopped copy left, `.<name>.tmp`).
 
 - **Hard links.** A copy shares most files with its source (same inode), so Steam updating the source in place changes
-  the copy's files too. The marker records the shared files at the time (`linked=` and `link_fingerprint=`: a
-  SHA-256 over each hard-linked file's path, device, inode, size and modification time); `doctor` compares and warns
-  when they differ while the source's version is unchanged (the Proton was rewritten in place), with Make again as the
-  fix. A copy made before this was recorded, and a copy made across filesystems (full copies, `linked=0`), is not
+  the copy's files too. The marker records the shared files at the time (`linked=` and one `link_file=` line each:
+  relative path, size, modification time; no device or inode numbers, no hashing); `doctor` warns when one of those
+  files' own size or time changed while the source's version is unchanged (the Proton was rewritten in place), with
+  Make again as the fix. A source that replaced a file (the copy then keeps the file it was made with) or was removed
+  is no change and says nothing. A copy made before this was recorded, and a copy made across filesystems (full copies, `linked=0`), is not
   checked and says nothing.
 
 **NGX updater (`nvngx_update.exe`).** Since driver R620 NVIDIA's `nvidia/wine` folder also ships `nvngx_update.exe`,
