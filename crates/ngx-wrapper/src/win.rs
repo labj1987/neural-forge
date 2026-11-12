@@ -25,6 +25,7 @@ extern "system" {
     fn QueryPerformanceCounter(count: *mut i64) -> i32;
     fn QueryPerformanceFrequency(freq: *mut i64) -> i32;
     fn DisableThreadLibraryCalls(module: Handle) -> i32;
+    fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
     fn GetModuleFileNameW(module: Handle, buf: *mut u16, len: u32) -> u32;
 }
 
@@ -434,9 +435,42 @@ fn resolve(this: Handle) -> Result<String, String> {
     }
     let mut text = format!("{} at {core:p}", module_path(core));
     if !stubbed.is_empty() {
-        text += &format!("; lacks {} (answered with NVSDK_NGX_Result_Fail)", stubbed.join(", "));
+        let hidden = hide_exports(this, &stubbed);
+        text += &format!(
+            "; lacks {} (taken out of this module's exports: {hidden} of {}; a caller that bound one before gets NVSDK_NGX_Result_Fail)",
+            stubbed.join(", "),
+            stubbed.len()
+        );
     }
     Ok(text)
+}
+
+/// Takes `names` out of this module's export table (their addresses set to 0, which Wine's `GetProcAddress` answers
+/// with NULL: `crate::pe`), so a game asking for an export NVIDIA's core lacks finds none, as from the core. How many
+/// were taken out.
+fn hide_exports(this: Handle, names: &[&str]) -> usize {
+    // SAFETY: `this` is this module's mapped image; its headers are readable, and the slice covers SizeOfImage.
+    let image = unsafe {
+        let headers = core::slice::from_raw_parts(this as *const u8, 0x400);
+        let Some(size) = crate::pe::size_of_image(headers) else { return 0 };
+        core::slice::from_raw_parts(this as *const u8, size)
+    };
+    let mut hidden = 0;
+    for name in names {
+        let Some(at) = crate::pe::export_entry(image, name) else { continue };
+        // SAFETY: a 4-byte entry inside the image; made writable for the write and put back.
+        unsafe {
+            let entry = (this as *mut u8).add(at) as *mut c_void;
+            let mut old = 0u32;
+            if VirtualProtect(entry, 4, PAGE_READWRITE, &mut old) != 0 {
+                core::ptr::write_unaligned(entry as *mut u32, 0);
+                VirtualProtect(entry, 4, old, &mut old);
+                hidden += 1;
+                trace(format_args!("load: {name} taken out of the exports (NVIDIA's core lacks it)"));
+            }
+        }
+    }
+    hidden
 }
 
 /// Loads NVIDIA's core and resolves the exports here, under the loader lock, which Microsoft's DllMain guidance
