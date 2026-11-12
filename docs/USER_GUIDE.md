@@ -487,24 +487,21 @@ the games that used one).
 
 ## More known issues
 
-- **Each DLSS game needs a test run before it is claimed:** engines hand DLSS its inputs in
-  different ways, and several broke an assumption the first time. See [Tested games](#tested-games).
-- **The model after DLSS is tested in three games** (Crimson Desert and Hogwarts Legacy with Ray
-  Reconstruction; Cyberpunk 2077 with and without it). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
-  much lower frame rate (14 against 70 fps shown in Crimson Desert at 4K with Ray Reconstruction).
-- **Hogwarts Legacy with Ray Reconstruction:** its Ray Reconstruction does not say what unit its motion vectors
-  are in (Cyberpunk 2077's does), so the model after DLSS takes them as render pixels, as their size suggests, or
-  in the unit Super Resolution gave if it ran earlier in the session. Neither has been checked against the picture
-  in this game: if the model's history drags or smears behind moving things there, set Placement to Finished frame.
-- **HDR on the finished frame:** HDR10 is handled (above) and tested in Crimson Desert; float16
-  (scRGB) swapchains are presented untouched, and HDR frames cannot be captured.
+- **A DLSS game that is not in [Tested games](#tested-games)** usually works, because Neural Forge reads what the
+  game hands DLSS. If the Status tab's Model placement line says DLSS's input was found but not held, the model runs
+  on the finished frame instead; attach **Save report** to an issue so the game can be added.
+- **With Ray Reconstruction, where DLSS's output cannot be held,** the model runs on the finished frame at the
+  output size, which costs far more frame rate (14 against 70 fps shown in Crimson Desert at 4K).
+- **Hogwarts Legacy with Ray Reconstruction:** its Ray Reconstruction does not say what unit its motion vectors are
+  in, so the model after DLSS takes them as render pixels. If the model's history drags or smears behind moving
+  things there, set Placement to Finished frame.
+- **HDR on the finished frame:** HDR10 is handled (above); float16 (scRGB) swapchains are presented untouched, and
+  HDR frames cannot be captured.
 - **Comparing with NVIDIA's own DLSS 5 in a game that ships it:** Proton's dxvk-nvapi 0.9.3 or newer passes
   NVIDIA's driver override for it, so the launch options
   `DXVK_NVAPI_DRS_NGX_DLSS_NR_OVERRIDE=on DXVK_NVAPI_DRS_NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION=render_preset_a`
   (presets `a` to `d`) pick which of NVIDIA's presets the game runs. They do not change Neural Forge. Switch
   the game's own DLSS 5 off while Neural Forge runs, or the frame gets both.
-- **Not carried over from upstream DLSS5VKLayer:** see
-  [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md).
 
 ## More troubleshooting
 
