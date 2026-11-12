@@ -809,6 +809,13 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     if let Some((_, _, hold)) = &owned {
         hold.lock().unwrap_or_else(|e| e.into_inner()).preupscale.stop_native();
     }
+    // The device made for the model on another GPU, its server joined just above: destroyed here, inside vkDestroyDevice,
+    // where the loader's lock is held (its device callbacks need it).
+    // SAFETY: forwarded; the server's worker was joined.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        crate::preupscale::offload::destroy_for(handle)
+    };
     // Then the hold inside DLSS's buffer: its slots and staging images (once the device is idle), and the
     // wrapping of the binding commands its tracking notes.
     // SAFETY: forwarded.

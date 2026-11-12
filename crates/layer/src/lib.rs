@@ -1086,6 +1086,14 @@ impl NeuralForgeInstanceHooks {
                                         bda_ext: requests_extension(info, c"VK_EXT_buffer_device_address"),
                                     };
                                     NATIVE_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().insert(device, setup);
+                                    // The device for the model on another GPU, made now: inside vkCreateDevice the loader
+                                    // holds the lock its device callbacks need (`preupscale::offload::make_for`).
+                                    // SAFETY: inside vkCreateDevice for `device`, with its request.
+                                    // Only for a device that presents (a game makes several; the one it draws its frames
+                                    // with asks for swapchains).
+                                    if requests_extension(info, c"VK_KHR_swapchain") {
+                                        unsafe { preupscale::offload::make_for(&instance.instance, setup, device, info) };
+                                    }
                                     log!("[native] device created with the network's extensions and features, loading queue {index} of family {family}");
                                     return result;
                                 }

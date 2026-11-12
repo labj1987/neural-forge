@@ -207,18 +207,24 @@ impl PostServer {
     /// game's instance (`game`: the game's device's setup and handle). The worker ends with [`Status::Unavailable`]
     /// when the device cannot be made, stalls, is lost or is too slow: the caller then runs the network on the game's
     /// GPU.
-    pub(crate) fn start_offload(instance: ash::Instance, game: Setup, game_device: vk::Device, choice: super::offload::Choice, view: ShmView) -> Option<Self> {
+    pub(crate) fn start_offload(instance: ash::Instance, game_device: vk::Device, view: ShmView) -> Option<Self> {
         Self::spawn(move |q, st| {
             let end = |s: Status| st.store(s as u8, Ordering::Release);
             // The channel first: a retry while another server holds it makes no device.
             let Some(claim) = claim_channel(view, u64::MAX, st) else { return };
-            // SAFETY: the game's instance and device outlive this thread (joined in Drop, before the device's teardown).
-            let off = match unsafe { super::offload::Offload::create(&instance, game, game_device, &choice) } {
-                Ok(off) => off,
-                Err(why) => {
-                    crate::log!("[offload] the model stays on the game's GPU: {why}");
-                    crate::logging::flush();
+            // Made with the game's device (`offload::make_for`, inside its vkCreateDevice, where the loader's lock is held).
+            let off = match super::offload::take(game_device) {
+                Some(Ok(off)) => off,
+                Some(Err(why)) => {
                     super::offload::note_state(super::offload::State::FellBack(why));
+                    drop(claim);
+                    return end(Status::Unavailable);
+                }
+                None => {
+                    let why = "no device was made for it with the game's device".to_string();
+                    crate::log!("[offload] the model stays on the game's GPU: {why}");
+                    super::offload::note_state(super::offload::State::FellBack(why));
+                    drop(claim);
                     return end(Status::Unavailable);
                 }
             };
@@ -237,8 +243,8 @@ impl PostServer {
                         super::offload::note_state(super::offload::State::FellBack("the stand-in's objects could not be made".into()));
                         loader.retire();
                         drop(loader);
-                        // SAFETY: nothing of the device's is alive (the loader never opened the network).
-                        unsafe { off.destroy() };
+                        super::offload::give_back(game_device, off, false);
+                        drop(claim);
                         return end(Status::Unavailable);
                     }
                 }
@@ -255,11 +261,11 @@ impl PostServer {
                 crate::log!("[offload] the other GPU's last frame never finished: its network and device are left to the process's end");
                 crate::logging::flush();
                 std::mem::forget(loader);
-                std::mem::forget(off);
+                super::offload::give_back(game_device, off, true);
             } else {
                 drop(loader);
-                // SAFETY: the server and the network are gone, nothing pending (waited, or the device lost).
-                unsafe { off.destroy() };
+                // Destroyed with the game's device (inside its vkDestroyDevice, the loader's lock held).
+                super::offload::give_back(game_device, off, false);
             }
         })
     }

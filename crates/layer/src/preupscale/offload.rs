@@ -412,15 +412,12 @@ impl Offload {
     /// # Safety
     /// `instance` is the game's (the next layer's dispatch), live for the call; `game_device` is live and created by
     /// this layer (its loader callbacks registered).
-    pub(crate) unsafe fn create(instance: &ash::Instance, game: Setup, game_device: vk::Device, choice: &Choice) -> Result<Self, String> {
+    unsafe fn create(instance: &ash::Instance, game: Setup, game_info: &vk::DeviceCreateInfo, choice: &Choice) -> Result<Self, String> {
         let callbacks = callbacks(game.instance).ok_or("the loader gave this instance no device callback (a Vulkan loader older than 1.2.x)")?;
         let layer_gipa = own_gipa().ok_or("the layer could not find its own vkGetInstanceProcAddr")?;
         // SAFETY: the game's live instance.
         let physicals = unsafe { instance.enumerate_physical_devices() }.map_err(|e| format!("listing the GPUs failed ({e:?})"))?;
         let described: Vec<Described> = physicals.iter().map(|&p| unsafe { describe(instance, p) }).collect();
-        for (i, d) in described.iter().enumerate() {
-            crate::log!("[offload] GPU {i}: {}{}", d.line(), if physicals[i] == game.physical { " (the game's)" } else { "" });
-        }
         let candidates: Vec<Candidate> = described
             .iter()
             .enumerate()
@@ -479,7 +476,9 @@ impl Offload {
             unsafe { ash::Device::load_with(|name| std::mem::transmute::<vk::PFN_vkVoidFunction, *const c_void>((gdpa)(device, name.as_ptr())), device) };
         // Objects the layer gets from below the loader for this device get the loader's dispatch pointer through the
         // game's device's callback (the loader's own, which finds any device it made).
-        let registration = crate::loader_data::register_like(device, game_device);
+        // SAFETY: the game's create info, its chain the loader's (its device-loader-data callback serves every device the
+        // loader made).
+        let registration = unsafe { crate::loader_data::register(device, game_info) };
         crate::note_secondary_device(device, true);
         let setup = Setup {
             gipa: game.gipa,
@@ -515,6 +514,113 @@ impl Offload {
         // SAFETY: as the contract; the loader's callback with the device's own vkDestroyDevice.
         unsafe { (self.destroy)(self.device.handle(), std::ptr::null(), destroy_device) };
         crate::note_secondary_device(self.device.handle(), false);
+    }
+}
+
+/// The GPUs of the instance, in the log once per process (where there is more than one): the indices and IDs
+/// `NEURAL_FORGE_OFFLOAD_GPU` takes.
+///
+/// # Safety
+/// `game` is a physical device of `instance`, which is Vulkan 1.3.
+unsafe fn log_gpus(instance: &ash::Instance, game: vk::PhysicalDevice) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    // SAFETY: the game's live instance.
+    let Ok(physicals) = (unsafe { instance.enumerate_physical_devices() }) else { return };
+    if physicals.len() < 2 || SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    for (i, &p) in physicals.iter().enumerate() {
+        // SAFETY: as the contract.
+        let d = unsafe { describe(instance, p) };
+        crate::log!(
+            "[offload] GPU {i}: {}{} (NEURAL_FORGE_OFFLOAD_GPU={i} or {:04x}:{:04x} runs the model there)",
+            d.line(),
+            if p == game { ", the game's" } else { "" },
+            d.vendor,
+            d.device
+        );
+    }
+}
+
+/// The offload devices made with the game's devices ([`make_for`]): per game device, the device (or why none), and
+/// whether a frame on it may still run (it is then never destroyed).
+struct Made {
+    game: vk::Device,
+    offload: Option<Result<Offload, String>>,
+    busy: bool,
+}
+
+// SAFETY: the handles and function pointers inside are plain values; the device is used by one thread at a time (the
+// server's, or the teardown's once the server was joined).
+unsafe impl Send for Made {}
+
+static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
+
+/// Called inside the game's `vkCreateDevice` (the loader holds its lock there, which its device callbacks need: they
+/// change the loader's device lists without taking it themselves), for a device the network runs on (`game`, made
+/// from `info`): logs the instance's GPUs, and with `NEURAL_FORGE_OFFLOAD_GPU` set makes the offload device now. The
+/// server takes it later ([`take`]).
+///
+/// # Safety
+/// Called inside `vkCreateDevice` for `device`; `info` is its request (the loader's chain); `game` its setup.
+pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk::Device, info: &vk::DeviceCreateInfo) {
+    // SAFETY: as the contract.
+    unsafe { log_gpus(instance, game.physical) };
+    let choice = Choice::current();
+    if choice == Choice::Off {
+        return;
+    }
+    // SAFETY: as the contract.
+    let made = unsafe { Offload::create(instance, game, info, &choice) };
+    if let Err(why) = &made {
+        crate::log!("[offload] the model stays on the game's GPU: {why}");
+        crate::logging::flush();
+    }
+    let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    all.retain(|m| m.game != device);
+    all.push(Made { game: device, offload: Some(made), busy: false });
+}
+
+/// The offload device made with `game` ([`make_for`]), for the server to run on; `None` when none was asked for, the
+/// error when it could not be made. Given back with [`give_back`].
+pub(crate) fn take(game: vk::Device) -> Option<Result<Offload, String>> {
+    MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|m| m.game == game)?.offload.take()
+}
+
+/// The server is done with the device (`busy`: a frame on it may still run, so it is never destroyed).
+pub(crate) fn give_back(game: vk::Device, offload: Offload, busy: bool) {
+    let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match all.iter_mut().find(|m| m.game == game) {
+        Some(m) => {
+            m.offload = Some(Ok(offload));
+            m.busy = busy;
+        }
+        None => all.push(Made { game, offload: Some(Ok(offload)), busy }),
+    }
+}
+
+/// Called inside the game's `vkDestroyDevice` for `game` (the loader's lock held), once its server was joined:
+/// destroys the offload device made with it, unless a frame on it may still run (left to the process's end, logged).
+///
+/// # Safety
+/// Inside `vkDestroyDevice` for `game`, after the server's worker was joined.
+pub(crate) unsafe fn destroy_for(game: vk::Device) {
+    let made = {
+        let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let k = all.iter().position(|m| m.game == game);
+        k.map(|k| all.remove(k))
+    };
+    let Some(m) = made else { return };
+    match m.offload {
+        Some(Ok(off)) if !m.busy => {
+            // SAFETY: nothing of it is alive (the server ended with it clean) and the loader's lock is held.
+            unsafe { off.destroy() };
+        }
+        Some(Ok(off)) => {
+            crate::log!("[offload] the other GPU's device is left to the process's end: a frame on it never finished");
+            std::mem::forget(off);
+        }
+        _ => {}
     }
 }
 

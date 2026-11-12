@@ -6596,7 +6596,8 @@ impl Session {
                 let (count, placements) = view.header().placements();
                 if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
                     self.post_offload = true;
-                    self.post_server = native_post::PostServer::start_offload(instance.clone(), loader.setup(), device.handle(), choice, view);
+                    let _ = choice;
+                    self.post_server = native_post::PostServer::start_offload(instance.clone(), device.handle(), view);
                     return;
                 }
                 static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
