@@ -13,6 +13,7 @@ pub mod exports;
 pub mod modules;
 pub mod ring;
 pub mod rules;
+pub mod trace;
 
 #[cfg(windows)]
 mod hooks;

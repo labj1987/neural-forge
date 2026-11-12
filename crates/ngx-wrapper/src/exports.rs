@@ -12,8 +12,29 @@ macro_rules! passthrough {
         /// Their targets in NVIDIA's core, in [`PASSTHROUGH`]'s order.
         #[cfg(windows)]
         pub(crate) static mut PASSTHROUGH_TARGETS: [usize; PASSTHROUGH.len()] = [0; PASSTHROUGH.len()];
+        /// The traced entries ([`crate::trace`]): with `NEURAL_FORGE_NGX_TRACE` set, [`PASSTHROUGH_TARGETS`] holds
+        /// these, and NVIDIA's functions are in [`crate::win::REAL_TARGETS`].
+        #[cfg(windows)]
+        pub(crate) static PASSTHROUGH_TRACED: [unsafe extern "C" fn(); PASSTHROUGH.len()] = [$(traced::$name),*];
         passthrough!(@each 0usize; $($name)*);
+        #[cfg(windows)]
+        #[allow(non_snake_case)]
+        mod traced {
+            passthrough!(@traced 0usize; $($name)*);
+        }
     };
+    (@traced $i:expr; $name:ident $($rest:ident)*) => {
+        /// The traced entry of this export: its index in r11, then the common thunk ([`crate::win::trace_thunk`]).
+        ///
+        /// # Safety
+        /// NGX's contract for this function.
+        #[unsafe(naked)]
+        pub(super) unsafe extern "C" fn $name() {
+            core::arch::naked_asm!("mov r11, {i}", "jmp {thunk}", i = const $i, thunk = sym crate::win::trace_thunk);
+        }
+        passthrough!(@traced $i + 1usize; $($rest)*);
+    };
+    (@traced $i:expr;) => {};
     (@each $i:expr; $name:ident $($rest:ident)*) => {
         /// NVIDIA's function of this name, reached by a jump.
         ///

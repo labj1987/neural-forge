@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use crate::ring::{Record, API_D3D11, API_D3D12, API_VULKAN, KIND_END};
 use crate::rules;
-use crate::win::{log, logging, publish, target};
+use crate::win::{log, logging, publish, target, trace_in, trace_out};
 
 /// NGX's `NVSDK_NGX_Parameter` (an MSVC C++ object): its getters' vtable slots. MSVC groups overloads and lays
 /// them out in reverse declaration order (measured: docs/PROTON_NGX.md).
@@ -473,7 +473,9 @@ macro_rules! hooks {
         /// NGX's contract.
         #[no_mangle]
         pub unsafe extern "C" fn $create(cmd: *mut c_void, feature: i32, p: *mut Parameter, out: *mut *mut NgxHandle) -> u32 {
+            let t = trace_in(stringify!($create), &[cmd as usize, feature as usize, p as usize, out as usize]);
             let r = real::<CreateFn>(stringify!($create))(cmd, feature, p, out);
+            trace_out(stringify!($create), t, r);
             create($api, feature, p, out, r);
             r
         }
@@ -481,8 +483,10 @@ macro_rules! hooks {
         /// NGX's contract.
         #[no_mangle]
         pub unsafe extern "C" fn $evaluate(cmd: *mut c_void, handle: *const NgxHandle, p: *mut Parameter, callback: *mut c_void) -> u32 {
+            let t = trace_in(stringify!($evaluate), &[cmd as usize, handle as usize, p as usize, callback as usize]);
             let rec = evaluate($api, handle, p);
             let r = real::<EvaluateFn>(stringify!($evaluate))(cmd, handle, p, callback);
+            trace_out(stringify!($evaluate), t, r);
             evaluated(rec);
             r
         }
@@ -490,8 +494,11 @@ macro_rules! hooks {
         /// NGX's contract.
         #[no_mangle]
         pub unsafe extern "C" fn $release(handle: *mut NgxHandle) -> u32 {
+            let t = trace_in(stringify!($release), &[handle as usize]);
             release($api, handle);
-            real::<ReleaseFn>(stringify!($release))(handle)
+            let r = real::<ReleaseFn>(stringify!($release))(handle);
+            trace_out(stringify!($release), t, r);
+            r
         }
     };
 }
@@ -510,7 +517,9 @@ pub unsafe extern "C" fn NVSDK_NGX_VULKAN_CreateFeature1(
     p: *mut Parameter,
     out: *mut *mut NgxHandle,
 ) -> u32 {
+    let t = trace_in("NVSDK_NGX_VULKAN_CreateFeature1", &[device as usize, cmd as usize, feature as usize, p as usize, out as usize]);
     let r = real::<Create1Fn>("NVSDK_NGX_VULKAN_CreateFeature1")(device, cmd, feature, p, out);
+    trace_out("NVSDK_NGX_VULKAN_CreateFeature1", t, r);
     create(Api::Vulkan, feature, p, out, r);
     r
 }
