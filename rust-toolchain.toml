@@ -4,4 +4,6 @@
 [toolchain]
 channel = "1.100.0"
 components = ["clippy", "rustfmt"]
+# The NGX wrapper DLL is built for Windows (crates/ngx-wrapper, scripts/build-ngx-wrapper.sh).
+targets = ["x86_64-pc-windows-gnu"]
 profile = "minimal"
