@@ -324,7 +324,7 @@ Great Circle and Clair Obscur: Expedition 33 (#51); the list carries them too.
 |---|---|---|---|
 | GTA V Enhanced | RAGE, DX12 | Super Resolution, Frame Generation 4x | Before the upscaler |
 | Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | After DLSS with Ray Reconstruction on; before the upscaler, inside DLSS's buffer, with it off |
-| GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | Before the upscaler |
+| GTA San Andreas - The Definitive Edition | Unreal Engine 4, DX11 | Super Resolution | Before the upscaler, inside DLSS's buffer |
 | Metro Last Light Redux | 4A Engine, DX12 | Super Resolution (the game's own DLSS 5 NR off) | Before the upscaler, inside DLSS's buffer |
 | God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | Before the upscaler |
 | Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Before the upscaler |
@@ -435,8 +435,8 @@ for the live settings. `doctor`, `report` and `shmctl status` only look: they cr
 from the driver, of every NGX file a game loaded in its last run with the folder it was loaded from (the game's own,
 the NGX models folder an over-the-air update fills, the driver's), and of the NGX files present in each switched-on
 game's folder and Proton prefix. A DLSS update by the game or NVIDIA, or a DLSS file you replaced yourself, shows there.
-The loaded files are recorded by the wrapper once a game has created a DLSS feature, so a game that was not started
-with Neural Forge on since this version has none yet.
+The loaded files are recorded by the wrapper once a game has created a DLSS feature, so a game that has not run with
+Neural Forge on and created a DLSS feature has none yet.
 `neural-forge-cli help [COMMAND]` (or `COMMAND --help`) has the details; an unknown or misspelt
 argument prints the usage and exits with status 2.
 

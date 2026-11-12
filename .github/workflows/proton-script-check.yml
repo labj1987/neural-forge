@@ -9,8 +9,11 @@ name: Proton script check
 # The answer lives in one standing issue (label proton-script-check), as in pin-check.yml, so this sends as few
 # notifications as possible: it is opened the first time the patch stops applying and reopened (never a second
 # issue) when it breaks again, its body is edited in place (an edit notifies nobody) only when the report changed,
-# and it is closed once the patch applies again. Never a comment. A failed scheduled run emails, so a run that
-# cannot reach upstream does not fail: it says so in its summary and leaves the issue alone.
+# and it is closed once the patch applies again. An issue closed by hand is not reopened while the report is the one
+# it was closed with (the body keeps the report's hash; `check_proton_scripts.py --decide`). Never a comment. A failed
+# scheduled run emails, so a run that cannot reach upstream (exit 2, tried three times) does not fail: it says so in
+# its summary and leaves the issue alone. A failure of the check itself (exit 1: the patch example does not build or
+# run, the API answers in a shape the script does not know) fails the run at once.
 #
 # A run on any other branch than the default one (workflow_dispatch, to test this workflow) only prints what it
 # would do to the issue.
@@ -71,7 +74,8 @@ jobs:
             case $status in
               0) state=current; break ;;
               10) state=broken; break ;;
-              *) echo "attempt $attempt: could not check" >&2; sleep 60 ;;
+              2) echo "attempt $attempt: upstream could not be reached" >&2; [ "$attempt" = 3 ] || sleep 60 ;;
+              *) cat report.md; echo "::error::the Proton script check itself failed (exit $status)"; exit 1 ;;
             esac
           done
           cat report.md
@@ -104,20 +108,18 @@ jobs:
           found="$(gh issue list --repo "$repo" --state all --label proton-script-check --limit 1 \
             --json number,state --jq '.[0] | "\(.number // "") \(.state // "")"')"
           read -r number state <<<"$found"
-          if [ "$STATE" = broken ]; then
-            if [ -z "$number" ]; then
-              act issue create --repo "$repo" --title "$TITLE" --label proton-script-check --body-file report.md
-              exit 0
-            fi
-            if [ "$(gh issue view "$number" --repo "$repo" --json body --jq .body)" != "$(cat report.md)" ]; then
-              act issue edit "$number" --repo "$repo" --body-file report.md
-            fi
-            if [ "$state" = CLOSED ]; then
-              act issue reopen "$number" --repo "$repo"
-            fi
-          elif [ -n "$number" ] && [ "$state" = OPEN ]; then
-            act issue edit "$number" --repo "$repo" --body-file report.md
-            act issue close "$number" --repo "$repo"
-          else
-            echo "the patch applies to every script"
+          : > old-body.md
+          if [ -n "$number" ]; then
+            gh issue view "$number" --repo "$repo" --json body --jq .body > old-body.md
           fi
+          actions="$(python3 scripts/check_proton_scripts.py --decide "$STATE" "${state:-none}" old-body.md report.md)"
+          echo "state $STATE, issue ${number:-none} ${state:-}: ${actions:-nothing to do}"
+          for action in $actions; do
+            case $action in
+              create) act issue create --repo "$repo" --title "$TITLE" --label proton-script-check --body-file report.md ;;
+              edit) act issue edit "$number" --repo "$repo" --body-file report.md ;;
+              reopen) act issue reopen "$number" --repo "$repo" ;;
+              close) act issue close "$number" --repo "$repo" ;;
+              *) echo "::error::unknown action $action"; exit 1 ;;
+            esac
+          done

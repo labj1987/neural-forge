@@ -56,9 +56,9 @@ name = "GTA San Andreas - The Definitive Edition"
 steam_appid = 1547000
 exe = ["PlayGTASanAndreas.exe", "SanAndreas.exe"]
 engine = "Unreal Engine 4"
-api = "DX12"
+api = "DX11"
 dlss = "Super Resolution"
-placement = "before"
+placement = "before-inside"
 hdr = "none"
 notes = [
   "It resets its Frame Rate setting to 60 at every launch (a game bug): set it to Unlocked in Options > Graphics each time.",
@@ -153,8 +153,8 @@ placement_rr = "after-dlss"
 hdr = "hdr10"
 hdr_route = "The game's HDR setting in its menu (saved in its cloud-synced options, not its .ini), with PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 (Proton-GE) or in gamescope with HDR on."
 notes = ["Its Ray Reconstruction switch turns itself off at every start: switch it on again in Display Options."]
-verified = "3.14.0"
-verified_on = "2026-11-10"
+verified = "4.1.0"
+verified_on = "2026-11-11"
 verified_by = "test machine"
 
 [[game]]
