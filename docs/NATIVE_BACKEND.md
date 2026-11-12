@@ -1722,6 +1722,17 @@ On one GPU `same` saves nothing (both devices share it); the point of the path i
 does not have. Not built: dma-buf sharing. The table's runs were taken before the fall-back rules and the shown-once
 cadence above; the review's re-runs are below it.
 
+Re-runs with the fall-back rules and the shown-once cadence (2026-11-12): `pan` at 2560x1440 with `same`: about 38 fps
+against 34-38 on the game's device, every one of 60 captured frames shown exactly one present late, none repeated or
+skipped, its composite against the game's device's for the same frame a mean 1.6/255 against an edit of 7.6/255. The
+stand-in on the UHD 770 at 3200x1800: 7.7 ms a frame (copies 3.8 ms in, 3.7 ms back, 23 MB each way). The stall
+switch: the frame waited 8 s, the server waited for it, then fell back and the network ran on the game's device. The
+slow switch (40 ms a frame against `pan`'s few): every one of 120 frames late, back to the game's device. Cyberpunk
+2077 at 4K HDR10 with `same`: 16.1 fps median, 55-58 ms a frame on the second device, 600 of 600 presents composed
+per summary, video memory at 11.8 of 12 GB; in 24 captured frames each composite is the previous frame with the edit,
+and after each stall the capture's own writing caused (2.7 s) one frame went out live and was then shown once more,
+composed.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL
