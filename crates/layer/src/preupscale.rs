@@ -1020,6 +1020,9 @@ pub(crate) struct Tracker {
     after_refused: Option<(DlssOutput, Instant)>,
     /// Outputs whose refusal was logged (once each).
     after_refused_said: Vec<DlssOutput>,
+    /// Output images whose rectangle (`DLSS.Output.Subrect.Base` at the feature's output size) did not fit them, logged
+    /// once each ([`Self::after_point_at`]).
+    after_crop_said: Vec<vk::Image>,
     images: HashMap<vk::Image, ImageDesc>,
     views: HashMap<vk::ImageView, vk::Image>,
     /// Views registered through `vkGetImageViewHandle*NVX`/`vkGetImageViewAddressNVX`, and their image.
@@ -2167,19 +2170,29 @@ impl Tracker {
         self.after_refused = None;
     }
 
-    fn after_point_at(&self, cb: vk::CommandBuffer, o: DlssOutput, plan: &placement::Plan) -> Option<InlinePoint> {
+    fn after_point_at(&mut self, cb: vk::CommandBuffer, o: DlssOutput, plan: &placement::Plan) -> Option<InlinePoint> {
         let image = *self.images.get(&o.image)?;
         let record = self.launch.get(&cb).and_then(|r| r.ngx);
-        let input = self.images.get(&o.input).map_or((0, 0), |d| (d.width, d.height));
+        // The colour input's extent: the image's where the layer tracks it, else the one the record gives; (0, 0) when
+        // neither is known.
+        let input = self.images.get(&o.input).map(|d| (d.width, d.height)).or(record.map(|r| r.colour_extent).filter(|e| e.0 > 0 && e.1 > 0)).unwrap_or((0, 0));
         // DLSS's render size (its subrect's where given) and the rectangle of the output it writes: the hold works on
         // that alone, and the render-size motion vectors at their base are resampled up to it.
         let render = record.map_or(input, |r| r.render_size(input));
         let out = match record.map(|r| r.output_crop((image.width, image.height))) {
-            Some(Err(_)) => return None,
+            Some(Err(why)) => {
+                if !self.after_crop_said.contains(&o.image) {
+                    self.after_crop_said.push(o.image);
+                    crate::log!("[placement] no hold after DLSS's output {}: {why}", hex(o.image));
+                    crate::logging::flush();
+                }
+                return None;
+            }
             Some(Ok(Some(rect))) => rect,
             _ => crate::ngx_ring::Rect::whole((image.width, image.height)),
         };
-        let subrect = record.is_some_and(|r| r.has_subrect(input));
+        // Without the colour input's extent nothing says what DLSS reads of it: the whole images.
+        let subrect = input != (0, 0) && record.is_some_and(|r| r.has_subrect(input));
         let desc = ImageDesc { width: out.size.0, height: out.size.1, ..image };
         let copyable = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
         if !OUTPUT_FORMATS.contains(&desc.format) || !desc.plain || !desc.usage.contains(copyable) {
@@ -2198,9 +2211,10 @@ impl Tracker {
             return None;
         }
         let mvec = self.images.get(&o.mvec).copied();
-        // The motion vectors' rectangle: with a subrect, the render size at their base (where it fits their image).
+        // The motion vectors' rectangle: with a subrect, the one the hold before the upscaler reads (MVLowRes first,
+        // [`crate::ngx_ring::Record::mvec_rect`]), where it fits their image.
         let mvec_rect = mvec.and_then(|d| match record.filter(|_| subrect) {
-            Some(r) => Some(crate::ngx_ring::Rect { at: r.mvec_base, size: render }).filter(|rect| rect.fits((d.width, d.height))),
+            Some(r) => r.mvec_rect(input, (d.width, d.height)),
             None => Some(crate::ngx_ring::Rect::whole((d.width, d.height))),
         });
         let mvec_input = mvec.map(|d| {
@@ -7537,6 +7551,33 @@ mod tests {
         assert_eq!(point.mv_units, Some([1707.0 * 1920.0 / 1280.0, 1440.0]), "MV.Scale over the render size, in the rectangle's pixels");
         assert_eq!(point.hold, placement::Hold::of(&plan, placement::Stage::Upscaled, (1280, 720), (1920, 1080)));
         assert!(at(&mut t, crate::ngx_ring::Record { output_base: (700, 0), ..sub }).is_none(), "a rectangle outside the output: no hold there");
+        // ... said once for that output, however often it comes.
+        assert!(at(&mut t, crate::ngx_ring::Record { output_base: (700, 0), ..sub }).is_none());
+        assert_eq!(t.after_crop_said, [img(0x400)], "the refusal said once");
+        // High-resolution motion vectors (no MVLowRes, the feature's output size fits their image): the same rectangle
+        // the hold before the upscaler reads, not the render size.
+        let hi = crate::ngx_ring::Record {
+            output_base: (0, 0),
+            output_size: (1600, 900),
+            create_flags: whole.create_flags & !crate::ngx_ring::FLAG_MV_LOW_RES,
+            ..sub
+        };
+        let point = at(&mut t, hi).expect("a point");
+        assert_eq!((point.offsets.mvec, point.mvec_extent), ((2, 1), (1600, 900)), "the output size at their base");
+        let point = at(&mut t, crate::ngx_ring::Record { create_flags: hi.create_flags | crate::ngx_ring::FLAG_MV_LOW_RES, ..hi }).expect("a point");
+        assert_eq!(point.mvec_extent, (1280, 720), "MVLowRes: the render size");
+        // A colour input the layer does not track: the record's extent says what DLSS reads; with neither known, the
+        // whole images (no rectangle made up from the render size alone).
+        let untracked = DlssOutput { input: img(0x9900), writes: 3, ..t.dlss_output.unwrap() };
+        let at_untracked = |t: &mut Tracker, r| {
+            t.launch.get_mut(&cb(2)).expect("launched").ngx = Some(r);
+            t.after_point_at(cb(2), untracked, &plan)
+        };
+        let full = crate::ngx_ring::Record { render: (1707, 960), colour_extent: (1707, 960), mvec_base: (0, 0), ..whole };
+        let point = at_untracked(&mut t, full).expect("a point");
+        assert_eq!((point.offsets, point.mvec_extent), (Offsets::default(), (1707, 960)), "the record's extent: the whole images");
+        let point = at_untracked(&mut t, crate::ngx_ring::Record { render: (1600, 900), colour_extent: (0, 0), mvec_base: (2, 1), ..full }).expect("a point");
+        assert_eq!((point.offsets, point.mvec_extent), (Offsets::default(), (1707, 960)), "no extent known: the whole images");
         t.launch.get_mut(&cb(2)).expect("launched").ngx = Some(whole);
         assert!(t.frame_of(cb(2)).reset, "the evaluate's reset");
         inject(vec![a, end_of(&a, 2), b, end_of(&b, 4)]);

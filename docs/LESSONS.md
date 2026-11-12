@@ -1949,6 +1949,15 @@ the fix (none reached a release):
   motion vectors resampled from 3840x2160; in play the picture is right against the model switched off in the same
   run. Its last two output rows are a little brighter with the model on and off alike: DLSS's or the game's, not the
   hold's.
+- **Known trade-offs.** A subrect frame the hold inside DLSS's buffer refuses (its compute state cannot be put back,
+  no slot, a layout it cannot read) is no longer held by the split either: the split writes the whole image, so it
+  refuses every subrect frame, and such a frame goes unheld. With dynamic resolution inside a fixed colour image, every
+  change of the render size builds the hold's staging images and resources again (history starting over, and frames
+  skipped while earlier holds run); keeping them across sizes needs the network to work on a region of larger
+  resources, not built.
+- **The motion vectors' rectangle** follows the feature's MVLowRes flag first (`Record::mvec_rect`): with it the
+  render size, without it the feature's output size where that fits their image; the size of their image decides only
+  after that. The hold after DLSS takes the same rectangle.
 - **Rule.** A game may hand DLSS larger images than it renders: read everything the game gives DLSS about which part
   it reads, and never feed the network, or write, pixels DLSS does not read.
 

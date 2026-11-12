@@ -157,12 +157,36 @@ impl Record {
         self.render_size(colour) != colour || [self.colour_base, self.mvec_base, self.depth_base] != [(0, 0); 3]
     }
 
+    /// The rectangle DLSS reads of its motion vectors (`mvec`, their image's extent; `colour`, the colour image's), at
+    /// their base, where it fits their image. The feature's flag decides first: created with MVLowRes, the render size;
+    /// else they are high-resolution ones, the feature's output size where it fits. Only then a guess: the render size
+    /// for an image as large as the colour input, else (no output size known) what their image holds from their base on.
+    /// Shared by the hold before the upscaler ([`Self::crop`]) and the one after it.
+    pub(crate) fn mvec_rect(&self, colour: (u32, u32), mvec: (u32, u32)) -> Option<Rect> {
+        let at = self.mvec_base;
+        let fit = |size| Some(Rect { at, size }).filter(|r| r.fits(mvec));
+        let render = self.render_size(colour);
+        if self.create_flags & FLAG_MV_LOW_RES != 0 {
+            return fit(render);
+        }
+        let output_known = self.output_size.0 > 0 && self.output_size.1 > 0;
+        if let Some(rect) = fit(self.output_size).filter(|_| output_known) {
+            return Some(rect);
+        }
+        if mvec == colour {
+            fit(render)
+        } else if output_known {
+            None
+        } else {
+            fit((mvec.0.saturating_sub(at.0), mvec.1.saturating_sub(at.1)))
+        }
+    }
+
     /// The rectangles a hold before the upscaler reads, given the extents of the colour image, the motion vectors' and the
-    /// depth's: `None` when DLSS reads the whole images (the hold works on them whole, as without a subrect). The motion
-    /// vectors' rectangle is the render size where the feature was created with MVLowRes or they are as large as the
-    /// colour image, else (high-resolution ones) the feature's output size, else what their image holds from their base
-    /// on. An `Err` says why the colour
-    /// input's rectangle does not fit its image: DLSS would read outside it, so nothing is held.
+    /// depth's: `None` when DLSS reads the whole images (the hold works on them whole, as without a subrect). Each input's
+    /// at its base: the colour input's and the depth's at the render size, the motion vectors' as [`Self::mvec_rect`]
+    /// says. An `Err` says why the colour input's rectangle does not fit its image: DLSS would read outside it, so
+    /// nothing is held.
     pub(crate) fn crop(&self, colour: (u32, u32), mvec: Option<(u32, u32)>, depth: Option<(u32, u32)>) -> Result<Option<Crop>, String> {
         if !self.has_subrect(colour) {
             return Ok(None);
@@ -175,16 +199,7 @@ impl Record {
                 size.0, size.1, rect.at.0, rect.at.1, colour.0, colour.1
             ));
         }
-        let mvec = mvec.and_then(|m| {
-            let size = if m == colour || self.create_flags & FLAG_MV_LOW_RES != 0 {
-                size
-            } else if self.output_size.0 > 0 && self.output_size.1 > 0 {
-                self.output_size
-            } else {
-                (m.0.saturating_sub(self.mvec_base.0), m.1.saturating_sub(self.mvec_base.1))
-            };
-            Some(Rect { at: self.mvec_base, size }).filter(|r| r.fits(m))
-        });
+        let mvec = mvec.and_then(|m| self.mvec_rect(colour, m));
         let depth = depth.and_then(|d| Some(Rect { at: self.depth_base, size }).filter(|r| r.fits(d)));
         Ok(Some(Crop { colour: rect, mvec, depth }))
     }
@@ -962,6 +977,30 @@ pub(crate) mod tests {
         assert!(out.as_ref().is_err_and(|e| e.contains("1485x835 at (4, 0)") && e.contains("1488x836")), "{out:?}");
         assert!(!Rect { at: (0, 0), size: (0, 4) }.fits((8, 8)), "empty");
         assert!(!Rect { at: (u32::MAX, 0), size: (2, 4) }.fits((8, 8)), "no overflow");
+    }
+
+    /// The motion vectors' rectangle follows the feature's flag first: without MVLowRes they are high-resolution ones at
+    /// the feature's output size, even in an image as large as the colour input (a dynamic-resolution game rendering
+    /// into an output-size colour image); with it, the render size whatever their image's size. Only without either
+    /// does the image's size decide.
+    #[test]
+    fn the_motion_vectors_rectangle_follows_mvlowres_before_the_image_size() {
+        let rect = |at, size| Some(Rect { at, size });
+        let dynamic = Record { render: (1280, 720), output_size: (1920, 1080), ..Record::default() };
+        assert_eq!(dynamic.mvec_rect((1920, 1080), (1920, 1080)), rect((0, 0), (1920, 1080)), "high-resolution: the output size");
+        let low = Record { create_flags: FLAG_MV_LOW_RES, ..dynamic };
+        assert_eq!(low.mvec_rect((1920, 1080), (1920, 1080)), rect((0, 0), (1280, 720)), "MVLowRes: the render size");
+        assert_eq!(low.mvec_rect((1920, 1080), (3840, 2160)), rect((0, 0), (1280, 720)), "MVLowRes in a larger image: still the render size");
+        // No output size known: the old guess.
+        let unknown = Record { output_size: (0, 0), mvec_base: (2, 2), ..dynamic };
+        assert_eq!(unknown.mvec_rect((1920, 1080), (1920, 1080)), rect((2, 2), (1280, 720)), "as large as the colour image: the render size");
+        assert_eq!(unknown.mvec_rect((1920, 1080), (3842, 2162)), rect((2, 2), (3840, 2160)), "else what the image holds from their base");
+        // An output size that does not fit falls back to the guess for an image as large as the colour input only.
+        let big = Record { output_size: (3840, 2160), ..dynamic };
+        assert_eq!(big.mvec_rect((1920, 1080), (1920, 1080)), rect((0, 0), (1280, 720)));
+        assert_eq!(big.mvec_rect((1920, 1080), (2000, 1100)), None);
+        // The hold before the upscaler takes the same rectangle.
+        assert_eq!(dynamic.crop((1920, 1080), Some((1920, 1080)), None).unwrap().unwrap().mvec, rect((0, 0), (1920, 1080)));
     }
 
     /// The output's rectangle for the hold after DLSS: the feature's output size at its base.
