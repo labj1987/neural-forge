@@ -154,7 +154,11 @@ def run_patch(files):
     """The example's output lines for `files` (paths in), keyed by path."""
     cmd = os.environ.get("NF_CHECK_PROTON_SCRIPT")
     cmd = [cmd] if cmd else ["cargo", "run", "-q", "-p", "neural-forge-supervisor", "--example", "check_proton_script", "--"]
-    out = subprocess.run(cmd + [str(f) for f in files], cwd=ROOT, capture_output=True, text=True)
+    try:
+        out = subprocess.run(cmd + [str(f) for f in files], cwd=ROOT, capture_output=True, text=True)
+    except OSError as e:
+        # A missing or unrunnable command is the check's own failure, not upstream's: it must fail the run.
+        raise ToolError(f"the patch check could not start: {e}") from e
     if out.returncode not in (0, BROKEN):
         raise ToolError(f"the patch check could not run (exit {out.returncode}): {out.stderr.strip() or out.stdout.strip()}")
     return out.stdout.splitlines()
@@ -169,7 +173,11 @@ def main():
                     results.append((repo, "-", f"fail proton: no release branch matches {RELEASE_BRANCH[repo]} any more"))
                     continue
                 path = Path(tmp) / f"{len(files)}.proton"
-                path.write_bytes(api(f"repos/{repo}/contents/proton?ref={urllib.parse.quote(ref, safe='')}", raw=True))
+                script = api(f"repos/{repo}/contents/proton?ref={urllib.parse.quote(ref, safe='')}", raw=True)
+                try:
+                    path.write_bytes(script)
+                except OSError as e:
+                    raise ToolError(f"could not write {repo} @ {ref}'s script: {e}") from e
                 files.append((repo, ref, path))
         lines = run_patch([f[2] for f in files])
     by_path = {l.split(" ", 2)[1].rstrip(":"): l for l in lines}
@@ -246,6 +254,8 @@ def exit_code_tests():
         run_patch = real_patch
         os.environ["NF_CHECK_PROTON_SCRIPT"] = "false"
         assert run() == TOOL, "the patch example failing to run fails the run"
+        os.environ["NF_CHECK_PROTON_SCRIPT"] = "/nonexistent/neural-forge-check-proton-script"
+        assert run() == TOOL, "a patch command that cannot start fails the run, it is not a network failure"
     finally:
         api, run_patch = real_api, real_patch
         os.environ.pop("NF_CHECK_PROTON_SCRIPT", None)
