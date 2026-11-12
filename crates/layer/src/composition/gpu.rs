@@ -377,6 +377,8 @@ struct Delayed {
     fence: [vk::Fence; 2],
     /// A pair's last keep was submitted (its fence is armed).
     armed: [bool; 2],
+    /// A pair holds a kept frame (a compose of a pair never kept is refused).
+    kept: [bool; 2],
 }
 
 impl Delayed {
@@ -1596,7 +1598,7 @@ impl GpuCompose {
             }
             ComposeInputs::Delayed { parity } => {
                 let frames = self.zc.frames.as_ref()?;
-                let kept = self.zc.delayed.as_ref()?;
+                let kept = self.zc.delayed.as_ref().filter(|d| d.kept[parity])?;
                 if generation == 0 || (answer_width, answer_height) != (width, height) || frames.frame_bytes != bytes as u64 || kept.frame_bytes != bytes as u64
                 {
                     return None;
@@ -1931,6 +1933,7 @@ impl GpuCompose {
                         cmd: [cmds[0], cmds[1]],
                         fence: [fences[0], fences[1]],
                         armed: [false; 2],
+                        kept: [false; 2],
                     });
                 }
                 (_, _, cmds) => {
@@ -1955,6 +1958,7 @@ impl GpuCompose {
             return false;
         }
         d.armed[parity] = false;
+        d.kept[parity] = false;
         let cmd = d.cmd[parity];
         let (raw, base) = (d.raw[parity].buffer, d.base[parity].buffer);
         // SAFETY: the pair's last keep was waited; every handle is live; the image is the swapchain's, in PRESENT_SRC_KHR
@@ -2020,6 +2024,7 @@ impl GpuCompose {
             return false;
         }
         d.armed[parity] = true;
+        d.kept[parity] = true;
         self.zc.last_queue = Some(queue);
         true
     }
@@ -3673,7 +3678,7 @@ mod tests {
                 device.free_memory(staging.1, None);
             }
         };
-        let present = |gpu: &mut GpuCompose, fresh: bool, generation: u64| -> Option<Vec<u8>> {
+        let present = |gpu: &mut GpuCompose, inputs: ComposeInputs, generation: u64| -> Option<Vec<u8>> {
             let sem = gpu.present_temporal_delta_async(
                 &device,
                 &instance,
@@ -3683,7 +3688,7 @@ mod tests {
                 height,
                 width,
                 height,
-                ComposeInputs::Gpu { fresh },
+                inputs,
                 generation,
                 false,
                 target.image,
@@ -3708,7 +3713,7 @@ mod tests {
         upload(&base, false);
         upload(&current, true);
         assert!(!gpu.holds_generation(1));
-        let fresh = present(&mut gpu, true, 1).expect("the fresh zero-copy present composes");
+        let fresh = present(&mut gpu, ComposeInputs::Gpu { fresh: true }, 1).expect("the fresh zero-copy present composes");
         assert_eq!(fresh, expected, "the zero-copy fresh present must match the CPU inputs byte for byte");
         assert!(gpu.holds_generation(1));
         assert!(gpu.wait_answer_region_reads(&device));
@@ -3719,10 +3724,26 @@ mod tests {
         unsafe { std::ptr::write_bytes(region, 0x5a, region_len as usize) };
         upload(&vec![7u8; frame_bytes as usize], false);
         upload(&current, true);
-        let carried = present(&mut gpu, false, 1).expect("a carried zero-copy present composes");
+        let carried = present(&mut gpu, ComposeInputs::Gpu { fresh: false }, 1).expect("a carried zero-copy present composes");
         assert_eq!(carried, expected, "a carried present reads the generation's own copy, not the shared regions");
 
-        assert!(present(&mut gpu, false, 2).is_none(), "a generation gen_* do not hold must be refused, not read from shm");
+        assert!(present(&mut gpu, ComposeInputs::Gpu { fresh: false }, 2).is_none(), "a generation gen_* do not hold must be refused, not read from shm");
+
+        // The delayed present (the model on a second GPU, `capture::delayed_present`): frame A and the proxy it was
+        // sent as are kept, then the live image and the capture target move on to frame B. The answer to A composes
+        // onto A, not B, and replaces the live image: frame A as it would have been shown, one present late.
+        let frame_b: Vec<u8> = current.chunks(4).flat_map(|p| [p[0].wrapping_add(90), p[1].wrapping_add(60), p[2].wrapping_add(30), 255]).collect();
+        upload(&base, false);
+        upload(&current, true);
+        assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1));
+        upload(&vec![9u8; frame_bytes as usize], false);
+        upload(&frame_b, true);
+        unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
+        let delayed = present(&mut gpu, ComposeInputs::Delayed { parity: 1 }, 3).expect("the delayed present composes");
+        assert_eq!(delayed, expected, "the delayed present composes the kept frame and proxy, not the live ones");
+        let on_b = compose_once(width, height, &frame_b, &base, &answer, params).expect("the CPU reference composes");
+        assert_ne!(delayed, on_b, "the live frame must not be what the answer composes onto");
+        assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0 }, 4).is_none(), "a pair never kept is refused");
 
         unsafe {
             device.device_wait_idle().unwrap();
