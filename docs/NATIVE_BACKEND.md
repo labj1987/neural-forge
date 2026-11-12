@@ -1687,8 +1687,16 @@ start or a change of size count for nothing (the network is built then). Leaving
 over one frame, as a flush of it would, since the frame it replaced is then not shown) and frees the pairs. Every
 present the keep writes to is ordered before the present: the compose or the show that follows it signals the present
 semaphore, or the keep itself does, or its fence is waited. The keeps and the show are in the compose's waits at
-teardown (`wait_in_flight`). Needs the zero-copy pair (direct capture at the frame's size, the answer region
-imported); otherwise the synchronous present runs (logged once). The model interval's carried frames are off while
+teardown (`wait_in_flight`). With the zero-copy pair (direct capture at the frame's size, the answer region
+imported) everything stays on the GPU. Without it (the Model resolution below Full: the proxy is the scaled model scratch;
+an odd frame size; no host-memory import) `delayed_present_cpu` does the same with CPU pairs (`Inflight::kept_cpu`: the
+frame and its small proxy, swapped out of the capture's scratches) and the compose's held frame (as frame hold), the
+answer read into memory before the next request; a frame that cannot be captured because the answer before it is
+still out is skipped there (its capture would write the proxy region the other GPU reads). Found in #63: 007 First
+Light at 2048x1536 with the Model resolution at Half fell back to the synchronous present, every frame waiting about 12
+ms for its own answer from the RTX 5080 (40-50 fps against 75 without the model), and the summary line was only
+written on the delayed path. HDR10 frames below Full still run synchronously (an HDR10 frame composes only a full-size
+answer), logged once. The `[offload]` summary every 600 presents counts both paths. The model interval's carried frames are off while
 offloaded. The white meter reads the proxy region after each capture, as the synchronous present's does.
 
 **Fall-back.** To the game's GPU for the session (`Status::Unavailable`, `offload::State::FellBack`) when: the device

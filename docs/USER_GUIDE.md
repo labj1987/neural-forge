@@ -458,6 +458,12 @@ The model goes back to the game's GPU for the rest of the session, and the log s
 - does not finish a frame (or its device is lost): the model goes back only once that frame is done; if it never is,
   the model stays off until the game restarts (the Status tab says the second GPU stalled).
 
+Keep the display connected to the game's GPU. With the display on the second GPU, every frame the game presents is
+also copied across to the second GPU for the screen (PRIME), on top of the model's own traffic there, and the
+compositor on that GPU waits for that copy: more latency, nothing gained. The Model resolution setting works with the
+second GPU; below Full the frames pass through the CPU on the game's side (a few milliseconds of copies a frame), at
+Full they stay on the GPUs.
+
 The Status tab's Model placement line and `doctor` say which GPU runs the model, or why it went back. Every 600
 frames the log has an `[offload]` line with the time per frame on the second GPU, the time from sending a frame to
 its answer, how many frames were shown with the model and without, and the time saved on the game's GPU.

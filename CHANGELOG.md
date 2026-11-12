@@ -15,6 +15,11 @@ first shipped them; their phase is kept as a subheading.
   cannot run or build the network, is far too slow for the game, or takes over a second for a frame, the model goes
   back to the game's GPU for the session; if a frame never finishes there, the model goes back once it has, and stays
   off until the game restarts if it never does. The log, the Status tab and `doctor` say which.
+- The second GPU works with any Model resolution: below Full each frame was waiting for its own answer (slower than
+  without the second GPU); it is now shown one frame late as at Full. Keep the display on the game's GPU: with it on
+  the second GPU every frame is also copied across for the screen.
+- Every 600 frames the log says how the second GPU is doing (its time per frame, the time from sending a frame to
+  its answer, frames shown with and without the model, and frames that had to wait for their own answer).
 
 ## 4.1.2 — 2026-11-12
 
