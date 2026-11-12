@@ -4,7 +4,6 @@
 //! returned (`ring::KIND_END`).
 
 use core::ffi::{c_char, c_void};
-use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -368,13 +367,13 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
     let mut take = |key: &str, follow: bool| -> Option<Image> {
         if !follow {
             if detail() {
-                let _ = write!(line, " {key}={:p}", raw(api, p, key));
+                line.push_str(&rules::pointer_text(key, raw(api, p, key) as usize));
             }
             return None;
         }
         let img = image(api, p, key)?;
         if detail() {
-            let _ = write!(line, " {key}=vk:{:#x}({}x{} fmt={} lay={})", img.vk, img.width, img.height, img.format, img.layout);
+            line.push_str(&rules::image_text(key, img.vk, img.width, img.height, img.format, img.layout));
         }
         Some(img)
     };
@@ -410,32 +409,7 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
     rec.output_base = pair("DLSS.Output.Subrect.Base.X", "DLSS.Output.Subrect.Base.Y");
     publish(rec);
     if detail() {
-        log(&format!(
-            "EVAL {} h={}@{handle:p} feat={}{line} jitter={},{} mv_scale={},{} pre_exposure={} exposure_scale={} reset={} render={}x{} bases=colour:{},{} mv:{},{} depth:{},{} output:{},{} out={}x{} flags={:#x}",
-            api.name(),
-            rec.handle,
-            feature_name(rec.feature),
-            rec.jitter[0],
-            rec.jitter[1],
-            rec.mv_scale[0],
-            rec.mv_scale[1],
-            rec.pre_exposure,
-            rec.exposure_scale,
-            rec.reset,
-            rec.render[0],
-            rec.render[1],
-            rec.colour_base[0],
-            rec.colour_base[1],
-            rec.mvec_base[0],
-            rec.mvec_base[1],
-            rec.depth_base[0],
-            rec.depth_base[1],
-            rec.output_base[0],
-            rec.output_base[1],
-            rec.output_size[0],
-            rec.output_size[1],
-            rec.create_flags
-        ));
+        log(&rules::eval_line(api.name(), handle as usize, feature_name(rec.feature), &line, &rec));
     }
     rec
 }

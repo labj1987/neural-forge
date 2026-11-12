@@ -62,9 +62,84 @@ pub fn resolution(has: impl Fn(&str) -> bool) -> Resolution {
     Resolution::Ok { stubbed: PASSTHROUGH.iter().copied().filter(|n| !has(n)).collect() }
 }
 
+/// An image the evaluate's text line names: its VkImage, extent, VkFormat and layout.
+pub fn image_text(key: &str, vk: u64, width: u32, height: u32, format: i32, layout: i32) -> String {
+    format!(" {key}=vk:{vk:#x}({width}x{height} fmt={format} lay={layout})")
+}
+
+/// A parameter the evaluate's text line names by its bare pointer.
+pub fn pointer_text(key: &str, ptr: usize) -> String {
+    format!(" {key}={ptr:#x}")
+}
+
+/// The evaluate's text line (`EVAL ...`): the images (`images`, from [`image_text`] and [`pointer_text`]) first, then
+/// every number of the record. The trace keeps it whole (`crate::trace::LINE_BYTES`; tested).
+pub fn eval_line(api: &str, handle: usize, feature: &str, images: &str, rec: &crate::ring::Record) -> String {
+    format!(
+        "EVAL {api} h={}@{handle:#x} feat={feature}{images} jitter={},{} mv_scale={},{} pre_exposure={} exposure_scale={} reset={} render={}x{} bases=colour:{},{} mv:{},{} depth:{},{} output:{},{} out={}x{} flags={:#x}",
+        rec.handle,
+        rec.jitter[0],
+        rec.jitter[1],
+        rec.mv_scale[0],
+        rec.mv_scale[1],
+        rec.pre_exposure,
+        rec.exposure_scale,
+        rec.reset,
+        rec.render[0],
+        rec.render[1],
+        rec.colour_base[0],
+        rec.colour_base[1],
+        rec.mvec_base[0],
+        rec.mvec_base[1],
+        rec.depth_base[0],
+        rec.depth_base[1],
+        rec.output_base[0],
+        rec.output_base[1],
+        rec.output_size[0],
+        rec.output_size[1],
+        rec.create_flags
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The longest evaluate line there can be (every image named with the largest numbers, every pointer, the longest
+    /// float texts) reaches the trace whole: as the `log: ` line the trace keeps of it, with its time and thread.
+    #[test]
+    fn the_longest_eval_line_fits_a_trace_line() {
+        let mut images = String::new();
+        for key in ["Color", "MotionVectors", "Depth", "Output", "ExposureTexture"] {
+            images += &image_text(key, u64::MAX, u32::MAX, u32::MAX, i32::MIN, i32::MIN);
+        }
+        for key in ["TransparencyMask", "DLSSG.Backbuffer", "DLSSG.HUDLess", "DLSSG.UI", "DLSSG.OutputInterpolated", "DLSSG.OutputReal"] {
+            images += &pointer_text(key, usize::MAX);
+        }
+        // The longest f32 texts: the smallest subnormal (47 characters) and the most negative.
+        let tiny = -f32::from_bits(1);
+        let rec = crate::ring::Record {
+            handle: u32::MAX,
+            create_flags: u32::MAX,
+            jitter: [tiny, -f32::MAX],
+            mv_scale: [tiny, tiny],
+            pre_exposure: tiny,
+            exposure_scale: tiny,
+            reset: i32::MIN,
+            render: [u32::MAX; 2],
+            colour_base: [u32::MAX; 2],
+            mvec_base: [u32::MAX; 2],
+            depth_base: [u32::MAX; 2],
+            output_base: [u32::MAX; 2],
+            output_size: [u32::MAX; 2],
+            ..Default::default()
+        };
+        let text = eval_line("vulkan", usize::MAX, "SR", &images, &rec);
+        let line = crate::trace::Line::new(f64::MAX.min(1e12), u32::MAX, format_args!("log: {text}"));
+        let got = std::str::from_utf8(line.bytes()).unwrap();
+        assert!(got.ends_with(&format!("{text}\n")), "cut at {} bytes: {} of the text's {}", crate::trace::LINE_BYTES, got.len(), text.len());
+        assert!(got.contains("flags=0xffffffff"));
+    }
 
     #[test]
     fn success_is_anything_outside_the_fail_family() {
