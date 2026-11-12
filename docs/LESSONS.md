@@ -1937,8 +1937,9 @@ the fix (none reached a release):
   the right edge (above): 3 columns there in Expedition 33. And because Hogwarts' motion vectors (2562x1441) were
   smaller than the colour input, 4.0 copied none of them at 4K: its holds had no motion for the history.
 - **Now.** The layer reads the render size and the bases (`ngx_ring::Record::crop`); the hold inside DLSS's buffer
-  copies the colour input's rectangle from its base, the motion vectors and depth from theirs, runs the network and
-  keeps its history at the rectangle's size, and writes back over the rectangle only. The split works on the whole
+  copies the colour input's rectangle from its base, the motion vectors and depth from theirs, runs the network on
+  them (first at the rectangle's size; since the dynamic-resolution change below, at the colour input's whole extent
+  with the rectangle's edge around it), and writes back over the rectangle only. The split works on the whole
   image, so it refuses such frames (`Hazard::Subrect`). Hogwarts Legacy, 4K, DLSS Quality, through Steam with this
   build (2026-11-11): `[ngx] DLSS (Super Resolution, handle 1) is given part of its inputs: 2562x1441 of the
   2564x1444 colour input`, `resources of the hold inside DLSS's buffer for 2562x1441 built`, held inside on every
@@ -1951,10 +1952,24 @@ the fix (none reached a release):
   hold's.
 - **Known trade-offs.** A subrect frame the hold inside DLSS's buffer refuses (its compute state cannot be put back,
   no slot, a layout it cannot read) is no longer held by the split either: the split writes the whole image, so it
-  refuses every subrect frame, and such a frame goes unheld. With dynamic resolution inside a fixed colour image, every
-  change of the render size builds the hold's staging images and resources again (history starting over, and frames
-  skipped while earlier holds run); keeping them across sizes needs the network to work on a region of larger
-  resources, not built.
+  refuses every subrect frame, and such a frame goes unheld. A change of the render size inside the same colour input
+  (dynamic resolution) resets the network's history and the edit cache's edit: they are in the rectangle's pixels,
+  which stand for other points of the screen at another size; nothing rescales them.
+- **Dynamic resolution (November 11, later).** The first version built the hold's staging images and network
+  resources at the rectangle's exact size, so every change of the render size built them again (history starting
+  over, holds skipped while earlier ones ran). An attempt to keep a steady working size by running the network over
+  the pixels around the rectangle was rejected: those are the pixels DLSS does not read, the cause of the edge line.
+  Now the staging images and resources are the colour input's whole extent (constant while the image is), the
+  rectangle is copied to their corner, and the rest is filled with the rectangle's edge (its last column to the
+  right, then its last row below: clamp-to-edge) for colour, motion vectors and depth alike (`inline::record_pad`:
+  NEAREST blits within each staging image, buffer copies for the depth), so the network never sees a pixel DLSS does
+  not read; only the rectangle is written back. Motion vectors are replicated, not zeroed: the padding continues the
+  edge's content, so it moves with the edge; zero would make the edge's copy look static while its colour changes,
+  a false disocclusion next to the rectangle. A new rectangle size is a format change of the history
+  (`native::format_of` reads `Target::region`): one reset, no rebuild. Cost: the network runs at the whole extent
+  (Hogwarts Legacy: 2564x1444 instead of 2562x1441, 0.3% more pixels; at a low dynamic-resolution step it runs over
+  the whole image for a smaller rectangle). The scene-cut detector and the measured exposure read the whole staging
+  image, padding included.
 - **The motion vectors' rectangle** follows the feature's MVLowRes flag first (`Record::mvec_rect`): with it the
   render size, without it the feature's output size where that fits their image; the size of their image decides only
   after that. The hold after DLSS takes the same rectangle.

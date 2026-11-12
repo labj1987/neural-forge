@@ -136,15 +136,18 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   (`DLSS.Render.Subrect.Dimensions`) at each input's base. Unreal Engine does (its scene textures are rounded up and
   kept at the largest size asked for; Expedition 33 gave 1485x835 of a 1488x836 colour input, #51). The hold before the
   upscaler then works on that rectangle alone (`ngx_ring::Record::crop`): it copies the colour input's rectangle from
-  its base, the motion vectors' and the depth's from theirs, runs the network and keeps its history at that size, and
-  writes back over the rectangle only, so nothing DLSS does not read is fed to the network or written. The split hold
+  its base, the motion vectors' and the depth's from theirs, to the corner of staging images of the colour input's whole
+  extent, fills the rest of them with the rectangle's edge (last column, then last row, replicated; motion vectors and
+  depth too), runs the network there, and writes back over the rectangle only, so nothing DLSS does not read is fed to
+  the network or written. The split hold
   works on the whole image, so it refuses such frames (`Hazard::Subrect`) and the hold inside DLSS's buffer takes them.
   A rectangle outside the colour input refuses the hold; motion vectors or depth whose rectangle leaves their image are
   not read. Their rectangle is the render size where the feature was created with `MVLowRes` or they are as large as the
   colour input (Hogwarts Legacy's 2562x1441 motion vectors for a 2564x1444 colour input), else (high-resolution ones)
   the feature's output size, at their base. The hold after DLSS works on the output's rectangle (the feature's output
   size at `DLSS.Output.Subrect.Base`), with the render-size motion vectors from their base. A new rectangle size
-  (dynamic resolution) builds the hold's resources for it, as a new colour input size does. The log says the subrect
+  inside the same image (dynamic resolution) builds nothing again; it resets the network's history (its pixels stand
+  for other points of the screen). A new image size builds the hold's resources for it. The log says the subrect
   once per feature (`[ngx] DLSS (...) is given part of its inputs: ...`).
 - **HDR:** a record with `IsHDR` clear is said once in the log (the encode has no path for a display-referred input
   yet).

@@ -1046,6 +1046,8 @@ fn record_inline_hold(
         depth: None,
         // The depth the hold copies beside the colour input (the native backend's depth copy).
         depth_buffer: ctx.depth.map(|f| (ctx.staging.depth, f)),
+        // The rectangle DLSS reads, at the staging images' corner: its size resets the history when it changes.
+        region: Some((ctx.source.desc.width, ctx.source.desc.height)),
         // The copy beside the colour input (the native backend's history).
         mvec: point.mvec_input,
         mvec_scale: point.mvec_scale(),
@@ -2124,6 +2126,7 @@ impl NeuralForgeDeviceInfo {
                 // the separate depth layouts only without stencil), as the hold inside DLSS's buffer.
                 .map(|a| crate::preupscale::Aux { readable: a.readable && a.layout.is_some_and(|l| crate::preupscale::depth_copy_layout(a.format, l)), ..a }),
             depth_buffer: None,
+            region: None,
             // The dump's buffer and file are RG16F (4 bytes a texel): RG32F motion vectors are not read.
             mvec: Some(aux(inputs.mvec, scan.mvec_layout))
                 .map(|a| crate::preupscale::Aux { readable: a.readable && a.format == vk::Format::R16G16_SFLOAT, ..a }),

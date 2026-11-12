@@ -1481,6 +1481,9 @@ pub(crate) struct InlinePoint {
     /// The colour input's description, its extent the rectangle the hold works on: the whole image, or the part DLSS
     /// is given ([`Self::offsets`]).
     pub desc: ImageDesc,
+    /// The colour input's whole extent (the output's, after DLSS): the hold's staging images and network resources
+    /// are this size, so a rectangle ([`Self::desc`]) that changes size inside the same image builds nothing again.
+    pub image: (u32, u32),
     /// Where the hold's rectangles start in the colour input (its copy in and back), the motion vectors and the depth:
     /// DLSS's subrect ([`crate::ngx_ring::Crop`]); zero for the whole images.
     pub offsets: Offsets,
@@ -1951,6 +1954,7 @@ impl Tracker {
                 && layout.is_some_and(|l| depth_copy_layout(d.format, l));
             Aux { image, format: d.format, layout, readable }
         });
+        let whole = desc;
         let (desc, offsets) = match crop {
             Some(c) => (
                 ImageDesc { width: c.colour.size.0, height: c.colour.size.1, ..desc },
@@ -1960,6 +1964,7 @@ impl Tracker {
         };
         Ok(InlinePoint {
             colour,
+            image: extent(whole),
             desc,
             offsets,
             layout,
@@ -2229,6 +2234,7 @@ impl Tracker {
         });
         Some(InlinePoint {
             colour: o.image,
+            image: (image.width, image.height),
             desc,
             offsets: Offsets { colour: out.at, mvec: mvec_rect.map_or((0, 0), |r| r.at), depth: (0, 0) },
             layout,
@@ -4405,6 +4411,10 @@ pub(crate) struct Target {
     pub colour: vk::Image,
     pub width: u32,
     pub height: u32,
+    /// Inside DLSS's buffer with a subrect: the rectangle's size at the image's corner (the rest of the
+    /// `width` x `height` the hold works on is its edge, replicated). A new size resets the history: its pixels
+    /// stand for other points of the screen. `None`: the whole extent.
+    pub region: Option<(u32, u32)>,
     pub depth: Option<Aux>,
     /// Inside DLSS's buffer: the slot buffer the hold copied DLSS's depth aspect into there, and the
     /// depth's format (`inline`). Copied from instead of [`Self::depth`].
@@ -8392,6 +8402,7 @@ mod tests {
     fn motion_vectors_scale_by_the_colour_input_over_their_extent() {
         let point = |mvec_extent| InlinePoint {
             colour: vk::Image::null(),
+            image: (1708, 964),
             desc: ImageDesc { width: 1708, height: 964, format: vk::Format::R16G16B16A16_SFLOAT, usage: vk::ImageUsageFlags::STORAGE, plain: true },
             offsets: Offsets::default(),
             layout: vk::ImageLayout::GENERAL,
@@ -10435,6 +10446,7 @@ mod tests {
                 height: h,
                 depth: None,
                 depth_buffer: None,
+                region: None,
                 mvec: None,
                 mvec_scale: [1.0, 1.0],
                 exposure: [None; MAX_EXPOSURE],
@@ -10593,6 +10605,7 @@ mod tests {
             height: h,
             depth: None,
             depth_buffer: None,
+            region: None,
             mvec: None,
             mvec_scale: [1.0, 1.0],
             exposure: [None; MAX_EXPOSURE],
@@ -11005,6 +11018,7 @@ mod tests {
             height: h,
             depth: None,
             depth_buffer: None,
+            region: None,
             mvec: None,
             mvec_scale: [1.0, 1.0],
             exposure: [None; MAX_EXPOSURE],
@@ -11112,6 +11126,7 @@ mod tests {
                 height: h,
                 depth: None,
                 depth_buffer: None,
+                region: None,
                 mvec: None,
                 mvec_scale: [1.0, 1.0],
                 exposure: [None; MAX_EXPOSURE],
@@ -11186,6 +11201,7 @@ mod tests {
                     height: h,
                     depth: None,
                     depth_buffer: None,
+                    region: None,
                     mvec: None,
                     mvec_scale: [1.0, 1.0],
                     exposure: [None; MAX_EXPOSURE],
@@ -11502,6 +11518,7 @@ mod tests {
             height: 4,
             depth: None,
             depth_buffer: None,
+            region: None,
             mvec: None,
             mvec_scale: [1.0, 1.0],
             exposure: [None; MAX_EXPOSURE],
@@ -11658,6 +11675,7 @@ mod tests {
             height: h,
             depth: Some(Aux { image: depth, format: depth_format, layout: Some(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL), readable: true }),
             depth_buffer: None,
+            region: None,
             mvec: None,
             mvec_scale: [1.0, 1.0],
             exposure: [None; MAX_EXPOSURE],
@@ -11825,6 +11843,7 @@ mod tests {
             height: h,
             depth: Some(Aux { image: depth, format: depth_format, layout: Some(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL), readable: true }),
             depth_buffer: None,
+            region: None,
             mvec: Some(Aux { image: mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
             mvec_scale: [1.0, 1.0],
             exposure: [
