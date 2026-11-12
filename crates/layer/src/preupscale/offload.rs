@@ -141,6 +141,46 @@ pub(crate) fn standin() -> bool {
     *ON
 }
 
+/// What the offload is doing, for the Status tab and `doctor` (`shm`'s layer status) and the log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum State {
+    /// Not asked for (or not at the finished-frame placement).
+    Off,
+    /// The device is being made and the network loaded (the GPU's name).
+    Starting(String),
+    /// The network runs on the other GPU (its name).
+    Active(String),
+    /// Back on the game's GPU for the session, and why.
+    FellBack(String),
+}
+
+static STATE: Mutex<State> = Mutex::new(State::Off);
+
+/// Notes what the offload is doing ([`State`]).
+pub(crate) fn note_state(state: State) {
+    let mut now = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let (State::FellBack(_), State::Starting(_) | State::Active(_)) = (&*now, &state) {
+        // A fall-back is for the session.
+        return;
+    }
+    *now = state;
+}
+
+/// What the offload is doing.
+pub(crate) fn state() -> State {
+    STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// The Status tab's line for it, or `None` while it is off.
+pub(crate) fn status_line() -> Option<String> {
+    match state() {
+        State::Off => None,
+        State::Starting(gpu) => Some(format!("second GPU: starting on {gpu}")),
+        State::Active(gpu) => Some(format!("second GPU: the model runs on {gpu}, each frame shown one frame later")),
+        State::FellBack(why) => Some(format!("second GPU: given up ({why}); the model runs on the game's GPU")),
+    }
+}
+
 /// Whether frames are offloaded now: the server on the other device is serving. The present delays every frame by
 /// one while it is (`capture`): the game's GPU renders the next frame while the other GPU runs this one's network.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -440,6 +480,7 @@ impl Offload {
         // Objects the layer gets from below the loader for this device get the loader's dispatch pointer through the
         // game's device's callback (the loader's own, which finds any device it made).
         let registration = crate::loader_data::register_like(device, game_device);
+        crate::note_secondary_device(device, true);
         let setup = Setup {
             gipa: game.gipa,
             instance: game.instance,
@@ -473,7 +514,7 @@ impl Offload {
         let destroy_device = self.device.fp_v1_0().destroy_device;
         // SAFETY: as the contract; the loader's callback with the device's own vkDestroyDevice.
         unsafe { (self.destroy)(self.device.handle(), std::ptr::null(), destroy_device) };
-        crate::forget_lost_device(self.device.handle());
+        crate::note_secondary_device(self.device.handle(), false);
     }
 }
 
@@ -589,6 +630,11 @@ impl Standin {
             let period_ns = instance.get_physical_device_properties(physical).limits.timestamp_period;
             Some(Self { pool, cmd: cmds[0], fence, queries, period_ns, sized: None })
         }
+    }
+
+    /// The fence of its copy (the one a stall waits for).
+    pub(crate) fn fence(&self) -> vk::Fence {
+        self.fence
     }
 
     /// Copies the frame (`bytes` at `proxy`) in and back out into `answer` on `queue`, waited for (bounded). The two

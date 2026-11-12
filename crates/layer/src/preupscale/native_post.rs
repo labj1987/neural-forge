@@ -198,7 +198,8 @@ impl PostServer {
         view: ShmView,
     ) -> Option<Self> {
         Self::spawn(move |q, st| {
-            work(&device, &instance, physical, setup, import, &loader, view, q, st, None);
+            let Some(claim) = claim_channel(view, ash::vk::Handle::as_raw(device.handle()).max(1), st) else { return };
+            work(&device, &instance, physical, setup, import, &loader, view, q, st, claim, None);
         })
     }
 
@@ -209,15 +210,19 @@ impl PostServer {
     pub(crate) fn start_offload(instance: ash::Instance, game: Setup, game_device: vk::Device, choice: super::offload::Choice, view: ShmView) -> Option<Self> {
         Self::spawn(move |q, st| {
             let end = |s: Status| st.store(s as u8, Ordering::Release);
+            // The channel first: a retry while another server holds it makes no device.
+            let Some(claim) = claim_channel(view, u64::MAX, st) else { return };
             // SAFETY: the game's instance and device outlive this thread (joined in Drop, before the device's teardown).
             let off = match unsafe { super::offload::Offload::create(&instance, game, game_device, &choice) } {
                 Ok(off) => off,
                 Err(why) => {
                     crate::log!("[offload] the model stays on the game's GPU: {why}");
                     crate::logging::flush();
+                    super::offload::note_state(super::offload::State::FellBack(why));
                     return end(Status::Unavailable);
                 }
             };
+            super::offload::note_state(super::offload::State::Starting(off.name.clone()));
             // Barriers between the network's launches, never counter chaining: chained launches spin on the GPU waiting for
             // each other, and beside another context on the same GPU (the game's, in the `same` test) the frame never
             // finished (2560x1440 on an RTX 5070: no answer in 20 s; with barriers 21 ms).
@@ -229,6 +234,7 @@ impl PostServer {
                     Some(s) => Some(s),
                     None => {
                         crate::log!("[offload] the stand-in's objects could not be made; the model stays on the game's GPU");
+                        super::offload::note_state(super::offload::State::FellBack("the stand-in's objects could not be made".into()));
                         loader.retire();
                         drop(loader);
                         // SAFETY: nothing of the device's is alive (the loader never opened the network).
@@ -240,15 +246,19 @@ impl PostServer {
                 None
             };
             let extra = Offloaded { standin, name: off.name.clone() };
-            let stalled = work(&off.device, &instance, off.physical, off.setup, off.import, &loader, view, q, st, Some(extra));
+            let ended = work(&off.device, &instance, off.physical, off.setup, off.import, &loader, view, q, st, claim, Some(extra));
             loader.retire();
             loader.stop_worker();
-            drop(loader);
-            if stalled {
-                // Its work may still run: the device is left as it is (the process's end frees it).
-                crate::log!("[offload] the other GPU stopped answering; its device is left to the process's end");
+            if ended == Ended::Leaked {
+                // Its work may still run: the network and the device are left as they are (the process's end frees them),
+                // never freed under the GPU (drain before free).
+                crate::log!("[offload] the other GPU's last frame never finished: its network and device are left to the process's end");
+                crate::logging::flush();
+                std::mem::forget(loader);
+                std::mem::forget(off);
             } else {
-                // SAFETY: the server and the network are gone, nothing pending.
+                drop(loader);
+                // SAFETY: the server and the network are gone, nothing pending (waited, or the device lost).
                 unsafe { off.destroy() };
             }
         })
@@ -273,8 +283,46 @@ struct Offloaded {
     name: String,
 }
 
-/// The server's worker: takes the channel ([`Owner`]), checks that nothing outside the process answers it (its
-/// heartbeat stands still), builds its pipelines and serves. Whether a frame stalled (the device's work may still run).
+/// Takes the channel for `token` ([`Owner`]) and checks that nothing outside the process answers it (its heartbeat
+/// stands still); `None` (the status set to [`Status::Retry`]) otherwise.
+fn claim_channel(view: ShmView, token: u64, st: &AtomicU8) -> Option<Claim<'static>> {
+    let end = |s: Status| st.store(s as u8, Ordering::Release);
+    let Some(claim) = OWNER.claim(token) else {
+        crate::log!("[native] another device's server is answering the after-the-upscaler requests: it keeps them");
+        end(Status::Retry);
+        return None;
+    };
+    let hdr = view.header();
+    let before = hdr.server_heartbeat.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(300));
+    if hdr.server_heartbeat.load(Ordering::Relaxed) != before {
+        crate::log!("[native] something else is answering the after-the-upscaler requests: it keeps them");
+        drop(claim);
+        end(Status::Retry);
+        return None;
+    }
+    Some(claim)
+}
+
+/// How a server's worker ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ended {
+    /// Nothing of its work may still run.
+    Clean,
+    /// A frame that never finished may still run on the device: nothing it uses may be freed.
+    Leaked,
+}
+
+/// How long a server on another GPU waits, at the end, for a frame that did not finish in time ([`work`]).
+const STALL_DRAIN: Duration = Duration::from_secs(5);
+
+/// The server's worker, with the channel claimed: builds its pipelines and serves.
+///
+/// On another GPU (`offloaded`) a frame that does not finish in time (or a lost device) ends the serving with
+/// [`Status::Stalled`] while it may still run, and the worker stays until it has: once it finished (or the device is
+/// lost) everything is freed and the status turns [`Status::Unavailable`] (the network goes back to the game's GPU, its
+/// shared regions no longer written by the other GPU). Asked to quit meanwhile, it waits [`STALL_DRAIN`] more and else
+/// leaves everything to the process's end ([`Ended::Leaked`]).
 #[allow(clippy::too_many_arguments)]
 fn work(
     device: &ash::Device,
@@ -286,36 +334,28 @@ fn work(
     view: ShmView,
     q: &AtomicBool,
     st: &AtomicU8,
+    claim: Claim<'static>,
     offloaded: Option<Offloaded>,
-) -> bool {
+) -> Ended {
     let end = |s: Status| st.store(s as u8, Ordering::Release);
-    let Some(claim) = OWNER.claim(ash::vk::Handle::as_raw(device.handle()).max(1)) else {
-        crate::log!("[native] another device's server is answering the after-the-upscaler requests: it keeps them");
-        end(Status::Retry);
-        return false;
-    };
-    let hdr = view.header();
-    let before = hdr.server_heartbeat.load(Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(300));
-    if hdr.server_heartbeat.load(Ordering::Relaxed) != before {
-        crate::log!("[native] something else is answering the after-the-upscaler requests: it keeps them");
-        drop(claim);
-        end(Status::Retry);
-        return false;
-    }
+    let offload = offloaded.is_some();
     // SAFETY: the device and the queue the setup names are live for this thread's life (joined in Drop,
     // before the device's teardown frees anything).
     let Some(mut gpu) = (unsafe { Gpu::new(device, setup) }) else {
         crate::log!("[native] the after-the-upscaler path's pipelines could not be built; it stays untouched for now");
         drop(claim);
-        end(Status::Retry);
-        return false;
+        // On another GPU it would fail the same way again: the network goes back to the game's GPU.
+        end(if offload { Status::Unavailable } else { Status::Retry });
+        if offload {
+            super::offload::note_state(super::offload::State::FellBack("its pipelines could not be built on the other GPU".into()));
+        }
+        return Ended::Clean;
     };
-    let offload = offloaded.is_some();
     if let Some(o) = offloaded {
         gpu.standin = o.standin;
         gpu.slow = Some(super::offload::ServerRule::default());
         crate::log!("[offload] answering the after-the-upscaler path's requests on {}", o.name);
+        super::offload::note_state(super::offload::State::Active(o.name));
     } else {
         crate::log!("[native] answering the after-the-upscaler path's requests on queue {} of family {}", setup.post_index, setup.family);
     }
@@ -328,25 +368,74 @@ fn work(
     if offload {
         super::offload::set_active(false);
     }
-    let stalled = gpu.stalled;
     let gave_up = gpu.give_up.take();
+    let mut ended = Ended::Clean;
+    let stall_waited = offload && (gpu.stalled || loader.dead());
+    if stall_waited {
+        crate::log!("[offload] a frame did not finish in time on the other GPU (or its device was lost): waiting for it before anything is freed");
+        crate::logging::flush();
+        end(Status::Stalled);
+        let fence = gpu.standin.as_ref().map_or(gpu.fence, super::offload::Standin::fence);
+        // Finished, or the device lost (its work cannot run any more); the network's own queue must not be stalled.
+        let finished = |timeout: Duration| {
+            // SAFETY: the server's own fence, submitted by the frame that stalled.
+            let waited = unsafe { device.wait_for_fences(&[fence], true, timeout.as_nanos() as u64) };
+            !matches!(waited, Err(vk::Result::TIMEOUT)) && !loader.dead()
+        };
+        loop {
+            if finished(Duration::from_millis(100)) {
+                gpu.stalled = false;
+                break;
+            }
+            if q.load(Ordering::Relaxed) {
+                if finished(STALL_DRAIN) {
+                    gpu.stalled = false;
+                } else {
+                    ended = Ended::Leaked;
+                }
+                break;
+            }
+        }
+    }
     if let Some(why) = &gave_up {
         crate::log!("[offload] back to the game's GPU: {why}");
         crate::logging::flush();
     }
-    // SAFETY: `serve` returns with nothing of `gpu` pending (or stalled, and then nothing is freed).
-    unsafe { gpu.destroy(device) };
+    if ended == Ended::Clean {
+        // SAFETY: `serve` returns with nothing of `gpu` pending, or the stalled frame was just waited for (a stall on the
+        // game's own GPU keeps `stalled`, and then nothing is freed).
+        unsafe { gpu.destroy(device) };
+    }
     drop(claim);
-    end(if stalled || gave_up.is_some() {
-        if offload {
-            Status::Unavailable
-        } else {
+    let status = if !offload {
+        if gpu.stalled {
             Status::Stalled
+        } else {
+            Status::Retry
         }
+    } else if ended == Ended::Leaked {
+        Status::Stalled
+    } else if gave_up.is_some() || stall_waited {
+        Status::Unavailable
     } else {
         Status::Retry
-    });
-    stalled
+    };
+    if offload && status != Status::Retry {
+        let why = gave_up.unwrap_or_else(|| {
+            if ended == Ended::Leaked {
+                "its last frame never finished".into()
+            } else {
+                "a frame did not finish in time (or its device was lost)".into()
+            }
+        });
+        super::offload::note_state(super::offload::State::FellBack(why));
+    }
+    end(status);
+    if !offload && gpu.stalled {
+        Ended::Leaked
+    } else {
+        ended
+    }
 }
 
 impl Drop for PostServer {

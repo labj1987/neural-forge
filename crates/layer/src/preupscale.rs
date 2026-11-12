@@ -5611,6 +5611,12 @@ pub(crate) struct Session {
     /// The model on another GPU (`offload`) was given up for the session.
     #[cfg(target_arch = "x86_64")]
     offload_given_up: bool,
+    /// The server running is the one on another GPU.
+    #[cfg(target_arch = "x86_64")]
+    post_offload: bool,
+    /// The offload's status line last published (`layer_reason`).
+    #[cfg(target_arch = "x86_64")]
+    offload_status: String,
     /// `NEURAL_FORGE_CAPTURE_AT`: how many times DLSS frames resumed after a gap, when the last resume was,
     /// and which of its entries were taken, one bit each ([`Self::capture_at_due`]).
     resumes: u32,
@@ -6537,6 +6543,12 @@ impl Session {
         import: bool,
         shm: &ShmClient,
     ) {
+        // The model on another GPU's state, on the Status tab's line and for `doctor` (`layer_reason`).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(line) = offload::status_line().filter(|l| *l != self.offload_status) {
+            shm.set_layer_reason(&line);
+            self.offload_status = line;
+        }
         #[cfg(target_arch = "x86_64")]
         if !self.post_stalled && native_on(self.native.as_ref()) {
             use native_post::Status;
@@ -6549,6 +6561,9 @@ impl Session {
                     }
                     return;
                 }
+                // The server on another GPU waits for a frame that did not finish (`native_post::work`): it ends on its
+                // own, with the network back here (Unavailable) once that frame is done.
+                Some(Status::Stalled) if self.post_offload => return,
                 Some(Status::Stalled) => {
                     self.post_stalled = true;
                     drop(self.post_server.take());
@@ -6558,6 +6573,7 @@ impl Session {
                 // network runs on this device's GPU from the next present on.
                 Some(Status::Unavailable) => {
                     self.offload_given_up = true;
+                    self.post_offload = false;
                     drop(self.post_server.take());
                     return;
                 }
@@ -6579,6 +6595,7 @@ impl Session {
             if choice != offload::Choice::Off && !self.offload_given_up {
                 let (count, placements) = view.header().placements();
                 if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
+                    self.post_offload = true;
                     self.post_server = native_post::PostServer::start_offload(instance.clone(), loader.setup(), device.handle(), choice, view);
                     return;
                 }

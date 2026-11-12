@@ -203,6 +203,18 @@ pub(crate) fn device_lost(device: vk::Device) -> bool {
     ANY_DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed) && LOST_DEVICES.lock().unwrap_or_else(|e| e.into_inner()).contains(&device)
 }
 
+/// Devices the layer made itself (`preupscale::offload`): a loss there is not the game's ([`note_vk`]).
+static SECONDARY_DEVICES: Mutex<Vec<vk::Device>> = Mutex::new(Vec::new());
+
+/// Notes `device` as one the layer made itself (`on`), or no longer (destroyed).
+pub(crate) fn note_secondary_device(device: vk::Device, on: bool) {
+    let mut all = SECONDARY_DEVICES.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|&d| d != device);
+    if on {
+        all.push(device);
+    }
+}
+
 /// Whether a device of this process is lost now (the channel's session record, `device_lost_at`). A
 /// game that recovered by destroying the lost device and creating another is no longer reported.
 pub(crate) fn any_device_lost() -> bool {
@@ -226,6 +238,16 @@ pub(crate) fn forget_lost_device(device: vk::Device) {
 /// Passes a Vulkan result of a call on `device` through unchanged, latching the layer inert on that
 /// device on `DEVICE_LOST`.
 pub(crate) fn note_vk<T>(device: vk::Device, result: ash::prelude::VkResult<T>) -> ash::prelude::VkResult<T> {
+    if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) && SECONDARY_DEVICES.lock().unwrap_or_else(|e| e.into_inner()).contains(&device) {
+        // A device the layer made for the model on another GPU (`preupscale::offload`): the game's devices are not
+        // lost, and the session is not marked so; the offload falls back on its own.
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[offload] VK_ERROR_DEVICE_LOST on the other GPU's device {:#x}", vk::Handle::as_raw(device));
+            crate::logging::flush();
+        }
+        return result;
+    }
     if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) {
         let first_of_device = {
             let mut lost = LOST_DEVICES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1461,6 +1483,19 @@ mod device_lost_tests {
 
     /// Held by the tests that latch devices lost: the latch is process-wide.
     static LOST_STATE: Mutex<()> = Mutex::new(());
+
+    /// A lost device the layer made for the model on another GPU marks neither the game's devices nor the session.
+    #[test]
+    fn a_lost_offload_device_is_not_the_sessions_loss() {
+        let _state = LOST_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        use ash::vk::Handle;
+        let offload = vk::Device::from_raw(0xdead_0003);
+        note_secondary_device(offload, true);
+        assert_eq!(note_vk::<()>(offload, Err(vk::Result::ERROR_DEVICE_LOST)), Err(vk::Result::ERROR_DEVICE_LOST));
+        assert!(!any_device_lost(), "the session is not marked lost");
+        assert!(!device_lost(offload));
+        note_secondary_device(offload, false);
+    }
 
     #[test]
     fn note_vk_passes_results_through_and_latches_only_the_lost_device() {
