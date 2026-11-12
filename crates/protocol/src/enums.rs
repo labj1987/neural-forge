@@ -26,7 +26,9 @@ pub mod preupscale_state {
     /// The game stopped calling DLSS altogether (no Super Resolution launch at all: a pause menu, a map, a loading
     /// screen) after holds ran the model before the upscaler or after DLSS: nothing runs it now (the
     /// after-the-upscaler path is kept off for up to 5 minutes after the last held frame), and it runs again on DLSS's
-    /// next frame, with the network still loaded. While DLSS goes on launching with no frame held (DLAA, inputs not
+    /// next frame, with the network still loaded. Also a DLSS game before DLSS's first frame (its menus and loading
+    /// screens, with no frame held yet: the after-the-upscaler path is kept off from the sign that it is a DLSS game,
+    /// `pre_dlss_post_off` in the layer), so a game starts out `PAUSED` with no holds. While DLSS goes on launching with no frame held (DLAA, inputs not
     /// identified, every frame refused) the state is [`WAITING`] or [`IDENTIFIED`] instead, and the
     /// after-the-upscaler path takes over 30 s after the last held frame.
     pub const PAUSED: u32 = 6;

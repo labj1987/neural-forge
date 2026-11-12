@@ -30,6 +30,7 @@ mod hotkey;
 mod loader_data;
 mod logging;
 mod ngx_ring;
+mod noop_bind;
 mod ownership;
 mod present_sync;
 mod preupscale;

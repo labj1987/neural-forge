@@ -6670,7 +6670,8 @@ impl Session {
     /// [`Self::suppresses_post`]) and Super Resolution's `launches`. Paused only while DLSS sends nothing at all (no Super
     /// Resolution launch within [`RECENT`]: a pause menu, a loading screen) with the post path kept off: nothing runs the
     /// model until DLSS's next frame, and that is not "waiting for DLSS input", which reads as the model having moved
-    /// after the upscaler (#49). While Super Resolution launches with no frame held (DLAA, inputs not identified, every
+    /// after the upscaler (#49). That includes a DLSS game before DLSS's first frame, kept off by
+    /// [`pre_dlss_post_off`] with no frame held yet. While Super Resolution launches with no frame held (DLAA, inputs not identified, every
     /// frame refused) the game plays: never paused, and the post path takes over after [`HAND_BACK`].
     fn status_at(&self, kept_off: bool, launches: Option<SrLaunches>, now: Instant, refusal: Option<&Refusal>) -> (u32, String) {
         let recent = |t: Option<Instant>| t.is_some_and(|t| now.saturating_duration_since(t) < RECENT);
@@ -6686,9 +6687,9 @@ impl Session {
 /// with its inputs identified within [`RECENT`] (`dlss`, [`Session::saw_dlss`]), and `refusal` the last reason a frame
 /// was not held: the state and the reason the header gets. DLSS identified with no hold is every frame refused, which
 /// is not the same as no DLSS at all ("waiting for DLSS input", #51): `IDENTIFIED`, with the reason. With neither, a
-/// device whose holds keep the post path off while DLSS sends nothing at all (`paused`, [`Session::status_at`]: a pause
-/// menu or a loading screen, for up to [`PAUSE_HAND_BACK`] after the last held frame) is `PAUSED`: the model resumes
-/// with DLSS (#49).
+/// device whose post path is kept off while DLSS sends nothing at all (`paused`, [`Session::status_at`]: a pause menu
+/// or a loading screen, for up to [`PAUSE_HAND_BACK`] after the last held frame, or a DLSS game before DLSS's first
+/// frame, [`pre_dlss_post_off`], with no hold yet) is `PAUSED`: the model resumes with DLSS (#49).
 fn status_of(holding: bool, dlss: bool, paused: bool, refusal: Option<&Refusal>) -> (u32, String) {
     if !holding && dlss {
         (neural_forge_protocol::enums::preupscale_state::IDENTIFIED, refusal.map(Refusal::text).unwrap_or_default())

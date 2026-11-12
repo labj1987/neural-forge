@@ -1,6 +1,6 @@
 #!/bin/bash
-# The pre-release game sweep: runs the tested games installed on this machine through their unattended routes
-# (scripts/game-sweep.toml) and prints a pass/fail table from the layer's status, its log and the kernel log, against
+# The pre-release game sweep: runs the tested games installed on this machine through their built-in benchmarks,
+# each started by Steam (scripts/game-sweep.toml), and prints a pass/fail table from the layer's status, its log and the kernel log, against
 # what data/games.toml says of each game. The work is done by crates/supervisor/examples/game_sweep.rs, built here.
 # Run it on the test machine, in tmux (a run takes minutes per game), with the build under test:
 #
@@ -13,8 +13,8 @@
 #                     default; the build's own when --layer is a build with another channel version)
 #   --out DIR         where the logs, status samples and results.txt go (default ~/nf-sweep/<unix time>)
 #   --lock FILE       the GPU lock taken for the whole sweep (default $NF_GPU_LOCK, else ~/scratch/gpu.lock)
-#   --vw PATH         the screen recorder (`vw record`/`vw analyze`, default ~/scratch/vw/bin/vw): each run is recorded for
-#                     10 s once at its placement and passes only when the analysis flags nothing (colour flashes,
+#   --vw PATH         the screen recorder (`vw replay`/`vw analyze`, default ~/scratch/vw/bin/vw): each run is recorded for
+#                     10 s, record_after seconds after its placement was reached, and passes only when the analysis flags nothing (colour flashes,
 #                     alternating frames, black frames, freezes); look at each run's <label>-vw/sheet.jpg too
 #   --no-record       no recording: every run then fails on its picture
 #   --dry-run         print each run's launch options, settings edits and expectations; change nothing

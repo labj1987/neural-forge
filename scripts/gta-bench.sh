@@ -3,13 +3,19 @@
 #
 # Runs on the rig itself, or from another machine with --host, which pipes this script
 # over ssh. Steam must be running on the rig. The game is launched through the same
-# Steam Linux Runtime entry point and Proton that Steam uses, with only the environment
+# Steam Linux Runtime entry point and Proton that Steam uses (the one Steam has for GTA in
+# config.vdf's CompatToolMapping, e.g. a Neural Forge Proton copy), with only the environment
 # given here (Steam's launch options are bypassed), and exits by itself after one
 # benchmark iteration. Results land in $NF_BENCH_DIR/<label> on the rig: GTA's
 # Benchmark/FrameTimes files, MangoHud's per-frame CSV (MangoHud is always the last
 # layer, i.e. below any frame generator, so it counts displayed frames), nvidia-smi
 # samples, and the launch log, which holds the layer's [sync] and [present] lines.
 # Summarise with scripts/bench-report.py.
+#
+# Why not a Steam launch (steam://rungameid, as the game sweep does): a benchmark needs exactly
+# the environment given here for each A/B side (no launch options or session variables mixed
+# in), MangoHud as the last layer, and its own process group to classify and relaunch a failed
+# attempt, none of which a Steam launch gives. Steam's own Proton choice is still what runs.
 #
 # usage: gta-bench.sh [--host HOST] [--tries N] [--set key=value]... <label> <VK layers above MangoHud> [env...]
 #        gta-bench.sh --self-test
@@ -39,7 +45,8 @@
 #       NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 #
 # Rig paths can be overridden with NF_BENCH_STEAM_LIBRARY (the library holding GTA),
-# NF_BENCH_STEAM_ROOT (the Steam client), NF_BENCH_PROTON, NF_BENCH_DIR, and NF_BENCH_CLI (the
+# NF_BENCH_STEAM_ROOT (the Steam client), NF_BENCH_PROTON (a Proton folder instead of Steam's
+# choice for GTA), NF_BENCH_DIR, and NF_BENCH_CLI (the
 # neural-forge-cli --set uses; the installed one by default, a development build's when the
 # layer under test has a newer shared-memory version than the installed CLI can open).
 # A frame series the layer captured during the run (NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<frames>,
@@ -132,6 +139,145 @@ def fg(csv, cap):
     print(fg_rule(times, float(cap)))
 
 
+# Valve's Protons: the name CompatToolMapping gives each and its Steam app (crates/supervisor/src/proton_tool.rs).
+VALVE_TOOLS = {"proton_experimental": "1493710", "proton_hotfix": "2180100", "proton_11": "4628710", "proton_10": "3658110",
+               "proton_9": "2805730", "proton_8": "2348590", "proton_7": "1887720", "proton_63": "1580130", "proton_513": "1420170"}
+
+
+def vdf_block(text, path):
+    """The text inside the nested "key" { ... } blocks of `path` (a plain VDF reader: keys, strings, braces; a //
+    comment runs to the end of its line, but // inside a string is part of it)."""
+    import re
+    found = re.findall(r'"((?:[^"\\]|\\.)*)"|(//[^\n]*)|([{}])', text)
+    tokens = [(st, brace) for st, comment, brace in found if not comment]
+    i = 0
+    for key in path:
+        depth = 0
+        while i < len(tokens):
+            s, brace = tokens[i]
+            i += 1
+            if brace == "{":
+                depth += 1
+            elif brace == "}":
+                depth -= 1
+                if depth < 0:
+                    return None
+            elif depth == 0 and s.lower() == key.lower() and i < len(tokens) and tokens[i][1] == "{":
+                i += 1
+                break
+        else:
+            return None
+    out, depth = [], 0
+    while i < len(tokens):
+        s, brace = tokens[i]
+        i += 1
+        if brace == "{":
+            depth += 1
+        elif brace == "}":
+            if depth == 0:
+                break
+            depth -= 1
+        out.append((s, brace, depth))
+    return out
+
+
+def vdf_pairs(block):
+    """The entries directly in `block` (vdf_block's list), in order: (key, value) for a string value, (key, None) for
+    a nested block. Keys and values are told apart by position, so a value that reads like a key is still a value."""
+    out, k = [], 0
+    block = block or []
+    while k < len(block):
+        s, brace, depth = block[k]
+        if brace or depth != 0 or k + 1 >= len(block):
+            k += 1
+            continue
+        nxt, nbrace, _ = block[k + 1]
+        if nbrace == "{":
+            out.append((s, None))
+            k += 2
+            while k < len(block) and not (block[k][1] == "}" and block[k][2] == 0):
+                k += 1
+            k += 1
+        else:
+            out.append((s, nxt))
+            k += 2
+    return out
+
+
+def vdf_value(block, key):
+    """The string value of `key` directly in `block` (vdf_block's list), else None."""
+    for k, v in vdf_pairs(block):
+        if k.lower() == key.lower() and v is not None:
+            return v
+    return None
+
+
+def steam_libraries(root):
+    """`root` and every library in its steamapps/libraryfolders.vdf, in order, without repeats."""
+    out = [root]
+    try:
+        text = open(os.path.join(root, "steamapps/libraryfolders.vdf"), errors="replace").read()
+    except OSError:
+        text = ""
+    for key, value in vdf_pairs(vdf_block(text, ["libraryfolders"])):
+        path = vdf_value(vdf_block(text, ["libraryfolders", key]), "path") if value is None else None
+        if path:
+            out.append(path)
+    seen, uniq = set(), []
+    for lib in out:
+        key = os.path.realpath(lib)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(lib)
+    return uniq
+
+
+def mapped_proton(root, libraries, appid):
+    """The folder of the Proton Steam runs `appid` with (config.vdf's CompatToolMapping: the game's entry, else the
+    default for every game, "0"), or an error line. Valve's Protons are looked for in `libraries` and every library
+    of `root`."""
+    try:
+        config = open(os.path.join(root, "config/config.vdf"), errors="replace").read()
+    except OSError as e:
+        return None, f"no Steam config: {e}"
+    mapping = ["InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping"]
+    name = vdf_value(vdf_block(config, mapping + [appid]), "name") or vdf_value(vdf_block(config, mapping + ["0"]), "name")
+    if not name:
+        return None, f"Steam has no Proton chosen for {appid} (choose one in its Properties > Compatibility)"
+    if name in VALVE_TOOLS:
+        for lib in list(libraries) + [l for l in steam_libraries(root) if l not in libraries]:
+            try:
+                acf = open(os.path.join(lib, "steamapps", f"appmanifest_{VALVE_TOOLS[name]}.acf"), errors="replace").read()
+            except OSError:
+                continue
+            state = vdf_block(acf, ["AppState"]) or []
+            for k, (s, brace, depth) in enumerate(state):
+                if not brace and depth == 0 and s == "installdir" and k + 1 < len(state):
+                    d = os.path.join(lib, "steamapps/common", state[k + 1][0])
+                    if os.path.isfile(os.path.join(d, "proton")):
+                        return d, None
+        return None, f"Steam runs {appid} with {name}, which is not installed"
+    tools = os.path.join(root, "compatibilitytools.d")
+    for d in sorted(glob.glob(os.path.join(tools, "*"))):
+        if os.path.basename(d).startswith(".") or not os.path.isfile(os.path.join(d, "proton")):
+            continue
+        try:
+            names = [s for s, brace, depth in (vdf_block(open(os.path.join(d, "compatibilitytool.vdf"), errors="replace").read(), ["compatibilitytools", "compat_tools"]) or []) if not brace and depth == 0]
+        except OSError:
+            names = [os.path.basename(d)]
+        if name in names or (not names and os.path.basename(d) == name):
+            return d, None
+    return None, f"Steam runs {appid} with {name}, which is not in {tools}"
+
+
+def proton(root, appid, *libraries):
+    d, err = mapped_proton(root, libraries or [root], appid)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(1)
+    print(d)
+
+
 def self_test():
     def minidump(addr, top_of_stack):
         # header, a stream directory of 2 (exception, memory list), the CONTEXT, one stack range
@@ -156,6 +302,45 @@ def self_test():
     assert lost.startswith("stopped 13") and lost.endswith(" 80 300"), lost
     # a dip of a few seconds (a scene change) is not a stop
     assert fg_rule(frames(0, 70, 60) + frames(70, 110, 300) + frames(110, 118, 80) + frames(118, 260, 300), 576) == "kept"
+    import tempfile
+    with tempfile.TemporaryDirectory() as root:
+        def put(rel, text):
+            os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+            open(os.path.join(root, rel), "w").write(text)
+        def config(name):
+            put("config/config.vdf", '"InstallConfigStore"\n{\n\t"Software"\n\t{\n\t\t"Valve"\n\t\t{\n\t\t\t"Steam"\n\t\t\t{\n'
+                '\t\t\t\t"CompatToolMapping"\n\t\t\t\t{\n\t\t\t\t\t"1091500"\n\t\t\t\t\t{\n\t\t\t\t\t\t"name"\t\t"other"\n\t\t\t\t\t}\n'
+                f'\t\t\t\t\t"3240220"\n\t\t\t\t\t{{\n\t\t\t\t\t\t"name"\t\t"{name}"\n\t\t\t\t\t\t"config"\t\t""\n\t\t\t\t\t}}\n\t\t\t\t}}\n\t\t\t}}\n\t\t}}\n\t}}\n}}\n')
+        for d, internal in [("Proton-CachyOS Latest", "proton-cachyos"), ("cachyos-11.0-NeuralForge", "cachyos-11.0-NeuralForge")]:
+            put(f"compatibilitytools.d/{d}/proton", "")
+            put(f"compatibilitytools.d/{d}/compatibilitytool.vdf", f'"compatibilitytools"\n{{\n  "compat_tools"\n  {{\n    "{internal}" // Internal name\n    {{\n      "install_path" "."\n    }}\n  }}\n}}\n')
+        put("steamapps/appmanifest_1493710.acf", '"AppState"\n{\n\t"appid"\t\t"1493710"\n\t"installdir"\t\t"Proton - Experimental"\n}\n')
+        put("steamapps/common/Proton - Experimental/proton", "")
+        config("cachyos-11.0-NeuralForge")
+        assert mapped_proton(root, [root], "3240220") == (os.path.join(root, "compatibilitytools.d/cachyos-11.0-NeuralForge"), None)
+        config("proton-cachyos")
+        assert mapped_proton(root, [root], "3240220") == (os.path.join(root, "compatibilitytools.d/Proton-CachyOS Latest"), None)
+        config("proton_experimental")
+        assert mapped_proton(root, [root], "3240220") == (os.path.join(root, "steamapps/common/Proton - Experimental"), None)
+        config("gone")
+        assert mapped_proton(root, [root], "3240220")[1].endswith("not in " + os.path.join(root, "compatibilitytools.d"))
+        assert "no Proton chosen" in mapped_proton(root, [root], "4000")[1]
+        # Keys and values by position: a value that reads "name" is not the key, a nested block is not a value.
+        assert vdf_pairs(vdf_block('"a"\n{\n "x" "name"\n "name" "real"\n "b" { "name" "inner" }\n}\n', ["a"])) == [("x", "name"), ("name", "real"), ("b", None)]
+        assert vdf_value(vdf_block('"a" { "b" { "name" "inner" } }', ["a"]), "name") is None
+        # A // inside a string is not a comment; a // comment is skipped.
+        assert vdf_value(vdf_block('"a" // note\n{\n "path" "//srv/x" // c\n}\n', ["a"]), "path") == "//srv/x"
+        # No entry for the game: Steam's default for every game ("0").
+        put("config/config.vdf", '"InstallConfigStore"\n{\n"Software"\n{\n"Valve"\n{\n"Steam"\n{\n"CompatToolMapping"\n{\n"0"\n{\n"name" "proton_experimental"\n}\n}\n}\n}\n}\n}\n')
+        assert mapped_proton(root, [root], "4000") == (os.path.join(root, "steamapps/common/Proton - Experimental"), None)
+        # Valve's Proton in another library, found through libraryfolders.vdf though not passed in.
+        lib2 = os.path.join(root, "lib2")
+        os.makedirs(os.path.join(lib2, "steamapps/common/Proton 9.0"))
+        put("lib2/steamapps/common/Proton 9.0/proton", "")
+        put("lib2/steamapps/appmanifest_2805730.acf", '"AppState"\n{\n\t"installdir"\t\t"Proton 9.0"\n}\n')
+        put("steamapps/libraryfolders.vdf", f'"libraryfolders"\n{{\n\t"0"\n\t{{\n\t\t"path"\t\t"{root}"\n\t}}\n\t"1"\n\t{{\n\t\t"path"\t\t"{lib2}"\n\t}}\n}}\n')
+        config("proton_9")
+        assert mapped_proton(root, [root], "3240220") == (os.path.join(lib2, "steamapps/common/Proton 9.0"), None)
     print("gta-bench self-test ok")
 
 
@@ -164,6 +349,8 @@ if cmd == "dumps":
     dumps(sys.argv[2], float(sys.argv[3]))
 elif cmd == "fg":
     fg(sys.argv[2], sys.argv[3])
+elif cmd == "proton":
+    proton(*sys.argv[2:])
 elif cmd == "self-test":
     self_test()
 PY
@@ -207,7 +394,11 @@ case $tries in ''|*[!0-9]*|0) echo "error: --tries takes a count of 1 or more" >
 
 C=${NF_BENCH_STEAM_ROOT:-$HOME/.local/share/Steam}
 S=${NF_BENCH_STEAM_LIBRARY:-$C}
-PROTON=${NF_BENCH_PROTON:-$C/compatibilitytools.d/Proton-CachyOS Latest}
+# The Proton Steam runs GTA with (config.vdf's CompatToolMapping), so a benchmark runs on what the game runs on
+# (a Neural Forge Proton copy gives the layer DLSS's own records); NF_BENCH_PROTON overrides it.
+if [ -n "${NF_BENCH_PROTON:-}" ]; then PROTON=$NF_BENCH_PROTON
+else PROTON=$(gta_py proton "$C" 3240220 "$S" "$C") || exit 1; fi
+echo "Proton: $PROTON"
 GAME="$S/steamapps/common/Grand Theft Auto V Enhanced"
 SLR=$S/steamapps/common/SteamLinuxRuntime_4
 PFX="$S/steamapps/compatdata/3240220"
