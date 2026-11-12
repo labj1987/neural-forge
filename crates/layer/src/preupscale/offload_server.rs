@@ -66,8 +66,9 @@ pub(crate) struct PreRunner {
     fence: vk::Fence,
     /// The regions on this device (imported, or staged copies of them), made on the first frame.
     regions: Option<(HostBuffer, HostBuffer)>,
-    /// Both devices can import the regions' memory.
+    /// Both devices can import the regions' memory, and the regions' whole sizes.
     shared: bool,
+    capacity: (usize, usize),
     frame: Option<Frame>,
     rule: super::offload::ServerRule,
     /// A frame did not finish: nothing of the device is freed.
@@ -81,7 +82,7 @@ unsafe impl Send for PreRunner {}
 impl PreRunner {
     /// On the offload device made with the game's device `game` (`offload::take`): its loader, queue and command
     /// buffers. `Err` with why it cannot serve (the device is given back).
-    pub(crate) fn start(instance: ash::Instance, game: vk::Device, shared: bool, metas: Metas) -> Result<(Self, String), String> {
+    pub(crate) fn start(instance: ash::Instance, game: vk::Device, shared: bool, capacity: (usize, usize), metas: Metas) -> Result<(Self, String), String> {
         let off = match super::offload::take(game) {
             Some(Ok(off)) => off,
             Some(Err(why)) => return Err(why),
@@ -144,6 +145,7 @@ impl PreRunner {
                 fence,
                 regions: None,
                 shared,
+                capacity,
                 frame: None,
                 rule: super::offload::ServerRule::default(),
                 leaked: false,
@@ -168,9 +170,8 @@ impl PreRunner {
         if self.regions.is_none() {
             let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
             // SAFETY: the regions outlive the runner (the worker is stopped before the exchange is destroyed).
-            let o =
-                unsafe { super::region_buffer(device, instance, physical, self.shared, out.cast_mut(), layout.out_bytes as usize, layout.out_bytes, usage) };
-            let i = unsafe { super::region_buffer(device, instance, physical, self.shared, inn, layout.in_bytes as usize, layout.in_bytes, usage) };
+            let o = unsafe { super::region_buffer(device, instance, physical, self.shared, out.cast_mut(), self.capacity.0, layout.out_bytes, usage) };
+            let i = unsafe { super::region_buffer(device, instance, physical, self.shared, inn, self.capacity.1, layout.in_bytes, usage) };
             match (o, i) {
                 (Some(o), Some(i)) => {
                     crate::log!(

@@ -370,6 +370,8 @@ pub(crate) struct Link {
     progress: Arc<Progress>,
     out: *mut u8,
     inn: *mut u8,
+    /// The regions' whole sizes (rounded up for the import's alignment).
+    pub capacity: (usize, usize),
     layout: Layout,
     /// The regions can be imported on another device as host memory (they are this module's own allocations).
     pub shared: bool,
@@ -488,6 +490,7 @@ impl Exchange {
             progress: self.progress.clone(),
             out: self.out.ptr,
             inn: self.inn.ptr,
+            capacity: (self.regions[0].layout.size(), self.regions[1].layout.size()),
             layout: self.layout,
             shared: self.shared,
         }
@@ -980,7 +983,7 @@ impl HoldSide {
         };
         let link = exchange.link(device);
         let metas = super::offload_server::Metas::default();
-        let (runner, name) = match super::offload_server::PreRunner::start(instance.clone(), device.handle(), link.shared, metas.clone()) {
+        let (runner, name) = match super::offload_server::PreRunner::start(instance.clone(), device.handle(), link.shared, link.capacity, metas.clone()) {
             Ok(r) => r,
             Err(why) => {
                 // SAFETY: never used.
@@ -1326,11 +1329,10 @@ mod tests {
             let import = dev.import && link.shared;
             let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
             // SAFETY: the regions outlive the runner (the worker is stopped before the exchange goes).
-            let out = unsafe {
-                crate::preupscale::region_buffer(&dev.device, &dev.instance, dev.physical, import, out_ptr, l.out_bytes as usize, l.out_bytes, usage)
-            }?;
+            let out =
+                unsafe { crate::preupscale::region_buffer(&dev.device, &dev.instance, dev.physical, import, out_ptr, link.capacity.0, l.out_bytes, usage) }?;
             let inn =
-                unsafe { crate::preupscale::region_buffer(&dev.device, &dev.instance, dev.physical, import, in_ptr, l.in_bytes as usize, l.in_bytes, usage) }?;
+                unsafe { crate::preupscale::region_buffer(&dev.device, &dev.instance, dev.physical, import, in_ptr, link.capacity.1, l.in_bytes, usage) }?;
             // SAFETY: a live device.
             unsafe {
                 let pool = dev
