@@ -31,8 +31,8 @@ dlss = "Super Resolution, Frame Generation 4x"
 placement = "before"
 hdr = "none"
 notes = []
-verified = "3.14.0"
-verified_on = "2026-11-10"
+verified = "4.1.1"
+verified_on = "2026-11-12"
 verified_by = "test machine"
 
 [[game]]
