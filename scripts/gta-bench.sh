@@ -145,10 +145,12 @@ VALVE_TOOLS = {"proton_experimental": "1493710", "proton_hotfix": "2180100", "pr
 
 
 def vdf_block(text, path):
-    """The text inside the nested "key" { ... } blocks of `path` (a plain VDF reader: keys, strings, braces)."""
+    """The text inside the nested "key" { ... } blocks of `path` (a plain VDF reader: keys, strings, braces; a //
+    comment runs to the end of its line, but // inside a string is part of it)."""
     import re
-    tokens = re.findall(r'"((?:[^"\\]|\\.)*)"|([{}])', re.sub(r"//[^\n]*", "", text))
-    i, depth_want = 0, 0
+    found = re.findall(r'"((?:[^"\\]|\\.)*)"|(//[^\n]*)|([{}])', text)
+    tokens = [(st, brace) for st, comment, brace in found if not comment]
+    i = 0
     for key in path:
         depth = 0
         while i < len(tokens):
@@ -179,22 +181,47 @@ def vdf_block(text, path):
     return out
 
 
+def vdf_value(block, key):
+    """The string value of `key` directly in `block` (vdf_block's list), else None."""
+    for k, (s, brace, depth) in enumerate(block or []):
+        if not brace and depth == 0 and s.lower() == key.lower() and k + 1 < len(block) and not block[k + 1][1]:
+            return block[k + 1][0]
+    return None
+
+
+def steam_libraries(root):
+    """`root` and every library in its steamapps/libraryfolders.vdf, in order, without repeats."""
+    out = [root]
+    try:
+        folders = vdf_block(open(os.path.join(root, "steamapps/libraryfolders.vdf"), errors="replace").read(), ["libraryfolders"]) or []
+    except OSError:
+        folders = []
+    for k, (s, brace, depth) in enumerate(folders):
+        if not brace and depth == 1 and s.lower() == "path" and k + 1 < len(folders):
+            out.append(folders[k + 1][0])
+    seen, uniq = set(), []
+    for lib in out:
+        key = os.path.realpath(lib)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(lib)
+    return uniq
+
+
 def mapped_proton(root, libraries, appid):
-    """The folder of the Proton Steam runs `appid` with (config.vdf's CompatToolMapping), or an error line."""
+    """The folder of the Proton Steam runs `appid` with (config.vdf's CompatToolMapping: the game's entry, else the
+    default for every game, "0"), or an error line. Valve's Protons are looked for in `libraries` and every library
+    of `root`."""
     try:
         config = open(os.path.join(root, "config/config.vdf"), errors="replace").read()
     except OSError as e:
         return None, f"no Steam config: {e}"
-    entry = vdf_block(config, ["InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping", appid])
-    name = None
-    for k, (s, brace, depth) in enumerate(entry or []):
-        if not brace and depth == 0 and s.lower() == "name" and k + 1 < len(entry):
-            name = entry[k + 1][0]
-            break
+    mapping = ["InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping"]
+    name = vdf_value(vdf_block(config, mapping + [appid]), "name") or vdf_value(vdf_block(config, mapping + ["0"]), "name")
     if not name:
         return None, f"Steam has no Proton chosen for {appid} (choose one in its Properties > Compatibility)"
     if name in VALVE_TOOLS:
-        for lib in libraries:
+        for lib in list(libraries) + [l for l in steam_libraries(root) if l not in libraries]:
             try:
                 acf = open(os.path.join(lib, "steamapps", f"appmanifest_{VALVE_TOOLS[name]}.acf"), errors="replace").read()
             except OSError:
@@ -214,7 +241,7 @@ def mapped_proton(root, libraries, appid):
             names = [s for s, brace, depth in (vdf_block(open(os.path.join(d, "compatibilitytool.vdf"), errors="replace").read(), ["compatibilitytools", "compat_tools"]) or []) if not brace and depth == 0]
         except OSError:
             names = [os.path.basename(d)]
-        if name in names[:1] or (not names and os.path.basename(d) == name):
+        if name in names or (not names and os.path.basename(d) == name):
             return d, None
     return None, f"Steam runs {appid} with {name}, which is not in {tools}"
 
@@ -274,6 +301,19 @@ def self_test():
         config("gone")
         assert mapped_proton(root, [root], "3240220")[1].endswith("not in " + os.path.join(root, "compatibilitytools.d"))
         assert "no Proton chosen" in mapped_proton(root, [root], "4000")[1]
+        # A // inside a string is not a comment; a // comment is skipped.
+        assert vdf_value(vdf_block('"a" // note\n{\n "path" "//srv/x" // c\n}\n', ["a"]), "path") == "//srv/x"
+        # No entry for the game: Steam's default for every game ("0").
+        put("config/config.vdf", '"InstallConfigStore"\n{\n"Software"\n{\n"Valve"\n{\n"Steam"\n{\n"CompatToolMapping"\n{\n"0"\n{\n"name" "proton_experimental"\n}\n}\n}\n}\n}\n}\n')
+        assert mapped_proton(root, [root], "4000") == (os.path.join(root, "steamapps/common/Proton - Experimental"), None)
+        # Valve's Proton in another library, found through libraryfolders.vdf though not passed in.
+        lib2 = os.path.join(root, "lib2")
+        os.makedirs(os.path.join(lib2, "steamapps/common/Proton 9.0"))
+        put("lib2/steamapps/common/Proton 9.0/proton", "")
+        put("lib2/steamapps/appmanifest_2805730.acf", '"AppState"\n{\n\t"installdir"\t\t"Proton 9.0"\n}\n')
+        put("steamapps/libraryfolders.vdf", f'"libraryfolders"\n{{\n\t"0"\n\t{{\n\t\t"path"\t\t"{root}"\n\t}}\n\t"1"\n\t{{\n\t\t"path"\t\t"{lib2}"\n\t}}\n}}\n')
+        config("proton_9")
+        assert mapped_proton(root, [root], "3240220") == (os.path.join(lib2, "steamapps/common/Proton 9.0"), None)
     print("gta-bench self-test ok")
 
 

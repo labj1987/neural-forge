@@ -1,19 +1,20 @@
-//! The pre-release game sweep: runs the tested games installed on the machine, each through its unattended route,
+//! The pre-release game sweep: runs the tested games installed on the machine, each through its built-in benchmark,
 //! and says from the layer's status, its log and the kernel log whether each still works as the tested games say
 //! (`data/games.toml`, `neural_forge_supervisor::compat`): the placement reached, frames held (the model ran),
-//! no missed frames, no refusal, no device lost or `[panic]`, no Xid, and the HDR verdict expected. Prints a table.
+//! the placement kept, frame generation on where expected, no missed frames, no device lost or `[panic]`, no Xid, the
+//! HDR verdict expected, and a clean recording. Prints a table.
 //! `scripts/game-sweep.sh` builds and runs it; docs/RUNNING_AND_MEASURING.md, "The pre-release game sweep".
 //!
-//! Routes (`scripts/game-sweep.toml`, one `[[run]]` per run):
-//! - `steam`: the game is started by Steam (`steam steam://rungameid/<appid>`), with Neural Forge's variables, the
-//!   run's log file, Proton's HDR switches (with `hdr = true`) and the run's arguments in its launch options. Launch
-//!   options are only written while Steam is shut down, so for each such run the sweep shuts Steam down, writes them,
-//!   starts Steam (through `systemd-run --user`, with the session's environment), runs the game, and puts them back
-//!   the same way.
+//! Every run (`scripts/game-sweep.toml`, one `[[run]]` per run) is started by Steam
+//! (`steam steam://rungameid/<appid>`), on the Proton Steam has for the game, with Neural Forge's variables, the run's
+//! log file, Proton's HDR switches (with `hdr = true`) and the run's arguments in its launch options. Launch options
+//! are only written while Steam is shut down, so for each run the sweep shuts Steam down, writes them, starts Steam
+//! (through `systemd-run --user`, with the session's environment), runs the game, and puts them back the same way.
 //!
 //! Each run is made from start to finish under the rig's GPU lock (`--lock`, default `$NF_GPU_LOCK` or
 //! `~/scratch/gpu.lock`; flock), unless a parent holds it (`NF_GPU_LOCK_HELD`), and everything it changed is put
-//! back before the lock is let go, also after an error or Ctrl-C: the launch options (Steam shut down, every
+//! back before the lock is let go, also after an error or Ctrl-C (not after a panic: the build aborts on one, and
+//! puts nothing back; the files as found are then in `<out>/<label>/`): the launch options (Steam shut down, every
 //! account's `localconfig.vdf` put back byte for byte, Steam started again), the game settings the run edits
 //! (`edit_file`, byte for byte, hash-checked), the installed layer when `--layer` swaps in a build under test
 //! (hash-checked) and the channel directory that build would re-create. Between runs the lock is free, so other
@@ -49,11 +50,6 @@ fn nap(d: Duration) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Route {
-    Steam,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditKind {
     /// Cyberpunk 2077's `UserSettings.json`: the option objects named `NAME` get `value` (bools from true/false).
     JsonOption,
@@ -73,7 +69,6 @@ enum HdrExpect {
 struct Run {
     label: String,
     appid: u32,
-    route: Route,
     /// Arguments after `%command%` (the game's own: a benchmark switch).
     args: String,
     /// How long to watch once the expected placement is reached (or until the game exits by itself).
@@ -86,6 +81,9 @@ struct Run {
     /// Record with the CPU encoder (`recorder = "cpu"`): only where the GPU encoder can't run beside the game (see
     /// [`Recorder`]); the GPU encoder keeps every frame and is the one vw's thresholds were set with.
     cpu_recorder: bool,
+    /// The game runs with frame generation (its settings as found, or the run's edits): the run fails when the
+    /// layer's presents per DLSS evaluate say it is off ([`FG_MIN_RATIO`]).
+    frame_generation: bool,
     hdr: bool,
     ray_reconstruction: bool,
     edit_kind: Option<EditKind>,
@@ -99,12 +97,12 @@ impl Run {
         const KEYS: [&str; 13] = [
             "label",
             "appid",
-            "route",
             "args",
             "seconds",
             "timeout",
             "record_after",
             "recorder",
+            "frame_generation",
             "hdr",
             "ray_reconstruction",
             "edit_kind",
@@ -133,10 +131,6 @@ impl Run {
         if label.is_empty() || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
             return Err(format!("label {label:?} must be letters, digits, - and _"));
         }
-        let route = match text("route").as_deref() {
-            Some("steam") => Route::Steam,
-            other => return Err(format!("route {other:?} is not steam (every game is started by Steam)")),
-        };
         let edit_kind = match text("edit_kind").as_deref() {
             None => None,
             Some("json-option") => Some(EditKind::JsonOption),
@@ -156,7 +150,6 @@ impl Run {
         let run = Run {
             label,
             appid,
-            route,
             args: text("args").unwrap_or_default(),
             seconds: int("seconds", 90)? as u64,
             timeout: int("timeout", 600)? as u64,
@@ -166,6 +159,7 @@ impl Run {
                 Some("cpu") => true,
                 Some(other) => return Err(format!("recorder {other:?} is not gpu or cpu")),
             },
+            frame_generation: flag("frame_generation")?,
             hdr: flag("hdr")?,
             ray_reconstruction: flag("ray_reconstruction")?,
             edit_kind,
@@ -232,6 +226,8 @@ struct Sample {
     holds: u64,
     device_lost: u64,
     hdr: String,
+    /// DLSS evaluates the layer matched to their launches so far (`ngx_matched`): one per rendered frame.
+    ngx_matched: u64,
 }
 
 fn parse_status(text: &str, secs: u64) -> Option<Sample> {
@@ -249,6 +245,7 @@ fn parse_status(text: &str, secs: u64) -> Option<Sample> {
             "preupscale_reason" => s.reason = v.to_string(),
             "preupscale_misses" => s.misses = num(),
             "device_lost_at" => s.device_lost = num(),
+            "ngx_matched" => s.ngx_matched = num(),
             "hdr_verdict" => s.hdr = v.to_string(),
             "edit_cache: refresh_holds" => {
                 // edit_cache: refresh_holds=N cached_holds=M ...
@@ -272,6 +269,10 @@ struct Outcome {
     reached: String,
     holds: String,
     misses: String,
+    /// Status samples after the placement was reached in which it was lost (not held, not a game pause).
+    lost: String,
+    /// Frame generation: presents per rendered frame while holding (`x3.0`), `-` with no measure.
+    fg: String,
     hdr: String,
     faults: String,
     /// The recording's verdict ([`picture_verdict`]): "ok", the flags, or why there is none.
@@ -279,8 +280,32 @@ struct Outcome {
     failures: Vec<String>,
 }
 
+/// More samples than this (5 s each) after the placement was reached without it, outside the game's own pauses,
+/// fail the run: the model has to keep running, not only get there (the VRAM guard pausing it counts).
+const MAX_LOST_SAMPLES: usize = 1;
+/// Presents per rendered frame (DLSS evaluate) under which frame generation counts as off.
+const FG_MIN_RATIO: f64 = 1.5;
+
+/// Whether `state` holds the model somewhere (any placement) or is the game's own pause (a menu, a loading screen).
+fn held_or_paused(state: u32) -> bool {
+    matches!(state, preupscale_state::HOLDING | preupscale_state::HOLDING_AFTER | preupscale_state::HOLDING_BOTH | preupscale_state::PAUSED)
+}
+
+/// Presents per DLSS evaluate over the intervals between consecutive samples that both hold `want`: about 1 without
+/// frame generation, its multiplier with it. `None` when no such interval saw an evaluate.
+fn frame_generation_ratio(samples: &[Sample], want: u32) -> Option<f64> {
+    let (mut frames, mut evaluates) = (0u64, 0u64);
+    for w in samples.windows(2) {
+        if w[0].state == want && w[1].state == want && w[1].ngx_matched > w[0].ngx_matched {
+            frames += w[1].layer_frames.saturating_sub(w[0].layer_frames);
+            evaluates += w[1].ngx_matched - w[0].ngx_matched;
+        }
+    }
+    (evaluates > 0).then(|| frames as f64 / evaluates as f64)
+}
+
 /// Judges a run from its status samples, its layer log and the kernel's Xid lines since it started.
-fn evaluate(expect: Placement, hdr: HdrExpect, samples: &[Sample], log: &str, xid: &str) -> Outcome {
+fn evaluate(expect: Placement, hdr: HdrExpect, fg_expected: bool, samples: &[Sample], log: &str, xid: &str) -> Outcome {
     let mut o = Outcome::default();
     let want = expect.preupscale_state();
     let Some(last) = samples.last() else {
@@ -310,14 +335,30 @@ fn evaluate(expect: Placement, hdr: HdrExpect, samples: &[Sample], log: &str, xi
             if expect != Placement::FinishedFrame && grew == 0 && last.holds == 0 {
                 o.failures.push("no frame was held: the model did not run in the game's frame".into());
             }
-            if last.state != want && last.state != preupscale_state::WAITING && last.state != preupscale_state::PAUSED {
+            let lost: Vec<&Sample> = samples[i..].iter().filter(|s| !held_or_paused(s.state)).collect();
+            o.lost = lost.len().to_string();
+            if lost.len() > MAX_LOST_SAMPLES {
+                let first = lost[0];
                 o.failures.push(format!(
-                    "left the placement: ended {}{}",
-                    state_name(last.state),
-                    if last.reason.is_empty() { String::new() } else { format!(": {}", last.reason) }
+                    "lost the placement in {} samples after reaching it (from {} s: {}{})",
+                    lost.len(),
+                    first.secs,
+                    state_name(first.state),
+                    if first.reason.is_empty() { String::new() } else { format!(": {}", first.reason) }
                 ));
             }
         }
+    }
+    if o.lost.is_empty() {
+        o.lost = "-".into();
+    }
+    let ratio = frame_generation_ratio(samples, want);
+    o.fg = ratio.map_or("-".into(), |r| format!("x{r:.1}"));
+    if fg_expected && ratio.is_none_or(|r| r < FG_MIN_RATIO) {
+        o.failures.push(format!(
+            "frame generation is off (presents per rendered frame while holding: {}); the run expects it on",
+            ratio.map_or("not measured".into(), |r| format!("{r:.2}"))
+        ));
     }
     if o.holds.is_empty() {
         o.holds = last.holds.to_string();
@@ -398,9 +439,19 @@ fn sweep_options(existing: &str, exe: &[String], log: &Path, hdr: bool, args: &s
     if tokens.len() == cmd {
         out.push("%command%".into());
     }
-    for arg in launch_options::split_tokens(args) {
-        if !out[cmd..].contains(&arg) {
-            out.push(arg);
+    // The run's arguments, each switch with the values after it (`-benchmarkIterations 1`) as one unit, added unless
+    // the game's options after %command% have that unit already.
+    let at = out.iter().position(|t| t == "%command%").map_or(out.len(), |i| i + 1);
+    let mut units: Vec<Vec<String>> = Vec::new();
+    for t in launch_options::split_tokens(args) {
+        match units.last_mut() {
+            Some(unit) if !t.starts_with('-') => unit.push(t),
+            _ => units.push(vec![t]),
+        }
+    }
+    for unit in units {
+        if !out[at..].windows(unit.len()).any(|w| w == unit.as_slice()) {
+            out.extend(unit);
         }
     }
     out.join(" ")
@@ -560,7 +611,9 @@ fn start_steam(env: &[(String, String)]) -> Result<(), String> {
     Err("Steam did not start within 2 minutes".into())
 }
 
-/// Everything the sweep changed, put back in [`Drop`] whatever happened.
+/// Everything the sweep changed, put back in [`Drop`] after an error or a Ctrl-C (not after a panic: the build has
+/// `panic = "abort"`; the localconfig.vdf files, game settings and installed layer as found are then in the run's
+/// folder, `<out>/<label>/`).
 struct Restore {
     out: PathBuf,
     /// Each account's `localconfig.vdf` as found.
@@ -773,10 +826,8 @@ fn sweep(o: &Options) -> Result<bool, String> {
         for p in &prepared {
             let current =
                 steam::launch_options(&p.game.root.path, &p.run.appid.to_string()).into_iter().find(|a| a.has_app).and_then(|a| a.options).unwrap_or_default();
-            println!("{} ({}, {:?}):", p.run.label, p.facts.name, p.run.route);
-            if p.run.route == Route::Steam {
-                println!("  launch options: {}", sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.args));
-            }
+            println!("{} ({}):", p.run.label, p.facts.name);
+            println!("  launch options: {}", sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.args));
             if let (Some(file), Some(kind)) = (&p.run.edit_file, p.run.edit_kind) {
                 let path = user_dir(p).join(file);
                 let check = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| apply_edits(kind, &t, &p.run.edits).map(|_| "applies"));
@@ -840,6 +891,7 @@ fn sweep(o: &Options) -> Result<bool, String> {
                 let found = std::fs::read(&installed).map_err(|e| format!("{}: {e}", installed.display()))?;
                 let new = std::fs::read(layer).map_err(|e| format!("{}: {e}", layer.display()))?;
                 println!("installed layer {}; the layer under test {} in place", &sha256(&found)[..12], &sha256(&new)[..12]);
+                std::fs::write(restore.out.join("libneural_forge_layer.so.as-found"), &found).map_err(|e| e.to_string())?;
                 restore.layer = Some((installed.clone(), found));
                 let tmp = installed.with_extension("sweep-tmp");
                 std::fs::write(&tmp, &new).and_then(|()| std::fs::rename(&tmp, &installed)).map_err(|e| format!("swapping in {}: {e}", layer.display()))?;
@@ -853,7 +905,7 @@ fn sweep(o: &Options) -> Result<bool, String> {
             }
             // Launch options: written only while Steam is shut down, put back (and Steam started again) before the
             // lock is let go, so no other run starts the game with them.
-            if p.run.route == Route::Steam {
+            {
                 stop_steam(&env)?;
                 restore.steam_stopped = true;
                 let backup = restore.out.join("localconfig");
@@ -873,6 +925,9 @@ fn sweep(o: &Options) -> Result<bool, String> {
             if let (Some(file), Some(kind)) = (&p.run.edit_file, p.run.edit_kind) {
                 let path = user_dir(p).join(file);
                 let found = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                // A copy on disk too: a panic aborts and puts nothing back.
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                std::fs::write(restore.out.join(format!("{name}.as-found")), &found).map_err(|e| e.to_string())?;
                 restore.files.push((path.clone(), found.clone()));
                 let edited = apply_edits(kind, &String::from_utf8_lossy(&found), &p.run.edits).map_err(|e| format!("{}: {e}", path.display()))?;
                 std::fs::write(&path, edited).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -881,10 +936,9 @@ fn sweep(o: &Options) -> Result<bool, String> {
             restore.steam_stopped = false;
             println!("== {} ({})", p.run.label, p.facts.name);
             let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            let recorder = Recorder::start(o, p.run.cpu_recorder);
-            let samples = match p.run.route {
-                Route::Steam => run_steam(o, p, &env),
-            };
+            // No recording, no verdict: the game is not started without the recorder.
+            let recorder = Recorder::start(o, p.run.cpu_recorder)?;
+            let samples = run_steam(o, p, &env);
             drop(recorder);
             std::fs::write(o.out.join(format!("{}.samples", p.run.label)), samples.iter().map(|s| format!("{s:?}\n")).collect::<String>()).ok();
             let log = std::fs::read_to_string(&p.log).unwrap_or_default();
@@ -893,7 +947,7 @@ fn sweep(o: &Options) -> Result<bool, String> {
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter(|l| l.contains("NVRM: Xid")).collect::<Vec<_>>().join("\n"))
                 .unwrap_or_default();
-            let mut outcome = evaluate(p.run.placement().unwrap_or(p.facts.placement), p.run.hdr_expect(), &samples, &log, &xid);
+            let mut outcome = evaluate(p.run.placement().unwrap_or(p.facts.placement), p.run.hdr_expect(), p.run.frame_generation, &samples, &log, &xid);
             match picture_verdict(o, p) {
                 Ok(v) => outcome.picture = v,
                 Err(e) => {
@@ -919,18 +973,20 @@ fn sweep(o: &Options) -> Result<bool, String> {
     }
     let mut table = String::new();
     table.push_str(&format!(
-        "{:<14} {:<32} {:<18} {:<14} {:>12} {:>6} {:<18} {:<8} {:<8} result\n",
-        "run", "game", "expected", "reached", "holds", "misses", "HDR", "faults", "picture"
+        "{:<14} {:<32} {:<18} {:<20} {:>14} {:>6} {:>4} {:>5} {:<18} {:<8} {:<8} result\n",
+        "run", "game", "expected", "reached", "holds", "misses", "lost", "FG", "HDR", "faults", "picture"
     ));
     for (p, expect, out) in &rows {
         table.push_str(&format!(
-            "{:<14} {:<32} {:<18} {:<14} {:>12} {:>6} {:<18} {:<8} {:<8} {}\n",
+            "{:<14} {:<32} {:<18} {:<20} {:>14} {:>6} {:>4} {:>5} {:<18} {:<8} {:<8} {}\n",
             p.run.label,
             p.facts.name,
             format!("{}{}", short_state(expect.preupscale_state()), if p.run.hdr { ", HDR10" } else { ", SDR" }),
             out.reached,
             out.holds,
             out.misses,
+            out.lost,
+            out.fg,
             out.hdr,
             out.faults,
             out.picture,
@@ -991,7 +1047,7 @@ fn status(cli: &Path, secs: u64) -> Option<Sample> {
 /// timeout passes without the placement.
 fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bool) -> Vec<Sample> {
     let mut samples = Vec::new();
-    let mut recorded = false;
+    let mut recording: Option<Option<std::thread::JoinHandle<()>>> = None;
     let want = p.run.placement().unwrap_or(p.facts.placement).preupscale_state();
     let mut reached: Option<Instant> = None;
     let mut seen = false;
@@ -1027,9 +1083,8 @@ fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bo
         } else {
             gone_since = None;
         }
-        if !recorded && reached.is_some_and(|r| r.elapsed() >= Duration::from_secs(p.run.record_after)) {
-            recorded = true;
-            record(o, p);
+        if recording.is_none() && reached.is_some_and(|r| r.elapsed() >= Duration::from_secs(p.run.record_after)) {
+            recording = Some(record(o, p));
         }
         if reached.is_some_and(|r| r.elapsed() >= Duration::from_secs(p.run.seconds)) {
             break;
@@ -1038,6 +1093,10 @@ fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bo
             println!("  no {} within {} s", state_name(want), p.run.timeout);
             break;
         }
+    }
+    // The recording finishes while the game still runs (it is ended after the watch).
+    if let Some(Some(h)) = recording {
+        let _ = h.join();
     }
     samples
 }
@@ -1049,88 +1108,98 @@ fn video(o: &Options, p: &Prepared) -> PathBuf {
 
 /// The screen recorder, started before the game (`vw replay start`: GPU Screen Recorder keeping the last seconds in
 /// memory, so it has its video memory before the game takes it all) and stopped after it (`vw replay stop`, also
-/// after an error or Ctrl-C). The GPU encoder takes about 310 MiB; at 4K with Ray Reconstruction and the model after
-/// DLSS that is more than there is: started once the game was up it got no CUDA context (no recording), started
-/// before the game it left the model too little and Neural Forge's VRAM guard paused it. Such a run records with the
-/// CPU encoder (`recorder = "cpu"`, `VW_ENCODER=cpu`, about 20 MiB), which keeps fewer frames (about 115 of 150 a
-/// second at 1920x1080) and so is used only where the GPU encoder can't be.
-struct Recorder<'a>(Option<&'a Path>);
+/// after an error or Ctrl-C), with its files in `<out>/recorder` (`VW_DIR`). The GPU encoder takes about 310 MiB;
+/// at 4K with Ray Reconstruction and the model after DLSS that is more than there is: started once the game was up
+/// it got no CUDA context (no recording), started before the game it left the model too little and Neural Forge's
+/// VRAM guard paused it at once. Such a run records with the CPU encoder (`recorder = "cpu"`, `VW_ENCODER=cpu`,
+/// about 20 MiB), which keeps fewer frames (about 115 of 150 a second at 1920x1080) and so is used only there. It
+/// does not keep the model running by itself: at 4K with Ray Reconstruction on a 12 GB card the game's own memory
+/// grows during the benchmark and the VRAM guard can pause the model anyway (the run's `lost` column says so).
+struct Recorder {
+    vw: PathBuf,
+    dir: PathBuf,
+}
 
-impl<'a> Recorder<'a> {
-    fn start(o: &'a Options, cpu: bool) -> Self {
-        let Some(vw) = o.vw.as_deref() else { return Recorder(None) };
+impl Recorder {
+    /// `None` with `--no-record`; an error (the run is not made) when the recorder does not start.
+    fn start(o: &Options, cpu: bool) -> Result<Option<Recorder>, String> {
+        let Some(vw) = o.vw.clone() else { return Ok(None) };
+        let r = Recorder { vw, dir: recorder_dir(o) };
+        // One left running from an earlier run that was cut short.
+        r.vw(&["replay", "stop"]).status().ok();
+        if Command::new("pgrep").args(["-x", "gpu-screen-reco"]).stdout(Stdio::null()).status().is_ok_and(|s| s.success()) {
+            return Err("another GPU Screen Recorder is running (a second one fails); stop it first".into());
+        }
         let secs = (RECORD_SECONDS + 2).to_string();
-        match Command::new(vw)
-            .args(["replay", "start", &secs])
-            .env("VW_ENCODER", if cpu { "cpu" } else { "gpu" })
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(s) if s.success() => Recorder(Some(vw)),
-            Ok(s) => {
-                println!("  vw replay start failed ({s}; see {})", vw_log().display());
-                Recorder(None)
-            }
-            Err(e) => {
-                println!("  vw replay start: {e}");
-                Recorder(None)
-            }
+        match r.vw(&["replay", "start", &secs]).env("VW_ENCODER", if cpu { "cpu" } else { "gpu" }).status() {
+            Ok(s) if s.success() => Ok(Some(r)),
+            Ok(s) => Err(format!("the recorder did not start ({s}; see {})", r.dir.join("replay.log").display())),
+            Err(e) => Err(format!("vw replay start: {e}")),
         }
+    }
+
+    fn vw(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(&self.vw);
+        c.args(args).env("VW_DIR", &self.dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        c
     }
 }
 
-impl Drop for Recorder<'_> {
+impl Drop for Recorder {
     fn drop(&mut self) {
-        if let Some(vw) = self.0 {
-            let _ = Command::new(vw).args(["replay", "stop"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
-        }
+        let _ = self.vw(&["replay", "stop"]).status();
     }
 }
 
-/// Records the screen for the run ([`video`]): the next [`RECORD_SECONDS`], saved from the [`Recorder`]'s memory
-/// (`vw replay save`), with the recorder's log so far next to it.
-fn record(o: &Options, p: &Prepared) {
-    let Some(vw) = &o.vw else { return };
+/// Where the run's recorder keeps its buffer, pid and log (`VW_DIR`).
+fn recorder_dir(o: &Options) -> PathBuf {
+    o.out.join("recorder")
+}
+
+/// Records the screen for the run ([`video`]) on a thread, so the watch goes on sampling: the next
+/// [`RECORD_SECONDS`], saved from the [`Recorder`]'s memory (`vw replay save`), with the recorder's log so far next
+/// to it.
+fn record(o: &Options, p: &Prepared) -> Option<std::thread::JoinHandle<()>> {
+    let vw = o.vw.clone()?;
     let out = video(o, p);
-    let _ = std::fs::remove_file(&out);
-    nap(Duration::from_secs(RECORD_SECONDS));
-    // The recorder keeps more than it was asked for (up to twice): the last RECORD_SECONDS of what it saved, cut at a
-    // keyframe without re-encoding, is the recording.
-    let full = out.with_extension("full.mp4");
-    let _ = std::fs::remove_file(&full);
-    let saved = Command::new(vw).args(["replay", "save"]).arg(&full).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    let _ = std::fs::copy(vw_log(), out.with_extension("mp4.log"));
-    let saved = saved.and_then(|s| {
-        if !s.success() {
-            return Ok(s);
-        }
-        let cut = Command::new("ffmpeg")
-            .args(["-nostdin", "-v", "error", "-y", "-sseof"])
-            .arg(format!("-{RECORD_SECONDS}"))
-            .arg("-i")
-            .arg(&full)
-            .args(["-c", "copy"])
-            .arg(&out)
-            .stdin(Stdio::null())
-            .status();
+    let dir = recorder_dir(o);
+    let label = p.run.label.clone();
+    Some(std::thread::spawn(move || {
+        let _ = std::fs::remove_file(&out);
+        nap(Duration::from_secs(RECORD_SECONDS));
+        // The recorder keeps more than it was asked for (up to twice): the last RECORD_SECONDS of what it saved, cut
+        // at a keyframe without re-encoding, is the recording.
+        let full = out.with_extension("full.mp4");
         let _ = std::fs::remove_file(&full);
-        cut
-    });
-    match saved {
-        Ok(s) if s.success() && out.is_file() => println!("  {}: recorded {} s ({})", p.run.label, RECORD_SECONDS, out.display()),
-        Ok(s) => println!("  {}: vw replay save failed ({s}; see {})", p.run.label, out.with_extension("mp4.log").display()),
-        Err(e) => println!("  {}: vw replay save: {e}", p.run.label),
-    }
-}
-
-/// The recorder's log (`vw replay`'s, in `$VW_DIR`, default ~/scratch/vw).
-fn vw_log() -> PathBuf {
-    std::env::var_os("VW_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("scratch/vw"))
-        .join("replay.log")
+        let quiet = |c: &mut Command| {
+            c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        };
+        let mut save = Command::new(&vw);
+        save.args(["replay", "save"]).arg(&full).env("VW_DIR", &dir);
+        quiet(&mut save);
+        let saved = save.status();
+        let log = out.with_extension("mp4.log");
+        let _ = std::fs::copy(dir.join("replay.log"), &log);
+        let saved = saved.and_then(|s| {
+            if !s.success() {
+                return Ok(s);
+            }
+            let mut cut = Command::new("ffmpeg");
+            cut.args(["-nostdin", "-v", "error", "-y", "-sseof"]).arg(format!("-{RECORD_SECONDS}")).arg("-i").arg(&full).args(["-c", "copy"]).arg(&out);
+            quiet(&mut cut);
+            let cut = cut.status();
+            // The whole buffer stays when the cut fails, to be looked at.
+            if cut.as_ref().is_ok_and(|c| c.success()) {
+                let _ = std::fs::remove_file(&full);
+            }
+            cut
+        });
+        match saved {
+            Ok(s) if s.success() && out.is_file() => println!("  {label}: recorded {RECORD_SECONDS} s ({})", out.display()),
+            Ok(s) => println!("  {label}: the recording failed ({s}; see {} and {})", log.display(), full.display()),
+            Err(e) => println!("  {label}: the recording failed: {e}"),
+        }
+    }))
 }
 
 /// The run's picture: `vw analyze` over its recording, and the flags it raised (a colour flash, frames alternating
@@ -1194,7 +1263,7 @@ mod tests {
     use super::*;
 
     fn sample(secs: u64, state: u32, holds: u64, misses: u64, hdr: &str) -> Sample {
-        Sample { secs, layer_frames: secs * 60, state, reason: String::new(), misses, holds, device_lost: 0, hdr: hdr.into() }
+        Sample { secs, layer_frames: secs * 60, state, reason: String::new(), misses, holds, device_lost: 0, hdr: hdr.into(), ngx_matched: secs * 20 }
     }
 
     #[test]
@@ -1202,25 +1271,26 @@ mod tests {
         let config = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/game-sweep.toml")).unwrap();
         let runs = parse_config(&config).unwrap();
         assert!(runs.iter().any(|r| r.appid == 1091500 && r.hdr), "Cyberpunk with HDR");
-        assert!(runs.iter().any(|r| r.appid == 3240220 && r.route == Route::Steam && r.args.contains("-benchmark")), "GTA's benchmark, started by Steam");
+        let gta = runs.iter().find(|r| r.appid == 3240220).expect("GTA's benchmark");
+        assert!(gta.args.contains("-benchmark") && gta.frame_generation, "GTA's benchmark with frame generation");
+        assert!(gta.edits.iter().any(|(k, v)| k == "FrameLimit" && v == "120"), "frame generation needs GTA's frame limit (docs/LESSONS.md)");
     }
 
     #[test]
     fn config_mistakes_are_refused() {
-        let ok = "[[run]]\nlabel = \"cp\"\nappid = 1091500\nroute = \"steam\"\n";
+        let ok = "[[run]]\nlabel = \"cp\"\nappid = 1091500\n";
         assert_eq!(parse_config(ok).unwrap()[0].seconds, 90);
         assert!(parse_config(&format!("{ok}hdr = 1\n")).unwrap_err().contains("hdr"));
         assert!(parse_config(&ok.replace("1091500", "42")).unwrap_err().contains("not in data/games.toml"));
         assert!(parse_config(&format!("{ok}{ok}")).unwrap_err().contains("used twice"));
-        assert!(parse_config(&ok.replace("\"steam\"", "\"walk\"")).unwrap_err().contains("route"));
+        assert!(parse_config(&format!("{ok}route = \"gta-bench\"\n")).unwrap_err().contains("unknown key route"), "every game is started by Steam");
+        assert!(parse_config(&format!("{ok}frame_generation = true\n")).unwrap()[0].frame_generation);
         assert!(parse_config(&format!("{ok}edits = [\"A=1\"]\n")).unwrap_err().contains("go together"));
         assert_eq!(parse_config(&format!("{ok}record_after = 80\n")).unwrap()[0].record_after, 80);
         assert!(parse_config(&format!("{ok}recorder = \"cpu\"\n")).unwrap()[0].cpu_recorder);
         assert!(!parse_config(ok).unwrap()[0].cpu_recorder);
         assert!(parse_config(&format!("{ok}recorder = \"nvenc\"\n")).unwrap_err().contains("recorder"));
         assert!(parse_config(&format!("{ok}record_after = 85\n")).unwrap_err().contains("must fit"), "the recording ends after the run");
-        let gta = "[[run]]\nlabel = \"gta\"\nappid = 3240220\nroute = \"gta-bench\"\n";
-        assert!(parse_config(gta).unwrap_err().contains("started by Steam"), "no route launches a game around Steam");
     }
 
     #[test]
@@ -1250,13 +1320,15 @@ mod tests {
         use preupscale_state::*;
         let hdr10 = "game outputs HDR10 (swapchain ...)";
         let good = [sample(5, WAITING, 0, 0, ""), sample(10, HOLDING, 5, 0, hdr10), sample(60, HOLDING, 900, 0, hdr10)];
-        let o = evaluate(Placement::BeforeInside, HdrExpect::Hdr10, &good, "fine\n", "");
+        let o = evaluate(Placement::BeforeInside, HdrExpect::Hdr10, false, &good, "fine\n", "");
         assert!(o.failures.is_empty(), "{:?}", o.failures);
+        assert_eq!((o.lost.as_str(), o.fg.as_str()), ("0", "x3.0"));
         assert_eq!((o.reached.as_str(), o.holds.as_str(), o.hdr.as_str(), o.faults.as_str()), ("before after 10 s", "900 (+895)", "HDR10", "none"));
         // SDR where HDR10 was expected; a miss; a panic; an Xid.
         let o = evaluate(
             Placement::BeforeInside,
             HdrExpect::Hdr10,
+            false,
             &good.map(|mut s| {
                 s.hdr = "game asked for SDR although HDR metadata was sent: ...".into();
                 s.misses = 2;
@@ -1269,11 +1341,63 @@ mod tests {
         assert_eq!(o.faults, "panic, Xid");
         // Never reached, or refused at the end.
         let refused = [sample(10, IDENTIFIED, 0, 0, "game outputs SDR (x)")];
-        let o = evaluate(Placement::Before, HdrExpect::Sdr, &refused, "", "");
+        let o = evaluate(Placement::Before, HdrExpect::Sdr, false, &refused, "", "");
         assert!(o.failures[0].starts_with("expected before the upscaler"), "{:?}", o.failures);
-        let left = [sample(10, HOLDING, 5, 0, "game outputs SDR (x)"), sample(20, IDENTIFIED, 5, 0, "game outputs SDR (x)")];
-        assert!(evaluate(Placement::Before, HdrExpect::Sdr, &left, "", "").failures.iter().any(|f| f.starts_with("left the placement")));
-        assert!(evaluate(Placement::Before, HdrExpect::Sdr, &[], "", "").failures[0].starts_with("no status"));
+        assert!(evaluate(Placement::Before, HdrExpect::Sdr, false, &[], "", "").failures[0].starts_with("no status"));
+    }
+
+    /// Reached, then lost (the VRAM guard pausing the model, as Cyberpunk 2077 with Ray Reconstruction at 4K did):
+    /// the run fails even though it was reached and nothing missed; the game's own pauses and one stray sample don't.
+    #[test]
+    fn a_placement_lost_after_reaching_it_fails() {
+        use preupscale_state::*;
+        let sdr = "game outputs SDR (x)";
+        let mut paused_by_guard = vec![sample(40, HOLDING_AFTER, 58, 0, sdr), sample(66, HOLDING_AFTER, 507, 0, sdr)];
+        for t in [71, 76, 81, 86] {
+            let mut s = sample(t, if t == 76 { WAITING } else { IDENTIFIED }, 510, 0, sdr);
+            s.reason = "the network is paused: too little video memory for it (VRAM guard); it resumes once there is room".into();
+            paused_by_guard.push(s);
+        }
+        let o = evaluate(Placement::AfterDlss, HdrExpect::Sdr, false, &paused_by_guard, "", "");
+        assert_eq!(o.lost, "4");
+        assert!(
+            o.failures.iter().any(|f| f.contains("lost the placement in 4 samples") && f.contains("from 71 s") && f.contains("VRAM guard")),
+            "{:?}",
+            o.failures
+        );
+        // GTA's loading screens between benchmark passes (the game's pause) and one stray sample pass.
+        let gta = [
+            sample(100, HOLDING, 32, 0, sdr),
+            sample(105, PAUSED, 67, 0, sdr),
+            sample(110, HOLDING, 184, 0, sdr),
+            sample(115, IDENTIFIED, 184, 0, sdr),
+            sample(120, HOLDING, 300, 0, sdr),
+        ];
+        let o = evaluate(Placement::Before, HdrExpect::Sdr, false, &gta, "", "");
+        assert!(o.failures.is_empty(), "{:?}", o.failures);
+        assert_eq!(o.lost, "1");
+    }
+
+    /// Frame generation from the layer's presents per DLSS evaluate while holding.
+    #[test]
+    fn frame_generation_is_measured_and_checked() {
+        use preupscale_state::*;
+        let sdr = "game outputs SDR (x)";
+        let at =
+            |secs: u64, state: u32, frames: u64, evaluates: u64| Sample { layer_frames: frames, ngx_matched: evaluates, ..sample(secs, state, 10, 0, sdr) };
+        // GTA with frame generation off: 50 presents and 50 evaluates a second.
+        let off = [at(100, HOLDING, 0, 0), at(105, HOLDING, 250, 250), at(110, HOLDING, 500, 500)];
+        let o = evaluate(Placement::Before, HdrExpect::Sdr, true, &off, "", "");
+        assert_eq!(o.fg, "x1.0");
+        assert!(o.failures.iter().any(|f| f.starts_with("frame generation is off")), "{:?}", o.failures);
+        assert!(evaluate(Placement::Before, HdrExpect::Sdr, false, &off, "", "").failures.is_empty(), "not expected, not checked");
+        // On (x4); a loading screen between (paused, presents with no evaluate) does not count.
+        let on = [at(100, HOLDING, 0, 0), at(105, HOLDING, 800, 200), at(110, PAUSED, 2000, 200), at(115, HOLDING, 2800, 400), at(120, HOLDING, 3600, 600)];
+        let o = evaluate(Placement::Before, HdrExpect::Sdr, true, &on, "", "");
+        assert!(o.failures.is_empty(), "{:?}", o.failures);
+        assert_eq!(o.fg, "x4.0");
+        // Never measured (no evaluate while holding): expected, so it fails.
+        assert!(evaluate(Placement::Before, HdrExpect::Sdr, true, &[at(5, HOLDING, 10, 0)], "", "").failures.iter().any(|f| f.contains("not measured")));
     }
 
     #[test]
@@ -1289,6 +1413,19 @@ mod tests {
         assert_eq!(
             sweep_options("", &exe, log, false, ""),
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' %command%"
+        );
+        // Three or more of the sweep's own variables in the game's options (dropped and set again): no slicing past
+        // the end, and the run's arguments go after %command%.
+        let many = "NEURAL_FORGE_LOG=/a NEURAL_FORGE_LOG_TIME=1 PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 %command%";
+        assert_eq!(
+            sweep_options(many, &exe, log, false, "-benchmark"),
+            "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' %command% -benchmark"
+        );
+        // A switch and its value are one unit: `1` is kept although another `1` is there already.
+        let gta = vec!["PlayGTAV.exe".to_string()];
+        assert_eq!(
+            sweep_options("%command% -foo 1", &gta, log, false, "-benchmark -benchmarkIterations 1 -benchmarkFrameTimes"),
+            "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' %command% -foo 1 -benchmark -benchmarkIterations 1 -benchmarkFrameTimes"
         );
     }
 

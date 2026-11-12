@@ -31,8 +31,8 @@ dlss = "Super Resolution, Frame Generation 4x"
 placement = "before"
 hdr = "none"
 notes = []
-verified = "4.1.1"
-verified_on = "2026-11-12"
+verified = "3.14.0"
+verified_on = "2026-11-10"
 verified_by = "test machine"
 
 [[game]]
@@ -169,8 +169,8 @@ placement_rr = "after-dlss"
 hdr = "hdr10"
 hdr_route = "The game's HDR setting (HDR10 PQ), with PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 (Proton-GE) or in gamescope with HDR on."
 notes = ["Its built-in benchmark (launch options: %command% --launcher-skip -skipStartScreen -benchmark) runs unattended."]
-verified = "4.1.1"
-verified_on = "2026-11-12"
+verified = "3.14.0"
+verified_on = "2026-11-10"
 verified_by = "test machine"
 
 [[game]]
