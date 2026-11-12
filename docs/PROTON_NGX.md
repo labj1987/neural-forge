@@ -87,9 +87,12 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   snippets `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `nvngx_dlssd.dll`, `nvngx_dlssnr.dll`, ...), whatever path each was
   loaded from, and reads each file's `VS_FIXEDFILEINFO` version through `version.dll` (loaded when needed, not
   imported). It logs them when the text log is on and, in a game the layer is on in, writes
-  `$XDG_STATE_HOME/neural-forge/ngx-modules/<exe>.txt` (the format is in `modules.rs`; a run replaces the file, and it
-  is rewritten only when the set of paths changes). `doctor` and the report (`ngx_versions.rs`) show that record with
-  how long ago it was written, and the NGX DLLs present in each switched-on game's folder, its prefix's
+  `$XDG_STATE_HOME/neural-forge/ngx-modules/<app id>-<exe>.txt` (the format is in `modules.rs`; a run replaces the
+  file, and it is rewritten only when the set of paths changes). `<app id>` is Steam's `SteamAppId` (else
+  `SteamGameId`), else `x` and a hash of the executable's path, so games whose executables share a name keep apart.
+  Wine does not pass `HOME` into the game's Windows environment (it gives `WINEHOMEDIR`, `\??\Z:\home\<user>`), so
+  without `XDG_STATE_HOME` the wrapper takes the home from there, the same directory the supervisor uses. `doctor`
+  and the report (`ngx_versions.rs`) show that record with how long ago it was written, and the NGX DLLs present in each switched-on game's folder, its prefix's
   `ProgramData/NVIDIA/NGX` and `system32`, and the driver's core, with their versions read from the PE resources on
   the Linux side (`model::dll_file_version`: headers and resource section only). The record is for a bug report's
   sake: nothing reads it to decide anything.
