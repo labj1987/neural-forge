@@ -67,40 +67,51 @@ impl std::fmt::Display for PciAddress {
 }
 
 impl PciAddress {
-    /// `0000:01:00.0` or `01:00.0` (the domain 0).
+    /// `0000:01:00.0` or `01:00.0` (the domain 0): hexadecimal, at most 4 digits for the domain, 2 for the bus and
+    /// the device (at most 0x1f) and 1 for the function (at most 7).
     fn parse(s: &str) -> Option<Self> {
         let (rest, function) = s.rsplit_once('.')?;
         let parts: Vec<&str> = rest.split(':').collect();
         let (domain, bus, device) = match parts.as_slice() {
-            [d, b, v] => (*d, *b, *v),
-            [b, v] => ("0", *b, *v),
+            [d, b, v] => (Some(*d), *b, *v),
+            [b, v] => (None, *b, *v),
             _ => return None,
         };
-        let hex = |t: &str| u32::from_str_radix(t, 16).ok();
-        Some(Self { domain: hex(domain)?, bus: hex(bus)?, device: hex(device)?, function: hex(function)? })
+        let domain = match domain {
+            Some(d) => hex(d, 4)?,
+            None => 0,
+        };
+        let (bus, device, function) = (hex(bus, 2)?, hex(device, 2)?, hex(function, 1)?);
+        (device <= 0x1f && function <= 7).then_some(Self { domain, bus, device, function })
     }
 }
 
+/// A hexadecimal number of 1 to `digits` digits, nothing else (no sign, no `0x`).
+fn hex(t: &str, digits: usize) -> Option<u32> {
+    (!t.is_empty() && t.len() <= digits && t.bytes().all(|b| b.is_ascii_hexdigit())).then(|| u32::from_str_radix(t, 16).ok()).flatten()
+}
+
 impl Choice {
-    /// The variable's value: `off` (or nothing), `same`, an index, or `vendor:device[@pci-address]`.
+    /// The variable's value: `off` (or nothing), `same`, an index (decimal digits), or `vendor:device[@pci-address]`
+    /// (each ID 4 hexadecimal digits).
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         let v = value.trim().to_ascii_lowercase();
-        if v.is_empty() || v == "off" || v == "0x0" {
+        if v.is_empty() || v == "off" {
             return Ok(Self::Off);
         }
         if v == "same" {
             return Ok(Self::Same);
         }
-        if let Ok(i) = v.parse::<u32>() {
-            return Ok(Self::Index(i));
+        if v.bytes().all(|b| b.is_ascii_digit()) {
+            return v.parse::<u32>().map(Self::Index).map_err(|_| format!("{value:?}: the index is too large"));
         }
         let (ids, bus) = match v.split_once('@') {
             Some((ids, bus)) => (ids, Some(PciAddress::parse(bus).ok_or_else(|| format!("{bus:?} is no PCI address (0000:01:00.0)"))?)),
             None => (v.as_str(), None),
         };
         let (vendor, device) = ids.split_once(':').ok_or_else(|| format!("{value:?} is not off, same, an index or vendor:device[@pci-address]"))?;
-        let hex = |t: &str| u32::from_str_radix(t.trim_start_matches("0x"), 16).map_err(|_| format!("{t:?} is not a hexadecimal PCI ID"));
-        Ok(Self::Pci { vendor: hex(vendor)?, device: hex(device)?, bus })
+        let id = |t: &str| hex(t, 4).ok_or_else(|| format!("{t:?} is not a PCI ID (4 hexadecimal digits, as 10de)"));
+        Ok(Self::Pci { vendor: id(vendor)?, device: id(device)?, bus })
     }
 
     /// `NEURAL_FORGE_OFFLOAD_GPU`, read once; a value that does not parse is logged and means [`Self::Off`].
@@ -528,9 +539,10 @@ pub(crate) struct Standin {
 struct StandinBuffers {
     bytes: u64,
     middle: (vk::Buffer, vk::DeviceMemory),
-    /// The proxy and answer regions imported, or `None` (staged through `staging`).
-    imported: Option<[(vk::Buffer, vk::DeviceMemory); 2]>,
-    staging: Option<(super::HostBuffer, super::HostBuffer)>,
+    /// The proxy and answer regions, imported where the device allows (`super::region_buffer`), else buffers of their
+    /// own that the frame is staged through (`staged`).
+    proxy: super::HostBuffer,
+    answer: super::HostBuffer,
 }
 
 impl Standin {
@@ -554,8 +566,13 @@ impl Standin {
                 device.destroy_command_pool(pool, None);
                 return None;
             };
-            let queries =
-                device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(3), None).unwrap_or_default();
+            // Timed only where the queue family writes timestamps (`timestampValidBits` 0: none).
+            let timed = instance.get_physical_device_queue_family_properties(physical).get(queue_family as usize).is_some_and(|f| f.timestamp_valid_bits > 0);
+            let queries = if timed {
+                device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(3), None).unwrap_or_default()
+            } else {
+                vk::QueryPool::null()
+            };
             let period_ns = instance.get_physical_device_properties(physical).limits.timestamp_period;
             Some(Self { pool, cmd: cmds[0], fence, queries, period_ns, sized: None })
         }
@@ -589,15 +606,11 @@ impl Standin {
             self.sized = unsafe { Self::buffers(device, instance, physical, import, proxy, answer, capacity, bytes) };
         }
         let s = self.sized.as_ref()?;
-        let (src, dst) = match (&s.imported, &s.staging) {
-            (Some([p, a]), _) => (p.0, a.0),
-            (None, Some((up, down))) => {
-                // SAFETY: host-coherent and mapped with room for `bytes`; the region holds the frame.
-                unsafe { std::ptr::copy_nonoverlapping(proxy, up.ptr, bytes as usize) };
-                (up.buffer, down.buffer)
-            }
-            _ => return None,
-        };
+        if s.proxy.staged {
+            // SAFETY: host-coherent and mapped with room for `bytes`; the region holds the frame.
+            unsafe { std::ptr::copy_nonoverlapping(proxy, s.proxy.ptr, bytes as usize) };
+        }
+        let (src, dst) = (s.proxy.buffer, s.answer.buffer);
         let region = [vk::BufferCopy::default().size(bytes)];
         let barrier = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
         let host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -655,9 +668,9 @@ impl Standin {
             *stalled = true;
             return None;
         }
-        if let (None, Some((_, down))) = (&s.imported, &s.staging) {
+        if s.answer.staged {
             // SAFETY: the copy into it completed; both hold `bytes`.
-            unsafe { std::ptr::copy_nonoverlapping(down.ptr, answer, bytes as usize) };
+            unsafe { std::ptr::copy_nonoverlapping(s.answer.ptr, answer, bytes as usize) };
         }
         let mut stamps = [0u64; 3];
         // SAFETY: the three queries were written by the completed buffer.
@@ -704,49 +717,29 @@ impl Standin {
             }
             (buffer, memory)
         };
-        // The regions imported whole (`capacity`, the mapping's size, which the import's alignment rules are met by).
-        let imported = import.then(|| {
-            // SAFETY: the regions are mapped for the process's life with `capacity` bytes each.
-            let p = unsafe { crate::capture::import_host_buffer(device, instance, physical, proxy, capacity as u64, vk::BufferUsageFlags::empty()) }?;
-            match unsafe { crate::capture::import_host_buffer(device, instance, physical, answer, capacity as u64, vk::BufferUsageFlags::empty()) } {
-                Some(a) => Some([p, a]),
-                None => {
-                    // SAFETY: unused.
-                    unsafe {
-                        device.destroy_buffer(p.0, None);
-                        device.free_memory(p.1, None);
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        // SAFETY: the regions are mapped for the process's life with `capacity` bytes each (the contract).
+        let proxy_buffer = unsafe { super::region_buffer(device, instance, physical, import, proxy, capacity, bytes, usage) };
+        let answer_buffer = unsafe { super::region_buffer(device, instance, physical, import, answer, capacity, bytes, usage) };
+        let (proxy_buffer, answer_buffer) = match (proxy_buffer, answer_buffer) {
+            (Some(p), Some(a)) => (p, a),
+            (p, a) => {
+                // SAFETY: none of it was used.
+                unsafe {
+                    for b in [p, a].into_iter().flatten() {
+                        b.destroy(device);
                     }
-                    None
+                    device.destroy_buffer(middle.0, None);
+                    device.free_memory(middle.1, None);
                 }
+                return None;
             }
-        });
-        let imported = imported.flatten();
-        let staging = if imported.is_none() {
-            let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-            let up = super::own_host_buffer_with(device, instance, physical, bytes, usage);
-            let down = super::own_host_buffer_with(device, instance, physical, bytes, usage);
-            match (up, down) {
-                (Some(u), Some(d)) => Some((u, d)),
-                (u, d) => {
-                    // SAFETY: unused.
-                    unsafe {
-                        for b in [u, d].into_iter().flatten() {
-                            b.destroy(device);
-                        }
-                        device.destroy_buffer(middle.0, None);
-                        device.free_memory(middle.1, None);
-                    }
-                    return None;
-                }
-            }
-        } else {
-            None
         };
         crate::log!(
             "[offload] stand-in copy for {bytes} bytes: {}",
-            if imported.is_some() { "the shared regions imported as host memory" } else { "staged through host-visible buffers" }
+            if proxy_buffer.staged || answer_buffer.staged { "staged through host-visible buffers" } else { "the shared regions imported as host memory" }
         );
-        Some(StandinBuffers { bytes, middle, imported, staging })
+        Some(StandinBuffers { bytes, middle, proxy: proxy_buffer, answer: answer_buffer })
     }
 
     /// # Safety
@@ -757,14 +750,8 @@ impl Standin {
             unsafe {
                 device.destroy_buffer(s.middle.0, None);
                 device.free_memory(s.middle.1, None);
-                for (b, m) in s.imported.into_iter().flatten() {
-                    device.destroy_buffer(b, None);
-                    device.free_memory(m, None);
-                }
-                if let Some((u, d)) = s.staging {
-                    u.destroy(device);
-                    d.destroy(device);
-                }
+                s.proxy.destroy(device);
+                s.answer.destroy(device);
             }
         }
     }
@@ -822,6 +809,16 @@ mod tests {
         assert_eq!(Choice::parse("10DE:2C05@0000:73:00.0"), Ok(Choice::Pci { vendor: 0x10de, device: 0x2c05, bus: Some(bus) }));
         assert_eq!(Choice::parse("10de:2c05@73:00.0"), Ok(Choice::Pci { vendor: 0x10de, device: 0x2c05, bus: Some(bus) }));
         assert!(Choice::parse("nvidia").is_err());
+        assert_eq!(Choice::parse("0"), Ok(Choice::Index(0)));
+        assert!(Choice::parse("0x0").is_err(), "no hexadecimal index");
+        assert!(Choice::parse("+1").is_err());
+        assert!(Choice::parse("-1").is_err());
+        assert!(Choice::parse("0x10de:2c05").is_err(), "IDs without 0x");
+        assert!(Choice::parse("10de0:2c05").is_err(), "IDs of 4 digits at most");
+        assert!(Choice::parse("10de:2c05@0000:73:20.0").is_err(), "a device number above 0x1f");
+        assert!(Choice::parse("10de:2c05@0000:73:00.8").is_err(), "a function above 7");
+        assert!(Choice::parse("10de:2c05@00000:73:00.0").is_err(), "a domain of 5 digits");
+        assert!(Choice::parse("10de:2c05@+7:00.0").is_err());
         assert!(Choice::parse("10de:zz").is_err());
         assert!(Choice::parse("10de:2c05@73").is_err());
         assert_eq!(bus.to_string(), "0000:73:00.0");
