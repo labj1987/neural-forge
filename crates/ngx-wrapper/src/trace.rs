@@ -23,8 +23,9 @@ pub const FILE_BYTES: usize = 64 << 20;
 pub const HEADER_BYTES: usize = 128;
 /// The ring of lines after the header.
 pub const DATA_BYTES: usize = FILE_BYTES - HEADER_BYTES;
-/// The longest line kept (a longer one is cut, its newline kept).
-pub const LINE_BYTES: usize = 384;
+/// The longest line kept (a longer one is cut, its newline kept): room for the longest evaluate line the text log
+/// writes (about 1.2 KB, `rules::tests::the_longest_eval_line_fits_a_trace_line`). On the stack of the calling thread.
+pub const LINE_BYTES: usize = 2048;
 
 /// A path variable's value as a Windows path: a Unix path (`/home/...`) through Wine's `Z:` drive (Z: is the Unix
 /// root in every prefix Wine and Proton make), anything else as given. Quotes Steam's launch options may leave
@@ -38,9 +39,13 @@ pub fn windows_path(value: &str) -> Option<String> {
 }
 
 /// `{pid}` in the path replaced by the game's Linux pid; without `{pid}`, `-<pid>` is put before the file's extension
-/// (or at its end), so a launcher and its game, or two runs, never write the same file.
+/// (or at its end), so a launcher and its game, or two runs, never write the same file. A path that ends in a
+/// separator names a folder: the file in it is `ngx-trace-<pid>.txt`.
 pub fn with_pid(path: &str, pid: Option<u32>) -> String {
     let pid = pid.unwrap_or(0).to_string();
+    if path.ends_with(['\\', '/']) {
+        return format!("{path}ngx-trace-{pid}.txt");
+    }
     if path.contains("{pid}") {
         return path.replace("{pid}", &pid);
     }
@@ -181,6 +186,8 @@ mod tests {
         assert_eq!(with_pid(r"Z:\tmp.d\trace", Some(42)), r"Z:\tmp.d\trace-42", "a dot in a folder is no extension");
         assert_eq!(with_pid(r"Z:\tmp\.trace", Some(7)), r"Z:\tmp\.trace-7");
         assert_eq!(with_pid("{pid}", None), "0");
+        assert_eq!(with_pid(r"Z:\home\u\", Some(9)), r"Z:\home\u\ngx-trace-9.txt", "a folder: the default name in it");
+        assert_eq!(with_pid("Z:/tmp/", Some(9)), "Z:/tmp/ngx-trace-9.txt");
     }
 
     /// The traced paths allocate nothing (a heap lock at process exit could hang it): counted per thread.
@@ -250,7 +257,7 @@ mod tests {
         let l = Line::new(1234.5678, 77, format_args!("> NVSDK_NGX_VULKAN_Init(0x{:x})", 0x1234));
         let s = std::str::from_utf8(l.bytes()).unwrap();
         assert_eq!(s, "     1234.568 tid=77     > NVSDK_NGX_VULKAN_Init(0x1234)\n");
-        let long = "x".repeat(1000);
+        let long = "x".repeat(5000);
         let l = Line::new(0.0, 1, format_args!("{long}"));
         assert_eq!(l.bytes().len(), LINE_BYTES);
         assert_eq!(*l.bytes().last().unwrap(), b'\n', "a cut line keeps its newline");
