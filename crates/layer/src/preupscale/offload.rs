@@ -199,7 +199,23 @@ pub(crate) fn status_line() -> Option<String> {
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn active() -> bool {
+    #[cfg(test)]
+    return TEST_ACTIVE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
     ACTIVE.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: offloaded on this thread only ([`set_active_for_test`]), so the tests that present in parallel never see
+    /// another test's offload.
+    static TEST_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: the present on this thread behaves as offloaded (`on`).
+#[cfg(test)]
+pub(crate) fn set_active_for_test(on: bool) {
+    TEST_ACTIVE.with(|a| a.set(on));
 }
 
 pub(crate) fn set_active(on: bool) {

@@ -5235,14 +5235,14 @@ mod tests {
     impl Offloaded<'_> {
         fn on() -> Self {
             let guard = TEST_MODE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::preupscale::offload::set_active(true);
+            crate::preupscale::offload::set_active_for_test(true);
             Self(guard)
         }
     }
 
     impl Drop for Offloaded<'_> {
         fn drop(&mut self) {
-            crate::preupscale::offload::set_active(false);
+            crate::preupscale::offload::set_active_for_test(false);
         }
     }
 
