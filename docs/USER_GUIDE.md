@@ -437,12 +437,15 @@ game's GPU no longer spends its frame time on the network:
 3. Add `NEURAL_FORGE_OFFLOAD_GPU=1` (that GPU's index) or its PCI IDs (`NEURAL_FORGE_OFFLOAD_GPU=10de:2c02`) to the
    game's launch options.
 
-The second GPU needs everything the network needs (an NVIDIA RTX 40 series or newer). Each frame goes to it and back
+The second GPU needs everything the network needs (an NVIDIA RTX 40 series or newer), and so does the game's GPU: the
+model goes back to it when the second GPU is given up (the log says so at start where the game's GPU cannot run the
+network). The Model interval setting is ignored while the second GPU runs the model (every frame gets its own answer).
+Each frame goes to it and back
 through system memory and is shown one frame later than on one GPU: the game's GPU renders the next frame while the
 second GPU works on this one. The frame rate is then bounded by the second GPU's time per frame (the network and the
 copies): a second GPU that takes longer per frame than the game holds the game back to its own rate. Where a frame
-comes back too late for its turn it is shown without the model's edit. When the delay starts (the first frames, and
-again after the game stalled for a quarter of a second) one frame is shown twice.
+comes back too late for its turn, or that could not be captured, is shown without the model's edit. When the delay
+starts (the first frames, and again after the game stalled for a quarter of a second) one frame is shown twice.
 
 The model goes back to the game's GPU for the rest of the session, and the log says why, when the second GPU:
 
@@ -450,10 +453,10 @@ The model goes back to the game's GPU for the rest of the session, and the log s
 - cannot build or keep the network (it has not run there for 30 seconds while frames came, for example paused by the
   VRAM guard);
 - takes more than a second for a frame (after the first frames of a build);
-- answers more than 30 of the last 120 frames later than three frame intervals of the game (too slow for its frame
-  rate);
+- is far too slow for the game: more than 30 of its last 120 frames came back later than both three of the game's frame
+  intervals and 100 ms, or 5 frames in a row got no answer within a quarter of a second;
 - does not finish a frame (or its device is lost): the model goes back only once that frame is done; if it never is,
-  the model stays off for the session.
+  the model stays off until the game restarts (the Status tab says the second GPU stalled).
 
 The Status tab's Model placement line and `doctor` say which GPU runs the model, or why it went back. Every 600
 frames the log has an `[offload]` line with the time per frame on the second GPU, the time from sending a frame to
