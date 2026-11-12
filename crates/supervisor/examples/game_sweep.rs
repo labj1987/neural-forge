@@ -90,11 +90,14 @@ struct Run {
     /// Relative to the game's Proton user folder (`compatdata/<appid>/pfx/drive_c/users/steamuser`).
     edit_file: Option<String>,
     edits: Vec<(String, String)>,
+    /// More variables for the game's launch options (`env = ["NAME=VALUE"]`): a run of a setting that only a
+    /// variable switches.
+    env: Vec<String>,
 }
 
 impl Run {
     fn from_table(t: &BTreeMap<String, Value>) -> Result<Run, String> {
-        const KEYS: [&str; 13] = [
+        const KEYS: [&str; 14] = [
             "label",
             "appid",
             "args",
@@ -108,6 +111,7 @@ impl Run {
             "edit_kind",
             "edit_file",
             "edits",
+            "env",
         ];
         if let Some(k) = t.keys().find(|k| !KEYS.contains(&k.as_str())) {
             return Err(format!("unknown key {k}"));
@@ -147,6 +151,19 @@ impl Run {
                 .collect::<Result<_, _>>()?,
             Some(_) => return Err("edits must be an array".into()),
         };
+        let env = match t.get("env") {
+            None => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .filter(|s| s.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')))
+                        .map(str::to_string)
+                        .ok_or("env entries are NAME=VALUE strings")
+                })
+                .collect::<Result<_, _>>()?,
+            Some(_) => return Err("env must be an array".into()),
+        };
         let run = Run {
             label,
             appid,
@@ -165,6 +182,7 @@ impl Run {
             edit_kind,
             edit_file: text("edit_file"),
             edits,
+            env,
         };
         if run.record_after + RECORD_SECONDS > run.seconds {
             return Err(format!("record_after + {RECORD_SECONDS} s of recording must fit in seconds ({})", run.seconds));
@@ -451,7 +469,7 @@ fn short_state(state: u32) -> &'static str {
 /// The launch options a run starts the game with: the game's own, without Neural Forge's log variables (which the
 /// sweep sets), with Neural Forge on for the game's executables, the run's log file, Proton's HDR switches and the
 /// run's arguments after `%command%`.
-fn sweep_options(existing: &str, exe: &[String], log: &Path, hdr: bool, args: &str) -> String {
+fn sweep_options(existing: &str, exe: &[String], log: &Path, hdr: bool, env: &[String], args: &str) -> String {
     let base = launch_options::merge(existing, &exe.join(","));
     let tokens = launch_options::split_tokens(&base);
     let cmd = tokens.iter().position(|t| t == "%command%").unwrap_or(tokens.len());
@@ -466,6 +484,12 @@ fn sweep_options(existing: &str, exe: &[String], log: &Path, hdr: bool, args: &s
     if hdr {
         out.push("PROTON_ENABLE_WAYLAND=1".into());
         out.push("PROTON_ENABLE_HDR=1".into());
+    }
+    // The run's own variables last: they win over the game's own of the same name.
+    for kv in env {
+        let name = kv.split_once('=').map_or(kv.as_str(), |(k, _)| k);
+        out.retain(|t| t.split_once('=').is_none_or(|(k, _)| k != name));
+        out.push(kv.clone());
     }
     out.extend(tokens[cmd..].iter().cloned());
     if tokens.len() == cmd {
@@ -887,7 +911,7 @@ fn sweep(o: &Options) -> Result<bool, String> {
             let current =
                 steam::launch_options(&p.game.root.path, &p.run.appid.to_string()).into_iter().find(|a| a.has_app).and_then(|a| a.options).unwrap_or_default();
             println!("{} ({}):", p.run.label, p.facts.name);
-            println!("  launch options: {}", sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.args));
+            println!("  launch options: {}", sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.env, &p.run.args));
             if let (Some(file), Some(kind)) = (&p.run.edit_file, p.run.edit_kind) {
                 let path = user_dir(p).join(file);
                 let check = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| apply_edits(kind, &t, &p.run.edits).map(|_| "applies"));
@@ -1090,7 +1114,7 @@ fn write_launch_options(localconfigs: &[(PathBuf, Vec<u8>)], p: &Prepared) -> Re
             found.clone()
         } else {
             let current = tree.string_at(&path).unwrap_or_default().to_string();
-            let options = sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.args);
+            let options = sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.env, &p.run.args);
             let (new, _) = vdf::set_string(found, &path, &options).map_err(|e| format!("{}: {e}", file.display()))?;
             if !vdf::verify_edit(found, &new, &path, &options) {
                 return Err(format!("{}: the edit did not verify", file.display()));
@@ -1539,30 +1563,35 @@ mod tests {
         let found =
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG=/x/cp.log NEURAL_FORGE_LOG_TIME=1 %command% --launcher-skip";
         assert_eq!(
-            sweep_options(found, &exe, log, true, "--launcher-skip -skipStartScreen -benchmark"),
+            sweep_options(found, &exe, log, true, &[], "--launcher-skip -skipStartScreen -benchmark"),
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 %command% --launcher-skip -skipStartScreen -benchmark"
         );
         assert_eq!(
-            sweep_options("", &exe, log, false, ""),
+            sweep_options("", &exe, log, false, &[], ""),
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' %command%"
+        );
+        // The run's own variables go in front of %command%, in place of the game's own of the same name.
+        assert_eq!(
+            sweep_options("NEURAL_FORGE_OFFLOAD_GPU=1 %command%", &exe, log, false, &["NEURAL_FORGE_OFFLOAD_GPU=same".to_string()], ""),
+            "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' NEURAL_FORGE_OFFLOAD_GPU=same %command%"
         );
         // Three or more of the sweep's own variables in the game's options (dropped and set again): no slicing past
         // the end, and the run's arguments go after %command%.
         let many = "NEURAL_FORGE_LOG=/a NEURAL_FORGE_LOG_TIME=1 PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 %command%";
         assert_eq!(
-            sweep_options(many, &exe, log, false, "-benchmark"),
+            sweep_options(many, &exe, log, false, &[], "-benchmark"),
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' %command% -benchmark"
         );
         // The game's own value for the same switch gives way to the run's; a negative number is a value.
         assert_eq!(
-            sweep_options("%command% -benchmarkIterations 3 -x", &exe, log, false, "-benchmarkIterations 1 -offset -5"),
+            sweep_options("%command% -benchmarkIterations 3 -x", &exe, log, false, &[], "-benchmarkIterations 1 -offset -5"),
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' %command% -benchmarkIterations 1 -x -offset -5"
         );
         assert!(is_switch("-x") && is_switch("--launcher-skip") && !is_switch("-5") && !is_switch("-.5") && !is_switch("-") && !is_switch("5"));
         // A switch and its value are one unit: `1` is kept although another `1` is there already.
         let gta = vec!["PlayGTAV.exe".to_string()];
         assert_eq!(
-            sweep_options("%command% -foo 1", &gta, log, false, "-benchmark -benchmarkIterations 1 -benchmarkFrameTimes"),
+            sweep_options("%command% -foo 1", &gta, log, false, &[], "-benchmark -benchmarkIterations 1 -benchmarkFrameTimes"),
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' %command% -foo 1 -benchmark -benchmarkIterations 1 -benchmarkFrameTimes"
         );
     }

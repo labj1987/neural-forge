@@ -4675,9 +4675,15 @@ unsafe fn native_hold(
         return result;
     }
     // The offload's side of the hold: the exchange with the other device and its worker, made on the first hold.
-    if offloaded && res.offpre.is_none() && !others_outstanding {
+    if offloaded && res.offpre.is_none() {
+        if others_outstanding {
+            // Not while holds recorded with these resources may still run (the cache's sets are written for it).
+            res.native = Some(native);
+            result.miss = Some(WAITING);
+            return result;
+        }
         // SAFETY: the game's live device; the offload device was made with it.
-        match unsafe { super::offload_pre::HoldSide::build(device, instance, physical_device, res.imported(), res.id, target.width, target.height) } {
+        match unsafe { super::offload_pre::HoldSide::build(device, instance, physical_device, res.id, target.width, target.height) } {
             Ok(side) => res.offpre = Some(side),
             Err(why) => {
                 crate::log!("[offload] the model stays on the game's GPU: {why}");
@@ -5178,7 +5184,9 @@ unsafe fn native_hold(
         });
         result.meta = Some(super::inline::Meta { cache_dump: pending, ..meta });
         result.evaluated = true;
-        result.wrote_back = cached || !offloaded;
+        // Offloaded without an edit to carry yet (the first frame sent, the network still loading there): the hold ran
+        // as planned, the frame goes to DLSS as it is.
+        result.wrote_back = true;
         result.cached = cached;
         result.cache_still = cache_hold.is_some_and(|h| h.interval > 1) && res.edit.as_ref().is_some_and(|e| e.state.regime.still());
         result.timing.writeback = Some(t_hold.elapsed());
@@ -5431,7 +5439,7 @@ unsafe fn native_hold(
         });
     }
     result.evaluated = true;
-    result.wrote_back = cached || !offloaded;
+    result.wrote_back = true;
     result.cached = cached;
     result.cache_still = cache_hold.is_some_and(|h| h.interval > 1) && res.edit.as_ref().is_some_and(|e| e.state.regime.still());
     result.timing.writeback = Some(t_hold.elapsed());

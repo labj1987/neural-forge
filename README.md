@@ -126,8 +126,8 @@ From a terminal: `~/.local/share/neural-forge/bin/neural-forge-cli uninstall --p
 At 4K on an RTX 5070 the model costs frame rate; the small network costs about half as much as the
 full one. Numbers per game: [docs/MEASURED_RESULTS.md](docs/MEASURED_RESULTS.md).
 
-With two GPUs, the model on the finished frame can run on the second one while the game renders on the first
-(`NEURAL_FORGE_OFFLOAD_GPU`, with Placement set to Finished frame): see
+With two GPUs, the model can run on the second one while the game renders on the first, before DLSS or on the
+finished frame (`NEURAL_FORGE_OFFLOAD_GPU`): see
 [the user guide](docs/USER_GUIDE.md#the-model-on-a-second-gpu).
 
 ## Reporting a bug

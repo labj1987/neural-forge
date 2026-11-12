@@ -188,6 +188,9 @@ pub(crate) trait Runner: Send {
 pub(crate) struct Progress {
     state: Mutex<Prog>,
     changed: Condvar,
+    /// Holds submitted that took the answer to the frame before them, and those planned to that found none.
+    taken: AtomicU64,
+    untaken: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -694,7 +697,34 @@ pub(crate) struct Worker {
     quit: Arc<AtomicBool>,
     mode: Arc<AtomicU8>,
     pub counters: Arc<Counters>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+/// The running workers by the game's device, so its destruction can end them (and with them free the other
+/// device's side) before the offload device goes ([`stop_for`]).
+type Running = (vk::Device, Arc<AtomicBool>, Arc<Mutex<Option<std::thread::JoinHandle<()>>>>);
+static WORKERS: Mutex<Vec<Running>> = Mutex::new(Vec::new());
+
+fn join(quit: &AtomicBool, thread: &Mutex<Option<std::thread::JoinHandle<()>>>) {
+    quit.store(true, Ordering::Release);
+    let handle = thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    if let Some(t) = handle {
+        let _ = t.join();
+    }
+}
+
+/// Ends every worker serving the game's device `game`: called inside its `vkDestroyDevice`, before the offload
+/// device made with it is destroyed (`offload::destroy_for`). Nothing of the game's device runs any more.
+pub(crate) fn stop_for(game: vk::Device) {
+    let ours: Vec<Running> = {
+        let mut all = WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (ours, rest) = std::mem::take(&mut *all).into_iter().partition(|(d, _, _)| *d == game);
+        *all = rest;
+        ours
+    };
+    for (_, quit, thread) in ours {
+        join(&quit, &thread);
+    }
 }
 
 /// What the worker tells its owner when it stops serving (it keeps finishing the frames sent, without an answer):
@@ -710,8 +740,11 @@ impl Worker {
         let mode = Arc::new(AtomicU8::new(SERVING));
         let counters = Arc::new(Counters::default());
         let (q, m, c) = (quit.clone(), mode.clone(), counters.clone());
+        let game = link.device.handle();
         let thread = std::thread::Builder::new().name("nf-offload-pre".into()).spawn(move || serve(&link, runner, late, dims, &q, &m, &c, &give_up)).ok()?;
-        Some(Self { quit, mode, counters, thread: Some(thread) })
+        let thread = Arc::new(Mutex::new(Some(thread)));
+        WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((game, quit.clone(), thread.clone()));
+        Some(Self { quit, mode, counters, thread })
     }
 
     /// Whether frames are run on the other GPU (else every send is finished at once, without an answer).
@@ -722,10 +755,8 @@ impl Worker {
     /// Stops the worker: no submit waits for it any more ([`Progress::settle`]), and the holds still recorded with
     /// the exchange take no answer.
     pub(crate) fn stop(&mut self) {
-        self.quit.store(true, Ordering::Release);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        join(&self.quit, &self.thread);
+        WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(_, q, _)| !Arc::ptr_eq(q, &self.quit));
     }
 }
 
@@ -867,12 +898,29 @@ fn settle_and_mark(progress: &Progress, inn: *mut u8, plan: &HoldPlan) -> bool {
             }
             std::sync::atomic::fence(Ordering::SeqCst);
             taken = ok;
+            if ok { &progress.taken } else { &progress.untaken }.fetch_add(1, Ordering::Relaxed);
         }
     }
     if let Some(seq) = plan.send {
         progress.queue(seq);
     }
     taken
+}
+
+/// The devices created with `VK_EXT_external_memory_host` enabled (`device.rs`, at their creation).
+static IMPORTING: Mutex<Vec<vk::Device>> = Mutex::new(Vec::new());
+
+/// Notes that `device` can import host memory (`on`), or forgets it (at its destruction).
+pub(crate) fn note_import(device: vk::Device, on: bool) {
+    let mut all = IMPORTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    all.retain(|d| *d != device);
+    if on {
+        all.push(device);
+    }
+}
+
+fn imports(device: vk::Device) -> bool {
+    IMPORTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&device)
 }
 
 /// Whether the before-DLSS placement is asked onto another GPU and not given up (`NEURAL_FORGE_OFFLOAD_GPU`).
@@ -908,18 +956,17 @@ pub(crate) struct HoldSide {
 #[cfg(target_arch = "x86_64")]
 impl HoldSide {
     /// # Safety
-    /// `device` is the game's live device (`import`: host memory can be imported on it); the offload device was
-    /// made with it.
+    /// `device` is the game's live device; the offload device was made with it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn build(
         device: &ash::Device,
         instance: &ash::Instance,
         physical: vk::PhysicalDevice,
-        import: bool,
         resources: u64,
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
+        let import = imports(device.handle());
         let (pw, ph) = super::padded(width, height);
         let (texels, padded) = (u64::from(width) * u64::from(height), u64::from(pw) * u64::from(ph));
         let sizes = Sizes { frame: padded * 8, motion: texels * 8, depth: texels * 4, side: super::hdr::HdrPass::EXPOSURE_BYTES + 16, answer: padded * 8 };
@@ -966,7 +1013,16 @@ impl HoldSide {
             .push((resources, Submits { progress: exchange.progress.clone(), inn: exchange.regions[1].clone() }));
         super::offload::note_state(super::offload::State::Active(name.clone()));
         SERVING_PRE.store(true, Ordering::Release);
-        crate::log!("[offload] before DLSS: the network's frames of {width}x{height} run on {name}");
+        crate::log!(
+            "[offload] before DLSS: the network's frames of {width}x{height} run on {name}; on the game's GPU the frame's regions are {}",
+            if exchange.shared {
+                "imported host memory (no CPU copy)"
+            } else if import {
+                "its own buffers (the import was refused): one more copy on the CPU each way"
+            } else {
+                "its own buffers (no host-memory import on this device): one more copy on the CPU each way"
+            }
+        );
         crate::logging::flush();
         Ok(Self { exchange, cadence: Cadence::default(), worker, metas, snapshot, sent: None, resources, holds: 0 })
     }
@@ -1017,7 +1073,15 @@ impl HoldSide {
         }
         self.holds += 1;
         if self.holds.is_multiple_of(600) {
-            crate::log!("[offload] {}; {}", self.worker.counters.summary(), super::offload::STATS.summary());
+            let p = &self.exchange.progress;
+            let (taken, untaken) = (p.taken.swap(0, Ordering::Relaxed), p.untaken.swap(0, Ordering::Relaxed));
+            let frames = super::offload::STATS.server_frames.swap(0, Ordering::Relaxed);
+            let us = super::offload::STATS.server_us.swap(0, Ordering::Relaxed);
+            crate::log!(
+                "[offload] {}; {taken} holds carried the edit of the frame before them, {untaken} found no answer; the network's frame on the other GPU {:.2} ms (copies included)",
+                self.worker.counters.summary(),
+                if frames == 0 { 0.0 } else { us as f64 / frames as f64 / 1000.0 }
+            );
         }
     }
 

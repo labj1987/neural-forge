@@ -814,6 +814,9 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     // SAFETY: forwarded; the server's worker was joined.
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        // The before-DLSS offload's workers first: each frees the other device's side and gives the device back.
+        crate::preupscale::offload_pre::stop_for(handle);
+        crate::preupscale::offload_pre::note_import(handle, false);
         crate::preupscale::offload::destroy_for(handle)
     };
     // Then the hold inside DLSS's buffer: its slots and staging images (once the device is idle), and the
@@ -1640,6 +1643,8 @@ impl NeuralForgeDeviceInfo {
             );
         }
         let external_memory_host = crate::take_external_memory_host_enabled(handle);
+        #[cfg(target_arch = "x86_64")]
+        crate::preupscale::offload_pre::note_import(handle, external_memory_host);
         // Recorded the same way, by the same hook (`crate::swapchain_maintenance`).
         let present_fences = crate::swapchain_maintenance::take_enabled(handle);
         crate::log!(
