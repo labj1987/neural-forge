@@ -1263,6 +1263,53 @@ mod tests {
     use super::super::hdr::OwnImage;
     use super::*;
 
+    /// The network on another GPU: the hold after one whose frame was sent is a cached hold that starts the chain
+    /// afresh, whatever the cadence (the still regime's every-hold refresh has no network here); with no answer
+    /// to take it is a refresh in the plan's terms (the caller writes nothing back), and nothing older is carried.
+    #[test]
+    fn offloaded_every_hold_carries_the_edit_of_the_hold_before_it() {
+        let hold = |n: u64| Hold {
+            interval: 2,
+            hold: n,
+            jitter: Some([0.25, -0.25]),
+            mvec: true,
+            depth: true,
+            history_ok: true,
+            armed: false,
+            debug_mask: false,
+            generation: 0,
+        };
+        let mut s = State::default();
+        s.set_offloaded(true);
+        s.regime = Regime { still: true, against: 0 };
+        // The first hold only sends.
+        let p1 = s.plan(&hold(1));
+        assert_eq!(p1.kind, Kind::Refresh);
+        s.went_through(&hold(1), &p1);
+        s.drop_edit();
+        for n in 2..6 {
+            // Its answer is stored at the next hold, before that hold's plan.
+            s.late_refresh(&hold(n - 1));
+            let p = s.plan(&hold(n));
+            assert_eq!(p.kind, Kind::Cached, "hold {n}");
+            assert_ne!(p.flags & F_FRESH, 0, "the accumulated field restarts at every hold: the edit is one hold old");
+            assert_ne!(p.flags & F_CHAINED, 0);
+            s.went_through(&hold(n), &p);
+        }
+        // No answer taken (the frame before was not sent): the edit of two holds ago is not carried.
+        let p = s.plan(&hold(6));
+        assert_eq!(p.kind, Kind::Refresh);
+        s.went_through(&hold(6), &p);
+        s.drop_edit();
+        // A DLSS frame that was not held: the late refresh is of hold 6, this is hold 8.
+        s.late_refresh(&hold(6));
+        assert_eq!(s.plan(&hold(8)).kind, Kind::Refresh);
+        // Leaving the offload drops what is stored.
+        s.late_refresh(&hold(8));
+        s.set_offloaded(false);
+        assert_eq!(s.plan(&hold(9)).kind, Kind::Refresh);
+    }
+
     #[test]
     fn the_push_constants_match_the_shaders_params_block() {
         // uvec2 size, uint flags, uint depth_kind, vec2 x3, float, uint, ten floats: 88 bytes, std430.

@@ -1755,27 +1755,88 @@ per summary, video memory at 11.8 of 12 GB; in 24 captured frames each composite
 and after each stall the capture's own writing caused (2.7 s) one frame went out live and was then shown once more,
 composed.
 
-## Before DLSS on a second GPU: the exchange (#63, 2026-11-12; not wired into the holds yet)
+## Before DLSS on a second GPU (#63, 2026-11-12)
 
-`preupscale::offload_pre`. The hold before DLSS is part of DLSS's command buffer, and DLSS needs the edited colour
-input before it runs, so the other GPU cannot run the same frame's network without the game's GPU waiting for the
-whole round trip. The design delays the edit, not the frame: hold N sends its frame's encode, accumulated motion and
-depth out and carries the edit of frame N-1 onto its own fresh frame as a cached hold of the edit cache does. DLSS
-gets frame N with frame N's depth, vectors and jitter; nothing of NGX's parameters is delayed, frame generation and
-the present see no added latency; the cost is an edit that is always one frame old, carried by the motion vectors
-(today: every second frame in motion, none while still). Delaying DLSS's whole input by a frame was rejected: every
-input and NGX's jitter and reset would have to be held a frame, and frame generation would get vectors of another
-frame.
+`preupscale::offload_pre` (the exchange and the hold's side), `preupscale::offload_server` (the network's frame on the
+other device), `native::native_hold` (`offloaded`). With `NEURAL_FORGE_OFFLOAD_GPU` set, the hold before DLSS (the
+split hold and the hold inside DLSS's buffer) sends its frame to the offload device and runs no network on the game's.
 
-Built so far is the exchange and its worker: two regions of system memory (imported as host memory on each device
-where it can be), `vkCmdSetEvent` after the send's copies so the worker starts in the order the GPU runs the holds,
-and the wait for the answer on the CPU at the submit of the next hold's buffer (`Exchange::at_submit`, 100 ms at
-most, only for a frame whose buffer went to the driver in an earlier submit). The game's GPU never waits in a command
-buffer: the host may not set an event a pending buffer waits on (VUID-vkSetEvent-event-09543; the first version did
-and the validation layer refused it). `preupscale_offload_gate.comp` leaves the edit unstored where the answer region
-does not hold the expected frame's complete answer (late, abandoned, a hold never submitted, two holds in one
-submit). Tests: two lavapipe devices, a copy on the second in place of the network. The hold's side, the server with
-the network on the other device, the fall-back and the Status tab are not built.
+**Why not the finished frame's trick.** The hold is part of DLSS's command buffer and DLSS needs the edited colour
+input before it runs: the other GPU cannot run the same frame's network without the game's GPU waiting for the whole
+round trip. Delaying DLSS's whole input by a frame instead would mean holding every input a frame (colour, depth,
+motion vectors, exposure) and NGX's jitter and reset with them (the wrapper delaying parameters, or the layer
+rewriting kernel words, which AGENTS.md rules out), frame generation getting vectors of another frame, and a frame of
+latency. So the **edit** is delayed, not the frame: hold N sends frame N out and carries the edit of frame N-1, which
+the other GPU finished while the game's GPU rendered frame N, onto its own fresh frame, exactly as a cached hold of
+the edit cache does (reprojected along DLSS's motion vectors, admitted by depth and fingerprint). DLSS gets frame N
+with frame N's depth, vectors and jitter; frame generation and the present see no added latency. The cost: the edit
+is always one frame old (on one GPU: fresh on every frame while the camera is still, on every second frame in
+motion), so still scenes lose the part of the answer that follows each frame's jitter, and uncovered texels get no
+edit for a frame (the cache's rejection).
+
+**The hold (game's GPU), in order:**
+
+1. *receive*, when the hold recorded right before sent a frame: the answer region copied into the HDR pass's answer
+   image, the cache's `capture` pass run a hold late (`CachePass::record_capture_late`: against the sent frame, whose
+   encode, exposure and depth are still in place because this runs before the hold's own capture; its colour from a
+   kept copy, `HoldSide::record_snapshot`, since the write-back has written the colour input since; a second
+   descriptor set of the cache, `bind_late`), then the gate (`preupscale_offload_gate.comp`): where the answer
+   region's header does not name that frame's complete answer, `STAT_EDIT_STORED` is cleared and the cached
+   write-back passes the frame through. The hold guard runs after it (inside DLSS's buffer), so a hold that does not
+   follow the one recorded before it still drops the edit. The cached write-back was checked to leave what the late
+   capture reads alone: it writes the colour input and the cache's own buffers only.
+2. the capture `C` as always (the encode, the depth copy, the scene cut, the cache's motion pass with a fresh chain:
+   the accumulated field is this hold's motion, back to the frame the edit is of).
+3. *send*: the colour input copied for the next hold's capture; the encode (RGBA16F at the padded extent), the
+   accumulated motion, the depth, the exposure and the native state's words (the scene cut) copied into the OUT
+   region; `vkCmdSetEvent(sent)`.
+4. the cached write-back when an answer was taken; nothing else (no decode: the frame goes to DLSS as it is).
+
+On the CPU the cache's state machine is unchanged but for one flag: `State::late_refresh` notes the sent hold as a
+refresh that went through, then `plan` makes this hold the cached one after it (`State::offloaded`: also in the
+still regime, whose every-hold refresh has no network here). A hold with no answer to take stores nothing
+(`drop_edit`), so an edit older than one hold is never carried with a field that does not reach back to it.
+
+**Ordering the two GPUs.** `sent` is set by the game's GPU after the copies, so the worker (`Worker`, a thread
+polling the event) starts in the order the GPU runs the holds, whatever order they were recorded in. Nothing on the
+game's GPU waits: a command buffer may not wait on an event the host sets while it is pending
+(VUID-vkSetEvent-event-09543; the first version did, passed on lavapipe, and the validation layer refused it). The
+wait is the CPU's, at the submit of the next hold's buffer (`Exchange::at_submit`: the split hold is inside
+`vkQueueSubmit` already; the hold inside DLSS's buffer gets it in `device.rs` beside its layout check,
+`inline::Meta::offload`): 100 ms at most, only for a frame whose buffer went to the driver in an earlier submit, and
+it writes the answer region's header (whose answer, complete or not) for the gate. Everything the game submitted
+before runs meanwhile, so the game's GPU goes idle only when the other GPU is slower than the game's frame: the frame
+rate is bounded by the other GPU, as on the finished frame. A frame not answered within the budget is abandoned (its
+answer never taken; the server's history starts afresh). What does not overlap: work recorded in front of DLSS in the
+same buffer or the same submit (Cyberpunk 2077 and Crimson Desert record a few passes there).
+
+**The other device (`PreRunner`).** The device and second loader the finished-frame offload makes (barriers, never
+counter chaining), a `NativePass`, an `HdrPass` (for its encoded image and exposure buffer) and a depth buffer of its
+own for the frame's extent; the regions imported as host memory or staged; one frame as the split hold submits it
+(the copies in, `N[parity]`, the answer's copy out), waited for. The history's rule is the hold's
+(`NativePass::begin_frame`); what the CPU decides per frame comes in a queue keyed by the frame's sequence number
+(`FrameMeta`). One pass runs there (the stage's first). One `HoldSide` (exchange, worker, runner, loader) per hold
+resources: a change of render extent loads the network again on the other device.
+
+**Fall-back** as on the finished frame (`ServerRule`, `LateRule` on the answers, `State::FellBack` for the process):
+the worker stops running frames (every send is finished at once without an answer) and the runner retires its
+loader, so the next hold runs the network on the game's device through the loader's lend. The workers of a device
+end inside its `vkDestroyDevice` before the offload device is destroyed (`offload_pre::stop_for`).
+
+**Measured (RTX 5070 alone, `same`: a second device of the game's GPU; Cyberpunk 2077 benchmark, 2560x1440 HDR10,
+frame generation x3, render 1485x835, the game sweep with `env = ["NEURAL_FORGE_OFFLOAD_GPU=same"]`):**
+
+| Run | Holds per second | Network frame | Capture on the game's GPU | Notes |
+|---|---|---|---|---|
+| model on the game's device | 43 (about 125 fps shown) | 7.6 ms (median, in DLSS's buffer) | 1.0 ms | every second hold a refresh in motion; sweep passes |
+| `same` | 33 (about 100 fps shown) | 17.7 ms on the second device, copies included; 21.0 ms from send to answer | 3.0 ms | 600 of 600 frames answered in time and 600 of 600 holds carried the edit in every summary once the network ran; cache rejection 0.4-5%; no misses, no faults; sweep passes, recording clean |
+
+On one GPU the path saves nothing, as on the finished frame: the second device's network shares the GPU with the
+game (barriers, another context), so its frame takes longer than the game's own. What the game's GPU pays per frame
+is the capture's extra 2 ms (the kept colour, 23.7 MB out, the late capture and the gate) and the 9.5 MB answer in.
+The worker's thread used 11% of a core (polling at 50 us while frames come, the staged copies included). Not
+measured: two different GPUs (this machine has one), the split hold in a game (GTA V Enhanced's benchmark ran without
+a DLSS evaluate on 2026-11-12, with and without the offload), a still scene's picture.
 
 ## Decided before Phase 1
 
