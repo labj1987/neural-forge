@@ -108,7 +108,7 @@ pub fn key_code_from_name(name: &str) -> u32 {
         return name.parse().unwrap_or(0);
     }
     let upper = name.to_ascii_uppercase();
-    let upper = upper.strip_prefix("KEY_").unwrap_or(&upper);
+    let upper = upper.trim_prefix("KEY_");
     KEYS.iter().find(|(n, _)| *n == upper).map_or(0, |&(_, code)| code)
 }
 

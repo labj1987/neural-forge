@@ -55,7 +55,7 @@ pub fn dir(var: impl Fn(&str) -> Option<String>) -> Option<String> {
 /// and Proton make) or `\??\unix\home\user` (no drive maps the home). `None` for another drive, whose Unix
 /// location is not known here.
 pub fn unix_home_from_wine(nt: &str) -> Option<String> {
-    let rest = nt.strip_prefix(r"\??\").unwrap_or(nt);
+    let rest = nt.trim_prefix(r"\??\");
     // Bytes, not `rest[..n]`: a slice inside a multi-byte character panics. The ASCII prefix matched, so `[n..]` is a boundary.
     let starts = |prefix: &str| rest.as_bytes().get(..prefix.len()).is_some_and(|b| b.eq_ignore_ascii_case(prefix.as_bytes()));
     let rest = if starts("z:") {
@@ -79,7 +79,7 @@ pub fn win_dir(var: impl Fn(&str) -> Option<String>) -> Option<String> {
         return dir(var).map(|d| format!("Z:{d}").replace('/', "\\"));
     }
     let wine = set("WINEHOMEDIR")?;
-    let rest = wine.strip_prefix(r"\??\").unwrap_or(&wine);
+    let rest = wine.trim_prefix(r"\??\");
     let bytes = rest.as_bytes();
     if bytes.get(..2).is_some_and(|b| b.eq_ignore_ascii_case(b"z:")) {
         return dir(var).map(|d| format!("Z:{d}").replace('/', "\\"));

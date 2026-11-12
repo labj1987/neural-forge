@@ -1209,7 +1209,7 @@ fn check_cannot_run(hdr: Option<&neural_forge_protocol::ShmHeader>, session: Opt
     let logged = session.and_then(|s| s.iter().rev().find(|e| e.kind == state_log::NATIVE_UNAVAILABLE));
     let line = reason.clone().or_else(|| logged.map(|e| e.message.clone()));
     let Some(line) = line else { return Vec::new() };
-    let first = line.strip_prefix(state_log::CANNOT_RUN_PREFIX).unwrap_or(&line).to_string();
+    let first = line.trim_prefix(state_log::CANNOT_RUN_PREFIX).to_string();
     let mut evidence = Vec::new();
     if let Some(r) = &reason {
         evidence.push(format!("channel: layer_reason \"{r}\""));

@@ -57,7 +57,7 @@ impl Config {
             if valid {
                 raw_lines.remove(&k);
             } else {
-                let raw = line.strip_suffix(b"\r").unwrap_or(line).to_vec();
+                let raw = line.trim_suffix(b"\r").to_vec();
                 raw_lines.insert(k.clone(), (v.clone(), raw));
             }
             map.insert(k, v);

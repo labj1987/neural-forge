@@ -6248,7 +6248,7 @@ impl Session {
         }
         let (holds, lo, hi) = (run.holds, run.lo, run.hi);
         p.run = None;
-        p.measuring = !p.measuring;
+        p.measuring.toggle();
         let seconds = held.as_secs_f32();
         Some(if p.measuring {
             (

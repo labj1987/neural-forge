@@ -301,7 +301,7 @@ static NATIVE_UNAVAILABLE: Mutex<Option<String>> = Mutex::new(None);
 /// `device cannot run the network: <first missing>` from `device_extend`'s message ("the device lacks
 /// X", or an exception's text).
 fn cannot_run_line(why: &str) -> String {
-    let first = why.strip_prefix("the device lacks ").unwrap_or(why);
+    let first = why.trim_prefix("the device lacks ");
     format!("{}{first}", neural_forge_protocol::state_log::CANNOT_RUN_PREFIX)
 }
 
