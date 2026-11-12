@@ -1062,9 +1062,8 @@ thread_local! {
 
 fn zero_copy_allowed() -> bool {
     #[cfg(test)]
-    if TEST_NO_ZERO_COPY.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
-    }
+    return !TEST_NO_ZERO_COPY.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
     true
 }
 

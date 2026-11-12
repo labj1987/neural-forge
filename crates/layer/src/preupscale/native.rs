@@ -2159,7 +2159,6 @@ impl NativePass {
     /// # Safety
     /// As [`Self::build`].
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn build_at(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -2210,7 +2209,6 @@ impl NativePass {
     ///
     /// # Safety
     /// As [`Self::build`].
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn build_inner(
         device: &ash::Device,
