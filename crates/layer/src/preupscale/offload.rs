@@ -486,26 +486,30 @@ pub(crate) static STATS: Stats = Stats {
 pub(crate) fn note_present() {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n % 600 == 0 {
+    if n.is_multiple_of(600) {
         crate::log!("[offload] {}", STATS.summary());
         crate::logging::flush();
     }
 }
 
 impl Stats {
-    /// One line for the log, the counters since the last, then reset. `local_ms`: what the same frames' network took
-    /// on the game's GPU before the offload (0: not measured), for the time saved there.
+    /// One line for the log: the counters since the last line, then reset. The network's time on the other GPU is what
+    /// the game's GPU no longer spends (with the copies in and out of system memory included there).
     pub(crate) fn summary(&self) -> String {
         let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
         let (frames, us, cin, cout) = (take(&self.server_frames), take(&self.server_us), take(&self.copy_in_us), take(&self.copy_out_us));
         let (shown, fell, rt, rts) = (take(&self.shown), take(&self.fell_back), take(&self.round_trip_us), take(&self.round_trips));
         let mean = |sum: u64, n: u64| if n == 0 { 0.0 } else { sum as f64 / n as f64 / 1000.0 };
+        let saved = if cin + cout > 0 {
+            "the stand-in copy ran in place of the network (NEURAL_FORGE_OFFLOAD_STANDIN)".to_string()
+        } else {
+            format!("the game's GPU saved about {:.2} ms a frame (the network ran there before)", mean(us, frames))
+        };
         format!(
-            "{frames} frames on the other GPU, {:.2} ms each there{}; request to answer {:.2} ms; presents {shown} with the answer, {fell} without; the game's GPU saved about {:.2} ms a frame (the network ran there before)",
+            "{frames} frames on the other GPU, {:.2} ms each there{}; request to answer {:.2} ms; presents {shown} with the answer, {fell} without; {saved}",
             mean(us, frames),
             if cin + cout > 0 { format!(" (copy in {:.2} ms, copy back {:.2} ms)", mean(cin, frames), mean(cout, frames)) } else { String::new() },
             mean(rt, rts),
-            mean(us.saturating_sub(cin + cout), frames),
         )
     }
 }
