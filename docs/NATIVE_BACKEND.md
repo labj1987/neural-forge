@@ -1652,13 +1652,16 @@ screenshots of one state do.
 ## The model on a second GPU (#63, 2026-11-12)
 
 `preupscale::offload`. With `NEURAL_FORGE_OFFLOAD_GPU` set and Placement `present` for every pass, the
-after-the-upscaler server (`native_post::PostServer::start_offload`) runs on a device of another GPU: the device is
-made on the server's thread through the loader's `VK_LOADER_LAYER_CREATE_DEVICE_CALLBACK` (the layers below this one
-see it as their own device; the layer's own `vkCreateDevice` hook passes it through, `offload::making`), with a
-compute family's two queues (loading, frames), the network's extensions and features
-(`neural_forge_native::device_extend`) and `VK_EXT_external_memory_host`. Its loader is a second `native::Loader`
-(the process's one network moves to it through the existing lend); objects from below the loader get their dispatch
-pointer through the game's device's loader callback (`loader_data::register_like`).
+after-the-upscaler server (`native_post::PostServer::start_offload`) runs on a device of another GPU. The device is made
+inside the game's `vkCreateDevice` (`offload::make_for`, for a device that asks for swapchains) and destroyed inside its
+`vkDestroyDevice` (`offload::destroy_for`), through the loader's `VK_LOADER_LAYER_CREATE_DEVICE_CALLBACK`: the loader's
+callbacks change its device lists without taking its lock, which its trampoline holds only inside those two calls (Vulkan-Loader
+1.4.341, `loader_layer_create_device`). The layers below this one see it as their own device; the layer's own
+`vkCreateDevice` hook passes it through (`offload::making`). It has a compute family's two queues (loading, frames),
+the network's extensions and features (`neural_forge_native::device_extend`) and `VK_EXT_external_memory_host`. Its
+loader is a second `native::Loader` (the process's one network moves to it through the existing lend), opened when
+the server first needs it; objects from below the loader get their dispatch pointer through the game's request's
+loader callback. A loss of that device marks neither the game's devices nor the session lost (`note_secondary_device`).
 
 **Transfer.** The finished-frame path already crosses system memory (the proxy and answer regions), so nothing new
 is shared between the devices: the other GPU imports both regions as host memory (no CPU copy) and stages them where
@@ -1667,20 +1670,34 @@ shared memory is where the request protocol already lives and both GPUs read it 
 
 **One frame late (`capture::delayed_present`).** Waiting for each frame's own answer, as the synchronous present
 does, would leave the game's GPU idle for the whole round trip and save nothing. Instead the present composes the
-answer to the frame the last present posted, onto that frame as it was kept (`GpuCompose::keep_delayed`: the image
-before anything is composed into it, and the proxy it was sent as), and that replaces the live image; then it posts
-this frame. Every frame is shown one present late with exactly its own composition (no ghosting, unlike
-`NEURAL_FORGE_PIPELINED`, which carries an older answer onto the live frame). Needs the zero-copy pair (direct
-capture at the frame's size, the answer region imported); otherwise the synchronous present runs (logged once).
-The model interval's carried frames are off while offloaded. A late answer is dropped when it lands
-(polled once a present) and its frame presented untouched. A frame posted more than 250 ms before the next present (the game stalled in
-between) is not shown: that present goes out live.
+answer to the frame the last present kept and posted, onto that frame as it was kept (`GpuCompose::keep_delayed`:
+the image before anything is written into it, and the proxy it was sent as), and that replaces the live image; then
+it keeps and posts this frame, in the other of two pairs. Every frame is shown one present late with exactly its own
+composition (no ghosting, unlike `NEURAL_FORGE_PIPELINED`, which carries an older answer onto the live frame). A frame
+whose answer does not come within the present's budget (the frame then is not sent either: the server still reads the
+proxy region), or that was not captured, is shown as it was kept in its turn (`GpuCompose::show_kept`), so no frame is
+dropped or repeated. The present waits for the answer, so the frame rate is bounded by the other GPU's time per frame.
+Where the delay starts (the first present, and after a stall: a frame kept more than 250 ms before the next present
+is not shown) that present shows its own frame and the next shows it again, composed: one repeat, inherent to
+starting a delay. Leaving the path (the model back on this GPU, frame hold) drops the kept frame (the stream steps
+over one frame, as a flush of it would, since the frame it replaced is then not shown) and frees the pairs. Every
+present the keep writes to is ordered before the present: the compose or the show that follows it signals the present
+semaphore, or the keep itself does, or its fence is waited. The keeps and the show are in the compose's waits at
+teardown (`wait_in_flight`). Needs the zero-copy pair (direct capture at the frame's size, the answer region
+imported); otherwise the synchronous present runs (logged once). The model interval's carried frames are off while
+offloaded. The white meter reads the proxy region after each capture, as the synchronous present's does.
 
-**Fall-back.** The device cannot be made or lacks a requirement, its frame does not finish (`FENCE_WAIT_TIMEOUT`;
-a lost device takes this route), 30 frames in a row over 250 ms (the present's budget) or one over a second: the
-server ends with `Status::Unavailable` and the next present starts the server on the game's device, for the rest
-of the session. A stalled offload device is left alive (its work may run). `NEURAL_FORGE_OFFLOAD_STANDIN=1` (tests
-only) runs a copy in and out of the other GPU in place of the network, for a GPU that cannot run it.
+**Fall-back.** To the game's GPU for the session (`Status::Unavailable`, `offload::State::FellBack`) when: the device
+cannot be made or lacks a requirement; the server's pipelines cannot be built there; the network has not run there
+for 30 s while frames came (`ServerRule::missed`: a build that fails, the VRAM guard's pause); a frame takes over a
+second (`ServerRule::ran`, after the first 10 frames of a build); or more than 30 of the last 120 sent frames come back
+later than three present intervals (`LateRule`, judged at the present; not in the `same` test, where the other device
+shares the game's GPU). A frame that does not finish (`FENCE_WAIT_TIMEOUT`, or a lost device) ends serving with
+`Status::Stalled`: the worker waits for it, and only once it finished (or the device is lost) frees the server, the
+network and the shared regions' imports and turns `Unavailable`; asked to quit meanwhile it waits 5 s more and else
+leaves the network and the device to the process's end (drain before free). The state is on the Status tab's line
+(`layer_reason`) and in `doctor` (`offload`). `NEURAL_FORGE_OFFLOAD_STANDIN=1` (tests only) runs a copy in and out of
+the other GPU in place of the network, for a GPU that cannot run it.
 
 **Counter chaining is off on the offload device.** With chaining, a second device of the same GPU beside the
 game's context never finished its first frame (2560x1440 on the RTX 5070, no answer in 20 s); with barriers 21 ms.
@@ -1700,8 +1717,8 @@ The offload loader is opened with `chain` false.
 
 Video memory sat at 11.8 of 12 GB in both Cyberpunk runs (the second device holds its own network and activations).
 On one GPU `same` saves nothing (both devices share it); the point of the path is a second GPU, which this machine
-does not have. Not built: the Status tab and `doctor` do not show the offload yet (the log does, at start and every
-600 frames); dma-buf sharing.
+does not have. Not built: dma-buf sharing. The table's runs were taken before the fall-back rules and the shown-once
+cadence above; the review's re-runs are below it.
 
 ## Decided before Phase 1
 

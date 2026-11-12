@@ -694,6 +694,10 @@ pub(crate) struct Standin {
     queries: vk::QueryPool,
     period_ns: f32,
     sized: Option<StandinBuffers>,
+    /// `NEURAL_FORGE_OFFLOAD_TEST_STALL=<frame>` (tests of the stall path only): that frame's copy waits on the GPU for
+    /// an event the host sets 8 s later, past the server's fence wait, so the frame stalls and then finishes.
+    test_stall: Option<(u64, vk::Event)>,
+    frames: u64,
 }
 
 struct StandinBuffers {
@@ -734,7 +738,10 @@ impl Standin {
                 vk::QueryPool::null()
             };
             let period_ns = instance.get_physical_device_properties(physical).limits.timestamp_period;
-            Some(Self { pool, cmd: cmds[0], fence, queries, period_ns, sized: None })
+            let test_stall = neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_TEST_STALL")
+                .and_then(|v| v.parse::<u64>().ok())
+                .and_then(|n| device.create_event(&vk::EventCreateInfo::default(), None).ok().map(|e| (n, e)));
+            Some(Self { pool, cmd: cmds[0], fence, queries, period_ns, sized: None, test_stall, frames: 0 })
         }
     }
 
@@ -788,6 +795,13 @@ impl Standin {
                     if timed {
                         device.cmd_reset_query_pool(self.cmd, self.queries, 0, 3);
                         device.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.queries, 0);
+                    }
+                    self.frames += 1;
+                    if let Some((_, event)) = self.test_stall.filter(|(n, _)| *n == self.frames) {
+                        crate::log!("[offload] NEURAL_FORGE_OFFLOAD_TEST_STALL: frame {} waits 8 s on the other GPU", self.frames);
+                        set_later(device.handle(), device.fp_v1_0().set_event, event);
+                        let host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::HOST_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                        device.cmd_wait_events(self.cmd, &[event], vk::PipelineStageFlags::HOST, vk::PipelineStageFlags::TRANSFER, &[host], &[], &[]);
                     }
                     device.cmd_copy_buffer(self.cmd, src, s.middle.0, &region);
                     device.cmd_pipeline_barrier(
@@ -928,10 +942,22 @@ impl Standin {
         unsafe {
             self.free(device);
             device.destroy_query_pool(self.queries, None);
+            if let Some((_, event)) = self.test_stall {
+                device.destroy_event(event, None);
+            }
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.pool, None);
         }
     }
+}
+
+/// Sets `event` from another thread 8 s from now (`NEURAL_FORGE_OFFLOAD_TEST_STALL`).
+fn set_later(device: vk::Device, set: vk::PFN_vkSetEvent, event: vk::Event) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(8));
+        // SAFETY: the event outlives the wait (destroyed with the stand-in, once its frame finished).
+        let _ = unsafe { set(device, event) };
+    });
 }
 
 /// The other GPU's frames as the server sees them: one over [`HUNG`] after the first [`WARM_FRAMES`] of a build, or

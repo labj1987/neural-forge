@@ -10,9 +10,10 @@ first shipped them; their phase is kept as a subheading.
 
 - With two GPUs, the model on the finished frame can run on the second one while the game renders on the first: set
   Placement to Finished frame and add `NEURAL_FORGE_OFFLOAD_GPU=<index or vendor:device>` to the game's launch
-  options (the user guide's "The model on a second GPU"). Each frame is shown one frame later than on one GPU. If the
-  second GPU cannot run the network, fails or is too slow, the model goes back to the game's GPU and the log says
-  why.
+  options; the log lists the GPUs and their indices (the user guide's "The model on a second GPU"). Each frame is shown
+  one frame later than on one GPU, and the frame rate is bounded by the second GPU's time per frame. If the second GPU
+  cannot run or build the network, is too slow for the game's frame rate, takes over a second for a frame or stops
+  answering, the model goes back to the game's GPU; the log, the Status tab and `doctor` say why.
 
 ## 4.1.2 — 2026-11-12
 
