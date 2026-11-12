@@ -2241,7 +2241,7 @@ pub unsafe fn run(
                         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                             crate::log!(
                                 "[offload] this present cannot be delayed ({}): its frames wait for their own answer, which saves nothing on this GPU",
-                                if pq10 { "an HDR10 frame at a Model resolution below Full" } else { "its frame could not be captured for the delay" }
+                                if pq10 { "an HDR10 frame without the zero-copy pair" } else { "its frame could not be captured for the delay" }
                             );
                         }
                         crate::preupscale::offload::STATS.sync.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

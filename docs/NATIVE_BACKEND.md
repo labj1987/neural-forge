@@ -1695,8 +1695,8 @@ answer read into memory before the next request; a frame that cannot be captured
 still out is skipped there (its capture would write the proxy region the other GPU reads). Found in #63: 007 First
 Light at 2048x1536 with the Model resolution at Half fell back to the synchronous present, every frame waiting about 12
 ms for its own answer from the RTX 5080 (40-50 fps against 75 without the model), and the summary line was only
-written on the delayed path. HDR10 frames below Full still run synchronously (an HDR10 frame composes only a full-size
-answer), logged once. The `[offload]` summary every 600 presents counts both paths. The model interval's carried frames are off while
+written on the delayed path. HDR10 frames below Full are not composed at all, with or without the second GPU (an HDR10 frame
+composes only a full-size answer). The `[offload]` summary every 600 presents counts both paths. The model interval's carried frames are off while
 offloaded. The white meter reads the proxy region after each capture, as the synchronous present's does.
 
 **Fall-back.** To the game's GPU for the session (`Status::Unavailable`, `offload::State::FellBack`) when: the device
