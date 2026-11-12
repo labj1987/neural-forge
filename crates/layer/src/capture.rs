@@ -608,6 +608,10 @@ unsafe fn delayed_present(
             }
         }
     }
+    // A late answer to a request whose frame was given up lands here and is dropped (polling it is what ends it).
+    if previous.is_none() && shm.has_pending_request(SLOT) {
+        let _ = shm.poll_async_request(SLOT);
+    }
     // Still out (late, or the server is gone): the server may still read the proxy region, so nothing is captured
     // into it now; the request is discarded when it lands.
     if shm.has_pending_request(SLOT) {
