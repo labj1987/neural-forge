@@ -1697,7 +1697,9 @@ shares the game's GPU). A frame that does not finish (`FENCE_WAIT_TIMEOUT`, or a
 network and the shared regions' imports and turns `Unavailable`; asked to quit meanwhile it waits 5 s more and else
 leaves the network and the device to the process's end (drain before free). The state is on the Status tab's line
 (`layer_reason`) and in `doctor` (`offload`). `NEURAL_FORGE_OFFLOAD_STANDIN=1` (tests only) runs a copy in and out of
-the other GPU in place of the network, for a GPU that cannot run it.
+the other GPU in place of the network, for a GPU that cannot run it; with it, `NEURAL_FORGE_OFFLOAD_TEST_STALL=<frame>`
+makes that frame wait 8 s on the GPU for a host-set event (a stall that finishes), and
+`NEURAL_FORGE_OFFLOAD_TEST_SLOW_MS=<ms>` adds that much to every frame (the late rule).
 
 **Counter chaining is off on the offload device.** With chaining, a second device of the same GPU beside the
 game's context never finished its first frame (2560x1440 on the RTX 5070, no answer in 20 s); with barriers 21 ms.
