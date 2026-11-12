@@ -3505,6 +3505,17 @@ impl NativePass {
         }
     }
 
+    /// A network frame on another device (`super::offload_server`) begins: the history's rule as the hold applies
+    /// it. `asked`: the hold had motion vectors and nothing on its side resets the history. Returns whether the
+    /// frame runs with its history.
+    pub(crate) fn begin_frame(&mut self, network: u32, asked: bool) -> bool {
+        if note_network(&mut self.gap, &mut self.history_network, network) {
+            crate::log!("[native] resetting the history (the {} network runs from here)", network::name(network));
+        }
+        let stale = self.gap.begin(hold_now());
+        self.frames > 0 && stale.is_none() && asked && !no_history()
+    }
+
     /// The command buffers for this frame, in submission order: the initialisation until one was
     /// submitted, then `N[parity]`. Writes the frame's parameters. Each buffer submitted is reported
     /// to [`Self::submitted`] (only then is the initialisation done and the timer pending).
@@ -4407,6 +4418,23 @@ unsafe fn native_hold(
         result.miss = Some("the network is serving the after-the-upscaler path");
         return result;
     }
+    // The network on a second GPU (`super::offload_pre`): this hold sends its frame there and carries the edit of
+    // the frame before it, as a cached hold does. Only the hold before DLSS, with the edit cache on (it is what
+    // carries the edit), and not for a cache dump (which needs the network's answer to its own frame).
+    let before_dlss = ctx.as_ref().is_none_or(|c| c.point.hold.stage != super::placement::Stage::Upscaled);
+    let offloaded = super::offload_pre::wanted()
+        && before_dlss
+        && arm.is_none()
+        && {
+            let cache = ask.interval > 1;
+            if !cache {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::log!("[offload] NEURAL_FORGE_EDIT_CACHE=off: the edit cache is what carries the other GPU's edit to the next frame; the model runs on the game's GPU");
+                }
+            }
+            cache
+        };
     // Every frame that ran the graph has completed (this path's: the hold waited above; the other
     // path's: `claim_pre` says none ran for a second): the chain watchdog's count is final for them.
     let fake = fake_chain_timeout(res.native.as_ref().map_or(0, |n| n.frames));
@@ -4432,7 +4460,9 @@ unsafe fn native_hold(
     // was waited for above, the other path's is kept off by `claim_pre`, and the holds recorded into DLSS's
     // buffers keep it until they are done: `Loader::ready_sizes`), and the frames go to DLSS untouched until
     // the chosen network is built. So does another set of sizes.
-    let Some(builts) = loader.ready_sizes(sizes, choice, reserved) else {
+    // Offloaded: no network on this device (the process's one network is on the other).
+    let ready = if offloaded { Some(Vec::new()) } else { loader.ready_sizes(sizes, choice, reserved) };
+    let Some(builts) = ready else {
         // Paused by the VRAM guard: the hold's own frame resources go too. Idle: this path's last hold was waited
         // for above, or no hold recorded into DLSS's buffers with them may still run; this hold records nothing.
         // SAFETY: as just said.
@@ -4452,7 +4482,9 @@ unsafe fn native_hold(
         return result;
     };
     // Pass 1's: its network, its generation and its input features (where the edit cache's buffers live).
-    let built = builts[own];
+    let built = builts.get(own).copied();
+    let features = built.map_or((vk::Buffer::null(), 0), |b| (b.frame.features, b.frame.features_bytes));
+    let generation = built.map_or(0, |b| b.generation);
     // Counter chaining faulted the GPU from the hold inside DLSS's buffer (Black Myth: Wukong, 3 runs
     // of 4: Xid 13 then 32 within seconds; none of 2 with barriers): that hold rebuilds the network
     // with barriers between its launches, for the rest of the process (`fall_back_to_barriers`).
@@ -4511,7 +4543,10 @@ unsafe fn native_hold(
             return result;
         }
     } else {
-        pass.clear_exposure();
+        if !offloaded {
+            // Offloaded, the capture clears it itself, after the late capture read the previous hold's.
+            pass.clear_exposure();
+        }
         // SAFETY: nothing of the pass is pending; the colour input is a live RGBA16F storage image.
         if !unsafe { pass.bind_colour(device, target.colour) } {
             result.miss = Some("a storage view of the colour input could not be created");
@@ -4615,7 +4650,7 @@ unsafe fn native_hold(
     unsafe { native.prepare_colour(device, instance, physical_device, &passes, lut) };
     // SAFETY: nothing of the pass is pending (`wait_idle` above), or its sets are not written now; the HDR
     // pass outlives it in `res`.
-    if !unsafe { native.record_graphs(device, instance, physical_device, &graphs, encoded, exposure, depth_buffer) } {
+    if !offloaded && !unsafe { native.record_graphs(device, instance, physical_device, &graphs, encoded, exposure, depth_buffer) } {
         res.native = Some(native);
         result.miss = Some(frozen.blocked().map_or("recording the native frame failed", |_| WAITING));
         return result;
@@ -4638,6 +4673,32 @@ unsafe fn native_hold(
         res.native = Some(native);
         result.miss = Some("the edit cache's passes could not be built");
         return result;
+    }
+    // The offload's side of the hold: the exchange with the other device and its worker, made on the first hold.
+    if offloaded && res.offpre.is_none() && !others_outstanding {
+        // SAFETY: the game's live device; the offload device was made with it.
+        match unsafe { super::offload_pre::HoldSide::build(device, instance, physical_device, res.imported(), res.id, target.width, target.height) } {
+            Ok(side) => res.offpre = Some(side),
+            Err(why) => {
+                crate::log!("[offload] the model stays on the game's GPU: {why}");
+                crate::logging::flush();
+                super::offload::note_state(super::offload::State::FellBack(why));
+                res.native = Some(native);
+                result.miss = Some("the second GPU could not take the network; it runs on the game's GPU from the next frame");
+                return result;
+            }
+        }
+    }
+    // Given up meanwhile (the worker's rules): this hold still goes as an offloaded one, without an answer; the
+    // next runs the network here.
+    let offloaded = offloaded && res.offpre.is_some();
+    if !offloaded && res.offpre.is_some() && !others_outstanding && !inline {
+        // The split hold's work was waited for above: the offload's side goes (its worker ends, the other device's
+        // side is freed and the network comes back through the loader's lend).
+        if let Some(side) = res.offpre.take() {
+            // SAFETY: idle, as just said.
+            unsafe { side.destroy(device) };
+        }
     }
     // The scene-cut detector, unless switched off (`NEURAL_FORGE_SCENE_CUT=off`). Without it (a failed
     // build, tried again on the retry schedule) the history resets on the other rules only.
@@ -4662,8 +4723,10 @@ unsafe fn native_hold(
     native.gap.note_format(format_of(target));
     // A frame of another network than the history's (the Network setting switched) resets the history
     // (`frame_passes` below then runs with no history: seed 0, no blend toward it, in every pass).
-    if note_network(&mut native.gap, &mut native.history_network, built.network) {
-        crate::log!("[native] resetting the history (the {} network runs from here)", network::name(built.network));
+    if let Some(b) = built {
+        if note_network(&mut native.gap, &mut native.history_network, b.network) {
+            crate::log!("[native] resetting the history (the {} network runs from here)", network::name(b.network));
+        }
     }
     // The game reset DLSS's history for this frame: the network's history starts afresh too, at this hold's
     // network frame or the next one, and the edit cache refreshes rather than carry the old scene's edit here.
@@ -4683,11 +4746,12 @@ unsafe fn native_hold(
             let bytes = edit.scratch_bytes();
             // SAFETY: `device` is live; nothing of the pass is pending (`wait_idle` above), or its buffers are
             // not replaced now.
-            unsafe { native.cache_scratch(device, instance, physical_device, (built.frame.features, built.frame.features_bytes), bytes) }
-                .unwrap_or((built.frame.features, built.frame.features_bytes))
+            unsafe { native.cache_scratch(device, instance, physical_device, features, bytes) }.unwrap_or(features)
         }
-        None => (built.frame.features, built.frame.features_bytes),
+        None => features,
     };
+    let mut off_plan: Option<super::offload_pre::HoldPlan> = None;
+    let mut late_bound = false;
     if let Some(edit) = res.edit.as_mut().filter(|_| cache_on) {
         chained = edit.chain(scratch.1);
         if !chained {
@@ -4699,10 +4763,11 @@ unsafe fn native_hold(
             jitter,
             mvec: mvec.is_some(),
             depth: depth.is_some(),
-            history_ok,
+            // Offloaded, the network's history is the other device's: the stored edit is one hold old at most.
+            history_ok: history_ok || offloaded,
             armed: arm.is_some(),
             debug_mask: ask.debug_mask,
-            generation: built.generation,
+            generation,
         };
         let hdr_ref = res.hdr.as_ref().expect("built above");
         let bindings = super::cache::Bindings {
@@ -4716,12 +4781,24 @@ unsafe fn native_hold(
             scratch,
             // The split hold makes a view of the colour input every hold (`HdrPass::bind_colour`): the set is
             // written every hold, as the view's handle often comes back for the next one.
-            made: [hdr_ref.colour_binding(), native.id(), built.generation],
+            made: [hdr_ref.colour_binding(), native.id(), generation],
         };
         // SAFETY: nothing of the pass is pending, or its set is not written now; every handle is live.
         unsafe { edit.bind(device, &bindings) };
+        if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
+            // SAFETY: as above; the kept image and the counters are live.
+            unsafe {
+                late_bound = edit.bind_late(device, side.snapshot_view());
+                side.exchange.bind_gate(device, edit.stats_buffer());
+            }
+        }
         // A hold that records nothing (below) must not have taken the stored edit out of the plan.
         if frozen.blocked().is_none() {
+            edit.state.set_offloaded(offloaded);
+            if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
+                // Its frame can be sent when the next hold can carry its edit: vectors, jitter, a chained cache.
+                off_plan = Some(side.plan(&mut edit.state, &h, chained && mvec.is_some() && jitter.is_some()));
+            }
             let p = edit.state.plan(&h);
             if !inline {
                 edit.clear_counters();
@@ -4737,6 +4814,25 @@ unsafe fn native_hold(
         }
     }
     let cached = plan.is_some_and(|p| p.kind == super::cache::Kind::Cached);
+    // Offloaded: the answer to the frame sent before this hold is taken when this hold is the cached one after it.
+    let take_seq = off_plan.filter(|p| p.take && cached && late_bound).and_then(|p| p.settle);
+    let late_push = res.offpre.as_ref().and_then(super::offload_pre::HoldSide::sent_push);
+    // The network frame of this hold runs on the other device: the history's rule, decided here as for a frame here.
+    let off_history = offloaded && off_plan.is_some_and(|p| p.send.is_some()) && native.gap.begin(hold_now()).is_none() && mvec.is_some() && !no_history();
+    let off_meta = off_plan.and_then(|p| p.send).map(|seq| super::offload_server::FrameMeta {
+        seq,
+        width: target.width,
+        height: target.height,
+        extents,
+        sizes: sizes.to_vec(),
+        choice,
+        history: off_history,
+        jitter,
+        mvec_scale: target.mvec_scale,
+        passes,
+        depth: depth.is_some(),
+        lut: lut.cloned(),
+    });
     // The motion pass while the cache runs (its prep and the accumulated field the network reads), at
     // interval 1 whenever there are vectors to convert.
     let run_motion = push.is_some() && (chained || mvec.is_some());
@@ -4818,11 +4914,58 @@ unsafe fn native_hold(
         }
     };
     let more = more && !cached;
+    let off_side = res.offpre.as_ref().filter(|_| offloaded);
+    let state_buffer = native.state_buffer();
+    // Offloaded, first in the hold: the answer to the frame sent last into its image, the capture of its edit
+    // against that frame (still in place: before this hold's own capture), and the gate.
+    let receive = |cmd: vk::CommandBuffer| {
+        let (Some(side), Some(seq), Some(hp), Some(e), Some(push)) = (off_side, take_seq, hdr_pass, edit, late_push.as_ref()) else { return };
+        let before = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ | vk::AccessFlags::HOST_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+        // SAFETY: recording into the hold's own buffer or DLSS's; everything bound above and live.
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[hp.answer_to_general()],
+            );
+            hp.record_answer_in(device, cmd, side.exchange.answer_buffer(), side.exchange.layout.answer_at);
+            e.record_capture_late(device, cmd, push);
+            side.exchange.record_gate(device, cmd, seq);
+        }
+    };
+    // Offloaded, after the capture: the colour input kept for the next hold's capture, and the frame sent.
+    let send = |cmd: vk::CommandBuffer| {
+        let (Some(side), Some(seq), Some(hp)) = (off_side, off_plan.and_then(|p| p.send), hdr_pass) else { return };
+        let (pw, ph) = super::padded(target.width, target.height);
+        let side_buffers = [(exposure, hdr::HdrPass::EXPOSURE_BYTES), (state_buffer, 16)];
+        let from = super::offload_pre::Sources {
+            frame: super::offload_pre::FrameSource::Image { image: hp.encoded_image(), width: pw, height: ph },
+            motion: Some(acc),
+            depth: depth_buffer,
+            side: &side_buffers,
+        };
+        // SAFETY: as above; the colour input is in GENERAL for the hold, the encode in its image.
+        unsafe {
+            side.record_snapshot(device, cmd, target.colour, target.width, target.height);
+            side.exchange.record_send(device, cmd, seq, &from);
+        }
+    };
+    let after_encode = |cmd: vk::CommandBuffer| {
+        after_encode(cmd);
+        send(cmd);
+    };
+    let run_extra = scene.is_some() || run_motion || offloaded;
     if let Some(ctx) = ctx {
         // ---- Inside DLSS's buffer: everything recorded into it, in the split hold's order. ----
         let cmd = ctx.cb;
         // The frame's plan (its parameters, its history, its parity), as the split hold makes it.
-        let (history, frame_plan) = if cached {
+        let (history, frame_plan) = if cached || offloaded {
             (false, None)
         } else {
             let stale = native.gap.begin(hold_now());
@@ -4843,6 +4986,7 @@ unsafe fn native_hold(
         // stays so while the buffer may run (nothing is destroyed or rewritten while a hold may run).
         unsafe {
             ctx.open();
+            receive(cmd);
             let verdict = if ctx.verdicts == vk::Buffer::null() { NO_VERDICT } else { ctx.slot };
             res.guard.as_ref().expect("bound above").record(device, cmd, seq, verdict);
             // What the split hold writes from the host before it submits: here, in the buffer's order.
@@ -4882,7 +5026,8 @@ unsafe fn native_hold(
                 mvec.map(|_| native.mvec.buffer),
                 depth_copy,
                 cache.map(|c| c.colour),
-                (scene.is_some() || run_motion).then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
+                run_extra.then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
+                None,
                 Some(cmd),
             );
             ctx.stamp(1);
@@ -4918,7 +5063,7 @@ unsafe fn native_hold(
         // SAFETY: as above.
         unsafe {
             ctx.stamp(2);
-            if network_ok {
+            if network_ok && (cached || !offloaded) {
                 let _ = if cached {
                     super::record_cached_writeback(device, res, &apply, Some(cmd))
                 } else {
@@ -4987,6 +5132,7 @@ unsafe fn native_hold(
             exposure_source: Some(source),
             cache_dump: None,
             timed: ctx.queries != vk::QueryPool::null(),
+            offload: off_plan.filter(|_| offloaded),
         };
         if !network_ok {
             if let Some(e) = res.edit.as_mut() {
@@ -5004,6 +5150,13 @@ unsafe fn native_hold(
         }
         if let (Some(edit), Some(h), Some(p)) = (res.edit.as_mut(), cache_hold.as_ref(), plan.as_ref()) {
             edit.state.went_through(h, p);
+            if offloaded && !cached {
+                // Nothing was stored by this hold: only the next hold's late capture stores this frame's edit.
+                edit.state.drop_edit();
+            }
+        }
+        if let (Some(side), Some(h), Some(q), Some(p)) = (res.offpre.as_mut().filter(|_| offloaded), cache_hold.as_ref(), push.as_ref(), off_plan.as_ref()) {
+            side.went_through(h, q, p, off_meta);
         }
         let pending = arm.filter(|_| cache.is_some()).map(|arm| super::cache_dump::Pending {
             arm,
@@ -5025,13 +5178,38 @@ unsafe fn native_hold(
         });
         result.meta = Some(super::inline::Meta { cache_dump: pending, ..meta });
         result.evaluated = true;
-        result.wrote_back = true;
+        result.wrote_back = cached || !offloaded;
         result.cached = cached;
         result.cache_still = cache_hold.is_some_and(|h| h.interval > 1) && res.edit.as_ref().is_some_and(|e| e.state.regime.still());
         result.timing.writeback = Some(t_hold.elapsed());
         return result;
     }
     let submit = submit.expect("the split hold submits");
+    // Offloaded: the wait for the answer to the frame sent last is here, where the frame's own rendering is
+    // already on the queue (`offload_pre::Exchange::at_submit`).
+    if let (Some(side), Some(p)) = (off_side, off_plan.as_ref()) {
+        side.exchange.at_submit(p);
+    }
+    let first = |cmd: vk::CommandBuffer| {
+        receive(cmd);
+        // What the host clears before the capture when the network runs here, after the late capture read it.
+        let cleared = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+        // SAFETY: recording the capture; the exposure buffer is the HDR pass's.
+        unsafe {
+            device.cmd_fill_buffer(cmd, exposure, 0, hdr::HdrPass::EXPOSURE_BYTES, 0);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[cleared],
+                &[],
+                &[],
+            );
+        }
+    };
     // SAFETY: the capture buffer is idle; the colour view was bound above. The encode stays in the HDR
     // pass's image: the network reads it there (no copy into slot 0's proxy, the after-the-upscaler
     // path's).
@@ -5046,7 +5224,8 @@ unsafe fn native_hold(
             mvec.map(|_| native.mvec.buffer),
             depth_copy,
             cache.map(|c| c.colour),
-            (scene.is_some() || run_motion).then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
+            run_extra.then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
+            offloaded.then_some(&first as &dyn Fn(vk::CommandBuffer)),
             None,
         )
     };
@@ -5071,6 +5250,9 @@ unsafe fn native_hold(
     let recorded = unsafe {
         if cached {
             super::record_cached_writeback(device, res, &apply, None)
+        } else if offloaded {
+            // No edit to carry on this hold: the frame goes to DLSS as it is (the write-back's buffer and fence stay).
+            super::record_cached_writeback(device, res, &|_| {}, None)
         } else {
             super::record_writeback(
                 device,
@@ -5091,7 +5273,7 @@ unsafe fn native_hold(
     }
     // A cached hold keeps the network's history as it is (no frame of the network): its parity,
     // seed and jitter stay the last refresh's.
-    let (history, frame_cmds, later) = if cached {
+    let (history, frame_cmds, later) = if cached || offloaded {
         (false, [None, None], Vec::new())
     } else {
         let stale = native.gap.begin(hold_now());
@@ -5110,8 +5292,14 @@ unsafe fn native_hold(
         d.valid = None;
     }
     if crate::note_vk(device.handle(), submit(super::Which::Capture, res.capture_cmd, vk::Fence::null())).is_err() {
+        if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
+            side.dropped();
+        }
         result.miss = Some("the capture submit failed");
         return result;
+    }
+    if let Some(side) = res.offpre.as_ref().filter(|_| offloaded) {
+        side.exchange.handed();
     }
     if let Some(d) = res.depth.as_mut() {
         d.valid = depth;
@@ -5209,6 +5397,18 @@ unsafe fn native_hold(
     if let (Some(edit), Some(h), Some(p)) = (res.edit.as_mut(), cache_hold.as_ref(), plan.as_ref()) {
         edit.state.went_through(h, p);
         edit.submitted(run_motion, cached || chained);
+        if offloaded && !cached {
+            // Nothing was stored by this hold: only the next hold's late capture stores this frame's edit.
+            edit.state.drop_edit();
+        }
+    }
+    if let (Some(side), Some(h), Some(q), Some(p)) = (res.offpre.as_mut().filter(|_| offloaded), cache_hold.as_ref(), push.as_ref(), off_plan.as_ref()) {
+        side.went_through(h, q, p, off_meta);
+    }
+    if offloaded && !cached {
+        if let Some(n) = res.native.as_mut() {
+            n.gap.touch(hold_now());
+        }
     }
     if let (Some(arm), Some(c)) = (arm.filter(|_| cache.is_some()), res.cache.as_mut()) {
         c.pending = Some(super::cache_dump::Pending {
@@ -5231,7 +5431,7 @@ unsafe fn native_hold(
         });
     }
     result.evaluated = true;
-    result.wrote_back = true;
+    result.wrote_back = cached || !offloaded;
     result.cached = cached;
     result.cache_still = cache_hold.is_some_and(|h| h.interval > 1) && res.edit.as_ref().is_some_and(|e| e.state.regime.still());
     result.timing.writeback = Some(t_hold.elapsed());

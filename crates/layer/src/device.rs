@@ -1920,6 +1920,9 @@ impl NeuralForgeDeviceInfo {
         let (Some(inline), Some(tracking)) = (&self.inline, &self.preupscale) else { return };
         let cbs: Vec<vk::CommandBuffer> = cbs.into_iter().collect();
         inline.check(&cbs, |earlier, image| tracking.lock().layout_when_run(earlier, image));
+        // The network on a second GPU: the wait for the answer the holds in these buffers take, with nothing locked.
+        #[cfg(target_arch = "x86_64")]
+        crate::preupscale::offload_pre::at_submit(&inline.offload_plans(&cbs));
     }
 
     /// A submission the next layer accepted on `queue`: each hold recorded into its buffers runs once more

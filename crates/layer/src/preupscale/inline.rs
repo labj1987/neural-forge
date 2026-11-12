@@ -196,6 +196,9 @@ unsafe impl Send for Slot {}
 /// What a hold recorded into a buffer says about itself, for what is read back once the buffer ran.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Meta {
+    /// The hold's part in the offload of the network to a second GPU (`super::offload_pre`): what its buffer's
+    /// submit settles first.
+    pub offload: Option<super::offload_pre::HoldPlan>,
     pub stage: Stage,
     /// The resources it was recorded with (`super::Resources::id`): readings of other ones are dropped.
     pub resources: u64,
@@ -762,6 +765,19 @@ impl Inline {
                 self.say_once(format!("the fence after the hold's work could not be submitted ({e:?}); the holds may overlap"));
             }
         }
+    }
+
+    /// Before a submission of `cbs` (in order) on the hold's queue: what the offloaded holds in them planned
+    /// (`super::offload_pre::at_submit`), with the resources each was recorded with.
+    pub(crate) fn offload_plans(&self, cbs: &[vk::CommandBuffer]) -> Vec<(u64, super::offload_pre::HoldPlan)> {
+        let s = lock(&self.slots);
+        if s.by_cb.is_empty() {
+            return Vec::new();
+        }
+        cbs.iter()
+            .flat_map(|cb| s.by_cb.get(cb).into_iter().flatten())
+            .filter_map(|&i| s.slots[i].meta.as_ref().and_then(|m| m.offload.map(|p| (m.resources, p))))
+            .collect()
     }
 
     /// Before a submission of `cbs` (in order) on the hold's queue: checks each layout a hold in them guessed
@@ -1396,6 +1412,7 @@ impl Meta {
             exposure_source: None,
             cache_dump: None,
             timed: false,
+            offload: None,
         }
     }
 }

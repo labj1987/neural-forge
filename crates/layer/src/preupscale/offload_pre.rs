@@ -36,10 +36,6 @@
 //! which its gate refuses), and the worker never reads OUT while the game's GPU writes it (but for an abandoned
 //! frame, whose answer is dropped and after which the runner starts its history afresh).
 
-// Not wired into the holds yet (the hold's side and the server on the other device are the next step,
-// DESIGN-preupscale-offload.md): until then only this module's tests use it.
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -162,6 +158,8 @@ impl Cadence {
 pub(crate) enum Ran {
     /// The answer is complete in IN.
     Answered,
+    /// No answer for this frame, and nothing wrong (the network is still loading there).
+    Skipped,
     /// The frame cannot run there or did not finish (why): the offload is given up.
     Failed(String),
 }
@@ -180,6 +178,9 @@ pub(crate) trait Runner: Send {
     /// it ran. Its answer is dropped; whatever the runner keeps from frame to frame (the network's history) starts
     /// afresh.
     fn abandoned(&mut self) {}
+
+    /// The offload was given up: the runner lets go of what the game's GPU needs back (the network).
+    fn gave_up(&mut self) {}
 }
 
 /// Which frames went to the driver and which the worker is done with: where [`Exchange::at_submit`] waits.
@@ -290,8 +291,9 @@ pub(crate) struct Exchange {
     pub layout: Layout,
     out: HostBuffer,
     inn: HostBuffer,
-    /// The regions' own memory (page aligned, for the host-memory import), freed with the exchange.
-    regions: [Region; 2],
+    /// The regions' own memory (page aligned, for the host-memory import), freed with the exchange (and the last
+    /// submit that writes IN's header, [`Submits`]).
+    regions: [Arc<Region>; 2],
     /// Both regions are imported on the game's device: another device may import the same memory.
     shared: bool,
     sent: vk::Event,
@@ -324,6 +326,10 @@ impl Region {
     }
 }
 
+// SAFETY: plain memory; who reads and writes it when is the exchange's protocol.
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
+
 impl Drop for Region {
     fn drop(&mut self) {
         // SAFETY: allocated in `new` with this layout.
@@ -343,7 +349,13 @@ pub(crate) struct Sources<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum FrameSource {
-    Image { image: vk::Image, width: u32, height: u32 },
+    Image {
+        image: vk::Image,
+        width: u32,
+        height: u32,
+    },
+    /// (the tests' frames)
+    #[cfg(test)]
     Buffer(vk::Buffer),
 }
 
@@ -365,11 +377,13 @@ pub(crate) struct Link {
 unsafe impl Send for Link {}
 
 impl Link {
+    #[cfg(test)]
     pub(crate) fn layout(&self) -> Layout {
         self.layout
     }
 
     /// The regions' memory, for a runner that imports them on its own device.
+    #[cfg(test)]
     pub(crate) fn regions(&self) -> (*mut u8, *mut u8) {
         (self.out, self.inn)
     }
@@ -381,7 +395,7 @@ impl Exchange {
     pub(crate) unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, import: bool, sizes: Sizes) -> Option<Self> {
         let layout = Layout::of(sizes);
         let alignment = if import { crate::capture::min_imported_host_pointer_alignment(instance, physical).unwrap_or(0) } else { 0 };
-        let regions = [Region::new(layout.out_bytes, alignment)?, Region::new(layout.in_bytes, alignment)?];
+        let regions = [Arc::new(Region::new(layout.out_bytes, alignment)?), Arc::new(Region::new(layout.in_bytes, alignment)?)];
         let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
         // SAFETY: the regions are valid for their sizes and live as long as the buffers (dropped after them).
         let out = unsafe { super::region_buffer(device, instance, physical, import, regions[0].ptr, regions[0].layout.size(), layout.out_bytes, usage) }?;
@@ -498,23 +512,12 @@ impl Exchange {
     /// hold that takes its answer, and notes this hold's send as part of the submit ([`Self::handed`] after it).
     /// `true` when the hold takes an answer that is there.
     pub(crate) fn at_submit(&self, plan: &HoldPlan) -> bool {
-        let mut taken = false;
-        if let Some(seq) = plan.settle {
-            let ok = self.progress.settle(seq, ANSWER_BUDGET);
-            if plan.take {
-                // SAFETY: IN's header, the exchange's own memory; the GPU reads it only in holds submitted after this.
-                unsafe {
-                    self.inn.ptr.cast::<u32>().add(IN_SEQ).write_volatile(seq);
-                    self.inn.ptr.cast::<u32>().add(IN_VALID).write_volatile(u32::from(ok));
-                }
-                std::sync::atomic::fence(Ordering::SeqCst);
-                taken = ok;
-            }
-        }
-        if let Some(seq) = plan.send {
-            self.progress.queue(seq);
-        }
-        taken
+        settle_and_mark(&self.progress, self.inn.ptr, plan)
+    }
+
+    /// The answer region's buffer on the game's device (the answer at the layout's `answer_at`).
+    pub(crate) fn answer_buffer(&self) -> vk::Buffer {
+        self.inn.buffer
     }
 
     /// The submit [`Self::at_submit`] was called for went to the driver: its send can run from here on.
@@ -527,6 +530,7 @@ impl Exchange {
     ///
     /// # Safety
     /// `cmd` is recording on the game's device, outside a render pass; `answer` is at least the layout's answer size.
+    #[cfg(test)]
     pub(crate) unsafe fn record_receive(&self, device: &ash::Device, cmd: vk::CommandBuffer, answer: vk::Buffer) {
         // SAFETY: the contract.
         unsafe {
@@ -633,6 +637,7 @@ impl Exchange {
             );
             device.cmd_update_buffer(cmd, self.out.buffer, 0, header_bytes);
             match from.frame {
+                #[cfg(test)]
                 FrameSource::Buffer(b) => copy(b, l.frame_at, l.sizes.frame),
                 FrameSource::Image { image, width, height } => {
                     let region = vk::BufferImageCopy::default()
@@ -714,11 +719,6 @@ impl Worker {
         self.mode.load(Ordering::Acquire) == SERVING
     }
 
-    /// Stops running frames on the other GPU: every send from now on is finished at once, without an answer.
-    pub(crate) fn pass_through(&self) {
-        self.mode.store(PASSING, Ordering::Release);
-    }
-
     /// Stops the worker: no submit waits for it any more ([`Progress::settle`]), and the holds still recorded with
     /// the exchange take no answer.
     pub(crate) fn stop(&mut self) {
@@ -792,7 +792,11 @@ fn serve(
             // SAFETY: the regions are the exchange's, valid for the layout's sizes.
             match unsafe { runner.run(seq, link.out, link.inn, &link.layout) } {
                 Ran::Answered => ok = true,
-                Ran::Failed(why) => stop_serving(why),
+                Ran::Skipped => {}
+                Ran::Failed(why) => {
+                    stop_serving(why);
+                    runner.gave_up();
+                }
             }
         }
         if link.progress.finish(seq, ok) && ok {
@@ -808,14 +812,282 @@ fn serve(
             }
         }
         if let (Some(rule), Some(interval)) = (late.as_mut(), interval) {
-            if mode.load(Ordering::Acquire) == SERVING {
+            // A frame the network was not ready for is no late answer.
+            if mode.load(Ordering::Acquire) == SERVING && ok {
                 if let Some(why) = rule.note(answer, interval, dims) {
                     stop_serving(why);
+                    runner.gave_up();
                 }
             }
         }
     }
     link.progress.stop();
+}
+
+/// What [`Exchange::at_submit`] needs, for the submit of a hold recorded into DLSS's buffer (`device.rs`, where
+/// the hold's resources are not at hand): kept by the resources' id while their exchange lives.
+#[derive(Clone)]
+struct Submits {
+    progress: Arc<Progress>,
+    /// Keeps IN's memory while a submit writes its header.
+    inn: Arc<Region>,
+}
+
+static SUBMITS: Mutex<Vec<(u64, Submits)>> = Mutex::new(Vec::new());
+
+/// Before a submit whose buffers hold these holds, in order (`plans`: each with the id of the resources it was
+/// recorded with, `inline::Meta`): [`Exchange::at_submit`] for each, then the sends count as handed to the driver
+/// (the next submit on the queue comes after this one).
+pub(crate) fn at_submit(plans: &[(u64, HoldPlan)]) {
+    if plans.is_empty() {
+        return;
+    }
+    let all: Vec<(u64, Submits)> = SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let mut touched: Vec<&Submits> = Vec::new();
+    for (id, plan) in plans {
+        let Some((_, s)) = all.iter().find(|(i, _)| i == id) else { continue };
+        settle_and_mark(&s.progress, s.inn.ptr, plan);
+        touched.push(s);
+    }
+    for s in touched {
+        s.progress.handed();
+    }
+}
+
+/// [`Exchange::at_submit`]'s body.
+fn settle_and_mark(progress: &Progress, inn: *mut u8, plan: &HoldPlan) -> bool {
+    let mut taken = false;
+    if let Some(seq) = plan.settle {
+        let ok = progress.settle(seq, ANSWER_BUDGET);
+        if plan.take {
+            // SAFETY: IN's header, the exchange's own memory; the GPU reads it only in holds submitted after this.
+            unsafe {
+                inn.cast::<u32>().add(IN_SEQ).write_volatile(seq);
+                inn.cast::<u32>().add(IN_VALID).write_volatile(u32::from(ok));
+            }
+            std::sync::atomic::fence(Ordering::SeqCst);
+            taken = ok;
+        }
+    }
+    if let Some(seq) = plan.send {
+        progress.queue(seq);
+    }
+    taken
+}
+
+/// Whether the before-DLSS placement is asked onto another GPU and not given up (`NEURAL_FORGE_OFFLOAD_GPU`).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn wanted() -> bool {
+    super::offload::Choice::current() != super::offload::Choice::Off && !super::offload::given_up() && !super::offload::standin()
+}
+
+/// The before-DLSS placement runs on the other GPU now (the Status tab's line, [`status_line`]).
+static SERVING_PRE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn serving_pre() -> bool {
+    SERVING_PRE.load(Ordering::Acquire)
+}
+
+/// The hold's side of the offload, for one set of hold resources (one render extent): the exchange, the worker
+/// with the network on the other device, the sent frame's kept colour, and the cadence.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct HoldSide {
+    pub exchange: Exchange,
+    cadence: Cadence,
+    worker: Worker,
+    metas: super::offload_server::Metas,
+    /// The colour input of the frame sent last, as the game left it: what the late capture measures the edit
+    /// against (the hold's write-back has written the colour input since).
+    snapshot: super::hdr::OwnImage,
+    /// The hold that sent last and its cache push, for the capture at the next hold.
+    sent: Option<(super::cache::Hold, super::cache::CachePush)>,
+    resources: u64,
+    holds: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl HoldSide {
+    /// # Safety
+    /// `device` is the game's live device (`import`: host memory can be imported on it); the offload device was
+    /// made with it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+        import: bool,
+        resources: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        let (pw, ph) = super::padded(width, height);
+        let (texels, padded) = (u64::from(width) * u64::from(height), u64::from(pw) * u64::from(ph));
+        let sizes = Sizes { frame: padded * 8, motion: texels * 8, depth: texels * 4, side: super::hdr::HdrPass::EXPOSURE_BYTES + 16, answer: padded * 8 };
+        // SAFETY: the contract.
+        let exchange =
+            unsafe { Exchange::build(device, instance, physical, import, sizes) }.ok_or("the frame's regions could not be made on the game's GPU")?;
+        // SAFETY: a live device; destroyed below on a later failure.
+        let Some(snapshot) = (unsafe { super::hdr::OwnImage::new(device, instance, physical, width, height, vk::ImageUsageFlags::TRANSFER_DST) }) else {
+            unsafe { exchange.destroy(device) };
+            return Err("the sent frame's copy could not be made on the game's GPU".into());
+        };
+        let link = exchange.link(device);
+        let metas = super::offload_server::Metas::default();
+        let (runner, name) = match super::offload_server::PreRunner::start(instance.clone(), device.handle(), link.shared, metas.clone()) {
+            Ok(r) => r,
+            Err(why) => {
+                // SAFETY: never used.
+                unsafe {
+                    snapshot.destroy(device);
+                    exchange.destroy(device);
+                }
+                return Err(why);
+            }
+        };
+        // Not judged late in the `same` test, where the other device shares the game's GPU (as the finished frame).
+        let late = (super::offload::Choice::current() != super::offload::Choice::Same).then(super::offload::LateRule::default);
+        let give_up: GiveUp = Box::new(|why| {
+            SERVING_PRE.store(false, Ordering::Release);
+            crate::log!("[offload] back to the game's GPU: {why}");
+            crate::logging::flush();
+            super::offload::note_state(super::offload::State::FellBack(why));
+        });
+        let Some(worker) = Worker::start(link, Box::new(runner), late, (width, height), give_up) else {
+            // SAFETY: never used (the runner was dropped with the failed start and gave its device back).
+            unsafe {
+                snapshot.destroy(device);
+                exchange.destroy(device);
+            }
+            return Err("the offload's worker could not be started".into());
+        };
+        SUBMITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((resources, Submits { progress: exchange.progress.clone(), inn: exchange.regions[1].clone() }));
+        super::offload::note_state(super::offload::State::Active(name.clone()));
+        SERVING_PRE.store(true, Ordering::Release);
+        crate::log!("[offload] before DLSS: the network's frames of {width}x{height} run on {name}");
+        crate::logging::flush();
+        Ok(Self { exchange, cadence: Cadence::default(), worker, metas, snapshot, sent: None, resources, holds: 0 })
+    }
+
+    /// Whether the other GPU runs the frames (else the offload is given up, and the holds run the network here).
+    pub(crate) fn serving(&self) -> bool {
+        self.worker.serving()
+    }
+
+    pub(crate) fn snapshot_view(&self) -> vk::ImageView {
+        self.snapshot.view
+    }
+
+    /// The cache push of the hold that sent last (the late capture's).
+    pub(crate) fn sent_push(&self) -> Option<super::cache::CachePush> {
+        self.sent.map(|(_, p)| p)
+    }
+
+    /// Plans hold `h`: what it does with the exchange, and, when it takes the answer to the frame sent before it,
+    /// that frame's refresh noted in the cache's `state` (before the hold's own plan is made there).
+    pub(crate) fn plan(&mut self, state: &mut super::cache::State, h: &super::cache::Hold, send: bool) -> HoldPlan {
+        let plan = self.cadence.hold(h.hold, send && self.serving());
+        if plan.take {
+            if let Some((sent, _)) = &self.sent {
+                state.late_refresh(sent);
+            }
+        }
+        plan
+    }
+
+    /// The hold planned as `plan` went through: its frame's parameters go to the worker, and it is the one the
+    /// next hold's capture measures against.
+    pub(crate) fn went_through(
+        &mut self,
+        h: &super::cache::Hold,
+        push: &super::cache::CachePush,
+        plan: &HoldPlan,
+        meta: Option<super::offload_server::FrameMeta>,
+    ) {
+        self.sent = plan.send.map(|_| (*h, *push));
+        if let Some(meta) = meta.filter(|_| plan.send.is_some()) {
+            let mut q = self.metas.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Frames whose buffers were never submitted leave theirs behind.
+            while q.len() > 64 {
+                q.pop_front();
+            }
+            q.push_back(meta);
+        }
+        self.holds += 1;
+        if self.holds.is_multiple_of(600) {
+            crate::log!("[offload] {}; {}", self.worker.counters.summary(), super::offload::STATS.summary());
+        }
+    }
+
+    /// The hold planned last recorded nothing after all.
+    pub(crate) fn dropped(&mut self) {
+        self.cadence.dropped();
+        self.sent = None;
+    }
+
+    /// Records the copy of the colour input (`colour`, `GENERAL`, readable by transfers) into the kept image,
+    /// left in `GENERAL` for the next hold's capture.
+    ///
+    /// # Safety
+    /// `cmd` is recording on the game's device, outside a render pass, before the hold's write-back.
+    pub(crate) unsafe fn record_snapshot(&self, device: &ash::Device, cmd: vk::CommandBuffer, colour: vk::Image, width: u32, height: u32) {
+        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+        let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
+        let image = |old: vk::ImageLayout, new: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags| {
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(src)
+                .dst_access_mask(dst)
+                .old_layout(old)
+                .new_layout(new)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.snapshot.image)
+                .subresource_range(range)
+        };
+        let before = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        let copy = vk::ImageCopy::default().src_subresource(layers).dst_subresource(layers).extent(vk::Extent3D { width, height, depth: 1 });
+        // SAFETY: the contract.
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[image(vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)],
+            );
+            device.cmd_copy_image(cmd, colour, vk::ImageLayout::GENERAL, self.snapshot.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[image(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ)],
+            );
+        }
+    }
+
+    /// # Safety
+    /// Nothing recorded with the exchange or the kept image may still run (drain before free).
+    pub(crate) unsafe fn destroy(mut self, device: &ash::Device) {
+        SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(id, _)| *id != self.resources);
+        // The worker first: its runner frees the other device's side and gives the device back.
+        self.worker.stop();
+        SERVING_PRE.store(false, Ordering::Release);
+        if matches!(super::offload::state(), super::offload::State::Active(_)) {
+            super::offload::note_state(super::offload::State::Off);
+        }
+        // SAFETY: the contract.
+        unsafe {
+            self.snapshot.destroy(device);
+            self.exchange.destroy(device);
+        }
+    }
 }
 
 /// The Status tab's words while the before-DLSS placement runs on `gpu`.

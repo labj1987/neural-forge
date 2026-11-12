@@ -1017,6 +1017,13 @@ impl HdrPass {
 
     /// Clears the exposure buffer to 0 (so a capture that did not read the exposure image leaves
     /// "unusable" behind, never the previous frame's value).
+    /// Writes the exposure buffer's bytes as another device's capture left them (`super::offload_server`).
+    pub(crate) fn set_exposure_bytes(&self, bytes: &[u8]) {
+        let n = bytes.len().min(EXPOSURE_BYTES as usize);
+        // SAFETY: the mapping covers EXPOSURE_BYTES; nothing of the pass is pending (the caller's frames are waited for).
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.exposure.ptr, n) };
+    }
+
     pub(crate) fn clear_exposure(&self) {
         // SAFETY: as above; nothing pending uses the buffer (called after the hold's `wait_idle`).
         unsafe { std::ptr::write_bytes(self.exposure.ptr, 0, EXPOSURE_BYTES as usize) };
@@ -1238,14 +1245,23 @@ impl HdrPass {
         paper_white: f32,
         before: Option<&dyn Fn(vk::CommandBuffer)>,
     ) {
-        let region = vk::BufferImageCopy {
-            buffer_offset: 0,
-            buffer_row_length: self.padded_width,
-            buffer_image_height: 0,
-            image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
-            image_offset: vk::Offset3D::default(),
-            image_extent: vk::Extent3D { width: self.padded_width, height: self.padded_height, depth: 1 },
-        };
+        // SAFETY: forwarded; every handle is live.
+        unsafe {
+            self.record_answer_in(device, cmd, source, 0);
+            if let Some(before) = before {
+                before(cmd);
+            }
+            self.dispatch(device, cmd, self.decode, paper_white, self.width, self.height);
+        }
+    }
+
+    /// Records the answer's copy from `source` at `offset` (the answer buffer's layout) into its image, ordered
+    /// before the compute passes that read it.
+    ///
+    /// # Safety
+    /// `cmd` is recording; the answer image is in `GENERAL` ([`Self::answer_to_general`]).
+    pub(crate) unsafe fn record_answer_in(&self, device: &ash::Device, cmd: vk::CommandBuffer, source: vk::Buffer, offset: u64) {
+        let region = vk::BufferImageCopy { buffer_offset: offset, ..self.padded_region() };
         let answer_in = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
         // SAFETY: forwarded; every handle is live.
         unsafe {
@@ -1259,10 +1275,6 @@ impl HdrPass {
                 &[],
                 &[],
             );
-            if let Some(before) = before {
-                before(cmd);
-            }
-            self.dispatch(device, cmd, self.decode, paper_white, self.width, self.height);
         }
     }
 

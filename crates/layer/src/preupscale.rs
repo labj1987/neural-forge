@@ -108,7 +108,10 @@ pub(crate) mod native;
 pub(crate) mod native_post;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod offload;
+#[cfg(target_arch = "x86_64")]
 pub(crate) mod offload_pre;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod offload_server;
 pub(crate) mod placement;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_flow;
@@ -4011,6 +4014,9 @@ pub(crate) struct Resources {
     /// The edit cache's passes (`cache`), built on the first native hold.
     #[cfg(target_arch = "x86_64")]
     pub(crate) edit: Option<cache::CachePass>,
+    /// The network on a second GPU for the hold before DLSS (`offload_pre`), made on its first offloaded hold.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) offpre: Option<offload_pre::HoldSide>,
     /// The scene-cut detector (`scene_cut`), built on the first native hold unless it is switched off.
     #[cfg(target_arch = "x86_64")]
     pub(crate) scene: Option<scene_cut::ScenePass>,
@@ -4176,6 +4182,8 @@ impl Resources {
             #[cfg(target_arch = "x86_64")]
             edit: None,
             #[cfg(target_arch = "x86_64")]
+            offpre: None,
+            #[cfg(target_arch = "x86_64")]
             scene: None,
             cache: None,
             #[cfg(target_arch = "x86_64")]
@@ -4306,6 +4314,10 @@ impl Resources {
             #[cfg(target_arch = "x86_64")]
             if let Some(depth) = &self.depth {
                 depth.destroy(device);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(side) = self.offpre.take() {
+                side.destroy(device);
             }
             #[cfg(target_arch = "x86_64")]
             if let Some(edit) = &self.edit {
@@ -4757,6 +4769,7 @@ unsafe fn record_capture(
     native_depth: Option<(vk::Buffer, Option<&crate::gpu_timer::GpuTimer>)>,
     colour_before: Option<vk::Buffer>,
     extra: Option<&dyn Fn(vk::CommandBuffer)>,
+    first: Option<&dyn Fn(vk::CommandBuffer)>,
     into: Option<vk::CommandBuffer>,
 ) -> ash::prelude::VkResult<()> {
     let relative = ExposureSource::of(target) == ExposureSource::Game;
@@ -4771,6 +4784,10 @@ unsafe fn record_capture(
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         }
+    }
+    // Before anything of this hold's capture (`native`, the offloaded hold: what the previous hold left is read first).
+    if let Some(first) = first {
+        first(cmd);
     }
     // The game's texel is copied in whenever it is the source, also when the auto-exposure lifts it after.
     let aux: Vec<DumpRead> =
@@ -5142,7 +5159,7 @@ pub(crate) unsafe fn run_hold(
     let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
     let dump_bufs = if dump { res.dump.as_ref() } else { None };
     // SAFETY: the capture buffer is idle (`wait_idle` above); the colour view was bound above.
-    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, Some(res.proxy.buffer), None, None, None, None, None) }.is_err() {
+    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, Some(res.proxy.buffer), None, None, None, None, None, None) }.is_err() {
         result.miss = Some("recording the capture failed");
         return result;
     }
@@ -6611,7 +6628,7 @@ impl Session {
                 }
                 static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    crate::log!("[offload] NEURAL_FORGE_OFFLOAD_GPU is set, but the model moves to another GPU only at the Placement setting `present` (every pass): it runs on the game's GPU");
+                    crate::log!("[offload] NEURAL_FORGE_OFFLOAD_GPU: not every pass is at the Placement setting `present`: the holds before DLSS send their frames to the other GPU themselves; a pass after DLSS's output or on the finished frame beside them runs on the game's GPU");
                 }
             }
 
@@ -11781,8 +11798,21 @@ mod tests {
             identification: 1,
         };
         let run = |res: &Resources, target: &Target, cache: Option<&CacheCopies>| unsafe {
-            record_capture(d, res, target, None, None, Some(res.proxy.buffer), None, Some((depth_copy.buffer, None)), cache.map(|c| c.colour), None, None)
-                .unwrap();
+            record_capture(
+                d,
+                res,
+                target,
+                None,
+                None,
+                Some(res.proxy.buffer),
+                None,
+                Some((depth_copy.buffer, None)),
+                cache.map(|c| c.colour),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
             record_writeback(d, res, target, res.proxy.buffer, None, cache, None, None).unwrap();
             let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
             d.queue_submit(gpu.queue, &[vk::SubmitInfo::default().command_buffers(&[res.capture_cmd, res.writeback_cmd])], fence).unwrap();

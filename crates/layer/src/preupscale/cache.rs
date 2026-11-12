@@ -444,6 +444,10 @@ pub(crate) struct State {
     refresh_seq: u64,
     /// The adaptive cadence, from the counts of the holds before.
     pub(crate) regime: Regime,
+    /// The network runs on another GPU (`super::offload_pre`): its edit of a frame is stored at the next hold
+    /// ([`Self::late_refresh`]), so a hold right after a refresh is cached whatever the cadence says (the still
+    /// regime's every-hold refresh has no network to run on this GPU).
+    offloaded: bool,
 }
 
 /// What a hold brings to [`State::plan`].
@@ -503,7 +507,8 @@ impl State {
         let chained = h.interval > 1;
         // The hold before went through on this chain, and this one can read the refresh's edit.
         let continues = chained && had && consecutive && h.jitter.is_some() && h.mvec && h.depth == self.refresh_depth && h.history_ok && !h.armed;
-        let cached = continues && self.since_refresh + 1 < self.regime.interval(h.interval);
+        let interval = if self.offloaded { h.interval } else { self.regime.interval(h.interval) };
+        let cached = continues && self.since_refresh + 1 < interval;
         let mut flags = if super::hdr::highlight_flags() != 0 { F_KEEP_CLAMPED } else { 0 } | transfer_bits(super::hdr::transfer_flags());
         if chained {
             flags |= F_CHAINED;
@@ -531,6 +536,25 @@ impl State {
             step_jitter: if consecutive { delta(self.prev_jitter) } else { [0.0; 2] },
             refresh_jitter: delta(self.refresh_jitter),
         }
+    }
+
+    /// Whether the network runs on another GPU ([`Self::offloaded`]). A change drops the stored edit.
+    pub(crate) fn set_offloaded(&mut self, on: bool) {
+        if self.offloaded != on {
+            self.offloaded = on;
+            self.drop_edit();
+        }
+    }
+
+    /// The other GPU's answer to the frame of hold `h` is stored by the hold being planned now, before its own
+    /// capture (`super::offload_pre`): as if `h` had been a refresh that went through. `h` itself went through
+    /// already (as a cached hold, or one that only sent its frame).
+    pub(crate) fn late_refresh(&mut self, h: &Hold) {
+        let plan = Plan { kind: Kind::Refresh, refresh: self.refresh_seq + 1, flags: 0, step_jitter: [0.0; 2], refresh_jitter: [0.0; 2] };
+        let pending = self.pending;
+        self.went_through(h, &plan);
+        // The counters still to be read are the hold's own, as it ran.
+        self.pending = pending;
     }
 
     /// The hold `h` planned as `plan` went through (everything submitted).
@@ -655,6 +679,10 @@ pub(crate) struct CachePass {
     pipelines: [vk::Pipeline; 7],
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
+    /// The set of the capture run a hold late (`super::offload_pre`): as `set`, with the sent frame's kept colour
+    /// in place of the colour input; what it points at ([`Self::bind_late`]).
+    late_set: vk::DescriptorSet,
+    late_bound: Option<(Bindings, bool, vk::ImageView)>,
     stats: HostBuffer,
     /// Bound where the scratch or the depth is not there (the shaders do not read it then).
     dummy: OwnBuffer,
@@ -734,13 +762,13 @@ impl CachePass {
                 p.pipelines.push(pipeline);
             }
             let sizes = [
-                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 3 },
-                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: BINDINGS - 3 },
+                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 6 },
+                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 * (BINDINGS - 3) },
             ];
-            p.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).ok()?;
-            let set = device
-                .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(p.pool).set_layouts(std::slice::from_ref(&p.set_layout)))
-                .ok()?[0];
+            p.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(2).pool_sizes(&sizes), None).ok()?;
+            let both = [p.set_layout, p.set_layout];
+            let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(p.pool).set_layouts(&both)).ok()?;
+            let (set, late_set) = (sets[0], sets[1]);
             // TRANSFER: inside DLSS's buffer the hold clears them and copies them out for the host itself.
             let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC;
             p.stats = Some(super::own_host_buffer_with(device, instance, physical_device, STAT_BYTES, usage)?);
@@ -757,6 +785,8 @@ impl CachePass {
                 pipelines,
                 pool: std::mem::take(&mut p.pool),
                 set,
+                late_set,
+                late_bound: None,
                 stats,
                 dummy,
                 chained: false,
@@ -825,6 +855,33 @@ impl CachePass {
             return;
         }
         self.bound = Some((*b, self.chained));
+        // SAFETY: the contract.
+        unsafe { self.write_set(device, self.set, b) };
+    }
+
+    /// Points the late capture's set at what [`Self::bind`] bound, with `colour` (the sent frame's kept colour,
+    /// `GENERAL`) as the colour input. `false` when it cannot be written now ([`super::may_rewrite`]) or nothing
+    /// is bound.
+    ///
+    /// # Safety
+    /// As [`Self::bind`], called before; `colour` is a live RGBA16F storage view.
+    pub(crate) unsafe fn bind_late(&mut self, device: &ash::Device, colour: vk::ImageView) -> bool {
+        let Some((b, chained)) = self.bound else { return false };
+        if self.late_bound == Some((b, chained, colour)) {
+            return true;
+        }
+        if !super::may_rewrite("the edit cache's late capture set") {
+            return false;
+        }
+        self.late_bound = Some((b, chained, colour));
+        // SAFETY: the contract.
+        unsafe { self.write_set(device, self.late_set, &Bindings { colour, ..b }) };
+        true
+    }
+
+    /// # Safety
+    /// `set` is not in use; every handle of `b` is live.
+    unsafe fn write_set(&mut self, device: &ash::Device, set: vk::DescriptorSet, b: &Bindings) {
         let dummy = self.dummy.buffer;
         // The scratch only above interval 1 and with room for the layout.
         let scratch = (self.chained && b.scratch.1 >= self.layout.total).then_some(b.scratch.0);
@@ -861,13 +918,10 @@ impl CachePass {
             .collect();
         let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(BINDINGS as usize);
         for ((n, _), info) in buffers.iter().zip(&buffer_infos) {
-            writes.push(
-                vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(*n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info),
-            );
+            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info));
         }
         for ((n, _), info) in images.iter().zip(&image_infos) {
-            writes
-                .push(vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(*n).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(info));
+            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*n).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(info));
         }
         // SAFETY: the set is not in use (contract); every handle is live.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -1016,6 +1070,32 @@ impl CachePass {
             }
             Self::to_host(device, cmd);
             // The decode writes the colour input this pass read.
+            Self::compute_barrier(device, cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE);
+        }
+    }
+
+    /// Records the capture of the edit a hold late (`super::offload_pre`): the other GPU's answer to the frame
+    /// the hold before sent, against that frame (its encode, exposure and depth still in place: this runs before
+    /// the hold's own capture; its colour from the kept copy, [`Self::bind_late`]), with that hold's `push`.
+    ///
+    /// # Safety
+    /// `cmd` is recording, the answer is in its image; [`Self::bind_late`] returned true for this hold, chained.
+    pub(crate) unsafe fn record_capture_late(&self, device: &ash::Device, cmd: vk::CommandBuffer, push: &CachePush) {
+        // SAFETY: `CachePush` is `repr(C)` plain data, read as bytes for its own size.
+        let bytes = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(push).cast::<u8>(), std::mem::size_of::<CachePush>()) };
+        // SAFETY: forwarded; the set, layout and pipelines are this pass's own.
+        unsafe {
+            Self::compute_barrier(
+                device,
+                cmd,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE,
+            );
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipelines[CAPTURE]);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, std::slice::from_ref(&self.late_set), &[]);
+            device.cmd_push_constants(cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+            device.cmd_dispatch(cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
+            Self::to_host(device, cmd);
             Self::compute_barrier(device, cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE);
         }
     }
