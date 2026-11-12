@@ -94,7 +94,8 @@ struct Run {
 
 impl Run {
     fn from_table(t: &BTreeMap<String, Value>) -> Result<Run, String> {
-        const KEYS: [&str; 12] = ["label", "appid", "route", "args", "seconds", "timeout", "hdr", "ray_reconstruction", "edit_kind", "edit_file", "edits", "env"];
+        const KEYS: [&str; 12] =
+            ["label", "appid", "route", "args", "seconds", "timeout", "hdr", "ray_reconstruction", "edit_kind", "edit_file", "edits", "env"];
         if let Some(k) = t.keys().find(|k| !KEYS.contains(&k.as_str())) {
             return Err(format!("unknown key {k}"));
         }
