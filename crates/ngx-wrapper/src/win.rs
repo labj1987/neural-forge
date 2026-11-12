@@ -2,7 +2,7 @@
 
 use core::ffi::c_void;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::exports::{missing_export, HOOKED, PASSTHROUGH, PASSTHROUGH_TARGETS, PASSTHROUGH_TRACED};
@@ -103,8 +103,6 @@ pub(crate) fn log(line: &str) {
 /// The mapped trace file (null: tracing off), and how many bytes went into its ring.
 static TRACE: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static TRACE_WRITTEN: AtomicU64 = AtomicU64::new(0);
-/// Whether passthrough calls go through the traced entries (set once, at load).
-static TRACE_CALLS: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn tracing() -> bool {
     !TRACE.load(Ordering::Relaxed).is_null()
@@ -418,7 +416,6 @@ fn resolve(this: Handle) -> Result<String, String> {
         Resolution::Ok { stubbed } => stubbed,
     };
     let traced = tracing();
-    TRACE_CALLS.store(traced, Ordering::Relaxed);
     for (i, name) in PASSTHROUGH.iter().enumerate() {
         let p = lookup(name);
         let p = if p.is_null() { missing_export as *const () as usize } else { p as usize };
@@ -507,7 +504,13 @@ pub unsafe extern "system" fn DllMain(this: Handle, reason: u32, _reserved: *mut
     ));
     let t = now_ms();
     let resolved = resolve(this);
-    trace(format_args!("load: resolved in {:.3} ms (passthrough calls traced: {})", now_ms() - t, TRACE_CALLS.load(Ordering::Relaxed)));
+    trace(format_args!("load: resolved in {:.3} ms (passthrough calls traced)", now_ms() - t));
+    // For the text log: whether the trace is on, and where, or why it could not be opened.
+    let trace_state = match &opened {
+        None => "off".to_string(),
+        Some(Ok(path)) => format!("on, {path}"),
+        Some(Err(e)) => format!("not opened: {e}"),
+    };
     match resolved {
         Ok(core) => {
             let ring = if rules::ring_wanted(|name| std::env::var(name).ok()) {
@@ -515,14 +518,18 @@ pub unsafe extern "system" fn DllMain(this: Handle, reason: u32, _reserved: *mut
             } else {
                 Err("not created: the Neural Forge layer is not on in this process (NEURAL_FORGE_ENABLE)".into())
             };
-            log(&format!("Neural Forge NGX wrapper {} in {exe} as {}; NVIDIA's core {core}; ring {ring:?}", env!("CARGO_PKG_VERSION"), module_path(this)));
+            log(&format!(
+                "Neural Forge NGX wrapper {} in {exe} as {}; NVIDIA's core {core}; ring {ring:?}; trace {trace_state}",
+                env!("CARGO_PKG_VERSION"),
+                module_path(this)
+            ));
             trace(format_args!("load: DllMain done"));
             1
         }
         Err(e) => {
             // Failing the load makes NGX report itself unavailable: the game runs without DLSS rather than with a
             // half-forwarded core.
-            log(&format!("Neural Forge NGX wrapper in {exe}: {e}"));
+            log(&format!("Neural Forge NGX wrapper in {exe}: {e}; trace {trace_state}"));
             0
         }
     }

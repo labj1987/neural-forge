@@ -121,7 +121,7 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
 For a game that stalls or crashes with the wrapper in and logs nothing in `NEURAL_FORGE_NGX_LOG` (#51: Indiana Jones
 and the Great Circle, Vulkan with Streamline, `vkQueuePresentKHR` returning `VK_TIMEOUT` about 5 s after its
 swapchain, before any feature was created). `NEURAL_FORGE_NGX_TRACE=<path>` (a Windows path, or a Linux one taken
-through `Z:`; `{pid}` becomes the Linux pid) makes the wrapper log:
+through `Z:`; `{pid}` becomes the Linux pid, and without it the pid goes before the extension) makes the wrapper log:
 
 - its load: the environment Proton set (`NVIDIA_WINE_DLL_DIR`, `WINEDLLOVERRIDES`), how long `LoadLibraryW` of
   NVIDIA's core took, every export's resolved address (and which the core lacks), the ring, `DllMain`'s end, and
@@ -138,9 +138,13 @@ through `Z:`; `{pid}` becomes the Linux pid) makes the wrapper log:
 
 The file is 64 MB, mapped once at load (shared, file-backed): a line is formatted on the stack and copied into the
 mapping at a position reserved with one atomic add, and a fixed 128-byte header line is rewritten with the next
-position. No system call, no lock, no flush on any call path; the kernel keeps the mapping's pages when the process
-dies, so the lines up to a crash are in the file. When the ring is full it wraps (the header says `wrapped` and
-where the next line goes); `tr -d '\0' < FILE | sort -n` orders the lines by time. A call that never returned shows
+position. No system call, no lock, no allocation, no flush on any call path (a test counts allocations); the kernel
+keeps the mapping's pages when the process dies, so the lines up to a crash are in the file. When the ring is full it
+wraps; the header says `wrapped` and about where the next line goes, but writers on several threads rewrite it
+without ordering, so it is a hint, not authoritative: `tr -d '\0' < FILE | sort -n` is what orders the lines by time.
+While tracing, the return addresses of passthrough calls point at `trace_return`, so a crash dump's or a debugger's
+stack walk through an NGX call is not reliable; the wrapper's text log line says whether the trace file opened (its
+path, or why not). A call that never returned shows
 as an entry line without its exit: in a stalled present, that names the NGX call the game's thread is in.
 
 ## What the layer does with the records (`crates/layer/src/ngx_ring.rs`, `preupscale.rs`)

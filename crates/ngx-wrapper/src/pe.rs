@@ -38,8 +38,9 @@ pub fn export_entry(img: &[u8], name: &str) -> Option<usize> {
     let name_table = u32_at(img, dir + 32)? as usize;
     let ordinal_table = u32_at(img, dir + 36)? as usize;
     for i in 0..names {
-        let at = u32_at(img, name_table + 4 * i)? as usize;
-        let bytes = img.get(at..at + name.len() + 1)?;
+        // A name that cannot be read is skipped, not the end of the search.
+        let Some(at) = u32_at(img, name_table + 4 * i) else { continue };
+        let Some(bytes) = img.get(at as usize..at as usize + name.len() + 1) else { continue };
         if &bytes[..name.len()] == name.as_bytes() && bytes[name.len()] == 0 {
             let ordinal = u16_at(img, ordinal_table + 2 * i)? as usize;
             return (ordinal < functions).then_some(function_table + 4 * ordinal);
@@ -88,6 +89,15 @@ mod tests {
         assert_eq!(export_entry(&img, "NVSDK_NGX_VULKAN_Init_Ext2"), Some(0x304));
         assert_eq!(export_entry(&img, "NVSDK_NGX_VULKAN_Ini"), None, "a prefix is not the name");
         assert_eq!(export_entry(&img, "NVSDK_NGX_VULKAN_Init_Ext"), None);
+    }
+
+    /// A name pointer past the image's end is skipped, and the names after it are still found.
+    #[test]
+    fn an_unreadable_name_is_skipped() {
+        let mut img = image(&["A_FIRST", "B_SECOND"]);
+        img[0x400..0x404].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        assert_eq!(export_entry(&img, "B_SECOND"), Some(0x304));
+        assert_eq!(export_entry(&img, "A_FIRST"), None);
     }
 
     #[test]
