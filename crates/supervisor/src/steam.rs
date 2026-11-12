@@ -31,22 +31,45 @@ pub struct Root {
 
 const FLATPAK_ROOT: &str = ".var/app/com.valvesoftware.Steam/.local/share/Steam";
 
-/// The Steam roots under `home`: native (`~/.local/share/Steam`, `~/.steam/steam`), Flatpak and
-/// Snap, each only if it has `steamapps/`, deduplicated after resolving symlinks.
+/// True when `dir` carries Steam's own install files (the bootstrap script, its runtime or client
+/// library, or its config), not just a `steamapps/` folder that something else created.
+fn has_install_markers(dir: &Path) -> bool {
+    dir.join("steam.sh").is_file()
+        || dir.join("ubuntu12_32").is_dir()
+        || dir.join("linux64/steamclient.so").is_file()
+        || dir.join("config/config.vdf").is_file()
+}
+
+/// The Steam roots under `home`, deduplicated after resolving symlinks. Steam's own `~/.steam/root`
+/// and `~/.steam/steam` links come first, then native, Flatpak and Snap. Only real installs (Steam's
+/// install files present) count: a stray `~/.local/share/Steam` holding just `steamapps/` is skipped
+/// whenever a real root exists. With no real root, every candidate that has `steamapps/` is kept.
 pub fn roots_from(home: &Path) -> Vec<Root> {
-    let candidates = [".local/share/Steam", ".steam/steam", FLATPAK_ROOT, "snap/steam/common/.local/share/Steam"];
-    let mut out: Vec<Root> = Vec::new();
+    let candidates = [".steam/root", ".steam/steam", ".local/share/Steam", FLATPAK_ROOT, "snap/steam/common/.local/share/Steam"];
+    let mut real: Vec<Root> = Vec::new();
+    let mut loose: Vec<Root> = Vec::new();
     for candidate in candidates {
         let path = home.join(candidate);
         if !path.join("steamapps").is_dir() {
             continue;
         }
         let path = path.canonicalize().unwrap_or(path);
-        if !out.iter().any(|r| r.path == path) {
-            out.push(Root { path, flatpak: candidate == FLATPAK_ROOT });
+        let flatpak = path.starts_with(home.join(FLATPAK_ROOT).canonicalize().unwrap_or_else(|_| home.join(FLATPAK_ROOT)));
+        if real.iter().chain(loose.iter()).any(|r| r.path == path) {
+            continue;
+        }
+        let root = Root { path, flatpak };
+        if has_install_markers(&root.path) {
+            real.push(root);
+        } else {
+            loose.push(root);
         }
     }
-    out
+    if real.is_empty() {
+        loose
+    } else {
+        real
+    }
 }
 
 /// [`roots_from`] the user's `$HOME`.
@@ -1095,6 +1118,36 @@ mod tests {
         assert!(roots[1].flatpak && !only_flatpak(&roots));
         assert!(only_flatpak(&roots[1..]));
         assert!(!only_flatpak(&[]));
+    }
+
+    #[test]
+    fn a_stray_steamapps_folder_does_not_hide_the_real_root() {
+        let home = Scratch::new("stray");
+        let h = &home.0;
+        std::fs::create_dir_all(h.join(".local/share/Steam/steamapps")).unwrap(); // stray: no install files
+        write(&h.join("steamroot/steam.sh"), "#!/bin/sh\n");
+        std::fs::create_dir_all(h.join("steamroot/steamapps")).unwrap();
+        std::fs::create_dir_all(h.join(".steam")).unwrap();
+        std::os::unix::fs::symlink(h.join("steamroot"), h.join(".steam/root")).unwrap();
+        std::os::unix::fs::symlink(h.join("steamroot"), h.join(".steam/steam")).unwrap();
+        let roots = roots_from(h);
+        assert_eq!(roots, [Root { path: h.join("steamroot").canonicalize().unwrap(), flatpak: false }]);
+        // Without any real root the old fallback keeps the stray one.
+        std::fs::remove_file(h.join("steamroot/steam.sh")).unwrap();
+        assert_eq!(roots_from(h).len(), 2);
+    }
+
+    #[test]
+    fn every_real_root_is_kept_and_flatpak_is_marked() {
+        let home = Scratch::new("realroots");
+        let h = &home.0;
+        write(&h.join(".local/share/Steam/steam.sh"), "");
+        std::fs::create_dir_all(h.join(".local/share/Steam/steamapps")).unwrap();
+        std::fs::create_dir_all(h.join(FLATPAK_ROOT).join("steamapps")).unwrap();
+        std::fs::create_dir_all(h.join(FLATPAK_ROOT).join("ubuntu12_32")).unwrap();
+        let roots = roots_from(h);
+        assert_eq!(roots.len(), 2);
+        assert!(!roots[0].flatpak && roots[1].flatpak);
     }
 
     #[test]
