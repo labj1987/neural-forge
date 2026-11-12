@@ -715,7 +715,7 @@ unsafe fn delayed_present(
     if !posted {
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if SAID.fetch_add(1, Relaxed) < 3 {
-            crate::log!("[offload] frame not sent to the other GPU: captured {sent:?} of {width}x{height}, on the GPU {gpu_original}, kept {kept}");
+            crate::log!("[offload] a frame was not sent to the other GPU (captured {sent:?} of {width}x{height}, on the GPU {gpu_original}, kept {kept}; the channel may not answer yet)");
         }
     }
     if posted {
