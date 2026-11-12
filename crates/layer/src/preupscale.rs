@@ -267,6 +267,11 @@ pub(crate) const HAND_BACK: Duration = Duration::from_secs(30);
 /// upscaler gets the post path after this.
 pub(crate) const PAUSE_HAND_BACK: Duration = Duration::from_secs(300);
 
+/// Frames of the process the model ran on (or carried its last result onto, the edit cache) inside the game's frame,
+/// before or after DLSS: the `[present]` line's rate for this placement, which the finished-frame composite count
+/// does not include (#51).
+pub(crate) static MODEL_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The submits of DLSS evaluates a device of the process saw, held or not ([`note_sr_launch`]):
 /// when the current run of them began (launches less than [`RECENT`] apart) and the last one.
 static SR_LAUNCHES: Mutex<Option<SrLaunches>> = Mutex::new(None);
@@ -6401,6 +6406,7 @@ impl Session {
             s.scene_cuts = s.scene_cuts.wrapping_add(1);
         }
         if result.native && result.evaluated {
+            MODEL_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if result.cache_still {
                 s.window_still += 1;
             }
@@ -6451,8 +6457,8 @@ impl Session {
         }
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {
             let (pw, ph) = padded(extent.0, extent.1);
-            // The window's rate: frames the model ran on before the upscaler (the post path's
-            // "composited" count does not include them). Loading screens inside a window lower it.
+            // The window's rate: frames the model ran on before the upscaler (the `[present]` line counts them as
+            // "with the model in the game's frame", apart from its finished-frame composites). Loading screens inside a window lower it.
             let now = Instant::now();
             let rate = per_second(SUMMARY_EVERY, s.window_start.map_or(Duration::ZERO, |t| now.duration_since(t)));
             s.window_start = Some(now);

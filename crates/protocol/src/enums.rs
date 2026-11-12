@@ -136,6 +136,13 @@ pub mod proxy_format {
     pub const PQ10_RGB: u32 = 4;
     /// [`PQ10_RGB`] in `A2R10G10B10_UNORM_PACK32`'s order: B in bits 0-9, G in 10-19, R in 20-29.
     pub const PQ10_BGR: u32 = 5;
+    /// A 10-bit SDR frame (sRGB-encoded BT.709, a 10-bit swapchain in `SRGB_NONLINEAR`),
+    /// `A2B10G10R10_UNORM_PACK32`'s layout as [`PQ10_RGB`]. The model server shows the network its 8-bit
+    /// picture (each code to 8 bits) and answers in [`RGBA8`]; the composition carries the change back onto
+    /// the 10-bit frame in linear light.
+    pub const SDR10_RGB: u32 = 6;
+    /// [`SDR10_RGB`] in `A2R10G10B10_UNORM_PACK32`'s order: B in bits 0-9, G in 10-19, R in 20-29.
+    pub const SDR10_BGR: u32 = 7;
 
     pub fn is_8bit(format: u32) -> bool {
         matches!(format, RGBA8 | BGRA8)
@@ -144,6 +151,21 @@ pub mod proxy_format {
     /// One of the 10-bit HDR10 formats ([`PQ10_RGB`], [`PQ10_BGR`]).
     pub fn is_pq10(format: u32) -> bool {
         matches!(format, PQ10_RGB | PQ10_BGR)
+    }
+
+    /// One of the 10-bit SDR formats ([`SDR10_RGB`], [`SDR10_BGR`]).
+    pub fn is_sdr10(format: u32) -> bool {
+        matches!(format, SDR10_RGB | SDR10_BGR)
+    }
+
+    /// A 10-bit frame the layer sends raw, one packed word a pixel: HDR10 or 10-bit SDR.
+    pub fn is_ten_bit(format: u32) -> bool {
+        is_pq10(format) || is_sdr10(format)
+    }
+
+    /// Blue in bits 0-9 of a 10-bit format's word (`A2R10G10B10_UNORM_PACK32`).
+    pub fn is_ten_bit_b_low(format: u32) -> bool {
+        matches!(format, PQ10_BGR | SDR10_BGR)
     }
 
     /// Bytes per pixel for a raw dump in this format -- shared by the layer (which

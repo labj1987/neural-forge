@@ -1301,20 +1301,20 @@ pub unsafe fn run(
     // this sent full-size and odd-size frames past every one of those limits on devices that
     // support host-memory import, and the model server rejected them.
     let use_direct = use_direct && (model_width, model_height) == (width, height);
-    // An HDR10 frame (docs/NATIVE_BACKEND.md, "HDR on the finished frame (3.10.0)") is sent raw at the frame's
+    // A 10-bit frame, HDR10 (docs/NATIVE_BACKEND.md, "HDR on the finished frame (3.10.0)") or 10-bit SDR, is sent raw at the frame's
     // own size, and its answer composed at that size: a working scale below 1, the model pixel cap and an odd
     // size (rounded to even above) would need the scaled, 8-bit scratch, and the pipelined mode applies answers
     // to later frames through a path that keeps only 8-bit ones. Those present it untouched, said once.
-    let pq10 = neural_forge_protocol::enums::proxy_format::is_pq10(proxy_format);
+    let pq10 = neural_forge_protocol::enums::proxy_format::is_ten_bit(proxy_format);
     if pq10 && ((model_width, model_height) != (width, height) || pipelined_present()) {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
             if pipelined_present() {
-                crate::log!("[layer] HDR10 frames present untouched: NEURAL_FORGE_PIPELINED composes only 8-bit frames");
+                crate::log!("[layer] 10-bit frames (HDR10 or 10-bit SDR) present untouched: NEURAL_FORGE_PIPELINED composes only 8-bit frames");
             } else {
                 crate::log!(
-                    "[layer] HDR10 frames present untouched: the model would work at {model_width}x{model_height}, not the frame's {width}x{height} \
-                     (a model resolution below 100%, the model pixel cap or an odd size), and HDR10 frames are only handled at the frame's own size"
+                    "[layer] 10-bit frames present untouched: the model would work at {model_width}x{model_height}, not the frame's {width}x{height} \
+                     (a model resolution below 100%, the model pixel cap or an odd size), and 10-bit frames are only handled at the frame's own size"
                 );
             }
             crate::logging::flush();
@@ -1829,7 +1829,7 @@ pub unsafe fn run(
                 debug_scale: settings.debug_scale,
                 proxy_encoded,
                 reversible_mode: settings.reversible_mode,
-                pq10: pq10.then(crate::hdr_present::reference_nits),
+                pq10: crate::hdr_present::Transfer::for_format(proxy_format),
             },
         );
         // Whatever the compose call read back from the slot it reused, published even when this
@@ -1850,7 +1850,13 @@ pub unsafe fn run(
                     let (gpu_capture_ms, gpu_compose_ms) = shm.published_gpu_ms();
                     crate::log!(
                         "[sync] {width}x{height}{}: total={total:.1?} capture_gpu={:.1?} copy_out={:.1?} meter={:.1?} wait_answer={:.1?} server={:.1?} rest(readback+compose)={:.1?} zc={} gpu_capture={gpu_capture_ms:.2}ms gpu_compose={gpu_compose_ms:.2}ms",
-                        if pq10 { " HDR10" } else { "" },
+                        if neural_forge_protocol::enums::proxy_format::is_pq10(proxy_format) {
+                            " HDR10"
+                        } else if pq10 {
+                            " 10-bit SDR"
+                        } else {
+                            ""
+                        },
                         t.capture_wait,
                         t.copy_out,
                         t.meter,
@@ -3757,18 +3763,35 @@ mod tests {
     /// picture). An answer the model was not run on (no `seq_eval`: the server's echo) leaves the frame untouched.
     #[test]
     fn an_hdr10_present_composes_the_sdr_answer_in_linear_light() {
-        use crate::hdr_present::reference::{code_of, compose, pack, sdr, sdr8, unpack};
-        use neural_forge_protocol::enums::proxy_format::{PQ10_BGR, PQ10_RGB};
+        ten_bit_present_composes_in_linear_light(false);
+    }
+
+    /// [`an_hdr10_present_composes_the_sdr_answer_in_linear_light`] for a 10-bit SDR swapchain (#51): the words reach
+    /// the model server as `SDR10_*`, and its answer to their 8-bit picture is composed back in linear light.
+    #[test]
+    fn a_10bit_sdr_present_composes_the_answer_in_linear_light() {
+        ten_bit_present_composes_in_linear_light(true);
+    }
+
+    fn ten_bit_present_composes_in_linear_light(srgb: bool) {
+        use crate::hdr_present::reference::{code_of, compose, compose_sdr10, pack, sdr, sdr10_8, sdr8, unpack};
+        use neural_forge_protocol::enums::proxy_format::{PQ10_BGR, PQ10_RGB, SDR10_BGR, SDR10_RGB};
+        let pic: fn(u32, bool) -> [u8; 3] = if srgb { sdr10_8 } else { |w, b| sdr8(w, b, 203.0) };
         let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else { return };
         let (width, height) = (8u32, 8u32);
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
-        let clear = |word: u32, b_low: bool| sdr(word, b_low, 203.0).iter().all(|v| ((v * 255.0).fract() - 0.5).abs() > 0.01);
+        // The 10-bit SDR picture is exact; the HDR10 one only away from a rounding step.
+        let clear = |word: u32, b_low: bool| srgb || sdr(word, b_low, 203.0).iter().all(|v| ((v * 255.0).fract() - 0.5).abs() > 0.01);
         for (b_low, evaluated) in [(false, true), (true, true), (false, false)] {
-            let (format, proxy_format) =
-                if b_low { (vk::Format::A2R10G10B10_UNORM_PACK32, PQ10_BGR) } else { (vk::Format::A2B10G10R10_UNORM_PACK32, PQ10_RGB) };
+            let (format, proxy_format) = match (b_low, srgb) {
+                (true, false) => (vk::Format::A2R10G10B10_UNORM_PACK32, PQ10_BGR),
+                (false, false) => (vk::Format::A2B10G10R10_UNORM_PACK32, PQ10_RGB),
+                (true, true) => (vk::Format::A2R10G10B10_UNORM_PACK32, SDR10_BGR),
+                (false, true) => (vk::Format::A2B10G10R10_UNORM_PACK32, SDR10_RGB),
+            };
             let words: Vec<u32> =
                 (0..width * height).map(|i| pack([code_of(5.0 + f64::from(i) * 1.5), code_of(90.0 - f64::from(i)), code_of(30.0)], i % 4, b_low)).collect();
             let (image, image_memory) = make_words_present_src_image(&device, &mem_props, queue, pool, width, height, format, &words);
@@ -3803,7 +3826,7 @@ mod tests {
                         let answer = unsafe { std::slice::from_raw_parts_mut(answer_addr as *mut u8, n * 4) };
                         for i in 0..n {
                             let word = u32::from_le_bytes(proxy[i * 4..i * 4 + 4].try_into().unwrap());
-                            let s = sdr8(word, b_low, 203.0).map(|v| if i % 5 == 0 { v } else { v.saturating_add(20) });
+                            let s = pic(word, b_low).map(|v| if i % 5 == 0 { v } else { v.saturating_add(20) });
                             answer[i * 4..i * 4 + 4].copy_from_slice(&[s[0], s[1], s[2], 255]);
                         }
                         hdr.answered_w.store(w, AtomicOrdering::Relaxed);
@@ -3893,8 +3916,9 @@ mod tests {
                         assert_eq!(o, w, "pixel {i}: an unchanged picture keeps the frame's word");
                         continue;
                     }
-                    let answer = sdr8(w, b_low, 203.0).map(|v| v.saturating_add(20));
-                    let (want, got) = (unpack(compose(w, w, answer, b_low, 203.0), b_low), unpack(o, b_low));
+                    let answer = pic(w, b_low).map(|v| v.saturating_add(20));
+                    let composed = if srgb { compose_sdr10(w, w, answer, b_low) } else { compose(w, w, answer, b_low, 203.0) };
+                    let (want, got) = (unpack(composed, b_low), unpack(o, b_low));
                     assert_eq!(got.1, want.1, "pixel {i}: alpha bits kept");
                     assert!(got.0.iter().zip(&want.0).all(|(g, w)| g.abs_diff(*w) <= 1), "pixel {i}: {:?} vs the reference's {:?}", got.0, want.0);
                     assert!(got.0.iter().zip(&unpack(w, b_low).0).all(|(g, b)| g > b), "pixel {i}: brightened");
