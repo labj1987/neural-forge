@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 /// The copy's name: the source's version name and this.
 pub const SUFFIX: &str = "-NeuralForge";
+pub use neural_forge_protocol::proton_copy::LinkedFile;
 /// In a copy: what it was made from (`source=`, `source_version=`, `wrapper_sha256=`, `wine=`).
 pub use neural_forge_protocol::proton_copy::MARKER;
 /// The wrapper in Neural Forge's install (under the data dir).
@@ -76,9 +77,9 @@ pub struct Tool {
     pub source_version: String,
     /// The SHA-256 of the wrapper in it ([`MARKER`]).
     pub wrapper_sha256: String,
-    /// The hard-linked files it had when it was made ([`link_fingerprint`], [`MARKER`]); `None` for a copy made
+    /// The hard-linked files it had when it was made ([`linked_files`], [`MARKER`]); `None` for a copy made
     /// before that was recorded.
-    pub linked: Option<(u64, String)>,
+    pub linked: Option<(u64, Vec<LinkedFile>)>,
 }
 
 fn sanitize(name: &str) -> String {
@@ -200,7 +201,7 @@ fn tool_at(dir: &Path) -> Option<Tool> {
         source: marker.source,
         source_version: marker.source_version,
         wrapper_sha256: marker.wrapper_sha256,
-        linked: marker.linked.map(|n| (n, marker.link_fingerprint)),
+        linked: marker.linked.map(|n| (n, marker.link_files)),
     })
 }
 
@@ -252,39 +253,44 @@ pub fn outdated(tool: &Tool) -> bool {
     source_changed(tool) || wrapper_changed(tool, &installed_wrapper())
 }
 
-/// How many files under `dir` are hard links (another name for them exists: the source's, while the source is
-/// there), and a SHA-256 over their paths, devices, inodes, sizes and modification times. Steam updates a Proton
-/// in place: a file it rewrites changes the copy's too (the same inode), a file it replaces leaves the copy
-/// the only name (no longer counted). Either changes the fingerprint.
-pub fn link_fingerprint(dir: &Path) -> (u64, String) {
+/// The files under `dir` that are hard links (another name for them exists: the source's, while the source is
+/// there), each with its path, size and modification time, sorted by path. Steam updates a Proton in place: a file
+/// it rewrites changes the copy's too (the same inode, so its size or time changes); a file it replaces leaves the
+/// copy the only name, with the contents it was made with. No file is read and no device or inode number is kept
+/// (btrfs's anonymous device numbers change across boots).
+pub fn linked_files(dir: &Path) -> Vec<LinkedFile> {
     use std::os::unix::fs::MetadataExt;
-    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<LinkedFile>) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for e in entries.flatten() {
             let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
             if meta.is_dir() {
                 walk(root, &e.path(), out);
             } else if meta.is_file() && meta.nlink() > 1 {
-                let rel = e.path().strip_prefix(root).map(|p| p.display().to_string()).unwrap_or_default();
-                out.push(format!("{rel}\t{}\t{}\t{}\t{}.{}\n", meta.dev(), meta.ino(), meta.size(), meta.mtime(), meta.mtime_nsec()));
+                let path = e.path().strip_prefix(root).map(|p| p.display().to_string()).unwrap_or_default();
+                out.push(LinkedFile { path, size: meta.size(), mtime: format!("{}.{}", meta.mtime(), meta.mtime_nsec()) });
             }
         }
     }
-    let mut lines = Vec::new();
-    walk(dir, dir, &mut lines);
-    lines.sort();
-    (lines.len() as u64, crate::install::digest(lines.concat().as_bytes()))
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
 }
 
-/// Whether the hard-linked files of `tool` are not the ones it was made with: Steam rewrote or replaced files of
-/// the source in place since ([`link_fingerprint`]), so the copy holds files that no longer match its marker's
-/// source version. False for a copy made before this was recorded, and for one made across filesystems (full
+/// Whether a hard-linked file of `tool` was modified in place since the copy was made: Steam rewrote a file of the
+/// source, so the copy holds a file that no longer matches its marker's source version. Only a recorded file's own
+/// size or modification time counts; one the source replaced (the copy is then its only name, unchanged) or that is
+/// gone is harmless. False for a copy made before this was recorded, and for one made across filesystems (full
 /// copies, nothing linked).
 pub fn links_changed(tool: &Tool) -> bool {
-    match &tool.linked {
-        Some((n, fingerprint)) if *n > 0 => link_fingerprint(&tool.dir).1 != *fingerprint,
-        _ => false,
-    }
+    use std::os::unix::fs::MetadataExt;
+    let Some((n, files)) = &tool.linked else { return false };
+    *n > 0
+        && files.iter().any(|f| match std::fs::symlink_metadata(tool.dir.join(&f.path)) {
+            Ok(m) if m.is_file() => m.size() != f.size || format!("{}.{}", m.mtime(), m.mtime_nsec()) != f.mtime,
+            _ => false,
+        })
 }
 
 /// The Wine version a Proton tree is built from: the `wine-<major>.<minor>` its `ntdll.so` carries
@@ -547,8 +553,8 @@ pub fn create_in(root: &Path, source: &Source, wrapper: &Path, proc_root: &Path)
         write_new(&tmp.join(MARKER), marker.as_bytes(), 0o644)
     };
     write().map_err(fail)?;
-    let (linked, fingerprint) = link_fingerprint(&tmp);
-    let marker = format!("{marker}linked={linked}\nlink_fingerprint={fingerprint}\n");
+    let files = linked_files(&tmp);
+    let marker = format!("{marker}linked={}\n{}", files.len(), files.iter().map(|f| format!("{}\n", f.line())).collect::<String>());
     write_new(&tmp.join(MARKER), marker.as_bytes(), 0o644).map_err(fail)?;
     if replaced {
         // One step where the filesystem has it; else the old copy aside, the new one in, the old one gone.
@@ -872,16 +878,28 @@ mod tests {
         assert!(links_changed(&t), "rewritten in place");
         // A copy without the record (made by an earlier Neural Forge): nothing to compare, nothing said.
         let text = std::fs::read_to_string(t.dir.join(MARKER)).unwrap();
-        let old: String = text.lines().filter(|l| !l.starts_with("linked=") && !l.starts_with("link_fingerprint=")).map(|l| format!("{l}\n")).collect();
+        let old: String = text.lines().filter(|l| !l.starts_with("linked=") && !l.starts_with("link_file=")).map(|l| format!("{l}\n")).collect();
         std::fs::write(t.dir.join(MARKER), old).unwrap();
         let t = tools(&root).remove(0);
         assert!(t.linked.is_none() && !links_changed(&t));
         // Replaced, not rewritten: the copy is then the file's only name.
         let again = create(&root, &sources(&root, &[])[0], &wrapper).unwrap().tool;
         assert!(!links_changed(&again));
+        // The source replaces the file (new inode): the copy keeps the file it was made with, which is no change.
         std::fs::remove_file(&shared).unwrap();
         std::fs::write(&shared, "replaced").unwrap();
-        assert!(links_changed(&again));
+        assert!(!links_changed(&again), "a replaced source file is harmless");
+        // The source removed entirely: also harmless.
+        std::fs::remove_dir_all(&src).unwrap();
+        assert!(!links_changed(&again));
+        // A linked file modified in place (here through the copy's own name, the same inode) is noticed.
+        let own = again.dir.join("files/lib/wine/x86_64-windows/ntdll.dll");
+        assert!(own.is_file());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut f = std::fs::OpenOptions::new().append(true).open(&own).unwrap();
+        std::io::Write::write_all(&mut f, b"x").unwrap();
+        // That file lost its link to the source above (replaced), but it is still the copy's recorded file.
+        assert!(links_changed(&again), "recorded file modified");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

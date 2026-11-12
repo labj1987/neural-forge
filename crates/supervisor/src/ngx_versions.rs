@@ -28,28 +28,43 @@ pub fn is_ngx_dll(file_name: &str) -> bool {
     name == "_nvngx.dll" || (name.starts_with("nvngx") && name.ends_with(".dll"))
 }
 
-/// The NGX DLLs in the tree under `dir`, at most `depth` levels down, sorted. Symbolic links are not followed.
-pub fn find_dlls(dir: &Path, depth: usize) -> Vec<PathBuf> {
-    let mut found = Vec::new();
+/// The NGX DLLs found in a tree.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Found {
+    /// Sorted.
+    pub dlls: Vec<PathBuf>,
+    /// The entry cap ([`ENTRY_CAP`]) was reached before the whole tree was looked at: more may exist deeper down.
+    pub capped: bool,
+}
+
+/// The NGX DLLs in the tree under `dir`, at most `depth` levels down, sorted. The tree is walked level by level, so
+/// when the entry cap stops it the shallow DLLs (the usual place) are already found. Symbolic links to DLL files
+/// count (a game folder may link them); symbolic links to folders are not followed.
+pub fn find_dlls(dir: &Path, depth: usize) -> Found {
+    find_dlls_capped(dir, depth, ENTRY_CAP)
+}
+
+fn find_dlls_capped(dir: &Path, depth: usize, cap: usize) -> Found {
+    let mut found = Found::default();
     let mut seen = 0usize;
-    let mut stack = vec![(dir.to_path_buf(), 0usize)];
-    while let Some((d, level)) = stack.pop() {
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), 0usize)]);
+    'walk: while let Some((d, level)) = queue.pop_front() {
         let Ok(entries) = std::fs::read_dir(&d) else { continue };
         for entry in entries.flatten() {
             seen += 1;
-            if seen > ENTRY_CAP {
-                found.sort();
-                return found;
+            if seen > cap {
+                found.capped = true;
+                break 'walk;
             }
             let Ok(kind) = entry.file_type() else { continue };
             if kind.is_dir() && level < depth {
-                stack.push((entry.path(), level + 1));
-            } else if kind.is_file() && is_ngx_dll(&entry.file_name().to_string_lossy()) {
-                found.push(entry.path());
+                queue.push_back((entry.path(), level + 1));
+            } else if is_ngx_dll(&entry.file_name().to_string_lossy()) && (kind.is_file() || (kind.is_symlink() && entry.path().is_file())) {
+                found.dlls.push(entry.path());
             }
         }
     }
-    found.sort();
+    found.dlls.sort();
     found
 }
 
@@ -141,7 +156,8 @@ fn version_of(path: &Path) -> String {
     }
 }
 
-fn list(out: &mut String, label: &str, base: &Path, dlls: &[PathBuf]) {
+fn list(out: &mut String, label: &str, base: &Path, found: &Found) {
+    let dlls = &found.dlls;
     if dlls.is_empty() {
         out.push_str(&format!("  {label}: no NGX DLLs\n"));
     }
@@ -150,6 +166,9 @@ fn list(out: &mut String, label: &str, base: &Path, dlls: &[PathBuf]) {
     }
     if dlls.len() > LIST_CAP {
         out.push_str(&format!("  {label}: and {} more\n", dlls.len() - LIST_CAP));
+    }
+    if found.capped {
+        out.push_str(&format!("  {label}: stopped after looking at {ENTRY_CAP} entries; there may be more NGX DLLs further down\n"));
     }
 }
 
@@ -188,7 +207,7 @@ mod tests {
     const RECORD: &str = "neural-forge-ngx-modules 1\nwrapper=4.0.0\nexe=C:\\Game\\g.exe\n\
         wrapper\t_nvngx.dll\t4.0.0\tC:\\windows\\system32\\_nvngx.dll\n\
         core\t_nvngx.dll\t595.58.3.0\tZ:\\usr\\lib\\nvidia\\wine\\_nvngx.dll\n\
-        snippet\tnvngx_dlssg.dll\t310.9.16.0\tC:\\Game\\nvngx_dlssg.dll\n\
+        snippet\tnvngx_dlssg.dll\t310.1.0.0\tC:\\Game\\nvngx_dlssg.dll\n\
         snippet\tnvngx_dlss.dll\t-\tC:\\Game\\nvngx_dlss.dll\n";
 
     #[test]
@@ -207,7 +226,7 @@ mod tests {
         assert_eq!((r.wrapper.as_str(), r.exe.as_str(), r.modules.len()), ("4.0.0", "C:\\Game\\g.exe", 4));
         assert_eq!(
             r.modules[2],
-            Recorded { role: "snippet".into(), file: "nvngx_dlssg.dll".into(), version: Some("310.9.16.0".into()), path: "C:\\Game\\nvngx_dlssg.dll".into() }
+            Recorded { role: "snippet".into(), file: "nvngx_dlssg.dll".into(), version: Some("310.1.0.0".into()), path: "C:\\Game\\nvngx_dlssg.dll".into() }
         );
         assert_eq!(r.modules[3].version, None);
         assert_eq!(parse_record("something else\n"), None);
@@ -240,7 +259,7 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, b"MZ").unwrap();
         }
-        let found = find_dlls(&game, GAME_DEPTH);
+        let found = find_dlls(&game, GAME_DEPTH).dlls;
         let names: Vec<String> = found.iter().map(|p| p.strip_prefix(&game).unwrap().display().to_string()).collect();
         assert_eq!(names, ["bin/x64/nvngx_dlss.dll", "nvngx_dlssg.dll"], "the one five levels down is out of reach");
 
@@ -256,7 +275,7 @@ mod tests {
              loaded by C:\\Game\\g.exe (g.txt), 3 h ago, wrapper 4.0.0\n\
              \x20 wrapper  _nvngx.dll         4.0.0  C:\\windows\\system32\\_nvngx.dll\n\
              \x20 core     _nvngx.dll         595.58.3.0  Z:\\usr\\lib\\nvidia\\wine\\_nvngx.dll\n\
-             \x20 snippet  nvngx_dlssg.dll    310.9.16.0  C:\\Game\\nvngx_dlssg.dll\n\
+             \x20 snippet  nvngx_dlssg.dll    310.1.0.0  C:\\Game\\nvngx_dlssg.dll\n\
              \x20 snippet  nvngx_dlss.dll     no version  C:\\Game\\nvngx_dlss.dll\n\
              files of Some Game (42):\n\
              \x20 game folder: bin/x64/nvngx_dlss.dll  version unreadable (not a readable DLL: truncated DOS header)\n\
@@ -265,6 +284,41 @@ mod tests {
              \x20 prefix system32: _nvngx.dll  version unreadable (not a readable DLL: truncated DOS header)\n"
         );
         assert!(render(None, &[], &[]).contains("nothing recorded yet"));
+    }
+
+    #[test]
+    fn walks_level_by_level_and_says_when_the_cap_stopped_it() {
+        let dir = scratch("cap");
+        let game = dir.join("game");
+        // A deep, wide tree listed first alphabetically, and the DLL at the top: a depth-first walk would spend the cap in `a`.
+        for i in 0..30 {
+            let p = game.join(format!("a/d{i}/f.txt"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        }
+        std::fs::write(game.join("nvngx_dlss.dll"), b"MZ").unwrap();
+        let found = find_dlls_capped(&game, GAME_DEPTH, 10);
+        assert!(found.capped);
+        assert_eq!(found.dlls, [game.join("nvngx_dlss.dll")], "the shallow DLL is found first");
+        assert!(!find_dlls_capped(&game, GAME_DEPTH, 1000).capped);
+        let mut text = String::new();
+        list(&mut text, "game folder", &game, &Found { dlls: Vec::new(), capped: true });
+        assert!(text.contains("stopped after looking at 50000 entries"), "{text}");
+    }
+
+    #[test]
+    fn follows_symlinked_dll_files_but_not_symlinked_folders() {
+        let dir = scratch("links");
+        let (game, elsewhere) = (dir.join("game"), dir.join("elsewhere"));
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::create_dir_all(elsewhere.join("sub")).unwrap();
+        std::fs::write(elsewhere.join("nvngx_dlssg.dll"), b"MZ").unwrap();
+        std::fs::write(elsewhere.join("sub/nvngx_dlssd.dll"), b"MZ").unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("nvngx_dlssg.dll"), game.join("nvngx_dlssg.dll")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("missing.dll"), game.join("nvngx_dlss.dll")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("sub"), game.join("linked")).unwrap();
+        let names: Vec<String> = find_dlls(&game, GAME_DEPTH).dlls.iter().map(|p| p.strip_prefix(&game).unwrap().display().to_string()).collect();
+        assert_eq!(names, ["nvngx_dlssg.dll"], "a dangling link and a linked folder are left out");
     }
 
     #[test]
