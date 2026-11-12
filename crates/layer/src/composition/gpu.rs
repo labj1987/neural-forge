@@ -3886,7 +3886,9 @@ mod tests {
         let on_b = compose_once(width, height, &frame_b, &base, &answer, params).expect("the CPU reference composes");
         assert_ne!(delayed, on_b, "the live frame must not be what the answer composes onto");
         assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0 }, 4).is_none(), "a pair never kept is refused");
-        // A kept frame with no answer is shown as it was, in its turn (the live image is frame B).
+        // A kept frame with no answer is shown as it was, in its turn (the live image is frame B; the read-back above
+        // left the image in TRANSFER_SRC_OPTIMAL, and the upload puts it back in PRESENT_SRC_KHR, as a present would).
+        upload(&frame_b, true);
         let sem = gpu.show_kept(&device, queue, target.image, width, height, 1).expect("a kept frame is shown");
         let stage = vk::PipelineStageFlags::ALL_COMMANDS;
         unsafe {
