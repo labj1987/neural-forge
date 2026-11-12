@@ -10,7 +10,7 @@ first shipped them; their phase is kept as a subheading.
 
 - On NVIDIA cards, GTA San Andreas – The Definitive Edition could freeze at the menu when Rockstar's Social Club
   overlay started, then close about two minutes later. A call the game's renderer makes that does nothing, but that
-  NVIDIA's driver mishandles, is now skipped, so the game keeps running.
+  NVIDIA's driver mishandles, is now skipped while Neural Forge is on for the game, so the game keeps running.
 
 ## 4.1.0 — 2026-11-11
 
