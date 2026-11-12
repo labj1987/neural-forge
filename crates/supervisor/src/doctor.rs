@@ -1272,6 +1272,15 @@ fn check_offload_status(hdr: &neural_forge_protocol::ShmHeader) -> Vec<Finding> 
             Some("The log's [offload] lines say more. Unset NEURAL_FORGE_OFFLOAD_GPU to run the model on the game's GPU.".into()),
         )];
     }
+    if let Some(rest) = reason.strip_prefix("second GPU: stalled: ") {
+        return vec![Finding::new(
+            "offload",
+            Severity::Warning,
+            format!("the second GPU stalled in the last game: {rest}"),
+            evidence,
+            Some("The model goes back to the game's GPU once that frame finishes; if it never does it stays off for the session. Unset NEURAL_FORGE_OFFLOAD_GPU to run it on the game's GPU.".into()),
+        )];
+    }
     if let Some(rest) = reason.strip_prefix("second GPU: ") {
         return vec![Finding::new("offload", Severity::Info, format!("the model on the second GPU: {rest}"), evidence, None)];
     }
@@ -2359,6 +2368,8 @@ mod tests {
         assert!(check_offload_status(&hdr).is_empty());
         hdr.set_layer_reason("second GPU: the model runs on NVIDIA GeForce RTX 5080, each frame shown one frame later");
         assert_eq!(check_offload_status(&hdr)[0].severity, Severity::Info);
+        hdr.set_layer_reason("second GPU: stalled: a frame on X did not finish; waiting for it, the frames go out without the model");
+        assert_eq!(check_offload_status(&hdr)[0].severity, Severity::Warning);
         hdr.set_layer_reason("second GPU: given up (a frame took 1.2s on the other GPU); the model runs on the game's GPU");
         let v = check_offload_status(&hdr);
         assert_eq!(v[0].severity, Severity::Warning);

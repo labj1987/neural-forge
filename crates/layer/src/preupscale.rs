@@ -5608,15 +5608,9 @@ pub(crate) struct Session {
     /// The server stalled on a frame: nothing starts on this device again.
     #[cfg(target_arch = "x86_64")]
     post_stalled: bool,
-    /// The model on another GPU (`offload`) was given up for the session.
-    #[cfg(target_arch = "x86_64")]
-    offload_given_up: bool,
     /// The server running is the one on another GPU.
     #[cfg(target_arch = "x86_64")]
     post_offload: bool,
-    /// The offload's status line last published (`layer_reason`).
-    #[cfg(target_arch = "x86_64")]
-    offload_status: String,
     /// `NEURAL_FORGE_CAPTURE_AT`: how many times DLSS frames resumed after a gap, when the last resume was,
     /// and which of its entries were taken, one bit each ([`Self::capture_at_due`]).
     resumes: u32,
@@ -6545,9 +6539,14 @@ impl Session {
     ) {
         // The model on another GPU's state, on the Status tab's line and for `doctor` (`layer_reason`).
         #[cfg(target_arch = "x86_64")]
-        if let Some(line) = offload::status_line().filter(|l| *l != self.offload_status) {
-            shm.set_layer_reason(&line);
-            self.offload_status = line;
+        if let Some(line) = offload::status_line() {
+            // Against what the channel holds (the native backend's line shares it): written when it says something else,
+            // except that once the offload was given up the native backend's own line (the network running here, or why
+            // not) is the one to keep.
+            let now = shm.layer_reason();
+            if now != line && !(offload::given_up() && now.starts_with("native network")) {
+                shm.set_layer_reason(&line);
+            }
         }
         #[cfg(target_arch = "x86_64")]
         if !self.post_stalled && native_on(self.native.as_ref()) {
@@ -6572,13 +6571,13 @@ impl Session {
                 // The second GPU could not start, stalled, was lost or was too slow (`offload`, logged there): the
                 // network runs on this device's GPU from the next present on.
                 Some(Status::Unavailable) => {
-                    self.offload_given_up = true;
                     self.post_offload = false;
                     drop(self.post_server.take());
                     return;
                 }
                 Some(Status::Retry) => {
                     // The worker has ended: joining it does not wait.
+                    self.post_offload = false;
                     drop(self.post_server.take());
                     self.post_retry.failed(now);
                     return;
@@ -6591,12 +6590,11 @@ impl Session {
             let (Some(loader), Some(view)) = (self.native.clone(), shm.view()) else { return };
             // The model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`, `offload`): only at the finished-frame placement, and
             // until it is given up for the session.
-            let choice = offload::Choice::current();
-            if choice != offload::Choice::Off && !self.offload_given_up {
+            // Given up for the process (`offload::given_up`): every device runs the network on its own GPU from then on.
+            if offload::Choice::current() != offload::Choice::Off && !offload::given_up() {
                 let (count, placements) = view.header().placements();
                 if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
                     self.post_offload = true;
-                    let _ = choice;
                     self.post_server = native_post::PostServer::start_offload(instance.clone(), device.handle(), view);
                     return;
                 }
@@ -6676,7 +6674,8 @@ impl Session {
                 loader.note_gpu_ms(ms);
             }
             let status = native::status(result, loader);
-            if status != self.native_status {
+            // Against what the channel holds too: the offload's line shares it.
+            if status != self.native_status || (!status.is_empty() && shm.layer_reason() != status) {
                 shm.set_layer_reason(&status);
                 self.native_status = status;
             }

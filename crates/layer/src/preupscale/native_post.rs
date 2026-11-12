@@ -203,10 +203,11 @@ impl PostServer {
         })
     }
 
-    /// [`Self::start`] on a device of another GPU ([`super::offload`]), made on the worker's thread for `choice` on the
-    /// game's instance (`game`: the game's device's setup and handle). The worker ends with [`Status::Unavailable`]
-    /// when the device cannot be made, stalls, is lost or is too slow: the caller then runs the network on the game's
-    /// GPU.
+    /// [`Self::start`] on the device of another GPU made with the game's device `game_device` (`offload::make_for`,
+    /// taken here and given back when the worker ends). The worker ends with [`Status::Unavailable`] when there is no
+    /// such device, it cannot serve, it is given up (too slow, the network not running there), or a frame that did not
+    /// finish has since: the caller then runs the network on the game's GPU. While such a frame has not finished it
+    /// reports [`Status::Stalled`] and stays.
     pub(crate) fn start_offload(instance: ash::Instance, game_device: vk::Device, view: ShmView) -> Option<Self> {
         Self::spawn(move |q, st| {
             let end = |s: Status| st.store(s as u8, Ordering::Release);
@@ -214,7 +215,12 @@ impl PostServer {
             let Some(claim) = claim_channel(view, u64::MAX, st) else { return };
             // Made with the game's device (`offload::make_for`, inside its vkCreateDevice, where the loader's lock is held).
             let off = match super::offload::take(game_device) {
-                Some(Ok(off)) => off,
+                Some(Ok(off)) => {
+                    crate::log!("[offload] {}", off.plan);
+                    crate::log!("[offload] the present shows each frame's answer one frame later: the game's GPU renders the next frame while the other GPU runs this one");
+                    crate::logging::flush();
+                    off
+                }
                 Some(Err(why)) => {
                     super::offload::note_state(super::offload::State::FellBack(why));
                     drop(claim);
@@ -357,6 +363,7 @@ fn work(
         }
         return Ended::Clean;
     };
+    let stalled_name = offloaded.as_ref().map(|o| o.name.clone());
     if let Some(o) = offloaded {
         gpu.standin = o.standin;
         gpu.slow = Some(super::offload::ServerRule::default());
@@ -379,6 +386,9 @@ fn work(
     let stall_waited = offload && (gpu.stalled || loader.dead());
     if stall_waited {
         crate::log!("[offload] a frame did not finish in time on the other GPU (or its device was lost): waiting for it before anything is freed");
+        if let Some(o) = &stalled_name {
+            super::offload::note_state(super::offload::State::Stalled(o.clone()));
+        }
         crate::logging::flush();
         end(Status::Stalled);
         let fence = gpu.standin.as_ref().map_or(gpu.fence, super::offload::Standin::fence);
