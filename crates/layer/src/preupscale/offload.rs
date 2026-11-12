@@ -847,6 +847,12 @@ impl Standin {
             *stalled = true;
             return None;
         }
+        // `NEURAL_FORGE_OFFLOAD_TEST_SLOW_MS` (tests of the late rule only): a second GPU this much slower per frame.
+        static SLOW: std::sync::LazyLock<Option<u64>> =
+            std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_TEST_SLOW_MS").and_then(|v| v.parse().ok()));
+        if let Some(ms) = *SLOW {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
         if s.answer.staged {
             // SAFETY: the copy into it completed; both hold `bytes`.
             unsafe { std::ptr::copy_nonoverlapping(s.answer.ptr, answer, bytes as usize) };
