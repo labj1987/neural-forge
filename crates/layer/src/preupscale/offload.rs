@@ -31,11 +31,16 @@ use super::native::Setup;
 /// The frames the present judges the other GPU over ([`LateRule`]), and how many of them may come late.
 pub(crate) const LATE_WINDOW: usize = 120;
 pub(crate) const LATE_ALLOWED: usize = 30;
-/// A frame is late when its answer takes longer than this many present intervals from its request (the game's own
-/// time between presents; the present waits for the rest, so at 3 the game's frame rate falls to a third), or does not
-/// come within the present's budget. Not 1: a second GPU somewhat slower than the game's frame still beats running the
-/// network on the game's GPU after the game's own frame; this catches one far too slow for it.
+/// A frame is late when its answer takes longer than this many present intervals from its request (the game's own time
+/// between presents; the present waits for the rest) and longer than [`LATE_FLOOR`], or does not come within the
+/// present's budget. The network costs the game's GPU its own time too when it runs there, which the present does not
+/// see: a second GPU somewhat slower than the game's frame (40 ms against a 120 fps game) still beats running the
+/// network after the game's frame on its GPU, so a frame is judged late only well past both.
 pub(crate) const LATE_INTERVALS: u32 = 3;
+pub(crate) const LATE_FLOOR: Duration = Duration::from_millis(100);
+/// This many sent frames in a row with no answer within the present's budget fall back at once (each held the game up
+/// to that budget).
+pub(crate) const UNANSWERED_IN_A_ROW: u32 = 5;
 /// A single frame of the other GPU slower than this falls back at once (vkDaedalus's rule for its second GPU: a
 /// second), except the first frames after a build ([`WARM_FRAMES`]: the driver compiles and the first copies map).
 pub(crate) const HUNG: Duration = Duration::from_secs(1);
@@ -998,29 +1003,38 @@ impl ServerRule {
 }
 
 /// The other GPU's frames as the present sees them: more than [`LATE_ALLOWED`] of the last [`LATE_WINDOW`] sent frames
-/// late ([`LATE_INTERVALS`]) falls back. Judged where the game waits, so a second GPU too slow for the game's frame rate
-/// is caught whatever its own times are.
+/// late ([`LateRule::is_late`]), or [`UNANSWERED_IN_A_ROW`] in a row with no answer at all, falls back, decided as soon
+/// as that is so. Judged where the game waits, so a second GPU far too slow for the game is caught whatever its own
+/// times are.
 #[derive(Default)]
 pub(crate) struct LateRule {
     window: std::collections::VecDeque<bool>,
+    unanswered: u32,
 }
 
 impl LateRule {
     /// Whether a frame is late: `answer` its request-to-answer time (`None`: none came in the budget), `interval` the time
     /// between its present and the next.
     pub(crate) fn is_late(answer: Option<Duration>, interval: Duration) -> bool {
-        answer.is_none_or(|a| a > interval * LATE_INTERVALS)
+        answer.is_none_or(|a| a > (interval * LATE_INTERVALS).max(LATE_FLOOR))
     }
 
-    /// Notes a sent frame; why to fall back.
-    pub(crate) fn note(&mut self, late: bool) -> Option<String> {
+    /// Notes a sent frame (`answer` as [`Self::is_late`] takes it); why to fall back.
+    pub(crate) fn note(&mut self, answer: Option<Duration>, interval: Duration) -> Option<String> {
+        self.unanswered = if answer.is_none() { self.unanswered + 1 } else { 0 };
+        if self.unanswered >= UNANSWERED_IN_A_ROW {
+            return Some(format!("{UNANSWERED_IN_A_ROW} frames in a row got no answer from the other GPU within the present's wait"));
+        }
         if self.window.len() == LATE_WINDOW {
             self.window.pop_front();
         }
-        self.window.push_back(late);
+        self.window.push_back(Self::is_late(answer, interval));
         let n = self.window.iter().filter(|&&l| l).count();
-        (self.window.len() == LATE_WINDOW && n > LATE_ALLOWED).then(|| {
-            format!("{n} of the last {LATE_WINDOW} frames came back from the other GPU later than {LATE_INTERVALS} frame intervals: it is too slow for this frame rate")
+        (n > LATE_ALLOWED).then(|| {
+            format!(
+                "{n} of the last {} frames came back from the other GPU later than {LATE_INTERVALS} frame intervals and {LATE_FLOOR:?}: it is too slow for this game",
+                self.window.len()
+            )
         })
     }
 }
@@ -1134,21 +1148,29 @@ mod tests {
     }
 
     #[test]
-    fn late_frames_fall_back_by_their_share_of_the_window() {
-        let i = Duration::from_millis(10);
-        assert!(!LateRule::is_late(Some(Duration::from_millis(15)), i));
-        assert!(!LateRule::is_late(Some(Duration::from_millis(25)), i));
-        assert!(LateRule::is_late(Some(Duration::from_millis(35)), i));
-        assert!(LateRule::is_late(None, i));
-        // A GPU at 60-240 ms a frame against a 16 ms game: every frame late.
+    fn late_frames_fall_back_only_when_far_past_the_frame_and_the_floor() {
+        let ms = Duration::from_millis;
+        assert!(!LateRule::is_late(Some(ms(25)), ms(10)));
+        assert!(!LateRule::is_late(Some(ms(35)), ms(10)), "past 3 intervals but under the floor");
+        assert!(LateRule::is_late(Some(ms(120)), ms(10)));
+        assert!(!LateRule::is_late(Some(ms(250)), ms(100)), "a slow game: 3 intervals");
+        assert!(LateRule::is_late(None, ms(10)));
+        // A second GPU at 30 ms a frame against a 7 ms game (frame generation at ~144 fps) beats the network after the
+        // game's frame on one GPU: it must not fall back, however long it runs.
         let mut rule = LateRule::default();
-        let gave_up = (0..LATE_WINDOW).filter_map(|_| rule.note(LateRule::is_late(Some(Duration::from_millis(60)), Duration::from_millis(16)))).count();
-        assert_eq!(gave_up, 1, "decided once the window is full");
-        // Alternating on time and late: half the window, over the allowance.
+        assert!((0..LATE_WINDOW * 3).all(|_| rule.note(Some(ms(30)), ms(7)).is_none()));
+        // A GPU far too slow (150 ms against a 16 ms game) is given up as soon as more than the allowance came late.
         let mut rule = LateRule::default();
-        assert!((0..LATE_WINDOW).filter_map(|k| rule.note(k % 2 == 0)).next().is_some());
+        let at = (0..LATE_WINDOW).position(|_| rule.note(Some(ms(150)), ms(16)).is_some());
+        assert_eq!(at, Some(LATE_ALLOWED), "decided at the first frame over the allowance, not after a full window");
         // A few late frames (a hitch) do not.
         let mut rule = LateRule::default();
-        assert!((0..LATE_WINDOW * 3).all(|k| rule.note(k % 10 == 0).is_none()));
+        assert!((0..LATE_WINDOW * 3).all(|k| rule.note(Some(if k % 10 == 0 { ms(150) } else { ms(20) }), ms(16)).is_none()));
+        // No answer at all: a few in a row are enough.
+        let mut rule = LateRule::default();
+        let at = (0..LATE_WINDOW).position(|_| rule.note(None, ms(16)).is_some());
+        assert_eq!(at, Some(UNANSWERED_IN_A_ROW as usize - 1));
+        let mut rule = LateRule::default();
+        assert!((0..8).all(|k| rule.note(if k % 4 == 0 { Some(ms(20)) } else { None }, ms(16)).is_none()), "an answer starts the count over");
     }
 }

@@ -664,8 +664,9 @@ unsafe fn delayed_present(
     // Judged where the game waits: a frame late against the present interval counts toward giving the other GPU up.
     // Not in the `same` test, where the other device shares the game's GPU: it is as slow as the network there.
     if let Some(req) = pending.filter(|r| r.sent && crate::preupscale::offload::Choice::current() != crate::preupscale::offload::Choice::Same) {
-        let late = crate::preupscale::offload::LateRule::is_late(round_trip, arrived.saturating_duration_since(req.posted));
-        let verdict = crate::preupscale::offload::LATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().note(late);
+        let interval = arrived.saturating_duration_since(req.posted);
+        let verdict =
+            crate::preupscale::offload::LATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().note(round_trip, interval);
         if let Some(why) = verdict {
             crate::preupscale::offload::give_up(why);
         }
