@@ -2,12 +2,13 @@
 
 use core::ffi::c_void;
 use std::io::Write;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::exports::{missing_export, HOOKED, PASSTHROUGH, PASSTHROUGH_TARGETS};
+use crate::exports::{missing_export, HOOKED, PASSTHROUGH, PASSTHROUGH_TARGETS, PASSTHROUGH_TRACED};
 use crate::ring::{self, Header, Record};
 use crate::rules::{self, Resolution};
+use crate::trace;
 
 pub(crate) type Handle = *mut c_void;
 
@@ -73,11 +74,12 @@ pub(crate) fn now_ms() -> f64 {
     (t - clock().start) as f64 * 1000.0 / clock().freq
 }
 
-/// The text log: `NEURAL_FORGE_NGX_LOG` (a Windows path, e.g. `Z:\tmp\ngx.log`), one line per call; off when unset.
+/// The text log: `NEURAL_FORGE_NGX_LOG` (a Windows path, e.g. `Z:\tmp\ngx.log`, or a Unix one, `/tmp/ngx.log`, taken
+/// through `Z:`: [`trace::windows_path`]), one line per creation, evaluate and release; off when unset.
 fn log_file() -> &'static Option<Mutex<std::fs::File>> {
     static LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
     LOG.get_or_init(|| {
-        let path = std::env::var("NEURAL_FORGE_NGX_LOG").ok().filter(|p| !p.is_empty())?;
+        let path = trace::windows_path(&std::env::var("NEURAL_FORGE_NGX_LOG").ok()?)?;
         std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
     })
 }
@@ -91,6 +93,201 @@ pub(crate) fn log(line: &str) {
         if let Ok(mut f) = file.lock() {
             let _ = writeln!(f, "[{:11.3} tid={}] {line}", now_ms(), thread_id());
         }
+    }
+    trace(format_args!("log: {line}"));
+}
+
+// ---- The call trace (`crate::trace`, `NEURAL_FORGE_NGX_TRACE`). ----
+
+/// The mapped trace file (null: tracing off), and how many bytes went into its ring.
+static TRACE: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static TRACE_WRITTEN: AtomicU64 = AtomicU64::new(0);
+/// Whether passthrough calls go through the traced entries (set once, at load).
+static TRACE_CALLS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn tracing() -> bool {
+    !TRACE.load(Ordering::Relaxed).is_null()
+}
+
+/// Appends one line to the trace: a copy into the mapping, no system call, no lock (a line's bytes are reserved with
+/// one atomic add, so threads never interleave inside a line).
+pub(crate) fn trace(args: core::fmt::Arguments) {
+    let base = TRACE.load(Ordering::Acquire);
+    if base.is_null() {
+        return;
+    }
+    let line = trace::Line::new(now_ms(), thread_id(), args);
+    let bytes = line.bytes();
+    let pos = TRACE_WRITTEN.fetch_add(bytes.len() as u64, Ordering::AcqRel);
+    // SAFETY: the view is FILE_BYTES long and never unmapped; concurrent writers own disjoint byte ranges (a writer a
+    // whole ring behind could overlap, which only garbles text).
+    unsafe {
+        let data = core::slice::from_raw_parts_mut(base.add(trace::HEADER_BYTES), trace::DATA_BYTES);
+        trace::write_at(data, pos, bytes);
+        let header = trace::header(pos + bytes.len() as u64);
+        core::ptr::copy_nonoverlapping(header.as_ptr(), base, trace::HEADER_BYTES);
+    }
+}
+
+/// Maps the trace file `NEURAL_FORGE_NGX_TRACE` names (a new file each run; `{pid}` in the name becomes the game's
+/// Linux pid), if set.
+fn open_trace() -> Option<Result<String, String>> {
+    let path = trace::windows_path(&std::env::var(trace::ENV).ok()?)?;
+    let path = trace::with_pid(&path, unix_pid());
+    let name = wide(&path);
+    // SAFETY: Win32 calls with valid arguments; the view stays mapped for the process's life.
+    unsafe {
+        let file = CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            core::ptr::null_mut(),
+            CREATE_ALWAYS,
+            0,
+            core::ptr::null_mut(),
+        );
+        if file == INVALID_HANDLE {
+            return Some(Err(format!("{path}: cannot create")));
+        }
+        let mapping = CreateFileMappingW(file, core::ptr::null_mut(), PAGE_READWRITE, 0, trace::FILE_BYTES as u32, core::ptr::null());
+        CloseHandle(file);
+        if mapping.is_null() {
+            return Some(Err(format!("{path}: cannot map")));
+        }
+        let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, trace::FILE_BYTES) as *mut u8;
+        CloseHandle(mapping);
+        if view.is_null() {
+            return Some(Err(format!("{path}: cannot view")));
+        }
+        let header = trace::header(0);
+        core::ptr::copy_nonoverlapping(header.as_ptr(), view, trace::HEADER_BYTES);
+        TRACE.store(view, Ordering::Release);
+    }
+    Some(Ok(path))
+}
+
+/// NVIDIA's passthrough functions while tracing (in [`PASSTHROUGH`]'s order); [`PASSTHROUGH_TARGETS`] then holds
+/// the traced entries.
+pub(crate) static mut REAL_TARGETS: [usize; PASSTHROUGH.len()] = [0; PASSTHROUGH.len()];
+
+thread_local! {
+    static STACK: core::cell::RefCell<trace::Stack> = const { core::cell::RefCell::new(trace::Stack::new()) };
+}
+
+/// The common thunk of the traced passthrough entries (`exports.rs`): r11 holds the export's index. It saves the
+/// argument registers (rcx, rdx, r8, r9, xmm0-3), lets [`trace_enter`] log the call and replace the caller's return
+/// address with [`trace_return`], restores them and jumps to NVIDIA's function with the caller's stack untouched
+/// otherwise, so any signature passes through. (Not for an export a C++ exception crosses: the unwinder would meet
+/// `trace_return` as a return address. NGX's C exports return a result code.)
+///
+/// # Safety
+/// Reached only from a traced entry, at an export's first instruction.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn trace_thunk() {
+    core::arch::naked_asm!(
+        "push rcx",
+        "push rdx",
+        "push r8",
+        "push r9",
+        "sub rsp, 0x68",
+        "movdqu [rsp + 0x20], xmm0",
+        "movdqu [rsp + 0x30], xmm1",
+        "movdqu [rsp + 0x40], xmm2",
+        "movdqu [rsp + 0x50], xmm3",
+        "mov rcx, r11",
+        "lea rdx, [rsp + 0x88]",
+        "lea r8, [rsp + 0x68]",
+        "call {enter}",
+        "movdqu xmm0, [rsp + 0x20]",
+        "movdqu xmm1, [rsp + 0x30]",
+        "movdqu xmm2, [rsp + 0x40]",
+        "movdqu xmm3, [rsp + 0x50]",
+        "add rsp, 0x68",
+        "pop r9",
+        "pop r8",
+        "pop rdx",
+        "pop rcx",
+        "jmp rax",
+        enter = sym trace_enter,
+    )
+}
+
+/// Where a traced passthrough call returns: [`trace_leave`] logs its exit and gives the caller's return address.
+///
+/// # Safety
+/// Reached only by the `ret` of a function [`trace_enter`] redirected.
+#[unsafe(naked)]
+unsafe extern "C" fn trace_return() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rdx",
+        "sub rsp, 0x30",
+        "movdqu [rsp + 0x20], xmm0",
+        "mov rcx, rax",
+        "call {leave}",
+        "mov r11, rax",
+        "movdqu xmm0, [rsp + 0x20]",
+        "add rsp, 0x30",
+        "pop rdx",
+        "pop rax",
+        "jmp r11",
+        leave = sym trace_leave,
+    )
+}
+
+/// A traced passthrough call's entry: logs it (its first four arguments: rcx, rdx, r8, r9), keeps the caller's return
+/// address and puts [`trace_return`] in its place, and gives NVIDIA's function. `regs` holds r9, r8, rdx, rcx.
+extern "C" fn trace_enter(export: usize, ret_slot: *mut usize, regs: *const usize) -> usize {
+    let name = PASSTHROUGH.get(export).copied().unwrap_or("?");
+    // SAFETY: the thunk passes its own stack slots; REAL_TARGETS is written once, before any export can be called.
+    let (real, args) = unsafe { ((*core::ptr::addr_of!(REAL_TARGETS))[export], [*regs.add(3), *regs.add(2), *regs.add(1), *regs]) };
+    let t_ms = now_ms();
+    let pushed = STACK.with(|s| {
+        let Ok(mut s) = s.try_borrow_mut() else { return false };
+        // SAFETY: the thunk's slot holding the caller's return address.
+        let ret = unsafe { *ret_slot };
+        if s.push(trace::Frame { export, ret, t_ms }) {
+            // SAFETY: as above.
+            unsafe { *ret_slot = trace_return as *const () as usize };
+            true
+        } else {
+            false
+        }
+    });
+    trace(format_args!("> {name}({:#x}, {:#x}, {:#x}, {:#x}){}", args[0], args[1], args[2], args[3], if pushed { "" } else { " [exit not traced]" }));
+    real
+}
+
+/// A traced passthrough call's exit: logs its result (eax) and time, and gives the caller's return address.
+extern "C" fn trace_leave(rax: usize) -> usize {
+    let frame = STACK.with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.pop()));
+    let Some(f) = frame else {
+        // Cannot happen: only a pushed call returns here. There is no return address to go back to.
+        trace(format_args!("trace: a traced return without its call; aborting"));
+        std::process::abort();
+    };
+    trace(format_args!("< {} = {:#x} ({:.3} ms)", PASSTHROUGH.get(f.export).copied().unwrap_or("?"), rax as u32, now_ms() - f.t_ms));
+    f.ret
+}
+
+/// A hooked export's entry line (`hooks.rs`); its start time for [`trace_out`] when tracing.
+pub(crate) fn trace_in(name: &str, args: &[usize]) -> Option<f64> {
+    if !tracing() {
+        return None;
+    }
+    match args {
+        [a, b, c, d, e] => trace(format_args!("> {name}({a:#x}, {b:#x}, {c:#x}, {d:#x}, {e:#x})")),
+        [a, b, c, d] => trace(format_args!("> {name}({a:#x}, {b:#x}, {c:#x}, {d:#x})")),
+        [a] => trace(format_args!("> {name}({a:#x})")),
+        _ => trace(format_args!("> {name}")),
+    }
+    Some(now_ms())
+}
+
+/// A hooked export's exit line.
+pub(crate) fn trace_out(name: &str, start: Option<f64>, result: u32) {
+    if let Some(t) = start {
+        trace(format_args!("< {name} = {result:#x} ({:.3} ms)", now_ms() - t));
     }
 }
 
@@ -201,7 +398,10 @@ pub(crate) fn target(name: &str) -> *const c_void {
 fn resolve(this: Handle) -> Result<String, String> {
     let path = core_path();
     let wpath = wide(&path);
+    let t = now_ms();
+    trace(format_args!("load: LoadLibraryW({path}) ..."));
     let core = unsafe { LoadLibraryW(wpath.as_ptr()) };
+    trace(format_args!("load: LoadLibraryW returned {core:p} after {:.3} ms", now_ms() - t));
     if core.is_null() {
         return Err(format!("NVIDIA's NGX core {path} did not load"));
     }
@@ -216,13 +416,21 @@ fn resolve(this: Handle) -> Result<String, String> {
         Resolution::MissingHooked(missing) => return Err(format!("NVIDIA's NGX core {path} lacks {}", missing.join(", "))),
         Resolution::Ok { stubbed } => stubbed,
     };
+    let traced = tracing();
+    TRACE_CALLS.store(traced, Ordering::Relaxed);
     for (i, name) in PASSTHROUGH.iter().enumerate() {
         let p = lookup(name);
         let p = if p.is_null() { missing_export as *const () as usize } else { p as usize };
-        unsafe { (*core::ptr::addr_of_mut!(PASSTHROUGH_TARGETS))[i] = p };
+        // SAFETY: written here only, under the loader lock, before any export can be called.
+        unsafe {
+            (*core::ptr::addr_of_mut!(REAL_TARGETS))[i] = p;
+            (*core::ptr::addr_of_mut!(PASSTHROUGH_TARGETS))[i] = if traced { PASSTHROUGH_TRACED[i] as *const () as usize } else { p };
+        }
+        trace(format_args!("load: {name} -> {p:#x}{}", if p == missing_export as *const () as usize { " (missing: NVSDK_NGX_Result_Fail)" } else { "" }));
     }
     for (i, name) in HOOKED.iter().enumerate() {
         HOOK_TARGETS[i].store(lookup(name) as *mut c_void, Ordering::Release);
+        trace(format_args!("load: {name} -> {:p} (hooked)", lookup(name)));
     }
     let mut text = format!("{} at {core:p}", module_path(core));
     if !stubbed.is_empty() {
@@ -244,13 +452,29 @@ fn resolve(this: Handle) -> Result<String, String> {
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(this: Handle, reason: u32, _reserved: *mut c_void) -> i32 {
     const DLL_PROCESS_ATTACH: u32 = 1;
+    const DLL_PROCESS_DETACH: u32 = 0;
+    if reason == DLL_PROCESS_DETACH {
+        trace(format_args!("unload: DLL_PROCESS_DETACH ({})", if _reserved.is_null() { "FreeLibrary" } else { "process exit" }));
+        return 1;
+    }
     if reason != DLL_PROCESS_ATTACH {
         return 1;
     }
     DisableThreadLibraryCalls(this);
     let _ = clock();
     let exe = module_path(core::ptr::null_mut());
-    match resolve(this) {
+    let opened = open_trace();
+    trace(format_args!(
+        "load: Neural Forge NGX wrapper {} in {exe} as {}; trace {opened:?}; NVIDIA_WINE_DLL_DIR={:?} WINEDLLOVERRIDES={:?}",
+        env!("CARGO_PKG_VERSION"),
+        module_path(this),
+        std::env::var("NVIDIA_WINE_DLL_DIR").ok(),
+        std::env::var("WINEDLLOVERRIDES").ok()
+    ));
+    let t = now_ms();
+    let resolved = resolve(this);
+    trace(format_args!("load: resolved in {:.3} ms (passthrough calls traced: {})", now_ms() - t, TRACE_CALLS.load(Ordering::Relaxed)));
+    match resolved {
         Ok(core) => {
             let ring = if rules::ring_wanted(|name| std::env::var(name).ok()) {
                 open_ring()
@@ -258,6 +482,7 @@ pub unsafe extern "system" fn DllMain(this: Handle, reason: u32, _reserved: *mut
                 Err("not created: the Neural Forge layer is not on in this process (NEURAL_FORGE_ENABLE)".into())
             };
             log(&format!("Neural Forge NGX wrapper {} in {exe} as {}; NVIDIA's core {core}; ring {ring:?}", env!("CARGO_PKG_VERSION"), module_path(this)));
+            trace(format_args!("load: DllMain done"));
             1
         }
         Err(e) => {

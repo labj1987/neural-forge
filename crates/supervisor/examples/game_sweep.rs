@@ -88,11 +88,13 @@ struct Run {
     /// Relative to the game's Proton user folder (`compatdata/<appid>/pfx/drive_c/users/steamuser`).
     edit_file: Option<String>,
     edits: Vec<(String, String)>,
+    /// Extra environment for the game (`NAME=VALUE`, before `%command%`): a debugging option for the run.
+    env: Vec<(String, String)>,
 }
 
 impl Run {
     fn from_table(t: &BTreeMap<String, Value>) -> Result<Run, String> {
-        const KEYS: [&str; 11] = ["label", "appid", "route", "args", "seconds", "timeout", "hdr", "ray_reconstruction", "edit_kind", "edit_file", "edits"];
+        const KEYS: [&str; 12] = ["label", "appid", "route", "args", "seconds", "timeout", "hdr", "ray_reconstruction", "edit_kind", "edit_file", "edits", "env"];
         if let Some(k) = t.keys().find(|k| !KEYS.contains(&k.as_str())) {
             return Err(format!("unknown key {k}"));
         }
@@ -136,6 +138,20 @@ impl Run {
                 .collect::<Result<_, _>>()?,
             Some(_) => return Err("edits must be an array".into()),
         };
+        let env = match t.get("env") {
+            None => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .and_then(|s| s.split_once('='))
+                        .filter(|(k, _)| !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .ok_or("env entries are NAME=VALUE strings")
+                })
+                .collect::<Result<_, _>>()?,
+            Some(_) => return Err("env must be an array".into()),
+        };
         let run = Run {
             label,
             appid,
@@ -148,6 +164,7 @@ impl Run {
             edit_kind,
             edit_file: text("edit_file"),
             edits,
+            env,
         };
         if run.edits.is_empty() != run.edit_file.is_none() || run.edit_file.is_some() != run.edit_kind.is_some() {
             return Err("edit_file, edit_kind and edits go together".into());
@@ -354,8 +371,8 @@ fn short_state(state: u32) -> &'static str {
 
 /// The launch options a run starts the game with: the game's own, without Neural Forge's log variables (which the
 /// sweep sets), with Neural Forge on for the game's executables, the run's log file, Proton's HDR switches and the
-/// run's arguments after `%command%`.
-fn sweep_options(existing: &str, exe: &[String], log: &Path, hdr: bool, args: &str) -> String {
+/// run's extra environment and its arguments after `%command%`.
+fn sweep_options(existing: &str, exe: &[String], log: &Path, hdr: bool, env: &[(String, String)], args: &str) -> String {
     let base = launch_options::merge(existing, &exe.join(","));
     let tokens = launch_options::split_tokens(&base);
     let cmd = tokens.iter().position(|t| t == "%command%").unwrap_or(tokens.len());
@@ -370,6 +387,10 @@ fn sweep_options(existing: &str, exe: &[String], log: &Path, hdr: bool, args: &s
     if hdr {
         out.push("PROTON_ENABLE_WAYLAND=1".into());
         out.push("PROTON_ENABLE_HDR=1".into());
+    }
+    for (k, v) in env {
+        out.retain(|t| !t.starts_with(&format!("{k}=")));
+        out.push(format!("{k}={}", launch_options::shell_quote(v)));
     }
     out.extend(tokens[cmd..].iter().cloned());
     if tokens.len() == cmd {
@@ -752,7 +773,7 @@ fn sweep(o: &Options) -> Result<bool, String> {
                 steam::launch_options(&p.game.root.path, &p.run.appid.to_string()).into_iter().find(|a| a.has_app).and_then(|a| a.options).unwrap_or_default();
             println!("{} ({}, {:?}):", p.run.label, p.facts.name, p.run.route);
             if p.run.route == Route::Steam {
-                println!("  launch options: {}", sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.args));
+                println!("  launch options: {}", sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.env, &p.run.args));
             }
             if let (Some(file), Some(kind)) = (&p.run.edit_file, p.run.edit_kind) {
                 let path = user_dir(p).join(file);
@@ -945,7 +966,7 @@ fn write_launch_options(localconfigs: &[(PathBuf, Vec<u8>)], p: &Prepared) -> Re
             found.clone()
         } else {
             let current = tree.string_at(&path).unwrap_or_default().to_string();
-            let options = sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.args);
+            let options = sweep_options(&current, &p.facts.exe, &p.log, p.run.hdr, &p.run.env, &p.run.args);
             let (new, _) = vdf::set_string(found, &path, &options).map_err(|e| format!("{}: {e}", file.display()))?;
             if !vdf::verify_edit(found, &new, &path, &options) {
                 return Err(format!("{}: the edit did not verify", file.display()));
@@ -1225,12 +1246,17 @@ mod tests {
         let found =
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG=/x/cp.log NEURAL_FORGE_LOG_TIME=1 %command% --launcher-skip";
         assert_eq!(
-            sweep_options(found, &exe, log, true, "--launcher-skip -skipStartScreen -benchmark"),
+            sweep_options(found, &exe, log, true, &[], "--launcher-skip -skipStartScreen -benchmark"),
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 %command% --launcher-skip -skipStartScreen -benchmark"
         );
         assert_eq!(
-            sweep_options("", &exe, log, false, ""),
+            sweep_options("", &exe, log, false, &[], ""),
             "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' %command%"
+        );
+        let env = [("NEURAL_FORGE_NGX_TRACE".to_string(), "/tmp/t {pid}.txt".to_string())];
+        assert_eq!(
+            sweep_options("", &exe, log, false, &env, ""),
+            "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe NEURAL_FORGE_LOG='/home/a/nf-sweep/1/cp.log' NEURAL_FORGE_NGX_TRACE='/tmp/t {pid}.txt' %command%"
         );
     }
 

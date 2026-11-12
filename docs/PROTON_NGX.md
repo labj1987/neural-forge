@@ -111,6 +111,33 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   slot's record is lost, never misread. A slot overwritten while copied fails the `seq` check after the copy and is
   skipped. Writers never wait on the reader.
 
+## The call trace (`NEURAL_FORGE_NGX_TRACE`, `crates/ngx-wrapper/src/trace.rs`)
+
+For a game that stalls or crashes with the wrapper in and logs nothing in `NEURAL_FORGE_NGX_LOG` (#51: Indiana Jones
+and the Great Circle, Vulkan with Streamline, `vkQueuePresentKHR` returning `VK_TIMEOUT` about 5 s after its
+swapchain, before any feature was created). `NEURAL_FORGE_NGX_TRACE=<path>` (a Windows path, or a Linux one taken
+through `Z:`; `{pid}` becomes the Linux pid) makes the wrapper log:
+
+- its load: the environment Proton set (`NVIDIA_WINE_DLL_DIR`, `WINEDLLOVERRIDES`), how long `LoadLibraryW` of
+  NVIDIA's core took, every export's resolved address (and which the core lacks), the ring, `DllMain`'s end, and
+  `DLL_PROCESS_DETACH`;
+- every call into any of the 75 exports: `> name(rcx, rdx, r8, r9)` on entry, `< name = result (ms)` on return, with
+  the thread id and the time since load. The hooked exports log in their Rust hooks; the passthrough exports, which
+  are bare jumps otherwise, jump to a per-export entry (`exports.rs`, `traced`) that puts the export's index in r11
+  and goes to `win::trace_thunk`: it saves the argument registers, logs the entry, replaces the caller's return
+  address with `win::trace_return` (the real one kept on a per-thread stack of 64 frames), restores the registers
+  and jumps to NVIDIA's function, so every signature passes through unchanged and the stack arguments stay where the
+  caller put them. `trace_return` logs the result and goes back to the kept address. A call deeper than 64 is
+  logged without its exit. (Not for a function a C++ exception crosses, which NGX's C exports do not let out.)
+- the text log's lines too (`log: ...`), so one file has all of it.
+
+The file is 64 MB, mapped once at load (shared, file-backed): a line is formatted on the stack and copied into the
+mapping at a position reserved with one atomic add, and a fixed 128-byte header line is rewritten with the next
+position. No system call, no lock, no flush on any call path; the kernel keeps the mapping's pages when the process
+dies, so the lines up to a crash are in the file. When the ring is full it wraps (the header says `wrapped` and
+where the next line goes); `tr -d '\0' < FILE | sort -n` orders the lines by time. A call that never returned shows
+as an entry line without its exit: in a stalled present, that names the NGX call the game's thread is in.
+
 ## What the layer does with the records (`crates/layer/src/ngx_ring.rs`, `preupscale.rs`)
 
 - **Which buffer is an evaluate's.** A command buffer belongs to an evaluate when one of its launches names (through
@@ -267,3 +294,9 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
   Proton and put it back on `disable`) held before the upscaler, 71 fps; GTA San Andreas - The Definitive Edition
   (D3D11 through DXVK) held before the upscaler, ~50 fps. Crimson Desert with DLSS off in its own settings: the model on
   the finished frame (13.5 fps, as before); with DLSS on and no wrapper: the model off, 104 fps, the log says why.
+- Where NVIDIA's core loads from does not change which DLSS files it picks (2026-11-12, driver 620.70's
+  `_nvngx.dll`, Ghidra): its "driver store" path under Wine is `NVIDIA_WINE_DLL_DIR` read from the environment
+  (`NGXGetPathUsingQAI`, after the adapter query fails), not its own module's folder, so the driver's
+  `nvngx_dlssg.dll`/`nvngx_dlssd.dll` are found the same way with and without the wrapper; and its over-the-air updater
+  is decided by `__NGX_DISABLE_UPDATER` and `PROTON_ENABLE_NGX_UPDATER` (`NGXIsUpdaterEnabledBase`), not by its path.
+  The Indiana Jones stall in #51 is therefore not the core's load path; the call trace is there to find what it is.

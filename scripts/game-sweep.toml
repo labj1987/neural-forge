@@ -15,6 +15,7 @@
 #   edit_file, edit_kind, edits   game settings for the run, restored afterwards byte for byte: the file relative to
 #                the game's Proton user folder (compatdata/<appid>/pfx/drive_c/users/steamuser), "json-option"
 #                (Cyberpunk 2077's UserSettings.json option names) or "xml-value" (<Name value="..."/>), NAME=VALUE
+#   env          extra environment for the game, ["NAME=VALUE", ...], before %command% (a debugging option)
 #
 # Every run is at 3840x2160 (the test machine's desktop); games with HDR run with it on.
 

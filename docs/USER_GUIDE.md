@@ -423,7 +423,8 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_SMOKE_SO=/path` | `scripts/smoke-test.sh` | Test this layer library instead of building the debug one. |
 | `PROTON_NO_NEURAL_FORGE_NGX=1` | a Proton copy's `proton` script | The game runs without the NGX wrapper (NVIDIA's core directly), as with the original Proton. |
 | `NEURAL_FORGE_NGX_RING=off\|/path` | layer | `off`: the layer reads no NGX records, so nothing is held before or after DLSS (as without the wrapper). A path: read that ring file (left in place) instead of this process's. |
-| `NEURAL_FORGE_NGX_LOG=Z:\path\ngx.log` | NGX wrapper (a Windows path) | One line per DLSS creation, evaluate (every named image, the jitter, motion vector scale, exposure and reset) and release. Off by default. |
+| `NEURAL_FORGE_NGX_LOG=/path/ngx.log` | NGX wrapper | One line per DLSS creation, evaluate (every named image, the jitter, motion vector scale, exposure and reset) and release. Off by default. A Linux path is used through Wine's `Z:` drive; a Windows path works too, but in Steam's launch options quote it, or the backslashes are lost: `NEURAL_FORGE_NGX_LOG='Z:\home\you\ngx.log' %command%`. |
+| `NEURAL_FORGE_NGX_TRACE=/path/ngx-trace-{pid}.txt` | NGX wrapper | For a game that stalls or crashes with the NGX wrapper in: every call into it (each NGX function, its thread, its first arguments, its result and how long NVIDIA's function took) and each step of its loading, in a 64 MB file of text lines (`{pid}` in the name becomes the game's process id). Writing a line costs about a microsecond and no file I/O, and the lines up to a crash are kept. Read it with `tr -d '\0' < FILE \| sort -n` (lines start with their time in ms; the file is a ring, so once full the oldest lines are overwritten). A path as for `NEURAL_FORGE_NGX_LOG`. Off by default. |
 | `NEURAL_FORGE_NGX_CORE=C:\path\_nvngx.dll` | NGX wrapper | Load NVIDIA's core from here instead of `NVIDIA_WINE_DLL_DIR`. |
 
 ## CLI
