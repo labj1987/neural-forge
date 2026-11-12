@@ -1433,10 +1433,17 @@ of running the network on an SDR-mapped copy of the HDR frame and restoring its 
 frame comes from Veyra-NRVideo (`HdrProxy`/`HdrRestore`; ATTRIBUTION.md); the maths here is this project's own,
 on SMPTE ST 2084 and the BT.2020/BT.709 matrices of ITU-R BT.2087 (`crate::hdr_present`, with its CPU reference).
 
-- **Admission** (`swapchain::is_supported_format(format, colour_space)`): the two 10-bit formats only with the
-  HDR10 colour space; the same `TRANSFER_SRC|TRANSFER_DST` usage as an 8-bit swapchain. A 10-bit swapchain in an
-  SDR colour space, and float16 (scRGB, `R16G16B16A16_SFLOAT`) ones, still present untouched: a float16 frame is
-  8 bytes a pixel, where the shared regions and the composition hold 4. A pass-through HDR10 swapchain (one the
+- **Admission** (`swapchain::is_supported_format(format, colour_space)`): the two 10-bit formats with the
+  HDR10 colour space; the same `TRANSFER_SRC|TRANSFER_DST` usage as an 8-bit swapchain. The same formats in
+  `SRGB_NONLINEAR` are 10-bit SDR (4.2.0, below). Float16 (scRGB, `R16G16B16A16_SFLOAT`) ones still present
+  untouched: a float16 frame is 8 bytes a pixel, where the shared regions and the composition hold 4.
+- **10-bit SDR (4.2.0, #51)**: a 10-bit swapchain in `SRGB_NONLINEAR` (DXVK and vkd3d-proton give one for a game's
+  `R10G10B10A2` swapchain; Stellar Blade under gamescope) takes the same raw path as `proxy_format::SDR10_RGB`/
+  `SDR10_BGR`, with the shaders' `transfer` push constant 1 (`hdr_present::Transfer::Srgb`): the network's picture is
+  each 10-bit sRGB code taken to 8 bits (`sdr10_word`, exact), and `compose_hdr.comp` puts the change back in linear
+  light, out = sRGB(EOTF(base) + EOTF(answer) - EOTF(picture)) at 10 bits, the frame's word where the answer equals
+  the picture, no shoulder or highlight rules (nothing was compressed). The same size, pipelined and pass-through
+  rules as HDR10 apply; `NEURAL_FORGE_HDR_PRESENT=off` does not affect it. A pass-through HDR10 swapchain (one the
   layer could not admit) is never composed onto from its render source. `NEURAL_FORGE_HDR_PRESENT=off` leaves
   HDR10 out, as before (a testing aid).
 - **Capture** (`capture::run`): the frame is copied raw (one packed word a pixel) into the proxy region as

@@ -60,8 +60,11 @@ layer picks the place for each game by itself:
   back onto the HDR frame in linear light. Highlights get less and less of the change from about 185 nits
   (in their brightest colour channel) and none from about 295 nits, pixels the network did not change keep
   their exact HDR values, and
-  the model resolution must be 100% (below it the frame is presented untouched). A float16 (scRGB) or
-  10-bit SDR swapchain is presented untouched, and captures of an HDR frame are refused.
+  the model resolution must be 100% (below it the frame is presented untouched). A 10-bit SDR frame (10-bit
+  in the sRGB colour space, as games under gamescope often present) is shown to the network as its 8-bit
+  picture, and the change is put back onto the 10-bit frame in linear light, at the same 100% model
+  resolution; pixels the network did not change keep their exact values. A float16 (scRGB) swapchain is
+  presented untouched, and captures of a 10-bit frame are refused.
 
 In a pause menu, a map or a loading screen many games stop calling DLSS (Cyberpunk 2077's Esc menu shows the
 last frame, which already has the model's edit, under the menu). The model then stays where it is, with its

@@ -18,6 +18,56 @@
 //! untouched HDR frame comes from Veyra-NRVideo (ATTRIBUTION.md); ST 2084 and the BT.2020/BT.709 matrices are
 //! public standards (SMPTE ST 2084, ITU-R BT.2087).
 
+/// How a 10-bit frame's codes carry light, which decides how the model server makes the 8-bit picture the network is
+/// shown (`shaders/native_post_hdr.comp`) and how the composition carries the change back (`shaders/compose_hdr.comp`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Transfer {
+    /// HDR10: ST 2084 code, BT.2020 primaries, at this reference white.
+    Pq { reference_nits: f32 },
+    /// 10-bit SDR: sRGB code, BT.709 (a 10-bit swapchain in `SRGB_NONLINEAR`). Its picture is each code taken to 8
+    /// bits; the composition works in linear light like the HDR10 one, without the shoulder or the highlight rules.
+    Srgb,
+}
+
+impl Transfer {
+    /// The shaders' `transfer` push constant.
+    pub(crate) fn code(self) -> u32 {
+        match self {
+            Transfer::Pq { .. } => 0,
+            Transfer::Srgb => 1,
+        }
+    }
+
+    /// The shaders' `reference_nits` (unused with [`Transfer::Srgb`]).
+    pub(crate) fn reference_nits(self) -> f32 {
+        match self {
+            Transfer::Pq { reference_nits } => reference_nits,
+            Transfer::Srgb => DEFAULT_REFERENCE_NITS,
+        }
+    }
+
+    /// `compose_hdr.comp`'s flags: the highlight rules only for HDR10.
+    pub(crate) fn compose_flags(self) -> u32 {
+        match self {
+            Transfer::Pq { .. } => compose_flags(),
+            Transfer::Srgb => 0,
+        }
+    }
+
+    /// The transfer of a raw 10-bit proxy format (`proxy_format::PQ10_*`, `SDR10_*`): HDR10 only while the HDR path is
+    /// on ([`enabled`]); `None` for any other format.
+    pub(crate) fn for_format(format: u32) -> Option<Self> {
+        use neural_forge_protocol::enums::proxy_format;
+        if proxy_format::is_pq10(format) {
+            enabled().then(|| Transfer::Pq { reference_nits: reference_nits() })
+        } else if proxy_format::is_sdr10(format) {
+            Some(Transfer::Srgb)
+        } else {
+            None
+        }
+    }
+}
+
 /// `off` keeps HDR10 swapchains out of the effect (presented untouched), as before the HDR path existed. A
 /// testing aid.
 pub(crate) const ENABLE_ENV: &str = "NEURAL_FORGE_HDR_PRESENT";
@@ -178,6 +228,28 @@ pub(crate) mod reference {
     pub(crate) fn pack(rgb: [u32; 3], alpha: u32, b_low: bool) -> u32 {
         let c = if b_low { [rgb[2], rgb[1], rgb[0]] } else { rgb };
         c[0] | (c[1] << 10) | (c[2] << 20) | (alpha << 30)
+    }
+
+    /// A 10-bit SDR word's 8-bit picture (`sdr10_word`): each code to 8 bits, rounded.
+    pub(crate) fn sdr10_8(word: u32, b_low: bool) -> [u8; 3] {
+        unpack(word, b_low).0.map(|c| (f64::from(c) / 1023.0 * 255.0).round() as u8)
+    }
+
+    /// `compose_hdr.comp`'s 10-bit SDR composition: the answer's change in linear light (sRGB EOTF) added to the
+    /// frame's, back to sRGB code at 10 bits; the frame's word when the answer equals its proxy's picture.
+    pub(crate) fn compose_sdr10(base: u32, proxy: u32, answer: [u8; 3], b_low: bool) -> u32 {
+        let s = sdr10_8(proxy, b_low);
+        if answer == s {
+            return base;
+        }
+        let (codes, alpha) = unpack(base, b_low);
+        let mut out = [0u32; 3];
+        for c in 0..3 {
+            let d = srgb_eotf(f64::from(answer[c]) / 255.0) - srgb_eotf(f64::from(s[c]) / 255.0);
+            let l = (srgb_eotf(f64::from(codes[c]) / 1023.0) + d).clamp(0.0, 1.0);
+            out[c] = ((srgb_oetf(l) * 1023.0).round() as u32).min(1023);
+        }
+        pack(out, alpha, b_low)
     }
 
     /// A word's light in linear BT.2020 nits.
