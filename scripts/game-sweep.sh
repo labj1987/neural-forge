@@ -13,7 +13,7 @@
 #                     default; the build's own when --layer is a build with another channel version)
 #   --out DIR         where the logs, status samples and results.txt go (default ~/nf-sweep/<unix time>)
 #   --lock FILE       the GPU lock taken for the whole sweep (default $NF_GPU_LOCK, else ~/scratch/gpu.lock)
-#   --vw PATH         the screen recorder (`vw record`/`vw analyze`, default ~/scratch/vw/bin/vw): each run is recorded for
+#   --vw PATH         the screen recorder (`vw replay`/`vw analyze`, default ~/scratch/vw/bin/vw): each run is recorded for
 #                     10 s once at its placement and passes only when the analysis flags nothing (colour flashes,
 #                     alternating frames, black frames, freezes); look at each run's <label>-vw/sheet.jpg too
 #   --no-record       no recording: every run then fails on its picture

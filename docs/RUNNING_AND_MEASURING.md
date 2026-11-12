@@ -101,8 +101,12 @@ commands below assumes that directory is on the PATH.)
 `scripts/gta-bench.sh` runs GTA V Enhanced's built-in benchmark with a chosen layer environment,
 with no one at the machine. It runs on the host, or from the dev machine with `--host`. Steam must
 be running on the host. The game is launched through the same Steam Linux Runtime entry point and
-Proton that Steam uses, with only the environment given (Steam's launch options are bypassed), and
-`-benchmark -benchmarkIterations 1 -benchmarkFrameTimes`. It exits by itself.
+the Proton Steam has for it (`config.vdf`'s `CompatToolMapping`: a Neural Forge Proton copy when the game is
+switched on in Neural Forge; `NF_BENCH_PROTON` overrides it), with only the environment given (Steam's launch
+options are bypassed), and `-benchmark -benchmarkIterations 1 -benchmarkFrameTimes`. It exits by itself. It is
+not a Steam launch because a benchmark needs exactly the environment given for each side of an A/B, MangoHud as
+the last layer and its own process group to classify and relaunch a failed attempt; the game sweep (section 11)
+launches through Steam.
 
 ```text
 gta-bench.sh [--host HOST] [--tries N] [--set key=value]... <label> <VK layers above MangoHud> [env...]
@@ -547,7 +551,7 @@ scripts/game-sweep.sh --dry-run            # each run's launch options, settings
 scripts/game-sweep.sh --only cyberpunk,gta # some runs
 ```
 
-Routes:
+Route:
 
 - `steam`: Steam starts the game (`steam steam://rungameid/<appid>`), with the Proton Steam maps it to. The
   launch options carry Neural Forge (`NEURAL_FORGE_ENABLE=1`, the game's executables), the run's log
@@ -557,8 +561,11 @@ Routes:
   writes the options, starts Steam with the session's environment (`systemd-run --user`, so `environment.d`'s
   variables apply as at login), runs the game, then shuts Steam down again, puts every account's `localconfig.vdf`
   back byte for byte and starts it again if it was running.
-- `gta-bench`: GTA V Enhanced's built-in benchmark through `scripts/gta-bench.sh` (section 3), one launch, with
-  the session's `DXVK_NVAPI_*` frame-generation variables passed on.
+
+The sweep has no other route: a game is never launched around Steam, so it always runs on the Proton Steam has for
+it (a direct launch through `scripts/gta-bench.sh` ran GTA on that script's default Proton, without Neural Forge's
+NGX wrapper). GTA V Enhanced runs its built-in benchmark this way (`-benchmark -benchmarkIterations 1
+-benchmarkFrameTimes`).
 
 A run's game settings (`edit_file`: Cyberpunk 2077's `UserSettings.json` for 3840x2160, HDR10 PQ and Ray
 Reconstruction; GTA's `settings.xml` for 3840x2160) are set from the file as found before each run and put back
@@ -572,8 +579,10 @@ or after `timeout` without the placement; then it ends every process of the game
 expected `preupscale_state` was reached and the edit cache counted holds (the model ran in the game's frame), it
 did not end refused (`preupscale_state=5`), `preupscale_misses` is 0, no device was lost, the log has no `[panic]`,
 the kernel logged no `NVRM: Xid` since the run began, the HDR verdict says HDR10 for an HDR run and SDR
-otherwise, and the picture is right: every run is recorded for 10 s once at its placement (`vw record`, `--vw`,
-default `~/scratch/vw/bin/vw`) and `vw analyze` must flag nothing (a colour flash: frames tinted against their
+otherwise, and the picture is right: every run is recorded for 10 s once at its placement (`--vw`, default
+`~/scratch/vw/bin/vw`: `vw replay start` before the game, encoding on the CPU (`VW_ENCODER=cpu`, 1920x1080, about
+20 MiB of video memory: the GPU encoder's ~310 MiB left the model too little at 4K with Ray Reconstruction and the
+VRAM guard paused it), then `vw replay save`; the recorder's log is `<label>.mp4.log`) and `vw analyze` must flag nothing (a colour flash: frames tinted against their
 neighbours, frames alternating between two states, black frames, freezes); the table's `picture` column says
 `ok` or `FAIL`. Log numbers alone never pass a run: look at each run's contact sheet (`<label>-vw/sheet.jpg`)
 against the game with the model off as well. `--no-record` makes no recording, and every run then fails. Each run's layer log, its status samples (`<label>.samples`) and `results.txt` go to `--out` (default
@@ -582,5 +591,4 @@ against the game with the model off as well. `--no-record` makes no recording, a
 Each run takes the GPU lock (`--lock`, default `$NF_GPU_LOCK`, else `~/scratch/gpu.lock`, an `flock`; waiting
 while another run holds it) from before it changes anything until everything is put back, and lets it go between
 runs, so other work on the machine goes in between; a run whose game is already open is skipped. The sweep refuses
-to start while the Neural Forge window is open. A parent that holds the lock already sets `NF_GPU_LOCK_HELD=1`; the
-sweep passes that to `gta-bench.sh`. A run takes 4 to 8 minutes, Steam's two restarts included.
+to start while the Neural Forge window is open. A parent that holds the lock already sets `NF_GPU_LOCK_HELD=1`. A run takes 4 to 8 minutes, Steam's two restarts included.

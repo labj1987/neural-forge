@@ -10,7 +10,6 @@
 //!   options are only written while Steam is shut down, so for each such run the sweep shuts Steam down, writes them,
 //!   starts Steam (through `systemd-run --user`, with the session's environment), runs the game, and puts them back
 //!   the same way.
-//! - `gta-bench`: `scripts/gta-bench.sh` (GTA V Enhanced's built-in benchmark, one launch), with Steam running.
 //!
 //! Each run is made from start to finish under the rig's GPU lock (`--lock`, default `$NF_GPU_LOCK` or
 //! `~/scratch/gpu.lock`; flock), unless a parent holds it (`NF_GPU_LOCK_HELD`), and everything it changed is put
@@ -52,7 +51,6 @@ fn nap(d: Duration) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
     Steam,
-    GtaBench,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +80,9 @@ struct Run {
     seconds: u64,
     /// How long to wait for the game to start and reach its placement.
     timeout: u64,
+    /// When the recording starts, in seconds after the placement was reached (default [`RECORD_AFTER`]): within one
+    /// scene of a benchmark, not across its own loading screens.
+    record_after: u64,
     hdr: bool,
     ray_reconstruction: bool,
     edit_kind: Option<EditKind>,
@@ -92,7 +93,8 @@ struct Run {
 
 impl Run {
     fn from_table(t: &BTreeMap<String, Value>) -> Result<Run, String> {
-        const KEYS: [&str; 11] = ["label", "appid", "route", "args", "seconds", "timeout", "hdr", "ray_reconstruction", "edit_kind", "edit_file", "edits"];
+        const KEYS: [&str; 12] =
+            ["label", "appid", "route", "args", "seconds", "timeout", "record_after", "hdr", "ray_reconstruction", "edit_kind", "edit_file", "edits"];
         if let Some(k) = t.keys().find(|k| !KEYS.contains(&k.as_str())) {
             return Err(format!("unknown key {k}"));
         }
@@ -117,8 +119,7 @@ impl Run {
         }
         let route = match text("route").as_deref() {
             Some("steam") => Route::Steam,
-            Some("gta-bench") => Route::GtaBench,
-            other => return Err(format!("route {other:?} is not steam or gta-bench")),
+            other => return Err(format!("route {other:?} is not steam (every game is started by Steam)")),
         };
         let edit_kind = match text("edit_kind").as_deref() {
             None => None,
@@ -143,17 +144,18 @@ impl Run {
             args: text("args").unwrap_or_default(),
             seconds: int("seconds", 90)? as u64,
             timeout: int("timeout", 600)? as u64,
+            record_after: int("record_after", RECORD_AFTER as i64)? as u64,
             hdr: flag("hdr")?,
             ray_reconstruction: flag("ray_reconstruction")?,
             edit_kind,
             edit_file: text("edit_file"),
             edits,
         };
+        if run.record_after + RECORD_SECONDS > run.seconds {
+            return Err(format!("record_after + {RECORD_SECONDS} s of recording must fit in seconds ({})", run.seconds));
+        }
         if run.edits.is_empty() != run.edit_file.is_none() || run.edit_file.is_some() != run.edit_kind.is_some() {
             return Err("edit_file, edit_kind and edits go together".into());
-        }
-        if run.route == Route::GtaBench && (run.hdr || !run.args.is_empty()) {
-            return Err("the gta-bench route takes no hdr or args".into());
         }
         Ok(run)
     }
@@ -648,7 +650,7 @@ struct Options {
     out: PathBuf,
     lock: PathBuf,
     dry_run: bool,
-    /// The screen recorder and analyser (`vw`: `vw record OUT SECONDS`, `vw analyze VIDEO --out DIR`), whose verdict
+    /// The screen recorder and analyser (`vw`: `vw replay start|save OUT|stop`, `vw analyze VIDEO --out DIR`), whose verdict
     /// every run needs to pass ([`picture_verdict`]); `None` with `--no-record`, and every run then fails.
     vw: Option<PathBuf>,
 }
@@ -858,10 +860,11 @@ fn sweep(o: &Options) -> Result<bool, String> {
             restore.steam_stopped = false;
             println!("== {} ({})", p.run.label, p.facts.name);
             let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let recorder = Recorder::start(o);
             let samples = match p.run.route {
                 Route::Steam => run_steam(o, p, &env),
-                Route::GtaBench => run_gta(o, p, &env),
             };
+            drop(recorder);
             std::fs::write(o.out.join(format!("{}.samples", p.run.label)), samples.iter().map(|s| format!("{s:?}\n")).collect::<String>()).ok();
             let log = std::fs::read_to_string(&p.log).unwrap_or_default();
             let xid = Command::new("journalctl")
@@ -1003,7 +1006,7 @@ fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bo
         } else {
             gone_since = None;
         }
-        if !recorded && reached.is_some_and(|r| r.elapsed() >= Duration::from_secs(RECORD_AFTER.min(p.run.seconds))) {
+        if !recorded && reached.is_some_and(|r| r.elapsed() >= Duration::from_secs(p.run.record_after)) {
             recorded = true;
             record(o, p);
         }
@@ -1023,16 +1026,89 @@ fn video(o: &Options, p: &Prepared) -> PathBuf {
     o.out.join(format!("{}.mp4", p.run.label))
 }
 
-/// Records the screen for the run ([`video`]) with `vw record`.
+/// The screen recorder, started before the game (`vw replay start`: GPU Screen Recorder keeping the last seconds in
+/// memory) and stopped after it (`vw replay stop`, also after an error or Ctrl-C), encoding on the CPU
+/// (`VW_ENCODER=cpu`, about 20 MiB of video memory). The GPU encoder takes about 310 MiB: started once the game was
+/// up at 4K with Ray Reconstruction and the model after DLSS, it got no CUDA context (no recording); started before
+/// the game, it left the model too little memory and Neural Forge's VRAM guard paused it. A recorder must not change
+/// what the run measures.
+struct Recorder<'a>(Option<&'a Path>);
+
+impl<'a> Recorder<'a> {
+    fn start(o: &'a Options) -> Self {
+        let Some(vw) = o.vw.as_deref() else { return Recorder(None) };
+        let secs = (RECORD_SECONDS + 2).to_string();
+        match Command::new(vw)
+            .args(["replay", "start", &secs])
+            .env("VW_ENCODER", "cpu")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(s) if s.success() => Recorder(Some(vw)),
+            Ok(s) => {
+                println!("  vw replay start failed ({s}; see {})", vw_log().display());
+                Recorder(None)
+            }
+            Err(e) => {
+                println!("  vw replay start: {e}");
+                Recorder(None)
+            }
+        }
+    }
+}
+
+impl Drop for Recorder<'_> {
+    fn drop(&mut self) {
+        if let Some(vw) = self.0 {
+            let _ = Command::new(vw).args(["replay", "stop"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+    }
+}
+
+/// Records the screen for the run ([`video`]): the next [`RECORD_SECONDS`], saved from the [`Recorder`]'s memory
+/// (`vw replay save`), with the recorder's log so far next to it.
 fn record(o: &Options, p: &Prepared) {
     let Some(vw) = &o.vw else { return };
     let out = video(o, p);
     let _ = std::fs::remove_file(&out);
-    match Command::new(vw).arg("record").arg(&out).arg(RECORD_SECONDS.to_string()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status() {
-        Ok(s) if s.success() => println!("  {}: recorded {} s ({})", p.run.label, RECORD_SECONDS, out.display()),
-        Ok(s) => println!("  {}: vw record failed ({s})", p.run.label),
-        Err(e) => println!("  {}: vw record: {e}", p.run.label),
+    nap(Duration::from_secs(RECORD_SECONDS));
+    // The recorder keeps more than it was asked for (up to twice): the last RECORD_SECONDS of what it saved, cut at a
+    // keyframe without re-encoding, is the recording.
+    let full = out.with_extension("full.mp4");
+    let _ = std::fs::remove_file(&full);
+    let saved = Command::new(vw).args(["replay", "save"]).arg(&full).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = std::fs::copy(vw_log(), out.with_extension("mp4.log"));
+    let saved = saved.and_then(|s| {
+        if !s.success() {
+            return Ok(s);
+        }
+        let cut = Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-sseof"])
+            .arg(format!("-{RECORD_SECONDS}"))
+            .arg("-i")
+            .arg(&full)
+            .args(["-c", "copy"])
+            .arg(&out)
+            .stdin(Stdio::null())
+            .status();
+        let _ = std::fs::remove_file(&full);
+        cut
+    });
+    match saved {
+        Ok(s) if s.success() && out.is_file() => println!("  {}: recorded {} s ({})", p.run.label, RECORD_SECONDS, out.display()),
+        Ok(s) => println!("  {}: vw replay save failed ({s}; see {})", p.run.label, out.with_extension("mp4.log").display()),
+        Err(e) => println!("  {}: vw replay save: {e}", p.run.label),
     }
+}
+
+/// The recorder's log (`vw replay`'s, in `$VW_DIR`, default ~/scratch/vw).
+fn vw_log() -> PathBuf {
+    std::env::var_os("VW_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("scratch/vw"))
+        .join("replay.log")
 }
 
 /// The run's picture: `vw analyze` over its recording, and the flags it raised (a colour flash, frames alternating
@@ -1042,7 +1118,7 @@ fn picture_verdict(o: &Options, p: &Prepared) -> Result<String, String> {
     let Some(vw) = &o.vw else { return Err("not recorded (--no-record)".into()) };
     let video = video(o, p);
     if !video.is_file() {
-        return Err("not recorded (the placement was never reached, or vw record failed)".into());
+        return Err("not recorded (the placement was never reached, or the recorder failed: <label>.mp4.log)".into());
     }
     let dir = o.out.join(format!("{}-vw", p.run.label));
     let analysed = Command::new(vw).arg("analyze").arg(&video).arg("--out").arg(&dir).stdin(Stdio::null()).output().map_err(|e| format!("vw analyze: {e}"))?;
@@ -1078,51 +1154,6 @@ fn run_steam(o: &Options, p: &Prepared, env: &[(String, String)]) -> Vec<Sample>
     samples
 }
 
-fn run_gta(o: &Options, p: &Prepared, env: &[(String, String)]) -> Vec<Sample> {
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut cmd = Command::new("bash");
-    cmd.arg(repo.join("scripts/gta-bench.sh"))
-        .args(["--tries", "1", &format!("sweep-{}", p.run.label), "VK_LAYER_neuralforge_neural", "NEURAL_FORGE_ENABLE=1"])
-        .arg(format!("NEURAL_FORGE_TARGET_EXE={}", p.facts.exe.join(",")))
-        .arg(format!("NEURAL_FORGE_LOG={}", p.log.display()));
-    // Frame generation's settings from the session (environment.d), which gta-bench.sh's clean environment drops.
-    for (k, v) in env.iter().filter(|(k, _)| k.starts_with("DXVK_NVAPI_")) {
-        cmd.arg(format!("{k}={v}"));
-    }
-    cmd.env("NF_BENCH_STEAM_LIBRARY", &p.game.library)
-        .env("NF_BENCH_DIR", o.out.join("gta-bench"))
-        .env("NF_BENCH_CLI", &o.cli)
-        .env("NF_GPU_LOCK_HELD", "1")
-        .stdin(Stdio::null());
-    let log = std::fs::File::create(o.out.join(format!("{}-gta-bench.out", p.run.label))).ok();
-    if let Some(log) = log {
-        if let Ok(err) = log.try_clone() {
-            cmd.stdout(log).stderr(err);
-        }
-    }
-    let _ = std::fs::remove_file(&p.log);
-    let start = Instant::now();
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            println!("  gta-bench.sh: {e}");
-            return Vec::new();
-        }
-    };
-    let mut exited = false;
-    let samples = watch(o, p, start, || {
-        exited = exited || child.try_wait().ok().flatten().is_some();
-        exited
-    });
-    if !exited {
-        // SAFETY: SIGTERM to our own child; gta-bench.sh ends its game on the way out.
-        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-        let _ = child.wait();
-    }
-    end_game(p.run.appid);
-    samples
-}
-
 fn self_test() -> std::process::ExitCode {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let config = std::fs::read_to_string(repo.join("scripts/game-sweep.toml")).expect("scripts/game-sweep.toml");
@@ -1149,7 +1180,7 @@ mod tests {
         let config = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/game-sweep.toml")).unwrap();
         let runs = parse_config(&config).unwrap();
         assert!(runs.iter().any(|r| r.appid == 1091500 && r.hdr), "Cyberpunk with HDR");
-        assert!(runs.iter().any(|r| r.route == Route::GtaBench), "GTA's benchmark");
+        assert!(runs.iter().any(|r| r.appid == 3240220 && r.route == Route::Steam && r.args.contains("-benchmark")), "GTA's benchmark, started by Steam");
     }
 
     #[test]
@@ -1161,8 +1192,10 @@ mod tests {
         assert!(parse_config(&format!("{ok}{ok}")).unwrap_err().contains("used twice"));
         assert!(parse_config(&ok.replace("\"steam\"", "\"walk\"")).unwrap_err().contains("route"));
         assert!(parse_config(&format!("{ok}edits = [\"A=1\"]\n")).unwrap_err().contains("go together"));
-        let gta = "[[run]]\nlabel = \"gta\"\nappid = 3240220\nroute = \"gta-bench\"\nhdr = true\n";
-        assert!(parse_config(gta).is_err(), "GTA has no HDR10, and gta-bench takes none");
+        assert_eq!(parse_config(&format!("{ok}record_after = 80\n")).unwrap()[0].record_after, 80);
+        assert!(parse_config(&format!("{ok}record_after = 85\n")).unwrap_err().contains("must fit"), "the recording ends after the run");
+        let gta = "[[run]]\nlabel = \"gta\"\nappid = 3240220\nroute = \"gta-bench\"\n";
+        assert!(parse_config(gta).unwrap_err().contains("started by Steam"), "no route launches a game around Steam");
     }
 
     #[test]
