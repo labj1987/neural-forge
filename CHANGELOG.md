@@ -4,6 +4,13 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.1.2 — 2026-11-12
+
+**Build**
+
+- Built with Rust 1.100, with a 3-day wait before newly published dependency versions are used and Cargo's own
+  lints switched on.
+
 ## 4.1.1 — 2026-11-12
 
 **GTA San Andreas – The Definitive Edition no longer hangs at the menu**

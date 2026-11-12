@@ -16,11 +16,15 @@
 
 [package]
 edition = "2021"
+rust-version.workspace = true
 name = "vulkan-layer"
 version = "0.1.0"
 publish = false
 license = "Apache-2.0"
 repository = "https://github.com/google/vk-layer-for-rust"
+
+[lints]
+workspace = true
 
 [dependencies]
 ash = "0.38.0"
@@ -46,6 +50,3 @@ vulkan-layer = { path = ".", default-features = false, features = ["_test"] }
 
 [build-dependencies]
 rustc_version = "0.4.0"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(RUSTC_NIGHTLY)'] }

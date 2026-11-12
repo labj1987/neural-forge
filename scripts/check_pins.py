@@ -305,6 +305,7 @@ def self_test():
     assert newest(["continuous"]) is None
     assert newest_common_sdk([["vulkan-sdk-1.4.357.0", "vulkan-sdk-1.4.363.0", "vulkan-sdk-1.4.370.0"], ["vulkan-sdk-1.4.357.0", "vulkan-sdk-1.4.363.0"]]) == "vulkan-sdk-1.4.363.0"
     assert newest_common_sdk([["vulkan-sdk-1.4.370.0"], ["vulkan-sdk-1.4.363.0"]]) is None
+    assert state("release", "1.99.1", "1.100.0") == "behind" and state("release", "1.100.0", "1.99.1") == "current"   # 1.100 is newer than 1.99, not older
     assert state("release", "1.96.0", "1.97.0") == "behind" and state("release", "1.96.0", "1.96.0") == "current"
     # Upstream that names no version (only `continuous` or -rc tags) is not a current pin.
     assert state("sdk", "vulkan-sdk-1.4.363.0", None) == "unknown" and state("release", "1.96.0", None) == "unknown"

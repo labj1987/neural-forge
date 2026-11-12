@@ -40,6 +40,9 @@ jobs:
       # Every build here starts the workspace's crates from nothing (see the Cargo cache below), so
       # incremental state would only be written, never reused.
       CARGO_INCREMENTAL: "0"
+      # Cargo's own lints ([lints.cargo]) are warnings by default; here they fail the build. Applies to
+      # the workspace's, the layer framework's and the NGX wrapper's builds, clippy runs and tests.
+      CARGO_BUILD_WARNINGS: deny
     steps:
       # Actions are pinned to full commit SHAs (a tag can be moved); the weekly maintenance
       # round updates them (see .github/dependabot.yml). The trailing comment is the release the SHA is.
@@ -365,9 +368,11 @@ jobs:
           (cd crates/ngx-wrapper &&
               CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked -p neural-forge-ngx-wrapper &&
               CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked --release -p neural-forge-ngx-wrapper)
-          rm -rf target/debug/incremental target/release/incremental
-          if find target -maxdepth 3 \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \
-                  -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' \) | grep .; then
+          # Only the final artifacts' own paths (target/<profile>/<file>) are checked; Cargo's intermediate layout
+          # (deps/, build/, incremental/) is not an interface. No incremental data exists (CARGO_INCREMENTAL=0).
+          if find target -type f -regex 'target/\(debug\|release\|x86_64-pc-windows-gnu/debug\|x86_64-pc-windows-gnu/release\)/[^/]*' \
+                  \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \
+                  -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' -o -name '*nvngx*' \) | grep .; then
               echo "error: the checkout's own build output is still in target/" >&2
               exit 1
           fi

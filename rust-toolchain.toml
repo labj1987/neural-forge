@@ -2,6 +2,6 @@
 # from here). The weekly pin check (scripts/check_pins.py, .github/workflows/pin-check.yml) moves it to
 # each new stable release once the full build and check passes with it.
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
