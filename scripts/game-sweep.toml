@@ -24,6 +24,7 @@
 #                the game's Proton user folder (compatdata/<appid>/pfx/drive_c/users/steamuser), "json-option"
 #                (Cyberpunk 2077's UserSettings.json option names) or "xml-value" (<Name value="..."/>), NAME=VALUE
 #   env          extra environment for the game, ["NAME=VALUE", ...], before %command% (a debugging option)
+#   prefix       a command the game runs inside, right before %command% (e.g. "gamescope ... --")
 #
 # Every run sets the game's own resolution to 2560x1440 (the desktop stays at 3840x2160; at 4K the 12 GB card ran out
 # of video memory with Ray Reconstruction); games with HDR run with it on.
