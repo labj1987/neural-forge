@@ -444,7 +444,7 @@ Each frame goes to it and back
 through system memory and is shown one frame later than on one GPU: the game's GPU renders the next frame while the
 second GPU works on this one. The frame rate is then bounded by the second GPU's time per frame (the network and the
 copies): a second GPU that takes longer per frame than the game holds the game back to its own rate. Where a frame
-comes back too late for its turn, or that could not be captured, is shown in its turn without the model's edit (after three failed captures in a row the frames wait for their own answer for a moment). When the delay
+comes back too late for its turn, or that could not be captured, is shown in its turn without the model's edit (after three failed captures in a row, the next 30 frames wait for their own answer instead). When the delay
 starts (the first frames, and again after the game stalled for a quarter of a second) one frame is shown twice.
 
 The model goes back to the game's GPU for the rest of the session, and the log says why, when the second GPU:

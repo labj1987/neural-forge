@@ -776,8 +776,9 @@ unsafe fn delayed_present(
     // 1. The previous present's frame: its answer, waited for within the budget (the other GPU had a whole frame).
     let (pending, previous) = take_previous(shm, inflight, deadline, pq10, dims);
     // The CPU pairs of `delayed_present_cpu`, if the path changed under them.
-    if inflight[SLOT.index()].kept_cpu.iter().any(|k| !k.original.is_empty()) {
+    if inflight[SLOT.index()].kept_cpu.iter().any(|k| !k.original.is_empty()) || !inflight[SLOT.index()].answer_cpu.is_empty() {
         inflight[SLOT.index()].kept_cpu = Default::default();
+        inflight[SLOT.index()].answer_cpu = Vec::new();
     }
     // A frame the CPU pairs kept (the path changed under it) is not in the GPU pairs: the delay starts again.
     let (pending, previous) = if pending.is_some_and(|r| r.cpu) { (None, Previous::None) } else { (pending, previous) };
@@ -965,9 +966,9 @@ unsafe fn delayed_present(
 /// an odd frame size or no host-memory import. The frames go through the CPU, as the synchronous present's do there:
 /// each present keeps its frame and proxy in one of two CPU pairs (`Inflight::kept_cpu`), and composes the previous
 /// frame's answer onto that frame as it was (the compose's held frame, as frame hold does), which replaces the live
-/// image. A frame whose answer is missing is shown as it was. A frame that cannot be captured because the answer before
-/// it is still out cannot be kept either (the capture would write the proxy region the other GPU still reads): it is
-/// skipped.
+/// image. A frame whose answer is missing is shown as itself ([`show_kept_cpu`]). A frame that cannot be captured (the
+/// answer before it still out: the capture would write the proxy region the other GPU still reads; or a failed capture)
+/// is kept as a raw frame on the GPU and shown in its turn.
 ///
 /// # Safety
 /// As [`run`].
@@ -1905,9 +1906,10 @@ thread_local! {
     static PREVIOUS_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether the last [`run`] on this thread showed the previous present's frame ([`PREVIOUS_FRAME`]).
+/// Whether the last [`run`] on this thread showed the previous present's frame ([`PREVIOUS_FRAME`]); cleared by the read.
 pub(crate) fn presented_previous_frame() -> bool {
-    PREVIOUS_FRAME.with(std::cell::Cell::get)
+    // Read once: a present that never reaches `run` (a capture of an untouched frame) does not see an older one's.
+    PREVIOUS_FRAME.with(|p| p.replace(false))
 }
 
 /// Records why this present goes out untouched and returns the no-compose result.
@@ -2344,7 +2346,11 @@ pub unsafe fn run(
         #[cfg(not(target_arch = "x86_64"))]
         let offloaded = false;
         #[cfg(target_arch = "x86_64")]
-        if !offloaded && (inflight[SLOT.index()].delayed.is_some() || gpu_compose.as_ref().is_some_and(crate::composition::gpu::GpuCompose::has_delayed)) {
+        if !offloaded
+            && (inflight[SLOT.index()].delayed.is_some()
+                || inflight[SLOT.index()].kept_cpu.iter().any(|k| !k.original.is_empty())
+                || gpu_compose.as_ref().is_some_and(crate::composition::gpu::GpuCompose::has_delayed))
+        {
             leave_delayed(device, gpu_compose, shm, inflight);
         }
         let carry = settings.model_interval > 1
@@ -2435,7 +2441,7 @@ pub unsafe fn run(
                                 if pq10 {
                                     "an HDR10 frame needs direct capture at its own size, which this swapchain does not give"
                                 } else {
-                                    "frames that could not be captured for the delay a few times in a row"
+                                    "the delay could not be set up (its composition or kept frames could not be made), or frames could not be captured for it three times in a row"
                                 }
                             );
                         }

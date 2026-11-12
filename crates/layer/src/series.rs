@@ -476,10 +476,17 @@ impl Series {
             invalidate(device, &r.composited);
             (std::slice::from_raw_parts(r.original.ptr, len).to_vec(), std::slice::from_raw_parts(r.composited.ptr, len).to_vec())
         };
-        // The delayed present shows the previous present's frame: its pair is that frame's original.
-        let previous = active.previous_original.replace(original.clone());
+        // The delayed present shows the previous present's frame: its pair is that frame's original. Kept only while the
+        // model runs on a second GPU; the first such present of a capture has no previous original and is left out.
+        let delayed = crate::capture::presented_previous_frame();
+        #[cfg(target_arch = "x86_64")]
+        let keep_previous = crate::preupscale::offload::active();
+        #[cfg(not(target_arch = "x86_64"))]
+        let keep_previous = false;
+        let previous = if keep_previous { active.previous_original.replace(original.clone()) } else { active.previous_original.take() };
         let original = match previous {
-            Some(p) if crate::capture::presented_previous_frame() && p.len() == original.len() => p,
+            Some(p) if delayed && p.len() == original.len() => p,
+            _ if delayed => return consumed,
             _ => original,
         };
         let seq = active.seq;

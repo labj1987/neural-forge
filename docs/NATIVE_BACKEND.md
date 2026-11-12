@@ -1698,7 +1698,7 @@ Replace mode gives it back too, never the enlarged small proxy). A frame that ca
 still out, or a failed capture) is kept as a raw frame on the GPU and shown in its turn, as on the zero-copy path. A
 late answer is judged against the game's interval before the wait, never as a stall. A capture series pairs each
 delayed present with the previous present's original (`capture::presented_previous_frame`), so its pairs are the frame
-and its own composite. Found in #63: 007 First
+and its own composite; the first delayed present of a capture has no previous original and is left out. Found in #63: 007 First
 Light at 2048x1536 with the Model resolution at Half fell back to the synchronous present, every frame waiting about 12
 ms for its own answer from the RTX 5080 (40-50 fps against 75 without the model), and the summary line was only
 written on the delayed path. HDR10 frames below Full are not composed at all, with or without the second GPU (an HDR10 frame

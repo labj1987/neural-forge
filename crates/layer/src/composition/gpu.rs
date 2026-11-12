@@ -372,7 +372,8 @@ struct ZeroCopy {
 struct Delayed {
     frame_bytes: u64,
     raw: [DeviceBuffer; 2],
-    base: [DeviceBuffer; 2],
+    /// The proxies, made the first time a frame is kept with its proxy (a raw keep needs none).
+    base: Option<[DeviceBuffer; 2]>,
     /// Each pair's keep, then the show of a kept frame (index 2).
     cmd: [vk::CommandBuffer; 3],
     fence: [vk::Fence; 3],
@@ -389,7 +390,7 @@ impl Delayed {
     unsafe fn destroy(&self, device: &ash::Device) {
         // SAFETY: forwarded; the command buffers go with the compose's pool.
         unsafe {
-            for b in self.raw.iter().chain(&self.base) {
+            for b in self.raw.iter().chain(self.base.iter().flatten()) {
                 b.destroy(device);
             }
             for f in self.fence {
@@ -1608,7 +1609,7 @@ impl GpuCompose {
                 }
                 let import = self.zc.answer_import.as_ref().filter(|a| a.bytes >= bytes as u64)?;
                 // The kept proxy stands where the capture target does on a fresh present.
-                let sources = (kept.base[parity].buffer, frames.gen_base.buffer, frames.gen_answer.buffer, Some(import.buffer));
+                let sources = (kept.base.as_ref()?[parity].buffer, frames.gen_base.buffer, frames.gen_answer.buffer, Some(import.buffer));
                 if self.zc.last_queue.is_some_and(|q| q != queue) && !self.wait_async_slots(device) {
                     return None;
                 }
@@ -1937,6 +1938,23 @@ impl GpuCompose {
         } else {
             None
         };
+        // The proxies, made with the first keep that has one.
+        if with_proxy && self.zc.delayed.as_ref().is_some_and(|d| d.base.is_none()) {
+            // SAFETY: plain property query.
+            let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+            match (DeviceBuffer::new(device, &props, bytes), DeviceBuffer::new(device, &props, bytes)) {
+                (Some(a), Some(b)) => self.zc.delayed.as_mut().expect("checked").base = Some([a, b]),
+                (a, b) => {
+                    // SAFETY: never used.
+                    unsafe {
+                        for x in [a, b].into_iter().flatten() {
+                            x.destroy(device);
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
         let d = self.zc.delayed.as_mut().expect("ensured");
         if d.armed[parity] && !wait_armed(device, &[Some(d.fence[parity])], "gpu::keep_delayed reuse") {
             return None;
@@ -1945,7 +1963,7 @@ impl GpuCompose {
         d.kept[parity] = false;
         d.kept_proxy[parity] = false;
         let cmd = d.cmd[parity];
-        let (raw, base) = (d.raw[parity].buffer, d.base[parity].buffer);
+        let (raw, base) = (d.raw[parity].buffer, d.base.as_ref().map_or(vk::Buffer::null(), |b| b[parity].buffer));
         // SAFETY: the pair's last keep was waited; every handle is live; the image is the swapchain's, in PRESENT_SRC_KHR
         // with transfer-source usage (the capture copies it too).
         let recorded = unsafe {
@@ -2145,20 +2163,20 @@ impl GpuCompose {
         }
         // SAFETY: plain property query.
         let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let made: Vec<DeviceBuffer> = (0..4).filter_map(|_| DeviceBuffer::new(device, &props, bytes)).collect();
+        let made: Vec<DeviceBuffer> = (0..2).filter_map(|_| DeviceBuffer::new(device, &props, bytes)).collect();
         // SAFETY: plain creations; each is destroyed below when the set is incomplete.
         let fences: Vec<vk::Fence> = (0..3).filter_map(|_| unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.ok()).collect();
         // SAFETY: the compose's own pool (reset-able buffers), used on the present's thread only.
         let cmds =
             unsafe { crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(3)) };
         match (made.len(), fences.len(), cmds) {
-            (4, 3, Ok(cmds)) => {
+            (2, 3, Ok(cmds)) => {
                 let mut b = made.into_iter();
-                let mut next = || b.next().expect("four");
+                let mut next = || b.next().expect("two");
                 self.zc.delayed = Some(Delayed {
                     frame_bytes: bytes,
                     raw: [next(), next()],
-                    base: [next(), next()],
+                    base: None,
                     cmd: [cmds[0], cmds[1], cmds[2]],
                     fence: [fences[0], fences[1], fences[2]],
                     armed: [false; 3],
