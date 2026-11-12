@@ -1,10 +1,11 @@
 #version 450
-// The model server's HDR10 conversion (docs/NATIVE_BACKEND.md, "HDR on the finished frame (3.10.0)";
+// The model server's 10-bit conversion (docs/NATIVE_BACKEND.md, "HDR on the finished frame (3.10.0)";
 // `preupscale::native_post`): the raw frame the layer captured from an HDR10 swapchain (one packed 10-bit
 // word a pixel, ST 2084 code, BT.2020) becomes the 8-bit SDR picture (RGBA8, R first, alpha 255) every pass
 // after it reads in place of the proxy. Per pixel: PQ decode to nits, BT.2020 to BT.709, negatives 0, divided by
 // the reference white, the pre-upscaler encode's per-channel shoulder, the sRGB OETF. compose_hdr.comp
-// computes the same picture again to take the network's change.
+// computes the same picture again to take the network's change. With `transfer` 1 the frame is 10-bit SDR
+// (sRGB code, BT.709: a 10-bit swapchain in SRGB_NONLINEAR), and its picture is each code taken to 8 bits.
 //
 // The push constants match `native_post::HdrConvertPush` field for field.
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -20,6 +21,7 @@ layout(push_constant) uniform Params {
   uvec2 size;           // the frame's extent
   uint b_low;           // 1: A2R10G10B10 (B in bits 0-9), 0: A2B10G10R10 (R in bits 0-9)
   float reference_nits; // the light the SDR picture's 1.0 (before the shoulder) stands for
+  uint transfer;        // 0: HDR10 (ST 2084, BT.2020), 1: 10-bit SDR (sRGB, BT.709)
 } p;
 
 // ---- HDR10 maths, the same functions in native_post_hdr.comp and compose_hdr.comp (no include:
@@ -79,11 +81,18 @@ uint sdr_word(uint word, bool b_low, float reference_nits) {
   return packUnorm4x8(vec4(s, 1.0));
 }
 
+// A 10-bit SDR word (sRGB code, BT.709; transfer 1) as the 8-bit picture the network is shown: each code to 8
+// bits as packUnorm4x8 rounds it (R first, alpha 255). No shoulder: the frame is display-referred already.
+uint sdr10_word(uint word, bool b_low) {
+  return packUnorm4x8(vec4(vec3(codes(word, b_low)) / 1023.0, 1.0));
+}
+
 void main() {
   uvec2 xy = gl_GlobalInvocationID.xy;
   if (any(greaterThanEqual(xy, p.size))) {
     return;
   }
   uint i = xy.y * p.size.x + xy.x;
-  u_sdr.px[i] = sdr_word(u_frame.px[i], p.b_low != 0u, p.reference_nits);
+  bool b_low = p.b_low != 0u;
+  u_sdr.px[i] = p.transfer == 1u ? sdr10_word(u_frame.px[i], b_low) : sdr_word(u_frame.px[i], b_low, p.reference_nits);
 }

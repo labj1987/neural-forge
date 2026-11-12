@@ -170,15 +170,21 @@ pub fn is_plausible_game_size(width: u32, height: u32) -> bool {
     u64::from(width) * u64::from(height) >= 1280 * 720
 }
 
-/// Whether this is a swapchain the pass can capture, compose onto and present: the 8-bit SDR formats, and
-/// the two 10-bit formats in the HDR10 colour space (`HDR10_ST2084_EXT`), whose frames the model server
-/// converts to SDR for the network and whose composition carries the network's change back in linear light
+/// Whether this is a swapchain the pass can capture, compose onto and present: the 8-bit SDR formats, the two
+/// 10-bit formats in the HDR10 colour space (`HDR10_ST2084_EXT`), whose frames the model server converts to SDR
+/// for the network and whose composition carries the network's change back in linear light
 /// (docs/NATIVE_BACKEND.md, "HDR on the finished frame (3.10.0)"; `NEURAL_FORGE_HDR_PRESENT=off` leaves them
-/// out). A 10-bit swapchain in an SDR colour space, and the float16 (scRGB) formats, present untouched: the
-/// first is not handled yet, and a float16 frame needs 8 bytes a pixel where the shared regions and the
-/// composition hold 4.
+/// out), and the same two 10-bit formats in `SRGB_NONLINEAR` (10-bit SDR, [`is_sdr_10bit`]), which take the same
+/// raw 10-bit path with the sRGB transfer. The float16 (scRGB) formats present untouched: a float16 frame needs
+/// 8 bytes a pixel where the shared regions and the composition hold 4.
 pub fn is_supported_format(format: vk::Format, color_space: vk::ColorSpaceKHR) -> bool {
-    is_sdr_8bit(format) || (detect_hdr_kind(format, color_space) == hdr_kind::PQ10 && crate::hdr_present::enabled())
+    is_sdr_8bit(format) || is_sdr_10bit(format, color_space) || (detect_hdr_kind(format, color_space) == hdr_kind::PQ10 && crate::hdr_present::enabled())
+}
+
+/// A 10-bit swapchain in the sRGB colour space: SDR with more precision (sRGB code, BT.709), as DXVK and
+/// vkd3d-proton give a game's `R10G10B10A2` swapchain (Stellar Blade under gamescope, #51).
+pub fn is_sdr_10bit(format: vk::Format, color_space: vk::ColorSpaceKHR) -> bool {
+    matches!(format, vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32) && color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
 }
 
 fn is_sdr_8bit(format: vk::Format) -> bool {
@@ -197,6 +203,8 @@ pub fn proxy_format_for(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u
         vk::Format::R16G16B16A16_SFLOAT => proxy_format::RGBA16F,
         vk::Format::A2B10G10R10_UNORM_PACK32 if detect_hdr_kind(format, color_space) == hdr_kind::PQ10 => proxy_format::PQ10_RGB,
         vk::Format::A2R10G10B10_UNORM_PACK32 if detect_hdr_kind(format, color_space) == hdr_kind::PQ10 => proxy_format::PQ10_BGR,
+        vk::Format::A2B10G10R10_UNORM_PACK32 if is_sdr_10bit(format, color_space) => proxy_format::SDR10_RGB,
+        vk::Format::A2R10G10B10_UNORM_PACK32 if is_sdr_10bit(format, color_space) => proxy_format::SDR10_BGR,
         _ => proxy_format::RGBA8,
     }
 }
@@ -245,7 +253,7 @@ pub fn hdr_metadata_line(format: vk::Format, color_space: vk::ColorSpaceKHR, m: 
         hdr_kind::LINEAR_FP16 => "the swapchain is linear FP16",
         _ if ten_bit && color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR => {
             "the application created this swapchain as sRGB: its frames are SDR, or PQ-encoded HDR10 the swapchain does not declare \
-             (then shown as sRGB); either way it is not an HDR10 swapchain to the layer, which presents it untouched"
+             (then shown as sRGB); the layer takes it as 10-bit SDR"
         }
         _ => "the swapchain's colour space is not HDR10",
     };
@@ -300,7 +308,7 @@ mod hdr_metadata_tests {
     fn hdr10_metadata_on_an_srgb_swapchain_says_the_swapchain_is_not_hdr10() {
         let line = hdr_metadata_line(vk::Format::A2B10G10R10_UNORM_PACK32, vk::ColorSpaceKHR::SRGB_NONLINEAR, &bt2020());
         assert!(line.starts_with("HDR metadata for a A2B10G10R10_UNORM_PACK32 SRGB_NONLINEAR swapchain: BT.2020 primaries"), "{line}");
-        assert!(line.contains("created this swapchain as sRGB") && line.contains("untouched"), "{line}");
+        assert!(line.contains("created this swapchain as sRGB") && line.contains("takes it as 10-bit SDR"), "{line}");
         let pq = hdr_metadata_line(vk::Format::A2B10G10R10_UNORM_PACK32, vk::ColorSpaceKHR::HDR10_ST2084_EXT, &bt2020());
         assert!(pq.contains("is HDR10 (PQ)") && pq.contains("1000 nits"), "{pq}");
     }
@@ -385,7 +393,8 @@ mod format_tests {
         }
         for f in [vk::Format::A2B10G10R10_UNORM_PACK32, vk::Format::A2R10G10B10_UNORM_PACK32] {
             assert!(is_supported_format(f, hdr10), "{f:?} in HDR10 has the HDR path");
-            assert!(!is_supported_format(f, srgb), "{f:?} in an SDR colour space presents untouched");
+            assert!(is_supported_format(f, srgb), "{f:?} in the sRGB colour space has the 10-bit SDR path");
+            assert!(is_sdr_10bit(f, srgb) && !is_sdr_10bit(f, hdr10));
             assert!(!is_supported_format(f, vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT));
         }
         for cs in [srgb, hdr10, vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT] {
@@ -414,5 +423,14 @@ mod format_tests {
         assert!(!is_bgr_order(vk::Format::A2B10G10R10_UNORM_PACK32));
         assert!(is_bgr_order(vk::Format::A2R10G10B10_UNORM_PACK32));
         assert!(!proxy_format::is_pq10(proxy_format::RGBA8) && !proxy_format::is_pq10(proxy_format::BGRA8));
+        let rgb = proxy_format_for(vk::Format::A2B10G10R10_UNORM_PACK32, srgb);
+        let bgr = proxy_format_for(vk::Format::A2R10G10B10_UNORM_PACK32, srgb);
+        assert_eq!((rgb, bgr), (proxy_format::SDR10_RGB, proxy_format::SDR10_BGR));
+        for f in [rgb, bgr] {
+            assert!(proxy_format::is_sdr10(f) && proxy_format::is_ten_bit(f) && !proxy_format::is_pq10(f) && !proxy_format::is_8bit(f));
+            assert_eq!(proxy_format::bytes_per_pixel(f), 4);
+        }
+        assert!(!proxy_format::is_ten_bit_b_low(rgb) && proxy_format::is_ten_bit_b_low(bgr));
+        assert!(!proxy_format::is_ten_bit(proxy_format::RGBA8));
     }
 }

@@ -108,16 +108,17 @@ struct HdrConvertPush {
     size: [u32; 2],
     b_low: u32,
     reference_nits: f32,
+    transfer: u32,
 }
 
-/// An HDR10 frame (`proxy_format::PQ10_RGB`/`PQ10_BGR`; docs/NATIVE_BACKEND.md, "HDR on the finished frame
-/// (3.10.0)"): converted to the 8-bit SDR picture every pass reads (`native_post_hdr.comp`), at this reference
-/// white, before the passes run.
+/// A raw 10-bit frame: HDR10 (`proxy_format::PQ10_RGB`/`PQ10_BGR`; docs/NATIVE_BACKEND.md, "HDR on the finished
+/// frame (3.10.0)") or 10-bit SDR (`SDR10_RGB`/`SDR10_BGR`), converted to the 8-bit SDR picture every pass reads
+/// (`native_post_hdr.comp`) before the passes run.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Pq10 {
     /// Blue in bits 0-9 (`A2R10G10B10`).
     pub b_low: bool,
-    pub reference_nits: f32,
+    pub transfer: crate::hdr_present::Transfer,
 }
 
 /// Which server answers the after-the-upscaler requests in this process: the channel is the process's, so
@@ -739,9 +740,9 @@ fn process(
     let format = hdr.proxy_format_slot(slot).load(Ordering::Relaxed);
     let dims_ok = neural_forge_protocol::frame_dims_valid(width, height, format);
     let bytes = if dims_ok { proxy_format::bytes_per_pixel(format) * width as usize * height as usize } else { 0 };
-    // An HDR10 frame runs through the network as its SDR picture (`Pq10`), unless the HDR path is switched off.
-    let pq10 = (proxy_format::is_pq10(format) && crate::hdr_present::enabled())
-        .then(|| Pq10 { b_low: format == proxy_format::PQ10_BGR, reference_nits: crate::hdr_present::reference_nits() });
+    // A 10-bit frame runs through the network as its 8-bit picture (`Pq10`): HDR10 unless the HDR path is switched
+    // off, 10-bit SDR always.
+    let pq10 = crate::hdr_present::Transfer::for_format(format).map(|transfer| Pq10 { b_low: proxy_format::is_ten_bit_b_low(format), transfer });
     let wanted = dims_ok
         && (proxy_format::is_8bit(format) || pq10.is_some())
         && width >= MIN_DIM
@@ -893,7 +894,7 @@ fn applied_lut<'a>(uploaded: Option<&'a PostLut>, now: Option<&Arc<super::colour
 /// for the next frame's rejection, and with the optical flow the frame's proxy goes into the flow session
 /// first (its own submit, then the flow on its queue, then the frame waiting for it).
 ///
-/// `pq10`: the proxy region holds an HDR10 frame's raw words; [`convert_hdr10`] turns it into its SDR picture
+/// `pq10`: the proxy region holds a 10-bit frame's raw words (HDR10 or 10-bit SDR); [`convert_hdr10`] turns it into its SDR picture
 /// first, and everything after (the passes, the history, the HUD, the flow, the thumbnail) reads that picture in
 /// place of the proxy. The answer is 8-bit RGBA as for an 8-bit frame (`bgra` is false then).
 ///
@@ -1571,7 +1572,8 @@ unsafe fn convert_hdr10(device: &ash::Device, gpu: &mut Gpu, s: usize, proxy_reg
         .map(|(n, i)| vk::WriteDescriptorSet::default().dst_set(conv.set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i));
     // SAFETY: the set is not in use (every frame waits for its own work); the buffers are live.
     unsafe { device.update_descriptor_sets(&writes, &[]) };
-    let push = HdrConvertPush { size: [width, height], b_low: u32::from(pq10.b_low), reference_nits: pq10.reference_nits };
+    let push =
+        HdrConvertPush { size: [width, height], b_low: u32::from(pq10.b_low), reference_nits: pq10.transfer.reference_nits(), transfer: pq10.transfer.code() };
     let barrier = |src: vk::AccessFlags, dst: vk::AccessFlags| [vk::MemoryBarrier::default().src_access_mask(src).dst_access_mask(dst)];
     let cmd = gpu.cmd;
     // SAFETY: the layer's own buffer, not pending; every handle is live.
@@ -2696,7 +2698,7 @@ mod tests {
             let Some(mut rig) = Rig::new() else { return };
             rig.write_head(head_pattern(1.0));
             let words = hdr_picture(b_low);
-            let answer = rig.frame_with(&words, &one, Some(Pq10 { b_low, reference_nits: 203.0 }));
+            let answer = rig.frame_with(&words, &one, Some(Pq10 { b_low, transfer: crate::hdr_present::Transfer::Pq { reference_nits: 203.0 } }));
             let read = |rig: &Rig| -> Vec<u32> {
                 let sdr = rig.gpu.slots[0].as_ref().and_then(|b| b.sdr.as_ref()).expect("the picture");
                 // SAFETY: host-coherent, sized for the frame; the frame was waited for.
@@ -2719,13 +2721,39 @@ mod tests {
             plain.write_head(head_pattern(1.0));
             assert_eq!(plain.frame(&shown, &one), answer, "the passes read the picture as they read an 8-bit frame");
             let darker = {
-                let _ = rig.frame_with(&words, &one, Some(Pq10 { b_low, reference_nits: 400.0 }));
+                let _ = rig.frame_with(&words, &one, Some(Pq10 { b_low, transfer: crate::hdr_present::Transfer::Pq { reference_nits: 400.0 } }));
                 read(&rig)
             };
             let sum = |p: &[u32]| p.iter().map(|t| t.to_le_bytes()[..3].iter().map(|&v| u64::from(v)).sum::<u64>()).sum::<u64>();
             assert!(sum(&darker) < sum(&shown), "a higher reference white darkens the picture");
             let _ = rig.frame(&picture(0), &one);
             assert!(rig.gpu.slots[0].as_ref().is_some_and(|b| b.sdr.is_none()), "an 8-bit frame frees the picture");
+        }
+    }
+
+    /// A 10-bit SDR frame (#51) runs through the passes as its 8-bit picture: each code to 8 bits, exactly, alpha 255,
+    /// and the answer is the one that picture gets as an 8-bit frame. In both channel orders.
+    #[test]
+    fn a_10bit_sdr_frame_runs_as_its_8bit_picture() {
+        use crate::hdr_present::reference::sdr10_8;
+        let one = [Conditioning::default()];
+        for b_low in [false, true] {
+            let Some(mut rig) = Rig::new() else { return };
+            rig.write_head(head_pattern(1.0));
+            let words = hdr_picture(b_low);
+            let answer = rig.frame_with(&words, &one, Some(Pq10 { b_low, transfer: crate::hdr_present::Transfer::Srgb }));
+            let sdr = rig.gpu.slots[0].as_ref().and_then(|b| b.sdr.as_ref()).expect("the picture");
+            // SAFETY: host-coherent, sized for the frame; the frame was waited for.
+            let bytes = unsafe { std::slice::from_raw_parts(sdr.ptr, (W * H * 4) as usize) };
+            let shown: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|&c| u32::from_le_bytes(c)).collect();
+            for (i, (&w, &t)) in words.iter().zip(&shown).enumerate() {
+                let (want, got) = (sdr10_8(w, b_low), t.to_le_bytes());
+                assert_eq!(got[..3], want, "pixel {i}");
+                assert_eq!(got[3], 255, "alpha");
+            }
+            let Some(mut plain) = Rig::new() else { return };
+            plain.write_head(head_pattern(1.0));
+            assert_eq!(plain.frame(&shown, &one), answer, "the passes read the picture as they read an 8-bit frame");
         }
     }
 
