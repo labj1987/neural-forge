@@ -1473,7 +1473,8 @@ with the ogkm-experimental patch series (the same numbers within noise, and no N
   launches, with Neural Forge (slower loading screens) in 3 of 8.
 - **Fix:** GTA's own `FrameLimit` 120 in settings.xml for runs with frame generation (gameplay renders under 120,
   so pass 4 is untouched): frame generation stayed on in every launch since (22 of 22). Runs without frame
-  generation keep no limit.
+  generation keep no limit. At 2560x1440 (the 4.1.1 sweep, 2026-11-12) it still holds: frame generation on (x4.0
+  presents per rendered frame), gameplay rendered at 16-23 frames a second, far under the limit.
 
 ### The network's cost at 4K
 
