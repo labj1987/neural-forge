@@ -4,9 +4,9 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
-## Unreleased
+## 4.2.0 — 2026-11-12
 
-**The model on a second GPU (test build for #63)**
+**The model on a second GPU**
 
 - With two GPUs, the model on the finished frame can run on the second one while the game renders on the first: set
   Placement to Finished frame and add `NEURAL_FORGE_OFFLOAD_GPU=<index or vendor:device>` to the game's launch
