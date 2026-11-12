@@ -21,6 +21,15 @@ resolver = "2"
 # for testing.
 default-members = ["vulkan-layer"]
 
+[workspace.package]
+rust-version = "1.100"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(RUSTC_NIGHTLY)'] }
+
+[workspace.lints.cargo]
+unused_dependencies = "warn"
+
 [profile.dev]
 panic = "abort"
 

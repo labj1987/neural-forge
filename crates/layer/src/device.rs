@@ -5240,7 +5240,7 @@ mod submit_order_tests {
             // `foo.rs` and `foo/mod.rs` keep their child modules in `foo/`; `lib.rs` in `src`.
             let dir = match name.strip_suffix(".rs") {
                 Some("lib") => String::new(),
-                Some(stem) => format!("{}/", stem.strip_suffix("/mod").unwrap_or(stem)),
+                Some(stem) => format!("{}/", stem.trim_suffix("/mod")),
                 None => unreachable!(),
             };
             while let Some(start) = code.find("#[cfg(test)]\nmod ") {

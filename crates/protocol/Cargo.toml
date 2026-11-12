@@ -5,7 +5,11 @@ publish.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Shared-memory channel between the Neural Forge layer, GUI and CLI"
+
+[lints]
+workspace = true
 
 [lib]
 name = "neural_forge_protocol"

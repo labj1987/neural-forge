@@ -5,7 +5,11 @@ publish.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Shared config, paths, model extraction and install for neural-forge-cli and neural-forge"
+
+[lints]
+workspace = true
 
 [dependencies]
 neural-forge-protocol = { path = "../protocol" }

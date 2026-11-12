@@ -5,7 +5,11 @@ publish.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Command-line front end: config, model extraction, install, live settings (shmctl) and profiles"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "neural-forge-cli"
