@@ -351,11 +351,24 @@ struct Described {
     driver: String,
 }
 
+/// `core2`: the instance may call `vkGetPhysicalDeviceProperties2` (Vulkan 1.1 or later); without it only the plain
+/// properties are read (no PCI address, the driver as its version number).
+///
 /// # Safety
-/// `physical` belongs to `instance`, which is Vulkan 1.3 (the network's).
-unsafe fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Described {
+/// `physical` belongs to `instance`.
+unsafe fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice, core2: bool) -> Described {
     // SAFETY: as the contract.
     let props = unsafe { instance.get_physical_device_properties(physical) };
+    let text = |chars: &[c_char]| unsafe { CStr::from_ptr(chars.as_ptr()) }.to_string_lossy().into_owned();
+    if !core2 {
+        return Described {
+            name: text(&props.device_name),
+            vendor: props.vendor_id,
+            device: props.device_id,
+            pci: None,
+            driver: format!("driver version {:#x}", props.driver_version),
+        };
+    }
     // SAFETY: as the contract.
     let has_pci = unsafe { instance.enumerate_device_extension_properties(physical) }
         .unwrap_or_default()
@@ -363,21 +376,29 @@ unsafe fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> De
         .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == c"VK_EXT_pci_bus_info");
     let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
     let mut driver = vk::PhysicalDeviceDriverProperties::default();
+    // The driver's name and version: core in Vulkan 1.2 devices.
+    let has_driver = props.api_version >= vk::API_VERSION_1_2;
     {
-        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+        let mut props2 = vk::PhysicalDeviceProperties2::default();
+        if has_driver {
+            props2 = props2.push_next(&mut driver);
+        }
         if has_pci {
             props2 = props2.push_next(&mut pci);
         }
-        // SAFETY: Vulkan 1.1 core on a 1.3 instance; the chain's structures outlive the call.
+        // SAFETY: Vulkan 1.1 core (`core2`); the chain holds only what the device offers, and outlives the call.
         unsafe { instance.get_physical_device_properties2(physical, &mut props2) };
     }
-    let text = |chars: &[c_char]| unsafe { CStr::from_ptr(chars.as_ptr()) }.to_string_lossy().into_owned();
     Described {
         name: text(&props.device_name),
         vendor: props.vendor_id,
         device: props.device_id,
         pci: has_pci.then_some(PciAddress { domain: pci.pci_domain, bus: pci.pci_bus, device: pci.pci_device, function: pci.pci_function }),
-        driver: format!("{} {}", text(&driver.driver_name), text(&driver.driver_info)).trim().to_string(),
+        driver: if has_driver {
+            format!("{} {}", text(&driver.driver_name), text(&driver.driver_info)).trim().to_string()
+        } else {
+            format!("driver version {:#x}", props.driver_version)
+        },
     }
 }
 
@@ -433,7 +454,8 @@ impl Offload {
         let layer_gipa = own_gipa().ok_or("the layer could not find its own vkGetInstanceProcAddr")?;
         // SAFETY: the game's live instance.
         let physicals = unsafe { instance.enumerate_physical_devices() }.map_err(|e| format!("listing the GPUs failed ({e:?})"))?;
-        let described: Vec<Described> = physicals.iter().map(|&p| unsafe { describe(instance, p) }).collect();
+        // SAFETY: physical devices of this 1.3 instance (the game's device runs the network).
+        let described: Vec<Described> = physicals.iter().map(|&p| unsafe { describe(instance, p, true) }).collect();
         let candidates: Vec<Candidate> = described
             .iter()
             .enumerate()
@@ -551,17 +573,23 @@ impl Offload {
 /// `NEURAL_FORGE_OFFLOAD_GPU` takes.
 ///
 /// # Safety
-/// `game` is a physical device of `instance`, which is Vulkan 1.3.
-pub(crate) unsafe fn log_gpus(instance: &ash::Instance, game: vk::PhysicalDevice) {
+/// `game` is a physical device of `instance`; `core2` only where the instance has Vulkan 1.1.
+pub(crate) unsafe fn log_gpus(instance: &ash::Instance, game: vk::PhysicalDevice, core2: bool) {
     static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.load(Ordering::Relaxed) {
+        return;
+    }
     // SAFETY: the game's live instance.
     let Ok(physicals) = (unsafe { instance.enumerate_physical_devices() }) else { return };
-    if physicals.len() < 2 || SAID.swap(true, Ordering::Relaxed) {
+    // Where the variable is set, or there is more than one real GPU (a CPU renderer such as llvmpipe does not count).
+    // SAFETY: plain property queries on the instance's own physical devices.
+    let gpus = physicals.iter().filter(|&&p| unsafe { instance.get_physical_device_properties(p) }.device_type != vk::PhysicalDeviceType::CPU).count();
+    if (gpus < 2 && Choice::current() == Choice::Off) || SAID.swap(true, Ordering::Relaxed) {
         return;
     }
     for (i, &p) in physicals.iter().enumerate() {
         // SAFETY: as the contract.
-        let d = unsafe { describe(instance, p) };
+        let d = unsafe { describe(instance, p, core2) };
         crate::log!(
             "[offload] GPU {i}: {}{} (NEURAL_FORGE_OFFLOAD_GPU={i} or {:04x}:{:04x} runs the model there)",
             d.line(),
@@ -595,7 +623,8 @@ static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
 /// Called inside `vkCreateDevice` for `device`; `info` is its request (the loader's chain); `game` its setup.
 pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk::Device, info: &vk::DeviceCreateInfo) {
     let choice = Choice::current();
-    if choice == Choice::Off {
+    // Given up for the process: no more devices for it.
+    if choice == Choice::Off || given_up() {
         return;
     }
     // SAFETY: as the contract.
@@ -1033,6 +1062,10 @@ impl ServerRule {
 pub(crate) struct LateRule {
     window: std::collections::VecDeque<bool>,
     unanswered: u32,
+    /// The frame size judged ([`Self::note`]), and how many frames were noted at it: the first [`WARM_FRAMES`] after
+    /// a start or a change of size (the network built for it) count for nothing.
+    dims: Option<(u32, u32)>,
+    seen: u32,
 }
 
 impl LateRule {
@@ -1043,7 +1076,14 @@ impl LateRule {
     }
 
     /// Notes a sent frame (`answer` as [`Self::is_late`] takes it); why to fall back.
-    pub(crate) fn note(&mut self, answer: Option<Duration>, interval: Duration) -> Option<String> {
+    pub(crate) fn note(&mut self, answer: Option<Duration>, interval: Duration, dims: (u32, u32)) -> Option<String> {
+        if self.dims != Some(dims) {
+            *self = Self { dims: Some(dims), ..Self::default() };
+        }
+        self.seen = self.seen.saturating_add(1);
+        if self.seen <= WARM_FRAMES {
+            return None;
+        }
         self.unanswered = if answer.is_none() { self.unanswered + 1 } else { 0 };
         if self.unanswered >= UNANSWERED_IN_A_ROW {
             return Some(format!("{UNANSWERED_IN_A_ROW} frames in a row got no answer from the other GPU within the present's wait"));
@@ -1195,22 +1235,31 @@ mod tests {
         assert!(LateRule::is_late(Some(ms(120)), ms(10)));
         assert!(!LateRule::is_late(Some(ms(250)), ms(100)), "a slow game: 3 intervals");
         assert!(LateRule::is_late(None, ms(10)));
+        const D: (u32, u32) = (64, 64);
+        // The first frames after a start or a change of size count for nothing (the network is built then).
+        let mut rule = LateRule::default();
+        assert!((0..WARM_FRAMES).all(|_| rule.note(None, ms(16), D).is_none()));
+        assert!((0..WARM_FRAMES).all(|_| rule.note(None, ms(16), (32, 32)).is_none()), "a new size warms up again");
+        let mut rule = LateRule::default();
+        for _ in 0..WARM_FRAMES {
+            rule.note(Some(ms(5)), ms(16), D);
+        }
         // A second GPU at 30 ms a frame against a 7 ms game (frame generation at ~144 fps) beats the network after the
         // game's frame on one GPU: it must not fall back, however long it runs.
         let mut rule = LateRule::default();
-        assert!((0..LATE_WINDOW * 3).all(|_| rule.note(Some(ms(30)), ms(7)).is_none()));
+        assert!((0..LATE_WINDOW * 3).all(|_| rule.note(Some(ms(30)), ms(7), D).is_none()));
         // A GPU far too slow (150 ms against a 16 ms game) is given up as soon as more than the allowance came late.
         let mut rule = LateRule::default();
-        let at = (0..LATE_WINDOW).position(|_| rule.note(Some(ms(150)), ms(16)).is_some());
-        assert_eq!(at, Some(LATE_ALLOWED), "decided at the first frame over the allowance, not after a full window");
+        let at = (0..LATE_WINDOW).position(|_| rule.note(Some(ms(150)), ms(16), D).is_some());
+        assert_eq!(at, Some(LATE_ALLOWED + WARM_FRAMES as usize), "decided at the first frame over the allowance, not after a full window");
         // A few late frames (a hitch) do not.
         let mut rule = LateRule::default();
-        assert!((0..LATE_WINDOW * 3).all(|k| rule.note(Some(if k % 10 == 0 { ms(150) } else { ms(20) }), ms(16)).is_none()));
+        assert!((0..LATE_WINDOW * 3).all(|k| rule.note(Some(if k % 10 == 0 { ms(150) } else { ms(20) }), ms(16), D).is_none()));
         // No answer at all: a few in a row are enough.
         let mut rule = LateRule::default();
-        let at = (0..LATE_WINDOW).position(|_| rule.note(None, ms(16)).is_some());
-        assert_eq!(at, Some(UNANSWERED_IN_A_ROW as usize - 1));
+        let at = (0..LATE_WINDOW).position(|_| rule.note(None, ms(16), D).is_some());
+        assert_eq!(at, Some(WARM_FRAMES as usize + UNANSWERED_IN_A_ROW as usize - 1));
         let mut rule = LateRule::default();
-        assert!((0..8).all(|k| rule.note(if k % 4 == 0 { Some(ms(20)) } else { None }, ms(16)).is_none()), "an answer starts the count over");
+        assert!((0..8).all(|k| rule.note(if k % 4 == 0 { Some(ms(20)) } else { None }, ms(16), D).is_none()), "an answer starts the count over");
     }
 }
