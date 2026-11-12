@@ -1648,6 +1648,7 @@ impl GpuCompose {
             ComposeInputs::Delayed { parity } => self.zc.delayed.as_ref().map(|d| (d.raw[parity].buffer, 0)),
             _ => None,
         };
+        let mut held_at_base = false;
         let (update_src, fresh_copy, small_proxy, held) = match inputs {
             ComposeInputs::Cpu { base, answer, proxy_small, held_original } => {
                 if base.len() < bytes || answer.len() < answer_bytes {
@@ -1676,7 +1677,10 @@ impl GpuCompose {
                     }
                 }
                 let held = held_original.is_some_and(|h| h.len() >= bytes) && (s.staging_capacity as usize) >= bytes * 3;
-                if let Some(h) = held_original.filter(|_| held) {
+                // The held frame is the base itself at the frame's size (the delayed present's): it is in the staging
+                // buffer's first segment already, and is not copied twice.
+                held_at_base = held && !small_proxy && held_original.is_some_and(|h| std::ptr::eq(h.as_ptr(), base.as_ptr()));
+                if let Some(h) = held_original.filter(|_| held && !held_at_base) {
                     // SAFETY: capacity checked just above; the slot's fence was waited on before reuse.
                     unsafe { std::ptr::copy_nonoverlapping(h.as_ptr(), s.staging_ptr.add(bytes * 2), bytes) };
                 }
@@ -1716,7 +1720,11 @@ impl GpuCompose {
                 bytes as u64,
                 update,
                 small_proxy,
-                if held { Some((slot.slot.sized.as_ref().expect("ensured").staging_buffer, bytes as u64 * 2)) } else { delayed_original },
+                if held {
+                    Some((slot.slot.sized.as_ref().expect("ensured").staging_buffer, if held_at_base { 0 } else { bytes as u64 * 2 }))
+                } else {
+                    delayed_original
+                },
                 bgr_order,
                 target_image,
                 compose,
@@ -3160,6 +3168,47 @@ mod tests {
         assert!((i32::from(got) - 140).abs() <= 2, "held frame shown ({got}), not the live one (30)");
         let unheld = compose_once_scaled(w, h, &live, &held, &held, (w, h), None, None, base).unwrap();
         assert!(unheld[((8 * w + 8) * 4) as usize] < 100, "without hold the live frame is composed");
+    }
+
+    /// The CPU delayed present's compose (the model on a second GPU below Full): a scaled answer with its small proxy is
+    /// composed onto the held frame, not the live one; and a held frame that is the base itself at the frame's size is
+    /// read from the base's own upload.
+    #[test]
+    fn a_scaled_answer_is_composed_onto_the_held_frame() {
+        let (w, h) = (16u32, 16u32);
+        let px = |n: u32, v: u8| -> Vec<u8> { (0..n).flat_map(|_| [v, v, v, 255]).collect() };
+        let live = px(w * h, 30);
+        let held = px(w * h, 140);
+        let proxy_small = px(w * h / 4, 140);
+        let answer_small = px(w * h / 4, 110);
+        let params = ComposeParams {
+            colour_strength: 0.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: 0.0,
+            compare: Compare::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 0.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+            pq10: None,
+        };
+        let Some(out) = compose_once_scaled(w, h, &live, &held, &answer_small, (w / 2, h / 2), Some(&proxy_small), Some(&held), params) else {
+            eprintln!("a_scaled_answer_is_composed_onto_the_held_frame: no Vulkan device, skipping");
+            return;
+        };
+        let got = i32::from(out[((8 * w + 8) * 4) as usize]);
+        assert!((got - 110).abs() <= 4, "the held frame with the answer's edit ({got}), not the live frame (30) or the held frame unedited (140)");
+        // The held frame is the base itself at full size: no second upload, the same picture.
+        let edited = px(w * h, 110);
+        let same = compose_once_scaled(w, h, &live, &held, &edited, (w, h), None, Some(&held), params).expect("composes");
+        let got = i32::from(same[((8 * w + 8) * 4) as usize]);
+        assert!((got - 110).abs() <= 4, "the base as the held frame ({got})");
     }
 
     /// Compare views on a real (lavapipe) device: the wipe shows the untouched frame on one side,
