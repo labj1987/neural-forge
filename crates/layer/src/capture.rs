@@ -1899,6 +1899,17 @@ thread_local! {
     static UNTOUCHED: std::cell::Cell<u32> = const { std::cell::Cell::new(reason::NONE) };
 }
 
+thread_local! {
+    /// The last [`run`] on this thread wrote the previous present's frame into its image (the delayed present of the
+    /// model on a second GPU): a capture pairs it with that frame's original (`crate::series`).
+    static PREVIOUS_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last [`run`] on this thread showed the previous present's frame ([`PREVIOUS_FRAME`]).
+pub(crate) fn presented_previous_frame() -> bool {
+    PREVIOUS_FRAME.with(std::cell::Cell::get)
+}
+
 /// Records why this present goes out untouched and returns the no-compose result.
 fn untouched(why: u32) -> Option<vk::Semaphore> {
     UNTOUCHED.with(|u| u.set(why));
@@ -1955,6 +1966,7 @@ pub unsafe fn run(
     // an undated list of wait completions. See `breadcrumbs`' own doc comment.
     crate::breadcrumbs::mark("capture::run enter");
     UNTOUCHED.with(|u| u.set(reason::NOT_COMPOSED));
+    PREVIOUS_FRAME.with(|p| p.set(false));
     let pipeline_start = std::time::Instant::now();
     // `composition_settings()` (and everything else below) only ever reads through an
     // already-open mapping -- nothing about it opens one. Every real path that DOES
@@ -2399,12 +2411,14 @@ pub unsafe fn run(
                         shm.publish_frame_timing(pipeline_start.elapsed(), true);
                         crate::preupscale::offload::note_present();
                         UNTOUCHED.with(|u| u.set(reason::NONE));
+                        PREVIOUS_FRAME.with(|p| p.set(true));
                         return Some(sem);
                     }
                     Delayed::Shown(sem) => {
                         shm.publish_frame_timing(pipeline_start.elapsed(), false);
                         crate::preupscale::offload::note_present();
                         UNTOUCHED.with(|u| u.set(reason::NO_ANSWER));
+                        PREVIOUS_FRAME.with(|p| p.set(true));
                         return Some(sem);
                     }
                     Delayed::Untouched(why, signalled) => {

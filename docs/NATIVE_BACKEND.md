@@ -1691,8 +1691,14 @@ teardown (`wait_in_flight`). With the zero-copy pair (direct capture at the fram
 imported) everything stays on the GPU. Without it (the Model resolution below Full: the proxy is the scaled model scratch;
 an odd frame size; no host-memory import) `delayed_present_cpu` does the same with CPU pairs (`Inflight::kept_cpu`: the
 frame and its small proxy, swapped out of the capture's scratches) and the compose's held frame (as frame hold), the
-answer read into memory before the next request; a frame that cannot be captured because the answer before it is
-still out is skipped there (its capture would write the proxy region the other GPU reads). Found in #63: 007 First
+answer read into memory (`Inflight::answer_cpu`) before the next request, and composed with the white point and
+reversible mode its proxy was encoded with (`DelayedRequest::white_point`: the meter may have moved the setting by
+then). A frame without its answer is shown as itself (`show_kept_cpu`: the frame as its own answer at full size, so a
+Replace mode gives it back too, never the enlarged small proxy). A frame that cannot be captured (the answer before it
+still out, or a failed capture) is kept as a raw frame on the GPU and shown in its turn, as on the zero-copy path. A
+late answer is judged against the game's interval before the wait, never as a stall. A capture series pairs each
+delayed present with the previous present's original (`capture::presented_previous_frame`), so its pairs are the frame
+and its own composite. Found in #63: 007 First
 Light at 2048x1536 with the Model resolution at Half fell back to the synchronous present, every frame waiting about 12
 ms for its own answer from the RTX 5080 (40-50 fps against 75 without the model), and the summary line was only
 written on the delayed path. HDR10 frames below Full are not composed at all, with or without the second GPU (an HDR10 frame
