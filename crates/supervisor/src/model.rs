@@ -287,6 +287,13 @@ impl<'a> Resources<'a> {
 
     /// The bytes of resource `kind`/`name`, first language.
     fn get(&self, kind: u32, name: Key) -> Option<&'a [u8]> {
+        let (rva, size) = self.locate(kind, name)?;
+        let start = self.offset(rva)?;
+        self.image.get(start..start.checked_add(size)?)
+    }
+
+    /// Where resource `kind`/`name` (first language) lies: its RVA and size, read from the directory alone.
+    fn locate(&self, kind: u32, name: Key) -> Option<(u32, usize)> {
         let mut entry = self.child(0, Some(Key::Id(kind)))?;
         for key in [Some(name), None] {
             if entry & 0x8000_0000 == 0 {
@@ -298,19 +305,87 @@ impl<'a> Resources<'a> {
             return None;
         }
         let leaf = self.root + entry as usize;
-        let start = self.offset(u32_at(self.image, leaf)?)?;
-        let size = u32_at(self.image, leaf + 4)? as usize;
-        self.image.get(start..start + size)
+        Some((u32_at(self.image, leaf)?, u32_at(self.image, leaf + 4)? as usize))
     }
 }
 
 /// The file version from `VS_FIXEDFILEINFO` (signature 0xFEEF04BD), as four parts.
 fn file_version(resources: &Resources) -> Option<[u16; 4]> {
-    let info = resources.get(RT_VERSION, Key::Id(1))?;
+    version_of_info(resources.get(RT_VERSION, Key::Id(1))?)
+}
+
+/// The same from the bytes of the version resource.
+fn version_of_info(info: &[u8]) -> Option<[u16; 4]> {
     let at = (0..info.len().saturating_sub(16)).step_by(4).find(|&i| u32_at(info, i) == Some(0xfeef_04bd))?;
     let ms = u32_at(info, at + 8)?;
     let ls = u32_at(info, at + 12)?;
     Some([(ms >> 16) as u16, ms as u16, (ls >> 16) as u16, ls as u16])
+}
+
+/// The file version (`VS_FIXEDFILEINFO`) of the PE32+ DLL at `path`, reading very little of it: the headers, the start
+/// of the resource section (where its directory tree lies) and the version resource's own bytes. The rest of the
+/// section is never read: `nvngx_dlssnr.dll` keeps its weights in RCDATA there, which can be hundreds of megabytes.
+/// The section is read into a zeroed buffer at its own file offset, so the offsets the resource walk computes hold.
+pub fn dll_file_version(path: &Path) -> Result<[u16; 4], ModelError> {
+    let io = |e: std::io::Error| pe_err(format!("{}: {e}", path.display()));
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    let len = file.metadata().map_err(io)?.len() as usize;
+    version_from(&mut file, len).map_err(|e| match e {
+        VersionReadError::Io(e) => io(e),
+        VersionReadError::Pe(e) => e,
+    })
+}
+
+enum VersionReadError {
+    Io(std::io::Error),
+    Pe(ModelError),
+}
+
+impl From<std::io::Error> for VersionReadError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<ModelError> for VersionReadError {
+    fn from(e: ModelError) -> Self {
+        Self::Pe(e)
+    }
+}
+
+/// [`dll_file_version`] on any reader of `len` bytes.
+fn version_from<R: std::io::Read + std::io::Seek>(file: &mut R, len: usize) -> Result<[u16; 4], VersionReadError> {
+    use std::io::SeekFrom;
+    const HEAD: usize = 4096;
+    /// How much of the resource section is read for its directory tree (a few kilobytes in practice).
+    const TREE: usize = 256 << 10;
+    /// The most a version resource may be (real ones are about 1 KB).
+    const VERSION_CAP: usize = 64 << 10;
+    let mut head = vec![0u8; len.min(HEAD)];
+    file.read_exact(&mut head)?;
+    let probe = Resources::parse(&head)?;
+    let (raw, raw_size) = probe
+        .sections
+        .iter()
+        .find(|(_, _, raw, raw_size)| (*raw as usize..(*raw as usize).saturating_add(*raw_size as usize)).contains(&probe.root))
+        .map(|(_, _, raw, raw_size)| (*raw as usize, *raw_size as usize))
+        .ok_or_else(|| pe_err("resource directory outside every section"))?;
+    let section_end = raw.checked_add(raw_size).filter(|end| *end <= len).ok_or_else(|| pe_err("resource section outside the file"))?;
+    let end = section_end.min(raw + TREE);
+    let mut image = vec![0u8; end.max(head.len())];
+    image[..head.len()].copy_from_slice(&head);
+    file.seek(SeekFrom::Start(raw as u64))?;
+    file.read_exact(&mut image[raw..end])?;
+    let resources = Resources::parse(&image)?;
+    let (rva, size) = resources.locate(RT_VERSION, Key::Id(1)).ok_or_else(|| pe_err("no version resource"))?;
+    let start = resources.offset(rva).ok_or_else(|| pe_err("version resource outside every section"))?;
+    if size > VERSION_CAP || start.checked_add(size).is_none_or(|e| e > len) {
+        return Err(pe_err("version resource outside the file or implausibly large").into());
+    }
+    let mut info = vec![0u8; size];
+    file.seek(SeekFrom::Start(start as u64))?;
+    file.read_exact(&mut info)?;
+    version_of_info(&info).ok_or_else(|| pe_err("no version resource").into())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1047,6 +1122,70 @@ mod tests {
         image[section + 20..section + 24].copy_from_slice(&0x400u32.to_le_bytes());
         image.extend(rsrc);
         image
+    }
+
+    #[test]
+    fn dll_file_version_reads_only_the_headers_and_the_resource_section() {
+        let dir = scratch("dll-file-version");
+        let path = dir.join("nvngx_dlss.dll");
+        let mut image = dll(&[1, 2, 3], [310, 4, 0, 7]);
+        // Megabytes of other sections in front of the resources do not matter: pad the file after them.
+        image.extend(std::iter::repeat_n(0xAB, 1 << 20));
+        std::fs::write(&path, &image).unwrap();
+        assert_eq!(dll_file_version(&path).unwrap(), [310, 4, 0, 7]);
+        std::fs::write(&path, &image[..0x500]).unwrap();
+        assert!(dll_file_version(&path).is_err(), "a truncated resource section is refused");
+        std::fs::write(&path, b"not a pe").unwrap();
+        assert!(dll_file_version(&path).is_err());
+        assert!(dll_file_version(&dir.join("missing.dll")).is_err());
+        std::fs::remove_dir_all(&*dir).unwrap();
+    }
+
+    /// A reader that counts the bytes it hands out.
+    struct Counting<R>(R, usize);
+
+    impl<R: std::io::Read> std::io::Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1 += n;
+            Ok(n)
+        }
+    }
+
+    impl<R: std::io::Seek> std::io::Seek for Counting<R> {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
+
+    #[test]
+    fn dll_file_version_does_not_read_the_weights_in_the_resource_section() {
+        // 8 MB of weights in RCDATA, as nvngx_dlssnr.dll carries (hundreds of MB there), in the resource section
+        // beside the version: the version still reads, and only a small part of the file is read.
+        let weights = vec![0x5Au8; 8 << 20];
+        let image = dll(&weights, [310, 1, 0, 0]);
+        let mut reader = Counting(std::io::Cursor::new(&image), 0);
+        let version = version_from(&mut reader, image.len()).ok().expect("reads");
+        assert_eq!(version, [310, 1, 0, 0]);
+        assert!(reader.1 < 300 << 10, "read {} of {} bytes", reader.1, image.len());
+        // The version data placed after the weights (the tree read does not reach it): read by seeking to it.
+        let mut late = dll(&weights, [311, 2, 3, 4]);
+        let version_data_at = late.len() - weights.len() - 64;
+        let moved: Vec<u8> = late.drain(version_data_at..version_data_at + 64).collect();
+        late.extend(&moved);
+        let new_rva = 0x1000u32 + (late.len() - 64 - 0x400) as u32;
+        late[0x400 + 0x110..0x400 + 0x114].copy_from_slice(&new_rva.to_le_bytes());
+        let len = late.len();
+        let section = 0x80 + 24 + 240;
+        late[section + 16..section + 20].copy_from_slice(&((len - 0x400) as u32).to_le_bytes());
+        let mut reader = Counting(std::io::Cursor::new(&late), 0);
+        assert_eq!(version_from(&mut reader, len).ok().expect("reads"), [311, 2, 3, 4]);
+        assert!(reader.1 < 300 << 10, "read {} of {len} bytes", reader.1);
+        // A version resource claiming to be megabytes is refused, not read.
+        let mut huge = dll(&[1, 2, 3], [1, 2, 3, 4]);
+        huge[0x400 + 0x114..0x400 + 0x118].copy_from_slice(&(1u32 << 20).to_le_bytes());
+        let huge_len = huge.len();
+        assert!(version_from(&mut std::io::Cursor::new(&huge), huge_len).is_err());
     }
 
     fn scratch(tag: &str) -> crate::paths::tests::ScratchDir {

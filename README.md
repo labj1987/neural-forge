@@ -9,7 +9,7 @@ NVIDIA's own runtime. Read [Legal](#legal) before you use it.
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab with the switch, style, strength, passes, placement and colour settings](screenshots/settings.png) | ![Setup tab with the model, the network choice and the Steam games with a switch each](screenshots/setup.png) | ![Status tab with the frame rate graph, the model placement and the HDR verdict](screenshots/status.png) |
+| ![Model tab with the per-game Settings for bar, the switch, style, strength preset and its values](screenshots/settings.png) | ![Setup tab with the model, the network choice and the Steam games with a switch each and where each was tested](screenshots/setup.png) | ![Status tab while Hogwarts Legacy runs: the model before the upscaler, the frame rate and the graph of frame time and the model's GPU time](screenshots/status.png) |
 
 ## Requirements
 
@@ -72,6 +72,9 @@ says what to do.
   off and on again in the Setup tab (or **Make copy** under **Proton with DLSS parameters**), and
   restart Steam. If the line says the game *is* on a Neural Forge Proton but no record of DLSS reached
   the layer, run **Diagnose**: the copy's NGX wrapper is outdated or did not load.
+- **"Proton copies out of date" on the Status tab.** The Proton a copy was made from has been updated
+  since. Close Steam and press **Make again** next to the copy in the Setup tab: its games move to the
+  new copy.
 - **The model runs on the finished frame in a DLSS game.** DLSS is not upscaling there: switched off,
   another upscaler, Frame Generation only, or DLAA. Loading screens and menus before DLSS's first frame
   stay untouched; the finished frame takes over after 5 minutes without DLSS, or 30 s of DLSS with no
@@ -100,11 +103,8 @@ More: [docs/USER_GUIDE.md](docs/USER_GUIDE.md#more-known-issues).
 
 ## Known issues
 
-- **GTA V Enhanced sometimes crashes during "Game Init".** A bug in the game; relaunch.
-- **The game's DLSS Frame Generation does not always switch on**, with or without Neural Forge. In
-  GTA V Enhanced, set `FrameLimit` 120 in its settings.xml and it stays on.
-- **At 4K a 12 GB card is at its video memory limit**, most of all with Ray Reconstruction.
-- **Unreal Engine 5 games are only partly tested.**
+- **Games that change their render resolution as they run** (dynamic resolution) make the model start its
+  history again at each new size, so the picture can lose some steadiness for a moment after a change.
 - **On the finished frame, Find the HUD can treat a first-person weapon as HUD.** Switch it off in
   the Model tab where that shows.
 

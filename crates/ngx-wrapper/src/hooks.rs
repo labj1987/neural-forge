@@ -285,6 +285,8 @@ struct Feature {
     id: u32,
     feature: u32,
     flags: u32,
+    /// `OutWidth`/`OutHeight` at its creation.
+    output: [u32; 2],
     evaluates: u64,
 }
 static FEATURES: Mutex<Vec<Feature>> = Mutex::new(Vec::new());
@@ -305,36 +307,38 @@ const LOGGED_IMAGES: &[&str] = &["TransparencyMask", "DLSSG.Backbuffer", "DLSSG.
 /// write it, so it may hold whatever the caller left there): a failed creation is logged and nothing more.
 unsafe fn create(api: Api, feature: i32, p: *mut Parameter, out: *mut *mut NgxHandle, result: u32) {
     let flags = get_i(p, "DLSS.Feature.Create.Flags").unwrap_or(0) as u32;
+    let size = |a: &str, b: &str| [get_ui(p, a).unwrap_or(0), get_ui(p, b).unwrap_or(0)];
+    let (render, output) = (size("Width", "Height"), size("OutWidth", "OutHeight"));
     if !rules::ngx_succeeded(result) {
         log(&format!("CREATE {} feature={feature}({}) result={result:#x}: failed", api.name(), feature_name(feature as u32)));
         return;
     }
+    crate::modules::note_loaded();
     let handle = if out.is_null() { core::ptr::null_mut() } else { *out };
     let id = if handle.is_null() { 0 } else { (*handle).id };
     if !handle.is_null() {
         let mut list = FEATURES.lock().unwrap_or_else(|e| e.into_inner());
         list.retain(|f| f.handle != handle as usize);
-        list.push(Feature { handle: handle as usize, id, feature: feature as u32, flags, evaluates: 0 });
+        list.push(Feature { handle: handle as usize, id, feature: feature as u32, flags, output, evaluates: 0 });
     }
-    let size = |a: &str, b: &str| (get_ui(p, a).unwrap_or(0), get_ui(p, b).unwrap_or(0));
-    let (render, output) = (size("Width", "Height"), size("OutWidth", "OutHeight"));
     publish(Record {
         api: api.code(),
         handle: id,
         feature: feature as u32,
         create_flags: flags,
-        render: [render.0, render.1],
-        output_extent: [output.0, output.1],
+        render,
+        output_extent: output,
+        output_size: output,
         ..Record::default()
     });
     log(&format!(
         "CREATE {} feature={feature}({}) result={result:#x} h={id}@{handle:p} {}x{} -> {}x{} flags={flags:#x}",
         api.name(),
         feature_name(feature as u32),
-        render.0,
-        render.1,
-        output.0,
-        output.1
+        render[0],
+        render[1],
+        output[0],
+        output[1]
     ));
 }
 
@@ -352,6 +356,7 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
         handle: if handle.is_null() { 0 } else { (*handle).id },
         feature: found.map_or(0, |f| f.feature),
         create_flags: found.map_or(0, |f| f.flags),
+        output_size: found.map_or([0, 0], |f| f.output),
         ..Record::default()
     };
     let mut line = String::new();
@@ -390,11 +395,18 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
     rec.pre_exposure = get_f(p, "DLSS.Pre.Exposure").unwrap_or(0.0);
     rec.exposure_scale = get_f(p, "DLSS.Exposure.Scale").unwrap_or(0.0);
     rec.reset = get_i(p, "Reset").unwrap_or(0);
-    rec.render = [get_ui(p, "DLSS.Render.Subrect.Dimensions.Width").unwrap_or(0), get_ui(p, "DLSS.Render.Subrect.Dimensions.Height").unwrap_or(0)];
+    // The rectangle DLSS works on (NVIDIA's DLSS SDK, nvsdk_ngx_defs.h; all set with `SetUI`): its size and where it
+    // starts in each input and in the output.
+    let pair = |x: &str, y: &str| [get_ui(p, x).unwrap_or(0), get_ui(p, y).unwrap_or(0)];
+    rec.render = pair("DLSS.Render.Subrect.Dimensions.Width", "DLSS.Render.Subrect.Dimensions.Height");
+    rec.colour_base = pair("DLSS.Input.Color.Subrect.Base.X", "DLSS.Input.Color.Subrect.Base.Y");
+    rec.mvec_base = pair("DLSS.Input.MV.Subrect.Base.X", "DLSS.Input.MV.Subrect.Base.Y");
+    rec.depth_base = pair("DLSS.Input.Depth.Subrect.Base.X", "DLSS.Input.Depth.Subrect.Base.Y");
+    rec.output_base = pair("DLSS.Output.Subrect.Base.X", "DLSS.Output.Subrect.Base.Y");
     publish(rec);
     if logging() {
         log(&format!(
-            "EVAL {} h={}@{handle:p} feat={}{line} jitter={},{} mv_scale={},{} pre_exposure={} exposure_scale={} reset={} render={}x{} flags={:#x}",
+            "EVAL {} h={}@{handle:p} feat={}{line} jitter={},{} mv_scale={},{} pre_exposure={} exposure_scale={} reset={} render={}x{} bases=colour:{},{} mv:{},{} depth:{},{} output:{},{} out={}x{} flags={:#x}",
             api.name(),
             rec.handle,
             feature_name(rec.feature),
@@ -407,6 +419,16 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
             rec.reset,
             rec.render[0],
             rec.render[1],
+            rec.colour_base[0],
+            rec.colour_base[1],
+            rec.mvec_base[0],
+            rec.mvec_base[1],
+            rec.depth_base[0],
+            rec.depth_base[1],
+            rec.output_base[0],
+            rec.output_base[1],
+            rec.output_size[0],
+            rec.output_size[1],
             rec.create_flags
         ));
     }

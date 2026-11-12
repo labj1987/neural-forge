@@ -4227,11 +4227,12 @@ fn apply_game_reset<F: Copy + PartialEq>(gap: &mut HistoryGap<F>, edit: Option<&
     }
 }
 
-/// Every hold's view of the target, for [`HistoryGap`]: the input's size. Not its identification: DLSS's
-/// input alternates between two colour images every frame in Black Myth: Wukong with frame generation on,
-/// and each switch reset the history.
+/// Every hold's view of the target, for [`HistoryGap`]: the input's size, or with a subrect the rectangle's
+/// ([`Target::region`]: the history is in its pixels, which stand for other points of the screen at another
+/// render size). Not its identification: DLSS's input alternates between two colour images every frame in
+/// Black Myth: Wukong with frame generation on, and each switch reset the history.
 pub(crate) fn format_of(target: &Target) -> (u32, u32) {
-    (target.width, target.height)
+    target.region.unwrap_or((target.width, target.height))
 }
 
 /// The native pass when it was built for other pass extents than `extents` (another model resolution),
@@ -4652,6 +4653,8 @@ unsafe fn native_hold(
         // SAFETY: nothing of the detector is pending (`wait_idle` above), or its set is not written now; the
         // encoded view and the native pass's state buffer are live.
         unsafe { s.bind(device, hdr_ref.encoded_view(), native.state_buffer(), [hdr_ref.id(), native.id()]) };
+        // The thumbnail is DLSS's rectangle's alone (a new size has nothing to compare with).
+        s.set_region(format_of(target));
     }
     native.gap.note_format(format_of(target));
     // A frame of another network than the history's (the Network setting switched) resets the history
@@ -7371,6 +7374,41 @@ mod tests {
         // Without an edit cache (interval 1, or the cache off) only the history resets.
         apply_game_reset(&mut gap, None);
         assert_eq!(gap.begin(t0), Some(Stale::GameReset));
+    }
+
+    /// DLSS's subrect changing size inside the same colour input (dynamic resolution): the hold's extent stays the
+    /// image's, but the history is in the rectangle's pixels, so a new rectangle size resets it once (and the next
+    /// hold is a network frame, not a cached one); the same size again keeps it.
+    #[test]
+    fn a_new_subrect_size_resets_the_history_once() {
+        let target = |region| super::super::Target {
+            colour: ash::vk::Image::null(),
+            width: 2564,
+            height: 1444,
+            region,
+            depth: None,
+            depth_buffer: None,
+            mvec: None,
+            mvec_scale: [1.0, 1.0],
+            exposure: [None; super::super::MAX_EXPOSURE],
+            exposure_input: None,
+            paper_white: 2.5,
+            lift_exposure: false,
+            pre_exposed: false,
+            identification: 1,
+        };
+        let mut gap: HistoryGap<(u32, u32)> = HistoryGap::default();
+        let t0 = Instant::now();
+        gap.note_format(format_of(&target(Some((2562, 1441)))));
+        gap.begin(t0);
+        gap.note_format(format_of(&target(Some((2562, 1441)))));
+        assert_eq!(gap.begin(t0), None, "the same rectangle keeps the history");
+        gap.note_format(format_of(&target(Some((2050, 1153)))));
+        assert!(gap.pending(t0).is_some(), "history_ok is false: a network frame, not a cached hold");
+        assert_eq!(gap.begin(t0), Some(Stale::FormatChanged), "a new rectangle size resets it");
+        gap.note_format(format_of(&target(Some((2050, 1153)))));
+        assert_eq!(gap.begin(t0), None, "once");
+        assert_eq!(format_of(&target(None)), (2564, 1444), "no subrect: the extent");
     }
 
     /// The render extent of the model resolution tests (half of it is above the 8-texel floor).

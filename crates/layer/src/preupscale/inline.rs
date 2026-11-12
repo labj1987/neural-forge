@@ -73,7 +73,7 @@ pub(crate) fn enabled() -> bool {
     *ON
 }
 
-/// The images and buffer one stage's holds work in, at the colour input's extent: the colour input
+/// The images and buffer one stage's holds work in, at the stage's working extent ([`working_extent`]): the colour input
 /// (RGBA16F, what the hold reads and writes), DLSS's exposure (1x1 R16F), its motion vectors (RG16F) and
 /// depth (4 bytes a texel at most). Shared by every hold of the stage: their buffers run on DLSS's queue,
 /// one after another.
@@ -251,6 +251,9 @@ struct Slots {
     secondary: HashSet<vk::CommandBuffer>,
     /// Each stage's staging images.
     staging: [Option<Staging>; 2],
+    /// Each stage's working extent ([`working_extent`]): the colour input's extent it is for, and the high-water mark
+    /// of the rectangles held there, rounded up to [`WORKING_STEP`] and within the image.
+    marks: [Option<Mark>; 2],
     /// The queue the last buffer carrying a hold was submitted on.
     queue: Option<vk::Queue>,
     /// Once the holds stopped for a second queue ([`Inline::stopped`]): a fence after the last submission
@@ -268,6 +271,27 @@ struct Slots {
 
 fn stage_index(stage: Stage) -> usize {
     usize::from(stage == Stage::Upscaled)
+}
+
+/// A stage's working extent: the colour input's extent it is for, and the extent ([`working_extent`]).
+type Mark = ((u32, u32), (u32, u32));
+
+/// The working extent grows in steps of this many pixels: a rectangle that grows a little at a time (dynamic
+/// resolution) rebuilds the hold's resources once per step at most.
+pub(crate) const WORKING_STEP: u32 = 64;
+
+/// The extent a stage's holds work at (the staging images and the network's resources) for the rectangle `rect` of
+/// a colour input of `image`, given the stage's last `mark` (the image's extent, the working extent): the largest
+/// rectangle held in this image so far, each side rounded up to [`WORKING_STEP`] and within the image. It only grows
+/// while the image stays the same, so a rectangle that shrinks builds nothing again; a larger one builds once. A
+/// 1920x1080 rectangle in a 3840x2160 image (DLSS's subrect) works at 1920x1088, not the image's 4x the pixels.
+pub(crate) fn working_extent(mark: Option<Mark>, image: (u32, u32), rect: (u32, u32)) -> (u32, u32) {
+    let up = |v: u32, max: u32| v.div_ceil(WORKING_STEP).saturating_mul(WORKING_STEP).min(max.max(v)).max(1);
+    let want = (up(rect.0, image.0), up(rect.1, image.1));
+    match mark {
+        Some((at, m)) if at == image => (m.0.max(want.0), m.1.max(want.1)),
+        _ => want,
+    }
 }
 
 impl Slots {
@@ -293,8 +317,8 @@ pub(crate) struct Ctx<'a> {
     pub cb: vk::CommandBuffer,
     /// The hold point, its auxiliary inputs replaced by the staging copies the hold reads (in `GENERAL`).
     pub point: InlinePoint,
-    /// The colour input's own point (what [`Self::open`] copies from).
-    source: InlinePoint,
+    /// The colour input's own point (what [`Self::open`] copies from): its `desc` is the rectangle DLSS reads.
+    pub source: InlinePoint,
     pub staging: Staging,
     /// The depth format copied into the staging buffer, if one is.
     pub depth: Option<vk::Format>,
@@ -338,7 +362,9 @@ impl Ctx<'_> {
                 self.cb,
                 (self.source.colour, self.source.layout, self.convert),
                 s.colour,
+                (self.source.desc.width, self.source.desc.height),
                 s.extent,
+                self.source.offsets,
                 self.exposure.map(|(image, layout)| (image, layout, s.exposure)),
                 self.mvec.map(|(image, layout, extent, format)| (image, layout, s.mvec, extent, format)),
                 self.depth_source.map(|(image, layout, format)| (image, layout, format, s.depth)),
@@ -373,7 +399,14 @@ impl Ctx<'_> {
         // SAFETY: the contract.
         unsafe {
             self.stamp(3);
-            record_copy_back(self.device, self.cb, (self.source.colour, self.source.layout, self.convert), self.staging.colour, self.staging.extent);
+            record_copy_back(
+                self.device,
+                self.cb,
+                (self.source.colour, self.source.layout, self.convert),
+                self.staging.colour,
+                (self.source.desc.width, self.source.desc.height),
+                self.source.offsets.colour,
+            );
         }
     }
 }
@@ -802,7 +835,13 @@ impl Inline {
             return Recorded::Skipped;
         }
         let stage = if point.hold.stage == Stage::Upscaled { Stage::Upscaled } else { Stage::Before };
-        let extent = (point.desc.width, point.desc.height);
+        // The staging images (and the network's resources, built for the held point's extent) are at the stage's
+        // working extent ([`working_extent`]): the largest rectangle (DLSS's subrect) held in this image so far,
+        // rounded up, so a rectangle that shrinks inside it builds nothing again, and a small rectangle in a large
+        // image does not run the network over the whole image. The rectangle is copied to their corner and its edge
+        // replicated over the rest ([`record_copy_in`]).
+        let rect = (point.desc.width, point.desc.height);
+        let extent: (u32, u32);
         let convert = point.desc.format != vk::Format::R16G16B16A16_SFLOAT;
         let (index, staging, queries, readback, outstanding, mut cache_dump) = {
             let mut s = lock(&self.slots);
@@ -875,8 +914,10 @@ impl Inline {
                     return Recorded::Skipped;
                 }
             };
-            // The stage's staging images at this extent: built again only once no hold of the stage may run.
+            // The stage's staging images at its working extent: built again only once no hold of the stage may run.
             let k = stage_index(stage);
+            extent = working_extent(s.marks[k], point.image, rect);
+            s.marks[k] = Some((point.image, extent));
             let others = s.outstanding(stage, None);
             if s.staging[k].is_none_or(|st| st.extent != extent) {
                 if others > 0 {
@@ -945,8 +986,13 @@ impl Inline {
             // `InlinePoint::mvec_scale`).
             mvec_input: mvec.map(|_| Aux { image: staging.mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
             depth_input: None,
-            // The staging images, in `GENERAL` (set by the copies in).
+            // The staging images, in `GENERAL` (set by the copies in), the rectangle at their corner and its edge
+            // replicated over the rest of them.
+            desc: super::ImageDesc { width: extent.0, height: extent.1, ..point.desc },
+            // The motion vectors' unit stays the rectangle's (with the source's extent, below).
+            mv_units: Some(point.mvec_scale()),
             guessed: super::Guessed::default(),
+            offsets: super::Offsets::default(),
             ..point
         };
         let mut ctx = Ctx {
@@ -1034,8 +1080,8 @@ impl Inline {
                     if convert { ", blitted to and from RGBA16F" } else { "" },
                     point.hazard,
                     match (mvec, point.mvec_input) {
-                        (Some((_, layout, e, vk::Format::R16G16_SFLOAT)), _) if e == extent => format!("copied from {layout:?}"),
-                        (Some((_, layout, e, format)), _) if e == extent => format!("blitted from {format:?} in {layout:?}"),
+                        (Some((_, layout, e, vk::Format::R16G16_SFLOAT)), _) if e == rect => format!("copied from {layout:?}"),
+                        (Some((_, layout, e, format)), _) if e == rect => format!("blitted from {format:?} in {layout:?}"),
                         (Some((_, layout, e, format)), _) => format!("resampled from {}x{} {format:?} in {layout:?}", e.0, e.1),
                         (None, Some(a)) => format!("not copied ({:?} in {:?}, readable {})", a.format, a.layout, a.readable),
                         (None, None) => "not known".to_string(),
@@ -1385,7 +1431,13 @@ const COLOUR_LAYERS: vk::ImageSubresourceLayers =
 /// staging image), motion vectors (`mvec`: source, its layout, the staging image, the source's extent: larger
 /// ones are blitted down) and depth aspect (`depth`: source, its layout, its format, the staging buffer). A
 /// colour input, motion vectors or depth outside a layout a transfer reads are moved to the transfer layout
-/// and back. Ends with everything copied visible to the hold's commands.
+/// and back. With DLSS's subrect (`offsets`, [`super::InlinePoint::offsets`]) each is read from its rectangle: the
+/// colour input's `rect` at its base, the motion vectors' (their extent, given with them) and the depth's at theirs,
+/// each to the staging images' corner. The staging images are the whole image's `full` extent: where the rectangle is
+/// smaller, its last column and then its last row are replicated over the rest of them ([`record_pad`]), for colour,
+/// motion vectors and depth alike, so the network (whose receptive field reaches past the rectangle's edge) sees the
+/// picture continued at its edge, never pixels DLSS does not read.
+/// Ends with everything copied visible to the hold's commands.
 ///
 /// # Safety
 /// `cb` is being recorded on this thread; every image is in the given layout at this point of the buffer
@@ -1401,24 +1453,14 @@ pub(crate) unsafe fn record_copy_in(
     (colour, layout, convert): (vk::Image, vk::ImageLayout, bool),
     staging: vk::Image,
     extent: (u32, u32),
+    full: (u32, u32),
+    offsets: super::Offsets,
     exposure: Option<(vk::Image, vk::ImageLayout, vk::Image)>,
     mvec: Option<MvecCopy>,
     depth: Option<(vk::Image, vk::ImageLayout, vk::Format, vk::Buffer)>,
 ) {
-    let region = vk::ImageCopy {
-        src_subresource: COLOUR_LAYERS,
-        src_offset: vk::Offset3D::default(),
-        dst_subresource: COLOUR_LAYERS,
-        dst_offset: vk::Offset3D::default(),
-        extent: vk::Extent3D { width: extent.0, height: extent.1, depth: 1 },
-    };
+    let (region, blit) = colour_regions(extent, offsets.colour, false);
     let far = vk::Offset3D { x: extent.0 as i32, y: extent.1 as i32, z: 1 };
-    let blit = vk::ImageBlit {
-        src_subresource: COLOUR_LAYERS,
-        src_offsets: [vk::Offset3D::default(), far],
-        dst_subresource: COLOUR_LAYERS,
-        dst_offsets: [vk::Offset3D::default(), far],
-    };
     let general = layout == vk::ImageLayout::GENERAL;
     let read_layout = if general { vk::ImageLayout::GENERAL } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
     // Everything the buffer wrote before this point (the frame, rendered in this same buffer) is visible to
@@ -1471,7 +1513,7 @@ pub(crate) unsafe fn record_copy_in(
             super::aux_range(f),
         )
     }));
-    let exposure_region = vk::ImageCopy { extent: vk::Extent3D { width: 1, height: 1, depth: 1 }, ..region };
+    let exposure_region = vk::ImageCopy { src_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: 1, height: 1, depth: 1 }, ..region };
     // The copies visible to the hold's commands (transfers and shaders), the sources back where they were.
     let copied = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1497,12 +1539,13 @@ pub(crate) unsafe fn record_copy_in(
         }
         if let Some((source, source_layout, own, (sw, sh), format)) = mvec {
             let from = if mvec_moved.is_some() { vk::ImageLayout::TRANSFER_SRC_OPTIMAL } else { source_layout };
+            let at = offset(offsets.mvec);
             if (sw, sh) == extent && format == vk::Format::R16G16_SFLOAT {
-                d.cmd_copy_image(cb, source, from, own, vk::ImageLayout::GENERAL, &[region]);
+                d.cmd_copy_image(cb, source, from, own, vk::ImageLayout::GENERAL, &[vk::ImageCopy { src_offset: at, ..region }]);
             } else {
                 let down = vk::ImageBlit {
                     src_subresource: COLOUR_LAYERS,
-                    src_offsets: [vk::Offset3D::default(), vk::Offset3D { x: sw as i32, y: sh as i32, z: 1 }],
+                    src_offsets: [at, vk::Offset3D { x: at.x + sw as i32, y: at.y + sh as i32, z: 1 }],
                     dst_subresource: COLOUR_LAYERS,
                     dst_offsets: [vk::Offset3D::default(), far],
                 };
@@ -1512,22 +1555,132 @@ pub(crate) unsafe fn record_copy_in(
         if let Some((source, source_layout, format, own)) = depth {
             let from = if depth_moved.is_some() { vk::ImageLayout::TRANSFER_SRC_OPTIMAL } else { source_layout };
             let aspect = if super::DEPTH_FORMATS.contains(&format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
+            // In rows of the staging images' width: the buffer is read at their extent.
             let copy = vk::BufferImageCopy {
                 buffer_offset: 0,
-                buffer_row_length: 0,
+                buffer_row_length: full.0,
                 buffer_image_height: 0,
                 image_subresource: vk::ImageSubresourceLayers { aspect_mask: aspect, ..COLOUR_LAYERS },
-                image_offset: vk::Offset3D::default(),
+                image_offset: offset(offsets.depth),
                 image_extent: vk::Extent3D { width: extent.0, height: extent.1, depth: 1 },
             };
             d.cmd_copy_image_to_buffer(cb, source, from, own, &[copy]);
         }
+        let images: Vec<vk::Image> = std::iter::once(staging).chain(mvec.map(|(_, _, own, _, _)| own)).collect();
+        let depth = depth.map(|(_, _, format, own)| (own, super::depth_texel_bytes(format)));
+        record_pad(d, cb, &images, depth, extent, full);
         d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[copied], &[], &back);
     }
 }
 
+/// Fills the staging images (`images`, in `GENERAL`) and the depth buffer (`depth`: it and its texel's bytes, in rows
+/// of `full.0` texels) outside the rectangle `rect` at their corner with its edge: its last column over the columns
+/// right of it, then the last row (now `full.0` wide) over the rows below, the corner taking the rectangle's corner
+/// pixel. Clamp-to-edge, as a sampler reads past an image's edge. Nothing when the rectangle is the whole extent.
+/// Images by NEAREST blits from the column or row they repeat, within the same image; the depth buffer, whose
+/// texels are 2 or 4 bytes, by buffer copies, each row's run doubled until it covers the columns (`vkCmdCopyBuffer`
+/// has no alignment rule, which copies from the depth image to the buffer have).
+///
+/// # Safety
+/// `cb` is being recorded on this thread; the rectangle was just copied in by transfers; the images are of `full`
+/// with `TRANSFER_SRC | TRANSFER_DST` and a format that blits; the buffer holds `full.0 * full.1` texels.
+unsafe fn record_pad(d: &ash::Device, cb: vk::CommandBuffer, images: &[vk::Image], depth: Option<(vk::Buffer, u64)>, rect: (u32, u32), full: (u32, u32)) {
+    let ((w, h), (fw, fh)) = (rect, full);
+    if (w >= fw && h >= fh) || w == 0 || h == 0 {
+        return;
+    }
+    let step = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+    let barrier = || {
+        // SAFETY: the contract.
+        unsafe {
+            d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[step], &[], &[])
+        }
+    };
+    let at = |x: u32, y: u32| vk::Offset3D { x: x as i32, y: y as i32, z: 0 };
+    let corner = |x: u32, y: u32| vk::Offset3D { x: x as i32, y: y as i32, z: 1 };
+    let blit = |src: [vk::Offset3D; 2], dst: [vk::Offset3D; 2]| vk::ImageBlit {
+        src_subresource: COLOUR_LAYERS,
+        src_offsets: src,
+        dst_subresource: COLOUR_LAYERS,
+        dst_offsets: dst,
+    };
+    // What the copies in wrote, visible to the padding's reads.
+    barrier();
+    let row_bytes = |b: u64| u64::from(fw) * b;
+    if w < fw {
+        // SAFETY: the contract; source and destination columns do not overlap.
+        unsafe {
+            for &image in images {
+                let region = blit([at(w - 1, 0), corner(w, h)], [at(w, 0), corner(fw, h)]);
+                d.cmd_blit_image(cb, image, vk::ImageLayout::GENERAL, image, vk::ImageLayout::GENERAL, &[region], vk::Filter::NEAREST);
+            }
+        }
+        if let Some((buffer, b)) = depth {
+            // Each row's last texel, then the run so far, copied to its right until the row is full.
+            let mut have = 1;
+            while have < fw - w + 1 {
+                let n = have.min(fw - w + 1 - have);
+                let regions: Vec<vk::BufferCopy> = (0..h)
+                    .map(|y| {
+                        let start = u64::from(y) * row_bytes(b) + u64::from(w - 1) * b;
+                        vk::BufferCopy { src_offset: start, dst_offset: start + u64::from(have) * b, size: u64::from(n) * b }
+                    })
+                    .collect();
+                // SAFETY: the contract; each region's source and destination are disjoint, and earlier steps' writes
+                // are visible (the barrier after each).
+                unsafe { d.cmd_copy_buffer(cb, buffer, buffer, &regions) };
+                barrier();
+                have += n;
+            }
+        }
+        // The columns written, visible to the rows' copies (which read the last row, now whole).
+        barrier();
+    }
+    if h < fh {
+        // SAFETY: the contract; the last row (complete after the columns) and the rows below do not overlap.
+        unsafe {
+            for &image in images {
+                let region = blit([at(0, h - 1), corner(fw, h)], [at(0, h), corner(fw, fh)]);
+                d.cmd_blit_image(cb, image, vk::ImageLayout::GENERAL, image, vk::ImageLayout::GENERAL, &[region], vk::Filter::NEAREST);
+            }
+            if let Some((buffer, b)) = depth {
+                let last = u64::from(h - 1) * row_bytes(b);
+                let regions: Vec<vk::BufferCopy> =
+                    (h..fh).map(|y| vk::BufferCopy { src_offset: last, dst_offset: u64::from(y) * row_bytes(b), size: row_bytes(b) }).collect();
+                d.cmd_copy_buffer(cb, buffer, buffer, &regions);
+            }
+        }
+    }
+}
+
+/// `offset` as a Vulkan offset.
+fn offset((x, y): (u32, u32)) -> vk::Offset3D {
+    vk::Offset3D { x: x as i32, y: y as i32, z: 0 }
+}
+
+/// The colour copy (and the blit, for a converted colour input) between the colour input's rectangle of `extent` at `at`
+/// and the staging image's corner: from the colour input, or to it (`back`).
+fn colour_regions(extent: (u32, u32), at: (u32, u32), back: bool) -> (vk::ImageCopy, vk::ImageBlit) {
+    let (corner, image) = (vk::Offset3D::default(), offset(at));
+    let (src, dst) = if back { (corner, image) } else { (image, corner) };
+    let far = |o: vk::Offset3D| vk::Offset3D { x: o.x + extent.0 as i32, y: o.y + extent.1 as i32, z: 1 };
+    (
+        vk::ImageCopy {
+            src_subresource: COLOUR_LAYERS,
+            src_offset: src,
+            dst_subresource: COLOUR_LAYERS,
+            dst_offset: dst,
+            extent: vk::Extent3D { width: extent.0, height: extent.1, depth: 1 },
+        },
+        vk::ImageBlit { src_subresource: COLOUR_LAYERS, src_offsets: [src, far(src)], dst_subresource: COLOUR_LAYERS, dst_offsets: [dst, far(dst)] },
+    )
+}
+
 /// The copy back recorded at the end of a hold: the staging image (in `GENERAL`, holding the hold's answer,
-/// or the frame as it was copied in when the hold wrote nothing) over the colour input, in its layout (moved
+/// or the frame as it was copied in when the hold wrote nothing) over the colour input (its rectangle at `at`: DLSS's
+/// subrect; nothing outside it is written), in its layout (moved
 /// to `TRANSFER_DST_OPTIMAL` and back outside `GENERAL`; blitted for an R11G11B10 one), then visible to
 /// everything after it in the buffer: DLSS's launch first.
 ///
@@ -1539,21 +1692,9 @@ pub(crate) unsafe fn record_copy_back(
     (colour, layout, convert): (vk::Image, vk::ImageLayout, bool),
     staging: vk::Image,
     extent: (u32, u32),
+    at: (u32, u32),
 ) {
-    let region = vk::ImageCopy {
-        src_subresource: COLOUR_LAYERS,
-        src_offset: vk::Offset3D::default(),
-        dst_subresource: COLOUR_LAYERS,
-        dst_offset: vk::Offset3D::default(),
-        extent: vk::Extent3D { width: extent.0, height: extent.1, depth: 1 },
-    };
-    let far = vk::Offset3D { x: extent.0 as i32, y: extent.1 as i32, z: 1 };
-    let blit = vk::ImageBlit {
-        src_subresource: COLOUR_LAYERS,
-        src_offsets: [vk::Offset3D::default(), far],
-        dst_subresource: COLOUR_LAYERS,
-        dst_offsets: [vk::Offset3D::default(), far],
-    };
+    let (region, blit) = colour_regions(extent, at, true);
     let general = layout == vk::ImageLayout::GENERAL;
     let write_layout = if general { vk::ImageLayout::GENERAL } else { vk::ImageLayout::TRANSFER_DST_OPTIMAL };
     // The hold's writes of the staging image (shaders or transfers) visible to the copy; outside GENERAL the
@@ -2034,6 +2175,7 @@ mod tests {
                 height: H,
                 depth: None,
                 depth_buffer: None,
+                region: None,
                 mvec: aux(self.mvec, vk::Format::R16G16_SFLOAT),
                 mvec_scale: [1.0, 1.0],
                 exposure: [None; crate::preupscale::MAX_EXPOSURE],
@@ -2089,6 +2231,7 @@ mod tests {
             let aux = |image, format| Some(Aux { image, format, layout: Some(vk::ImageLayout::GENERAL), readable: true });
             InlinePoint {
                 colour: self.colour,
+                image: (W, H),
                 desc: ImageDesc {
                     width: W,
                     height: H,
@@ -2096,6 +2239,7 @@ mod tests {
                     usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE,
                     plain: true,
                 },
+                offsets: crate::preupscale::Offsets::default(),
                 layout: vk::ImageLayout::GENERAL,
                 exposure_input: aux(self.exposure, vk::Format::R16_SFLOAT),
                 mvec_input: aux(self.mvec, vk::Format::R16G16_SFLOAT),
@@ -2135,6 +2279,7 @@ mod tests {
                     height: H,
                     depth: None,
                     depth_buffer: None,
+                    region: None,
                     mvec: ctx.point.mvec_input,
                     mvec_scale: ctx.point.mvec_scale(),
                     exposure: [None; crate::preupscale::MAX_EXPOSURE],
@@ -2708,8 +2853,14 @@ mod tests {
             (2 * W, 2 * H),
             vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE,
         );
-        let big =
-            InlinePoint { colour: big_image, desc: ImageDesc { width: 2 * W, height: 2 * H, ..small.desc }, mvec_input: None, exposure_input: None, ..small };
+        let big = InlinePoint {
+            colour: big_image,
+            image: (2 * W, 2 * H),
+            desc: ImageDesc { width: 2 * W, height: 2 * H, ..small.desc },
+            mvec_input: None,
+            exposure_input: None,
+            ..small
+        };
         let (a, b) = (rig.buffer(), rig.buffer());
         let staging = |rig: &Rig| lock(&rig.inline.slots).staging[0].map(|s| s.extent);
         FAIL_IMAGES.set(true);
@@ -2895,6 +3046,200 @@ mod tests {
         let held = run(&mut rig, true);
         assert!(reference.iter().any(|&b| b != 0), "the clear wrote something");
         assert_eq!(held, reference, "an R11G11B10 frame changed across a hold that wrote nothing");
+    }
+
+    /// One hold given part of its inputs (NGX's subrect) on the subrect rig's images ([`subrect_rig`]): the rectangle
+    /// `rect` at the colour input's base (3, 2), the motion vectors' (5, 1) and the depth's (0, 4). The hold reads the
+    /// staging images whole, then writes a constant over the staging colour. Returns the staging colour (RGBA16F), motion
+    /// vectors (RG16F) and depth (f32) as the hold saw them, the colour input after it, the staging images' id and the
+    /// extent the held point gave the hold (what the network's resources are built for).
+    fn subrect_hold(rig: &mut Rig, images: SubrectImages, rect: (u32, u32)) -> SubrectSeen {
+        let (colour, mvec, depth, (cw, ch)) = images;
+        // The game's images as they are before every hold.
+        let texels = |each: &dyn Fn(u32, u32) -> Vec<u8>| -> Vec<u8> { (0..ch).flat_map(|y| (0..cw).flat_map(move |x| each(x, y))).collect() };
+        rig.upload_image(colour, (cw, ch), &texels(&|x, y| subrect_colour(x, y).iter().flat_map(|v| v.to_le_bytes()).collect()));
+        rig.upload_image(mvec, (cw, ch), &texels(&|x, y| [half(x as f32), half(y as f32)].iter().flat_map(|v| v.to_le_bytes()).collect()));
+        rig.upload_image(depth, (cw, ch), &texels(&|x, y| (x as f32 * 100.0 + y as f32).to_le_bytes().to_vec()));
+        let (rgba, rg, r32) = (vk::Format::R16G16B16A16_SFLOAT, vk::Format::R16G16_SFLOAT, vk::Format::R32_SFLOAT);
+        let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
+        let aux = |image, format| Some(Aux { image, format, layout: Some(vk::ImageLayout::GENERAL), readable: true });
+        let point = InlinePoint {
+            colour,
+            image: (cw, ch),
+            desc: ImageDesc { width: rect.0, height: rect.1, format: rgba, usage: usage | vk::ImageUsageFlags::STORAGE, plain: true },
+            offsets: crate::preupscale::Offsets { colour: (3, 2), mvec: (5, 1), depth: (0, 4) },
+            exposure_input: None,
+            mvec_input: aux(mvec, rg),
+            mvec_extent: rect,
+            depth_input: aux(depth, r32),
+            hazard: Hazard::Subrect,
+            ..rig.point()
+        };
+        let n = u64::from(cw * ch);
+        let seen = rig.host(n * 8, vk::BufferUsageFlags::TRANSFER_DST);
+        let seen_mv = rig.host(n * 4, vk::BufferUsageFlags::TRANSFER_DST);
+        let seen_depth = rig.host(n * 4, vk::BufferUsageFlags::TRANSFER_DST);
+        let back = rig.host(n * 8, vk::BufferUsageFlags::TRANSFER_DST);
+        let (buffers, d) = ((rig.hosts[seen].buffer, rig.hosts[seen_mv].buffer, rig.hosts[seen_depth].buffer), rig.device.clone());
+        let held_extent = std::cell::Cell::new((0, 0));
+        let hold = |ctx: &mut Ctx| -> Result<Meta, Recorded> {
+            held_extent.set((ctx.point.desc.width, ctx.point.desc.height));
+            let (sw, sh) = ctx.staging.extent;
+            // SAFETY: the test's buffer, recording on this thread; the staging images are in GENERAL after the copies in.
+            unsafe {
+                ctx.open();
+                d.cmd_copy_image_to_buffer(ctx.cb, ctx.staging.colour, vk::ImageLayout::GENERAL, buffers.0, &[whole(sw, sh)]);
+                d.cmd_copy_image_to_buffer(ctx.cb, ctx.staging.mvec, vk::ImageLayout::GENERAL, buffers.1, &[whole(sw, sh)]);
+                d.cmd_copy_buffer(ctx.cb, ctx.staging.depth, buffers.2, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(sw * sh) * 4 }]);
+                let read = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                let t = vk::PipelineStageFlags::TRANSFER;
+                d.cmd_pipeline_barrier(ctx.cb, t, t, vk::DependencyFlags::empty(), &[read], &[], &[]);
+                d.cmd_clear_color_image(ctx.cb, ctx.staging.colour, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: SUBRECT_ANSWER }, &[RANGE]);
+            }
+            Ok(Meta::empty(Stage::Before))
+        };
+        let cb = rig.buffer();
+        rig.begin(cb);
+        // SAFETY: recording the test's buffer.
+        unsafe {
+            assert_eq!(rig.inline.record_outcome(cb, point, hold), Recorded::Held);
+            let all = vk::PipelineStageFlags::ALL_COMMANDS;
+            let written = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            rig.device.cmd_pipeline_barrier(cb, all, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[written], &[], &[]);
+            rig.device.cmd_copy_image_to_buffer(cb, colour, vk::ImageLayout::GENERAL, rig.hosts[back].buffer, &[whole(cw, ch)]);
+        }
+        rig.end(cb);
+        rig.submit(&[cb]);
+        // Begun again (the buffer ran): its hold can no longer run, and the next may build the staging images again.
+        rig.begin(cb);
+        rig.end(cb);
+        let staging = lock(&rig.inline.slots).staging[0].expect("built");
+        let (sw, sh) = staging.extent;
+        assert_eq!(staging.extent, held_extent.get(), "the staging images are at the held extent");
+        // SAFETY: mapped; the buffer ran.
+        let read = |k: usize, n: u32| -> Vec<u16> { unsafe { std::slice::from_raw_parts(rig.hosts[k].ptr.cast::<u16>(), n as usize) }.to_vec() };
+        // SAFETY: as above.
+        let depths: Vec<f32> = unsafe { std::slice::from_raw_parts(rig.hosts[seen_depth].ptr.cast::<f32>(), (sw * sh) as usize) }.to_vec();
+        (read(seen, sw * sh * 4), read(seen_mv, sw * sh * 2), depths, read(back, cw * ch * 4), staging.id, held_extent.get(), (cw, ch))
+    }
+
+    /// What [`subrect_hold`] read back: the staging colour, motion vectors and depth (at the held extent), the colour
+    /// input after the hold, the staging images' id, the held extent and the colour input's extent.
+    /// The subrect rig's colour input, motion vectors and depth, and their extent.
+    type SubrectImages = (vk::Image, vk::Image, vk::Image, (u32, u32));
+
+    type SubrectSeen = (Vec<u16>, Vec<u16>, Vec<f32>, Vec<u16>, u64, (u32, u32), (u32, u32));
+
+    /// The subrect rig's colour input, motion vectors and depth (R32F), larger than the rig's W x H: each texel holds
+    /// its own position (colour: x, y, 0.5, 1; motion vectors: x, y; depth: 100 x + y).
+    const SUBRECT_IMAGE: (u32, u32) = (W + 7, H + 5);
+    const SUBRECT_ANSWER: [f32; 4] = [2.0, 3.0, 4.0, 1.0];
+
+    fn subrect_colour(x: u32, y: u32) -> [u16; 4] {
+        [half(x as f32), half(y as f32), half(0.5), half(1.0)]
+    }
+
+    fn subrect_rig(size: (u32, u32)) -> Option<(Rig, SubrectImages)> {
+        let mut rig = Rig::open(false)?;
+        let (cw, ch) = size;
+        let (rgba, rg, r32) = (vk::Format::R16G16B16A16_SFLOAT, vk::Format::R16G16_SFLOAT, vk::Format::R32_SFLOAT);
+        let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
+        let colour = rig.image(rgba, (cw, ch), usage | vk::ImageUsageFlags::STORAGE);
+        let mvec = rig.image(rg, (cw, ch), usage);
+        let depth = rig.image(r32, (cw, ch), usage);
+        Some((rig, (colour, mvec, depth, size)))
+    }
+
+    /// Checks one [`subrect_hold`] of `rect`, held at `working` (the staging images' and the network's extent): the
+    /// colour input changed inside the rectangle alone; the staging images hold the rectangle at their corner, each
+    /// input from its own base, and outside it, up to the working extent, the rectangle's edge replicated (its last
+    /// column to the right, its last row below, the corner its corner pixel).
+    fn check_subrect(got: &SubrectSeen, rect: (u32, u32), working: (u32, u32)) {
+        let (colour, vectors, depths, after, _, held, (cw, ch)) = got;
+        let (cw, ch) = (*cw, *ch);
+        assert_eq!(*held, working, "the hold (and the network's resources) work at the working extent for {rect:?}");
+        let (sw, sh) = working;
+        for y in 0..ch {
+            for x in 0..cw {
+                let i = ((y * cw + x) * 4) as usize;
+                let inside = (3..3 + rect.0).contains(&x) && (2..2 + rect.1).contains(&y);
+                let want = if inside { SUBRECT_ANSWER.map(half) } else { subrect_colour(x, y) };
+                assert_eq!(after[i..i + 4], want, "the colour input at ({x}, {y}) after the hold of {rect:?} (inside the rectangle: {inside})");
+            }
+        }
+        for y in 0..sh {
+            for x in 0..sw {
+                let i = (y * sw + x) as usize;
+                // The rectangle's pixel this staging pixel shows: itself inside it, its edge outside.
+                let (rx, ry) = (x.min(rect.0 - 1), y.min(rect.1 - 1));
+                assert_eq!(colour[4 * i..4 * i + 4], subrect_colour(rx + 3, ry + 2), "the network's colour at ({x}, {y}) for {rect:?}");
+                let mv = [f16_to_f32(vectors[2 * i]), f16_to_f32(vectors[2 * i + 1])];
+                assert_eq!(mv, [(rx + 5) as f32, (ry + 1) as f32], "the motion vectors at ({x}, {y}) for {rect:?}");
+                assert_eq!(depths[i], rx as f32 * 100.0 + (ry + 4) as f32, "the depth at ({x}, {y}) for {rect:?}");
+            }
+        }
+    }
+
+    /// DLSS given part of its inputs (NGX's subrect): the hold copies in the colour input's rectangle from its base and
+    /// the motion vectors' and the depth's from theirs to the staging images' corner, fills the rest of them (the
+    /// colour input's whole extent) with the rectangle's edge, and writes back over that rectangle only: every pixel
+    /// outside it stays as the game left it, and the network never reads a pixel DLSS does not.
+    #[test]
+    fn a_subrect_hold_reads_and_writes_its_rectangle_alone() {
+        let Some((mut rig, images)) = subrect_rig(SUBRECT_IMAGE) else { return };
+        check_subrect(&subrect_hold(&mut rig, images, (W, H)), (W, H), SUBRECT_IMAGE);
+    }
+
+    /// Dynamic resolution inside a fixed colour input: a rectangle of another size builds neither the staging images nor
+    /// (the held extent being the image's) the network's resources again, writes back over its own rectangle alone, and
+    /// replicates its own edge.
+    #[test]
+    fn a_subrect_that_changes_size_builds_nothing_again() {
+        let Some((mut rig, images)) = subrect_rig(SUBRECT_IMAGE) else { return };
+        let first = subrect_hold(&mut rig, images, (W, H));
+        check_subrect(&first, (W, H), SUBRECT_IMAGE);
+        // Each fits every input's rectangle in its image (the largest: the motion vectors' at (5, 1), the depth's at (0, 4)).
+        for rect in [(W - 6, H - 3), (W + 2, H - 5), (W - 1, H + 1), (W + 2, H + 1)] {
+            let got = subrect_hold(&mut rig, images, rect);
+            // The image is within one step of the working extent: that is the image's whole extent.
+            check_subrect(&got, rect, SUBRECT_IMAGE);
+            assert_eq!(got.4, first.4, "the staging images were built again for the rectangle {rect:?}");
+        }
+    }
+
+    /// A small rectangle in a large colour input (DLSS's subrect: 1920x1080 in a 3840x2160 image) is held at its
+    /// working extent, not the image's: the largest rectangle so far, rounded up to [`WORKING_STEP`] and within the
+    /// image. A rectangle that grows past it builds the staging images (and the network's resources) once more; one
+    /// that shrinks, or grows within it, builds nothing. The padding replicates the rectangle's edge up to the working
+    /// extent.
+    #[test]
+    fn a_subrect_is_held_at_its_high_water_mark() {
+        const IMAGE: (u32, u32) = (150, 140);
+        let Some((mut rig, images)) = subrect_rig(IMAGE) else { return };
+        let mut id = None;
+        // Each rectangle, the working extent it is held at and whether that builds the staging images again (every
+        // rectangle fits each input's base: the motion vectors' at (5, 1), the depth's at (0, 4)).
+        let steps = [
+            ((60, 30), (64, 64), true),
+            ((40, 20), (64, 64), false),
+            ((70, 30), (128, 64), true),
+            ((50, 50), (128, 64), false),
+            ((60, 61), (128, 64), false),
+            ((100, 100), (128, 128), true),
+            ((20, 10), (128, 128), false),
+            ((145, 136), IMAGE, true),
+            ((30, 30), IMAGE, false),
+        ];
+        for (rect, working, builds) in steps {
+            let got = subrect_hold(&mut rig, images, rect);
+            check_subrect(&got, rect, working);
+            assert_eq!(id != Some(got.4), builds, "the staging images built again for {rect:?}: {builds} expected");
+            id = Some(got.4);
+        }
+        assert_eq!(working_extent(None, (3840, 2160), (1920, 1080)), (1920, 1088));
+        assert_eq!(working_extent(Some(((3840, 2160), (1920, 1088))), (3840, 2160), (1280, 720)), (1920, 1088), "never shrinks");
+        assert_eq!(working_extent(Some(((3840, 2160), (1920, 1088))), (2560, 1440), (1280, 720)), (1280, 768), "another image starts afresh");
+        assert_eq!(working_extent(None, (3840, 2160), (3840, 2160)), (3840, 2160), "the whole image is held as before");
     }
 
     fn whole(w: u32, h: u32) -> vk::BufferImageCopy {

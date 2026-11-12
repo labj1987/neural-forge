@@ -92,7 +92,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, the HUD group: finding the HUD and HUD regions on the finished frame, and the Sharpening group: adaptive sharpening (CAS) and Clarity on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
-| Status | Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
+| Status | **Proton copies out of date** (shown only when a Neural Forge Proton copy is older than the Proton it was made from: the copy, both versions and the games that run with it; see [Proton with DLSS parameters](#proton-with-dlss-parameters)), Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
 | Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on; a tested game says where the model runs in it), the launch option to copy by hand for a game you pick, **Proton with DLSS parameters** (below) and **Uninstall…** (see [Uninstall](#uninstall)). |
 
 **The HDR verdict** (the Status tab's HDR line, `hdr_verdict=` in `neural-forge-cli shmctl status`, Save report and the
@@ -270,8 +270,11 @@ unchanged. Your original Proton is not changed. Then:
 2. In the game's Properties > Compatibility, tick "Force the use of a specific Steam Play compatibility tool" and
    choose the copy.
 
-A copy whose original has changed since (a new GE-Proton in a "Latest" folder, a Proton Experimental update), or that
-holds another NGX wrapper than the installed Neural Forge, is marked with **Make again** (`proton-tool update`): with
+A copy whose original has changed since (a new GE-Proton in a "Latest" folder, a Proton Experimental update) is out of
+date: it keeps the older Proton's files, so a fix the new version brings is missing from it. The Status tab says so
+(**Proton copies out of date**: the copy, its two versions and the games that run with it), the game's layer log gets a
+`[proton]` line at launch (`NEURAL_FORGE_LOG`, see Files), `doctor` reports it (and warns when Steam changed a Proton's files in place after a copy was made from it), and the Setup tab marks it with
+**Make again** (`proton-tool update`; so is a copy that holds another NGX wrapper than the installed Neural Forge): with
 Steam closed it makes the copy again (a new version under its new name, its games moved over and the old copy
 removed), or puts the new wrapper in place. A copy whose original was deleted (ProtonUp replaced it with a newer
 version) keeps working as it is. Updating Neural Forge puts its wrapper into every copy by itself. A copy a
@@ -321,7 +324,7 @@ Great Circle and Clair Obscur: Expedition 33 (#51); the list carries them too.
 |---|---|---|---|
 | GTA V Enhanced | RAGE, DX12 | Super Resolution, Frame Generation 4x | Before the upscaler |
 | Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | After DLSS with Ray Reconstruction on; before the upscaler, inside DLSS's buffer, with it off |
-| GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | Before the upscaler |
+| GTA San Andreas - The Definitive Edition | Unreal Engine 4, DX11 | Super Resolution | Before the upscaler, inside DLSS's buffer |
 | Metro Last Light Redux | 4A Engine, DX12 | Super Resolution (the game's own DLSS 5 NR off) | Before the upscaler, inside DLSS's buffer |
 | God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | Before the upscaler |
 | Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Before the upscaler |
@@ -428,6 +431,12 @@ The CLI is installed as `~/.local/share/neural-forge/bin/neural-forge-cli`; add 
 `game-settings list|show GAME|set GAME NAME VALUE|clear GAME [NAME]` for a game's own settings, and
 `shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--view V]|capture --cancel|dump-cache [--holds K]|reset|lut FILE|none`
 for the live settings. `doctor`, `report` and `shmctl status` only look: they create and change nothing.
+`doctor` (and the `summary.txt` of **Save report**) lists the **NGX versions**: the file version of NVIDIA's NGX core
+from the driver, of every NGX file a game loaded in its last run with the folder it was loaded from (the game's own,
+the NGX models folder an over-the-air update fills, the driver's), and of the NGX files present in each switched-on
+game's folder and Proton prefix. A DLSS update by the game or NVIDIA, or a DLSS file you replaced yourself, shows there.
+The loaded files are recorded by the wrapper once a game has created a DLSS feature, so a game that has not run with
+Neural Forge on and created a DLSS feature has none yet.
 `neural-forge-cli help [COMMAND]` (or `COMMAND --help`) has the details; an unknown or misspelt
 argument prints the usage and exits with status 2.
 
@@ -478,24 +487,21 @@ the games that used one).
 
 ## More known issues
 
-- **Each DLSS game needs a test run before it is claimed:** engines hand DLSS its inputs in
-  different ways, and several broke an assumption the first time. See [Tested games](#tested-games).
-- **The model after DLSS is tested in three games** (Crimson Desert and Hogwarts Legacy with Ray
-  Reconstruction; Cyberpunk 2077 with and without it). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
-  much lower frame rate (14 against 70 fps shown in Crimson Desert at 4K with Ray Reconstruction).
-- **Hogwarts Legacy with Ray Reconstruction:** its Ray Reconstruction does not say what unit its motion vectors
-  are in (Cyberpunk 2077's does), so the model after DLSS takes them as render pixels, as their size suggests, or
-  in the unit Super Resolution gave if it ran earlier in the session. Neither has been checked against the picture
-  in this game: if the model's history drags or smears behind moving things there, set Placement to Finished frame.
-- **HDR on the finished frame:** HDR10 is handled (above) and tested in Crimson Desert; float16
-  (scRGB) swapchains are presented untouched, and HDR frames cannot be captured.
+- **A DLSS game that is not in [Tested games](#tested-games)** usually works, because Neural Forge reads what the
+  game hands DLSS. If the Status tab's Model placement line says DLSS's input was found but not held, the model runs
+  on the finished frame instead; attach **Save report** to an issue so the game can be added.
+- **With Ray Reconstruction, where DLSS's output cannot be held,** the model runs on the finished frame at the
+  output size, which costs far more frame rate (14 against 70 fps shown in Crimson Desert at 4K).
+- **Hogwarts Legacy with Ray Reconstruction:** its Ray Reconstruction does not say what unit its motion vectors are
+  in, so the model after DLSS takes them as render pixels. If the model's history drags or smears behind moving
+  things there, set Placement to Finished frame.
+- **HDR on the finished frame:** HDR10 is handled (above); float16 (scRGB) swapchains are presented untouched, and
+  HDR frames cannot be captured.
 - **Comparing with NVIDIA's own DLSS 5 in a game that ships it:** Proton's dxvk-nvapi 0.9.3 or newer passes
   NVIDIA's driver override for it, so the launch options
   `DXVK_NVAPI_DRS_NGX_DLSS_NR_OVERRIDE=on DXVK_NVAPI_DRS_NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION=render_preset_a`
   (presets `a` to `d`) pick which of NVIDIA's presets the game runs. They do not change Neural Forge. Switch
   the game's own DLSS 5 off while Neural Forge runs, or the frame gets both.
-- **Not carried over from upstream DLSS5VKLayer:** see
-  [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md).
 
 ## More troubleshooting
 

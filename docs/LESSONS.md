@@ -1714,7 +1714,8 @@ Not built. A face pass would also need a detector with a licence that fits (SCRF
   launch parameters (DLSS_KERNEL_CATALOGUE.md lists words that may hold it, measured only where the image was the
   render size), so it cannot feed the network less than the image. The reporter saw it go with Auto; it should go
   with the fog. If it stays, `NEURAL_FORGE_PROBE_PARAMS=1` would show whether DLSS is given 1485x835 inside the
-  1488x836 image.
+  1488x836 image. (Later, November 11: the NGX records give the subrect, and the hold works on the rendered
+  rectangle alone; see "November 11: DLSS's subrect".)
 
 ## November 10: two vkd3d-proton games the hold missed (#51)
 
@@ -1915,6 +1916,71 @@ the fix (none reached a release):
   half, so only RG32F narrows; the reading covers a non-finite vector from any of them.
 - **Lesson:** a game's motion vectors can hold values no conversion keeps (NaN, beyond the half's range); every
   reader of the copy must agree on what such a vector means, and "no history" is the one that cannot smear.
+
+## November 11: DLSS's subrect (ring version 3)
+
+- **What was missing.** The NGX wrapper wrote `DLSS.Render.Subrect.Dimensions` into its records since 4.0, but the
+  layer never read it, nor where the rectangle starts in each image (`DLSS.Input.{Color,MV,Depth}.Subrect.Base`,
+  `DLSS.Output.Subrect.Base`, which the wrapper did not read). The hold worked on the whole colour input. Idea from
+  chooidos's OptiScaler fix (3zwr1/AMD-NR---OptiScaler PR #61): read the game's subrect and work on that alone; no
+  code taken from it.
+- **Who uses one.** Of the installed DLSS games, Cyberpunk 2077, GTA V Enhanced, Red Dead Redemption 2 and Crimson
+  Desert give DLSS the whole images (their wrapper logs: render size = colour input, every base 0). Hogwarts Legacy
+  (Unreal Engine 4) at 3840x2160 with DLSS Quality renders 2562x1441 into a 2564x1444 colour input (and 1707x960 into
+  1708x964 at 2560x1440), with render-size motion vectors in an image of exactly 2562x1441 (created with MVLowRes).
+  GTA San Andreas - The Definitive Edition (Unreal Engine 4, D3D11 through DXVK) at 4K renders 2228x1253 into a
+  2228x1256 colour input, with 3840x2160 motion vectors (high-resolution).
+  Unreal rounds its scene textures up and keeps them at the largest size asked for; Expedition 33 (#51) gave
+  1485x835 of 1488x836.
+- **What it did.** The network ran on the 2 columns and 3 rows DLSS never reads, whatever they held, and DLSS read
+  the network's answer next to them: the network's edges mixed them in. That is the likely cause of the line down
+  the right edge (above): 3 columns there in Expedition 33. And because Hogwarts' motion vectors (2562x1441) were
+  smaller than the colour input, 4.0 copied none of them at 4K: its holds had no motion for the history.
+- **Now.** The layer reads the render size and the bases (`ngx_ring::Record::crop`); the hold inside DLSS's buffer
+  copies the colour input's rectangle from its base, the motion vectors and depth from theirs, runs the network on
+  them (first at the rectangle's size; since the dynamic-resolution change below, at the colour input's whole extent
+  with the rectangle's edge around it), and writes back over the rectangle only. The split works on the whole
+  image, so it refuses such frames (`Hazard::Subrect`). Hogwarts Legacy, 4K, DLSS Quality, through Steam with this
+  build (2026-11-11): `[ngx] DLSS (Super Resolution, handle 1) is given part of its inputs: 2562x1441 of the
+  2564x1444 colour input`, `resources of the hold inside DLSS's buffer for 2562x1441 built`, held inside on every
+  frame with the motion vectors copied, 4328 holds, no miss, network 16.2 ms; the recording of its menu scene (the
+  character select) shows no edge line and nothing wrong at the right or bottom edge. Its HDR did not reach the window
+  on Proton Experimental's copy (no HDR colour space offered), so that run was SDR. GTA San Andreas DE, which the split held
+  before, is now held inside DLSS's buffer (D3D11 through DXVK) at 2228x1253, about 49 holds a second, no miss, the
+  motion vectors resampled from 3840x2160; in play the picture is right against the model switched off in the same
+  run. Its last two output rows are a little brighter with the model on and off alike: DLSS's or the game's, not the
+  hold's.
+- **Known trade-offs.** A subrect frame the hold inside DLSS's buffer refuses (its compute state cannot be put back,
+  no slot, a layout it cannot read) is no longer held by the split either: the split writes the whole image, so it
+  refuses every subrect frame, and such a frame goes unheld. A change of the render size inside the same colour input
+  (dynamic resolution) resets the network's history and the edit cache's edit: they are in the rectangle's pixels,
+  which stand for other points of the screen at another size; nothing rescales them.
+- **Dynamic resolution (November 11, later).** The first version built the hold's staging images and network
+  resources at the rectangle's exact size, so every change of the render size built them again (history starting
+  over, holds skipped while earlier ones ran). An attempt to keep a steady working size by running the network over
+  the pixels around the rectangle was rejected: those are the pixels DLSS does not read, the cause of the edge line.
+  Now the staging images and resources are the colour input's whole extent (constant while the image is), the
+  rectangle is copied to their corner, and the rest is filled with the rectangle's edge (its last column to the
+  right, then its last row below: clamp-to-edge) for colour, motion vectors and depth alike (`inline::record_pad`:
+  NEAREST blits within each staging image, buffer copies for the depth), so the network never sees a pixel DLSS does
+  not read; only the rectangle is written back. Motion vectors are replicated, not zeroed: the padding continues the
+  edge's content, so it moves with the edge; zero would make the edge's copy look static while its colour changes,
+  a false disocclusion next to the rectangle. A new rectangle size is a format change of the history
+  (`native::format_of` reads `Target::region`): one reset, no rebuild. Cost: the network runs over the padding too.
+- **Working extent, not the whole image (review, November 11).** Working at the colour input's whole extent ran the
+  network, the edit cache, the scene-cut detector and the depth over the whole image for any rectangle: a 1920x1080
+  rectangle in a 3840x2160 image cost 4x the pixels and far more VRAM. Each stage now works at the high-water mark of
+  the rectangles held in that image (`inline::working_extent`): rounded up to 64 pixels, within the image, only
+  growing while the image's extent stays, so a smaller rectangle never rebuilds and a larger one rebuilds once
+  (Hogwarts Legacy's 2562x1441 of 2564x1444 still works at the whole image). The padding fills from the rectangle to
+  the working extent. The scene-cut detector and the measured exposure read the rectangle alone (`Target::region`,
+  `ScenePass::set_region`): they had read the padding, so the replicated edge weighed in the comparison and the
+  histogram. A new region size leaves the detector nothing to compare with.
+- **The motion vectors' rectangle** follows the feature's MVLowRes flag first (`Record::mvec_rect`): with it the
+  render size, without it the feature's output size where that fits their image; the size of their image decides only
+  after that. The hold after DLSS takes the same rectangle.
+- **Rule.** A game may hand DLSS larger images than it renders: read everything the game gives DLSS about which part
+  it reads, and never feed the network, or write, pixels DLSS does not read.
 
 ## Deliberately not done, or left open
 

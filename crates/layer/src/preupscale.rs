@@ -895,6 +895,11 @@ pub(crate) enum Hazard {
     /// ahead of the submit that identified the inputs, may carry a transition or a same-layout barrier
     /// before DLSS's launch.
     RecordedBefore,
+    /// Not a synchronization hazard: DLSS is given part of its inputs (NGX's subrect,
+    /// [`crate::ngx_ring::Record::crop`]). The split works on the whole colour input, so it would run the network
+    /// on pixels DLSS never reads and write over them; only the hold inside DLSS's buffer, which copies the
+    /// rectangle alone, takes such a frame.
+    Subrect,
 }
 
 impl Hazard {
@@ -909,6 +914,7 @@ impl Hazard {
             Self::NotSplittable => "the colour input is not an RGBA16F image in GENERAL; only the hold inside DLSS's buffer takes it",
             Self::HeldInside => "this identification's holds run inside DLSS's buffer; every buffer is held there, so the hold keeps one set of resources and the network its history",
             Self::RecordedBefore => "the DLSS launch buffer, or a buffer before it in the submit, was recorded before DLSS's inputs were identified, so its barriers on them were not seen; not holding it (buffers recorded since are held)",
+            Self::Subrect => "DLSS is given part of its colour input (a subrect); the split works on the whole image, so only the hold inside DLSS's buffer takes such frames, on the rectangle alone",
         }
     }
 
@@ -933,7 +939,7 @@ impl Hazard {
             Self::MemoryBarrier => inside!("has a global memory barrier with a write in its source access before its launch"),
             Self::EventWait => inside!("waits on an event before its launch"),
             Self::SuspendedRendering => inside!("resumes dynamic rendering suspended in the buffer before it"),
-            Self::NotSplittable | Self::HeldInside => self.why(),
+            Self::NotSplittable | Self::HeldInside | Self::Subrect => self.why(),
             // Not "takes such buffers": the hold inside refuses a DLSS buffer begun before the identification
             // ([`InlineRefusal::BegunBefore`]); only one begun since, behind an earlier buffer begun before, is taken.
             Self::RecordedBefore => "the DLSS launch buffer, or a buffer before it in the submit, was recorded before DLSS's inputs were identified, so its barriers on them were not seen and the submit is not split in front of it; the hold inside DLSS's buffer takes it only where DLSS's own buffer was begun since (\"holding inside DLSS's command buffer\" says when it holds), and buffers recorded since are held",
@@ -1014,6 +1020,9 @@ pub(crate) struct Tracker {
     after_refused: Option<(DlssOutput, Instant)>,
     /// Outputs whose refusal was logged (once each).
     after_refused_said: Vec<DlssOutput>,
+    /// Output images whose rectangle (`DLSS.Output.Subrect.Base` at the feature's output size) did not fit them, logged
+    /// once each ([`Self::after_point_at`]).
+    after_crop_said: Vec<vk::Image>,
     images: HashMap<vk::Image, ImageDesc>,
     views: HashMap<vk::ImageView, vk::Image>,
     /// Views registered through `vkGetImageViewHandle*NVX`/`vkGetImageViewAddressNVX`, and their image.
@@ -1310,6 +1319,8 @@ pub(crate) enum InlineRefusal {
     /// The buffer itself left the colour input in `GENERAL` and nothing in it keeps the split from it: the
     /// split hold takes the frame at the submit.
     LeftToSplit,
+    /// DLSS's render rectangle (its subrect) does not fit the colour input: DLSS would read outside it.
+    SubrectOutside(crate::ngx_ring::Rect, (u32, u32)),
 }
 
 impl InlineRefusal {
@@ -1339,6 +1350,9 @@ impl InlineRefusal {
             Self::LayoutUnknown => "the colour input's layout at DLSS's launch is unknown".into(),
             Self::Layout(l) => format!("the colour input is in {l:?} at DLSS's launch (the copies take GENERAL, SHADER_READ_ONLY, COLOR_ATTACHMENT or TRANSFER layouts)"),
             Self::LeftToSplit => "the buffer leaves the colour input in GENERAL with nothing in the way: the hold splits the submit instead".into(),
+            Self::SubrectOutside(r, (w, h)) => {
+                format!("DLSS's render rectangle {}x{} at ({}, {}) does not fit its {w}x{h} colour input", r.size.0, r.size.1, r.at.0, r.at.1)
+            }
         }
     }
 
@@ -1356,6 +1370,7 @@ impl InlineRefusal {
             Self::LayoutUnknown => 8,
             Self::Layout(_) => 9,
             Self::LeftToSplit => 10,
+            Self::SubrectOutside(..) => 11,
         }
     }
 }
@@ -1463,7 +1478,15 @@ pub(crate) fn note_held_inside(runs: u32) {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InlinePoint {
     pub colour: vk::Image,
+    /// The colour input's description, its extent the rectangle the hold works on: the whole image, or the part DLSS
+    /// is given ([`Self::offsets`]).
     pub desc: ImageDesc,
+    /// The colour input's whole extent (the output's, after DLSS): the hold's staging images and network resources
+    /// are this size, so a rectangle ([`Self::desc`]) that changes size inside the same image builds nothing again.
+    pub image: (u32, u32),
+    /// Where the hold's rectangles start in the colour input (its copy in and back), the motion vectors and the depth:
+    /// DLSS's subrect ([`crate::ngx_ring::Crop`]); zero for the whole images.
+    pub offsets: Offsets,
     /// The colour input's layout at the hold (restored after it).
     pub layout: vk::ImageLayout,
     pub exposure_input: Option<Aux>,
@@ -1486,6 +1509,14 @@ pub(crate) struct InlinePoint {
     /// The inputs whose layout at the hold is a guess, not something this buffer set: checked when the
     /// buffer is submitted ([`Tracker::layout_when_run`], `inline::Inline::check`).
     pub guessed: Guessed,
+}
+
+/// Where a hold's rectangles start in the images it copies ([`InlinePoint::offsets`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Offsets {
+    pub colour: (u32, u32),
+    pub mvec: (u32, u32),
+    pub depth: (u32, u32),
 }
 
 /// The layouts [`Tracker::inline_point`] took for the hold's inputs without this buffer setting them (no barrier
@@ -1840,6 +1871,15 @@ impl Tracker {
         if self.rendering.get(&cb).is_some_and(|r| r.last_suspending || r.open_resume) {
             return Err(InlineRefusal::SuspendedRendering);
         }
+        // DLSS given part of its inputs (NGX's subrect): the hold works on that rectangle alone, each input read at its
+        // own base, and writes back only there.
+        let live_mvec = self.images.get(&inputs.mvec.0).copied();
+        let (named, _) = self.hold_depth(cb, inputs.depth, None, true);
+        let live_depth = self.images.get(&named).copied();
+        let extent = |d: ImageDesc| (d.width, d.height);
+        let crop = record.crop(extent(desc), live_mvec.map(extent), live_depth.map(extent)).map_err(|_| {
+            InlineRefusal::SubrectOutside(crate::ngx_ring::Rect { at: record.colour_base, size: record.render_size(extent(desc)) }, extent(desc))
+        })?;
         let rgba16f = desc.format == vk::Format::R16G16B16A16_SFLOAT;
         let mut guessed = Guessed::default();
         // A layout the buffer did not set itself is a guess. The best one is what the colour input was in at DLSS's
@@ -1863,6 +1903,8 @@ impl Tracker {
         let at = Inputs { colour: (colour, desc), ..inputs };
         let hazard = match self.launch_hazard(cb, Some(&at)).0 {
             Some(h) => h,
+            // The split would work on the whole image (it refuses the frame for that, [`Self::scan`]).
+            None if crop.is_some() => Hazard::Subrect,
             None if rgba16f && layout == vk::ImageLayout::GENERAL && self.inline_in_use == Some(self.generation) => Hazard::HeldInside,
             None if rgba16f && layout == vk::ImageLayout::GENERAL => return Err(InlineRefusal::LeftToSplit),
             None => Hazard::NotSplittable,
@@ -1880,8 +1922,8 @@ impl Tracker {
         });
         // DLSS's motion vectors, copied beside the colour input for the native backend's history: RG16F
         // at the colour input's extent or larger (high-resolution motion vectors, resampled to it), in
-        // a layout known here (or GENERAL for a storage image).
-        let live_mvec = self.images.get(&inputs.mvec.0).copied();
+        // a layout known here (or GENERAL for a storage image). With a subrect, their own rectangle where it
+        // fits their image.
         let mvec_input = live_mvec.map(|d| {
             let image = inputs.mvec.0;
             let known = self.layout_in(cb, image, true, d.usage.contains(vk::ImageUsageFlags::STORAGE));
@@ -1889,29 +1931,42 @@ impl Tracker {
             let layout = known.map(|(l, _)| l);
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
                 && MVEC_HOLD_FORMATS.contains(&d.format)
-                && d.width >= desc.width
-                && d.height >= desc.height
+                && crop.map_or(d.width >= desc.width && d.height >= desc.height, |c| {
+                    c.mvec.is_some_and(|r| r.size.0 >= c.colour.size.0 && r.size.1 >= c.colour.size.1)
+                })
                 && layout.is_some_and(|l| MVEC_COPY_LAYOUTS.contains(&l));
             Aux { image, format: d.format, layout, readable }
         });
-        let mvec_extent = live_mvec.map_or((0, 0), |d| (d.width, d.height));
+        let mvec_extent = match crop {
+            Some(c) => c.mvec.map_or((0, 0), |r| r.size),
+            None => live_mvec.map_or((0, 0), extent),
+        };
         // DLSS's depth, copied beside it into a slot buffer for the native backend: at the colour
-        // input's extent, in a layout known here. Not when it was destroyed since (Black Myth: Wukong
-        // hands DLSS a new one every frame with frame generation on).
-        let (named, _) = self.hold_depth(cb, inputs.depth, None, true);
-        let depth_input = self.images.get(&named).copied().map(|d| {
+        // input's extent (with a subrect, its rectangle at its base), in a layout known here. Not when it was
+        // destroyed since (Black Myth: Wukong hands DLSS a new one every frame with frame generation on).
+        let depth_input = live_depth.map(|d| {
             let image = named;
             let known = self.layout_in(cb, image, true, false);
             guessed.depth = known.filter(|(_, set)| !set).map(|(l, _)| l);
             let layout = known.map(|(l, _)| l);
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
-                && (d.width, d.height) == (desc.width, desc.height)
+                && crop.map_or((d.width, d.height) == (desc.width, desc.height), |c| c.depth.is_some())
                 && layout.is_some_and(|l| depth_copy_layout(d.format, l));
             Aux { image, format: d.format, layout, readable }
         });
+        let whole = desc;
+        let (desc, offsets) = match crop {
+            Some(c) => (
+                ImageDesc { width: c.colour.size.0, height: c.colour.size.1, ..desc },
+                Offsets { colour: c.colour.at, mvec: c.mvec.map_or((0, 0), |r| r.at), depth: c.depth.map_or((0, 0), |r| r.at) },
+            ),
+            None => (desc, Offsets::default()),
+        };
         Ok(InlinePoint {
             colour,
+            image: extent(whole),
             desc,
+            offsets,
             layout,
             exposure_input,
             mvec_input,
@@ -2120,9 +2175,30 @@ impl Tracker {
         self.after_refused = None;
     }
 
-    fn after_point_at(&self, cb: vk::CommandBuffer, o: DlssOutput, plan: &placement::Plan) -> Option<InlinePoint> {
-        let desc = *self.images.get(&o.image)?;
-        let render = self.images.get(&o.input).map_or((0, 0), |d| (d.width, d.height));
+    fn after_point_at(&mut self, cb: vk::CommandBuffer, o: DlssOutput, plan: &placement::Plan) -> Option<InlinePoint> {
+        let image = *self.images.get(&o.image)?;
+        let record = self.launch.get(&cb).and_then(|r| r.ngx);
+        // The colour input's extent: the image's where the layer tracks it, else the one the record gives; (0, 0) when
+        // neither is known.
+        let input = self.images.get(&o.input).map(|d| (d.width, d.height)).or(record.map(|r| r.colour_extent).filter(|e| e.0 > 0 && e.1 > 0)).unwrap_or((0, 0));
+        // DLSS's render size (its subrect's where given) and the rectangle of the output it writes: the hold works on
+        // that alone, and the render-size motion vectors at their base are resampled up to it.
+        let render = record.map_or(input, |r| r.render_size(input));
+        let out = match record.map(|r| r.output_crop((image.width, image.height))) {
+            Some(Err(why)) => {
+                if !self.after_crop_said.contains(&o.image) {
+                    self.after_crop_said.push(o.image);
+                    crate::log!("[placement] no hold after DLSS's output {}: {why}", hex(o.image));
+                    crate::logging::flush();
+                }
+                return None;
+            }
+            Some(Ok(Some(rect))) => rect,
+            _ => crate::ngx_ring::Rect::whole((image.width, image.height)),
+        };
+        // Without the colour input's extent nothing says what DLSS reads of it: the whole images.
+        let subrect = input != (0, 0) && record.is_some_and(|r| r.has_subrect(input));
+        let desc = ImageDesc { width: out.size.0, height: out.size.1, ..image };
         let copyable = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
         if !OUTPUT_FORMATS.contains(&desc.format) || !desc.plain || !desc.usage.contains(copyable) {
             return None;
@@ -2140,27 +2216,39 @@ impl Tracker {
             return None;
         }
         let mvec = self.images.get(&o.mvec).copied();
+        // The motion vectors' rectangle: with a subrect, the one the hold before the upscaler reads (MVLowRes first,
+        // [`crate::ngx_ring::Record::mvec_rect`]), where it fits their image. With the colour input's extent unknown but
+        // DLSS's render size known and not their image's, the same rule on the render size (none where it does not fit:
+        // the vectors are dropped rather than the whole image resampled over a rectangle DLSS does not read).
+        let mvec_rect = mvec.and_then(|d| {
+            let extent = (d.width, d.height);
+            match record {
+                Some(r) if subrect => r.mvec_rect(input, extent),
+                Some(r) if input == (0, 0) && r.render.0 > 0 && r.render.1 > 0 && r.render != extent => r.mvec_rect(r.render, extent),
+                _ => Some(crate::ngx_ring::Rect::whole(extent)),
+            }
+        });
         let mvec_input = mvec.map(|d| {
             let known = layout_of(o.mvec, &d);
             guessed.mvec = known.filter(|(_, set)| !set).map(|(l, _)| l);
             let layout = known.map(|(l, _)| l);
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
                 && MVEC_HOLD_FORMATS.contains(&d.format)
+                && mvec_rect.is_some()
                 && layout.is_some_and(|l| MVEC_COPY_LAYOUTS.contains(&l));
             Aux { image: o.mvec, format: d.format, layout, readable }
         });
         Some(InlinePoint {
             colour: o.image,
+            image: (image.width, image.height),
             desc,
+            offsets: Offsets { colour: out.at, mvec: mvec_rect.map_or((0, 0), |r| r.at), depth: (0, 0) },
             layout,
             exposure_input: None,
             mvec_input,
-            mvec_extent: mvec.map_or((0, 0), |d| (d.width, d.height)),
+            mvec_extent: mvec_rect.map_or((0, 0), |r| r.size),
             // NGX's `MV.Scale` gives the colour input's pixels; the hold works on the output's.
-            mv_units: self
-                .launch
-                .get(&cb)
-                .and_then(|r| r.ngx)
+            mv_units: record
                 .and_then(|r| r.mv_units())
                 .filter(|_| render.0 > 0 && render.1 > 0)
                 .map(|units| [units[0] * desc.width as f32 / render.0 as f32, units[1] * desc.height as f32 / render.1 as f32]),
@@ -2648,6 +2736,9 @@ impl Tracker {
                     });
                     let colour_owner = inputs.and_then(|i| proposed.get(&i.colour.0).and_then(|p| p.1).or(self.owners.get(&i.colour.0).copied()));
                     let (hazard, dump_hazard, depth_hazard) = self.launch_hazard(cb, inputs.as_ref());
+                    // DLSS given part of its colour input: the split works on the whole image.
+                    let subrect = inputs.is_some_and(|i| record.has_subrect((i.colour.1.width, i.colour.1.height)));
+                    let hazard = hazard.or(subrect.then_some(Hazard::Subrect));
                     self.probe_depth(cb, inputs.as_ref(), depth_hazard);
                     found = Some(Scan {
                         batch: bi,
@@ -2870,6 +2961,8 @@ impl Tracking {
     pub(crate) fn new_for(device: vk::Device) -> Arc<Self> {
         let tracking = Arc::new(Self { device: device.as_raw(), ..Self::default() });
         lock(&TRACKING).insert(device, tracking.clone());
+        // A Proton copy older than its source says so in the log, once.
+        crate::proton_notice::note_once();
         // Model mode: whether the game uses DLSS, known before DLSS's first frame ([`dlss_game`]).
         if mode() == Mode::Model {
             dlss_game::watch();
@@ -4324,6 +4417,10 @@ pub(crate) struct Target {
     pub colour: vk::Image,
     pub width: u32,
     pub height: u32,
+    /// Inside DLSS's buffer with a subrect: the rectangle's size at the image's corner (the rest of the
+    /// `width` x `height` the hold works on is its edge, replicated). A new size resets the history: its pixels
+    /// stand for other points of the screen. `None`: the whole extent.
+    pub region: Option<(u32, u32)>,
     pub depth: Option<Aux>,
     /// Inside DLSS's buffer: the slot buffer the hold copied DLSS's depth aspect into there, and the
     /// depth's format (`inline`). Copied from instead of [`Self::depth`].
@@ -4750,7 +4847,7 @@ unsafe fn record_capture(
                 // Unbuilt where it measures (the caller builds it first), the exposure buffer would keep the 0
                 // it was cleared to, and nothing would be written back. Where it only observes, unbuilt
                 // records nothing.
-                pass.record_auto_exposure(device, cmd, ExposureSource::auto_use(target));
+                pass.record_auto_exposure(device, cmd, native::format_of(target), ExposureSource::auto_use(target));
                 pass.record_encode(device, cmd, proxy, target.paper_white);
             }
             None => {
@@ -7454,6 +7551,69 @@ mod tests {
         let plan = placement::current(t.frame());
         let point = t.after_point_at(cb(2), DlssOutput { writes: 3, ..t.dlss_output.unwrap() }, &plan).expect("a point on the output");
         assert_eq!(point.mv_units, Some([2560.0, 1440.0]), "MV.Scale (render pixels per unit) in the output's pixels");
+        assert_eq!((point.offsets, point.desc.width, point.desc.height, point.mvec_extent), (Offsets::default(), 2560, 1440, (1707, 960)), "the whole images");
+        // DLSS writing part of a larger output (`DLSS.Output.Subrect.Base`, at the feature's output size) from part of
+        // its inputs: the hold works on that rectangle, the render-size motion vectors taken at their base.
+        let whole = t.launch[&cb(2)].ngx.expect("matched");
+        let sub = crate::ngx_ring::Record { render: (1280, 720), mvec_base: (2, 1), output_base: (16, 8), output_size: (1920, 1080), ..whole };
+        let at = |t: &mut Tracker, r| {
+            t.launch.get_mut(&cb(2)).expect("launched").ngx = Some(r);
+            t.after_point_at(cb(2), DlssOutput { writes: 3, ..t.dlss_output.unwrap() }, &plan)
+        };
+        let point = at(&mut t, sub).expect("a point on the output's rectangle");
+        assert_eq!((point.desc.width, point.desc.height), (1920, 1080));
+        assert_eq!(point.offsets, Offsets { colour: (16, 8), mvec: (2, 1), depth: (0, 0) });
+        assert_eq!(point.mvec_extent, (1280, 720), "the render size at their base");
+        assert_eq!(point.mv_units, Some([1707.0 * 1920.0 / 1280.0, 1440.0]), "MV.Scale over the render size, in the rectangle's pixels");
+        assert_eq!(point.hold, placement::Hold::of(&plan, placement::Stage::Upscaled, (1280, 720), (1920, 1080)));
+        assert!(at(&mut t, crate::ngx_ring::Record { output_base: (700, 0), ..sub }).is_none(), "a rectangle outside the output: no hold there");
+        // ... said once for that output, however often it comes.
+        assert!(at(&mut t, crate::ngx_ring::Record { output_base: (700, 0), ..sub }).is_none());
+        assert_eq!(t.after_crop_said, [img(0x400)], "the refusal said once");
+        // High-resolution motion vectors (no MVLowRes, the feature's output size fits their image): the same rectangle
+        // the hold before the upscaler reads, not the render size.
+        let hi = crate::ngx_ring::Record {
+            output_base: (0, 0),
+            output_size: (1600, 900),
+            create_flags: whole.create_flags & !crate::ngx_ring::FLAG_MV_LOW_RES,
+            ..sub
+        };
+        let point = at(&mut t, hi).expect("a point");
+        assert_eq!((point.offsets.mvec, point.mvec_extent), ((2, 1), (1600, 900)), "the output size at their base");
+        let point = at(&mut t, crate::ngx_ring::Record { create_flags: hi.create_flags | crate::ngx_ring::FLAG_MV_LOW_RES, ..hi }).expect("a point");
+        assert_eq!(point.mvec_extent, (1280, 720), "MVLowRes: the render size");
+        // A colour input the layer does not track: the record's extent says what DLSS reads; with neither known, the
+        // output whole, and the motion vectors' rectangle from the render size where that is known and not their image's
+        // (none where it does not fit).
+        let untracked = DlssOutput { input: img(0x9900), writes: 3, ..t.dlss_output.unwrap() };
+        let at_untracked = |t: &mut Tracker, r| {
+            t.launch.get_mut(&cb(2)).expect("launched").ngx = Some(r);
+            t.after_point_at(cb(2), untracked, &plan)
+        };
+        let full = crate::ngx_ring::Record { render: (1707, 960), colour_extent: (1707, 960), mvec_base: (0, 0), ..whole };
+        let point = at_untracked(&mut t, full).expect("a point");
+        assert_eq!((point.offsets, point.mvec_extent), (Offsets::default(), (1707, 960)), "the record's extent: the whole images");
+        let low = full.create_flags | crate::ngx_ring::FLAG_MV_LOW_RES;
+        let point = at_untracked(&mut t, crate::ngx_ring::Record { render: (1600, 900), colour_extent: (0, 0), mvec_base: (2, 1), create_flags: low, ..full })
+            .expect("a point");
+        assert_eq!(
+            (point.offsets, point.mvec_extent),
+            (Offsets { mvec: (2, 1), ..Offsets::default() }, (1600, 900)),
+            "no extent known, MVLowRes: the render size of the motion vectors at their base"
+        );
+        let point = at_untracked(&mut t, crate::ngx_ring::Record { render: (1600, 900), colour_extent: (0, 0), mvec_base: (2, 1), ..full }).expect("a point");
+        assert_eq!(
+            (point.offsets.mvec, point.mvec_extent),
+            ((2, 1), (1705, 959)),
+            "no extent known, high-resolution vectors and no output size: what their image holds from their base"
+        );
+        let point = at_untracked(&mut t, crate::ngx_ring::Record { render: (1706, 960), colour_extent: (0, 0), mvec_base: (2, 1), create_flags: low, ..full })
+            .expect("a point");
+        assert_eq!(point.mvec_extent, (0, 0), "the render size does not fit at their base: no motion vectors");
+        assert!(point.mvec_input.is_some_and(|a| !a.readable), "and not read");
+        let point = at_untracked(&mut t, crate::ngx_ring::Record { render: (0, 0), colour_extent: (0, 0), mvec_base: (0, 0), ..full }).expect("a point");
+        assert_eq!((point.offsets, point.mvec_extent), (Offsets::default(), (1707, 960)), "nothing known: the whole images");
+        t.launch.get_mut(&cb(2)).expect("launched").ngx = Some(whole);
         assert!(t.frame_of(cb(2)).reset, "the evaluate's reset");
         inject(vec![a, end_of(&a, 2), b, end_of(&b, 4)]);
         t.launch(cb(2), Some(&param_block(&[0x1400])));
@@ -7990,6 +8150,48 @@ mod tests {
         }
     }
 
+    /// DLSS given part of its colour input (NGX's subrect; Unreal Engine's 1485x835 inside 1488x836, #51): the hold
+    /// inside its buffer works on that rectangle, each input at its own base, also where the split could have taken
+    /// the buffer, and the split refuses the frame (it works on the whole image). A rectangle outside the colour input
+    /// refuses the hold.
+    #[test]
+    fn a_subrect_is_held_inside_on_its_rectangle_and_never_split() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, params) = held_tracker_with(copyable);
+        let sub = crate::ngx_ring::Record {
+            render: (1700, 956),
+            colour_base: (4, 2),
+            mvec_base: (1, 0),
+            depth_base: (0, 3),
+            ..sr_record(2, [0x100, 0x300, 0x200, 0, 0])
+        };
+        crate::ngx_ring::inject(vec![sub]);
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert_eq!(c, sub);
+        let point = t.inline_point(b, &c).expect("held inside: GENERAL, nothing in the way, but a subrect");
+        assert_eq!((point.desc.width, point.desc.height, point.hazard), (1700, 956, Hazard::Subrect));
+        assert_eq!(point.offsets, Offsets { colour: (4, 2), mvec: (1, 0), depth: (0, 3) });
+        assert_eq!(point.mvec_extent, (1700, 956));
+        assert!(point.mvec_input.is_some_and(|m| m.readable), "{:?}", point.mvec_input);
+        let outside = crate::ngx_ring::Record { colour_base: (8, 0), ..sub };
+        assert_eq!(
+            t.inline_point(b, &outside).err(),
+            Some(InlineRefusal::SubrectOutside(crate::ngx_ring::Rect { at: (8, 0), size: (1700, 956) }, (1707, 960)))
+        );
+        // The motion vectors' rectangle outside their image: the hold goes without them.
+        let point = t.inline_point(b, &crate::ngx_ring::Record { mvec_base: (8, 0), ..sub }).expect("held inside");
+        assert!(point.mvec_input.is_some_and(|m| !m.readable) && point.mvec_extent == (0, 0), "{point:?}");
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!(scan.hazard, Some(Hazard::Subrect), "the split refuses it");
+        // The whole image again: the split's, as before.
+        let (mut t, params) = held_tracker_with(copyable);
+        t.launch(cb(3), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert_eq!(t.inline_point(b, &c).err(), Some(InlineRefusal::LeftToSplit));
+        assert_eq!(t.submit_ok(&[vec![cb(3)]]).expect("launch-bearing").hazard, None);
+    }
+
     /// Synchronization on a DLSS input inside the launch buffer, before the launch, is something
     /// the hold would run ahead of: each kind makes the submit one to forward untouched, also when
     /// the layout stays `GENERAL`.
@@ -8225,7 +8427,9 @@ mod tests {
     fn motion_vectors_scale_by_the_colour_input_over_their_extent() {
         let point = |mvec_extent| InlinePoint {
             colour: vk::Image::null(),
+            image: (1708, 964),
             desc: ImageDesc { width: 1708, height: 964, format: vk::Format::R16G16B16A16_SFLOAT, usage: vk::ImageUsageFlags::STORAGE, plain: true },
+            offsets: Offsets::default(),
             layout: vk::ImageLayout::GENERAL,
             exposure_input: None,
             mvec_input: None,
@@ -10267,6 +10471,7 @@ mod tests {
                 height: h,
                 depth: None,
                 depth_buffer: None,
+                region: None,
                 mvec: None,
                 mvec_scale: [1.0, 1.0],
                 exposure: [None; MAX_EXPOSURE],
@@ -10425,6 +10630,7 @@ mod tests {
             height: h,
             depth: None,
             depth_buffer: None,
+            region: None,
             mvec: None,
             mvec_scale: [1.0, 1.0],
             exposure: [None; MAX_EXPOSURE],
@@ -10831,12 +11037,18 @@ mod tests {
 
     /// Runs one auto-exposure hold (roundtrip mode, no exposure image) on `texels` and returns it.
     fn auto_hold(gpu: &Gpu, res: &mut Resources, image: vk::Image, w: u32, h: u32, identification: u64) -> HoldResult {
+        auto_hold_in(gpu, res, image, (w, h), None, identification)
+    }
+
+    /// [`auto_hold`] with DLSS's subrect: `region` at the image's corner ([`Target::region`]).
+    fn auto_hold_in(gpu: &Gpu, res: &mut Resources, image: vk::Image, (w, h): (u32, u32), region: Option<(u32, u32)>, identification: u64) -> HoldResult {
         let target = Target {
             colour: image,
             width: w,
             height: h,
             depth: None,
             depth_buffer: None,
+            region,
             mvec: None,
             mvec_scale: [1.0, 1.0],
             exposure: [None; MAX_EXPOSURE],
@@ -10912,6 +11124,15 @@ mod tests {
         // A new identification starts over: the target at once.
         let reset = auto_hold(&gpu, &mut res, image, w, h, identification + 1).auto_exposure.unwrap();
         assert!((reset.log2_e - reset.target_log2_e).abs() < 1e-6 && (reset.log2_e - after.log2_e).abs() > 1.5, "{reset:?} after {after:?}");
+        // DLSS's subrect: only the rectangle at the corner is measured, never the padding around it (here far brighter).
+        let (rw, rh) = (120u32, 70u32);
+        let inside = frame(rw, rh, sky);
+        let padded = frame(w, h, |x, y| if x < rw && y < rh { sky(x, y) } else { grey(5000.0) });
+        gpu.upload(image, w, h, &padded);
+        let got = auto_hold_in(&gpu, &mut res, image, (w, h), Some((rw, rh)), identification + 2).auto_exposure.unwrap();
+        let want = hdr::auto_exposure_reference(&inside, rw, rh, None);
+        assert_eq!(got.samples, want.samples, "the rectangle's samples alone");
+        assert!((got.log2_e - want.log2_e).abs() < 0.01, "the rectangle's exposure: GPU {} vs CPU {}", got.log2_e, want.log2_e);
         finish(&gpu, res, &[(image, memory)]);
     }
 
@@ -10944,6 +11165,7 @@ mod tests {
                 height: h,
                 depth: None,
                 depth_buffer: None,
+                region: None,
                 mvec: None,
                 mvec_scale: [1.0, 1.0],
                 exposure: [None; MAX_EXPOSURE],
@@ -11018,6 +11240,7 @@ mod tests {
                     height: h,
                     depth: None,
                     depth_buffer: None,
+                    region: None,
                     mvec: None,
                     mvec_scale: [1.0, 1.0],
                     exposure: [None; MAX_EXPOSURE],
@@ -11334,6 +11557,7 @@ mod tests {
             height: 4,
             depth: None,
             depth_buffer: None,
+            region: None,
             mvec: None,
             mvec_scale: [1.0, 1.0],
             exposure: [None; MAX_EXPOSURE],
@@ -11490,6 +11714,7 @@ mod tests {
             height: h,
             depth: Some(Aux { image: depth, format: depth_format, layout: Some(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL), readable: true }),
             depth_buffer: None,
+            region: None,
             mvec: None,
             mvec_scale: [1.0, 1.0],
             exposure: [None; MAX_EXPOSURE],
@@ -11657,6 +11882,7 @@ mod tests {
             height: h,
             depth: Some(Aux { image: depth, format: depth_format, layout: Some(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL), readable: true }),
             depth_buffer: None,
+            region: None,
             mvec: Some(Aux { image: mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
             mvec_scale: [1.0, 1.0],
             exposure: [

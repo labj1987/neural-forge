@@ -23,9 +23,9 @@ use ash::vk::Handle;
 
 /// The file's first 8 bytes, version, and sizes (`crates/ngx-wrapper/src/ring.rs`).
 pub(crate) const MAGIC: [u8; 8] = *b"NFNGXRG1";
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 pub(crate) const HEADER_BYTES: usize = 32;
-pub(crate) const RECORD_BYTES: usize = 128;
+pub(crate) const RECORD_BYTES: usize = 168;
 
 /// `api`'s kind bit of an end-of-evaluate record (`crates/ngx-wrapper/src/ring.rs`: `KIND_END`), and the API's bits.
 pub(crate) const KIND_END: u32 = 1 << 16;
@@ -40,6 +40,8 @@ pub(crate) const FEATURE_RR: u32 = 13;
 
 /// `DLSS.Feature.Create.Flags`' IsHDR bit.
 pub(crate) const FLAG_HDR: u32 = 1;
+/// `DLSS.Feature.Create.Flags`' MVLowRes bit: the motion vectors are at the render size.
+pub(crate) const FLAG_MV_LOW_RES: u32 = 2;
 
 /// The environment variable: `off` reads no ring; a path reads that file instead of this process's.
 pub(crate) const RING_ENV: &str = "NEURAL_FORGE_NGX_RING";
@@ -74,6 +76,47 @@ pub(crate) struct Record {
     pub reset: bool,
     pub colour_extent: (u32, u32),
     pub output_extent: (u32, u32),
+    /// `DLSS.Render.Subrect.Dimensions`: the size of the rectangle DLSS reads of its colour input, depth and (render
+    /// size) motion vectors; (0, 0) when the game gave none (the whole colour input).
+    pub render: (u32, u32),
+    /// Where that rectangle starts in the colour input, the motion vectors and the depth (`DLSS.Input.*.Subrect.Base`),
+    /// and where DLSS writes its output (`DLSS.Output.Subrect.Base`).
+    pub colour_base: (u32, u32),
+    pub mvec_base: (u32, u32),
+    pub depth_base: (u32, u32),
+    pub output_base: (u32, u32),
+    /// The feature's output size (`OutWidth`/`OutHeight` at its creation; (0, 0) when not known): what DLSS writes at
+    /// `output_base`.
+    pub output_size: (u32, u32),
+}
+
+/// A rectangle of an image: where it starts and its size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Rect {
+    pub at: (u32, u32),
+    pub size: (u32, u32),
+}
+
+impl Rect {
+    /// The whole of an image of `extent`.
+    pub(crate) fn whole(extent: (u32, u32)) -> Self {
+        Rect { at: (0, 0), size: extent }
+    }
+    /// Whether it is not empty and lies inside an image of `extent`.
+    pub(crate) fn fits(&self, extent: (u32, u32)) -> bool {
+        let inside = |at: u32, size: u32, whole: u32| size > 0 && u64::from(at) + u64::from(size) <= u64::from(whole);
+        inside(self.at.0, self.size.0, extent.0) && inside(self.at.1, self.size.1, extent.1)
+    }
+}
+
+/// What a hold reads of DLSS's inputs when DLSS is given only part of them ([`Record::crop`]): the rendered rectangle of
+/// the colour input (the hold works on it alone and writes back only there), of the motion vectors and of the depth
+/// (`None` where theirs does not fit their image: the hold goes without them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Crop {
+    pub colour: Rect,
+    pub mvec: Option<Rect>,
+    pub depth: Option<Rect>,
 }
 
 impl Record {
@@ -98,6 +141,91 @@ impl Record {
     pub(crate) fn hdr(&self) -> bool {
         self.create_flags & FLAG_HDR != 0
     }
+    /// The size of the rectangle DLSS reads of its colour input: `DLSS.Render.Subrect.Dimensions` where given, else
+    /// `colour`, the colour image's extent.
+    pub(crate) fn render_size(&self, colour: (u32, u32)) -> (u32, u32) {
+        if self.render.0 > 0 && self.render.1 > 0 {
+            self.render
+        } else {
+            colour
+        }
+    }
+
+    /// Whether DLSS reads less of its inputs than the whole images (`colour`, the colour image's extent): a render
+    /// size below it, or a rectangle that starts elsewhere than at an input's corner.
+    pub(crate) fn has_subrect(&self, colour: (u32, u32)) -> bool {
+        self.render_size(colour) != colour || [self.colour_base, self.mvec_base, self.depth_base] != [(0, 0); 3]
+    }
+
+    /// The rectangle DLSS reads of its motion vectors (`mvec`, their image's extent; `colour`, the colour image's), at
+    /// their base, where it fits their image. The feature's flag decides first: created with MVLowRes, the render size;
+    /// else they are high-resolution ones, the feature's output size where it fits. Only then a guess: the render size
+    /// for an image as large as the colour input, else (no output size known) what their image holds from their base on.
+    /// Shared by the hold before the upscaler ([`Self::crop`]) and the one after it.
+    pub(crate) fn mvec_rect(&self, colour: (u32, u32), mvec: (u32, u32)) -> Option<Rect> {
+        let at = self.mvec_base;
+        let fit = |size| Some(Rect { at, size }).filter(|r| r.fits(mvec));
+        let render = self.render_size(colour);
+        if self.create_flags & FLAG_MV_LOW_RES != 0 {
+            return fit(render);
+        }
+        let output_known = self.output_size.0 > 0 && self.output_size.1 > 0;
+        if let Some(rect) = fit(self.output_size).filter(|_| output_known) {
+            return Some(rect);
+        }
+        if mvec == colour {
+            fit(render)
+        } else if output_known {
+            None
+        } else {
+            fit((mvec.0.saturating_sub(at.0), mvec.1.saturating_sub(at.1)))
+        }
+    }
+
+    /// The rectangles a hold before the upscaler reads, given the extents of the colour image, the motion vectors' and the
+    /// depth's: `None` when DLSS reads the whole images (the hold works on them whole, as without a subrect). Each input's
+    /// at its base: the colour input's and the depth's at the render size, the motion vectors' as [`Self::mvec_rect`]
+    /// says. An `Err` says why the colour input's rectangle does not fit its image: DLSS would read outside it, so
+    /// nothing is held.
+    pub(crate) fn crop(&self, colour: (u32, u32), mvec: Option<(u32, u32)>, depth: Option<(u32, u32)>) -> Result<Option<Crop>, String> {
+        if !self.has_subrect(colour) {
+            return Ok(None);
+        }
+        let size = self.render_size(colour);
+        let rect = Rect { at: self.colour_base, size };
+        if !rect.fits(colour) {
+            return Err(format!(
+                "DLSS's render rectangle {}x{} at ({}, {}) does not fit its {}x{} colour input",
+                size.0, size.1, rect.at.0, rect.at.1, colour.0, colour.1
+            ));
+        }
+        let mvec = mvec.and_then(|m| self.mvec_rect(colour, m));
+        let depth = depth.and_then(|d| Some(Rect { at: self.depth_base, size }).filter(|r| r.fits(d)));
+        Ok(Some(Crop { colour: rect, mvec, depth }))
+    }
+
+    /// The rectangle DLSS writes of its output image (`output`, its extent), for the hold after DLSS: `None` when it
+    /// writes the whole image. The feature's output size at `DLSS.Output.Subrect.Base` (what the image holds from the
+    /// base on where the size is not known); an `Err` when that does not fit the image.
+    pub(crate) fn output_crop(&self, output: (u32, u32)) -> Result<Option<Rect>, String> {
+        let size = if self.output_size.0 > 0 && self.output_size.1 > 0 {
+            self.output_size
+        } else {
+            (output.0.saturating_sub(self.output_base.0), output.1.saturating_sub(self.output_base.1))
+        };
+        let rect = Rect { at: self.output_base, size };
+        if rect == Rect::whole(output) {
+            return Ok(None);
+        }
+        if !rect.fits(output) {
+            return Err(format!(
+                "DLSS's output rectangle {}x{} at ({}, {}) does not fit its {}x{} output image",
+                size.0, size.1, rect.at.0, rect.at.1, output.0, output.1
+            ));
+        }
+        Ok(Some(rect))
+    }
+
     /// What turns the motion vectors into the colour input's pixels (`MV.Scale`), when usable: finite, magnitude in
     /// [1e-3, 1e5].
     pub(crate) fn mv_units(&self) -> Option<[f32; 2]> {
@@ -167,6 +295,12 @@ pub(crate) fn parse_record(b: &[u8]) -> Record {
         reset: u32_at(b, 96) != 0,
         colour_extent: (u32_at(b, 108), u32_at(b, 112)),
         output_extent: (u32_at(b, 116), u32_at(b, 120)),
+        render: (u32_at(b, 100), u32_at(b, 104)),
+        colour_base: (u32_at(b, 128), u32_at(b, 132)),
+        mvec_base: (u32_at(b, 136), u32_at(b, 140)),
+        depth_base: (u32_at(b, 144), u32_at(b, 148)),
+        output_base: (u32_at(b, 152), u32_at(b, 156)),
+        output_size: (u32_at(b, 160), u32_at(b, 164)),
     }
 }
 
@@ -499,6 +633,40 @@ pub(crate) fn note_matched(record: &Record) {
         crate::log!("[ngx] DLSS's colour input is not HDR (NGX's IsHDR flag is clear); the encode treats it as scene-linear all the same");
         crate::logging::flush();
     }
+    if let Some(line) = subrect_line(record, &mut SAID_SUBRECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) {
+        crate::log!("[ngx] {line}");
+        crate::logging::flush();
+    }
+}
+
+/// The features ([`Record::feature`], [`Record::handle`]) whose subrect was said ([`subrect_line`]).
+static SAID_SUBRECT: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+/// Once per feature (in `said`): the line saying DLSS is given only part of its inputs, with the rectangle's size and
+/// where it starts in each image. `None` for an evaluate given the whole images.
+fn subrect_line(r: &Record, said: &mut Vec<(u32, u32)>) -> Option<String> {
+    if !r.has_subrect(r.colour_extent) || said.contains(&(r.feature, r.handle)) {
+        return None;
+    }
+    said.push((r.feature, r.handle));
+    let (size, at) = (r.render_size(r.colour_extent), |(x, y): (u32, u32)| format!("({x}, {y})"));
+    Some(format!(
+        "DLSS ({}, handle {}) is given part of its inputs: {}x{} of the {}x{} colour input at {}, the motion vectors at {}, the depth at {}; its output at {} of {}x{}{}{}",
+        if r.is_rr() { "Ray Reconstruction" } else { "Super Resolution" },
+        r.handle,
+        size.0,
+        size.1,
+        r.colour_extent.0,
+        r.colour_extent.1,
+        at(r.colour_base),
+        at(r.mvec_base),
+        at(r.depth_base),
+        at(r.output_base),
+        r.output_extent.0,
+        r.output_extent.1,
+        if r.output_size.0 > 0 { format!(" (the feature's output {}x{})", r.output_size.0, r.output_size.1) } else { String::new() },
+        if r.is_rr() { "" } else { ". The hold before the upscaler works on that rectangle alone" },
+    ))
 }
 
 /// Whether the evaluate of record `seq` ended (its end record was read); an evaluate no longer kept ended long ago.
@@ -707,7 +875,8 @@ pub(crate) mod tests {
             b[72 + 4 * k..76 + 4 * k].copy_from_slice(&v.to_bits().to_le_bytes());
         }
         b[96..100].copy_from_slice(&reset.to_le_bytes());
-        for (k, v) in [1920u32, 1080, 1920, 1080, 3840, 2160].iter().enumerate() {
+        // No render size given (the whole colour input), then the colour input's and the output's extents.
+        for (k, v) in [0u32, 0, 1920, 1080, 3840, 2160].iter().enumerate() {
             b[100 + 4 * k..104 + 4 * k].copy_from_slice(&v.to_le_bytes());
         }
         b
@@ -743,6 +912,120 @@ pub(crate) mod tests {
         assert_eq!((r.colour_extent, r.output_extent), ((1920, 1080), (3840, 2160)));
         assert!(r.hdr() && r.upscales() && r.is_evaluate() && !r.is_rr());
         assert_eq!(r.paper_white_factor(), 4.0, "pre-exposure 2 over exposure scale 0.5");
+        assert_eq!(r.render, (0, 0));
+        assert!(!r.has_subrect(r.colour_extent), "the whole colour input");
+        let r = parse_record(&with_subrect(b, (1485, 835), [(1, 2), (3, 4), (5, 6), (7, 8)], (3840, 2160)));
+        assert_eq!(
+            (r.render, r.colour_base, r.mvec_base, r.depth_base, r.output_base, r.output_size),
+            ((1485, 835), (1, 2), (3, 4), (5, 6), (7, 8), (3840, 2160))
+        );
+        assert!(r.has_subrect(r.colour_extent));
+    }
+
+    /// `rec` with a render size, the bases of the colour input, motion vectors, depth and output, and the feature's
+    /// output size, where the wrapper writes them.
+    pub(crate) fn with_subrect(mut rec: [u8; RECORD_BYTES], render: (u32, u32), bases: [(u32, u32); 4], output: (u32, u32)) -> [u8; RECORD_BYTES] {
+        let mut put = |at: usize, (x, y): (u32, u32)| {
+            rec[at..at + 4].copy_from_slice(&x.to_le_bytes());
+            rec[at + 4..at + 8].copy_from_slice(&y.to_le_bytes());
+        };
+        put(100, render);
+        for (k, b) in bases.into_iter().enumerate() {
+            put(128 + 8 * k, b);
+        }
+        put(160, output);
+        rec
+    }
+
+    /// The rectangles a hold reads: none for the whole images; the render size at each input's base; high-resolution
+    /// motion vectors at the feature's output size; an input whose rectangle leaves its image is not read, and a colour
+    /// rectangle that does not fit refuses.
+    #[test]
+    fn the_crop_follows_the_render_rectangle() {
+        let whole = Record { colour_extent: (1488, 836), render: (1488, 836), ..Record::default() };
+        assert_eq!(whole.crop((1488, 836), Some((1488, 836)), Some((1488, 836))), Ok(None));
+        assert_eq!(Record { render: (0, 0), ..whole }.crop((1488, 836), None, None), Ok(None), "no render size given: the whole image");
+        // Expedition 33's shape (issue #51): 1485x835 inside 1488x836.
+        let ue = Record { render: (1485, 835), ..whole };
+        let rect = |at, size| Rect { at, size };
+        assert_eq!(
+            ue.crop((1488, 836), Some((1488, 836)), Some((1488, 836))),
+            Ok(Some(Crop { colour: rect((0, 0), (1485, 835)), mvec: Some(rect((0, 0), (1485, 835))), depth: Some(rect((0, 0), (1485, 835))) }))
+        );
+        // Each input at its own base.
+        let based = Record { render: (1280, 720), colour_base: (100, 50), mvec_base: (10, 20), depth_base: (0, 360), ..whole };
+        assert_eq!(
+            based.crop((1920, 1080), Some((1920, 1080)), Some((1920, 1080))),
+            Ok(Some(Crop { colour: rect((100, 50), (1280, 720)), mvec: Some(rect((10, 20), (1280, 720))), depth: Some(rect((0, 360), (1280, 720))) }))
+        );
+        // A depth too small for its rectangle is not read; the colour input still is.
+        assert_eq!(based.crop((1920, 1080), None, Some((1280, 720))).map(|c| c.map(|c| (c.mvec, c.depth))), Ok(Some((None, None))));
+        // The same base in the whole image is a subrect too.
+        assert!(Record { colour_base: (0, 1), ..whole }.has_subrect((1488, 836)));
+        assert!(Record { mvec_base: (8, 0), ..whole }.has_subrect((1488, 836)));
+        // High-resolution motion vectors: the feature's output size at their base, else what their image holds.
+        let hi = Record { render: (2560, 1440), output_size: (3840, 2160), ..whole };
+        assert_eq!(hi.crop((2564, 1444), Some((3840, 2160)), None).unwrap().unwrap().mvec, Some(rect((0, 0), (3840, 2160))));
+        let hi = Record { output_size: (0, 0), mvec_base: (4, 4), ..hi };
+        assert_eq!(hi.crop((2564, 1444), Some((3844, 2164)), None).unwrap().unwrap().mvec, Some(rect((4, 4), (3840, 2160))));
+        // Render-size motion vectors in an image of their own size (MVLowRes): the render size at their base.
+        let low = Record { render: (2562, 1441), create_flags: FLAG_MV_LOW_RES, ..whole };
+        assert_eq!(low.crop((2564, 1444), Some((2568, 1448)), None).unwrap().unwrap().mvec, Some(rect((0, 0), (2562, 1441))));
+        assert_eq!(Record { create_flags: 0, output_size: (3840, 2160), ..low }.crop((2564, 1444), Some((2568, 1448)), None).unwrap().unwrap().mvec, None);
+        // Outside the colour input: refused, with the sizes said.
+        let out = Record { render: (1485, 835), colour_base: (4, 0), ..whole }.crop((1488, 836), None, None);
+        assert!(out.as_ref().is_err_and(|e| e.contains("1485x835 at (4, 0)") && e.contains("1488x836")), "{out:?}");
+        assert!(!Rect { at: (0, 0), size: (0, 4) }.fits((8, 8)), "empty");
+        assert!(!Rect { at: (u32::MAX, 0), size: (2, 4) }.fits((8, 8)), "no overflow");
+    }
+
+    /// The motion vectors' rectangle follows the feature's flag first: without MVLowRes they are high-resolution ones at
+    /// the feature's output size, even in an image as large as the colour input (a dynamic-resolution game rendering
+    /// into an output-size colour image); with it, the render size whatever their image's size. Only without either
+    /// does the image's size decide.
+    #[test]
+    fn the_motion_vectors_rectangle_follows_mvlowres_before_the_image_size() {
+        let rect = |at, size| Some(Rect { at, size });
+        let dynamic = Record { render: (1280, 720), output_size: (1920, 1080), ..Record::default() };
+        assert_eq!(dynamic.mvec_rect((1920, 1080), (1920, 1080)), rect((0, 0), (1920, 1080)), "high-resolution: the output size");
+        let low = Record { create_flags: FLAG_MV_LOW_RES, ..dynamic };
+        assert_eq!(low.mvec_rect((1920, 1080), (1920, 1080)), rect((0, 0), (1280, 720)), "MVLowRes: the render size");
+        assert_eq!(low.mvec_rect((1920, 1080), (3840, 2160)), rect((0, 0), (1280, 720)), "MVLowRes in a larger image: still the render size");
+        // No output size known: the old guess.
+        let unknown = Record { output_size: (0, 0), mvec_base: (2, 2), ..dynamic };
+        assert_eq!(unknown.mvec_rect((1920, 1080), (1920, 1080)), rect((2, 2), (1280, 720)), "as large as the colour image: the render size");
+        assert_eq!(unknown.mvec_rect((1920, 1080), (3842, 2162)), rect((2, 2), (3840, 2160)), "else what the image holds from their base");
+        // An output size that does not fit falls back to the guess for an image as large as the colour input only.
+        let big = Record { output_size: (3840, 2160), ..dynamic };
+        assert_eq!(big.mvec_rect((1920, 1080), (1920, 1080)), rect((0, 0), (1280, 720)));
+        assert_eq!(big.mvec_rect((1920, 1080), (2000, 1100)), None);
+        // The hold before the upscaler takes the same rectangle.
+        assert_eq!(dynamic.crop((1920, 1080), Some((1920, 1080)), None).unwrap().unwrap().mvec, rect((0, 0), (1920, 1080)));
+    }
+
+    /// The output's rectangle for the hold after DLSS: the feature's output size at its base.
+    #[test]
+    fn the_output_rectangle_is_the_features_output_at_its_base() {
+        let r = Record { output_size: (3840, 2160), ..Record::default() };
+        assert_eq!(r.output_crop((3840, 2160)), Ok(None));
+        assert_eq!(Record { output_size: (0, 0), ..r }.output_crop((3840, 2160)), Ok(None), "size not known: the whole image");
+        assert_eq!(r.output_crop((3840, 2176)), Ok(Some(Rect { at: (0, 0), size: (3840, 2160) })));
+        assert_eq!(Record { output_base: (0, 16), ..r }.output_crop((3840, 2176)), Ok(Some(Rect { at: (0, 16), size: (3840, 2160) })));
+        assert_eq!(Record { output_base: (0, 16), output_size: (0, 0), ..r }.output_crop((3840, 2176)), Ok(Some(Rect { at: (0, 16), size: (3840, 2160) })));
+        assert!(Record { output_base: (0, 17), ..r }.output_crop((3840, 2176)).is_err());
+    }
+
+    /// The subrect is said once per feature, with its size and every base; not for an evaluate given the whole images.
+    #[test]
+    fn a_subrect_is_said_once_per_feature() {
+        let mut said = Vec::new();
+        let whole = Record { feature: FEATURE_SR, handle: 1, colour_extent: (1488, 836), render: (1488, 836), ..Record::default() };
+        assert_eq!(subrect_line(&whole, &mut said), None);
+        let ue = Record { render: (1485, 835), depth_base: (0, 1), ..whole };
+        let line = subrect_line(&ue, &mut said).expect("said");
+        assert!(line.contains("1485x835 of the 1488x836 colour input at (0, 0)") && line.contains("the depth at (0, 1)"), "{line}");
+        assert_eq!(subrect_line(&Record { render: (1400, 800), ..ue }, &mut said), None, "once per feature");
+        assert!(subrect_line(&Record { handle: 2, ..ue }, &mut said).is_some(), "another feature");
     }
 
     /// An end record: the kind bit read apart from the API, and tied to its evaluate by feature, handle, thread and
@@ -785,6 +1068,15 @@ pub(crate) mod tests {
         assert_eq!(latest_for(img(0x10)).map(|r| r.seq), Some(1), "its parameters stay readable");
     }
 
+    /// The wrapper writes the version and record size read here (it is its own workspace: its constants are read from
+    /// its source).
+    #[test]
+    fn the_wrapper_writes_the_format_read_here() {
+        let wrapper = include_str!("../../ngx-wrapper/src/ring.rs");
+        assert!(wrapper.contains(&format!("pub const VERSION: u32 = {VERSION};")), "the wrapper's ring version");
+        assert!(wrapper.contains(&format!("pub const RECORD_BYTES: usize = {RECORD_BYTES};")), "the wrapper's record size");
+    }
+
     #[test]
     fn the_header_is_checked() {
         assert_eq!(parse_header(&header(4, 0)), Ok(4));
@@ -794,6 +1086,14 @@ pub(crate) mod tests {
         let mut v1 = header(4, 0);
         v1[8] = 1;
         assert!(parse_header(&v1).unwrap_err().contains("version 1"), "a wrapper without end records");
+        // 4.0's wrapper: end records, no subrects, 128-byte records.
+        let mut v2 = header(4, 0);
+        v2[8] = 2;
+        v2[12..16].copy_from_slice(&128u32.to_le_bytes());
+        assert!(parse_header(&v2).unwrap_err().contains("ring version 2 with 128-byte records; this layer reads version 3"), "a wrapper without subrects");
+        let mut short = header(4, 0);
+        short[12..16].copy_from_slice(&128u32.to_le_bytes());
+        assert!(parse_header(&short).is_err(), "this version with another record size");
         assert!(parse_header(&header(4, 0)[..HEADER_BYTES + RECORD_BYTES]).is_err(), "shorter than its slots");
     }
 

@@ -285,6 +285,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
     }
     out.extend(check_steam(roots));
     out.extend(check_proton(roots));
+    out.extend(check_ngx_versions(roots));
     out.extend(check_xid(roots));
     out.extend(check_input_group(roots));
     out.extend(check_session_log(roots, events.as_deref().map_err(|e| e.kind()), session.as_deref()));
@@ -811,6 +812,27 @@ fn enabled_options(game: &crate::steam::Game) -> Option<String> {
     crate::steam::launch_options(&game.root.path, &game.appid).into_iter().filter_map(|a| a.options).find(|o| crate::launch_options::is_enabled(o))
 }
 
+/// The NGX file versions ([`crate::ngx_versions`]): the driver's core, what each game loaded in its last run (the
+/// wrapper's record), and the NGX DLLs present in each switched-on game's folder and prefix. Always a note: it is
+/// there so a bug report shows which DLSS files a game runs: an over-the-air update, a game's own update or a DLL the user
+/// replaced.
+fn check_ngx_versions(roots: &Roots) -> Vec<Finding> {
+    use crate::ngx_versions as nv;
+    let games = crate::steam::games(&roots.steam_roots);
+    let on: Vec<&crate::steam::Game> = games.iter().filter(|g| g.unsupported().is_none() && enabled_options(g).is_some()).collect();
+    let dirs: Vec<&Path> = roots.driver_lib_dirs.iter().map(PathBuf::as_path).collect();
+    let core = crate::proton_tool::driver_core(&dirs);
+    let records = nv::read_records(&roots.state_dir, std::time::SystemTime::now());
+    let dirs: Vec<(PathBuf, PathBuf)> = on.iter().map(|g| (g.dir(), g.library.join("steamapps/compatdata").join(&g.appid).join("pfx/drive_c"))).collect();
+    let files: Vec<nv::GameFiles> =
+        on.iter().zip(&dirs).map(|(g, (game_dir, drive_c))| nv::GameFiles { name: &g.name, appid: &g.appid, game_dir, drive_c }).collect();
+    let summary = match records.len() {
+        0 => "NGX versions: no game has recorded its loaded DLSS files yet".to_string(),
+        n => format!("NGX versions: {n} game(s) recorded their loaded DLSS files"),
+    };
+    vec![Finding::new("ngx-versions", Severity::Info, summary, nv::render(core.as_deref(), &records, &files), None)]
+}
+
 /// Since 4.0 the layer works only in games run with a Neural Forge Proton (`proton_tool`): the NGX wrapper must be
 /// installed and match the driver's NGX core both ways ([`compare_exports`]); each copy must be on Wine 10 or newer
 /// and hold the installed wrapper; each switched-on game (but a native Linux one) must be set to such a Proton; and a
@@ -881,6 +903,15 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
                     format!("{} was made from {}, which is no longer installed: the copy keeps working as it is", t.name, t.source.display()),
                     t.dir.display().to_string(),
                     Some("Nothing to do. For a newer Proton, switch the game off, choose that Proton for it in Steam, and switch it on again.".into()),
+                ));
+            }
+            if !proton_tool::source_changed(t) && !proton_tool::source_gone(t) && proton_tool::links_changed(t) {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Warning,
+                    format!("{} shares files with {} that Steam changed in place since the copy was made: it no longer matches the version it records", t.name, t.source.display()),
+                    t.dir.display().to_string(),
+                    Some("Close Steam, then make it again in the Setup tab (or `neural-forge-cli proton-tool create` for its source): the copy then holds the source's current files.".into()),
                 ));
             }
         }
@@ -1676,6 +1707,23 @@ mod tests {
         assert!(has(Severity::Info, "which is no longer installed: the copy keeps working"), "{v:#?}");
         assert!(!has(Severity::Info, "was made from an older"), "a source that is gone is not a newer one: {v:#?}");
         assert!(v.iter().any(|x| x.check == "ngx-ring" && x.summary.contains("ring version 1")), "{v:#?}");
+    }
+
+    /// A running game whose copy still holds the wrapper of the ring version before (no subrects) is said; one of the
+    /// version this layer reads is not.
+    #[test]
+    fn a_ring_of_the_version_before_is_reported() {
+        let f = quiet();
+        write(&f.roots.data_dir.join(crate::proton_tool::WRAPPER), "MZ");
+        let ring = f.roots.ring_dir.join(format!("neural-forge-ngx-{}.ring", std::process::id()));
+        write(&ring, "NFNGXRG1\x02\0\0\0");
+        let v = check_proton(&f.roots);
+        let found = v.iter().find(|x| x.check == "ngx-ring").expect("reported");
+        assert!(found.summary.contains("ring version 2") && found.summary.contains("reads version 3"), "{found:#?}");
+        let mut current = b"NFNGXRG1".to_vec();
+        current.extend(crate::proton_tool::RING_VERSION.to_le_bytes());
+        std::fs::write(&ring, current).unwrap();
+        assert!(!check_proton(&f.roots).iter().any(|x| x.check == "ngx-ring"), "the version read");
     }
 
     fn one<'a>(findings: &'a [Finding], check: &str) -> &'a Finding {

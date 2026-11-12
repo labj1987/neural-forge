@@ -35,6 +35,7 @@ mod present_sync;
 mod preupscale;
 mod probe_ngx;
 mod probe_seq;
+mod proton_notice;
 mod series;
 mod shared_queue;
 mod sharpen;

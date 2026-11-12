@@ -45,6 +45,7 @@ mod path;
 pub mod persist;
 pub mod private_dir;
 pub mod processes;
+pub mod proton_copy;
 pub mod rebuild;
 mod slot;
 pub mod state_log;

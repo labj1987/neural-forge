@@ -1106,10 +1106,13 @@ impl HdrPass {
     ///
     /// # Safety
     /// `cmd` is recording; [`Self::bind_colour`] was called for this hold.
-    pub(crate) unsafe fn record_auto_exposure(&self, device: &ash::Device, cmd: vk::CommandBuffer, using: AutoUse) -> bool {
+    pub(crate) unsafe fn record_auto_exposure(&self, device: &ash::Device, cmd: vk::CommandBuffer, region: (u32, u32), using: AutoUse) -> bool {
         let Some(auto) = &self.auto else { return false };
+        // Only `region` (DLSS's rectangle at the corner, or the whole extent) is measured: the rest is the rectangle's
+        // edge replicated, which would weigh its border in the histogram.
+        let (width, height) = (region.0.clamp(1, self.width), region.1.clamp(1, self.height));
         // SAFETY: forwarded.
-        unsafe { auto.record(device, cmd, self.width, self.height, using) };
+        unsafe { auto.record(device, cmd, width, height, using) };
         true
     }
 

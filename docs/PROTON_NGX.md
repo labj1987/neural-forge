@@ -58,26 +58,44 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   handles the layer saw at `vkCreateImage`. The interop device is asked for per resource and released after the
   lookup, so the wrapper keeps no device alive and a game that makes a new device is asked through the new one.
   Per evaluate: `Color`, `MotionVectors`, `Depth`, `Output`,
-  `ExposureTexture`, `Jitter.Offset`, `MV.Scale`, `DLSS.Pre.Exposure`, `DLSS.Exposure.Scale`, `Reset`, the render
-  subrect, the extents, and the feature (Super Resolution 1, Frame Generation 11, Ray Reconstruction 13) with its
-  creation flags (`IsHDR`, `MVLowRes`, `MVJittered`, `DepthInverted`, `AutoExposure`).
+  `ExposureTexture`, `Jitter.Offset`, `MV.Scale`, `DLSS.Pre.Exposure`, `DLSS.Exposure.Scale`, `Reset`, the extents,
+  DLSS's subrect (`DLSS.Render.Subrect.Dimensions`, and where the rectangle starts in each image:
+  `DLSS.Input.Color.Subrect.Base`, `DLSS.Input.MV.Subrect.Base`, `DLSS.Input.Depth.Subrect.Base` and
+  `DLSS.Output.Subrect.Base`, X and Y, which NVIDIA's SDK helpers set with `SetUI`; 0 when not given), the feature's
+  output size from its creation (`OutWidth`/`OutHeight`), and the feature (Super Resolution 1, Frame Generation 11,
+  Ray Reconstruction 13) with its creation flags (`IsHDR`, `MVLowRes`, `MVJittered`, `DepthInverted`, `AutoExposure`).
   Looking an image up calls into the resource the parameter names, so the wrapper does it only for parameters
   NVIDIA's own call reads, which the game must keep alive: the images only for Super Resolution and Ray
   Reconstruction (the features the layer uses; Frame Generation's records carry none), and `ExposureTexture` not
   with `AutoExposure` (DLSS ignores it then, so a game may leave it pointing at a freed resource). The other images
   the text log lists are logged as their bare pointers. A creation NVIDIA failed (`NVSDK_NGX_FAILED`) is logged
   only: its handle out-parameter is not NVIDIA's then, and is not read.
-- **The ring.** `crates/ngx-wrapper/src/ring.rs` (version 2): a 32-byte header, 1024 slots of 128 bytes. A writer reserves a slot
-  with an atomic add, zeroes its `seq`, writes it, then sets `seq` to its number; the reader takes a slot only while
-  `seq` reads the same before and after copying it. The file is named by the Linux pid (the wrapper asks Wine with
-  `NtQueryInformationProcess(ProcessWineUnixPid)`; `Z:\proc\self` would name the wineserver, which opens files for
-  Wine), which the layer gets from `getpid()`. The layer maps it read-only and removes the
-  file, so nothing is left behind. A ring no layer opened is removed once its game is gone: when Neural Forge (the app
-  or the CLI) starts, and by `uninstall --purge`; never a running process's (`proton_tool::sweep_dead_rings`).
-  `doctor` reports a running game's ring of another version than the layer reads (a copy with an older wrapper). An evaluate's record is written
-  before NVIDIA's `EvaluateFeature` is called, so before NGX records any of the evaluate's launches, on the same
-  thread; once the call returned, the wrapper writes the same record again with `KIND_END` (bit 16 of `api`; the API is
-  the low 16 bits). Every launch of the evaluate lies between the two.
+- **The ring.** `crates/ngx-wrapper/src/ring.rs` (version 3, since the subrect fields; 4.0's wrapper writes version 2):
+  a 32-byte header, 1024 slots of 168 bytes. A writer reserves a slot with an atomic add, zeroes its `seq`, writes it,
+  then sets `seq` to its number; the reader takes a slot only while `seq` reads the same before and after copying it.
+  The file is named by the Linux pid (the wrapper asks Wine with `NtQueryInformationProcess(ProcessWineUnixPid)`;
+  `Z:\proc\self` would name the wineserver, which opens files for Wine), which the layer gets from `getpid()`. The layer
+  maps it read-only and removes the file, so nothing is left behind. A ring no layer opened is removed once its game is
+  gone: when Neural Forge (the app or the CLI) starts, and by `uninstall --purge`; never a running process's
+  (`proton_tool::sweep_dead_rings`). `doctor` reports a running game's ring of another version than the layer reads (a
+  copy with an older wrapper). An evaluate's record is written before NVIDIA's `EvaluateFeature` is called, so before
+  NGX records any of the evaluate's launches, on the same thread; once the call returned, the wrapper writes the same
+  record again with `KIND_END` (bit 16 of `api`; the API is the low 16 bits). Every launch of the evaluate lies between
+  the two.
+- **The NGX versions.** After a feature is created (`modules.rs`, `note_loaded`) the wrapper lists the process's
+  modules (`K32EnumProcessModules`, which Wine serves), keeps `_nvngx.dll` and `nvngx*.dll` (itself, NVIDIA's core, the
+  snippets `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `nvngx_dlssd.dll`, `nvngx_dlssnr.dll`, ...), whatever path each was
+  loaded from, and reads each file's `VS_FIXEDFILEINFO` version through `version.dll` (loaded when needed, not
+  imported). It logs them when the text log is on and, in a game the layer is on in, writes
+  `$XDG_STATE_HOME/neural-forge/ngx-modules/<app id>-<exe>.txt` (the format is in `modules.rs`; a run replaces the
+  file, and it is rewritten only when the set of paths changes). `<app id>` is Steam's `SteamAppId` (else
+  `SteamGameId`), else `x` and a hash of the executable's path, so games whose executables share a name keep apart.
+  Wine does not pass `HOME` into the game's Windows environment (it gives `WINEHOMEDIR`, `\??\Z:\home\<user>`), so
+  without `XDG_STATE_HOME` the wrapper takes the home from there, the same directory the supervisor uses. It writes through `Z:` for a `Z:` home, and through the NT path (`\\?\unix\home\<user>\.local\state\...`, or the other drive's) for a `\??\unix\...` or other-drive `WINEHOMEDIR`, so it needs no `Z:` drive. `doctor`
+  and the report (`ngx_versions.rs`) show that record with how long ago it was written, and the NGX DLLs present in each switched-on game's folder, its prefix's
+  `ProgramData/NVIDIA/NGX` and `system32`, and the driver's core, with their versions read from the PE resources on
+  the Linux side (`model::dll_file_version`: headers and resource section only). The record is for a bug report's
+  sake: nothing reads it to decide anything.
 - **Only where the layer is on.** The wrapper is in every game a Neural Forge Proton runs, but it creates the ring
   only with `NEURAL_FORGE_ENABLE=1` (the layer's `enable_environment`), without `NEURAL_FORGE_DISABLE=1`, and not with
   `NEURAL_FORGE_NGX_RING=off`: the layer is the ring's only reader and the one that removes the file, so in any
@@ -114,6 +132,27 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
 - **Pre-exposure:** where the encode uses the game's exposure as it is, the paper white is multiplied by
   `DLSS.Pre.Exposure / DLSS.Exposure.Scale` (the colour input is the scene times the pre-exposure; DLSS scales the
   exposure image's value). Encode and decode read the same paper white, so the write-back stays exact.
+- **Subrect:** a game may hand DLSS larger images than it renders and say which part to read: the render size
+  (`DLSS.Render.Subrect.Dimensions`) at each input's base. Unreal Engine does (its scene textures are rounded up and
+  kept at the largest size asked for; Expedition 33 gave 1485x835 of a 1488x836 colour input, #51). The hold before the
+  upscaler then works on that rectangle alone (`ngx_ring::Record::crop`): it copies the colour input's rectangle from
+  its base, the motion vectors' and the depth's from theirs, to the corner of staging images of the stage's working
+  extent (the largest rectangle held in that image so far, rounded up to 64 pixels and within the image: a 1920x1080
+  rectangle of a 3840x2160 image works at 1920x1088, not on 4x the pixels), fills the rest of them with the rectangle's
+  edge (last column, then last row, replicated; motion vectors and depth too), runs the network there, and writes back
+  over the rectangle only, so nothing DLSS does not read is fed to the network or written. The scene-cut detector and
+  the measured exposure read the rectangle alone, not the padding (a new rectangle size has no thumbnail to compare
+  with). The split hold
+  works on the whole image, so it refuses such frames (`Hazard::Subrect`) and the hold inside DLSS's buffer takes them.
+  A rectangle outside the colour input refuses the hold; motion vectors or depth whose rectangle leaves their image are
+  not read. Their rectangle is the render size where the feature was created with `MVLowRes` or they are as large as the
+  colour input (Hogwarts Legacy's 2562x1441 motion vectors for a 2564x1444 colour input), else (high-resolution ones)
+  the feature's output size, at their base. The hold after DLSS works on the output's rectangle (the feature's output
+  size at `DLSS.Output.Subrect.Base`), with the render-size motion vectors from their base (also where the colour
+  input's extent is unknown but the render size is known: none where it does not fit their image). A smaller rectangle
+  inside the same image (dynamic resolution) builds nothing again, and a larger one only once it grows past the working
+  extent; a new size resets the network's history (its pixels stand for other points of the screen). A new image size builds the hold's resources for it. The log says the subrect
+  once per feature (`[ngx] DLSS (...) is given part of its inputs: ...`).
 - **HDR:** a record with `IsHDR` clear is said once in the log (the encode has no path for a display-referred input
   yet).
 
@@ -151,7 +190,17 @@ running game uses (a process whose executable or arguments lie in it) is neither
   `config.vdf` is edited; a `config.vdf` without a `CompatToolMapping` block gets one.
 - **Updates.** When the source changes (a new GE-Proton in a "Latest" folder, a Proton Experimental update), the copy
   is listed as outdated, and `proton-tool update` (or Make again) makes a copy of the new version; with Steam closed,
-  every game set to the old copy is moved to the new one and the old copy is removed. When Neural Forge itself is
+  every game set to the old copy is moved to the new one and the old copy is removed. The copy's name holds the
+  source's version name, so a new version is a new name (the games' `CompatToolMapping` moves with it); the same
+  name (a wrapper-only update) is made again in place. **One check, four places:** `proton_copy::newer_source`
+  (`crates/protocol/src/proton_copy.rs`: the copy's marker names its source and the source's version then; the
+  source's version now is its `version` file's second word) is behind `proton_tool::source_changed`, `doctor`, the
+  Status tab's **Proton copies out of date** group and Setup's Make again (`compat_tool::stale_copies` adds the
+  games set to each copy), and the layer's launch notice. At launch only the layer runs (the launch options are
+  environment variables), so it reads Steam's `STEAM_COMPAT_TOOL_PATHS` (the compat tool folders the game runs with),
+  and for a copy among them whose source has another version than its marker names, logs once per process
+  (`proton_notice.rs`): `[proton] this game runs with <copy>, made from <old> but <source> has <new> now: close Steam
+  and use Make again ...`. Nothing is logged when the source is unreachable from the game's container or gone. When Neural Forge itself is
   installed or updated (the app at start, `install --appdir`), each copy whose marker names another wrapper
   (`wrapper_sha256=`) gets the installed one; `doctor` warns about a copy that still holds another. A copy whose
   source folder is gone (ProtonUp replaced GE-Proton11-12 with 11-13) is not outdated: it holds its own files and keeps
@@ -160,6 +209,23 @@ running game uses (a process whose executable or arguments lie in it) is neither
   named). Otherwise it puts back each recorded game's Proton, takes any other game still set to a copy (a marked one,
   or a `-NeuralForge` name whose folder is gone; never another tool with that suffix) off it, then removes only marked
   copies (and what a stopped copy left, `.<name>.tmp`).
+
+- **Hard links.** A copy shares most files with its source (same inode), so Steam updating the source in place changes
+  the copy's files too. The marker records the shared files at the time (`linked=` and one `link_file=` line each:
+  relative path, size, modification time; no device or inode numbers, no hashing); `doctor` warns when one of those
+  files' own size or time changed while the source's version is unchanged (the Proton was rewritten in place), with
+  Make again as the fix. A source that replaced a file (the copy then keeps the file it was made with) or was removed
+  is no change and says nothing. A copy made before this was recorded, and a copy made across filesystems (full copies, `linked=0`), is not
+  checked and says nothing.
+
+**NGX updater (`nvngx_update.exe`).** Since driver R620 NVIDIA's `nvidia/wine` folder also ships `nvngx_update.exe`,
+NGX's over-the-air updater, and Proton (e3cff01d, PR #10340) and proton-cachyos now copy it into the prefix's
+`system32` next to `_nvngx.dll` and `nvngx.dll`. Copying does not run it: NVIDIA's core starts the updater under Wine
+only when `PROTON_ENABLE_NGX_UPDATER=1` is set, which Proton does not do. Tested on 620.70.06 with Cyberpunk 2077 in a
+Neural Forge copy of patched Proton Experimental: the updater never ran, `ProgramData/NVIDIA/NGX/models` stayed empty,
+and no DLSS file in the prefix or the game folder changed. The wrapper works the same either way. A game that sets
+`PROTON_ENABLE_NGX_UPDATER=1` lets NGX download newer snippets into `ProgramData/NVIDIA/NGX/models`. Neural Forge does
+not depend on which DLSS snippet versions NGX loads.
 
 Proton links many of a prefix's `system32` files to the Proton that last ran it; a removed copy's prefixes are set up
 again by the next Proton a game runs with.
@@ -175,7 +241,8 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
 - GE-Proton releases about three times a month (GE-Proton11-1 2026-06-24 to 11-12 2026-11-03: twelve). A copy is made
   again in seconds. The wrapper needs Wine 10 or newer (`ProcessWineUnixPid`), nothing else of the Wine version.
 - What can break: Valve rewrites the `NVIDIA_WINE_DLL_DIR` block (its TODO says the copies into `system32` go once
-  NGXCore's `NGXPath` is set): the patch then refuses, and the anchor needs updating. NVIDIA adds an export to its core:
+  NGXCore's `NGXPath` is set): the patch then refuses, and the anchor needs updating. `scripts/check_proton_scripts.py` (weekly, `proton-script-check.yml`) runs
+  the patch on the newest Proton Experimental and proton-cachyos scripts and keeps one standing issue open while it does not apply. NVIDIA adds an export to its core:
   the wrapper lacks it and NGX's loader may refuse the core, so the game runs without DLSS. NVIDIA's core lacks one of
   the wrapper's exports (an older driver): a passthrough one answers `NVSDK_NGX_Result_Fail`, a hooked one fails the
   wrapper's load, so the game runs without DLSS (see "Exports the core lacks"). `build-ngx-wrapper.sh` compares the

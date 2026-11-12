@@ -134,6 +134,9 @@ pub(crate) fn effect(reading: Reading, recorded: Recorded) -> Effect {
 pub(crate) struct ScenePass {
     width: u32,
     height: u32,
+    /// The part of the encoded capture the thumbnail is taken of ([`Self::set_region`]): DLSS's rectangle at the
+    /// corner (the rest is its edge replicated, which would weigh in the comparison), else the whole extent.
+    region: (u32, u32),
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     /// The thumbnail pass, then the decision.
@@ -259,6 +262,7 @@ impl ScenePass {
             Some(Self {
                 width,
                 height,
+                region: (width, height),
                 set_layout: std::mem::take(&mut p.set_layout),
                 pipeline_layout: std::mem::take(&mut p.pipeline_layout),
                 pipelines,
@@ -276,6 +280,17 @@ impl ScenePass {
 
     pub(crate) fn matches(&self, width: u32, height: u32) -> bool {
         (self.width, self.height) == (width, height)
+    }
+
+    /// The part of the capture this hold's thumbnail is taken of (`native::format_of`: DLSS's rectangle at the
+    /// corner, or the whole extent), within the pass's extent. A region of another size has nothing to compare
+    /// with: its thumbnail's blocks stand for other pixels, so the next hold only writes it.
+    pub(crate) fn set_region(&mut self, region: (u32, u32)) {
+        let region = (region.0.clamp(1, self.width), region.1.clamp(1, self.height));
+        if region != self.region {
+            self.region = region;
+            self.have = false;
+        }
     }
 
     /// Points the set at this hold's encoded capture and the native pass's state buffer (when they
@@ -317,10 +332,10 @@ impl ScenePass {
     /// # Safety
     /// `cmd` is recording; [`Self::bind`] was called for this hold; `threshold` is above 0.
     pub(crate) unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, threshold: u32) {
-        let push = Push { size: [self.width, self.height], threshold, compare: u32::from(self.have) };
+        let push = Push { size: [self.region.0, self.region.1], threshold, compare: u32::from(self.have) };
         // SAFETY: `Push` is `repr(C)` plain data, read as bytes for its own size.
         let bytes = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<Push>()) };
-        let groups = samples(self.width, self.height).max(1).div_ceil(GROUP);
+        let groups = samples(self.region.0, self.region.1).max(1).div_ceil(GROUP);
         let to_compute = |src_stage, src| {
             let b = vk::MemoryBarrier::default().src_access_mask(src).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
             // SAFETY: forwarded.
@@ -709,6 +724,25 @@ mod tests {
             // Settled again (the same picture twice), a new picture cuts again.
             assert!(!hold(&mut pass, &a, THRESHOLD).cut);
             assert!(hold(&mut pass, &b, THRESHOLD).cut, "a cut after the picture settled");
+
+            // DLSS's subrect: the thumbnail is the rectangle's at the corner; the rest of the capture (the
+            // rectangle's edge replicated) is never read.
+            let (rw, rh) = (W / 2 + 3, H / 2 + 1);
+            let crop = |f: &[[f32; 3]]| -> Vec<[f32; 3]> { (0..rw * rh).map(|i| f[((i / rw) * W + i % rw) as usize]).collect() };
+            let mix = |inside: &[[f32; 3]], outside: &[[f32; 3]]| -> Vec<[f32; 3]> {
+                (0..W * H).map(|i| if i % W < rw && i / W < rh { inside[i as usize] } else { outside[i as usize] }).collect()
+            };
+            pass.set_region((rw, rh));
+            assert_eq!(hold(&mut pass, &a, THRESHOLD), Reading { cut: false, mean: 0 }, "a rectangle of a new size compares with nothing");
+            assert_eq!(hold(&mut pass, &mix(&a, &b), THRESHOLD), Reading { cut: false, mean: 0 }, "outside the rectangle is not read");
+            let rn = samples(rw, rh);
+            let mean_in = cpu_sum(&cpu_thumbnail(&crop(&a), rw, rh), &cpu_thumbnail(&crop(&b), rw, rh)) / rn;
+            assert!(mean_in >= THRESHOLD, "the rectangle's new picture is a cut ({mean_in})");
+            assert_eq!(hold(&mut pass, &mix(&b, &a), THRESHOLD), Reading { cut: true, mean: mean_in }, "the rectangle's own difference");
+            pass.set_region((rw, rh));
+            assert!(!hold(&mut pass, &mix(&b, &b), THRESHOLD).cut, "the same size keeps the comparison");
+            pass.set_region((W, H));
+            assert_eq!(hold(&mut pass, &a, THRESHOLD), Reading { cut: false, mean: 0 }, "back to the whole extent: nothing to compare with");
 
             pass.destroy(device);
             encoded.destroy(device);
