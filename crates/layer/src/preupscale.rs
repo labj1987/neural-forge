@@ -106,6 +106,8 @@ pub(crate) mod inline;
 pub(crate) mod native;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native_post;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod offload;
 pub(crate) mod placement;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_flow;
@@ -5606,6 +5608,9 @@ pub(crate) struct Session {
     /// The server stalled on a frame: nothing starts on this device again.
     #[cfg(target_arch = "x86_64")]
     post_stalled: bool,
+    /// The model on another GPU (`offload`) was given up for the session.
+    #[cfg(target_arch = "x86_64")]
+    offload_given_up: bool,
     /// `NEURAL_FORGE_CAPTURE_AT`: how many times DLSS frames resumed after a gap, when the last resume was,
     /// and which of its entries were taken, one bit each ([`Self::capture_at_due`]).
     resumes: u32,
@@ -6549,6 +6554,13 @@ impl Session {
                     drop(self.post_server.take());
                     return;
                 }
+                // The second GPU could not start, stalled, was lost or was too slow (`offload`, logged there): the
+                // network runs on this device's GPU from the next present on.
+                Some(Status::Unavailable) => {
+                    self.offload_given_up = true;
+                    drop(self.post_server.take());
+                    return;
+                }
                 Some(Status::Retry) => {
                     // The worker has ended: joining it does not wait.
                     drop(self.post_server.take());
@@ -6561,6 +6573,21 @@ impl Session {
                 return;
             }
             let (Some(loader), Some(view)) = (self.native.clone(), shm.view()) else { return };
+            // The model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`, `offload`): only at the finished-frame placement, and
+            // until it is given up for the session.
+            let choice = offload::Choice::current();
+            if choice != offload::Choice::Off && !self.offload_given_up {
+                let (count, placements) = view.header().placements();
+                if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
+                    self.post_server = native_post::PostServer::start_offload(instance.clone(), loader.setup(), device.handle(), choice, view);
+                    return;
+                }
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::log!("[offload] NEURAL_FORGE_OFFLOAD_GPU is set, but the model moves to another GPU only at the Placement setting `present` (every pass): it runs on the game's GPU");
+                }
+            }
+
             // The network's queue is the application's, shared (`crate::shared_queue`): no after-the-upscaler server.
             // Its frames are waited for at the present, and on that queue they run behind the application's own work,
             // which can wait on what the application does only after that present: Red Dead Redemption 2 froze at its

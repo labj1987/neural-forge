@@ -49,6 +49,16 @@ pub unsafe fn register(device: vk::Device, info: &vk::DeviceCreateInfo) -> Regis
     Registration(device)
 }
 
+/// Registers `device` (one the layer made itself, through the loader: `preupscale::offload`) with the loader callback
+/// `like` (the game's device) was registered with: the loader's own, which serves every device the loader made.
+#[cfg(target_arch = "x86_64")]
+pub fn register_like(device: vk::Device, like: vk::Device) -> Registration {
+    let mut devices = DEVICES.lock().unwrap();
+    let setter = devices.get(&like).copied().flatten();
+    devices.insert(device, setter);
+    Registration(device)
+}
+
 unsafe fn initialize(device: vk::Device, object: *mut c_void) -> VkResult<()> {
     let registration = DEVICES.lock().unwrap().get(&device).copied();
     match registration {

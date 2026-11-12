@@ -827,6 +827,12 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         p_device: &mut std::mem::MaybeUninit<vk::Device>,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         self.remember(physical_device);
+        // The device the layer makes for the model on a second GPU, should the loader route it through this layer:
+        // made as asked (`preupscale::offload`).
+        #[cfg(target_arch = "x86_64")]
+        if preupscale::offload::making() {
+            return LayerResult::Unhandled;
+        }
         // A process the layer is off in, or one the target filter excludes (launchers, overlays),
         // gets its device exactly as it asked for it: no queues, features, extensions or worker.
         if !(layer_enabled() && ownership::eligible()) {
@@ -1230,6 +1236,12 @@ impl Layer for NeuralForgeLayer {
             api_version = api_version.max(vk::API_VERSION_1_3);
         }
         let surface_maintenance = swapchain_maintenance::take_instance(instance.handle());
+        // The loader's device callback, for the model on a second GPU (`preupscale::offload`).
+        // SAFETY: the application's create info, valid for the call, its chain the loader's.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            preupscale::offload::note_instance(instance.handle(), create_info)
+        };
         NeuralForgeInstanceHooks {
             ctx: Some(InstanceContext {
                 instance,

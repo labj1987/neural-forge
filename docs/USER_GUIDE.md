@@ -406,6 +406,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_PROBE_DEPTH=1` | layer | Testing aid: log the depth choice and barriers of the first 120 holds. |
 | `NEURAL_FORGE_PROBE_IMAGE=<kernel>[+],...` | layer | Testing aid: copy the images a named CUDA launch reads, before it (or after it with `+`), once, into `captures/probe-<ms>/`. |
 | `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` | layer | Gives every network activation its own allocation again instead of sharing memory by lifetime (more video memory, same result). |
+| `NEURAL_FORGE_OFFLOAD_GPU=same\|N\|vendor:device[@pci-address]` | layer | Runs the model on the finished frame on another GPU: the one at index `N` of the list the layer log prints at start (`[offload] GPU N: ...`), or the one with that PCI vendor and device ID (`10de:2c02`; add `@0000:73:00.0` where two cards share the ID). `same` puts it on a second device of the game's own GPU, which tests the path and saves nothing. Unset or `off`: the game's GPU. See [The model on a second GPU](#the-model-on-a-second-gpu). |
 | `NEURAL_FORGE_POST_MOTION=zero\|flow\|none`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | After the upscaler (the finished frame), the model's history: its previous output at the same pixel (`zero`, the default), where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; it adds that extension and one optical-flow queue to the game's devices, which hung GTA V Enhanced), or none (`none`: every frame on its own, which flickers in large soft patches on grainy or noisy frames). The history is not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and is dropped on a scene cut. |
 | `NEURAL_FORGE_RAISE_VULKAN=off` | layer | A game whose Vulkan instance asks for a version below 1.3 (Red Dead Redemption 2 asks for 1.1) gets one created for 1.3, which the model needs; `off` creates it as the game asks (the model then cannot run in that game). |
 | `NEURAL_FORGE_SHARE_QUEUE=off` | layer | A game that takes every compute queue of the GPU (Red Dead Redemption 2) gets one of them shared with the model, every use of it synchronized; the model then runs before the upscaler only. `off`: no model on such a game. |
@@ -422,6 +423,25 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_NGX_RING=off\|/path` | layer | `off`: the layer reads no NGX records, so nothing is held before or after DLSS (as without the wrapper). A path: read that ring file (left in place) instead of this process's. |
 | `NEURAL_FORGE_NGX_LOG=Z:\path\ngx.log` | NGX wrapper (a Windows path) | One line per DLSS creation, evaluate (every named image, the jitter, motion vector scale, exposure and reset) and release. Off by default. |
 | `NEURAL_FORGE_NGX_CORE=C:\path\_nvngx.dll` | NGX wrapper | Load NVIDIA's core from here instead of `NVIDIA_WINE_DLL_DIR`. |
+
+## The model on a second GPU
+
+With two GPUs in the machine, the model can run on the second one while the game renders on the first, so the
+game's GPU no longer spends its frame time on the network:
+
+1. Set **Placement** to **Finished frame** on the Model tab (`set_placement=3`). Only the model on the finished frame
+   moves: before the upscaler and after DLSS it runs inside DLSS's own work on the game's GPU.
+2. Add `NEURAL_FORGE_OFFLOAD_GPU=1` (the second GPU's index) or its PCI IDs (`NEURAL_FORGE_OFFLOAD_GPU=10de:2c02`) to
+   the game's launch options. The layer log lists every GPU with its index, IDs and PCI address at start
+   (`[offload] GPU 0: ...`), and says which one runs the network and how the frame crosses to it.
+
+The second GPU needs everything the network needs (an NVIDIA RTX 40 series or newer). Each frame goes to it and back
+through system memory, and each frame is shown one frame later than it would be on one GPU: the game's GPU renders
+the next frame while the second GPU works on this one. If the second GPU cannot run the network, cannot be set up,
+stops answering, or takes more than 250 ms a frame for 30 frames in a row (or a whole second once), the model goes
+back to the game's GPU for the rest of the session, and the log says why. Every 600 frames the log has an `[offload]`
+line with the time per frame on the second GPU, the time from sending a frame to its answer, how many frames were
+shown with the model and without, and the time saved on the game's GPU.
 
 ## CLI
 

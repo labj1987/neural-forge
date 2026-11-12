@@ -4,6 +4,16 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## Unreleased
+
+**The model on a second GPU (test build for #63)**
+
+- With two GPUs, the model on the finished frame can run on the second one while the game renders on the first: set
+  Placement to Finished frame and add `NEURAL_FORGE_OFFLOAD_GPU=<index or vendor:device>` to the game's launch
+  options (the user guide's "The model on a second GPU"). Each frame is shown one frame later than on one GPU. If the
+  second GPU cannot run the network, fails or is too slow, the model goes back to the game's GPU and the log says
+  why.
+
 ## 4.1.0 — 2026-11-11
 
 **The model works on exactly what DLSS uses, and outdated Proton copies show up**

@@ -245,6 +245,11 @@ pub enum ComposeInputs<'a> {
     /// `gen_base`/`gen_answer` first. Every other present of the same generation (a carried
     /// frame, the other async slot) reads `gen_*` only. Full-size answers only.
     Gpu { fresh: bool },
+    /// The delayed present of the model on a second GPU (`preupscale::offload`): the answer in the answer region is the
+    /// previous present's frame, whose proxy and full frame [`GpuCompose::keep_delayed`] kept in its pair `parity`. The
+    /// composition works on that frame, not the live image, and its result replaces the live image: each frame is
+    /// shown one present late, exactly as it would have been shown without the delay. Full-size answers only.
+    Delayed { parity: usize },
 }
 
 /// `compose_hdr.comp`'s pipeline over `layout` (compose.comp's).
@@ -357,6 +362,37 @@ struct ZeroCopy {
     /// capture target's and `gen_*`'s reads and writes; on a different queue every async slot is
     /// waited instead.
     last_queue: Option<vk::Queue>,
+    /// The delayed present's kept frames ([`GpuCompose::keep_delayed`]).
+    delayed: Option<Delayed>,
+}
+
+/// Two presents' frames for the delayed present ([`ComposeInputs::Delayed`]): each one's full frame (read off the
+/// swapchain image before anything is composed into it) and the proxy the model was shown (the capture target), kept
+/// until the next present composes its answer.
+struct Delayed {
+    frame_bytes: u64,
+    raw: [DeviceBuffer; 2],
+    base: [DeviceBuffer; 2],
+    cmd: [vk::CommandBuffer; 2],
+    fence: [vk::Fence; 2],
+    /// A pair's last keep was submitted (its fence is armed).
+    armed: [bool; 2],
+}
+
+impl Delayed {
+    /// # Safety
+    /// Nothing submitted may still use them.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded; the command buffers go with the compose's pool.
+        unsafe {
+            for b in self.raw.iter().chain(&self.base) {
+                b.destroy(device);
+            }
+            for f in self.fence {
+                device.destroy_fence(f, None);
+            }
+        }
+    }
 }
 
 struct Sized_ {
@@ -792,7 +828,7 @@ impl ComposeSlot {
         frame_bytes: u64,
         update_cache: bool,
         small_proxy: bool,
-        held: bool,
+        original_from: Option<(vk::Buffer, u64)>,
         bgr_order: bool,
         target_image: vk::Image,
         compose: ComposeParams,
@@ -1104,7 +1140,8 @@ impl ComposeSlot {
             );
             // Frame hold: the composition works on the held frame (third staging segment) rather
             // than whatever the game has drawn since, and the result replaces the live image.
-            let (original_src, original_offset) = if held { (s.staging_buffer, frame_bytes * 2) } else { (s.current_buffer, 0) };
+            // The delayed present: the kept frame the answer belongs to (`ComposeInputs::Delayed`).
+            let (original_src, original_offset) = original_from.unwrap_or((s.current_buffer, 0));
             device.cmd_copy_buffer_to_image(
                 self.cmd,
                 original_src,
@@ -1557,6 +1594,21 @@ impl GpuCompose {
                 }
                 Some(sources)
             }
+            ComposeInputs::Delayed { parity } => {
+                let frames = self.zc.frames.as_ref()?;
+                let kept = self.zc.delayed.as_ref()?;
+                if generation == 0 || (answer_width, answer_height) != (width, height) || frames.frame_bytes != bytes as u64 || kept.frame_bytes != bytes as u64
+                {
+                    return None;
+                }
+                let import = self.zc.answer_import.as_ref().filter(|a| a.bytes >= bytes as u64)?;
+                // The kept proxy stands where the capture target does on a fresh present.
+                let sources = (kept.base[parity].buffer, frames.gen_base.buffer, frames.gen_answer.buffer, Some(import.buffer));
+                if self.zc.last_queue.is_some_and(|q| q != queue) && !self.wait_async_slots(device) {
+                    return None;
+                }
+                Some(sources)
+            }
             ComposeInputs::Cpu { .. } => None,
         };
         let semaphore = self.present_semaphores.get(target_image, || unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok() })?;
@@ -1587,6 +1639,10 @@ impl GpuCompose {
             return None;
         }
         let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let delayed_original = match inputs {
+            ComposeInputs::Delayed { parity } => self.zc.delayed.as_ref().map(|d| (d.raw[parity].buffer, 0)),
+            _ => None,
+        };
         let (update_src, fresh_copy, small_proxy, held) = match inputs {
             ComposeInputs::Cpu { base, answer, proxy_small, held_original } => {
                 if base.len() < bytes || answer.len() < answer_bytes {
@@ -1621,7 +1677,7 @@ impl GpuCompose {
                 }
                 ((s.staging_buffer, 0, s.staging_buffer, bytes as u64), None, small_proxy, held)
             }
-            ComposeInputs::Gpu { .. } => {
+            ComposeInputs::Gpu { .. } | ComposeInputs::Delayed { .. } => {
                 let (capture_target, gen_base, gen_answer, fresh_source) = zero_copy.expect("resolved above");
                 if !slot.slot.ensure_sized(device, &props, width, height) {
                     return None;
@@ -1655,7 +1711,7 @@ impl GpuCompose {
                 bytes as u64,
                 update,
                 small_proxy,
-                held,
+                if held { Some((slot.slot.sized.as_ref().expect("ensured").staging_buffer, bytes as u64 * 2)) } else { delayed_original },
                 bgr_order,
                 target_image,
                 compose,
@@ -1827,6 +1883,147 @@ impl GpuCompose {
         true
     }
 
+    /// The delayed present ([`ComposeInputs::Delayed`]): keeps this present's frame in pair `parity` before anything is
+    /// composed into it: `target_image` (in `PRESENT_SRC_KHR`, `width` x `height`, 4 bytes a pixel) as it is, and the
+    /// capture target the capture just wrote (the proxy the model is shown). Submitted on `queue` behind the capture,
+    /// ahead of the compose that writes the image; waits only for the pair's keep of two presents ago. `false` when
+    /// the pair cannot be kept (then nothing of this frame may be composed later).
+    #[allow(clippy::too_many_arguments)]
+    pub fn keep_delayed(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue: vk::Queue,
+        target_image: vk::Image,
+        width: u32,
+        height: u32,
+        parity: usize,
+    ) -> bool {
+        let bytes = u64::from(width) * u64::from(height) * 4;
+        let Some(capture_target) = self.zc.frames.as_ref().filter(|f| f.frame_bytes == bytes).map(|f| f.capture_target.buffer) else { return false };
+        if self.zc.delayed.as_ref().is_some_and(|d| d.frame_bytes != bytes) {
+            let d = self.zc.delayed.as_ref().expect("checked");
+            let armed: Vec<Option<vk::Fence>> = (0..2).map(|k| d.armed[k].then_some(d.fence[k])).collect();
+            if !wait_armed(device, &armed, "gpu::keep_delayed resize") || !self.wait_async_slots(device) {
+                return false;
+            }
+            // SAFETY: its keeps and every compose that may read it were just waited.
+            unsafe { self.zc.delayed.take().expect("checked").destroy(device) };
+        }
+        if self.zc.delayed.is_none() {
+            // SAFETY: plain property query.
+            let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+            let made: Vec<DeviceBuffer> = (0..4).filter_map(|_| DeviceBuffer::new(device, &props, bytes)).collect();
+            let fences: Vec<vk::Fence> = (0..2).filter_map(|_| unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.ok()).collect();
+            // SAFETY: the compose's own pool (reset-able buffers), used on the present's thread only.
+            let cmds = unsafe {
+                crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(2))
+            };
+            match (made.len(), fences.len(), cmds) {
+                (4, 2, Ok(cmds)) => {
+                    let mut b = made.into_iter();
+                    let mut next = || b.next().expect("four");
+                    self.zc.delayed = Some(Delayed {
+                        frame_bytes: bytes,
+                        raw: [next(), next()],
+                        base: [next(), next()],
+                        cmd: [cmds[0], cmds[1]],
+                        fence: [fences[0], fences[1]],
+                        armed: [false; 2],
+                    });
+                }
+                (_, _, cmds) => {
+                    // SAFETY: none of it was used.
+                    unsafe {
+                        for m in &made {
+                            m.destroy(device);
+                        }
+                        for f in fences {
+                            device.destroy_fence(f, None);
+                        }
+                        if let Ok(c) = cmds {
+                            device.free_command_buffers(self.pool, &c);
+                        }
+                    }
+                    return false;
+                }
+            }
+        }
+        let d = self.zc.delayed.as_mut().expect("made above");
+        if d.armed[parity] && !wait_armed(device, &[Some(d.fence[parity])], "gpu::keep_delayed reuse") {
+            return false;
+        }
+        d.armed[parity] = false;
+        let cmd = d.cmd[parity];
+        let (raw, base) = (d.raw[parity].buffer, d.base[parity].buffer);
+        // SAFETY: the pair's last keep was waited; every handle is live; the image is the swapchain's, in PRESENT_SRC_KHR
+        // with transfer-source usage (the capture copies it too).
+        let recorded = unsafe {
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).is_ok()
+                && device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).is_ok()
+                && {
+                    // After everything before it on the queue (the capture's writes of the target, earlier composes' reads
+                    // of these buffers), and the image readable.
+                    let to_src = image_barrier(
+                        target_image,
+                        vk::ImageLayout::PRESENT_SRC_KHR,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_READ,
+                    );
+                    let memory = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[memory],
+                        &[],
+                        &[to_src],
+                    );
+                    device.cmd_copy_image_to_buffer(cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, raw, &[image_copy_region(width, height, 0)]);
+                    device.cmd_copy_buffer(cmd, capture_target, base, &[vk::BufferCopy::default().size(bytes)]);
+                    let back = image_barrier(
+                        target_image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::ImageLayout::PRESENT_SRC_KHR,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::AccessFlags::empty(),
+                    );
+                    // The compose after it overwrites the image and reads the kept pair: both ordered by this.
+                    let written = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[written],
+                        &[],
+                        &[back],
+                    );
+                    device.end_command_buffer(cmd).is_ok()
+                }
+        };
+        if !recorded {
+            return false;
+        }
+        let d = self.zc.delayed.as_mut().expect("made above");
+        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        // SAFETY: the fence is unsignalled-idle (waited and reset); the caller holds the queue (the present's).
+        let submitted = unsafe { device.reset_fences(&[d.fence[parity]]).and_then(|()| device.queue_submit(queue, &[submit], d.fence[parity])) };
+        if crate::note_vk(device.handle(), submitted).is_err() {
+            return false;
+        }
+        d.armed[parity] = true;
+        self.zc.last_queue = Some(queue);
+        true
+    }
+
     /// Whether `gen_*` hold this answer generation, so a zero-copy compose can present it again
     /// (a carried frame) with no CPU copy of the answer anywhere.
     pub fn holds_generation(&self, generation: u64) -> bool {
@@ -1886,6 +2083,9 @@ impl GpuCompose {
                 f.capture_target.destroy(device);
                 f.gen_base.destroy(device);
                 f.gen_answer.destroy(device);
+            }
+            if let Some(d) = &self.zc.delayed {
+                d.destroy(device);
             }
             // Freeing imported memory never unmaps it: the mapping is `ShmClient`'s.
             if let Some(a) = &self.zc.answer_import {
