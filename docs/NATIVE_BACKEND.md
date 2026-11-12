@@ -1680,8 +1680,10 @@ dropped or repeated. The present waits for the answer, so the frame rate is boun
 Where the delay starts (the first present, and after a stall: a frame kept more than 250 ms before the next present
 is not shown, and this present's frame is kept and sent as a first one's) that present shows its own frame and the
 next shows it again, composed: one repeat, inherent to starting a delay. A frame that could be captured but was not
-is not kept (`keeps_frame`): with nothing waiting the synchronous present takes it, else the frame waiting is shown and
-the next present starts again, so a capture that keeps failing never leaves the stream late without the model. Leaving the path (the model back on this GPU, frame hold, the effect off) drops the kept frame (the stream steps
+is kept as it is and shown in its turn (`keeps_frame`), so an isolated failure costs that frame its edit and nothing
+else; after 3 in a row the synchronous present has the frames for 30 presents before the delayed one tries again, so a
+capture that keeps failing never leaves the stream late without the model. The late rule's first 10 frames after a
+start or a change of size count for nothing (the network is built then). Leaving the path (the model back on this GPU, frame hold, the effect off) drops the kept frame (the stream steps
 over one frame, as a flush of it would, since the frame it replaced is then not shown) and frees the pairs. Every
 present the keep writes to is ordered before the present: the compose or the show that follows it signals the present
 semaphore, or the keep itself does, or its fence is waited. The keeps and the show are in the compose's waits at

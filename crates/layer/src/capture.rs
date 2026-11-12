@@ -511,6 +511,8 @@ pub struct Inflight {
     /// The delayed present's request (the model on a second GPU): the frame posted at the last present, whose answer
     /// this present composes ([`delayed_present`]).
     delayed: Option<DelayedRequest>,
+    /// Presents in a row whose frame could be captured for the other GPU and was not ([`delayed_present`]).
+    unsent: u32,
 }
 
 impl Inflight {}
@@ -571,10 +573,16 @@ fn previous_frame(pending: Option<DelayedRequest>, answered: bool, answer_fits: 
     }
 }
 
-/// Whether the delayed present keeps this present's frame: when it was captured (it is sent), or when it could not be
-/// sent at all (the answer to the frame before is still out: kept as it is, it is shown in its turn).
-fn keeps_frame(captured: bool, can_send: bool) -> bool {
-    captured || !can_send
+/// After this many presents in a row whose frame could not be captured for the other GPU, the synchronous present has
+/// the frames for [`UNSENT_RETRY`] presents before the delayed one tries again.
+const UNSENT_GIVE_WAY: u32 = 3;
+const UNSENT_RETRY: u32 = 30;
+
+/// Whether the delayed present keeps this present's frame: when it was captured (it is sent), when it could not be sent
+/// at all (the answer to the frame before is still out), or after a capture that failed while fewer than
+/// [`UNSENT_GIVE_WAY`] failed in a row before it (`unsent`): kept as it is, it is shown in its turn.
+fn keeps_frame(captured: bool, can_send: bool, unsent: u32) -> bool {
+    captured || !can_send || unsent + 1 < UNSENT_GIVE_WAY
 }
 
 /// A frame the delayed present could capture and did not (logged a few times).
@@ -679,15 +687,24 @@ unsafe fn delayed_present(
     // Not in the `same` test, where the other device shares the game's GPU: it is as slow as the network there.
     if let Some(req) = pending.filter(|r| r.sent && crate::preupscale::offload::Choice::current() != crate::preupscale::offload::Choice::Same) {
         let interval = arrived.saturating_duration_since(req.posted);
-        let verdict =
-            crate::preupscale::offload::LATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().note(round_trip, interval);
+        let verdict = crate::preupscale::offload::LATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().note(
+            round_trip,
+            interval,
+            (width, height),
+        );
         if let Some(why) = verdict {
             crate::preupscale::offload::give_up(why);
         }
     }
     let previous = previous_frame(pending, answered, fits, dims, pending.map_or(std::time::Duration::ZERO, |r| r.posted.elapsed()));
-    // 2. This frame, kept in the other pair; captured and sent only when the server is done with the proxy region.
+    // 2. This frame, kept in the other pair; captured and sent only when the server is done with the proxy region. After
+    // captures that keep failing, the synchronous present has the frames for a while (no capture tried here twice).
     let parity = next_parity(pending);
+    let unsent = inflight[SLOT.index()].unsent;
+    if pending.is_none() && unsent >= UNSENT_GIVE_WAY {
+        inflight[SLOT.index()].unsent = if unsent >= UNSENT_GIVE_WAY + UNSENT_RETRY { 0 } else { unsent + 1 };
+        return Delayed::NotHere;
+    }
     let can_send = !shm.has_pending_request(SLOT);
     let mut sent_dims = None;
     let mut encoded = false;
@@ -755,23 +772,20 @@ unsafe fn delayed_present(
     }
     let Some(gpu) = gpu_compose.as_mut() else { return Delayed::NotHere };
     // 3. Kept before anything is written into the image: this frame as it is (and the proxy it is sent as). After a
-    // stall the delay starts again: nothing kept now, this frame is shown live.
+    // stall the delay starts again with this frame, kept and sent like the first one's. A frame that could be captured
+    // but was not is kept as it is (shown in its turn, without the model) once or twice; after
+    // [`UNSENT_GIVE_WAY`] in a row it is not kept: with nothing waiting the synchronous present takes it, else the frame
+    // waiting is shown and the synchronous present has the next ones for a while.
     let shows_after = matches!(previous, Previous::Answer(_) | Previous::Raw(_));
-    // After a stall the delay starts again with this frame, kept and sent like the first one's. A frame that could be
-    // captured but was not is not kept: with nothing waiting, the synchronous present takes this one; else the frame
-    // waiting is shown and the next present starts again (a capture that keeps failing then never leaves the stream one
-    // frame late with no model).
-    if !keeps_frame(captured, can_send) {
+    inflight[SLOT.index()].unsent = if captured || !can_send { 0 } else { unsent + 1 };
+    let keeps = keeps_frame(captured, can_send, unsent);
+    if !keeps {
         if pending.is_none() || previous == Previous::Stale {
             return Delayed::NotHere;
         }
         note_unsent();
     }
-    let keep = if keeps_frame(captured, can_send) {
-        gpu.keep_delayed(device, instance, physical_device, queue, image, width, height, parity, captured, !shows_after)
-    } else {
-        None
-    };
+    let keep = if keeps { gpu.keep_delayed(device, instance, physical_device, queue, image, width, height, parity, captured, !shows_after) } else { None };
     // 4. The previous frame into this image: composed with its answer, or as it was.
     let mut result = None;
     if let Previous::Answer(req) = previous {
@@ -3422,9 +3436,11 @@ mod tests {
     /// leave the stream late with no model.
     #[test]
     fn a_frame_is_kept_only_when_sent_or_unsendable() {
-        assert!(keeps_frame(true, true));
-        assert!(keeps_frame(false, false), "the answer before is still out: kept as it is");
-        assert!(!keeps_frame(false, true), "a failed capture is not kept");
+        assert!(keeps_frame(true, true, 5));
+        assert!(keeps_frame(false, false, 5), "the answer before is still out: kept as it is");
+        assert!(keeps_frame(false, true, 0), "an isolated failed capture is kept as it is (no skip, no repeat)");
+        assert!(keeps_frame(false, true, UNSENT_GIVE_WAY - 2));
+        assert!(!keeps_frame(false, true, UNSENT_GIVE_WAY - 1), "captures that keep failing give way");
     }
 
     /// The pair a frame is kept in is never the one the frame waiting to be shown is in, whatever the presents count.

@@ -1020,7 +1020,7 @@ impl NeuralForgeInstanceHooks {
         // SAFETY: `physical_device` belongs to this instance.
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            preupscale::offload::log_gpus(&instance.instance, physical_device)
+            preupscale::offload::log_gpus(&instance.instance, physical_device, instance.properties2 == vram::Properties2::Core)
         };
         // Why the model cannot move to another GPU from this device, where the network does not run on it.
         #[cfg(target_arch = "x86_64")]
