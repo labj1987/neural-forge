@@ -694,6 +694,8 @@ pub(crate) struct Stats {
     /// The presents: with the previous frame's answer composed, and without (it was not back, or none was asked).
     pub shown: AtomicU64,
     pub fell_back: AtomicU64,
+    /// Presents that waited for their own answer (the delay was not possible there).
+    pub sync: AtomicU64,
     /// The time from a request to its answer, seen at the present (µs).
     pub round_trip_us: AtomicU64,
     pub round_trips: AtomicU64,
@@ -706,6 +708,7 @@ pub(crate) static STATS: Stats = Stats {
     copy_out_us: AtomicU64::new(0),
     shown: AtomicU64::new(0),
     fell_back: AtomicU64::new(0),
+    sync: AtomicU64::new(0),
     round_trip_us: AtomicU64::new(0),
     round_trips: AtomicU64::new(0),
 };
@@ -727,6 +730,7 @@ impl Stats {
         let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
         let (frames, us, cin, cout) = (take(&self.server_frames), take(&self.server_us), take(&self.copy_in_us), take(&self.copy_out_us));
         let (shown, fell, rt, rts) = (take(&self.shown), take(&self.fell_back), take(&self.round_trip_us), take(&self.round_trips));
+        let sync = take(&self.sync);
         let mean = |sum: u64, n: u64| if n == 0 { 0.0 } else { sum as f64 / n as f64 / 1000.0 };
         let saved = if cin + cout > 0 {
             "the stand-in copy ran in place of the network (NEURAL_FORGE_OFFLOAD_STANDIN)".to_string()
@@ -734,7 +738,7 @@ impl Stats {
             format!("the game's GPU saved about {:.2} ms a frame (the network ran there before)", mean(us, frames))
         };
         format!(
-            "{frames} frames on the other GPU, {:.2} ms each there{}; request to answer {:.2} ms; presents {shown} with the answer, {fell} without; {saved}",
+            "{frames} frames on the other GPU, {:.2} ms each there{}; request to answer {:.2} ms; presents one frame late: {shown} with the answer, {fell} without; {sync} waited for their own answer; {saved}",
             mean(us, frames),
             if cin + cout > 0 { format!(" (copy in {:.2} ms, copy back {:.2} ms)", mean(cin, frames), mean(cout, frames)) } else { String::new() },
             mean(rt, rts),
