@@ -1755,6 +1755,28 @@ per summary, video memory at 11.8 of 12 GB; in 24 captured frames each composite
 and after each stall the capture's own writing caused (2.7 s) one frame went out live and was then shown once more,
 composed.
 
+## Before DLSS on a second GPU: the exchange (#63, 2026-11-12; not wired into the holds yet)
+
+`preupscale::offload_pre`. The hold before DLSS is part of DLSS's command buffer, and DLSS needs the edited colour
+input before it runs, so the other GPU cannot run the same frame's network without the game's GPU waiting for the
+whole round trip. The design delays the edit, not the frame: hold N sends its frame's encode, accumulated motion and
+depth out and carries the edit of frame N-1 onto its own fresh frame as a cached hold of the edit cache does. DLSS
+gets frame N with frame N's depth, vectors and jitter; nothing of NGX's parameters is delayed, frame generation and
+the present see no added latency; the cost is an edit that is always one frame old, carried by the motion vectors
+(today: every second frame in motion, none while still). Delaying DLSS's whole input by a frame was rejected: every
+input and NGX's jitter and reset would have to be held a frame, and frame generation would get vectors of another
+frame.
+
+Built so far is the exchange and its worker: two regions of system memory (imported as host memory on each device
+where it can be), `vkCmdSetEvent` after the send's copies so the worker starts in the order the GPU runs the holds,
+and the wait for the answer on the CPU at the submit of the next hold's buffer (`Exchange::at_submit`, 100 ms at
+most, only for a frame whose buffer went to the driver in an earlier submit). The game's GPU never waits in a command
+buffer: the host may not set an event a pending buffer waits on (VUID-vkSetEvent-event-09543; the first version did
+and the validation layer refused it). `preupscale_offload_gate.comp` leaves the edit unstored where the answer region
+does not hold the expected frame's complete answer (late, abandoned, a hold never submitted, two holds in one
+submit). Tests: two lavapipe devices, a copy on the second in place of the network. The hold's side, the server with
+the network on the other device, the fall-back and the Status tab are not built.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

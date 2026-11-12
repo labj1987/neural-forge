@@ -108,6 +108,7 @@ pub(crate) mod native;
 pub(crate) mod native_post;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod offload;
+pub(crate) mod offload_pre;
 pub(crate) mod placement;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_flow;
