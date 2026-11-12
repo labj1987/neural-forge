@@ -10,9 +10,9 @@
 //! never do.
 //!
 //! `NEURAL_FORGE_OFFLOAD_GPU` names the device ([`Choice`]). The device must have everything the network needs
-//! (`neural_forge_native::device_supported`); anything else, a failed setup, a lost device, or frames slower than
-//! [`TOO_SLOW`], sends the network back to the game's GPU for the rest of the session ([`super::native_post`]),
-//! said once in the log. Only the finished-frame placement can move: the holds before the upscaler and after DLSS
+//! (`neural_forge_native::device_supported`); anything else, a failed setup, the network not running there
+//! ([`ServerRule`]), frames too slow for the game ([`LateRule`]), or a frame that did not finish (once it has), sends the
+//! network back to the game's GPU for the rest of the session ([`given_up`], `super::native_post`), said once in the log. Only the finished-frame placement can move: the holds before the upscaler and after DLSS
 //! run inside DLSS's own command buffer on the game's GPU.
 //!
 //! `NEURAL_FORGE_OFFLOAD_STANDIN=1` (a test switch, never for a game session) runs a copy in place of the network
@@ -155,6 +155,8 @@ pub(crate) enum State {
     Starting(String),
     /// The network runs on the other GPU (its name).
     Active(String),
+    /// A frame on the other GPU (its name) did not finish: the server waits for it, the frames go out without the model.
+    Stalled(String),
     /// Back on the game's GPU for the session, and why.
     FellBack(String),
 }
@@ -164,11 +166,16 @@ static STATE: Mutex<State> = Mutex::new(State::Off);
 /// Notes what the offload is doing ([`State`]).
 pub(crate) fn note_state(state: State) {
     let mut now = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let (State::FellBack(_), State::Starting(_) | State::Active(_)) = (&*now, &state) {
+    if let (State::FellBack(_), State::Starting(_) | State::Active(_) | State::Stalled(_)) = (&*now, &state) {
         // A fall-back is for the session.
         return;
     }
     *now = state;
+}
+
+/// The offload was given up for the session: every device of the process runs the network on its own GPU from then on.
+pub(crate) fn given_up() -> bool {
+    matches!(state(), State::FellBack(_))
 }
 
 /// What the offload is doing.
@@ -182,6 +189,7 @@ pub(crate) fn status_line() -> Option<String> {
         State::Off => None,
         State::Starting(gpu) => Some(format!("second GPU: starting on {gpu}")),
         State::Active(gpu) => Some(format!("second GPU: the model runs on {gpu}, each frame shown one frame later")),
+        State::Stalled(gpu) => Some(format!("second GPU: stalled: a frame on {gpu} did not finish; waiting for it, the frames go out without the model")),
         State::FellBack(why) => Some(format!("second GPU: given up ({why}); the model runs on the game's GPU")),
     }
 }
@@ -397,6 +405,8 @@ pub(crate) struct Offload {
     pub standin: bool,
     /// For the log: the device's name, IDs, PCI address and driver.
     pub name: String,
+    /// For the log when the server starts on it: which GPU, the game's, and how the frame crosses.
+    pub plan: String,
     destroy: PfnLayerDestroyDevice,
     _registration: crate::loader_data::Registration,
 }
@@ -411,12 +421,13 @@ fn family(families: &[vk::QueueFamilyProperties], wanted: u32) -> Option<u32> {
 }
 
 impl Offload {
-    /// Makes the device `choice` names on the game's instance (`game`: its setup, device and GPU). Logs every device
-    /// of the instance and the choice. Slow (a device creation): called on the server's thread.
+    /// Makes the device `choice` names on the game's instance (`game`: the setup of the game's device being made from
+    /// `game_info`). Called inside the game's `vkCreateDevice` ([`make_for`]): the loader's device callback needs the
+    /// lock its trampoline holds there.
     ///
     /// # Safety
-    /// `instance` is the game's (the next layer's dispatch), live for the call; `game_device` is live and created by
-    /// this layer (its loader callbacks registered).
+    /// `instance` is the game's (the next layer's dispatch), live for the call; `game_info` is the game's request, its
+    /// chain the loader's.
     unsafe fn create(instance: &ash::Instance, game: Setup, game_info: &vk::DeviceCreateInfo, choice: &Choice) -> Result<Self, String> {
         let callbacks = callbacks(game.instance).ok_or("the loader gave this instance no device callback (a Vulkan loader older than 1.2.x)")?;
         let layer_gipa = own_gipa().ok_or("the layer could not find its own vkGetInstanceProcAddr")?;
@@ -472,8 +483,12 @@ impl Offload {
             return Err(format!("making the device on {} failed ({made:?})", described[k].name));
         }
         let Some(gdpa) = next_gdpa else {
-            // SAFETY: just made; nothing uses it. The loader's destroy needs the device's own vkDestroyDevice, which
-            // only the missing gdpa gives: it is left to the process's end.
+            // Destroyed again through the loader, with the vkDestroyDevice the next layer's instance gives for it.
+            // SAFETY: just made, nothing of it used; the name is a valid C string.
+            if let Some(destroy) = unsafe { instance.get_device_proc_addr(device, c"vkDestroyDevice".as_ptr()) } {
+                // SAFETY: the loader's callback with the device's own vkDestroyDevice (the PFN's signature by its name).
+                unsafe { (callbacks.destroy)(device, std::ptr::null(), std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroyDevice>(destroy)) };
+            }
             return Err("the loader made the device without the next vkGetDeviceProcAddr".into());
         };
         // SAFETY: the next layer's vkGetDeviceProcAddr for the device just made.
@@ -499,15 +514,25 @@ impl Offload {
             bda_ext: false,
         };
         let name = described[k].line();
-        crate::log!(
-            "[offload] the network runs on GPU {k}: {name}{}; the game's GPU: {}; queue family {family}; the frame crosses system memory: {} on the other GPU, host copies on the game's",
+        crate::log!("[offload] a device made on GPU {k} ({name}) for the model on the finished frame: used once Placement is Finished frame");
+        crate::logging::flush();
+        let plan = format!(
+            "the network runs on GPU {k}: {name}{}; the game's GPU: {}; queue family {family}; the frame crosses system memory: {} on the other GPU, host copies on the game's",
             if same { " (the game's own GPU, a second device: a test of the path, it saves nothing)" } else { "" },
             described.iter().zip(&physicals).find(|(_, &p)| p == game.physical).map_or("unknown".to_string(), |(d, _)| d.line()),
             if host { "imported host memory (VK_EXT_external_memory_host, no CPU copy)" } else { "staged copies (no VK_EXT_external_memory_host)" },
         );
-        crate::log!("[offload] the present shows each frame's answer one frame later: the game's GPU renders the next frame while the other GPU runs this one");
-        crate::logging::flush();
-        Ok(Self { device: ash_device, physical, setup, import: host, standin: !run_network, name, destroy: callbacks.destroy, _registration: registration })
+        Ok(Self {
+            device: ash_device,
+            physical,
+            setup,
+            import: host,
+            standin: !run_network,
+            name,
+            plan,
+            destroy: callbacks.destroy,
+            _registration: registration,
+        })
     }
 
     /// Destroys the device (through the loader, as it was made).
@@ -527,7 +552,7 @@ impl Offload {
 ///
 /// # Safety
 /// `game` is a physical device of `instance`, which is Vulkan 1.3.
-unsafe fn log_gpus(instance: &ash::Instance, game: vk::PhysicalDevice) {
+pub(crate) unsafe fn log_gpus(instance: &ash::Instance, game: vk::PhysicalDevice) {
     static SAID: AtomicBool = AtomicBool::new(false);
     // SAFETY: the game's live instance.
     let Ok(physicals) = (unsafe { instance.enumerate_physical_devices() }) else { return };
@@ -569,8 +594,6 @@ static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
 /// # Safety
 /// Called inside `vkCreateDevice` for `device`; `info` is its request (the loader's chain); `game` its setup.
 pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk::Device, info: &vk::DeviceCreateInfo) {
-    // SAFETY: as the contract.
-    unsafe { log_gpus(instance, game.physical) };
     let choice = Choice::current();
     if choice == Choice::Off {
         return;
@@ -1106,6 +1129,23 @@ mod tests {
         assert!(pick(&Choice::Pci { vendor: 0x10de, device: 0x2c02, bus: None }, &three).unwrap_err().contains("PCI address"));
         let at3 = Some(PciAddress { domain: 0, bus: 3, device: 0, function: 0 });
         assert_eq!(pick(&Choice::Pci { vendor: 0x10de, device: 0x2c02, bus: at3 }, &three), Ok(2));
+    }
+
+    /// Given up is for the process and the session: nothing later reads as running again.
+    #[test]
+    fn a_fall_back_is_for_the_whole_process() {
+        assert!(!given_up());
+        note_state(State::Active("GPU".into()));
+        assert_eq!(status_line().as_deref(), Some("second GPU: the model runs on GPU, each frame shown one frame later"));
+        note_state(State::Stalled("GPU".into()));
+        assert!(status_line().is_some_and(|l| l.contains("stalled")), "a stall is not shown as running");
+        note_state(State::FellBack("too slow".into()));
+        assert!(given_up());
+        note_state(State::Starting("GPU".into()));
+        note_state(State::Active("GPU".into()));
+        assert!(given_up(), "another device's server cannot start it again");
+        assert!(status_line().is_some_and(|l| l.contains("given up (too slow)")));
+        *STATE.lock().unwrap() = State::Off;
     }
 
     #[test]

@@ -561,6 +561,11 @@ impl ShmClient {
 
     /// The layer's status line for the GUI (the native backend's state, or why it is not running).
     #[cfg(target_arch = "x86_64")]
+    /// The layer's status line the channel holds now (empty without a mapping).
+    pub fn layer_reason(&self) -> String {
+        self.header().map(neural_forge_protocol::ShmHeader::layer_reason).unwrap_or_default()
+    }
+
     pub fn set_layer_reason(&self, reason: &str) {
         if let Some(hdr) = self.header() {
             hdr.set_layer_reason(reason);
