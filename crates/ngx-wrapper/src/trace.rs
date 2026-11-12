@@ -5,8 +5,9 @@
 //!
 //! The file is a fixed-size memory-mapped ring of text lines: writing a line is a copy into shared memory, with no
 //! system call and no lock, and the kernel keeps the pages when the process dies, so the last lines before a crash
-//! are there. A fixed-width header line names where the next line goes; once the ring wrapped, the oldest lines
-//! start there. Every line starts with its time, so `tr -d '\0' < FILE | sort -n` puts them in order.
+//! are there. A fixed-width header line names about where the next line goes (a hint: writers on several threads
+//! rewrite it without ordering, so it can lag a line). Every line starts with its time, so `tr -d '\0' < FILE | sort
+//! -n` is the way to put them in order, wrapped or not. Neither a line nor the header allocates or takes a lock.
 //!
 //! This module is the part that needs no Windows (tested on Linux); `win.rs` maps the file and `exports.rs` holds the
 //! thunks that send passthrough calls through [`crate::win`]'s tracer.
@@ -36,24 +37,45 @@ pub fn windows_path(value: &str) -> Option<String> {
     Some(if v.starts_with('/') { format!("Z:{}", v.replace('/', "\\")) } else { v.to_string() })
 }
 
-/// `{pid}` in the path replaced by the game's Linux pid (so a launcher and its game keep apart), else left as is.
+/// `{pid}` in the path replaced by the game's Linux pid; without `{pid}`, `-<pid>` is put before the file's extension
+/// (or at its end), so a launcher and its game, or two runs, never write the same file.
 pub fn with_pid(path: &str, pid: Option<u32>) -> String {
-    match pid {
-        Some(pid) => path.replace("{pid}", &pid.to_string()),
-        None => path.replace("{pid}", "0"),
+    let pid = pid.unwrap_or(0).to_string();
+    if path.contains("{pid}") {
+        return path.replace("{pid}", &pid);
+    }
+    let name_at = path.rfind(['\\', '/']).map_or(0, |i| i + 1);
+    match path[name_at..].rfind('.').filter(|&dot| dot > 0) {
+        Some(dot) => format!("{}-{pid}{}", &path[..name_at + dot], &path[name_at + dot..]),
+        None => format!("{path}-{pid}"),
+    }
+}
+
+/// A `fmt::Write` into a fixed buffer that cuts what does not fit (no allocation).
+struct Cursor<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl fmt::Write for Cursor<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
     }
 }
 
 /// The header line for a ring whose next line goes at data offset `next % DATA_BYTES`, after `written` bytes in all.
 pub fn header(written: u64) -> [u8; HEADER_BYTES] {
     let mut out = [b' '; HEADER_BYTES];
-    let text = format!(
+    let mut w = Cursor { buf: &mut out[..HEADER_BYTES - 1], len: 0 };
+    let _ = write!(
+        w,
         "neural-forge-ngx-trace 1 header={HEADER_BYTES} ring={DATA_BYTES} written={written:016} next={:010}{}",
         written % DATA_BYTES as u64,
         if written > DATA_BYTES as u64 { " wrapped" } else { "" }
     );
-    let n = text.len().min(HEADER_BYTES - 1);
-    out[..n].copy_from_slice(&text.as_bytes()[..n]);
     out[HEADER_BYTES - 1] = b'\n';
     out
 }
@@ -77,25 +99,16 @@ pub struct Line {
     len: usize,
 }
 
-impl fmt::Write for Line {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let room = LINE_BYTES - 1 - self.len;
-        let n = s.len().min(room);
-        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
-        self.len += n;
-        Ok(())
-    }
-}
-
 impl Line {
     /// `t_ms` (since the wrapper loaded), the thread, the text, a newline.
     pub fn new(t_ms: f64, thread: u32, args: fmt::Arguments) -> Line {
-        let mut line = Line { buf: [0; LINE_BYTES], len: 0 };
-        let _ = write!(line, "{t_ms:13.3} tid={thread:<6} ");
-        let _ = line.write_fmt(args);
-        line.buf[line.len] = b'\n';
-        line.len += 1;
-        line
+        let mut buf = [0; LINE_BYTES];
+        let mut w = Cursor { buf: &mut buf[..LINE_BYTES - 1], len: 0 };
+        let _ = write!(w, "{t_ms:13.3} tid={thread:<6} ");
+        let _ = w.write_fmt(args);
+        let len = w.len;
+        buf[len] = b'\n';
+        Line { buf, len: len + 1 }
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -164,8 +177,49 @@ mod tests {
     #[test]
     fn the_pid_is_put_in() {
         assert_eq!(with_pid(r"Z:\tmp\t-{pid}.txt", Some(42)), r"Z:\tmp\t-42.txt");
-        assert_eq!(with_pid(r"Z:\tmp\t.txt", Some(42)), r"Z:\tmp\t.txt");
+        assert_eq!(with_pid(r"Z:\tmp\t.txt", Some(42)), r"Z:\tmp\t-42.txt", "no {{pid}}: put before the extension");
+        assert_eq!(with_pid(r"Z:\tmp.d\trace", Some(42)), r"Z:\tmp.d\trace-42", "a dot in a folder is no extension");
+        assert_eq!(with_pid(r"Z:\tmp\.trace", Some(7)), r"Z:\tmp\.trace-7");
         assert_eq!(with_pid("{pid}", None), "0");
+    }
+
+    /// The traced paths allocate nothing (a heap lock at process exit could hang it): counted per thread.
+    mod no_allocation {
+        use super::super::*;
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        struct Counting;
+        thread_local! {
+            static COUNT: Cell<usize> = const { Cell::new(0) };
+        }
+        // SAFETY: forwards to the system allocator.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+        #[global_allocator]
+        static ALLOC: Counting = Counting;
+
+        #[test]
+        fn a_line_and_the_header_allocate_nothing() {
+            let before = COUNT.with(Cell::get);
+            let h = header(DATA_BYTES as u64 + 77);
+            let l = Line::new(12.5, 3, format_args!("> {}({:#x}, {:.3} ms)", "NVSDK_NGX_VULKAN_Init", 0x10u32, 1.25f64));
+            let mut ring = [0u8; 64];
+            write_at(&mut ring, 60, l.bytes());
+            let mut s = Stack::new();
+            s.push(Frame { export: 1, ret: 2, t_ms: 0.0 });
+            assert_eq!(COUNT.with(Cell::get), before, "allocated");
+            assert_eq!(h[HEADER_BYTES - 1], b'\n');
+            let _ = String::from("counted");
+            assert!(COUNT.with(Cell::get) > before, "the counter counts");
+        }
     }
 
     #[test]

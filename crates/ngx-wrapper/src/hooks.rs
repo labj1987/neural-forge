@@ -10,7 +10,12 @@ use std::sync::Mutex;
 
 use crate::ring::{Record, API_D3D11, API_D3D12, API_VULKAN, KIND_END};
 use crate::rules;
-use crate::win::{log, logging, publish, target, trace_in, trace_out};
+use crate::win::{log, logging, publish, target, trace_in, trace_out, tracing};
+
+/// Whether the per-evaluate detail is put together: for the text log or the trace (the trace takes the log's lines).
+fn detail() -> bool {
+    logging() || tracing()
+}
 
 /// NGX's `NVSDK_NGX_Parameter` (an MSVC C++ object): its getters' vtable slots. MSVC groups overloads and lays
 /// them out in reverse declaration order (measured: docs/PROTON_NGX.md).
@@ -362,13 +367,13 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
     let mut line = String::new();
     let mut take = |key: &str, follow: bool| -> Option<Image> {
         if !follow {
-            if logging() {
+            if detail() {
                 let _ = write!(line, " {key}={:p}", raw(api, p, key));
             }
             return None;
         }
         let img = image(api, p, key)?;
-        if logging() {
+        if detail() {
             let _ = write!(line, " {key}=vk:{:#x}({}x{} fmt={} lay={})", img.vk, img.width, img.height, img.format, img.layout);
         }
         Some(img)
@@ -385,7 +390,7 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
         rec.output_extent = [i.width, i.height];
     }
     rec.exposure = take("ExposureTexture", images && rules::reads_exposure_texture(rec.create_flags)).map_or(0, |i| i.vk);
-    if logging() {
+    if detail() {
         for key in LOGGED_IMAGES {
             take(key, false);
         }
@@ -404,7 +409,7 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
     rec.depth_base = pair("DLSS.Input.Depth.Subrect.Base.X", "DLSS.Input.Depth.Subrect.Base.Y");
     rec.output_base = pair("DLSS.Output.Subrect.Base.X", "DLSS.Output.Subrect.Base.Y");
     publish(rec);
-    if logging() {
+    if detail() {
         log(&format!(
             "EVAL {} h={}@{handle:p} feat={}{line} jitter={},{} mv_scale={},{} pre_exposure={} exposure_scale={} reset={} render={}x{} bases=colour:{},{} mv:{},{} depth:{},{} output:{},{} out={}x{} flags={:#x}",
             api.name(),
