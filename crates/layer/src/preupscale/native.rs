@@ -1365,6 +1365,11 @@ impl Loader {
     }
 
     /// Why the network is not usable right now, if a load or build failed.
+    /// A wait on the network's own queue timed out: its work may still run, so nothing of it may be freed.
+    pub(crate) fn dead(&self) -> bool {
+        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dead
+    }
+
     pub(crate) fn failed(&self) -> Option<String> {
         self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).failed.clone()
     }

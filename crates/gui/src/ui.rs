@@ -3131,7 +3131,16 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     every(&sparkline, std::time::Duration::from_millis(u64::from(TELEMETRY_INTERVAL_MS)), move |sparkline| {
         let hdr = shm_for_timer.header();
 
-        model_row.set_subtitle(if hdr.native_running.load(Ordering::Relaxed) != 0 { "running before the upscaler" } else { "not running before the upscaler" });
+        // The model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`) runs on the finished frame, not before the upscaler: its
+        // line is the layer's (`layer_reason`).
+        let reason = hdr.layer_reason();
+        model_row.set_subtitle(if hdr.native_running.load(Ordering::Relaxed) != 0 {
+            "running before the upscaler"
+        } else if reason.starts_with("second GPU: the model runs on") {
+            "running on the second GPU, on the finished frame"
+        } else {
+            "not running before the upscaler"
+        });
         // The name is only as current as the frames: a closed game leaves its name behind.
         let game = hdr.game_name();
         let active = live.alive(hdr);
