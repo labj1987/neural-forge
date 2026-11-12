@@ -368,17 +368,19 @@ struct ZeroCopy {
 
 /// Two presents' frames for the delayed present ([`ComposeInputs::Delayed`]): each one's full frame (read off the
 /// swapchain image before anything is composed into it) and the proxy the model was shown (the capture target), kept
-/// until the next present composes its answer.
+/// until the next present composes its answer or shows the frame as it was ([`GpuCompose::show_kept`]).
 struct Delayed {
     frame_bytes: u64,
     raw: [DeviceBuffer; 2],
     base: [DeviceBuffer; 2],
-    cmd: [vk::CommandBuffer; 2],
-    fence: [vk::Fence; 2],
-    /// A pair's last keep was submitted (its fence is armed).
-    armed: [bool; 2],
-    /// A pair holds a kept frame (a compose of a pair never kept is refused).
+    /// Each pair's keep, then the show of a kept frame (index 2).
+    cmd: [vk::CommandBuffer; 3],
+    fence: [vk::Fence; 3],
+    /// Which of them were submitted and not yet seen waited (their fence armed).
+    armed: [bool; 3],
+    /// A pair holds a kept frame, and with it the proxy that frame was sent as.
     kept: [bool; 2],
+    kept_proxy: [bool; 2],
 }
 
 impl Delayed {
@@ -393,6 +395,7 @@ impl Delayed {
             for f in self.fence {
                 device.destroy_fence(f, None);
             }
+            // The command buffers go with the compose's pool.
         }
     }
 }
@@ -1598,7 +1601,7 @@ impl GpuCompose {
             }
             ComposeInputs::Delayed { parity } => {
                 let frames = self.zc.frames.as_ref()?;
-                let kept = self.zc.delayed.as_ref().filter(|d| d.kept[parity])?;
+                let kept = self.zc.delayed.as_ref().filter(|d| d.kept_proxy[parity])?;
                 if generation == 0 || (answer_width, answer_height) != (width, height) || frames.frame_bytes != bytes as u64 || kept.frame_bytes != bytes as u64
                 {
                     return None;
@@ -1753,8 +1756,16 @@ impl GpuCompose {
     /// Waits for every async slot's last submission. Used before anything a slot's submission
     /// may still read or write is replaced, and when a zero-copy compose changes queue.
     fn wait_async_slots(&self, device: &ash::Device) -> bool {
-        let fences = self.async_slots.each_ref().map(|s| s.slot.armed_fence());
-        wait_armed(device, &fences, "gpu::zero-copy drain")
+        wait_armed(device, &self.all_armed(), "gpu::zero-copy drain")
+    }
+
+    /// Every armed fence of the compose's submissions: the async slots' and the delayed present's keeps and show.
+    fn all_armed(&self) -> Vec<Option<vk::Fence>> {
+        let mut fences: Vec<Option<vk::Fence>> = self.async_slots.iter().map(|s| s.slot.armed_fence()).collect();
+        if let Some(d) = &self.zc.delayed {
+            fences.extend((0..3).map(|k| d.armed[k].then_some(d.fence[k])));
+        }
+        fences
     }
 
     /// Imports the model server's answer region (`host_ptr`, `bytes`: aligned and sized to the driver's
@@ -1886,10 +1897,11 @@ impl GpuCompose {
     }
 
     /// The delayed present ([`ComposeInputs::Delayed`]): keeps this present's frame in pair `parity` before anything is
-    /// composed into it: `target_image` (in `PRESENT_SRC_KHR`, `width` x `height`, 4 bytes a pixel) as it is, and the
-    /// capture target the capture just wrote (the proxy the model is shown). Submitted on `queue` behind the capture,
-    /// ahead of the compose that writes the image; waits only for the pair's keep of two presents ago. `false` when
-    /// the pair cannot be kept (then nothing of this frame may be composed later).
+    /// composed into it: `target_image` (in `PRESENT_SRC_KHR`, `width` x `height`, 4 bytes a pixel) as it is, and with
+    /// `with_proxy` the capture target the capture just wrote (the proxy the model is shown). Submitted on `queue`
+    /// behind the capture, ahead of what writes the image after it; waits only for the pair's keep of two presents ago.
+    /// With `signal` the submission signals the image's present semaphore, returned (nothing else of this present
+    /// will). `None` when the pair cannot be kept.
     #[allow(clippy::too_many_arguments)]
     pub fn keep_delayed(
         &mut self,
@@ -1901,64 +1913,29 @@ impl GpuCompose {
         width: u32,
         height: u32,
         parity: usize,
-    ) -> bool {
+        with_proxy: bool,
+        signal: bool,
+    ) -> Option<Option<vk::Semaphore>> {
         let bytes = u64::from(width) * u64::from(height) * 4;
-        let Some(capture_target) = self.zc.frames.as_ref().filter(|f| f.frame_bytes == bytes).map(|f| f.capture_target.buffer) else { return false };
-        if self.zc.delayed.as_ref().is_some_and(|d| d.frame_bytes != bytes) {
-            let d = self.zc.delayed.as_ref().expect("checked");
-            let armed: Vec<Option<vk::Fence>> = (0..2).map(|k| d.armed[k].then_some(d.fence[k])).collect();
-            if !wait_armed(device, &armed, "gpu::keep_delayed resize") || !self.wait_async_slots(device) {
-                return false;
-            }
-            // SAFETY: its keeps and every compose that may read it were just waited.
-            unsafe { self.zc.delayed.take().expect("checked").destroy(device) };
+        let capture_target = self.zc.frames.as_ref().filter(|f| f.frame_bytes == bytes).map(|f| f.capture_target.buffer);
+        if with_proxy && capture_target.is_none() {
+            return None;
         }
-        if self.zc.delayed.is_none() {
-            // SAFETY: plain property query.
-            let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-            let made: Vec<DeviceBuffer> = (0..4).filter_map(|_| DeviceBuffer::new(device, &props, bytes)).collect();
-            let fences: Vec<vk::Fence> = (0..2).filter_map(|_| unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.ok()).collect();
-            // SAFETY: the compose's own pool (reset-able buffers), used on the present's thread only.
-            let cmds = unsafe {
-                crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(2))
-            };
-            match (made.len(), fences.len(), cmds) {
-                (4, 2, Ok(cmds)) => {
-                    let mut b = made.into_iter();
-                    let mut next = || b.next().expect("four");
-                    self.zc.delayed = Some(Delayed {
-                        frame_bytes: bytes,
-                        raw: [next(), next()],
-                        base: [next(), next()],
-                        cmd: [cmds[0], cmds[1]],
-                        fence: [fences[0], fences[1]],
-                        armed: [false; 2],
-                        kept: [false; 2],
-                    });
-                }
-                (_, _, cmds) => {
-                    // SAFETY: none of it was used.
-                    unsafe {
-                        for m in &made {
-                            m.destroy(device);
-                        }
-                        for f in fences {
-                            device.destroy_fence(f, None);
-                        }
-                        if let Ok(c) = cmds {
-                            device.free_command_buffers(self.pool, &c);
-                        }
-                    }
-                    return false;
-                }
-            }
+        if !self.ensure_delayed(device, instance, physical_device, bytes) {
+            return None;
         }
-        let d = self.zc.delayed.as_mut().expect("made above");
+        let semaphore = if signal {
+            Some(self.present_semaphores.get(target_image, || unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok() })?)
+        } else {
+            None
+        };
+        let d = self.zc.delayed.as_mut().expect("ensured");
         if d.armed[parity] && !wait_armed(device, &[Some(d.fence[parity])], "gpu::keep_delayed reuse") {
-            return false;
+            return None;
         }
         d.armed[parity] = false;
         d.kept[parity] = false;
+        d.kept_proxy[parity] = false;
         let cmd = d.cmd[parity];
         let (raw, base) = (d.raw[parity].buffer, d.base[parity].buffer);
         // SAFETY: the pair's last keep was waited; every handle is live; the image is the swapchain's, in PRESENT_SRC_KHR
@@ -1967,8 +1944,8 @@ impl GpuCompose {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).is_ok()
                 && device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).is_ok()
                 && {
-                    // After everything before it on the queue (the capture's writes of the target, earlier composes' reads
-                    // of these buffers), and the image readable.
+                    // After everything before it on the queue (the capture's writes of the target, earlier composes' and
+                    // shows' reads of these buffers), and the image readable.
                     let to_src = image_barrier(
                         target_image,
                         vk::ImageLayout::PRESENT_SRC_KHR,
@@ -1989,7 +1966,9 @@ impl GpuCompose {
                         &[to_src],
                     );
                     device.cmd_copy_image_to_buffer(cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, raw, &[image_copy_region(width, height, 0)]);
-                    device.cmd_copy_buffer(cmd, capture_target, base, &[vk::BufferCopy::default().size(bytes)]);
+                    if let Some(target) = capture_target.filter(|_| with_proxy) {
+                        device.cmd_copy_buffer(cmd, target, base, &[vk::BufferCopy::default().size(bytes)]);
+                    }
                     let back = image_barrier(
                         target_image,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -1997,7 +1976,7 @@ impl GpuCompose {
                         vk::AccessFlags::TRANSFER_READ,
                         vk::AccessFlags::empty(),
                     );
-                    // The compose after it overwrites the image and reads the kept pair: both ordered by this.
+                    // What comes after it overwrites the image and reads the kept pair: both ordered by this.
                     let written = vk::MemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                         .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -2014,19 +1993,183 @@ impl GpuCompose {
                 }
         };
         if !recorded {
-            return false;
+            return None;
         }
-        let d = self.zc.delayed.as_mut().expect("made above");
-        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-        // SAFETY: the fence is unsignalled-idle (waited and reset); the caller holds the queue (the present's).
+        let d = self.zc.delayed.as_mut().expect("ensured");
+        let mut submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        if let Some(sem) = semaphore.as_ref() {
+            submit = submit.signal_semaphores(std::slice::from_ref(sem));
+        }
+        // SAFETY: the fence was waited and is reset here; the caller holds the queue (the present's).
         let submitted = unsafe { device.reset_fences(&[d.fence[parity]]).and_then(|()| device.queue_submit(queue, &[submit], d.fence[parity])) };
         if crate::note_vk(device.handle(), submitted).is_err() {
-            return false;
+            return None;
         }
         d.armed[parity] = true;
         d.kept[parity] = true;
+        d.kept_proxy[parity] = with_proxy;
         self.zc.last_queue = Some(queue);
+        Some(semaphore)
+    }
+
+    /// The delayed present's frame kept in pair `parity` written into `target_image` as it was (its answer did not come
+    /// in time, or it was never sent): the frame shown in its place, one present late, without the model's edit.
+    /// Signals and returns the image's present semaphore; `None` when nothing was kept there or the submit failed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_kept(
+        &mut self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        target_image: vk::Image,
+        width: u32,
+        height: u32,
+        parity: usize,
+    ) -> Option<vk::Semaphore> {
+        let bytes = u64::from(width) * u64::from(height) * 4;
+        if !self.zc.delayed.as_ref().is_some_and(|d| d.kept[parity] && d.frame_bytes == bytes) {
+            return None;
+        }
+        let semaphore = self.present_semaphores.get(target_image, || unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok() })?;
+        let d = self.zc.delayed.as_mut().expect("checked");
+        if d.armed[2] && !wait_armed(device, &[Some(d.fence[2])], "gpu::show_kept reuse") {
+            return None;
+        }
+        d.armed[2] = false;
+        let (cmd, raw) = (d.cmd[2], d.raw[parity].buffer);
+        // SAFETY: the show's last submission was waited; the image is the swapchain's in PRESENT_SRC_KHR with
+        // transfer-destination usage (the compose writes it too).
+        let recorded = unsafe {
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).is_ok()
+                && device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).is_ok()
+                && {
+                    let to_dst = image_barrier(
+                        target_image,
+                        vk::ImageLayout::PRESENT_SRC_KHR,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    );
+                    let memory = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[memory],
+                        &[],
+                        &[to_dst],
+                    );
+                    device.cmd_copy_buffer_to_image(cmd, raw, target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+                    let back = image_barrier(
+                        target_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::PRESENT_SRC_KHR,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::empty(),
+                    );
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[back],
+                    );
+                    device.end_command_buffer(cmd).is_ok()
+                }
+        };
+        if !recorded {
+            return None;
+        }
+        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd)).signal_semaphores(std::slice::from_ref(&semaphore));
+        // SAFETY: the fence was waited and is reset here; the caller holds the queue.
+        let submitted = unsafe { device.reset_fences(&[d.fence[2]]).and_then(|()| device.queue_submit(queue, &[submit], d.fence[2])) };
+        if crate::note_vk(device.handle(), submitted).is_err() {
+            return None;
+        }
+        d.armed[2] = true;
+        Some(semaphore)
+    }
+
+    /// Waits for pair `parity`'s keep (a present whose image nothing else of this layer's touches after the keep: the
+    /// present must not read the image while the keep's copy does). `false` if the wait failed.
+    pub fn wait_keep(&mut self, device: &ash::Device, parity: usize) -> bool {
+        let Some(d) = self.zc.delayed.as_mut() else { return true };
+        if d.armed[parity] && !wait_armed(device, &[Some(d.fence[parity])], "gpu::wait_keep") {
+            return false;
+        }
+        d.armed[parity] = false;
         true
+    }
+
+    /// Frees the delayed present's kept frames (it is no longer used: the model came back to this GPU), once nothing
+    /// may still read them. `false` if a wait failed (they are kept).
+    pub fn release_delayed(&mut self, device: &ash::Device) -> bool {
+        if self.zc.delayed.is_none() {
+            return true;
+        }
+        if !self.wait_async_slots(device) {
+            return false;
+        }
+        if let Some(d) = self.zc.delayed.take() {
+            // SAFETY: every submission that used them (keeps, show, composes) was just waited.
+            unsafe {
+                d.destroy(device);
+                device.free_command_buffers(self.pool, &d.cmd);
+            }
+        }
+        true
+    }
+
+    /// Makes the delayed present's buffers at `bytes` a frame (again, at another size, once nothing reads the old ones).
+    fn ensure_delayed(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, bytes: u64) -> bool {
+        if self.zc.delayed.as_ref().is_some_and(|d| d.frame_bytes == bytes) {
+            return true;
+        }
+        if !self.release_delayed(device) {
+            return false;
+        }
+        // SAFETY: plain property query.
+        let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let made: Vec<DeviceBuffer> = (0..4).filter_map(|_| DeviceBuffer::new(device, &props, bytes)).collect();
+        // SAFETY: plain creations; each is destroyed below when the set is incomplete.
+        let fences: Vec<vk::Fence> = (0..3).filter_map(|_| unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.ok()).collect();
+        // SAFETY: the compose's own pool (reset-able buffers), used on the present's thread only.
+        let cmds =
+            unsafe { crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(3)) };
+        match (made.len(), fences.len(), cmds) {
+            (4, 3, Ok(cmds)) => {
+                let mut b = made.into_iter();
+                let mut next = || b.next().expect("four");
+                self.zc.delayed = Some(Delayed {
+                    frame_bytes: bytes,
+                    raw: [next(), next()],
+                    base: [next(), next()],
+                    cmd: [cmds[0], cmds[1], cmds[2]],
+                    fence: [fences[0], fences[1], fences[2]],
+                    armed: [false; 3],
+                    kept: [false; 2],
+                    kept_proxy: [false; 2],
+                });
+                true
+            }
+            (_, _, cmds) => {
+                // SAFETY: none of it was used.
+                unsafe {
+                    for m in &made {
+                        m.destroy(device);
+                    }
+                    for f in fences {
+                        device.destroy_fence(f, None);
+                    }
+                    if let Ok(c) = cmds {
+                        device.free_command_buffers(self.pool, &c);
+                    }
+                }
+                false
+            }
+        }
     }
 
     /// Whether `gen_*` hold this answer generation, so a zero-copy compose can present it again
@@ -2038,8 +2181,7 @@ impl GpuCompose {
     /// Waits for every compose this `GpuCompose` has submitted. Only its own fences, so it is
     /// legal from any hook on any thread.
     pub fn wait_in_flight(&self, device: &ash::Device) -> bool {
-        let fences = self.async_slots.each_ref().map(|s| s.slot.armed_fence());
-        wait_armed(device, &fences, "gpu::wait_in_flight")
+        wait_armed(device, &self.all_armed(), "gpu::wait_in_flight")
     }
 
     /// The latest async compose GPU time read back since the last call (see
@@ -3735,7 +3877,7 @@ mod tests {
         let frame_b: Vec<u8> = current.chunks(4).flat_map(|p| [p[0].wrapping_add(90), p[1].wrapping_add(60), p[2].wrapping_add(30), 255]).collect();
         upload(&base, false);
         upload(&current, true);
-        assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1));
+        assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false).is_some());
         upload(&vec![9u8; frame_bytes as usize], false);
         upload(&frame_b, true);
         unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
@@ -3744,6 +3886,27 @@ mod tests {
         let on_b = compose_once(width, height, &frame_b, &base, &answer, params).expect("the CPU reference composes");
         assert_ne!(delayed, on_b, "the live frame must not be what the answer composes onto");
         assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0 }, 4).is_none(), "a pair never kept is refused");
+        // A kept frame with no answer is shown as it was, in its turn (the live image is frame B).
+        let sem = gpu.show_kept(&device, queue, target.image, width, height, 1).expect("a kept frame is shown");
+        let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+        unsafe {
+            let wait_fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            device
+                .queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                    wait_fence,
+                )
+                .unwrap();
+            device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+            device.destroy_fence(wait_fence, None);
+        }
+        let shown = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
+        assert_eq!(shown, current, "the kept frame A replaces the live frame B, untouched");
+        assert!(gpu.show_kept(&device, queue, target.image, width, height, 0).is_none(), "nothing kept in pair 0");
+        assert!(gpu.wait_in_flight(&device));
+        assert!(gpu.release_delayed(&device));
+        assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 1 }, 5).is_none(), "released pairs are gone");
 
         unsafe {
             device.device_wait_idle().unwrap();
