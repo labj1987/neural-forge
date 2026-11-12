@@ -580,9 +580,11 @@ expected `preupscale_state` was reached and the edit cache counted holds (the mo
 did not end refused (`preupscale_state=5`), `preupscale_misses` is 0, no device was lost, the log has no `[panic]`,
 the kernel logged no `NVRM: Xid` since the run began, the HDR verdict says HDR10 for an HDR run and SDR
 otherwise, and the picture is right: every run is recorded for 10 s once at its placement (`--vw`, default
-`~/scratch/vw/bin/vw`: `vw replay start` before the game, encoding on the CPU (`VW_ENCODER=cpu`, 1920x1080, about
-20 MiB of video memory: the GPU encoder's ~310 MiB left the model too little at 4K with Ray Reconstruction and the
-VRAM guard paused it), then `vw replay save`; the recorder's log is `<label>.mp4.log`) and `vw analyze` must flag nothing (a colour flash: frames tinted against their
+`~/scratch/vw/bin/vw`: `vw replay start` before the game, so the recorder has its video memory first, then the last
+10 s of `vw replay save`, `record_after` seconds after the placement was reached; the recorder's log is
+`<label>.mp4.log`). A run with `recorder = "cpu"` (Cyberpunk 2077 with Ray Reconstruction: the GPU encoder's
+~310 MiB left the model too little at 4K and the VRAM guard paused it) encodes on the CPU (`VW_ENCODER=cpu`,
+1920x1080, about 20 MiB), which keeps about 115 of 150 frames a second. and `vw analyze` must flag nothing (a colour flash: frames tinted against their
 neighbours, frames alternating between two states, black frames, freezes); the table's `picture` column says
 `ok` or `FAIL`. Log numbers alone never pass a run: look at each run's contact sheet (`<label>-vw/sheet.jpg`)
 against the game with the model off as well. `--no-record` makes no recording, and every run then fails. Each run's layer log, its status samples (`<label>.samples`) and `results.txt` go to `--out` (default

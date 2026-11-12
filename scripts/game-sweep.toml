@@ -13,6 +13,8 @@
 #   timeout      how long to wait for the placement (default 600)
 #   record_after when the 10 s recording starts, in seconds after the placement was reached (default 10): inside
 #                one scene, not across the benchmark's own loading screens (record_after + 10 <= seconds)
+#   recorder     "gpu" (default) or "cpu": the CPU encoder (about 20 MiB of video memory instead of 310, but fewer
+#                frames kept) only where the GPU encoder leaves the model too little video memory
 #   hdr          run with HDR: PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1, the game's HDR setting in edits
 #   ray_reconstruction   expect the game's Ray Reconstruction placement (set it on in edits)
 #   edit_file, edit_kind, edits   game settings for the run, restored afterwards byte for byte: the file relative to
@@ -42,6 +44,8 @@ seconds = 60
 timeout = 420
 hdr = true
 ray_reconstruction = true
+# 4K with Ray Reconstruction and the model after DLSS leaves no room for the GPU encoder's ~310 MiB.
+recorder = "cpu"
 edit_file = "AppData/Local/CD Projekt Red/Cyberpunk 2077/UserSettings.json"
 edit_kind = "json-option"
 edits = ["Resolution=3840x2160", "HDRModes=HDR10_PQ", "DLSS_D=true"]

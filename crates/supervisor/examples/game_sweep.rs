@@ -83,6 +83,9 @@ struct Run {
     /// When the recording starts, in seconds after the placement was reached (default [`RECORD_AFTER`]): within one
     /// scene of a benchmark, not across its own loading screens.
     record_after: u64,
+    /// Record with the CPU encoder (`recorder = "cpu"`): only where the GPU encoder can't run beside the game (see
+    /// [`Recorder`]); the GPU encoder keeps every frame and is the one vw's thresholds were set with.
+    cpu_recorder: bool,
     hdr: bool,
     ray_reconstruction: bool,
     edit_kind: Option<EditKind>,
@@ -93,8 +96,21 @@ struct Run {
 
 impl Run {
     fn from_table(t: &BTreeMap<String, Value>) -> Result<Run, String> {
-        const KEYS: [&str; 12] =
-            ["label", "appid", "route", "args", "seconds", "timeout", "record_after", "hdr", "ray_reconstruction", "edit_kind", "edit_file", "edits"];
+        const KEYS: [&str; 13] = [
+            "label",
+            "appid",
+            "route",
+            "args",
+            "seconds",
+            "timeout",
+            "record_after",
+            "recorder",
+            "hdr",
+            "ray_reconstruction",
+            "edit_kind",
+            "edit_file",
+            "edits",
+        ];
         if let Some(k) = t.keys().find(|k| !KEYS.contains(&k.as_str())) {
             return Err(format!("unknown key {k}"));
         }
@@ -145,6 +161,11 @@ impl Run {
             seconds: int("seconds", 90)? as u64,
             timeout: int("timeout", 600)? as u64,
             record_after: int("record_after", RECORD_AFTER as i64)? as u64,
+            cpu_recorder: match text("recorder").as_deref() {
+                None | Some("gpu") => false,
+                Some("cpu") => true,
+                Some(other) => return Err(format!("recorder {other:?} is not gpu or cpu")),
+            },
             hdr: flag("hdr")?,
             ray_reconstruction: flag("ray_reconstruction")?,
             edit_kind,
@@ -860,7 +881,7 @@ fn sweep(o: &Options) -> Result<bool, String> {
             restore.steam_stopped = false;
             println!("== {} ({})", p.run.label, p.facts.name);
             let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            let recorder = Recorder::start(o);
+            let recorder = Recorder::start(o, p.run.cpu_recorder);
             let samples = match p.run.route {
                 Route::Steam => run_steam(o, p, &env),
             };
@@ -1027,20 +1048,21 @@ fn video(o: &Options, p: &Prepared) -> PathBuf {
 }
 
 /// The screen recorder, started before the game (`vw replay start`: GPU Screen Recorder keeping the last seconds in
-/// memory) and stopped after it (`vw replay stop`, also after an error or Ctrl-C), encoding on the CPU
-/// (`VW_ENCODER=cpu`, about 20 MiB of video memory). The GPU encoder takes about 310 MiB: started once the game was
-/// up at 4K with Ray Reconstruction and the model after DLSS, it got no CUDA context (no recording); started before
-/// the game, it left the model too little memory and Neural Forge's VRAM guard paused it. A recorder must not change
-/// what the run measures.
+/// memory, so it has its video memory before the game takes it all) and stopped after it (`vw replay stop`, also
+/// after an error or Ctrl-C). The GPU encoder takes about 310 MiB; at 4K with Ray Reconstruction and the model after
+/// DLSS that is more than there is: started once the game was up it got no CUDA context (no recording), started
+/// before the game it left the model too little and Neural Forge's VRAM guard paused it. Such a run records with the
+/// CPU encoder (`recorder = "cpu"`, `VW_ENCODER=cpu`, about 20 MiB), which keeps fewer frames (about 115 of 150 a
+/// second at 1920x1080) and so is used only where the GPU encoder can't be.
 struct Recorder<'a>(Option<&'a Path>);
 
 impl<'a> Recorder<'a> {
-    fn start(o: &'a Options) -> Self {
+    fn start(o: &'a Options, cpu: bool) -> Self {
         let Some(vw) = o.vw.as_deref() else { return Recorder(None) };
         let secs = (RECORD_SECONDS + 2).to_string();
         match Command::new(vw)
             .args(["replay", "start", &secs])
-            .env("VW_ENCODER", "cpu")
+            .env("VW_ENCODER", if cpu { "cpu" } else { "gpu" })
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1193,6 +1215,9 @@ mod tests {
         assert!(parse_config(&ok.replace("\"steam\"", "\"walk\"")).unwrap_err().contains("route"));
         assert!(parse_config(&format!("{ok}edits = [\"A=1\"]\n")).unwrap_err().contains("go together"));
         assert_eq!(parse_config(&format!("{ok}record_after = 80\n")).unwrap()[0].record_after, 80);
+        assert!(parse_config(&format!("{ok}recorder = \"cpu\"\n")).unwrap()[0].cpu_recorder);
+        assert!(!parse_config(ok).unwrap()[0].cpu_recorder);
+        assert!(parse_config(&format!("{ok}recorder = \"nvenc\"\n")).unwrap_err().contains("recorder"));
         assert!(parse_config(&format!("{ok}record_after = 85\n")).unwrap_err().contains("must fit"), "the recording ends after the run");
         let gta = "[[run]]\nlabel = \"gta\"\nappid = 3240220\nroute = \"gta-bench\"\n";
         assert!(parse_config(gta).unwrap_err().contains("started by Steam"), "no route launches a game around Steam");
