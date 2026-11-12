@@ -571,6 +571,20 @@ fn previous_frame(pending: Option<DelayedRequest>, answered: bool, answer_fits: 
     }
 }
 
+/// Whether the delayed present keeps this present's frame: when it was captured (it is sent), or when it could not be
+/// sent at all (the answer to the frame before is still out: kept as it is, it is shown in its turn).
+fn keeps_frame(captured: bool, can_send: bool) -> bool {
+    captured || !can_send
+}
+
+/// A frame the delayed present could capture and did not (logged a few times).
+fn note_unsent() {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+        crate::log!("[offload] a frame could not be captured for the other GPU: the frame waiting is shown, and the next present starts again");
+    }
+}
+
 /// The pair this present's frame is kept in: the other one than the frame waiting to be shown (whose pair the compose
 /// or the show still reads).
 fn next_parity(pending: Option<DelayedRequest>) -> usize {
@@ -743,10 +757,20 @@ unsafe fn delayed_present(
     // 3. Kept before anything is written into the image: this frame as it is (and the proxy it is sent as). After a
     // stall the delay starts again: nothing kept now, this frame is shown live.
     let shows_after = matches!(previous, Previous::Answer(_) | Previous::Raw(_));
-    let keep = if previous == Previous::Stale {
-        None
-    } else {
+    // After a stall the delay starts again with this frame, kept and sent like the first one's. A frame that could be
+    // captured but was not is not kept: with nothing waiting, the synchronous present takes this one; else the frame
+    // waiting is shown and the next present starts again (a capture that keeps failing then never leaves the stream one
+    // frame late with no model).
+    if !keeps_frame(captured, can_send) {
+        if pending.is_none() || previous == Previous::Stale {
+            return Delayed::NotHere;
+        }
+        note_unsent();
+    }
+    let keep = if keeps_frame(captured, can_send) {
         gpu.keep_delayed(device, instance, physical_device, queue, image, width, height, parity, captured, !shows_after)
+    } else {
+        None
     };
     // 4. The previous frame into this image: composed with its answer, or as it was.
     let mut result = None;
@@ -1541,6 +1565,11 @@ pub unsafe fn run(
     let disabled = !settings.apply_model || !settings.neural_enabled || shm.model_known_unavailable();
     if disabled {
         UNTOUCHED.with(|u| u.set(if shm.model_known_unavailable() { reason::MODEL_UNAVAILABLE } else { reason::EFFECT_OFF }));
+        // The effect off: the delayed present's kept frames go (it starts afresh when the effect is back).
+        #[cfg(target_arch = "x86_64")]
+        if inflight[Slot::Primary.index()].delayed.is_some() || gpu_compose.as_ref().is_some_and(crate::composition::gpu::GpuCompose::has_delayed) {
+            leave_delayed(device, gpu_compose, shm, inflight);
+        }
     }
     // The model server cannot allocate its NGX images until it knows the game's actual
     // swapchain dimensions.  Waiting until the user enables NR often means GTA has
@@ -1847,7 +1876,7 @@ pub unsafe fn run(
         #[cfg(not(target_arch = "x86_64"))]
         let offloaded = false;
         #[cfg(target_arch = "x86_64")]
-        if !offloaded && inflight[SLOT.index()].delayed.is_some() {
+        if !offloaded && (inflight[SLOT.index()].delayed.is_some() || gpu_compose.as_ref().is_some_and(crate::composition::gpu::GpuCompose::has_delayed)) {
             leave_delayed(device, gpu_compose, shm, inflight);
         }
         let carry = settings.model_interval > 1
@@ -3386,6 +3415,16 @@ mod tests {
         assert_eq!(previous_frame(Some(unsent), true, true, d, fast), Previous::Raw(unsent), "a frame never sent has no answer");
         assert_eq!(previous_frame(Some(r), true, true, (32, 32, 0), fast), Previous::None, "another size: the delay starts again");
         assert_eq!(previous_frame(Some(r), true, true, d, SYNC_BUDGET + fast), Previous::Stale);
+    }
+
+    /// A frame is kept when it is sent, or when it could not be (the answer before it is still out: it is shown in its
+    /// turn); a frame that could have been captured and was not is never kept, so a capture that keeps failing does not
+    /// leave the stream late with no model.
+    #[test]
+    fn a_frame_is_kept_only_when_sent_or_unsendable() {
+        assert!(keeps_frame(true, true));
+        assert!(keeps_frame(false, false), "the answer before is still out: kept as it is");
+        assert!(!keeps_frame(false, true), "a failed capture is not kept");
     }
 
     /// The pair a frame is kept in is never the one the frame waiting to be shown is in, whatever the presents count.

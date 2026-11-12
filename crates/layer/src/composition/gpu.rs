@@ -2103,6 +2103,11 @@ impl GpuCompose {
         true
     }
 
+    /// Whether the delayed present's kept frames exist ([`Self::release_delayed`] frees them).
+    pub fn has_delayed(&self) -> bool {
+        self.zc.delayed.is_some()
+    }
+
     /// Frees the delayed present's kept frames (it is no longer used: the model came back to this GPU), once nothing
     /// may still read them. `false` if a wait failed (they are kept).
     pub fn release_delayed(&mut self, device: &ash::Device) -> bool {
