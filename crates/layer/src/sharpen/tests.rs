@@ -55,7 +55,7 @@ fn encode(c: [f32; 3], word: u32, ten: bool) -> u32 {
 }
 
 fn weights(f: &Frame) -> [f32; 3] {
-    let w = if f.ten_bit { [0.2627, 0.6780, 0.0593] } else { [0.2126, 0.7152, 0.0722] };
+    let w = if f.bt2020 { [0.2627, 0.6780, 0.0593] } else { [0.2126, 0.7152, 0.0722] };
     if f.bgr {
         [w[2], w[1], w[0]]
     } else {
@@ -316,7 +316,7 @@ fn channels(word: u32, ten: bool) -> [i32; 4] {
 /// Runs `cases` (settings and regions) through `Sharpen::apply` on a fresh image of `pattern` each, and checks
 /// each result against the reference: within one code value per channel, alpha bit for bit, and every pixel the
 /// reference leaves alone exactly the frame's.
-fn check_against_reference(format: vk::Format, bgr: bool, ten: bool, cases: &[(SharpenSettings, Vec<HudRegion>)]) {
+fn check_against_reference(format: vk::Format, bgr: bool, ten: bool, bt2020: bool, cases: &[(SharpenSettings, Vec<HudRegion>)]) {
     let Some(gpu) = crate::composition::gpu::test_device() else {
         eprintln!("no Vulkan device: skipped");
         return;
@@ -337,7 +337,7 @@ fn check_against_reference(format: vk::Format, bgr: bool, ten: bool, cases: &[(S
         let words = pattern(W, H, ten);
         for (s, regions) in cases {
             let img = upload(device, &props, queue, pool, format, (W, H), &words);
-            let frame = Frame { image: img.image, layout: vk::ImageLayout::GENERAL, width: W, height: H, bgr, ten_bit: ten };
+            let frame = Frame { image: img.image, layout: vk::ImageLayout::GENERAL, width: W, height: H, bgr, ten_bit: ten, bt2020 };
             let applied = sharpen.apply(device, queue, &frame, s, regions);
             assert_eq!(applied.is_some(), s.any(), "submitted only with a filter on ({s:?})");
             if let Some(sem) = applied {
@@ -390,6 +390,7 @@ fn the_shader_matches_its_reference_and_keeps_the_hud_regions_8_bit() {
         vk::Format::R8G8B8A8_UNORM,
         false,
         false,
+        false,
         &[(SharpenSettings::DEFAULT, vec![]), (cas, vec![]), (clarity, vec![]), (both, vec![]), (both, regions)],
     );
 }
@@ -398,7 +399,24 @@ fn the_shader_matches_its_reference_and_keeps_the_hud_regions_8_bit() {
 #[test]
 fn the_shader_matches_its_reference_10_bit_blue_first() {
     let both = SharpenSettings { cas: 0.5, clarity: 0.8, radius: 16.0, midtones: 0.5, edges: 0.5 };
-    check_against_reference(vk::Format::A2R10G10B10_UNORM_PACK32, true, true, &[(both, vec![]), (both, vec![keep(0.1, 0.1, 0.5, 0.5)])]);
+    check_against_reference(vk::Format::A2R10G10B10_UNORM_PACK32, true, true, true, &[(both, vec![]), (both, vec![keep(0.1, 0.1, 0.5, 0.5)])]);
+}
+
+/// The same for a 10-bit SDR frame (A2B10G10R10 in sRGB, #51): ten bits a channel with BT.709 luma.
+#[test]
+fn the_shader_matches_its_reference_10_bit_sdr() {
+    let both = SharpenSettings { cas: 0.5, clarity: 0.8, radius: 16.0, midtones: 0.5, edges: 0.5 };
+    check_against_reference(vk::Format::A2B10G10R10_UNORM_PACK32, false, true, false, &[(both, vec![]), (both, vec![keep(0.1, 0.1, 0.5, 0.5)])]);
+}
+
+/// The push constants say BT.2020 only for HDR10: a 10-bit SDR frame gets BT.709's luma weights.
+#[test]
+fn only_hdr10_gets_bt2020_luma() {
+    let frame = |ten_bit, bt2020| Frame { image: vk::Image::null(), layout: vk::ImageLayout::GENERAL, width: 8, height: 8, bgr: false, ten_bit, bt2020 };
+    let s = SharpenSettings { cas: 0.5, ..SharpenSettings::DEFAULT };
+    assert_eq!(Push::of(&frame(true, false), &s, 0, 0).flags[0], 2, "10-bit SDR: ten bits, BT.709");
+    assert_eq!(Push::of(&frame(true, true), &s, 0, 0).flags[0], 6, "HDR10: ten bits, BT.2020");
+    assert_eq!(Push::of(&frame(false, false), &s, 0, 0).flags[0], 0);
 }
 
 /// Inside a `keep` region the frame is its own, bit for bit, whatever the filters do outside (checked directly,
@@ -407,7 +425,7 @@ fn the_shader_matches_its_reference_10_bit_blue_first() {
 fn a_keep_region_is_left_bit_for_bit() {
     let r = reference(
         &pattern(40, 30, false),
-        &Frame { image: vk::Image::null(), layout: vk::ImageLayout::GENERAL, width: 40, height: 30, bgr: false, ten_bit: false },
+        &Frame { image: vk::Image::null(), layout: vk::ImageLayout::GENERAL, width: 40, height: 30, bgr: false, ten_bit: false, bt2020: false },
         &SharpenSettings { cas: 1.0, clarity: 2.0, radius: 8.0, midtones: 0.0, edges: 0.0 },
         &[keep(0.5, 0.0, 0.5, 1.0)],
     );
@@ -477,7 +495,7 @@ fn cost_at_1440p_and_effect_on_a_still_frame() {
         let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
         let mut sharpen = Sharpen::new(device, instance, physical, family).expect("the pass builds");
         let img = upload(device, &props, queue, pool, vk::Format::R8G8B8A8_UNORM, (w, h), &words);
-        let frame = Frame { image: img.image, layout: vk::ImageLayout::GENERAL, width: w, height: h, bgr: false, ten_bit: false };
+        let frame = Frame { image: img.image, layout: vk::ImageLayout::GENERAL, width: w, height: h, bgr: false, ten_bit: false, bt2020: false };
         let stage = [vk::PipelineStageFlags::ALL_COMMANDS];
         for (label, s) in &cases {
             let mut readings = Vec::new();

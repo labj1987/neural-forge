@@ -60,10 +60,11 @@ pub struct ComposeParams {
     /// The curve the proxy encode used (`neural_forge_protocol::enums::reversible_mode`),
     /// which the composition reproduces wherever it rebuilds the frame's proxy.
     pub reversible_mode: u32,
-    /// `Some(reference white in nits)`: the frames are HDR10 (`proxy_format::PQ10_*`), the answer is the
-    /// network's 8-bit SDR answer to their SDR picture, and `shaders/compose_hdr.comp` composes instead of
-    /// `compose.comp` (`crate::hdr_present`). Only full-size answers; none of the settings above apply to it.
-    pub pq10: Option<f32>,
+    /// `Some(transfer)`: the frames are raw 10-bit words, HDR10 (`proxy_format::PQ10_*`) or 10-bit SDR
+    /// (`SDR10_*`), the answer is the network's 8-bit answer to their 8-bit picture, and `shaders/compose_hdr.comp`
+    /// composes instead of `compose.comp` (`crate::hdr_present`). Only full-size answers; none of the settings above
+    /// apply to it.
+    pub pq10: Option<crate::hdr_present::Transfer>,
 }
 
 /// The comparison view, straight from the header.
@@ -105,7 +106,7 @@ struct PushConstants {
 }
 
 /// `compose_hdr.comp`'s `Params` block, field for field: pushed through `compose.comp`'s pipeline layout
-/// (its range covers these 12 bytes).
+/// (its range covers these 16 bytes).
 #[repr(C)]
 struct HdrPushConstants {
     reference_nits: f32,
@@ -113,6 +114,8 @@ struct HdrPushConstants {
     b_low: u32,
     /// `crate::hdr_present::KEEP_CLAMPED`.
     flags: u32,
+    /// `crate::hdr_present::Transfer::code`.
+    transfer: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<HdrPushConstants>() <= std::mem::size_of::<PushConstants>());
@@ -1142,8 +1145,13 @@ impl ComposeSlot {
             // The live settings are threaded now rather than hardcoded: mode 2 reads
             // transfer_strength as a power on the ratio and max_ratio as the guard, so
             // both genuinely decide the picture here.
-            if let Some(reference_nits) = compose.pq10 {
-                let push = HdrPushConstants { reference_nits, b_low: u32::from(bgr_order), flags: crate::hdr_present::compose_flags() };
+            if let Some(transfer) = compose.pq10 {
+                let push = HdrPushConstants {
+                    reference_nits: transfer.reference_nits(),
+                    b_low: u32::from(bgr_order),
+                    flags: transfer.compose_flags(),
+                    transfer: transfer.code(),
+                };
                 let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<HdrPushConstants>());
                 device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             } else {
@@ -3572,6 +3580,21 @@ mod tests {
         reference: f32,
         answer_dims: (u32, u32),
     ) -> Option<Option<Vec<u32>>> {
+        compose_ten_bit_once(width, height, current, proxy, answer, b_low, crate::hdr_present::Transfer::Pq { reference_nits: reference }, answer_dims)
+    }
+
+    /// [`compose_hdr_once`] with any 10-bit transfer (HDR10 or 10-bit SDR).
+    #[allow(clippy::too_many_arguments)]
+    fn compose_ten_bit_once(
+        width: u32,
+        height: u32,
+        current: &[u32],
+        proxy: &[u32],
+        answer: &[[u8; 3]],
+        b_low: bool,
+        transfer: crate::hdr_present::Transfer,
+        answer_dims: (u32, u32),
+    ) -> Option<Option<Vec<u32>>> {
         let (_entry, instance, physical_device, device, queue, queue_family) = test_device()?;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -3645,7 +3668,7 @@ mod tests {
             debug_scale: 1.0,
             proxy_encoded: false,
             reversible_mode: 0,
-            pq10: Some(reference),
+            pq10: Some(transfer),
         };
         let proxy = words(proxy);
         let sem = gpu.present_temporal_delta_async(
@@ -3702,6 +3725,41 @@ mod tests {
     /// the shader's single-precision maths rounds it the same way.
     fn clear_of_rounding(word: u32, b_low: bool) -> bool {
         crate::hdr_present::reference::sdr(word, b_low, 203.0).iter().all(|v| ((v * 255.0).fract() - 0.5).abs() > 0.01)
+    }
+
+    /// 10-bit SDR (#51): no edit (the answer equals each code taken to 8 bits) keeps every word bit for bit, alpha bits
+    /// included, in both channel orders; an edit moves the light as the CPU reference says (within a code), brightens
+    /// where the answer is brighter, and keeps the words the network left alone.
+    #[test]
+    fn sdr10_composes_in_linear_light_and_keeps_unedited_words() {
+        use crate::hdr_present::reference::{compose_sdr10, sdr10_8, unpack};
+        let srgb = crate::hdr_present::Transfer::Srgb;
+        for b_low in [false, true] {
+            let (w, h) = (16u32, 16u32);
+            let frame = hdr_words(w, h, b_low);
+            let same: Vec<[u8; 3]> = frame.iter().map(|&t| sdr10_8(t, b_low)).collect();
+            let Some(out) = compose_ten_bit_once(w, h, &frame, &frame, &same, b_low, srgb, (w, h)) else { return };
+            assert_eq!(out.expect("composed"), frame, "no edit: the frame bit for bit (b_low {b_low})");
+            let answer: Vec<[u8; 3]> = same.iter().enumerate().map(|(i, s)| if i % 5 == 0 { *s } else { s.map(|v| v.saturating_add(12)) }).collect();
+            let Some(out) = compose_ten_bit_once(w, h, &frame, &frame, &answer, b_low, srgb, (w, h)) else { return };
+            let out = out.expect("composed");
+            for i in 0..(w * h) as usize {
+                if i % 5 == 0 {
+                    assert_eq!(out[i], frame[i], "pixel {i}: no edit, the frame's word");
+                    continue;
+                }
+                let (got, alpha) = unpack(out[i], b_low);
+                let (base, base_alpha) = unpack(frame[i], b_low);
+                assert_eq!(alpha, base_alpha, "alpha bits kept");
+                let want = unpack(compose_sdr10(frame[i], frame[i], answer[i], b_low), b_low).0;
+                for c in 0..3 {
+                    assert!(got[c].abs_diff(want[c]) <= 1, "pixel {i} channel {c}: {} vs the reference's {}", got[c], want[c]);
+                    if same[i][c] < 243 {
+                        assert!(got[c] > base[c], "pixel {i} channel {c}: brightened ({} -> {})", base[c], got[c]);
+                    }
+                }
+            }
+        }
     }
 
     /// No edit (the answer equals the frame's SDR picture) leaves every word of an HDR10 frame bit for bit, alpha

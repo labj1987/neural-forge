@@ -12,6 +12,9 @@
 //   else out = PQ(lin(base) + M * R * (S⁻¹(answer) - S⁻¹(S)) * (1 - smoothstep(0.954, 0.999, peak))), with lin
 //   the PQ decode to BT.2020 nits, M BT.709 to BT.2020 and R the reference white; the frame's alpha bits kept.
 // With flags bit 0 clear the two highlight rules are off (the shoulder's inverse everywhere).
+// With transfer 1 the frame is 10-bit SDR (sRGB code, BT.709): S is each code taken to 8 bits (sdr10_word), and
+//   out = sRGB(lin(base) + EOTF(answer) - EOTF(S)), lin the sRGB EOTF of the frame's 10-bit codes, clamped to
+//   0..1; answer == S keeps the frame's word bit for bit; no highlight rules (nothing was compressed).
 //
 // The push constants match `composition::gpu::HdrPushConstants` field for field, within compose.comp's range.
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -26,6 +29,7 @@ layout(push_constant) uniform Params {
   float reference_nits;
   uint b_low; // 1: A2R10G10B10 (B in bits 0-9), 0: A2B10G10R10
   uint flags; // bit 0: keep the frame where S is at the shoulder's top
+  uint transfer; // 0: HDR10 (ST 2084, BT.2020), 1: 10-bit SDR (sRGB, BT.709)
 } p;
 
 const float CLAMPED = 0.999;
@@ -89,6 +93,12 @@ uint sdr_word(uint word, bool b_low, float reference_nits) {
   return packUnorm4x8(vec4(s, 1.0));
 }
 
+// A 10-bit SDR word (sRGB code, BT.709; transfer 1) as the 8-bit picture the network is shown: each code to 8
+// bits as packUnorm4x8 rounds it (R first, alpha 255). No shoulder: the frame is display-referred already.
+uint sdr10_word(uint word, bool b_low) {
+  return packUnorm4x8(vec4(vec3(codes(word, b_low)) / 1023.0, 1.0));
+}
+
 // ST 2084's inverse EOTF: nits to code (0 to 1).
 float nits_to_pq(float nits) {
   float y = clamp(nits / PEAK_NITS, 0.0, 1.0);
@@ -126,6 +136,21 @@ void main() {
   }
   bool b_low = p.b_low != 0u;
   uint base = packUnorm4x8(imageLoad(u_original, at));
+  if (p.transfer == 1u) {
+    uvec3 s8 = bytes3(sdr10_word(packUnorm4x8(imageLoad(u_proxy, at)), b_low));
+    uvec3 a8 = bytes3(packUnorm4x8(imageLoad(u_model_answer, at)));
+    if (all(equal(a8, s8))) {
+      imageStore(u_output, at, unpackUnorm4x8(base));
+      return;
+    }
+    vec3 e = vec3(codes(base, b_low)) / 1023.0;
+    vec3 d = vec3(srgb_eotf(float(a8.r) / 255.0) - srgb_eotf(float(s8.r) / 255.0), srgb_eotf(float(a8.g) / 255.0) - srgb_eotf(float(s8.g) / 255.0),
+                  srgb_eotf(float(a8.b) / 255.0) - srgb_eotf(float(s8.b) / 255.0));
+    vec3 l = clamp(vec3(srgb_eotf(e.r), srgb_eotf(e.g), srgb_eotf(e.b)) + d, vec3(0.0), vec3(1.0));
+    uvec3 c = uvec3(round(vec3(srgb_oetf(l.r), srgb_oetf(l.g), srgb_oetf(l.b)) * 1023.0));
+    imageStore(u_output, at, unpackUnorm4x8(pack_word(min(c, uvec3(1023u)), base >> 30, b_low)));
+    return;
+  }
   uvec3 s = bytes3(sdr_word(packUnorm4x8(imageLoad(u_proxy, at)), b_low, p.reference_nits));
   uvec3 answer = bytes3(packUnorm4x8(imageLoad(u_model_answer, at)));
   float peak = float(max(s.r, max(s.g, s.b))) / 255.0;

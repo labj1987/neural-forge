@@ -4,6 +4,26 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.3.0 — 2026-11-12
+
+**10-bit SDR games get the model, and a trace for games that stall with the NGX wrapper**
+
+- Games that present a 10-bit SDR picture (common under gamescope with HDR on) now get the model on the finished
+  frame instead of being presented untouched. The model sees the frame's 8-bit picture and its change is
+  put back onto the 10-bit frame, so pixels it leaves alone keep their full precision.
+- New `NEURAL_FORGE_NGX_TRACE=/path/to/trace.txt` launch option: Neural Forge's NGX wrapper then logs every DLSS call
+  with its thread and timing, and how it loaded, and keeps the last lines even if the game crashes. It is meant for
+  games that freeze or crash only with a Neural Forge Proton copy (Indiana Jones and the Great Circle); the user
+  guide says how to read it.
+- `NEURAL_FORGE_NGX_LOG` (and the new trace option) take a normal Linux path now. A Windows path still works; the user
+  guide shows how to quote it in Steam's launch options.
+- `proton-tool list`, the Setup tab and everything else that looks for Steam no longer stop at a stray
+  `~/.local/share/Steam` folder that only has a `steamapps` folder in it: Neural Forge finds Steam the way Steam does
+  and uses every real Steam install.
+- The layer's log now counts the frames the model runs on inside the game's frame (before or after DLSS) in its
+  per-5-seconds `[present]` line, next to the finished-frame count, which used to read 0 while the model ran before
+  the upscaler.
+
 ## 4.1.2 — 2026-11-12
 
 **Build**

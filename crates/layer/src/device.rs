@@ -1174,6 +1174,8 @@ struct PresentWindow {
     start: std::time::Instant,
     presents: u32,
     composed: u32,
+    /// [`crate::preupscale::MODEL_FRAMES`] when the window started.
+    model_frames: u64,
     intervals: [f32; PRESENT_INTERVALS],
     len: usize,
     next: usize,
@@ -1181,7 +1183,8 @@ struct PresentWindow {
 
 impl PresentWindow {
     fn new(start: std::time::Instant) -> Self {
-        Self { start, presents: 0, composed: 0, intervals: [0.0; PRESENT_INTERVALS], len: 0, next: 0 }
+        let model_frames = crate::preupscale::MODEL_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        Self { start, presents: 0, composed: 0, model_frames, intervals: [0.0; PRESENT_INTERVALS], len: 0, next: 0 }
     }
 
     fn push(&mut self, ms: f32) {
@@ -1210,6 +1213,9 @@ fn frame_time_stats(intervals: &mut [f32]) -> Option<(f32, f32)> {
 /// `layer_frames` counts only the presents the layer engages on, so it stops on loading screens
 /// and cannot say whether turning the effect off actually gave the frames back. The line ends with the
 /// window's frame times ([`frame_time_stats`]): the present-to-present interval's 99th percentile and the 1% low.
+/// The model's frames are counted where it runs: composited on the finished frame (`composited by the effect`),
+/// and run before or after DLSS inside the game's frame (`with the model in the game's frame`, the holds that ran
+/// the network or carried its result: [`crate::preupscale::MODEL_FRAMES`]), so neither reads 0 while the other runs.
 fn note_present_rate(composited: bool) {
     const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
     // The window, and the last present (intervals run on across windows).
@@ -1229,10 +1235,12 @@ fn note_present_rate(composited: bool) {
         let len = w.len;
         let times = frame_time_stats(&mut w.intervals[..len])
             .map_or_else(String::new, |(p99, low)| format!("; frame time p99 {p99:.1} ms, 1% low {low:.1} fps ({len} intervals)"));
+        let model = crate::preupscale::MODEL_FRAMES.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(w.model_frames);
         crate::log!(
-            "[present] {:.1} fps ({:.1}/s composited by the effect) over {:.1}s{times}",
+            "[present] {:.1} fps ({:.1}/s composited by the effect on the finished frame, {:.1}/s with the model in the game's frame) over {:.1}s{times}",
             f64::from(w.presents) / secs,
             f64::from(w.composed) / secs,
+            model as f64 / secs,
             secs
         );
         crate::logging::flush();
@@ -2412,6 +2420,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     " (HDR10: untouched, not admitted)"
                 } else {
                     " (HDR10: the network runs on an SDR-mapped copy)"
+                }
+            } else if swapchain::is_sdr_10bit(state.format, state.color_space) {
+                if state.pass_through {
+                    " (10-bit SDR: untouched, not admitted)"
+                } else {
+                    " (10-bit SDR: the network runs on its 8-bit picture)"
                 }
             } else {
                 ""
@@ -3940,25 +3954,28 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 // and write raw. A pass-through one's render source is never composed onto.
                 let pq10 = supported && sw.hdr_kind == neural_forge_protocol::enums::hdr_kind::PQ10;
                 state.shm.publish_hdr_active(if pq10 && !sw.pass_through { sw.hdr_kind } else { neural_forge_protocol::enums::hdr_kind::NONE });
-                if !supported || (pq10 && sw.pass_through) {
+                // A raw 10-bit frame (HDR10 or 10-bit SDR): only from an admitted swapchain's own image.
+                let ten_bit = supported && neural_forge_protocol::enums::proxy_format::is_ten_bit(swapchain::proxy_format_for(sw.format, sw.color_space));
+                if !supported || (ten_bit && sw.pass_through) {
                     // Not merely `pass_through`: a pass-through swapchain can still be composed
                     // onto from a tracked render source, which is exactly what must not happen
-                    // to a float or SDR-colour-space 10-bit swapchain (see `swapchain::is_supported_format`),
-                    // nor to an HDR10 one's render source.
+                    // to a float swapchain (see `swapchain::is_supported_format`), nor to a 10-bit one's
+                    // render source (HDR10 or 10-bit SDR: raw words only from the swapchain's own image).
                     // A capture of the game's frames cannot be served either: said, not left waiting.
                     if state.shm.capture_requested() && would_be_primary(self.device.handle(), sc, sw.width, sw.height) {
                         crate::series::refuse_waiting(&state.shm, dump_owns_one_shot(), neural_forge_protocol::capture::reason::UNSUPPORTED_FORMAT);
                     }
                     static SAID_FORMAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !SAID_FORMAT.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        if pq10 {
+                        if ten_bit {
                             crate::log!(
-                                "[layer] present skipped: the HDR10 swapchain ({:?}) was not admitted for capture; its frames present untouched",
-                                sw.format
+                                "[layer] present skipped: the 10-bit swapchain ({:?} in {:?}) was not admitted for capture; its frames present untouched",
+                                sw.format,
+                                sw.color_space
                             );
                         } else {
                             crate::log!(
-                                "[layer] present skipped: swapchain format {:?} in {:?} is neither SDR 8-bit nor HDR10; it presents untouched",
+                                "[layer] present skipped: swapchain format {:?} in {:?} is neither 8-bit SDR, 10-bit SDR nor HDR10; it presents untouched",
                                 sw.format,
                                 sw.color_space
                             );
@@ -3967,8 +3984,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     }
                     continue;
                 }
-                if pq10 && state.shm.capture_requested() && would_be_primary(self.device.handle(), sc, sw.width, sw.height) {
-                    // Captures write 8-bit PNGs of the swapchain image: an HDR10 frame cannot be read as one.
+                if ten_bit && state.shm.capture_requested() && would_be_primary(self.device.handle(), sc, sw.width, sw.height) {
+                    // Captures write 8-bit PNGs of the swapchain image: a 10-bit frame cannot be read as one.
                     crate::series::refuse_waiting(&state.shm, dump_owns_one_shot(), neural_forge_protocol::capture::reason::UNSUPPORTED_FORMAT);
                 }
                 if pq10 {
@@ -4106,16 +4123,16 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let proxy_format = swapchain::proxy_format_for(sw.format, sw.color_space);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
                 let srgb = swapchain::is_srgb(sw.format);
-                // Whether the frame can be read back for a capture (`crate::series`, 8-bit PNGs): never an HDR10
-                // one (refused above).
-                let readable = sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && !pq10;
+                // Whether the frame can be read back for a capture (`crate::series`, 8-bit PNGs): never a 10-bit
+                // one, HDR10 or SDR (refused above).
+                let readable = sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && !ten_bit;
                 // The sharpening reads and writes the swapchain's image itself: an admitted swapchain's (a pass-through
                 // one's frames come from its render source, which is not sharpened).
                 if !sw.pass_through && sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST) {
                     sharpen_target = Some(SharpenTarget {
                         swapchain: sc,
                         queue_family,
-                        frame: crate::sharpen::Frame { image, layout: vk::ImageLayout::PRESENT_SRC_KHR, width, height, bgr: bgr_order, ten_bit: pq10 },
+                        frame: crate::sharpen::Frame { image, layout: vk::ImageLayout::PRESENT_SRC_KHR, width, height, bgr: bgr_order, ten_bit, bt2020: pq10 },
                     });
                 }
                 let (capture_image, capture_layout) = match tap {

@@ -44,7 +44,12 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   resolved at load; one the core lacks (an older driver) jumps to a stub that returns `NVSDK_NGX_Result_Fail`
   (`0xBAD00000`), as NGX answers a call it cannot serve, and the log names it. The stub takes no arguments, which is
   safe whatever the export's signature: on x64 Windows the caller passes arguments in registers and its own stack
-  space and cleans up after the call.
+  space and cleans up after the call. Since 4.3.0 such an export is also taken out of the wrapper's export table at
+  load (its address set to 0, `pe.rs`; Wine's `find_ordinal_export` answers that with `STATUS_PROCEDURE_NOT_FOUND`),
+  so `GetProcAddress` finds it missing, as it would in NVIDIA's core, and a caller that checks for an entry point
+  takes the same path as without the wrapper (#51: the reporter's driver, 615.71, is older than the 620.70 export
+  list). Only a caller that bound it before the wrapper's `DllMain` ended (none: NGX is loaded with `LoadLibrary`)
+  would meet the stub.
 - **Loading the core from `DllMain`.** The wrapper loads NVIDIA's core and resolves the exports in its `DllMain`,
   under the loader lock, which Microsoft's guidance for `DllMain` advises against. It is needed and safe here: the
   passthrough exports are bare jumps through the resolved pointers, so they must be set before any export can be
@@ -110,6 +115,40 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   there until the next poll, and once the writer has reserved 1024 records past it, the reader jumps ahead and the
   slot's record is lost, never misread. A slot overwritten while copied fails the `seq` check after the copy and is
   skipped. Writers never wait on the reader.
+
+## The call trace (`NEURAL_FORGE_NGX_TRACE`, `crates/ngx-wrapper/src/trace.rs`)
+
+For a game that stalls or crashes with the wrapper in and logs nothing in `NEURAL_FORGE_NGX_LOG` (#51: Indiana Jones
+and the Great Circle, Vulkan with Streamline, `vkQueuePresentKHR` returning `VK_TIMEOUT` about 5 s after its
+swapchain, before any feature was created). `NEURAL_FORGE_NGX_TRACE=<path>` (a Windows path, or a Linux one taken
+through `Z:`; `{pid}` becomes the Linux pid, without it the pid goes before the extension, and a path ending in a
+separator gets `ngx-trace-<pid>.txt` in that folder) makes the wrapper log:
+
+- its load: the environment Proton set (`NVIDIA_WINE_DLL_DIR`, `WINEDLLOVERRIDES`), how long `LoadLibraryW` of
+  NVIDIA's core took, every export's resolved address (and which the core lacks), the ring, `DllMain`'s end, and
+  `DLL_PROCESS_DETACH`;
+- every call into any of the 75 exports: `> name(rcx, rdx, r8, r9)` on entry, `< name = result (ms)` on return, with
+  the thread id and the time since load. The hooked exports log in their Rust hooks; the passthrough exports, which
+  are bare jumps otherwise, jump to a per-export entry (`exports.rs`, `traced`) that puts the export's index in r11
+  and goes to `win::trace_thunk`: it saves the argument registers, logs the entry, replaces the caller's return
+  address with `win::trace_return` (the real one kept on a per-thread stack of 64 frames), restores the registers
+  and jumps to NVIDIA's function, so every signature passes through unchanged and the stack arguments stay where the
+  caller put them. `trace_return` logs the result and goes back to the kept address. A call deeper than 64 is
+  logged without its exit. (Not for a function a C++ exception crosses, which NGX's C exports do not let out.)
+- the text log's lines too (`log: ...`), so one file has all of it.
+
+The file is 64 MB, mapped once at load (shared, file-backed): a line is formatted on the stack and copied into the
+mapping at a position reserved with one atomic add, and a fixed 128-byte header line is rewritten with the next
+position. Writing a trace line and tracing a passthrough call take no system call, no lock, no allocation and no
+flush (a test counts allocations); the hooked calls' detail lines (creation, evaluate, release) are formatted on the heap
+first, as for the text log, and a line holds up to 2 KB, so the longest evaluate line is kept whole. The kernel
+keeps the mapping's pages when the process dies, so the lines up to a crash are in the file. When the ring is full it
+wraps; the header says `wrapped` and about where the next line goes, but writers on several threads rewrite it
+without ordering, so it is a hint, not authoritative: `tr -d '\0' < FILE | sort -n` is what orders the lines by time.
+While tracing, the return addresses of passthrough calls point at `trace_return`, so a crash dump's or a debugger's
+stack walk through an NGX call is not reliable; the wrapper's text log line says whether the trace file opened (its
+path, or why not). A call that never returned shows
+as an entry line without its exit: in a stalled present, that names the NGX call the game's thread is in.
 
 ## What the layer does with the records (`crates/layer/src/ngx_ring.rs`, `preupscale.rs`)
 
@@ -267,3 +306,9 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
   Proton and put it back on `disable`) held before the upscaler, 71 fps; GTA San Andreas - The Definitive Edition
   (D3D11 through DXVK) held before the upscaler, ~50 fps. Crimson Desert with DLSS off in its own settings: the model on
   the finished frame (13.5 fps, as before); with DLSS on and no wrapper: the model off, 104 fps, the log says why.
+- Where NVIDIA's core loads from does not change which DLSS files it picks (2026-11-12, driver 620.70's
+  `_nvngx.dll`, Ghidra): its "driver store" path under Wine is `NVIDIA_WINE_DLL_DIR` read from the environment
+  (`NGXGetPathUsingQAI`, after the adapter query fails), not its own module's folder, so the driver's
+  `nvngx_dlssg.dll`/`nvngx_dlssd.dll` are found the same way with and without the wrapper; and its over-the-air updater
+  is decided by `__NGX_DISABLE_UPDATER` and `PROTON_ENABLE_NGX_UPDATER` (`NGXIsUpdaterEnabledBase`), not by its path.
+  The Indiana Jones stall in #51 is therefore not the core's load path; the call trace is there to find what it is.
