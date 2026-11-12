@@ -1435,9 +1435,9 @@ on SMPTE ST 2084 and the BT.2020/BT.709 matrices of ITU-R BT.2087 (`crate::hdr_p
 
 - **Admission** (`swapchain::is_supported_format(format, colour_space)`): the two 10-bit formats with the
   HDR10 colour space; the same `TRANSFER_SRC|TRANSFER_DST` usage as an 8-bit swapchain. The same formats in
-  `SRGB_NONLINEAR` are 10-bit SDR (4.2.0, below). Float16 (scRGB, `R16G16B16A16_SFLOAT`) ones still present
+  `SRGB_NONLINEAR` are 10-bit SDR (4.3.0, below). Float16 (scRGB, `R16G16B16A16_SFLOAT`) ones still present
   untouched: a float16 frame is 8 bytes a pixel, where the shared regions and the composition hold 4.
-- **10-bit SDR (4.2.0, #51)**: a 10-bit swapchain in `SRGB_NONLINEAR` (DXVK and vkd3d-proton give one for a game's
+- **10-bit SDR (4.3.0, #51)**: a 10-bit swapchain in `SRGB_NONLINEAR` (DXVK and vkd3d-proton give one for a game's
   `R10G10B10A2` swapchain; Stellar Blade under gamescope) takes the same raw path as `proxy_format::SDR10_RGB`/
   `SDR10_BGR`, with the shaders' `transfer` push constant 1 (`hdr_present::Transfer::Srgb`): the network's picture is
   each 10-bit sRGB code taken to 8 bits (`sdr10_word`, exact), and `compose_hdr.comp` puts the change back in linear
