@@ -202,6 +202,9 @@ pub(crate) struct Progress {
     /// Holds submitted that took the answer to the frame before them, and those planned to that found none.
     taken: AtomicU64,
     untaken: AtomicU64,
+    /// Held while the host resets `sent` (the worker) and while a hold records its set: `vkResetEvent` needs the
+    /// event externally synchronized, and the hold's thread records it while the worker runs.
+    event: Mutex<()>,
     /// Tests: how many times a settle blocked (waited for the worker at all), whatever it then found.
     #[cfg(test)]
     blocked: AtomicU64,
@@ -696,6 +699,7 @@ impl Exchange {
                 &[],
                 &[],
             );
+            let _event = self.progress.event.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             device.cmd_set_event(cmd, self.sent, vk::PipelineStageFlags::TRANSFER);
         }
     }
@@ -907,7 +911,10 @@ fn serve(
         let now = Instant::now();
         let interval = last_sent.replace(now).map(|t| now - t);
         // SAFETY: as above; the GPU set it for this frame, and no command buffer waits on it.
-        let _ = unsafe { device.reset_event(link.sent) };
+        let _ = unsafe {
+            let _event = link.progress.event.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            device.reset_event(link.sent)
+        };
         // SAFETY: OUT's header, written before `sent` was set.
         let seq = unsafe { link.out.cast::<u32>().add(OUT_SEQ).read_volatile() };
         counters.sent.fetch_add(1, Ordering::Relaxed);
@@ -1849,6 +1856,10 @@ mod tests {
         let mut cadence = Cadence::default();
         for hold in 1..=6u64 {
             let plan = cadence.hold(hold, true);
+            // The answer is there before the hold that takes it (the budget is not what this test is about).
+            if hold > 1 {
+                wait_finished(&game, hold as u32 - 1);
+            }
             game.run(&[game.record(plan, 100 + hold as u32)]);
             if hold == 1 {
                 assert!(!plan.take);
@@ -1857,6 +1868,7 @@ mod tests {
             }
         }
         // The last frame is answered too.
+        wait_finished(&game, 6);
         game.run(&[game.record(cadence.hold(7, false), 0)]);
         assert_eq!(game.landed(), (Some(106), true));
         assert_eq!(*ran.lock().unwrap(), vec![1, 2, 3, 4, 5, 6]);
@@ -1873,12 +1885,32 @@ mod tests {
         let mut cadence = Cadence::default();
         let holds: Vec<_> = (1..=4u64).map(|hold| game.record(cadence.hold(hold, true), 200 + hold as u32)).collect();
         for (i, hold) in holds.iter().enumerate() {
+            if i > 0 {
+                wait_finished(&game, i as u32);
+            }
             game.run(std::slice::from_ref(hold));
             if i > 0 {
                 assert_eq!(game.landed(), (Some(200 + i as u32), true));
             }
         }
-        assert_eq!(*ran.lock().unwrap(), vec![1, 2, 3]);
+        // The last hold's frame runs too, after it (whenever the worker gets to it).
+        wait_finished(&game, 4);
+        assert_eq!(*ran.lock().unwrap(), vec![1, 2, 3, 4]);
+        game.close(worker);
+    }
+
+    /// The worker resets `sent` on the host while the game's thread records the next hold's set of it: the two are
+    /// kept apart (`vkResetEvent` needs the event externally synchronized; the validation layer reports a threading
+    /// error otherwise). Many holds, each recorded right after the one before was submitted, as the worker picks it up.
+    #[test]
+    fn the_worker_s_reset_and_a_hold_s_recording_of_the_event_do_not_overlap() {
+        let Some((game, worker, _, gave_up, _)) = rig(Vec::new(), None) else { return };
+        let mut cadence = Cadence::default();
+        for hold in 1..=200u64 {
+            game.run(&[game.record(cadence.hold(hold, true), hold as u32)]);
+        }
+        wait_finished(&game, 200);
+        assert!(gave_up.lock().unwrap().is_empty());
         game.close(worker);
     }
 
@@ -1907,15 +1939,23 @@ mod tests {
     /// the runner, so the first frame's answer is not kept and the runner is told (its history starts afresh).
     #[test]
     fn a_frame_written_over_while_it_runs_is_not_answered() {
-        let Some((game, worker, _, gave_up, abandoned)) = rig(vec![1], None) else { return };
+        let Some((game, worker, ran, gave_up, abandoned)) = rig(vec![1], None) else { return };
         let mut cadence = Cadence::default();
         let holds: Vec<_> = (1..=2u64).map(|hold| game.record(cadence.hold(hold, true), 700 + hold as u32)).collect();
         game.run(&holds);
         // Frame 2 is answered once the worker is past frame 1; hold 3 carries it.
-        std::thread::sleep(ANSWER_BUDGET + Duration::from_millis(400));
+        wait_finished(&game, 2);
         game.run(&[game.record(cadence.hold(3, false), 0)]);
         assert_eq!(game.landed(), (Some(702), true));
-        assert_eq!(*abandoned.lock().unwrap(), vec![1], "frame 1 was written over by frame 2's send while it ran");
+        // Whether the worker woke between the two sends is up to the scheduler: if it ran frame 1, frame 2's send
+        // wrote OUT under it and frame 1 is not answered (the runner is told); if it only ever saw frame 2, frame 1 was
+        // never run and there is nothing to tell. Either way only frame 2 is answered.
+        if ran.lock().unwrap().first() == Some(&1) {
+            assert_eq!(*abandoned.lock().unwrap(), vec![1], "frame 1 was written over by frame 2's send while it ran");
+        } else {
+            assert_eq!(*ran.lock().unwrap(), vec![2], "the worker woke after both sends and ran only frame 2");
+            assert!(abandoned.lock().unwrap().is_empty(), "frame 1 never ran: nothing to abandon");
+        }
         assert_eq!(worker.counters.answered.load(Ordering::Relaxed), 1);
         assert!(gave_up.lock().unwrap().is_empty());
         game.close(worker);
