@@ -1008,7 +1008,12 @@ impl Inline {
             }),
             // The copy is at the colour input's extent; the source's extent stays (the vectors' unit,
             // `InlinePoint::mvec_scale`).
-            mvec_input: mvec.map(|_| Aux { image: staging.mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
+            // Not copied: DLSS's own, unread, so a frame the offload cannot send says why (`native::unsendable`: their
+            // layout unknown, not "DLSS names no motion vectors"); everything reading them checks `readable`.
+            mvec_input: match mvec {
+                Some(_) => Some(Aux { image: staging.mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
+                None => point.mvec_input.map(|a| Aux { readable: false, ..a }),
+            },
             depth_input: None,
             // The staging images, in `GENERAL` (set by the copies in), the rectangle at their corner and its edge
             // replicated over the rest of them.
