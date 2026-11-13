@@ -1015,8 +1015,6 @@ impl HdrPass {
         u32::from_le_bytes(unsafe { std::ptr::read_volatile(self.exposure.ptr.add(4).cast::<[u8; 4]>()) })
     }
 
-    /// Clears the exposure buffer to 0 (so a capture that did not read the exposure image leaves
-    /// "unusable" behind, never the previous frame's value).
     /// Writes the exposure buffer's bytes as another device's capture left them (`super::offload_server`).
     pub(crate) fn set_exposure_bytes(&self, bytes: &[u8]) {
         let n = bytes.len().min(EXPOSURE_BYTES as usize);
@@ -1024,6 +1022,8 @@ impl HdrPass {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.exposure.ptr, n) };
     }
 
+    /// Clears the exposure buffer to 0 (so a capture that did not read the exposure image leaves
+    /// "unusable" behind, never the previous frame's value).
     pub(crate) fn clear_exposure(&self) {
         // SAFETY: as above; nothing pending uses the buffer (called after the hold's `wait_idle`).
         unsafe { std::ptr::write_bytes(self.exposure.ptr, 0, EXPOSURE_BYTES as usize) };
