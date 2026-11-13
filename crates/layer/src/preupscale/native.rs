@@ -4899,4 +4899,3547 @@ unsafe fn native_hold(
         if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
             // SAFETY: as above; the kept image and the counters are live.
             unsafe {
+                late_bound = edit.bind_late(device, side.snapshot_view(), side.snapshot_made());
+                side.exchange.bind_gate(device, edit.stats_buffer(), edit.stats_made());
                 side.exchange.bind_pack(device, native.acc.buffer);
+            }
+        }
+        // A hold that records nothing (below) must not have taken the stored edit out of the plan.
+        if frozen.blocked().is_none() {
+            edit.state.set_offloaded(offloaded);
+            if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
+                // Its frame can be sent when the next hold can carry its edit: vectors, jitter, a chained cache.
+                off_plan = Some(side.plan(&mut edit.state, &h, chained && mvec.is_some() && jitter.is_some()));
+            }
+            let p = edit.state.plan(&h);
+            if !inline {
+                edit.clear_counters();
+            }
+            // No vectors copied this hold: the motion pass writes no history and counts nothing.
+            let flags = p.flags | if mvec.is_none() { super::cache::F_NO_MVEC } else { 0 };
+            let mut q = edit.push(flags, depth.map_or(0, super::cache::depth_kind), target.mvec_scale, target.paper_white);
+            q.step_jitter = p.step_jitter;
+            q.refresh_jitter = p.refresh_jitter;
+            cache_hold = Some(h);
+            plan = Some(p);
+            push = Some(q);
+        }
+    }
+    let cached = plan.is_some_and(|p| p.kind == super::cache::Kind::Cached);
+    // Offloaded: the answer to the frame sent before this hold is taken when this hold is the cached one after it.
+    let take_seq = off_plan.filter(|p| p.take && cached && late_bound).and_then(|p| p.settle);
+    let late_push = res.offpre.as_ref().and_then(super::offload_pre::HoldSide::sent_push);
+    // The network frame of this hold runs on the other device: the history's rule, decided here as for a frame here.
+    let off_history = offloaded && off_plan.is_some_and(|p| p.send.is_some()) && native.gap.begin(hold_now()).is_none() && mvec.is_some() && !no_history();
+    let off_meta = off_plan.and_then(|p| p.send).map(|seq| super::offload_server::FrameMeta {
+        seq,
+        width: target.width,
+        height: target.height,
+        extents,
+        sizes: sizes.to_vec(),
+        choice,
+        history: off_history,
+        jitter,
+        mvec_scale: target.mvec_scale,
+        passes,
+        depth: depth.is_some(),
+        motion_half: res.offpre.as_ref().is_some_and(|side| side.exchange.motion_half()),
+        lut: lut.cloned(),
+    });
+    // The motion pass while the cache runs (its prep and the accumulated field the network reads), at
+    // interval 1 whenever there are vectors to convert.
+    let run_motion = push.is_some() && (chained || mvec.is_some());
+    // A cache dump's readbacks for an armed hold, built on its first one (inside DLSS's buffer, the slot's).
+    let dump_buffers = match ctx.as_deref_mut() {
+        Some(c) => {
+            if arm.is_some() && c.cache_dump.is_none() {
+                // SAFETY: `device` is live.
+                *c.cache_dump = unsafe { super::cache_dump::Buffers::build(device, instance, physical_device, target.width, target.height) };
+            }
+            arm.and(c.cache_dump.as_ref())
+        }
+        None => {
+            if arm.is_some() && res.cache.is_none() {
+                // SAFETY: `device` is live.
+                res.cache = unsafe { super::cache_dump::Buffers::build(device, instance, physical_device, target.width, target.height) };
+            }
+            arm.and(res.cache.as_ref())
+        }
+    };
+    let cache = dump_buffers.map(|c| super::CacheCopies {
+        colour: c.colour.buffer,
+        answer: c.answer.buffer,
+        mvec: mvec.map(|_| (native.mvec.buffer, c.mvec.buffer)),
+        depth: depth.and(res.depth.as_ref()).map(|d| (d.buffer(), c.depth.buffer)),
+    });
+    // Inside DLSS's buffer: the guard that checks this hold follows the one recorded before it, and the copies
+    // between the network's passes, made ready now (nothing of them is written once recording starts).
+    if inline {
+        if res.guard.is_none() {
+            // SAFETY: `device` is live.
+            res.guard = unsafe { HoldGuard::build(device, instance, physical_device) };
+        }
+        let stats = res.edit.as_ref().filter(|_| cache_on).map(super::cache::CachePass::stats_buffer);
+        // SAFETY: both buffers are live; the set is not written while a hold that bound it may run.
+        let verdicts = ctx.as_ref().map_or(vk::Buffer::null(), |c| c.verdicts);
+        let bound = res.guard.as_mut().is_some_and(|g| unsafe { g.bind(device, native.state_buffer(), native.id(), stats, verdicts) });
+        if !bound && frozen.blocked().is_none() {
+            res.native = Some(native);
+            result.miss = Some("the hold guard could not be built");
+            return result;
+        }
+        if more && !cached {
+            let encoded_view = res.hdr.as_ref().expect("built above").encoded_view();
+            // SAFETY: the feedback blend's set is not written while a hold that bound it may run.
+            if !unsafe { native.prepare_copies(device, encoded_view, passes.feedback) } && frozen.blocked().is_none() {
+                res.native = Some(native);
+                result.miss = Some("the feedback blend between the network's passes could not be built");
+                return result;
+            }
+        }
+    }
+    if let Some(why) = frozen.blocked() {
+        crate::log!("[native] the hold waits: {why} would change while holds recorded with it may still run");
+        res.native = Some(native);
+        result.miss = Some(WAITING);
+        return result;
+    }
+    let hdr_pass = res.hdr.as_ref();
+    let depth_copy = depth.and(res.depth.as_ref()).map(|d| (d.buffer(), d.timer.as_ref()));
+    let edit = res.edit.as_ref().filter(|_| cache_on);
+    let acc = native.acc.buffer;
+    let no_push = super::cache::CachePush::default();
+    let push_ref = push.as_ref().unwrap_or(&no_push);
+    // SAFETY (the three closures, only called while the cache runs): recording into the hold's own
+    // buffers or DLSS's; the set was bound above.
+    let motion = |cmd: vk::CommandBuffer| unsafe { edit.expect("the cache runs").record_motion(device, cmd, push_ref, acc) };
+    let capture_edit = |cmd: vk::CommandBuffer| unsafe { edit.expect("the cache runs").record_capture(device, cmd, push_ref) };
+    let apply = |cmd: vk::CommandBuffer| unsafe { edit.expect("the cache runs").record_apply(device, cmd, push_ref) };
+    // After the encode in the capture: the scene-cut detector, then the cache's motion pass.
+    let scene = res.scene.as_ref().filter(|_| threshold > 0);
+    let after_encode = |cmd: vk::CommandBuffer| {
+        if let Some(s) = scene {
+            // SAFETY: recording the capture, after the encode; bound above.
+            unsafe { s.record(device, cmd, threshold) };
+        }
+        if run_motion {
+            motion(cmd);
+        }
+    };
+    let more = more && !cached;
+    let off_side = res.offpre.as_ref().filter(|_| offloaded);
+    let state_buffer = native.state_buffer();
+    // Offloaded, first in the hold: the answer to the frame sent last into its image, the capture of its edit
+    // against that frame (still in place: before this hold's own capture), and the gate.
+    let receive = |cmd: vk::CommandBuffer| {
+        let (Some(side), Some(seq), Some(hp), Some(e), Some(push)) = (off_side, take_seq, hdr_pass, edit, late_push.as_ref()) else { return };
+        // SAFETY: recording into the hold's own buffer or DLSS's; everything bound above and live.
+        unsafe {
+            side.exchange.record_receive(device, cmd, &[hp.answer_to_general()], &|region, at| hp.record_answer_in(device, cmd, region, at));
+            e.record_capture_late(device, cmd, push);
+            side.exchange.record_gate(device, cmd, seq);
+        }
+    };
+    // Offloaded, after the capture: the colour input kept for the next hold's capture, and the frame sent.
+    let send = |cmd: vk::CommandBuffer| {
+        let (Some(side), Some(seq), Some(hp)) = (off_side, off_plan.and_then(|p| p.send), hdr_pass) else { return };
+        let (pw, ph) = super::padded(target.width, target.height);
+        let side_buffers = [(exposure, hdr::HdrPass::EXPOSURE_BYTES), (state_buffer, 16)];
+        let from = super::offload_pre::Sources {
+            frame: super::offload_pre::FrameSource::Image { image: hp.encoded_image(), width: pw, height: ph },
+            motion: Some(acc),
+            depth: depth_buffer,
+            side: &side_buffers,
+        };
+        // SAFETY: as above; the colour input is in GENERAL for the hold, the encode in its image.
+        unsafe {
+            side.record_snapshot(device, cmd, target.colour, target.width, target.height);
+            side.exchange.record_send(device, cmd, seq, &from);
+        }
+    };
+    let after_encode = |cmd: vk::CommandBuffer| {
+        after_encode(cmd);
+        send(cmd);
+    };
+    let run_extra = scene.is_some() || run_motion || offloaded;
+    if let Some(ctx) = ctx {
+        // ---- Inside DLSS's buffer: everything recorded into it, in the split hold's order. ----
+        let cmd = ctx.cb;
+        // The frame's plan (its parameters, its history, its parity), as the split hold makes it.
+        let (history, frame_plan) = if cached || offloaded {
+            (false, None)
+        } else {
+            let stale = native.gap.begin(hold_now());
+            #[cfg(test)]
+            {
+                native.last_stale = stale;
+            }
+            note_network_reset(native.frames, stale, &mut result.scene_cut);
+            let history = native.frames > 0 && stale.is_none() && mvec.is_some() && !no_history();
+            (history, Some(native.frame_plan(&graphs, history, jitter, target.mvec_scale, &passes)))
+        };
+        let seq = res.seq + 1;
+        let stats = edit.map(super::cache::CachePass::stats_buffer);
+        let auto_state = res.hdr.as_ref().and_then(hdr::HdrPass::auto_state_buffer).filter(|_| auto_reset);
+        let auto_read = res.hdr.as_ref().and_then(hdr::HdrPass::auto_state_buffer);
+        let scene_result = scene.map(super::scene_cut::ScenePass::result_buffer);
+        // SAFETY: DLSS's buffer is being recorded on this thread (the contract); every handle is live and
+        // stays so while the buffer may run (nothing is destroyed or rewritten while a hold may run).
+        unsafe {
+            ctx.open();
+            receive(cmd);
+            let verdict = if ctx.verdicts == vk::Buffer::null() { NO_VERDICT } else { ctx.slot };
+            res.guard.as_ref().expect("bound above").record(device, cmd, seq, verdict);
+            // What the split hold writes from the host before it submits: here, in the buffer's order.
+            device.cmd_fill_buffer(cmd, exposure, 0, hdr::HdrPass::EXPOSURE_BYTES, 0);
+            if let Some(stats) = stats {
+                device.cmd_fill_buffer(cmd, stats, 0, super::cache::CLEARED_BYTES, 0);
+            }
+            if let Some((state, bytes)) = auto_state {
+                device.cmd_fill_buffer(cmd, state, 0, bytes, 0);
+            }
+            for (buffer, params) in frame_plan.iter().flat_map(|p| p.params.iter()) {
+                device.cmd_update_buffer(cmd, *buffer, 0, std::slice::from_raw_parts(std::ptr::from_ref(params).cast::<u8>(), PARAMS_BYTES as usize));
+            }
+            let written = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::UNIFORM_READ
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[written],
+                &[],
+                &[],
+            );
+            let _ = super::record_capture(
+                device,
+                res,
+                target,
+                None,
+                hdr_pass,
+                None,
+                mvec.map(|_| native.mvec.buffer),
+                depth_copy,
+                cache.map(|c| c.colour),
+                run_extra.then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
+                None,
+                Some(cmd),
+            );
+            ctx.stamp(1);
+        }
+        let mut network_ok = true;
+        if let Some(fp) = frame_plan.as_ref() {
+            let hdr_ref = res.hdr.as_ref().expect("built above");
+            let slot = ctx.slot;
+            let mut network = |cmd: vk::CommandBuffer, built: &Built| {
+                // SAFETY: `cmd` is DLSS's buffer, recording; no buffer recorded with this slot may still run.
+                unsafe { loader.record_graph(built, slot, cmd) }
+            };
+            // SAFETY: as above; the copies were made ready above.
+            let recorded = unsafe {
+                native.record_frame_inline(
+                    device,
+                    cmd,
+                    fp,
+                    &graphs,
+                    hdr_ref.encoded_image(),
+                    hdr_ref.padded_region(),
+                    passes.count,
+                    passes.feedback,
+                    &mut network,
+                )
+            };
+            if let Err(why) = recorded {
+                crate::log!("[native] recording the network into DLSS's buffer failed: {why}; this frame goes to DLSS as it was");
+                crate::logging::flush();
+                network_ok = false;
+            }
+        }
+        // SAFETY: as above.
+        unsafe {
+            ctx.stamp(2);
+            if network_ok && (cached || !offloaded) {
+                let _ = if cached {
+                    super::record_cached_writeback(device, res, &apply, Some(cmd))
+                } else {
+                    super::record_writeback(
+                        device,
+                        res,
+                        target,
+                        native.answer(),
+                        hdr_pass,
+                        cache.as_ref(),
+                        chained.then_some(&capture_edit as &dyn Fn(vk::CommandBuffer)),
+                        Some(cmd),
+                    )
+                };
+            }
+            // What the host reads once the buffer ran (`inline::Harvest`): the counters, the scene cut, the
+            // exposure and the auto-exposure's state, copied out of the buffers the next holds write again.
+            let before = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            let copy =
+                |src: vk::Buffer, at: u64, size: u64| device.cmd_copy_buffer(cmd, src, ctx.readback, &[vk::BufferCopy { src_offset: 0, dst_offset: at, size }]);
+            if let Some(stats) = stats {
+                copy(stats, super::inline::READ_STATS, super::cache::STAT_WORDS as u64 * 4);
+            }
+            if let Some(result) = scene_result {
+                copy(result, super::inline::READ_SCENE, 16);
+            }
+            copy(exposure, super::inline::READ_EXPOSURE, 8);
+            if let Some((state, bytes)) = auto_read {
+                copy(state, super::inline::READ_AUTO, bytes.min(super::inline::READBACK_BYTES - super::inline::READ_AUTO));
+            }
+            let read = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[read], &[], &[]);
+        }
+        res.seq = seq;
+        result.timing.prep = Some(t_hold.elapsed());
+        result.waits_consumed = true;
+        if let Some(d) = res.depth.as_mut() {
+            d.valid = depth;
+        }
+        if let Some(s) = res.scene.as_mut().filter(|_| threshold > 0) {
+            s.recorded_inline();
+        }
+        res.game_exposure_read = (source == super::ExposureSource::Game).then_some(target.identification);
+        let (pass_id, init_command) = (native.id(), native.init_command());
+        res.native = Some(native);
+        let meta = super::inline::Meta {
+            stage: if ctx.point.hold.stage == super::placement::Stage::Upscaled { super::placement::Stage::Upscaled } else { super::placement::Stage::Before },
+            resources: res.id,
+            identification: target.identification,
+            stats: stats.is_some(),
+            scene: scene_result.map(|_| super::scene_cut::Recorded { network: !cached, history }),
+            auto: auto_read.is_some(),
+            kind: plan.map(|p| p.kind),
+            refresh: plan.map_or(0, |p| p.refresh),
+            init: Some((pass_id, init_command)),
+            fresh: (pass_id, frame_plan.as_ref().map_or(0, |p| p.fresh)),
+            exposure_source: Some(source),
+            cache_dump: None,
+            timed: ctx.queries != vk::QueryPool::null(),
+            offload: off_plan.filter(|_| offloaded),
+            remote: offloaded,
+        };
+        if !network_ok {
+            if let Some(e) = res.edit.as_mut() {
+                e.state.drop_edit();
+            }
+            result.miss = Some("recording the network into DLSS's buffer failed");
+            result.meta = Some(meta);
+            return result;
+        }
+        if cached {
+            // The 500 ms rule counts from this hold, not the last network frame.
+            if let Some(n) = res.native.as_mut() {
+                n.gap.touch(hold_now());
+            }
+        }
+        if let (Some(edit), Some(h), Some(p)) = (res.edit.as_mut(), cache_hold.as_ref(), plan.as_ref()) {
+            edit.state.went_through(h, p);
+            if offloaded && !cached {
+                // Nothing was stored by this hold: only the next hold's late capture stores this frame's edit.
+                edit.state.drop_edit();
+            }
+        }
+        if let (Some(side), Some(h), Some(q), Some(p)) = (res.offpre.as_mut().filter(|_| offloaded), cache_hold.as_ref(), push.as_ref(), off_plan.as_ref()) {
+            side.went_through(h, q, p, off_meta);
+        }
+        let pending = arm.filter(|_| cache.is_some()).map(|arm| super::cache_dump::Pending {
+            arm,
+            time_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+            jitter,
+            history,
+            mvec: mvec.is_some(),
+            depth,
+            depth_missing: depth.is_none().then(|| {
+                if cache_on {
+                    depth_missing(target)
+                } else {
+                    "the edit cache is off (NEURAL_FORGE_EDIT_CACHE=off): no depth is copied"
+                }
+            }),
+            depth_layout: target.depth.and_then(|a| a.layout),
+            mvec_scale: target.mvec_scale,
+            paper_white: target.paper_white,
+        });
+        result.meta = Some(super::inline::Meta { cache_dump: pending, ..meta });
+        result.evaluated = true;
+        // Offloaded without an edit to carry yet (the first frame sent, the network still loading there): the hold ran
+        // as planned, the frame goes to DLSS as it is.
+        result.wrote_back = true;
+        result.cached = cached;
+        result.cache_still = cache_hold.is_some_and(|h| h.interval > 1) && res.edit.as_ref().is_some_and(|e| e.state.regime.still());
+        result.timing.writeback = Some(t_hold.elapsed());
+        return result;
+    }
+    let submit = submit.expect("the split hold submits");
+    // Offloaded: the wait for the answer to the frame sent last is here, where the frame's own rendering is
+    // already on the queue (`offload_pre::Exchange::at_submit`).
+    if let (Some(side), Some(p)) = (off_side, off_plan.as_ref()) {
+        side.exchange.at_submit(p);
+    }
+    let first = |cmd: vk::CommandBuffer| {
+        receive(cmd);
+        // What the host clears before the capture when the network runs here, after the late capture read it.
+        let cleared = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+        // SAFETY: recording the capture; the exposure buffer is the HDR pass's.
+        unsafe {
+            device.cmd_fill_buffer(cmd, exposure, 0, hdr::HdrPass::EXPOSURE_BYTES, 0);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[cleared],
+                &[],
+                &[],
+            );
+        }
+    };
+    // SAFETY: the capture buffer is idle; the colour view was bound above. The encode stays in the HDR
+    // pass's image: the network reads it there (no copy into slot 0's proxy, the after-the-upscaler
+    // path's).
+    let recorded = unsafe {
+        super::record_capture(
+            device,
+            res,
+            target,
+            None,
+            hdr_pass,
+            None,
+            mvec.map(|_| native.mvec.buffer),
+            depth_copy,
+            cache.map(|c| c.colour),
+            run_extra.then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
+            offloaded.then_some(&first as &dyn Fn(vk::CommandBuffer)),
+            None,
+        )
+    };
+    if recorded.is_err() {
+        res.native = Some(native);
+        result.miss = Some("recording the capture failed");
+        return result;
+    }
+    // The copies between the passes, on a network frame with more than one.
+    if more {
+        let pass = res.hdr.as_ref().expect("built above");
+        // SAFETY: built above and not pending (the hold waited for the previous one's fence, which
+        // comes after them); the encoded image is in GENERAL.
+        if unsafe { native.record_copies(device, pass.encoded_image(), pass.encoded_view(), pass.padded_region(), passes.count, passes.feedback) }.is_err() {
+            res.native = Some(native);
+            result.miss = Some("recording the copies between the network's passes failed");
+            return result;
+        }
+    }
+    // SAFETY: as above: on a cached hold the cache's passes write the colour input; else the decode,
+    // with the native pass's answer as its source (and the edit captured first while the cache runs).
+    let recorded = unsafe {
+        if cached {
+            super::record_cached_writeback(device, res, &apply, None)
+        } else if offloaded {
+            // No edit to carry on this hold: the frame goes to DLSS as it is (the write-back's buffer and fence stay).
+            super::record_cached_writeback(device, res, &|_| {}, None)
+        } else {
+            super::record_writeback(
+                device,
+                res,
+                target,
+                native.answer(),
+                hdr_pass,
+                cache.as_ref(),
+                chained.then_some(&capture_edit as &dyn Fn(vk::CommandBuffer)),
+                None,
+            )
+        }
+    };
+    if recorded.is_err() {
+        res.native = Some(native);
+        result.miss = Some("recording the write-back failed");
+        return result;
+    }
+    // A cached hold keeps the network's history as it is (no frame of the network): its parity,
+    // seed and jitter stay the last refresh's.
+    let (history, frame_cmds, later) = if cached || offloaded {
+        (false, [None, None], Vec::new())
+    } else {
+        let stale = native.gap.begin(hold_now());
+        #[cfg(test)]
+        {
+            native.last_stale = stale;
+        }
+        note_network_reset(native.frames, stale, &mut result.scene_cut);
+        let history = native.frames > 0 && stale.is_none() && mvec.is_some() && !no_history();
+        let (cmds, later) = native.frame_graphs(&graphs, history, jitter, target.mvec_scale, &passes);
+        (history, cmds, if more { later } else { Vec::new() })
+    };
+    res.native = Some(native);
+    result.timing.prep = Some(t_hold.elapsed());
+    if let Some(d) = res.depth.as_mut() {
+        d.valid = None;
+    }
+    // Offloaded: the frame's parameters are there before its send can run.
+    if let (Some(side), Some(meta)) = (res.offpre.as_mut().filter(|_| offloaded), off_meta.clone()) {
+        side.queue_meta(meta);
+    }
+    if crate::note_vk(device.handle(), submit(super::Which::Capture, res.capture_cmd, vk::Fence::null())).is_err() {
+        if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
+            side.dropped();
+        }
+        result.miss = Some("the capture submit failed");
+        return result;
+    }
+    if let Some(side) = res.offpre.as_ref().filter(|_| offloaded) {
+        side.exchange.handed();
+    }
+    if let Some(d) = res.depth.as_mut() {
+        d.valid = depth;
+        if depth.is_some() {
+            if let Some(t) = d.timer.as_mut() {
+                t.mark_submitted();
+            }
+        }
+    }
+    result.waits_consumed = true;
+    if let Some(s) = res.scene.as_mut().filter(|_| threshold > 0) {
+        s.submitted(super::scene_cut::Recorded { network: !cached, history });
+    }
+    res.game_exposure_read = (source == super::ExposureSource::Game).then_some(target.identification);
+    res.auto_read = res.hdr.as_ref().is_some_and(hdr::HdrPass::auto_built).then_some(target.identification);
+    // From here on something of this hold is on the queue: a failure fences what went (so the next
+    // hold waits for it before it records any of those buffers again), and the network's history and
+    // the cache's chain start afresh (the capture's motion pass moved the field on already).
+    let failed = |res: &mut super::Resources, submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>| {
+        // SAFETY: the write-back fence is idle (waited above; a failed submit leaves it as it was).
+        unsafe { res.fence_submitted(device, submit) };
+        if let Some(e) = res.edit.as_mut() {
+            e.state.drop_edit();
+        }
+        if res.writeback_pending {
+            // The empty buffer's fence comes after the network's frame on the same queue: it covers it.
+            loader.pre_submitted(device, res.writeback_fence);
+        } else {
+            // No fence could be put after it: the network may be in use for as long as a frame may run.
+            loader.pre_unfenced();
+        }
+    };
+    for cmd in frame_cmds.into_iter().flatten() {
+        if crate::note_vk(device.handle(), submit(super::Which::Native, cmd, vk::Fence::null())).is_err() {
+            // The capture ran; nothing reads its result. The decode is not submitted, so DLSS gets
+            // the frame as it was.
+            failed(res, submit);
+            result.miss = Some("the network's submit failed");
+            return result;
+        }
+        if let Some(n) = res.native.as_mut() {
+            n.submitted(cmd);
+        }
+    }
+    if let (false, Some(copies)) = (later.is_empty(), res.native.as_ref().and_then(|n| n.more.as_ref()).map(|m| m.copies)) {
+        // Pass 2 on: `X` (or `Y`) puts the previous answer where the network reads, then the pass;
+        // `R` puts the capture back for the write-back.
+        let mut ok = true;
+        for (k, &cmd) in later.iter().enumerate() {
+            let copy = if k == 0 { copies[0] } else { copies[1] };
+            ok = ok
+                && crate::note_vk(device.handle(), submit(super::Which::Native, copy, vk::Fence::null())).is_ok()
+                && crate::note_vk(device.handle(), submit(super::Which::Native, cmd, vk::Fence::null())).is_ok();
+        }
+        ok = ok && crate::note_vk(device.handle(), submit(super::Which::Native, copies[2], vk::Fence::null())).is_ok();
+        if !ok {
+            failed(res, submit);
+            result.miss = Some("a later pass of the network could not be submitted");
+            return result;
+        }
+        if let Some(m) = res.native.as_mut().and_then(|n| n.more.as_mut()) {
+            // `X` took the passes' new history to GENERAL.
+            for f in m.fresh.iter_mut().take(later.len()) {
+                *f = false;
+            }
+            if let Some(t) = m.timer.as_mut() {
+                t.mark_submitted();
+            }
+        }
+    }
+    // SAFETY: the layer's own fence, idle (`wait_idle` above, or never submitted).
+    if unsafe { device.reset_fences(&[res.writeback_fence]) }.is_err() {
+        failed(res, submit);
+        result.miss = Some("resetting the write-back fence failed");
+        return result;
+    }
+    if crate::note_vk(device.handle(), submit(super::Which::WriteBack, res.writeback_cmd, res.writeback_fence)).is_err() {
+        failed(res, submit);
+        result.miss = Some("the write-back submit failed");
+        return result;
+    }
+    // The write-back's fence also covers the capture and the network, submitted before it on the
+    // same queue.
+    res.writeback_pending = true;
+    loader.pre_submitted(device, res.writeback_fence);
+    if let Some(timer) = res.writeback_timer.as_mut() {
+        timer.mark_submitted();
+    }
+    if cached {
+        // The 500 ms rule counts from this hold, not the last network frame.
+        if let Some(n) = res.native.as_mut() {
+            n.gap.touch(hold_now());
+        }
+    }
+    if let (Some(edit), Some(h), Some(p)) = (res.edit.as_mut(), cache_hold.as_ref(), plan.as_ref()) {
+        edit.state.went_through(h, p);
+        edit.submitted(run_motion, cached || chained);
+        if offloaded && !cached {
+            // Nothing was stored by this hold: only the next hold's late capture stores this frame's edit.
+            edit.state.drop_edit();
+        }
+    }
+    if let (Some(side), Some(h), Some(q), Some(p)) = (res.offpre.as_mut().filter(|_| offloaded), cache_hold.as_ref(), push.as_ref(), off_plan.as_ref()) {
+        // Its parameters were queued before the capture's submit.
+        side.went_through(h, q, p, None);
+    }
+    if offloaded && !cached {
+        if let Some(n) = res.native.as_mut() {
+            n.gap.touch(hold_now());
+        }
+    }
+    if let (Some(arm), Some(c)) = (arm.filter(|_| cache.is_some()), res.cache.as_mut()) {
+        c.pending = Some(super::cache_dump::Pending {
+            arm,
+            time_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+            jitter,
+            history,
+            mvec: mvec.is_some(),
+            depth,
+            depth_missing: depth.is_none().then(|| {
+                if cache_on {
+                    depth_missing(target)
+                } else {
+                    "the edit cache is off (NEURAL_FORGE_EDIT_CACHE=off): no depth is copied"
+                }
+            }),
+            depth_layout: target.depth.and_then(|a| a.layout),
+            mvec_scale: target.mvec_scale,
+            paper_white: target.paper_white,
+        });
+    }
+    result.evaluated = true;
+    result.wrote_back = true;
+    result.cached = cached;
+    result.cache_still = cache_hold.is_some_and(|h| h.interval > 1) && res.edit.as_ref().is_some_and(|e| e.state.regime.still());
+    result.timing.writeback = Some(t_hold.elapsed());
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_running_line_fits_the_channel_with_every_note_of_the_vram_guard() {
+        assert_eq!(super::running_line(None), "native network running");
+        assert_eq!(super::running_line(Some("lower")), "native network running (lower)");
+        // Every variant fits the channel's field whole (a cut line would read as changed at every hold).
+        for guard in [None, Some(super::super::vram_guard::NOTE_SMALL), Some(super::super::vram_guard::NOTE_PAUSED)] {
+            let line = super::running_line(guard);
+            assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
+        }
+    }
+    use super::*;
+
+    /// Resources built untimed (inside DLSS's buffer the hold times its slot) make no GPU timer at all: a timer
+    /// has no destructor, so one made and dropped left its query pool behind, past `vkDestroyDevice` (which the
+    /// validation layer reports here, at the end of the test).
+    #[test]
+    fn untimed_resources_make_no_query_pool() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        // SAFETY: a fresh device; nothing is submitted; everything is destroyed before the device.
+        unsafe {
+            let extents = pass_extents(W, H, &[1.0; neural_forge_protocol::MAX_PASSES]);
+            let mut pass = NativePass::build_at(device, instance, physical, family, W, H, extents, false, false).expect("the pass builds");
+            assert!(pass.timers.iter().all(Option::is_none), "the frames untimed");
+            assert!(pass.ensure_more(device, instance, physical, family, 2), "the later passes build");
+            assert!(pass.more.as_ref().is_some_and(|m| m.timer.is_none()), "the later passes untimed");
+            let depth = DepthCopy::build(device, instance, physical, family, W, H, false).expect("the depth copy builds");
+            assert!(depth.timer.is_none(), "the depth copy untimed");
+            let cache = super::super::cache::CachePass::build(device, instance, physical, family, W, H, false).expect("the edit cache builds");
+            cache.destroy(device);
+            depth.destroy(device);
+            pass.destroy(device);
+            device.destroy_device(None);
+        }
+    }
+
+    /// A failed hold whose work no fence covers keeps the after-the-upscaler path off the network for
+    /// as long as a frame may run; nothing else does.
+    #[test]
+    fn unfenced_pre_upscaler_work_keeps_the_post_path_off_the_network() {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical: vk::PhysicalDevice::null(),
+            frame_family: 0,
+            family: 0,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+            shared: None,
+            bda_ext: false,
+        };
+        let loader = Loader::start(vk::Device::null(), setup, HoldCounts::default(), true);
+        // No hold for longer than the path switch: the post path may claim.
+        loader.claims.last_pre.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _ = epoch_ms();
+        std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
+        assert!(loader.claim_post());
+        loader.release_post();
+        loader.claims.last_post.store(0, std::sync::atomic::Ordering::SeqCst);
+        loader.pre_unfenced();
+        assert!(!loader.claim_post(), "unfenced work may still use the network");
+        loader.claims.pre_unfenced_until.store(epoch_ms().saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
+        assert!(loader.claim_post(), "once a frame can no longer be running");
+        loader.release_post();
+    }
+
+    /// The network is lent to another device only while neither path here uses it: not with a hold recorded into
+    /// DLSS's buffers that may run, not while an after-the-upscaler frame runs, not within a path switch of either
+    /// path's last frame; and a loader with no network open has none to lend.
+    #[test]
+    fn the_network_is_lent_only_while_neither_path_uses_it() {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical: vk::PhysicalDevice::null(),
+            frame_family: 0,
+            family: 0,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+            shared: None,
+            bda_ext: false,
+        };
+        let holds = HoldCounts::default();
+        let loader = Loader::start(vk::Device::null(), setup, holds.clone(), true);
+        use std::sync::atomic::Ordering::SeqCst;
+        let _ = epoch_ms();
+        std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
+        let unused = || loader.unused();
+        assert!(unused(), "nothing ran");
+        holds.all.store(1, SeqCst);
+        holds.local.store(1, SeqCst);
+        assert!(!unused(), "a hold in DLSS's buffers may still run");
+        holds.all.store(0, SeqCst);
+        holds.local.store(0, SeqCst);
+        loader.claims.post_busy.store(true, SeqCst);
+        assert!(!unused(), "an after-the-upscaler frame runs");
+        loader.release_post();
+        assert!(!unused(), "within a path switch of it");
+        loader.claims.last_post.store(0, SeqCst);
+        loader.claims.last_local.store(epoch_ms(), SeqCst);
+        assert!(!unused(), "within a path switch of a hold that took it");
+        loader.claims.last_local.store(0, SeqCst);
+        assert!(unused());
+        assert!(!loader.lend(), "no network open here: nothing to lend");
+        assert_eq!(loader.claims.last_pre.load(SeqCst), 0, "a refused lend leaves the hold's stamp as it was: the other path is not kept off");
+    }
+
+    /// #63: holds before DLSS whose model runs on a second GPU record nothing of the game's network. A network the
+    /// after-the-upscaler path opened on the game's device beside them is not in use, so it is lent to the second GPU's
+    /// loader; before, their stamp and their count kept it here for good, and the second GPU never got the network
+    /// back after a change of DLSS's render size (the model off until the offload fell back 30 s later).
+    #[test]
+    fn holds_whose_model_runs_on_a_second_gpu_do_not_keep_the_network_here() {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical: vk::PhysicalDevice::null(),
+            frame_family: 0,
+            family: 0,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+            shared: None,
+            bda_ext: false,
+        };
+        use std::sync::atomic::Ordering::SeqCst;
+        let holds = HoldCounts::default();
+        let loader = Loader::for_test(setup, vec![built((64, 32), 1, network::FULL)], holds.clone(), Box::new(|_, _| {}));
+        // The after-the-upscaler path opened it and stopped a path switch ago.
+        let _ = epoch_ms();
+        std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
+        loader.claims.last_post.store(0, SeqCst);
+        // Offloaded holds come on and on: each stamps the hold (keeping that path off) and is outstanding.
+        assert!(loader.claim_pre(), "a hold before DLSS");
+        assert!(!loader.claim_post(), "the after-the-upscaler path stays off beside the holds");
+        holds.all.store(3, SeqCst);
+        holds.local.store(0, SeqCst);
+        assert!(loader.unused(), "holds that record nothing of the network are no use of it");
+        // One of them recorded the network after all: in use.
+        holds.local.store(1, SeqCst);
+        assert!(!loader.unused(), "a hold that recorded the network may still run");
+        holds.local.store(0, SeqCst);
+        // A hold that took a build here is a use, whatever the count says.
+        assert!(loader.ready_sizes(&[(64, 32)], network::FULL, 0).is_some());
+        assert!(!loader.unused(), "within a path switch of a hold that took the network");
+        loader.claims.last_local.store(0, SeqCst);
+        assert!(loader.unused());
+    }
+
+    /// While the network is being lent to another device, neither path takes it, and each use is counted (a
+    /// path that took it after the lend was decided keeps it: `Loader::work`); the lend stamps the hold before it reads whether the
+    /// after-the-upscaler path is busy, which that path sets before it reads the stamp, so one sees the other.
+    #[test]
+    fn a_lent_network_is_taken_by_neither_path_and_a_late_use_keeps_it() {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical: vk::PhysicalDevice::null(),
+            frame_family: 0,
+            family: 0,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+            shared: None,
+            bda_ext: false,
+        };
+        use std::sync::atomic::Ordering::SeqCst;
+        let loader = Loader::for_test(setup, vec![built((64, 32), 1, network::FULL)], HoldCounts::default(), Box::new(|_, _| {}));
+        assert!(loader.ready_sizes(&[(64, 32)], network::FULL, 0).is_some());
+        assert_eq!(loader.shared.0.lock().unwrap().uses, 1, "a path took it");
+        loader.shared.0.lock().unwrap().lend = true;
+        assert!(loader.ready_sizes(&[(64, 32)], network::FULL, 0).is_none(), "being lent: the hold does not take it");
+        assert!(loader.ready(64, 32, network::FULL).is_none(), "nor the after-the-upscaler path");
+        assert_eq!(loader.shared.0.lock().unwrap().uses, 1);
+        loader.shared.0.lock().unwrap().lend = false;
+        // The after-the-upscaler path claimed (busy) before the lend's stamp: the lend sees it.
+        loader.claims.last_pre.store(0, SeqCst);
+        loader.claims.last_post.store(0, SeqCst);
+        let _ = epoch_ms();
+        std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
+        assert!(loader.claim_post());
+        assert!(!loader.lend(), "the after-the-upscaler path is running");
+        loader.release_post();
+    }
+
+    fn built(size: (u32, u32), generation: u64, network: u32) -> Built {
+        let graph = vk::CommandBuffer::null();
+        Built { width: size.0, height: size.1, frame: nn::Frame::default(), graph, graph_own: graph, generation, network }
+    }
+
+    /// The loader's side of a switch of the Network setting: the build of the network open is not
+    /// handed out for another choice, the loader thread is woken and has work (closing it and opening
+    /// the chosen one), and once that is built it is served.
+    #[test]
+    fn another_network_chosen_is_not_served_the_open_one_and_wakes_the_loader() {
+        let mut s = LoaderState { opened: true, opened_for: Some(network::FULL), running: network::FULL, ..Default::default() };
+        s.built = vec![built((64, 32), 1, network::FULL)];
+        s.wanted = Some(vec![(64, 32)]);
+        assert!(!s.wants_work(), "the full network is built for the size wanted");
+        let (b, wake) = s.want((64, 32), network::FULL);
+        assert_eq!((b.map(|b| b.generation), wake), (Some(1), false), "the default choice gets the open network");
+        let (b, wake) = s.want((64, 32), network::SMALL);
+        assert!(b.is_none() && wake, "the small network is chosen: the full one's build is not used, the loader is woken");
+        assert!(s.switching() && s.wants_work(), "the loader closes the full network and opens the small one");
+        // Asked again before the loader got to it: still nothing, and no second wake.
+        assert!(!s.want((64, 32), network::SMALL).1);
+        // The loader opened and built the small network (what `work` stores).
+        s.opened_for = Some(network::SMALL);
+        s.running = network::SMALL;
+        s.built = vec![built((64, 32), 2, network::SMALL)];
+        assert!(!s.switching() && !s.wants_work());
+        let (b, wake) = s.want((64, 32), network::SMALL);
+        assert_eq!((b.map(|b| (b.generation, b.network)), wake), (Some((2, network::SMALL)), false));
+        // The small network chosen, not extracted, the full one running in its place: no switch.
+        s.running = network::FULL;
+        assert!(!s.switching());
+        // Back to the full network: the open one is not served until it is reopened.
+        assert!(s.want((64, 32), network::FULL).0.is_none());
+        assert!(s.switching() && s.wants_work());
+        // A dead network is never switched.
+        s.dead = true;
+        assert!(!s.wants_work());
+    }
+
+    /// A step down decided while no path takes the network (the spill stalls the game, the layer stops working on its
+    /// frames) is applied by the loader thread once none has for IDLE_STEP and nothing that used the build may run;
+    /// not before, and not with holds outstanding; a step up is left to the paths.
+    #[test]
+    fn a_step_down_nobody_asks_for_is_applied_when_the_network_is_idle() {
+        use super::super::vram_guard::Level;
+        let claims = quiet_claims();
+        let now = Instant::now();
+        let mut s = spilled_state(now);
+        s.last_use = Some(now);
+        assert_eq!(s.apply_idle_step(&claims, now + Duration::from_secs(2)), None, "a path took it 2 s ago");
+        claims.holds.store(1, std::sync::atomic::Ordering::SeqCst);
+        claims.local.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP), None, "a hold recorded with the build may run");
+        claims.holds.store(0, std::sync::atomic::Ordering::SeqCst);
+        claims.local.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP), Some(Level::Paused));
+        assert!(s.pausing() && s.wants_work(), "the loader thread closes the network");
+        assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP * 2), None, "nothing pending any more");
+    }
+
+    /// Frames that took the network more than IDLE_STEP ago may still run (#59's Xid 31: the copy engine read the
+    /// network's freed memory): an after-the-upscaler frame whose fence wait timed out (its claim kept until the fence
+    /// signals), a split hold submitted with no fence after it (until FENCE_WAIT_TIMEOUT after the submit) or with its
+    /// fence pending, and an after-the-upscaler frame running now each keep the idle step off, and the loader thread
+    /// frees no build while any of them is in flight. Once each is over, the step is applied.
+    #[test]
+    fn frames_still_in_flight_keep_the_idle_step_and_the_free_off() {
+        use super::super::vram_guard::Level;
+        use std::sync::atomic::Ordering::SeqCst;
+        let claims = quiet_claims();
+        let now = Instant::now();
+        let later = now + IDLE_STEP;
+        let mut s = spilled_state(now);
+        s.last_use = Some(now);
+        assert!(s.frees_now(&claims), "nothing in flight");
+        // An after-the-upscaler frame whose wait timed out: its fence has not signalled.
+        *claims.post_inflight.lock().unwrap() = Some(fake_in_flight());
+        claims.post_busy.store(true, SeqCst);
+        FENCE_PENDING.store(true, SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, later), None, "a stalled after-the-upscaler frame may still run");
+        assert!(!s.frees_now(&claims));
+        // Its fence signals: the claim is released, but that frame ran just now (within a path switch).
+        FENCE_PENDING.store(false, SeqCst);
+        assert!(!claims.in_flight(), "the stalled frame finished");
+        assert!(claims.post_inflight.lock().unwrap().is_none() && !claims.post_busy.load(SeqCst));
+        claims.last_post.store(0, SeqCst);
+        // A split hold with no fence after its work: in use until FENCE_WAIT_TIMEOUT after its submit.
+        claims.pre_unfenced_until.store(epoch_ms() + crate::FENCE_WAIT_TIMEOUT.as_millis() as u64, SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, later), None, "an unfenced split hold may still run");
+        assert!(!s.frees_now(&claims));
+        claims.pre_unfenced_until.store(epoch_ms().saturating_sub(1), SeqCst);
+        // A split hold whose fence is pending.
+        *claims.pre_inflight.lock().unwrap() = Some(fake_in_flight());
+        FENCE_PENDING.store(true, SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, later), None, "a split hold's fence is pending");
+        assert!(!s.frees_now(&claims));
+        FENCE_PENDING.store(false, SeqCst);
+        // An after-the-upscaler frame running now.
+        claims.post_busy.store(true, SeqCst);
+        assert_eq!(s.apply_idle_step(&claims, later), None, "an after-the-upscaler frame runs");
+        assert!(!s.frees_now(&claims));
+        claims.post_busy.store(false, SeqCst);
+        // Nothing in flight: the free may go ahead, and the step is applied.
+        assert!(s.frees_now(&claims));
+        assert_eq!(s.apply_idle_step(&claims, later), Some(Level::Paused));
+        // With nothing open or built there is nothing to free, whatever runs.
+        claims.post_busy.store(true, SeqCst);
+        s.built.clear();
+        s.network = None;
+        assert!(s.frees_now(&claims));
+    }
+
+    /// Claims with neither path having run for longer than a path switch.
+    fn quiet_claims() -> Claims {
+        let _ = epoch_ms();
+        std::thread::sleep(Duration::from_millis(PATH_SWITCH_MS + 5));
+        let claims = Claims::default();
+        assert!(claims.unused() && !claims.in_flight());
+        claims
+    }
+
+    /// The full network built at 4K, with a step down to a pause decided (the build ended at the budget).
+    fn spilled_state(now: Instant) -> LoaderState {
+        let mut s = LoaderState { opened: true, opened_for: Some(network::FULL), running: network::FULL, ..Default::default() };
+        s.built = vec![built((3840, 2160), 1, network::FULL)];
+        assert!(s.guard.built(network::FULL, Some(1500), (3840, 2160), Some((8000, 8010)), network::FULL, false, now).is_some());
+        assert!(s.guard.step_down_pending());
+        s
+    }
+
+    /// Whether [`fake_in_flight`]'s fences are pending (one test uses them).
+    static FENCE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// A submission whose fence reads as pending while [`FENCE_PENDING`] is set (no device: the status is the stand-in's).
+    fn fake_in_flight() -> InFlight {
+        unsafe extern "system" fn status(_: vk::Device, _: vk::Fence) -> vk::Result {
+            if FENCE_PENDING.load(std::sync::atomic::Ordering::SeqCst) {
+                vk::Result::NOT_READY
+            } else {
+                vk::Result::SUCCESS
+            }
+        }
+        InFlight { device: vk::Device::null(), status, fence: vk::Fence::from_raw(0x51) }
+    }
+
+    /// A step down decided while holds recorded with the build may still run: no further hold takes the build (they kept
+    /// coming every 0.4 s in Cyberpunk 2077 with path tracing, and the step was never applied); once only the asking hold
+    /// is left, the step is applied there and nothing is served.
+    #[test]
+    fn a_pending_step_down_stops_new_holds_until_the_outstanding_ones_drain() {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical: vk::PhysicalDevice::null(),
+            frame_family: 0,
+            family: 0,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+            shared: None,
+            bda_ext: false,
+        };
+        use std::sync::atomic::Ordering::SeqCst;
+        let holds = HoldCounts::default();
+        let loader = Loader::for_test(setup, vec![built((3840, 2160), 1, network::FULL)], holds.clone(), Box::new(|_, _| {}));
+        let size = [(3840, 2160)];
+        // Another hold outstanding, nothing decided: the build is served as before.
+        holds.all.store(2, SeqCst);
+        assert!(loader.ready_sizes(&size, network::FULL, 1).is_some());
+        // The build ended at the budget: a pause is decided.
+        {
+            let mut st = loader.shared.0.lock().unwrap();
+            assert!(st.guard.built(network::FULL, Some(1500), (3840, 2160), Some((8000, 8010)), network::FULL, false, Instant::now()).is_some());
+            assert!(st.guard.step_down_pending());
+        }
+        let uses = loader.shared.0.lock().unwrap().uses;
+        assert!(loader.ready_sizes(&size, network::FULL, 1).is_none(), "a step down waits: no new hold on the build");
+        assert_eq!(loader.shared.0.lock().unwrap().uses, uses, "not taken");
+        assert!(!loader.paused(), "not applied under the other hold");
+        // The other hold is done with: the asking one applies the pause, and nothing is served.
+        holds.all.store(1, SeqCst);
+        assert!(loader.ready_sizes(&size, network::FULL, 1).is_none());
+        assert!(loader.paused());
+    }
+
+    /// #59: the after-the-upscaler path asks for its size (the loader thread is woken to rebuild), and a hold takes the
+    /// current render-size build before the thread got to it: the request is dropped, so the thread does not free the
+    /// build that hold was just recorded with. Asked again with no path on the current build, it is honoured.
+    #[test]
+    fn a_path_taking_the_current_build_drops_the_other_paths_pending_rebuild() {
+        let mut s = LoaderState { opened: true, opened_for: Some(network::FULL), running: network::FULL, ..Default::default() };
+        s.built = vec![built((1920, 1080), 1, network::FULL)];
+        s.wanted = Some(vec![(1920, 1080)]);
+        let (b, wake) = s.want((3840, 2160), network::FULL);
+        assert!(b.is_none() && wake, "the after-the-upscaler path's size: not built, the thread is woken");
+        assert!(s.wants_work());
+        let (b, _) = s.want((1920, 1080), network::FULL);
+        assert_eq!(b.map(|b| b.generation), Some(1), "the hold takes the current build");
+        assert!(!s.wants_work(), "and the pending rebuild is dropped: the thread leaves the build alone");
+        assert_eq!(s.built.len(), 1);
+        let (b, wake) = s.want((3840, 2160), network::FULL);
+        assert!(b.is_none() && wake && s.wants_work(), "asked again: honoured");
+    }
+
+    /// The VRAM guard's steps reach the loader the way a switch of the Network setting does: not while holds
+    /// recorded with the build may still run; then the build of the network stepped from is not served and the
+    /// loader switches; a pause serves nothing and has the loader close the network; a change of the setting
+    /// starts the guard afresh.
+    #[test]
+    fn the_vram_guard_steps_like_a_switch_of_the_setting() {
+        let now = Instant::now();
+        let mut s = LoaderState { opened: true, opened_for: Some(network::FULL), running: network::FULL, ..Default::default() };
+        s.built = vec![built((64, 32), 1, network::FULL)];
+        s.wanted = Some(vec![(64, 32)]);
+        assert!(s.guard.built(network::FULL, Some(1500), (64, 32), Some((8000, 8010)), network::FULL, true, now).is_some(), "a build at the budget");
+        // Holds may still run: nothing applied, the full build still served.
+        assert!(s.serves(&[(64, 32)], network::FULL));
+        assert_eq!(s.want_sizes(&[(64, 32)], network::FULL, false).0.map(|b| b[0].generation), Some(1));
+        // Applied: the loader switches to the small network.
+        let (b, wake) = s.want((64, 32), network::FULL);
+        assert!(b.is_none() && wake);
+        assert!(s.switching() && s.wants_work());
+        s.opened_for = Some(network::SMALL);
+        s.running = network::SMALL;
+        s.built = vec![built((64, 32), 2, network::SMALL)];
+        assert!(!s.switching() && !s.wants_work());
+        assert_eq!(s.want((64, 32), network::FULL).0.map(|b| b.network), Some(network::SMALL), "served for the full choice");
+        // The small network at the budget too: paused, the loader closes it.
+        s.guard.built(network::SMALL, Some(700), (64, 32), Some((8000, 8010)), network::FULL, true, now);
+        let (b, wake) = s.want((64, 32), network::FULL);
+        assert!(b.is_none() && wake);
+        assert!(s.pausing() && s.wants_work());
+        s.built = Vec::new();
+        s.opened_for = None;
+        assert!(!s.pausing() && !s.wants_work(), "closed: nothing to do while paused");
+        assert!(s.want((64, 32), network::FULL).0.is_none());
+        // The user picks the small network: the guard starts afresh and the loader opens it.
+        let (b, wake) = s.want((64, 32), network::SMALL);
+        assert!(b.is_none() && wake);
+        assert_eq!(s.target(), Some(network::SMALL));
+        assert!(s.wants_work());
+    }
+
+    /// The chosen network loads when it is extracted; when it is not, the other one does, and with
+    /// neither nothing does.
+    #[test]
+    fn the_chosen_network_loads_and_the_other_only_when_it_is_missing() {
+        let both = |_| true;
+        assert_eq!(network_to_load(network::FULL, both), Some(network::FULL));
+        assert_eq!(network_to_load(network::SMALL, both), Some(network::SMALL));
+        let only_full = |n| n == network::FULL;
+        assert_eq!(network_to_load(network::SMALL, only_full), Some(network::FULL), "a DLL without the small network");
+        assert_eq!(network_to_load(network::FULL, only_full), Some(network::FULL));
+        let only_small = |n| n == network::SMALL;
+        assert_eq!(network_to_load(network::FULL, only_small), Some(network::SMALL));
+        assert_eq!(network_to_load(network::FULL, |_| false), None);
+        // The directories are the setting's names for the networks under the model directory.
+        assert_eq!(network_dir(network::FULL).file_name().unwrap(), "full");
+        assert_eq!(network_dir(network::SMALL).file_name().unwrap(), "small");
+        assert_eq!(network_dir(network::SMALL).parent(), Some(model_dir().as_path()));
+    }
+
+    /// A frame of another network than the one whose answers the history holds starts the history
+    /// afresh; frames of the same network keep it.
+    #[test]
+    fn switching_the_network_resets_the_history() {
+        let t0 = Instant::now();
+        let mut gap: HistoryGap<(u32, u32)> = HistoryGap::default();
+        let mut of = None;
+        let frame = |gap: &mut HistoryGap<(u32, u32)>, of: &mut Option<u32>, network: u32, at: u64| {
+            gap.note_format((64, 32));
+            let changed = note_network(gap, of, network);
+            (changed, gap.begin(t0 + std::time::Duration::from_millis(at)))
+        };
+        assert_eq!(frame(&mut gap, &mut of, network::FULL, 0), (false, None), "the first frame");
+        assert_eq!(frame(&mut gap, &mut of, network::FULL, 16), (false, None), "the same network keeps its history");
+        assert_eq!(frame(&mut gap, &mut of, network::SMALL, 33), (true, Some(Stale::Skipped)), "a switch resets it");
+        assert_eq!(frame(&mut gap, &mut of, network::SMALL, 50), (false, None));
+        assert_eq!(frame(&mut gap, &mut of, network::FULL, 66), (true, Some(Stale::Skipped)), "and so does the way back");
+        assert_eq!(of, Some(network::FULL));
+    }
+
+    #[test]
+    fn a_failure_is_new_once_per_reason_until_it_clears() {
+        let mut last = None;
+        assert!(failure_is_new(&mut last, "no model at /x"));
+        assert!(!failure_is_new(&mut last, "no model at /x"), "a retry failing the same way is not written again");
+        assert!(failure_is_new(&mut last, "building the network for 1280x720 failed: out of memory"));
+        last = None;
+        assert!(failure_is_new(&mut last, "no model at /x"), "after a recovery the same failure is new again");
+    }
+
+    #[test]
+    fn model_source_reads_network_build_and_verified() {
+        let source = |extra: &str| format!("{{\n  \"source\": {{\n    \"build\": \"310.9.1.0\",\n    \"resource\": \"WEIGHTS_HT\"{extra}\n  }}\n}}");
+        assert_eq!(model_source(&source(",\n    \"verified\": false")), "full network, build 310.9.1.0, not verified against NVIDIA's runtime");
+        assert_eq!(model_source(&source(",\n    \"verified\": true")), "full network, build 310.9.1.0, verified");
+        assert_eq!(model_source(&source("")), "full network, build 310.9.1.0, not verified against NVIDIA's runtime");
+        assert_eq!(model_source(""), "full network, build unknown, not verified against NVIDIA's runtime");
+        let small = "{\n  \"source\": {\n    \"build\": \"310.9.16.0\",\n    \"verified\": false\n  },\n  \"network\": \"small\",\n  \"stages\": []\n}";
+        assert_eq!(model_source(small), "small network, build 310.9.16.0, not verified against NVIDIA's runtime");
+    }
+
+    #[test]
+    fn the_history_needs_motion_vectors_the_capture_copies() {
+        let aux = |layout, readable| Some(super::super::Aux { image: vk::Image::null(), format: vk::Format::R16G16_SFLOAT, layout, readable });
+        assert!(copied_mvec(aux(Some(vk::ImageLayout::UNDEFINED), true)).is_none(), "UNDEFINED is not copied");
+        assert!(copied_mvec(aux(Some(vk::ImageLayout::PREINITIALIZED), true)).is_none(), "PREINITIALIZED is not copied");
+        assert!(copied_mvec(aux(None, true)).is_none(), "no barrier seen");
+        assert!(copied_mvec(aux(Some(vk::ImageLayout::GENERAL), false)).is_none(), "not readable");
+        assert!(copied_mvec(None).is_none());
+        assert!(copied_mvec(aux(Some(vk::ImageLayout::GENERAL), true)).is_some());
+        assert!(copied_mvec(aux(Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL), true)).is_some(), "transitioned for the copy");
+    }
+
+    /// A failure at every creation step of the native pass destroys everything created before it, and a
+    /// failed build is not tried again by the next hold inside the retry's backoff.
+    #[test]
+    fn a_failed_native_pass_build_destroys_what_it_made_and_waits_before_trying_again() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let live = || LIVE.with(std::cell::Cell::get);
+        for at in 0..BUILD_STEPS {
+            // SAFETY: a fresh device; nothing is submitted.
+            let pass = unsafe { NativePass::build_failing_at(device, instance, physical, family, W, H, Some(at), false) };
+            assert!(pass.is_none(), "step {at} fails");
+            assert_eq!(live(), 0, "every object made before step {at} is destroyed");
+        }
+        // SAFETY: as above.
+        let pass = unsafe { NativePass::build_failing_at(device, instance, physical, family, W, H, Some(BUILD_STEPS), false) }.expect("no step fails");
+        assert!(live() > 0);
+        // SAFETY: nothing of it was submitted.
+        unsafe { pass.destroy(device) };
+        assert_eq!(live(), 0, "destroy destroys everything build made");
+
+        // The hold's retry: a failure, then a second hold inside the backoff does not build.
+        let mut retry = PassRetry::default();
+        let calls = std::cell::Cell::new(0);
+        let t0 = Instant::now();
+        let hold = |retry: &mut PassRetry, extent: (u32, u32), at: Instant, fail: bool| {
+            retry.build(extent, at, || {
+                calls.set(calls.get() + 1);
+                // SAFETY: as above.
+                unsafe { NativePass::build_failing_at(device, instance, physical, family, extent.0, extent.1, fail.then_some(3), false) }
+            })
+        };
+        assert!(hold(&mut retry, (W, H), t0, true).is_none());
+        assert!(hold(&mut retry, (W, H), t0 + std::time::Duration::from_millis(100), true).is_none());
+        assert_eq!(calls.get(), 1, "the second hold inside the backoff does not build");
+        // Another extent is tried at once; the first one again once its backoff passed.
+        assert!(hold(&mut retry, (W + 2, H), t0 + std::time::Duration::from_millis(200), true).is_none());
+        assert_eq!(calls.get(), 2, "another extent builds at once");
+        let later = t0 + BuildRetry::SHORT[0] + BuildRetry::SHORT[1] + std::time::Duration::from_millis(300);
+        let pass = hold(&mut retry, (W, H), later, false).expect("built once the backoff passed");
+        assert_eq!(calls.get(), 3);
+        assert_eq!(retry.failed, None);
+        // SAFETY: nothing of it was submitted.
+        unsafe { pass.destroy(device) };
+        assert_eq!(live(), 0);
+    }
+
+    /// At interval 1 the frame shaders read the accumulated field the cache's motion pass made from
+    /// DLSS's vectors, where they read the packed vectors before (`MOTION_HALF`, the old path): the
+    /// network's 16 input lanes and its answer are bit for bit the same over frames with history,
+    /// with fractional vectors and a high-resolution scale.
+    #[test]
+    fn at_interval_1_the_network_sees_exactly_what_it_saw_before_the_accumulated_field() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1),
+                )
+                .unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device
+                .begin_command_buffer(
+                    graph,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance),
+                )
+                .unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let frame = nn::Frame {
+                field_width: FW,
+                field_height: FH,
+                features: features.buffer,
+                features_bytes: u64::from(FW * FH) * 64,
+                head: head.buffer,
+                head_bytes: u64::from(FW * FH) * 16,
+                blend_scale: 0.5,
+                chained: 0,
+            };
+            let built = Built { width: W, height: H, frame, graph, graph_own: graph, generation: 1, network: network::FULL };
+            let texels: Vec<u16> =
+                (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+            let range =
+                vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            fx.one_shot(|cmd| {
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(encoded.image)
+                    .subresource_range(range);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+                let region = vk::BufferImageCopy {
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                    ..Default::default()
+                };
+                device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+            });
+            // The old path (packed halves) and the new (the field), side by side.
+            let mut old = NativePass::build_failing_at(device, instance, physical, family, W, H, None, true).unwrap();
+            let mut new = NativePass::build(device, instance, physical, family, W, H, false).unwrap();
+            assert!(old.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
+            assert!(new.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
+            let mut cache = super::super::cache::CachePass::build(device, instance, physical, family, W, H, true).unwrap();
+            cache.bind(
+                device,
+                &super::super::cache::Bindings {
+                    colour: encoded.view,
+                    encoded: encoded.view,
+                    answer: encoded.view,
+                    exposure: exposure.buffer,
+                    depth: None,
+                    mvec: new.mvec.buffer,
+                    acc: new.acc.buffer,
+                    scratch: (vk::Buffer::null(), 0),
+                    made: [0; 3],
+                },
+            );
+            let answer_of = |pass: &NativePass| -> Vec<u16> {
+                fx.one_shot(|cmd| {
+                    device.cmd_copy_buffer(cmd, pass.answer(), staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }])
+                });
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).to_vec()
+            };
+            let lanes = || -> Vec<u32> { std::slice::from_raw_parts(features.ptr.cast::<u32>(), (FW * FH * 16) as usize).to_vec() };
+            // Fractional vectors of both signs, some pointing out of the frame, a NaN and an infinity.
+            let vectors = |frame: u32| -> Vec<u32> {
+                (0..W * H)
+                    .map(|i| {
+                        let (x, y) = (i % W, i / W);
+                        let vx = ((x * 7 + y * 3 + frame * 5) % 23) as f32 * 0.37 - 4.1;
+                        let vy = ((x * 5 + y * 11 + frame) % 19) as f32 * -0.29 + 2.3;
+                        let bits = |v: f32| u32::from(super::super::tests::f32_to_f16(v));
+                        match i {
+                            17 => u32::from(0x7e00u16) | bits(vy) << 16,
+                            41 => u32::from(0x7c00u16) | bits(vy) << 16,
+                            _ => bits(vx) | bits(vy) << 16,
+                        }
+                    })
+                    .collect()
+            };
+            for (frame, (history, scale, jitter)) in [
+                (false, [1.0, 1.0], Some([0.1, -0.2])),
+                (true, [1.0, 1.0], Some([-0.3, 0.25])),
+                (true, [0.6667, 0.6667], Some([0.4, 0.1])),
+                (true, [0.5, 0.25], None),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let frame = frame as u32;
+                let v = vectors(frame);
+                let fill = |pass: &NativePass| {
+                    std::ptr::copy_nonoverlapping(v.as_ptr().cast::<u8>(), staging.ptr, v.len() * 4);
+                    fx.one_shot(|cmd| {
+                        device.cmd_copy_buffer(
+                            cmd,
+                            staging.buffer,
+                            pass.mvec.buffer,
+                            &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(W * H) * 4 }],
+                        )
+                    });
+                };
+                fill(&old);
+                fill(&new);
+                // The capture's motion pass at interval 1.
+                let push = cache.push(super::super::cache::F_KEEP_CLAMPED, 0, scale, 3.0);
+                fx.one_shot(|cmd| cache.record_motion(device, cmd, &push, new.acc.buffer));
+                let h: Vec<f32> = (0..FH)
+                    .flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, frame), residual(x, y, 1, frame), residual(x, y, 2, frame), 1.5]))
+                    .collect();
+                std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+                let cmds = old.frame(&built, history, jitter, scale, Conditioning::default());
+                fx.submit(&mut old, cmds);
+                let (old_lanes, old_answer) = (lanes(), answer_of(&old));
+                let cmds = new.frame(&built, history, jitter, scale, Conditioning::default());
+                fx.submit(&mut new, cmds);
+                let (new_lanes, new_answer) = (lanes(), answer_of(&new));
+                assert!(old_lanes == new_lanes, "frame {frame}: the network's input lanes differ");
+                assert!(old_answer == new_answer, "frame {frame}: the answer differs");
+            }
+            for pass in [&old, &new] {
+                pass.destroy(device);
+            }
+            cache.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &features, &head, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    const W: u32 = 20;
+    const H: u32 = 12;
+    const FW: u32 = 32;
+    const FH: u32 = 16;
+
+    fn half(v: f32) -> u16 {
+        // Truncates toward zero, which is also the composite's rounding; the test's values are exact halves.
+        let b = v.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+        let mant = b & 0x7f_ffff;
+        if v == 0.0 {
+            return sign;
+        }
+        assert!(exp > 0 && exp < 31, "test values stay normal halves");
+        sign | ((exp as u16) << 10) | ((mant >> 13) as u16)
+    }
+
+    fn f16(h: u16) -> f32 {
+        super::super::f16_to_f32(h)
+    }
+
+    /// The composite's truncation to the half grid (toward zero), on the CPU.
+    fn trunc_half(v: f32) -> f32 {
+        let h = half(v);
+        let back = f16(h);
+        if back.abs() > v.abs() {
+            f16(h - 1)
+        } else {
+            back
+        }
+    }
+
+    fn centre(v: f32) -> f32 {
+        // f16(f16(f16(v) - 0.5) * 0.125): exact for the test's values.
+        (v - 0.5) * 0.125
+    }
+
+    fn proxy(x: u32, y: u32, c: u32) -> f32 {
+        ((x * 7 + y * 3 + c * 5) % 64) as f32 / 64.0
+    }
+
+    fn residual(x: u32, y: u32, c: u32, frame: u32) -> f32 {
+        (((x + y + c + frame * 3) % 9) as f32 - 4.0) * 0.25
+    }
+
+    fn neural(x: u32, y: u32, c: u32, frame: u32) -> f32 {
+        let inner = residual(x, y, c, frame) * 0.03125 + (proxy(x, y, c) * 0.125 - 0.0625);
+        trunc_half((inner * 8.0 + 0.5).clamp(0.0, 1.0))
+    }
+
+    struct Fixture {
+        gpu: (ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32),
+        pool: vk::CommandPool,
+    }
+
+    impl Fixture {
+        fn one_shot(&self, record: impl FnOnce(vk::CommandBuffer)) {
+            let d = &self.gpu.3;
+            // SAFETY: the test's own pool, queue and device.
+            unsafe {
+                let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(1)).unwrap()[0];
+                d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+                record(cmd);
+                d.end_command_buffer(cmd).unwrap();
+                d.queue_submit(self.gpu.4, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
+                d.queue_wait_idle(self.gpu.4).unwrap();
+                d.free_command_buffers(self.pool, &[cmd]);
+            }
+        }
+
+        /// Submits a frame's buffers ([`NativePass::frame`]) and tells the pass, as the hold does.
+        fn submit(&self, pass: &mut NativePass, cmds: [Option<vk::CommandBuffer>; 2]) {
+            let d = &self.gpu.3;
+            let cmds: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().collect();
+            // SAFETY: recorded, idle command buffers of this device.
+            unsafe {
+                d.queue_submit(self.gpu.4, &[vk::SubmitInfo::default().command_buffers(&cmds)], vk::Fence::null()).unwrap();
+                d.queue_wait_idle(self.gpu.4).unwrap();
+            }
+            for cmd in cmds {
+                pass.submitted(cmd);
+            }
+        }
+    }
+
+    /// The native frame around the network (preprocess, the recorded graph, composite), with an empty
+    /// secondary in the graph's place and a head written by the test: the input lanes, a first frame's
+    /// answer, the blend toward the previous answer on a frame with history, and the intensity blend, each
+    /// against the CPU (bit for bit where the arithmetic is exact), and the history through scaled motion vectors.
+    #[test]
+    fn the_native_frame_builds_the_lanes_and_composites_the_head_with_its_history() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            // The encoded proxy, the exposure (1.0), the network's features and head buffers, an empty "graph".
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1),
+                )
+                .unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device
+                .begin_command_buffer(
+                    graph,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance),
+                )
+                .unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let blend = 0.5f32;
+            let built = Built {
+                width: W,
+                height: H,
+                frame: nn::Frame {
+                    field_width: FW,
+                    field_height: FH,
+                    features: features.buffer,
+                    features_bytes: u64::from(FW * FH) * 64,
+                    head: head.buffer,
+                    head_bytes: u64::from(FW * FH) * 16,
+                    blend_scale: blend,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation: 1,
+                network: network::FULL,
+            };
+            // The proxy into the encoded image (padded; the composite reads the valid part).
+            let texels: Vec<u16> =
+                (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+            let range =
+                vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            fx.one_shot(|cmd| {
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(encoded.image)
+                    .subresource_range(range);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+                let region = vk::BufferImageCopy {
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                    ..Default::default()
+                };
+                device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+            });
+            let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
+            assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
+            // The frame shaders read the accumulated field (the cache's motion pass makes it from
+            // DLSS's vectors): no motion.
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            let write_head = |frame: u32, logit: f32| {
+                let h: Vec<f32> = (0..FH)
+                    .flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, frame), residual(x, y, 1, frame), residual(x, y, 2, frame), logit]))
+                    .collect();
+                std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+            };
+            let answer = pass.answer();
+            let read_answer = || -> Vec<f32> {
+                fx.one_shot(|cmd| {
+                    device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }])
+                });
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).iter().map(|&h| f16(h)).collect()
+            };
+            let lanes = |x: u32, y: u32| -> Vec<f32> { std::slice::from_raw_parts(features.ptr.cast::<f32>().add(((y * FW + x) * 16) as usize), 16).to_vec() };
+
+            // Frame 1: no history. Lanes 4-6 and 7-9 are the centred proxy; the answer is the residual on it.
+            write_head(0, 10.0);
+            let cmds = pass.frame(&built, false, None, [1.0, 1.0], Conditioning::default());
+            assert!(cmds.iter().all(Option::is_some), "the initialisation, then the frame");
+            fx.submit(&mut pass, cmds);
+            let l = lanes(5, 3);
+            for c in 0..3 {
+                assert_eq!(l[4 + c as usize], centre(proxy(5, 3, c)), "proxy lane {c}");
+                assert_eq!(l[7 + c as usize], centre(proxy(5, 3, c)), "history lane {c} without history");
+            }
+            assert_eq!((l[3], l[10], l[11], l[12], l[13], l[14], l[15]), (1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0), "constant and conditioning lanes");
+            // Padding mirrors the image without repeating the edge: field column W maps to W - 2.
+            assert_eq!(lanes(W, 2)[4], centre(proxy(W - 2, 2, 0)), "the padding mirrors");
+            let a1 = read_answer();
+            for y in 0..H {
+                for x in 0..W {
+                    for c in 0..3 {
+                        assert_eq!(a1[((y * pw + x) * 4 + c) as usize], neural(x, y, c, 0), "frame 1 at {x},{y} channel {c}");
+                    }
+                }
+            }
+
+            // Frame 2: history (no motion, no jitter): lanes 7-9 are the previous answer, and the answer blends
+            // toward it by sigmoid(logit) * blendScale.
+            write_head(1, 10.0);
+            let cmds = pass.frame(&built, true, None, [1.0, 1.0], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            let l = lanes(5, 3);
+            assert_eq!(l[7], centre(neural(5, 3, 0, 0)), "history lane from the previous answer");
+            let a2 = read_answer();
+            let weight = blend / (1.0 + (10.0f32 * -std::f32::consts::LOG2_E).exp2());
+            for y in 0..H {
+                for x in 0..W {
+                    for c in 0..3 {
+                        let n = neural(x, y, c, 1);
+                        let want = trunc_half(weight.mul_add(neural(x, y, c, 0) - n, n));
+                        let got = a2[((y * pw + x) * 4 + c) as usize];
+                        assert!((got - want).abs() <= 2.0 * 2f32.powi(-11), "frame 2 at {x},{y} channel {c}: {got} vs {want}");
+                    }
+                }
+            }
+
+            // Frame 3: intensity 0.5, no history: the answer halfway from the proxy to the network's.
+            write_head(2, 10.0);
+            let cmds = pass.frame(&built, false, None, [1.0, 1.0], Conditioning { intensity: 0.5, ..Conditioning::default() });
+            fx.submit(&mut pass, cmds);
+            let a3 = read_answer();
+            for c in 0..3 {
+                let (p, n) = (proxy(7, 4, c), neural(7, 4, c, 2));
+                assert_eq!(a3[((4 * pw + 7) * 4 + c) as usize], trunc_half(0.5f32.mul_add(n - p, p).clamp(0.0, 1.0)), "intensity channel {c}");
+            }
+
+            // Frame 4: history through motion vectors of (2, 4) (in output pixels) at a scale of
+            // (0.5, 0.25) (high-resolution motion vectors): pixel (5, 3) was at (6, 4) in the previous frame.
+            let field: Vec<f32> = (0..W * H).flat_map(|_| [2.0f32, 4.0]).collect();
+            std::ptr::copy_nonoverlapping(field.as_ptr().cast::<u8>(), staging.ptr, field.len() * 4);
+            fx.one_shot(|cmd| {
+                device.cmd_copy_buffer(cmd, staging.buffer, pass.acc.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(W * H) * 8 }])
+            });
+            write_head(3, 10.0);
+            let cmds = pass.frame(&built, true, None, [0.5, 0.25], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            // The history is frame 3's network answer (before its intensity blend).
+            assert_ne!(neural(6, 4, 0, 2), neural(7, 7, 0, 2), "the test tells the scaled position from the unscaled one");
+            assert_eq!(lanes(5, 3)[7], centre(neural(6, 4, 0, 2)), "history lane from the previous answer where the scaled vector points");
+
+            // Frame 4 with y pointing up (a negative `MVScale`, as Crimson Desert's Ray Reconstruction gets it): vectors
+            // of (2, -4) at a scale of (0.5, -0.25) point to the same pixel. A frame without history first, so the
+            // history is frame 3's network answer again.
+            write_head(2, 10.0);
+            let cmds = pass.frame(&built, false, None, [1.0, 1.0], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            let field: Vec<f32> = (0..W * H).flat_map(|_| [2.0f32, -4.0]).collect();
+            std::ptr::copy_nonoverlapping(field.as_ptr().cast::<u8>(), staging.ptr, field.len() * 4);
+            fx.one_shot(|cmd| {
+                device.cmd_copy_buffer(cmd, staging.buffer, pass.acc.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(W * H) * 8 }])
+            });
+            write_head(3, 10.0);
+            let cmds = pass.frame(&built, true, None, [0.5, -0.25], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            assert_eq!(lanes(5, 3)[7], centre(neural(6, 4, 0, 2)), "a negative y scale: the same pixel as frame 4's");
+
+            // Frame 5: a NaN head at (5, 3), residual and logit, on a frame with history (no motion again): clamp()
+            // of a NaN is undefined, so the composite reads it as 0. The answer there is 0 and the history the
+            // next frame reads is 0, not NaN (which would reach the network's input lanes, frame after frame).
+            // Lavapipe's clamp() happens to return 0 for a NaN too; the shader no longer relies on it.
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            write_head(4, 10.0);
+            let nan_at = ((3 * FW + 5) * 4) as usize;
+            for k in 0..4 {
+                *head.ptr.cast::<f32>().add(nan_at + k) = f32::NAN;
+            }
+            let cmds = pass.frame(&built, true, None, [1.0, 1.0], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            let a5 = read_answer();
+            for c in 0..3 {
+                assert_eq!(a5[((3 * pw + 5) * 4 + c) as usize].to_bits(), 0, "a NaN head answers 0 in channel {c}");
+            }
+            write_head(5, 10.0);
+            let cmds = pass.frame(&built, true, None, [1.0, 1.0], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            let l = lanes(5, 3);
+            for c in 0..3 {
+                assert_eq!(l[7 + c].to_bits(), centre(0.0).to_bits(), "the history lane {c} after a NaN head is 0, centred");
+            }
+
+            pass.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &features, &head, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+    /// The colour of the edit before the upscaler (`native_colour.comp`), on edits the head makes exactly
+    /// (neural = proxy + residual / 4 on mid-range proxies): neutral values leave the answer and the history
+    /// bit for bit as the network made them, even with the stage recorded; saturation 0 leaves a grey change of
+    /// the same luma; contrast 0 a change of no luma; detail 0 removes a checkerboard and keeps the broad part;
+    /// the gamut guard keeps the red channel from clipping and the change's direction (hue), where the clamp
+    /// without it turns it; the look-up table at strength 0 changes nothing and at full strength is the table
+    /// where the edit is large, and nothing where the network left the pixel alone.
+    #[test]
+    fn the_colour_of_the_edit_reshapes_the_answer_and_leaves_the_history() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1),
+                )
+                .unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device
+                .begin_command_buffer(
+                    graph,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance),
+                )
+                .unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let built = Built {
+                width: W,
+                height: H,
+                frame: nn::Frame {
+                    field_width: FW,
+                    field_height: FH,
+                    features: features.buffer,
+                    features_bytes: u64::from(FW * FH) * 64,
+                    head: head.buffer,
+                    head_bytes: u64::from(FW * FH) * 16,
+                    blend_scale: 0.5,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation: 1,
+                network: network::FULL,
+            };
+            // Mid-range proxies (0.25 to 0.49, exact halves), so a change of up to 1/8 never clips by itself.
+            let mid = |x: u32, y: u32, c: u32| 0.25 + ((x * 7 + y * 3 + c * 5) % 32) as f32 / 128.0;
+            let range =
+                vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            let region = vk::BufferImageCopy {
+                image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                ..Default::default()
+            };
+            let mut first = true;
+            let mut fill = |proxy: &dyn Fn(u32, u32, u32) -> f32| {
+                let texels: Vec<u16> =
+                    (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+                std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+                let was_first = first;
+                first = false;
+                fx.one_shot(|cmd| {
+                    if was_first {
+                        let to_general = vk::ImageMemoryBarrier::default()
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::GENERAL)
+                            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(encoded.image)
+                            .subresource_range(range);
+                        device.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &[to_general],
+                        );
+                    }
+                    device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+                });
+            };
+            fill(&mid);
+            let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            // The head for an edit of `edit(x, y, c)` (neural = proxy + residual / 4, exact on these values).
+            let write_head = |edit: &dyn Fn(u32, u32, u32) -> f32| {
+                let h: Vec<f32> =
+                    (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [4.0 * edit(x, y, 0), 4.0 * edit(x, y, 1), 4.0 * edit(x, y, 2), 10.0])).collect();
+                std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+            };
+            let answer = pass.answer();
+            let read_answer = || -> Vec<f32> {
+                fx.one_shot(|cmd| {
+                    device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }])
+                });
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).iter().map(|&h| f16(h)).collect()
+            };
+            let at = |a: &[f32], x: u32, y: u32| -> [f32; 3] { std::array::from_fn(|c| a[((y * pw + x) * 4 + c as u32) as usize]) };
+            let lanes = |x: u32, y: u32| -> Vec<f32> { std::slice::from_raw_parts(features.ptr.cast::<f32>().add(((y * FW + x) * 16) as usize), 16).to_vec() };
+            let luma = |e: [f32; 3]| e[0] * LUMA[0] + e[1] * LUMA[1] + e[2] * LUMA[2];
+            // One frame with `colour` (no history unless `history`); `force` records the stage even when
+            // nothing asks for it.
+            let mut run =
+                |colour: neural_forge_protocol::ColourSettings, lut: Option<&Arc<super::super::colour::Lut>>, history: bool, force: bool| -> (Vec<f32>, bool) {
+                    let passes = Passes { colour, ..Passes::default() };
+                    pass.prepare_colour(device, instance, physical, &passes, lut);
+                    if force {
+                        pass.colour_wanted = true;
+                    }
+                    assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
+                    let (cmds, _) = pass.frame_passes(&built, history, None, [1.0, 1.0], &passes);
+                    fx.submit(&mut pass, cmds);
+                    (read_answer(), pass.colour_recorded)
+                };
+            let neutral = neural_forge_protocol::ColourSettings::DEFAULT;
+            // A varied edit of up to 1/16 a channel.
+            let edit = |x: u32, y: u32, c: u32| (((x * 5 + y * 11 + c * 3) % 9) as f32 - 4.0) / 64.0;
+            let want = |x: u32, y: u32, c: u32| trunc_half(mid(x, y, c) + edit(x, y, c));
+            write_head(&edit);
+
+            // Neutral: as the network made it, without the stage and with it recorded.
+            let (plain, recorded) = run(neutral, None, false, false);
+            assert!(!recorded, "nothing asks for the stage by default");
+            for y in 0..H {
+                for x in 0..W {
+                    for c in 0..3 {
+                        assert_eq!(at(&plain, x, y)[c as usize], want(x, y, c), "the network's answer at {x},{y} channel {c}");
+                    }
+                }
+            }
+            let (forced, recorded) = run(neutral, None, false, true);
+            assert!(recorded);
+            assert_eq!(
+                forced.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                plain.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "neutral values leave the answer bit for bit"
+            );
+
+            // Saturation 0: a grey change of the edit's luma. The history the next frame reads is the network's
+            // answer, not the reshaped one.
+            let (grey, recorded) = run(
+                neural_forge_protocol::ColourSettings {
+                    each: [neural_forge_protocol::EditColour { saturation: 0.0, ..neural_forge_protocol::EditColour::NEUTRAL };
+                        neural_forge_protocol::MAX_PASSES],
+                    ..neutral
+                },
+                None,
+                false,
+                false,
+            );
+            assert!(recorded);
+            for (x, y) in [(5, 3), (0, 0), (W - 1, H - 1), (11, 7)] {
+                let e: [f32; 3] = std::array::from_fn(|c| want(x, y, c as u32) - mid(x, y, c as u32));
+                let g = at(&grey, x, y);
+                let d: [f32; 3] = std::array::from_fn(|c| g[c] - mid(x, y, c as u32));
+                assert!((d[0] - d[1]).abs() <= 2f32.powi(-10) && (d[1] - d[2]).abs() <= 2f32.powi(-10), "saturation 0 leaves a grey change at {x},{y}: {d:?}");
+                assert!((d[1] - luma(e)).abs() <= 2f32.powi(-10), "of the edit's luma at {x},{y}: {d:?} against {}", luma(e));
+                assert!(e.iter().zip(&e[1..]).any(|(a, b)| a != b), "the test's edit has chroma at {x},{y}");
+            }
+            let mut history_colour = neutral;
+            history_colour.each[0].saturation = 0.0;
+            run(history_colour, None, true, false);
+            assert_eq!(lanes(5, 3)[7], centre(want(5, 3, 0)), "the history lane is the network's answer, not the reshaped one");
+
+            // Contrast 0: the change has no luma; its chroma is the edit's.
+            let (flat, _) = run(
+                neural_forge_protocol::ColourSettings {
+                    each: [neural_forge_protocol::EditColour { contrast: 0.0, ..neural_forge_protocol::EditColour::NEUTRAL };
+                        neural_forge_protocol::MAX_PASSES],
+                    ..neutral
+                },
+                None,
+                false,
+                false,
+            );
+            for (x, y) in [(5, 3), (0, 0), (W - 1, H - 1), (11, 7)] {
+                let e: [f32; 3] = std::array::from_fn(|c| want(x, y, c as u32) - mid(x, y, c as u32));
+                let f = at(&flat, x, y);
+                let d: [f32; 3] = std::array::from_fn(|c| f[c] - mid(x, y, c as u32));
+                assert!(luma(d).abs() <= 2f32.powi(-10), "contrast 0 leaves no luma change at {x},{y}: {d:?}");
+                for c in 0..3 {
+                    assert!((d[c] - (e[c] - luma(e))).abs() <= 2f32.powi(-10), "the chroma stays at {x},{y} channel {c}");
+                }
+                assert!(luma(e).abs() > 2f32.powi(-8) || (x, y) != (5, 3), "the test's edit has luma");
+            }
+
+            // Detail 0: a checkerboard on a broad change of 1/64 leaves the broad change (away from the edges,
+            // where the blur clamps).
+            let checker = |x: u32, y: u32, c: u32| {
+                let sign = if (x + y).is_multiple_of(2) { 1.0 } else { -1.0 };
+                1.0 / 64.0 + sign * (c + 1) as f32 / 64.0
+            };
+            write_head(&checker);
+            let (broad, _) = run(
+                neural_forge_protocol::ColourSettings {
+                    each: [neural_forge_protocol::EditColour { detail: 0.0, ..neural_forge_protocol::EditColour::NEUTRAL }; neural_forge_protocol::MAX_PASSES],
+                    ..neutral
+                },
+                None,
+                false,
+                false,
+            );
+            for y in 1..H - 1 {
+                for x in 1..W - 1 {
+                    for c in 0..3 {
+                        let d = at(&broad, x, y)[c as usize] - mid(x, y, c);
+                        assert!((d - 1.0 / 64.0).abs() <= 2f32.powi(-10), "detail 0 keeps the broad change only at {x},{y} channel {c}: {d}");
+                    }
+                }
+            }
+
+            // The gamut guard: proxy (0.875, 0.5, 0.5), edit (1/8, -1/32, -1/32); saturation 2 would take red
+            // past 1. With the guard the change is shortened along itself; without, red clips and the hue turns.
+            fill(&|_, _, c| if c == 0 { 0.875 } else { 0.5 });
+            write_head(&|x, _, c| match (x < W / 2, c) {
+                (true, 0) => 0.125,
+                (true, _) => -0.03125,
+                (false, 0) => 0.03125,
+                (false, _) => -0.0078125,
+            });
+            let sat2 = |guard: bool| neural_forge_protocol::ColourSettings {
+                each: [neural_forge_protocol::EditColour { saturation: 2.0, ..neural_forge_protocol::EditColour::NEUTRAL }; neural_forge_protocol::MAX_PASSES],
+                gamut_guard: guard,
+                ..neutral
+            };
+            let (guarded, _) = run(sat2(true), None, false, false);
+            let (clipped, _) = run(sat2(false), None, false, false);
+            let shaped = |e: [f32; 3]| -> [f32; 3] { std::array::from_fn(|c| luma(e) + 2.0 * (e[c] - luma(e))) };
+            let e = shaped([0.125, -0.03125, -0.03125]);
+            assert!(0.875 + e[0] > 1.0, "the test's shaped change leaves the range");
+            let g = at(&guarded, 2, 2);
+            assert!(g[0] <= 1.0, "the guard keeps red in range");
+            let ratio = (g[1] - 0.5) / (g[0] - 0.875);
+            assert!((ratio - e[1] / e[0]).abs() < 0.01, "the guarded change keeps its direction: {ratio} against {}", e[1] / e[0]);
+            let k = at(&clipped, 2, 2);
+            assert_eq!(k[0], 1.0, "without the guard red clips");
+            let clipped_ratio = (k[1] - 0.5) / (k[0] - 0.875);
+            assert!((clipped_ratio - e[1] / e[0]).abs() > 0.05, "and the clipped change turns: {clipped_ratio}");
+            // A pixel whose shaped change stays in range is the same either way, bit for bit.
+            let inside = at(&guarded, W - 2, 2);
+            assert!(inside[0] < 1.0);
+            assert_eq!(inside.map(f32::to_bits), at(&clipped, W - 2, 2).map(f32::to_bits), "in range, the guard changes nothing");
+
+            // The protections (Oklab of the encoded values read as sRGB): full hue protection keeps an orange's hue
+            // where the edit turns it toward yellow; full shadow protection holds back darkening a dark grey.
+            let oklab = |v: [f32; 3]| -> [f32; 3] {
+                let [r, g, b] = v.map(|s| if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) });
+                let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_99 * b).cbrt();
+                let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+                let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+                [
+                    0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+                    1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+                    0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+                ]
+            };
+            let hue = |o: [f32; 3]| o[2].atan2(o[1]).to_degrees();
+            let protected = |k: [f32; 4]| neural_forge_protocol::ColourSettings { protect: k, ..neutral };
+            fill(&|_, _, c| [0.78125, 0.34375, 0.25][c as usize]);
+            write_head(&|_, _, c| [0.015625, 0.15625, -0.03125][c as usize]);
+            let (free, _) = run(neutral, None, false, false);
+            let (kept, recorded) = run(protected([1.0, 0.0, 0.0, 0.0]), None, false, false);
+            assert!(recorded, "a protection records the stage");
+            let h0 = hue(oklab([0.78125, 0.34375, 0.25]));
+            let (hf, hk) = (hue(oklab(at(&free, 3, 3))), hue(oklab(at(&kept, 3, 3))));
+            assert!((hf - h0).abs() > 8.0, "the test's edit turns the hue: {h0} -> {hf}");
+            assert!((hk - h0).abs() < 1.0, "full hue protection keeps it before the upscaler too: {h0} -> {hk}");
+            fill(&|_, _, _| 0.125);
+            write_head(&|_, _, _| -0.0625);
+            let (dark, _) = run(neutral, None, false, false);
+            let (held, _) = run(protected([0.0, 0.0, 1.0, 0.0]), None, false, false);
+            assert!(at(&dark, 3, 3)[1] < 0.07, "the test darkens the shadow");
+            assert!((at(&held, 3, 3)[1] - 0.125).abs() < 2f32.powi(-9), "shadow protection holds it: {:?}", at(&held, 3, 3));
+
+            // The look-up table (a channel rotation, exact under trilinear): strength 0 changes nothing; at full
+            // strength the result is the table's where the edit is large, and untouched where there is none.
+            fill(&mid);
+            write_head(&|x, _, _| if x < W / 2 { 0.0 } else { 0.0625 });
+            let mut cube = neural_forge_protocol::cube::Cube::identity(2);
+            for e in &mut cube.table {
+                *e = [e[2], e[0], e[1]];
+            }
+            let lut = Arc::new(super::super::colour::Lut { generation: 7, cube });
+            let (none, _) = run(neutral, Some(&lut), false, true);
+            let (full, _) = run(neural_forge_protocol::ColourSettings { lut_strength: 1.0, lut_adapt: 0.01, ..neutral }, Some(&lut), false, false);
+            for (x, y) in [(1, 1), (W - 1, H - 1), (W / 2, 3)] {
+                let n = at(&none, x, y);
+                let want_n: [f32; 3] = std::array::from_fn(|c| trunc_half(mid(x, y, c as u32) + if x < W / 2 { 0.0 } else { 0.0625 }));
+                assert_eq!(n, want_n, "strength 0 is the network's answer at {x},{y}");
+                let f = at(&full, x, y);
+                if x < W / 2 {
+                    assert_eq!(f, n, "no edit, no table at {x},{y}");
+                } else {
+                    let rotated = [n[2], n[0], n[1]];
+                    for c in 0..3 {
+                        assert!(
+                            (f[c] - rotated[c]).abs() <= 2f32.powi(-10),
+                            "the table where the edit is large at {x},{y} channel {c}: {f:?} against {rotated:?}"
+                        );
+                    }
+                }
+            }
+            // The table gone (its file unreadable) with the strength still up and the stage recorded: the one
+            // still in the buffer is not applied.
+            let (gone, recorded) = run(neural_forge_protocol::ColourSettings { lut_strength: 1.0, lut_adapt: 0.01, ..neutral }, None, false, true);
+            assert!(recorded);
+            assert_eq!(
+                gone.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                none.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "no table now, none applied"
+            );
+
+            pass.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &features, &head, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// Two passes, the second with its own intensity: pass 2 reads pass 1's answer as its colour input (its
+    /// proxy lanes), its answer is the network's on that picture blended by its own intensity, and the
+    /// encoded capture is put back after it for the write-back.
+    #[test]
+    fn a_later_pass_reads_the_previous_answer_with_its_own_settings_and_the_capture_is_put_back() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1),
+                )
+                .unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device
+                .begin_command_buffer(
+                    graph,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance),
+                )
+                .unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let built = Built {
+                width: W,
+                height: H,
+                frame: nn::Frame {
+                    field_width: FW,
+                    field_height: FH,
+                    features: features.buffer,
+                    features_bytes: u64::from(FW * FH) * 64,
+                    head: head.buffer,
+                    head_bytes: u64::from(FW * FH) * 16,
+                    blend_scale: 0.5,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation: 1,
+                network: network::FULL,
+            };
+            let texels: Vec<u16> =
+                (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+            let range =
+                vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            let region = vk::BufferImageCopy {
+                image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                buffer_row_length: pw,
+                image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                ..Default::default()
+            };
+            fx.one_shot(|cmd| {
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(encoded.image)
+                    .subresource_range(range);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+                device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+            });
+            let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
+            assert!(pass.ensure_more(device, instance, physical, family, 2), "the later passes build");
+            assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
+            pass.record_copies(device, encoded.image, encoded.view, region, 2, 1.0).unwrap();
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            let h: Vec<f32> =
+                (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, 0), residual(x, y, 1, 0), residual(x, y, 2, 0), 10.0])).collect();
+            std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+
+            let mut passes = Passes::one(Conditioning::default());
+            passes.count = 2;
+            passes.each[1].intensity = 0.5;
+            let (cmds, later) = pass.frame_passes(&built, false, None, [1.0, 1.0], &passes);
+            assert_eq!(later.len(), 1, "one later pass");
+            let copies = pass.more.as_ref().unwrap().copies;
+            let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
+            device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&order)], vk::Fence::null()).unwrap();
+            device.queue_wait_idle(gpu.4).unwrap();
+            for cmd in order {
+                pass.submitted(cmd);
+            }
+
+            // Pass 1's answer is what the one-pass test computes; pass 2's proxy lanes are it, centred.
+            let a1 = |x: u32, y: u32, c: u32| neural(x, y, c, 0);
+            let lane = |x: u32, y: u32, i: usize| *features.ptr.cast::<f32>().add(((y * FW + x) * 16) as usize + i);
+            for c in 0..3 {
+                assert_eq!(lane(5, 3, 4 + c as usize), centre(a1(5, 3, c)), "pass 2 reads pass 1's answer, channel {c}");
+            }
+            let answer = pass.answer();
+            fx.one_shot(|cmd| {
+                device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }])
+            });
+            let a2: Vec<f32> = std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).iter().map(|&h| f16(h)).collect();
+            for y in 0..H {
+                for x in 0..W {
+                    for c in 0..3 {
+                        let p = a1(x, y, c);
+                        let n = trunc_half(((residual(x, y, c, 0) * 0.03125 + (p * 0.125 - 0.0625)) * 8.0 + 0.5).clamp(0.0, 1.0));
+                        let want = trunc_half(0.5f32.mul_add(n - p, p).clamp(0.0, 1.0));
+                        let got = a2[((y * pw + x) * 4 + c) as usize];
+                        assert!((got - want).abs() <= 2.0 * 2f32.powi(-11), "pass 2 at {x},{y} channel {c}: {got} vs {want}");
+                    }
+                }
+            }
+            // The capture is back in the encoded image.
+            fx.one_shot(|cmd| device.cmd_copy_image_to_buffer(cmd, encoded.image, vk::ImageLayout::GENERAL, staging.buffer, &[region]));
+            let back = std::slice::from_raw_parts(staging.ptr.cast::<u16>(), texels.len());
+            assert_eq!(back, &texels[..], "the encoded capture is put back after the last pass");
+
+            // Frame 2, one pass with history: pass 1 blends toward its own previous answer (frame 1's pass 1),
+            // not toward the two-pass picture pass 2 made.
+            let cmds = pass.frame(&built, true, None, [1.0, 1.0], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            assert_ne!(a1(5, 3, 0), a2[((3 * pw + 5) * 4) as usize], "the test tells the two answers apart");
+            assert_eq!(lane(5, 3, 7), centre(a1(5, 3, 0)), "pass 1's history is its own answer");
+
+            // Frame 3, two passes without history at a pass feedback of 0.5: pass 2's colour input is halfway
+            // from the frame to pass 1's answer (on the encoded image's half grid).
+            pass.record_copies(device, encoded.image, encoded.view, region, 2, 0.5).unwrap();
+            let (cmds, later) = pass.frame_passes(&built, false, None, [1.0, 1.0], &passes);
+            let copies = pass.more.as_ref().unwrap().copies;
+            let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
+            device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&order)], vk::Fence::null()).unwrap();
+            device.queue_wait_idle(gpu.4).unwrap();
+            for cmd in order {
+                pass.submitted(cmd);
+            }
+            for c in 0..3u32 {
+                let (x, y) = (5u32, 3u32);
+                let input = f16(half(f16(half(proxy(x, y, c))) + 0.5 * (a1(x, y, c) - f16(half(proxy(x, y, c))))));
+                assert!(
+                    (lane(x, y, 4 + c as usize) - centre(input)).abs() <= 2f32.powi(-12),
+                    "pass 2's input at feedback 0.5, channel {c}: {} against {}",
+                    lane(x, y, 4 + c as usize),
+                    centre(input)
+                );
+            }
+
+            pass.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &features, &head, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+    /// The control mask: an all-ones mask (the dark rule with every value at 1) gives exactly the answer
+    /// and the network inputs of no mask; the sky rule leaves pixels at the far plane as they were and
+    /// the rest as without it; the dark rule's structure lowers the auto mask's structure lanes.
+    #[test]
+    fn the_control_mask_keeps_the_sky_lowers_structure_and_changes_nothing_when_all_ones() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            // Reversed depth: the sky (0) in columns 0-3, the scene (0.5) elsewhere.
+            let depth = own_host_buffer_with(device, instance, physical, u64::from(W * H) * 4, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let d: Vec<f32> = (0..H).flat_map(|_| (0..W).map(|x| if x < 4 { 0.0 } else { 0.5 })).collect();
+            std::ptr::copy_nonoverlapping(d.as_ptr().cast::<u8>(), depth.ptr, d.len() * 4);
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1),
+                )
+                .unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device
+                .begin_command_buffer(
+                    graph,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance),
+                )
+                .unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let built = Built {
+                width: W,
+                height: H,
+                frame: nn::Frame {
+                    field_width: FW,
+                    field_height: FH,
+                    features: features.buffer,
+                    features_bytes: u64::from(FW * FH) * 64,
+                    head: head.buffer,
+                    head_bytes: u64::from(FW * FH) * 16,
+                    blend_scale: 0.5,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation: 1,
+                network: network::FULL,
+            };
+            let texels: Vec<u16> =
+                (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+            let range =
+                vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            fx.one_shot(|cmd| {
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(encoded.image)
+                    .subresource_range(range);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+                let region = vk::BufferImageCopy {
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                    ..Default::default()
+                };
+                device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+            });
+            let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
+            assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, Some(depth.buffer)));
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            let h: Vec<f32> =
+                (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, 0), residual(x, y, 1, 0), residual(x, y, 2, 0), 10.0])).collect();
+            std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+            let answer = pass.answer();
+            // One frame without history with `mask`: the answer and the features.
+            let mut run = |mask: Mask| -> (Vec<u16>, Vec<f32>) {
+                let mut passes = Passes::one(Conditioning::default());
+                passes.mask = mask;
+                let (cmds, _) = pass.frame_passes(&built, false, None, [1.0, 1.0], &passes);
+                fx.submit(&mut pass, cmds);
+                fx.one_shot(|cmd| {
+                    device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }])
+                });
+                let a = std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).to_vec();
+                let f = std::slice::from_raw_parts(features.ptr.cast::<f32>(), (FW * FH * 16) as usize).to_vec();
+                (a, f)
+            };
+            let (a0, f0) = run(Mask::default());
+            let ones = Mask { rules: MASK_DARK, dark: [1.0, 1.0, 1.0], ..Mask::default() };
+            let (a1, f1) = run(ones);
+            assert!(a0 == a1, "an all-ones mask gives the answer of no mask, bit for bit");
+            assert!(f0.iter().zip(&f1).all(|(x, y)| x.to_bits() == y.to_bits()), "and the same network inputs");
+
+            // The sky rule: columns 0-1 see only sky in their 5x5 neighbourhood (no edit: the proxy, on the
+            // half grid), columns 6 on see none (the network's answer, as without a mask).
+            let sky = Mask { rules: MASK_SKY, depth_kind: 1, reversed: true, sky_margin: 0.00001, ..Mask::default() };
+            let (a2, _) = run(sky);
+            for y in 0..H {
+                for c in 0..3u32 {
+                    let at = |x: u32| ((y * pw + x) * 4 + c) as usize;
+                    assert_eq!(f16(a2[at(0)]), trunc_half(f16(half(proxy(0, y, c)))), "sky at 0,{y} channel {c}: the frame as it was");
+                    assert_eq!(f16(a2[at(1)]), trunc_half(f16(half(proxy(1, y, c)))), "sky at 1,{y} channel {c}");
+                    assert_eq!(a2[at(7)], a0[at(7)], "scene at 7,{y} channel {c}: as without the mask");
+                }
+            }
+            assert_ne!(a2[(2 * pw * 4) as usize], a0[(2 * pw * 4) as usize], "the test's sky pixel is edited without the mask");
+            // Ordinary depth: the same picture's 0 is the near plane, so nothing is sky.
+            let (a3, _) = run(Mask { reversed: false, ..sky });
+            assert!(a3 == a0, "with ordinary depth no pixel of this picture is sky");
+
+            // The dark rule's structure (intensity left at 1): b fades from 1 at the threshold (1.0, so every
+            // pixel) toward 0.5 at black; with auto mask on, the skin and structure lanes take min(lane, b).
+            let dark = Mask { rules: MASK_DARK, dark: [1.0, 1.0, 0.5], ..Mask::default() };
+            let (_, f4) = run(dark);
+            for (x, y) in [(5u32, 3u32), (9, 6)] {
+                let luma = 0.2126 * f16(half(proxy(x, y, 0))) + 0.7152 * f16(half(proxy(x, y, 1))) + 0.0722 * f16(half(proxy(x, y, 2)));
+                let b = 1.0 - 0.5 * (1.0 - luma).clamp(0.0, 1.0);
+                let q = (b * 255.0).round() / 255.0;
+                let lane = |i: usize| f4[((y * FW + x) * 16) as usize + i];
+                assert_eq!(lane(12), 1.0, "auto mask on: lane 12 stays 1");
+                for i in [13, 14] {
+                    assert!((lane(i) - q).abs() < 2e-3, "lane {i} at {x},{y}: {} against {q}", lane(i));
+                }
+                assert_eq!(lane(11), f0[((y * FW + x) * 16) as usize + 11], "local tone untouched (g stays 1)");
+            }
+
+            pass.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &features, &head, &staging, &depth] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// A cut the GPU reset on the last network frame (read at the start of the hold) stays counted through a
+    /// network frame that consumes no latched cut, as inside DLSS's buffer: the split hold overwrote it, so
+    /// the session's count missed every such cut with the edit cache off or the camera still.
+    #[test]
+    fn a_cut_the_gpu_reset_stays_counted_through_the_next_network_frame() {
+        for (frames, stale, before, after) in [
+            (3, None, true, true),
+            (3, Some(Stale::Idle(std::time::Duration::from_secs(1))), true, true),
+            (3, Some(Stale::SceneCut(60)), false, true),
+            (3, None, false, false),
+            (0, Some(Stale::SceneCut(60)), false, false),
+        ] {
+            let mut cut = before;
+            note_network_reset(frames, stale, &mut cut);
+            assert_eq!(cut, after, "frames {frames}, {stale:?}, counted before: {before}");
+        }
+    }
+
+    /// A frame whose capture the scene-cut detector marked (the state buffer's `cut` word) runs every pass
+    /// exactly as a frame without history does (the same lanes, seed 0, no blend, the same answer), and with
+    /// the seed restarted after it (`restart_seed`, what the next hold does on the reading) the next frame is
+    /// bit for bit the one after a reset. Without the mark the frame blends toward its history.
+    #[test]
+    fn a_scene_cut_frame_runs_every_pass_as_a_reset_and_the_next_frame_follows_it() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1),
+                )
+                .unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device
+                .begin_command_buffer(
+                    graph,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance),
+                )
+                .unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let built = Built {
+                width: W,
+                height: H,
+                frame: nn::Frame {
+                    field_width: FW,
+                    field_height: FH,
+                    features: features.buffer,
+                    features_bytes: u64::from(FW * FH) * 64,
+                    head: head.buffer,
+                    head_bytes: u64::from(FW * FH) * 16,
+                    blend_scale: 0.5,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation: 1,
+                network: network::FULL,
+            };
+            let texels: Vec<u16> =
+                (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+            let range =
+                vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            let region = vk::BufferImageCopy {
+                image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                buffer_row_length: pw,
+                image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                ..Default::default()
+            };
+            fx.one_shot(|cmd| {
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(encoded.image)
+                    .subresource_range(range);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+                device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+            });
+            let mut passes = Passes::one(Conditioning::default());
+            passes.count = 2;
+            passes.each[1].intensity = 0.5;
+            let answer_of = |pass: &NativePass| -> Vec<u16> {
+                let answer = pass.answer();
+                fx.one_shot(|cmd| {
+                    device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }])
+                });
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).to_vec()
+            };
+            let lanes = || -> Vec<u32> { std::slice::from_raw_parts(features.ptr.cast::<u32>(), (FW * FH * 16) as usize).to_vec() };
+            // One network frame of both passes: `history` the CPU's flag, `cut` the detector's word.
+            let frame = |pass: &mut NativePass, n: u32, history: bool, cut: bool| -> (Vec<u16>, Vec<u32>, u32) {
+                let h: Vec<f32> =
+                    (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, n), residual(x, y, 1, n), residual(x, y, 2, n), 10.0])).collect();
+                std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+                pass.record_copies(device, encoded.image, encoded.view, region, 2, 1.0).unwrap();
+                let (cmds, later) = pass.frame_passes(&built, history, None, [1.0, 1.0], &passes);
+                assert_eq!(later.len(), 1, "one later pass");
+                let seed = (*pass.params[((pass.frames - 1) & 1) as usize].ptr.cast::<Params>()).frame[1];
+                let copies = pass.more.as_ref().unwrap().copies;
+                let state = pass.state_buffer();
+                let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
+                // The initialisation clears the state; the capture writes the cut word after it, before the frame.
+                let init_cmd = pass.commands[2];
+                let (init, rest): (Vec<vk::CommandBuffer>, Vec<vk::CommandBuffer>) = order.iter().copied().partition(|&c| c == init_cmd);
+                if !init.is_empty() {
+                    device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&init)], vk::Fence::null()).unwrap();
+                    device.queue_wait_idle(gpu.4).unwrap();
+                }
+                fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, state, 8, 4, u32::from(cut)));
+                device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&rest)], vk::Fence::null()).unwrap();
+                device.queue_wait_idle(gpu.4).unwrap();
+                for cmd in order {
+                    pass.submitted(cmd);
+                }
+                if let Some(m) = pass.more.as_mut() {
+                    m.fresh[0] = false;
+                }
+                (answer_of(pass), lanes(), seed)
+            };
+            let build = || {
+                let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
+                assert!(pass.ensure_more(device, instance, physical, family, 2), "the later passes build");
+                assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
+                fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+                pass
+            };
+
+            // The reference: frame 2 without history (a reset on the CPU), frame 3 with it.
+            let mut reset = build();
+            frame(&mut reset, 0, false, false);
+            let (ra2, rl2, rs2) = frame(&mut reset, 1, false, false);
+            let (ra3, rl3, rs3) = frame(&mut reset, 2, true, false);
+            assert_eq!((rs2, rs3), (0, 1), "a reset's seeds");
+            // Frame 2 cut: the CPU kept the history (seed 1), the detector marked the frame.
+            let mut cut = build();
+            frame(&mut cut, 0, false, false);
+            let (ca2, cl2, cs2) = frame(&mut cut, 1, true, true);
+            assert_eq!(cs2, 1, "the CPU's parameters kept the history");
+            assert_eq!(cl2, rl2, "every lane of the last pass (noise seed 0, no history) as on a reset");
+            assert_eq!(ca2, ra2, "the answer of both passes as on a reset");
+            cut.restart_seed();
+            let (ca3, cl3, cs3) = frame(&mut cut, 2, true, false);
+            assert_eq!(cs3, 1, "the seed restarts after the cut");
+            assert_eq!(cl3, rl3, "the frame after the cut is the frame after a reset");
+            assert_eq!(ca3, ra3);
+            // A frame whose later passes cannot run (their buffers failed to build: `runnable`): pass 1 alone is
+            // planned, pass 2 is not noted as run, and the next frame that runs it starts it without its history.
+            let single = runnable(passes, false);
+            assert_eq!((single.count, runnable(passes, true).count), (1, 2));
+            let mut lone = build();
+            frame(&mut lone, 0, false, false);
+            let (_, later) = lone.frame_passes(&built, true, None, [1.0, 1.0], &single);
+            assert!(later.is_empty(), "pass 1 alone");
+            let (_, later) = lone.frame_passes(&built, true, None, [1.0, 1.0], &passes);
+            assert_eq!(later.len(), 1);
+            let parity = ((lone.frames - 1) & 1) as usize;
+            let own = (*lone.more.as_ref().unwrap().params[0][parity].ptr.cast::<Params>()).frame[2];
+            assert_eq!(own, 0, "pass 2 did not run on the frame before: no history of its own");
+            // Without the mark the same frame 2 keeps its history: the test tells the two apart.
+            let mut kept = build();
+            frame(&mut kept, 0, false, false);
+            let (ka2, _, _) = frame(&mut kept, 1, true, false);
+            assert_ne!(ka2, ra2, "with history the answer blends toward it");
+
+            // An exposure jump: frame 2 encoded at 4 times frame 1's exposure (both usable). The CPU kept the history
+            // (seed 1); the frame shaders start afresh as on a reset, and the composite reports the two exposures.
+            let set_exposure = |bits: u32| std::ptr::copy_nonoverlapping(bits.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let jump_word = || std::ptr::read_volatile(exposure.ptr.add(4).cast::<u32>());
+            let mut jump = build();
+            set_exposure(0x3c00);
+            frame(&mut jump, 0, false, false);
+            assert_eq!(jump_word(), 0, "no previous frame: nothing to report");
+            set_exposure(0x4400);
+            let (ja2, jl2, js2) = frame(&mut jump, 1, true, false);
+            assert_eq!(js2, 1, "the CPU's parameters kept the history");
+            assert_eq!(jl2, rl2, "every lane of the last pass (noise seed 0, no history) as on a reset");
+            assert_eq!(ja2, ra2, "the answer of both passes as on a reset");
+            assert_eq!(jump_word(), 0x3c00 | (0x4400 << 16), "the report: 1.0 before, 4.0 now");
+            apply_exposure_jump(jump_word(), Some(&mut jump));
+            let (ja3, jl3, js3) = frame(&mut jump, 2, true, false);
+            assert_eq!(js3, 1, "the seed restarts after the jump");
+            assert_eq!((jl3, ja3), (rl3.clone(), ra3.clone()), "the frame after the jump is the frame after a reset");
+            assert_eq!(jump_word(), 0, "a steady exposure reports nothing");
+            // Within the factor (1.0 to 1.5) the history is kept, as with a steady exposure.
+            let mut small = build();
+            set_exposure(0x3c00);
+            frame(&mut small, 0, false, false);
+            set_exposure(0x3e00);
+            let (sa2, _, _) = frame(&mut small, 1, true, false);
+            assert_eq!(sa2, ka2, "half a stop keeps the history");
+            assert_eq!(jump_word(), 0);
+            // A frame the CPU already resets is not reported as a jump.
+            let mut both = build();
+            set_exposure(0x3c00);
+            frame(&mut both, 0, false, false);
+            set_exposure(0x4400);
+            frame(&mut both, 1, false, false);
+            assert_eq!(jump_word(), 0, "the CPU's reset took the history, not the jump");
+            set_exposure(0x3c00);
+
+            for p in [&reset, &cut, &kept, &lone, &jump, &small, &both] {
+                p.destroy(device);
+            }
+            encoded.destroy(device);
+            for b in [&exposure, &features, &head, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// The next hold's side of a reading: a cut the GPU reset restarts the seed and is counted; a cut on a
+    /// cached hold resets the next network frame (its parameters' history off, counted then) and makes the
+    /// edit cache refresh instead of carrying its edit on; no cut changes nothing.
+    #[test]
+    fn a_reading_restarts_the_seed_or_resets_the_next_network_frame_and_refreshes_the_cache() {
+        use super::super::cache::{Hold, Kind, State};
+        use super::super::scene_cut::Effect;
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let hold = |n: u64| Hold {
+            interval: 2,
+            hold: n,
+            jitter: Some([0.0; 2]),
+            mvec: true,
+            depth: true,
+            history_ok: true,
+            armed: false,
+            debug_mask: false,
+            generation: 1,
+        };
+        // A cache that just refreshed: its next hold is cached.
+        let refreshed = || {
+            let mut s = State::default();
+            let h = hold(1);
+            let p = s.plan(&h);
+            assert_eq!(p.kind, Kind::Refresh);
+            s.went_through(&h, &p);
+            s
+        };
+        let built = Built {
+            width: W,
+            height: H,
+            frame: nn::Frame {
+                field_width: FW,
+                field_height: FH,
+                features: vk::Buffer::null(),
+                features_bytes: 0,
+                head: vk::Buffer::null(),
+                head_bytes: 0,
+                blend_scale: 0.5,
+                chained: 0,
+            },
+            graph: vk::CommandBuffer::null(),
+            graph_own: vk::CommandBuffer::null(),
+            generation: 1,
+            network: network::FULL,
+        };
+        let seed = |pass: &NativePass| unsafe { (*pass.params[((pass.frames - 1) & 1) as usize].ptr.cast::<Params>()).frame[1] };
+        // SAFETY: a fresh device; the pass is never submitted.
+        unsafe {
+            let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
+            let t0 = Instant::now();
+            for _ in 0..3 {
+                pass.gap.begin(t0);
+                pass.frame_passes(&built, true, None, [1.0, 1.0], &Passes::default());
+            }
+            assert_eq!(seed(&pass), 3);
+            let mut cache = refreshed();
+            // No cut: nothing changes.
+            assert!(!apply_scene_cut(Effect::None, Some(&mut pass), Some(&mut cache)));
+            assert_eq!(pass.gap.pending(t0), None);
+            assert_eq!(cache.plan(&hold(2)).kind, Kind::Cached, "the cache carries its edit");
+            // The GPU reset the last network frame: counted, and the next frame's seed is a reset's next.
+            assert!(apply_scene_cut(Effect::ResetOnGpu(80), Some(&mut pass), None));
+            assert_eq!(pass.gap.pending(t0), None, "the reset already happened");
+            pass.frame_passes(&built, true, None, [1.0, 1.0], &Passes::default());
+            assert_eq!(seed(&pass), 1, "the seed counts on from the cut frame's 0");
+            // A cut on a cached hold: the next network frame resets, the cache refreshes.
+            let mut cache = refreshed();
+            assert!(!apply_scene_cut(Effect::Latch(90), Some(&mut pass), Some(&mut cache)), "counted when it is consumed");
+            assert_eq!(cache.plan(&hold(2)).kind, Kind::Refresh, "the cache refreshes across the cut");
+            let stale = pass.gap.begin(t0);
+            assert_eq!(stale, Some(Stale::SceneCut(90)));
+            // run_native_hold's rule for the frame's history flag.
+            assert!(!(pass.frames > 0 && stale.is_none()), "the next network frame has no history");
+            pass.frame_passes(&built, false, None, [1.0, 1.0], &Passes::default());
+            assert_eq!((*pass.params[((pass.frames - 1) & 1) as usize].ptr.cast::<Params>()).frame[2], 0, "its parameters' history flag is off");
+            assert_eq!(pass.gap.begin(t0), None, "once");
+            pass.destroy(device);
+        }
+    }
+
+    /// `NEURAL_FORGE_EXPOSURE_JUMP`: one stop by default, `off` or 0 off, else stops above 0 and up to 16.
+    #[test]
+    fn the_exposure_jump_setting_parses() {
+        assert_eq!(parse_exposure_jump(None), Ok(1.0));
+        assert_eq!(parse_exposure_jump(Some(" ")), Ok(1.0));
+        assert_eq!(parse_exposure_jump(Some("on")), Ok(1.0));
+        assert_eq!(parse_exposure_jump(Some("off")), Ok(0.0));
+        assert_eq!(parse_exposure_jump(Some("0")), Ok(0.0));
+        assert_eq!(parse_exposure_jump(Some("2.5")), Ok(2.5));
+        assert_eq!(parse_exposure_jump(Some("16")), Ok(16.0));
+        for bad in ["-1", "17", "NaN", "inf", "two"] {
+            assert_eq!(parse_exposure_jump(Some(bad)), Err(bad.to_string()));
+        }
+    }
+
+    /// The composite's exposure-jump word read back: the two exposures once per jump, also where holds the network did
+    /// not run on read the same word again; nothing for 0.
+    #[test]
+    fn an_exposure_jump_word_is_taken_once() {
+        let mut last = 0;
+        assert_eq!(take_exposure_jump(&mut last, 0), None);
+        let word = 0x3c00 | (0x4400 << 16);
+        assert_eq!(take_exposure_jump(&mut last, word), Some((1.0, 4.0)));
+        assert_eq!(take_exposure_jump(&mut last, word), None, "a cached hold's copy of the same word");
+        assert_eq!(take_exposure_jump(&mut last, 0), None);
+        assert_eq!(take_exposure_jump(&mut last, 0x4400 | (0x3c00 << 16)), Some((4.0, 1.0)), "and back");
+        assert_eq!(take_exposure_jump(&mut last, word), Some((1.0, 4.0)), "a new jump right after");
+    }
+
+    /// The game's reset of DLSS's history: the edit cache refreshes on the hold that carries it (a cached hold would
+    /// carry the old scene's answer), the network frame resets once, logged as the game's and not counted as a
+    /// scene cut; a hold without it changes nothing.
+    #[test]
+    fn a_game_reset_refreshes_the_cache_and_resets_the_next_network_frame_once() {
+        use super::super::cache::{Hold, Kind, State};
+        let hold = |n: u64, history_ok: bool| Hold {
+            interval: 2,
+            hold: n,
+            jitter: Some([0.0; 2]),
+            mvec: true,
+            depth: true,
+            history_ok,
+            armed: false,
+            debug_mask: false,
+            generation: 1,
+        };
+        let mut cache = State::default();
+        let h = hold(1, true);
+        let p = cache.plan(&h);
+        assert_eq!(p.kind, Kind::Refresh);
+        cache.went_through(&h, &p);
+        let mut gap: HistoryGap<(u32, u32)> = HistoryGap::default();
+        let t0 = Instant::now();
+        gap.begin(t0);
+        apply_game_reset(&mut gap, Some(&mut cache));
+        // native_hold's history_ok: the reset is pending until the network frame consumes it.
+        let history_ok = gap.pending(t0).is_none();
+        assert!(!history_ok);
+        assert_eq!(cache.plan(&hold(2, history_ok)).kind, Kind::Refresh, "not served from the edit cache");
+        let stale = gap.begin(t0);
+        assert_eq!(stale, Some(Stale::GameReset));
+        let mut scene_cut = false;
+        note_network_reset(1, stale, &mut scene_cut);
+        assert!(!scene_cut, "not counted as a scene cut");
+        assert_eq!(gap.begin(t0), None, "once");
+        // Without an edit cache (interval 1, or the cache off) only the history resets.
+        apply_game_reset(&mut gap, None);
+        assert_eq!(gap.begin(t0), Some(Stale::GameReset));
+    }
+
+    /// DLSS's subrect changing size inside the same colour input (dynamic resolution): the hold's extent stays the
+    /// image's, but the history is in the rectangle's pixels, so a new rectangle size resets it once (and the next
+    /// hold is a network frame, not a cached one); the same size again keeps it.
+    #[test]
+    fn a_new_subrect_size_resets_the_history_once() {
+        let target = |region| super::super::Target {
+            colour: ash::vk::Image::null(),
+            width: 2564,
+            height: 1444,
+            region,
+            depth: None,
+            depth_buffer: None,
+            mvec: None,
+            mvec_scale: [1.0, 1.0],
+            exposure: [None; super::super::MAX_EXPOSURE],
+            exposure_input: None,
+            paper_white: 2.5,
+            lift_exposure: false,
+            pre_exposed: false,
+            identification: 1,
+        };
+        let mut gap: HistoryGap<(u32, u32)> = HistoryGap::default();
+        let t0 = Instant::now();
+        gap.note_format(format_of(&target(Some((2562, 1441)))));
+        gap.begin(t0);
+        gap.note_format(format_of(&target(Some((2562, 1441)))));
+        assert_eq!(gap.begin(t0), None, "the same rectangle keeps the history");
+        gap.note_format(format_of(&target(Some((2050, 1153)))));
+        assert!(gap.pending(t0).is_some(), "history_ok is false: a network frame, not a cached hold");
+        assert_eq!(gap.begin(t0), Some(Stale::FormatChanged), "a new rectangle size resets it");
+        gap.note_format(format_of(&target(Some((2050, 1153)))));
+        assert_eq!(gap.begin(t0), None, "once");
+        assert_eq!(format_of(&target(None)), (2564, 1444), "no subrect: the extent");
+    }
+
+    /// The render extent of the model resolution tests (half of it is above the 8-texel floor).
+    const SW: u32 = 20;
+    const SH: u32 = 16;
+
+    /// A network stand-in for one extent: host-visible features and head, the given field.
+    struct Stand {
+        built: Built,
+        features: HostBuffer,
+        head: HostBuffer,
+    }
+
+    impl Stand {
+        /// # Safety
+        /// `device` is live; `graph` is an empty secondary of it.
+        unsafe fn new(
+            device: &ash::Device,
+            instance: &ash::Instance,
+            physical: vk::PhysicalDevice,
+            extent: (u32, u32),
+            field: (u32, u32),
+            graph: vk::CommandBuffer,
+            generation: u64,
+        ) -> Self {
+            let texels = u64::from(field.0 * field.1);
+            let features = own_host_buffer_with(device, instance, physical, texels * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, texels * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let built = Built {
+                width: extent.0,
+                height: extent.1,
+                frame: nn::Frame {
+                    field_width: field.0,
+                    field_height: field.1,
+                    features: features.buffer,
+                    features_bytes: texels * 64,
+                    head: head.buffer,
+                    head_bytes: texels * 16,
+                    blend_scale: 0.5,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation,
+                network: network::FULL,
+            };
+            Self { built, features, head }
+        }
+
+        /// The head: `residual(x, y, c)` in every field texel, logit 10.
+        fn write_head(&self, residual: impl Fn(u32, u32, u32) -> f32) {
+            let (fw, fh) = (self.built.frame.field_width, self.built.frame.field_height);
+            let h: Vec<f32> =
+                (0..fh).flat_map(|y| (0..fw).flat_map(|x| [residual(x, y, 0), residual(x, y, 1), residual(x, y, 2), 10.0]).collect::<Vec<_>>()).collect();
+            // SAFETY: mapped for the whole field.
+            unsafe { std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), self.head.ptr, h.len() * 4) };
+        }
+
+        /// Input lane `i` of field texel (x, y).
+        fn lane(&self, x: u32, y: u32, i: usize) -> f32 {
+            // SAFETY: mapped for the whole field; the frame that wrote it completed.
+            unsafe { *self.features.ptr.cast::<f32>().add(((y * self.built.frame.field_width + x) * 16) as usize + i) }
+        }
+
+        fn graph(&self) -> Graph {
+            Graph { built: self.built, graph: self.built.graph }
+        }
+
+        /// # Safety
+        /// Nothing pending uses them.
+        unsafe fn destroy(&self, device: &ash::Device) {
+            // SAFETY: forwarded.
+            unsafe {
+                self.features.destroy(device);
+                self.head.destroy(device);
+            }
+        }
+    }
+
+    /// An empty secondary (the graph's place) and its pool.
+    ///
+    /// # Safety
+    /// `device` is live.
+    unsafe fn empty_graph(device: &ash::Device, family: u32) -> (vk::CommandPool, vk::CommandBuffer) {
+        // SAFETY: forwarded; valid create infos.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1),
+                )
+                .unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device
+                .begin_command_buffer(
+                    graph,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance),
+                )
+                .unwrap();
+            device.end_command_buffer(graph).unwrap();
+            (pool, graph)
+        }
+    }
+
+    /// `texels` (RGBA16F rows of the padded width) into `image`, left in GENERAL.
+    fn upload_encoded(fx: &Fixture, staging: &HostBuffer, image: &OwnImage, pw: u32, ph: u32, texels: &[u16]) {
+        let d = &fx.gpu.3;
+        // SAFETY: the staging buffer is mapped for the texels; the image is the test's.
+        unsafe {
+            std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+            fx.one_shot(|cmd| {
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image.image)
+                    .subresource_range(range);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+                let region = vk::BufferImageCopy {
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                    ..Default::default()
+                };
+                d.cmd_copy_buffer_to_image(cmd, staging.buffer, image.image, vk::ImageLayout::GENERAL, &[region]);
+            });
+        }
+    }
+
+    /// The answer buffer (RGBA16F rows of the padded width), as f32.
+    fn read_answer(fx: &Fixture, staging: &HostBuffer, answer: vk::Buffer, pw: u32, ph: u32) -> Vec<f32> {
+        let d = &fx.gpu.3;
+        // SAFETY: as `upload_encoded`.
+        unsafe {
+            fx.one_shot(|cmd| d.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }]));
+            std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).iter().map(|&h| f16(h)).collect()
+        }
+    }
+
+    #[test]
+    fn the_model_extent_follows_the_scale_and_full_size_is_the_render_extent() {
+        for s in [1.0, 1.5, f32::NAN, f32::INFINITY] {
+            assert_eq!(model_extent(1485, 836, s), (1485, 836), "scale {s}");
+        }
+        assert_eq!(model_extent(1485, 836, 0.5), (743, 418));
+        assert_eq!(model_extent(1485, 836, 0.667), (990, 558));
+        assert_eq!(model_extent(1485, 836, 0.333), (495, 278));
+        assert_eq!(model_extent(1485, 836, 0.1), (371, 209), "at least the setting's lowest scale");
+        assert_eq!(model_extent(12, 6, 0.25), (8, 6), "at least 8 texels, never more than the side");
+        // At 1 every pass is at the render extent and the network is built for that one size, as before.
+        let full = pass_extents(SW, SH, &[1.0; neural_forge_protocol::MAX_PASSES]);
+        assert!(full.iter().all(|&e| e == (SW, SH)));
+        assert_eq!(graph_sizes(&full, 3), vec![(SW, SH)]);
+        let mut scales = [1.0; neural_forge_protocol::MAX_PASSES];
+        scales[1] = 0.5;
+        scales[2] = 0.5;
+        scales[4] = 0.333;
+        let mixed = pass_extents(SW, SH, &scales);
+        assert_eq!(graph_sizes(&mixed, 3), vec![(SW, SH), (10, 8)], "pass 1's first, each size once");
+        assert_eq!(graph_sizes(&mixed, 5), vec![(SW, SH), (10, 8), (8, 8)], "never below 8 texels");
+        assert_eq!(graph_sizes(&mixed, 1), vec![(SW, SH)], "only the passes that run");
+    }
+
+    /// A model resolution of 1 is the native frame as it was, bit for bit: a pass built for every slot at the
+    /// render extent (what the hold builds at the default) gives the same input lanes and answers as one built
+    /// the old way, over two passes and frames with history.
+    #[test]
+    fn at_full_model_resolution_the_frame_is_bit_for_bit_as_before() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(SW, SH);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let (graph_pool, graph) = empty_graph(device, family);
+            let net = Stand::new(device, instance, physical, (SW, SH), (FW, FH), graph, 1);
+            let texels: Vec<u16> =
+                (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            let region = vk::BufferImageCopy {
+                image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                buffer_row_length: pw,
+                image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                ..Default::default()
+            };
+            let extents = pass_extents(SW, SH, &[1.0; neural_forge_protocol::MAX_PASSES]);
+            let mut old = NativePass::build(device, instance, physical, family, SW, SH, false).unwrap();
+            let mut new = NativePass::build_at(device, instance, physical, family, SW, SH, extents, false, true).unwrap();
+            let mut passes = Passes::one(Conditioning::default());
+            passes.count = 2;
+            passes.each[1].intensity = 0.5;
+            let mut results = Vec::new();
+            for (k, pass) in [&mut old, &mut new].into_iter().enumerate() {
+                assert!(pass.ensure_more(device, instance, physical, family, 2));
+                assert!(pass.ensure_lanes(device, instance, physical, 2), "nothing to build at full size");
+                assert!(pass.lanes.is_empty() && pass.resize.is_none(), "no lane or resize pipeline at full size");
+                let graphs = [net.graph()];
+                assert!(if k == 0 {
+                    pass.record(device, instance, physical, &net.built, graph, encoded.view, exposure.buffer, None)
+                } else {
+                    pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None)
+                });
+                fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+                let mut frames = Vec::new();
+                for frame in 0..3u32 {
+                    upload_encoded(&fx, &staging, &encoded, pw, ph, &texels);
+                    net.write_head(|x, y, c| residual(x, y, c, frame));
+                    // Recorded for each frame, as each hold does: they are one-time-submit buffers.
+                    pass.record_copies(device, encoded.image, encoded.view, region, 2, 1.0).unwrap();
+                    let (cmds, later) = if k == 0 {
+                        pass.frame_passes(&net.built, frame > 0, Some([0.25, -0.25]), [1.0, 1.0], &passes)
+                    } else {
+                        pass.frame_graphs(&graphs, frame > 0, Some([0.25, -0.25]), [1.0, 1.0], &passes)
+                    };
+                    let copies = pass.more.as_ref().unwrap().copies;
+                    let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
+                    device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&order)], vk::Fence::null()).unwrap();
+                    device.queue_wait_idle(gpu.4).unwrap();
+                    for cmd in order {
+                        pass.submitted(cmd);
+                    }
+                    // The submit took the later pass's new history to GENERAL (the hold clears it the same way).
+                    if let Some(m) = pass.more.as_mut() {
+                        m.fresh[0] = false;
+                    }
+                    let lanes: Vec<u32> = (0..FW * FH * 16).map(|i| (*net.features.ptr.cast::<f32>().add(i as usize)).to_bits()).collect();
+                    frames.push((lanes, read_answer(&fx, &staging, pass.answer(), pw, ph).iter().map(|v| v.to_bits()).collect::<Vec<u32>>()));
+                }
+                results.push(frames);
+            }
+            for (frame, (a, b)) in results[0].iter().zip(&results[1]).enumerate() {
+                assert!(a.0 == b.0, "frame {frame}: the network's input lanes differ");
+                assert!(a.1 == b.1, "frame {frame}: the answer differs");
+            }
+            for pass in [&old, &new] {
+                pass.destroy(device);
+            }
+            net.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// At half the model resolution: the network's input is the area average of the encoded frame at half
+    /// its size, and its edit comes back at full size: a constant residual (a constant edit) is added to every
+    /// full-resolution pixel with its own magnitude; an edit of opposite sign on either side of a hard edge in
+    /// the frame stays on its side up to the edge, where a plain bilinear enlargement would mix the two over
+    /// the pixels next to it.
+    #[test]
+    fn at_half_model_resolution_the_edit_comes_back_at_full_size_without_crossing_an_edge() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let mut scales = [1.0; neural_forge_protocol::MAX_PASSES];
+        scales[0] = 0.5;
+        let extents = pass_extents(SW, SH, &scales);
+        let (mw, mh) = extents[0];
+        assert_eq!((mw, mh), (10, 8));
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(SW, SH);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let (graph_pool, graph) = empty_graph(device, family);
+            let net = Stand::new(device, instance, physical, (mw, mh), (16, 8), graph, 1);
+            // The frame: dark on the left half, bright on the right (a hard edge between columns 9 and 10, on a
+            // texel boundary of the half-size picture), a fine texture on each side.
+            let frame = |x: u32, y: u32, c: u32| -> f32 { (if x < SW / 2 { 0.25 } else { 0.75 }) + ((x + 2 * y + c) % 4) as f32 / 256.0 };
+            let texels: Vec<u16> = (0..ph)
+                .flat_map(|y| {
+                    (0..pw).flat_map(move |x| {
+                        [
+                            half(frame(x.min(SW - 1), y.min(SH - 1), 0)),
+                            half(frame(x.min(SW - 1), y.min(SH - 1), 1)),
+                            half(frame(x.min(SW - 1), y.min(SH - 1), 2)),
+                            half(1.0),
+                        ]
+                    })
+                })
+                .collect();
+            upload_encoded(&fx, &staging, &encoded, pw, ph, &texels);
+            let mut pass = NativePass::build_at(device, instance, physical, family, SW, SH, extents, false, true).unwrap();
+            assert!(!pass.record_graphs(device, instance, physical, &[net.graph()], encoded.view, exposure.buffer, None), "pass 1's lane is needed first");
+            assert!(pass.ensure_lanes(device, instance, physical, 1));
+            let graphs = [net.graph()];
+            assert!(pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None));
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            // The CPU's picture of the network's input: each texel the mean of its 2x2 render pixels.
+            let small = |x: u32, y: u32, c: u32| (0..4).map(|k| f16(half(frame(2 * x + k % 2, 2 * y + k / 2, c)))).sum::<f32>() / 4.0;
+            // The full-size answer as an edit of the frame.
+            let run = |pass: &mut NativePass, edit: &dyn Fn(u32) -> f32| -> Vec<f32> {
+                // A residual of 4e is an edit of e (the composite's residual / 4).
+                net.write_head(|x, _, _| 4.0 * edit(x));
+                let (cmds, _) = pass.frame_graphs(&graphs, false, None, [1.0, 1.0], &Passes::default());
+                fx.submit(pass, cmds);
+                let a = read_answer(&fx, &staging, pass.answer(), pw, ph);
+                (0..SH)
+                    .flat_map(|y| (0..SW).flat_map(move |x| (0..3).map(move |c| (x, y, c))))
+                    .map(|(x, y, c)| a[((y * pw + x) * 4 + c) as usize] - f16(half(frame(x, y, c))))
+                    .collect()
+            };
+            // A constant edit of 0.1.
+            let e = run(&mut pass, &|_| 0.1);
+            for x in 0..mw {
+                for c in 0..3 {
+                    let got = net.lane(x, 2, 4 + c as usize);
+                    let want = (small(x, 2, c) - 0.5) * 0.125;
+                    assert!((got - want).abs() < 2e-4, "the network's input at ({x}, 2) channel {c}: {got} against the area average's {want}");
+                }
+            }
+            for (i, v) in e.iter().enumerate() {
+                assert!((v - 0.1).abs() < 2e-3, "pixel {} channel {}: an edit of {v}, not 0.1", i / 3 % SW as usize, i % 3);
+            }
+            // +0.1 on the left half of the network's texels, -0.1 on the right: every pixel takes its own side's.
+            let e = run(&mut pass, &|x| if x < mw / 2 { 0.1 } else { -0.1 });
+            for y in 0..SH {
+                for x in 0..SW {
+                    let want = if x < SW / 2 { 0.1 } else { -0.1 };
+                    for c in 0..3 {
+                        let got = e[((y * SW + x) * 3 + c) as usize];
+                        assert!((got - want).abs() < 4e-3, "pixel ({x}, {y}) channel {c}: an edit of {got}, its side's is {want}");
+                    }
+                }
+            }
+            pass.destroy(device);
+            net.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+            assert_eq!(LIVE.with(std::cell::Cell::get), 0, "everything the pass made is destroyed");
+        }
+    }
+
+    /// Another model resolution builds the pass again: the hold's rule takes the old pass out (to destroy), and
+    /// the new one's first frame runs without history (its lanes 7-9 are the frame, not the previous answer),
+    /// while the same resolution keeps the pass and its history.
+    #[test]
+    fn another_model_resolution_starts_the_history_afresh() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(SW, SH);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let (graph_pool, graph) = empty_graph(device, family);
+            let full = Stand::new(device, instance, physical, (SW, SH), (FW, FH), graph, 1);
+            let half_net = Stand::new(device, instance, physical, (10, 8), (16, 8), graph, 2);
+            let texels: Vec<u16> =
+                (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            upload_encoded(&fx, &staging, &encoded, pw, ph, &texels);
+            let at = |s: f32| {
+                let mut scales = [1.0; neural_forge_protocol::MAX_PASSES];
+                scales[0] = s;
+                pass_extents(SW, SH, &scales)
+            };
+            // The hold's frame: the pass for these extents (the old one taken out when it is for others), its
+            // history flag by the hold's rule (a pass that ran a frame before).
+            let mut slot: Option<NativePass> = None;
+            let hold = |slot: &mut Option<NativePass>, scale: f32, net: &Stand, frame: u32| {
+                let extents = at(scale);
+                if let Some(old) = take_other_extents(slot, SW, SH, &extents) {
+                    old.destroy(device);
+                }
+                let mut pass = slot.take().unwrap_or_else(|| NativePass::build_at(device, instance, physical, family, SW, SH, extents, false, true).unwrap());
+                assert!(pass.ensure_lanes(device, instance, physical, 1));
+                assert!(pass.record_graphs(device, instance, physical, &[net.graph()], encoded.view, exposure.buffer, None));
+                if pass.frames == 0 {
+                    fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+                }
+                net.write_head(|x, y, c| residual(x, y, c, frame));
+                let history = pass.frames > 0;
+                let (cmds, _) = pass.frame_graphs(&[net.graph()], history, None, [1.0, 1.0], &Passes::default());
+                fx.submit(&mut pass, cmds);
+                *slot = Some(pass);
+                history
+            };
+            assert!(!hold(&mut slot, 1.0, &full, 0), "the first frame has no history");
+            assert!(hold(&mut slot, 1.0, &full, 1), "the same model resolution keeps the pass and its history");
+            assert_eq!(full.lane(5, 3, 7), centre(neural(5, 3, 0, 0)), "lanes 7-9 hold the previous answer");
+            assert!(!hold(&mut slot, 0.5, &half_net, 2), "another model resolution: a new pass, no history");
+            assert_eq!(slot.as_ref().unwrap().extents[0], (10, 8));
+            let input = half_net.lane(2, 1, 4);
+            assert_eq!(half_net.lane(2, 1, 7), input, "lanes 7-9 are the frame itself: the history started afresh");
+            assert!(hold(&mut slot, 0.5, &half_net, 3), "and is kept at that resolution");
+            assert!(!hold(&mut slot, 1.0, &full, 4), "back to full size: afresh again");
+            slot.take().unwrap().destroy(device);
+            full.destroy(device);
+            half_net.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// Two passes at their own model resolutions (pass 1 at full size, pass 2 at half): each runs at its own
+    /// extent with its own network build: pass 1's input lanes are the frame at full size, pass 2's the area
+    /// average of pass 1's full-size answer at half size, and pass 2's history is at half size. With pass 2's
+    /// edit zero the answer is pass 1's.
+    #[test]
+    fn each_pass_runs_at_its_own_model_resolution() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let mut scales = [1.0; neural_forge_protocol::MAX_PASSES];
+        scales[1] = 0.5;
+        let extents = pass_extents(SW, SH, &scales);
+        assert_eq!(graph_sizes(&extents, 2), vec![(SW, SH), (10, 8)]);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(SW, SH);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let (graph_pool, graph) = empty_graph(device, family);
+            // One build of two sizes: one generation.
+            let first = Stand::new(device, instance, physical, (SW, SH), (FW, FH), graph, 7);
+            let second = Stand::new(device, instance, physical, (10, 8), (16, 8), graph, 7);
+            let texels: Vec<u16> =
+                (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            upload_encoded(&fx, &staging, &encoded, pw, ph, &texels);
+            let region = vk::BufferImageCopy {
+                image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                buffer_row_length: pw,
+                image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                ..Default::default()
+            };
+            let mut pass = NativePass::build_at(device, instance, physical, family, SW, SH, extents, false, true).unwrap();
+            assert!(pass.ensure_more(device, instance, physical, family, 2));
+            assert!(pass.ensure_lanes(device, instance, physical, 2));
+            assert_eq!(pass.lanes.len(), 1, "one lane, pass 2's");
+            let graphs = [first.graph(), second.graph()];
+            assert!(pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None));
+            pass.record_copies(device, encoded.image, encoded.view, region, 2, 1.0).unwrap();
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            first.write_head(|x, y, c| residual(x, y, c, 0));
+            second.write_head(|_, _, _| 0.0);
+            let mut passes = Passes::one(Conditioning::default());
+            passes.count = 2;
+            passes.scales = scales;
+            let (cmds, later) = pass.frame_graphs(&graphs, false, None, [1.0, 1.0], &passes);
+            assert_eq!(later.len(), 1, "pass 2 runs");
+            let copies = pass.more.as_ref().unwrap().copies;
+            let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
+            device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&order)], vk::Fence::null()).unwrap();
+            device.queue_wait_idle(gpu.4).unwrap();
+            for cmd in order {
+                pass.submitted(cmd);
+            }
+            // Pass 1 at full size: its lanes are the frame.
+            for c in 0..3 {
+                assert_eq!(first.lane(5, 3, 4 + c as usize), centre(proxy(5, 3, c)), "pass 1's input, channel {c}");
+            }
+            // Pass 2 at half size: its lanes are the 2x2 means of pass 1's answer.
+            let a1 = |x: u32, y: u32, c: u32| neural(x, y, c, 0);
+            for (x, y) in [(0, 0), (2, 1), (9, 5)] {
+                for c in 0..3 {
+                    let mean = (0..4).map(|k| a1(2 * x + k % 2, 2 * y + k / 2, c)).sum::<f32>() / 4.0;
+                    let got = second.lane(x, y, 4 + c as usize);
+                    assert!((got - (mean - 0.5) * 0.125).abs() < 2e-4, "pass 2's input at ({x}, {y}) channel {c}: {got} against {}", (mean - 0.5) * 0.125);
+                }
+            }
+            let m = pass.more.as_ref().unwrap();
+            assert_eq!(m.recorded_pass[0], Some(7));
+            assert!(m.history[0].is_some() && pass.extents[1] == (10, 8), "pass 2's history is at its extent");
+            // Pass 2's params: its extent and field, the vectors' scale at its size.
+            let p2 = &*m.params[0][0].ptr.cast::<Params>();
+            assert_eq!(p2.dims, [16, 8, 10, 8]);
+            assert_eq!(p2.full[..3], [SW, SH, pw]);
+            // Its edit is zero: the answer is pass 1's, at full size.
+            let a = read_answer(&fx, &staging, pass.answer(), pw, ph);
+            for y in 0..SH {
+                for x in 0..SW {
+                    for c in 0..3 {
+                        let got = a[((y * pw + x) * 4 + c) as usize];
+                        assert!((got - a1(x, y, c)).abs() < 2e-3, "({x}, {y}) channel {c}: {got} against pass 1's {}", a1(x, y, c));
+                    }
+                }
+            }
+            pass.destroy(device);
+            first.destroy(device);
+            second.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// The per-pass split: two passes, one placed before the upscaler and one after DLSS. Each stage's hold
+    /// runs its own pass only, with that pass's own settings (pass 1's intensity before the upscaler, pass 2's
+    /// after DLSS) and no later pass recorded, and both holds ask the network for the same two sizes (render and
+    /// output), so neither rebuilds it for the other. The look-up table stays with the stack's last pass.
+    #[test]
+    fn each_stage_records_only_its_own_passes() {
+        use super::super::placement::{Frame, Hold, Plan, Stage};
+        use neural_forge_protocol::enums::placement::{BEFORE, UPSCALED};
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let (render, output) = ((SW, SH), (2 * SW, 2 * SH));
+        let mut all = Passes::one(Conditioning::default());
+        all.count = 2;
+        all.each[0].intensity = 0.25;
+        all.each[1].intensity = 0.75;
+        all.colour.lut_strength = 0.5;
+        let mut settings = [BEFORE; neural_forge_protocol::MAX_PASSES];
+        settings[1] = UPSCALED;
+        let plan = Plan::of(2, &settings, Frame { rr: false, output: true, hook: true });
+        let before = Hold::of(&plan, Stage::Before, render, output);
+        let after = Hold::of(&plan, Stage::Upscaled, render, output);
+        assert_eq!(frame_sizes(&all, before, render), vec![render, output], "both holds' sizes, the render size first");
+        assert_eq!(frame_sizes(&all, after, output), frame_sizes(&all, before, render), "the same set from either hold");
+        assert_eq!(frame_sizes(&all, Hold::ALL_BEFORE, render), vec![render], "every pass before the upscaler: one size, as always");
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let (graph_pool, graph) = empty_graph(device, family);
+            let stands = [
+                Stand::new(device, instance, physical, render, (FW, FH), graph, 3),
+                Stand::new(device, instance, physical, output, (2 * FW, 2 * FH), graph, 3),
+            ];
+            let graphs = [stands[0].graph(), stands[1].graph()];
+            for (hold, extent, intensity, lut) in [(before, render, 0.25, 0.0), (after, output, 0.75, 0.5)] {
+                let passes = stage_passes(&all, hold).expect("the stage has a pass");
+                assert_eq!((passes.count, passes.each[0].intensity, passes.colour.lut_strength), (1, intensity, lut), "{:?}", hold.stage);
+                let (pw, ph) = super::super::padded(extent.0, extent.1);
+                let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+                let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+                let extents = pass_extents(extent.0, extent.1, &passes.scales);
+                let mut pass = NativePass::build_at(device, instance, physical, family, extent.0, extent.1, extents, false, true).unwrap();
+                assert!(pass.ensure_lanes(device, instance, physical, passes.count));
+                assert!(pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None));
+                let (cmds, later) = pass.frame_graphs(&graphs, false, None, [1.0, 1.0], &passes);
+                assert!(cmds[1].is_some() && later.is_empty(), "{:?}: one pass, no later one", hold.stage);
+                assert!(pass.more.is_none(), "{:?}: no later pass's buffers", hold.stage);
+                let p = &*pass.params[0].ptr.cast::<Params>();
+                assert_eq!(p.motion[3], intensity, "{:?}: its own pass's intensity", hold.stage);
+                assert_eq!(p.dims[2..], [extent.0, extent.1], "{:?}: at its own size", hold.stage);
+                pass.destroy(device);
+                encoded.destroy(device);
+                exposure.destroy(device);
+            }
+            for st in &stands {
+                st.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+        }
+        // A stage with none of the frame's passes runs nothing.
+        let mut settings = [BEFORE; neural_forge_protocol::MAX_PASSES];
+        settings[0] = UPSCALED;
+        let plan = Plan::of(2, &settings, Frame { rr: false, output: true, hook: true });
+        assert!(stage_passes(&all, Hold::of(&plan, Stage::Before, render, output)).is_none());
+    }
+}
