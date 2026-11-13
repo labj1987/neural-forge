@@ -9,16 +9,21 @@ first shipped them; their phase is kept as a subheading.
 **The second GPU with Ray Reconstruction**
 
 - With `NEURAL_FORGE_OFFLOAD_GPU` set, the second GPU now also runs the model in games using DLSS Ray Reconstruction
-  (path tracing), where the model works on DLSS's output. Until now the model stayed on the game's GPU there. Nothing
-  to change: leave Placement on Auto.
+  (path tracing), where the model works on DLSS's output, and in any game with Placement set to After DLSS. Until now
+  the model stayed on the game's GPU there. With Ray Reconstruction there is nothing to change: leave Placement on
+  Auto.
 - It works as before DLSS does: each of DLSS's output frames goes to the second GPU and its edit is applied to the
   next one, carried along the game's motion vectors. No frame is shown later; the edit is one frame old.
 - The network runs at the output resolution there, so the second GPU needs longer per frame than before DLSS, and
-  the frame rate is bounded by it. At 4K the small network or a lower Model resolution helps.
+  the frame rate is bounded by it. This is not yet measured at 4K or on two different cards; if the second GPU is too
+  slow, the model returns to the game's GPU. At 4K the small network or a lower Model resolution helps.
 - The Status tab says "second GPU: the model runs on ... after DLSS, its edit applied one frame later". The same
   rules send the model back to the game's GPU when the second GPU cannot keep up or fails.
-- With passes both before and after DLSS, the second GPU runs the pass before DLSS and the others stay on the game's
-  GPU.
+- With passes both before and after DLSS in one frame, the second GPU is not used: every pass runs on the game's GPU,
+  and the Status tab says so. (In 4.2.0 the second GPU took the pass before DLSS and the passes after DLSS did not
+  run.)
+- The Status tab's Model row says where the model runs: before the upscaler, after DLSS, or on the second GPU before
+  DLSS, after DLSS or on the finished frame. The frame-time graph shows the model's time after DLSS too.
 
 ## 4.2.0 — 2026-11-12
 

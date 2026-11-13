@@ -50,7 +50,8 @@ struct Frame {
     extents: [(u32, u32); neural_forge_protocol::MAX_PASSES],
     hdr: super::hdr::HdrPass,
     native: NativePass,
-    depth: super::native::DepthCopy,
+    /// DLSS's depth as the hold sent it: only for the hold before DLSS (after DLSS's output there is none).
+    depth: Option<super::native::DepthCopy>,
 }
 
 pub(crate) struct PreRunner {
@@ -229,7 +230,9 @@ impl PreRunner {
                 unsafe {
                     f.native.destroy(device);
                     f.hdr.destroy(device);
-                    f.depth.destroy(device);
+                    if let Some(d) = f.depth {
+                        d.destroy(device);
+                    }
                 }
             }
         }
@@ -238,9 +241,14 @@ impl PreRunner {
             let built = unsafe {
                 let hdr = super::hdr::HdrPass::build(device, instance, physical, meta.width, meta.height);
                 let native = NativePass::build_at(device, instance, physical, setup.family, meta.width, meta.height, meta.extents, false, false);
-                let depth = super::native::DepthCopy::build(device, instance, physical, setup.family, meta.width, meta.height, false);
+                // No depth crosses for the hold after DLSS's output: no buffer for it there.
+                let wants_depth = layout.sizes.depth > 0;
+                let depth =
+                    if wants_depth { super::native::DepthCopy::build(device, instance, physical, setup.family, meta.width, meta.height, false) } else { None };
                 match (hdr, native, depth) {
-                    (Some(hdr), Some(native), Some(depth)) => Some(Frame { width: meta.width, height: meta.height, extents: meta.extents, hdr, native, depth }),
+                    (Some(hdr), Some(native), depth) if depth.is_some() == wants_depth => {
+                        Some(Frame { width: meta.width, height: meta.height, extents: meta.extents, hdr, native, depth })
+                    }
                     (hdr, native, depth) => {
                         if let Some(x) = hdr {
                             x.destroy(device);
@@ -280,7 +288,7 @@ impl PreRunner {
         let graphs: Vec<Graph> = builts.iter().map(|&b| Graph { built: b, graph: b.graph_own }).collect();
         // One pass there (the first of the stage).
         let passes = super::native::runnable(meta.passes, false);
-        let depth = (meta.depth && layout.sizes.depth > 0).then(|| f.depth.buffer());
+        let depth = f.depth.as_ref().filter(|_| meta.depth && layout.sizes.depth > 0).map(super::native::DepthCopy::buffer);
         // SAFETY: nothing of the pass is pending (every frame is waited for); every handle is this device's.
         unsafe {
             if !f.native.ensure_lanes(device, instance, physical, passes.count) {
@@ -335,8 +343,8 @@ impl PreRunner {
                     device.cmd_copy_buffer(up, o.buffer, dst, &[vk::BufferCopy { src_offset: at, dst_offset: to, size }])
                 };
                 copy(f.native.acc.buffer, layout.motion_at, 0, (texels * 8).min(layout.sizes.motion));
-                if meta.depth && layout.sizes.depth > 0 {
-                    copy(f.depth.buffer(), layout.depth_at, 0, (texels * 4).min(layout.sizes.depth));
+                if let Some(depth) = depth {
+                    copy(depth, layout.depth_at, 0, (texels * 4).min(layout.sizes.depth));
                 }
                 // The scene cut the game's GPU decided in its capture: the state's third word.
                 copy(f.native.state_buffer(), layout.side_at + super::hdr::HdrPass::EXPOSURE_BYTES + 8, 8, 4);
@@ -473,7 +481,9 @@ impl Runner for PreRunner {
             unsafe {
                 f.native.destroy(&off.device);
                 f.hdr.destroy(&off.device);
-                f.depth.destroy(&off.device);
+                if let Some(d) = f.depth {
+                    d.destroy(&off.device);
+                }
             }
         }
         if let Some(loader) = self.loader.take() {
@@ -509,7 +519,9 @@ impl Drop for PreRunner {
             if let Some(f) = self.frame.take() {
                 f.native.destroy(device);
                 f.hdr.destroy(device);
-                f.depth.destroy(device);
+                if let Some(d) = f.depth {
+                    d.destroy(device);
+                }
             }
             if let Some((o, i)) = self.regions.take() {
                 o.destroy(device);

@@ -1920,9 +1920,18 @@ Status tab's words: "second GPU: the model runs on <gpu> after DLSS, its edit ap
   the hold for the frame's own answer idles the game's GPU for the round trip. So the edit is delayed, as before
   DLSS: no latency added, the edit one frame old on every hold.
 
-**One stage of a frame.** The offload device has the process's one network. In a frame with passes before DLSS and
-after its output the other GPU has the hold before DLSS, as in 4.2.0, and the hold after DLSS runs as it did (the
-Status line "second GPU: not used here: these passes run on the game's GPU after DLSS; ...").
+**One hold of a frame.** The process has one network (`nf_native.cpp`, `g_live`) and the offload device has it
+while a hold's side serves. In a frame with passes before DLSS and after its output neither hold is offloaded
+(`placement::Hold::offload_takes`: only a frame whose held passes all run at one hold): every pass runs on the game's
+GPU, said once in the log and on the Status line ("second GPU: not used here: with passes before and after DLSS the
+model runs on the game's GPU", the hold's own line: no side serves, so the offload's line does not have the channel).
+A side built before the plan became mixed is destroyed at the next hold with nothing outstanding, which closes the
+network on the other device. Found in review and confirmed in Cyberpunk 2077 (pass 1 before, pass 2 After DLSS,
+`same`): with the hold before DLSS offloaded, as 4.2.0 and this branch's first version did, the hold after DLSS found
+the network open elsewhere on every frame ("another network is open in this process", every frame untouched there)
+while the log and the docs said it ran on the game's GPU; the other GPU's runner stamps its use every frame, so it
+was never lent. Serving both holds from the one remote network (one runner for two exchanges and two sizes, both
+submits waiting) is the follow-up. On the other device the depth buffer is built only for the hold before DLSS.
 
 **What crosses, per hold** (imported host memory on both devices): the encode and the answer at the padded output
 extent (RGBA16F) and the accumulated motion (2 x f32 a texel): 56.3 MB out and 28.1 MB back at 2560x1440, about 133

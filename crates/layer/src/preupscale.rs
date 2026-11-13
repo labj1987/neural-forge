@@ -213,7 +213,7 @@ pub(crate) unsafe fn run_native(
         passes.mask = shm.mask_settings().map_or_else(native::Mask::default, native::Mask::from);
         // The edit cache's interval (its own, not `model_interval`: that is the after-the-upscaler
         // path's), and the debug view of its rejection mask.
-        let ask = native::CacheAsk { hold, interval: cache::interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW };
+        let ask = native::CacheAsk { hold, interval: cache::interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW, at };
         // Told when this hold's work is waited on (`Resources::wait_idle`): until then the
         // after-the-upscaler path keeps off the network.
         res.pre_loader = Some(loader.clone());
@@ -290,12 +290,12 @@ fn native_line_due(status: &str, last: &str, channel: &str, offload_active: bool
     !offload_active && (status != last || (!status.is_empty() && channel != neural_forge_protocol::stored_reason(status)))
 }
 
-/// The offload's Status line a hold writes (`line`, [`offload::status_line`]): while the hold before DLSS sends its
-/// frames to the other GPU (`serving_pre`, with the offload `active`) and the channel says something else. The
-/// present's writer ([`Session::ensure_post_server`]) does not run while frames are held before the upscaler, so
+/// The offload's Status line a hold writes (`line`, [`offload::status_line`]): while a hold (before DLSS or after
+/// its output) sends its frames to the other GPU (`serving_hold`, with the offload `active`) and the channel says something else. The
+/// present's writer ([`Session::ensure_post_server`]) does not run while frames are held, so
 /// without this the channel kept the native line a hold wrote before the offload started.
-fn hold_offload_line<'a>(line: Option<&'a str>, active: bool, serving_pre: bool, channel: &str) -> Option<&'a str> {
-    line.filter(|l| active && serving_pre && neural_forge_protocol::stored_reason(l) != channel)
+fn hold_offload_line<'a>(line: Option<&'a str>, active: bool, serving_hold: bool, channel: &str) -> Option<&'a str> {
+    line.filter(|l| active && serving_hold && neural_forge_protocol::stored_reason(l) != channel)
 }
 
 impl SrLaunches {
@@ -4093,7 +4093,8 @@ pub(crate) struct Resources {
     /// The edit cache's passes (`cache`), built on the first native hold.
     #[cfg(target_arch = "x86_64")]
     pub(crate) edit: Option<cache::CachePass>,
-    /// The network on a second GPU for the hold before DLSS (`offload_pre`), made on its first offloaded hold.
+    /// The network on a second GPU for these hold resources (`offload_pre`: the hold before DLSS, or the one after
+    /// its output), made on their first offloaded hold.
     #[cfg(target_arch = "x86_64")]
     pub(crate) offpre: Option<offload_pre::HoldSide>,
     /// The scene-cut detector (`scene_cut`), built on the first native hold unless it is switched off.
@@ -4653,9 +4654,9 @@ pub(crate) struct HoldResult {
     pub timing: HoldTiming,
     /// The native backend ran this hold (`evaluated` means the network ran).
     pub native: bool,
-    /// The native backend: a hold after DLSS's output in a frame that also has passes before DLSS, while the model on a
-    /// second GPU is asked for: these passes run on the game's GPU, the second GPU has the hold before DLSS.
-    pub after_dlss_on_game_gpu: bool,
+    /// The native backend: a hold of a frame with passes before DLSS and after its output while the model on a second
+    /// GPU is asked for: neither hold is offloaded (`placement::Hold::offload_takes`), every pass runs on the game's GPU.
+    pub mixed_on_game_gpu: bool,
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
     /// network, composite), read when its fence was found signalled here.
     pub network_gpu_ms: Option<f32>,
@@ -6639,14 +6640,14 @@ impl Session {
     ) {
         // The model on another GPU's state, on the Status tab's line and for `doctor` (`layer_reason`).
         #[cfg(target_arch = "x86_64")]
-        // Only while the offload is what runs (serving at the finished-frame placement, or the hold before DLSS sending
+        // Only while the offload is what runs (serving at the finished-frame placement, or a hold sending
         // its frames) or not running (starting, stalled, given up): when the placement left it, the native backend's
         // line has the channel (`offload::shows_line`).
         let at_present = shm.view().is_some_and(|v| {
             let (count, placements) = v.header().placements();
             placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT)
         });
-        let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_pre());
+        let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_hold());
         if let Some(line) = offload::status_line().filter(|_| offload_line) {
             // Against what the channel holds (the native backend's line shares it): written when it says something else,
             // except that once the offload was given up the native backend's own line (the network running here, or why
@@ -6785,7 +6786,7 @@ impl Session {
             // Against what the channel holds too: the offload's line shares it, and while the offload serves the line is
             // its own (the hold's "native network running" would overwrite it on every frame).
             let offload_active = matches!(offload::state(), offload::State::Active(_));
-            if let Some(line) = hold_offload_line(offload::status_line().as_deref(), offload_active, offload_pre::serving_pre(), &shm.layer_reason()) {
+            if let Some(line) = hold_offload_line(offload::status_line().as_deref(), offload_active, offload_pre::serving_hold(), &shm.layer_reason()) {
                 shm.set_layer_reason(line);
             }
             if native_line_due(&status, &self.native_status, &shm.layer_reason(), offload_active) {
@@ -12164,10 +12165,30 @@ mod native_line_tests {
         assert_eq!(hold_offload_line(Some(offload), true, true, ""), Some(offload));
         // Already there: nothing written.
         assert_eq!(hold_offload_line(Some(offload), true, true, offload), None);
-        // Not the hold before DLSS serving (the finished frame, after DLSS, off, given up): not the hold's to write.
+        // No hold serving (the finished frame, off, given up): not the hold's to write.
         assert_eq!(hold_offload_line(Some(offload), true, false, "native network running"), None);
         assert_eq!(hold_offload_line(Some(offload), false, true, "native network running"), None);
         assert_eq!(hold_offload_line(None, false, false, ""), None);
+    }
+
+    /// A frame with passes before and after DLSS: no hold is offloaded (the state is not `Active`), so the hold's own
+    /// line, which says the second GPU is not used and why, is the one written: over the native line, over a line a
+    /// side left behind before the plan changed, and once.
+    #[test]
+    fn a_mixed_frames_line_reaches_the_channel() {
+        let mixed = crate::preupscale::native::running_line(None, true);
+        let before = "second GPU: the model runs on X before DLSS, its edit applied one frame later";
+        assert!(mixed.len() < neural_forge_protocol::REASON_BYTES);
+        // No side serves: the offload's line is not written by the hold,
+        assert_eq!(hold_offload_line(None, false, false, "native network running"), None);
+        assert_eq!(hold_offload_line(Some(before), false, false, before), None);
+        // and the hold's line is due against whatever the channel holds,
+        for channel in ["", "native network running", before] {
+            assert!(native_line_due(&mixed, "", channel, false), "over {channel:?}");
+            assert!(native_line_due(&mixed, &mixed, channel, false), "again when the channel lost it: {channel:?}");
+        }
+        // until it is there.
+        assert!(!native_line_due(&mixed, &mixed, neural_forge_protocol::stored_reason(&mixed), false));
     }
 
     #[test]

@@ -1090,10 +1090,10 @@ pub(crate) fn wanted() -> bool {
 
 /// Which hold's model runs on the other GPU now (the Status tab's line, [`status_line`]): 0 none, 1 the hold before
 /// DLSS, 2 the hold after DLSS's output.
-static SERVING_PRE: AtomicU8 = AtomicU8::new(0);
+static SERVING_HOLD: AtomicU8 = AtomicU8::new(0);
 
 fn set_serving(at: Option<Where>) {
-    SERVING_PRE.store(
+    SERVING_HOLD.store(
         match at {
             None => 0,
             Some(Where::Before) => 1,
@@ -1105,7 +1105,7 @@ fn set_serving(at: Option<Where>) {
 
 /// The hold whose frames the other GPU runs now, if any.
 pub(crate) fn serving_where() -> Option<Where> {
-    match SERVING_PRE.load(Ordering::Acquire) {
+    match SERVING_HOLD.load(Ordering::Acquire) {
         0 => None,
         1 => Some(Where::Before),
         _ => Some(Where::After),
@@ -1113,7 +1113,7 @@ pub(crate) fn serving_where() -> Option<Where> {
 }
 
 /// A hold (before DLSS or after its output) sends its frames to the other GPU now.
-pub(crate) fn serving_pre() -> bool {
+pub(crate) fn serving_hold() -> bool {
     serving_where().is_some()
 }
 
@@ -2138,9 +2138,9 @@ mod tests {
         let _state = crate::preupscale::offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         set_serving(Some(Where::After));
         side_gone(!worker.ended());
-        assert!(serving_pre(), "another set's side serves: the Status tab keeps the second GPU");
+        assert!(serving_hold(), "another set's side serves: the Status tab keeps the second GPU");
         side_gone(true);
-        assert!(!serving_pre());
+        assert!(!serving_hold());
         // Its side's submits do not wait for it.
         let mut cadence = Cadence::default();
         game.run(&[game.record(cadence.hold(1, true), 801)]);

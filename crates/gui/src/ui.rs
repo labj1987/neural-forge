@@ -807,15 +807,15 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_page.add(&build_sharpen_group(&shm));
     view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", "applications-graphics-symbolic");
 
-    // Model resolution and model-every-Nth-frame apply after the upscaler only: shown while a game runs
-    // and the model is not running before the upscaler.
+    // Model resolution and model-every-Nth-frame apply on the finished frame only: shown while a game runs
+    // and the model is not running in a hold (before the upscaler or after DLSS).
     {
         let shm = std::sync::Arc::clone(&shm);
         let live = Liveness::default();
         let working_scale_row = working_scale_row.clone();
         every(&interval_row, SECOND, move |interval_row| {
             let hdr = shm.header();
-            let after_upscaler = live.alive(hdr) && hdr.native_running.load(Ordering::Relaxed) == 0;
+            let after_upscaler = live.alive(hdr) && !model_held(hdr.preupscale_state.load(Ordering::Relaxed));
             interval_row.set_visible(after_upscaler);
             working_scale_row.set_visible(after_upscaler);
         });
@@ -1539,6 +1539,38 @@ fn placement_row(selected: u32, setter: impl Fn(u32) + 'static) -> adw::ComboRow
     describe(&row);
     row.connect_selected_notify(describe);
     row
+}
+
+/// Whether the model runs in a hold (`preupscale_state`): before the upscaler, after DLSS's output, or both.
+fn model_held(state: u32) -> bool {
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH};
+    matches!(state, HOLDING | HOLDING_AFTER | HOLDING_BOTH)
+}
+
+/// Whether the layer's line (`reason`) says the model runs on a second GPU now.
+fn on_second_gpu(reason: &str) -> bool {
+    reason.starts_with("second GPU: the model runs on")
+}
+
+/// The Status tab's Model row: where the model runs, from the hold's state (`preupscale_state`) and the layer's line
+/// (`reason`), which while the model runs on a second GPU says which hold it serves, or neither for the finished frame.
+fn model_row_subtitle(state: u32, reason: &str) -> &'static str {
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH};
+    if on_second_gpu(reason) {
+        return if reason.contains(" before DLSS, its edit") {
+            "running on the second GPU, before DLSS"
+        } else if reason.contains(" after DLSS, its edit") {
+            "running on the second GPU, after DLSS"
+        } else {
+            "running on the second GPU, on the finished frame"
+        };
+    }
+    match state {
+        HOLDING => "running before the upscaler",
+        HOLDING_AFTER => "running after DLSS",
+        HOLDING_BOTH => "running before the upscaler and after DLSS",
+        _ => "not running before the upscaler",
+    }
 }
 
 /// The sharpening of the finished frame (`crate::sharpen` in the layer): FidelityFX CAS and Clarity, both off at 0,
@@ -3131,16 +3163,10 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     every(&sparkline, std::time::Duration::from_millis(u64::from(TELEMETRY_INTERVAL_MS)), move |sparkline| {
         let hdr = shm_for_timer.header();
 
-        // The model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`) runs on the finished frame, not before the upscaler: its
-        // line is the layer's (`layer_reason`).
+        // Where the model runs: the hold's state, and with the model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`) the
+        // layer's line (`layer_reason`), which names the hold it serves or the finished frame.
         let reason = hdr.layer_reason();
-        model_row.set_subtitle(if hdr.native_running.load(Ordering::Relaxed) != 0 {
-            "running before the upscaler"
-        } else if reason.starts_with("second GPU: the model runs on") {
-            "running on the second GPU, on the finished frame"
-        } else {
-            "not running before the upscaler"
-        });
+        model_row.set_subtitle(model_row_subtitle(hdr.preupscale_state.load(Ordering::Relaxed), &reason));
         // The name is only as current as the frames: a closed game leaves its name behind.
         let game = hdr.game_name();
         let active = live.alive(hdr);
@@ -3165,7 +3191,9 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
         let model = f32::from_bits(hdr.preupscale_network_gpu_ms_bits.load(Ordering::Relaxed));
         let sample = TelemetrySample {
             frame_ms: layer_fps.filter(|&f| active && f > 0.5).map(|f| (1000.0 / f) as f32),
-            model_ms: (active && hdr.native_running.load(Ordering::Relaxed) != 0 && model.is_finite() && model > 0.0).then_some(model),
+            // The network's time on the game's GPU: none while a second GPU runs it.
+            model_ms: (active && model_held(hdr.preupscale_state.load(Ordering::Relaxed)) && !on_second_gpu(&reason) && model.is_finite() && model > 0.0)
+                .then_some(model),
         };
         let ms = |v: Option<f32>| v.map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"));
         frame_label.set_text(&format!("Frame time {}", ms(sample.frame_ms)));
@@ -3912,6 +3940,39 @@ mod preupscale_label_tests {
             "off: the layer's own reason",
             "the layer's reason when it gives one"
         );
+    }
+
+    /// The Model row says where the model runs: each hold's state, and with a second GPU the hold it serves (the
+    /// layer's line), where it used to say "on the finished frame" for every offloaded hold after DLSS.
+    #[test]
+    fn the_model_row_says_which_hold_runs_the_model_and_on_which_gpu() {
+        use super::{model_held, model_row_subtitle, on_second_gpu};
+        use neural_forge_protocol::enums::preupscale_state::*;
+        assert_eq!(model_row_subtitle(HOLDING, "native network running"), "running before the upscaler");
+        assert_eq!(model_row_subtitle(HOLDING_AFTER, "native network running"), "running after DLSS");
+        assert_eq!(model_row_subtitle(HOLDING_BOTH, ""), "running before the upscaler and after DLSS");
+        assert_eq!(model_row_subtitle(OFF, ""), "not running before the upscaler");
+        assert_eq!(model_row_subtitle(PAUSED, "native network running"), "not running before the upscaler");
+        let on = |rest: &str| format!("second GPU: the model runs on NVIDIA GeForce RTX 5080 {rest}");
+        assert_eq!(model_row_subtitle(HOLDING, &on("before DLSS, its edit applied one frame later")), "running on the second GPU, before DLSS");
+        assert_eq!(model_row_subtitle(HOLDING_AFTER, &on("after DLSS, its edit applied one frame later")), "running on the second GPU, after DLSS");
+        assert_eq!(
+            model_row_subtitle(OFF, &on("each frame shown one frame later").replace("5080 ", "5080, ")),
+            "running on the second GPU, on the finished frame"
+        );
+        // The second GPU asked for but not used (passes at both holds), given up or stalled: the hold's own state.
+        assert_eq!(
+            model_row_subtitle(HOLDING_BOTH, "second GPU: not used here: with passes before and after DLSS the model runs on the game's GPU"),
+            "running before the upscaler and after DLSS"
+        );
+        assert_eq!(model_row_subtitle(HOLDING, "second GPU: given up (too slow); the model runs on the game's GPU"), "running before the upscaler");
+        // The frame-time graph's model time and the finished-frame rows follow every hold, not only the one before the upscaler.
+        assert!(model_held(HOLDING) && model_held(HOLDING_AFTER) && model_held(HOLDING_BOTH));
+        // No model time on the game's GPU is shown while a second GPU runs the network; it is when that GPU is not used.
+        assert!(on_second_gpu(&on("after DLSS, its edit applied one frame later")));
+        assert!(!on_second_gpu("second GPU: not used here: with passes before and after DLSS the model runs on the game's GPU"));
+        assert!(!on_second_gpu("second GPU: given up (too slow); the model runs on the game's GPU") && !on_second_gpu("native network running"));
+        assert!(!model_held(OFF) && !model_held(WAITING) && !model_held(IDENTIFIED) && !model_held(PAUSED) && !model_held(NO_WRAPPER));
     }
 
     /// Placement "At present" (#49): the model runs on the finished frame by choice, not while waiting for DLSS.
