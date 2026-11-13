@@ -364,6 +364,38 @@ struct ZeroCopy {
     last_queue: Option<vk::Queue>,
     /// The delayed present's kept frames ([`GpuCompose::keep_delayed`]).
     delayed: Option<Delayed>,
+    /// The delayed present's relay and its sends ([`GpuCompose::ensure_paced`]).
+    #[cfg(target_arch = "x86_64")]
+    paced: Option<Paced>,
+    /// The relay ended, or its resources could not be made: not tried again on this compose.
+    #[cfg(target_arch = "x86_64")]
+    paced_dead: bool,
+}
+
+/// The delayed present with the relay (`super::pace`): each pair's copy of its frame into the proxy region, and
+/// the relay that waits for those copies and lets the other GPU run the frames.
+#[cfg(target_arch = "x86_64")]
+struct Paced {
+    cmd: [vk::CommandBuffer; 2],
+    fence: [vk::Fence; 2],
+    armed: [bool; 2],
+    pacer: super::pace::Pacer,
+    /// The number of the frame sent last.
+    sent: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Paced {
+    /// # Safety
+    /// The relay has ended and every send was waited.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: the contract; the command buffers go with the compose's pool (or are freed by the caller).
+        unsafe {
+            for f in self.fence {
+                device.destroy_fence(f, None);
+            }
+        }
+    }
 }
 
 /// Two presents' frames for the delayed present ([`ComposeInputs::Delayed`]): each one's full frame (read off the
@@ -1774,6 +1806,10 @@ impl GpuCompose {
         if let Some(d) = &self.zc.delayed {
             fences.extend((0..3).map(|k| d.armed[k].then_some(d.fence[k])));
         }
+        #[cfg(target_arch = "x86_64")]
+        if let Some(p) = &self.zc.paced {
+            fences.extend((0..2).map(|k| p.armed[k].then_some(p.fence[k])));
+        }
         fences
     }
 
@@ -1924,10 +1960,13 @@ impl GpuCompose {
         parity: usize,
         with_proxy: bool,
         signal: bool,
+        proxy_from_image: bool,
     ) -> Option<Option<vk::Semaphore>> {
         let bytes = u64::from(width) * u64::from(height) * 4;
         let capture_target = self.zc.frames.as_ref().filter(|f| f.frame_bytes == bytes).map(|f| f.capture_target.buffer);
-        if with_proxy && capture_target.is_none() {
+        // `proxy_from_image` (the present that hands its frame to the relay): no capture ran; the proxy is the frame
+        // itself, copied off the image here, and [`Self::send_delayed`] sends it from the pair.
+        if with_proxy && !proxy_from_image && capture_target.is_none() {
             return None;
         }
         if !self.ensure_delayed(device, instance, physical_device, bytes) {
@@ -1992,7 +2031,9 @@ impl GpuCompose {
                         &[to_src],
                     );
                     device.cmd_copy_image_to_buffer(cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, raw, &[image_copy_region(width, height, 0)]);
-                    if let Some(target) = capture_target.filter(|_| with_proxy) {
+                    if with_proxy && proxy_from_image {
+                        device.cmd_copy_image_to_buffer(cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, base, &[image_copy_region(width, height, 0)]);
+                    } else if let Some(target) = capture_target.filter(|_| with_proxy) {
                         device.cmd_copy_buffer(cmd, target, base, &[vk::BufferCopy::default().size(bytes)]);
                     }
                     let back = image_barrier(
@@ -2137,6 +2178,11 @@ impl GpuCompose {
     /// Frees the delayed present's kept frames (it is no longer used: the model came back to this GPU), once nothing
     /// may still read them. `false` if a wait failed (they are kept).
     pub fn release_delayed(&mut self, device: &ash::Device) -> bool {
+        // The relay first: it waits on the sends' fences.
+        #[cfg(target_arch = "x86_64")]
+        if !self.release_paced(device) {
+            return false;
+        }
         if self.zc.delayed.is_none() {
             return true;
         }
@@ -2203,6 +2249,136 @@ impl GpuCompose {
         }
     }
 
+    /// The delayed present's relay (`super::pace`) over `port` (the channel's request side) and each pair's send,
+    /// made on first use. `false` when they cannot be made or the relay ended: the present then makes every wait
+    /// itself, for the life of this compose.
+    #[cfg(target_arch = "x86_64")]
+    pub fn ensure_paced(&mut self, device: &ash::Device, port: impl FnOnce() -> Option<Box<dyn super::pace::Port>>) -> bool {
+        if self.zc.paced_dead {
+            return false;
+        }
+        if let Some(p) = &self.zc.paced {
+            if !p.pacer.ended() {
+                return true;
+            }
+            self.zc.paced_dead = true;
+            return false;
+        }
+        // SAFETY: plain creations on the live device, each destroyed below when the set is incomplete.
+        let made = unsafe {
+            let fences: Vec<vk::Fence> = (0..2).filter_map(|_| device.create_fence(&vk::FenceCreateInfo::default(), None).ok()).collect();
+            let cmds = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(2));
+            // SAFETY: the device outlives the relay (`release_paced` and `destroy` end it first), and so do the fences.
+            let pacer = match (fences.len(), &cmds) {
+                (2, Ok(_)) => port().and_then(|port| super::pace::Pacer::start(device.clone(), port)),
+                _ => None,
+            };
+            match (pacer, cmds) {
+                (Some(pacer), Ok(cmds)) => Some(Paced { cmd: [cmds[0], cmds[1]], fence: [fences[0], fences[1]], armed: [false; 2], pacer, sent: 0 }),
+                (_, cmds) => {
+                    for f in fences {
+                        device.destroy_fence(f, None);
+                    }
+                    if let Ok(c) = cmds {
+                        device.free_command_buffers(self.pool, &c);
+                    }
+                    None
+                }
+            }
+        };
+        self.zc.paced_dead = made.is_none();
+        self.zc.paced = made;
+        self.zc.paced.is_some()
+    }
+
+    /// The delayed present's relay, once [`Self::ensure_paced`] made it.
+    #[cfg(target_arch = "x86_64")]
+    pub fn pacer(&self) -> Option<&super::pace::Pacer> {
+        self.zc.paced.as_ref().map(|p| &p.pacer)
+    }
+
+    /// Sends the frame kept in pair `parity` (with its proxy, [`Self::keep_delayed`]) to the other GPU: its proxy copied
+    /// into `proxy` (the proxy region on this device, `bytes` of it) on `queue`, behind the compose of the frame before
+    /// (which reads the answer region: the server may write it again once this copy is done). Nothing is waited for
+    /// here: the frame's number and the copy's fence go to the relay ([`super::pace::Token`]), which waits for the
+    /// fence and posts the request. The caller knows the server is done with the proxy region (the frame before is
+    /// resolved). `None` when nothing was submitted.
+    #[cfg(target_arch = "x86_64")]
+    pub fn send_delayed(&mut self, device: &ash::Device, queue: vk::Queue, parity: usize, proxy: vk::Buffer, bytes: u64) -> Option<(u64, vk::Fence)> {
+        let base = self.zc.delayed.as_ref().filter(|d| d.kept_proxy[parity] && d.frame_bytes == bytes)?.base.as_ref()?[parity].buffer;
+        let p = self.zc.paced.as_mut()?;
+        // The pair's last send is two frames old, and the relay is done with its fence (its frame was resolved).
+        if p.armed[parity] && !wait_armed(device, &[Some(p.fence[parity])], "gpu::send_delayed reuse") {
+            return None;
+        }
+        p.armed[parity] = false;
+        let cmd = p.cmd[parity];
+        // SAFETY: the pair's last send was waited; the buffers are live; nothing else writes the proxy region now.
+        let recorded = unsafe {
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).is_ok()
+                && device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).is_ok()
+                && {
+                    let before = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[before],
+                        &[],
+                        &[],
+                    );
+                    device.cmd_copy_buffer(cmd, base, proxy, &[vk::BufferCopy::default().size(bytes)]);
+                    let to_host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &[to_host],
+                        &[],
+                        &[],
+                    );
+                    device.end_command_buffer(cmd).is_ok()
+                }
+        };
+        if !recorded {
+            return None;
+        }
+        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        // SAFETY: the fence was waited and is reset here; the caller holds the queue (the present's).
+        let submitted = unsafe { device.reset_fences(&[p.fence[parity]]).and_then(|()| device.queue_submit(queue, &[submit], p.fence[parity])) };
+        if crate::note_vk(device.handle(), submitted).is_err() {
+            return None;
+        }
+        p.armed[parity] = true;
+        p.sent += 1;
+        self.zc.last_queue = Some(queue);
+        Some((p.sent, p.fence[parity]))
+    }
+
+    /// Ends the relay and frees the sends: the relay first (the frame in its hand is resolved without an answer), then
+    /// every send is waited. `false` when a wait failed: nothing is freed (drain before free), and it is not used again.
+    #[cfg(target_arch = "x86_64")]
+    pub fn release_paced(&mut self, device: &ash::Device) -> bool {
+        let Some(p) = self.zc.paced.as_ref() else { return true };
+        p.pacer.stop();
+        if !wait_armed(device, &[p.armed[0].then_some(p.fence[0]), p.armed[1].then_some(p.fence[1])], "gpu::release_paced") {
+            self.zc.paced_dead = true;
+            return false;
+        }
+        if let Some(p) = self.zc.paced.take() {
+            // SAFETY: the relay ended and both sends were just waited.
+            unsafe {
+                p.destroy(device);
+                device.free_command_buffers(self.pool, &p.cmd);
+            }
+        }
+        true
+    }
+
     /// Whether `gen_*` hold this answer generation, so a zero-copy compose can present it again
     /// (a carried frame) with no CPU copy of the answer anywhere.
     pub fn holds_generation(&self, generation: u64) -> bool {
@@ -2264,6 +2440,12 @@ impl GpuCompose {
             }
             if let Some(d) = &self.zc.delayed {
                 d.destroy(device);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(p) = &self.zc.paced {
+                // The relay ends first (its thread waits on the sends' fences).
+                p.pacer.stop();
+                p.destroy(device);
             }
             // Freeing imported memory never unmaps it: the mapping is `ShmClient`'s.
             if let Some(a) = &self.zc.answer_import {
@@ -3949,7 +4131,7 @@ mod tests {
         let frame_b: Vec<u8> = current.chunks(4).flat_map(|p| [p[0].wrapping_add(90), p[1].wrapping_add(60), p[2].wrapping_add(30), 255]).collect();
         upload(&base, false);
         upload(&current, true);
-        assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false).is_some());
+        assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, false).is_some());
         upload(&vec![9u8; frame_bytes as usize], false);
         upload(&frame_b, true);
         unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
@@ -3978,6 +4160,83 @@ mod tests {
         let shown = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
         assert_eq!(shown, current, "the kept frame A replaces the live frame B, untouched");
         assert!(gpu.show_kept(&device, queue, target.image, width, height, 0).is_none(), "nothing kept in pair 0");
+
+        // With the relay (`super::pace`): the frame is kept with its proxy copied off the image, sent from the pair
+        // behind whatever the queue holds, and the relay posts its request once that copy is done. The answer then
+        // composes exactly as on the present's own waits, where the proxy is the frame.
+        {
+            use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+            use std::sync::Arc;
+            #[derive(Default)]
+            struct Fake {
+                begun: AtomicU32,
+                good: AtomicBool,
+            }
+            impl super::super::pace::Port for Arc<Fake> {
+                fn begin(&self) -> Option<u32> {
+                    Some(self.begun.fetch_add(1, Ordering::SeqCst) + 1)
+                }
+                fn answered(&self, _req: u32) -> bool {
+                    true
+                }
+                fn fits(&self, _req: u32, _proxy: (u32, u32), _pq10: bool) -> bool {
+                    self.good.load(Ordering::SeqCst)
+                }
+                fn quit(&self) -> bool {
+                    false
+                }
+                fn publish_white(&self, _reading: f32) {}
+            }
+            let fake = Arc::new(Fake::default());
+            let port = fake.clone();
+            assert!(gpu.ensure_paced(&device, || Some(Box::new(port))));
+            assert!(gpu.ensure_paced(&device, || None), "made once");
+            // The proxy region's stand-in on this device: host-visible, so the test can read what was sent.
+            let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let (sent_buffer, sent_memory, sent_ptr) = unsafe {
+                let info = vk::BufferCreateInfo::default().size(frame_bytes).usage(vk::BufferUsageFlags::TRANSFER_DST);
+                let buffer = device.create_buffer(&info, None).unwrap();
+                let reqs = device.get_buffer_memory_requirements(buffer);
+                let kind = find_memory_type(&mem_props, reqs.memory_type_bits, host).expect("host-visible memory");
+                let memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(kind), None).unwrap();
+                device.bind_buffer_memory(buffer, memory, 0).unwrap();
+                (buffer, memory, device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()).unwrap().cast::<u8>())
+            };
+            let composed = compose_once(width, height, &current, &current, &answer, params).expect("the CPU reference composes");
+            for (round, good) in [true, false].into_iter().enumerate() {
+                fake.good.store(good, Ordering::SeqCst);
+                upload(&current, true);
+                assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, true).is_some());
+                let (number, copied) = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes).expect("the frame is sent");
+                assert_eq!(number, round as u64 + 1);
+                let pacer = gpu.pacer().expect("made");
+                assert!(pacer.post(super::super::pace::Token {
+                    number,
+                    copied,
+                    proxy: (width, height),
+                    pq10: false,
+                    dims: (width, height),
+                    budget: std::time::Duration::from_secs(30),
+                    posted: std::time::Instant::now(),
+                    judged: false,
+                    meter: None,
+                }));
+                assert_eq!(pacer.wait_resolved(number, std::time::Instant::now() + std::time::Duration::from_secs(30)), Some(good));
+                // The request was posted after the copy: the region holds the frame.
+                assert_eq!(unsafe { std::slice::from_raw_parts(sent_ptr, frame_bytes as usize) }, &current[..], "the proxy sent is the kept frame");
+                // The next present: the live image is frame B, and A's answer composes onto A.
+                upload(&frame_b, true);
+                unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
+                let shown = present(&mut gpu, ComposeInputs::Delayed { parity: 1 }, 10 + number).expect("the delayed present composes");
+                assert_eq!(shown, composed, "the answer composes onto the kept frame, whose proxy is the frame itself");
+            }
+            assert_eq!(fake.begun.load(Ordering::SeqCst), 2, "one request a frame");
+            assert!(gpu.release_paced(&device) && gpu.pacer().is_none());
+            unsafe {
+                device.destroy_buffer(sent_buffer, None);
+                device.free_memory(sent_memory, None);
+            }
+        }
         assert!(gpu.wait_in_flight(&device));
         assert!(gpu.release_delayed(&device));
         assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 1 }, 5).is_none(), "released pairs are gone");

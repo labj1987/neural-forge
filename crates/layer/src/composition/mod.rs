@@ -14,3 +14,5 @@ pub mod color;
 pub mod encode;
 pub mod encode_pass;
 pub mod gpu;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod pace;
