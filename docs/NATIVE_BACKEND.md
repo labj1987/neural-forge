@@ -1949,6 +1949,11 @@ HDR10, frame generation x3; the game sweep's `cyberpunk-rr` run with and without
 | model on the game's device | 32-33 | 95-100 fps | 17.7 ms (median), every second hold | capture 2.4 ms, write-back 1.3 ms | cache rejection 1-5%; sweep passes |
 | `same` | 21-22 | 62-67 fps | 34.0-34.3 ms on the second device, copies included; 34.3 ms from send to answer | capture 6.7 ms, write-back 2.6 ms | 600 of 600 frames answered in time and 600 of 600 holds carried the edit in every summary once the network ran; cache rejection 7-14% (more motion per hold at the lower rate); no misses; sweep passes, recording clean |
 
+The same hold without Ray Reconstruction (Super Resolution, Placement set to After DLSS while the benchmark ran,
+`same`): 21-22 holds per second, 63-65 fps shown, 37.0 ms on the second device, 600 of 600 answered and carried, cache
+rejection 4-12%, no misses. So the placement is offloaded for any game whose passes all run there, once per rendered
+frame and before frame generation, where the finished-frame placement runs the network on every presented frame.
+
 As before DLSS, `same` saves nothing (both devices share the GPU, and the second device's network takes twice the
 time beside the game); the numbers show the path works and what it adds. The picture: fine detail over the views
 two 35 s recordings share (143 pairs, the method of the section above), offloaded over local a median 0.964, inside
