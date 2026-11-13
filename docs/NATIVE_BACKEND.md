@@ -1861,6 +1861,15 @@ frame, 600 of 600), with the frames shown one present late: in each run's record
 clean, with one hitch of 120 to 230 ms at the benchmark's scene change in every kind. Not measured: two different
 GPUs, where the other GPU can be faster than the game and the wait on the GPU is the only one left.
 
+After the review fixes (the GPU wait opt-in; 2026-11-13, same benchmark and settings): the default (relay) ran 600 of
+600 presents with the answer in every summary, none waiting on the GPU and no sync fd exported, 30.9-32.7 ms of the
+game's thread a present, and its recording flags nothing (longest gap 92 ms). With `=gpu` 600 of 600 composes waited
+on the GPU, except once: one answer came later than its budget (the relay gave up; 5 frames went out without their
+edit, the presents took their waits back for 34 frames). Its recording shows that as a 242 ms stop and six frames
+tinted by up to 7 levels against their neighbours (the frames without the edit). That is what the wait on the GPU
+costs when the other GPU is late: the game's GPU holds until the other is done (on the relay the present waits up to
+`SYNC_BUDGET` on the game's thread, then lets the frame through), and why it stays opt-in.
+
 
 ## Before DLSS on a second GPU (#63, 2026-11-12)
 

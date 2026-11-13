@@ -18,8 +18,9 @@ first shipped them; their phase is kept as a subheading.
   a row were answered and steps back by itself when an answer is late. `NEURAL_FORGE_OFFLOAD_PACING=cpu` keeps every
   wait in the game, as before.
 - Experimental, for systems with two GPUs: `NEURAL_FORGE_OFFLOAD_PACING=gpu` lets the game's GPU wait for the answer
-  instead of the game, where both GPUs' drivers have sync-file semaphores (NVIDIA's do). If the second GPU hangs, the
-  game then freezes instead of showing a frame without its edit, so it is off by default.
+  instead of the game, where both GPUs' drivers have sync-file semaphores (NVIDIA's do). When the second GPU is late,
+  the game's GPU waits for it: a visible hitch (one run on one card showed a quarter-second stop and a few frames
+  without their edit). If the second GPU hangs, the game freezes. That is why it is off by default.
 - Before and after DLSS on the second GPU: the motion vectors sent with each frame are half the size (about 42 MB
   out per frame instead of 56 MB at 2560x1440 after DLSS, about 100 MB instead of 133 MB at 3840x2160). They are
   DLSS's own vectors, which are half precision to begin with, so the picture does not change.
