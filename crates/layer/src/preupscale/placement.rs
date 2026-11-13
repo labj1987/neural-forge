@@ -232,17 +232,17 @@ impl Hold {
         Self { stage, before: plan.range(Stage::Before), upscaled: plan.range(Stage::Upscaled), render, output }
     }
 
-    /// Whether the model on a second GPU takes this hold (`super::offload_pre`): only in a frame whose held passes
-    /// all run at this hold's stage (every pass before the upscaler; or every pass after DLSS's output: Ray
-    /// Reconstruction, or the placement set there). The process has one network, and the other GPU serves one hold of
-    /// a frame: in a frame with passes at both stages neither hold is offloaded (with one of them there, the other
-    /// found the network open elsewhere and never ran), and both run on the game's GPU.
+    /// Whether the model on a second GPU takes this hold (`super::offload_pre`): every hold that has passes (before
+    /// the upscaler, or after DLSS's output: Ray Reconstruction, or the placement set there). In a frame with passes at
+    /// both stages both holds are the other GPU's: the process has one network, and both holds' runners share it
+    /// there (`offload_server::Core`), where with one hold there and one here the hold here found the network open
+    /// elsewhere and never ran.
     pub(crate) fn offload_takes(&self) -> bool {
-        let (own, other) = match self.stage {
-            Stage::Upscaled => (self.upscaled, self.before),
-            _ => (self.before, self.upscaled),
+        let own = match self.stage {
+            Stage::Upscaled => self.upscaled,
+            _ => self.before,
         };
-        own.0 < own.1 && other.0 >= other.1
+        own.0 < own.1
     }
 
     /// This hold's passes, `first..end`.
@@ -359,8 +359,8 @@ mod tests {
         assert_eq!(plan.notes().count(), 0);
         assert_eq!((plan.range(Before), plan.range(Upscaled), plan.range(Present)), ((0, 1), (1, 2), (0, 0)));
         let hold = Hold::of(&plan, Upscaled, (1707, 960), (2560, 1440));
-        // A frame with passes at both stages: the second GPU takes neither hold (one network in the process).
-        assert!(!hold.offload_takes() && !Hold::of(&plan, Before, (1707, 960), (2560, 1440)).offload_takes());
+        // A frame with passes at both stages: the second GPU takes both holds (they share its one network).
+        assert!(hold.offload_takes() && Hold::of(&plan, Before, (1707, 960), (2560, 1440)).offload_takes());
         assert!(Hold::ALL_BEFORE.offload_takes());
         assert_eq!(hold.passes(), (1, 2));
         assert_eq!(Hold::of(&plan, Before, (1707, 960), (2560, 1440)).passes(), (0, 1));
