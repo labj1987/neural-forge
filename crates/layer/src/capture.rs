@@ -1222,6 +1222,10 @@ unsafe fn paced_present(
         }
         fd.try_clone()
     };
+    // A gate for the compose or the send; where this device refuses its import, they wait for the relay to resolve the
+    // frame before instead, within its budget.
+    let as_gate =
+        |fd: std::os::fd::OwnedFd, token| crate::composition::gpu::Gate { fd: fd.into_raw_fd(), token, until: std::time::Instant::now() + SYNC_BUDGET };
     let mut answered = true;
     let (gate, after) = match gate.take().map(|fd| (dup(&fd), fd)) {
         Some((Ok(after), fd)) => (Some(fd), Some(after)),
@@ -1245,7 +1249,7 @@ unsafe fn paced_present(
             height,
             width,
             height,
-            crate::composition::gpu::ComposeInputs::Delayed { parity: req.parity, gate: gate.map(IntoRawFd::into_raw_fd) },
+            crate::composition::gpu::ComposeInputs::Delayed { parity: req.parity, gate: gate.map(|fd| as_gate(fd, req.token)) },
             *raw_answer_generation,
             proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
             image,
@@ -1290,7 +1294,7 @@ unsafe fn paced_present(
     };
     // This frame to the other GPU, behind the compose (the frame before is resolved: the server is done with both regions).
     let posted_at = std::time::Instant::now();
-    let sent = gpu.send_delayed(device, queue, parity, proxy, frame_bytes, after.map(IntoRawFd::into_raw_fd));
+    let sent = gpu.send_delayed(device, queue, parity, proxy, frame_bytes, after.map(|fd| as_gate(fd, req.token)));
     static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let meter = (!pq10 && METER_FRAME.fetch_add(1, Relaxed).is_multiple_of(8)).then(|| shm.proxy_region(SLOT)).flatten().map(|(frame, capacity)| {
         crate::composition::pace::Meter {

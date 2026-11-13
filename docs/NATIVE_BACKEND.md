@@ -1806,8 +1806,15 @@ set; `pace::has_semaphore_fd`), and the other device imports the regions (its fr
    changes: the compose is the same compose, and it still signals the present semaphore itself.
 
 Fall-backs to the wait on the game's thread: either device without the extension, staged regions on the other
-device, an fd that cannot be exported (the semaphore is then not signalled again), duplicated or imported, an
-answer that will not fit (never gated), and the pacing not set to `gpu` (unset or `relay`: the default).
+device, an fd that cannot be exported (the semaphore is then not signalled again) or duplicated (the frame before
+is composed only when the relay resolves it with a good answer, else it goes out as it was kept), an answer that
+will not fit (never gated), and the pacing not set to `gpu` (unset or `relay`: the default). An import the game's
+device refuses (`Paced::take_gate`) is said once in the log and ends the waits on the GPU for that compose
+(`can_gate` is false from then on): that present's compose (or send) waits for the relay to resolve the frame and
+composes it ungated, only with a good answer, and every later present waits on the game's thread. A submission
+that fails after its import leaves the semaphore with a payload nothing consumes: it is replaced
+(`Paced::renew`). A present that cannot keep its frame once it has the gate hands it back, and its own path waits
+for that answer before it composes.
 `NEURAL_FORGE_OFFLOAD_PACING=cpu` keeps all three waits on the game's thread. Only the zero-copy pair has any of
 this (the CPU pairs of
 `delayed_present_cpu` do not).
