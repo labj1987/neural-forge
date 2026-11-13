@@ -424,7 +424,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_OFFLOAD_GPU=same\|N\|vendor:device[@pci-address]` | layer | Runs the model on another GPU (before DLSS, after DLSS with Ray Reconstruction or with Placement set to After DLSS, or on the finished frame): the one at index `N` (decimal) of the list the layer log prints when the game creates its device on a machine with more than one GPU (`[offload] GPU N: ...`), or the one with that PCI vendor and device ID (4 hexadecimal digits each, `10de:2c02`; add `@0000:73:00.0` where two cards share the ID). `same` puts it on a second device of the game's own GPU, which tests the path and saves nothing. Unset or `off`: the game's GPU. See [The model on a second GPU](#the-model-on-a-second-gpu). |
 | `NEURAL_FORGE_OFFLOAD_PACING=cpu\|relay\|gpu` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model on the finished frame. Unset or `relay`: a helper thread waits for the game's GPU to copy each frame out, the game's thread for the answer. `cpu`: the game's thread makes every wait of a present itself, as before 4.4.0. `gpu` (experimental, for two-GPU systems, not measured on two different cards): the game's GPU waits for the answer instead of the game's thread, where both GPUs have sync-file semaphores; a late second GPU then holds the game's GPU for as long as it is late (a visible hitch), and one that hangs freezes the game. |
 | `NEURAL_FORGE_OFFLOAD_MOTION=float` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: the motion vectors cross to the other GPU as two floats a texel (twice the bytes), as before 4.4.0. Unset, they cross as two halves a texel, which is what DLSS's vectors are. |
-| `NEURAL_FORGE_OFFLOAD_TRIAL=off\|on` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: `off` never tries the game's GPU when the game waits for the second GPU (see [The model on a second GPU](#the-model-on-a-second-gpu)); `on` tries it with `same` too (tests; unset, `same` is not tried). `NEURAL_FORGE_OFFLOAD_TRIAL_VERDICT=offload` (tests only) sends the model back to the other GPU whatever the trial measured. |
+| `NEURAL_FORGE_OFFLOAD_TRIAL=off\|on` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: `off` (or `0`, `false`) never tries the game's GPU when the game waits for the second GPU (see [The model on a second GPU](#the-model-on-a-second-gpu)); `on` tries it with `same` too (tests; unset, `same` is not tried). `NEURAL_FORGE_OFFLOAD_TRIAL_VERDICT=offload` (tests only) sends the model back to the other GPU whatever the trial measured. |
 | `NEURAL_FORGE_OFFLOAD_TEST_FAIL=N` | layer | Tests only, with `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: the `N`th frame fails on the other GPU, so the model goes back to the game's GPU. |
 | `NEURAL_FORGE_TEST_REBUILD_AT=N:S` | layer | Tests only: from the `N`th DLSS launch nothing is held for `S` seconds, then the hold's resources are built again as for a change of DLSS's render size. |
 | `NEURAL_FORGE_OFFLOAD_STANDIN=1` | layer | Tests only, with `NEURAL_FORGE_OFFLOAD_GPU`: a copy in and back out of the other GPU runs in place of the network (for a GPU that cannot run it), so every frame comes back unchanged. |
@@ -520,10 +520,16 @@ The model goes back to the game's GPU for the rest of the session, and the log s
 
 Before or after DLSS the game waits for the second GPU's answer to the frame before, so a second GPU slower than the
 game's frame sets the frame rate. Once the game has waited for it (2 ms a frame or more, and a tenth of its frame time)
-over 600 frames, the model is tried once on the game's GPU: a few seconds of frames there (the network is built there
-first, about a second without the model) decide. A game's GPU whose frames come at least 10% faster keeps the model for
-the session; otherwise it goes back to the second GPU, and nothing is tried again. The log's `[offload]` lines give both
-frame times, and the summaries every 600 frames say how long the game waited a frame. Where the frames cross system
+in two windows of 600 frames in a row with about the same frame rate (so 1200 frames after the start at the earliest),
+the model is tried once on the game's GPU: a few seconds of frames there (the network is built there first, about a
+second without the model) decide. A game's GPU whose frames come at least 10% faster keeps the model until the game
+restarts; otherwise, or when the game's GPU cannot run the model (it is not built within 15 seconds of frames, or 30
+frames in a row miss it), it goes back to the second GPU, and nothing is tried again. A change of what is held during
+the trial (another size, another number of passes) sends the model back and lets a later window try again. The Status
+tab says "second GPU: trying the game's GPU for a few seconds" during the trial and "second GPU: not used: the game's GPU
+is faster (18.6 ms vs 22.8 ms a frame)" once it kept the model there; the log's `[offload]` lines give both frame times,
+and the summaries every 600 frames say how long the game waited a frame. Only the model before and after DLSS is
+tried: the finished frame's placement keeps its own rules. Where the frames cross system
 memory slowly (a second GPU in a slot with fewer PCIe lanes, or behind the chipset), the copies alone can take longer
 than the network: Cyberpunk 2077 with Ray Reconstruction at 2048x1536 moved 72 MB a frame and took 28.6 ms a frame on
 an RTX 5080 beside an RTX 4090, where the 4090 ran the network itself in 7.2 ms. `NEURAL_FORGE_OFFLOAD_TRIAL=off`

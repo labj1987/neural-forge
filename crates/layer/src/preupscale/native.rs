@@ -4242,7 +4242,7 @@ fn fake_chain_timeout(frames: u64) -> Option<(u32, String)> {
 /// What the Status tab says about the native backend after a hold: running, or why not.
 pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     if result.evaluated {
-        return running_line(loader.guard_note().as_deref());
+        return running_line(loader.guard_note().as_deref(), super::offload_trial::status_line().as_deref());
     }
     match (loader.failed(), result.miss) {
         (Some(why), _) => format!("native network not running: {why}"),
@@ -4251,10 +4251,13 @@ pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     }
 }
 
-/// The Status line of a hold whose network ran: `guard`, the VRAM guard's note.
-pub(crate) fn running_line(guard: Option<&str>) -> String {
+/// The Status line of a running hold, with the VRAM guard and the second GPU's trial.
+pub(crate) fn running_line(guard: Option<&str>, trial: Option<&str>) -> String {
     let guard = guard.map(|why| format!(" ({why})")).unwrap_or_default();
-    format!("native network running{guard}")
+    match trial {
+        Some(trial) => format!("{trial}{guard}"),
+        None => format!("native network running{guard}"),
+    }
 }
 
 /// The last network failure written to the state log, so a retry schedule that keeps failing the same
@@ -4830,7 +4833,9 @@ unsafe fn native_hold(
         return result;
     }
     // The offload's side of the hold: the exchange with the other device and its worker, made on the first hold.
-    if res.offpre.as_ref().is_some_and(super::offload_pre::HoldSide::released) && !others_outstanding {
+    // A side whose worker stopped serving (the trial on the game's GPU gave it up) while the offload is wanted again: the
+    // same.
+    if res.offpre.as_ref().is_some_and(|s| s.released() || (!s.serving() && super::offload_pre::wanted())) && !others_outstanding {
         // Its worker was ended for another set of hold resources while these had no hold: built again below.
         if let Some(side) = res.offpre.take() {
             // The late capture's set points at this side's kept copy: written again for the next side's.
@@ -5652,11 +5657,11 @@ mod tests {
 
     #[test]
     fn the_running_line_fits_the_channel_with_every_note_of_the_vram_guard() {
-        assert_eq!(super::running_line(None), "native network running");
-        assert_eq!(super::running_line(Some("lower")), "native network running (lower)");
+        assert_eq!(super::running_line(None, None), "native network running");
+        assert_eq!(super::running_line(Some("lower"), None), "native network running (lower)");
         // Every variant fits the channel's field whole (a cut line would read as changed at every hold).
         for guard in [None, Some(super::super::vram_guard::NOTE_SMALL), Some(super::super::vram_guard::NOTE_PAUSED)] {
-            let line = super::running_line(guard);
+            let line = super::running_line(guard, None);
             assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
         }
     }

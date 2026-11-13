@@ -2,10 +2,12 @@
 //! #70): the hold waits at its submit for the other GPU's answer to the frame before it, so once the other GPU is
 //! slower than the game's frame it sets the frame rate. The present's late rule (`super::offload::LateRule`) never
 //! sees that: the frames get as slow as the answers, so no answer is ever late. Whether the game's GPU does better
-//! with the network on it is measured, not guessed: once a window of offloaded holds shows the game waiting for the
-//! other GPU ([`Trial::offloaded`]), the model goes to the game's GPU for one trial ([`Trial::local`]); the frame
-//! rate there decides, once per process ([`decide`]). A game's GPU that is no faster gives the frames back to the
-//! other GPU (the network is built there again), and nothing is tried again.
+//! with the network on it is measured, not guessed: once two windows of offloaded holds in a row show the game waiting
+//! for the other GPU ([`Trial::offloaded`]), the held placements go to the game's GPU for one trial ([`Trial::local`]);
+//! the frame rate there decides, once per process ([`decide`]). A game's GPU that is no faster, or cannot run the
+//! model, gives the frames back to the other GPU, and nothing is tried again. The trial only steers the held
+//! placements ([`keeps_local`], read by `offload_pre::wanted`): the offload's own state (`super::offload::State`, the
+//! finished-frame placement) is left alone.
 //!
 //! On the #63 reporter's machine (RTX 4090 with an RTX 5080 beside it, the frames crossing system memory at about
 //! 3.5 GB/s): Cyberpunk 2077 with Ray Reconstruction at 2048x1536 ran at 27-36 fps with the 5080's 28.6 ms frames
@@ -20,55 +22,82 @@ use std::time::{Duration, Instant};
 pub(crate) const WAIT_MIN: Duration = Duration::from_millis(2);
 /// The share of the frame time the mean wait must reach as well.
 pub(crate) const WAIT_SHARE: f64 = 0.10;
+/// How far two windows (two offloaded ones in a row, or the local window's halves) may differ and still agree.
+pub(crate) const AGREE: f64 = 0.10;
 /// Local holds after the trial began that count for nothing: the network's build on the game's GPU, the first
-/// frames of its history.
+/// frames of its history (counted from the first hold that ran the model there).
 pub(crate) const LOCAL_WARM: u32 = 60;
-/// Local holds measured once warm.
+/// Frame times measured on the game's GPU once warm; extended while its two halves disagree, up to [`LOCAL_MAX`].
 pub(crate) const LOCAL_WINDOW: usize = 300;
+pub(crate) const LOCAL_MAX: usize = 900;
 /// How much shorter the game's GPU's frames must be to keep the model there: within it the other GPU keeps it (the
 /// user asked for it, and it leaves the game's GPU its time).
 pub(crate) const MARGIN: f64 = 1.10;
-/// A gap between two holds longer than this (a pause menu, a loading screen) is not a frame time.
-const GAP: Duration = Duration::from_millis(250);
+/// A time between two holds longer than this (a pause menu, a loading screen) is no frame time.
+pub(crate) const FRAME_GAP: Duration = Duration::from_millis(250);
+/// How long the game's GPU has, from the trial's start, to run the model at all (its build), counted over holds that
+/// keep coming; and how many holds in a row it may then miss. Past either the other GPU gets the frames back.
+pub(crate) const BUILD_BUDGET: Duration = Duration::from_secs(15);
+pub(crate) const MISSES: u32 = 30;
+/// Trials cut short by a change of what is held (another size, another pass count) before the offload keeps the
+/// model for good.
+pub(crate) const ABORTS: u32 = 3;
 
-/// `NEURAL_FORGE_OFFLOAD_TRIAL`: `off` never tries the game's GPU (the second GPU keeps the model whatever the
-/// frame rate); `on` tries it with `same` too (tests); unset: tried with a real second GPU, not with `same`.
+/// `NEURAL_FORGE_OFFLOAD_TRIAL`: `off` (or `0`, `false`) never tries the game's GPU (the second GPU keeps the model
+/// whatever the frame rate); `on` (`1`, `true`) tries it with `same` too (tests); unset: tried with a real second GPU,
+/// not with `same`.
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         let same = super::offload::Choice::current() == super::offload::Choice::Same;
-        match neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_TRIAL").as_deref() {
-            Some("off") => false,
-            Some("on") => true,
-            Some(other) => {
+        let value = neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_TRIAL").map(|v| v.to_ascii_lowercase());
+        parse_switch(value.as_deref()).unwrap_or_else(|| {
+            if let Some(other) = value {
                 crate::log!("[offload] NEURAL_FORGE_OFFLOAD_TRIAL={other}: not on or off; the default holds");
-                !same
             }
-            None => !same,
-        }
+            !same
+        })
     });
     *ON
+}
+
+/// `on`/`off` and their spellings; `None` for anything else.
+fn parse_switch(v: Option<&str>) -> Option<bool> {
+    match v? {
+        "on" | "1" | "true" => Some(true),
+        "off" | "0" | "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// `NEURAL_FORGE_OFFLOAD_TRIAL_VERDICT=offload` (tests only): the trial's verdict is the other GPU whatever was
 /// measured, so the way back to it can be run on one GPU.
 fn forced_offload() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_TRIAL_VERDICT").as_deref() == Some("offload"));
+        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_TRIAL_VERDICT").is_some_and(|v| v.eq_ignore_ascii_case("offload")));
     *ON
 }
 
-/// What the trial found.
+/// What is held, which a window's frame times belong to: the hold's extent and the frame's pass count.
+pub(crate) type Key = ((u32, u32), usize);
+
+/// What a local hold brought the trial.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Verdict {
-    /// The game's GPU is faster: the model stays there (why, for the log and the Status tab).
-    Local(String),
-    /// The other GPU is as fast or faster: the frames go back to it (why).
+    /// The game's GPU is faster: the held placements stay there for the process (the log's line, and the Status tab's).
+    Local { log: String, status: String },
+    /// The other GPU is as fast or faster, or the game's GPU could not run the model: the frames go back to it (why).
     Offload(String),
+    /// What is held changed under the trial: the frames go back to the other GPU, and a later window may try again.
+    Aborted(String),
 }
 
 /// Where the model ends up after a trial whose offloaded frames came every `off` and local ones every `local`.
 pub(crate) fn decide(off: Duration, local: Duration) -> bool {
     local.as_secs_f64() * MARGIN < off.as_secs_f64()
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
 }
 
 fn fps(d: Duration) -> f64 {
@@ -79,44 +108,77 @@ fn fps(d: Duration) -> f64 {
     }
 }
 
-fn ms(d: Duration) -> f64 {
-    d.as_secs_f64() * 1000.0
+/// The mean of `v` with its lowest and highest tenth left out (`v` sorted here); zero for none. Not the median: with
+/// the edit cache a local window's frames are two kinds (the network's and the cached), and the median picks one.
+pub(crate) fn trimmed_mean(v: &mut [Duration]) -> Duration {
+    if v.is_empty() {
+        return Duration::ZERO;
+    }
+    v.sort_unstable();
+    let cut = v.len() / 10;
+    let kept = &v[cut..v.len() - cut];
+    kept.iter().sum::<Duration>() / kept.len() as u32
 }
 
-/// The median of `v` (`v` not empty).
-fn median(v: &mut [Duration]) -> Duration {
-    v.sort_unstable();
-    v[v.len() / 2]
+/// Whether two frame times agree within [`AGREE`].
+fn agree(a: Duration, b: Duration) -> bool {
+    let (a, b) = (a.as_secs_f64(), b.as_secs_f64());
+    a > 0.0 && b > 0.0 && (a - b).abs() <= AGREE * a.max(b)
 }
 
 #[derive(Debug, Default)]
 enum Phase {
-    /// Offloaded, not tried yet.
+    /// Offloaded, not tried yet; the last window that showed the game waiting, if the one before this did.
     #[default]
     Watching,
-    /// On the game's GPU for the trial: the offloaded frame time and wait it is measured against, and the local holds.
-    Local { off: Duration, wait: Duration, warm: u32, last: Option<Instant>, intervals: Vec<Duration> },
-    /// Decided for the process.
+    /// On the game's GPU for the trial.
+    Local(Local),
+    /// The held placements stay on the game's GPU for the process (the Status line).
+    KeptLocal(String),
+    /// Decided for the other GPU.
     Decided,
+}
+
+#[derive(Debug)]
+struct Local {
+    key: Key,
+    off: Duration,
+    wait: Duration,
+    began: Instant,
+    /// Holds that ran the model here (the warm-up counts them), the misses in a row since, the last hold's time.
+    ran: u32,
+    missed: u32,
+    last: Option<Instant>,
+    intervals: Vec<Duration>,
 }
 
 /// The process's trial ([`TRIAL`]); its own type so tests drive one of their own.
 #[derive(Debug, Default)]
 pub(crate) struct Trial {
     phase: Phase,
+    /// The previous offloaded window that showed the game waiting (its key and frame time): a trial starts on two in
+    /// a row that agree.
+    waiting: Option<(Key, Duration)>,
+    aborts: u32,
 }
 
 impl Trial {
-    /// A window of offloaded holds: their median frame time `frame` and the mean wait per hold at the submit for the
-    /// other GPU, `wait`. `Some(why)` starts the trial: the caller gives the other GPU up with `why`.
-    pub(crate) fn offloaded(&mut self, frame: Duration, wait: Duration, enabled: bool) -> Option<String> {
+    /// A window of offloaded holds of `key`: their frame time `frame` ([`trimmed_mean`]) and the mean wait per hold at
+    /// the submit for the other GPU, `wait`. `Some(why)` starts the trial: the caller stops its offloaded side.
+    pub(crate) fn offloaded(&mut self, key: Key, frame: Duration, wait: Duration, enabled: bool, now: Instant) -> Option<String> {
         if !enabled || !matches!(self.phase, Phase::Watching) || frame.is_zero() {
             return None;
         }
         if wait < WAIT_MIN || wait.as_secs_f64() < frame.as_secs_f64() * WAIT_SHARE {
+            self.waiting = None;
             return None;
         }
-        self.phase = Phase::Local { off: frame, wait, warm: 0, last: None, intervals: Vec::with_capacity(LOCAL_WINDOW) };
+        let before = self.waiting.replace((key, frame));
+        if !before.is_some_and(|(k, f)| k == key && agree(f, frame)) {
+            return None;
+        }
+        self.waiting = None;
+        self.phase = Phase::Local(Local { key, off: frame, wait, began: now, ran: 0, missed: 0, last: None, intervals: Vec::with_capacity(LOCAL_MAX) });
         Some(format!(
             "trying the model on the game's GPU: the game waited {:.1} ms a frame for the other GPU's answer (a frame every {:.1} ms, {:.0} fps); the frame rate there decides where the model runs",
             ms(wait),
@@ -125,26 +187,58 @@ impl Trial {
         ))
     }
 
-    /// A hold that ran the model on the game's GPU at `now`. `Some` once the trial is decided.
-    pub(crate) fn local(&mut self, now: Instant, forced_offload: bool) -> Option<Verdict> {
-        let Phase::Local { off, wait, warm, last, intervals } = &mut self.phase else { return None };
-        if *warm < LOCAL_WARM {
-            *warm += 1;
-            *last = Some(now);
-            return None;
+    /// A hold of `key` at `now` during the trial, on the game's GPU: `ran` when the model ran on it, else `miss`, why
+    /// not. `Some` once the trial is over.
+    pub(crate) fn local(&mut self, key: Key, now: Instant, ran: bool, miss: Option<&str>, forced_offload: bool) -> Option<Verdict> {
+        let Phase::Local(l) = &mut self.phase else { return None };
+        if key != l.key {
+            let why = format!(
+                "the trial on the game's GPU stopped: the held frames changed ({}x{}, {} pass(es), from {}x{}, {}); the model goes back to the other GPU",
+                key.0 .0, key.0 .1, key.1, l.key.0 .0, l.key.0 .1, l.key.1
+            );
+            self.aborts += 1;
+            self.phase = if self.aborts >= ABORTS { Phase::Decided } else { Phase::Watching };
+            return Some(Verdict::Aborted(why));
         }
-        if let Some(t) = last.replace(now) {
-            let d = now.saturating_duration_since(t);
-            if d < GAP {
-                intervals.push(d);
+        // A pause between holds (a menu, a loading screen) moves the budget's start: it counts holds that keep coming.
+        let gap = l.last.map(|t| now.saturating_duration_since(t)).filter(|&d| d >= FRAME_GAP);
+        if let Some(gap) = gap {
+            l.began += gap;
+        }
+        if !ran {
+            l.missed += 1;
+            let failed = if l.ran == 0 { now.saturating_duration_since(l.began) > BUILD_BUDGET } else { l.missed >= MISSES };
+            l.last = Some(now);
+            if failed {
+                self.phase = Phase::Decided;
+                return Some(Verdict::Offload(format!(
+                    "the game's GPU could not run the model ({}): it goes back to the other GPU",
+                    miss.unwrap_or("not built in time")
+                )));
             }
-        }
-        if intervals.len() < LOCAL_WINDOW {
             return None;
         }
-        let local = median(intervals);
-        let (off, wait) = (*off, *wait);
-        self.phase = Phase::Decided;
+        l.missed = 0;
+        l.ran += 1;
+        let previous = l.last.replace(now);
+        if l.ran <= LOCAL_WARM {
+            return None;
+        }
+        if let Some(d) = previous.map(|t| now.saturating_duration_since(t)).filter(|&d| d < FRAME_GAP) {
+            l.intervals.push(d);
+        }
+        let n = l.intervals.len();
+        if n < LOCAL_WINDOW {
+            return None;
+        }
+        // The window's halves must agree (a scene that changed under it is measured longer), up to the longest window.
+        let mut first = l.intervals[..n / 2].to_vec();
+        let mut second = l.intervals[n / 2..].to_vec();
+        if !agree(trimmed_mean(&mut first), trimmed_mean(&mut second)) && n < LOCAL_MAX {
+            return None;
+        }
+        let local = trimmed_mean(&mut l.intervals);
+        let (off, wait) = (l.off, l.wait);
         let numbers = format!(
             "a frame every {:.1} ms ({:.0} fps) with the model on the game's GPU, every {:.1} ms ({:.0} fps) with it on the other GPU, which the game waited {:.1} ms a frame for",
             ms(local),
@@ -153,28 +247,45 @@ impl Trial {
             fps(off),
             ms(wait)
         );
-        Some(if decide(off, local) && !forced_offload {
-            Verdict::Local(format!("the game's GPU is faster here ({numbers}): the model stays on it for the session"))
+        if decide(off, local) && !forced_offload {
+            let status = format!("second GPU: not used: the game's GPU is faster ({:.1} ms vs {:.1} ms a frame)", ms(local), ms(off));
+            self.phase = Phase::KeptLocal(status.clone());
+            Some(Verdict::Local { log: format!("the game's GPU is faster here ({numbers}): the model stays on it until the game restarts"), status })
         } else {
-            Verdict::Offload(format!("the other GPU is as fast or faster here ({numbers}): the model goes back to it"))
-        })
+            self.phase = Phase::Decided;
+            Some(Verdict::Offload(format!("the other GPU is as fast or faster here ({numbers}): the model goes back to it")))
+        }
     }
 
-    /// The trial runs: the holds are on the game's GPU for it.
+    /// The trial runs: the held placements are on the game's GPU for it.
     pub(crate) fn running(&self) -> bool {
-        matches!(self.phase, Phase::Local { .. })
+        matches!(self.phase, Phase::Local(_))
+    }
+
+    /// The held placements stay on the game's GPU: during the trial, and for good once it found the game's GPU faster.
+    pub(crate) fn keeps_local(&self) -> bool {
+        matches!(self.phase, Phase::Local(_) | Phase::KeptLocal(_))
+    }
+
+    /// The Status tab's line while the model runs on the game's GPU for the trial or after it.
+    pub(crate) fn status_line(&self) -> Option<String> {
+        match &self.phase {
+            Phase::Local(_) => Some("second GPU: trying the game's GPU for a few seconds: the faster one keeps the model".into()),
+            Phase::KeptLocal(s) => Some(s.clone()),
+            _ => None,
+        }
     }
 }
 
-static TRIAL: Mutex<Trial> = Mutex::new(Trial { phase: Phase::Watching });
+static TRIAL: Mutex<Trial> = Mutex::new(Trial { phase: Phase::Watching, waiting: None, aborts: 0 });
 
 fn lock() -> std::sync::MutexGuard<'static, Trial> {
     TRIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// [`Trial::offloaded`] for the process.
-pub(crate) fn offloaded(frame: Duration, wait: Duration) -> Option<String> {
-    lock().offloaded(frame, wait, enabled())
+pub(crate) fn offloaded(key: Key, frame: Duration, wait: Duration) -> Option<String> {
+    lock().offloaded(key, frame, wait, enabled(), Instant::now())
 }
 
 /// Whether the process's trial runs ([`Trial::running`]).
@@ -182,29 +293,39 @@ pub(crate) fn running() -> bool {
     lock().running()
 }
 
-/// A hold ran the model on the game's GPU ([`Trial::local`]); a decided trial is logged and acted on: kept on the
-/// game's GPU for the session, or the offload asked for again.
-pub(crate) fn local_hold(now: Instant) {
+/// Whether the held placements stay on the game's GPU ([`Trial::keeps_local`]).
+pub(crate) fn keeps_local() -> bool {
+    lock().keeps_local()
+}
+
+/// The trial's Status line ([`Trial::status_line`]).
+pub(crate) fn status_line() -> Option<String> {
+    lock().status_line()
+}
+
+/// A hold on the game's GPU while the trial runs ([`Trial::local`]); its verdict is logged. The held placements
+/// follow [`keeps_local`] from the next hold on.
+pub(crate) fn local_hold(key: Key, now: Instant, ran: bool, miss: Option<&str>) {
     let verdict = {
         let mut t = lock();
         if !t.running() {
             return;
         }
-        t.local(now, forced_offload())
+        t.local(key, now, ran, miss, forced_offload())
     };
-    match verdict {
-        Some(Verdict::Local(why)) => {
-            crate::log!("[offload] {why}");
-            crate::logging::flush();
-            super::offload::note_state(super::offload::State::FellBack(why));
-        }
-        Some(Verdict::Offload(why)) => {
-            crate::log!("[offload] {why}");
-            crate::logging::flush();
-            super::offload::resume();
-        }
-        None => {}
-    }
+    let line = match verdict {
+        Some(Verdict::Local { log, .. }) => log,
+        Some(Verdict::Offload(why) | Verdict::Aborted(why)) => why,
+        None => return,
+    };
+    crate::log!("[offload] {line}");
+    crate::logging::flush();
+}
+
+/// Tests: the process's trial starts afresh.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    *lock() = Trial::default();
 }
 
 #[cfg(test)]
@@ -212,18 +333,23 @@ mod tests {
     use super::*;
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
+    const KEY: Key = ((1485, 836), 1);
 
-    /// Drives a trial to its verdict with local holds every `every`, after the warm-up.
-    fn run_local(t: &mut Trial, every: Duration, forced: bool) -> Verdict {
-        let mut now = Instant::now();
-        for _ in 0..LOCAL_WARM {
-            assert!(t.local(now, forced).is_none());
-            now += every;
-        }
-        for i in 0..=LOCAL_WINDOW {
-            if let Some(v) = t.local(now, forced) {
-                assert_eq!(i, LOCAL_WINDOW - 1, "decided with the window's last interval");
-                return v;
+    /// A trial started from two agreeing windows of offloaded holds every `frame`, waiting `wait`.
+    fn started(frame: Duration, wait: Duration) -> (Trial, Instant) {
+        let mut t = Trial::default();
+        let now = Instant::now();
+        assert!(t.offloaded(KEY, frame, wait, true, now).is_none(), "one window starts nothing");
+        assert!(t.offloaded(KEY, frame, wait, true, now).is_some(), "two that agree start the trial");
+        assert!(t.running() && t.keeps_local());
+        (t, now)
+    }
+
+    /// Drives a trial with local holds every `every` (the model running on each) to its verdict, from `now`.
+    fn run_local(t: &mut Trial, mut now: Instant, every: Duration, forced: bool) -> (usize, Verdict) {
+        for i in 0..2000 {
+            if let Some(v) = t.local(KEY, now, true, None, forced) {
+                return (i, v);
             }
             now += every;
         }
@@ -233,77 +359,188 @@ mod tests {
     #[test]
     fn a_gpu_that_keeps_up_is_not_tried() {
         let mut t = Trial::default();
+        let now = Instant::now();
         // The 5080 before DLSS in Cyberpunk 2077 at 1188x891: 9 ms frames, the game at its 75 fps cap, no wait.
-        assert!(t.offloaded(MS(13), Duration::from_micros(300), true).is_none());
+        for _ in 0..3 {
+            assert!(t.offloaded(KEY, MS(13), Duration::from_micros(300), true, now).is_none());
+        }
         // Waits of a few percent of the frame: jitter.
-        assert!(t.offloaded(MS(40), MS(3), true).is_none());
+        for _ in 0..3 {
+            assert!(t.offloaded(KEY, MS(40), MS(3), true, now).is_none());
+        }
         assert!(!t.running());
+    }
+
+    #[test]
+    fn two_windows_must_agree_to_start() {
+        let mut t = Trial::default();
+        let now = Instant::now();
+        assert!(t.offloaded(KEY, MS(20), MS(8), true, now).is_none());
+        assert!(t.offloaded(KEY, MS(30), MS(8), true, now).is_none(), "30 ms after 20 ms: not the same scene");
+        assert!(t.offloaded(((2048, 1536), 1), MS(30), MS(8), true, now).is_none(), "another size");
+        assert!(t.offloaded(KEY, MS(30), MS(8), true, now).is_none(), "the size changed between");
+        assert!(t.offloaded(KEY, MS(31), MS(8), true, now).is_some());
     }
 
     #[test]
     fn the_reporters_machine_keeps_the_model_on_the_game_gpu() {
         // #70: Red Dead Redemption 2 before DLSS, the 5080's 15.1 ms frames: holds every 20.6 ms, waiting ~13 ms.
-        let mut t = Trial::default();
-        let why = t.offloaded(Duration::from_micros(20_600), MS(13), true).expect("the trial starts");
-        assert!(why.contains("13.0 ms a frame"), "{why}");
-        assert!(t.running());
+        let (mut t, now) = started(Duration::from_micros(20_600), MS(13));
+        assert!(t.status_line().is_some_and(|l| l.contains("trying the game's GPU")));
         // The 4090 with the network on it: about 60 fps.
-        match run_local(&mut t, Duration::from_micros(16_600), false) {
-            Verdict::Local(why) => assert!(why.contains("the game's GPU is faster"), "{why}"),
+        let (i, v) = run_local(&mut t, now, Duration::from_micros(16_600), false);
+        assert_eq!(i, LOCAL_WARM as usize + LOCAL_WINDOW - 1, "the warm-up, then the window");
+        match v {
+            Verdict::Local { log, status } => {
+                assert!(log.contains("the game's GPU is faster") && log.contains("until the game restarts"), "{log}");
+                assert_eq!(status, "second GPU: not used: the game's GPU is faster (16.6 ms vs 20.6 ms a frame)");
+                assert!(status.len() < neural_forge_protocol::REASON_BYTES);
+            }
             v => panic!("{v:?}"),
         }
-        assert!(!t.running());
+        assert!(!t.running() && t.keeps_local());
         // Decided once: no second trial.
-        assert!(t.offloaded(Duration::from_micros(20_600), MS(13), true).is_none());
+        assert!(t.offloaded(KEY, Duration::from_micros(20_600), MS(13), true, now).is_none());
+        assert!(t.offloaded(KEY, Duration::from_micros(20_600), MS(13), true, now).is_none());
     }
 
     #[test]
     fn a_slower_game_gpu_gives_the_frames_back() {
-        let mut t = Trial::default();
-        assert!(t.offloaded(MS(20), MS(8), true).is_some());
-        // Local frames 10% shorter or less: the other GPU keeps the model.
-        assert!(matches!(run_local(&mut t, MS(19), false), Verdict::Offload(_)));
-        let mut t = Trial::default();
-        assert!(t.offloaded(MS(20), MS(8), true).is_some());
-        assert!(matches!(run_local(&mut t, MS(30), false), Verdict::Offload(_)));
+        for local in [MS(19), MS(30)] {
+            let (mut t, now) = started(MS(20), MS(8));
+            assert!(matches!(run_local(&mut t, now, local, false).1, Verdict::Offload(_)), "{local:?}");
+            assert!(!t.keeps_local() && t.status_line().is_none());
+        }
     }
 
     #[test]
     fn the_test_switch_forces_the_way_back() {
-        let mut t = Trial::default();
-        assert!(t.offloaded(MS(36), MS(16), true).is_some());
-        assert!(matches!(run_local(&mut t, MS(13), true), Verdict::Offload(_)));
+        let (mut t, now) = started(MS(36), MS(16));
+        assert!(matches!(run_local(&mut t, now, MS(13), true).1, Verdict::Offload(_)));
+        assert!(!t.keeps_local());
     }
 
     #[test]
     fn off_never_tries() {
         let mut t = Trial::default();
-        assert!(t.offloaded(MS(36), MS(16), false).is_none());
+        let now = Instant::now();
+        for _ in 0..3 {
+            assert!(t.offloaded(KEY, MS(36), MS(16), false, now).is_none());
+        }
         assert!(!t.running());
     }
 
     #[test]
-    fn pauses_and_the_warm_up_do_not_count_as_frames() {
-        let mut t = Trial::default();
-        assert!(t.offloaded(MS(36), MS(16), true).is_some());
-        let mut now = Instant::now();
-        // The build on the game's GPU: slow first holds.
-        for _ in 0..LOCAL_WARM {
-            assert!(t.local(now, false).is_none());
-            now += MS(100);
-        }
-        // Holds every 13 ms with a menu's pause of 2 s in the middle.
+    fn a_game_gpu_that_cannot_run_the_model_gives_the_frames_back() {
+        // Never built: the budget runs out over holds that keep coming.
+        let (mut t, mut now) = started(MS(36), MS(16));
         let mut verdict = None;
-        for i in 0..400 {
-            now += if i == 150 { Duration::from_secs(2) } else { MS(13) };
-            if let Some(v) = t.local(now, false) {
-                verdict = Some((i, v));
+        for _ in 0..2000 {
+            now += MS(20);
+            if let Some(v) = t.local(KEY, now, false, Some("the native network is still loading"), false) {
+                verdict = Some(v);
                 break;
             }
         }
-        let (i, v) = verdict.expect("decided");
-        assert_eq!(i, LOCAL_WINDOW, "the pause's interval is not a frame: one more hold is needed");
-        assert!(matches!(v, Verdict::Local(ref why) if why.contains("13.0 ms")), "{v:?}");
+        match verdict.expect("decided") {
+            Verdict::Offload(why) => assert!(why.contains("could not run the model (the native network is still loading)"), "{why}"),
+            v => panic!("{v:?}"),
+        }
+        assert!(!t.keeps_local() && !t.running());
+        // Built, then paused (the VRAM guard): 30 misses in a row.
+        let (mut t, mut now) = started(MS(36), MS(16));
+        for _ in 0..10 {
+            now += MS(13);
+            assert!(t.local(KEY, now, true, None, false).is_none());
+        }
+        for i in 1..=MISSES {
+            now += MS(13);
+            let v = t.local(KEY, now, false, Some("the VRAM guard paused the network"), false);
+            assert_eq!(v.is_some(), i == MISSES);
+        }
+        assert!(!t.keeps_local());
+    }
+
+    #[test]
+    fn a_pause_does_not_use_up_the_build_budget() {
+        let (mut t, mut now) = started(MS(36), MS(16));
+        for _ in 0..50 {
+            now += MS(100);
+            assert!(t.local(KEY, now, false, Some("loading"), false).is_none());
+        }
+        // A menu of 30 s, then the build finishes within a few holds.
+        now += Duration::from_secs(30);
+        assert!(t.local(KEY, now, false, Some("loading"), false).is_none());
+        now += MS(100);
+        assert!(t.local(KEY, now, true, None, false).is_none());
+        assert!(t.running());
+    }
+
+    #[test]
+    fn a_change_of_what_is_held_aborts_and_may_try_again() {
+        let (mut t, now) = started(MS(36), MS(16));
+        let v = t.local(((2560, 1440), 1), now, true, None, false);
+        assert!(matches!(v, Some(Verdict::Aborted(_))), "{v:?}");
+        assert!(!t.keeps_local());
+        // Another two windows try again; after three aborts, never.
+        for _ in 1..ABORTS {
+            assert!(t.offloaded(KEY, MS(36), MS(16), true, now).is_none());
+            assert!(t.offloaded(KEY, MS(36), MS(16), true, now).is_some());
+            assert!(matches!(t.local(((1, 1), 2), now, true, None, false), Some(Verdict::Aborted(_))));
+        }
+        assert!(t.offloaded(KEY, MS(36), MS(16), true, now).is_none());
+        assert!(t.offloaded(KEY, MS(36), MS(16), true, now).is_none());
+    }
+
+    #[test]
+    fn two_kinds_of_frames_and_pauses_are_measured_fairly() {
+        // The edit cache in motion: network frames of 20 ms and cached ones of 10 ms, alternating: a mean of 15 ms
+        // (the median would say 10 or 20).
+        let (mut t, mut now) = started(MS(20), MS(8));
+        let mut verdict = None;
+        for i in 0..2000u32 {
+            now += if i == 200 {
+                Duration::from_secs(2)
+            } else if i % 2 == 0 {
+                MS(20)
+            } else {
+                MS(10)
+            };
+            if let Some(v) = t.local(KEY, now, true, None, false) {
+                verdict = Some(v);
+                break;
+            }
+        }
+        match verdict.expect("decided") {
+            Verdict::Local { status, .. } => assert!(status.contains("(15.0 ms vs 20.0 ms"), "{status}"),
+            v => panic!("{v:?}"),
+        }
+    }
+
+    #[test]
+    fn a_window_whose_halves_disagree_is_extended() {
+        let (mut t, mut now) = started(MS(40), MS(16));
+        let mut n = 0;
+        let verdict = loop {
+            n += 1;
+            // 10 ms frames for the warm-up and the first half, then 20 ms: the halves disagree until the longest window.
+            now += if n <= LOCAL_WARM as usize + LOCAL_WINDOW / 2 { MS(10) } else { MS(20) };
+            if let Some(v) = t.local(KEY, now, true, None, false) {
+                break v;
+            }
+            assert!(n < 5000);
+        };
+        assert!(n > LOCAL_WARM as usize + LOCAL_WINDOW + 1, "extended past the first window ({n})");
+        assert!(matches!(verdict, Verdict::Local { .. }));
+    }
+
+    #[test]
+    fn the_switch_reads_its_spellings() {
+        for (v, want) in [("on", Some(true)), ("1", Some(true)), ("true", Some(true)), ("off", Some(false)), ("0", Some(false)), ("false", Some(false))] {
+            assert_eq!(parse_switch(Some(v)), want, "{v}");
+        }
+        assert_eq!(parse_switch(Some("maybe")), None);
+        assert_eq!(parse_switch(None), None);
     }
 
     #[test]
@@ -311,5 +548,12 @@ mod tests {
         assert!(decide(MS(36), MS(13)));
         assert!(!decide(MS(20), MS(19)));
         assert!(decide(MS(20), MS(18)));
+    }
+
+    #[test]
+    fn the_trimmed_mean_leaves_out_the_tails() {
+        let mut v: Vec<Duration> = (0..10).map(|_| MS(10)).chain([MS(100)]).collect();
+        assert_eq!(trimmed_mean(&mut v), MS(10));
+        assert_eq!(trimmed_mean(&mut []), Duration::ZERO);
     }
 }
