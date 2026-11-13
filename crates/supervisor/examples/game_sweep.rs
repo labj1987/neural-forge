@@ -184,8 +184,8 @@ impl Run {
             edits,
             env,
         };
-        if run.record_after + RECORD_SECONDS > run.seconds {
-            return Err(format!("record_after + {RECORD_SECONDS} s of recording must fit in seconds ({})", run.seconds));
+        if run.record_after + record_seconds() > run.seconds {
+            return Err(format!("record_after + {} s of recording must fit in seconds ({})", record_seconds(), run.seconds));
         }
         if run.edits.is_empty() != run.edit_file.is_none() || run.edit_file.is_some() != run.edit_kind.is_some() {
             return Err("edit_file, edit_kind and edits go together".into());
@@ -815,6 +815,15 @@ struct Options {
 
 /// How long each run is recorded once its placement was reached, and how long after reaching it.
 const RECORD_SECONDS: u64 = 10;
+
+/// How long each run is recorded: [`RECORD_SECONDS`], or `NF_SWEEP_RECORD_SECONDS` (10 to 60) for a comparison of two
+/// runs that needs the same seconds of a benchmark in both recordings.
+fn record_seconds() -> u64 {
+    static SECONDS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("NF_SWEEP_RECORD_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| (10..=60).contains(n)).unwrap_or(RECORD_SECONDS)
+    });
+    *SECONDS
+}
 const RECORD_AFTER: u64 = 10;
 
 const USAGE: &str =
@@ -1188,7 +1197,7 @@ fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bo
         }
         if recording.is_none() && reached.is_some_and(|r| r.elapsed() >= Duration::from_secs(p.run.record_after)) {
             recording = Some(record(o, p));
-            window = Some((secs, secs + RECORD_SECONDS));
+            window = Some((secs, secs + record_seconds()));
         }
         if reached.is_some_and(|r| r.elapsed() >= Duration::from_secs(p.run.seconds)) {
             break;
@@ -1245,7 +1254,7 @@ impl Recorder {
     fn start(o: &Options, cpu: bool) -> Result<Option<Recorder>, String> {
         let Some(vw) = o.vw.clone() else { return Ok(None) };
         let r = Recorder { vw, dir: recorder_dir(o) };
-        let secs = (RECORD_SECONDS + 2).to_string();
+        let secs = (record_seconds() + 2).to_string();
         match r.vw(&["replay", "start", &secs]).env("VW_ENCODER", if cpu { "cpu" } else { "gpu" }).status() {
             Ok(s) if s.success() => Ok(Some(r)),
             Ok(s) => Err(format!("the recorder did not start ({s}; see {})", r.dir.join("replay.log").display())),
@@ -1281,7 +1290,7 @@ fn record(o: &Options, p: &Prepared) -> Option<std::thread::JoinHandle<()>> {
     let label = p.run.label.clone();
     Some(std::thread::spawn(move || {
         let _ = std::fs::remove_file(&out);
-        nap(Duration::from_secs(RECORD_SECONDS));
+        nap(Duration::from_secs(record_seconds()));
         // The recorder keeps more than it was asked for (up to twice): the last RECORD_SECONDS of what it saved, cut
         // at a keyframe without re-encoding, is the recording.
         let full = out.with_extension("full.mp4");
@@ -1300,7 +1309,7 @@ fn record(o: &Options, p: &Prepared) -> Option<std::thread::JoinHandle<()>> {
                 return Ok(s);
             }
             let mut cut = Command::new("ffmpeg");
-            cut.args(["-nostdin", "-v", "error", "-y", "-sseof"]).arg(format!("-{RECORD_SECONDS}")).arg("-i").arg(&full).args(["-c", "copy"]).arg(&out);
+            cut.args(["-nostdin", "-v", "error", "-y", "-sseof"]).arg(format!("-{}", record_seconds())).arg("-i").arg(&full).args(["-c", "copy"]).arg(&out);
             quiet(&mut cut);
             let cut = cut.status();
             // The whole buffer stays when the cut fails, to be looked at.
@@ -1310,7 +1319,7 @@ fn record(o: &Options, p: &Prepared) -> Option<std::thread::JoinHandle<()>> {
             cut
         });
         match saved {
-            Ok(s) if s.success() && out.is_file() => println!("  {label}: recorded {RECORD_SECONDS} s ({})", out.display()),
+            Ok(s) if s.success() && out.is_file() => println!("  {label}: recorded {} s ({})", record_seconds(), out.display()),
             Ok(s) => println!("  {label}: the recording failed ({s}; see {} and {})", log.display(), full.display()),
             Err(e) => println!("  {label}: the recording failed: {e}"),
         }
