@@ -3096,13 +3096,17 @@ impl NativePass {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
         let Some(m) = &self.more else { return Ok(()) };
-        let begin = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // `Y` runs before every pass from 3 on: in one submit more than once (the runner's), or submitted again while its
+        // earlier submit is pending (the split hold's). It records the same copy each time, so it is a buffer for
+        // simultaneous use (VUID-vkQueueSubmit-pCommandBuffers-00071); `X` and `R` run once a frame.
+        let once = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let again = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE);
         let fresh = m.fresh.clone();
         // SAFETY: forwarded; every handle is live.
         unsafe {
             for (i, &cmd) in m.copies.iter().enumerate() {
                 device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-                device.begin_command_buffer(cmd, &begin)?;
+                device.begin_command_buffer(cmd, if i == 1 { &again } else { &once })?;
                 self.record_copy(device, cmd, i, encoded, region, count, feedback, &fresh, i == 0 && m.timer.is_some(), i == 2 && m.timer.is_some());
                 device.end_command_buffer(cmd)?;
             }
@@ -5425,8 +5429,9 @@ unsafe fn native_hold(
         result.miss = Some("recording the capture failed");
         return result;
     }
-    // The copies between the passes, on a network frame with more than one.
-    if more {
+    // The copies between the passes, on a network frame with more than one (offloaded: the other device's runner records
+    // its own, `NativePass::record_later`).
+    if more && !offloaded {
         let pass = res.hdr.as_ref().expect("built above");
         // SAFETY: built above and not pending (the hold waited for the previous one's fence, which
         // comes after them); the encoded image is in GENERAL.
@@ -7168,8 +7173,10 @@ mod tests {
             };
             let h: Vec<f32> =
                 (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, 0), residual(x, y, 1, 0), residual(x, y, 2, 0), 10.0])).collect();
-            // One frame of `count` passes on a pass of its own, the split hold's way or the runner's: its answer.
-            let run = |count: usize, feedback: f32, runner: bool| -> Vec<u16> {
+            // A sequence of network frames (`count` passes at `feedback` each, with history from the second on) on a pass
+            // of its own, the split hold's way (each buffer in its own submit, as `run_native_hold` submits them) or the
+            // runner's (one submit, `record_later`'s order): each frame's answer.
+            let run = |frames: &[(usize, f32)], runner: bool| -> Vec<Vec<u16>> {
                 let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
                 std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
                 fx.one_shot(|cmd| {
@@ -7194,55 +7201,74 @@ mod tests {
                 });
                 std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
                 let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
-                assert!(pass.ensure_more(device, instance, physical, family, count), "the later passes build");
-                assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
-                let mut passes = Passes::one(Conditioning::default());
-                passes.count = count;
-                passes.feedback = feedback;
-                passes.each[1].intensity = 0.5;
-                passes.each[2].intensity = 0.75;
-                if !runner {
-                    pass.record_copies(device, encoded.image, encoded.view, region, count, feedback).unwrap();
-                }
                 fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
-                let (cmds, later) = pass.frame_passes(&built, false, None, [1.0, 1.0], &passes);
-                assert_eq!(later.len(), count - 1);
-                let order: Vec<vk::CommandBuffer> = if runner {
-                    let sequence = pass.record_later(device, encoded.image, encoded.view, region, &passes, &later).unwrap();
-                    cmds.into_iter().flatten().chain(sequence).collect()
-                } else {
-                    // The split hold's order, written out: `X`, pass 2, then `Y` before each further pass, `R`.
-                    let copies = pass.more.as_ref().unwrap().copies;
-                    let mut order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().collect();
-                    for (k, &l) in later.iter().enumerate() {
-                        order.push(if k == 0 { copies[0] } else { copies[1] });
-                        order.push(l);
+                let mut answers = Vec::new();
+                for (n, &(count, feedback)) in frames.iter().enumerate() {
+                    assert!(pass.ensure_more(device, instance, physical, family, count), "the later passes build");
+                    assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
+                    let mut passes = Passes::one(Conditioning::default());
+                    passes.count = count;
+                    passes.feedback = feedback;
+                    for (k, each) in passes.each.iter_mut().enumerate().take(count).skip(1) {
+                        each.intensity = 1.0 - 0.05 * k as f32;
                     }
-                    order.push(copies[2]);
-                    order
-                };
-                device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&order)], vk::Fence::null()).unwrap();
-                device.queue_wait_idle(gpu.4).unwrap();
-                for cmd in order {
-                    pass.submitted(cmd);
+                    if !runner {
+                        pass.record_copies(device, encoded.image, encoded.view, region, count, feedback).unwrap();
+                    }
+                    let (cmds, later) = pass.frame_passes(&built, n > 0, None, [1.0, 1.0], &passes);
+                    assert_eq!(later.len(), count - 1);
+                    let first: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().collect();
+                    let order: Vec<vk::CommandBuffer> = if runner {
+                        let sequence = pass.record_later(device, encoded.image, encoded.view, region, &passes, &later).unwrap();
+                        let all: Vec<vk::CommandBuffer> = first.iter().copied().chain(sequence).collect();
+                        device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&all)], vk::Fence::null()).unwrap();
+                        all
+                    } else {
+                        // The split hold's order, written out: `X`, pass 2, then `Y` before each further pass, `R`; each
+                        // buffer submitted on its own, `Y` again while its earlier submit may still be pending.
+                        let copies = pass.more.as_ref().unwrap().copies;
+                        let mut order = first.clone();
+                        for (k, &l) in later.iter().enumerate() {
+                            order.push(if k == 0 { copies[0] } else { copies[1] });
+                            order.push(l);
+                        }
+                        order.push(copies[2]);
+                        for &cmd in &order {
+                            device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
+                        }
+                        order
+                    };
+                    device.queue_wait_idle(gpu.4).unwrap();
+                    for cmd in order {
+                        pass.submitted(cmd);
+                    }
+                    pass.later_submitted(later.len());
+                    let m = pass.more.as_ref().unwrap();
+                    assert!(m.fresh.iter().take(count - 1).all(|f| !f), "frame {n}: the later passes' histories are out of UNDEFINED");
+                    let answer = pass.answer();
+                    fx.one_shot(|cmd| {
+                        device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }])
+                    });
+                    answers.push(std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).to_vec());
                 }
-                pass.later_submitted(later.len());
-                let answer = pass.answer();
-                fx.one_shot(|cmd| {
-                    device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }])
-                });
-                let got = std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).to_vec();
                 pass.destroy(device);
                 encoded.destroy(device);
-                got
+                answers
             };
-            let first = run(1, 1.0, true);
-            for (count, feedback) in [(2, 1.0), (3, 1.0), (2, 0.5), (3, 0.5)] {
-                let split = run(count, feedback, false);
-                let runner = run(count, feedback, true);
+            let first = run(&[(1, 1.0)], true).remove(0);
+            for (count, feedback) in [(2, 1.0), (3, 1.0), (2, 0.5), (3, 0.5), (4, 1.0), (4, 0.5), (neural_forge_protocol::MAX_PASSES, 1.0)] {
+                let split = run(&[(count, feedback)], false);
+                let runner = run(&[(count, feedback)], true);
                 assert_eq!(runner, split, "{count} passes at feedback {feedback}: the runner's answer is the split hold's");
-                assert_ne!(runner, first, "{count} passes at feedback {feedback}: the later passes changed the answer");
+                assert_ne!(runner[0], first, "{count} passes at feedback {feedback}: the later passes changed the answer");
             }
+            // Frames in a row with the pass count changing (2, 3, 2): each later pass's history is its own, read from
+            // the second frame on, and pass 3's comes out of UNDEFINED when it first runs.
+            let frames = [(2, 1.0), (3, 0.5), (2, 1.0)];
+            let split = run(&frames, false);
+            let runner = run(&frames, true);
+            assert_eq!(runner, split, "2, 3, 2 passes: the runner's answers are the split hold's, frame by frame");
+            assert_ne!(runner[0], runner[2], "the third frame reads the histories the first two left");
             for b in [&exposure, &features, &head, &staging] {
                 b.destroy(device);
             }

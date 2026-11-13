@@ -1981,7 +1981,8 @@ frame and before frame generation, where the finished-frame placement runs the n
 As before DLSS, `same` saves nothing (both devices share the GPU, and the second device's network takes twice the
 time beside the game); the numbers show the path works and what it adds. The picture: fine detail over the views
 two 35 s recordings share (143 pairs, the method of the section above), offloaded over local a median 0.964, inside
-what two runs of one build differ by. Frames looked at where the camera moves past pillars, railings and walking
+what two runs of one build differ by. With 3 passes (one comparison, Cyberpunk 2077 with Ray Reconstruction, 120 pairs)
+it is a median 0.919, against 0.964 with one pass. Frames looked at where the camera moves past pillars, railings and walking
 people: no edit trailing behind an edge. Not measured: two different GPUs, 3840x2160 (the 12 GB card cannot hold a
 second network at that size beside path tracing), a still scene.
 
