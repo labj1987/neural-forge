@@ -290,6 +290,14 @@ fn native_line_due(status: &str, last: &str, channel: &str, offload_active: bool
     !offload_active && (status != last || (!status.is_empty() && channel != status))
 }
 
+/// The offload's Status line a hold writes (`line`, [`offload::status_line`]): while the hold before DLSS sends its
+/// frames to the other GPU (`serving_pre`, with the offload `active`) and the channel says something else. The
+/// present's writer ([`Session::ensure_post_server`]) does not run while frames are held before the upscaler, so
+/// without this the channel kept the native line a hold wrote before the offload started.
+fn hold_offload_line<'a>(line: Option<&'a str>, active: bool, serving_pre: bool, channel: &str) -> Option<&'a str> {
+    line.filter(|l| active && serving_pre && *l != channel)
+}
+
 impl SrLaunches {
     /// The run after a launch at `now`.
     fn after(run: Option<Self>, now: Instant) -> Self {
@@ -4645,6 +4653,9 @@ pub(crate) struct HoldResult {
     pub timing: HoldTiming,
     /// The native backend ran this hold (`evaluated` means the network ran).
     pub native: bool,
+    /// The native backend: a hold after DLSS's output (Ray Reconstruction) while the model on a second GPU is asked
+    /// for: the network runs on the game's GPU here, the second GPU takes only the holds before DLSS.
+    pub after_dlss_on_game_gpu: bool,
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
     /// network, composite), read when its fence was found signalled here.
     pub network_gpu_ms: Option<f32>,
@@ -6774,6 +6785,9 @@ impl Session {
             // Against what the channel holds too: the offload's line shares it, and while the offload serves the line is
             // its own (the hold's "native network running" would overwrite it on every frame).
             let offload_active = matches!(offload::state(), offload::State::Active(_));
+            if let Some(line) = hold_offload_line(offload::status_line().as_deref(), offload_active, offload_pre::serving_pre(), &shm.layer_reason()) {
+                shm.set_layer_reason(line);
+            }
             if native_line_due(&status, &self.native_status, &shm.layer_reason(), offload_active) {
                 shm.set_layer_reason(&status);
                 self.native_status = status;
@@ -12140,7 +12154,21 @@ mod tests {
 
 #[cfg(test)]
 mod native_line_tests {
-    use super::native_line_due;
+    use super::{hold_offload_line, native_line_due};
+
+    #[test]
+    fn a_hold_writes_the_offloads_line_while_it_sends_its_frames() {
+        let offload = "second GPU: the model runs on X before DLSS, its edit applied one frame later";
+        // The native line a hold wrote before the offload started is replaced (the present's writer is off while held).
+        assert_eq!(hold_offload_line(Some(offload), true, true, "native network running"), Some(offload));
+        assert_eq!(hold_offload_line(Some(offload), true, true, ""), Some(offload));
+        // Already there: nothing written.
+        assert_eq!(hold_offload_line(Some(offload), true, true, offload), None);
+        // Not the hold before DLSS serving (the finished frame, after DLSS, off, given up): not the hold's to write.
+        assert_eq!(hold_offload_line(Some(offload), true, false, "native network running"), None);
+        assert_eq!(hold_offload_line(Some(offload), false, true, "native network running"), None);
+        assert_eq!(hold_offload_line(None, false, false, ""), None);
+    }
 
     #[test]
     fn the_offloads_line_is_not_overwritten_while_it_serves() {

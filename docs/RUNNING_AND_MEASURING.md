@@ -432,7 +432,7 @@ The `# live status` block:
 | `server_frames` | Requests the model server has answered. |
 | `server_upload_ms`, `server_eval_ms`, `server_readback_ms` | Its stage times for the last request. |
 | `server_busy_ms` | Its whole time for its last slot-0 request. |
-| `layer_reason` | The native network's status line ("native network running", or why not). |
+| `layer_reason` | The Status tab's line: the native network's ("native network running", or why not), or the second GPU's ("second GPU: ...") with `NEURAL_FORGE_OFFLOAD_GPU`. |
 | `native_running` | 1 while the layer runs the network before the upscaler. |
 | `layer_frames`, `layer_ms` | Frames the layer captured, and its last per-frame time. |
 | `layer_capture_gpu_ms`, `layer_compose_gpu_ms` | The layer's own GPU time from timestamps (after the upscaler). |

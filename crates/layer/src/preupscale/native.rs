@@ -4177,15 +4177,24 @@ fn fake_chain_timeout(frames: u64) -> Option<(u32, String)> {
 /// What the Status tab says about the native backend after a hold: running, or why not.
 pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     if result.evaluated {
-        return match loader.guard_note() {
-            Some(why) => format!("native network running ({why})"),
-            None => "native network running".to_string(),
-        };
+        return running_line(loader.guard_note().as_deref(), result.after_dlss_on_game_gpu);
     }
     match (loader.failed(), result.miss) {
         (Some(why), _) => format!("native network not running: {why}"),
         (None, Some(miss)) => format!("native network: {miss}"),
         (None, None) => String::new(),
+    }
+}
+
+/// The Status line of a hold whose network ran: `guard`, the VRAM guard's note; `after_dlss_on_game_gpu`, a hold after
+/// DLSS's output while the model on a second GPU is asked for, which says where the model runs and what the second
+/// GPU covers (the native line alone read as if the second GPU were not asked for).
+fn running_line(guard: Option<&str>, after_dlss_on_game_gpu: bool) -> String {
+    let guard = guard.map(|why| format!(" ({why})")).unwrap_or_default();
+    if after_dlss_on_game_gpu {
+        format!("second GPU: not used here: Ray Reconstruction is on, so the model runs on the game's GPU after DLSS{guard}; the second GPU takes only the model before DLSS")
+    } else {
+        format!("native network running{guard}")
     }
 }
 
@@ -4461,6 +4470,7 @@ unsafe fn native_hold(
     // carries the edit), and not for a cache dump (which needs the network's answer to its own frame).
     let before_dlss = ctx.as_ref().is_none_or(|c| c.point.hold.stage != super::placement::Stage::Upscaled);
     if !before_dlss && super::offload_pre::wanted() {
+        result.after_dlss_on_game_gpu = true;
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
             crate::log!("[offload] NEURAL_FORGE_OFFLOAD_GPU: the hold after DLSS's output (the placement with Ray Reconstruction) runs the model on the game's GPU; the other GPU takes the hold before DLSS and the finished frame");
@@ -5514,6 +5524,15 @@ unsafe fn native_hold(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_running_line_says_where_the_model_runs_with_ray_reconstruction_and_a_second_gpu() {
+        assert_eq!(super::running_line(None, false), "native network running");
+        assert_eq!(super::running_line(Some("lower"), false), "native network running (lower)");
+        let rr = super::running_line(None, true);
+        assert!(rr.starts_with("second GPU: "), "doctor reports it with the second GPU's lines: {rr}");
+        assert!(rr.contains("the game's GPU after DLSS") && rr.contains("only the model before DLSS"), "{rr}");
+        assert!(super::running_line(Some("lower"), true).contains("after DLSS (lower);"));
+    }
     use super::*;
 
     /// Resources built untimed (inside DLSS's buffer the hold times its slot) make no GPU timer at all: a timer
