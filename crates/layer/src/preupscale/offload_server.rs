@@ -442,6 +442,10 @@ impl Runner for PreRunner {
         }
     }
 
+    fn stuck(&self) -> bool {
+        self.leaked
+    }
+
     fn gave_up(&mut self) {
         // The process's one network goes back to the game's device: it is closed here (the loader's own drop does
         // it; retiring alone leaves it open, and the game's loader then finds it open elsewhere for good). Not after

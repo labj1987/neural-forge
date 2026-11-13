@@ -467,14 +467,15 @@ The model goes back to the game's GPU for the rest of the session, and the log s
 - cannot run the network, or its device cannot be made;
 - cannot build or keep the network (it has not run there for 30 seconds while frames came, for example paused by the
   VRAM guard);
-- before DLSS: gets 30 frames in a row without the game's motion vectors or jitter (the edit could not be carried to
-  the next frame);
+- before DLSS: gets 30 frames in a row, over at least a second, without the game's motion vectors or jitter (the
+  edit could not be carried to the next frame);
 - takes more than a second for a frame (after the first frames of a build);
 - is far too slow for the game: more than 30 of its last 120 frames came back later than both three of the game's frame
   intervals and 100 ms, or 5 frames in a row got no answer in time (a quarter of a second on the finished frame, a
   tenth before DLSS);
 - does not finish a frame (or its device is lost): the model goes back only once that frame is done; if it never is,
-  the model stays off until the game restarts (the Status tab says the second GPU stalled).
+  the model stays off until the game restarts (the Status tab says the second GPU stalled). Before DLSS the
+  model is off from that frame on for the rest of the session, and the log says so.
 
 Keep the display connected to the game's GPU. With the display on the second GPU, every frame the game presents is
 also copied across to the second GPU for the screen (PRIME), on top of the model's own traffic there, and the

@@ -4681,6 +4681,13 @@ unsafe fn native_hold(
         return result;
     }
     // The offload's side of the hold: the exchange with the other device and its worker, made on the first hold.
+    if res.offpre.as_ref().is_some_and(super::offload_pre::HoldSide::released) && !others_outstanding {
+        // Its worker was ended for another set of hold resources while these had no hold: built again below.
+        if let Some(side) = res.offpre.take() {
+            // SAFETY: nothing recorded with these resources may still run.
+            unsafe { side.destroy(device) };
+        }
+    }
     if offloaded && res.offpre.is_none() {
         if others_outstanding {
             // Not while holds recorded with these resources may still run (the cache's sets are written for it).
@@ -4688,9 +4695,9 @@ unsafe fn native_hold(
             result.miss = Some(WAITING);
             return result;
         }
-        if super::offload_pre::serving_device(device.handle()) {
+        if super::offload_pre::serving_device(device.handle()) && !super::offload_pre::release_idle(device.handle(), super::offload_pre::IDLE_SIDE) {
             // Another set of hold resources of this device has the offload device (and with it the process's one
-            // network): these wait for it, and say so once.
+            // network) and holds with it: these wait until it has had no hold for a few seconds, and say so once.
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 crate::log!(
@@ -4717,9 +4724,10 @@ unsafe fn native_hold(
     // Given up meanwhile (the worker's rules): this hold still goes as an offloaded one, without an answer; the
     // next runs the network here.
     let offloaded = offloaded && res.offpre.is_some();
-    if res.offpre.is_some() && !super::offload_pre::wanted() && !others_outstanding {
-        // Given up, and nothing recorded with these resources may still run (the split hold's work was waited for
-        // above): the offload's side goes (its worker ends and the other device's side is freed).
+    if !offloaded && res.offpre.is_some() && !super::offload_pre::wanted() && !others_outstanding {
+        // Given up for the process, this hold is not an offloaded one, and nothing recorded with these resources may
+        // still run (inside DLSS's buffer: none outstanding; the split hold's work was waited for above): the
+        // offload's side goes (its worker ends and the other device's side is freed).
         if let Some(side) = res.offpre.take() {
             // SAFETY: idle, as just said.
             unsafe { side.destroy(device) };
@@ -5422,7 +5430,8 @@ unsafe fn native_hold(
         }
     }
     if let (Some(side), Some(h), Some(q), Some(p)) = (res.offpre.as_mut().filter(|_| offloaded), cache_hold.as_ref(), push.as_ref(), off_plan.as_ref()) {
-        side.went_through(h, q, p, off_meta);
+        // Its parameters were queued before the capture's submit.
+        side.went_through(h, q, p, None);
     }
     if offloaded && !cached {
         if let Some(n) = res.native.as_mut() {

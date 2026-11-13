@@ -181,6 +181,17 @@ pub(crate) trait Runner: Send {
 
     /// The offload was given up: the runner lets go of what the game's GPU needs back (the network).
     fn gave_up(&mut self) {}
+
+    /// A frame never finished on the other GPU: nothing it uses can be freed or taken back.
+    fn stuck(&self) -> bool {
+        false
+    }
+}
+
+/// Whether sequence number `a` was given out after `b` (serial-number arithmetic: the numbers wrap, and two that
+/// are compared are never half the range apart).
+fn after(a: u32, b: u32) -> bool {
+    a != b && a.wrapping_sub(b) < u32::MAX / 2
 }
 
 /// Which frames went to the driver and which the worker is done with: where [`Exchange::at_submit`] waits.
@@ -201,7 +212,7 @@ struct Prog {
     /// The frame the worker finished last, and whether its answer is complete in IN.
     finished: Option<(u32, bool)>,
     /// The newest frame a submit gave up waiting for: its answer, and that of every frame sent before it, is never
-    /// taken (sequence numbers only grow; the wrap after four thousand million frames costs one answer).
+    /// taken. Sequence numbers are compared as serial numbers ([`after`]), so their wrap changes nothing.
     abandoned: Option<u32>,
     /// The worker runs no frames any more.
     stopped: bool,
@@ -229,7 +240,7 @@ impl Progress {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                p.abandoned = Some(p.abandoned.map_or(seq, |a| a.max(seq)));
+                p.abandoned = Some(p.abandoned.map_or(seq, |a| if after(seq, a) { seq } else { a }));
                 return false;
             }
             p = self.changed.wait_timeout(p, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
@@ -253,7 +264,7 @@ impl Progress {
     /// abandoned it: the answer is not taken.
     fn finish(&self, seq: u32, ok: bool) -> bool {
         let mut p = self.lock();
-        let kept = p.abandoned.is_none_or(|a| seq > a);
+        let kept = p.abandoned.is_none_or(|a| after(seq, a));
         p.finished = Some((seq, ok && kept));
         self.changed.notify_all();
         kept
@@ -702,11 +713,41 @@ pub(crate) struct Worker {
     /// Why the hold's side wants the offload given up ([`Self::give_up`]), until the worker took it.
     asked: Arc<Mutex<Option<String>>>,
     thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// When its side last planned a hold ([`now_ms`]).
+    touched: Arc<AtomicU64>,
 }
 
 /// The running workers by the game's device, so its destruction can end them (and with them free the other
 /// device's side) before the offload device goes ([`stop_for`]).
-type Running = (vk::Device, Arc<AtomicBool>, Arc<Mutex<Option<std::thread::JoinHandle<()>>>>);
+type Running = (vk::Device, Arc<AtomicBool>, Arc<Mutex<Option<std::thread::JoinHandle<()>>>>, Arc<AtomicU64>);
+
+/// A hold's side that has had no hold for this long gives the offload device up to another set of hold resources
+/// of the same game that waits for it ([`release_idle`]).
+pub(crate) const IDLE_SIDE: Duration = Duration::from_secs(3);
+
+fn now_ms() -> u64 {
+    static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    START.elapsed().as_millis() as u64 + 1
+}
+
+/// Ends the workers of the game's device `game` whose side had no hold for `idle` (their runners free the other
+/// device's side and give the device back): another set of hold resources can then take the offload. The sides they
+/// belonged to find their worker ended ([`Worker::ended`]) and are built again when they next hold. Whether any ended.
+pub(crate) fn release_idle(game: vk::Device, idle: Duration) -> bool {
+    let now = now_ms();
+    let ours: Vec<Running> = {
+        let mut all = WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (ours, rest) = std::mem::take(&mut *all)
+            .into_iter()
+            .partition(|(d, _, _, touched)| *d == game && now.saturating_sub(touched.load(Ordering::Relaxed)) >= idle.as_millis() as u64);
+        *all = rest;
+        ours
+    };
+    for (_, quit, thread, _) in &ours {
+        join(quit, thread);
+    }
+    !ours.is_empty()
+}
 static WORKERS: Mutex<Vec<Running>> = Mutex::new(Vec::new());
 
 fn join(quit: &AtomicBool, thread: &Mutex<Option<std::thread::JoinHandle<()>>>) {
@@ -722,18 +763,19 @@ fn join(quit: &AtomicBool, thread: &Mutex<Option<std::thread::JoinHandle<()>>>) 
 pub(crate) fn stop_for(game: vk::Device) {
     let ours: Vec<Running> = {
         let mut all = WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (ours, rest) = std::mem::take(&mut *all).into_iter().partition(|(d, _, _)| *d == game);
+        let (ours, rest) = std::mem::take(&mut *all).into_iter().partition(|(d, _, _, _)| *d == game);
         *all = rest;
         ours
     };
-    for (_, quit, thread) in ours {
+    for (_, quit, thread, _) in ours {
         join(&quit, &thread);
     }
 }
 
 /// What the worker tells its owner when it stops serving (it keeps finishing the frames sent, without an answer):
-/// why the offload is given up.
-pub(crate) type GiveUp = Box<dyn Fn(String) + Send>;
+/// why the offload is given up, and whether a frame on the other GPU never finished ([`Runner::stuck`]: the network
+/// cannot be taken back, so the model is off from here on).
+pub(crate) type GiveUp = Box<dyn Fn(String, bool) + Send>;
 
 impl Worker {
     /// Starts the worker on `link` with `runner`. `late` judges the answers against the game's frame
@@ -749,13 +791,24 @@ impl Worker {
         let thread =
             std::thread::Builder::new().name("nf-offload-pre".into()).spawn(move || serve(&link, runner, late, dims, &q, &m, &a, &c, &give_up)).ok()?;
         let thread = Arc::new(Mutex::new(Some(thread)));
-        WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((game, quit.clone(), thread.clone()));
-        Some(Self { quit, mode, counters, asked, thread })
+        let touched = Arc::new(AtomicU64::new(now_ms()));
+        WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((game, quit.clone(), thread.clone(), touched.clone()));
+        Some(Self { quit, mode, counters, asked, thread, touched })
     }
 
     /// Whether frames are run on the other GPU (else every send is finished at once, without an answer).
     pub(crate) fn serving(&self) -> bool {
         self.mode.load(Ordering::Acquire) == SERVING
+    }
+
+    /// Its side plans a hold now.
+    pub(crate) fn touch(&self) {
+        self.touched.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// The worker's thread has ended (stopped, or released for another set of hold resources, [`release_idle`]).
+    pub(crate) fn ended(&self) -> bool {
+        self.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none()
     }
 
     /// Gives the offload up from the hold's side (`why`): the worker stops running frames and tells its owner, as
@@ -768,7 +821,7 @@ impl Worker {
     /// the exchange take no answer.
     pub(crate) fn stop(&mut self) {
         join(&self.quit, &self.thread);
-        WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(_, q, _)| !Arc::ptr_eq(q, &self.quit));
+        WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(_, q, _, _)| !Arc::ptr_eq(q, &self.quit));
     }
 }
 
@@ -800,9 +853,9 @@ fn serve(
     give_up: &GiveUp,
 ) {
     let device = &link.device;
-    let stop_serving = |why: String| {
+    let stop_serving = |why: String, stuck: bool| {
         if mode.swap(PASSING, Ordering::AcqRel) == SERVING {
-            give_up(why);
+            give_up(why, stuck);
         }
     };
     let mut idle = 0u32;
@@ -811,7 +864,7 @@ fn serve(
     while !quit.load(Ordering::Acquire) {
         // Asked from the hold's side to give up ([`Worker::give_up`]).
         if let Some(why) = asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
-            stop_serving(why);
+            stop_serving(why, false);
         }
         // Given up: the runner lets go of what the game's GPU needs back, once.
         if !retired && mode.load(Ordering::Acquire) != SERVING {
@@ -828,7 +881,7 @@ fn serve(
             }
             Err(_) => {
                 // The game's device is lost: none of its holds run any more.
-                stop_serving("the game's device was lost".into());
+                stop_serving("the game's device was lost".into(), false);
                 break;
             }
         }
@@ -847,7 +900,7 @@ fn serve(
             match unsafe { runner.run(seq, link.out, link.inn, &link.layout) } {
                 Ran::Answered => ok = true,
                 Ran::Skipped => {}
-                Ran::Failed(why) => stop_serving(why),
+                Ran::Failed(why) => stop_serving(why, runner.stuck()),
             }
         }
         // Another send ran while this frame did (a hold whose submit did not settle this one: two holds in one
@@ -872,7 +925,7 @@ fn serve(
             // A frame the network was not ready for is no late answer.
             if mode.load(Ordering::Acquire) == SERVING && ok {
                 if let Some(why) = rule.note(answer, interval, dims) {
-                    stop_serving(why);
+                    stop_serving(why, false);
                 }
             }
         }
@@ -950,7 +1003,7 @@ fn imports(device: vk::Device) -> bool {
 
 /// Whether a worker serves the game's device `game` already (another set of hold resources has the offload device).
 pub(crate) fn serving_device(game: vk::Device) -> bool {
-    WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(d, _, _)| *d == game)
+    WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(d, _, _, _)| *d == game)
 }
 
 /// Whether the before-DLSS placement is asked onto another GPU and not given up (`NEURAL_FORGE_OFFLOAD_GPU`).
@@ -983,18 +1036,38 @@ pub(crate) struct HoldSide {
     holds: u64,
     /// The hold planned last has not gone through yet: if it never does, what it planned is dropped at the next plan.
     pending: bool,
-    /// Holds in a row whose frame could not be sent (no motion vectors, no jitter, no chained cache).
-    unsendable: u32,
+    /// Holds in a row whose frame could not be sent (no motion vectors, no jitter, no chained cache), and when the
+    /// row began.
+    unsendable: (u32, Option<Instant>),
 }
 
-/// This many holds in a row that cannot send their frame give the offload up: the game's frames do not have what
-/// the next frame needs to carry the edit, and the model would not run at all. One such hold now and then does not.
+/// This many holds in a row that cannot send their frame, over at least [`UNSENDABLE_FOR`], give the offload up: the
+/// game's frames do not have what the next frame needs to carry the edit, and the model would not run at all. A
+/// few such holds (a cut, a menu's first frames) do not.
 pub(crate) const UNSENDABLE_HOLDS: u32 = 30;
+pub(crate) const UNSENDABLE_FOR: Duration = Duration::from_secs(1);
 
-/// Whether `streak` holds in a row that could not send give the offload up, after one more that `can` or cannot.
-pub(crate) fn unsendable_gives_up(streak: &mut u32, can: bool) -> bool {
-    *streak = if can { 0 } else { streak.saturating_add(1) };
-    *streak == UNSENDABLE_HOLDS
+/// Whether the row of holds that could not send (`streak`: their number and when the row began) gives the offload
+/// up now, after one more hold at `now` that `can` or cannot. Once per row.
+pub(crate) fn unsendable_gives_up(streak: &mut (u32, Option<Instant>), can: bool, now: Instant) -> bool {
+    if can {
+        *streak = (0, None);
+        return false;
+    }
+    let Some(began) = streak.1 else {
+        *streak = (1, Some(now));
+        return false;
+    };
+    if streak.0 == u32::MAX {
+        // Given up for this row already.
+        return false;
+    }
+    streak.0 += 1;
+    if streak.0 >= UNSENDABLE_HOLDS && now.saturating_duration_since(began) >= UNSENDABLE_FOR {
+        streak.0 = u32::MAX;
+        return true;
+    }
+    false
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1037,8 +1110,16 @@ impl HoldSide {
         };
         // Not judged late in the `same` test, where the other device shares the game's GPU (as the finished frame).
         let late = (super::offload::Choice::current() != super::offload::Choice::Same).then(super::offload::LateRule::default);
-        let give_up: GiveUp = Box::new(|why| {
+        let stalled = name.clone();
+        let give_up: GiveUp = Box::new(move |why, stuck| {
             SERVING_PRE.store(false, Ordering::Release);
+            if stuck {
+                // The network is still in use by that frame: it cannot go back to the game's GPU.
+                crate::log!("[offload] {why}: the network cannot be taken back while that frame may run; the model is off for the rest of the session");
+                crate::logging::flush();
+                super::offload::note_state(super::offload::State::Stalled(stalled.clone()));
+                return;
+            }
             crate::log!("[offload] back to the game's GPU: {why}");
             crate::logging::flush();
             super::offload::note_state(super::offload::State::FellBack(why));
@@ -1068,12 +1149,17 @@ impl HoldSide {
             }
         );
         crate::logging::flush();
-        Ok(Self { exchange, cadence: Cadence::default(), worker, metas, snapshot, sent: None, resources, holds: 0, pending: false, unsendable: 0 })
+        Ok(Self { exchange, cadence: Cadence::default(), worker, metas, snapshot, sent: None, resources, holds: 0, pending: false, unsendable: (0, None) })
     }
 
     /// Whether the other GPU runs the frames (else the offload is given up, and the holds run the network here).
     pub(crate) fn serving(&self) -> bool {
-        self.worker.serving()
+        self.worker.serving() && !self.worker.ended()
+    }
+
+    /// Its worker was ended for another set of hold resources ([`release_idle`]): the side is to be built again.
+    pub(crate) fn released(&self) -> bool {
+        self.worker.ended()
     }
 
     pub(crate) fn snapshot_view(&self) -> vk::ImageView {
@@ -1093,9 +1179,10 @@ impl HoldSide {
             self.dropped();
             self.pending = true;
         }
-        if self.serving() && unsendable_gives_up(&mut self.unsendable, send) {
+        self.worker.touch();
+        if self.serving() && unsendable_gives_up(&mut self.unsendable, send, Instant::now()) {
             self.worker.give_up(format!(
-                "{UNSENDABLE_HOLDS} frames in a row had no motion vectors, no jitter or no room for the edit cache: nothing can carry the other GPU's edit to the next frame"
+                "{UNSENDABLE_HOLDS} frames in a row and more than a second had no motion vectors, no jitter or no room for the edit cache: nothing can carry the other GPU's edit to the next frame"
             ));
         }
         let plan = self.cadence.hold(h.hold, send && self.serving());
@@ -1326,16 +1413,39 @@ mod tests {
     }
 
     #[test]
+    fn sequence_numbers_compare_across_their_wrap() {
+        assert!(after(2, 1) && !after(1, 2) && !after(5, 5));
+        assert!(after(1, u32::MAX) && !after(u32::MAX, 1));
+        // An abandoned frame from before the wrap does not keep the answers after it out.
+        let p = Progress::default();
+        p.queue(u32::MAX);
+        p.handed();
+        assert!(!p.settle(u32::MAX, Duration::from_millis(2)));
+        assert!(!p.finish(u32::MAX, true));
+        p.queue(1);
+        p.handed();
+        assert!(p.finish(1, true));
+        assert!(p.settle(1, Duration::from_secs(30)));
+    }
+
+    #[test]
     fn frames_that_cannot_be_sent_give_up_only_in_a_long_row() {
-        let mut streak = 0;
+        let mut streak = (0, None);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
         // One hold without vectors now and then does not.
         for n in 0..200 {
-            assert!(!unsendable_gives_up(&mut streak, n % 10 != 0));
+            assert!(!unsendable_gives_up(&mut streak, n % 10 != 0, at(n * 100)));
         }
-        // A row of them does, once.
-        let gave_up: Vec<bool> = (0..2 * UNSENDABLE_HOLDS).map(|_| unsendable_gives_up(&mut streak, false)).collect();
+        // Nor does a quick burst of them: 60 holds within half a second.
+        for n in 0..60 {
+            assert!(!unsendable_gives_up(&mut streak, false, at(30_000 + n * 8)));
+        }
+        assert!(!unsendable_gives_up(&mut streak, true, at(31_000)));
+        // A row of them over a second does, once.
+        let gave_up: Vec<bool> = (0..4 * u64::from(UNSENDABLE_HOLDS)).map(|n| unsendable_gives_up(&mut streak, false, at(40_000 + n * 20))).collect();
         assert_eq!(gave_up.iter().filter(|g| **g).count(), 1);
-        assert!(gave_up[UNSENDABLE_HOLDS as usize - 1]);
+        assert_eq!(gave_up.iter().position(|g| *g), Some(50), "30 holds are there after 0.6 s, the second is full at hold 51");
     }
 
     #[test]
@@ -1629,7 +1739,7 @@ mod tests {
         let abandoned = runner.abandoned_list();
         let gave_up = Arc::new(std::sync::Mutex::new(Vec::new()));
         let g = gave_up.clone();
-        let worker = Worker::start(link, Box::new(runner), None, (64, 64), Box::new(move |why| g.lock().unwrap().push(why)))?;
+        let worker = Worker::start(link, Box::new(runner), None, (64, 64), Box::new(move |why, _| g.lock().unwrap().push(why)))?;
         Some((game, worker, ran, gave_up, abandoned))
     }
 
@@ -1765,6 +1875,26 @@ mod tests {
         assert_eq!(*ran.lock().unwrap(), vec![1]);
         assert_eq!(*gave_up.lock().unwrap(), vec!["the test's frame failed".to_string()]);
         assert!(!worker.serving());
+        game.close(worker);
+    }
+
+    /// A side that had no hold for a while gives its worker up to another set of hold resources of the same device.
+    #[test]
+    fn an_idle_side_is_released_for_another() {
+        let Some((game, worker, _, _, _)) = rig(Vec::new(), None) else { return };
+        let device = game.dev.device.handle();
+        assert!(serving_device(device));
+        worker.touch();
+        assert!(!release_idle(device, Duration::from_secs(3600)), "it just held");
+        assert!(!worker.ended());
+        assert!(release_idle(device, Duration::ZERO));
+        assert!(worker.ended() && !serving_device(device));
+        // Its side's submits do not wait for it.
+        let mut cadence = Cadence::default();
+        game.run(&[game.record(cadence.hold(1, true), 801)]);
+        let t = Instant::now();
+        game.run(&[game.record(cadence.hold(2, false), 0)]);
+        assert!(t.elapsed() < ANSWER_BUDGET);
         game.close(worker);
     }
 
