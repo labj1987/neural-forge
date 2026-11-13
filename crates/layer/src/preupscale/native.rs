@@ -4875,6 +4875,7 @@ unsafe fn native_hold(
             unsafe {
                 late_bound = edit.bind_late(device, side.snapshot_view());
                 side.exchange.bind_gate(device, edit.stats_buffer());
+                side.exchange.bind_pack(device, native.acc.buffer);
             }
         }
         // A hold that records nothing (below) must not have taken the stored edit out of the plan.
@@ -4916,6 +4917,7 @@ unsafe fn native_hold(
         mvec_scale: target.mvec_scale,
         passes,
         depth: depth.is_some(),
+        motion_half: res.offpre.as_ref().is_some_and(|side| side.exchange.motion_half()),
         lut: lut.cloned(),
     });
     // The motion pass while the cache runs (its prep and the accumulated field the network reads), at

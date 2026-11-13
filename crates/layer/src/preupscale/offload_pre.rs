@@ -45,6 +45,22 @@ use ash::vk;
 use super::HostBuffer;
 
 const GATE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_offload_gate.spv");
+const PACK_SPV: &[u8] = include_bytes!("../../shaders/preupscale_offload_pack.spv");
+/// `preupscale_offload_pack.comp`'s local size and the texels a row of its dispatch covers.
+const PACK_LOCAL: u64 = 64;
+const PACK_ROW: u64 = 65536;
+/// The half a texel of the packed motion holds in both components where the field is not a number (the chain left
+/// the frame, or the hold had no vectors): the one pattern the pack ever writes that is not a number.
+#[cfg(test)]
+const HALF_NAN: u32 = 0x7e00_7e00;
+
+/// `NEURAL_FORGE_OFFLOAD_MOTION`: `float` sends the accumulated motion as it is (2 x f32 a texel, as 4.3.0 did);
+/// anything else, or unset, packs it to two halves a texel (`preupscale_offload_pack.comp`), half the bytes.
+pub(crate) fn motion_packed() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_MOTION").is_none_or(|v| !v.trim().eq_ignore_ascii_case("float")));
+    *ON
+}
 
 /// Each region's header, and the alignment of every section after it (a storage buffer's offset alignment is at
 /// most this on every driver the layer runs on).
@@ -100,8 +116,10 @@ impl Where {
 pub(crate) struct Sizes {
     /// The frame as the capture encoded it.
     pub frame: u64,
-    /// The accumulated motion the network's history reads.
+    /// The accumulated motion the network's history reads: 2 x f32 a texel, or packed to two halves.
     pub motion: u64,
+    /// The texels of the motion when it crosses packed (`preupscale_offload_pack.comp`); 0 when it crosses as floats.
+    pub packed_texels: u64,
     /// DLSS's depth as the capture copied it (the control mask's sky rule).
     pub depth: u64,
     /// The small buffers the frame shaders read (the exposure, the scene cut's word), one after another.
@@ -112,14 +130,15 @@ pub(crate) struct Sizes {
 
 impl Sizes {
     /// What a hold of `width` x `height` at `at` exchanges: the encode and the answer (RGBA16F at the padded
-    /// extent), the accumulated motion (2 x f32 a texel), the small state, and DLSS's depth before DLSS only (the
-    /// hold after DLSS's output has none at its size).
-    pub(crate) fn of(at: Where, width: u32, height: u32) -> Self {
+    /// extent), the accumulated motion (two halves a texel with `packed`, else 2 x f32), the small state, and DLSS's
+    /// depth before DLSS only (the hold after DLSS's output has none at its size).
+    pub(crate) fn of(at: Where, width: u32, height: u32, packed: bool) -> Self {
         let (pw, ph) = super::padded(width, height);
         let (texels, padded) = (u64::from(width) * u64::from(height), u64::from(pw) * u64::from(ph));
         Self {
             frame: padded * 8,
-            motion: texels * 8,
+            motion: texels * if packed { 4 } else { 8 },
+            packed_texels: if packed { texels } else { 0 },
             depth: if at == Where::Before { texels * 4 } else { 0 },
             side: super::hdr::HdrPass::EXPOSURE_BYTES + 16,
             answer: padded * 8,
@@ -388,6 +407,70 @@ pub(crate) struct Exchange {
     set: vk::DescriptorSet,
     /// The counters the gate's set points at.
     gated: vk::Buffer,
+    /// The motion's pack (`Sizes::packed_texels`).
+    pack: Option<Pack>,
+}
+
+/// The pack of the accumulated motion to halves before it is sent (`preupscale_offload_pack.comp`): its pipeline (over
+/// the gate's layout: two storage buffers and one pushed word), its set and the packed field.
+struct Pack {
+    pipeline: vk::Pipeline,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    packed: super::native::OwnBuffer,
+    texels: u64,
+    /// The field the set points at.
+    bound: vk::Buffer,
+}
+
+impl Pack {
+    /// # Safety
+    /// `device` is live; `layout` and `set_layout` are the gate's.
+    unsafe fn build(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+        layout: vk::PipelineLayout,
+        set_layout: vk::DescriptorSetLayout,
+        texels: u64,
+    ) -> Option<Self> {
+        // SAFETY: valid create infos; everything made is destroyed on a later failure.
+        unsafe {
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC;
+            let packed = super::native::OwnBuffer::new(device, instance, physical, texels * 4, usage)?;
+            let Some(pipeline) = super::hdr::compute_pipeline(device, layout, PACK_SPV) else {
+                packed.destroy(device);
+                return None;
+            };
+            let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
+            let pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).ok();
+            let set = pool.and_then(|pool| {
+                device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout])).ok()
+            });
+            match (pool, set) {
+                (Some(pool), Some(sets)) => Some(Self { pipeline, pool, set: sets[0], packed, texels, bound: vk::Buffer::null() }),
+                (pool, _) => {
+                    if let Some(pool) = pool {
+                        device.destroy_descriptor_pool(pool, None);
+                    }
+                    device.destroy_pipeline(pipeline, None);
+                    packed.destroy(device);
+                    None
+                }
+            }
+        }
+    }
+
+    /// # Safety
+    /// Nothing submitted may still use it.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: the contract.
+        unsafe {
+            device.destroy_descriptor_pool(self.pool, None);
+            device.destroy_pipeline(self.pipeline, None);
+            self.packed.destroy(device);
+        }
+    }
 }
 
 /// Page-aligned zeroed memory.
@@ -544,6 +627,17 @@ impl Exchange {
                 inn.destroy(device);
                 return None;
             };
+            let pack = if sizes.packed_texels > 0 { Pack::build(device, instance, physical, pipeline_layout, set_layout, sizes.packed_texels) } else { None };
+            if sizes.packed_texels > 0 && pack.is_none() {
+                device.destroy_descriptor_pool(pool, None);
+                device.destroy_pipeline(pipeline, None);
+                device.destroy_pipeline_layout(pipeline_layout, None);
+                device.destroy_descriptor_set_layout(set_layout, None);
+                device.destroy_event(sent, None);
+                out.destroy(device);
+                inn.destroy(device);
+                return None;
+            }
             Some(Self {
                 layout,
                 out,
@@ -558,6 +652,7 @@ impl Exchange {
                 pool,
                 set,
                 gated: vk::Buffer::null(),
+                pack,
             })
         }
     }
@@ -591,6 +686,27 @@ impl Exchange {
         // SAFETY: the contract.
         unsafe { device.update_descriptor_sets(&[w(0, &header), w(1, &counters)], &[]) };
         self.gated = stats;
+    }
+
+    /// Points the motion's pack at the accumulated field `field` (2 x f32 a texel), when it changed and the motion
+    /// crosses packed.
+    ///
+    /// # Safety
+    /// `field` is live and holds the layout's packed texels; nothing that may run uses the set unless it is unchanged.
+    pub(crate) unsafe fn bind_pack(&mut self, device: &ash::Device, field: vk::Buffer) {
+        let Some(pack) = self.pack.as_mut().filter(|p| p.bound != field) else { return };
+        let from = [vk::DescriptorBufferInfo { buffer: field, offset: 0, range: pack.texels * 8 }];
+        let to = [vk::DescriptorBufferInfo { buffer: pack.packed.buffer, offset: 0, range: vk::WHOLE_SIZE }];
+        let w =
+            |n: u32, i| vk::WriteDescriptorSet::default().dst_set(pack.set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i);
+        // SAFETY: the contract.
+        unsafe { device.update_descriptor_sets(&[w(0, &from), w(1, &to)], &[]) };
+        pack.bound = field;
+    }
+
+    /// Whether the motion crosses packed to halves.
+    pub(crate) fn motion_half(&self) -> bool {
+        self.pack.is_some()
     }
 
     /// Before the buffer of a hold planned as `plan` goes to the driver (in the order of the submit's buffers):
@@ -686,12 +802,14 @@ impl Exchange {
         }
     }
 
-    /// Records the hold's send of its frame as number `seq` (never 0): the copies into OUT, then `sent` set. The
-    /// hold's submit settles the send before it first ([`Self::at_submit`]).
+    /// Records the hold's send of its frame as number `seq` (never 0): the motion's pack where it crosses packed (a
+    /// compute pipeline, set and pushed word, as the gate's), the copies into OUT, then `sent` set. The hold's submit
+    /// settles the send before it first ([`Self::at_submit`]).
     ///
     /// # Safety
     /// `cmd` is recording on the game's device, outside a render pass, after the hold's capture; every source is
-    /// live, at least its section's size, and the image is in `GENERAL` with `TRANSFER_SRC` usage.
+    /// live, at least its section's size, and the image is in `GENERAL` with `TRANSFER_SRC` usage; with the motion
+    /// packed, the pack is bound to the motion's buffer ([`Self::bind_pack`]).
     pub(crate) unsafe fn record_send(&self, device: &ash::Device, cmd: vk::CommandBuffer, seq: u32, from: &Sources) {
         let l = &self.layout;
         let mut header = [0u32; 8];
@@ -707,6 +825,35 @@ impl Exchange {
                 // SAFETY: the contract.
                 unsafe { device.cmd_copy_buffer(cmd, src, self.out.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: at, size }]) };
             }
+        };
+        // The motion packed to halves first: what is copied below is the packed field.
+        let motion = match (from.motion, self.pack.as_ref()) {
+            (Some(field), Some(pack)) => {
+                debug_assert_eq!(pack.bound, field, "the pack is bound to the hold's field");
+                let field_ready = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                let rows = pack.texels.div_ceil(PACK_ROW) as u32;
+                let groups = if rows > 1 { PACK_ROW / PACK_LOCAL } else { pack.texels.div_ceil(PACK_LOCAL) } as u32;
+                // SAFETY: the contract.
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[field_ready],
+                        &[],
+                        &[],
+                    );
+                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pack.pipeline);
+                    device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, std::slice::from_ref(&pack.set), &[]);
+                    device.cmd_push_constants(cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &(pack.texels as u32).to_ne_bytes());
+                    device.cmd_dispatch(cmd, groups, rows, 1);
+                }
+                Some(pack.packed.buffer)
+            }
+            (motion, _) => motion,
         };
         // SAFETY: the contract.
         unsafe {
@@ -731,7 +878,7 @@ impl Exchange {
                     device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, self.out.buffer, &[region]);
                 }
             }
-            if let Some(m) = from.motion {
+            if let Some(m) = motion {
                 copy(m, l.motion_at, l.sizes.motion);
             }
             if let Some(d) = from.depth {
@@ -762,6 +909,9 @@ impl Exchange {
     pub(crate) unsafe fn destroy(self, device: &ash::Device) {
         // SAFETY: the contract.
         unsafe {
+            if let Some(pack) = &self.pack {
+                pack.destroy(device);
+            }
             device.destroy_descriptor_pool(self.pool, None);
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
@@ -1347,7 +1497,7 @@ impl HoldSide {
         height: u32,
     ) -> Result<Self, String> {
         let import = imports(device.handle());
-        let sizes = Sizes::of(at, width, height);
+        let sizes = Sizes::of(at, width, height, motion_packed());
         // SAFETY: the contract.
         let exchange =
             unsafe { Exchange::build(device, instance, physical, import, sizes) }.ok_or("the frame's regions could not be made on the game's GPU")?;
@@ -1408,8 +1558,9 @@ impl HoldSide {
         super::offload::note_state(super::offload::State::Active(name.clone()));
         set_serving(at, true);
         crate::log!(
-            "[offload] {}: the network's frames of {width}x{height} run on {name}; on the game's GPU the frame's regions are {}",
+            "[offload] {}: the network's frames of {width}x{height} run on {name}; the motion crosses as {}; on the game's GPU the frame's regions are {}",
             at.name(),
+            if exchange.motion_half() { "two halves a texel" } else { "two floats a texel (NEURAL_FORGE_OFFLOAD_MOTION=float)" },
             if exchange.shared {
                 "imported host memory (no CPU copy)"
             } else if import {
@@ -1624,11 +1775,11 @@ mod tests {
     /// After DLSS's output the hold has no depth at its size: nothing of it crosses, and the rest is the output size's.
     #[test]
     fn the_hold_after_dlss_exchanges_no_depth() {
-        let before = Sizes::of(Where::Before, 1485, 835);
+        let before = Sizes::of(Where::Before, 1485, 835, false);
         let (pw, ph) = crate::preupscale::padded(1485, 835);
         assert_eq!(before.depth, 1485 * 835 * 4);
         assert_eq!((before.frame, before.answer, before.motion), (u64::from(pw * ph) * 8, u64::from(pw * ph) * 8, 1485 * 835 * 8));
-        let after = Sizes::of(Where::After, 2560, 1440);
+        let after = Sizes::of(Where::After, 2560, 1440, false);
         assert_eq!(after.depth, 0);
         let (pw, ph) = crate::preupscale::padded(2560, 1440);
         assert_eq!((after.frame, after.answer, after.motion), (u64::from(pw * ph) * 8, u64::from(pw * ph) * 8, 2560 * 1440 * 8));
@@ -1657,7 +1808,7 @@ mod tests {
 
     #[test]
     fn the_layout_keeps_every_section_apart_and_aligned() {
-        let l = Layout::of(Sizes { frame: 1000, motion: 300, depth: 0, side: 32, answer: 777 });
+        let l = Layout::of(Sizes { frame: 1000, motion: 300, packed_texels: 0, depth: 0, side: 32, answer: 777 });
         assert_eq!(l.frame_at, HEADER_BYTES);
         assert_eq!(l.motion_at, HEADER_BYTES + 1024);
         assert_eq!(l.depth_at, l.motion_at + 512);
@@ -1876,7 +2027,7 @@ mod tests {
     }
 
     const TEXELS: u64 = 4096;
-    const SIZES: Sizes = Sizes { frame: TEXELS * 4, motion: 1024, depth: 0, side: 16, answer: TEXELS * 4 };
+    const SIZES: Sizes = Sizes { frame: TEXELS * 4, motion: 1024, packed_texels: 0, depth: 0, side: 16, answer: TEXELS * 4 };
 
     /// The stand-in for the network on the second device: the answer is the frame, copied on that device's queue
     /// from OUT to IN (imported there where the device can, else staged through its own buffers).
@@ -2657,7 +2808,7 @@ mod tests {
         fence: vk::Fence,
     }
 
-    const SIZES_AFTER: Sizes = Sizes { frame: TEXELS * 12, motion: 2048, depth: 0, side: 16, answer: TEXELS * 12 };
+    const SIZES_AFTER: Sizes = Sizes { frame: TEXELS * 12, motion: 2048, packed_texels: 0, depth: 0, side: 16, answer: TEXELS * 12 };
 
     impl Pair {
         fn new() -> Option<Self> {
@@ -2957,5 +3108,117 @@ mod tests {
         clear_serving();
         pair.close(workers);
         assert_eq!(*log.lock().unwrap(), vec!["made", "dropped"]);
+    }
+
+    /// The motion packed to halves is half the bytes: at 2560x1440 after DLSS the way out drops from 56 MB to 42 MB.
+    #[test]
+    fn the_packed_motion_is_half_the_floats() {
+        let (floats, packed) = (Sizes::of(Where::After, 2560, 1440, false), Sizes::of(Where::After, 2560, 1440, true));
+        assert_eq!((floats.motion, floats.packed_texels), (2560 * 1440 * 8, 0));
+        assert_eq!((packed.motion, packed.packed_texels), (2560 * 1440 * 4, 2560 * 1440));
+        assert_eq!(Sizes { motion: 0, packed_texels: 0, ..packed }, Sizes { motion: 0, packed_texels: 0, ..floats }, "nothing else changes");
+        let (a, b) = (Layout::of(floats), Layout::of(packed));
+        assert_eq!(a.out_bytes - b.out_bytes, 2560 * 1440 * 4);
+        assert!(b.out_bytes < 43 << 20 && a.in_bytes == b.in_bytes, "{b:?}");
+        let before = Sizes::of(Where::Before, 1485, 835, true);
+        assert_eq!((before.motion, before.depth), (1485 * 835 * 4, 1485 * 835 * 4));
+    }
+
+    fn half_to_f32(h: u16) -> f32 {
+        let (sign, exponent, fraction) = (if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }, i32::from((h >> 10) & 31), f32::from(h & 0x3ff));
+        match exponent {
+            0 => sign * fraction * 2f32.powi(-24),
+            31 => {
+                if fraction == 0.0 {
+                    sign * f32::INFINITY
+                } else {
+                    f32::NAN
+                }
+            }
+            e => sign * (1.0 + fraction / 1024.0) * 2f32.powi(e - 15),
+        }
+    }
+
+    /// The pack on the GPU, over every finite half: a field that is DLSS's vectors (halves) times the vectors' scale
+    /// and divided by it again, as the motion pass leaves it with a fresh chain, packs back to exactly those halves,
+    /// whatever the scale. A texel with a NaN in either component is the reserved pattern in both; nothing else ever
+    /// is a NaN or an infinity (values past the half's range are its largest finite value).
+    #[test]
+    fn the_pack_gives_dlss_s_halves_back_exactly_and_keeps_the_nan_marker() {
+        let Some(dev) = Dev::open() else {
+            assert_ne!(neural_forge_protocol::env::var("NEURAL_FORGE_REQUIRE_VULKAN").as_deref(), Some("1"), "no Vulkan device for the pack's test");
+            return;
+        };
+        const SCALES: [f32; 4] = [1.0, 1485.0, 835.0, 0.000_673_4];
+        // Every finite half as x (y another half), once per scale, then the special texels: more than three rows
+        // of the dispatch.
+        let finite: Vec<u16> = (0..=u16::MAX).filter(|h| (h >> 10) & 31 != 31).collect();
+        let mut field: Vec<[f32; 2]> = Vec::new();
+        let mut expected: Vec<u32> = Vec::new();
+        for scale in SCALES {
+            for (k, &h) in finite.iter().enumerate() {
+                let other = finite[(k * 7919 + 13) % finite.len()];
+                let through = |h: u16| (half_to_f32(h) * scale) / scale;
+                field.push([through(h), through(other)]);
+                expected.push(u32::from(h) | (u32::from(other) << 16));
+            }
+        }
+        let specials: [([f32; 2], u32); 8] = [
+            ([f32::NAN, f32::NAN], HALF_NAN),
+            ([f32::NAN, 1.5], HALF_NAN),
+            ([-2.25, f32::NAN], HALF_NAN),
+            ([f32::INFINITY, f32::NEG_INFINITY], 0x7bff | (0xfbff << 16)),
+            ([1.0e9, -1.0e9], 0x7bff | (0xfbff << 16)),
+            ([65504.0, -65504.0], 0x7bff | (0xfbff << 16)),
+            ([0.0, -0.0], 0x8000 << 16),
+            ([0.5, -3.25], 0x3800 | (0xc280 << 16)),
+        ];
+        for (v, bits) in specials {
+            field.push(v);
+            expected.push(bits);
+        }
+        let texels = field.len() as u64;
+        assert!(texels > 3 * PACK_ROW, "more than one row of the dispatch");
+        let sizes = Sizes { frame: 256, motion: texels * 4, packed_texels: texels, depth: 0, side: 16, answer: 256 };
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
+        let own = |bytes: u64| crate::preupscale::own_host_buffer_with(&dev.device, &dev.instance, dev.physical, bytes, usage).unwrap();
+        // SAFETY: a live device; the test's own objects, destroyed below.
+        unsafe {
+            let mut exchange = Exchange::build(&dev.device, &dev.instance, dev.physical, dev.import, sizes).expect("the exchange with a pack");
+            assert!(exchange.motion_half());
+            let (source, frame, side) = (own(texels * 8), own(sizes.frame), own(sizes.side));
+            std::ptr::copy_nonoverlapping(field.as_ptr().cast::<u8>(), source.ptr, field.len() * 8);
+            exchange.bind_pack(&dev.device, source.buffer);
+            let d = &dev.device;
+            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(dev.family), None).unwrap();
+            let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+            let sides = [(side.buffer, sizes.side)];
+            exchange.record_send(d, cmd, 9, &Sources { frame: FrameSource::Buffer(frame.buffer), motion: Some(source.buffer), depth: None, side: &sides });
+            d.end_command_buffer(cmd).unwrap();
+            d.queue_submit(dev.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
+            d.wait_for_fences(&[fence], true, 60_000_000_000).expect("the send finished");
+            let sent = std::slice::from_raw_parts(exchange.out.ptr.add(exchange.layout.motion_at as usize).cast::<u32>(), texels as usize);
+            let wrong: Vec<usize> = (0..sent.len()).filter(|&k| sent[k] != expected[k]).take(5).collect();
+            assert!(
+                wrong.is_empty(),
+                "{} texels differ; the first: {:?}",
+                (0..sent.len()).filter(|&k| sent[k] != expected[k]).count(),
+                wrong.iter().map(|&k| (k, field[k], format!("{:08x} for {:08x}", sent[k], expected[k]))).collect::<Vec<_>>()
+            );
+            // The marker is the only pattern that is not a number, and no texel is an infinity.
+            let not_finite = |h: u32| (h >> 10) & 31 == 31;
+            assert_eq!(sent.iter().filter(|&&w| not_finite(w & 0xffff) || not_finite(w >> 16)).count(), 3);
+            assert!(sent.iter().all(|&w| !(not_finite(w & 0xffff) || not_finite(w >> 16)) || w == HALF_NAN));
+            assert_eq!(exchange.out.ptr.cast::<u32>().add(OUT_SEQ).read_volatile(), 9, "the frame's header went with it");
+            d.destroy_fence(fence, None);
+            d.destroy_command_pool(pool, None);
+            for b in [&source, &frame, &side] {
+                b.destroy(d);
+            }
+            exchange.destroy(d);
+        }
+        dev.close();
     }
 }

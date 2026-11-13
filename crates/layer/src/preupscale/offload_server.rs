@@ -44,6 +44,9 @@ pub(crate) struct FrameMeta {
     pub passes: Passes,
     /// The hold sent DLSS's depth (the control mask's sky rule reads it).
     pub depth: bool,
+    /// The motion came packed to two halves a texel (`offload_pre::Sizes::packed_texels`): the frame shaders read it
+    /// as they read DLSS's packed vectors (`MOTION_HALF`).
+    pub motion_half: bool,
     pub lut: Option<Arc<super::colour::Lut>>,
 }
 
@@ -55,6 +58,8 @@ struct Frame {
     width: u32,
     height: u32,
     extents: [(u32, u32); neural_forge_protocol::MAX_PASSES],
+    /// The pass reads the motion as packed halves (from its `mvec` buffer), else as floats (from `acc`).
+    motion_half: bool,
     hdr: super::hdr::HdrPass,
     native: NativePass,
     /// DLSS's depth as the hold sent it: only for the hold before DLSS (after DLSS's output there is none).
@@ -310,7 +315,7 @@ impl PreRunner {
             }
         }
         // The pass for this extent and these pass extents.
-        if self.frame.as_ref().is_some_and(|f| (f.width, f.height, f.extents) != (meta.width, meta.height, meta.extents)) {
+        if self.frame.as_ref().is_some_and(|f| (f.width, f.height, f.extents, f.motion_half) != (meta.width, meta.height, meta.extents, meta.motion_half)) {
             if let Some(f) = self.frame.take() {
                 // SAFETY: idle: every frame is waited for before `run` returns.
                 unsafe {
@@ -326,14 +331,14 @@ impl PreRunner {
             // SAFETY: a live device; the frames' family is the setup's.
             let built = unsafe {
                 let hdr = super::hdr::HdrPass::build(device, instance, physical, meta.width, meta.height);
-                let native = NativePass::build_at(device, instance, physical, setup.family, meta.width, meta.height, meta.extents, false, false);
+                let native = NativePass::build_at(device, instance, physical, setup.family, meta.width, meta.height, meta.extents, meta.motion_half, false);
                 // No depth crosses for the hold after DLSS's output: no buffer for it there.
                 let wants_depth = layout.sizes.depth > 0;
                 let depth =
                     if wants_depth { super::native::DepthCopy::build(device, instance, physical, setup.family, meta.width, meta.height, false) } else { None };
                 match (hdr, native, depth) {
                     (Some(hdr), Some(native), depth) if depth.is_some() == wants_depth => {
-                        Some(Frame { width: meta.width, height: meta.height, extents: meta.extents, hdr, native, depth })
+                        Some(Frame { width: meta.width, height: meta.height, extents: meta.extents, motion_half: meta.motion_half, hdr, native, depth })
                     }
                     (hdr, native, depth) => {
                         if let Some(x) = hdr {
@@ -428,7 +433,12 @@ impl PreRunner {
                 let copy = |dst: vk::Buffer, at: u64, to: u64, size: u64| {
                     device.cmd_copy_buffer(up, o.buffer, dst, &[vk::BufferCopy { src_offset: at, dst_offset: to, size }])
                 };
-                copy(f.native.acc.buffer, layout.motion_at, 0, (texels * 8).min(layout.sizes.motion));
+                // The motion: packed halves into the buffer the frame shaders read DLSS's vectors from, or the floats.
+                if f.motion_half {
+                    copy(f.native.mvec.buffer, layout.motion_at, 0, (texels * 4).min(layout.sizes.motion));
+                } else {
+                    copy(f.native.acc.buffer, layout.motion_at, 0, (texels * 8).min(layout.sizes.motion));
+                }
                 if let Some(depth) = depth {
                     copy(depth, layout.depth_at, 0, (texels * 4).min(layout.sizes.depth));
                 }

@@ -1,0 +1,36 @@
+#version 450
+// The held placements on a second GPU (preupscale::offload_pre): the accumulated motion a hold sends, packed
+// from f32 x and y per texel (preupscale_cache_motion.comp's field, 8 bytes) to two halves (4 bytes), which
+// the frame shaders on the other GPU read as they read DLSS's packed vectors (MOTION_HALF).
+//
+// A hold that sends its frame runs the motion pass with a fresh chain, so the field is DLSS's own vectors,
+// which are halves, multiplied by the vectors' scale and divided by it again: at most an f32 rounding step
+// from the half it came from, and packing gives that half back exactly. A field accumulated over more than
+// one hold would be rounded to the half's 11 bits (1/64 px at a motion of 16 to 32 px, 1/16 px at 64 to 128).
+//
+// The field is NaN where the chain left the frame or the hold had no vectors (no history there). A texel
+// with a NaN in either component is written as HALF_NAN in both, the one pattern this pass ever writes that
+// is not a number; every other value is clamped to the half's finite range first, so none becomes an
+// infinity (the cache's own reading of DLSS's vectors clamps the same way, half_vector).
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Field { vec2 v[]; } u_field;
+layout(set = 0, binding = 1, std430) writeonly buffer Packed { uint mv[]; } u_packed;
+
+layout(push_constant) uniform Push {
+  uint texels;
+} p;
+
+const float HALF_MAX = 65504.0;
+const uint HALF_NAN = 0x7e007e00u;
+
+// Texels a row of the dispatch: 1024 groups of 64 (a field of 3840x2160 texels is past the 65535 groups one
+// dimension may have).
+const uint ROW = 65536u;
+
+void main() {
+  uint i = gl_GlobalInvocationID.y * ROW + gl_GlobalInvocationID.x;
+  if (i >= p.texels) return;
+  vec2 v = u_field.v[i];
+  u_packed.mv[i] = (isnan(v.x) || isnan(v.y)) ? HALF_NAN : packHalf2x16(clamp(v, vec2(-HALF_MAX), vec2(HALF_MAX)));
+}
