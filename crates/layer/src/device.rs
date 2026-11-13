@@ -1584,8 +1584,13 @@ impl NeuralForgeDeviceInfo {
         extended_usage: bool,
     ) -> Self {
         let handle = device.handle();
-        // The empty pipeline layout DXVK's binds of nothing go on with (`noop_bind`), in every process the layer works in.
-        if crate::layer_enabled() && crate::ownership::eligible() {
+        // The empty pipeline layout DXVK's binds of nothing go on with (`noop_bind`), in every process the layer works in;
+        // not for the device the layer makes for the model on another GPU (no game command reaches it).
+        #[cfg(target_arch = "x86_64")]
+        let own_device = crate::preupscale::offload::making();
+        #[cfg(not(target_arch = "x86_64"))]
+        let own_device = false;
+        if crate::layer_enabled() && crate::ownership::eligible() && !own_device {
             // SAFETY: the device is live and `device` is its next-layer dispatch.
             unsafe { crate::noop_bind::device_created(&device) };
         }
