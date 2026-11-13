@@ -2505,6 +2505,15 @@ impl Tracker {
         // Every image of the colour input's shape: an evaluate may name another one than the identified (Remnant II and
         // Expedition 33 alternate between several).
         watch.is_some_and(|w| desc.is_some_and(|d| w.covers(d)))
+            // The motion vectors of the evaluate whose output the hold after DLSS goes after, and every image of their
+            // shape (Cyberpunk 2077 hands DLSS two in turn): Ray Reconstruction identifies nothing (`Self::refresh`), and
+            // without this, vectors no compute shader writes (not `STORAGE`, so not taken as `GENERAL`) had no layout
+            // there, and the hold after it neither copied them nor could send its frames to a second GPU (#63:
+            // Cyberpunk with Ray Reconstruction and ray tracing, path tracing off).
+            || self.dlss_output.is_some_and(|o| {
+                let shape = |d: &ImageDesc| (d.width, d.height, d.format);
+                o.mvec == image || desc.is_some_and(|d| self.images.get(&o.mvec).is_some_and(|m| shape(m) == shape(d)))
+            })
             || inputs.is_some_and(|i| {
                 i.colour.0 == image
                     || i.depth.0 == image
@@ -7692,6 +7701,48 @@ mod tests {
         t.launch(cb(2), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
         let (scan, _) = submit(&mut t, &[vec![cb(2)]]);
         assert!(scan.is_some_and(|s| s.identified_now) && !t.frame().rr);
+    }
+
+    /// #63: Ray Reconstruction identifies nothing (`Tracker::refresh`), so only the output it learns watches its motion
+    /// vectors. Cyberpunk 2077 with ray tracing and path tracing off hands DLSS vectors it renders (no `STORAGE`, so
+    /// not taken as `GENERAL`), two in turn: the hold after DLSS reads the one its evaluate names in the layout the
+    /// game's barrier left it in. Without the watch their layout was unknown, nothing was copied, and the offload
+    /// gave up on every frame ("DLSS names no motion vectors").
+    #[test]
+    fn the_hold_after_ray_reconstruction_knows_its_rendered_motion_vectors_layout() {
+        use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let rendered = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut set = gta_registered();
+        for raw in [0x300, 0x310] {
+            set.insert(raw, (img(raw), desc(1707, 960, rgba, rendered)));
+        }
+        let mut t = tracker_with(&set);
+        let rr = |seq, mvec| parse_record(&record_bytes(seq, FEATURE_RR, 1, [0x100, mvec, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        let a = rr(1, 0x300);
+        inject(vec![a]);
+        t.begin(cb(1));
+        t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        t.launch(cb(1), Some(&param_block(&[0x1400])));
+        inject(vec![a, end_of(&a, 2)]);
+        submit(&mut t, &[vec![cb(1)]]);
+        assert!(t.dlss_output.is_some_and(|o| o.rr && o.mvec == img(0x300)), "the output learnt");
+        assert!(t.inputs.is_none(), "Ray Reconstruction identifies nothing");
+        // The next frame's vectors are the other image of their shape, moved to be read in a buffer before DLSS's.
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        t.begin(cb(2));
+        t.barrier(cb(2), ImageSync::to(img(0x310), read));
+        submit(&mut t, &[vec![cb(2)]]);
+        let b = rr(3, 0x310);
+        inject(vec![a, end_of(&a, 2), b]);
+        t.begin(cb(3));
+        t.launch(cb(3), Some(&param_block(&[0x1100, 0x1200, 0x1310])));
+        t.launch(cb(3), Some(&param_block(&[0x1400])));
+        let (c, o, plan) = t.after_at.take().expect("the hold after DLSS's output");
+        let point = t.after_point_at(c, o, &plan).expect("a point on the output");
+        let mv = point.mvec_input.expect("the evaluate's motion vectors");
+        assert_eq!((mv.image, mv.layout, mv.readable), (img(0x310), Some(read), true), "{mv:?}");
+        assert_eq!(point.guessed.mvec, Some(read), "set before DLSS's buffer: checked at its submit");
     }
 
     /// A game handing DLSS another colour image of the same shape every frame (Remnant II, Expedition 33): every

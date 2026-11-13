@@ -26,6 +26,10 @@ first shipped them; their phase is kept as a subheading.
   ran there and the others were left out.
 - When the model goes back to the game's GPU because its frames cannot be sent to the second GPU, the Status tab and
   the log now say what was missing (the game's motion vectors, their layout, the jitter or the edit cache's room).
+- With Ray Reconstruction and ray tracing but path tracing off, the model after DLSS now gets the game's motion
+  vectors when the game was started with Ray Reconstruction already on. Without them the second GPU gave up at once
+  ("DLSS names no motion vectors"), and on the game's GPU the network ran every frame without its history or the edit
+  cache, which can show as a slight flicker with one pass.
 - The Status tab's Model row says where the model runs: before the upscaler, after DLSS, or on the second GPU before
   DLSS, after DLSS or on the finished frame. The frame-time graph shows the model's time after DLSS too.
 
