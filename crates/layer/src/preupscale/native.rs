@@ -7270,6 +7270,198 @@ mod tests {
         }
     }
 
+    /// The runner's sequence for the shared core on the other GPU (`offload_server::Core`), at the `NativePass` level
+    /// (`frame_graphs`, `record_later`, one submit, `submitted`, `later_submitted`; not `PreRunner::frame` or `Core`
+    /// themselves): a frame with passes before DLSS and after its output sends both holds' frames to the one device, one
+    /// network and one queue, each hold with its own pass (its `NativePass`, so its own later passes' buffers, lanes and
+    /// histories). Here the hold before DLSS runs 2 passes (pass
+    /// 2 at half the model resolution) and the hold after DLSS 3 (pass 2 at half, pass 3 at full, a pass feedback of
+    /// 0.5); pass 2 after DLSS runs at the render size, so it shares that size's network buffers with pass 1 before
+    /// DLSS. Run as the runners run them (one submit each, `record_later`'s copies, the two holds' frames one after the
+    /// other on the one queue) every frame of each hold is bit for bit the answer that hold gets alone on the game's GPU
+    /// (the split hold's own submits, nothing of the other hold in between).
+    #[test]
+    fn two_holds_on_one_core_run_every_pass_as_each_does_alone() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let (render, output) = ((SW, SH), (2 * SW, 2 * SH));
+        // SAFETY: a fresh device; every object below is used on its queue only, waited for and destroyed before it.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (graph_pool, graph) = empty_graph(device, family);
+            // The one network, built for every size of the frame (`frame_sizes`): render, half of it, output.
+            let stands = [
+                Stand::new(device, instance, physical, render, (FW, FH), graph, 5),
+                Stand::new(device, instance, physical, (SW / 2, SH / 2), (FW / 2, FH / 2), graph, 5),
+                Stand::new(device, instance, physical, output, (2 * FW, 2 * FH), graph, 5),
+            ];
+            let graphs = [stands[0].graph(), stands[1].graph(), stands[2].graph()];
+            let (opw, oph) = super::super::padded(output.0, output.1);
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(opw * oph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            // The two holds' passes: (extent, count, scales, feedback, intensities, the frame's texture).
+            let stage = |count: usize, half_at: &[usize], feedback: f32, base: f32| {
+                let mut p = Passes::one(Conditioning::default());
+                p.count = count;
+                p.feedback = feedback;
+                for &k in half_at {
+                    p.scales[k] = 0.5;
+                }
+                for (k, each) in p.each.iter_mut().enumerate().take(count) {
+                    each.intensity = base - 0.1 * k as f32;
+                }
+                p
+            };
+            let holds = [(render, stage(2, &[1], 1.0, 0.9), 0u32), (output, stage(3, &[1], 0.5, 0.8), 11u32)];
+            struct HoldRun {
+                pass: NativePass,
+                encoded: OwnImage,
+                pw: u32,
+                ph: u32,
+                region: vk::BufferImageCopy,
+                texels: Vec<u16>,
+            }
+            let make = |k: usize| -> HoldRun {
+                let ((w, h), passes, shift) = holds[k];
+                let (pw, ph) = super::super::padded(w, h);
+                let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+                let extents = pass_extents(w, h, &passes.scales);
+                let mut pass = NativePass::build_at(device, instance, physical, family, w, h, extents, false, true).expect("the native pass builds");
+                assert!(pass.ensure_more(device, instance, physical, family, passes.count), "the later passes build");
+                assert!(pass.ensure_lanes(device, instance, physical, passes.count), "the passes' lanes build");
+                assert!(pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None));
+                fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+                let texels = (0..ph)
+                    .flat_map(|y| {
+                        (0..pw).flat_map(move |x| [half(proxy(x + shift, y, 0)), half(proxy(x, y + shift, 1)), half(proxy(x + shift, y + 1, 2)), half(1.0)])
+                    })
+                    .collect();
+                let region = vk::BufferImageCopy {
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    buffer_row_length: pw,
+                    image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                    ..Default::default()
+                };
+                HoldRun { pass, encoded, pw, ph, region, texels }
+            };
+            // One network frame of hold `k` (frame `n`): the network's answers for this hold and frame in the head of
+            // every size, the hold's capture uploaded, then its passes the runner's way (`runner`: one submit with
+            // `record_later`'s order) or the split hold's (each buffer submitted on its own); its answer.
+            let frame = |run: &mut HoldRun, k: usize, n: u32, runner: bool| -> Vec<u16> {
+                let passes = holds[k].1;
+                for (s, st) in stands.iter().enumerate() {
+                    st.write_head(|x, y, c| residual(x + 3 * k as u32, y + s as u32, c, n));
+                }
+                upload_encoded(&fx, &staging, &run.encoded, run.pw, run.ph, &run.texels);
+                if !runner {
+                    run.pass.record_copies(device, run.encoded.image, run.encoded.view, run.region, passes.count, passes.feedback).unwrap();
+                }
+                let (cmds, later) = run.pass.frame_graphs(&graphs, n > 0, None, [1.0, 1.0], &passes);
+                assert_eq!(later.len(), passes.count - 1, "hold {k}: every later pass is planned");
+                let first: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().collect();
+                let order: Vec<vk::CommandBuffer> = if runner {
+                    let sequence = run.pass.record_later(device, run.encoded.image, run.encoded.view, run.region, &passes, &later).unwrap();
+                    assert_eq!(sequence.len(), 2 * later.len() + 1);
+                    let all: Vec<vk::CommandBuffer> = first.iter().copied().chain(sequence).collect();
+                    device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&all)], vk::Fence::null()).unwrap();
+                    all
+                } else {
+                    let order: Vec<vk::CommandBuffer> = first.iter().copied().chain(run.pass.later_sequence(&later)).collect();
+                    for &cmd in &order {
+                        device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
+                    }
+                    order
+                };
+                device.queue_wait_idle(gpu.4).unwrap();
+                for cmd in order {
+                    run.pass.submitted(cmd);
+                }
+                run.pass.later_submitted(later.len());
+                let answer = run.pass.answer();
+                let bytes = u64::from(run.pw * run.ph) * 8;
+                fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]));
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (run.pw * run.ph * 4) as usize).to_vec()
+            };
+            const FRAMES: u32 = 4;
+            // Each hold alone, the split hold's way.
+            let mut alone = Vec::new();
+            for k in 0..2 {
+                let mut run = make(k);
+                alone.push((0..FRAMES).map(|n| frame(&mut run, k, n, false)).collect::<Vec<_>>());
+                run.pass.destroy(device);
+                run.encoded.destroy(device);
+            }
+            // Both holds through the one core: before DLSS, then after it, frame after frame.
+            let mut runs = [make(0), make(1)];
+            let mut shared = [Vec::new(), Vec::new()];
+            for n in 0..FRAMES {
+                for (k, run) in runs.iter_mut().enumerate() {
+                    shared[k].push(frame(run, k, n, true));
+                }
+            }
+            for k in 0..2 {
+                let m = runs[k].pass.more.as_ref().unwrap();
+                assert!(m.history.iter().take(holds[k].1.count - 1).all(Option::is_some), "hold {k}: every later pass has its history");
+                assert_eq!(runs[k].pass.extents[1], (holds[k].0 .0 / 2, holds[k].0 .1 / 2), "hold {k}: pass 2 at half its size");
+                for n in 0..FRAMES as usize {
+                    assert!(shared[k][n] == alone[k][n], "hold {k}, frame {n}: the shared core's answer is the hold's own alone, bit for bit");
+                }
+                assert_ne!(shared[k][0], shared[k][FRAMES as usize - 1], "hold {k}: the frames differ (their heads and histories do)");
+            }
+            // The later passes changed the answer: pass 1 alone is another picture.
+            let mut one = make(1);
+            let only = {
+                let ((_, _), mut passes, _) = holds[1];
+                passes.count = 1;
+                stands[2].write_head(|x, y, c| residual(x + 3, y + 2, c, 0));
+                upload_encoded(&fx, &staging, &one.encoded, one.pw, one.ph, &one.texels);
+                let (cmds, _) = one.pass.frame_graphs(&graphs, false, None, [1.0, 1.0], &passes);
+                fx.submit(&mut one.pass, cmds);
+                let bytes = u64::from(one.pw * one.ph) * 8;
+                let answer = one.pass.answer();
+                fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]));
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (one.pw * one.ph * 4) as usize).to_vec()
+            };
+            assert_ne!(only, shared[1][0], "the after-DLSS hold's later passes changed its answer");
+            one.pass.destroy(device);
+            one.encoded.destroy(device);
+            for run in runs {
+                run.pass.destroy(device);
+                run.encoded.destroy(device);
+            }
+            for st in &stands {
+                st.destroy(device);
+            }
+            for b in [&exposure, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
     /// Two passes, the second with its own intensity: pass 2 reads pass 1's answer as its colour input (its
     /// proxy lanes), its answer is the network's on that picture blended by its own intensity, and the
     /// encoded capture is put back after it for the write-back.

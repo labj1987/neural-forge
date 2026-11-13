@@ -2055,8 +2055,13 @@ device, its loader with the network, the queue, the command buffers and the fenc
 runner locks the core for the whole of a frame and waits for the frame before it lets go, so the two holds' frames
 run one after the other and nothing of the device or the network is rebuilt or freed under a frame that runs. Both
 holds ask the network for the same set of sizes (`native::frame_sizes`: the render size and the output size), so
-neither's frame rebuilds it. Each submit waits for its own hold's answer (`Exchange::at_submit`, by the resources'
-id), 100 ms at most each.
+neither's frame rebuilds it (`frame_sizes` takes every pass's extent of both stages, so the later passes' sizes are
+built too). Every pass of each hold's stage runs there (`NativePass::record_later`, as for one hold): each runner's
+own `NativePass` holds its later passes' buffers, lanes and histories, so the two holds may run different pass counts
+at different per-pass extents and share only the network's buffers of a size, used one frame after the other (the
+test `two_holds_on_one_core_run_every_pass_as_each_does_alone`, which runs the runner's sequence at the `NativePass` level: 2 passes before DLSS and 3 after it, frames of the two
+holds alternating on one queue, every answer bit for bit the hold's own alone). Each submit waits for its own hold's
+answer (`Exchange::at_submit`, by the resources' id), 100 ms at most each.
 
 Ownership: the first runner of a game's device takes the offload device (`offload::take`) and the last to leave gives
 it back, both under the seats' lock, so a runner that asks meanwhile waits and then makes a new core from what was
