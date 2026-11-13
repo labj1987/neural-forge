@@ -263,6 +263,27 @@ mod tests {
         assert!(!binds_nothing(&info(0, &[], chained)), "a chained VkPipelineLayoutCreateInfo (dynamicPipelineLayout)");
     }
 
+    /// On a real device (lavapipe; under the validation layer in CI): `device_created` makes the empty layout and
+    /// `forget` destroys it with the device's entry, so nothing of the layer's is left when the device goes (the
+    /// validation layer reports an object left at `vkDestroyDevice`).
+    #[test]
+    fn the_empty_layout_lives_and_goes_with_the_device() {
+        let Some((_entry, instance, _physical, device, _queue, _family)) = crate::composition::gpu::test_device() else {
+            return;
+        };
+        unsafe {
+            let k = key(device.handle().as_raw());
+            device_created(&device);
+            let empty = entry_for(k).empty.expect("the device's empty layout");
+            assert_ne!(empty.layout, vk::PipelineLayout::null());
+            assert_eq!(empty.device, device.handle());
+            forget(device.handle());
+            assert!(entry_for(k).empty.is_none(), "the entry goes with the device");
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
     /// Through `intercept` and the wrapper, with dispatchable stand-ins whose first word is a shared dispatch key
     /// (as the loader makes a device's command buffers). A call that binds nothing (DXVK's before DLSS's launches) goes
     /// on with the device's empty layout in place of the null one, nothing else changed; it is dropped only where the
