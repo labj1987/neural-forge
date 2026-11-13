@@ -7244,9 +7244,11 @@ mod tests {
         }
     }
 
-    /// The shared core on the other GPU (`offload_server::Core`): a frame with passes before DLSS and after its output
-    /// sends both holds' frames to the one device, one network and one queue, each hold with its own pass (its
-    /// `NativePass`, so its own later passes' buffers, lanes and histories). Here the hold before DLSS runs 2 passes (pass
+    /// The runner's sequence for the shared core on the other GPU (`offload_server::Core`), at the `NativePass` level
+    /// (`frame_graphs`, `record_later`, one submit, `submitted`, `later_submitted`; not `PreRunner::frame` or `Core`
+    /// themselves): a frame with passes before DLSS and after its output sends both holds' frames to the one device, one
+    /// network and one queue, each hold with its own pass (its `NativePass`, so its own later passes' buffers, lanes and
+    /// histories). Here the hold before DLSS runs 2 passes (pass
     /// 2 at half the model resolution) and the hold after DLSS 3 (pass 2 at half, pass 3 at full, a pass feedback of
     /// 0.5); pass 2 after DLSS runs at the render size, so it shares that size's network buffers with pass 1 before
     /// DLSS. Run as the runners run them (one submit each, `record_later`'s copies, the two holds' frames one after the

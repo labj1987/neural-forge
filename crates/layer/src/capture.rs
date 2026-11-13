@@ -1049,8 +1049,19 @@ thread_local! {
     /// Test faults for [`paced_present`]: its next gated present cannot keep its frame, or cannot duplicate its gate.
     static PACED_FAULT_KEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PACED_FAULT_DUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The relay's budget for the frames this thread posts, where a test makes it longer than the present's own wait.
+    static PACED_RELAY_BUDGET: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
     /// How many gates the present waited for on its own thread after [`paced_present`] did not take the frame.
     static GATE_WAITED_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// How long the relay waits for the answer to a frame this thread posts.
+fn relay_budget() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(budget) = PACED_RELAY_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
+    SYNC_BUDGET
 }
 
 /// Whether the delayed present just made on this thread handed its frame to the relay (and forgets it).
@@ -1227,10 +1238,15 @@ unsafe fn paced_present(
     let as_gate =
         |fd: std::os::fd::OwnedFd, token| crate::composition::gpu::Gate { fd: fd.into_raw_fd(), token, until: std::time::Instant::now() + SYNC_BUDGET };
     let mut answered = true;
+    // Whether the frame before was not resolved in time, when the gate could not be duplicated: nothing waits for the
+    // server's read of the regions then, so this frame is neither composed nor sent (as a refused import is).
+    let mut unresolved = false;
     let (gate, after) = match gate.take().map(|fd| (dup(&fd), fd)) {
         Some((Ok(after), fd)) => (Some(fd), Some(after)),
         Some((Err(_), _)) => {
-            answered = gpu.pacer().and_then(|p| p.wait_resolved(req.token, std::time::Instant::now() + SYNC_BUDGET)) == Some(true);
+            let resolved = gpu.pacer().and_then(|p| p.wait_resolved(req.token, std::time::Instant::now() + SYNC_BUDGET));
+            answered = resolved == Some(true);
+            unresolved = resolved.is_none();
             (None, None)
         }
         None => (None, None),
@@ -1292,9 +1308,11 @@ unsafe fn paced_present(
             gpu.show_kept(device, queue, image, width, height, req.parity).map(Delayed::Shown)
         }
     };
-    // This frame to the other GPU, behind the compose (the frame before is resolved: the server is done with both regions).
+    // This frame to the other GPU, behind the compose. The frame before is resolved (the server is done with both
+    // regions) or its sync fd gates the copy; where the gate could not be duplicated and the frame before was not
+    // resolved in time, the server may still be reading the proxy region: nothing is sent.
     let posted_at = std::time::Instant::now();
-    let sent = gpu.send_delayed(device, queue, parity, proxy, frame_bytes, after.map(|fd| as_gate(fd, req.token)));
+    let sent = if unresolved { None } else { gpu.send_delayed(device, queue, parity, proxy, frame_bytes, after.map(|fd| as_gate(fd, req.token))) };
     static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let meter = (!pq10 && METER_FRAME.fetch_add(1, Relaxed).is_multiple_of(8)).then(|| shm.proxy_region(SLOT)).flatten().map(|(frame, capacity)| {
         crate::composition::pace::Meter {
@@ -1313,7 +1331,7 @@ unsafe fn paced_present(
                 proxy: (width, height),
                 pq10,
                 dims: (width, height),
-                budget: SYNC_BUDGET,
+                budget: relay_budget(),
                 posted: posted_at,
                 judged: crate::preupscale::offload::Choice::current() != crate::preupscale::offload::Choice::Same,
                 meter,
@@ -6678,14 +6696,26 @@ mod tests {
         // once it has the gate (the gate goes back to the present's own wait), and one that cannot duplicate it while
         // the server gave up on that frame after its submit (the frame goes out as it was kept, not composed with the
         // answer before).
-        let presents: usize = if on_gpu { 340 } else { 260 };
-        let (mut keep_fault_at, mut dup_fault_at) = (None, None);
+        let presents: usize = if on_gpu { 420 } else { 260 };
+        let (mut keep_fault_at, mut dup_fault_at, mut timed_out_at) = (None, None, None);
         for k in 0..presents {
             match k {
                 262 if on_gpu => PACED_FAULT_KEEP.with(|f| f.set(true)),
                 300 if on_gpu => {
                     given_up.store(true, AtomicOrdering::Relaxed);
                     PACED_FAULT_DUP.with(|f| f.set(true));
+                }
+                // As at 300, but the relay waits longer for the frame before than the present does: the present that cannot
+                // duplicate its gate finds that frame unresolved at its own budget, and sends nothing.
+                363 if on_gpu => PACED_RELAY_BUDGET.with(|b| b.set(Some(Duration::from_millis(2000)))),
+                364 if on_gpu => {
+                    given_up.store(true, AtomicOrdering::Relaxed);
+                    PACED_FAULT_DUP.with(|f| f.set(true));
+                }
+                365 if on_gpu => {
+                    PACED_RELAY_BUDGET.with(|b| b.set(None));
+                    std::thread::sleep(Duration::from_millis(2200));
+                    starts_allowed += 1;
                 }
                 // As at 110: the channel ends the request that is still out; the delay starts again.
                 312 if on_gpu => {
@@ -6751,7 +6781,13 @@ mod tests {
                 assert_eq!(GATE_WAITED_HERE.with(std::cell::Cell::get), waited_here + 1, "present {k}: the gate came back and was waited for here");
             }
             if dup_armed && !PACED_FAULT_DUP.with(std::cell::Cell::get) {
-                dup_fault_at = Some(k);
+                if k < 350 {
+                    dup_fault_at = Some(k);
+                } else {
+                    timed_out_at = Some(k);
+                    // The frame before was not resolved in time: this frame was not sent (its token stays 0).
+                    assert!(s.inflight[0].delayed.is_some_and(|r| r.token == 0), "present {k}: a frame sent after the one before timed out");
+                }
             }
             if let Some(sem) = sem {
                 let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
@@ -6793,6 +6829,7 @@ mod tests {
         if on_gpu {
             assert!(keep_fault_at.is_some(), "a gated present could not keep its frame: {paced_at:?}");
             assert!(dup_fault_at.is_some(), "a gated present could not duplicate its gate: {paced_at:?}");
+            assert!(timed_out_at.is_some(), "a present that could not duplicate its gate found the frame before unresolved: {paced_at:?}");
             PACED_FAULT_KEEP.with(|f| f.set(false));
             PACED_FAULT_DUP.with(|f| f.set(false));
         }

@@ -2059,7 +2059,7 @@ neither's frame rebuilds it (`frame_sizes` takes every pass's extent of both sta
 built too). Every pass of each hold's stage runs there (`NativePass::record_later`, as for one hold): each runner's
 own `NativePass` holds its later passes' buffers, lanes and histories, so the two holds may run different pass counts
 at different per-pass extents and share only the network's buffers of a size, used one frame after the other (the
-test `two_holds_on_one_core_run_every_pass_as_each_does_alone`: 2 passes before DLSS and 3 after it, frames of the two
+test `two_holds_on_one_core_run_every_pass_as_each_does_alone`, which runs the runner's sequence at the `NativePass` level: 2 passes before DLSS and 3 after it, frames of the two
 holds alternating on one queue, every answer bit for bit the hold's own alone). Each submit waits for its own hold's
 answer (`Exchange::at_submit`, by the resources' id), 100 ms at most each.
 
