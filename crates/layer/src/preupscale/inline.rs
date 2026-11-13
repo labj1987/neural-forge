@@ -2178,7 +2178,7 @@ mod tests {
         }
 
         fn ask(hold: u64) -> CacheAsk {
-            CacheAsk { hold, interval: 2, debug_mask: false }
+            CacheAsk { hold, interval: 2, debug_mask: false, at: crate::preupscale::placement::Hold::ALL_BEFORE }
         }
 
         /// The split hold (the reference): frame `f` uploaded, held in front of the game's buffer as hold

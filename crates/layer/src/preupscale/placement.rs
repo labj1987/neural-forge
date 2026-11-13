@@ -232,14 +232,17 @@ impl Hold {
         Self { stage, before: plan.range(Stage::Before), upscaled: plan.range(Stage::Upscaled), render, output }
     }
 
-    /// Whether the model on a second GPU takes this hold (`super::offload_pre`): the hold before the upscaler always,
-    /// the hold after DLSS's output when the frame has no pass before the upscaler (Ray Reconstruction, or every pass
-    /// placed after DLSS). The other GPU has the process's one network and serves one stage of a frame.
+    /// Whether the model on a second GPU takes this hold (`super::offload_pre`): only in a frame whose held passes
+    /// all run at this hold's stage (every pass before the upscaler; or every pass after DLSS's output: Ray
+    /// Reconstruction, or the placement set there). The process has one network, and the other GPU serves one hold of
+    /// a frame: in a frame with passes at both stages neither hold is offloaded (with one of them there, the other
+    /// found the network open elsewhere and never ran), and both run on the game's GPU.
     pub(crate) fn offload_takes(&self) -> bool {
-        match self.stage {
-            Stage::Upscaled => self.before.0 >= self.before.1,
-            _ => true,
-        }
+        let (own, other) = match self.stage {
+            Stage::Upscaled => (self.upscaled, self.before),
+            _ => (self.before, self.upscaled),
+        };
+        own.0 < own.1 && other.0 >= other.1
     }
 
     /// This hold's passes, `first..end`.
@@ -356,8 +359,9 @@ mod tests {
         assert_eq!(plan.notes().count(), 0);
         assert_eq!((plan.range(Before), plan.range(Upscaled), plan.range(Present)), ((0, 1), (1, 2), (0, 0)));
         let hold = Hold::of(&plan, Upscaled, (1707, 960), (2560, 1440));
-        // A frame with passes at both stages: the second GPU has the one before DLSS only.
-        assert!(!hold.offload_takes() && Hold::of(&plan, Before, (1707, 960), (2560, 1440)).offload_takes());
+        // A frame with passes at both stages: the second GPU takes neither hold (one network in the process).
+        assert!(!hold.offload_takes() && !Hold::of(&plan, Before, (1707, 960), (2560, 1440)).offload_takes());
+        assert!(Hold::ALL_BEFORE.offload_takes());
         assert_eq!(hold.passes(), (1, 2));
         assert_eq!(Hold::of(&plan, Before, (1707, 960), (2560, 1440)).passes(), (0, 1));
         // Out of order: pass 2 before the upscaler after pass 1 after DLSS runs after DLSS too.
@@ -366,6 +370,8 @@ mod tests {
         let plan = Plan::of(2, &s, sr);
         assert_eq!(&plan.stages[..2], &[Upscaled, Upscaled]);
         assert_eq!(plan.notes().collect::<Vec<_>>(), [Note::Order { pass: 1, asked: Before, runs: Upscaled }]);
+        // Every pass after DLSS's output (as with Ray Reconstruction): that hold is the second GPU's.
+        assert!(Hold::of(&plan, Upscaled, (1707, 960), (2560, 1440)).offload_takes());
         // At present after a hold: to the hold after DLSS where the output is learnt, else before the upscaler.
         s[0] = BEFORE;
         s[1] = PRESENT;
