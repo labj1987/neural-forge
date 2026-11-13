@@ -315,7 +315,8 @@ Each game was run on the test machine (RTX 5070, 2560x1440 or 3840x2160, Proton)
 DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. In each one the model
 ran with no missed frames and no GPU fault. GTA V Enhanced (`FrameLimit` 120), Cyberpunk 2077, Red Dead
 Redemption 2 and Crimson Desert were run again at 3840x2160, the last three with the game's HDR (HDR10) on
-(Proton-GE with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`); GTA V has no HDR.
+(Proton-GE with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`); GTA V has no HDR. God of War was run at 2560x1440
+with its HDR on the same way.
 
 The same facts, with the version each game was last seen working in and its known issues, are built into the app:
 the Status tab's **Tested game** line shows the running game's, the Setup tab's games list says where the model runs
@@ -330,7 +331,7 @@ Great Circle and Clair Obscur: Expedition 33 (#51); the list carries them too.
 | Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | After DLSS with Ray Reconstruction on; before the upscaler, inside DLSS's buffer, with it off |
 | GTA San Andreas - The Definitive Edition | Unreal Engine 4, DX11 | Super Resolution | Before the upscaler, inside DLSS's buffer |
 | Metro Last Light Redux | 4A Engine, DX12 | Super Resolution (the game's own DLSS 5 NR off) | Before the upscaler, inside DLSS's buffer |
-| God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | Before the upscaler |
+| God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | Before the upscaler, inside DLSS's buffer |
 | Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Before the upscaler |
 | Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Before the upscaler |
 | Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | Before the upscaler, inside DLSS's buffer |

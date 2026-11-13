@@ -42,8 +42,8 @@ impl EntryPoints {
         } else {
             original
         };
-        // Binds of nothing with a null layout, dropped before NVIDIA's driver reads the layout (`noop_bind`): in
-        // every process the layer works in, on devices that have the command.
+        // Binds of nothing with a null layout, forwarded with the device's empty pipeline layout so NVIDIA's driver
+        // never reads a null one (`noop_bind`): in every process the layer works in, on devices that have the command.
         let original =
             unsafe { crate::noop_bind::intercept(device, CStr::from_ptr(name).to_bytes(), original, crate::layer_enabled() && crate::ownership::eligible()) };
         unsafe { Self::intercept(name, original) }

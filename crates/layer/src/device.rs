@@ -1584,6 +1584,11 @@ impl NeuralForgeDeviceInfo {
         extended_usage: bool,
     ) -> Self {
         let handle = device.handle();
+        // The empty pipeline layout DXVK's binds of nothing go on with (`noop_bind`), in every process the layer works in.
+        if crate::layer_enabled() && crate::ownership::eligible() {
+            // SAFETY: the device is live and `device` is its next-layer dispatch.
+            unsafe { crate::noop_bind::device_created(&device) };
+        }
         // SAFETY: `next_get_device_proc_addr` is the next layer/driver's own
         // `vkGetDeviceProcAddr`, handed to us by the layer framework for exactly this
         // device; each name below matches the `PFN_vk*` type requested.

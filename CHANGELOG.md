@@ -24,6 +24,16 @@ first shipped them; their phase is kept as a subheading.
 - Every 600 frames the log says how the second GPU is doing (its time per frame, the time from sending a frame to
   its answer, frames shown with and without the model, and frames that had to wait for their own answer).
 
+## 4.1.3 — 2026-11-12
+
+**God of War no longer goes black with the model before the upscaler**
+
+- On recent NVIDIA drivers, God of War and other DX11 games running through Proton's DXVK showed a black picture
+  with only the HUD whenever Neural Forge was on, since 4.1.1. The call 4.1.1 skipped for GTA San Andreas – The
+  Definitive Edition is one DXVK needs right before DLSS runs; it is now passed on in a form NVIDIA's driver
+  handles, instead of skipped, so DLSS gets its images again and GTA San Andreas – The Definitive Edition still
+  does not hang at the menu.
+
 ## 4.1.2 — 2026-11-12
 
 **Build**
