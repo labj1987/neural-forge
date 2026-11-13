@@ -14,7 +14,6 @@
 //! and at its 75 fps cap with the network on the 4090 (7.2 ms); Red Dead Redemption 2 before DLSS at 1365x1024 ran
 //! at 48.5 fps with the 5080's 15.1 ms frames.
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The mean wait per hold at which the other GPU counts as setting the frame rate ([`Trial::offloaded`]), with
@@ -39,6 +38,9 @@ pub(crate) const FRAME_GAP: Duration = Duration::from_millis(250);
 /// keep coming; and how many holds in a row it may then miss. Past either the other GPU gets the frames back.
 pub(crate) const BUILD_BUDGET: Duration = Duration::from_secs(15);
 pub(crate) const MISSES: u32 = 30;
+/// Frame times of the model on the game's GPU longer than [`FRAME_GAP`] (below 4 frames a second) after which the trial
+/// gives the frames back: no window would ever fill.
+pub(crate) const SLOW: u32 = 30;
 /// Trials cut short by a change of what is held (another size, another pass count) before the offload keeps the
 /// model for good.
 pub(crate) const ABORTS: u32 = 3;
@@ -145,10 +147,14 @@ struct Local {
     off: Duration,
     wait: Duration,
     began: Instant,
-    /// Holds that ran the model here (the warm-up counts them), the misses in a row since, the last hold's time.
+    /// Holds that ran the model here (the warm-up counts them), the misses in a row since, the last hold's time, the
+    /// last hold's that ran the model while the one before it did too (an interval is only between two such), and
+    /// the intervals too long to be frame times.
     ran: u32,
     missed: u32,
     last: Option<Instant>,
+    last_ran: Option<Instant>,
+    slow: u32,
     intervals: Vec<Duration>,
 }
 
@@ -178,7 +184,18 @@ impl Trial {
             return None;
         }
         self.waiting = None;
-        self.phase = Phase::Local(Local { key, off: frame, wait, began: now, ran: 0, missed: 0, last: None, intervals: Vec::with_capacity(LOCAL_MAX) });
+        self.phase = Phase::Local(Local {
+            key,
+            off: frame,
+            wait,
+            began: now,
+            ran: 0,
+            missed: 0,
+            last: None,
+            last_ran: None,
+            slow: 0,
+            intervals: Vec::with_capacity(LOCAL_MAX),
+        });
         Some(format!(
             "trying the model on the game's GPU: the game waited {:.1} ms a frame for the other GPU's answer (a frame every {:.1} ms, {:.0} fps); the frame rate there decides where the model runs",
             ms(wait),
@@ -207,6 +224,8 @@ impl Trial {
         }
         if !ran {
             l.missed += 1;
+            // A frame without the model: the next interval would span it.
+            l.last_ran = None;
             let failed = if l.ran == 0 { now.saturating_duration_since(l.began) > BUILD_BUDGET } else { l.missed >= MISSES };
             l.last = Some(now);
             if failed {
@@ -220,12 +239,22 @@ impl Trial {
         }
         l.missed = 0;
         l.ran += 1;
-        let previous = l.last.replace(now);
+        l.last = Some(now);
+        let previous = l.last_ran.replace(now);
         if l.ran <= LOCAL_WARM {
             return None;
         }
-        if let Some(d) = previous.map(|t| now.saturating_duration_since(t)).filter(|&d| d < FRAME_GAP) {
-            l.intervals.push(d);
+        match previous.map(|t| now.saturating_duration_since(t)) {
+            Some(d) if d < FRAME_GAP => l.intervals.push(d),
+            Some(_) => l.slow += 1,
+            None => {}
+        }
+        // No window fills: the model runs below 4 frames a second here, or too few of its frames come in a row.
+        if l.slow >= SLOW || l.ran > LOCAL_WARM + 2 * LOCAL_MAX as u32 {
+            self.phase = Phase::Decided;
+            return Some(Verdict::Offload(
+                "the game's GPU could not be measured (too few frames in a row with the model on it): it goes back to the other GPU".into(),
+            ));
         }
         let n = l.intervals.len();
         if n < LOCAL_WINDOW {
@@ -277,42 +306,57 @@ impl Trial {
     }
 }
 
-static TRIAL: Mutex<Trial> = Mutex::new(Trial { phase: Phase::Watching, waiting: None, aborts: 0 });
+#[cfg(not(test))]
+static TRIAL: std::sync::Mutex<Trial> = std::sync::Mutex::new(Trial { phase: Phase::Watching, waiting: None, aborts: 0 });
 
-fn lock() -> std::sync::MutexGuard<'static, Trial> {
-    TRIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+/// The process's trial.
+#[cfg(not(test))]
+fn with<R>(f: impl FnOnce(&mut Trial) -> R) -> R {
+    f(&mut TRIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: each test thread's own trial, so a test that runs one is never reached by another test's holds
+    /// (`Session::note` from tests that run in parallel).
+    static TRIAL: std::cell::RefCell<Trial> = std::cell::RefCell::new(Trial::default());
+}
+
+#[cfg(test)]
+fn with<R>(f: impl FnOnce(&mut Trial) -> R) -> R {
+    TRIAL.with(|t| f(&mut t.borrow_mut()))
+}
+
+/// A side of the held placements was built on the other GPU: windows from before it say nothing of its frames.
+pub(crate) fn side_built() {
+    with(|t| t.waiting = None);
 }
 
 /// [`Trial::offloaded`] for the process.
 pub(crate) fn offloaded(key: Key, frame: Duration, wait: Duration) -> Option<String> {
-    lock().offloaded(key, frame, wait, enabled(), Instant::now())
+    with(|t| t.offloaded(key, frame, wait, enabled(), Instant::now()))
 }
 
 /// Whether the process's trial runs ([`Trial::running`]).
 pub(crate) fn running() -> bool {
-    lock().running()
+    with(|t| t.running())
 }
 
 /// Whether the held placements stay on the game's GPU ([`Trial::keeps_local`]).
 pub(crate) fn keeps_local() -> bool {
-    lock().keeps_local()
+    with(|t| t.keeps_local())
 }
 
 /// The trial's Status line ([`Trial::status_line`]).
 pub(crate) fn status_line() -> Option<String> {
-    lock().status_line()
+    with(|t| t.status_line())
 }
 
 /// A hold on the game's GPU while the trial runs ([`Trial::local`]); its verdict is logged. The held placements
 /// follow [`keeps_local`] from the next hold on.
 pub(crate) fn local_hold(key: Key, now: Instant, ran: bool, miss: Option<&str>) {
-    let verdict = {
-        let mut t = lock();
-        if !t.running() {
-            return;
-        }
-        t.local(key, now, ran, miss, forced_offload())
-    };
+    let forced = forced_offload();
+    let verdict = with(|t| if t.running() { t.local(key, now, ran, miss, forced) } else { None });
     let line = match verdict {
         Some(Verdict::Local { log, .. }) => log,
         Some(Verdict::Offload(why) | Verdict::Aborted(why)) => why,
@@ -322,10 +366,10 @@ pub(crate) fn local_hold(key: Key, now: Instant, ran: bool, miss: Option<&str>) 
     crate::logging::flush();
 }
 
-/// Tests: the process's trial starts afresh.
+/// Tests: this thread's trial starts afresh.
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
-    *lock() = Trial::default();
+    with(|t| *t = Trial::default());
 }
 
 #[cfg(test)]
@@ -532,6 +576,53 @@ mod tests {
         };
         assert!(n > LOCAL_WARM as usize + LOCAL_WINDOW + 1, "extended past the first window ({n})");
         assert!(matches!(verdict, Verdict::Local { .. }));
+    }
+
+    #[test]
+    fn a_game_gpu_below_four_frames_a_second_gives_the_frames_back() {
+        let (mut t, mut now) = started(MS(36), MS(16));
+        let mut verdict = None;
+        for _ in 0..1000 {
+            now += MS(300);
+            if let Some(v) = t.local(KEY, now, true, None, false) {
+                verdict = Some(v);
+                break;
+            }
+        }
+        match verdict.expect("decided") {
+            Verdict::Offload(why) => assert!(why.contains("could not be measured"), "{why}"),
+            v => panic!("{v:?}"),
+        }
+        assert!(!t.running() && !t.keeps_local() && t.status_line().is_none());
+    }
+
+    #[test]
+    fn frames_without_the_model_are_no_frame_times() {
+        // The model on every second hold (misses between): 10 ms holds, but no interval between two that ran; the
+        // measuring phase ends without a window, never with the misses' 10 ms taken for the model's frame time.
+        let (mut t, mut now) = started(MS(36), MS(16));
+        let mut verdict = None;
+        for i in 0..10_000u32 {
+            now += MS(10);
+            if let Some(v) = t.local(KEY, now, i % 2 == 0, Some("miss"), false) {
+                verdict = Some(v);
+                break;
+            }
+        }
+        assert!(matches!(verdict, Some(Verdict::Offload(ref why)) if why.contains("could not be measured")), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_new_side_forgets_the_window_before_it() {
+        let mut t = Trial::default();
+        let now = Instant::now();
+        assert!(t.offloaded(KEY, MS(36), MS(16), true, now).is_none());
+        reset_for_test();
+        with(|p| *p = std::mem::take(&mut t));
+        side_built();
+        assert!(offloaded(KEY, MS(36), MS(16)).is_none(), "the window before the side counts for nothing");
+        assert!(offloaded(KEY, MS(36), MS(16)).is_some());
+        reset_for_test();
     }
 
     #[test]
