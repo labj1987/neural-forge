@@ -74,10 +74,20 @@ pub(crate) struct PreRunner {
     /// A frame did not finish: nothing of the device is freed.
     leaked: bool,
     said_loading: bool,
+    /// Frames asked of the runner so far.
+    frames: u64,
 }
 
 // SAFETY: plain handles of the offload device and its own mappings, used on the worker's thread only.
 unsafe impl Send for PreRunner {}
+
+/// `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (a test switch): that frame of the before-DLSS offload fails on the other
+/// GPU, so the fall-back to the game's GPU can be seen in a game.
+fn test_fail_at() -> Option<u64> {
+    static AT: std::sync::LazyLock<Option<u64>> =
+        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_TEST_FAIL").and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0));
+    *AT
+}
 
 impl PreRunner {
     /// On the offload device made with the game's device `game` (`offload::take`): its loader, queue and command
@@ -150,6 +160,7 @@ impl PreRunner {
                 rule: super::offload::ServerRule::default(),
                 leaked: false,
                 said_loading: false,
+                frames: 0,
             },
             name,
         ))
@@ -408,6 +419,11 @@ impl Runner for PreRunner {
             }
         };
         let Some(meta) = meta else { return Ran::Skipped };
+        // Tests: the frame with this number (from 1) fails, as a frame that cannot run there does.
+        self.frames += 1;
+        if test_fail_at() == Some(self.frames) {
+            return Ran::Failed("the test's failure (NEURAL_FORGE_OFFLOAD_TEST_FAIL)".into());
+        }
         // SAFETY: the contract.
         match unsafe { self.frame(&meta, out, inn, layout) } {
             Ok(()) => Ran::Answered,
@@ -427,9 +443,26 @@ impl Runner for PreRunner {
     }
 
     fn gave_up(&mut self) {
-        // The process's one network goes back to the game's device.
-        if let Some(loader) = self.loader.as_ref() {
+        // The process's one network goes back to the game's device: it is closed here (the loader's own drop does
+        // it; retiring alone leaves it open, and the game's loader then finds it open elsewhere for good). Not after
+        // a frame that never finished: nothing it uses is freed.
+        if self.leaked {
+            return;
+        }
+        if let (Some(off), Some(f)) = (self.off.as_ref(), self.frame.take()) {
+            // SAFETY: idle: every frame was waited for.
+            unsafe {
+                f.native.destroy(&off.device);
+                f.hdr.destroy(&off.device);
+                f.depth.destroy(&off.device);
+            }
+        }
+        if let Some(loader) = self.loader.take() {
             loader.retire();
+            loader.stop_worker();
+            drop(loader);
+            crate::log!("[offload] before DLSS: the network is closed on the other GPU; the game's GPU loads it");
+            crate::logging::flush();
         }
     }
 }
