@@ -1029,6 +1029,10 @@ fn record_inline_hold(
         crate::preupscale::note_not_held(crate::preupscale::MODEL_OFF);
         return Err(Recorded::Skipped);
     }
+    if crate::preupscale::test_holds_off() {
+        inline_tally("skipped (NEURAL_FORGE_TEST_REBUILD_AT keeps the holds off)");
+        return Err(Recorded::Skipped);
+    }
     // The after-the-upscaler path stays off the network while the holds run before the upscaler.
     crate::preupscale::keep_post_off();
     let Some(loader) = session.native.clone() else { return Err(Recorded::Refused) };

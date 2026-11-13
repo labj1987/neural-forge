@@ -1471,6 +1471,62 @@ fn plans_before(plan: &placement::Plan) -> bool {
 
 /// Holds that ran, for the tally line ([`Tracking::scan`]): split holds that wrote back, and holds recorded
 /// inside DLSS's buffers that ran (each run of a buffer counts).
+/// `NEURAL_FORGE_TEST_REBUILD_AT=<launch>[:<seconds>][,...]` (a test switch): from that DLSS launch the hook holds
+/// nothing for `<seconds>` (as in a game's settings menu where DLSS still runs but no frame is held: after 30 s the
+/// after-the-upscaler path takes the network), then the hold's resources are built again as for another render extent
+/// (the game's change of DLSS mode, which needs the game's menu), so what that does to the hold's state (the offload's
+/// side, the network on the other GPU) can be seen in a game ([`test_holds_off`], [`test_rebuild_due`]).
+static TEST_REBUILD: LazyLock<Vec<(u64, u64)>> = LazyLock::new(|| {
+    neural_forge_protocol::env::var("NEURAL_FORGE_TEST_REBUILD_AT")
+        .map(|v| {
+            v.split(',')
+                .filter_map(|e| {
+                    let mut it = e.trim().split(':');
+                    let at = it.next()?.parse().ok()?;
+                    Some((at, it.next().and_then(|s| s.parse().ok()).unwrap_or(0)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+});
+
+/// [`TEST_REBUILD`]'s state: when the holds were kept off from, for how long, and a rebuild due.
+static TEST_STATE: Mutex<(Option<(Instant, u64)>, bool)> = Mutex::new((None, false));
+
+/// Whether [`TEST_REBUILD`] keeps this DLSS launch from being held (counted per launch the hook sees).
+pub(crate) fn test_holds_off() -> bool {
+    static LAUNCHES: AtomicU64 = AtomicU64::new(0);
+    if TEST_REBUILD.is_empty() {
+        return false;
+    }
+    let n = LAUNCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut st = lock(&TEST_STATE);
+    if let Some(&(_, pause)) = TEST_REBUILD.iter().find(|(at, _)| *at == n) {
+        crate::log!("[preupscale] NEURAL_FORGE_TEST_REBUILD_AT: no hold for {pause} s from DLSS launch {n}, then the hold's resources are built again");
+        st.0 = Some((Instant::now(), pause));
+    }
+    match st.0 {
+        Some((since, pause)) if since.elapsed() < Duration::from_secs(pause) => true,
+        Some(_) => {
+            st.0 = None;
+            st.1 = true;
+            false
+        }
+        None => false,
+    }
+}
+
+/// Whether [`TEST_REBUILD`] has the hold's resources built again now (once nothing recorded with them may still run).
+fn test_rebuild_due(outstanding: usize) -> bool {
+    let mut st = lock(&TEST_STATE);
+    if !st.1 || outstanding > 0 {
+        return st.1;
+    }
+    st.1 = false;
+    crate::log!("[preupscale] NEURAL_FORGE_TEST_REBUILD_AT: the hold's resources are built again, as for another render extent");
+    true
+}
+
 static HOLDS_SPLIT: AtomicU64 = AtomicU64::new(0);
 static HOLDS_INSIDE: AtomicU64 = AtomicU64::new(0);
 
@@ -5960,7 +6016,7 @@ impl Session {
         outstanding: usize,
     ) -> Result<(), &'static str> {
         let slot = self.res_inline(stage);
-        if slot.as_ref().is_some_and(|r| r.inline && r.matches(queue_family, width, height)) {
+        if slot.as_ref().is_some_and(|r| r.inline && r.matches(queue_family, width, height)) && !test_rebuild_due(outstanding) {
             return Ok(());
         }
         if slot.is_some() && outstanding > 0 {

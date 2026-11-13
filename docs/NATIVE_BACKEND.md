@@ -1850,9 +1850,10 @@ when I change the DLSS resolution"). Holds whose model runs on the other GPU rec
 (no build, no graph): `inline::Inline` counts them apart (`Meta::remote`, `Claims::remote`, counted after the
 outstanding count and let go before it), and the loader's use of the network is the holds that recorded it
 (`Claims::network_holds`) and the last time a path took a build (`Claims::last_local`, stamped in `ready_sizes`), not
-the hold's stamp: the network is lent back within a retry or two (the Cyberpunk 2077 benchmark with `NEURAL_FORGE_OFFLOAD_GPU=same`,
-the holds kept off for 40 s and the hold's resources built again: before the fix the offload never answered after the
-rebuild; with it, 600 of 600 holds carried the other GPU's edit).
+the hold's stamp: the network is lent back within a retry or two. `NEURAL_FORGE_TEST_REBUILD_AT=<launch>:<seconds>`
+(tests) keeps the holds off for that long from that DLSS launch and then builds the hold's resources again, as a
+change of render size does (the Cyberpunk 2077 benchmark with `NEURAL_FORGE_OFFLOAD_GPU=same` and `60:40`: before the
+fix the offload never answered after the rebuild; with it, 600 of 600 holds carried the other GPU's edit).
 
 **Measured (RTX 5070 alone, `same`: a second device of the game's GPU; the game sweep with
 `env = ["NEURAL_FORGE_OFFLOAD_GPU=same"]`; 2560x1440, render 1485x835, frame generation on; 2026-11-12):**
