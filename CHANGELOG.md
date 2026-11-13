@@ -10,8 +10,9 @@ first shipped them; their phase is kept as a subheading.
 
 - With passes both before and after DLSS in one frame (for example pass 1 before the upscaler and pass 2 set to
   After DLSS), the second GPU now runs both. In 4.3.0 every pass ran on the game's GPU in that case. The Status tab
-  says "second GPU: the model runs on ... before and after DLSS, its edits applied one frame later". The second GPU
-  does both passes' work for every frame, one after the other, so the frame rate is bounded by the two together.
+  says "second GPU: the model runs on ... before and after DLSS, its edits applied one frame later". Every pass runs
+  there, also with several passes on either side. The second GPU does all of their work for every frame, one after
+  the other, so the frame rate is bounded by the two sides together.
 - Finished frame on the second GPU: the game no longer waits at every present for its own GPU to finish copying the
   frame out; a helper thread hands each frame to the second GPU once it is copied. The game still waits for the
   second GPU's answer. Frames are still shown one frame later, each with its own answer. It starts once 30 frames in
@@ -46,6 +47,10 @@ first shipped them; their phase is kept as a subheading.
 - With passes both before and after DLSS in one frame, the second GPU is not used: every pass runs on the game's GPU,
   and the Status tab says so. (In 4.2.0 the second GPU took the pass before DLSS and the passes after DLSS did not
   run.)
+- With more than one pass, every pass now runs on the second GPU, before or after DLSS. In 4.2.0 only the first pass
+  ran there and the others were left out.
+- When the model goes back to the game's GPU because its frames cannot be sent to the second GPU, the Status tab and
+  the log now say what was missing (the game's motion vectors, their layout, the jitter or the edit cache's room).
 - The Status tab's Model row says where the model runs: before the upscaler, after DLSS, or on the second GPU before
   DLSS, after DLSS or on the finished frame. The frame-time graph shows the model's time after DLSS too.
 

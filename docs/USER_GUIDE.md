@@ -457,8 +457,8 @@ one GPU it is fresh on every frame while the camera is still, and on every secon
 changed in between (something uncovered, a cut) that spot gets no edit for a frame. The frame rate is bounded by the
 second GPU's time per frame here too: the game waits, a tenth of a second at most, for the answer to the frame before
 the one it is about to hand to DLSS, and a frame whose answer does not come in time goes to DLSS without the edit.
-This needs the edit cache (on unless `NEURAL_FORGE_EDIT_CACHE=off`) and the game's motion vectors; with more than one
-pass before DLSS the second GPU runs the first. The Status tab says "the model runs on ... before DLSS, its edit
+This needs the edit cache (on unless `NEURAL_FORGE_EDIT_CACHE=off`) and the game's motion vectors. With more than one
+pass, the second GPU runs all of them, so its time per frame grows with each pass. The Status tab says "the model runs on ... before DLSS, its edit
 applied one frame later".
 
 **After DLSS (Ray Reconstruction, or with Placement set to After DLSS).** The same, on DLSS's finished output instead of its input: each output frame goes
@@ -492,7 +492,8 @@ The model goes back to the game's GPU for the rest of the session, and the log s
 - cannot build or keep the network (it has not run there for 30 seconds while frames came, for example paused by the
   VRAM guard);
 - before or after DLSS: gets 30 frames in a row, over at least a second, without the game's motion vectors or jitter (the
-  edit could not be carried to the next frame);
+  edit could not be carried to the next frame; the Status tab says which, for example "the motion vectors' layout is
+  unknown");
 - takes more than a second for a frame (after the first frames of a build);
 - is far too slow for the game: more than 30 of its last 120 frames came back later than both three of the game's frame
   intervals and 100 ms, or 5 frames in a row got no answer in time (a quarter of a second on the finished frame, a

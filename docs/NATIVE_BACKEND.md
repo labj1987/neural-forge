@@ -1931,13 +1931,24 @@ counter chaining), a `NativePass`, an `HdrPass` (for its encoded image and expos
 own for the frame's extent; the regions imported as host memory or staged; one frame as the split hold submits it
 (the copies in, `N[parity]`, the answer's copy out), waited for. The history's rule is the hold's
 (`NativePass::begin_frame`); what the CPU decides per frame comes in a queue keyed by the frame's sequence number
-(`FrameMeta`). One pass runs there (the stage's first). One `HoldSide` (exchange, worker, runner, loader) per hold
+(`FrameMeta`). Every pass of the stage runs there, as on the game's device: the later passes' buffers
+(`NativePass::ensure_more`) are built on the other device, the game's device builds none for an offloaded hold, and
+the runner records the copies between the passes every frame as the split hold does (`NativePass::record_later`:
+`record_copies`, with the pass feedback) and submits `X`, pass 2, `Y` and each further pass, `R` between pass 1 and
+the answer's copy out (`NativePass::later_sequence`; the test `the_other_gpus_later_passes_match_the_split_holds`
+compares its answer with the split hold's for two and three passes at a feedback of 1 and 0.5); the game's device
+builds pass 1's lanes only; the log says "all N passes of the stage run on the other GPU" once per count. Until
+4.3.0 only the stage's first pass ran there and the others were dropped (#63: three passes after DLSS took 34 ms on the
+other device, as one does). One `HoldSide` (exchange, worker, runner, loader) per hold
 resources: a change of render extent loads the network again on the other device.
 
 **Fall-back** as on the finished frame (`ServerRule`, `LateRule` on the answers, `State::FellBack` for the process),
 and when 30 holds in a row, over at least a second of holds that keep coming (a pause of more than 250 ms between two
-of them starts the row again), cannot send their frame (no motion vectors, no jitter, no room for the chained cache:
-nothing could carry the edit, and the model would not run at all): the worker stops running frames (every send is
+of them starts the row again), cannot send their frame (no motion vectors, motion vectors whose layout the layer never saw set, no jitter, no
+room for the chained cache, `native::unsendable`: nothing could carry the edit, and the model would not run at all;
+the log line and the Status tab name the reason, "given up (after DLSS: its frames cannot be sent: the motion
+vectors' layout is unknown)" in the #63 reporter's session, where the hold after DLSS found DLSS's motion vectors in
+no known layout with a single pass): the worker stops running frames (every send is
 finished at once without an answer) and the runner frees its frame resources and closes its loader and with it the
 network (`PreRunner::gave_up`; retiring the loader alone leaves the network open there, and the game's loader then
 finds it open elsewhere for good), so the next holds load and run the network on the game's device. The hold's side is
@@ -2044,8 +2055,13 @@ device, its loader with the network, the queue, the command buffers and the fenc
 runner locks the core for the whole of a frame and waits for the frame before it lets go, so the two holds' frames
 run one after the other and nothing of the device or the network is rebuilt or freed under a frame that runs. Both
 holds ask the network for the same set of sizes (`native::frame_sizes`: the render size and the output size), so
-neither's frame rebuilds it. Each submit waits for its own hold's answer (`Exchange::at_submit`, by the resources'
-id), 100 ms at most each.
+neither's frame rebuilds it (`frame_sizes` takes every pass's extent of both stages, so the later passes' sizes are
+built too). Every pass of each hold's stage runs there (`NativePass::record_later`, as for one hold): each runner's
+own `NativePass` holds its later passes' buffers, lanes and histories, so the two holds may run different pass counts
+at different per-pass extents and share only the network's buffers of a size, used one frame after the other (the
+test `two_holds_on_one_core_run_every_pass_as_each_does_alone`: 2 passes before DLSS and 3 after it, frames of the two
+holds alternating on one queue, every answer bit for bit the hold's own alone). Each submit waits for its own hold's
+answer (`Exchange::at_submit`, by the resources' id), 100 ms at most each.
 
 Ownership: the first runner of a game's device takes the offload device (`offload::take`) and the last to leave gives
 it back, both under the seats' lock, so a runner that asks meanwhile waits and then makes a new core from what was
@@ -2127,7 +2143,8 @@ frame and before frame generation, where the finished-frame placement runs the n
 As before DLSS, `same` saves nothing (both devices share the GPU, and the second device's network takes twice the
 time beside the game); the numbers show the path works and what it adds. The picture: fine detail over the views
 two 35 s recordings share (143 pairs, the method of the section above), offloaded over local a median 0.964, inside
-what two runs of one build differ by. Frames looked at where the camera moves past pillars, railings and walking
+what two runs of one build differ by. With 3 passes (one comparison, Cyberpunk 2077 with Ray Reconstruction, 120 pairs)
+it is a median 0.919, against 0.964 with one pass. Frames looked at where the camera moves past pillars, railings and walking
 people: no edit trailing behind an edge. Not measured: two different GPUs, 3840x2160 (the 12 GB card cannot hold a
 second network at that size beside path tracing), a still scene.
 

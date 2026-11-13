@@ -4,13 +4,15 @@
 //! What the hold on the game's GPU sent (the frame's encode, the accumulated motion, the depth, the exposure and
 //! the scene cut's word) goes into a native pass of this device's own, built as the game's device builds its
 //! (`NativePass`: the model resolution, the control mask, the colour of the edit), with the network of a second
-//! loader on that device (barriers, never counter chaining: `super::native_post`). One network frame, as the split
-//! hold submits it (`N[parity]` on the frames' queue), and the answer copied into the answer region. What the CPU
+//! loader on that device (barriers, never counter chaining: `super::native_post`). One network frame with every pass of
+//! the stage, as the split hold submits it (`N[parity]`, then `X`, pass 2, `Y` and each further pass, `R`:
+//! `NativePass::record_later`), and the answer copied into the answer region. What the CPU
 //! decides per frame on the game's device (the history, the jitter, the passes' settings) comes in a queue keyed
 //! by the frame's sequence number ([`Metas`]).
 //!
 //! A frame with passes before DLSS and after its output has two holds and so two runners, one per hold, each with
-//! its own regions and pass resources at its own size. They share the other device, its one network (the process
+//! its own regions and pass resources at its own size and pass count (its `NativePass`: the later passes' buffers,
+//! lanes and histories are never the other hold's). They share the other device, its one network (the process
 //! has one: `nf_native.cpp`'s `g_live`) and what a frame is submitted with ([`Core`], through
 //! `offload_pre::Seats`): a runner locks the core for the whole of a frame and waits for the frame before it lets
 //! go, so the two holds' frames run one after the other and nothing is freed or rebuilt under a frame that runs.
@@ -119,6 +121,30 @@ pub(crate) struct PreRunner {
     frames: u64,
     /// The hold it serves (the log's words).
     at: super::offload_pre::Where,
+    /// The pass count last said in the log (more than one pass asked).
+    said_more: Option<usize>,
+}
+
+/// The passes a frame runs on the other device: every pass of the stage the hold sent (`asked`) when the later passes'
+/// buffers are built there (`more`), else pass 1 alone (`native::runnable`, as on the game's GPU).
+fn server_passes(asked: Passes, more: bool) -> Passes {
+    super::native::runnable(asked, more)
+}
+
+/// One frame's buffers on the other device, in submission order: the copies in (`up`), pass 1 (`frame`: its first
+/// frame's buffer and its parity's), the later passes with the copies between them (`later`:
+/// `NativePass::later_sequence`), the answer's copy out (`down`).
+fn frame_submits(
+    up: vk::CommandBuffer,
+    frame: &[Option<vk::CommandBuffer>; 2],
+    later: &[vk::CommandBuffer],
+    down: vk::CommandBuffer,
+) -> Vec<vk::CommandBuffer> {
+    let mut all = vec![up];
+    all.extend(frame.iter().flatten().copied());
+    all.extend_from_slice(later);
+    all.push(down);
+    all
 }
 
 // SAFETY: plain handles of the offload device and its own mappings, used on the worker's thread only.
@@ -172,6 +198,7 @@ impl PreRunner {
                 said_loading: false,
                 frames: 0,
                 at,
+                said_more: None,
             },
             name,
         ))
@@ -377,8 +404,18 @@ impl PreRunner {
         let built = builts[own];
         // Its own compute family: the graph recorded for it.
         let graphs: Vec<Graph> = builts.iter().map(|&b| Graph { built: b, graph: b.graph_own }).collect();
-        // One pass there (the first of the stage).
-        let passes = super::native::runnable(meta.passes, false);
+        // Every pass of the stage there, as on the game's GPU: the later passes' buffers built once (a failure runs one).
+        // SAFETY: nothing of the pass is pending (every frame is waited for); the frames' family is the setup's.
+        let more = meta.passes.count > 1 && unsafe { f.native.ensure_more(device, instance, physical, setup.family, meta.passes.count) };
+        let passes = server_passes(meta.passes, more);
+        if meta.passes.count > 1 && self.said_more != Some(passes.count) {
+            if more {
+                crate::log!("[offload] {}: all {} passes of the stage run on the other GPU", self.at.name(), passes.count);
+            } else {
+                crate::log!("[offload] {}: the later passes' buffers could not be made on the other GPU: it runs pass 1 alone", self.at.name());
+            }
+        }
+        self.said_more = (meta.passes.count > 1).then_some(passes.count);
         let depth = f.depth.as_ref().filter(|_| meta.depth && layout.sizes.depth > 0).map(super::native::DepthCopy::buffer);
         // SAFETY: nothing of the pass is pending (every frame is waited for); every handle is this device's.
         unsafe {
@@ -391,7 +428,16 @@ impl PreRunner {
             }
         }
         let history = f.native.begin_frame(built.network, meta.history);
-        let (frame_cmds, _) = f.native.frame_graphs(&graphs, history, meta.jitter, meta.mvec_scale, &passes);
+        let (frame_cmds, later) = f.native.frame_graphs(&graphs, history, meta.jitter, meta.mvec_scale, &passes);
+        let later = if more { later } else { Vec::new() };
+        // The copies between the passes, recorded for this frame (as the split hold does): `X` saves the capture and
+        // puts pass 1's answer (or its blend at a pass feedback below 1) where pass 2 reads, `Y` the same for each
+        // further pass, `R` puts the capture back. The encoded image is in GENERAL once `up` ran.
+        // SAFETY: built above and not pending (every frame is waited for); the encoded image is this device's.
+        let sequence = match unsafe { f.native.record_later(device, f.hdr.encoded_image(), f.hdr.encoded_view(), f.hdr.padded_region(), &passes, &later) } {
+            Ok(s) => s,
+            Err(_) => return Err(failed("recording the copies between the network's passes failed on the other GPU")),
+        };
         let (o, i) = self.regions.as_ref().expect("made above");
         let texels = u64::from(meta.width) * u64::from(meta.height);
         // SAFETY: the regions as the contract; the device's own command buffers, not pending.
@@ -490,9 +536,7 @@ impl PreRunner {
             if recorded.is_err() {
                 return Err(failed("recording the frame's copies failed on the other GPU"));
             }
-            let mut all = vec![up];
-            all.extend(frame_cmds.into_iter().flatten());
-            all.push(down);
+            let all = frame_submits(up, &frame_cmds, &sequence, down);
             let started = Instant::now();
             if crate::note_vk(device.handle(), device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&all)], fence)).is_err() {
                 f.native.gap.skipped();
@@ -501,6 +545,7 @@ impl PreRunner {
             for cmd in frame_cmds.into_iter().flatten() {
                 f.native.submitted(cmd);
             }
+            f.native.later_submitted(later.len());
             loader.pre_submitted(device, fence);
             let waited = device.wait_for_fences(&[fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64);
             if waited.is_err() {
@@ -622,5 +667,29 @@ impl Drop for PreRunner {
                 i.destroy(device);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pass of the stage the hold sent runs on the other GPU once the later passes' buffers are there (#63: only
+    /// pass 1 ran there, the others were dropped); without them pass 1 alone.
+    #[test]
+    fn the_other_gpu_runs_every_pass_of_the_stage() {
+        let asked = Passes { count: 3, ..Passes::default() };
+        assert_eq!(server_passes(asked, true).count, 3);
+        assert_eq!(server_passes(asked, false).count, 1);
+        assert_eq!(server_passes(Passes::default(), false).count, 1);
+    }
+
+    /// The later passes run after pass 1 and before the answer is copied out.
+    #[test]
+    fn the_answer_is_copied_out_after_the_last_pass() {
+        let cb = |n: u64| <vk::CommandBuffer as ash::vk::Handle>::from_raw(n);
+        let (up, down) = (cb(1), cb(9));
+        assert_eq!(frame_submits(up, &[None, Some(cb(2))], &[], down), vec![up, cb(2), down]);
+        assert_eq!(frame_submits(up, &[Some(cb(3)), Some(cb(2))], &[cb(5), cb(6), cb(7)], down), vec![up, cb(3), cb(2), cb(5), cb(6), cb(7), down]);
     }
 }
