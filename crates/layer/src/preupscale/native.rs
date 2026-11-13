@@ -924,12 +924,14 @@ impl Loader {
 
     /// Opens the network the Network setting `choice` names ([`network_to_load`]); returns it with
     /// which network it is.
-    fn open(device: vk::Device, setup: Setup, choice: u32, chain: bool) -> Result<(nn::Network, u32), nn::OpenError> {
+    /// `said_substitute`: the choice whose stand-in network was said last, so a refused open asked again every second
+    /// does not say it each time.
+    fn open(device: vk::Device, setup: Setup, choice: u32, chain: bool, said_substitute: &mut Option<u32>) -> Result<(nn::Network, u32), nn::OpenError> {
         let Some(running) = network_to_load(choice, network_present) else {
             let message = format!("no model at {}: extract it in the Setup tab (neural-forge-cli extract-model)", network_dir(choice).display());
             return Err(nn::OpenError { message, stalled: false });
         };
-        if running != choice {
+        if running != choice && said_substitute.replace(choice) != Some(choice) {
             crate::log!(
                 "[native] the {} network is chosen but not extracted (the DLL has none); running the {} network",
                 network::name(choice),
@@ -976,6 +978,8 @@ impl Loader {
         // This device's VRAM readings for the build lines (it outlives this thread: `Drop` joins it).
         let vram = crate::vram::probe(setup.gipa, setup.instance, setup.physical, setup.properties2);
         let mut retry = BuildRetry::default();
+        // The Network setting whose stand-in network was said last ([`Self::open`]).
+        let mut said_substitute: Option<u32> = None;
         let mut inject = neural_forge_protocol::env::var(FailInject::ENV).and_then(|v| FailInject::parse(&v));
         if let Some(f) = inject {
             crate::log!("[native] {}: the next {} network builds will fail on purpose", FailInject::ENV, f.remaining());
@@ -1131,7 +1135,7 @@ impl Loader {
             let mut loaded = None;
             let result = match network.take() {
                 Some(n) => Ok(n),
-                None => Self::open(device, setup, choice, !barriers_from_start)
+                None => Self::open(device, setup, choice, !barriers_from_start, &mut said_substitute)
                     .map(|(n, running)| {
                         opened = Some((t.elapsed(), vram.as_ref().map(crate::vram::reading)));
                         loaded = Some(running);
@@ -1216,6 +1220,8 @@ impl Loader {
             }
             match result {
                 Ok((n, built)) => {
+                    // Opened or built: a later refusal by another device is a new run, said again.
+                    retry.owner_done();
                     state.barriers |= switched;
                     if let Some(built) = built {
                         // Unique in the process: a hold's buffers recorded for one build are never taken

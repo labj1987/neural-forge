@@ -1855,7 +1855,8 @@ stamped in `ready_sizes`), not the hold's stamp: the network is lent back within
 another device has the network is not counted toward the retry streak, whose fourth wait (30 s) came after the second
 GPU's own 30 s rule: it is asked again every second while that device closes it, and while it uses it every second the
 first 5 times in a row, then every 5 s (each ask runs its lend check), said once per run of the same answer
-(`BuildRetry::wait_for_owner`). That rule (`ServerRule`) adds up the time frames not run keep coming: an interval of
+(`BuildRetry::wait_for_owner`; a run ends when the network opens, at a real failure, or with a refusal more than 10 s
+after the last one). That rule (`ServerRule`) adds up the time frames not run keep coming: an interval of
 more than a second between two misses (a menu, a loading screen) adds nothing, and only a frame that ran starts it
 over, so bursts of misses between pauses still fall back. `NEURAL_FORGE_TEST_REBUILD_AT=<launch>:<seconds>`
 (tests) keeps the holds off for that long from that DLSS launch and then builds the hold's resources again, as a

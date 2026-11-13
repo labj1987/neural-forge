@@ -47,6 +47,9 @@ pub struct BuildRetry {
     /// refusals in a row while using the network.
     owner_said: Option<bool>,
     owner_busy: u32,
+    /// When the last refusal of the run was ([`Self::wait_for_owner`]): one more than [`Self::OWNER_RUN_GAP`] later
+    /// starts a new run.
+    owner_last: Option<Instant>,
 }
 
 impl BuildRetry {
@@ -75,8 +78,7 @@ impl BuildRetry {
 
     /// A build failed at `now`. Returns the wait before the next attempt.
     pub fn failed(&mut self, now: Instant) -> Duration {
-        self.owner_said = None;
-        self.owner_busy = 0;
+        self.owner_done();
         self.streak += 1;
         let wait = Self::SHORT.get(self.streak as usize - 1).copied().unwrap_or(Self::LONG);
         self.next_at = Some(now + wait);
@@ -92,6 +94,9 @@ impl BuildRetry {
     pub const OWNER_BUSY_WAIT: Duration = Duration::from_secs(5);
     /// Refusals in a row with the other device using the network before the asks slow to [`Self::OWNER_BUSY_WAIT`].
     pub const OWNER_BUSY_SHORT: u32 = 5;
+    /// A refusal this long after the last one starts a new run of them (said again, back to [`Self::OWNER_WAIT`]):
+    /// twice the longest wait between two of one run.
+    pub const OWNER_RUN_GAP: Duration = Duration::from_secs(10);
 
     /// The open was refused at `now` because another device of the process has the network, which was asked to lend
     /// it: `lending` when it closes it now, else it is using it. No failure of this loader's (the streak and its
@@ -101,12 +106,24 @@ impl BuildRetry {
     /// [`Self::OWNER_BUSY_SHORT`] times in a row. Returns the wait, and whether to say so: once per run of refusals
     /// with the same answer.
     pub fn wait_for_owner(&mut self, now: Instant, lending: bool) -> (Duration, bool) {
+        if self.owner_last.replace(now).is_some_and(|t| now.saturating_duration_since(t) > Self::OWNER_RUN_GAP) {
+            self.owner_said = None;
+            self.owner_busy = 0;
+        }
         let say = self.owner_said != Some(lending);
         self.owner_said = Some(lending);
         self.owner_busy = if lending { 0 } else { self.owner_busy.saturating_add(1) };
         let wait = if self.owner_busy > Self::OWNER_BUSY_SHORT { Self::OWNER_BUSY_WAIT } else { Self::OWNER_WAIT };
         self.next_at = Some(now + wait);
         (wait, say)
+    }
+
+    /// The run of refusals is over (the network opened, or the loader asked for nothing more): the next refusal is
+    /// said again and asked again at [`Self::OWNER_WAIT`].
+    pub fn owner_done(&mut self) {
+        self.owner_said = None;
+        self.owner_busy = 0;
+        self.owner_last = None;
     }
 
     /// A build succeeded: the streak is over.
@@ -225,6 +242,20 @@ mod tests {
         assert!(!r.failing());
         // A real failure after them starts the streak at its first short wait, and the next refusal is said again.
         assert_eq!(r.failed(now), BuildRetry::SHORT[0]);
+        assert_eq!(r.wait_for_owner(now, false), (BuildRetry::OWNER_WAIT, true));
+        // A run that ended with no build and no failure (the loader went idle): a refusal long after starts a new one,
+        // said again and asked again in a second; one within the gap continues it.
+        let mut r = BuildRetry::default();
+        let mut now = t0;
+        for _ in 0..8 {
+            now += r.wait_for_owner(now, false).0;
+        }
+        assert_eq!(r.wait_for_owner(now, false), (BuildRetry::OWNER_BUSY_WAIT, false), "within the gap: the same run");
+        now += BuildRetry::OWNER_RUN_GAP + Duration::from_secs(1);
+        assert_eq!(r.wait_for_owner(now, false), (BuildRetry::OWNER_WAIT, true), "hours later: a new run");
+        // The network opened in between: the next refusal is a new run too.
+        now += r.wait_for_owner(now, false).0;
+        r.owner_done();
         assert_eq!(r.wait_for_owner(now, false), (BuildRetry::OWNER_WAIT, true));
     }
 
