@@ -6,7 +6,7 @@ first shipped them; their phase is kept as a subheading.
 
 ## 4.4.0 — 2026-11-13
 
-**The second GPU: passes before and after DLSS together, lighter presents, less to send**
+**The second GPU: passes before and after DLSS together, fewer waits in the game at the finished frame, less to send**
 
 - With passes both before and after DLSS in one frame (for example pass 1 before the upscaler and pass 2 set to
   After DLSS), the second GPU now runs both. In 4.3.0 every pass ran on the game's GPU in that case. The Status tab
