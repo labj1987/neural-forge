@@ -4,6 +4,22 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.3.0 — 2026-11-13
+
+**The second GPU with Ray Reconstruction**
+
+- With `NEURAL_FORGE_OFFLOAD_GPU` set, the second GPU now also runs the model in games using DLSS Ray Reconstruction
+  (path tracing), where the model works on DLSS's output. Until now the model stayed on the game's GPU there. Nothing
+  to change: leave Placement on Auto.
+- It works as before DLSS does: each of DLSS's output frames goes to the second GPU and its edit is applied to the
+  next one, carried along the game's motion vectors. No frame is shown later; the edit is one frame old.
+- The network runs at the output resolution there, so the second GPU needs longer per frame than before DLSS, and
+  the frame rate is bounded by it. At 4K the small network or a lower Model resolution helps.
+- The Status tab says "second GPU: the model runs on ... after DLSS, its edit applied one frame later". The same
+  rules send the model back to the game's GPU when the second GPU cannot keep up or fails.
+- With passes both before and after DLSS, the second GPU runs the pass before DLSS and the others stay on the game's
+  GPU.
+
 ## 4.2.0 — 2026-11-12
 
 **The model on a second GPU**
