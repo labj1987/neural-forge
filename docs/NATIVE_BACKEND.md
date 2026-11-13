@@ -2083,7 +2083,11 @@ frames a second (54 holds, about 81 fps shown); with `same` 17 (34 holds, about 
 second device for the hold before DLSS and 37.4 ms for the hold after it (39.8 ms from send to answer there: it waits
 for the other hold's frame), 600 of 600 frames answered in time and 600 of 600 holds carrying the edit at each hold in
 every summary once the network ran, no misses, video memory 10.5 of 12 GB. As everywhere on one GPU, `same` saves
-nothing; it shows that both holds are served.
+nothing; it shows that both holds are served. With every pass of each hold there (the merge of 4.3.0's fixes; same
+benchmark, 3 passes, pass 1 before the upscaler and passes 2 and 3 set to After DLSS): "after DLSS: all 2 passes of the
+stage run on the other GPU", 16.8 ms a frame there before DLSS and 54.7 ms after it (two passes at 2560x1440), 473 and
+471 of 598 frames answered in time and carried (the one GPU is saturated by the three passes and the game: the
+others go without the edit, as the budget rule says), the Status "before and after DLSS", the recording clean.
 
 **What crosses, per hold** (imported host memory on both devices): the encode and the answer at the padded output
 extent (RGBA16F) and the accumulated motion, packed to two halves a texel since 4.4.0 (below): 42.2 MB out and 28.1
