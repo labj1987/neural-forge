@@ -408,6 +408,8 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_PROBE_IMAGE=<kernel>[+],...` | layer | Testing aid: copy the images a named CUDA launch reads, before it (or after it with `+`), once, into `captures/probe-<ms>/`. |
 | `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` | layer | Gives every network activation its own allocation again instead of sharing memory by lifetime (more video memory, same result). |
 | `NEURAL_FORGE_OFFLOAD_GPU=same\|N\|vendor:device[@pci-address]` | layer | Runs the model on another GPU (before DLSS, after DLSS with Ray Reconstruction or with Placement set to After DLSS, or on the finished frame): the one at index `N` (decimal) of the list the layer log prints when the game creates its device on a machine with more than one GPU (`[offload] GPU N: ...`), or the one with that PCI vendor and device ID (4 hexadecimal digits each, `10de:2c02`; add `@0000:73:00.0` where two cards share the ID). `same` puts it on a second device of the game's own GPU, which tests the path and saves nothing. Unset or `off`: the game's GPU. See [The model on a second GPU](#the-model-on-a-second-gpu). |
+| `NEURAL_FORGE_OFFLOAD_PACING=cpu\|relay` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model on the finished frame. `cpu`: the game's thread makes every wait of a present itself (for its GPU's copy of the frame and for the answer), as before 4.4.0. `relay`: a helper thread waits for the copy, the game's thread for the answer. Unset: the game's GPU also waits for the answer (where both GPUs have sync-file semaphores), and the game's thread for neither. |
+| `NEURAL_FORGE_OFFLOAD_MOTION=float` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: the motion vectors cross to the other GPU as two floats a texel (twice the bytes), as before 4.4.0. Unset, they cross as two halves a texel, which is what DLSS's vectors are. |
 | `NEURAL_FORGE_OFFLOAD_TEST_FAIL=N` | layer | Tests only, with `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: the `N`th frame fails on the other GPU, so the model goes back to the game's GPU. |
 | `NEURAL_FORGE_TEST_REBUILD_AT=N:S` | layer | Tests only: from the `N`th DLSS launch nothing is held for `S` seconds, then the hold's resources are built again as for a change of DLSS's render size. |
 | `NEURAL_FORGE_OFFLOAD_STANDIN=1` | layer | Tests only, with `NEURAL_FORGE_OFFLOAD_GPU`: a copy in and back out of the other GPU runs in place of the network (for a GPU that cannot run it), so every frame comes back unchanged. |
@@ -436,8 +438,9 @@ game's GPU no longer spends its frame time on the network:
 1. Leave **Placement** on Auto: the second GPU then takes the model before DLSS (where its edit changes textures and
    detail most), or after DLSS in games running Ray Reconstruction (path tracing), where the model always works on
    DLSS's output. Or set it to **After DLSS** (`set_placement=2`) or **Finished frame** (`set_placement=3`). With several passes split
-   between before and after DLSS in one frame, the second GPU is not used and every pass runs on the game's GPU (the
-   Status tab says "second GPU: not used here: with passes before and after DLSS the model runs on the game's GPU").
+   between before and after DLSS in one frame, the second GPU runs both, one after the other for every frame (the
+   Status tab says "second GPU: the model runs on ... before and after DLSS, its edits applied one frame later"), and
+   the frame rate is bounded by the two together.
 2. Start the game once with Neural Forge on: where the machine has more than one GPU, the layer log lists them when
    the game creates its device (`[offload] GPU 1: NVIDIA GeForce RTX 5080 [10de:2c02@0000:73:00.0], ...`).
 3. Add `NEURAL_FORGE_OFFLOAD_GPU=1` (that GPU's index) or its PCI IDs (`NEURAL_FORGE_OFFLOAD_GPU=10de:2c02`) to the
@@ -462,7 +465,7 @@ applied one frame later".
 to the second GPU and its edit is applied to the next output frame, carried along the game's motion vectors, before
 the game's own post-processing, HUD and frame generation. Nothing is shown later. The network runs at the output
 resolution here (2560x1440 or 3840x2160, not DLSS's smaller render size), so the second GPU needs longer per frame
-than before DLSS and more crosses between the GPUs (about 56 MB out and 28 MB back per frame at 2560x1440, 133 MB
+than before DLSS and more crosses between the GPUs (about 42 MB out and 28 MB back per frame at 2560x1440, 100 MB
 and 66 MB at 3840x2160), and the frame rate is bounded by that time: expect a larger drop than before DLSS. This is
 not yet measured at 4K or on two different cards; if the second GPU is too slow, the model returns to the game's GPU.
 Consider the small network or a lower Model resolution at 4K. The Status tab says "the model runs on ... after DLSS,
@@ -472,7 +475,12 @@ its edit applied one frame later".
 Each frame goes to it and back
 through system memory and is shown one frame later than on one GPU: the game's GPU renders the next frame while the
 second GPU works on this one. The frame rate is then bounded by the second GPU's time per frame (the network and the
-copies): a second GPU that takes longer per frame than the game holds the game back to its own rate. Where a frame
+copies): a second GPU that takes longer per frame than the game holds the game back to its own rate. Once the answers
+come every frame (30 in a row), the game stops waiting at each present for its own GPU to copy the frame out (a helper
+thread does), and where both GPUs' drivers have sync-file semaphores (NVIDIA's do) it no longer waits for the answer
+either: its GPU waits for it before the frame is shown, and the game prepares the next frame meanwhile. It steps back
+to its own waits when an answer is late (`NEURAL_FORGE_OFFLOAD_PACING=relay` keeps the answer's wait in the game,
+`=cpu` all of them). Where a frame
 comes back too late for its turn, or that could not be captured, is shown in its turn without the model's edit (after three failed captures in a row, the next 30 frames wait for their own answer instead). When the delay
 starts (the first frames, and again after the game stalled for a quarter of a second) one frame is shown twice.
 

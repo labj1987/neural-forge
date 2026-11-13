@@ -4,6 +4,28 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.4.0 — 2026-11-13
+
+**The second GPU: passes before and after DLSS together, lighter presents, less to send**
+
+- With passes both before and after DLSS in one frame (for example pass 1 before the upscaler and pass 2 set to
+  After DLSS), the second GPU now runs both. In 4.3.0 every pass ran on the game's GPU in that case. The Status tab
+  says "second GPU: the model runs on ... before and after DLSS, its edits applied one frame later". The second GPU
+  does both passes' work for every frame, one after the other, so the frame rate is bounded by the two together.
+- Finished frame on the second GPU: the game no longer waits at every present for its own GPU to finish copying the
+  frame out, nor for the second GPU's answer. A helper thread hands each frame to the second GPU once it is copied,
+  and the game's GPU itself waits for the answer before it shows the frame, so the game can already prepare the next
+  one. Frames are still shown one frame later, each with its own answer. It starts once 30 frames in a row were
+  answered and steps back by itself when an answer is late. The wait on the GPU needs a driver with sync-file
+  semaphores on both GPUs (NVIDIA has them); without, the game waits for the answer as before.
+  `NEURAL_FORGE_OFFLOAD_PACING=relay` keeps the answer's wait in the game, `=cpu` all of them.
+- Before and after DLSS on the second GPU: the motion vectors sent with each frame are half the size (about 42 MB
+  out per frame instead of 56 MB at 2560x1440 after DLSS, about 100 MB instead of 133 MB at 3840x2160). They are
+  DLSS's own vectors, which are half precision to begin with, so the picture does not change.
+  `NEURAL_FORGE_OFFLOAD_MOTION=float` sends them as before.
+- None of this is measured on two different cards yet: the test machine has one GPU, where a second device of the
+  same card shows that the paths work and what they add, not what a second card saves.
+
 ## 4.3.0 — 2026-11-13
 
 **The second GPU with Ray Reconstruction**
