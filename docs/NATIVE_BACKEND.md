@@ -1838,6 +1838,22 @@ ran (two offloaded holds in one submit, or after an abandoned frame) is not answ
 afresh (`serve`: OUT's sequence number and `sent` read again after the run). The workers of a device end inside its
 `vkDestroyDevice` before the offload device is destroyed (`offload_pre::stop_for`).
 
+**The game's network beside the offloaded holds (#63, 2026-11-13).** The game's own loader can have the process's one
+network open while the holds send their frames to the other GPU: the after-the-upscaler path takes it after 30 s
+without a held frame while DLSS still runs (a game's settings menu), and the offload loader lends it to that path
+(it is idle there). A change of DLSS's render size then builds a new hold's side, whose loader on the other device
+asks for the network back. The game's loader used to refuse it for as long as the holds came: every offloaded hold
+stamped its `last_pre` (which keeps the after-the-upscaler path off) and counted among its outstanding holds, so the
+network looked in use, the other GPU answered no frame (599 of 599 unanswered in the Cyberpunk 2077 reproduction) and
+the model was off until `ServerRule` fell back to the game's GPU 30 s later (the reporter: "the effect disappears
+when I change the DLSS resolution"). Holds whose model runs on the other GPU record nothing of the game's network
+(no build, no graph): `inline::Inline` counts them apart (`Meta::remote`, `Claims::remote`, counted after the
+outstanding count and let go before it), and the loader's use of the network is the holds that recorded it
+(`Claims::network_holds`) and the last time a path took a build (`Claims::last_local`, stamped in `ready_sizes`), not
+the hold's stamp: the network is lent back within a retry or two (the Cyberpunk 2077 benchmark with `NEURAL_FORGE_OFFLOAD_GPU=same`,
+the holds kept off for 40 s and the hold's resources built again: before the fix the offload never answered after the
+rebuild; with it, 600 of 600 holds carried the other GPU's edit).
+
 **Measured (RTX 5070 alone, `same`: a second device of the game's GPU; the game sweep with
 `env = ["NEURAL_FORGE_OFFLOAD_GPU=same"]`; 2560x1440, render 1485x835, frame generation on; 2026-11-12):**
 

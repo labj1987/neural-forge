@@ -247,7 +247,7 @@ impl LoaderState {
         // a split hold's work (its fence pending, or none covering it), an after-the-upscaler frame running, or one whose
         // wait timed out and whose fence has not signalled. A frame taken more than IDLE_STEP ago can still run then, and
         // closing the network under it was a copy-engine read of freed memory (Xid 31, #59).
-        let unused = || claims.unused(claims.last_pre.load(std::sync::atomic::Ordering::SeqCst));
+        let unused = || claims.unused();
         (idle && self.guard.step_down_pending() && unused()).then(|| self.guard.apply()).flatten()
     }
 
@@ -383,6 +383,17 @@ struct Claims {
     /// current build, so nothing rebuilds it ([`Loader::ready_sizes`], [`Loader::fall_back`]) and the
     /// after-the-upscaler path does not take the network ([`Claims::pre_running`]) while there are any.
     holds: Arc<std::sync::atomic::AtomicUsize>,
+    /// Those of [`Self::holds`] that recorded nothing of this network: holds before DLSS whose model runs on a
+    /// second GPU (`super::offload_pre`), counted by `super::inline::Inline` once recorded and until released. They
+    /// keep no build or close from happening ([`Self::holds_beyond`] counts them) but are no use of the network: a
+    /// network the after-the-upscaler path opened here is lent to the second GPU's loader beside them
+    /// ([`Claims::unused`]), which otherwise was refused it for good (#63: the model gone after a change of DLSS's
+    /// render size, back on the game's GPU 30 s later).
+    remote: Arc<std::sync::atomic::AtomicUsize>,
+    /// The last time a path took a build of this network ([`Loader::ready_sizes`]; ms since [`epoch_ms`]'s start). Holds
+    /// whose model runs on a second GPU stamp [`Self::last_pre`] (it keeps the after-the-upscaler path off) but never
+    /// this.
+    last_local: std::sync::atomic::AtomicU64,
 }
 
 /// [`Loader::test_graph`].
@@ -417,6 +428,14 @@ impl Claims {
         self.holds.load(std::sync::atomic::Ordering::SeqCst) > reserved
     }
 
+    /// The holds recorded into DLSS's buffers that may still run and recorded this network ([`Self::holds`] less
+    /// [`Self::remote`]). `remote` is counted after `holds` and let go before it, so this is never below the true count.
+    fn network_holds(&self) -> usize {
+        use std::sync::atomic::Ordering::SeqCst;
+        let remote = self.remote.load(SeqCst);
+        self.holds.load(SeqCst).saturating_sub(remote)
+    }
+
     fn release_post(&self) {
         use std::sync::atomic::Ordering::SeqCst;
         self.last_post.store(epoch_ms(), SeqCst);
@@ -436,7 +455,7 @@ impl Claims {
     /// Whether a pre-upscaler hold's work may still use the network: a split hold's (its fence), or one
     /// recorded into DLSS's buffers.
     fn pre_running(&self) -> bool {
-        if self.holds_beyond(0) {
+        if self.network_holds() > 0 {
             return true;
         }
         let mut inflight = self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -458,12 +477,13 @@ impl Claims {
         self.pre_running() || self.post_busy.load(SeqCst) || stalled || epoch_ms() < self.pre_unfenced_until.load(SeqCst)
     }
 
-    /// Neither path uses the network: nothing [`Self::in_flight`], and neither path ran for [`PATH_SWITCH_MS`] (`last_pre`
-    /// the last hold's stamp).
-    fn unused(&self, last_pre: u64) -> bool {
+    /// Neither path uses the network: nothing [`Self::in_flight`], and neither path took it for [`PATH_SWITCH_MS`]
+    /// ([`Self::last_local`], [`Self::last_post`]). Holds whose model runs on a second GPU do not count: they record
+    /// nothing of it.
+    fn unused(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         let quiet = |at: u64| epoch_ms().saturating_sub(at) >= PATH_SWITCH_MS;
-        !self.in_flight() && quiet(last_pre) && quiet(self.last_post.load(SeqCst))
+        !self.in_flight() && quiet(self.last_local.load(SeqCst)) && quiet(self.last_post.load(SeqCst))
     }
 }
 
@@ -660,11 +680,6 @@ impl Loader {
         loader
     }
 
-    /// Holds recorded into DLSS's buffers that may still run.
-    fn holds_out(&self) -> bool {
-        self.holds_beyond(0)
-    }
-
     /// More than `reserved` holds recorded (or being recorded) into DLSS's buffers may still run: a hold being
     /// recorded counts itself from before it asks for the network (`inline::Inline::record_outcome`), and passes
     /// 1 here, so only the others keep a rebuild off.
@@ -842,11 +857,11 @@ impl Loader {
             let _ = self.claims.last_pre.compare_exchange(stamp, before, SeqCst, SeqCst);
             false
         };
-        if !self.unused(before) {
+        if !self.unused() {
             return refuse();
         }
         let mut st = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if st.network.is_none() || self.holds_out() || st.uses != uses {
+        if st.network.is_none() || self.claims.network_holds() > 0 || st.uses != uses {
             drop(st);
             return refuse();
         }
@@ -857,9 +872,25 @@ impl Loader {
         true
     }
 
-    /// Neither path uses the network ([`Self::lend`]'s condition), `last_pre` the last hold's stamp.
-    fn unused(&self, last_pre: u64) -> bool {
-        self.claims.unused(last_pre)
+    /// Neither path uses the network ([`Self::lend`]'s condition).
+    fn unused(&self) -> bool {
+        self.claims.unused()
+    }
+
+    /// The count of the holds recorded into DLSS's buffers that record nothing of this network (their model runs on a
+    /// second GPU), kept by `super::inline::Inline` ([`Claims::remote`]).
+    #[cfg(test)]
+    pub(crate) fn remote_holds(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.claims.remote.clone()
+    }
+
+    /// The loader with `remote` as its count of [`Self::remote_holds`] (shared with the device's `super::inline::Inline`),
+    /// right after [`Self::start`].
+    pub(crate) fn with_remote_holds(mut self, remote: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        if let Some(claims) = Arc::get_mut(&mut self.claims) {
+            claims.remote = remote;
+        }
+        self
     }
 
     /// The device is being destroyed: no other device's loader reaches this one from here on ([`Self::ask_owner`]
@@ -1327,6 +1358,7 @@ impl Loader {
         if built.is_some() {
             st.uses += 1;
             st.last_use = Some(Instant::now());
+            self.claims.last_local.store(epoch_ms(), std::sync::atomic::Ordering::SeqCst);
         }
         drop(st);
         if woken {
@@ -5161,6 +5193,7 @@ unsafe fn native_hold(
             cache_dump: None,
             timed: ctx.queries != vk::QueryPool::null(),
             offload: off_plan.filter(|_| offloaded),
+            remote: offloaded,
         };
         if !network_ok {
             if let Some(e) = res.edit.as_mut() {
@@ -5565,7 +5598,7 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
         let _ = epoch_ms();
         std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
-        let unused = || loader.unused(loader.claims.last_pre.load(SeqCst));
+        let unused = || loader.unused();
         assert!(unused(), "nothing ran");
         holds.store(1, SeqCst);
         assert!(!unused(), "a hold in DLSS's buffers may still run");
@@ -5575,12 +5608,62 @@ mod tests {
         loader.release_post();
         assert!(!unused(), "within a path switch of it");
         loader.claims.last_post.store(0, SeqCst);
-        loader.claims.last_pre.store(epoch_ms(), SeqCst);
-        assert!(!unused(), "within a path switch of a hold");
-        loader.claims.last_pre.store(0, SeqCst);
+        loader.claims.last_local.store(epoch_ms(), SeqCst);
+        assert!(!unused(), "within a path switch of a hold that took it");
+        loader.claims.last_local.store(0, SeqCst);
         assert!(unused());
         assert!(!loader.lend(), "no network open here: nothing to lend");
         assert_eq!(loader.claims.last_pre.load(SeqCst), 0, "a refused lend leaves the hold's stamp as it was: the other path is not kept off");
+    }
+
+    /// #63: holds before DLSS whose model runs on a second GPU record nothing of the game's network. A network the
+    /// after-the-upscaler path opened on the game's device beside them is not in use, so it is lent to the second GPU's
+    /// loader; before, their stamp and their count kept it here for good, and the second GPU never got the network
+    /// back after a change of DLSS's render size (the model off until the offload fell back 30 s later).
+    #[test]
+    fn holds_whose_model_runs_on_a_second_gpu_do_not_keep_the_network_here() {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical: vk::PhysicalDevice::null(),
+            frame_family: 0,
+            family: 0,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+            shared: None,
+            bda_ext: false,
+        };
+        use std::sync::atomic::Ordering::SeqCst;
+        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader = Loader::for_test(setup, vec![built((64, 32), 1, network::FULL)], holds.clone(), Box::new(|_, _| {}));
+        let remote = loader.remote_holds();
+        // The after-the-upscaler path opened it and stopped a path switch ago.
+        let _ = epoch_ms();
+        std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
+        loader.claims.last_post.store(0, SeqCst);
+        // Offloaded holds come on and on: each stamps the hold (keeping that path off) and is outstanding.
+        assert!(loader.claim_pre(), "a hold before DLSS");
+        assert!(!loader.claim_post(), "the after-the-upscaler path stays off beside the holds");
+        holds.store(3, SeqCst);
+        remote.store(3, SeqCst);
+        assert!(loader.unused(), "holds that record nothing of the network are no use of it");
+        // One of them recorded the network after all: in use.
+        remote.store(2, SeqCst);
+        assert!(!loader.unused(), "a hold that recorded the network may still run");
+        remote.store(3, SeqCst);
+        // A hold that took a build here is a use, whatever the count says.
+        assert!(loader.ready_sizes(&[(64, 32)], network::FULL, 0).is_some());
+        assert!(!loader.unused(), "within a path switch of a hold that took the network");
+        loader.claims.last_local.store(0, SeqCst);
+        assert!(loader.unused());
+        // The count is never below the true one: let go before the holds, counted after them.
+        remote.store(4, SeqCst);
+        assert_eq!(loader.claims.network_holds(), 0);
     }
 
     /// While the network is being lent to another device, neither path takes it, and each use is counted (a
@@ -5738,7 +5821,7 @@ mod tests {
         let _ = epoch_ms();
         std::thread::sleep(Duration::from_millis(PATH_SWITCH_MS + 5));
         let claims = Claims::default();
-        assert!(claims.unused(0) && !claims.in_flight());
+        assert!(claims.unused() && !claims.in_flight());
         claims
     }
 

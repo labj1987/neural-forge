@@ -199,6 +199,9 @@ pub(crate) struct Meta {
     /// The hold's part in the offload of the network to a second GPU (`super::offload_pre`): what its buffer's
     /// submit settles first.
     pub offload: Option<super::offload_pre::HoldPlan>,
+    /// The hold recorded nothing of the game's network (its model runs on a second GPU): counted in
+    /// [`Inline::remote`] while it may run.
+    pub remote: bool,
     pub stage: Stage,
     /// The resources it was recorded with (`super::Resources::id`): readings of other ones are dropped.
     pub resources: u64,
@@ -432,6 +435,10 @@ pub(crate) struct Inline {
     /// Holds recorded and not yet released, on every stage: the network's loader rebuilds nothing they use
     /// while there are any (`native::Loader`).
     outstanding: Arc<AtomicUsize>,
+    /// Those of [`Self::outstanding`] that recorded nothing of the game's network ([`Meta::remote`]), shared with the
+    /// network's loader: they are no use of it (`native::Loader::remote_holds`). Counted after `outstanding` and let go
+    /// before it.
+    remote: Arc<AtomicUsize>,
     /// The hold's buffers were submitted on more than one queue: no more holds are recorded (their work
     /// shares the stage's resources and must run one after another).
     stopped: AtomicBool,
@@ -456,6 +463,7 @@ impl Inline {
         physical_device: vk::PhysicalDevice,
         app_family: u32,
         outstanding: Arc<AtomicUsize>,
+        remote: Arc<AtomicUsize>,
         restore: super::restore::Fns,
     ) -> Arc<Self> {
         // SAFETY: `physical_device` is the device's own.
@@ -495,6 +503,7 @@ impl Inline {
             slots: Mutex::new(Slots::default()),
             harvest: Mutex::new(Vec::new()),
             outstanding,
+            remote,
             stopped: AtomicBool::new(false),
             first_recorded: AtomicBool::new(false),
             said: Mutex::new(HashSet::new()),
@@ -1064,6 +1073,9 @@ impl Inline {
             // Something was recorded: the slot is the buffer's until it can no longer run, whatever the hold
             // decided after opening (its readings are then dropped).
             Ok(meta) if opened => {
+                if meta.remote {
+                    self.remote.fetch_add(1, Ordering::SeqCst);
+                }
                 slot.meta = Some(meta);
                 slot.recorded = Some(Instant::now());
                 s.by_cb.entry(cb).or_default().push(index);
@@ -1158,6 +1170,9 @@ impl Inline {
                 continue;
             }
             if let Some(meta) = slot.meta.take() {
+                if meta.remote {
+                    self.remote.fetch_sub(1, Ordering::SeqCst);
+                }
                 self.outstanding.fetch_sub(1, Ordering::SeqCst);
                 if slot.submits > 0 {
                     // SAFETY: the buffer cannot be pending (the application's call that released it requires
@@ -1413,6 +1428,7 @@ impl Meta {
             cache_dump: None,
             timed: false,
             offload: None,
+            remote: false,
         }
     }
 }
@@ -1932,7 +1948,7 @@ mod tests {
                     bind_descriptor_buffers: gdpa(c"vkCmdBindDescriptorBuffersEXT").map(|f| std::mem::transmute(f)),
                     bind_shaders: gdpa(c"vkCmdBindShadersEXT").map(|f| std::mem::transmute(f)),
                 };
-                let inline = Inline::new(device.clone(), &instance, physical, family, holds.clone(), fns);
+                let inline = Inline::new(device.clone(), &instance, physical, family, holds.clone(), Arc::default(), fns);
                 inline.pool_created(pool, family);
                 // As after the device's first hold point: every buffer the tests begin is noted.
                 inline.restore.activate();
@@ -2490,6 +2506,31 @@ mod tests {
         assert_eq!(seen.get(), 1, "counted while it is recorded");
         assert_eq!(rig.inline.outstanding.load(Ordering::SeqCst), 0, "nothing recorded: no longer counted");
         rig.end(cb);
+    }
+
+    /// #63: a hold whose model runs on a second GPU records nothing of the game's network: it counts among the
+    /// outstanding holds (the hold's resources stay) and among the remote ones (the network is no use of it) until its
+    /// buffer can no longer run; a hold that ran the network here counts only among the outstanding.
+    #[test]
+    fn a_hold_whose_model_runs_on_a_second_gpu_counts_as_remote_while_it_may_run() {
+        let Some(rig) = Rig::open(false) else { return };
+        let remote_hold = |ctx: &mut Ctx| {
+            // SAFETY: the test's buffer, recording on this thread.
+            unsafe { ctx.open() };
+            Ok(Meta { remote: true, ..Meta::empty(Stage::Before) })
+        };
+        let (a, b) = (rig.buffer(), rig.buffer());
+        rig.begin(a);
+        assert_eq!(rig.inline.record_outcome(a, rig.point(), remote_hold), Recorded::Held);
+        rig.end(a);
+        rig.begin(b);
+        assert_eq!(rig.inline.record_outcome(b, rig.point(), copies_only), Recorded::Held);
+        rig.end(b);
+        assert_eq!(rig.inline.outstanding.load(Ordering::SeqCst), 2);
+        assert_eq!(rig.inline.remote.load(Ordering::SeqCst), 1, "only the hold whose model runs elsewhere");
+        rig.inline.reset_pool(rig.pool, false);
+        assert_eq!(rig.inline.outstanding.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.inline.remote.load(Ordering::SeqCst), 0, "let go with its buffer");
     }
 
     /// A hold that misses once the network ran (here: the network's sizes do not include the hold's): the frame
