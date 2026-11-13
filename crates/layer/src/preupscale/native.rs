@@ -1082,6 +1082,9 @@ impl Loader {
                 note_failure(&why);
                 state.failed = Some(why);
                 drop(state);
+                if n.is_some() {
+                    disown(device.as_raw());
+                }
                 drop(n);
                 crate::log!("[native] VRAM guard: the network is closed; frames go to DLSS untouched until there is room again");
                 crate::logging::flush();
@@ -1125,6 +1128,8 @@ impl Loader {
             state.built = Vec::new();
             drop(state);
             if step == Step::ReinitThenBuild && network.take().is_some() {
+                // Owned again only if the reopen keeps a network ([`owns_network`]).
+                disown(device.as_raw());
                 crate::log!("[native] {} failed attempts in a row: closing the network and loading it again", retry.streak());
             }
             // Another network chosen: this one is closed and the chosen one opened (and built for the
@@ -1132,6 +1137,7 @@ impl Loader {
             // asks for another network only in `ready`, after the frames that used this one were drained,
             // and neither path takes the network while the other's work may run).
             if switching && network.take().is_some() {
+                disown(device.as_raw());
                 crate::log!("[native] the {} network is chosen: closing the open one and loading it", network::name(choice));
             }
             let t = Instant::now();
