@@ -85,9 +85,12 @@ exe = ["GoW.exe"]
 engine = "Santa Monica Studio"
 api = "DX11"
 dlss = "Super Resolution"
-placement = "before"
-hdr = "unknown"
+placement = "before-inside"
+hdr = "hdr10"
+hdr_route = "The game's HDR setting, with PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 in its launch options (Proton-GE) or in gamescope with HDR on."
 notes = []
+verified = "4.1.3"
+verified_on = "2026-11-12"
 verified_by = "test machine"
 
 [[game]]
