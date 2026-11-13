@@ -163,6 +163,11 @@ pub(crate) enum State {
 
 static STATE: Mutex<State> = Mutex::new(State::Off);
 
+/// Tests that write the process's offload state ([`STATE`], `offload_pre`'s serving flag) hold this, so they never
+/// see each other's.
+#[cfg(test)]
+pub(crate) static TEST_STATE: Mutex<()> = Mutex::new(());
+
 /// Notes what the offload is doing ([`State`]).
 pub(crate) fn note_state(state: State) {
     let mut now = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -189,6 +194,17 @@ pub(crate) fn given_up() -> bool {
 /// What the offload is doing.
 pub(crate) fn state() -> State {
     STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// Whether the Status tab's line is the offload's ([`status_line`]) in `state`: while it starts, stalled or was given
+/// up; and while it runs, only when the offload is what runs the model: the finished-frame server serving with every
+/// pass at the placement `present` (`finished`), or the hold before DLSS sending its frames (`before_dlss`). When the
+/// placement left the finished frame and nothing is offloaded, the native backend's line has the channel.
+pub(crate) fn shows_line(state: &State, finished: bool, before_dlss: bool) -> bool {
+    match state {
+        State::Active(_) => finished || before_dlss,
+        _ => true,
+    }
 }
 
 /// The Status tab's line for it, or `None` while it is off.
@@ -648,8 +664,9 @@ static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
 /// Called inside `vkCreateDevice` for `device`; `info` is its request (the loader's chain); `game` its setup.
 pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk::Device, info: &vk::DeviceCreateInfo) {
     let choice = Choice::current();
-    // Given up for the process: no more devices for it.
-    if choice == Choice::Off || given_up() {
+    // Given up for the process, or a frame on an offload device never finished (the model is off for the session):
+    // no more devices for it.
+    if choice == Choice::Off || given_up() || matches!(state(), State::Stalled(_)) {
         return;
     }
     // SAFETY: as the contract.
@@ -666,36 +683,24 @@ pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk:
 /// The offload device made with `game` ([`make_for`]), for the server to run on; `None` when none was asked for, the
 /// error when it could not be made. Given back with [`give_back`].
 pub(crate) fn take(game: vk::Device) -> Option<Result<Offload, String>> {
-    if is_busy(game) {
+    let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let m = all.iter_mut().find(|m| m.game == game)?;
+    if m.busy {
         // A frame on it never finished: it is not handed out again (and never destroyed).
         return Some(Err("a frame on the other GPU never finished: its device is not used again this session".into()));
     }
-    MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|m| m.game == game)?.offload.take()
+    m.offload.take()
 }
 
-/// The game devices whose offload device has a frame that never finished ([`give_back`] with `busy`): for the life
+/// Whether a frame on the offload device made with `game` never finished ([`give_back`] with `busy`): for the life
 /// of the game's device, whatever is given back after.
-static BUSY: Mutex<Vec<vk::Device>> = Mutex::new(Vec::new());
-
-/// Whether a frame on the offload device made with `game` never finished.
 pub(crate) fn is_busy(game: vk::Device) -> bool {
-    BUSY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&game)
-}
-
-fn mark_busy(game: vk::Device) {
-    let mut all = BUSY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !all.contains(&game) {
-        all.push(game);
-    }
+    MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|m| m.game == game && m.busy)
 }
 
 /// The server is done with the device (`busy`: a frame on it may still run, so it is never destroyed).
 pub(crate) fn give_back(game: vk::Device, offload: Offload, busy: bool) {
-    if busy {
-        mark_busy(game);
-    }
     // Busy stays busy: a later clean hand-back does not make the device safe to destroy.
-    let busy = busy || is_busy(game);
     let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match all.iter_mut().find(|m| m.game == game) {
         Some(m) => {
@@ -717,14 +722,7 @@ pub(crate) unsafe fn destroy_for(game: vk::Device) {
         let k = all.iter().position(|m| m.game == game);
         k.map(|k| all.remove(k))
     };
-    let stuck = {
-        let mut all = BUSY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let was = all.contains(&game);
-        all.retain(|d| *d != game);
-        was
-    };
-    let Some(mut m) = made else { return };
-    m.busy |= stuck;
+    let Some(m) = made else { return };
     match m.offload {
         Some(Ok(off)) if !m.busy => {
             // SAFETY: nothing of it is alive (the server ended with it clean) and the loader's lock is held.
@@ -1253,17 +1251,31 @@ mod tests {
         let game = vk::Device::from_raw(0x5757_0001);
         assert!(!is_busy(game));
         assert!(take(game).is_none(), "no device was made with it");
-        mark_busy(game);
+        MADE.lock().unwrap().push(Made { game, offload: None, busy: true });
         assert!(is_busy(game));
         assert!(matches!(take(game), Some(Err(_))));
+        assert!(is_busy(game), "asking for it changes nothing");
         // Its game's device going away is what ends it.
-        // SAFETY: no offload device was made with this handle: only the registry's entries go.
+        // SAFETY: no offload device is in the entry: only the entry goes.
         unsafe { destroy_for(game) };
         assert!(!is_busy(game));
     }
 
+    /// The before-DLSS offload serves with no pass at the placement `present`: its line is shown too.
+    #[test]
+    fn the_status_line_is_the_offloads_while_either_path_serves() {
+        let active = State::Active("GPU".into());
+        assert!(shows_line(&active, true, false), "the finished-frame server serving at `present`");
+        assert!(shows_line(&active, false, true), "the hold before DLSS sending its frames");
+        assert!(!shows_line(&active, false, false), "the placement left the offload: the native backend's line");
+        for other in [State::Starting("GPU".into()), State::Stalled("GPU".into()), State::FellBack("why".into())] {
+            assert!(shows_line(&other, false, false));
+        }
+    }
+
     #[test]
     fn a_fall_back_is_for_the_whole_process() {
+        let _state = TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(!given_up());
         note_state(State::Active("GPU".into()));
         assert_eq!(status_line().as_deref(), Some("second GPU: the model runs on GPU, each frame shown one frame later"));

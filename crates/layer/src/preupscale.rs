@@ -6557,16 +6557,14 @@ impl Session {
     ) {
         // The model on another GPU's state, on the Status tab's line and for `doctor` (`layer_reason`).
         #[cfg(target_arch = "x86_64")]
-        // Only while the offload is what runs (serving at the finished-frame placement) or not running (starting, stalled,
-        // given up): when the placement left it, the native backend's line has the channel.
+        // Only while the offload is what runs (serving at the finished-frame placement, or the hold before DLSS sending
+        // its frames) or not running (starting, stalled, given up): when the placement left it, the native backend's
+        // line has the channel (`offload::shows_line`).
         let at_present = shm.view().is_some_and(|v| {
             let (count, placements) = v.header().placements();
             placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT)
         });
-        let offload_line = match offload::state() {
-            offload::State::Active(_) => offload::active() && at_present,
-            _ => true,
-        };
+        let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_pre());
         if let Some(line) = offload::status_line().filter(|_| offload_line) {
             // Against what the channel holds (the native backend's line shares it): written when it says something else,
             // except that once the offload was given up the native backend's own line (the network running here, or why

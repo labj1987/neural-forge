@@ -222,7 +222,10 @@ impl PostServer {
                     off
                 }
                 Some(Err(why)) => {
-                    super::offload::note_state(super::offload::State::FellBack(why));
+                    // A device whose frame never finished stays stalled (the Status says so): no fall-back noted over it.
+                    if !super::offload::is_busy(game_device) {
+                        super::offload::note_state(super::offload::State::FellBack(why));
+                    }
                     drop(claim);
                     return end(Status::Unavailable);
                 }

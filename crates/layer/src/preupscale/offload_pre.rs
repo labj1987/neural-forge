@@ -767,8 +767,14 @@ pub(crate) fn stop_for(game: vk::Device) {
         *all = rest;
         ours
     };
+    let any = !ours.is_empty();
     for (_, quit, thread, _) in ours {
         join(&quit, &thread);
+    }
+    if any {
+        // Their sides are destroyed after this and find their workers ended, as released ones do: the status goes here.
+        #[cfg(target_arch = "x86_64")]
+        side_gone(true);
     }
 }
 
@@ -1933,6 +1939,7 @@ mod tests {
         assert!(release_idle(device, Duration::ZERO));
         assert!(worker.ended() && !serving_device(device));
         // The released side's end leaves the status to the side that serves now; an owning side's end clears it.
+        let _state = crate::preupscale::offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         SERVING_PRE.store(true, Ordering::Release);
         side_gone(!worker.ended());
         assert!(serving_pre(), "another set's side serves: the Status tab keeps the second GPU");

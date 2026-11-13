@@ -1819,22 +1819,24 @@ own for the frame's extent; the regions imported as host memory or staged; one f
 resources: a change of render extent loads the network again on the other device.
 
 **Fall-back** as on the finished frame (`ServerRule`, `LateRule` on the answers, `State::FellBack` for the process),
-and when 30 holds in a row over at least a second cannot send their frame (no motion vectors, no jitter, no room for the chained cache:
+and when 30 holds in a row, over at least a second of holds that keep coming (a pause of more than 250 ms between two
+of them starts the row again), cannot send their frame (no motion vectors, no jitter, no room for the chained cache:
 nothing could carry the edit, and the model would not run at all): the worker stops running frames (every send is
 finished at once without an answer) and the runner frees its frame resources and closes its loader and with it the
 network (`PreRunner::gave_up`; retiring the loader alone leaves the network open there, and the game's loader then
-finds it open elsewhere for good), so the next holds load and run the network on the game's device. The hold's side
-is destroyed once nothing recorded with it may still run. `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (tests) fails that
-frame on the other GPU. A second set of hold resources on the same device while the offload device is taken waits
-(its frames go to DLSS as they are) until the set that has it had no hold for 3 seconds, whose worker is then ended
-for it (`release_idle`; that set's side is built again at its next hold); it is not a fall-back. After a frame that
-never finished there (the 5 s fence wait) nothing is closed or taken back: the state is `Stalled` and the model is
-off for the rest of the session, said once. That is for the life of the game's device: the offload device is marked busy (`offload::is_busy`, kept
-through any later hand-back), `offload::take` refuses it, no new hold's side is built, `Stalled` is never replaced
-by the offload starting or running again, and the device is not destroyed with the game's. A frame whose OUT region was written again while it ran
-(two offloaded holds in one submit, or after an abandoned frame) is not answered and the runner's history starts
-afresh (`serve`: OUT's sequence number and `sent` read again after the run). The workers of a device
-end inside its `vkDestroyDevice` before the offload device is destroyed (`offload_pre::stop_for`).
+finds it open elsewhere for good), so the next holds load and run the network on the game's device. The hold's side is
+destroyed once nothing recorded with it may still run. `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (tests) fails that
+frame on the other GPU. A second set of hold resources on the same device while the offload device is taken waits (its
+frames go to DLSS as they are) until the set that has it had no hold for 3 seconds, whose worker is then ended for it
+(`release_idle`; that set's side is built again at its next hold); it is not a fall-back. After a frame that never
+finished there (the 5 s fence wait) nothing is closed or taken back: the state is `Stalled` and the model is off for
+the rest of the session, said once. That is for the life of the game's device: the offload device is marked busy
+(`offload::is_busy`, kept through any later hand-back), `offload::take` refuses it, no new hold's side is built, no
+offload device is made for a later game device while `Stalled`, `Stalled` is never replaced by the offload starting or
+running again, and the device is not destroyed with the game's. A frame whose OUT region was written again while it
+ran (two offloaded holds in one submit, or after an abandoned frame) is not answered and the runner's history starts
+afresh (`serve`: OUT's sequence number and `sent` read again after the run). The workers of a device end inside its
+`vkDestroyDevice` before the offload device is destroyed (`offload_pre::stop_for`).
 
 **Measured (RTX 5070 alone, `same`: a second device of the game's GPU; the game sweep with
 `env = ["NEURAL_FORGE_OFFLOAD_GPU=same"]`; 2560x1440, render 1485x835, frame generation on; 2026-11-12):**
