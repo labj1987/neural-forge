@@ -1818,9 +1818,17 @@ own for the frame's extent; the regions imported as host memory or staged; one f
 (`FrameMeta`). One pass runs there (the stage's first). One `HoldSide` (exchange, worker, runner, loader) per hold
 resources: a change of render extent loads the network again on the other device.
 
-**Fall-back** as on the finished frame (`ServerRule`, `LateRule` on the answers, `State::FellBack` for the process):
-the worker stops running frames (every send is finished at once without an answer) and the runner retires its
-loader, so the next hold runs the network on the game's device through the loader's lend. The workers of a device
+**Fall-back** as on the finished frame (`ServerRule`, `LateRule` on the answers, `State::FellBack` for the process),
+and when 30 holds in a row cannot send their frame (no motion vectors, no jitter, no room for the chained cache:
+nothing could carry the edit, and the model would not run at all): the worker stops running frames (every send is
+finished at once without an answer) and the runner frees its frame resources and closes its loader and with it the
+network (`PreRunner::gave_up`; retiring the loader alone leaves the network open there, and the game's loader then
+finds it open elsewhere for good), so the next holds load and run the network on the game's device. The hold's side
+is destroyed once nothing recorded with it may still run. `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (tests) fails that
+frame on the other GPU. A second set of hold resources on the same device while the offload device is taken waits
+(its frames go to DLSS as they are); it is not a fall-back. A frame whose OUT region was written again while it ran
+(two offloaded holds in one submit, or after an abandoned frame) is not answered and the runner's history starts
+afresh (`serve`: OUT's sequence number and `sent` read again after the run). The workers of a device
 end inside its `vkDestroyDevice` before the offload device is destroyed (`offload_pre::stop_for`).
 
 **Measured (RTX 5070 alone, `same`: a second device of the game's GPU; the game sweep with
@@ -1839,19 +1847,16 @@ about a quarter. What the game's GPU pays per frame is the capture's extra 2 ms 
 MB out, the late capture and the gate) and the 9.5 MB answer in. The worker's thread: 1.3% of a core with the regions
 imported on both devices, 11% with staged copies (it polls every 50 us while frames come).
 
-**The picture.** Against the model on the game's device over the same second of Cyberpunk's benchmark (the alley
-after the bar; recordings at 2560x1440, 30 frames each, not frame-exact), the offloaded picture is softer: the mean
-absolute Laplacian of the luma is 4.10 against 4.90 (16% less fine detail), visible in crops of the ground and the
-manhole. Expected from the design and now measured: every frame gets a carried edit (the cache's history read,
-pyramid and guided filter, at another jitter phase than the frame it was computed on), where one GPU gives DLSS a
-fresh, full-detail decode on every second frame in motion and on every frame while still. Ideas not built: a decode
-of the answer onto the frame it belongs to wherever the frame did not move (still texels: the edit as the network
-gave it, moved by the jitter step only, in place of the filtered carry); the jitter step applied when the stored
-edit is read (a sub-pixel shift of the edit toward this frame's phase); a sharper history read (the cache's `F_NEAREST`
-only picks the nearest surface's motion, the edit itself is read bilinearly); and running the network at DLSS's
-output extent on the second GPU's spare time, which the after-DLSS hold would need. Not measured: two different GPUs
-(this machine has one), a still scene's picture (the benchmarks have none), GTA V's picture against local (the two
-recordings are not of the same view).
+**The picture.** Against the model on the game's device, fine detail was compared over the views two recordings of
+Cyberpunk's benchmark share (35 s each, `NF_SWEEP_RECORD_SECONDS=35`; frames at 5 fps paired by view, 114 to 166 pairs
+a comparison; the mean absolute Laplacian of the luma, B over A per pair): offloaded over local, median 0.966 and
+0.994 in two runs; offloaded over offloaded, two runs, 0.969. So the offloaded picture has no loss of fine detail
+beyond what two runs of the same build differ by (about 3%); a first comparison over one second of poorly matched
+views had said 16% less and was wrong. Tried for it and not kept: the carried edit read with a Catmull-Rom filter at
+the exact position in place of the strongest tap (local over that 0.987, offloaded over that 1.010: nothing
+measurable). The history read already applies the jitter step and takes the strongest depth-admitted tap. Not
+measured: two different GPUs (this machine has one), a still scene's picture (the benchmarks have none), GTA V's
+picture against local.
 
 GTA V note: its `settings.xml` names the CPU (`CPUDescription`); with another CPU in the machine the game resets every
 graphics setting at each launch (DLSS and frame generation off, so no DLSS evaluate and no hold). The runs above set
