@@ -1823,20 +1823,39 @@ the worker stops running frames (every send is finished at once without an answe
 loader, so the next hold runs the network on the game's device through the loader's lend. The workers of a device
 end inside its `vkDestroyDevice` before the offload device is destroyed (`offload_pre::stop_for`).
 
-**Measured (RTX 5070 alone, `same`: a second device of the game's GPU; Cyberpunk 2077 benchmark, 2560x1440 HDR10,
-frame generation x3, render 1485x835, the game sweep with `env = ["NEURAL_FORGE_OFFLOAD_GPU=same"]`):**
+**Measured (RTX 5070 alone, `same`: a second device of the game's GPU; the game sweep with
+`env = ["NEURAL_FORGE_OFFLOAD_GPU=same"]`; 2560x1440, render 1485x835, frame generation on; 2026-11-12):**
 
-| Run | Holds per second | Network frame | Capture on the game's GPU | Notes |
+| Run | Holds per second | Network frame | On the game's GPU | Notes |
 |---|---|---|---|---|
-| model on the game's device | 43 (about 125 fps shown) | 7.6 ms (median, in DLSS's buffer) | 1.0 ms | every second hold a refresh in motion; sweep passes |
-| `same` | 33 (about 100 fps shown) | 17.7 ms on the second device, copies included; 21.0 ms from send to answer | 3.0 ms | 600 of 600 frames answered in time and 600 of 600 holds carried the edit in every summary once the network ran; cache rejection 0.4-5%; no misses, no faults; sweep passes, recording clean |
+| Cyberpunk 2077 (HDR10, hold inside DLSS's buffer), model on the game's device | 43 (about 125 fps shown) | 7.6 ms (median) | capture 1.0 ms | every second hold a refresh in motion; sweep passes |
+| Cyberpunk 2077, `same` | 33 (about 100 fps shown) | 17.7-18.0 ms on the second device, copies included; 18.0 ms from send to answer (21.0 ms before both devices imported the regions) | capture 2.7-3.0 ms | 600 of 600 frames answered in time and 600 of 600 holds carried the edit in every summary once the network ran; cache rejection 0.4-8%; no misses, no faults; sweep passes, recording clean |
+| GTA V Enhanced (split hold), model on the game's device | about 60 in the benchmark's long pass | 7.8 ms | write-back 0.5 ms | sweep's run |
+| GTA V Enhanced, `same` | about 42 in the long pass | 18.3-18.8 ms on the second device; 18.3-18.9 ms from send to answer | the submit waits 5.3 ms (median) for the answer; cache passes 2.4 ms | 601 split holds, 600 of 600 answered and carried in the summaries (1 of the first 599 not answered); no misses |
 
 On one GPU the path saves nothing, as on the finished frame: the second device's network shares the GPU with the
-game (barriers, another context), so its frame takes longer than the game's own. What the game's GPU pays per frame
-is the capture's extra 2 ms (the kept colour, 23.7 MB out, the late capture and the gate) and the 9.5 MB answer in.
-The worker's thread used 11% of a core (polling at 50 us while frames come, the staged copies included). Not
-measured: two different GPUs (this machine has one), the split hold in a game (GTA V Enhanced's benchmark ran without
-a DLSS evaluate on 2026-11-12, with and without the offload), a still scene's picture.
+game (barriers, another context), so its frame takes more than twice the game's own and the frame rate falls by
+about a quarter. What the game's GPU pays per frame is the capture's extra 2 ms in Cyberpunk (the kept colour, 23.7
+MB out, the late capture and the gate) and the 9.5 MB answer in. The worker's thread: 1.3% of a core with the regions
+imported on both devices, 11% with staged copies (it polls every 50 us while frames come).
+
+**The picture.** Against the model on the game's device over the same second of Cyberpunk's benchmark (the alley
+after the bar; recordings at 2560x1440, 30 frames each, not frame-exact), the offloaded picture is softer: the mean
+absolute Laplacian of the luma is 4.10 against 4.90 (16% less fine detail), visible in crops of the ground and the
+manhole. Expected from the design and now measured: every frame gets a carried edit (the cache's history read,
+pyramid and guided filter, at another jitter phase than the frame it was computed on), where one GPU gives DLSS a
+fresh, full-detail decode on every second frame in motion and on every frame while still. Ideas not built: a decode
+of the answer onto the frame it belongs to wherever the frame did not move (still texels: the edit as the network
+gave it, moved by the jitter step only, in place of the filtered carry); the jitter step applied when the stored
+edit is read (a sub-pixel shift of the edit toward this frame's phase); a sharper history read (the cache's `F_NEAREST`
+only picks the nearest surface's motion, the edit itself is read bilinearly); and running the network at DLSS's
+output extent on the second GPU's spare time, which the after-DLSS hold would need. Not measured: two different GPUs
+(this machine has one), a still scene's picture (the benchmarks have none), GTA V's picture against local (the two
+recordings are not of the same view).
+
+GTA V note: its `settings.xml` names the CPU (`CPUDescription`); with another CPU in the machine the game resets every
+graphics setting at each launch (DLSS and frame generation off, so no DLSS evaluate and no hold). The runs above set
+that line for the run only.
 
 ## Decided before Phase 1
 
