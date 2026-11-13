@@ -781,7 +781,7 @@ pub(crate) struct Worker {
     mode: Arc<AtomicU8>,
     pub counters: Arc<Counters>,
     /// Why the hold's side wants the offload given up ([`Self::give_up`]), until the worker took it.
-    asked: Arc<Mutex<Option<String>>>,
+    asked: Arc<Mutex<Option<(String, Stop)>>>,
     thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     /// When its side last planned a hold ([`now_ms`]).
     touched: Arc<AtomicU64>,
@@ -851,7 +851,18 @@ pub(crate) fn stop_for(game: vk::Device) {
 /// What the worker tells its owner when it stops serving (it keeps finishing the frames sent, without an answer):
 /// why the offload is given up, and whether a frame on the other GPU never finished ([`Runner::stuck`]: the network
 /// cannot be taken back, so the model is off from here on).
-pub(crate) type GiveUp = Box<dyn Fn(String, bool) + Send>;
+pub(crate) type GiveUp = Box<dyn Fn(String, Stop) + Send>;
+
+/// Why a worker stopped serving, for its owner's callback ([`GiveUp`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// A failure, or a rule given up on: back to the game's GPU for the session.
+    Failed,
+    /// A frame that never finished may still run: the network cannot be taken back.
+    Stuck,
+    /// The trial on the game's GPU (`super::offload_trial`): its side said and did what it does, at its call.
+    Trial,
+}
 
 impl Worker {
     /// Starts the worker on `link` with `runner`. `late` judges the answers against the game's frame
@@ -890,7 +901,13 @@ impl Worker {
     /// Gives the offload up from the hold's side (`why`): the worker stops running frames and tells its owner, as
     /// for a failure of its own.
     pub(crate) fn give_up(&self, why: String) {
-        *self.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+        *self.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((why, Stop::Failed));
+    }
+
+    /// Stops serving for the trial on the game's GPU (`super::offload_trial`): no fall-back; the hold's side logged it
+    /// and cleared the serving state itself (the worker may end before it reads this).
+    pub(crate) fn stop_for_trial(&self) {
+        *self.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((String::new(), Stop::Trial));
     }
 
     /// Stops the worker: no submit waits for it any more ([`Progress::settle`]), and the holds still recorded with
@@ -924,14 +941,14 @@ fn serve(
     dims: (u32, u32),
     quit: &AtomicBool,
     mode: &AtomicU8,
-    asked: &Mutex<Option<String>>,
+    asked: &Mutex<Option<(String, Stop)>>,
     counters: &Counters,
     give_up: &GiveUp,
 ) {
     let device = &link.device;
-    let stop_serving = |why: String, stuck: bool| {
+    let stop_serving = |why: String, stop: Stop| {
         if mode.swap(PASSING, Ordering::AcqRel) == SERVING {
-            give_up(why, stuck);
+            give_up(why, stop);
         }
     };
     let mut idle = 0u32;
@@ -939,8 +956,8 @@ fn serve(
     let mut retired = false;
     while !quit.load(Ordering::Acquire) {
         // Asked from the hold's side to give up ([`Worker::give_up`]).
-        if let Some(why) = asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
-            stop_serving(why, false);
+        if let Some((why, stop)) = asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            stop_serving(why, stop);
         }
         // Given up: the runner lets go of what the game's GPU needs back, once.
         if !retired && mode.load(Ordering::Acquire) != SERVING {
@@ -957,7 +974,7 @@ fn serve(
             }
             Err(_) => {
                 // The game's device is lost: none of its holds run any more.
-                stop_serving("the game's device was lost".into(), false);
+                stop_serving("the game's device was lost".into(), Stop::Failed);
                 break;
             }
         }
@@ -979,7 +996,7 @@ fn serve(
             match unsafe { runner.run(seq, link.out, link.inn, &link.layout) } {
                 Ran::Answered => ok = true,
                 Ran::Skipped => {}
-                Ran::Failed(why) => stop_serving(why, runner.stuck()),
+                Ran::Failed(why) => stop_serving(why, if runner.stuck() { Stop::Stuck } else { Stop::Failed }),
             }
         }
         // Another send ran while this frame did (a hold whose submit did not settle this one: two holds in one
@@ -1004,7 +1021,7 @@ fn serve(
             // A frame the network was not ready for is no late answer.
             if mode.load(Ordering::Acquire) == SERVING && ok {
                 if let Some(why) = rule.note(answer, interval, dims) {
-                    stop_serving(why, false);
+                    stop_serving(why, Stop::Failed);
                 }
             }
         }
@@ -1251,17 +1268,13 @@ impl HoldSide {
         // Not judged late in the `same` test, where the other device shares the game's GPU (as the finished frame).
         let late = (super::offload::Choice::current() != super::offload::Choice::Same).then(super::offload::LateRule::default);
         let stalled = name.clone();
-        let give_up: GiveUp = Box::new(move |why, stuck| {
-            set_serving(None);
-            if !stuck && super::offload_trial::running() {
-                // The trial on the game's GPU (`super::offload_trial`): not a fall-back; the held placements follow
-                // `offload_trial::keeps_local`, and the offload's state is the trial's to show (the native line).
-                crate::log!("[offload] {why}");
-                crate::logging::flush();
-                super::offload::note_state(super::offload::State::Off);
+        let give_up: GiveUp = Box::new(move |why, stop| {
+            if stop == Stop::Trial {
+                // Said and done by the hold's side ([`HoldSide::went_through`]).
                 return;
             }
-            if stuck {
+            set_serving(None);
+            if stop == Stop::Stuck {
                 // The network is still in use by that frame: it cannot go back to the game's GPU.
                 crate::log!("[offload] {why}: the network cannot be taken back while that frame may run; the model is off for the rest of the session");
                 crate::logging::flush();
@@ -1286,6 +1299,7 @@ impl HoldSide {
             .push((resources, Submits { progress: exchange.progress.clone(), inn: exchange.regions[1].clone() }));
         super::offload::note_state(super::offload::State::Active(name.clone()));
         set_serving(Some(at));
+        super::offload_trial::side_built();
         crate::log!(
             "[offload] {}: the network's frames of {width}x{height} run on {name}; on the game's GPU the frame's regions are {}",
             at.name(),
@@ -1419,7 +1433,16 @@ impl HoldSide {
             if self.holds > SUMMARY_HOLDS && self.serving() {
                 let key = (self.extent, super::placement::settings().0);
                 if let Some(why) = super::offload_trial::offloaded(key, frame, waited) {
-                    self.worker.give_up(why);
+                    // The trial on the game's GPU: not a fall-back. The held placements follow
+                    // `offload_trial::keeps_local` from the next hold, and the Status line is the native one's (the
+                    // offload's state is off, unless something else, a stall, already took it).
+                    crate::log!("[offload] {why}");
+                    crate::logging::flush();
+                    set_serving(None);
+                    if matches!(super::offload::state(), super::offload::State::Active(_)) {
+                        super::offload::note_state(super::offload::State::Off);
+                    }
+                    self.worker.stop_for_trial();
                 }
             }
         }

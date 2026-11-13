@@ -621,6 +621,12 @@ fn no_history() -> bool {
 /// holds were refused it for good (2026-10-23).
 static NETWORK_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `device` closed the network: it owns it no longer (unless another device opened it since).
+fn disown(device: u64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _ = NETWORK_OWNER.compare_exchange(device, 0, SeqCst, SeqCst);
+}
+
 /// The longest a build waits for the game to stop loading ([`Loader::work`]).
 const LOADING_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -1006,6 +1012,7 @@ impl Loader {
                     state.failed = Some("lent to another device of the game, which runs the model".into());
                     drop(state);
                     drop(network);
+                    disown(device.as_raw());
                     crate::log!("[native] the network is closed on this device: another device of the game asked for it (one network per process)");
                     crate::logging::flush();
                     state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1460,7 +1467,9 @@ impl Drop for Loader {
     fn drop(&mut self) {
         self.stop_worker();
         // The network (closed here) must not be pending: the device's teardown waited for its work.
-        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.take();
+        if self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.take().is_some() {
+            disown(self.device);
+        }
     }
 }
 
@@ -5680,6 +5689,12 @@ mod tests {
         assert!(!super::owns_network(true, false, false), "opened, failed and dropped: nothing to lend");
         assert!(!super::owns_network(false, true, true), "not opened here (a rebuild of one opened before)");
         assert!(!super::owns_network(false, false, false));
+        // Closed: owned no longer, unless another device opened it since.
+        super::NETWORK_OWNER.store(0xA, std::sync::atomic::Ordering::SeqCst);
+        super::disown(0xB);
+        assert_eq!(super::NETWORK_OWNER.load(std::sync::atomic::Ordering::SeqCst), 0xA);
+        super::disown(0xA);
+        assert_eq!(super::NETWORK_OWNER.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

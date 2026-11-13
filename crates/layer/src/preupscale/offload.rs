@@ -668,6 +668,8 @@ pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk:
     let choice = Choice::current();
     // Given up for the process, or a frame on an offload device never finished (the model is off for the session):
     // no more devices for it.
+    // A trial that kept the held placements on the game's GPU (`offload_trial::keeps_local`) does not stop this on
+    // purpose: the finished-frame placement may still ask for the offload device.
     if choice == Choice::Off || given_up() || matches!(state(), State::Stalled(_)) {
         return;
     }

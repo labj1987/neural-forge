@@ -1840,7 +1840,8 @@ sets `State::Off`, not `FellBack`: the trial is not a fall-back, and the finishe
 intervals, extended up to 900 while the window's halves disagree by more than 10%, is compared: 10% shorter keeps the
 model here until the game restarts; otherwise the next hold builds its side again (a side whose worker no longer serves
 counts as released). The game's GPU that cannot run the model (not built within 15 s of holds that keep coming, or 30
-misses in a row once it ran) sends the frames back; a hold of another key aborts (a later pair of windows may try
+misses in a row once it ran) or cannot be measured (30 frame times over 250 ms, or 1860 holds that ran without a
+window; an interval counts only between two holds that both ran the model) sends the frames back; a hold of another key aborts (a later pair of windows may try
 again, three times at most). The Status line is the native line's (`native::running_line`'s `trial`): "second GPU:
 trying the game's GPU for a few seconds: the faster one keeps the model", then "second GPU: not used: the game's GPU is
 faster (18.6 ms vs 22.8 ms a frame)". `NEURAL_FORGE_OFFLOAD_TRIAL=off` (`0`, `false`) never tries; with `same` it is off
