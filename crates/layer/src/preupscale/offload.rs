@@ -212,9 +212,7 @@ pub(crate) fn status_line() -> Option<String> {
     match state() {
         State::Off => None,
         State::Starting(gpu) => Some(format!("second GPU: starting on {gpu}")),
-        State::Active(gpu) if super::offload_pre::serving_hold() => {
-            Some(super::offload_pre::status_line(&gpu, super::offload_pre::serving_where().unwrap_or(super::offload_pre::Where::Before)))
-        }
+        State::Active(gpu) if super::offload_pre::serving_hold() => Some(super::offload_pre::status_line(&gpu, super::offload_pre::serving())),
         State::Active(gpu) => Some(format!("second GPU: the model runs on {gpu}, each frame shown one frame later")),
         State::Stalled(gpu) => Some(format!("second GPU: stalled: a frame on {gpu} did not finish; waiting for it, the frames go out without the model")),
         State::FellBack(why) => Some(format!("second GPU: given up ({why}); the model runs on the game's GPU")),

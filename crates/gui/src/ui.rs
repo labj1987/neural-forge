@@ -1558,9 +1558,12 @@ fn model_row_subtitle(state: u32, reason: &str) -> &'static str {
     use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH};
     // The hold wordings only while a hold runs: its side stays alive through a pause menu, and the line with it.
     if on_second_gpu(reason) {
+        // (Both holds in a frame with passes before and after DLSS: "before and after DLSS, its edits".)
         if reason.contains(" before DLSS, its edit") || reason.contains(" after DLSS, its edit") {
             if model_held(state) {
-                return if reason.contains(" before DLSS, its edit") {
+                return if reason.contains(" before and after DLSS, its edit") {
+                    "running on the second GPU, before and after DLSS"
+                } else if reason.contains(" before DLSS, its edit") {
                     "running on the second GPU, before DLSS"
                 } else {
                     "running on the second GPU, after DLSS"
@@ -3968,17 +3971,17 @@ mod preupscale_label_tests {
         // Paused or waiting (a menu, a loading screen): the hold's side keeps its line, but no hold runs the model.
         assert_eq!(model_row_subtitle(PAUSED, &on("after DLSS, its edit applied one frame later")), "not running before the upscaler");
         assert_eq!(model_row_subtitle(WAITING, &on("before DLSS, its edit applied one frame later")), "not running before the upscaler");
-        // The second GPU asked for but not used (passes at both holds), given up or stalled: the hold's own state.
-        assert_eq!(
-            model_row_subtitle(HOLDING_BOTH, "second GPU: not used here: with passes before and after DLSS the model runs on the game's GPU"),
-            "running before the upscaler and after DLSS"
-        );
+        // Passes at both holds: both run on the second GPU.
+        let both = on("before and after DLSS, its edits applied one frame later");
+        assert_eq!(model_row_subtitle(HOLDING_BOTH, &both), "running on the second GPU, before and after DLSS");
+        assert_eq!(model_row_subtitle(PAUSED, &both), "not running before the upscaler");
+        assert!(on_second_gpu(&both));
+        // The second GPU given up or stalled: the hold's own state.
         assert_eq!(model_row_subtitle(HOLDING, "second GPU: given up (too slow); the model runs on the game's GPU"), "running before the upscaler");
         // The frame-time graph's model time and the finished-frame rows follow every hold, not only the one before the upscaler.
         assert!(model_held(HOLDING) && model_held(HOLDING_AFTER) && model_held(HOLDING_BOTH));
         // No model time on the game's GPU is shown while a second GPU runs the network; it is when that GPU is not used.
         assert!(on_second_gpu(&on("after DLSS, its edit applied one frame later")));
-        assert!(!on_second_gpu("second GPU: not used here: with passes before and after DLSS the model runs on the game's GPU"));
         assert!(!on_second_gpu("second GPU: given up (too slow); the model runs on the game's GPU") && !on_second_gpu("native network running"));
         assert!(!model_held(OFF) && !model_held(WAITING) && !model_held(IDENTIFIED) && !model_held(PAUSED) && !model_held(NO_WRAPPER));
     }

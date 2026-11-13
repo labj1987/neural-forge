@@ -4177,7 +4177,7 @@ fn fake_chain_timeout(frames: u64) -> Option<(u32, String)> {
 /// What the Status tab says about the native backend after a hold: running, or why not.
 pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     if result.evaluated {
-        return running_line(loader.guard_note().as_deref(), result.mixed_on_game_gpu);
+        return running_line(loader.guard_note().as_deref());
     }
     match (loader.failed(), result.miss) {
         (Some(why), _) => format!("native network not running: {why}"),
@@ -4186,17 +4186,10 @@ pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     }
 }
 
-/// The Status line of a hold whose network ran: `guard`, the VRAM guard's note; `mixed_on_game_gpu`, a hold of a
-/// frame with passes before DLSS and after its output while the model on a second GPU is asked for: the second GPU
-/// serves one hold of a frame, so neither is offloaded, and the line says so (the native line alone read as if the
-/// second GPU were not asked for).
-pub(crate) fn running_line(guard: Option<&str>, mixed_on_game_gpu: bool) -> String {
+/// The Status line of a hold whose network ran: `guard`, the VRAM guard's note.
+pub(crate) fn running_line(guard: Option<&str>) -> String {
     let guard = guard.map(|why| format!(" ({why})")).unwrap_or_default();
-    if mixed_on_game_gpu {
-        format!("second GPU: not used here: with passes before and after DLSS the model runs on the game's GPU{guard}")
-    } else {
-        format!("native network running{guard}")
-    }
+    format!("native network running{guard}")
 }
 
 /// The last network failure written to the state log, so a retry schedule that keeps failing the same
@@ -4470,37 +4463,12 @@ unsafe fn native_hold(
         return result;
     }
     // The network on a second GPU (`super::offload_pre`): this hold sends its frame there and carries the edit of
-    // the frame before it, as a cached hold does: the hold before DLSS, or the hold after DLSS's output (Ray
-    // Reconstruction), in a frame whose passes all run at that one hold (`placement::Hold::offload_takes`), with the
-    // edit cache on (it is what carries the edit), and not for a cache dump (which needs the network's answer to its
-    // own frame).
+    // the frame before it, as a cached hold does: the hold before DLSS and the hold after DLSS's output (Ray
+    // Reconstruction, or passes placed there), each with a side of its own; in a frame with passes at both, both sides'
+    // runners share the other device and its one network (`offload_server::Core`). With the edit cache on (it is what
+    // carries the edit), and not for a cache dump (which needs the network's answer to its own frame).
     let offload_at = super::offload_pre::Where::of(ask.at.stage);
     let offload_takes = ask.at.offload_takes();
-    if !offload_takes && super::offload_pre::wanted() {
-        result.mixed_on_game_gpu = true;
-        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            crate::log!("[offload] NEURAL_FORGE_OFFLOAD_GPU: this frame has passes before DLSS and after its output, and the other GPU serves one of the two at a time: every pass runs on the game's GPU while that is so");
-        }
-        // A side built while every pass ran at this hold has the network on the other device: it goes, so that the
-        // holds can load it here (once nothing recorded with these resources may still run: the split hold's work
-        // was waited for above).
-        if !others_outstanding {
-            if let Some(side) = res.offpre.take() {
-                if matches!(super::offload::state(), super::offload::State::Stalled(_)) || super::offload::is_busy(device.handle()) {
-                    // A frame never finished there: the network cannot be taken back (the runner keeps it).
-                    crate::log!(
-                        "[offload] {}: the frame now has passes at both holds, but a frame on the second GPU never finished: the model is off for this session",
-                        offload_at.name()
-                    );
-                } else {
-                    crate::log!("[offload] {}: the frame now has passes at both holds; the network comes back to the game's GPU", offload_at.name());
-                }
-                // SAFETY: idle, as just said.
-                unsafe { side.destroy(device) };
-            }
-        }
-    }
     let offloaded = super::offload_pre::wanted()
         && offload_takes
         && arm.is_none()
@@ -4775,9 +4743,12 @@ unsafe fn native_hold(
             result.miss = Some(WAITING);
             return result;
         }
-        if super::offload_pre::serving_device(device.handle()) && !super::offload_pre::release_idle(device.handle(), super::offload_pre::IDLE_SIDE) {
-            // Another set of hold resources of this device has the offload device (and with it the process's one
-            // network) and holds with it: these wait until it has had no hold for a few seconds, and say so once.
+        if super::offload_pre::serving_at(device.handle(), offload_at)
+            && !super::offload_pre::release_idle(device.handle(), offload_at, super::offload_pre::IDLE_SIDE)
+        {
+            // Another set of hold resources of this device serves this hold on the offload device (another render size:
+            // the other GPU keeps one pass per hold) and holds with it: these wait until it has had no hold for a few
+            // seconds, and say so once. (The frame's other hold has its own place there.)
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 crate::log!(
@@ -5551,19 +5522,13 @@ unsafe fn native_hold(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn the_running_line_says_where_the_model_runs_with_passes_at_both_holds_and_a_second_gpu() {
-        assert_eq!(super::running_line(None, false), "native network running");
-        assert_eq!(super::running_line(Some("lower"), false), "native network running (lower)");
-        let mixed = super::running_line(None, true);
-        assert!(mixed.starts_with("second GPU: "), "doctor reports it with the second GPU's lines: {mixed}");
-        assert!(mixed.contains("passes before and after DLSS") && mixed.ends_with("runs on the game's GPU"), "{mixed}");
-        assert!(super::running_line(Some("lower"), true).ends_with("the game's GPU (lower)"));
+    fn the_running_line_fits_the_channel_with_every_note_of_the_vram_guard() {
+        assert_eq!(super::running_line(None), "native network running");
+        assert_eq!(super::running_line(Some("lower")), "native network running (lower)");
         // Every variant fits the channel's field whole (a cut line would read as changed at every hold).
         for guard in [None, Some(super::super::vram_guard::NOTE_SMALL), Some(super::super::vram_guard::NOTE_PAUSED)] {
-            for mixed in [false, true] {
-                let line = super::running_line(guard, mixed);
-                assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
-            }
+            let line = super::running_line(guard);
+            assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
         }
     }
     use super::*;

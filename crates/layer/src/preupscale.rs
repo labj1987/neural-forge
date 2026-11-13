@@ -4654,9 +4654,6 @@ pub(crate) struct HoldResult {
     pub timing: HoldTiming,
     /// The native backend ran this hold (`evaluated` means the network ran).
     pub native: bool,
-    /// The native backend: a hold of a frame with passes before DLSS and after its output while the model on a second
-    /// GPU is asked for: neither hold is offloaded (`placement::Hold::offload_takes`), every pass runs on the game's GPU.
-    pub mixed_on_game_gpu: bool,
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
     /// network, composite), read when its fence was found signalled here.
     pub network_gpu_ms: Option<f32>,
@@ -12228,24 +12225,18 @@ mod native_line_tests {
         assert_eq!(hold_offload_line(None, false, false, ""), None);
     }
 
-    /// A frame with passes before and after DLSS: no hold is offloaded (the state is not `Active`), so the hold's own
-    /// line, which says the second GPU is not used and why, is the one written: over the native line, over a line a
-    /// side left behind before the plan changed, and once.
+    /// A frame with passes before and after DLSS: both holds send their frames to the other GPU, and the offload's
+    /// line, which then names both, takes the channel from the line one hold alone left there, once.
     #[test]
     fn a_mixed_frames_line_reaches_the_channel() {
-        let mixed = crate::preupscale::native::running_line(None, true);
-        let before = "second GPU: the model runs on X before DLSS, its edit applied one frame later";
-        assert!(mixed.len() < neural_forge_protocol::REASON_BYTES);
-        // No side serves: the offload's line is not written by the hold,
-        assert_eq!(hold_offload_line(None, false, false, "native network running"), None);
-        assert_eq!(hold_offload_line(Some(before), false, false, before), None);
-        // and the hold's line is due against whatever the channel holds,
-        for channel in ["", "native network running", before] {
-            assert!(native_line_due(&mixed, "", channel, false), "over {channel:?}");
-            assert!(native_line_due(&mixed, &mixed, channel, false), "again when the channel lost it: {channel:?}");
+        use super::offload_pre::{self, Serving};
+        let both = offload_pre::status_line("X", Serving { before: true, after: true });
+        let before = offload_pre::status_line("X", Serving { before: true, after: false });
+        assert!(both.contains("before and after DLSS"), "{both}");
+        for channel in ["", "native network running", before.as_str()] {
+            assert_eq!(hold_offload_line(Some(&both), true, true, channel), Some(both.as_str()), "over {channel:?}");
         }
-        // until it is there.
-        assert!(!native_line_due(&mixed, &mixed, neural_forge_protocol::stored_reason(&mixed), false));
+        assert_eq!(hold_offload_line(Some(&both), true, true, neural_forge_protocol::stored_reason(&both)), None, "until it is there");
     }
 
     #[test]

@@ -8,6 +8,13 @@
 //! hold submits it (`N[parity]` on the frames' queue), and the answer copied into the answer region. What the CPU
 //! decides per frame on the game's device (the history, the jitter, the passes' settings) comes in a queue keyed
 //! by the frame's sequence number ([`Metas`]).
+//!
+//! A frame with passes before DLSS and after its output has two holds and so two runners, one per hold, each with
+//! its own regions and pass resources at its own size. They share the other device, its one network (the process
+//! has one: `nf_native.cpp`'s `g_live`) and what a frame is submitted with ([`Core`], through
+//! `offload_pre::Seats`): a runner locks the core for the whole of a frame and waits for the frame before it lets
+//! go, so the two holds' frames run one after the other and nothing is freed or rebuilt under a frame that runs.
+//! Both holds ask the network for the same set of sizes (`native::frame_sizes`), so neither's frame rebuilds it.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -16,7 +23,7 @@ use std::time::Instant;
 use ash::vk;
 
 use super::native::{Graph, Loader, NativePass, Passes};
-use super::offload_pre::{Layout, Ran, Runner};
+use super::offload_pre::{Layout, Ran, Runner, Seat, Seats};
 use super::HostBuffer;
 
 /// What the hold decided for the frame it sent as `seq`.
@@ -54,17 +61,44 @@ struct Frame {
     depth: Option<super::native::DepthCopy>,
 }
 
-pub(crate) struct PreRunner {
+/// What the runners of one game device share on the other GPU: the device made for the offload, its loader (the
+/// process's one network) and what a frame is submitted with. Locked by a runner for the whole of a frame.
+struct Core {
     game: vk::Device,
-    instance: ash::Instance,
     off: Option<super::offload::Offload>,
+    /// `None` once the offload was given up ([`Runner::gave_up`]): the network is closed here.
     loader: Option<Arc<Loader>>,
-    metas: Metas,
     queue: vk::Queue,
     pool: vk::CommandPool,
     /// The copies in, and the answer's copy out.
     cmds: [vk::CommandBuffer; 2],
     fence: vk::Fence,
+    /// A frame did not finish: nothing of the device is freed, and no runner submits to it again.
+    leaked: bool,
+}
+
+// SAFETY: plain handles of the offload device, used by one thread at a time (under the seats' lock of it).
+unsafe impl Send for Core {}
+
+/// The cores by the game's device.
+static CORES: Seats<Core> = Seats::new();
+
+/// Why a runner may not run a frame on a core in this state (`leaked`: a frame never finished there; `closed`: the
+/// offload was given up and the network closed), and whether that is a frame that never finished.
+pub(crate) fn refused(leaked: bool, closed: bool) -> Option<(&'static str, bool)> {
+    if leaked {
+        Some(("a frame on the other GPU did not finish", true))
+    } else if closed {
+        Some(("the second GPU was given up", false))
+    } else {
+        None
+    }
+}
+
+pub(crate) struct PreRunner {
+    instance: ash::Instance,
+    seat: Seat<Core>,
+    metas: Metas,
     /// The regions on this device (imported, or staged copies of them), made on the first frame.
     regions: Option<(HostBuffer, HostBuffer)>,
     /// Both devices can import the regions' memory, and the regions' whole sizes.
@@ -72,7 +106,8 @@ pub(crate) struct PreRunner {
     capacity: (usize, usize),
     frame: Option<Frame>,
     rule: super::offload::ServerRule,
-    /// A frame did not finish: nothing of the device is freed.
+    /// A frame did not finish (this runner's, or one of the other hold's on the same device): nothing of the device
+    /// is freed.
     leaked: bool,
     said_loading: bool,
     /// Frames asked of the runner so far.
@@ -103,6 +138,45 @@ impl PreRunner {
         metas: Metas,
         at: super::offload_pre::Where,
     ) -> Result<(Self, String), String> {
+        let seat = CORES.join(game, |core| refused(core.leaked, core.loader.is_none()).map_or(Ok(()), |(why, _)| Err(why.to_string())), || Core::make(game))?;
+        let (name, import) = {
+            let core = seat.lock();
+            match core.off.as_ref() {
+                Some(off) => (off.name.clone(), off.import),
+                None => return Err("the other GPU's device is gone".into()),
+            }
+        };
+        crate::log!(
+            "[offload] {}: each frame's edit comes from the other GPU and is applied one frame later, carried by DLSS's motion vectors; {}",
+            at.name(),
+            if at == super::offload_pre::Where::Before { "nothing DLSS reads is delayed" } else { "DLSS's output is not delayed" }
+        );
+        crate::logging::flush();
+        let shared = shared && import;
+        Ok((
+            Self {
+                instance,
+                seat,
+                metas,
+                regions: None,
+                shared,
+                capacity,
+                frame: None,
+                rule: super::offload::ServerRule::default(),
+                leaked: false,
+                said_loading: false,
+                frames: 0,
+                at,
+            },
+            name,
+        ))
+    }
+}
+
+impl Core {
+    /// On the offload device made with the game's device `game` (`offload::take`): its loader, queue and command
+    /// buffers. `Err` with why it cannot serve (the device is given back).
+    fn make(game: vk::Device) -> Result<Self, String> {
         let off = match super::offload::take(game) {
             Some(Ok(off)) => off,
             Some(Err(why)) => return Err(why),
@@ -113,13 +187,7 @@ impl PreRunner {
             super::offload::give_back(game, off, false);
             return Err(why);
         }
-        let name = off.name.clone();
         crate::log!("[offload] {}", off.plan);
-        crate::log!(
-            "[offload] {}: each frame's edit comes from the other GPU and is applied one frame later, carried by DLSS's motion vectors; {}",
-            at.name(),
-            if at == super::offload_pre::Where::Before { "nothing DLSS reads is delayed" } else { "DLSS's output is not delayed" }
-        );
         crate::logging::flush();
         let device = &off.device;
         let setup = off.setup;
@@ -155,39 +223,57 @@ impl PreRunner {
         // Barriers between the network's launches, never counter chaining (`native_post::PostServer::start_offload`).
         let loader = Arc::new(Loader::start(off.device.handle(), off.setup, super::native::HoldCounts::default(), false));
         loader.register(off.device.handle());
-        let shared = shared && off.import;
-        Ok((
-            Self {
-                game,
-                instance,
-                off: Some(off),
-                loader: Some(loader),
-                metas,
-                queue,
-                pool,
-                cmds,
-                fence,
-                regions: None,
-                shared,
-                capacity,
-                frame: None,
-                rule: super::offload::ServerRule::default(),
-                leaked: false,
-                said_loading: false,
-                frames: 0,
-                at,
-            },
-            name,
-        ))
+        Ok(Self { game, off: Some(off), loader: Some(loader), queue, pool, cmds, fence, leaked: false })
     }
+}
 
-    /// One frame; `Err` with [`Ran::Skipped`] or [`Ran::Failed`].
+impl Drop for Core {
+    /// The last runner left (inside the game's `vkDestroyDevice` at the latest, `offload_pre::stop_for`): the
+    /// network is closed and the device given back, unless a frame on it never finished.
+    fn drop(&mut self) {
+        let Some(off) = self.off.take() else { return };
+        let loader = self.loader.take();
+        if let Some(l) = loader.as_ref() {
+            l.retire();
+            l.stop_worker();
+        }
+        if self.leaked {
+            crate::log!("[offload] the other GPU's last frame never finished: its network and device are left to the process's end");
+            crate::logging::flush();
+            if let Some(l) = loader {
+                std::mem::forget(l);
+            }
+            super::offload::give_back(self.game, off, true);
+            return;
+        }
+        // SAFETY: idle: every frame was waited for, and every runner freed what it made before it left.
+        unsafe {
+            off.device.destroy_fence(self.fence, None);
+            off.device.destroy_command_pool(self.pool, None);
+        }
+        drop(loader);
+        // Destroyed with the game's device (inside its vkDestroyDevice, the loader's lock held).
+        super::offload::give_back(self.game, off, false);
+    }
+}
+
+impl PreRunner {
+    /// One frame; `Err` with [`Ran::Skipped`] or [`Ran::Failed`]. The core is locked for all of it: the other hold's
+    /// runner waits for this frame to be done with the device and the network.
     ///
     /// # Safety
     /// As [`Runner::run`].
     unsafe fn frame(&mut self, meta: &FrameMeta, out: *const u8, inn: *mut u8, layout: &Layout) -> Result<(), Ran> {
         let failed = |why: &str| Ran::Failed(why.to_string());
-        let (Some(off), Some(loader)) = (self.off.as_ref(), self.loader.as_ref()) else { return Err(failed("the other GPU's device is gone")) };
+        let mut core = self.seat.lock();
+        let Core { off, loader, queue, cmds, fence, leaked, .. } = &mut *core;
+        if let Some((why, stuck)) = refused(*leaked, loader.is_none()) {
+            // The other hold's frame never finished there, or its worker gave the offload up: nothing is submitted.
+            self.leaked |= stuck;
+            return Err(failed(why));
+        }
+        let (Some(off), Some(loader)) = (off.as_ref(), loader.as_ref()) else { return Err(failed("the other GPU's device is gone")) };
+        let (queue, cmds, fence) = (*queue, *cmds, *fence);
         let (device, instance, physical, setup) = (&off.device, &self.instance, off.physical, off.setup);
         if loader.dead() {
             return Err(failed("the other GPU's device was lost"));
@@ -311,7 +397,7 @@ impl PreRunner {
             // The exposure the encode used, and the scene cut's word.
             let side = out.add(layout.side_at as usize);
             f.hdr.set_exposure_bytes(std::slice::from_raw_parts(side, super::hdr::HdrPass::EXPOSURE_BYTES as usize));
-            let [up, down] = self.cmds;
+            let [up, down] = cmds;
             let begin = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             let recorded = (|| -> ash::prelude::VkResult<()> {
                 device.reset_command_buffer(up, vk::CommandBufferResetFlags::empty())?;
@@ -398,25 +484,26 @@ impl PreRunner {
             all.extend(frame_cmds.into_iter().flatten());
             all.push(down);
             let started = Instant::now();
-            if crate::note_vk(device.handle(), device.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&all)], self.fence)).is_err() {
+            if crate::note_vk(device.handle(), device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&all)], fence)).is_err() {
                 f.native.gap.skipped();
                 return Err(failed("the frame's submit failed on the other GPU"));
             }
             for cmd in frame_cmds.into_iter().flatten() {
                 f.native.submitted(cmd);
             }
-            loader.pre_submitted(device, self.fence);
-            let waited = device.wait_for_fences(&[self.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64);
+            loader.pre_submitted(device, fence);
+            let waited = device.wait_for_fences(&[fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64);
             if waited.is_err() {
-                // Still running (or the device is lost): nothing it uses is freed (drain before free).
+                // Still running (or the device is lost): nothing it uses is freed (drain before free), and no runner
+                // of this device submits to it again.
                 self.leaked = true;
+                *leaked = true;
                 return Err(failed("a frame on the other GPU did not finish"));
             }
-            loader.pre_idle(self.fence);
-            let _ = device.reset_fences(&[self.fence]);
+            loader.pre_idle(fence);
+            let _ = device.reset_fences(&[fence]);
             let took = started.elapsed();
-            super::offload::STATS.server_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            super::offload::STATS.server_us.fetch_add(took.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            super::offload_pre::note_server_frame(self.at, took);
             if i.staged {
                 std::ptr::copy_nonoverlapping(i.ptr.add(layout.answer_at as usize), inn.add(layout.answer_at as usize), layout.sizes.answer as usize);
             }
@@ -473,11 +560,15 @@ impl Runner for PreRunner {
         // The process's one network goes back to the game's device: it is closed here (the loader's own drop does
         // it; retiring alone leaves it open, and the game's loader then finds it open elsewhere for good). Not after
         // a frame that never finished: nothing it uses is freed.
-        if self.leaked {
+        // Both holds' runners: a give-up is the process's, so the first to get here closes the network for both (the
+        // other's next frame is refused, and its own give-up finds the loader gone).
+        let mut core = self.seat.lock();
+        if core.leaked {
+            self.leaked = true;
             return;
         }
-        if let (Some(off), Some(f)) = (self.off.as_ref(), self.frame.take()) {
-            // SAFETY: idle: every frame was waited for.
+        if let (Some(off), Some(f)) = (core.off.as_ref(), self.frame.take()) {
+            // SAFETY: idle: every frame was waited for (the core is locked).
             unsafe {
                 f.native.destroy(&off.device);
                 f.hdr.destroy(&off.device);
@@ -486,7 +577,7 @@ impl Runner for PreRunner {
                 }
             }
         }
-        if let Some(loader) = self.loader.take() {
+        if let Some(loader) = core.loader.take() {
             loader.retire();
             loader.stop_worker();
             drop(loader);
@@ -497,23 +588,16 @@ impl Runner for PreRunner {
 }
 
 impl Drop for PreRunner {
+    /// Frees what this runner made on the other device; its seat's drop then leaves the core, and the last runner to
+    /// leave closes the network and gives the device back ([`Core`]'s drop).
     fn drop(&mut self) {
-        let Some(off) = self.off.take() else { return };
-        let loader = self.loader.take();
-        if let Some(l) = loader.as_ref() {
-            l.retire();
-            l.stop_worker();
-        }
-        if self.leaked {
-            crate::log!("[offload] the other GPU's last frame never finished: its network and device are left to the process's end");
-            crate::logging::flush();
-            if let Some(l) = loader {
-                std::mem::forget(l);
-            }
-            super::offload::give_back(self.game, off, true);
+        let core = self.seat.lock();
+        // A frame never finished there (this runner's or the other hold's): nothing on the device is freed.
+        if core.leaked {
             return;
         }
-        // SAFETY: idle: every frame was waited for.
+        let Some(off) = core.off.as_ref() else { return };
+        // SAFETY: idle: every frame was waited for (the core is locked).
         unsafe {
             let device = &off.device;
             if let Some(f) = self.frame.take() {
@@ -527,11 +611,6 @@ impl Drop for PreRunner {
                 o.destroy(device);
                 i.destroy(device);
             }
-            device.destroy_fence(self.fence, None);
-            device.destroy_command_pool(self.pool, None);
         }
-        drop(loader);
-        // Destroyed with the game's device (inside its vkDestroyDevice, the loader's lock held).
-        super::offload::give_back(self.game, off, false);
     }
 }
