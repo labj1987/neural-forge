@@ -825,7 +825,7 @@ unsafe fn delayed_present(
                         shm,
                         inflight,
                         req,
-                        gate.take(),
+                        &mut gate,
                         encode_push,
                         pq10,
                         raw_answer_generation,
@@ -840,7 +840,11 @@ unsafe fn delayed_present(
         inflight[SLOT.index()].paced_streak = 0;
     }
     if let Some(req) = pending.filter(|_| gate.take().is_some()) {
-        // The frame before is on its way and this present cannot wait for it on the GPU after all: it waits here.
+        // The frame before is on its way and this present cannot wait for it on the GPU after all (also when
+        // `paced_present` could not keep this frame: it hands the gate back): it waits here, and the server's writes
+        // of the answer region are done before step 4 composes it.
+        #[cfg(test)]
+        GATE_WAITED_HERE.with(|c| c.set(c.get() + 1));
         let valid = gpu.pacer().and_then(|p| p.wait_resolved(req.token, deadline + SYNC_BUDGET)).unwrap_or(false);
         previous = previous_frame(Some(req), valid, valid, dims, std::time::Duration::ZERO);
         relay_idle(gpu, shm, None);
@@ -1040,6 +1044,15 @@ thread_local! {
     static PACED_PRESENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test faults for [`paced_present`]: its next gated present cannot keep its frame, or cannot duplicate its gate.
+    static PACED_FAULT_KEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PACED_FAULT_DUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many gates the present waited for on its own thread after [`paced_present`] did not take the frame.
+    static GATE_WAITED_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether the delayed present just made on this thread handed its frame to the relay (and forgets it).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn took_paced_present() -> bool {
@@ -1158,7 +1171,8 @@ unsafe fn idle_proxy_buffer(
 /// this present waits for nothing. It keeps this frame, composes the frame before, copies this frame's proxy from
 /// the kept pair into the proxy region behind that compose, and hands the frame to the relay, which lets the other
 /// GPU run it once the game's GPU is done with the copy. `None` when the frame cannot be kept: the caller's own path
-/// has the present (and, with `gate`, waits for that answer itself).
+/// has the present, and `gate` is left where it is, so that the caller waits for that answer itself before it
+/// composes. `gate` is taken only once the frame is kept.
 ///
 /// # Safety
 /// As [`run`]; `proxy` is the proxy region's buffer on this device, idle.
@@ -1179,7 +1193,7 @@ unsafe fn paced_present(
     shm: &ShmClient,
     inflight: &mut [Inflight; 2],
     req: DelayedRequest,
-    gate: Option<std::os::fd::OwnedFd>,
+    gate: &mut Option<std::os::fd::OwnedFd>,
     encode_push: crate::composition::encode_pass::EncodePush,
     pq10: bool,
     raw_answer_generation: &mut u64,
@@ -1191,52 +1205,71 @@ unsafe fn paced_present(
     use std::os::fd::IntoRawFd;
     let dims = (width, height, proxy_format);
     let parity = 1 - req.parity;
-    // This frame as it is, and as the proxy it is sent as, before anything is written into the image.
+    // This frame as it is, and as the proxy it is sent as, before anything is written into the image. Not kept: the
+    // gate stays with the caller, which waits for the answer before it composes.
+    #[cfg(test)]
+    if gate.is_some() && PACED_FAULT_KEEP.with(|f| f.replace(false)) {
+        return None;
+    }
     gpu.keep_delayed(device, instance, physical_device, queue, image, width, height, parity, true, false, true)?;
     // The other device's submission is waited for twice on the GPU: by the compose (the answer region is written) and
-    // by this frame's send (the proxy region is read). Without a second fd for the send, the answer is waited for here.
-    let (gate, after) = match gate.map(|fd| (fd.try_clone(), fd)) {
+    // by this frame's send (the proxy region is read). Without a second fd for the send, the answer is waited for here,
+    // and composed only when it came and fits (else the frame goes out as it was kept).
+    let dup = |fd: &std::os::fd::OwnedFd| {
+        #[cfg(test)]
+        if PACED_FAULT_DUP.with(|f| f.replace(false)) {
+            return Err(std::io::Error::other("test fault"));
+        }
+        fd.try_clone()
+    };
+    let mut answered = true;
+    let (gate, after) = match gate.take().map(|fd| (dup(&fd), fd)) {
         Some((Ok(after), fd)) => (Some(fd), Some(after)),
         Some((Err(_), _)) => {
-            let _ = gpu.pacer().and_then(|p| p.wait_resolved(req.token, std::time::Instant::now() + SYNC_BUDGET));
+            answered = gpu.pacer().and_then(|p| p.wait_resolved(req.token, std::time::Instant::now() + SYNC_BUDGET)) == Some(true);
             (None, None)
         }
         None => (None, None),
     };
     let gated = gate.is_some();
-    // The frame before into this image, composed with its answer (or as it was, when the compose cannot be made).
+    // The frame before into this image, composed with its answer (or as it was, when the compose cannot be made or
+    // the answer did not come).
     *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
-    let composed = gpu.present_temporal_delta_async(
-        device,
-        instance,
-        physical_device,
-        queue,
-        width,
-        height,
-        width,
-        height,
-        crate::composition::gpu::ComposeInputs::Delayed { parity: req.parity, gate: gate.map(IntoRawFd::into_raw_fd) },
-        *raw_answer_generation,
-        proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
-        image,
-        crate::composition::gpu::ComposeParams {
-            colour_strength: settings.colour_strength,
-            transfer_strength: settings.transfer_strength,
-            max_ratio: settings.max_ratio,
-            ghost_guard: 0.0,
-            transfer: settings.transfer,
-            model_small: false,
-            white_point: req.white_point,
-            compare: settings.compare,
-            colour_trust: settings.colour_trust,
-            ratio_smooth: settings.ratio_smooth,
-            debug_view: settings.debug_view,
-            debug_scale: settings.debug_scale,
-            proxy_encoded: req.encoded,
-            reversible_mode: req.reversible_mode,
-            pq10: pq10.then(crate::hdr_present::reference_nits),
-        },
-    );
+    let composed = if answered {
+        gpu.present_temporal_delta_async(
+            device,
+            instance,
+            physical_device,
+            queue,
+            width,
+            height,
+            width,
+            height,
+            crate::composition::gpu::ComposeInputs::Delayed { parity: req.parity, gate: gate.map(IntoRawFd::into_raw_fd) },
+            *raw_answer_generation,
+            proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+            image,
+            crate::composition::gpu::ComposeParams {
+                colour_strength: settings.colour_strength,
+                transfer_strength: settings.transfer_strength,
+                max_ratio: settings.max_ratio,
+                ghost_guard: 0.0,
+                transfer: settings.transfer,
+                model_small: false,
+                white_point: req.white_point,
+                compare: settings.compare,
+                colour_trust: settings.colour_trust,
+                ratio_smooth: settings.ratio_smooth,
+                debug_view: settings.debug_view,
+                debug_scale: settings.debug_scale,
+                proxy_encoded: req.encoded,
+                reversible_mode: req.reversible_mode,
+                pq10: pq10.then(crate::hdr_present::reference_nits),
+            },
+        )
+    } else {
+        None
+    };
     if let Some(ms) = gpu.take_compose_gpu_ms() {
         shm.publish_compose_gpu_ms(ms);
     }
@@ -6573,6 +6606,10 @@ mod tests {
         let answer_region = shm.answer_region(Slot::Primary).unwrap().0 as usize;
         let (stop, withhold) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let (stop_clone, withhold_clone) = (Arc::clone(&stop), Arc::clone(&withhold));
+        // A server that gives up on a frame after its device's submission: the fd is published, the answer region is
+        // not written (it still holds the answer before) and the request is never answered.
+        let given_up = Arc::new(AtomicBool::new(false));
+        let given_up_clone = Arc::clone(&given_up);
         let first_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
         // The other GPU: each request's frame comes back as its answer (no edit), a little later than it was asked.
         let server = std::thread::spawn(move || {
@@ -6592,9 +6629,20 @@ mod tests {
                     // answer on the CPU; the fd it publishes is of an empty submission, so the frames here also check
                     // that a compose that ran before the answer was written would show.)
                     if let Some(other) = other.as_ref() {
+                        let dims = (hdr.width.load(AtomicOrdering::Relaxed), hdr.height.load(AtomicOrdering::Relaxed));
+                        if given_up_clone.swap(false, AtomicOrdering::Relaxed) {
+                            // SAFETY: the layer reads the answer region only after the fd below (or not at all).
+                            unsafe { std::ptr::write_bytes(answer_region as *mut u8, 0xff, frame_bytes / 2) };
+                            crate::composition::pace::publish(
+                                hdr_ptr,
+                                0,
+                                req,
+                                crate::composition::pace::Submitted { fd: other.submit(), dims, evaluated: false },
+                            );
+                            continue;
+                        }
                         // SAFETY: both regions hold the frame; the layer reads neither before the fd it gets below.
                         unsafe { std::ptr::copy_nonoverlapping(proxy_region as *const u8, answer_region as *mut u8, frame_bytes) };
-                        let dims = (hdr.width.load(AtomicOrdering::Relaxed), hdr.height.load(AtomicOrdering::Relaxed));
                         crate::composition::pace::publish(hdr_ptr, 0, req, crate::composition::pace::Submitted { fd: other.submit(), dims, evaluated: false });
                         // Slower than the presents come: the next present finds the frame submitted, not answered.
                         std::thread::sleep(Duration::from_millis(9));
@@ -6622,9 +6670,24 @@ mod tests {
         let mut own_at = Vec::new();
         // The presents whose frame the relay sent.
         let mut paced_at = Vec::new();
-        const PRESENTS: usize = 260;
-        for k in 0..PRESENTS {
+        // With the answers waited for on the GPU, two faults after the stall: a present that cannot keep its frame
+        // once it has the gate (the gate goes back to the present's own wait), and one that cannot duplicate it while
+        // the server gave up on that frame after its submit (the frame goes out as it was kept, not composed with the
+        // answer before).
+        let presents: usize = if on_gpu { 340 } else { 260 };
+        let (mut keep_fault_at, mut dup_fault_at) = (None, None);
+        for k in 0..presents {
             match k {
+                262 if on_gpu => PACED_FAULT_KEEP.with(|f| f.set(true)),
+                300 if on_gpu => {
+                    given_up.store(true, AtomicOrdering::Relaxed);
+                    PACED_FAULT_DUP.with(|f| f.set(true));
+                }
+                // As at 110: the channel ends the request that is still out; the delay starts again.
+                312 if on_gpu => {
+                    std::thread::sleep(Duration::from_millis(1200));
+                    starts_allowed += 1;
+                }
                 // An answer that never comes, with the relay: given up after the frame's budget.
                 100 => withhold.store(true, AtomicOrdering::Relaxed),
                 // The channel ends the request that is still out after a second; the game stood still meanwhile, so
@@ -6641,6 +6704,8 @@ mod tests {
                 _ => {}
             }
             upload_present_src(&device, &mem_props, queue, pool, image, width, height, &flat(width, height, colour_of(k)));
+            let (keep_armed, dup_armed, waited_here) =
+                (PACED_FAULT_KEEP.with(std::cell::Cell::get), PACED_FAULT_DUP.with(std::cell::Cell::get), GATE_WAITED_HERE.with(std::cell::Cell::get));
             // SAFETY: `image` is this test's own, PRESENT_SRC_KHR; one thread.
             let sem = unsafe {
                 run(
@@ -6677,6 +6742,13 @@ mod tests {
             if s.inflight[0].delayed.is_some_and(|r| r.token != 0) {
                 paced_at.push(k);
             }
+            if keep_armed && !PACED_FAULT_KEEP.with(std::cell::Cell::get) {
+                keep_fault_at = Some(k);
+                assert_eq!(GATE_WAITED_HERE.with(std::cell::Cell::get), waited_here + 1, "present {k}: the gate came back and was waited for here");
+            }
+            if dup_armed && !PACED_FAULT_DUP.with(std::cell::Cell::get) {
+                dup_fault_at = Some(k);
+            }
             if let Some(sem) = sem {
                 let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
                 let stage = vk::PipelineStageFlags::ALL_COMMANDS;
@@ -6707,13 +6779,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(own <= starts_allowed, "{own} presents showed their own frame (at {own_at:?}); the delay starts only {starts_allowed} times");
-        assert!(previous >= PRESENTS - 10, "only {previous} of {PRESENTS} presents showed the frame before them");
+        assert!(previous >= presents - 10, "only {previous} of {presents} presents showed the frame before them");
         let first = *paced_at.first().expect("the relay took the frames");
         assert!(first > crate::composition::pace::PACE_AFTER as usize && first < 60, "after a run of answered frames: first at {first}");
         assert!(paced_at.iter().filter(|k| **k < 100).count() >= 40, "with the relay until the answer that never came: {paced_at:?}");
         assert!(!paced_at.iter().any(|k| (104..=110).contains(k)), "on the present's own waits after the lost answer: {paced_at:?}");
         assert!(paced_at.iter().any(|k| (150..220).contains(k)), "and with the relay again once the answers came back: {paced_at:?}");
         assert!(paced_at.iter().any(|k| *k > 252), "and again after the stall: {paced_at:?}");
+        if on_gpu {
+            assert!(keep_fault_at.is_some(), "a gated present could not keep its frame: {paced_at:?}");
+            assert!(dup_fault_at.is_some(), "a gated present could not duplicate its gate: {paced_at:?}");
+            PACED_FAULT_KEEP.with(|f| f.set(false));
+            PACED_FAULT_DUP.with(|f| f.set(false));
+        }
         let gated = crate::composition::pace::GATED_TOTAL.load(AtomicOrdering::Relaxed) - gated_before;
         if on_gpu {
             assert!(gated >= 100, "only {gated} composes waited for their answer on the GPU");
