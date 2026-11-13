@@ -284,6 +284,12 @@ pub(crate) struct SrLaunches {
     pub last: Instant,
 }
 
+/// Whether the native backend's Status line is written after a hold: when it changed or the channel holds something else,
+/// but never while the model on another GPU is serving (its line is the Status tab's then).
+fn native_line_due(status: &str, last: &str, channel: &str, offload_active: bool) -> bool {
+    !offload_active && (status != last || (!status.is_empty() && channel != status))
+}
+
 impl SrLaunches {
     /// The run after a launch at `now`.
     fn after(run: Option<Self>, now: Instant) -> Self {
@@ -6700,8 +6706,10 @@ impl Session {
                 loader.note_gpu_ms(ms);
             }
             let status = native::status(result, loader);
-            // Against what the channel holds too: the offload's line shares it.
-            if status != self.native_status || (!status.is_empty() && shm.layer_reason() != status) {
+            // Against what the channel holds too: the offload's line shares it, and while the offload serves the line is
+            // its own (the hold's "native network running" would overwrite it on every frame).
+            let offload_active = matches!(offload::state(), offload::State::Active(_));
+            if native_line_due(&status, &self.native_status, &shm.layer_reason(), offload_active) {
                 shm.set_layer_reason(&status);
                 self.native_status = status;
             }
@@ -12054,5 +12062,21 @@ mod tests {
         t.forget_image(i(1));
         t.forget_image(i(4));
         assert_eq!(t.exposure_names.keys().copied().collect::<Vec<_>>(), [i(5)]);
+    }
+}
+
+#[cfg(test)]
+mod native_line_tests {
+    use super::native_line_due;
+
+    #[test]
+    fn the_offloads_line_is_not_overwritten_while_it_serves() {
+        let offload = "second GPU: the model runs on X before DLSS, its edit applied one frame later";
+        assert!(!native_line_due("native network running", "native network running", offload, true));
+        assert!(!native_line_due("native network running", "", offload, true));
+        // Not serving (off, given up): the native backend's line comes back.
+        assert!(native_line_due("native network running", "native network running", offload, false));
+        assert!(native_line_due("native network running", "", "", false));
+        assert!(!native_line_due("native network running", "native network running", "native network running", false));
     }
 }
