@@ -1038,7 +1038,7 @@ pub(crate) struct HoldSide {
     pending: bool,
     /// Holds in a row whose frame could not be sent (no motion vectors, no jitter, no chained cache), and when the
     /// row began.
-    unsendable: (u32, Option<Instant>),
+    unsendable: Unsendable,
 }
 
 /// This many holds in a row that cannot send their frame, over at least [`UNSENDABLE_FOR`], give the offload up: the
@@ -1047,24 +1047,37 @@ pub(crate) struct HoldSide {
 pub(crate) const UNSENDABLE_HOLDS: u32 = 30;
 pub(crate) const UNSENDABLE_FOR: Duration = Duration::from_secs(1);
 
-/// Whether the row of holds that could not send (`streak`: their number and when the row began) gives the offload
-/// up now, after one more hold at `now` that `can` or cannot. Once per row.
-pub(crate) fn unsendable_gives_up(streak: &mut (u32, Option<Instant>), can: bool, now: Instant) -> bool {
+/// A pause between two holds longer than this starts the row afresh: the second of [`UNSENDABLE_FOR`] is a second
+/// of holds that keep coming, not a pause (a loading screen) between two short bursts.
+pub(crate) const UNSENDABLE_GAP: Duration = Duration::from_millis(250);
+
+/// The row of holds that could not send: how many, when it began and when its last hold was.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Unsendable {
+    holds: u32,
+    began: Option<Instant>,
+    last: Option<Instant>,
+    /// Given up for this row already.
+    said: bool,
+}
+
+/// Whether the row of holds that could not send (`streak`) gives the offload up now, after one more hold at `now`
+/// that `can` or cannot. Once per row.
+pub(crate) fn unsendable_gives_up(streak: &mut Unsendable, can: bool, now: Instant) -> bool {
     if can {
-        *streak = (0, None);
+        *streak = Unsendable::default();
         return false;
     }
-    let Some(began) = streak.1 else {
-        *streak = (1, Some(now));
-        return false;
-    };
-    if streak.0 == u32::MAX {
-        // Given up for this row already.
+    let paused = streak.last.is_some_and(|l| now.saturating_duration_since(l) > UNSENDABLE_GAP);
+    if streak.began.is_none() || paused {
+        *streak = Unsendable { holds: 1, began: Some(now), last: Some(now), said: false };
         return false;
     }
-    streak.0 += 1;
-    if streak.0 >= UNSENDABLE_HOLDS && now.saturating_duration_since(began) >= UNSENDABLE_FOR {
-        streak.0 = u32::MAX;
+    streak.holds = streak.holds.saturating_add(1);
+    streak.last = Some(now);
+    let long = streak.began.is_some_and(|b| now.saturating_duration_since(b) >= UNSENDABLE_FOR);
+    if !streak.said && streak.holds >= UNSENDABLE_HOLDS && long {
+        streak.said = true;
         return true;
     }
     false
@@ -1149,7 +1162,18 @@ impl HoldSide {
             }
         );
         crate::logging::flush();
-        Ok(Self { exchange, cadence: Cadence::default(), worker, metas, snapshot, sent: None, resources, holds: 0, pending: false, unsendable: (0, None) })
+        Ok(Self {
+            exchange,
+            cadence: Cadence::default(),
+            worker,
+            metas,
+            snapshot,
+            sent: None,
+            resources,
+            holds: 0,
+            pending: false,
+            unsendable: Unsendable::default(),
+        })
     }
 
     /// Whether the other GPU runs the frames (else the offload is given up, and the holds run the network here).
@@ -1300,16 +1324,27 @@ impl HoldSide {
     pub(crate) unsafe fn destroy(mut self, device: &ash::Device) {
         SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(id, _)| *id != self.resources);
         // The worker first: its runner frees the other device's side and gives the device back.
+        let owned = !self.worker.ended();
         self.worker.stop();
-        SERVING_PRE.store(false, Ordering::Release);
-        if matches!(super::offload::state(), super::offload::State::Active(_)) {
-            super::offload::note_state(super::offload::State::Off);
-        }
+        side_gone(owned);
         // SAFETY: the contract.
         unsafe {
             self.snapshot.destroy(device);
             self.exchange.destroy(device);
         }
+    }
+}
+
+/// A hold's side is destroyed. `owned`: its worker still ran, so the offload was its own; a side whose worker was
+/// ended for another set of hold resources ([`release_idle`]) leaves the status to the side that serves now.
+#[cfg(target_arch = "x86_64")]
+fn side_gone(owned: bool) {
+    if !owned {
+        return;
+    }
+    SERVING_PRE.store(false, Ordering::Release);
+    if matches!(super::offload::state(), super::offload::State::Active(_)) {
+        super::offload::note_state(super::offload::State::Off);
     }
 }
 
@@ -1430,7 +1465,7 @@ mod tests {
 
     #[test]
     fn frames_that_cannot_be_sent_give_up_only_in_a_long_row() {
-        let mut streak = (0, None);
+        let mut streak = Unsendable::default();
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         // One hold without vectors now and then does not.
@@ -1446,6 +1481,14 @@ mod tests {
         let gave_up: Vec<bool> = (0..4 * u64::from(UNSENDABLE_HOLDS)).map(|n| unsendable_gives_up(&mut streak, false, at(40_000 + n * 20))).collect();
         assert_eq!(gave_up.iter().filter(|g| **g).count(), 1);
         assert_eq!(gave_up.iter().position(|g| *g), Some(50), "30 holds are there after 0.6 s, the second is full at hold 51");
+        // Two short bursts with a pause between them (a loading screen) are not a second of holds without vectors.
+        let mut streak = Unsendable::default();
+        for n in 0..29 {
+            assert!(!unsendable_gives_up(&mut streak, false, at(60_000 + n * 8)));
+        }
+        for n in 0..29 {
+            assert!(!unsendable_gives_up(&mut streak, false, at(63_000 + n * 8)), "the row began again after the pause");
+        }
     }
 
     #[test]
@@ -1889,6 +1932,12 @@ mod tests {
         assert!(!worker.ended());
         assert!(release_idle(device, Duration::ZERO));
         assert!(worker.ended() && !serving_device(device));
+        // The released side's end leaves the status to the side that serves now; an owning side's end clears it.
+        SERVING_PRE.store(true, Ordering::Release);
+        side_gone(!worker.ended());
+        assert!(serving_pre(), "another set's side serves: the Status tab keeps the second GPU");
+        side_gone(true);
+        assert!(!serving_pre());
         // Its side's submits do not wait for it.
         let mut cadence = Cadence::default();
         game.run(&[game.record(cadence.hold(1, true), 801)]);

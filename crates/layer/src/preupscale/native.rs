@@ -4689,6 +4689,13 @@ unsafe fn native_hold(
         }
     }
     if offloaded && res.offpre.is_none() {
+        if matches!(super::offload::state(), super::offload::State::Stalled(_)) || super::offload::is_busy(device.handle()) {
+            // A frame on the other GPU never finished: its device is not used again and the network cannot be taken
+            // back, so no side is built; the frames go to DLSS as they are (said when it stalled).
+            res.native = Some(native);
+            result.miss = Some("a frame on the second GPU never finished: the model is off for this session");
+            return result;
+        }
         if others_outstanding {
             // Not while holds recorded with these resources may still run (the cache's sets are written for it).
             res.native = Some(native);

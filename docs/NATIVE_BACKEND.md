@@ -1829,7 +1829,9 @@ frame on the other GPU. A second set of hold resources on the same device while 
 (its frames go to DLSS as they are) until the set that has it had no hold for 3 seconds, whose worker is then ended
 for it (`release_idle`; that set's side is built again at its next hold); it is not a fall-back. After a frame that
 never finished there (the 5 s fence wait) nothing is closed or taken back: the state is `Stalled` and the model is
-off for the rest of the session, said once. A frame whose OUT region was written again while it ran
+off for the rest of the session, said once. That is for the life of the game's device: the offload device is marked busy (`offload::is_busy`, kept
+through any later hand-back), `offload::take` refuses it, no new hold's side is built, `Stalled` is never replaced
+by the offload starting or running again, and the device is not destroyed with the game's. A frame whose OUT region was written again while it ran
 (two offloaded holds in one submit, or after an abandoned frame) is not answered and the runner's history starts
 afresh (`serve`: OUT's sequence number and `sent` read again after the run). The workers of a device
 end inside its `vkDestroyDevice` before the offload device is destroyed (`offload_pre::stop_for`).

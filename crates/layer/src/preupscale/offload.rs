@@ -166,11 +166,19 @@ static STATE: Mutex<State> = Mutex::new(State::Off);
 /// Notes what the offload is doing ([`State`]).
 pub(crate) fn note_state(state: State) {
     let mut now = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let (State::FellBack(_), State::Starting(_) | State::Active(_) | State::Stalled(_)) = (&*now, &state) {
-        // A fall-back is for the session.
-        return;
+    if replaces(&now, &state) {
+        *now = state;
     }
-    *now = state;
+}
+
+/// Whether `new` may take `now`'s place: a fall-back is for the session, and a stall is never followed by the offload
+/// starting or running again (the frame that did not finish may still run on that device; only its end, a fall-back,
+/// or the offload going away follows it).
+fn replaces(now: &State, new: &State) -> bool {
+    !matches!(
+        (now, new),
+        (State::FellBack(_), State::Starting(_) | State::Active(_) | State::Stalled(_)) | (State::Stalled(_), State::Starting(_) | State::Active(_))
+    )
 }
 
 /// The offload was given up for the session: every device of the process runs the network on its own GPU from then on.
@@ -658,16 +666,41 @@ pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk:
 /// The offload device made with `game` ([`make_for`]), for the server to run on; `None` when none was asked for, the
 /// error when it could not be made. Given back with [`give_back`].
 pub(crate) fn take(game: vk::Device) -> Option<Result<Offload, String>> {
+    if is_busy(game) {
+        // A frame on it never finished: it is not handed out again (and never destroyed).
+        return Some(Err("a frame on the other GPU never finished: its device is not used again this session".into()));
+    }
     MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|m| m.game == game)?.offload.take()
+}
+
+/// The game devices whose offload device has a frame that never finished ([`give_back`] with `busy`): for the life
+/// of the game's device, whatever is given back after.
+static BUSY: Mutex<Vec<vk::Device>> = Mutex::new(Vec::new());
+
+/// Whether a frame on the offload device made with `game` never finished.
+pub(crate) fn is_busy(game: vk::Device) -> bool {
+    BUSY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&game)
+}
+
+fn mark_busy(game: vk::Device) {
+    let mut all = BUSY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !all.contains(&game) {
+        all.push(game);
+    }
 }
 
 /// The server is done with the device (`busy`: a frame on it may still run, so it is never destroyed).
 pub(crate) fn give_back(game: vk::Device, offload: Offload, busy: bool) {
+    if busy {
+        mark_busy(game);
+    }
+    // Busy stays busy: a later clean hand-back does not make the device safe to destroy.
+    let busy = busy || is_busy(game);
     let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match all.iter_mut().find(|m| m.game == game) {
         Some(m) => {
             m.offload = Some(Ok(offload));
-            m.busy = busy;
+            m.busy |= busy;
         }
         None => all.push(Made { game, offload: Some(Ok(offload)), busy }),
     }
@@ -684,7 +717,14 @@ pub(crate) unsafe fn destroy_for(game: vk::Device) {
         let k = all.iter().position(|m| m.game == game);
         k.map(|k| all.remove(k))
     };
-    let Some(m) = made else { return };
+    let stuck = {
+        let mut all = BUSY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was = all.contains(&game);
+        all.retain(|d| *d != game);
+        was
+    };
+    let Some(mut m) = made else { return };
+    m.busy |= stuck;
     match m.offload {
         Some(Ok(off)) if !m.busy => {
             // SAFETY: nothing of it is alive (the server ended with it clean) and the loader's lock is held.
@@ -1193,6 +1233,35 @@ mod tests {
     }
 
     /// Given up is for the process and the session: nothing later reads as running again.
+    #[test]
+    fn a_stall_is_never_followed_by_the_offload_running_again() {
+        let (stalled, fell) = (State::Stalled("gpu".into()), State::FellBack("why".into()));
+        for new in [State::Starting("gpu".into()), State::Active("gpu".into())] {
+            assert!(!replaces(&stalled, &new));
+            assert!(!replaces(&fell, &new));
+            assert!(replaces(&State::Off, &new));
+        }
+        assert!(replaces(&stalled, &fell) && replaces(&stalled, &State::Off));
+        assert!(!replaces(&fell, &stalled));
+        assert!(replaces(&State::Active("gpu".into()), &stalled));
+    }
+
+    /// A device with a frame that never finished is not handed out again, whatever is given back after.
+    #[test]
+    fn a_device_with_a_stuck_frame_is_not_taken_again() {
+        use ash::vk::Handle;
+        let game = vk::Device::from_raw(0x5757_0001);
+        assert!(!is_busy(game));
+        assert!(take(game).is_none(), "no device was made with it");
+        mark_busy(game);
+        assert!(is_busy(game));
+        assert!(matches!(take(game), Some(Err(_))));
+        // Its game's device going away is what ends it.
+        // SAFETY: no offload device was made with this handle: only the registry's entries go.
+        unsafe { destroy_for(game) };
+        assert!(!is_busy(game));
+    }
+
     #[test]
     fn a_fall_back_is_for_the_whole_process() {
         assert!(!given_up());
