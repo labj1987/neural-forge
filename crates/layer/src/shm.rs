@@ -222,6 +222,51 @@ impl Channel {
     }
 }
 
+/// The request side of one slot, over the header's atomics: what the delayed present's relay (`composition::pace`)
+/// needs of [`ShmClient::begin_async_request`] and [`ShmClient::poll_async_request`] on its own thread.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct HeaderPort {
+    channel: Channel,
+    slot: Slot,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl crate::composition::pace::Port for HeaderPort {
+    fn begin(&self) -> Option<u32> {
+        let hdr = self.channel.header()?;
+        if hdr.quit.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        let req = neural_forge_protocol::next_request(hdr.seq_req_slot(self.slot).load(Ordering::Relaxed));
+        std::sync::atomic::fence(Ordering::Release);
+        hdr.seq_req_slot(self.slot).store(req, Ordering::Relaxed);
+        Some(req)
+    }
+
+    fn answered(&self, req: u32) -> bool {
+        // Equality, as `ShmClient::poll_async_request`: the counter wraps.
+        self.channel.header().is_some_and(|hdr| hdr.seq_resp_slot(self.slot).load(Ordering::Relaxed) == req)
+    }
+
+    fn fits(&self, req: u32, proxy: (u32, u32), pq10: bool) -> bool {
+        let Some(hdr) = self.channel.header() else { return false };
+        let dims = (hdr.answered_w.load(Ordering::Relaxed), hdr.answered_h.load(Ordering::Relaxed));
+        let evaluated = self.slot == Slot::Primary && req != 0 && hdr.seq_eval.load(Ordering::Acquire) == req;
+        crate::capture::answer_fits((dims != (0, 0)).then_some(dims), proxy, pq10, evaluated)
+    }
+
+    fn quit(&self) -> bool {
+        self.channel.header().is_none_or(|hdr| hdr.quit.load(Ordering::Relaxed) != 0)
+    }
+
+    fn publish_white(&self, reading: f32) {
+        let Some(hdr) = self.channel.header() else { return };
+        let prev = f32::from_bits(hdr.layer_measured_white_bits.load(Ordering::Relaxed));
+        let next = if prev.is_finite() && prev > 1e-4 { prev + (reading - prev) * 0.3 } else { reading };
+        hdr.layer_measured_white_bits.store(next.to_bits(), Ordering::Relaxed);
+    }
+}
+
 /// One mapping of a channel file per path for the whole process, shared by every device's
 /// [`ShmClient`]: each used to map the whole file (about 1 GiB of address space) again and keep it to
 /// the end of the process.
@@ -1007,6 +1052,37 @@ impl ShmClient {
     /// slots to ask this about instead of one.
     pub fn has_pending_request(&self, slot: Slot) -> bool {
         self.pending[slot.index()].is_some()
+    }
+
+    /// Whether a request could be started on `slot` now ([`Self::begin_async_request`]'s own conditions, checked
+    /// without starting one): the channel is open and alive, and the frame `set_frame_info` described last fits its
+    /// regions. The delayed present's pacing on the GPU asks before it hands a frame to its relay
+    /// ([`Self::request_port`]), which posts the request later.
+    pub fn can_request(&mut self, slot: Slot) -> bool {
+        if !self.open() || self.dead || self.pending[slot.index()].is_some() || !self.frame_backed[slot.index()] {
+            return false;
+        }
+        self.header().is_some_and(|hdr| hdr.quit.load(Ordering::Relaxed) == 0)
+    }
+
+    /// The request side of `slot` for the delayed present's relay (`composition::pace`), which posts requests and
+    /// sees their answers from its own thread while the present paces on the GPU. While it does, this client starts
+    /// no request on the slot itself; a request the relay gave up on comes back through [`Self::adopt_request`].
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn request_port(&self, slot: Slot) -> Option<HeaderPort> {
+        self.channel().map(|channel| HeaderPort { channel, slot })
+    }
+
+    /// Takes over a request the delayed present's relay posted on `slot` and gave up on (`req`, posted at `sent_at`),
+    /// when it is still out at the server: it is pending here from now on, so no new request is written over it,
+    /// and [`Self::poll_async_request`] ends it (answered late, or timed out) by the channel's own rules.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn adopt_request(&mut self, slot: Slot, req: u32, sent_at: Instant) {
+        let Some(hdr) = self.header() else { return };
+        if self.pending[slot.index()].is_none() && hdr.seq_resp_slot(slot).load(Ordering::Relaxed) != req {
+            self.pending[slot.index()] = Some((req, sent_at));
+            self.last_req[slot.index()] = req;
+        }
     }
 
     /// Starts a round trip on the given slot without waiting for it: bumps that

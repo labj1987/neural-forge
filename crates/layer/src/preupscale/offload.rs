@@ -773,7 +773,7 @@ pub(crate) fn note_present() {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_multiple_of(600) {
-        crate::log!("[offload] {}", STATS.summary());
+        crate::log!("[offload] {}; {}", STATS.summary(), crate::composition::pace::WAITS.summary());
         crate::logging::flush();
     }
 }
