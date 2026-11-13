@@ -1787,15 +1787,17 @@ VUID-vkSetEvent-event-09543.)
 
 What the rule allows is a wait on a signal that *is* submitted: the other device's own submission of the frame. It
 is opt-in and experimental, with `NEURAL_FORGE_OFFLOAD_PACING=gpu` (`pace::gpu_wait_wanted`; the releaser below says
-why it is not the default). Then, where both devices have `VK_KHR_external_semaphore_fd` with `SYNC_FD` (added to
-the offload device where the GPU has it, and to the game's device by the layer's device hook, only with the GPU wait
-chosen and `NEURAL_FORGE_OFFLOAD_GPU` set; `pace::has_semaphore_fd`), and the other device imports the regions (its
-frame writes the answer itself):
+why it is not the default). Then, where both devices have `VK_KHR_external_semaphore_fd` with `SYNC_FD` (asked of
+the driver, `pace::sync_fd_capable`: `vkGetPhysicalDeviceExternalSemaphoreProperties` says `SYNC_FD` semaphores are
+exportable on the other GPU and importable on the game's, not just the extension's name; added to the offload device
+and to the game's device by the layer's device hook, only with the GPU wait chosen and `NEURAL_FORGE_OFFLOAD_GPU`
+set; `pace::has_semaphore_fd`), and the other device imports the regions (its frame writes the answer itself):
 
 1. the server's last submission of a frame (`native_post::evaluate`: the network frame; an HDR10 frame's conversion
    comes before it) signals an exportable binary semaphore, and its sync fd, exported right after the submit, is
    published with the request's number, the size the answer is for and that it is evaluated (`pace::publish`). The
-   export takes the signal, so the one semaphore serves every frame;
+   export takes the signal, so the one semaphore serves every frame. An export may give -1 when the submission is
+   already done: nothing is published (the export is not broken), and the relay resolves the frame on its answer;
 2. the relay takes it for the request it posted (`Port::submitted`) and keeps it for the present;
 3. the next present waits only until the frame before it is submitted there or resolved (`Pacer::wait_ready`).
    Submitted and fitting: the fd is duplicated, one is imported as a temporary payload into a semaphore of the

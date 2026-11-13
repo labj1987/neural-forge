@@ -59,7 +59,31 @@ pub(crate) fn note_semaphore_fd(device: vk::Device, on: bool) {
     }
 }
 
-/// Whether `device` was created with `VK_KHR_external_semaphore_fd` ([`note_semaphore_fd`]).
+/// Whether `physical` can pass sync-fd binary semaphores as the wait on the GPU needs them: it offers
+/// `VK_KHR_external_semaphore_fd`, and `vkGetPhysicalDeviceExternalSemaphoreProperties` says `SYNC_FD` semaphores are
+/// exportable (`export`: the other GPU, whose frames are exported) or importable (the game's GPU, whose compose and
+/// send import them). The extension's name alone does not say that the handle type is supported.
+///
+/// # Safety
+/// `physical` is a physical device of `instance`, made with API version 1.1 or newer.
+pub(crate) unsafe fn sync_fd_capable(instance: &ash::Instance, physical: vk::PhysicalDevice, export: bool) -> bool {
+    let name = ash::khr::external_semaphore_fd::NAME;
+    // SAFETY: the contract; each name is a NUL-terminated array.
+    let offered = unsafe { instance.enumerate_device_extension_properties(physical) }
+        .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == name));
+    if !offered {
+        return false;
+    }
+    let kind = vk::PhysicalDeviceExternalSemaphoreInfo::default().handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    let mut props = vk::ExternalSemaphoreProperties::default();
+    // SAFETY: the contract (a 1.1 core query).
+    unsafe { instance.get_physical_device_external_semaphore_properties(physical, &kind, &mut props) };
+    let feature = if export { vk::ExternalSemaphoreFeatureFlags::EXPORTABLE } else { vk::ExternalSemaphoreFeatureFlags::IMPORTABLE };
+    props.external_semaphore_features.contains(feature)
+}
+
+/// Whether `device` was created with `VK_KHR_external_semaphore_fd` for the wait on the GPU ([`note_semaphore_fd`]):
+/// chosen, and its GPU passed [`sync_fd_capable`].
 pub(crate) fn has_semaphore_fd(device: vk::Device) -> bool {
     SEMAPHORE_FD.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&device)
 }
@@ -620,6 +644,31 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The capability is the driver's answer for `SYNC_FD`, both ways, where the test driver has the extension: the
+    /// same answer the tests' other device (which queries it itself) gets.
+    #[test]
+    fn sync_fd_capability_is_asked_of_the_driver() {
+        // SAFETY: plain queries on the test driver's first physical device.
+        unsafe {
+            let Ok(entry) = ash::Entry::load() else { return };
+            let Some((instance, _)) = crate::composition::gpu::test_instance(&entry) else { return };
+            let physical = *instance.enumerate_physical_devices().unwrap().first().expect("a device");
+            let other = test_support::OtherDevice::open();
+            assert_eq!(sync_fd_capable(&instance, physical, true), other.is_some());
+            let kind = vk::PhysicalDeviceExternalSemaphoreInfo::default().handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+            let mut props = vk::ExternalSemaphoreProperties::default();
+            instance.get_physical_device_external_semaphore_properties(physical, &kind, &mut props);
+            assert_eq!(
+                sync_fd_capable(&instance, physical, false),
+                other.is_some() && props.external_semaphore_features.contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE)
+            );
+            if let Some(other) = other {
+                other.close();
+            }
+            instance.destroy_instance(None);
+        }
+    }
 
     /// The wait on the GPU cannot be released, so it is only ever chosen by name: unset and every other value keep the
     /// answer's wait on the game's thread.

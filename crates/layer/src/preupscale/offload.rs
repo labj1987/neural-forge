@@ -525,9 +525,11 @@ impl Offload {
         let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
         let offers = |name: &CStr| extensions.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == name);
         let host = offers(crate::EXTERNAL_MEMORY_HOST_EXTENSION);
-        // Sync-fd semaphores, where the GPU has them and the GPU wait is chosen (`NEURAL_FORGE_OFFLOAD_PACING=gpu`):
-        // each frame's submission is exported for the game's present to wait on (`composition::pace`).
-        let semaphore_fd = crate::composition::pace::gpu_wait_wanted() && offers(ash::khr::external_semaphore_fd::NAME);
+        // Sync-fd semaphores, where the GPU can export them (asked of the driver) and the GPU wait is chosen
+        // (`NEURAL_FORGE_OFFLOAD_PACING=gpu`): each frame's submission is exported for the game's present to wait on
+        // (`composition::pace`).
+        // SAFETY: a physical device of this 1.3 instance.
+        let semaphore_fd = crate::composition::pace::gpu_wait_wanted() && unsafe { crate::composition::pace::sync_fd_capable(instance, physical, true) };
         let mut names: Vec<*const c_char> = if host { vec![crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()] } else { Vec::new() };
         if semaphore_fd {
             names.push(ash::khr::external_semaphore_fd::NAME.as_ptr());

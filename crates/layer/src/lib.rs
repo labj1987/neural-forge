@@ -1050,14 +1050,14 @@ impl NeuralForgeInstanceHooks {
                         // (`composition::pace`). Only asked for with `NEURAL_FORGE_OFFLOAD_GPU` set and the GPU wait
                         // chosen (`NEURAL_FORGE_OFFLOAD_PACING=gpu`).
                         let semaphore_fd = ash::khr::external_semaphore_fd::NAME;
-                        let gpu_wait = preupscale::offload::Choice::current() != preupscale::offload::Choice::Off && composition::pace::gpu_wait_wanted();
-                        let has_semaphore_fd = requests_extension(info, semaphore_fd);
-                        let add_semaphore_fd = !has_semaphore_fd
-                            && gpu_wait
+                        // The game's GPU imports the other's sync fds: asked of the driver, not read off the extension's name.
+                        let gpu_wait = preupscale::offload::Choice::current() != preupscale::offload::Choice::Off
+                            && composition::pace::gpu_wait_wanted()
                             && core_1_1(instance.api_version, vk::API_VERSION_1_1)
-                            // SAFETY: the instance's own physical device; each name is a NUL-terminated array.
-                            && unsafe { instance.instance.enumerate_device_extension_properties(physical_device) }
-                                .is_ok_and(|e| e.iter().any(|x| unsafe { CStr::from_ptr(x.extension_name.as_ptr()) } == semaphore_fd));
+                            // SAFETY: the instance's own physical device; the instance is 1.1 or newer (checked just above).
+                            && unsafe { composition::pace::sync_fd_capable(&instance.instance, physical_device, false) };
+                        let has_semaphore_fd = requests_extension(info, semaphore_fd);
+                        let add_semaphore_fd = !has_semaphore_fd && gpu_wait;
                         let mut names_with_fd: Vec<*const std::ffi::c_char> = if info.enabled_extension_count == 0 || info.pp_enabled_extension_names.is_null()
                         {
                             Vec::new()
@@ -1126,7 +1126,7 @@ impl NeuralForgeInstanceHooks {
                                         bda_ext: requests_extension(info, c"VK_EXT_buffer_device_address"),
                                     };
                                     NATIVE_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().insert(device, setup);
-                                    composition::pace::note_semaphore_fd(device, gpu_wait && (has_semaphore_fd || add_semaphore_fd));
+                                    composition::pace::note_semaphore_fd(device, gpu_wait);
                                     // The device for the model on another GPU, made now: inside vkCreateDevice the loader
                                     // holds the lock its device callbacks need (`preupscale::offload::make_for`).
                                     // SAFETY: inside vkCreateDevice for `device`, with its request.
