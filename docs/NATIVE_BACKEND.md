@@ -1894,6 +1894,68 @@ GTA V note: its `settings.xml` names the CPU (`CPUDescription`); with another CP
 graphics setting at each launch (DLSS and frame generation off, so no DLSS evaluate and no hold). The runs above set
 that line for the run only.
 
+## After DLSS on a second GPU (Ray Reconstruction, 4.3.0, 2026-11-13)
+
+With `NEURAL_FORGE_OFFLOAD_GPU` set, the hold after DLSS's output (`Stage::Upscaled`: the placement with Ray
+Reconstruction, or every pass set there) sends its frames to the offload device too, through the before-DLSS path
+as it is: `HoldSide` (exchange, cadence, worker, the kept colour), `PreRunner`, the gate, the wait at the submit,
+the fall-back rules. `offload_pre::Where` tells the side which hold it serves (the regions' sizes, the log's and the
+Status tab's words: "second GPU: the model runs on <gpu> after DLSS, its edit applied one frame later").
+
+**What is different there, and why the design still holds.**
+
+- The hold is the same code (`native::native_hold` with the inline `Ctx`, its own `Session::res_after`); one gate
+  kept it on the game's GPU. Nothing in the path reads Ray Reconstruction: it is taken by the hold's stage and plan
+  (`placement::Hold::offload_takes`: a frame with no pass before DLSS), so any denoiser whose output is held there
+  goes the same way.
+- DLSS's output is not jittered (`Tracking::frame_after`: a jitter of zero, known), so the edit cache's rules hold
+  and the before-DLSS offload's loss on still scenes (the part of the answer that follows each frame's jitter is not
+  carried) does not exist: a one-frame-old edit of a still frame lands on the same texels.
+- The motion vectors are DLSS's own, resampled to the output size and scaled to its pixels (`after_point`), as the
+  cached holds on one GPU use them.
+- There is no depth at the output size: the cache admits by fingerprint alone, on one GPU and offloaded alike, and
+  the regions have no depth section (`Sizes::of`).
+- Delaying DLSS's output by a frame instead (the finished frame's trick) would hand the game's post-processing, HUD
+  and frame generation frame N-1's colour with frame N's depth and vectors, and add a frame of latency. Waiting in
+  the hold for the frame's own answer idles the game's GPU for the round trip. So the edit is delayed, as before
+  DLSS: no latency added, the edit one frame old on every hold.
+
+**One stage of a frame.** The offload device has the process's one network. In a frame with passes before DLSS and
+after its output the other GPU has the hold before DLSS, as in 4.2.0, and the hold after DLSS runs as it did (the
+Status line "second GPU: not used here: these passes run on the game's GPU after DLSS; ...").
+
+**What crosses, per hold** (imported host memory on both devices): the encode and the answer at the padded output
+extent (RGBA16F) and the accumulated motion (2 x f32 a texel): 56.3 MB out and 28.1 MB back at 2560x1440, about 133
+MB and 66 MB at 3840x2160 (before DLSS at 1485x835: 23.7 MB and 9.5 MB). The copies are recorded in DLSS's buffer,
+so they are the game GPU's frame time: the capture went from 2.4 ms to 6.7 ms in the run below (on one shared GPU).
+Half of what goes out is the motion: with a zero jitter and a fresh chain on every hold the accumulated field is
+DLSS's vectors, which exist as packed halves (4 bytes a texel, `MOTION_HALF`); sending those would cut the way out
+to about 42 MB / 100 MB. Not built: the field is NaN where the chain leaves the frame and the packed path is not,
+so it needs its own comparison first.
+
+**The frame rate is bounded by the second GPU at the output size.** The network there takes three to four times
+what it does at DLSS's render size, and the submit waits for the answer to the frame before (100 ms at most). The
+finished-frame placement has the same bound for the same reason, and pays it on every presented frame, where this
+hold pays it once per rendered frame (frame generation's frames come after it). Lifting the bound means not waiting:
+sending when the other GPU is free and carrying the edit over more than one hold (a kept encode per sent frame and
+a second accumulated field); not built.
+
+**Measured (RTX 5070 alone, `same`; Cyberpunk 2077's benchmark, path tracing with Ray Reconstruction, 2560x1440
+HDR10, frame generation x3; the game sweep's `cyberpunk-rr` run with and without
+`env = ["NEURAL_FORGE_OFFLOAD_GPU=same"]`; 2026-11-13):**
+
+| Run | Holds per second | Shown | Network frame | On the game's GPU | Notes |
+|---|---|---|---|---|---|
+| model on the game's device | 32-33 | 95-100 fps | 17.7 ms (median), every second hold | capture 2.4 ms, write-back 1.3 ms | cache rejection 1-5%; sweep passes |
+| `same` | 21-22 | 62-67 fps | 34.0-34.3 ms on the second device, copies included; 34.3 ms from send to answer | capture 6.7 ms, write-back 2.6 ms | 600 of 600 frames answered in time and 600 of 600 holds carried the edit in every summary once the network ran; cache rejection 7-14% (more motion per hold at the lower rate); no misses; sweep passes, recording clean |
+
+As before DLSS, `same` saves nothing (both devices share the GPU, and the second device's network takes twice the
+time beside the game); the numbers show the path works and what it adds. The picture: fine detail over the views
+two 35 s recordings share (143 pairs, the method of the section above), offloaded over local a median 0.964, inside
+what two runs of one build differ by. Frames looked at where the camera moves past pillars, railings and walking
+people: no edit trailing behind an edge. Not measured: two different GPUs, 3840x2160 (the 12 GB card cannot hold a
+second network at that size beside path tracing), a still scene.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

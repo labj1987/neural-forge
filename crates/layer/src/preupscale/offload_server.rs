@@ -94,7 +94,14 @@ fn test_fail_at() -> Option<u64> {
 impl PreRunner {
     /// On the offload device made with the game's device `game` (`offload::take`): its loader, queue and command
     /// buffers. `Err` with why it cannot serve (the device is given back).
-    pub(crate) fn start(instance: ash::Instance, game: vk::Device, shared: bool, capacity: (usize, usize), metas: Metas, at: super::offload_pre::Where) -> Result<(Self, String), String> {
+    pub(crate) fn start(
+        instance: ash::Instance,
+        game: vk::Device,
+        shared: bool,
+        capacity: (usize, usize),
+        metas: Metas,
+        at: super::offload_pre::Where,
+    ) -> Result<(Self, String), String> {
         let off = match super::offload::take(game) {
             Some(Ok(off)) => off,
             Some(Err(why)) => return Err(why),
