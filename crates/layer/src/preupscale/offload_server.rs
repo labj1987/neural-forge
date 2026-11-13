@@ -76,6 +76,8 @@ pub(crate) struct PreRunner {
     said_loading: bool,
     /// Frames asked of the runner so far.
     frames: u64,
+    /// The hold it serves (the log's words).
+    at: super::offload_pre::Where,
 }
 
 // SAFETY: plain handles of the offload device and its own mappings, used on the worker's thread only.
@@ -92,7 +94,7 @@ fn test_fail_at() -> Option<u64> {
 impl PreRunner {
     /// On the offload device made with the game's device `game` (`offload::take`): its loader, queue and command
     /// buffers. `Err` with why it cannot serve (the device is given back).
-    pub(crate) fn start(instance: ash::Instance, game: vk::Device, shared: bool, capacity: (usize, usize), metas: Metas) -> Result<(Self, String), String> {
+    pub(crate) fn start(instance: ash::Instance, game: vk::Device, shared: bool, capacity: (usize, usize), metas: Metas, at: super::offload_pre::Where) -> Result<(Self, String), String> {
         let off = match super::offload::take(game) {
             Some(Ok(off)) => off,
             Some(Err(why)) => return Err(why),
@@ -105,7 +107,11 @@ impl PreRunner {
         }
         let name = off.name.clone();
         crate::log!("[offload] {}", off.plan);
-        crate::log!("[offload] before DLSS: each frame's edit comes from the other GPU and is applied one frame later, carried by DLSS's motion vectors; nothing DLSS reads is delayed");
+        crate::log!(
+            "[offload] {}: each frame's edit comes from the other GPU and is applied one frame later, carried by DLSS's motion vectors; {}",
+            at.name(),
+            if at == super::offload_pre::Where::Before { "nothing DLSS reads is delayed" } else { "DLSS's output is not delayed" }
+        );
         crate::logging::flush();
         let device = &off.device;
         let setup = off.setup;
@@ -161,6 +167,7 @@ impl PreRunner {
                 leaked: false,
                 said_loading: false,
                 frames: 0,
+                at,
             },
             name,
         ))
@@ -186,7 +193,8 @@ impl PreRunner {
             match (o, i) {
                 (Some(o), Some(i)) => {
                     crate::log!(
-                        "[offload] before DLSS: the frame crosses system memory, {} on the other GPU ({:.1} MB out, {:.1} MB back per frame)",
+                        "[offload] {}: the frame crosses system memory, {} on the other GPU ({:.1} MB out, {:.1} MB back per frame)",
+                        self.at.name(),
                         if o.staged || i.staged { "copied once more there" } else { "imported there without a copy" },
                         layout.out_bytes as f64 / 1048576.0,
                         layout.in_bytes as f64 / 1048576.0
@@ -249,7 +257,7 @@ impl PreRunner {
         }
         let Some(builts) = loader.ready_sizes(&meta.sizes, meta.choice, 0) else {
             if !std::mem::replace(&mut self.said_loading, true) {
-                crate::log!("[offload] before DLSS: the network is loading on the other GPU; the frames go to DLSS as they are until it runs");
+                crate::log!("[offload] {}: the network is loading on the other GPU; the frames go on as they are until it runs", self.at.name());
                 crate::logging::flush();
             }
             let why = loader.failed().or_else(|| loader.paused().then(|| "the VRAM guard paused it".to_string()));
@@ -265,7 +273,7 @@ impl PreRunner {
         let graphs: Vec<Graph> = builts.iter().map(|&b| Graph { built: b, graph: b.graph_own }).collect();
         // One pass there (the first of the stage).
         let passes = super::native::runnable(meta.passes, false);
-        let depth = meta.depth.then(|| f.depth.buffer());
+        let depth = (meta.depth && layout.sizes.depth > 0).then(|| f.depth.buffer());
         // SAFETY: nothing of the pass is pending (every frame is waited for); every handle is this device's.
         unsafe {
             if !f.native.ensure_lanes(device, instance, physical, passes.count) {
@@ -320,7 +328,7 @@ impl PreRunner {
                     device.cmd_copy_buffer(up, o.buffer, dst, &[vk::BufferCopy { src_offset: at, dst_offset: to, size }])
                 };
                 copy(f.native.acc.buffer, layout.motion_at, 0, (texels * 8).min(layout.sizes.motion));
-                if meta.depth {
+                if meta.depth && layout.sizes.depth > 0 {
                     copy(f.depth.buffer(), layout.depth_at, 0, (texels * 4).min(layout.sizes.depth));
                 }
                 // The scene cut the game's GPU decided in its capture: the state's third word.
@@ -465,7 +473,7 @@ impl Runner for PreRunner {
             loader.retire();
             loader.stop_worker();
             drop(loader);
-            crate::log!("[offload] before DLSS: the network is closed on the other GPU; the game's GPU loads it");
+            crate::log!("[offload] {}: the network is closed on the other GPU; the game's GPU loads it", self.at.name());
             crate::logging::flush();
         }
     }

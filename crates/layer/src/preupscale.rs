@@ -4653,8 +4653,8 @@ pub(crate) struct HoldResult {
     pub timing: HoldTiming,
     /// The native backend ran this hold (`evaluated` means the network ran).
     pub native: bool,
-    /// The native backend: a hold after DLSS's output (Ray Reconstruction's placement, or the one set there) while the model on a second GPU is asked
-    /// for: the network runs on the game's GPU here, the second GPU takes only the holds before DLSS.
+    /// The native backend: a hold after DLSS's output in a frame that also has passes before DLSS, while the model on a
+    /// second GPU is asked for: these passes run on the game's GPU, the second GPU has the hold before DLSS.
     pub after_dlss_on_game_gpu: bool,
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
     /// network, composite), read when its fence was found signalled here.

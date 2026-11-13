@@ -60,6 +60,33 @@ pub(crate) const IN_SEQ: usize = 1;
 /// hold goes on without the answer. The finished-frame offload's floor for a late frame.
 pub(crate) const ANSWER_BUDGET: Duration = super::offload::LATE_FLOOR;
 
+/// Which hold the other GPU serves: the one before DLSS (at DLSS's render size), or the one after DLSS's output (at
+/// the output size: the placement with Ray Reconstruction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Where {
+    Before,
+    After,
+}
+
+impl Where {
+    /// Of a hold at `stage`.
+    pub(crate) fn of(stage: super::placement::Stage) -> Self {
+        if stage == super::placement::Stage::Upscaled {
+            Self::After
+        } else {
+            Self::Before
+        }
+    }
+
+    /// As the log and the Status tab say it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Before => "before DLSS",
+            Self::After => "after DLSS",
+        }
+    }
+}
+
 /// The sizes of what crosses, in bytes (0 for a section the hold does not have).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Sizes {
@@ -73,6 +100,23 @@ pub(crate) struct Sizes {
     pub side: u64,
     /// The network's answer.
     pub answer: u64,
+}
+
+impl Sizes {
+    /// What a hold of `width` x `height` at `at` exchanges: the encode and the answer (RGBA16F at the padded
+    /// extent), the accumulated motion (2 x f32 a texel), the small state, and DLSS's depth before DLSS only (the
+    /// hold after DLSS's output has none at its size).
+    pub(crate) fn of(at: Where, width: u32, height: u32) -> Self {
+        let (pw, ph) = super::padded(width, height);
+        let (texels, padded) = (u64::from(width) * u64::from(height), u64::from(pw) * u64::from(ph));
+        Self {
+            frame: padded * 8,
+            motion: texels * 8,
+            depth: if at == Where::Before { texels * 4 } else { 0 },
+            side: super::hdr::HdrPass::EXPOSURE_BYTES + 16,
+            answer: padded * 8,
+        }
+    }
 }
 
 /// Where each section is in its region.
@@ -303,12 +347,13 @@ pub(crate) struct Counters {
 
 impl Counters {
     /// The summary line's text since the last call (the counters start over).
-    pub(crate) fn summary(&self) -> String {
+    pub(crate) fn summary(&self, at: Where) -> String {
         let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
         let (sent, answered, late, us) = (take(&self.sent), take(&self.answered), take(&self.late), take(&self.answer_us));
         let mean = if answered == 0 { 0.0 } else { us as f64 / answered as f64 / 1000.0 };
         format!(
-            "before DLSS: {sent} frames sent to the other GPU, {answered} answered in time (mean {mean:.1} ms from send to answer), {late} without an answer"
+            "{}: {sent} frames sent to the other GPU, {answered} answered in time (mean {mean:.1} ms from send to answer), {late} without an answer",
+            at.name()
         )
     }
 }
@@ -1043,11 +1088,33 @@ pub(crate) fn wanted() -> bool {
     super::offload::Choice::current() != super::offload::Choice::Off && !super::offload::given_up() && !super::offload::standin()
 }
 
-/// The before-DLSS placement runs on the other GPU now (the Status tab's line, [`status_line`]).
-static SERVING_PRE: AtomicBool = AtomicBool::new(false);
+/// Which hold's model runs on the other GPU now (the Status tab's line, [`status_line`]): 0 none, 1 the hold before
+/// DLSS, 2 the hold after DLSS's output.
+static SERVING_PRE: AtomicU8 = AtomicU8::new(0);
 
+fn set_serving(at: Option<Where>) {
+    SERVING_PRE.store(
+        match at {
+            None => 0,
+            Some(Where::Before) => 1,
+            Some(Where::After) => 2,
+        },
+        Ordering::Release,
+    );
+}
+
+/// The hold whose frames the other GPU runs now, if any.
+pub(crate) fn serving_where() -> Option<Where> {
+    match SERVING_PRE.load(Ordering::Acquire) {
+        0 => None,
+        1 => Some(Where::Before),
+        _ => Some(Where::After),
+    }
+}
+
+/// A hold (before DLSS or after its output) sends its frames to the other GPU now.
 pub(crate) fn serving_pre() -> bool {
-    SERVING_PRE.load(Ordering::Acquire)
+    serving_where().is_some()
 }
 
 /// The hold's side of the offload, for one set of hold resources (one render extent): the exchange, the worker
@@ -1057,6 +1124,8 @@ pub(crate) struct HoldSide {
     pub exchange: Exchange,
     cadence: Cadence,
     worker: Worker,
+    /// The hold it serves.
+    at: Where,
     metas: super::offload_server::Metas,
     /// The colour input of the frame sent last, as the game left it: what the late capture measures the edit
     /// against (the hold's write-back has written the colour input since).
@@ -1124,13 +1193,12 @@ impl HoldSide {
         instance: &ash::Instance,
         physical: vk::PhysicalDevice,
         resources: u64,
+        at: Where,
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
         let import = imports(device.handle());
-        let (pw, ph) = super::padded(width, height);
-        let (texels, padded) = (u64::from(width) * u64::from(height), u64::from(pw) * u64::from(ph));
-        let sizes = Sizes { frame: padded * 8, motion: texels * 8, depth: texels * 4, side: super::hdr::HdrPass::EXPOSURE_BYTES + 16, answer: padded * 8 };
+        let sizes = Sizes::of(at, width, height);
         // SAFETY: the contract.
         let exchange =
             unsafe { Exchange::build(device, instance, physical, import, sizes) }.ok_or("the frame's regions could not be made on the game's GPU")?;
@@ -1141,7 +1209,7 @@ impl HoldSide {
         };
         let link = exchange.link(device);
         let metas = super::offload_server::Metas::default();
-        let (runner, name) = match super::offload_server::PreRunner::start(instance.clone(), device.handle(), link.shared, link.capacity, metas.clone()) {
+        let (runner, name) = match super::offload_server::PreRunner::start(instance.clone(), device.handle(), link.shared, link.capacity, metas.clone(), at) {
             Ok(r) => r,
             Err(why) => {
                 // SAFETY: never used.
@@ -1156,7 +1224,7 @@ impl HoldSide {
         let late = (super::offload::Choice::current() != super::offload::Choice::Same).then(super::offload::LateRule::default);
         let stalled = name.clone();
         let give_up: GiveUp = Box::new(move |why, stuck| {
-            SERVING_PRE.store(false, Ordering::Release);
+            set_serving(None);
             if stuck {
                 // The network is still in use by that frame: it cannot go back to the game's GPU.
                 crate::log!("[offload] {why}: the network cannot be taken back while that frame may run; the model is off for the rest of the session");
@@ -1181,9 +1249,10 @@ impl HoldSide {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((resources, Submits { progress: exchange.progress.clone(), inn: exchange.regions[1].clone() }));
         super::offload::note_state(super::offload::State::Active(name.clone()));
-        SERVING_PRE.store(true, Ordering::Release);
+        set_serving(Some(at));
         crate::log!(
-            "[offload] before DLSS: the network's frames of {width}x{height} run on {name}; on the game's GPU the frame's regions are {}",
+            "[offload] {}: the network's frames of {width}x{height} run on {name}; on the game's GPU the frame's regions are {}",
+            at.name(),
             if exchange.shared {
                 "imported host memory (no CPU copy)"
             } else if import {
@@ -1197,6 +1266,7 @@ impl HoldSide {
             exchange,
             cadence: Cadence::default(),
             worker,
+            at,
             metas,
             snapshot,
             sent: None,
@@ -1286,7 +1356,7 @@ impl HoldSide {
             let us = super::offload::STATS.server_us.swap(0, Ordering::Relaxed);
             crate::log!(
                 "[offload] {}; {taken} holds carried the edit of the frame before them, {untaken} found no answer; the network's frame on the other GPU {:.2} ms (copies included)",
-                self.worker.counters.summary(),
+                self.worker.counters.summary(self.at),
                 if frames == 0 { 0.0 } else { us as f64 / frames as f64 / 1000.0 }
             );
         }
@@ -1374,20 +1444,48 @@ fn side_gone(owned: bool) {
     if !owned {
         return;
     }
-    SERVING_PRE.store(false, Ordering::Release);
+    set_serving(None);
     if matches!(super::offload::state(), super::offload::State::Active(_)) {
         super::offload::note_state(super::offload::State::Off);
     }
 }
 
-/// The Status tab's words while the before-DLSS placement runs on `gpu`.
-pub(crate) fn status_line(gpu: &str) -> String {
-    format!("second GPU: the model runs on {gpu} before DLSS, its edit applied one frame later")
+/// The Status tab's words while the hold `at` sends its frames to `gpu`.
+pub(crate) fn status_line(gpu: &str, at: Where) -> String {
+    format!("second GPU: the model runs on {gpu} {}, its edit applied one frame later", at.name())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After DLSS's output the hold has no depth at its size: nothing of it crosses, and the rest is the output size's.
+    #[test]
+    fn the_hold_after_dlss_exchanges_no_depth() {
+        let before = Sizes::of(Where::Before, 1485, 835);
+        let (pw, ph) = crate::preupscale::padded(1485, 835);
+        assert_eq!(before.depth, 1485 * 835 * 4);
+        assert_eq!((before.frame, before.answer, before.motion), (u64::from(pw * ph) * 8, u64::from(pw * ph) * 8, 1485 * 835 * 8));
+        let after = Sizes::of(Where::After, 2560, 1440);
+        assert_eq!(after.depth, 0);
+        let (pw, ph) = crate::preupscale::padded(2560, 1440);
+        assert_eq!((after.frame, after.answer, after.motion), (u64::from(pw * ph) * 8, u64::from(pw * ph) * 8, 2560 * 1440 * 8));
+        // The side section follows the motion directly, on its alignment, and the regions hold every section.
+        let l = Layout::of(after);
+        assert_eq!(l.side_at, l.depth_at);
+        assert_eq!(l.side_at % HEADER_BYTES, 0);
+        assert!(l.out_bytes >= l.side_at + after.side && l.in_bytes >= l.answer_at + after.answer);
+        // At 2560x1440: about 59 MB out and 29.5 MB back a frame.
+        assert!(l.out_bytes < 60 << 20 && l.in_bytes < 30 << 20, "{l:?}");
+    }
+
+    #[test]
+    fn the_status_line_names_the_hold_the_other_gpu_serves() {
+        assert_eq!(status_line("X", Where::Before), "second GPU: the model runs on X before DLSS, its edit applied one frame later");
+        assert_eq!(status_line("X", Where::After), "second GPU: the model runs on X after DLSS, its edit applied one frame later");
+        assert_eq!(Where::of(crate::preupscale::placement::Stage::Upscaled), Where::After);
+        assert_eq!(Where::of(crate::preupscale::placement::Stage::Before), Where::Before);
+    }
 
     #[test]
     fn the_layout_keeps_every_section_apart_and_aligned() {
@@ -1566,8 +1664,11 @@ mod tests {
         c.answered.store(8, Ordering::Relaxed);
         c.late.store(2, Ordering::Relaxed);
         c.answer_us.store(80_000, Ordering::Relaxed);
-        assert_eq!(c.summary(), "before DLSS: 10 frames sent to the other GPU, 8 answered in time (mean 10.0 ms from send to answer), 2 without an answer");
-        assert!(c.summary().starts_with("before DLSS: 0 frames sent"));
+        assert_eq!(
+            c.summary(Where::Before),
+            "before DLSS: 10 frames sent to the other GPU, 8 answered in time (mean 10.0 ms from send to answer), 2 without an answer"
+        );
+        assert!(c.summary(Where::After).starts_with("after DLSS: 0 frames sent"));
     }
 
     #[test]
@@ -2035,7 +2136,7 @@ mod tests {
         assert!(worker.ended() && !serving_device(device));
         // The released side's end leaves the status to the side that serves now; an owning side's end clears it.
         let _state = crate::preupscale::offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        SERVING_PRE.store(true, Ordering::Release);
+        set_serving(Some(Where::After));
         side_gone(!worker.ended());
         assert!(serving_pre(), "another set's side serves: the Status tab keeps the second GPU");
         side_gone(true);
