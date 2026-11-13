@@ -79,6 +79,30 @@ pub(crate) struct PreRunner {
     frames: u64,
     /// The hold it serves (the log's words).
     at: super::offload_pre::Where,
+    /// The pass count last said in the log (more than one pass asked).
+    said_more: Option<usize>,
+}
+
+/// The passes a frame runs on the other device: every pass of the stage the hold sent (`asked`) when the later passes'
+/// buffers are built there (`more`), else pass 1 alone (`native::runnable`, as on the game's GPU).
+fn server_passes(asked: Passes, more: bool) -> Passes {
+    super::native::runnable(asked, more)
+}
+
+/// One frame's buffers on the other device, in submission order: the copies in (`up`), pass 1 (`frame`: its first
+/// frame's buffer and its parity's), the later passes with the copies between them (`later`:
+/// `NativePass::later_sequence`), the answer's copy out (`down`).
+fn frame_submits(
+    up: vk::CommandBuffer,
+    frame: &[Option<vk::CommandBuffer>; 2],
+    later: &[vk::CommandBuffer],
+    down: vk::CommandBuffer,
+) -> Vec<vk::CommandBuffer> {
+    let mut all = vec![up];
+    all.extend(frame.iter().flatten().copied());
+    all.extend_from_slice(later);
+    all.push(down);
+    all
 }
 
 // SAFETY: plain handles of the offload device and its own mappings, used on the worker's thread only.
@@ -176,6 +200,7 @@ impl PreRunner {
                 said_loading: false,
                 frames: 0,
                 at,
+                said_more: None,
             },
             name,
         ))
@@ -286,8 +311,18 @@ impl PreRunner {
         let built = builts[own];
         // Its own compute family: the graph recorded for it.
         let graphs: Vec<Graph> = builts.iter().map(|&b| Graph { built: b, graph: b.graph_own }).collect();
-        // One pass there (the first of the stage).
-        let passes = super::native::runnable(meta.passes, false);
+        // Every pass of the stage there, as on the game's GPU: the later passes' buffers built once (a failure runs one).
+        // SAFETY: nothing of the pass is pending (every frame is waited for); the frames' family is the setup's.
+        let more = meta.passes.count > 1 && unsafe { f.native.ensure_more(device, instance, physical, setup.family, meta.passes.count) };
+        let passes = server_passes(meta.passes, more);
+        if meta.passes.count > 1 && self.said_more != Some(passes.count) {
+            if more {
+                crate::log!("[offload] {}: all {} passes of the stage run on the other GPU", self.at.name(), passes.count);
+            } else {
+                crate::log!("[offload] {}: the later passes' buffers could not be made on the other GPU: it runs pass 1 alone", self.at.name());
+            }
+        }
+        self.said_more = (meta.passes.count > 1).then_some(passes.count);
         let depth = f.depth.as_ref().filter(|_| meta.depth && layout.sizes.depth > 0).map(super::native::DepthCopy::buffer);
         // SAFETY: nothing of the pass is pending (every frame is waited for); every handle is this device's.
         unsafe {
@@ -300,7 +335,9 @@ impl PreRunner {
             }
         }
         let history = f.native.begin_frame(built.network, meta.history);
-        let (frame_cmds, _) = f.native.frame_graphs(&graphs, history, meta.jitter, meta.mvec_scale, &passes);
+        let (frame_cmds, later) = f.native.frame_graphs(&graphs, history, meta.jitter, meta.mvec_scale, &passes);
+        let later = if more { later } else { Vec::new() };
+        let sequence = f.native.later_sequence(&later);
         let (o, i) = self.regions.as_ref().expect("made above");
         let texels = u64::from(meta.width) * u64::from(meta.height);
         // SAFETY: the regions as the contract; the device's own command buffers, not pending.
@@ -394,9 +431,7 @@ impl PreRunner {
             if recorded.is_err() {
                 return Err(failed("recording the frame's copies failed on the other GPU"));
             }
-            let mut all = vec![up];
-            all.extend(frame_cmds.into_iter().flatten());
-            all.push(down);
+            let all = frame_submits(up, &frame_cmds, &sequence, down);
             let started = Instant::now();
             if crate::note_vk(device.handle(), device.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&all)], self.fence)).is_err() {
                 f.native.gap.skipped();
@@ -405,6 +440,7 @@ impl PreRunner {
             for cmd in frame_cmds.into_iter().flatten() {
                 f.native.submitted(cmd);
             }
+            f.native.later_submitted(later.len());
             loader.pre_submitted(device, self.fence);
             let waited = device.wait_for_fences(&[self.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64);
             if waited.is_err() {
@@ -533,5 +569,29 @@ impl Drop for PreRunner {
         drop(loader);
         // Destroyed with the game's device (inside its vkDestroyDevice, the loader's lock held).
         super::offload::give_back(self.game, off, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pass of the stage the hold sent runs on the other GPU once the later passes' buffers are there (#63: only
+    /// pass 1 ran there, the others were dropped); without them pass 1 alone.
+    #[test]
+    fn the_other_gpu_runs_every_pass_of_the_stage() {
+        let asked = Passes { count: 3, ..Passes::default() };
+        assert_eq!(server_passes(asked, true).count, 3);
+        assert_eq!(server_passes(asked, false).count, 1);
+        assert_eq!(server_passes(Passes::default(), false).count, 1);
+    }
+
+    /// The later passes run after pass 1 and before the answer is copied out.
+    #[test]
+    fn the_answer_is_copied_out_after_the_last_pass() {
+        let cb = |n: u64| <vk::CommandBuffer as ash::vk::Handle>::from_raw(n);
+        let (up, down) = (cb(1), cb(9));
+        assert_eq!(frame_submits(up, &[None, Some(cb(2))], &[], down), vec![up, cb(2), down]);
+        assert_eq!(frame_submits(up, &[Some(cb(3)), Some(cb(2))], &[cb(5), cb(6), cb(7)], down), vec![up, cb(3), cb(2), cb(5), cb(6), cb(7), down]);
     }
 }

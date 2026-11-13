@@ -1815,13 +1815,21 @@ counter chaining), a `NativePass`, an `HdrPass` (for its encoded image and expos
 own for the frame's extent; the regions imported as host memory or staged; one frame as the split hold submits it
 (the copies in, `N[parity]`, the answer's copy out), waited for. The history's rule is the hold's
 (`NativePass::begin_frame`); what the CPU decides per frame comes in a queue keyed by the frame's sequence number
-(`FrameMeta`). One pass runs there (the stage's first). One `HoldSide` (exchange, worker, runner, loader) per hold
+(`FrameMeta`). Every pass of the stage runs there, as on the game's device: the later passes' buffers
+(`NativePass::ensure_more`) are built on the other device, the game's device builds none for an offloaded hold, and
+the frame submits `X`, pass 2, `Y` and each further pass, `R` between pass 1 and the answer's copy out
+(`NativePass::later_sequence`); the log says "all N passes of the stage run on the other GPU" once per count. Until
+4.3.0 only the stage's first pass ran there and the others were dropped (#63: three passes after DLSS took 34 ms on the
+other device, as one does). One `HoldSide` (exchange, worker, runner, loader) per hold
 resources: a change of render extent loads the network again on the other device.
 
 **Fall-back** as on the finished frame (`ServerRule`, `LateRule` on the answers, `State::FellBack` for the process),
 and when 30 holds in a row, over at least a second of holds that keep coming (a pause of more than 250 ms between two
-of them starts the row again), cannot send their frame (no motion vectors, no jitter, no room for the chained cache:
-nothing could carry the edit, and the model would not run at all): the worker stops running frames (every send is
+of them starts the row again), cannot send their frame (no motion vectors, motion vectors whose layout the layer never saw set, no jitter, no
+room for the chained cache, `native::unsendable`: nothing could carry the edit, and the model would not run at all;
+the log line and the Status tab name the reason, "given up (after DLSS: its frames cannot be sent: the motion
+vectors' layout is unknown)" in the #63 reporter's session, where the hold after DLSS found DLSS's motion vectors in
+no known layout with a single pass): the worker stops running frames (every send is
 finished at once without an answer) and the runner frees its frame resources and closes its loader and with it the
 network (`PreRunner::gave_up`; retiring the loader alone leaves the network open there, and the game's loader then
 finds it open elsewhere for good), so the next holds load and run the network on the game's device. The hold's side is

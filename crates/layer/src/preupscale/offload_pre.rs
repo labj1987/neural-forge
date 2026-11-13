@@ -1184,6 +1184,12 @@ pub(crate) fn unsendable_gives_up(streak: &mut Unsendable, can: bool, now: Insta
     false
 }
 
+/// Why the offload gave up on a row of holds that could not send (`why`, the last one's reason): the Status tab's
+/// words (short enough for the channel's line).
+pub(crate) fn unsendable_line(at: Where, why: &str) -> String {
+    format!("{}: its frames cannot be sent: {why}", at.name())
+}
+
 #[cfg(target_arch = "x86_64")]
 impl HoldSide {
     /// # Safety
@@ -1298,8 +1304,10 @@ impl HoldSide {
     }
 
     /// Plans hold `h`: what it does with the exchange, and, when it takes the answer to the frame sent before it,
-    /// that frame's refresh noted in the cache's `state` (before the hold's own plan is made there).
-    pub(crate) fn plan(&mut self, state: &mut super::cache::State, h: &super::cache::Hold, send: bool) -> HoldPlan {
+    /// that frame's refresh noted in the cache's `state` (before the hold's own plan is made there). `unsendable`:
+    /// why this hold's frame cannot be sent (`native::unsendable`), `None` when it can.
+    pub(crate) fn plan(&mut self, state: &mut super::cache::State, h: &super::cache::Hold, unsendable: Option<&'static str>) -> HoldPlan {
+        let send = unsendable.is_none();
         if std::mem::replace(&mut self.pending, true) {
             // The hold planned before this one never went through (a miss after its plan): it sent nothing.
             self.dropped();
@@ -1307,9 +1315,12 @@ impl HoldSide {
         }
         self.worker.touch();
         if self.serving() && unsendable_gives_up(&mut self.unsendable, send, Instant::now()) {
-            self.worker.give_up(format!(
-                "{UNSENDABLE_HOLDS} frames in a row and more than a second had no motion vectors, no jitter or no room for the edit cache: nothing can carry the other GPU's edit to the next frame"
-            ));
+            let why = unsendable.unwrap_or("");
+            crate::log!(
+                "[offload] {}: {UNSENDABLE_HOLDS} frames in a row and more than a second could not be sent ({why}): nothing can carry the other GPU's edit to the next frame",
+                self.at.name()
+            );
+            self.worker.give_up(unsendable_line(self.at, why));
         }
         let mut plan = self.cadence.hold(h.hold, send && self.serving());
         // At a hold the game reset, the answer to the frame before is the old scene's: not taken (it still sends).
@@ -1486,6 +1497,15 @@ mod tests {
         assert_eq!(status_line("X", Where::After), "second GPU: the model runs on X after DLSS, its edit applied one frame later");
         assert_eq!(Where::of(crate::preupscale::placement::Stage::Upscaled), Where::After);
         assert_eq!(Where::of(crate::preupscale::placement::Stage::Before), Where::Before);
+    }
+
+    /// Given up on frames that cannot be sent, the Status tab says which hold and why, within the channel's line.
+    #[test]
+    fn the_unsendable_line_names_the_hold_and_the_reason() {
+        let line = unsendable_line(Where::After, "the motion vectors' layout is unknown");
+        assert_eq!(line, "after DLSS: its frames cannot be sent: the motion vectors' layout is unknown");
+        let status = format!("second GPU: given up ({line}); the model runs on the game's GPU");
+        assert!(status.len() < neural_forge_protocol::REASON_BYTES, "{status}");
     }
 
     #[test]

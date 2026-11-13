@@ -2931,7 +2931,14 @@ impl NativePass {
     ///
     /// # Safety
     /// `device` is live; `family` is this pass's family; nothing of this pass is pending.
-    unsafe fn ensure_more(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, count: usize) -> bool {
+    pub(crate) unsafe fn ensure_more(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        family: u32,
+        count: usize,
+    ) -> bool {
         // SAFETY: forwarded.
         if !unsafe { self.ensure_more_base(device, instance, physical_device, family) } {
             return false;
@@ -3607,6 +3614,26 @@ impl NativePass {
         let p = plan.parity;
         let later = plan.passes.iter().skip(1).map(|r| self.more.as_ref().expect("a later pass").commands[r.index - 1][p]).collect();
         ([(!self.initialised).then_some(self.commands[2]), Some(self.commands[p])], later)
+    }
+
+    /// The buffers that run passes 2 on after pass 1's, in submission order: `X` and pass 2, `Y` and each further pass,
+    /// then `R` (`later`: [`Self::frame_graphs`]'s, of a frame whose later passes' buffers are built). Empty without them.
+    pub(crate) fn later_sequence(&self, later: &[vk::CommandBuffer]) -> Vec<vk::CommandBuffer> {
+        let Some(copies) = self.more.as_ref().map(|m| m.copies).filter(|_| !later.is_empty()) else { return Vec::new() };
+        later_order(copies, later)
+    }
+
+    /// The buffers of [`Self::later_sequence`] for `later` went to the queue: `X` takes the later passes' new
+    /// histories to `GENERAL`.
+    pub(crate) fn later_submitted(&mut self, later: usize) {
+        if let Some(m) = self.more.as_mut().filter(|_| later > 0) {
+            for f in m.fresh.iter_mut().take(later) {
+                *f = false;
+            }
+            if let Some(t) = m.timer.as_mut() {
+                t.mark_submitted();
+            }
+        }
     }
 
     /// What one network frame runs, and the parameters each of its passes reads (written by the caller: on
@@ -4335,6 +4362,38 @@ pub(crate) struct CacheAsk {
     pub at: super::placement::Hold,
 }
 
+/// [`NativePass::later_sequence`]'s order: `copies` are `X`, `Y`, `R`.
+fn later_order(copies: [vk::CommandBuffer; 3], later: &[vk::CommandBuffer]) -> Vec<vk::CommandBuffer> {
+    let mut all = Vec::with_capacity(2 * later.len() + 1);
+    for (k, &cmd) in later.iter().enumerate() {
+        all.push(if k == 0 { copies[0] } else { copies[1] });
+        all.push(cmd);
+    }
+    all.push(copies[2]);
+    all
+}
+
+/// Why a hold's frame cannot be sent to the other GPU (`super::offload_pre`): the next hold could not carry its edit
+/// (`chained`: the edit cache has its buffers; `aux`: DLSS's motion vectors as the hold found them, `copied` when they
+/// are copied this hold; `jitter`: DLSS's jitter is known). `None` when it can be sent. The first reason that applies,
+/// for the log line and the Status tab when the offload gives up on a long row of them.
+pub(crate) fn unsendable(chained: bool, aux: Option<super::Aux>, copied: bool, jitter: bool) -> Option<&'static str> {
+    if !chained {
+        return Some("the edit cache has no room for its buffers");
+    }
+    if !copied {
+        return Some(match aux {
+            None => "DLSS names no motion vectors",
+            Some(a) if a.layout.is_none() => "the motion vectors' layout is unknown",
+            Some(_) => "the motion vectors cannot be copied",
+        });
+    }
+    if !jitter {
+        return Some("DLSS's jitter is unknown");
+    }
+    None
+}
+
 /// Why a hold inside DLSS's buffer records nothing while changes wait for the holds recorded before it.
 pub(crate) const WAITING: &str = "waiting for the holds recorded in DLSS's buffers to be done before changing what they use";
 
@@ -4693,12 +4752,14 @@ unsafe fn native_hold(
             }
         }
     };
-    // More than one pass: their buffers, built once (a failure runs one pass).
-    let more = passes.count > 1 && {
-        let family = res.queue_family;
-        // SAFETY: `device` is live; `family` is the pass's; nothing of it is pending.
-        unsafe { native.ensure_more(device, instance, physical_device, family, passes.count) }
-    };
+    // More than one pass: their buffers, built once (a failure runs one pass). Offloaded, every pass of the stage runs
+    // on the other device (`offload_server::PreRunner`), which builds them there: none here.
+    let more = passes.count > 1
+        && (offloaded || {
+            let family = res.queue_family;
+            // SAFETY: `device` is live; `family` is the pass's; nothing of it is pending.
+            unsafe { native.ensure_more(device, instance, physical_device, family, passes.count) }
+        });
     let passes = runnable(passes, more);
     // Below a model resolution of 1: the passes' resources at their extents.
     // SAFETY: as above.
@@ -4911,7 +4972,7 @@ unsafe fn native_hold(
             edit.state.set_offloaded(offloaded);
             if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
                 // Its frame can be sent when the next hold can carry its edit: vectors, jitter, a chained cache.
-                off_plan = Some(side.plan(&mut edit.state, &h, chained && mvec.is_some() && jitter.is_some()));
+                off_plan = Some(side.plan(&mut edit.state, &h, unsendable(chained, target.mvec, mvec.is_some(), jitter.is_some())));
             }
             let p = edit.state.plan(&h);
             if !inline {
@@ -5453,30 +5514,18 @@ unsafe fn native_hold(
             n.submitted(cmd);
         }
     }
-    if let (false, Some(copies)) = (later.is_empty(), res.native.as_ref().and_then(|n| n.more.as_ref()).map(|m| m.copies)) {
-        // Pass 2 on: `X` (or `Y`) puts the previous answer where the network reads, then the pass;
-        // `R` puts the capture back for the write-back.
-        let mut ok = true;
-        for (k, &cmd) in later.iter().enumerate() {
-            let copy = if k == 0 { copies[0] } else { copies[1] };
-            ok = ok
-                && crate::note_vk(device.handle(), submit(super::Which::Native, copy, vk::Fence::null())).is_ok()
-                && crate::note_vk(device.handle(), submit(super::Which::Native, cmd, vk::Fence::null())).is_ok();
-        }
-        ok = ok && crate::note_vk(device.handle(), submit(super::Which::Native, copies[2], vk::Fence::null())).is_ok();
+    // Pass 2 on: `X` (or `Y`) puts the previous answer where the network reads, then the pass; `R` puts the capture
+    // back for the write-back.
+    let sequence = res.native.as_ref().map_or_else(Vec::new, |n| n.later_sequence(&later));
+    if !sequence.is_empty() {
+        let ok = sequence.iter().all(|&cmd| crate::note_vk(device.handle(), submit(super::Which::Native, cmd, vk::Fence::null())).is_ok());
         if !ok {
             failed(res, submit);
             result.miss = Some("a later pass of the network could not be submitted");
             return result;
         }
-        if let Some(m) = res.native.as_mut().and_then(|n| n.more.as_mut()) {
-            // `X` took the passes' new history to GENERAL.
-            for f in m.fresh.iter_mut().take(later.len()) {
-                *f = false;
-            }
-            if let Some(t) = m.timer.as_mut() {
-                t.mark_submitted();
-            }
+        if let Some(n) = res.native.as_mut() {
+            n.later_submitted(later.len());
         }
     }
     // SAFETY: the layer's own fence, idle (`wait_idle` above, or never submitted).
@@ -5550,6 +5599,28 @@ unsafe fn native_hold(
 
 #[cfg(test)]
 mod tests {
+    /// The later passes go in the order the local hold and the other GPU's runner submit them: `X` before pass 2,
+    /// `Y` before each further pass, `R` after the last.
+    #[test]
+    fn the_later_passes_go_between_their_copies() {
+        let cb = |n: u64| <vk::CommandBuffer as ash::vk::Handle>::from_raw(n);
+        let copies = [cb(100), cb(101), cb(102)];
+        assert_eq!(later_order(copies, &[cb(2)]), vec![cb(100), cb(2), cb(102)]);
+        assert_eq!(later_order(copies, &[cb(2), cb(3), cb(4)]), vec![cb(100), cb(2), cb(101), cb(3), cb(101), cb(4), cb(102)]);
+    }
+
+    /// The reason a hold's frame cannot go to the other GPU names what is missing, the first that applies.
+    #[test]
+    fn a_frame_that_cannot_be_sent_says_why() {
+        let aux = |layout| Some(super::super::Aux { image: vk::Image::null(), format: vk::Format::R16G16_SFLOAT, layout, readable: false });
+        assert_eq!(unsendable(true, aux(Some(vk::ImageLayout::GENERAL)), true, true), None);
+        assert_eq!(unsendable(false, None, false, false), Some("the edit cache has no room for its buffers"));
+        assert_eq!(unsendable(true, None, false, true), Some("DLSS names no motion vectors"));
+        assert_eq!(unsendable(true, aux(None), false, true), Some("the motion vectors' layout is unknown"));
+        assert_eq!(unsendable(true, aux(Some(vk::ImageLayout::UNDEFINED)), false, true), Some("the motion vectors cannot be copied"));
+        assert_eq!(unsendable(true, aux(Some(vk::ImageLayout::GENERAL)), true, false), Some("DLSS's jitter is unknown"));
+    }
+
     #[test]
     fn the_running_line_says_where_the_model_runs_with_passes_at_both_holds_and_a_second_gpu() {
         assert_eq!(super::running_line(None, false), "native network running");
