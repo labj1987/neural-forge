@@ -7127,6 +7127,7 @@ pub(crate) fn write_dump_async(frame: DumpFrame, capture: Option<(neural_forge_p
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// `NEURAL_FORGE_TEST_REBUILD_AT`'s entries: a launch with an optional pause; what does not parse is left out.
     #[test]
@@ -7135,8 +7136,6 @@ mod tests {
         assert_eq!(parse_test_rebuild("60:x,abc"), vec![(60, 0)]);
         assert!(parse_test_rebuild("on").is_empty());
     }
-
-    use super::*;
 
     fn sem(raw: u64) -> vk::Semaphore {
         vk::Semaphore::from_raw(raw)

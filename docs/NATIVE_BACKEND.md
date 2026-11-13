@@ -1852,9 +1852,12 @@ the network (`HoldCounts::local`: each hold from before it asks for the network,
 nothing of it, `Meta::remote`, else when it can no longer run; one load, never an undercount), and the loader's use of
 the network is that count (`Claims::network_holds`) and the last time a path took a build (`Claims::last_local`,
 stamped in `ready_sizes`), not the hold's stamp: the network is lent back within a retry or two. A refusal because
-another device has the network is asked again every second (`BuildRetry::wait_for_owner`), not counted toward the
-retry streak, whose fourth wait (30 s) came after the second GPU's own 30 s rule; and that rule (`ServerRule`) counts
-frames not run that keep coming, a pause of more than a second between two of them starting it afresh. `NEURAL_FORGE_TEST_REBUILD_AT=<launch>:<seconds>`
+another device has the network is not counted toward the retry streak, whose fourth wait (30 s) came after the second
+GPU's own 30 s rule: it is asked again every second while that device closes it, and while it uses it every second the
+first 5 times in a row, then every 5 s (each ask runs its lend check), said once per run of the same answer
+(`BuildRetry::wait_for_owner`). That rule (`ServerRule`) adds up the time frames not run keep coming: an interval of
+more than a second between two misses (a menu, a loading screen) adds nothing, and only a frame that ran starts it
+over, so bursts of misses between pauses still fall back. `NEURAL_FORGE_TEST_REBUILD_AT=<launch>:<seconds>`
 (tests) keeps the holds off for that long from that DLSS launch and then builds the hold's resources again, as a
 change of render size does (the Cyberpunk 2077 benchmark with `NEURAL_FORGE_OFFLOAD_GPU=same` and `60:40`: before the
 fix the offload never answered after the rebuild; with it, 600 of 600 holds carried the other GPU's edit).

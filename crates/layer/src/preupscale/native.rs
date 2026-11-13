@@ -360,8 +360,6 @@ pub(crate) struct Loader {
     test_graph: Option<TestGraph>,
 }
 
-/// Who may be using the network's frame (activations, counters) and builds, which the two paths share and the loader
-/// thread checks before it frees a build or closes the network ([`Claims::in_flight`], [`Claims::unused`]).
 /// The device's counts of the holds recorded into DLSS's buffers that may still run, shared by its loader and its
 /// `super::inline::Inline`: all of them ([`Claims::holds`]), and those that may record the network ([`Claims::local`]).
 #[derive(Clone, Default)]
@@ -370,6 +368,8 @@ pub(crate) struct HoldCounts {
     pub local: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// Who may be using the network's frame (activations, counters) and builds, which the two paths share and the loader
+/// thread checks before it frees a build or closes the network ([`Claims::in_flight`], [`Claims::unused`]).
 #[derive(Default)]
 struct Claims {
     /// The last pre-upscaler hold and the last after-the-upscaler frame (ms since [`epoch_ms`]'s start), and
@@ -1286,17 +1286,23 @@ impl Loader {
                     drop(network);
                 }
                 Err(why) => {
-                    // Another device has the network and was asked to lend it: asked again in a second, not a failure
-                    // of this loader's (its streak would reach the 30 s wait).
-                    let wait = if refused && asked.is_some() { retry.wait_for_owner(Instant::now()) } else { retry.failed(Instant::now()) };
-                    match asked {
-                        Some(true) => {
-                            lines.push("[native] the network is open on another device of the game, which is not using it: it is asked to close it".into())
+                    // Another device has the network and was asked to lend it: asked again on the owner's cadence, not a
+                    // failure of this loader's (its streak would reach the 30 s wait), and said once per run of the same
+                    // answer ([`BuildRetry::wait_for_owner`]).
+                    let (wait, say) = match asked.filter(|_| refused) {
+                        Some(lending) => retry.wait_for_owner(Instant::now(), lending),
+                        None => (retry.failed(Instant::now()), true),
+                    };
+                    if say {
+                        match asked {
+                            Some(true) => {
+                                lines.push("[native] the network is open on another device of the game, which is not using it: it is asked to close it".into())
+                            }
+                            Some(false) => lines.push("[native] the network is open on another device of the game, which is using it".into()),
+                            None => {}
                         }
-                        Some(false) => lines.push("[native] the network is open on another device of the game, which is using it".into()),
-                        None => {}
+                        lines.push(format!("[native] {why}; frames go to DLSS untouched, trying again in {} ms", wait.as_millis()));
                     }
-                    lines.push(format!("[native] {why}; frames go to DLSS untouched, trying again in {} ms", wait.as_millis()));
                     state.failed = Some(why);
                     state.network = network;
                     // A failed build leaves no graph; the switch to barriers, once made, stays, and one the
@@ -1308,7 +1314,9 @@ impl Loader {
             for line in &lines {
                 crate::log!("{line}");
             }
-            crate::logging::flush();
+            if !lines.is_empty() {
+                crate::logging::flush();
+            }
             state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }

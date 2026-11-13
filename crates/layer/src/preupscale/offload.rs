@@ -1089,19 +1089,20 @@ pub(crate) struct ServerRule {
     /// The build the frames ran with, and how many ran with it.
     generation: u64,
     warm: u32,
-    not_running_since: Option<std::time::Instant>,
-    /// The last frame noted not run ([`Self::missed`]).
+    /// How long frames not run have kept coming since the network last ran ([`Self::missed`]), and the last of them.
+    missed_for: Duration,
     last_miss: Option<std::time::Instant>,
 }
 
-/// A pause between two frames not run longer than this starts [`ServerRule`]'s count afresh: its [`NOT_RUNNING`] is
-/// of frames that keep coming, not a pause (a menu, a loading screen) between a miss and the next.
+/// The longest interval between two frames not run that counts toward [`ServerRule`]'s [`NOT_RUNNING`]: that is time
+/// with frames coming, not a pause (a menu, a loading screen) between a miss and the next, which adds nothing (and
+/// takes nothing away: pauses between bursts of misses do not keep a broken second GPU from falling back).
 pub(crate) const NOT_RUNNING_GAP: Duration = Duration::from_secs(1);
 
 impl ServerRule {
     /// Notes a frame the network ran on (`generation`: the build's), and how long it took; why to fall back.
     pub(crate) fn ran(&mut self, generation: u64, took: Duration) -> Option<String> {
-        self.not_running_since = None;
+        self.missed_for = Duration::ZERO;
         self.last_miss = None;
         if generation != self.generation {
             self.generation = generation;
@@ -1114,11 +1115,13 @@ impl ServerRule {
     /// Notes a frame the model was wanted for that the network did not run on (`why`: the loader's reason, if any), at
     /// `now`; why to fall back.
     pub(crate) fn missed(&mut self, now: std::time::Instant, why: Option<&str>) -> Option<String> {
-        if self.last_miss.replace(now).is_some_and(|l| now.saturating_duration_since(l) > NOT_RUNNING_GAP) {
-            self.not_running_since = None;
+        if let Some(last) = self.last_miss.replace(now) {
+            let step = now.saturating_duration_since(last);
+            if step <= NOT_RUNNING_GAP {
+                self.missed_for += step;
+            }
         }
-        let since = *self.not_running_since.get_or_insert(now);
-        (now.saturating_duration_since(since) >= NOT_RUNNING)
+        (self.missed_for >= NOT_RUNNING)
             .then(|| format!("the network has not run on the other GPU for {NOT_RUNNING:?}{}", why.map_or(String::new(), |w| format!(" ({w})"))))
     }
 }
@@ -1240,11 +1243,10 @@ mod tests {
         assert_eq!(pick(&Choice::Pci { vendor: 0x10de, device: 0x2c02, bus: at3 }, &three), Ok(2));
     }
 
-    /// Given up is for the process and the session: nothing later reads as running again.
-    /// The server's 30 s rule counts frames not run that keep coming: one miss, then a pause longer than the rule (a
+    /// The server's 30 s rule counts the time frames not run keep coming: one miss, then a pause longer than the rule (a
     /// menu), then a miss does not fall back; misses that keep coming for 30 s do.
     #[test]
-    fn a_pause_between_misses_starts_the_servers_count_afresh() {
+    fn a_pause_between_misses_does_not_count_toward_the_servers_rule() {
         let t0 = std::time::Instant::now();
         let mut rule = ServerRule::default();
         assert_eq!(rule.missed(t0, None), None);
@@ -1259,6 +1261,36 @@ mod tests {
         assert!(fell.is_some_and(|w| w.contains("lent")), "misses that keep coming for 30 s fall back");
     }
 
+    /// Bursts of misses between pauses (a map, an inventory, loading screens) add up: a second GPU that never runs the
+    /// network falls back in the fourth burst of 10 s, and a frame that ran starts the count over.
+    #[test]
+    fn bursts_of_misses_between_pauses_add_up_to_the_servers_rule() {
+        let mut rule = ServerRule::default();
+        let mut now = std::time::Instant::now();
+        let mut fell_in = None;
+        for burst in 1..=5 {
+            let end = now + Duration::from_secs(10);
+            while now < end && fell_in.is_none() {
+                if rule.missed(now, None).is_some() {
+                    fell_in = Some(burst);
+                }
+                now += Duration::from_millis(100);
+            }
+            now += Duration::from_secs(5);
+        }
+        assert_eq!(fell_in, Some(4));
+        let mut rule = ServerRule::default();
+        let t0 = std::time::Instant::now();
+        for ms in (0..20_000).step_by(100) {
+            assert!(rule.missed(t0 + Duration::from_millis(ms), None).is_none());
+        }
+        assert!(rule.ran(1, Duration::from_millis(5)).is_none());
+        for ms in (20_000..45_000).step_by(100) {
+            assert!(rule.missed(t0 + Duration::from_millis(ms), None).is_none(), "a frame that ran starts the count over");
+        }
+    }
+
+    /// Given up is for the process and the session: nothing later reads as running again.
     #[test]
     fn a_stall_is_never_followed_by_the_offload_running_again() {
         let (stalled, fell) = (State::Stalled("gpu".into()), State::FellBack("why".into()));
