@@ -202,6 +202,9 @@ pub(crate) struct Progress {
     /// Holds submitted that took the answer to the frame before them, and those planned to that found none.
     taken: AtomicU64,
     untaken: AtomicU64,
+    /// Tests: how many times a settle blocked (waited for the worker at all), whatever it then found.
+    #[cfg(test)]
+    blocked: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -243,6 +246,8 @@ impl Progress {
                 p.abandoned = Some(p.abandoned.map_or(seq, |a| if after(seq, a) { seq } else { a }));
                 return false;
             }
+            #[cfg(test)]
+            self.blocked.fetch_add(1, Ordering::Relaxed);
             p = self.changed.wait_timeout(p, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
         }
     }
@@ -1776,6 +1781,15 @@ mod tests {
 
     type Ranlist = Arc<std::sync::Mutex<Vec<u32>>>;
 
+    /// Waits (20 s at most) until the worker is done with frame `seq`.
+    fn wait_finished(game: &Game, seq: u32) {
+        let start = Instant::now();
+        while game.exchange.progress.lock().finished.is_none_or(|(done, _)| done != seq) {
+            assert!(start.elapsed() < Duration::from_secs(20), "the worker finished frame {seq}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn rig(late: Vec<u32>, fail: Option<u32>) -> Option<(Game, Worker, Ranlist, Arc<std::sync::Mutex<Vec<String>>>, Ranlist)> {
         let Some(game) = Game::new() else {
@@ -1839,11 +1853,15 @@ mod tests {
         let Some((game, worker, _, _, _)) = rig(Vec::new(), None) else { return };
         let mut cadence = Cadence::default();
         let holds: Vec<_> = (1..=3u64).map(|hold| game.record(cadence.hold(hold, true), 250 + hold as u32)).collect();
-        let t = Instant::now();
+        // Counted, not timed: the submit's wall time also holds the device's work and the worker's, which a slow
+        // machine (lavapipe under validation) can stretch past the budget without any settle waiting.
         game.run(&holds);
-        assert!(t.elapsed() < ANSWER_BUDGET, "no submit waited out its budget");
+        assert_eq!(game.exchange.progress.blocked.load(Ordering::Relaxed), 0, "no submit waited for another's frame");
+        assert_eq!(game.exchange.progress.lock().abandoned, None, "no submit waited out its budget");
         assert!(!game.landed().1, "no edit: the answer was not there when the submit was made");
-        // The stream goes on from the last frame sent.
+        // The stream goes on from the last frame sent, once the worker is done with it (however long the machine takes;
+        // the hold's budget is not what this test is about).
+        wait_finished(&game, 3);
         game.run(&[game.record(cadence.hold(4, true), 254)]);
         assert_eq!(game.landed(), (Some(253), true));
         game.close(worker);
@@ -1875,10 +1893,11 @@ mod tests {
         let mut cadence = Cadence::default();
         game.run(&[game.record(cadence.hold(1, true), 301)]);
         let _never = game.record(cadence.hold(2, true), 302);
-        let t = Instant::now();
+        let blocked = game.exchange.progress.blocked.load(Ordering::Relaxed);
         game.run(&[game.record(cadence.hold(3, true), 303)]);
-        assert!(t.elapsed() < ANSWER_BUDGET);
+        assert_eq!(game.exchange.progress.blocked.load(Ordering::Relaxed), blocked, "hold 3 did not wait for frame 2");
         assert!(!game.landed().1, "frame 2 never ran: no edit at hold 3");
+        wait_finished(&game, 3);
         game.run(&[game.record(cadence.hold(4, true), 304)]);
         assert_eq!(game.landed(), (Some(303), true));
         game.close(worker);
@@ -1948,9 +1967,9 @@ mod tests {
         // Its side's submits do not wait for it.
         let mut cadence = Cadence::default();
         game.run(&[game.record(cadence.hold(1, true), 801)]);
-        let t = Instant::now();
+        let blocked = game.exchange.progress.blocked.load(Ordering::Relaxed);
         game.run(&[game.record(cadence.hold(2, false), 0)]);
-        assert!(t.elapsed() < ANSWER_BUDGET);
+        assert_eq!(game.exchange.progress.blocked.load(Ordering::Relaxed), blocked, "hold 2 did not wait for the released worker");
         game.close(worker);
     }
 
@@ -1967,9 +1986,9 @@ mod tests {
         game.run(&[game.record(cadence.hold(2, true), 602)]);
         assert_eq!(game.landed(), (Some(601), true));
         worker.stop();
-        let t = Instant::now();
+        let blocked = game.exchange.progress.blocked.load(Ordering::Relaxed);
         game.run(&[game.record(cadence.hold(3, false), 0)]);
-        assert!(t.elapsed() < ANSWER_BUDGET);
+        assert_eq!(game.exchange.progress.blocked.load(Ordering::Relaxed), blocked, "hold 3 did not wait for the stopped worker");
         // Frame 2's answer when the worker finished it before it stopped, else none: never a wait, never another frame's.
         let landed = game.landed();
         assert!(landed == (Some(602), true) || !landed.1, "{landed:?}");
