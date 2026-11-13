@@ -1045,6 +1045,29 @@ impl NeuralForgeInstanceHooks {
                         let mut with = *info;
                         with.queue_create_info_count = queues.len() as u32;
                         with.p_queue_create_infos = queues.as_ptr();
+                        // The model on another GPU at the finished frame: sync-fd semaphores on the game's device too,
+                        // where it has them, so a present can wait on the GPU for the other device's frame
+                        // (`composition::pace`). Only asked for with `NEURAL_FORGE_OFFLOAD_GPU` set.
+                        let semaphore_fd = ash::khr::external_semaphore_fd::NAME;
+                        let has_semaphore_fd = requests_extension(info, semaphore_fd);
+                        let add_semaphore_fd = !has_semaphore_fd
+                            && preupscale::offload::Choice::current() != preupscale::offload::Choice::Off
+                            && core_1_1(instance.api_version, vk::API_VERSION_1_1)
+                            // SAFETY: the instance's own physical device; each name is a NUL-terminated array.
+                            && unsafe { instance.instance.enumerate_device_extension_properties(physical_device) }
+                                .is_ok_and(|e| e.iter().any(|x| unsafe { CStr::from_ptr(x.extension_name.as_ptr()) } == semaphore_fd));
+                        let mut names_with_fd: Vec<*const std::ffi::c_char> = if info.enabled_extension_count == 0 || info.pp_enabled_extension_names.is_null()
+                        {
+                            Vec::new()
+                        } else {
+                            // SAFETY: the application's own array of that many names.
+                            unsafe { std::slice::from_raw_parts(info.pp_enabled_extension_names, info.enabled_extension_count as usize) }.to_vec()
+                        };
+                        if add_semaphore_fd {
+                            names_with_fd.push(semaphore_fd.as_ptr());
+                            with.enabled_extension_count = names_with_fd.len() as u32;
+                            with.pp_enabled_extension_names = names_with_fd.as_ptr();
+                        }
                         // SAFETY: the next layer's gipa for this instance; `with` and everything it
                         // points to outlive the extension, which outlives the call.
                         match unsafe { neural_forge_native::device_extend(gipa, instance.instance.handle(), instance.api_version, physical_device, &with) } {
@@ -1101,6 +1124,7 @@ impl NeuralForgeInstanceHooks {
                                         bda_ext: requests_extension(info, c"VK_EXT_buffer_device_address"),
                                     };
                                     NATIVE_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().insert(device, setup);
+                                    composition::pace::note_semaphore_fd(device, has_semaphore_fd || add_semaphore_fd);
                                     // The device for the model on another GPU, made now: inside vkCreateDevice the loader
                                     // holds the lock its device callbacks need (`preupscale::offload::make_for`).
                                     // SAFETY: inside vkCreateDevice for `device`, with its request.

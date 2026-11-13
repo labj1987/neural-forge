@@ -817,6 +817,7 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
         // The before-DLSS offload's workers first: each frees the other device's side and gives the device back.
         crate::preupscale::offload_pre::stop_for(handle);
         crate::preupscale::offload_pre::note_import(handle, false);
+        crate::composition::pace::note_semaphore_fd(handle, false);
         crate::preupscale::offload::destroy_for(handle)
     };
     // Then the hold inside DLSS's buffer: its slots and staging images (once the device is idle), and the

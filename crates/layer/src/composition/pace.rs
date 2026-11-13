@@ -42,8 +42,63 @@ const GPU_WAIT: Duration = crate::FENCE_WAIT_TIMEOUT;
 /// answer needs (the warm-up, the give-up, the retry) stays where it is, on the present's own path.
 pub(crate) const PACE_AFTER: u32 = 30;
 
+/// The devices created with `VK_KHR_external_semaphore_fd` enabled (`lib.rs`, at their creation; the offload device
+/// in `offload::Offload::create`): a sync fd can be exported from, and imported on, those.
+static SEMAPHORE_FD: Mutex<Vec<vk::Device>> = Mutex::new(Vec::new());
+
+/// Notes that `device` has `VK_KHR_external_semaphore_fd` (`on`), or forgets it (at its destruction).
+pub(crate) fn note_semaphore_fd(device: vk::Device, on: bool) {
+    let mut all = SEMAPHORE_FD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    all.retain(|d| *d != device);
+    if on {
+        all.push(device);
+    }
+}
+
+/// Whether `device` was created with `VK_KHR_external_semaphore_fd` ([`note_semaphore_fd`]).
+pub(crate) fn has_semaphore_fd(device: vk::Device) -> bool {
+    SEMAPHORE_FD.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&device)
+}
+
+/// What the other device's submission of a request's frame gave ([`publish`]): a sync fd that signals once that
+/// submission's work is done (the answer is in the answer region, which that device writes itself), and what the
+/// answer will be, known when the frame was recorded.
+pub(crate) struct Submitted {
+    pub fd: std::os::fd::OwnedFd,
+    /// The size the answer is for (the proxy's, echoed), and whether the frame runs through the network
+    /// (`capture::answer_fits`).
+    pub dims: (u32, u32),
+    pub evaluated: bool,
+}
+
+/// The newest submission published per channel (its header's address) and slot, until the relay takes it.
+static SUBMITS: Mutex<Vec<(usize, usize, u32, Submitted)>> = Mutex::new(Vec::new());
+
+/// The server on the other device submitted request `req` of `slot` on the channel whose header is at `channel`.
+/// Replaces what was published for that slot before (its fd is closed).
+pub(crate) fn publish(channel: usize, slot: usize, req: u32, submitted: Submitted) {
+    let mut all = SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    all.retain(|(c, s, _, _)| (*c, *s) != (channel, slot));
+    all.push((channel, slot, req, submitted));
+}
+
+/// What was published for request `req` ([`publish`]), once.
+pub(crate) fn take_published(channel: usize, slot: usize, req: u32) -> Option<Submitted> {
+    let mut all = SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let k = all.iter().position(|(c, s, r, _)| (*c, *s, *r) == (channel, slot, req))?;
+    Some(all.swap_remove(k).3)
+}
+
 /// `NEURAL_FORGE_OFFLOAD_PACING`: `cpu` keeps every wait of the delayed present on the game's thread (as before
-/// 4.4.0); anything else, or unset, hands the frames to the relay.
+/// 4.4.0); `relay` hands the frames to the relay and waits for each answer on the game's thread; anything else, or
+/// unset, also waits for the answer on the GPU where both devices have sync-fd semaphores.
+pub(crate) fn gpu_wait_wanted() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_PACING").is_none_or(|v| !v.trim().eq_ignore_ascii_case("relay")));
+    *ON && wanted()
+}
+
+/// `NEURAL_FORGE_OFFLOAD_PACING` is not `cpu`: the delayed present hands its frames to the relay.
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_PACING").is_none_or(|v| !v.trim().eq_ignore_ascii_case("cpu")));
@@ -59,6 +114,11 @@ pub(crate) trait Port: Send + Sync {
     /// Whether the answer to `req` is the one to a frame sent as a proxy of `proxy` texels (and, for an HDR10 frame,
     /// ran through the network): `capture::answer_fits`.
     fn fits(&self, req: u32, proxy: (u32, u32), pq10: bool) -> bool;
+    /// What the other device's submission of request `req` gave, once it was made and published ([`publish`]); taken
+    /// once. `None` from a server that publishes nothing (its answers are waited for on the game's thread).
+    fn submitted(&self, _req: u32) -> Option<Submitted> {
+        None
+    }
     /// The channel is shutting down.
     fn quit(&self) -> bool;
     /// Folds a white-meter reading into the published value.
@@ -114,6 +174,9 @@ struct Queue {
     resolved: VecDeque<(u64, bool)>,
     /// A request the relay posted and gave up on, still out at the server: its number and when it was posted.
     outstanding: Option<(u32, Instant)>,
+    /// The frame in the relay's hand was submitted on the other device: its number, the sync fd of that submission and
+    /// whether the answer will fit, until the present takes it ([`Pacer::wait_ready`]) or the frame is resolved.
+    submitted: Option<(u64, std::os::fd::OwnedFd, bool)>,
 }
 
 struct Shared {
@@ -175,7 +238,17 @@ impl Shared {
         };
         let sent = Instant::now();
         let mut polls = 0u32;
+        let mut published = false;
         while !self.port.answered(req) {
+            // The other device's submission of this frame, for a present that waits for the answer on the GPU.
+            if !published {
+                if let Some(s) = self.port.submitted(req) {
+                    published = true;
+                    let fits = crate::capture::answer_fits((s.dims != (0, 0)).then_some(s.dims), t.proxy, t.pq10, s.evaluated);
+                    self.lock().submitted = Some((t.number, s.fd, fits));
+                    self.changed.notify_all();
+                }
+            }
             if sent.elapsed() >= t.budget || self.port.quit() || self.quitting() {
                 self.lock().outstanding = Some((req, sent));
                 self.lose("a frame's answer did not come within its budget");
@@ -263,6 +336,8 @@ fn relay(s: &Shared) {
         last_posted = Some(token.posted);
         let mut q = s.lock();
         q.busy = false;
+        // Not taken by a present: the answer is in, nothing waits for it on the GPU.
+        q.submitted = None;
         q.resolved.push_back((token.number, valid));
         while q.resolved.len() > 8 {
             q.resolved.pop_front();
@@ -327,6 +402,30 @@ impl Pacer {
         }
     }
 
+    /// Waits until frame `number` is resolved, or submitted on the other device ([`Port::submitted`]), or `deadline`
+    /// passes: the present that can wait for the answer on the GPU. A frame already resolved is [`Ready::Resolved`]
+    /// (nothing is left to wait for); `None` when neither came in time.
+    pub(crate) fn wait_ready(&self, number: u64, deadline: Instant) -> Option<Ready> {
+        let mut q = self.shared.lock();
+        loop {
+            if let Some((_, valid)) = q.resolved.iter().find(|(n, _)| *n == number) {
+                return Some(Ready::Resolved(*valid));
+            }
+            if q.ended {
+                return Some(Ready::Resolved(false));
+            }
+            if q.submitted.as_ref().is_some_and(|(n, _, _)| *n == number) {
+                let (_, fd, fits) = q.submitted.take().expect("checked");
+                return Some(Ready::Submitted { fd, fits });
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            q = self.shared.changed.wait_timeout(q, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+        }
+    }
+
     /// Waits until the relay has nothing posted and nothing in hand, `deadline` at most. Whether it is so.
     pub(crate) fn drain(&self, deadline: Instant) -> bool {
         let mut q = self.shared.lock();
@@ -376,9 +475,20 @@ impl Drop for Pacer {
     }
 }
 
+/// What a present finds of the frame before it ([`Pacer::wait_ready`]).
+pub(crate) enum Ready {
+    /// Resolved: with a good answer, or without.
+    Resolved(bool),
+    /// Submitted on the other device and not finished: the sync fd of that submission, and whether its answer will
+    /// fit the frame.
+    Submitted { fd: std::os::fd::OwnedFd, fits: bool },
+}
+
 /// How many delayed presents handed their frame to the relay and how many made every wait themselves, and how long
 /// the game's thread spent in them (µs), for the `[offload]` summary.
 pub(crate) struct Waits {
+    /// Of the presents with the relay: those whose compose waited for the answer on the GPU.
+    pub gated: AtomicU64,
     pub gpu_presents: AtomicU64,
     pub gpu_us: AtomicU64,
     pub cpu_presents: AtomicU64,
@@ -386,7 +496,11 @@ pub(crate) struct Waits {
 }
 
 pub(crate) static WAITS: Waits =
-    Waits { gpu_presents: AtomicU64::new(0), gpu_us: AtomicU64::new(0), cpu_presents: AtomicU64::new(0), cpu_us: AtomicU64::new(0) };
+    Waits { gated: AtomicU64::new(0), gpu_presents: AtomicU64::new(0), gpu_us: AtomicU64::new(0), cpu_presents: AtomicU64::new(0), cpu_us: AtomicU64::new(0) };
+
+/// Tests: every compose that waited for its answer on the GPU, never reset (the summary resets [`Waits::gated`]).
+#[cfg(test)]
+pub(crate) static GATED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 impl Waits {
     /// A delayed present took the game's thread `took`, with the relay (`gpu`) or on its own waits.
@@ -400,12 +514,90 @@ impl Waits {
     pub(crate) fn summary(&self) -> String {
         let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
         let mean = |us: u64, n: u64| if n == 0 { 0.0 } else { us as f64 / n as f64 / 1000.0 };
-        let (gn, gu, cn, cu) = (take(&self.gpu_presents), take(&self.gpu_us), take(&self.cpu_presents), take(&self.cpu_us));
+        let (gn, gu, cn, cu, gated) = (take(&self.gpu_presents), take(&self.gpu_us), take(&self.cpu_presents), take(&self.cpu_us), take(&self.gated));
         format!(
-            "the game's thread spent {:.2} ms in each of {gn} presents that left their GPU waits to the relay and {:.2} ms in each of {cn} that waited themselves",
+            "the game's thread spent {:.2} ms in each of {gn} presents that left their GPU waits to the relay ({gated} of them waited for the answer on the GPU) and {:.2} ms in each of {cn} that waited themselves",
             mean(gu, gn),
             mean(cu, cn)
         )
+    }
+}
+
+/// The tests' other device: a second device of the test driver whose every "frame" is an empty submission that
+/// signals an exportable semaphore, exported as a sync fd once the submission is made, as the server on the other GPU
+/// does for its frames.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use ash::vk;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    pub(crate) struct OtherDevice {
+        _entry: ash::Entry,
+        instance: ash::Instance,
+        device: ash::Device,
+        queue: vk::Queue,
+        api: ash::khr::external_semaphore_fd::Device,
+        done: vk::Semaphore,
+    }
+
+    // SAFETY: the test's own device, used by one thread at a time.
+    unsafe impl Send for OtherDevice {}
+
+    impl OtherDevice {
+        /// `None` where the test driver has no sync-fd semaphores.
+        pub(crate) fn open() -> Option<Self> {
+            // SAFETY: as `composition::gpu::test_device`; plain queries and valid requests.
+            unsafe {
+                let entry = ash::Entry::load().ok()?;
+                let (instance, _) = crate::composition::gpu::test_instance(&entry)?;
+                let made = (|| {
+                    let physical = *instance.enumerate_physical_devices().ok()?.first()?;
+                    let name = ash::khr::external_semaphore_fd::NAME;
+                    let offered = instance
+                        .enumerate_device_extension_properties(physical)
+                        .is_ok_and(|e| e.iter().any(|x| std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) == name));
+                    let kind = vk::PhysicalDeviceExternalSemaphoreInfo::default().handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+                    let mut props = vk::ExternalSemaphoreProperties::default();
+                    instance.get_physical_device_external_semaphore_properties(physical, &kind, &mut props);
+                    if !offered || !props.external_semaphore_features.contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE) {
+                        return None;
+                    }
+                    let names = [name.as_ptr()];
+                    let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&[1.0])];
+                    instance.create_device(physical, &vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&names), None).ok()
+                })();
+                let Some(device) = made else {
+                    instance.destroy_instance(None);
+                    return None;
+                };
+                let mut export = vk::ExportSemaphoreCreateInfo::default().handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+                let done = device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None).unwrap();
+                let api = ash::khr::external_semaphore_fd::Device::new(&instance, &device);
+                Some(Self { queue: device.get_device_queue(0, 0), _entry: entry, instance, device, api, done })
+            }
+        }
+
+        /// One frame's submission on this device, and its sync fd.
+        pub(crate) fn submit(&self) -> OwnedFd {
+            let signals = [self.done];
+            // SAFETY: the test's own objects; the export follows the submission that signals the semaphore, and takes its
+            // payload, so the semaphore is ready for the next frame.
+            unsafe {
+                self.device.queue_submit(self.queue, &[vk::SubmitInfo::default().signal_semaphores(&signals)], vk::Fence::null()).unwrap();
+                let info = vk::SemaphoreGetFdInfoKHR::default().semaphore(self.done).handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+                OwnedFd::from_raw_fd(self.api.get_semaphore_fd(&info).unwrap())
+            }
+        }
+
+        pub(crate) fn close(self) {
+            // SAFETY: nothing of it is pending once the device is idle.
+            unsafe {
+                self.device.device_wait_idle().unwrap();
+                self.device.destroy_semaphore(self.done, None);
+                self.device.destroy_device(None);
+                self.instance.destroy_instance(None);
+            }
+        }
     }
 }
 
@@ -414,12 +606,13 @@ mod tests {
     use super::*;
 
     /// The channel's request side for the relay's tests: requests are numbered from 1, answered when the test says
-    /// so, and fit when it says so.
+    /// so, and fit when it says so; submitted on "the other device" when the test hands a fd over.
     #[derive(Default)]
     struct FakePort {
         begun: AtomicU64,
         answers: AtomicBool,
         fits: AtomicBool,
+        submitted: Mutex<Option<Submitted>>,
     }
 
     impl Port for Arc<FakePort> {
@@ -432,10 +625,53 @@ mod tests {
         fn fits(&self, _req: u32, _proxy: (u32, u32), _pq10: bool) -> bool {
             self.fits.load(Ordering::SeqCst)
         }
+        fn submitted(&self, _req: u32) -> Option<Submitted> {
+            self.submitted.lock().unwrap().take()
+        }
         fn quit(&self) -> bool {
             false
         }
         fn publish_white(&self, _reading: f32) {}
+    }
+
+    /// A present that can wait for the answer on the GPU is given the other device's submission as soon as it is
+    /// made, before the answer is in, with whether the answer will fit; once the answer is in, there is nothing left
+    /// to hand over.
+    #[test]
+    fn a_present_gets_the_other_devices_submission_before_the_answer() {
+        let Some(mut rig) = Rig::open() else { return };
+        let any_fd = || std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        let one = rig.token(1, Duration::from_secs(20));
+        assert!(rig.pacer.post(one));
+        rig.gpu_done(1);
+        assert!(rig.pacer.wait_ready(1, Instant::now() + Duration::from_millis(60)).is_none(), "posted, not submitted there yet");
+        *rig.port.submitted.lock().unwrap() = Some(Submitted { fd: any_fd(), dims: (16, 24), evaluated: false });
+        assert!(matches!(rig.pacer.wait_ready(1, soon()), Some(Ready::Submitted { fits: true, .. })));
+        // Taken once; the frame is resolved when its answer is in, as always.
+        rig.port.fits.store(true, Ordering::SeqCst);
+        rig.port.answers.store(true, Ordering::SeqCst);
+        assert!(matches!(rig.pacer.wait_ready(1, soon()), Some(Ready::Resolved(true))));
+        // Another size than the frame was sent at: said with the submission.
+        rig.port.answers.store(false, Ordering::SeqCst);
+        let two = rig.token(2, Duration::from_secs(20));
+        assert!(rig.pacer.post(two));
+        rig.gpu_done(2);
+        *rig.port.submitted.lock().unwrap() = Some(Submitted { fd: any_fd(), dims: (8, 8), evaluated: false });
+        assert!(matches!(rig.pacer.wait_ready(2, soon()), Some(Ready::Submitted { fits: false, .. })));
+        // A submission no present took is dropped when the answer comes.
+        let three = rig.token(3, Duration::from_secs(20));
+        assert!(rig.pacer.post(three));
+        *rig.port.submitted.lock().unwrap() = Some(Submitted { fd: any_fd(), dims: (16, 24), evaluated: false });
+        rig.port.answers.store(true, Ordering::SeqCst);
+        rig.gpu_done(3);
+        assert_eq!(rig.pacer.wait_resolved(3, soon()), Some(true));
+        assert!(matches!(rig.pacer.wait_ready(3, soon()), Some(Ready::Resolved(true))));
+        // The published submissions are kept per channel and slot, newest only, and taken once.
+        publish(0x51ab, 0, 7, Submitted { fd: any_fd(), dims: (1, 1), evaluated: true });
+        publish(0x51ab, 0, 8, Submitted { fd: any_fd(), dims: (2, 2), evaluated: true });
+        assert!(take_published(0x51ab, 0, 7).is_none() && take_published(0x51ab, 1, 8).is_none());
+        assert!(take_published(0x51ab, 0, 8).is_some_and(|s| s.dims == (2, 2)) && take_published(0x51ab, 0, 8).is_none());
+        rig.close();
     }
 
     /// A device, fences standing in for the frames' copies, and the relay over a [`FakePort`]. Each frame's "copy" is
@@ -603,12 +839,19 @@ mod tests {
 
     #[test]
     fn the_summary_says_what_the_games_thread_spent_with_and_without_the_relay() {
-        let w = Waits { gpu_presents: AtomicU64::new(0), gpu_us: AtomicU64::new(0), cpu_presents: AtomicU64::new(0), cpu_us: AtomicU64::new(0) };
+        let w = Waits {
+            gated: AtomicU64::new(0),
+            gpu_presents: AtomicU64::new(0),
+            gpu_us: AtomicU64::new(0),
+            cpu_presents: AtomicU64::new(0),
+            cpu_us: AtomicU64::new(0),
+        };
         w.note(true, Duration::from_micros(300));
         w.note(true, Duration::from_micros(500));
         w.note(false, Duration::from_millis(6));
         let line = w.summary();
         assert!(line.contains("0.40 ms in each of 2 presents that left") && line.contains("6.00 ms in each of 1 that waited themselves"), "{line}");
+        assert!(line.contains("(0 of them waited for the answer on the GPU)"), "{line}");
         assert!(w.summary().contains("each of 0 presents"), "the counters start over");
     }
 }
