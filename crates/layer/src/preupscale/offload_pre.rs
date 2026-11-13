@@ -252,6 +252,13 @@ impl Progress {
         }
     }
 
+    /// Whether frame `seq` went to the driver in an earlier submit (handed last, or already finished): only then can a
+    /// hold have its answer, and only then does [`settle_and_mark`] write IN's header for it.
+    fn went_out(&self, seq: u32) -> bool {
+        let p = self.lock();
+        p.handed == Some(seq) || p.finished.is_some_and(|(done, _)| done == seq)
+    }
+
     /// A buffer that sends frame `seq` is in the submit being made.
     fn queue(&self, seq: u32) {
         self.lock().queued = Some(seq);
@@ -978,8 +985,14 @@ pub(crate) fn at_submit(plans: &[(u64, HoldPlan)]) {
 fn settle_and_mark(progress: &Progress, inn: *mut u8, plan: &HoldPlan) -> bool {
     let mut taken = false;
     if let Some(seq) = plan.settle {
+        let went_out = progress.went_out(seq);
         let ok = progress.settle(seq, ANSWER_BUDGET);
-        if plan.take {
+        // IN has one header for every hold of a submit. A hold whose frame did not go out before this submit (sent by
+        // an earlier hold of the same submit, or never submitted) cannot have its answer, and its gate already refuses
+        // the header's frame: the header is left to the hold before it in this submit, which may have a good answer.
+        if plan.take && !went_out {
+            progress.untaken.fetch_add(1, Ordering::Relaxed);
+        } else if plan.take {
             // SAFETY: IN's header, the exchange's own memory; the GPU reads it only in holds submitted after this.
             unsafe {
                 inn.cast::<u32>().add(IN_SEQ).write_volatile(seq);
@@ -1438,6 +1451,28 @@ mod tests {
         let t = Instant::now();
         assert!(!p.settle(4, long));
         assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Two holds in one submit, the first taking the answer to a frame of an earlier submit: the second (whose frame is
+    /// the first's, in the same submit) leaves IN's header to the first, so its good answer is kept.
+    #[test]
+    fn the_second_hold_of_a_submit_leaves_the_header_to_the_first() {
+        let p = Progress::default();
+        let mut inn = [0u32; (HEADER_BYTES / 4) as usize];
+        let at = inn.as_mut_ptr().cast::<u8>();
+        p.queue(1);
+        p.handed();
+        assert!(p.finish(1, true));
+        let first = HoldPlan { settle: Some(1), take: true, send: Some(2) };
+        let second = HoldPlan { settle: Some(2), take: true, send: Some(3) };
+        assert!(settle_and_mark(&p, at, &first));
+        assert!(!settle_and_mark(&p, at, &second));
+        assert_eq!((inn[IN_VALID], inn[IN_SEQ]), (1, 1), "the header still names frame 1's complete answer");
+        // Alone in a later submit, a hold whose frame went out writes it (here: frame 3 failed, no answer).
+        p.handed();
+        assert!(p.finish(3, false));
+        assert!(!settle_and_mark(&p, at, &HoldPlan { settle: Some(3), take: true, send: None }));
+        assert_eq!((inn[IN_VALID], inn[IN_SEQ]), (0, 3));
     }
 
     /// Two frames abandoned before the first finished: neither late answer is taken (one slot kept only the last).
