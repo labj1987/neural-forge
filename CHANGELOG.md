@@ -22,6 +22,9 @@ first shipped them; their phase is kept as a subheading.
   memory slowly, the game's own GPU is often faster: on an RTX 4090 with an RTX 5080 beside it, Cyberpunk 2077 with
   Ray Reconstruction ran at 27-36 fps with the 5080 and at its 75 fps cap on the 4090.
   `NEURAL_FORGE_OFFLOAD_TRIAL=off` keeps the model on the second GPU.
+- When building the network failed on one GPU after the model was loaded there (it is tried again later), no other
+  GPU or device of the game could take the model until that retry: the second GPU gave up after 30 seconds. The
+  network is now handed over on request.
 - The Status tab says "second GPU: the model runs on ... after DLSS, its edit applied one frame later". The same
   rules send the model back to the game's GPU when the second GPU cannot keep up or fails.
 - With passes both before and after DLSS in one frame, the second GPU is not used: every pass runs on the game's GPU,

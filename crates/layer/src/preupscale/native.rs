@@ -1181,7 +1181,11 @@ impl Loader {
                     }
                 }
             });
-            if opened.is_some() && result.is_ok() {
+            // Opened here, built or not: a build that failed after the open keeps the network open on this device
+            // (tried again on the retry schedule), and another device's loader must be able to ask for it. Unowned,
+            // it was asked of nobody: the second GPU's loader, back after the trial on the game's GPU failed its
+            // build (`offload_trial`), was refused for 30 s and the offload given up.
+            if owns_network(opened.is_some(), result.is_ok(), network.is_some()) {
                 NETWORK_OWNER.store(device.as_raw(), std::sync::atomic::Ordering::SeqCst);
             }
             // Refused because another device's loader has the network: that one is asked to lend it.
@@ -4259,6 +4263,15 @@ pub(crate) fn running_line(guard: Option<&str>, mixed_on_game_gpu: bool, trial: 
     }
 }
 
+/// Whether a loader's work leaves this device the process's network owner (`NETWORK_OWNER`, which another device's
+/// loader asks to lend it, [`Loader::ask_owner`]): it opened the network (`opened`) and either built it (`built`) or
+/// kept it open after a failed build (`kept`, tried again on the retry schedule). A kept network that is nobody's is
+/// asked of nobody, and every other device is refused it until this one's next build (the second GPU given up after
+/// 30 s of refusals, #63).
+fn owns_network(opened: bool, built: bool, kept: bool) -> bool {
+    opened && (built || kept)
+}
+
 /// The last network failure written to the state log, so a retry schedule that keeps failing the same
 /// way writes it once; `None` once the network was built again.
 static LAST_FAILURE: Mutex<Option<String>> = Mutex::new(None);
@@ -5656,6 +5669,17 @@ mod tests {
         assert_eq!(unsendable(true, aux(None), false, true), Some("the motion vectors' layout is unknown"));
         assert_eq!(unsendable(true, aux(Some(vk::ImageLayout::UNDEFINED)), false, true), Some("the motion vectors cannot be copied"));
         assert_eq!(unsendable(true, aux(Some(vk::ImageLayout::GENERAL)), true, false), Some("DLSS's jitter is unknown"));
+    }
+
+    /// #63: a build that fails after the open keeps the network on its device; that device must own it, so another
+    /// device's loader asks it to lend the network instead of being refused for good.
+    #[test]
+    fn a_network_kept_after_a_failed_build_is_owned() {
+        assert!(super::owns_network(true, true, true), "opened and built");
+        assert!(super::owns_network(true, false, true), "opened, the build failed, the network kept");
+        assert!(!super::owns_network(true, false, false), "opened, failed and dropped: nothing to lend");
+        assert!(!super::owns_network(false, true, true), "not opened here (a rebuild of one opened before)");
+        assert!(!super::owns_network(false, false, false));
     }
 
     #[test]
