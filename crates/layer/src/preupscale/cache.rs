@@ -448,6 +448,9 @@ pub(crate) struct State {
     /// ([`Self::late_refresh`]), so a hold right after a refresh is cached whatever the cadence says (the still
     /// regime's every-hold refresh has no network to run on this GPU).
     offloaded: bool,
+    /// The game reset DLSS's history at the hold being planned ([`Self::reset_edit`]): no edit of an earlier frame
+    /// is stored for it, the other GPU's late one included. Cleared by [`Self::plan`].
+    reset: bool,
 }
 
 /// What a hold brings to [`State::plan`].
@@ -493,6 +496,13 @@ impl State {
         self.chain_live = false;
     }
 
+    /// The game reset DLSS's history at the hold about to be planned: the stored edit is dropped, and the other GPU's
+    /// answer to the frame before ([`Self::late_refresh`]) is not stored either (it is the old scene's).
+    pub(crate) fn reset_edit(&mut self) {
+        self.drop_edit();
+        self.reset = true;
+    }
+
     /// The depth's convention once decided ([`infer_reverse_z`]): `Some(true)` for reversed-Z.
     pub(crate) fn reverse_z(&self) -> Option<bool> {
         self.reverse_z
@@ -501,6 +511,7 @@ impl State {
     /// Whether this hold is cached or refreshes, and its passes' flags. Takes the stored edit out.
     pub(crate) fn plan(&mut self, h: &Hold) -> Plan {
         let consecutive = self.last_seen.is_some_and(|s| s.wrapping_add(1) == h.hold) && self.generation == h.generation;
+        self.reset = false;
         let had = std::mem::take(&mut self.valid);
         let chain_live = std::mem::take(&mut self.chain_live) && consecutive;
         let jitter = h.jitter.unwrap_or_default();
@@ -549,12 +560,17 @@ impl State {
     /// The other GPU's answer to the frame of hold `h` is stored by the hold being planned now, before its own
     /// capture (`super::offload_pre`): as if `h` had been a refresh that went through. `h` itself went through
     /// already (as a cached hold, or one that only sent its frame).
-    pub(crate) fn late_refresh(&mut self, h: &Hold) {
+    /// `false`, storing nothing, at a hold the game reset ([`Self::reset_edit`]).
+    pub(crate) fn late_refresh(&mut self, h: &Hold) -> bool {
+        if self.reset {
+            return false;
+        }
         let plan = Plan { kind: Kind::Refresh, refresh: self.refresh_seq + 1, flags: 0, step_jitter: [0.0; 2], refresh_jitter: [0.0; 2] };
         let pending = self.pending;
         self.went_through(h, &plan);
         // The counters still to be read are the hold's own, as it ran.
         self.pending = pending;
+        true
     }
 
     /// The hold `h` planned as `plan` went through (everything submitted).
@@ -1308,6 +1324,39 @@ mod tests {
         s.late_refresh(&hold(8));
         s.set_offloaded(false);
         assert_eq!(s.plan(&hold(9)).kind, Kind::Refresh);
+    }
+
+    #[test]
+    fn a_game_reset_is_not_undone_by_the_other_gpus_late_answer() {
+        let hold = |n: u64| Hold {
+            interval: 2,
+            hold: n,
+            jitter: Some([0.25, -0.25]),
+            mvec: true,
+            depth: true,
+            history_ok: true,
+            armed: false,
+            debug_mask: false,
+            generation: 0,
+        };
+        let mut s = State::default();
+        s.set_offloaded(true);
+        s.regime = Regime { still: true, against: 0 };
+        let p = s.plan(&hold(1));
+        s.went_through(&hold(1), &p);
+        assert!(s.late_refresh(&hold(1)));
+        let p = s.plan(&hold(2));
+        assert_eq!(p.kind, Kind::Cached);
+        s.went_through(&hold(2), &p);
+        // The game resets at hold 3: the answer to hold 2's frame (the old scene) is not stored, and hold 3 refreshes.
+        s.reset_edit();
+        assert!(!s.late_refresh(&hold(2)), "the old scene's answer is refused");
+        let p = s.plan(&hold(3));
+        assert_eq!(p.kind, Kind::Refresh, "the reset frame gets no edit of the frame before it");
+        s.went_through(&hold(3), &p);
+        // The hold after it takes the answer to the reset frame again.
+        assert!(s.late_refresh(&hold(3)));
+        assert_eq!(s.plan(&hold(4)).kind, Kind::Cached);
     }
 
     #[test]

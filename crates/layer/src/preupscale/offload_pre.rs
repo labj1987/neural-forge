@@ -1220,10 +1220,11 @@ impl HoldSide {
                 "{UNSENDABLE_HOLDS} frames in a row and more than a second had no motion vectors, no jitter or no room for the edit cache: nothing can carry the other GPU's edit to the next frame"
             ));
         }
-        let plan = self.cadence.hold(h.hold, send && self.serving());
+        let mut plan = self.cadence.hold(h.hold, send && self.serving());
+        // At a hold the game reset, the answer to the frame before is the old scene's: not taken (it still sends).
         if plan.take {
             if let Some((sent, _)) = &self.sent {
-                state.late_refresh(sent);
+                plan.take = state.late_refresh(sent);
             }
         }
         plan

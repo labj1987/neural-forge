@@ -4192,7 +4192,7 @@ pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
 fn running_line(guard: Option<&str>, after_dlss_on_game_gpu: bool) -> String {
     let guard = guard.map(|why| format!(" ({why})")).unwrap_or_default();
     if after_dlss_on_game_gpu {
-        format!("second GPU: not used here: Ray Reconstruction is on, so the model runs on the game's GPU after DLSS{guard}; the second GPU takes only the model before DLSS")
+        format!("second GPU: not used here: the model runs on the game's GPU after DLSS{guard}; the second GPU covers only before DLSS")
     } else {
         format!("native network running{guard}")
     }
@@ -4284,7 +4284,7 @@ pub(crate) fn apply_scene_cut(effect: super::scene_cut::Effect, native: Option<&
 fn apply_game_reset<F: Copy + PartialEq>(gap: &mut HistoryGap<F>, edit: Option<&mut super::cache::State>) {
     gap.game_reset();
     if let Some(e) = edit {
-        e.drop_edit();
+        e.reset_edit();
     }
 }
 
@@ -5530,8 +5530,15 @@ mod tests {
         assert_eq!(super::running_line(Some("lower"), false), "native network running (lower)");
         let rr = super::running_line(None, true);
         assert!(rr.starts_with("second GPU: "), "doctor reports it with the second GPU's lines: {rr}");
-        assert!(rr.contains("the game's GPU after DLSS") && rr.contains("only the model before DLSS"), "{rr}");
+        assert!(rr.contains("the game's GPU after DLSS") && rr.contains("covers only before DLSS"), "{rr}");
         assert!(super::running_line(Some("lower"), true).contains("after DLSS (lower);"));
+        // Every variant fits the channel's field whole (a cut line would read as changed at every hold).
+        for guard in [None, Some(super::super::vram_guard::NOTE_SMALL), Some(super::super::vram_guard::NOTE_PAUSED)] {
+            for after in [false, true] {
+                let line = super::running_line(guard, after);
+                assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
+            }
+        }
     }
     use super::*;
 
