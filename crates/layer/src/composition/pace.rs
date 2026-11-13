@@ -19,9 +19,12 @@
 //! when the answer is in): the present's own binary semaphore would then sit behind a wait whose signal is not
 //! submitted yet, which the validation layer refuses (VUID-vkQueueSubmit-pWaitSemaphores-03238,
 //! VUID-vkQueuePresentKHR-pWaitSemaphores-03268), also when the semaphore is signalled by an ungated submission
-//! behind the gated one. MAKO's host is another process, whose signal the game's device never sees pending; here it
-//! was built, measured against the validation layer and removed (docs/NATIVE_BACKEND.md has what remains to try:
-//! a sync-fd semaphore exported after the other device's own submit).
+//! behind the gated one. MAKO's host is another process, whose signal the game's device never sees pending. What
+//! this module has instead, opt-in with `NEURAL_FORGE_OFFLOAD_PACING=gpu` ([`gpu_wait_wanted`]), is a wait on the
+//! other device's own submission: the server exports a sync fd after it has submitted the frame ([`publish`]), and
+//! the compose and the next send import it and wait for it on the GPU. That signal is always submitted already, so
+//! the validation layer has nothing to refuse; but nothing can release such a wait, so a hung other GPU would stall
+//! the game's queue, and the default stays the relay with the answer waited for on the game's thread.
 //!
 //! The releaser is the relay itself: a frame whose copy does not finish or whose answer does not come within its
 //! budget is resolved without one ([`Pacer::lost`] from then on: the present goes back to its own waits, which have
@@ -42,8 +45,9 @@ const GPU_WAIT: Duration = crate::FENCE_WAIT_TIMEOUT;
 /// answer needs (the warm-up, the give-up, the retry) stays where it is, on the present's own path.
 pub(crate) const PACE_AFTER: u32 = 30;
 
-/// The devices created with `VK_KHR_external_semaphore_fd` enabled (`lib.rs`, at their creation; the offload device
-/// in `offload::Offload::create`): a sync fd can be exported from, and imported on, those.
+/// The devices set up for the wait on the GPU: created with `VK_KHR_external_semaphore_fd` enabled while it is chosen
+/// ([`gpu_wait_wanted`]; `lib.rs`, at their creation; the offload device in `offload::Offload::create`): a sync fd
+/// can be exported from, and imported on, those.
 static SEMAPHORE_FD: Mutex<Vec<vk::Device>> = Mutex::new(Vec::new());
 
 /// Notes that `device` has `VK_KHR_external_semaphore_fd` (`on`), or forgets it (at its destruction).
@@ -90,12 +94,21 @@ pub(crate) fn take_published(channel: usize, slot: usize, req: u32) -> Option<Su
 }
 
 /// `NEURAL_FORGE_OFFLOAD_PACING`: `cpu` keeps every wait of the delayed present on the game's thread (as before
-/// 4.4.0); `relay` hands the frames to the relay and waits for each answer on the game's thread; anything else, or
-/// unset, also waits for the answer on the GPU where both devices have sync-fd semaphores.
+/// 4.4.0); unset (or anything else) hands the frames to the relay and waits for each answer on the game's thread;
+/// `gpu` (experimental) also waits for the answer on the GPU where both devices can pass sync-fd semaphores.
+///
+/// The GPU wait is opt-in: once the game's queue waits on the other GPU's sync fd, nothing can release it, so a hung
+/// or slow other GPU stalls the game's queue (a frozen game), where the waits on the game's thread give up after
+/// their budget. Only with it are sync-fd semaphores asked for on either device (`lib.rs`, `offload.rs`) and the
+/// server's frames exported (`native_post`).
 pub(crate) fn gpu_wait_wanted() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_PACING").is_none_or(|v| !v.trim().eq_ignore_ascii_case("relay")));
-    *ON && wanted()
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| gpu_wait_in(neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_PACING").as_deref()));
+    *ON
+}
+
+/// [`gpu_wait_wanted`] for the variable's value `v`.
+fn gpu_wait_in(v: Option<&str>) -> bool {
+    v.is_some_and(|v| v.trim().eq_ignore_ascii_case("gpu"))
 }
 
 /// `NEURAL_FORGE_OFFLOAD_PACING` is not `cpu`: the delayed present hands its frames to the relay.
@@ -607,6 +620,18 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wait on the GPU cannot be released, so it is only ever chosen by name: unset and every other value keep the
+    /// answer's wait on the game's thread.
+    #[test]
+    fn the_gpu_wait_is_opt_in() {
+        for off in [None, Some("relay"), Some("cpu"), Some(""), Some("1"), Some("on")] {
+            assert!(!gpu_wait_in(off), "{off:?} does not choose the GPU wait");
+        }
+        for on in ["gpu", "GPU", " gpu "] {
+            assert!(gpu_wait_in(Some(on)), "{on:?} chooses it");
+        }
+    }
 
     /// The channel's request side for the relay's tests: requests are numbered from 1, answered when the test says
     /// so, and fit when it says so; submitted on "the other device" when the test hands a fd over.

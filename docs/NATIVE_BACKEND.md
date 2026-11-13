@@ -1785,10 +1785,12 @@ that has not been made is not; also through the queue's order, with the present 
 submission behind the gated one. (The first before-DLSS version had the same end with a host-set event,
 VUID-vkSetEvent-event-09543.)
 
-What the rule allows is a wait on a signal that *is* submitted: the other device's own submission of the frame.
-Where both devices have `VK_KHR_external_semaphore_fd` with `SYNC_FD` (added to the offload device where the GPU
-has it, and to the game's device by the layer's device hook when `NEURAL_FORGE_OFFLOAD_GPU` is set;
-`pace::has_semaphore_fd`), and the other device imports the regions (its frame writes the answer itself):
+What the rule allows is a wait on a signal that *is* submitted: the other device's own submission of the frame. It
+is opt-in and experimental, with `NEURAL_FORGE_OFFLOAD_PACING=gpu` (`pace::gpu_wait_wanted`; the releaser below says
+why it is not the default). Then, where both devices have `VK_KHR_external_semaphore_fd` with `SYNC_FD` (added to
+the offload device where the GPU has it, and to the game's device by the layer's device hook, only with the GPU wait
+chosen and `NEURAL_FORGE_OFFLOAD_GPU` set; `pace::has_semaphore_fd`), and the other device imports the regions (its
+frame writes the answer itself):
 
 1. the server's last submission of a frame (`native_post::evaluate`: the network frame; an HDR10 frame's conversion
    comes before it) signals an exportable binary semaphore, and its sync fd, exported right after the submit, is
@@ -1803,8 +1805,9 @@ has it, and to the game's device by the layer's device hook when `NEURAL_FORGE_O
 
 Fall-backs to the wait on the game's thread: either device without the extension, staged regions on the other
 device, an fd that cannot be exported (the semaphore is then not signalled again), duplicated or imported, an
-answer that will not fit (never gated), `NEURAL_FORGE_OFFLOAD_PACING=relay`. `NEURAL_FORGE_OFFLOAD_PACING=cpu` keeps
-all three waits on the game's thread. Only the zero-copy pair has any of this (the CPU pairs of
+answer that will not fit (never gated), and the pacing not set to `gpu` (unset or `relay`: the default).
+`NEURAL_FORGE_OFFLOAD_PACING=cpu` keeps all three waits on the game's thread. Only the zero-copy pair has any of
+this (the CPU pairs of
 `delayed_present_cpu` do not).
 
 **The releaser.** Every wait of the relay's own is bounded; a frame whose copy does not finish or whose answer does
@@ -1818,8 +1821,10 @@ waits for the relay first (`leave_delayed`), and the compose's teardown ends it 
 come: an fd exists only for a submission that was made, and such a submission finishes or its device is lost,
 which signals its fence too. What that leaves: a frame the server gives up on after its submit (a counter-chain
 timeout, a lost device) is composed once with whatever is in the answer region, and a submission that hangs on the
-other GPU holds the game's queue for as long (on the game's thread it held the present for `SYNC_BUDGET` and then
-let the frame through). Not seen in any run; on two different GPUs not run at all.
+other GPU holds the game's queue for as long: a hung or very slow other GPU freezes the game, where on the game's
+thread the present waits `SYNC_BUDGET` and then lets the frame through (a hitch of a quarter of a second). Not seen
+in any run, and on two different GPUs not run at all; that is why the wait on the GPU is opt-in
+(`NEURAL_FORGE_OFFLOAD_PACING=gpu`) and the default is the relay with the answer waited for on the game's thread.
 
 **What it changes.** With the relay alone the game's thread no longer waits for its own GPU at each present, and
 waits for the answer only as long as the other GPU is behind the game. With the wait on the GPU it waits only until
@@ -1835,8 +1840,8 @@ while it ran, frame generation on; the `[offload]` summary's time of the game's 
 | Pacing | Game's thread, per present | Presented | On the second device | Notes |
 |---|---|---|---|---|
 | `NEURAL_FORGE_OFFLOAD_PACING=cpu` (all three waits on the game's thread) | 31.6-32.2 ms | 31.4-31.7 fps | 28-30 ms a frame | 600 of 600 presents with the answer |
-| `=relay` (the copy's wait with the relay) | 32.3-32.9 ms (31.1-33.0 in a second run) | 29.2-30.8 fps (31.1) | 29.6-30.2 ms | 600 of 600 with the answer; 0 waited on the GPU |
-| unset (the answer waited for on the GPU, sync fd) | 32.5-33.5 ms | 29.3-30.2 fps | 30.1-31.0 ms | 600 of 600 with the answer, 600 of 600 composes waiting on the GPU; no export or import refused |
+| unset or `=relay`, the default (the copy's wait with the relay) | 32.3-32.9 ms (31.1-33.0 in a second run) | 29.2-30.8 fps (31.1) | 29.6-30.2 ms | 600 of 600 with the answer; 0 waited on the GPU |
+| `=gpu` (the answer waited for on the GPU, sync fd) | 32.5-33.5 ms | 29.3-30.2 fps | 30.1-31.0 ms | 600 of 600 with the answer, 600 of 600 composes waiting on the GPU; no export or import refused |
 
 One GPU cannot show the gain: the second device's network takes about 30 ms beside the game, four times the
 game's own frame, so the pipeline is full whichever way it is paced, the game's thread waits a frame's worth of the

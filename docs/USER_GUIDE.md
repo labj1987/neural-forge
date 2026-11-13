@@ -408,7 +408,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_PROBE_IMAGE=<kernel>[+],...` | layer | Testing aid: copy the images a named CUDA launch reads, before it (or after it with `+`), once, into `captures/probe-<ms>/`. |
 | `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` | layer | Gives every network activation its own allocation again instead of sharing memory by lifetime (more video memory, same result). |
 | `NEURAL_FORGE_OFFLOAD_GPU=same\|N\|vendor:device[@pci-address]` | layer | Runs the model on another GPU (before DLSS, after DLSS with Ray Reconstruction or with Placement set to After DLSS, or on the finished frame): the one at index `N` (decimal) of the list the layer log prints when the game creates its device on a machine with more than one GPU (`[offload] GPU N: ...`), or the one with that PCI vendor and device ID (4 hexadecimal digits each, `10de:2c02`; add `@0000:73:00.0` where two cards share the ID). `same` puts it on a second device of the game's own GPU, which tests the path and saves nothing. Unset or `off`: the game's GPU. See [The model on a second GPU](#the-model-on-a-second-gpu). |
-| `NEURAL_FORGE_OFFLOAD_PACING=cpu\|relay` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model on the finished frame. `cpu`: the game's thread makes every wait of a present itself (for its GPU's copy of the frame and for the answer), as before 4.4.0. `relay`: a helper thread waits for the copy, the game's thread for the answer. Unset: the game's GPU also waits for the answer (where both GPUs have sync-file semaphores), and the game's thread for neither. |
+| `NEURAL_FORGE_OFFLOAD_PACING=cpu\|relay\|gpu` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model on the finished frame. Unset or `relay`: a helper thread waits for the game's GPU to copy each frame out, the game's thread for the answer. `cpu`: the game's thread makes every wait of a present itself, as before 4.4.0. `gpu` (experimental, for two-GPU systems, not measured on two different cards): the game's GPU waits for the answer instead of the game's thread, where both GPUs have sync-file semaphores; a second GPU that hangs then freezes the game instead of costing it a quarter-second hitch. |
 | `NEURAL_FORGE_OFFLOAD_MOTION=float` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: the motion vectors cross to the other GPU as two floats a texel (twice the bytes), as before 4.4.0. Unset, they cross as two halves a texel, which is what DLSS's vectors are. |
 | `NEURAL_FORGE_OFFLOAD_TEST_FAIL=N` | layer | Tests only, with `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: the `N`th frame fails on the other GPU, so the model goes back to the game's GPU. |
 | `NEURAL_FORGE_TEST_REBUILD_AT=N:S` | layer | Tests only: from the `N`th DLSS launch nothing is held for `S` seconds, then the hold's resources are built again as for a change of DLSS's render size. |
@@ -477,10 +477,11 @@ through system memory and is shown one frame later than on one GPU: the game's G
 second GPU works on this one. The frame rate is then bounded by the second GPU's time per frame (the network and the
 copies): a second GPU that takes longer per frame than the game holds the game back to its own rate. Once the answers
 come every frame (30 in a row), the game stops waiting at each present for its own GPU to copy the frame out (a helper
-thread does), and where both GPUs' drivers have sync-file semaphores (NVIDIA's do) it no longer waits for the answer
-either: its GPU waits for it before the frame is shown, and the game prepares the next frame meanwhile. It steps back
-to its own waits when an answer is late (`NEURAL_FORGE_OFFLOAD_PACING=relay` keeps the answer's wait in the game,
-`=cpu` all of them). Where a frame
+thread does); it still waits for the answer. It steps back to its own waits when an answer is late
+(`NEURAL_FORGE_OFFLOAD_PACING=cpu` keeps all of them in the game). `NEURAL_FORGE_OFFLOAD_PACING=gpu` is an
+experiment for two-GPU systems, not yet measured on two different cards: where both GPUs' drivers have sync-file
+semaphores (NVIDIA's do), the game's GPU waits for the answer before the frame is shown and the game prepares the
+next frame meanwhile; a second GPU that hangs then freezes the game instead of skipping the frame's edit. Where a frame
 comes back too late for its turn, or that could not be captured, is shown in its turn without the model's edit (after three failed captures in a row, the next 30 frames wait for their own answer instead). When the delay
 starts (the first frames, and again after the game stalled for a quarter of a second) one frame is shown twice.
 

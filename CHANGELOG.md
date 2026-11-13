@@ -13,12 +13,13 @@ first shipped them; their phase is kept as a subheading.
   says "second GPU: the model runs on ... before and after DLSS, its edits applied one frame later". The second GPU
   does both passes' work for every frame, one after the other, so the frame rate is bounded by the two together.
 - Finished frame on the second GPU: the game no longer waits at every present for its own GPU to finish copying the
-  frame out, nor for the second GPU's answer. A helper thread hands each frame to the second GPU once it is copied,
-  and the game's GPU itself waits for the answer before it shows the frame, so the game can already prepare the next
-  one. Frames are still shown one frame later, each with its own answer. It starts once 30 frames in a row were
-  answered and steps back by itself when an answer is late. The wait on the GPU needs a driver with sync-file
-  semaphores on both GPUs (NVIDIA has them); without, the game waits for the answer as before.
-  `NEURAL_FORGE_OFFLOAD_PACING=relay` keeps the answer's wait in the game, `=cpu` all of them.
+  frame out; a helper thread hands each frame to the second GPU once it is copied. The game still waits for the
+  second GPU's answer. Frames are still shown one frame later, each with its own answer. It starts once 30 frames in
+  a row were answered and steps back by itself when an answer is late. `NEURAL_FORGE_OFFLOAD_PACING=cpu` keeps every
+  wait in the game, as before.
+- Experimental, for systems with two GPUs: `NEURAL_FORGE_OFFLOAD_PACING=gpu` lets the game's GPU wait for the answer
+  instead of the game, where both GPUs' drivers have sync-file semaphores (NVIDIA's do). If the second GPU hangs, the
+  game then freezes instead of showing a frame without its edit, so it is off by default.
 - Before and after DLSS on the second GPU: the motion vectors sent with each frame are half the size (about 42 MB
   out per frame instead of 56 MB at 2560x1440 after DLSS, about 100 MB instead of 133 MB at 3840x2160). They are
   DLSS's own vectors, which are half precision to begin with, so the picture does not change.

@@ -1092,7 +1092,8 @@ fn paced_previous(
     // How long the game took from that present to this one, not counting the wait below: a late answer is not a stall.
     let age = req.posted.elapsed();
     let until = deadline + SYNC_BUDGET;
-    let on_gpu = crate::composition::pace::gpu_wait_wanted() && gpu.can_gate();
+    // (Only a device set up for the wait on the GPU can gate: `NEURAL_FORGE_OFFLOAD_PACING=gpu`, `pace::gpu_wait_wanted`.)
+    let on_gpu = gpu.can_gate();
     let ready = gpu.pacer().and_then(|p| if on_gpu { p.wait_ready(req.token, until) } else { p.wait_resolved(req.token, until).map(Ready::Resolved) });
     let (valid, mut gate) = match ready {
         Some(Ready::Resolved(valid)) => (valid, None),
