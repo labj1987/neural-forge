@@ -4422,6 +4422,12 @@ unsafe fn native_hold(
     // the frame before it, as a cached hold does. Only the hold before DLSS, with the edit cache on (it is what
     // carries the edit), and not for a cache dump (which needs the network's answer to its own frame).
     let before_dlss = ctx.as_ref().is_none_or(|c| c.point.hold.stage != super::placement::Stage::Upscaled);
+    if !before_dlss && super::offload_pre::wanted() {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[offload] NEURAL_FORGE_OFFLOAD_GPU: the hold after DLSS's output (the placement with Ray Reconstruction) runs the model on the game's GPU; the other GPU takes the hold before DLSS and the finished frame");
+        }
+    }
     let offloaded = super::offload_pre::wanted()
         && before_dlss
         && arm.is_none()
@@ -4682,6 +4688,19 @@ unsafe fn native_hold(
             result.miss = Some(WAITING);
             return result;
         }
+        if super::offload_pre::serving_device(device.handle()) {
+            // Another set of hold resources of this device has the offload device (and with it the process's one
+            // network): these wait for it, and say so once.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!(
+                    "[offload] before DLSS: the other GPU serves another render size of this game; frames of this one go to DLSS as they are until it is free"
+                );
+            }
+            res.native = Some(native);
+            result.miss = Some("the second GPU is serving another render size");
+            return result;
+        }
         // SAFETY: the game's live device; the offload device was made with it.
         match unsafe { super::offload_pre::HoldSide::build(device, instance, physical_device, res.id, target.width, target.height) } {
             Ok(side) => res.offpre = Some(side),
@@ -4698,9 +4717,9 @@ unsafe fn native_hold(
     // Given up meanwhile (the worker's rules): this hold still goes as an offloaded one, without an answer; the
     // next runs the network here.
     let offloaded = offloaded && res.offpre.is_some();
-    if !offloaded && res.offpre.is_some() && !others_outstanding && !inline {
-        // The split hold's work was waited for above: the offload's side goes (its worker ends, the other device's
-        // side is freed and the network comes back through the loader's lend).
+    if res.offpre.is_some() && !super::offload_pre::wanted() && !others_outstanding {
+        // Given up, and nothing recorded with these resources may still run (the split hold's work was waited for
+        // above): the offload's side goes (its worker ends and the other device's side is freed).
         if let Some(side) = res.offpre.take() {
             // SAFETY: idle, as just said.
             unsafe { side.destroy(device) };
@@ -4926,21 +4945,9 @@ unsafe fn native_hold(
     // against that frame (still in place: before this hold's own capture), and the gate.
     let receive = |cmd: vk::CommandBuffer| {
         let (Some(side), Some(seq), Some(hp), Some(e), Some(push)) = (off_side, take_seq, hdr_pass, edit, late_push.as_ref()) else { return };
-        let before = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ | vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
         // SAFETY: recording into the hold's own buffer or DLSS's; everything bound above and live.
         unsafe {
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[before],
-                &[],
-                &[hp.answer_to_general()],
-            );
-            hp.record_answer_in(device, cmd, side.exchange.answer_buffer(), side.exchange.layout.answer_at);
+            side.exchange.record_receive(device, cmd, &[hp.answer_to_general()], &|region, at| hp.record_answer_in(device, cmd, region, at));
             e.record_capture_late(device, cmd, push);
             side.exchange.record_gate(device, cmd, seq);
         }
@@ -5298,6 +5305,10 @@ unsafe fn native_hold(
     result.timing.prep = Some(t_hold.elapsed());
     if let Some(d) = res.depth.as_mut() {
         d.valid = None;
+    }
+    // Offloaded: the frame's parameters are there before its send can run.
+    if let (Some(side), Some(meta)) = (res.offpre.as_mut().filter(|_| offloaded), off_meta.clone()) {
+        side.queue_meta(meta);
     }
     if crate::note_vk(device.handle(), submit(super::Which::Capture, res.capture_cmd, vk::Fence::null())).is_err() {
         if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {

@@ -200,7 +200,8 @@ struct Prog {
     handed: Option<u32>,
     /// The frame the worker finished last, and whether its answer is complete in IN.
     finished: Option<(u32, bool)>,
-    /// The frame a submit gave up waiting for: its answer is never taken.
+    /// The newest frame a submit gave up waiting for: its answer, and that of every frame sent before it, is never
+    /// taken (sequence numbers only grow; the wrap after four thousand million frames costs one answer).
     abandoned: Option<u32>,
     /// The worker runs no frames any more.
     stopped: bool,
@@ -228,7 +229,7 @@ impl Progress {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                p.abandoned = Some(seq);
+                p.abandoned = Some(p.abandoned.map_or(seq, |a| a.max(seq)));
                 return false;
             }
             p = self.changed.wait_timeout(p, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
@@ -252,7 +253,7 @@ impl Progress {
     /// abandoned it: the answer is not taken.
     fn finish(&self, seq: u32, ok: bool) -> bool {
         let mut p = self.lock();
-        let kept = p.abandoned != Some(seq);
+        let kept = p.abandoned.is_none_or(|a| seq > a);
         p.finished = Some((seq, ok && kept));
         self.changed.notify_all();
         kept
@@ -521,23 +522,26 @@ impl Exchange {
         settle_and_mark(&self.progress, self.inn.ptr, plan)
     }
 
-    /// The answer region's buffer on the game's device (the answer at the layout's `answer_at`).
-    pub(crate) fn answer_buffer(&self) -> vk::Buffer {
-        self.inn.buffer
-    }
-
     /// The submit [`Self::at_submit`] was called for went to the driver: its send can run from here on.
     pub(crate) fn handed(&self) {
         self.progress.handed();
     }
 
-    /// Records the receive of a hold that takes the answer: the answer copied into `answer` from its start,
-    /// ordered before whatever reads it next. Nothing waits here ([`Self::at_submit`] did).
+    /// Records the receive of a hold that takes the answer: the answer region ordered after the host's and the
+    /// other GPU's writes (with `images`' transitions), `copy` (the hold's copy out of the region: its buffer and
+    /// the answer's offset in it), and the copy ordered before whatever reads it next. Nothing waits here
+    /// ([`Self::at_submit`] did).
     ///
     /// # Safety
-    /// `cmd` is recording on the game's device, outside a render pass; `answer` is at least the layout's answer size.
-    #[cfg(test)]
-    pub(crate) unsafe fn record_receive(&self, device: &ash::Device, cmd: vk::CommandBuffer, answer: vk::Buffer) {
+    /// `cmd` is recording on the game's device, outside a render pass; `copy` records a transfer out of the buffer
+    /// it is given, at most the layout's answer size from that offset.
+    pub(crate) unsafe fn record_receive(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        images: &[vk::ImageMemoryBarrier],
+        copy: &dyn Fn(vk::Buffer, u64),
+    ) {
         // SAFETY: the contract.
         unsafe {
             let before = vk::MemoryBarrier::default()
@@ -550,14 +554,9 @@ impl Exchange {
                 vk::DependencyFlags::empty(),
                 &[before],
                 &[],
-                &[],
+                images,
             );
-            device.cmd_copy_buffer(
-                cmd,
-                self.inn.buffer,
-                answer,
-                &[vk::BufferCopy { src_offset: self.layout.answer_at, dst_offset: 0, size: self.layout.sizes.answer }],
-            );
+            copy(self.inn.buffer, self.layout.answer_at);
             let after = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
@@ -700,6 +699,8 @@ pub(crate) struct Worker {
     quit: Arc<AtomicBool>,
     mode: Arc<AtomicU8>,
     pub counters: Arc<Counters>,
+    /// Why the hold's side wants the offload given up ([`Self::give_up`]), until the worker took it.
+    asked: Arc<Mutex<Option<String>>>,
     thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
@@ -742,17 +743,25 @@ impl Worker {
         let quit = Arc::new(AtomicBool::new(false));
         let mode = Arc::new(AtomicU8::new(SERVING));
         let counters = Arc::new(Counters::default());
-        let (q, m, c) = (quit.clone(), mode.clone(), counters.clone());
+        let asked = Arc::new(Mutex::new(None));
+        let (q, m, c, a) = (quit.clone(), mode.clone(), counters.clone(), asked.clone());
         let game = link.device.handle();
-        let thread = std::thread::Builder::new().name("nf-offload-pre".into()).spawn(move || serve(&link, runner, late, dims, &q, &m, &c, &give_up)).ok()?;
+        let thread =
+            std::thread::Builder::new().name("nf-offload-pre".into()).spawn(move || serve(&link, runner, late, dims, &q, &m, &a, &c, &give_up)).ok()?;
         let thread = Arc::new(Mutex::new(Some(thread)));
         WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((game, quit.clone(), thread.clone()));
-        Some(Self { quit, mode, counters, thread })
+        Some(Self { quit, mode, counters, asked, thread })
     }
 
     /// Whether frames are run on the other GPU (else every send is finished at once, without an answer).
     pub(crate) fn serving(&self) -> bool {
         self.mode.load(Ordering::Acquire) == SERVING
+    }
+
+    /// Gives the offload up from the hold's side (`why`): the worker stops running frames and tells its owner, as
+    /// for a failure of its own.
+    pub(crate) fn give_up(&self, why: String) {
+        *self.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
     }
 
     /// Stops the worker: no submit waits for it any more ([`Progress::settle`]), and the holds still recorded with
@@ -786,6 +795,7 @@ fn serve(
     dims: (u32, u32),
     quit: &AtomicBool,
     mode: &AtomicU8,
+    asked: &Mutex<Option<String>>,
     counters: &Counters,
     give_up: &GiveUp,
 ) {
@@ -797,7 +807,17 @@ fn serve(
     };
     let mut idle = 0u32;
     let mut last_sent: Option<Instant> = None;
+    let mut retired = false;
     while !quit.load(Ordering::Acquire) {
+        // Asked from the hold's side to give up ([`Worker::give_up`]).
+        if let Some(why) = asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            stop_serving(why);
+        }
+        // Given up: the runner lets go of what the game's GPU needs back, once.
+        if !retired && mode.load(Ordering::Acquire) != SERVING {
+            runner.gave_up();
+            retired = true;
+        }
         // SAFETY: the game's device and its event, live while the worker runs.
         match unsafe { device.get_event_status(link.sent) } {
             Ok(true) => {}
@@ -827,13 +847,16 @@ fn serve(
             match unsafe { runner.run(seq, link.out, link.inn, &link.layout) } {
                 Ran::Answered => ok = true,
                 Ran::Skipped => {}
-                Ran::Failed(why) => {
-                    stop_serving(why);
-                    runner.gave_up();
-                }
+                Ran::Failed(why) => stop_serving(why),
             }
         }
-        if link.progress.finish(seq, ok) && ok {
+        // Another send ran while this frame did (a hold whose submit did not settle this one: two holds in one
+        // submit, or after an abandoned frame): the game's GPU wrote OUT under the runner, the frame is not this one's.
+        // SAFETY: as above.
+        let torn =
+            ok && (unsafe { link.out.cast::<u32>().add(OUT_SEQ).read_volatile() } != seq || matches!(unsafe { device.get_event_status(link.sent) }, Ok(true)));
+        let kept = link.progress.finish(seq, ok && !torn);
+        if ok && kept && !torn {
             let took = now.elapsed();
             counters.answered.fetch_add(1, Ordering::Relaxed);
             counters.answer_us.fetch_add(took.as_micros() as u64, Ordering::Relaxed);
@@ -841,7 +864,7 @@ fn serve(
         } else {
             counters.late.fetch_add(1, Ordering::Relaxed);
             if ok {
-                // Abandoned by the hold that waited for it.
+                // Abandoned by the hold that waited for it, or written over while it ran.
                 runner.abandoned();
             }
         }
@@ -850,7 +873,6 @@ fn serve(
             if mode.load(Ordering::Acquire) == SERVING && ok {
                 if let Some(why) = rule.note(answer, interval, dims) {
                     stop_serving(why);
-                    runner.gave_up();
                 }
             }
         }
@@ -926,6 +948,11 @@ fn imports(device: vk::Device) -> bool {
     IMPORTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&device)
 }
 
+/// Whether a worker serves the game's device `game` already (another set of hold resources has the offload device).
+pub(crate) fn serving_device(game: vk::Device) -> bool {
+    WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(d, _, _)| *d == game)
+}
+
 /// Whether the before-DLSS placement is asked onto another GPU and not given up (`NEURAL_FORGE_OFFLOAD_GPU`).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn wanted() -> bool {
@@ -954,6 +981,20 @@ pub(crate) struct HoldSide {
     sent: Option<(super::cache::Hold, super::cache::CachePush)>,
     resources: u64,
     holds: u64,
+    /// The hold planned last has not gone through yet: if it never does, what it planned is dropped at the next plan.
+    pending: bool,
+    /// Holds in a row whose frame could not be sent (no motion vectors, no jitter, no chained cache).
+    unsendable: u32,
+}
+
+/// This many holds in a row that cannot send their frame give the offload up: the game's frames do not have what
+/// the next frame needs to carry the edit, and the model would not run at all. One such hold now and then does not.
+pub(crate) const UNSENDABLE_HOLDS: u32 = 30;
+
+/// Whether `streak` holds in a row that could not send give the offload up, after one more that `can` or cannot.
+pub(crate) fn unsendable_gives_up(streak: &mut u32, can: bool) -> bool {
+    *streak = if can { 0 } else { streak.saturating_add(1) };
+    *streak == UNSENDABLE_HOLDS
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1027,7 +1068,7 @@ impl HoldSide {
             }
         );
         crate::logging::flush();
-        Ok(Self { exchange, cadence: Cadence::default(), worker, metas, snapshot, sent: None, resources, holds: 0 })
+        Ok(Self { exchange, cadence: Cadence::default(), worker, metas, snapshot, sent: None, resources, holds: 0, pending: false, unsendable: 0 })
     }
 
     /// Whether the other GPU runs the frames (else the offload is given up, and the holds run the network here).
@@ -1047,6 +1088,16 @@ impl HoldSide {
     /// Plans hold `h`: what it does with the exchange, and, when it takes the answer to the frame sent before it,
     /// that frame's refresh noted in the cache's `state` (before the hold's own plan is made there).
     pub(crate) fn plan(&mut self, state: &mut super::cache::State, h: &super::cache::Hold, send: bool) -> HoldPlan {
+        if std::mem::replace(&mut self.pending, true) {
+            // The hold planned before this one never went through (a miss after its plan): it sent nothing.
+            self.dropped();
+            self.pending = true;
+        }
+        if self.serving() && unsendable_gives_up(&mut self.unsendable, send) {
+            self.worker.give_up(format!(
+                "{UNSENDABLE_HOLDS} frames in a row had no motion vectors, no jitter or no room for the edit cache: nothing can carry the other GPU's edit to the next frame"
+            ));
+        }
         let plan = self.cadence.hold(h.hold, send && self.serving());
         if plan.take {
             if let Some((sent, _)) = &self.sent {
@@ -1056,8 +1107,22 @@ impl HoldSide {
         plan
     }
 
-    /// The hold planned as `plan` went through: its frame's parameters go to the worker, and it is the one the
-    /// next hold's capture measures against.
+    /// The parameters of the frame a hold is about to send, for the worker: before the send can run (the split
+    /// hold's capture submit), once per frame.
+    pub(crate) fn queue_meta(&mut self, meta: super::offload_server::FrameMeta) {
+        let mut q = self.metas.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if q.back().is_some_and(|m| m.seq == meta.seq) {
+            return;
+        }
+        // Frames whose buffers were never submitted leave theirs behind.
+        while q.len() > 64 {
+            q.pop_front();
+        }
+        q.push_back(meta);
+    }
+
+    /// The hold planned as `plan` went through: its frame's parameters go to the worker (unless queued already),
+    /// and it is the one the next hold's capture measures against.
     pub(crate) fn went_through(
         &mut self,
         h: &super::cache::Hold,
@@ -1065,14 +1130,10 @@ impl HoldSide {
         plan: &HoldPlan,
         meta: Option<super::offload_server::FrameMeta>,
     ) {
+        self.pending = false;
         self.sent = plan.send.map(|_| (*h, *push));
         if let Some(meta) = meta.filter(|_| plan.send.is_some()) {
-            let mut q = self.metas.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Frames whose buffers were never submitted leave theirs behind.
-            while q.len() > 64 {
-                q.pop_front();
-            }
-            q.push_back(meta);
+            self.queue_meta(meta);
         }
         self.holds += 1;
         if self.holds.is_multiple_of(600) {
@@ -1090,6 +1151,14 @@ impl HoldSide {
 
     /// The hold planned last recorded nothing after all.
     pub(crate) fn dropped(&mut self) {
+        self.pending = false;
+        // Its parameters, when they were queued before the send (the split hold's): the frame never ran.
+        if let Some(seq) = self.cadence.sent {
+            let mut q = self.metas.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.cadence.takeable.is_some() && q.back().is_some_and(|m| m.seq == seq) {
+                q.pop_back();
+            }
+        }
         self.cadence.dropped();
         self.sent = None;
     }
@@ -1235,6 +1304,38 @@ mod tests {
         let t = Instant::now();
         assert!(!p.settle(4, long));
         assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Two frames abandoned before the first finished: neither late answer is taken (one slot kept only the last).
+    #[test]
+    fn every_abandoned_frame_stays_abandoned() {
+        let p = Progress::default();
+        for seq in [1, 2] {
+            p.queue(seq);
+            p.handed();
+            assert!(!p.settle(seq, Duration::from_millis(2)));
+        }
+        assert!(!p.finish(1, true), "frame 1 was abandoned before frame 2 was");
+        assert!(!p.finish(2, true));
+        assert!(!p.settle(1, Duration::from_secs(30)) && !p.settle(2, Duration::from_secs(30)));
+        // The frames after them are answered again.
+        p.queue(3);
+        p.handed();
+        assert!(p.finish(3, true));
+        assert!(p.settle(3, Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn frames_that_cannot_be_sent_give_up_only_in_a_long_row() {
+        let mut streak = 0;
+        // One hold without vectors now and then does not.
+        for n in 0..200 {
+            assert!(!unsendable_gives_up(&mut streak, n % 10 != 0));
+        }
+        // A row of them does, once.
+        let gave_up: Vec<bool> = (0..2 * UNSENDABLE_HOLDS).map(|_| unsendable_gives_up(&mut streak, false)).collect();
+        assert_eq!(gave_up.iter().filter(|g| **g).count(), 1);
+        assert!(gave_up[UNSENDABLE_HOLDS as usize - 1]);
     }
 
     #[test]
@@ -1456,7 +1557,10 @@ mod tests {
                 d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
                 d.cmd_fill_buffer(cmd, self.stats.buffer, 14 * 4, 4, u32::from(plan.take));
                 if let Some(seq) = plan.settle.filter(|_| plan.take) {
-                    self.exchange.record_receive(d, cmd, self.answer.buffer);
+                    let (answer, size) = (self.answer.buffer, SIZES.answer);
+                    self.exchange.record_receive(d, cmd, &[], &|region, at| {
+                        d.cmd_copy_buffer(cmd, region, answer, &[vk::BufferCopy { src_offset: at, dst_offset: 0, size }])
+                    });
                     self.exchange.record_gate(d, cmd, seq);
                 }
                 if let Some(seq) = plan.send {
@@ -1583,6 +1687,24 @@ mod tests {
         // The stream goes on from the last frame sent.
         game.run(&[game.record(cadence.hold(4, true), 254)]);
         assert_eq!(game.landed(), (Some(253), true));
+        game.close(worker);
+    }
+
+    /// Two holds in one submit while the other GPU is still on the first's frame: the second's send writes OUT under
+    /// the runner, so the first frame's answer is not kept and the runner is told (its history starts afresh).
+    #[test]
+    fn a_frame_written_over_while_it_runs_is_not_answered() {
+        let Some((game, worker, _, gave_up, abandoned)) = rig(vec![1], None) else { return };
+        let mut cadence = Cadence::default();
+        let holds: Vec<_> = (1..=2u64).map(|hold| game.record(cadence.hold(hold, true), 700 + hold as u32)).collect();
+        game.run(&holds);
+        // Frame 2 is answered once the worker is past frame 1; hold 3 carries it.
+        std::thread::sleep(ANSWER_BUDGET + Duration::from_millis(400));
+        game.run(&[game.record(cadence.hold(3, false), 0)]);
+        assert_eq!(game.landed(), (Some(702), true));
+        assert_eq!(*abandoned.lock().unwrap(), vec![1], "frame 1 was written over by frame 2's send while it ran");
+        assert_eq!(worker.counters.answered.load(Ordering::Relaxed), 1);
+        assert!(gave_up.lock().unwrap().is_empty());
         game.close(worker);
     }
 
