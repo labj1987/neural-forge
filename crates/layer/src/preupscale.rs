@@ -112,6 +112,8 @@ pub(crate) mod offload;
 pub(crate) mod offload_pre;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod offload_server;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod offload_trial;
 pub(crate) mod placement;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_flow;
@@ -6614,6 +6616,11 @@ impl Session {
         }
         if result.native && result.evaluated {
             self.engaged = true;
+            // The model ran on the game's GPU while the trial against the other GPU measures it there.
+            #[cfg(target_arch = "x86_64")]
+            if result.wrote_back && offload_trial::running() && !offload_pre::serving_hold() {
+                offload_trial::local_hold(now);
+            }
         }
         self.share_post_off();
         let holding = self.holding();

@@ -15,8 +15,12 @@ first shipped them; their phase is kept as a subheading.
 - It works as before DLSS does: each of DLSS's output frames goes to the second GPU and its edit is applied to the
   next one, carried along the game's motion vectors. No frame is shown later; the edit is one frame old.
 - The network runs at the output resolution there, so the second GPU needs longer per frame than before DLSS, and
-  the frame rate is bounded by it. This is not yet measured at 4K or on two different cards; if the second GPU is too
-  slow, the model returns to the game's GPU. At 4K the small network or a lower Model resolution helps.
+  the frame rate is bounded by it. At 4K the small network or a lower Model resolution helps.
+- Before or after DLSS, when the game keeps waiting for the second GPU, the model is now tried once on the game's GPU
+  for a few seconds, and stays where the frame rate is higher (the log gives both). Where the frames cross system
+  memory slowly, the game's own GPU is often faster: on an RTX 4090 with an RTX 5080 beside it, Cyberpunk 2077 with
+  Ray Reconstruction ran at 27-36 fps with the 5080 and at its 75 fps cap on the 4090.
+  `NEURAL_FORGE_OFFLOAD_TRIAL=off` keeps the model on the second GPU.
 - The Status tab says "second GPU: the model runs on ... after DLSS, its edit applied one frame later". The same
   rules send the model back to the game's GPU when the second GPU cannot keep up or fails.
 - With passes both before and after DLSS in one frame, the second GPU is not used: every pass runs on the game's GPU,
