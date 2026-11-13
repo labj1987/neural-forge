@@ -337,7 +337,14 @@ impl PreRunner {
         let history = f.native.begin_frame(built.network, meta.history);
         let (frame_cmds, later) = f.native.frame_graphs(&graphs, history, meta.jitter, meta.mvec_scale, &passes);
         let later = if more { later } else { Vec::new() };
-        let sequence = f.native.later_sequence(&later);
+        // The copies between the passes, recorded for this frame (as the split hold does): `X` saves the capture and
+        // puts pass 1's answer (or its blend at a pass feedback below 1) where pass 2 reads, `Y` the same for each
+        // further pass, `R` puts the capture back. The encoded image is in GENERAL once `up` ran.
+        // SAFETY: built above and not pending (every frame is waited for); the encoded image is this device's.
+        let sequence = match unsafe { f.native.record_later(device, f.hdr.encoded_image(), f.hdr.encoded_view(), f.hdr.padded_region(), &passes, &later) } {
+            Ok(s) => s,
+            Err(_) => return Err(failed("recording the copies between the network's passes failed on the other GPU")),
+        };
         let (o, i) = self.regions.as_ref().expect("made above");
         let texels = u64::from(meta.width) * u64::from(meta.height);
         // SAFETY: the regions as the contract; the device's own command buffers, not pending.

@@ -22,7 +22,7 @@ first shipped them; their phase is kept as a subheading.
 - With passes both before and after DLSS in one frame, the second GPU is not used: every pass runs on the game's GPU,
   and the Status tab says so. (In 4.2.0 the second GPU took the pass before DLSS and the passes after DLSS did not
   run.)
-- With more than one pass, every pass now runs on the second GPU, before or after DLSS. Until now only the first pass
+- With more than one pass, every pass now runs on the second GPU, before or after DLSS. In 4.2.0 only the first pass
   ran there and the others were left out.
 - When the model goes back to the game's GPU because its frames cannot be sent to the second GPU, the Status tab and
   the log now say what was missing (the game's motion vectors, their layout, the jitter or the edit cache's room).

@@ -1817,8 +1817,11 @@ own for the frame's extent; the regions imported as host memory or staged; one f
 (`NativePass::begin_frame`); what the CPU decides per frame comes in a queue keyed by the frame's sequence number
 (`FrameMeta`). Every pass of the stage runs there, as on the game's device: the later passes' buffers
 (`NativePass::ensure_more`) are built on the other device, the game's device builds none for an offloaded hold, and
-the frame submits `X`, pass 2, `Y` and each further pass, `R` between pass 1 and the answer's copy out
-(`NativePass::later_sequence`); the log says "all N passes of the stage run on the other GPU" once per count. Until
+the runner records the copies between the passes every frame as the split hold does (`NativePass::record_later`:
+`record_copies`, with the pass feedback) and submits `X`, pass 2, `Y` and each further pass, `R` between pass 1 and
+the answer's copy out (`NativePass::later_sequence`; the test `the_other_gpus_later_passes_match_the_split_holds`
+compares its answer with the split hold's for two and three passes at a feedback of 1 and 0.5); the game's device
+builds pass 1's lanes only; the log says "all N passes of the stage run on the other GPU" once per count. Until
 4.3.0 only the stage's first pass ran there and the others were dropped (#63: three passes after DLSS took 34 ms on the
 other device, as one does). One `HoldSide` (exchange, worker, runner, loader) per hold
 resources: a change of render extent loads the network again on the other device.
