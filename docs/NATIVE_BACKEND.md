@@ -2078,7 +2078,10 @@ as `0x7e007e00` (a half NaN in both), the one pattern the pack writes that is no
 clamped to the half's finite range first, as the cache's own read of DLSS's vectors is (`half_vector`).
 `the_pack_gives_dlss_s_halves_back_exactly_and_keeps_the_nan_marker` runs the pack over every finite half, through
 four scales (1, 1485, 835, 0.0006734): each texel comes back as exactly the half it started as, so what the other GPU
-reads is DLSS's vectors bit for bit, where the f32 path read them one rounding step off. A field accumulated over
+reads is DLSS's vectors bit for bit, where the f32 path read them one rounding step off. That is proven on the test
+driver (lavapipe), which rounds `packHalf2x16` to nearest; Vulkan does not require round-to-nearest there, so a
+driver that rounds otherwise may give the neighbouring half for some texels (a step of 1/2048 of the value). A field
+accumulated over
 more than one hold (none is sent today) would be rounded to the half's 11 bits: 1/64 px at a motion of 16 to 32 px,
 1/16 px at 64 to 128.
 
