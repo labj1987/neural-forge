@@ -17,7 +17,8 @@ first shipped them; their phase is kept as a subheading.
 - The network runs at the output resolution there, so the second GPU needs longer per frame than before DLSS, and
   the frame rate is bounded by it. At 4K the small network or a lower Model resolution helps.
 - Before or after DLSS, when the game keeps waiting for the second GPU, the model is now tried once on the game's GPU
-  for a few seconds, and stays where the frame rate is higher (the log gives both). Where the frames cross system
+  for a few seconds, and stays where the frame rate is higher until the game restarts (the log gives both, and the
+  Status tab says which). Where the frames cross system
   memory slowly, the game's own GPU is often faster: on an RTX 4090 with an RTX 5080 beside it, Cyberpunk 2077 with
   Ray Reconstruction ran at 27-36 fps with the 5080 and at its 75 fps cap on the 4090.
   `NEURAL_FORGE_OFFLOAD_TRIAL=off` keeps the model on the second GPU.

@@ -186,15 +186,6 @@ fn replaces(now: &State, new: &State) -> bool {
     )
 }
 
-/// The measured trial on the game's GPU (`super::offload_trial`) found the other GPU as fast or faster: its fall-back
-/// ends, and the held placements ask for the other GPU again (`super::offload_pre::wanted`).
-pub(crate) fn resume() {
-    let mut now = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if matches!(*now, State::FellBack(_)) {
-        *now = State::Off;
-    }
-}
-
 /// The offload was given up for the session: every device of the process runs the network on its own GPU from then on.
 pub(crate) fn given_up() -> bool {
     matches!(state(), State::FellBack(_))

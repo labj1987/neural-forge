@@ -4232,7 +4232,7 @@ fn fake_chain_timeout(frames: u64) -> Option<(u32, String)> {
 /// What the Status tab says about the native backend after a hold: running, or why not.
 pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     if result.evaluated {
-        return running_line(loader.guard_note().as_deref(), result.mixed_on_game_gpu);
+        return running_line(loader.guard_note().as_deref(), result.mixed_on_game_gpu, super::offload_trial::status_line().as_deref());
     }
     match (loader.failed(), result.miss) {
         (Some(why), _) => format!("native network not running: {why}"),
@@ -4245,9 +4245,14 @@ pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
 /// frame with passes before DLSS and after its output while the model on a second GPU is asked for: the second GPU
 /// serves one hold of a frame, so neither is offloaded, and the line says so (the native line alone read as if the
 /// second GPU were not asked for).
-pub(crate) fn running_line(guard: Option<&str>, mixed_on_game_gpu: bool) -> String {
+///
+/// `trial`: the line of the trial against the second GPU (`super::offload_trial`), while it runs or once it kept the
+/// model here.
+pub(crate) fn running_line(guard: Option<&str>, mixed_on_game_gpu: bool, trial: Option<&str>) -> String {
     let guard = guard.map(|why| format!(" ({why})")).unwrap_or_default();
-    if mixed_on_game_gpu {
+    if let Some(trial) = trial.filter(|_| !mixed_on_game_gpu) {
+        format!("{trial}{guard}")
+    } else if mixed_on_game_gpu {
         format!("second GPU: not used here: with passes before and after DLSS the model runs on the game's GPU{guard}")
     } else {
         format!("native network running{guard}")
@@ -4844,7 +4849,9 @@ unsafe fn native_hold(
         return result;
     }
     // The offload's side of the hold: the exchange with the other device and its worker, made on the first hold.
-    if res.offpre.as_ref().is_some_and(super::offload_pre::HoldSide::released) && !others_outstanding {
+    // A side whose worker stopped serving (the trial on the game's GPU gave it up) while the offload is wanted again: the
+    // same.
+    if res.offpre.as_ref().is_some_and(|s| s.released() || (!s.serving() && super::offload_pre::wanted())) && !others_outstanding {
         // Its worker was ended for another set of hold resources while these had no hold: built again below.
         if let Some(side) = res.offpre.take() {
             // SAFETY: nothing recorded with these resources may still run.
@@ -5653,17 +5660,24 @@ mod tests {
 
     #[test]
     fn the_running_line_says_where_the_model_runs_with_passes_at_both_holds_and_a_second_gpu() {
-        assert_eq!(super::running_line(None, false), "native network running");
-        assert_eq!(super::running_line(Some("lower"), false), "native network running (lower)");
-        let mixed = super::running_line(None, true);
+        assert_eq!(super::running_line(None, false, None), "native network running");
+        assert_eq!(super::running_line(Some("lower"), false, None), "native network running (lower)");
+        let mixed = super::running_line(None, true, None);
         assert!(mixed.starts_with("second GPU: "), "doctor reports it with the second GPU's lines: {mixed}");
         assert!(mixed.contains("passes before and after DLSS") && mixed.ends_with("runs on the game's GPU"), "{mixed}");
-        assert!(super::running_line(Some("lower"), true).ends_with("the game's GPU (lower)"));
+        assert!(super::running_line(Some("lower"), true, None).ends_with("the game's GPU (lower)"));
+        // The trial against the second GPU (`offload_trial`) names itself while it runs and once it kept the model here.
+        let trying = "second GPU: trying the game's GPU for a few seconds: the faster one keeps the model";
+        let kept = "second GPU: not used: the game's GPU is faster (188.6 ms vs 222.8 ms a frame)";
+        assert_eq!(super::running_line(None, false, Some(trying)), trying);
+        assert_eq!(super::running_line(Some("lower"), false, Some(kept)), format!("{kept} (lower)"));
         // Every variant fits the channel's field whole (a cut line would read as changed at every hold).
         for guard in [None, Some(super::super::vram_guard::NOTE_SMALL), Some(super::super::vram_guard::NOTE_PAUSED)] {
             for mixed in [false, true] {
-                let line = super::running_line(guard, mixed);
-                assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
+                for trial in [None, Some(trying), Some(kept)] {
+                    let line = super::running_line(guard, mixed, trial);
+                    assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
+                }
             }
         }
     }

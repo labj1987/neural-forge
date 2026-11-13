@@ -1095,7 +1095,10 @@ pub(crate) fn serving_device(game: vk::Device) -> bool {
 /// (`NEURAL_FORGE_OFFLOAD_GPU`).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn wanted() -> bool {
-    super::offload::Choice::current() != super::offload::Choice::Off && !super::offload::given_up() && !super::offload::standin()
+    super::offload::Choice::current() != super::offload::Choice::Off
+        && !super::offload::given_up()
+        && !super::offload::standin()
+        && !super::offload_trial::keeps_local()
 }
 
 /// Which hold's model runs on the other GPU now (the Status tab's line, [`status_line`]): 0 none, 1 the hold before
@@ -1129,19 +1132,6 @@ pub(crate) fn serving_hold() -> bool {
 
 /// Holds between two `[offload]` summaries (and the windows of `super::offload_trial`).
 const SUMMARY_HOLDS: u64 = 600;
-/// A time between two holds longer than this (a pause menu, a loading screen) is no frame time.
-const FRAME_GAP: Duration = Duration::from_millis(250);
-
-/// The median time between the window's holds (`intervals`, emptied); zero for none.
-fn window_frame(intervals: &mut Vec<Duration>) -> Duration {
-    if intervals.is_empty() {
-        return Duration::ZERO;
-    }
-    intervals.sort_unstable();
-    let m = intervals[intervals.len() / 2];
-    intervals.clear();
-    m
-}
 
 /// The hold's side of the offload, for one set of hold resources (one render extent): the exchange, the worker
 /// with the network on the other device, the sent frame's kept colour, and the cadence.
@@ -1164,6 +1154,8 @@ pub(crate) struct HoldSide {
     /// offloaded frame time `super::offload_trial` measures.
     last_hold: Option<Instant>,
     intervals: Vec<Duration>,
+    /// The extent its frames have (the trial's key).
+    extent: (u32, u32),
     /// The hold planned last has not gone through yet: if it never does, what it planned is dropped at the next plan.
     pending: bool,
     /// Holds in a row whose frame could not be sent (no motion vectors, no jitter, no chained cache), and when the
@@ -1261,6 +1253,14 @@ impl HoldSide {
         let stalled = name.clone();
         let give_up: GiveUp = Box::new(move |why, stuck| {
             set_serving(None);
+            if !stuck && super::offload_trial::running() {
+                // The trial on the game's GPU (`super::offload_trial`): not a fall-back; the held placements follow
+                // `offload_trial::keeps_local`, and the offload's state is the trial's to show (the native line).
+                crate::log!("[offload] {why}");
+                crate::logging::flush();
+                super::offload::note_state(super::offload::State::Off);
+                return;
+            }
             if stuck {
                 // The network is still in use by that frame: it cannot go back to the game's GPU.
                 crate::log!("[offload] {why}: the network cannot be taken back while that frame may run; the model is off for the rest of the session");
@@ -1309,6 +1309,7 @@ impl HoldSide {
             resources,
             holds: 0,
             last_hold: None,
+            extent: (width, height),
             intervals: Vec::with_capacity(SUMMARY_HOLDS as usize),
             pending: false,
             unsendable: Unsendable::default(),
@@ -1395,7 +1396,7 @@ impl HoldSide {
         let now = Instant::now();
         if let Some(t) = self.last_hold.replace(now) {
             let d = now.saturating_duration_since(t);
-            if d < FRAME_GAP {
+            if d < super::offload_trial::FRAME_GAP {
                 self.intervals.push(d);
             }
         }
@@ -1405,7 +1406,8 @@ impl HoldSide {
             let waited = Duration::from_micros(p.waited_us.swap(0, Ordering::Relaxed) / SUMMARY_HOLDS);
             let frames = super::offload::STATS.server_frames.swap(0, Ordering::Relaxed);
             let us = super::offload::STATS.server_us.swap(0, Ordering::Relaxed);
-            let frame = window_frame(&mut self.intervals);
+            let frame = super::offload_trial::trimmed_mean(&mut self.intervals);
+            self.intervals.clear();
             crate::log!(
                 "[offload] {}; {taken} holds carried the edit of the frame before them, {untaken} found no answer; the network's frame on the other GPU {:.2} ms (copies included); a hold every {:.1} ms, the game waiting {:.1} ms a frame for the answer",
                 self.worker.counters.summary(self.at),
@@ -1415,7 +1417,8 @@ impl HoldSide {
             );
             // Not the first window: the network was still loading on the other GPU for part of it.
             if self.holds > SUMMARY_HOLDS && self.serving() {
-                if let Some(why) = super::offload_trial::offloaded(frame, waited) {
+                let key = (self.extent, super::placement::settings().0);
+                if let Some(why) = super::offload_trial::offloaded(key, frame, waited) {
                     self.worker.give_up(why);
                 }
             }

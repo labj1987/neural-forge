@@ -6616,11 +6616,12 @@ impl Session {
         }
         if result.native && result.evaluated {
             self.engaged = true;
-            // The model ran on the game's GPU while the trial against the other GPU measures it there.
-            #[cfg(target_arch = "x86_64")]
-            if result.wrote_back && offload_trial::running() && !offload_pre::serving_hold() {
-                offload_trial::local_hold(now);
-            }
+        }
+        // While the trial against the other GPU measures the game's GPU: every hold, whether the model ran on it.
+        #[cfg(target_arch = "x86_64")]
+        if offload_trial::running() && !offload_pre::serving_hold() {
+            let ran = result.native && result.evaluated && result.wrote_back;
+            offload_trial::local_hold((extent, placement::settings().0), now, ran, result.miss);
         }
         self.share_post_off();
         let holding = self.holding();
@@ -8512,6 +8513,44 @@ mod tests {
         assert!(shm.preupscale_reason_is(&header.preupscale_reason()));
         publish_reason(&shm, "");
         assert_eq!(header.preupscale_reason(), "");
+    }
+
+    /// The trial against the second GPU (`offload_trial`), wired as the holds drive it: two offloaded windows that
+    /// show the game waiting start it (the held placements then stay on the game's GPU, `offload_pre::wanted`), the
+    /// holds on the game's GPU go through `Session::note`, the Status line is the trial's, and a game's GPU that is
+    /// faster keeps the model, with its line reaching the channel over the native one.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_trial_runs_through_the_holds_notes_and_status() {
+        let _state = offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        offload_trial::reset_for_test();
+        let key = ((1485, 836), placement::settings().0);
+        assert!(offload_trial::offloaded(key, Duration::from_millis(23), Duration::from_millis(5)).is_none());
+        assert!(offload_trial::offloaded(key, Duration::from_millis(23), Duration::from_millis(5)).is_some());
+        assert!(offload_trial::running() && offload_trial::keeps_local());
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.init_defaults();
+        let shm = ShmClient::test_over_header(&header);
+        let mut session = Session::default();
+        let held = HoldResult { wrote_back: true, waits_consumed: true, native: true, evaluated: true, ..Default::default() };
+        let trying = native::running_line(None, false, offload_trial::status_line().as_deref());
+        assert!(trying.starts_with("second GPU: trying the game's GPU"), "{trying}");
+        assert!(native_line_due(&trying, "native network running", "native network running", false));
+        // Holds every 2 ms on the game's GPU (much faster than 23 ms): the warm-up, the window, the verdict.
+        for _ in 0..(offload_trial::LOCAL_WARM as usize + offload_trial::LOCAL_WINDOW + 50) {
+            if !offload_trial::running() {
+                break;
+            }
+            session.note(&shm, &held, Duration::ZERO, (1485, 836));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!offload_trial::running(), "decided");
+        assert!(offload_trial::keeps_local(), "kept on the game's GPU");
+        let kept = native::running_line(None, false, offload_trial::status_line().as_deref());
+        assert!(kept.starts_with("second GPU: not used: the game's GPU is faster ("), "{kept}");
+        shm.set_layer_reason("native network running");
+        assert!(native_line_due(&kept, "native network running", &shm.layer_reason(), false));
+        offload_trial::reset_for_test();
     }
 
     /// A hold that runs and holds nothing gives the status its reason (#59): with the VRAM guard's pause in Cyberpunk 2077 at
@@ -12508,7 +12547,7 @@ mod native_line_tests {
     /// side left behind before the plan changed, and once.
     #[test]
     fn a_mixed_frames_line_reaches_the_channel() {
-        let mixed = crate::preupscale::native::running_line(None, true);
+        let mixed = crate::preupscale::native::running_line(None, true, None);
         let before = "second GPU: the model runs on X before DLSS, its edit applied one frame later";
         assert!(mixed.len() < neural_forge_protocol::REASON_BYTES);
         // No side serves: the offload's line is not written by the hold,
