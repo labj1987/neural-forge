@@ -249,7 +249,11 @@ pub enum ComposeInputs<'a> {
     /// previous present's frame, whose proxy and full frame [`GpuCompose::keep_delayed`] kept in its pair `parity`. The
     /// composition works on that frame, not the live image, and its result replaces the live image: each frame is
     /// shown one present late, exactly as it would have been shown without the delay. Full-size answers only.
-    Delayed { parity: usize },
+    ///
+    /// `gate`: the answer is not in yet, but the other device has submitted the frame's work: the sync fd of that
+    /// submission (`super::pace::Submitted`). It is imported into a semaphore of this device and the compose's
+    /// submission waits for it on the GPU. The fd is consumed, whatever the outcome.
+    Delayed { parity: usize, gate: Option<std::os::fd::RawFd> },
 }
 
 /// `compose_hdr.comp`'s pipeline over `layout` (compose.comp's).
@@ -382,6 +386,40 @@ struct Paced {
     pacer: super::pace::Pacer,
     /// The number of the frame sent last.
     sent: u64,
+    /// The semaphores the other device's sync fds are imported into, on a device with
+    /// `VK_KHR_external_semaphore_fd`.
+    sync: Option<SyncFd>,
+}
+
+/// Binary semaphores of this device that take the other device's sync fds as temporary payloads: one per async slot
+/// for the compose that waits for an answer on the GPU, one per pair for the send that waits for the server to be
+/// done with the proxy region. A payload is consumed by the submission that waits on it.
+#[cfg(target_arch = "x86_64")]
+struct SyncFd {
+    api: ash::khr::external_semaphore_fd::Device,
+    compose: [vk::Semaphore; ASYNC_SLOTS],
+    send: [vk::Semaphore; 2],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SyncFd {
+    /// Imports sync fd `fd` into `semaphore` as its temporary payload. The fd is consumed: by the import, or closed
+    /// here when the import is refused (`false`).
+    fn import(&self, semaphore: vk::Semaphore, fd: std::os::fd::RawFd) -> bool {
+        let info = vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(semaphore)
+            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+            .fd(fd);
+        // SAFETY: a semaphore of this device with no pending operation (its last wait's submission was waited for);
+        // `fd` is a sync fd the caller owns.
+        let imported = unsafe { self.api.import_semaphore_fd(&info) }.is_ok();
+        if !imported {
+            // SAFETY: still the caller's, and handed over to this function.
+            unsafe { libc::close(fd) };
+        }
+        imported
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -393,6 +431,11 @@ impl Paced {
         unsafe {
             for f in self.fence {
                 device.destroy_fence(f, None);
+            }
+            if let Some(sync) = &self.sync {
+                for s in sync.compose.iter().chain(&sync.send) {
+                    device.destroy_semaphore(*s, None);
+                }
             }
         }
     }
@@ -1603,6 +1646,13 @@ impl GpuCompose {
     ) -> Option<vk::Semaphore> {
         let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
         let answer_bytes = (u64::from(answer_width) * u64::from(answer_height) * 4) as usize;
+        // The gate's sync fd is this call's from here: closed on every way out that does not import it.
+        #[cfg(target_arch = "x86_64")]
+        let mut gate_fd = match inputs {
+            // SAFETY: the caller hands the fd over (`ComposeInputs::Delayed`).
+            ComposeInputs::Delayed { gate: Some(fd), .. } => Some(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) }),
+            _ => None,
+        };
         // An HDR10 frame composes only a full-size answer (the 8-bit enlargement would blur the frame's own
         // words), and only with its own pipeline: anything else presents it untouched.
         if compose.pq10.is_some() && (self.hdr_pipeline == vk::Pipeline::null() || (answer_width, answer_height) != (width, height)) {
@@ -1632,7 +1682,7 @@ impl GpuCompose {
                 }
                 Some(sources)
             }
-            ComposeInputs::Delayed { parity } => {
+            ComposeInputs::Delayed { parity, .. } => {
                 let frames = self.zc.frames.as_ref()?;
                 let kept = self.zc.delayed.as_ref().filter(|d| d.kept_proxy[parity])?;
                 if generation == 0 || (answer_width, answer_height) != (width, height) || frames.frame_bytes != bytes as u64 || kept.frame_bytes != bytes as u64
@@ -1678,7 +1728,7 @@ impl GpuCompose {
         }
         let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let delayed_original = match inputs {
-            ComposeInputs::Delayed { parity } => self.zc.delayed.as_ref().map(|d| (d.raw[parity].buffer, 0)),
+            ComposeInputs::Delayed { parity, .. } => self.zc.delayed.as_ref().map(|d| (d.raw[parity].buffer, 0)),
             _ => None,
         };
         let mut held_at_base = false;
@@ -1774,7 +1824,29 @@ impl GpuCompose {
             return None;
         }
         let cmd = slot.slot.cmd;
-        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd)).signal_semaphores(std::slice::from_ref(&semaphore));
+        let mut submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd)).signal_semaphores(std::slice::from_ref(&semaphore));
+        // Gated: the other device's submission of this answer, imported, is what this submission waits for on the GPU.
+        // That signal is submitted already (the fd exists), so the present's wait on `semaphore` depends on nothing
+        // that is not (VUID-vkQueuePresentKHR-pWaitSemaphores-03268).
+        #[cfg(target_arch = "x86_64")]
+        let gate = match gate_fd.take().map(std::os::fd::IntoRawFd::into_raw_fd) {
+            Some(fd) => match self.zc.paced.as_ref().and_then(|p| p.sync.as_ref()) {
+                Some(sync) if sync.import(sync.compose[idx], fd) => Some(sync.compose[idx]),
+                Some(_) => return None,
+                None => {
+                    // SAFETY: taken out of its guard just above, and not imported.
+                    unsafe { libc::close(fd) };
+                    return None;
+                }
+            },
+            None => None,
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let gate: Option<vk::Semaphore> = None;
+        let (waits, stages) = ([gate.unwrap_or_default()], [vk::PipelineStageFlags::ALL_COMMANDS]);
+        if gate.is_some() {
+            submit = submit.wait_semaphores(&waits).wait_dst_stage_mask(&stages);
+        }
         if !slot.slot.submit(device, queue, submit) {
             return None;
         }
@@ -2253,7 +2325,7 @@ impl GpuCompose {
     /// made on first use. `false` when they cannot be made or the relay ended: the present then makes every wait
     /// itself, for the life of this compose.
     #[cfg(target_arch = "x86_64")]
-    pub fn ensure_paced(&mut self, device: &ash::Device, port: impl FnOnce() -> Option<Box<dyn super::pace::Port>>) -> bool {
+    pub fn ensure_paced(&mut self, device: &ash::Device, instance: &ash::Instance, port: impl FnOnce() -> Option<Box<dyn super::pace::Port>>) -> bool {
         if self.zc.paced_dead {
             return false;
         }
@@ -2274,7 +2346,28 @@ impl GpuCompose {
                 _ => None,
             };
             match (pacer, cmds) {
-                (Some(pacer), Ok(cmds)) => Some(Paced { cmd: [cmds[0], cmds[1]], fence: [fences[0], fences[1]], armed: [false; 2], pacer, sent: 0 }),
+                (Some(pacer), Ok(cmds)) => {
+                    // The semaphores for the other device's sync fds, where this device can import them.
+                    let sync = super::pace::has_semaphore_fd(device.handle())
+                        .then(|| {
+                            let made: Vec<vk::Semaphore> =
+                                (0..ASYNC_SLOTS + 2).filter_map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()).collect();
+                            if made.len() == ASYNC_SLOTS + 2 {
+                                Some(SyncFd {
+                                    api: ash::khr::external_semaphore_fd::Device::new(instance, device),
+                                    compose: std::array::from_fn(|k| made[k]),
+                                    send: [made[ASYNC_SLOTS], made[ASYNC_SLOTS + 1]],
+                                })
+                            } else {
+                                for s in made {
+                                    device.destroy_semaphore(s, None);
+                                }
+                                None
+                            }
+                        })
+                        .flatten();
+                    Some(Paced { cmd: [cmds[0], cmds[1]], fence: [fences[0], fences[1]], armed: [false; 2], pacer, sent: 0, sync })
+                }
                 (_, cmds) => {
                     for f in fences {
                         device.destroy_fence(f, None);
@@ -2291,6 +2384,13 @@ impl GpuCompose {
         self.zc.paced.is_some()
     }
 
+    /// Whether a compose and a send can wait on the GPU for the other device's sync fd (`ComposeInputs::Delayed`'s
+    /// `gate`, [`Self::send_delayed`]'s `after`): this device has `VK_KHR_external_semaphore_fd`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn can_gate(&self) -> bool {
+        self.zc.paced.as_ref().is_some_and(|p| p.sync.is_some())
+    }
+
     /// The delayed present's relay, once [`Self::ensure_paced`] made it.
     #[cfg(target_arch = "x86_64")]
     pub fn pacer(&self) -> Option<&super::pace::Pacer> {
@@ -2301,14 +2401,44 @@ impl GpuCompose {
     /// into `proxy` (the proxy region on this device, `bytes` of it) on `queue`, behind the compose of the frame before
     /// (which reads the answer region: the server may write it again once this copy is done). Nothing is waited for
     /// here: the frame's number and the copy's fence go to the relay ([`super::pace::Token`]), which waits for the
-    /// fence and posts the request. The caller knows the server is done with the proxy region (the frame before is
-    /// resolved). `None` when nothing was submitted.
+    /// fence and posts the request. The server must be done with the proxy region before the copy runs: the caller
+    /// knows the frame before is resolved, or gives `after`, the sync fd of the other device's submission of that
+    /// frame (consumed, whatever the outcome), which the copy then waits for on the GPU. `None` when nothing was
+    /// submitted.
     #[cfg(target_arch = "x86_64")]
-    pub fn send_delayed(&mut self, device: &ash::Device, queue: vk::Queue, parity: usize, proxy: vk::Buffer, bytes: u64) -> Option<(u64, vk::Fence)> {
-        let base = self.zc.delayed.as_ref().filter(|d| d.kept_proxy[parity] && d.frame_bytes == bytes)?.base.as_ref()?[parity].buffer;
-        let p = self.zc.paced.as_mut()?;
+    pub fn send_delayed(
+        &mut self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        parity: usize,
+        proxy: vk::Buffer,
+        bytes: u64,
+        after: Option<std::os::fd::RawFd>,
+    ) -> Option<(u64, vk::Fence)> {
+        let close = |fd: Option<std::os::fd::RawFd>| {
+            if let Some(fd) = fd {
+                // SAFETY: the caller's fd, handed over to this function and not used yet.
+                unsafe { libc::close(fd) };
+            }
+        };
+        let Some(base) =
+            self.zc.delayed.as_ref().filter(|d| d.kept_proxy[parity] && d.frame_bytes == bytes).and_then(|d| d.base.as_ref()).map(|b| b[parity].buffer)
+        else {
+            close(after);
+            return None;
+        };
+        let Some(p) = self.zc.paced.as_mut() else {
+            close(after);
+            return None;
+        };
+        if after.is_some() && p.sync.is_none() {
+            // Nothing to wait with: the copy must not run under the server's read.
+            close(after);
+            return None;
+        }
         // The pair's last send is two frames old, and the relay is done with its fence (its frame was resolved).
         if p.armed[parity] && !wait_armed(device, &[Some(p.fence[parity])], "gpu::send_delayed reuse") {
+            close(after);
             return None;
         }
         p.armed[parity] = false;
@@ -2345,9 +2475,23 @@ impl GpuCompose {
                 }
         };
         if !recorded {
+            close(after);
             return None;
         }
-        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        let mut submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        let gate = match (after, p.sync.as_ref()) {
+            (Some(fd), Some(sync)) => {
+                if !sync.import(sync.send[parity], fd) {
+                    return None;
+                }
+                Some(sync.send[parity])
+            }
+            _ => None,
+        };
+        let (waits, stages) = ([gate.unwrap_or_default()], [vk::PipelineStageFlags::ALL_COMMANDS]);
+        if gate.is_some() {
+            submit = submit.wait_semaphores(&waits).wait_dst_stage_mask(&stages);
+        }
         // SAFETY: the fence was waited and is reset here; the caller holds the queue (the present's).
         let submitted = unsafe { device.reset_fences(&[p.fence[parity]]).and_then(|()| device.queue_submit(queue, &[submit], p.fence[parity])) };
         if crate::note_vk(device.handle(), submitted).is_err() {
@@ -2594,7 +2738,13 @@ pub(crate) fn test_device_with_external_memory_host() -> Option<(ash::Entry, ash
     }
     let queue_family = 0;
     let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&[1.0])];
-    let extension_names = test_device_extensions(&instance, physical_device, surface, &[crate::EXTERNAL_MEMORY_HOST_EXTENSION]);
+    // With sync-fd semaphores where the driver has them (the delayed present's wait for the answer on the GPU).
+    let semaphore_fd = ash::khr::external_semaphore_fd::NAME;
+    let has_semaphore_fd = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == semaphore_fd));
+    let wanted: &[&'static std::ffi::CStr] =
+        if has_semaphore_fd { &[crate::EXTERNAL_MEMORY_HOST_EXTENSION, semaphore_fd] } else { &[crate::EXTERNAL_MEMORY_HOST_EXTENSION] };
+    let extension_names = test_device_extensions(&instance, physical_device, surface, wanted);
     let device_create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -4135,11 +4285,11 @@ mod tests {
         upload(&vec![9u8; frame_bytes as usize], false);
         upload(&frame_b, true);
         unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
-        let delayed = present(&mut gpu, ComposeInputs::Delayed { parity: 1 }, 3).expect("the delayed present composes");
+        let delayed = present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: None }, 3).expect("the delayed present composes");
         assert_eq!(delayed, expected, "the delayed present composes the kept frame and proxy, not the live ones");
         let on_b = compose_once(width, height, &frame_b, &base, &answer, params).expect("the CPU reference composes");
         assert_ne!(delayed, on_b, "the live frame must not be what the answer composes onto");
-        assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0 }, 4).is_none(), "a pair never kept is refused");
+        assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0, gate: None }, 4).is_none(), "a pair never kept is refused");
         // A kept frame with no answer is shown as it was, in its turn (the live image is frame B; the read-back above
         // left the image in TRANSFER_SRC_OPTIMAL, and the upload puts it back in PRESENT_SRC_KHR, as a present would).
         upload(&frame_b, true);
@@ -4189,8 +4339,12 @@ mod tests {
             }
             let fake = Arc::new(Fake::default());
             let port = fake.clone();
-            assert!(gpu.ensure_paced(&device, || Some(Box::new(port))));
-            assert!(gpu.ensure_paced(&device, || None), "made once");
+            // On a device with sync-fd semaphores the compose and the send can wait for the other device on the GPU.
+            let other = super::super::pace::test_support::OtherDevice::open();
+            super::super::pace::note_semaphore_fd(device.handle(), other.is_some());
+            assert!(gpu.ensure_paced(&device, &instance, || Some(Box::new(port))));
+            assert!(gpu.ensure_paced(&device, &instance, || None), "made once");
+            assert_eq!(gpu.can_gate(), other.is_some());
             // The proxy region's stand-in on this device: host-visible, so the test can read what was sent.
             let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
             let (sent_buffer, sent_memory, sent_ptr) = unsafe {
@@ -4207,7 +4361,7 @@ mod tests {
                 fake.good.store(good, Ordering::SeqCst);
                 upload(&current, true);
                 assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, true).is_some());
-                let (number, copied) = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes).expect("the frame is sent");
+                let (number, copied) = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes, None).expect("the frame is sent");
                 assert_eq!(number, round as u64 + 1);
                 let pacer = gpu.pacer().expect("made");
                 assert!(pacer.post(super::super::pace::Token {
@@ -4227,10 +4381,32 @@ mod tests {
                 // The next present: the live image is frame B, and A's answer composes onto A.
                 upload(&frame_b, true);
                 unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
-                let shown = present(&mut gpu, ComposeInputs::Delayed { parity: 1 }, 10 + number).expect("the delayed present composes");
+                let shown = present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: None }, 10 + number).expect("the delayed present composes");
                 assert_eq!(shown, composed, "the answer composes onto the kept frame, whose proxy is the frame itself");
             }
             assert_eq!(fake.begun.load(Ordering::SeqCst), 2, "one request a frame");
+            // The answer waited for on the GPU: the other device's submission of the frame, as a sync fd, gates the
+            // compose and the next frame's send. The compose is the same compose.
+            if let Some(other) = other {
+                use std::os::fd::IntoRawFd;
+                for round in 0..3u64 {
+                    upload(&current, true);
+                    assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, true).is_some());
+                    upload(&frame_b, true);
+                    unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
+                    let (gate, after) = (other.submit(), other.submit());
+                    let shown = present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: Some(gate.into_raw_fd()) }, 20 + round)
+                        .expect("the gated compose is submitted");
+                    assert_eq!(shown, composed, "the gated compose is the same compose");
+                    let sent = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes, Some(after.into_raw_fd())).expect("the gated send is submitted");
+                    unsafe { device.wait_for_fences(&[sent.1], true, 30_000_000_000) }.expect("the send ran once the other device's work was done");
+                }
+                // A pair that was never kept: the fd is consumed all the same (nothing is left open or imported).
+                assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0, gate: Some(other.submit().into_raw_fd()) }, 30).is_none());
+                assert!(gpu.wait_in_flight(&device));
+                other.close();
+            }
+            super::super::pace::note_semaphore_fd(device.handle(), false);
             assert!(gpu.release_paced(&device) && gpu.pacer().is_none());
             unsafe {
                 device.destroy_buffer(sent_buffer, None);
@@ -4239,7 +4415,7 @@ mod tests {
         }
         assert!(gpu.wait_in_flight(&device));
         assert!(gpu.release_delayed(&device));
-        assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 1 }, 5).is_none(), "released pairs are gone");
+        assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: None }, 5).is_none(), "released pairs are gone");
 
         unsafe {
             device.device_wait_idle().unwrap();

@@ -255,6 +255,10 @@ impl crate::composition::pace::Port for HeaderPort {
         crate::capture::answer_fits((dims != (0, 0)).then_some(dims), proxy, pq10, evaluated)
     }
 
+    fn submitted(&self, req: u32) -> Option<crate::composition::pace::Submitted> {
+        crate::composition::pace::take_published(self.channel.header as usize, self.slot.index(), req)
+    }
+
     fn quit(&self) -> bool {
         self.channel.header().is_none_or(|hdr| hdr.quit.load(Ordering::Relaxed) != 0)
     }

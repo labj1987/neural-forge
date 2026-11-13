@@ -525,7 +525,13 @@ impl Offload {
         let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
         let offers = |name: &CStr| extensions.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == name);
         let host = offers(crate::EXTERNAL_MEMORY_HOST_EXTENSION);
-        let names: Vec<*const c_char> = if host { vec![crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()] } else { Vec::new() };
+        // Sync-fd semaphores, where the GPU has them: each frame's submission is exported for the game's present to
+        // wait on (`composition::pace`).
+        let semaphore_fd = offers(ash::khr::external_semaphore_fd::NAME);
+        let mut names: Vec<*const c_char> = if host { vec![crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()] } else { Vec::new() };
+        if semaphore_fd {
+            names.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
+        }
         let base = vk::DeviceCreateInfo::default().queue_create_infos(&queue).enabled_extension_names(&names);
         // The network's extensions and features on top (they outlive the call).
         let extension = if run_network {
@@ -563,6 +569,7 @@ impl Offload {
         // loader made).
         let registration = unsafe { crate::loader_data::register(device, game_info) };
         crate::note_secondary_device(device, true);
+        crate::composition::pace::note_semaphore_fd(device, semaphore_fd);
         let setup = Setup {
             gipa: game.gipa,
             instance: game.instance,
@@ -607,6 +614,7 @@ impl Offload {
         // SAFETY: as the contract; the loader's callback with the device's own vkDestroyDevice.
         unsafe { (self.destroy)(self.device.handle(), std::ptr::null(), destroy_device) };
         crate::note_secondary_device(self.device.handle(), false);
+        crate::composition::pace::note_semaphore_fd(self.device.handle(), false);
     }
 }
 
