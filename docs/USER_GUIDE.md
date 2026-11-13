@@ -435,7 +435,8 @@ game's GPU no longer spends its frame time on the network:
 
 1. Leave **Placement** on Auto or Before DLSS for the model's edit to go into DLSS's input (where it changes
    textures and detail most), or set it to **Finished frame** (`set_placement=3`). After DLSS's output (the placement
-   games with Ray Reconstruction get) the model stays on the game's GPU.
+   games with Ray Reconstruction get) the model stays on the game's GPU, and the Status tab says so ("second GPU: not
+   used here: Ray Reconstruction is on, ...").
 2. Start the game once with Neural Forge on: where the machine has more than one GPU, the layer log lists them when
    the game creates its device (`[offload] GPU 1: NVIDIA GeForce RTX 5080 [10de:2c02@0000:73:00.0], ...`).
 3. Add `NEURAL_FORGE_OFFLOAD_GPU=1` (that GPU's index) or its PCI IDs (`NEURAL_FORGE_OFFLOAD_GPU=10de:2c02`) to the
