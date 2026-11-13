@@ -783,6 +783,12 @@ pub(crate) struct ImageSync {
 /// until a barrier on both aspects says where they are.
 pub(crate) const ASPECTS_APART: vk::ImageLayout = vk::ImageLayout::from_raw(0x7fff_0001);
 
+/// [`Tracker::layout_when_run`] of DLSS's output's motion vectors (watched for them alone, [`MvecWatch`]) where a buffer
+/// begun before they were watched runs in front, in the same submission or an earlier one, or nothing is known: their
+/// layout then may be anything, so a hold that guessed one is taken as wrong (`inline::Inline::check`), as the split
+/// refuses a buffer recorded before the identification ([`Hazard::RecordedBefore`]).
+pub(crate) const MVEC_UNSEEN: vk::ImageLayout = vk::ImageLayout::from_raw(0x7fff_0002);
+
 impl ImageSync {
     pub(crate) fn from_barrier(b: &vk::ImageMemoryBarrier, src_stage: vk::PipelineStageFlags, dst_stage: vk::PipelineStageFlags) -> Self {
         Self {
@@ -1735,6 +1741,10 @@ impl Tracker {
         self.owners.remove(&image);
         self.launch_layouts.remove(&image);
         self.colour_barriers.remove(&image);
+        // The watched motion vectors' handle may come back for another image; their shape stays watched.
+        if let Some(m) = self.mvec_watch.as_mut().filter(|m| m.image == image) {
+            m.image = vk::Image::null();
+        }
         self.exposure_names.retain(|c, (e, _)| *c != image && *e != image);
     }
 
@@ -2115,9 +2125,14 @@ impl Tracker {
 
     /// `image`'s layout when a buffer submitted right after `earlier` (the buffers in front of it in the same
     /// submission, in order) starts: what the last of them to set it left, else what the buffers submitted
-    /// before left. `None` when nothing is known (an image not watched, or never seen in a barrier).
+    /// before left. `None` when nothing is known (an image not watched, or never seen in a barrier); for DLSS's output's
+    /// motion vectors then, or behind a buffer begun before they were watched, [`MVEC_UNSEEN`].
     pub(crate) fn layout_when_run(&self, earlier: &[vk::CommandBuffer], image: vk::Image) -> Option<vk::ImageLayout> {
-        earlier
+        let mvec_only = self.watched_for_mvec_only(image);
+        if mvec_only && earlier.iter().any(|cb| !self.recorded_mvec.contains(cb)) {
+            return Some(MVEC_UNSEEN);
+        }
+        let known = earlier
             .iter()
             .rev()
             .find_map(|cb| {
@@ -2127,7 +2142,8 @@ impl Tracker {
                     .and_then(|p| p.iter().rev().filter(|s| s.image == image).find_map(ImageSync::layout_after))
                     .or_else(|| self.attached.get(cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
             })
-            .or_else(|| self.committed.get(&image).copied())
+            .or_else(|| self.committed.get(&image).copied());
+        known.or(mvec_only.then_some(MVEC_UNSEEN))
     }
 
     /// [`Self::inline_point`] refused a hold inside DLSS's buffer at a launch naming the colour input `colour`:
@@ -2389,7 +2405,8 @@ impl Tracker {
     }
 
     /// `vkBeginCommandBuffer` (or a reset): the earlier recording is gone, and the new one is seen
-    /// whole from here on when inputs are watched ([`Self::recorded_watched`]).
+    /// whole from here on when inputs are watched ([`Self::recorded_watched`]), or DLSS's output's motion vectors
+    /// ([`Self::recorded_mvec`]).
     pub(crate) fn begin(&mut self, command_buffer: vk::CommandBuffer) {
         self.free(&[command_buffer]);
         if self.inputs.is_some() {
@@ -2614,7 +2631,8 @@ impl Tracker {
     /// whole for them ([`Self::recorded_mvec`]).
     fn watch_mvec(&mut self, mvec: MvecWatch) {
         let old = self.mvec_watch;
-        if old == Some(mvec) {
+        // The same image, or another of the same shape (Cyberpunk 2077 alternates two): the watch is unchanged.
+        if old == Some(mvec) || old.is_some_and(|o| o.shape.is_some() && o.shape == mvec.shape) {
             return;
         }
         let (inputs, watch) = (self.inputs, self.colour_watch);
@@ -3361,7 +3379,7 @@ impl Tracking {
         self.rearm(&t);
     }
 
-    /// An image copy ([`Tracker::copy`]), while inputs are watched.
+    /// An image copy ([`Tracker::copy`]), while inputs or DLSS's output's motion vectors are watched.
     pub(crate) fn copy(&self, command_buffer: vk::CommandBuffer, src: vk::Image, dst: vk::Image) {
         if !self.watching.load(Ordering::Relaxed) {
             return;
@@ -3371,7 +3389,8 @@ impl Tracking {
         self.rearm(&t);
     }
 
-    /// `vkCmdBeginRendering`'s attachments ([`Tracker::attachments`]), while inputs are watched.
+    /// `vkCmdBeginRendering`'s attachments ([`Tracker::attachments`]), while inputs or DLSS's output's motion vectors are
+    /// watched.
     pub(crate) fn attachments(&self, command_buffer: vk::CommandBuffer, views: &[(vk::ImageView, vk::ImageLayout)]) {
         if !self.watching.load(Ordering::Relaxed) || views.is_empty() {
             return;
@@ -7820,6 +7839,40 @@ mod tests {
         let mv = point.mvec_input.expect("the evaluate's motion vectors");
         assert_eq!((mv.image, mv.layout, mv.readable), (img(0x310), Some(read), true), "{mv:?}");
         assert_eq!(point.guessed.mvec, Some(read), "set before DLSS's buffer: checked at its submit");
+    }
+
+    /// The hold inside DLSS's buffer guessed the motion vectors' committed layout: a buffer begun before they were
+    /// watched, in front in the same submission or submitted in between, may have moved them unseen, so the check at the
+    /// submit finds the guess wrong ([`MVEC_UNSEEN`]) rather than keeping it (the same layout still committed, or none).
+    #[test]
+    fn a_buffer_begun_before_the_motion_vector_watch_makes_their_guessed_layout_wrong() {
+        use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let rendered = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut set = gta_registered();
+        set.insert(0x300, (img(0x300), desc(1707, 960, rgba, rendered)));
+        let mut t = tracker_with(&set);
+        t.begin(cb(9));
+        let a = parse_record(&record_bytes(1, FEATURE_RR, 1, [0x100, 0x300, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        inject(vec![a]);
+        t.begin(cb(1));
+        t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        t.launch(cb(1), Some(&param_block(&[0x1400])));
+        inject(vec![a, end_of(&a, 2)]);
+        submit(&mut t, &[vec![cb(1)]]);
+        assert!(t.mvec_watch.is_some());
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        t.begin(cb(2));
+        t.barrier(cb(2), ImageSync::to(img(0x300), read));
+        submit(&mut t, &[vec![cb(2)]]);
+        t.begin(cb(3));
+        assert_eq!(t.layout_when_run(&[], img(0x300)), Some(read), "what the buffers seen whole left");
+        assert_eq!(t.layout_when_run(&[cb(3)], img(0x300)), Some(read));
+        assert_eq!(t.layout_when_run(&[cb(9)], img(0x300)), Some(MVEC_UNSEEN), "behind a buffer begun before, in the same submission");
+        assert_eq!(t.layout_when_run(&[cb(9)], img(0x400)), None, "an image not watched keeps its rule");
+        submit(&mut t, &[vec![cb(9)]]);
+        assert_eq!(t.layout_when_run(&[], img(0x300)), Some(MVEC_UNSEEN), "after it was submitted");
+        assert_eq!(t.layout_when_run(&[cb(3)], img(0x300)), Some(MVEC_UNSEEN));
     }
 
     /// #63 through the device's hooks: a game started with Ray Reconstruction on identifies nothing, so the hooks record

@@ -826,8 +826,13 @@ impl Inline {
             s.slots[i].sound = wrong.is_none();
             verdicts.set(i, wrong.is_none());
             if let Some((image, guess, layout)) = wrong {
+                let layout = if layout == super::MVEC_UNSEEN {
+                    "not known (a buffer recorded before it was watched runs first)".to_string()
+                } else {
+                    format!("{layout:?}")
+                };
                 self.say_once(format!(
-                    "an input of a hold inside DLSS's buffer was read as {guess:?}, its layout before this buffer was recorded, but it is {layout:?} when the buffer runs (image {}): that hold carries nothing to the next",
+                    "an input of a hold inside DLSS's buffer was read as {guess:?}, its layout before this buffer was recorded, but it is {layout} when the buffer runs (image {}): that hold carries nothing to the next",
                     super::hex(image)
                 ));
             }
