@@ -4,7 +4,7 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
-## 4.2.0 — 2026-11-12
+## 4.2.0 — 2026-11-13
 
 **The model on a second GPU**
 
