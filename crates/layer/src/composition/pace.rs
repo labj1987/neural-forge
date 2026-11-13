@@ -590,9 +590,12 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn close(self) {
-            // SAFETY: nothing of it is pending once the device is idle.
+            // SAFETY: nothing of it is pending once a submission behind every frame's has finished.
             unsafe {
-                self.device.device_wait_idle().unwrap();
+                let last = self.device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+                self.device.queue_submit(self.queue, &[], last).unwrap();
+                self.device.wait_for_fences(&[last], true, 30_000_000_000).unwrap();
+                self.device.destroy_fence(last, None);
                 self.device.destroy_semaphore(self.done, None);
                 self.device.destroy_device(None);
                 self.instance.destroy_instance(None);
