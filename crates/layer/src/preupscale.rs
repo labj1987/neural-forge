@@ -5639,6 +5639,40 @@ fn hold_clock() -> Instant {
     Instant::now()
 }
 
+/// The network's GPU time a frame costs, for the Status tab's graph: the last time each hold of the frame reported,
+/// summed. The holds before the upscaler and after DLSS's output are told apart by their size (render and output);
+/// where the two are the same size (DLAA with passes at both holds) they share a slot and the time is one hold's. A
+/// hold that has not reported for [`Self::FRESH`] (its passes moved to the other hold, a pause) no longer counts.
+#[derive(Debug, Default)]
+pub(crate) struct NetworkMs {
+    slots: [Option<NetworkSlot>; 2],
+}
+
+/// One hold's last report: its size, the time, and when.
+#[derive(Clone, Copy, Debug)]
+struct NetworkSlot {
+    extent: (u32, u32),
+    ms: f32,
+    at: Instant,
+}
+
+impl NetworkMs {
+    const FRESH: Duration = Duration::from_secs(1);
+
+    /// The hold of `extent` reports `ms` at `now`: the frame's time.
+    pub(crate) fn note(&mut self, extent: (u32, u32), ms: f32, now: Instant) -> f32 {
+        for slot in &mut self.slots {
+            if slot.is_some_and(|s| now.saturating_duration_since(s.at) > Self::FRESH) {
+                *slot = None;
+            }
+        }
+        let own = self.slots.iter().position(|s| s.is_some_and(|s| s.extent == extent));
+        let at = own.or_else(|| self.slots.iter().position(Option::is_none)).unwrap_or(0);
+        self.slots[at] = Some(NetworkSlot { extent, ms, at: now });
+        self.slots.iter().flatten().map(|s| s.ms).sum()
+    }
+}
+
 /// One device's pre-upscaler state, kept in its `State` (so holds and presents are serialized by
 /// the same lock).
 #[derive(Default)]
@@ -5653,6 +5687,8 @@ pub(crate) struct Session {
     /// in the same frame.
     pub(crate) res_after: Option<Resources>,
     stats: Stats,
+    /// The network's GPU time of the frame's holds, for the Status tab ([`NetworkMs`]).
+    network_ms: NetworkMs,
     last_hold: Option<Instant>,
     /// The last hold ran the native backend (for `native_running`).
     last_hold_native: bool,
@@ -6548,7 +6584,8 @@ impl Session {
             shm.publish_cache(s.refresh_holds, s.cached_holds, s.last_rejected, gpu);
             shm.publish_scene_cuts(s.scene_cuts);
             if let Some(g) = result.network_gpu_ms {
-                shm.publish_network_gpu_ms(g);
+                // A frame with holds before the upscaler and after DLSS runs the network twice: the frame's time is both.
+                shm.publish_network_gpu_ms(self.network_ms.note(extent, g, now));
             }
         }
         shm.publish_preupscale_state(hold_state(holding), self.last_hold_native, extent.0, extent.1);
@@ -12156,6 +12193,26 @@ mod tests {
 #[cfg(test)]
 mod native_line_tests {
     use super::{hold_offload_line, native_line_due};
+
+    /// The Status tab's model time is the frame's: both holds' in a frame with passes before the upscaler and after
+    /// DLSS, one hold's otherwise, and a hold that stopped reporting drops out.
+    #[test]
+    fn the_published_network_time_adds_the_frames_two_holds() {
+        use std::time::{Duration, Instant};
+        let mut n = super::NetworkMs::default();
+        let t = Instant::now();
+        let (render, output) = ((1485, 835), (2560, 1440));
+        assert_eq!(n.note(render, 7.5, t), 7.5);
+        assert_eq!(n.note(render, 8.0, t + Duration::from_millis(20)), 8.0, "one hold: its last time");
+        assert_eq!(n.note(output, 17.0, t + Duration::from_millis(21)), 25.0, "both holds of a frame");
+        assert_eq!(n.note(render, 7.0, t + Duration::from_millis(40)), 24.0);
+        // The passes all moved after DLSS: the hold before the upscaler reports no more.
+        assert_eq!(n.note(output, 17.5, t + Duration::from_millis(900)), 24.5);
+        assert_eq!(n.note(output, 17.5, t + Duration::from_millis(1500)), 17.5);
+        // Another size (DLSS's quality changed): the stale slot is taken, never a third added.
+        assert_eq!(n.note((1280, 720), 6.0, t + Duration::from_millis(1510)), 23.5);
+        assert_eq!(n.note((1707, 960), 9.0, t + Duration::from_millis(1520)), 26.5, "a third size replaces one");
+    }
 
     #[test]
     fn a_hold_writes_the_offloads_line_while_it_sends_its_frames() {

@@ -435,7 +435,7 @@ game's GPU no longer spends its frame time on the network:
 
 1. Leave **Placement** on Auto: the second GPU then takes the model before DLSS (where its edit changes textures and
    detail most), or after DLSS in games running Ray Reconstruction (path tracing), where the model always works on
-   DLSS's output. Or set it to **After DLSS** or **Finished frame** (`set_placement=3`). With several passes split
+   DLSS's output. Or set it to **After DLSS** (`set_placement=2`) or **Finished frame** (`set_placement=3`). With several passes split
    between before and after DLSS in one frame, the second GPU is not used and every pass runs on the game's GPU (the
    Status tab says "second GPU: not used here: with passes before and after DLSS the model runs on the game's GPU").
 2. Start the game once with Neural Forge on: where the machine has more than one GPU, the layer log lists them when

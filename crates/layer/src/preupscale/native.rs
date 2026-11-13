@@ -4487,7 +4487,15 @@ unsafe fn native_hold(
         // was waited for above).
         if !others_outstanding {
             if let Some(side) = res.offpre.take() {
-                crate::log!("[offload] {}: the frame now has passes at both holds; the network comes back to the game's GPU", offload_at.name());
+                if matches!(super::offload::state(), super::offload::State::Stalled(_)) || super::offload::is_busy(device.handle()) {
+                    // A frame never finished there: the network cannot be taken back (the runner keeps it).
+                    crate::log!(
+                        "[offload] {}: the frame now has passes at both holds, but a frame on the second GPU never finished: the model is off for this session",
+                        offload_at.name()
+                    );
+                } else {
+                    crate::log!("[offload] {}: the frame now has passes at both holds; the network comes back to the game's GPU", offload_at.name());
+                }
                 // SAFETY: idle, as just said.
                 unsafe { side.destroy(device) };
             }
@@ -5546,14 +5554,14 @@ mod tests {
     fn the_running_line_says_where_the_model_runs_with_passes_at_both_holds_and_a_second_gpu() {
         assert_eq!(super::running_line(None, false), "native network running");
         assert_eq!(super::running_line(Some("lower"), false), "native network running (lower)");
-        let rr = super::running_line(None, true);
-        assert!(rr.starts_with("second GPU: "), "doctor reports it with the second GPU's lines: {rr}");
-        assert!(rr.contains("passes before and after DLSS") && rr.ends_with("runs on the game's GPU"), "{rr}");
+        let mixed = super::running_line(None, true);
+        assert!(mixed.starts_with("second GPU: "), "doctor reports it with the second GPU's lines: {mixed}");
+        assert!(mixed.contains("passes before and after DLSS") && mixed.ends_with("runs on the game's GPU"), "{mixed}");
         assert!(super::running_line(Some("lower"), true).ends_with("the game's GPU (lower)"));
         // Every variant fits the channel's field whole (a cut line would read as changed at every hold).
         for guard in [None, Some(super::super::vram_guard::NOTE_SMALL), Some(super::super::vram_guard::NOTE_PAUSED)] {
-            for after in [false, true] {
-                let line = super::running_line(guard, after);
+            for mixed in [false, true] {
+                let line = super::running_line(guard, mixed);
                 assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
             }
         }

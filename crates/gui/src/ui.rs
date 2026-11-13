@@ -1556,14 +1556,19 @@ fn on_second_gpu(reason: &str) -> bool {
 /// (`reason`), which while the model runs on a second GPU says which hold it serves, or neither for the finished frame.
 fn model_row_subtitle(state: u32, reason: &str) -> &'static str {
     use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH};
+    // The hold wordings only while a hold runs: its side stays alive through a pause menu, and the line with it.
     if on_second_gpu(reason) {
-        return if reason.contains(" before DLSS, its edit") {
-            "running on the second GPU, before DLSS"
-        } else if reason.contains(" after DLSS, its edit") {
-            "running on the second GPU, after DLSS"
+        if reason.contains(" before DLSS, its edit") || reason.contains(" after DLSS, its edit") {
+            if model_held(state) {
+                return if reason.contains(" before DLSS, its edit") {
+                    "running on the second GPU, before DLSS"
+                } else {
+                    "running on the second GPU, after DLSS"
+                };
+            }
         } else {
-            "running on the second GPU, on the finished frame"
-        };
+            return "running on the second GPU, on the finished frame";
+        }
     }
     match state {
         HOLDING => "running before the upscaler",
@@ -3960,6 +3965,9 @@ mod preupscale_label_tests {
             model_row_subtitle(OFF, &on("each frame shown one frame later").replace("5080 ", "5080, ")),
             "running on the second GPU, on the finished frame"
         );
+        // Paused or waiting (a menu, a loading screen): the hold's side keeps its line, but no hold runs the model.
+        assert_eq!(model_row_subtitle(PAUSED, &on("after DLSS, its edit applied one frame later")), "not running before the upscaler");
+        assert_eq!(model_row_subtitle(WAITING, &on("before DLSS, its edit applied one frame later")), "not running before the upscaler");
         // The second GPU asked for but not used (passes at both holds), given up or stalled: the hold's own state.
         assert_eq!(
             model_row_subtitle(HOLDING_BOTH, "second GPU: not used here: with passes before and after DLSS the model runs on the game's GPU"),

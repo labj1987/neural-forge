@@ -1931,7 +1931,11 @@ network on the other device. Found in review and confirmed in Cyberpunk 2077 (pa
 the network open elsewhere on every frame ("another network is open in this process", every frame untouched there)
 while the log and the docs said it ran on the game's GPU; the other GPU's runner stamps its use every frame, so it
 was never lent. Serving both holds from the one remote network (one runner for two exchanges and two sizes, both
-submits waiting) is the follow-up. On the other device the depth buffer is built only for the hold before DLSS.
+submits waiting) is the follow-up. The way back was run too (mixed, then one pass before DLSS, `same`): the side is
+built again, the game's loader is asked for the network and closes it within two retries, and the answers resume (410
+of the next 599 frames, the rest while the network loaded there). On the other device the depth buffer is built only
+for the hold before DLSS. The Status tab's model time is the frame's: both holds' in a mixed frame
+(`preupscale::NetworkMs`).
 
 **What crosses, per hold** (imported host memory on both devices): the encode and the answer at the padded output
 extent (RGBA16F) and the accumulated motion (2 x f32 a texel): 56.3 MB out and 28.1 MB back at 2560x1440, about 133

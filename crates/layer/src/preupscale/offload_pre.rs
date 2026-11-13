@@ -1082,7 +1082,8 @@ pub(crate) fn serving_device(game: vk::Device) -> bool {
     WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(d, _, _, _)| *d == game)
 }
 
-/// Whether the before-DLSS placement is asked onto another GPU and not given up (`NEURAL_FORGE_OFFLOAD_GPU`).
+/// Whether the held placements (before DLSS, after its output) are asked onto another GPU and not given up
+/// (`NEURAL_FORGE_OFFLOAD_GPU`).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn wanted() -> bool {
     super::offload::Choice::current() != super::offload::Choice::Off && !super::offload::given_up() && !super::offload::standin()
