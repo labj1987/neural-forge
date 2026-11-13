@@ -548,6 +548,13 @@ struct Gpu {
     broken_export: Option<vk::Semaphore>,
 }
 
+/// A sync fd `vkGetSemaphoreFdKHR` gave, owned; `None` for -1 (or any negative value), which a `SYNC_FD` export may
+/// return for a signal that is already done: nothing to wait for (and an `OwnedFd` must never hold -1).
+fn owned_sync_fd(fd: std::os::fd::RawFd) -> Option<std::os::fd::OwnedFd> {
+    // SAFETY: a new fd from the export, this call's to own.
+    (fd >= 0).then(|| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+}
+
 /// What the offload server exports each frame's submission with ([`Gpu::export`]).
 struct Export {
     api: ash::khr::external_semaphore_fd::Device,
@@ -1861,12 +1868,13 @@ unsafe fn evaluate(
     if let (Some((slot, seq, width, height)), Some(e)) = (publish, gpu.export.as_ref()) {
         let info = vk::SemaphoreGetFdInfoKHR::default().semaphore(e.done).handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
         // SAFETY: the semaphore's signal was just submitted, with everything it depends on (the flow's submits).
-        match unsafe { e.api.get_semaphore_fd(&info) } {
-            Ok(fd) => {
-                // SAFETY: a new fd, this call's to own.
-                let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        match unsafe { e.api.get_semaphore_fd(&info) }.map(owned_sync_fd) {
+            Ok(Some(fd)) => {
                 crate::composition::pace::publish(e.channel, slot, seq, crate::composition::pace::Submitted { fd, dims: (width, height), evaluated: true });
             }
+            // -1: the submission was already done, the signal taken with it (the export is fine). Nothing to wait
+            // for on the GPU: the relay resolves the frame on its answer.
+            Ok(None) => {}
             Err(why) => {
                 // The semaphore keeps its signal: it is not signalled again (and freed with the device's other objects).
                 crate::log!("[offload] the frame's sync fd could not be exported ({why:?}): the presents wait for the answers on the game's thread");
@@ -2442,6 +2450,17 @@ fn note_flow_off(why: &str) {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// A `SYNC_FD` export may give -1 for a signal that is already done: nothing to publish, and never an `OwnedFd`
+    /// holding -1. A real fd is owned (closed with it).
+    #[test]
+    fn an_export_of_minus_one_publishes_nothing() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        assert!(owned_sync_fd(-1).is_none());
+        let raw = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let owned = owned_sync_fd(raw).expect("a real fd is kept");
+        assert_eq!(owned.as_raw_fd(), raw);
+    }
 
     thread_local! {
         /// Makes [`Gpu::new`] fail at this step.
