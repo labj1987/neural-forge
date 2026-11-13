@@ -84,7 +84,7 @@ pub(crate) struct PreRunner {
 // SAFETY: plain handles of the offload device and its own mappings, used on the worker's thread only.
 unsafe impl Send for PreRunner {}
 
-/// `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (a test switch): that frame of the before-DLSS offload fails on the other
+/// `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (a test switch): that frame of a hold's offload (before DLSS or after its output) fails on the other
 /// GPU, so the fall-back to the game's GPU can be seen in a game.
 fn test_fail_at() -> Option<u64> {
     static AT: std::sync::LazyLock<Option<u64>> =
