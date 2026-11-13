@@ -25,7 +25,7 @@ first shipped them; their phase is kept as a subheading.
 - The Status tab's Model row says where the model runs: before the upscaler, after DLSS, or on the second GPU before
   DLSS, after DLSS or on the finished frame. The frame-time graph shows the model's time after DLSS too.
 
-## 4.2.0 — 2026-11-12
+## 4.2.0 — 2026-11-13
 
 **The model on a second GPU**
 
