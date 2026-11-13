@@ -362,6 +362,14 @@ pub(crate) struct Loader {
 
 /// Who may be using the network's frame (activations, counters) and builds, which the two paths share and the loader
 /// thread checks before it frees a build or closes the network ([`Claims::in_flight`], [`Claims::unused`]).
+/// The device's counts of the holds recorded into DLSS's buffers that may still run, shared by its loader and its
+/// `super::inline::Inline`: all of them ([`Claims::holds`]), and those that may record the network ([`Claims::local`]).
+#[derive(Clone, Default)]
+pub(crate) struct HoldCounts {
+    pub all: Arc<std::sync::atomic::AtomicUsize>,
+    pub local: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 #[derive(Default)]
 struct Claims {
     /// The last pre-upscaler hold and the last after-the-upscaler frame (ms since [`epoch_ms`]'s start), and
@@ -383,13 +391,13 @@ struct Claims {
     /// current build, so nothing rebuilds it ([`Loader::ready_sizes`], [`Loader::fall_back`]) and the
     /// after-the-upscaler path does not take the network ([`Claims::pre_running`]) while there are any.
     holds: Arc<std::sync::atomic::AtomicUsize>,
-    /// Those of [`Self::holds`] that recorded nothing of this network: holds before DLSS whose model runs on a
-    /// second GPU (`super::offload_pre`), counted by `super::inline::Inline` once recorded and until released. They
-    /// keep no build or close from happening ([`Self::holds_beyond`] counts them) but are no use of the network: a
-    /// network the after-the-upscaler path opened here is lent to the second GPU's loader beside them
-    /// ([`Claims::unused`]), which otherwise was refused it for good (#63: the model gone after a change of DLSS's
-    /// render size, back on the game's GPU 30 s later).
-    remote: Arc<std::sync::atomic::AtomicUsize>,
+    /// Those of [`Self::holds`] that may record this network: every hold from before it asks for it until it can no
+    /// longer run, except the holds before DLSS whose model runs on a second GPU (`super::offload_pre`), which
+    /// `super::inline::Inline` lets go of once recorded. Those keep no build or close from happening
+    /// ([`Self::holds_beyond`] counts them) but are no use of the network: a network the after-the-upscaler path
+    /// opened here is lent to the second GPU's loader beside them ([`Claims::unused`]), which otherwise was refused it
+    /// for good (#63: the model gone after a change of DLSS's render size, back on the game's GPU 30 s later).
+    local: Arc<std::sync::atomic::AtomicUsize>,
     /// The last time a path took a build of this network ([`Loader::ready_sizes`]; ms since [`epoch_ms`]'s start). Holds
     /// whose model runs on a second GPU stamp [`Self::last_pre`] (it keeps the after-the-upscaler path off) but never
     /// this.
@@ -428,12 +436,10 @@ impl Claims {
         self.holds.load(std::sync::atomic::Ordering::SeqCst) > reserved
     }
 
-    /// The holds recorded into DLSS's buffers that may still run and recorded this network ([`Self::holds`] less
-    /// [`Self::remote`]). `remote` is counted after `holds` and let go before it, so this is never below the true count.
+    /// The holds recorded (or being recorded) into DLSS's buffers that may still run and may have recorded this network
+    /// ([`Self::local`]): one load, never below the true count (a hold counts from before it asks for the network).
     fn network_holds(&self) -> usize {
-        use std::sync::atomic::Ordering::SeqCst;
-        let remote = self.remote.load(SeqCst);
-        self.holds.load(SeqCst).saturating_sub(remote)
+        self.local.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn release_post(&self) {
@@ -646,7 +652,7 @@ impl Loader {
     /// still run (shared with `super::inline::Inline`).
     /// The loader of `device`'s network, opened with counter chaining when `chain` (and `NEURAL_FORGE_NATIVE_CHAIN`
     /// allows it): `false` where the holds run inside DLSS's buffer, which needs barriers.
-    pub(crate) fn start(device: vk::Device, setup: Setup, holds: Arc<std::sync::atomic::AtomicUsize>, chain: bool) -> Self {
+    pub(crate) fn start(device: vk::Device, setup: Setup, holds: HoldCounts, chain: bool) -> Self {
         let shared: Arc<(Mutex<LoaderState>, Condvar)> = Arc::default();
         shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).barriers_from_start = !chain;
         Self {
@@ -655,7 +661,7 @@ impl Loader {
             pending: Mutex::new(Some((device, setup))),
             setup,
             device: device.as_raw(),
-            claims: Arc::new(Claims { holds, ..Default::default() }),
+            claims: Arc::new(Claims { holds: holds.all, local: holds.local, ..Default::default() }),
             #[cfg(test)]
             test_graph: None,
         }
@@ -664,7 +670,7 @@ impl Loader {
     /// Tests: a loader whose network is `built` (open, no worker), with `graph` recording into a hold's
     /// buffer in the graph's place.
     #[cfg(test)]
-    pub(crate) fn for_test(setup: Setup, built: Vec<Built>, holds: Arc<std::sync::atomic::AtomicUsize>, graph: TestGraph) -> Self {
+    pub(crate) fn for_test(setup: Setup, built: Vec<Built>, holds: HoldCounts, graph: TestGraph) -> Self {
         let mut loader = Self::start(vk::Device::null(), setup, holds, true);
         *loader.pending.get_mut().unwrap() = None;
         loader.test_graph = Some(graph);
@@ -762,7 +768,7 @@ impl Loader {
             shared: None,
             bda_ext: false,
         };
-        Self::start(vk::Device::null(), setup, Arc::default(), true)
+        Self::start(vk::Device::null(), setup, HoldCounts::default(), true)
     }
 
     /// Tests: the claims' stamps (the last hold's, the after-the-upscaler path's last frame's) and whether that path runs one.
@@ -875,22 +881,6 @@ impl Loader {
     /// Neither path uses the network ([`Self::lend`]'s condition).
     fn unused(&self) -> bool {
         self.claims.unused()
-    }
-
-    /// The count of the holds recorded into DLSS's buffers that record nothing of this network (their model runs on a
-    /// second GPU), kept by `super::inline::Inline` ([`Claims::remote`]).
-    #[cfg(test)]
-    pub(crate) fn remote_holds(&self) -> Arc<std::sync::atomic::AtomicUsize> {
-        self.claims.remote.clone()
-    }
-
-    /// The loader with `remote` as its count of [`Self::remote_holds`] (shared with the device's `super::inline::Inline`),
-    /// right after [`Self::start`].
-    pub(crate) fn with_remote_holds(mut self, remote: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        if let Some(claims) = Arc::get_mut(&mut self.claims) {
-            claims.remote = remote;
-        }
-        self
     }
 
     /// The device is being destroyed: no other device's loader reaches this one from here on ([`Self::ask_owner`]
@@ -1296,7 +1286,9 @@ impl Loader {
                     drop(network);
                 }
                 Err(why) => {
-                    let wait = retry.failed(Instant::now());
+                    // Another device has the network and was asked to lend it: asked again in a second, not a failure
+                    // of this loader's (its streak would reach the 30 s wait).
+                    let wait = if refused && asked.is_some() { retry.wait_for_owner(Instant::now()) } else { retry.failed(Instant::now()) };
                     match asked {
                         Some(true) => {
                             lines.push("[native] the network is open on another device of the game, which is not using it: it is asked to close it".into())
@@ -5557,7 +5549,7 @@ mod tests {
             shared: None,
             bda_ext: false,
         };
-        let loader = Loader::start(vk::Device::null(), setup, Arc::default(), true);
+        let loader = Loader::start(vk::Device::null(), setup, HoldCounts::default(), true);
         // No hold for longer than the path switch: the post path may claim.
         loader.claims.last_pre.store(0, std::sync::atomic::Ordering::SeqCst);
         let _ = epoch_ms();
@@ -5593,16 +5585,18 @@ mod tests {
             shared: None,
             bda_ext: false,
         };
-        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holds = HoldCounts::default();
         let loader = Loader::start(vk::Device::null(), setup, holds.clone(), true);
         use std::sync::atomic::Ordering::SeqCst;
         let _ = epoch_ms();
         std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
         let unused = || loader.unused();
         assert!(unused(), "nothing ran");
-        holds.store(1, SeqCst);
+        holds.all.store(1, SeqCst);
+        holds.local.store(1, SeqCst);
         assert!(!unused(), "a hold in DLSS's buffers may still run");
-        holds.store(0, SeqCst);
+        holds.all.store(0, SeqCst);
+        holds.local.store(0, SeqCst);
         loader.claims.post_busy.store(true, SeqCst);
         assert!(!unused(), "an after-the-upscaler frame runs");
         loader.release_post();
@@ -5639,9 +5633,8 @@ mod tests {
             bda_ext: false,
         };
         use std::sync::atomic::Ordering::SeqCst;
-        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holds = HoldCounts::default();
         let loader = Loader::for_test(setup, vec![built((64, 32), 1, network::FULL)], holds.clone(), Box::new(|_, _| {}));
-        let remote = loader.remote_holds();
         // The after-the-upscaler path opened it and stopped a path switch ago.
         let _ = epoch_ms();
         std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
@@ -5649,21 +5642,18 @@ mod tests {
         // Offloaded holds come on and on: each stamps the hold (keeping that path off) and is outstanding.
         assert!(loader.claim_pre(), "a hold before DLSS");
         assert!(!loader.claim_post(), "the after-the-upscaler path stays off beside the holds");
-        holds.store(3, SeqCst);
-        remote.store(3, SeqCst);
+        holds.all.store(3, SeqCst);
+        holds.local.store(0, SeqCst);
         assert!(loader.unused(), "holds that record nothing of the network are no use of it");
         // One of them recorded the network after all: in use.
-        remote.store(2, SeqCst);
+        holds.local.store(1, SeqCst);
         assert!(!loader.unused(), "a hold that recorded the network may still run");
-        remote.store(3, SeqCst);
+        holds.local.store(0, SeqCst);
         // A hold that took a build here is a use, whatever the count says.
         assert!(loader.ready_sizes(&[(64, 32)], network::FULL, 0).is_some());
         assert!(!loader.unused(), "within a path switch of a hold that took the network");
         loader.claims.last_local.store(0, SeqCst);
         assert!(loader.unused());
-        // The count is never below the true one: let go before the holds, counted after them.
-        remote.store(4, SeqCst);
-        assert_eq!(loader.claims.network_holds(), 0);
     }
 
     /// While the network is being lent to another device, neither path takes it, and each use is counted (a
@@ -5688,7 +5678,7 @@ mod tests {
             bda_ext: false,
         };
         use std::sync::atomic::Ordering::SeqCst;
-        let loader = Loader::for_test(setup, vec![built((64, 32), 1, network::FULL)], Arc::default(), Box::new(|_, _| {}));
+        let loader = Loader::for_test(setup, vec![built((64, 32), 1, network::FULL)], HoldCounts::default(), Box::new(|_, _| {}));
         assert!(loader.ready_sizes(&[(64, 32)], network::FULL, 0).is_some());
         assert_eq!(loader.shared.0.lock().unwrap().uses, 1, "a path took it");
         loader.shared.0.lock().unwrap().lend = true;
@@ -5757,8 +5747,10 @@ mod tests {
         s.last_use = Some(now);
         assert_eq!(s.apply_idle_step(&claims, now + Duration::from_secs(2)), None, "a path took it 2 s ago");
         claims.holds.store(1, std::sync::atomic::Ordering::SeqCst);
+        claims.local.store(1, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP), None, "a hold recorded with the build may run");
         claims.holds.store(0, std::sync::atomic::Ordering::SeqCst);
+        claims.local.store(0, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP), Some(Level::Paused));
         assert!(s.pausing() && s.wants_work(), "the loader thread closes the network");
         assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP * 2), None, "nothing pending any more");
@@ -5871,11 +5863,11 @@ mod tests {
             bda_ext: false,
         };
         use std::sync::atomic::Ordering::SeqCst;
-        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holds = HoldCounts::default();
         let loader = Loader::for_test(setup, vec![built((3840, 2160), 1, network::FULL)], holds.clone(), Box::new(|_, _| {}));
         let size = [(3840, 2160)];
         // Another hold outstanding, nothing decided: the build is served as before.
-        holds.store(2, SeqCst);
+        holds.all.store(2, SeqCst);
         assert!(loader.ready_sizes(&size, network::FULL, 1).is_some());
         // The build ended at the budget: a pause is decided.
         {
@@ -5888,7 +5880,7 @@ mod tests {
         assert_eq!(loader.shared.0.lock().unwrap().uses, uses, "not taken");
         assert!(!loader.paused(), "not applied under the other hold");
         // The other hold is done with: the asking one applies the pause, and nothing is served.
-        holds.store(1, SeqCst);
+        holds.all.store(1, SeqCst);
         assert!(loader.ready_sizes(&size, network::FULL, 1).is_none());
         assert!(loader.paused());
     }

@@ -1469,26 +1469,30 @@ fn plans_before(plan: &placement::Plan) -> bool {
     before
 }
 
-/// Holds that ran, for the tally line ([`Tracking::scan`]): split holds that wrote back, and holds recorded
-/// inside DLSS's buffers that ran (each run of a buffer counts).
 /// `NEURAL_FORGE_TEST_REBUILD_AT=<launch>[:<seconds>][,...]` (a test switch): from that DLSS launch the hook holds
 /// nothing for `<seconds>` (as in a game's settings menu where DLSS still runs but no frame is held: after 30 s the
 /// after-the-upscaler path takes the network), then the hold's resources are built again as for another render extent
 /// (the game's change of DLSS mode, which needs the game's menu), so what that does to the hold's state (the offload's
 /// side, the network on the other GPU) can be seen in a game ([`test_holds_off`], [`test_rebuild_due`]).
 static TEST_REBUILD: LazyLock<Vec<(u64, u64)>> = LazyLock::new(|| {
-    neural_forge_protocol::env::var("NEURAL_FORGE_TEST_REBUILD_AT")
-        .map(|v| {
-            v.split(',')
-                .filter_map(|e| {
-                    let mut it = e.trim().split(':');
-                    let at = it.next()?.parse().ok()?;
-                    Some((at, it.next().and_then(|s| s.parse().ok()).unwrap_or(0)))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(v) = neural_forge_protocol::env::var("NEURAL_FORGE_TEST_REBUILD_AT") else { return Vec::new() };
+    let at = parse_test_rebuild(&v);
+    if at.is_empty() {
+        crate::log!("[preupscale] NEURAL_FORGE_TEST_REBUILD_AT={v:?} names no DLSS launch (<launch>[:<seconds>][,...]); ignored");
+    }
+    at
 });
+
+/// [`TEST_REBUILD`]'s entries: each `<launch>[:<seconds>]` that parses.
+fn parse_test_rebuild(v: &str) -> Vec<(u64, u64)> {
+    v.split(',')
+        .filter_map(|e| {
+            let mut it = e.trim().split(':');
+            let at = it.next()?.parse().ok()?;
+            Some((at, it.next().and_then(|s| s.parse().ok()).unwrap_or(0)))
+        })
+        .collect()
+}
 
 /// [`TEST_REBUILD`]'s state: when the holds were kept off from, for how long, and a rebuild due.
 static TEST_STATE: Mutex<(Option<(Instant, u64)>, bool)> = Mutex::new((None, false));
@@ -1518,6 +1522,9 @@ pub(crate) fn test_holds_off() -> bool {
 
 /// Whether [`TEST_REBUILD`] has the hold's resources built again now (once nothing recorded with them may still run).
 fn test_rebuild_due(outstanding: usize) -> bool {
+    if TEST_REBUILD.is_empty() {
+        return false;
+    }
     let mut st = lock(&TEST_STATE);
     if !st.1 || outstanding > 0 {
         return st.1;
@@ -1527,6 +1534,8 @@ fn test_rebuild_due(outstanding: usize) -> bool {
     true
 }
 
+/// Holds that ran, for the tally line ([`Tracking::scan`]): split holds that wrote back, and holds recorded
+/// inside DLSS's buffers that ran (each run of a buffer counts).
 static HOLDS_SPLIT: AtomicU64 = AtomicU64::new(0);
 static HOLDS_INSIDE: AtomicU64 = AtomicU64::new(0);
 
@@ -7118,6 +7127,15 @@ pub(crate) fn write_dump_async(frame: DumpFrame, capture: Option<(neural_forge_p
 
 #[cfg(test)]
 mod tests {
+
+    /// `NEURAL_FORGE_TEST_REBUILD_AT`'s entries: a launch with an optional pause; what does not parse is left out.
+    #[test]
+    fn the_rebuild_test_switch_reads_its_entries() {
+        assert_eq!(parse_test_rebuild("60:40, 900"), vec![(60, 40), (900, 0)]);
+        assert_eq!(parse_test_rebuild("60:x,abc"), vec![(60, 0)]);
+        assert!(parse_test_rebuild("on").is_empty());
+    }
+
     use super::*;
 
     fn sem(raw: u64) -> vk::Semaphore {
@@ -10703,7 +10721,7 @@ mod tests {
         let d = &gpu.device;
         let shm = scratch_shm("prefence");
         let setup = native::Setup::for_test(&gpu._entry, &gpu.instance, gpu.physical, gpu.family);
-        let loader: NativeLoader = Arc::new(native::Loader::for_test(setup, Vec::new(), Arc::default(), Box::new(|_, _| {})));
+        let loader: NativeLoader = Arc::new(native::Loader::for_test(setup, Vec::new(), native::HoldCounts::default(), Box::new(|_, _| {})));
         // SAFETY: a fresh device; each submit below is waited on before the resources are destroyed.
         unsafe {
             let mut first = Resources::build(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false).expect("resources");

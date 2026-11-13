@@ -77,6 +77,19 @@ impl BuildRetry {
         wait
     }
 
+    /// The wait before asking again for a network another device of the process has open
+    /// ([`Self::wait_for_owner`]): flat, and no failure.
+    pub const OWNER_WAIT: Duration = Duration::from_secs(1);
+
+    /// The open was refused at `now` because another device of the process has the network and was asked to lend it:
+    /// no failure of this loader's (the streak and its re-initialisations stay as they are), asked again in
+    /// [`Self::OWNER_WAIT`]. Counted as a failure, the 4th refusal waited [`Self::LONG`], longer than the second GPU's
+    /// own 30 s rule, and the offload fell back before its loader asked again (#63). Returns the wait.
+    pub fn wait_for_owner(&mut self, now: Instant) -> Duration {
+        self.next_at = Some(now + Self::OWNER_WAIT);
+        Self::OWNER_WAIT
+    }
+
     /// A build succeeded: the streak is over.
     pub fn succeeded(&mut self) {
         if self.streak > 0 {
@@ -161,6 +174,26 @@ impl FailInject {
 
 #[cfg(test)]
 mod tests {
+
+    /// #63: refusals because another device of the process has the network are asked again every second, for as long
+    /// as they last, without growing the streak toward the 30 s wait or a re-initialisation.
+    #[test]
+    fn a_network_open_on_another_device_is_asked_for_again_every_second() {
+        let t0 = Instant::now();
+        let mut r = BuildRetry::default();
+        let mut now = t0;
+        for _ in 0..10 {
+            assert_eq!(r.step(now), Step::Build);
+            assert_eq!(r.wait_for_owner(now), BuildRetry::OWNER_WAIT);
+            assert!(matches!(r.step(now), Step::Wait(_)));
+            now += BuildRetry::OWNER_WAIT;
+        }
+        assert_eq!(r.streak(), 0);
+        assert!(!r.failing());
+        // A real failure after them starts the streak at its first short wait.
+        assert_eq!(r.failed(now), BuildRetry::SHORT[0]);
+    }
+
     use super::*;
 
     /// A frame-key change long after the last build rebuilds at once (the layer's breaker would

@@ -199,8 +199,8 @@ pub(crate) struct Meta {
     /// The hold's part in the offload of the network to a second GPU (`super::offload_pre`): what its buffer's
     /// submit settles first.
     pub offload: Option<super::offload_pre::HoldPlan>,
-    /// The hold recorded nothing of the game's network (its model runs on a second GPU): counted in
-    /// [`Inline::remote`] while it may run.
+    /// The hold recorded nothing of the game's network (its model runs on a second GPU): no longer counted in
+    /// [`Inline::local`] once recorded.
     pub remote: bool,
     pub stage: Stage,
     /// The resources it was recorded with (`super::Resources::id`): readings of other ones are dropped.
@@ -435,10 +435,10 @@ pub(crate) struct Inline {
     /// Holds recorded and not yet released, on every stage: the network's loader rebuilds nothing they use
     /// while there are any (`native::Loader`).
     outstanding: Arc<AtomicUsize>,
-    /// Those of [`Self::outstanding`] that recorded nothing of the game's network ([`Meta::remote`]), shared with the
-    /// network's loader: they are no use of it (`native::Loader::remote_holds`). Counted after `outstanding` and let go
-    /// before it.
-    remote: Arc<AtomicUsize>,
+    /// Those of [`Self::outstanding`] that may record the game's network, shared with the network's loader
+    /// (`native::HoldCounts::local`): each hold from before it asks for the network, let go once recorded when it
+    /// recorded nothing of it ([`Meta::remote`]: its model runs on a second GPU), else when it can no longer run.
+    local: Arc<AtomicUsize>,
     /// The hold's buffers were submitted on more than one queue: no more holds are recorded (their work
     /// shares the stage's resources and must run one after another).
     stopped: AtomicBool,
@@ -462,8 +462,7 @@ impl Inline {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         app_family: u32,
-        outstanding: Arc<AtomicUsize>,
-        remote: Arc<AtomicUsize>,
+        holds: super::native::HoldCounts,
         restore: super::restore::Fns,
     ) -> Arc<Self> {
         // SAFETY: `physical_device` is the device's own.
@@ -502,8 +501,8 @@ impl Inline {
             ticks,
             slots: Mutex::new(Slots::default()),
             harvest: Mutex::new(Vec::new()),
-            outstanding,
-            remote,
+            outstanding: holds.all,
+            local: holds.local,
             stopped: AtomicBool::new(false),
             first_recorded: AtomicBool::new(false),
             said: Mutex::new(HashSet::new()),
@@ -1043,10 +1042,12 @@ impl Inline {
         // Counted among the holds that may still run from before it asks for the network: nothing rebuilds the
         // network or lends it to another device while it is being recorded (`native::Loader::ready_sizes`).
         self.outstanding.fetch_add(1, Ordering::SeqCst);
+        self.local.fetch_add(1, Ordering::SeqCst);
         let outcome = hold(&mut ctx);
         let opened = ctx.opened;
         if !opened {
             // Nothing recorded: nothing of it can run.
+            self.local.fetch_sub(1, Ordering::SeqCst);
             self.outstanding.fetch_sub(1, Ordering::SeqCst);
         }
         if opened {
@@ -1074,7 +1075,8 @@ impl Inline {
             // decided after opening (its readings are then dropped).
             Ok(meta) if opened => {
                 if meta.remote {
-                    self.remote.fetch_add(1, Ordering::SeqCst);
+                    // Recorded nothing of the network: no use of it from here on.
+                    self.local.fetch_sub(1, Ordering::SeqCst);
                 }
                 slot.meta = Some(meta);
                 slot.recorded = Some(Instant::now());
@@ -1170,8 +1172,8 @@ impl Inline {
                 continue;
             }
             if let Some(meta) = slot.meta.take() {
-                if meta.remote {
-                    self.remote.fetch_sub(1, Ordering::SeqCst);
+                if !meta.remote {
+                    self.local.fetch_sub(1, Ordering::SeqCst);
                 }
                 self.outstanding.fetch_sub(1, Ordering::SeqCst);
                 if slot.submits > 0 {
@@ -1937,7 +1939,7 @@ mod tests {
                     )
                     .unwrap();
                 device.end_command_buffer(graph).unwrap();
-                let holds = Arc::new(AtomicUsize::new(0));
+                let holds = super::super::native::HoldCounts::default();
                 // The replay's functions, as `device.rs` resolves them below the layer.
                 let gdpa = |name: &std::ffi::CStr| (instance.fp_v1_0().get_device_proc_addr)(device.handle(), name.as_ptr());
                 let fns = super::super::restore::Fns {
@@ -1948,7 +1950,7 @@ mod tests {
                     bind_descriptor_buffers: gdpa(c"vkCmdBindDescriptorBuffersEXT").map(|f| std::mem::transmute(f)),
                     bind_shaders: gdpa(c"vkCmdBindShadersEXT").map(|f| std::mem::transmute(f)),
                 };
-                let inline = Inline::new(device.clone(), &instance, physical, family, holds.clone(), Arc::default(), fns);
+                let inline = Inline::new(device.clone(), &instance, physical, family, holds.clone(), fns);
                 inline.pool_created(pool, family);
                 // As after the device's first hold point: every buffer the tests begin is noted.
                 inline.restore.activate();
@@ -2505,6 +2507,7 @@ mod tests {
         assert_eq!(outcome, Recorded::Skipped);
         assert_eq!(seen.get(), 1, "counted while it is recorded");
         assert_eq!(rig.inline.outstanding.load(Ordering::SeqCst), 0, "nothing recorded: no longer counted");
+        assert_eq!(rig.inline.local.load(Ordering::SeqCst), 0, "nor as a use of the network");
         rig.end(cb);
     }
 
@@ -2527,10 +2530,10 @@ mod tests {
         assert_eq!(rig.inline.record_outcome(b, rig.point(), copies_only), Recorded::Held);
         rig.end(b);
         assert_eq!(rig.inline.outstanding.load(Ordering::SeqCst), 2);
-        assert_eq!(rig.inline.remote.load(Ordering::SeqCst), 1, "only the hold whose model runs elsewhere");
+        assert_eq!(rig.inline.local.load(Ordering::SeqCst), 1, "only the hold that ran the network here");
         rig.inline.reset_pool(rig.pool, false);
         assert_eq!(rig.inline.outstanding.load(Ordering::SeqCst), 0);
-        assert_eq!(rig.inline.remote.load(Ordering::SeqCst), 0, "let go with its buffer");
+        assert_eq!(rig.inline.local.load(Ordering::SeqCst), 0, "let go with its buffer");
     }
 
     /// A hold that misses once the network ran (here: the network's sizes do not include the hold's): the frame

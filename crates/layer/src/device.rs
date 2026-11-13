@@ -1689,10 +1689,7 @@ impl NeuralForgeDeviceInfo {
         let active = crate::layer_enabled() && crate::ownership::eligible();
         // The holds recorded into DLSS's buffers that may still run: the network keeps the build they use.
         #[cfg(target_arch = "x86_64")]
-        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        // Those of them whose model runs on a second GPU: they record nothing of the network (#63).
-        #[cfg(target_arch = "x86_64")]
-        let remote_holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holds = crate::preupscale::native::HoldCounts::default();
         // The game's graphics family, where DLSS's buffers run: the network's frame family.
         #[cfg(target_arch = "x86_64")]
         let mut frame_family = None;
@@ -1715,9 +1712,7 @@ impl NeuralForgeDeviceInfo {
                 // Holds inside DLSS's buffer (below) run the network with barriers: opened so from the start, not
                 // chained and then built again (each build runs the network once on the layer's queue).
                 let inline_holds = preupscale.is_some() && instance.is_some() && crate::preupscale::inline::enabled() && !inline_chain_kept();
-                let loader = std::sync::Arc::new(
-                    crate::preupscale::native::Loader::start(handle, setup, holds.clone(), !inline_holds).with_remote_holds(remote_holds.clone()),
-                );
+                let loader = std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup, holds.clone(), !inline_holds));
                 loader.register(handle);
                 hold.lock().unwrap_or_else(std::sync::PoisonError::into_inner).preupscale.native = Some(loader);
             }
@@ -1741,8 +1736,7 @@ impl NeuralForgeDeviceInfo {
                         bind_shaders: resolve(next_get_device_proc_addr, handle, c"vkCmdBindShadersEXT"),
                     }
                 };
-                let inline =
-                    crate::preupscale::inline::Inline::new(device.clone(), instance, physical_device, app_family, holds.clone(), remote_holds.clone(), fns);
+                let inline = crate::preupscale::inline::Inline::new(device.clone(), instance, physical_device, app_family, holds.clone(), fns);
                 // SAFETY: the device is live.
                 unsafe { crate::preupscale::restore::register(handle, inline.restore.clone()) };
                 Some(inline)

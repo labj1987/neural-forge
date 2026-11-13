@@ -241,7 +241,7 @@ impl PostServer {
             // Barriers between the network's launches, never counter chaining: chained launches spin on the GPU waiting for
             // each other, and beside another context on the same GPU (the game's, in the `same` test) the frame never
             // finished (2560x1440 on an RTX 5070: no answer in 20 s; with barriers 21 ms).
-            let loader = Arc::new(Loader::start(off.device.handle(), off.setup, Arc::default(), false));
+            let loader = Arc::new(Loader::start(off.device.handle(), off.setup, super::native::HoldCounts::default(), false));
             loader.register(off.device.handle());
             let standin = if off.standin {
                 // SAFETY: the device just made, with the queue family its setup names.

@@ -139,7 +139,7 @@ impl PreRunner {
             return Err("its command buffers could not be made on the other GPU".into());
         };
         // Barriers between the network's launches, never counter chaining (`native_post::PostServer::start_offload`).
-        let loader = Arc::new(Loader::start(off.device.handle(), off.setup, Arc::default(), false));
+        let loader = Arc::new(Loader::start(off.device.handle(), off.setup, super::native::HoldCounts::default(), false));
         loader.register(off.device.handle());
         let shared = shared && off.import;
         Ok((

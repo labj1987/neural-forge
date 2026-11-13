@@ -1090,12 +1090,19 @@ pub(crate) struct ServerRule {
     generation: u64,
     warm: u32,
     not_running_since: Option<std::time::Instant>,
+    /// The last frame noted not run ([`Self::missed`]).
+    last_miss: Option<std::time::Instant>,
 }
+
+/// A pause between two frames not run longer than this starts [`ServerRule`]'s count afresh: its [`NOT_RUNNING`] is
+/// of frames that keep coming, not a pause (a menu, a loading screen) between a miss and the next.
+pub(crate) const NOT_RUNNING_GAP: Duration = Duration::from_secs(1);
 
 impl ServerRule {
     /// Notes a frame the network ran on (`generation`: the build's), and how long it took; why to fall back.
     pub(crate) fn ran(&mut self, generation: u64, took: Duration) -> Option<String> {
         self.not_running_since = None;
+        self.last_miss = None;
         if generation != self.generation {
             self.generation = generation;
             self.warm = 0;
@@ -1107,6 +1114,9 @@ impl ServerRule {
     /// Notes a frame the model was wanted for that the network did not run on (`why`: the loader's reason, if any), at
     /// `now`; why to fall back.
     pub(crate) fn missed(&mut self, now: std::time::Instant, why: Option<&str>) -> Option<String> {
+        if self.last_miss.replace(now).is_some_and(|l| now.saturating_duration_since(l) > NOT_RUNNING_GAP) {
+            self.not_running_since = None;
+        }
         let since = *self.not_running_since.get_or_insert(now);
         (now.saturating_duration_since(since) >= NOT_RUNNING)
             .then(|| format!("the network has not run on the other GPU for {NOT_RUNNING:?}{}", why.map_or(String::new(), |w| format!(" ({w})"))))
@@ -1231,6 +1241,24 @@ mod tests {
     }
 
     /// Given up is for the process and the session: nothing later reads as running again.
+    /// The server's 30 s rule counts frames not run that keep coming: one miss, then a pause longer than the rule (a
+    /// menu), then a miss does not fall back; misses that keep coming for 30 s do.
+    #[test]
+    fn a_pause_between_misses_starts_the_servers_count_afresh() {
+        let t0 = std::time::Instant::now();
+        let mut rule = ServerRule::default();
+        assert_eq!(rule.missed(t0, None), None);
+        assert_eq!(rule.missed(t0 + NOT_RUNNING + Duration::from_secs(5), None), None, "a pause, not 30 s of frames");
+        let mut now = t0 + NOT_RUNNING + Duration::from_secs(5);
+        let end = now + NOT_RUNNING;
+        let mut fell = None;
+        while now <= end {
+            now += Duration::from_millis(100);
+            fell = fell.or(rule.missed(now, Some("lent")));
+        }
+        assert!(fell.is_some_and(|w| w.contains("lent")), "misses that keep coming for 30 s fall back");
+    }
+
     #[test]
     fn a_stall_is_never_followed_by_the_offload_running_again() {
         let (stalled, fell) = (State::Stalled("gpu".into()), State::FellBack("why".into()));
@@ -1319,8 +1347,15 @@ mod tests {
     fn frames_the_network_never_runs_on_fall_back_after_a_while() {
         let mut rule = ServerRule::default();
         let t0 = std::time::Instant::now();
-        assert!(rule.missed(t0, None).is_none());
-        assert!(rule.missed(t0 + NOT_RUNNING / 2, Some("the network could not be built")).is_none());
+        // Frames keep coming (one every 100 ms), none run.
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let half = NOT_RUNNING.as_millis() as u64 / 2;
+        for ms in (0..half).step_by(100) {
+            assert!(rule.missed(at(ms), None).is_none());
+        }
+        for ms in (half..NOT_RUNNING.as_millis() as u64).step_by(100) {
+            assert!(rule.missed(at(ms), Some("the network could not be built")).is_none());
+        }
         let why = rule.missed(t0 + NOT_RUNNING, Some("paused: too little VRAM")).expect("gives up");
         assert!(why.contains("too little VRAM"));
         let mut rule = ServerRule::default();
