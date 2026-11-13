@@ -43,6 +43,13 @@ pub struct BuildRetry {
     reinits: u32,
     /// The streak a success just ended, until [`Self::take_recovered`].
     recovered: Option<u32>,
+    /// The other device's last answer in this run of refusals ([`Self::wait_for_owner`]: lending or not), and its
+    /// refusals in a row while using the network.
+    owner_said: Option<bool>,
+    owner_busy: u32,
+    /// When the last refusal of the run was ([`Self::wait_for_owner`]): one more than [`Self::OWNER_RUN_GAP`] later
+    /// starts a new run.
+    owner_last: Option<Instant>,
 }
 
 impl BuildRetry {
@@ -71,10 +78,52 @@ impl BuildRetry {
 
     /// A build failed at `now`. Returns the wait before the next attempt.
     pub fn failed(&mut self, now: Instant) -> Duration {
+        self.owner_done();
         self.streak += 1;
         let wait = Self::SHORT.get(self.streak as usize - 1).copied().unwrap_or(Self::LONG);
         self.next_at = Some(now + wait);
         wait
+    }
+
+    /// The wait before asking again for a network another device of the process has open while that device is
+    /// closing it for this one ([`Self::wait_for_owner`]), and while it is using it, the first
+    /// [`Self::OWNER_BUSY_SHORT`] times in a row.
+    pub const OWNER_WAIT: Duration = Duration::from_secs(1);
+    /// The wait while the other device keeps using the network: each ask runs its lend check (which briefly holds
+    /// its holds' stamp), and nothing else bounds the asks but the second GPU's own 30 s rule.
+    pub const OWNER_BUSY_WAIT: Duration = Duration::from_secs(5);
+    /// Refusals in a row with the other device using the network before the asks slow to [`Self::OWNER_BUSY_WAIT`].
+    pub const OWNER_BUSY_SHORT: u32 = 5;
+    /// A refusal this long after the last one starts a new run of them (said again, back to [`Self::OWNER_WAIT`]):
+    /// twice the longest wait between two of one run.
+    pub const OWNER_RUN_GAP: Duration = Duration::from_secs(10);
+
+    /// The open was refused at `now` because another device of the process has the network, which was asked to lend
+    /// it: `lending` when it closes it now, else it is using it. No failure of this loader's (the streak and its
+    /// re-initialisations stay as they are): counted as one, the 4th refusal waited [`Self::LONG`], longer than the
+    /// second GPU's own 30 s rule, and the offload fell back before its loader asked again (#63). Asked again in
+    /// [`Self::OWNER_WAIT`], or [`Self::OWNER_BUSY_WAIT`] once the other device has refused
+    /// [`Self::OWNER_BUSY_SHORT`] times in a row. Returns the wait, and whether to say so: once per run of refusals
+    /// with the same answer.
+    pub fn wait_for_owner(&mut self, now: Instant, lending: bool) -> (Duration, bool) {
+        if self.owner_last.replace(now).is_some_and(|t| now.saturating_duration_since(t) > Self::OWNER_RUN_GAP) {
+            self.owner_said = None;
+            self.owner_busy = 0;
+        }
+        let say = self.owner_said != Some(lending);
+        self.owner_said = Some(lending);
+        self.owner_busy = if lending { 0 } else { self.owner_busy.saturating_add(1) };
+        let wait = if self.owner_busy > Self::OWNER_BUSY_SHORT { Self::OWNER_BUSY_WAIT } else { Self::OWNER_WAIT };
+        self.next_at = Some(now + wait);
+        (wait, say)
+    }
+
+    /// The run of refusals is over (the network opened, or the loader asked for nothing more): the next refusal is
+    /// said again and asked again at [`Self::OWNER_WAIT`].
+    pub fn owner_done(&mut self) {
+        self.owner_said = None;
+        self.owner_busy = 0;
+        self.owner_last = None;
     }
 
     /// A build succeeded: the streak is over.
@@ -162,6 +211,53 @@ impl FailInject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #63: refusals because another device of the process has the network are asked again every second while it
+    /// lends it, and every second the first few times it is using it, then every 5 s; never growing the streak toward
+    /// the 30 s wait or a re-initialisation; and said once per run of the same answer.
+    #[test]
+    fn a_network_open_on_another_device_is_asked_for_again_on_its_own_cadence() {
+        let t0 = Instant::now();
+        let mut r = BuildRetry::default();
+        let mut now = t0;
+        let ask = |r: &mut BuildRetry, now: &mut Instant, lending: bool| {
+            assert_eq!(r.step(*now), Step::Build);
+            let (wait, say) = r.wait_for_owner(*now, lending);
+            assert!(matches!(r.step(*now), Step::Wait(_)));
+            *now += wait;
+            (wait, say)
+        };
+        // Using it: 1 s the first OWNER_BUSY_SHORT times, then 5 s; said once.
+        let busy: Vec<(Duration, bool)> = (0..8).map(|_| ask(&mut r, &mut now, false)).collect();
+        let short = BuildRetry::OWNER_BUSY_SHORT as usize;
+        assert!(busy[..short].iter().all(|(w, _)| *w == BuildRetry::OWNER_WAIT));
+        assert!(busy[short..].iter().all(|(w, _)| *w == BuildRetry::OWNER_BUSY_WAIT));
+        assert_eq!(busy.iter().filter(|(_, say)| *say).count(), 1, "said once while the answer stays");
+        // Lending now: back to 1 s, said once more.
+        assert_eq!(ask(&mut r, &mut now, true), (BuildRetry::OWNER_WAIT, true));
+        assert_eq!(ask(&mut r, &mut now, true), (BuildRetry::OWNER_WAIT, false));
+        // Using it again: the count starts over.
+        assert_eq!(ask(&mut r, &mut now, false), (BuildRetry::OWNER_WAIT, true));
+        assert_eq!(r.streak(), 0);
+        assert!(!r.failing());
+        // A real failure after them starts the streak at its first short wait, and the next refusal is said again.
+        assert_eq!(r.failed(now), BuildRetry::SHORT[0]);
+        assert_eq!(r.wait_for_owner(now, false), (BuildRetry::OWNER_WAIT, true));
+        // A run that ended with no build and no failure (the loader went idle): a refusal long after starts a new one,
+        // said again and asked again in a second; one within the gap continues it.
+        let mut r = BuildRetry::default();
+        let mut now = t0;
+        for _ in 0..8 {
+            now += r.wait_for_owner(now, false).0;
+        }
+        assert_eq!(r.wait_for_owner(now, false), (BuildRetry::OWNER_BUSY_WAIT, false), "within the gap: the same run");
+        now += BuildRetry::OWNER_RUN_GAP + Duration::from_secs(1);
+        assert_eq!(r.wait_for_owner(now, false), (BuildRetry::OWNER_WAIT, true), "hours later: a new run");
+        // The network opened in between: the next refusal is a new run too.
+        now += r.wait_for_owner(now, false).0;
+        r.owner_done();
+        assert_eq!(r.wait_for_owner(now, false), (BuildRetry::OWNER_WAIT, true));
+    }
 
     /// A frame-key change long after the last build rebuilds at once (the layer's breaker would
     /// otherwise count a spacing's worth of echoes); one right after a build still waits for the

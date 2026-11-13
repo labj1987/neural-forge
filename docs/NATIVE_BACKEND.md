@@ -1649,6 +1649,251 @@ Crimson Desert's weak change after DLSS (7 of 255, NATIVE_BACKEND's Crimson Dese
 and `r.HDR.Display.ColorGamut=2` start it in HDR10; against the menu's HDR the picture differs by less than two
 screenshots of one state do.
 
+## The model on a second GPU (#63, 2026-11-12)
+
+`preupscale::offload`. With `NEURAL_FORGE_OFFLOAD_GPU` set and Placement `present` for every pass, the
+after-the-upscaler server (`native_post::PostServer::start_offload`) runs on a device of another GPU. The device is made
+inside the game's `vkCreateDevice` (`offload::make_for`, for a device that asks for swapchains) and destroyed inside its
+`vkDestroyDevice` (`offload::destroy_for`), through the loader's `VK_LOADER_LAYER_CREATE_DEVICE_CALLBACK`: the loader's
+callbacks change its device lists without taking its lock, which its trampoline holds only inside those two calls (Vulkan-Loader
+1.4.341, `loader_layer_create_device`). The layers below this one see it as their own device; the layer's own
+`vkCreateDevice` hook passes it through (`offload::making`). It has a compute family's two queues (loading, frames),
+the network's extensions and features (`neural_forge_native::device_extend`) and `VK_EXT_external_memory_host`. Its
+loader is a second `native::Loader` (the process's one network moves to it through the existing lend), opened when
+the server first needs it; objects from below the loader get their dispatch pointer through the game's request's
+loader callback. A loss of that device marks neither the game's devices nor the session lost (`note_secondary_device`).
+
+**Transfer.** The finished-frame path already crosses system memory (the proxy and answer regions), so nothing new
+is shared between the devices: the other GPU imports both regions as host memory (no CPU copy) and stages them where
+it cannot. dma-buf sharing between the two devices would save the game GPU's capture into host memory, but the
+shared memory is where the request protocol already lives and both GPUs read it over PCIe either way; not built.
+
+**One frame late (`capture::delayed_present`).** Waiting for each frame's own answer, as the synchronous present
+does, would leave the game's GPU idle for the whole round trip and save nothing. Instead the present composes the
+answer to the frame the last present kept and posted, onto that frame as it was kept (`GpuCompose::keep_delayed`:
+the image before anything is written into it, and the proxy it was sent as), and that replaces the live image; then
+it keeps and posts this frame, in the other of two pairs. Every frame is shown one present late with exactly its own
+composition (no ghosting, unlike `NEURAL_FORGE_PIPELINED`, which carries an older answer onto the live frame). A frame
+whose answer does not come within the present's budget (the frame then is not sent either: the server still reads the
+proxy region), or that was not captured, is shown as it was kept in its turn (`GpuCompose::show_kept`), so no frame is
+dropped or repeated. The present waits for the answer, so the frame rate is bounded by the other GPU's time per frame.
+Where the delay starts (the first present, and after a stall: a frame kept more than 250 ms before the next present
+is not shown, and this present's frame is kept and sent as a first one's) that present shows its own frame and the
+next shows it again, composed: one repeat, inherent to starting a delay. A frame that could be captured but was not
+is kept as it is and shown in its turn (`keeps_frame`), so an isolated failure costs that frame its edit and nothing
+else; after 3 in a row the synchronous present has the frames for 30 presents before the delayed one tries again, so a
+capture that keeps failing never leaves the stream late without the model. The late rule's first 10 frames after a
+start or a change of size count for nothing (the network is built then). Leaving the path (the model back on this GPU, frame hold, the effect off) drops the kept frame (the stream steps
+over one frame, as a flush of it would, since the frame it replaced is then not shown) and frees the pairs. Every
+present the keep writes to is ordered before the present: the compose or the show that follows it signals the present
+semaphore, or the keep itself does, or its fence is waited. The keeps and the show are in the compose's waits at
+teardown (`wait_in_flight`). With the zero-copy pair (direct capture at the frame's size, the answer region
+imported) everything stays on the GPU. Without it (the Model resolution below Full: the proxy is the scaled model scratch;
+an odd frame size; no host-memory import) `delayed_present_cpu` does the same with CPU pairs (`Inflight::kept_cpu`: the
+frame and its small proxy, swapped out of the capture's scratches) and the compose's held frame (as frame hold), the
+answer read into memory (`Inflight::answer_cpu`) before the next request, and composed with the white point and
+reversible mode its proxy was encoded with (`DelayedRequest::white_point`: the meter may have moved the setting by
+then). A frame without its answer is shown as itself (`show_kept_cpu`: the frame as its own answer at full size, so a
+Replace mode gives it back too, never the enlarged small proxy). A frame that cannot be captured (the answer before it
+still out, or a failed capture) is kept as a raw frame on the GPU and shown in its turn, as on the zero-copy path. A
+late answer is judged against the game's interval before the wait, never as a stall. A capture series pairs each
+delayed present with the previous present's original (`capture::presented_previous_frame`), so its pairs are the frame
+and its own composite; the first delayed present of a capture has no previous original and is left out. Found in #63: 007 First
+Light at 2048x1536 with the Model resolution at Half fell back to the synchronous present, every frame waiting about 12
+ms for its own answer from the RTX 5080 (40-50 fps against 75 without the model), and the summary line was only
+written on the delayed path. HDR10 frames below Full are not composed at all, with or without the second GPU (an HDR10 frame
+composes only a full-size answer). The `[offload]` summary every 600 presents counts both paths. The model interval's carried frames are off while
+offloaded. The white meter reads the proxy region after each capture, as the synchronous present's does.
+
+**Fall-back.** To the game's GPU for the session (`Status::Unavailable`, `offload::State::FellBack`) when: the device
+cannot be made or lacks a requirement; the server's pipelines cannot be built there; the network has not run there
+for 30 s while frames came (`ServerRule::missed`: a build that fails, the VRAM guard's pause); a frame takes over a
+second (`ServerRule::ran`, after the first 10 frames of a build); or more than 30 of the last 120 sent frames come back
+later than both three present intervals and 100 ms, or 5 in a row get no answer within the present's budget
+(`LateRule`, judged at the present and decided as soon as that is so; not in the `same` test, where the other device
+shares the game's GPU). The 100 ms floor: the present does not see what the network would cost the game's GPU, and a
+second GPU at 40 ms a frame against a 120 fps game still beats running it after the game's frame on one GPU. The
+give-up is for the process (`offload::given_up`): every device runs the network on its own GPU from then on. A frame that does not finish (`FENCE_WAIT_TIMEOUT`, or a lost device) ends serving with
+`Status::Stalled`: the worker waits for it, and only once it finished (or the device is lost) frees the server, the
+network and the shared regions' imports and turns `Unavailable`; asked to quit meanwhile it waits 5 s more and else
+leaves the network and the device to the process's end (drain before free). While it waits the Status tab and
+`doctor` say the second GPU stalled (`State::Stalled`). The state is on the Status tab's line
+(`layer_reason`) and in `doctor` (`offload`). `NEURAL_FORGE_OFFLOAD_STANDIN=1` (tests only) runs a copy in and out of
+the other GPU in place of the network, for a GPU that cannot run it; with it, `NEURAL_FORGE_OFFLOAD_TEST_STALL=<frame>`
+makes that frame wait 8 s on the GPU for a host-set event (a stall that finishes), and
+`NEURAL_FORGE_OFFLOAD_TEST_SLOW_MS=<ms>` adds that much to every frame (the late rule).
+
+**Counter chaining is off on the offload device.** With chaining, a second device of the same GPU beside the
+game's context never finished its first frame (2560x1440 on the RTX 5070, no answer in 20 s); with barriers 21 ms.
+The offload loader is opened with `chain` false.
+
+**Measured (RTX 5070, Intel UHD 770; `pan` at 2560x1440, Cyberpunk 2077 at 3840x2160 HDR):**
+
+| Run | Frames shown | Network frame | Request to answer | Notes |
+|---|---|---|---|---|
+| `pan` 2560x1440, model on the game's device (synchronous) | 40 fps, every frame composed | 19.7 ms (server) | 19.7 ms | reference |
+| `pan` 2560x1440, `same` (second device, same GPU) | 41 fps, 600 of 600 composed | 21.4 ms | 21.7 ms | every captured frame shown exactly one present late (60 of 60); its composite against the reference's for the same frame: mean 1.7/255, against an edit of 7.6/255 (the history and the network's own run-to-run differences) |
+| `pan` 2560x1440, Intel UHD 770, stand-in copy | 367 of 600 presents with the answer once running | 6.5 ms on the iGPU | 8.3 ms | copies in 2.8 ms and back 2.8 ms (14.7 MB each way, imported host memory) |
+| `pan` 3773x2091 (near 4K), `same`, stand-in copy | (synchronous: odd size, no zero-copy pair) | | 3.4-6 ms | the round trip through system memory on the RTX 5070: 31.5 MB in and back out, imported host memory |
+| `pan` 3773x2091, Intel UHD 770, stand-in copy | (synchronous) | | 57 ms | the same round trip on the iGPU |
+| Cyberpunk 2077, 4K HDR10, frame generation on, model on the game's device | 16.6 fps | 47-49 ms (server) | | |
+| Cyberpunk 2077, 4K HDR10, `same` | 15.3-16.6 fps, 600 of 600 composed | 56-58 ms | 56-58 ms | captured frames (HDR, tone-mapped for viewing): each composite is the previous frame with the model's edit, none later; no tearing or mixed frames |
+
+Video memory sat at 11.8 of 12 GB in both Cyberpunk runs (the second device holds its own network and activations).
+On one GPU `same` saves nothing (both devices share it); the point of the path is a second GPU, which this machine
+does not have. Not built: dma-buf sharing. The table's runs were taken before the fall-back rules and the shown-once
+cadence above; the review's re-runs are below it.
+
+Re-runs with the fall-back rules and the shown-once cadence (2026-11-12): `pan` at 2560x1440 with `same`: about 38 fps
+against 34-38 on the game's device, every one of 60 captured frames shown exactly one present late, none repeated or
+skipped, its composite against the game's device's for the same frame a mean 1.6/255 against an edit of 7.6/255. The
+stand-in on the UHD 770 at 3200x1800: 7.7 ms a frame (copies 3.8 ms in, 3.7 ms back, 23 MB each way). The stall
+switch: the frame waited 8 s, the server waited for it, then fell back and the network ran on the game's device. The
+slow switch (40 ms a frame against `pan`'s few): every one of 120 frames late, back to the game's device. Cyberpunk
+2077 at 4K HDR10 with `same`: 16.1 fps median, 55-58 ms a frame on the second device, 600 of 600 presents composed
+per summary, video memory at 11.8 of 12 GB; in 24 captured frames each composite is the previous frame with the edit,
+and after each stall the capture's own writing caused (2.7 s) one frame went out live and was then shown once more,
+composed.
+
+## Before DLSS on a second GPU (#63, 2026-11-12)
+
+`preupscale::offload_pre` (the exchange and the hold's side), `preupscale::offload_server` (the network's frame on the
+other device), `native::native_hold` (`offloaded`). With `NEURAL_FORGE_OFFLOAD_GPU` set, the hold before DLSS (the
+split hold and the hold inside DLSS's buffer) sends its frame to the offload device and runs no network on the game's.
+
+**Why not the finished frame's trick.** The hold is part of DLSS's command buffer and DLSS needs the edited colour
+input before it runs: the other GPU cannot run the same frame's network without the game's GPU waiting for the whole
+round trip. Delaying DLSS's whole input by a frame instead would mean holding every input a frame (colour, depth,
+motion vectors, exposure) and NGX's jitter and reset with them (the wrapper delaying parameters, or the layer
+rewriting kernel words, which AGENTS.md rules out), frame generation getting vectors of another frame, and a frame of
+latency. So the **edit** is delayed, not the frame: hold N sends frame N out and carries the edit of frame N-1, which
+the other GPU finished while the game's GPU rendered frame N, onto its own fresh frame, exactly as a cached hold of
+the edit cache does (reprojected along DLSS's motion vectors, admitted by depth and fingerprint). DLSS gets frame N
+with frame N's depth, vectors and jitter; frame generation and the present see no added latency. The cost: the edit
+is always one frame old (on one GPU: fresh on every frame while the camera is still, on every second frame in
+motion), so still scenes lose the part of the answer that follows each frame's jitter, and uncovered texels get no
+edit for a frame (the cache's rejection).
+
+**The hold (game's GPU), in order:**
+
+1. *receive*, when the hold recorded right before sent a frame: the answer region copied into the HDR pass's answer
+   image, the cache's `capture` pass run a hold late (`CachePass::record_capture_late`: against the sent frame, whose
+   encode, exposure and depth are still in place because this runs before the hold's own capture; its colour from a
+   kept copy, `HoldSide::record_snapshot`, since the write-back has written the colour input since; a second
+   descriptor set of the cache, `bind_late`), then the gate (`preupscale_offload_gate.comp`): where the answer
+   region's header does not name that frame's complete answer, `STAT_EDIT_STORED` is cleared and the cached
+   write-back passes the frame through. The hold guard runs after it (inside DLSS's buffer), so a hold that does not
+   follow the one recorded before it still drops the edit. The cached write-back was checked to leave what the late
+   capture reads alone: it writes the colour input and the cache's own buffers only.
+2. the capture `C` as always (the encode, the depth copy, the scene cut, the cache's motion pass with a fresh chain:
+   the accumulated field is this hold's motion, back to the frame the edit is of).
+3. *send*: the colour input copied for the next hold's capture; the encode (RGBA16F at the padded extent), the
+   accumulated motion, the depth, the exposure and the native state's words (the scene cut) copied into the OUT
+   region; `vkCmdSetEvent(sent)`.
+4. the cached write-back when an answer was taken; nothing else (no decode: the frame goes to DLSS as it is).
+
+On the CPU the cache's state machine is unchanged but for one flag: `State::late_refresh` notes the sent hold as a
+refresh that went through, then `plan` makes this hold the cached one after it (`State::offloaded`: also in the
+still regime, whose every-hold refresh has no network here). A hold with no answer to take stores nothing
+(`drop_edit`), so an edit older than one hold is never carried with a field that does not reach back to it.
+
+**Ordering the two GPUs.** `sent` is set by the game's GPU after the copies, so the worker (`Worker`, a thread
+polling the event) starts in the order the GPU runs the holds, whatever order they were recorded in. Nothing on the
+game's GPU waits: a command buffer may not wait on an event the host sets while it is pending
+(VUID-vkSetEvent-event-09543; the first version did, passed on lavapipe, and the validation layer refused it). The
+wait is the CPU's, at the submit of the next hold's buffer (`Exchange::at_submit`: the split hold is inside
+`vkQueueSubmit` already; the hold inside DLSS's buffer gets it in `device.rs` beside its layout check,
+`inline::Meta::offload`): 100 ms at most, only for a frame whose buffer went to the driver in an earlier submit, and
+it writes the answer region's header (whose answer, complete or not) for the gate. Everything the game submitted
+before runs meanwhile, so the game's GPU goes idle only when the other GPU is slower than the game's frame: the frame
+rate is bounded by the other GPU, as on the finished frame. A frame not answered within the budget is abandoned (its
+answer never taken; the server's history starts afresh). What does not overlap: work recorded in front of DLSS in the
+same buffer or the same submit (Cyberpunk 2077 and Crimson Desert record a few passes there).
+
+**The other device (`PreRunner`).** The device and second loader the finished-frame offload makes (barriers, never
+counter chaining), a `NativePass`, an `HdrPass` (for its encoded image and exposure buffer) and a depth buffer of its
+own for the frame's extent; the regions imported as host memory or staged; one frame as the split hold submits it
+(the copies in, `N[parity]`, the answer's copy out), waited for. The history's rule is the hold's
+(`NativePass::begin_frame`); what the CPU decides per frame comes in a queue keyed by the frame's sequence number
+(`FrameMeta`). One pass runs there (the stage's first). One `HoldSide` (exchange, worker, runner, loader) per hold
+resources: a change of render extent loads the network again on the other device.
+
+**Fall-back** as on the finished frame (`ServerRule`, `LateRule` on the answers, `State::FellBack` for the process),
+and when 30 holds in a row, over at least a second of holds that keep coming (a pause of more than 250 ms between two
+of them starts the row again), cannot send their frame (no motion vectors, no jitter, no room for the chained cache:
+nothing could carry the edit, and the model would not run at all): the worker stops running frames (every send is
+finished at once without an answer) and the runner frees its frame resources and closes its loader and with it the
+network (`PreRunner::gave_up`; retiring the loader alone leaves the network open there, and the game's loader then
+finds it open elsewhere for good), so the next holds load and run the network on the game's device. The hold's side is
+destroyed once nothing recorded with it may still run. `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (tests) fails that
+frame on the other GPU. A second set of hold resources on the same device while the offload device is taken waits (its
+frames go to DLSS as they are) until the set that has it had no hold for 3 seconds, whose worker is then ended for it
+(`release_idle`; that set's side is built again at its next hold); it is not a fall-back. After a frame that never
+finished there (the 5 s fence wait) nothing is closed or taken back: the state is `Stalled` and the model is off for
+the rest of the session, said once. That is for the life of the game's device: the offload device is marked busy
+(`offload::is_busy`, kept through any later hand-back), `offload::take` refuses it, no new hold's side is built, no
+offload device is made for a later game device while `Stalled`, `Stalled` is never replaced by the offload starting or
+running again, and the device is not destroyed with the game's. A frame whose OUT region was written again while it
+ran (two offloaded holds in one submit, or after an abandoned frame) is not answered and the runner's history starts
+afresh (`serve`: OUT's sequence number and `sent` read again after the run). The workers of a device end inside its
+`vkDestroyDevice` before the offload device is destroyed (`offload_pre::stop_for`).
+
+**The game's network beside the offloaded holds (#63, 2026-11-13).** The game's own loader can have the process's one
+network open while the holds send their frames to the other GPU: the after-the-upscaler path takes it after 30 s
+without a held frame while DLSS still runs (a game's settings menu), and the offload loader lends it to that path
+(it is idle there). A change of DLSS's render size then builds a new hold's side, whose loader on the other device
+asks for the network back. The game's loader used to refuse it for as long as the holds came: every offloaded hold
+stamped its `last_pre` (which keeps the after-the-upscaler path off) and counted among its outstanding holds, so the
+network looked in use, the other GPU answered no frame (599 of 599 unanswered in the Cyberpunk 2077 reproduction) and
+the model was off until `ServerRule` fell back to the game's GPU 30 s later (the reporter: "the effect disappears
+when I change the DLSS resolution"). Holds whose model runs on the other GPU record nothing of the game's network
+(no build, no graph): `inline::Inline` keeps a second count beside the outstanding one, of the holds that may record
+the network (`HoldCounts::local`: each hold from before it asks for the network, let go once recorded when it recorded
+nothing of it, `Meta::remote`, else when it can no longer run; one load, never an undercount), and the loader's use of
+the network is that count (`Claims::network_holds`) and the last time a path took a build (`Claims::last_local`,
+stamped in `ready_sizes`), not the hold's stamp: the network is lent back within a retry or two. A refusal because
+another device has the network is not counted toward the retry streak, whose fourth wait (30 s) came after the second
+GPU's own 30 s rule: it is asked again every second while that device closes it, and while it uses it every second the
+first 5 times in a row, then every 5 s (each ask runs its lend check), said once per run of the same answer
+(`BuildRetry::wait_for_owner`; a run ends when the network opens, at a real failure, or with a refusal more than 10 s
+after the last one). That rule (`ServerRule`) adds up the time frames not run keep coming: an interval of
+more than a second between two misses (a menu, a loading screen) adds nothing, and only a frame that ran starts it
+over, so bursts of misses between pauses still fall back. `NEURAL_FORGE_TEST_REBUILD_AT=<launch>:<seconds>`
+(tests) keeps the holds off for that long from that DLSS launch and then builds the hold's resources again, as a
+change of render size does (the Cyberpunk 2077 benchmark with `NEURAL_FORGE_OFFLOAD_GPU=same` and `60:40`: before the
+fix the offload never answered after the rebuild; with it, 600 of 600 holds carried the other GPU's edit).
+
+**Measured (RTX 5070 alone, `same`: a second device of the game's GPU; the game sweep with
+`env = ["NEURAL_FORGE_OFFLOAD_GPU=same"]`; 2560x1440, render 1485x835, frame generation on; 2026-11-12):**
+
+| Run | Holds per second | Network frame | On the game's GPU | Notes |
+|---|---|---|---|---|
+| Cyberpunk 2077 (HDR10, hold inside DLSS's buffer), model on the game's device | 43 (about 125 fps shown) | 7.6 ms (median) | capture 1.0 ms | every second hold a refresh in motion; sweep passes |
+| Cyberpunk 2077, `same` | 33 (about 100 fps shown) | 17.7-18.0 ms on the second device, copies included; 18.0 ms from send to answer (21.0 ms before both devices imported the regions) | capture 2.7-3.0 ms | 600 of 600 frames answered in time and 600 of 600 holds carried the edit in every summary once the network ran; cache rejection 0.4-8%; no misses, no faults; sweep passes, recording clean |
+| GTA V Enhanced (split hold), model on the game's device | about 60 in the benchmark's long pass | 7.8 ms | write-back 0.5 ms | sweep's run |
+| GTA V Enhanced, `same` | about 42 in the long pass | 18.3-18.8 ms on the second device; 18.3-18.9 ms from send to answer | the submit waits 5.3 ms (median) for the answer; cache passes 2.4 ms | 601 split holds, 600 of 600 answered and carried in the summaries (1 of the first 599 not answered); no misses |
+
+On one GPU the path saves nothing, as on the finished frame: the second device's network shares the GPU with the
+game (barriers, another context), so its frame takes more than twice the game's own and the frame rate falls by
+about a quarter. What the game's GPU pays per frame is the capture's extra 2 ms in Cyberpunk (the kept colour, 23.7
+MB out, the late capture and the gate) and the 9.5 MB answer in. The worker's thread: 1.3% of a core with the regions
+imported on both devices, 11% with staged copies (it polls every 50 us while frames come).
+
+**The picture.** Against the model on the game's device, fine detail was compared over the views two recordings of
+Cyberpunk's benchmark share (35 s each, `NF_SWEEP_RECORD_SECONDS=35`; frames at 5 fps paired by view, 114 to 166 pairs
+a comparison; the mean absolute Laplacian of the luma, B over A per pair): offloaded over local, median 0.966 and
+0.994 in two runs; offloaded over offloaded, two runs, 0.969. So the offloaded picture has no loss of fine detail
+beyond what two runs of the same build differ by (about 3%); a first comparison over one second of poorly matched
+views had said 16% less and was wrong. Tried for it and not kept: the carried edit read with a Catmull-Rom filter at
+the exact position in place of the strongest tap (local over that 0.987, offloaded over that 1.010: nothing
+measurable). The history read already applies the jitter step and takes the strongest depth-admitted tap. Not
+measured: two different GPUs (this machine has one), a still scene's picture (the benchmarks have none), GTA V's
+picture against local.
+
+GTA V note: its `settings.xml` names the CPU (`CPUDescription`); with another CPU in the machine the game resets every
+graphics setting at each launch (DLSS and frame generation off, so no DLSS evaluate and no hold). The runs above set
+that line for the run only.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

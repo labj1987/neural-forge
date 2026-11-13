@@ -238,6 +238,9 @@ struct Active {
     report: Arc<Report>,
     /// Set by [`Series::before`] when the original readback is on the queue.
     original_pending: bool,
+    /// The previous present's original: a present that showed the frame before it (the delayed present of the model
+    /// on a second GPU, `capture::presented_previous_frame`) is paired with that one, not with its own live frame.
+    previous_original: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -332,6 +335,7 @@ impl Series {
             sender: None,
             report,
             original_pending: false,
+            previous_original: None,
         });
     }
 
@@ -471,6 +475,19 @@ impl Series {
             invalidate(device, &r.original);
             invalidate(device, &r.composited);
             (std::slice::from_raw_parts(r.original.ptr, len).to_vec(), std::slice::from_raw_parts(r.composited.ptr, len).to_vec())
+        };
+        // The delayed present shows the previous present's frame: its pair is that frame's original. Kept only while the
+        // model runs on a second GPU; the first such present of a capture has no previous original and is left out.
+        let delayed = crate::capture::presented_previous_frame();
+        #[cfg(target_arch = "x86_64")]
+        let keep_previous = crate::preupscale::offload::active();
+        #[cfg(not(target_arch = "x86_64"))]
+        let keep_previous = false;
+        let previous = if keep_previous { active.previous_original.replace(original.clone()) } else { active.previous_original.take() };
+        let original = match previous {
+            Some(p) if delayed && p.len() == original.len() => p,
+            _ if delayed => return consumed,
+            _ => original,
         };
         let seq = active.seq;
         let composed = compose_done.is_some();

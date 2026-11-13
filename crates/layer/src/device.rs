@@ -809,6 +809,16 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     if let Some((_, _, hold)) = &owned {
         hold.lock().unwrap_or_else(|e| e.into_inner()).preupscale.stop_native();
     }
+    // The device made for the model on another GPU, its server joined just above: destroyed here, inside vkDestroyDevice,
+    // where the loader's lock is held (its device callbacks need it).
+    // SAFETY: forwarded; the server's worker was joined.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // The before-DLSS offload's workers first: each frees the other device's side and gives the device back.
+        crate::preupscale::offload_pre::stop_for(handle);
+        crate::preupscale::offload_pre::note_import(handle, false);
+        crate::preupscale::offload::destroy_for(handle)
+    };
     // Then the hold inside DLSS's buffer: its slots and staging images (once the device is idle), and the
     // wrapping of the binding commands its tracking notes.
     // SAFETY: forwarded.
@@ -1017,6 +1027,10 @@ fn record_inline_hold(
     if !shm.model_enabled() {
         inline_tally("skipped (the model is switched off)");
         crate::preupscale::note_not_held(crate::preupscale::MODEL_OFF);
+        return Err(Recorded::Skipped);
+    }
+    if crate::preupscale::test_holds_off() {
+        inline_tally("skipped (NEURAL_FORGE_TEST_REBUILD_AT keeps the holds off)");
         return Err(Recorded::Skipped);
     }
     // The after-the-upscaler path stays off the network while the holds run before the upscaler.
@@ -1570,8 +1584,13 @@ impl NeuralForgeDeviceInfo {
         extended_usage: bool,
     ) -> Self {
         let handle = device.handle();
-        // The empty pipeline layout DXVK's binds of nothing go on with (`noop_bind`), in every process the layer works in.
-        if crate::layer_enabled() && crate::ownership::eligible() {
+        // The empty pipeline layout DXVK's binds of nothing go on with (`noop_bind`), in every process the layer works in;
+        // not for the device the layer makes for the model on another GPU (no game command reaches it).
+        #[cfg(target_arch = "x86_64")]
+        let own_device = crate::preupscale::offload::making();
+        #[cfg(not(target_arch = "x86_64"))]
+        let own_device = false;
+        if crate::layer_enabled() && crate::ownership::eligible() && !own_device {
             // SAFETY: the device is live and `device` is its next-layer dispatch.
             unsafe { crate::noop_bind::device_created(&device) };
         }
@@ -1638,6 +1657,8 @@ impl NeuralForgeDeviceInfo {
             );
         }
         let external_memory_host = crate::take_external_memory_host_enabled(handle);
+        #[cfg(target_arch = "x86_64")]
+        crate::preupscale::offload_pre::note_import(handle, external_memory_host);
         // Recorded the same way, by the same hook (`crate::swapchain_maintenance`).
         let present_fences = crate::swapchain_maintenance::take_enabled(handle);
         crate::log!(
@@ -1678,7 +1699,7 @@ impl NeuralForgeDeviceInfo {
         let active = crate::layer_enabled() && crate::ownership::eligible();
         // The holds recorded into DLSS's buffers that may still run: the network keeps the build they use.
         #[cfg(target_arch = "x86_64")]
-        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holds = crate::preupscale::native::HoldCounts::default();
         // The game's graphics family, where DLSS's buffers run: the network's frame family.
         #[cfg(target_arch = "x86_64")]
         let mut frame_family = None;
@@ -1918,6 +1939,9 @@ impl NeuralForgeDeviceInfo {
         let (Some(inline), Some(tracking)) = (&self.inline, &self.preupscale) else { return };
         let cbs: Vec<vk::CommandBuffer> = cbs.into_iter().collect();
         inline.check(&cbs, |earlier, image| tracking.lock().layout_when_run(earlier, image));
+        // The network on a second GPU: the wait for the answer the holds in these buffers take, with nothing locked.
+        #[cfg(target_arch = "x86_64")]
+        crate::preupscale::offload_pre::at_submit(&inline.offload_plans(&cbs));
     }
 
     /// A submission the next layer accepted on `queue`: each hold recorded into its buffers runs once more

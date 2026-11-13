@@ -559,6 +559,12 @@ impl ShmClient {
         self.header().map(neural_forge_protocol::ShmHeader::network_choice)
     }
 
+    /// The layer's status line the channel holds now (empty without a mapping).
+    #[cfg(target_arch = "x86_64")]
+    pub fn layer_reason(&self) -> String {
+        self.header().map(neural_forge_protocol::ShmHeader::layer_reason).unwrap_or_default()
+    }
+
     /// The layer's status line for the GUI (the native backend's state, or why it is not running).
     #[cfg(target_arch = "x86_64")]
     pub fn set_layer_reason(&self, reason: &str) {

@@ -247,7 +247,7 @@ impl LoaderState {
         // a split hold's work (its fence pending, or none covering it), an after-the-upscaler frame running, or one whose
         // wait timed out and whose fence has not signalled. A frame taken more than IDLE_STEP ago can still run then, and
         // closing the network under it was a copy-engine read of freed memory (Xid 31, #59).
-        let unused = || claims.unused(claims.last_pre.load(std::sync::atomic::Ordering::SeqCst));
+        let unused = || claims.unused();
         (idle && self.guard.step_down_pending() && unused()).then(|| self.guard.apply()).flatten()
     }
 
@@ -360,6 +360,14 @@ pub(crate) struct Loader {
     test_graph: Option<TestGraph>,
 }
 
+/// The device's counts of the holds recorded into DLSS's buffers that may still run, shared by its loader and its
+/// `super::inline::Inline`: all of them ([`Claims::holds`]), and those that may record the network ([`Claims::local`]).
+#[derive(Clone, Default)]
+pub(crate) struct HoldCounts {
+    pub all: Arc<std::sync::atomic::AtomicUsize>,
+    pub local: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 /// Who may be using the network's frame (activations, counters) and builds, which the two paths share and the loader
 /// thread checks before it frees a build or closes the network ([`Claims::in_flight`], [`Claims::unused`]).
 #[derive(Default)]
@@ -383,6 +391,17 @@ struct Claims {
     /// current build, so nothing rebuilds it ([`Loader::ready_sizes`], [`Loader::fall_back`]) and the
     /// after-the-upscaler path does not take the network ([`Claims::pre_running`]) while there are any.
     holds: Arc<std::sync::atomic::AtomicUsize>,
+    /// Those of [`Self::holds`] that may record this network: every hold from before it asks for it until it can no
+    /// longer run, except the holds before DLSS whose model runs on a second GPU (`super::offload_pre`), which
+    /// `super::inline::Inline` lets go of once recorded. Those keep no build or close from happening
+    /// ([`Self::holds_beyond`] counts them) but are no use of the network: a network the after-the-upscaler path
+    /// opened here is lent to the second GPU's loader beside them ([`Claims::unused`]), which otherwise was refused it
+    /// for good (#63: the model gone after a change of DLSS's render size, back on the game's GPU 30 s later).
+    local: Arc<std::sync::atomic::AtomicUsize>,
+    /// The last time a path took a build of this network ([`Loader::ready_sizes`]; ms since [`epoch_ms`]'s start). Holds
+    /// whose model runs on a second GPU stamp [`Self::last_pre`] (it keeps the after-the-upscaler path off) but never
+    /// this.
+    last_local: std::sync::atomic::AtomicU64,
 }
 
 /// [`Loader::test_graph`].
@@ -417,6 +436,12 @@ impl Claims {
         self.holds.load(std::sync::atomic::Ordering::SeqCst) > reserved
     }
 
+    /// The holds recorded (or being recorded) into DLSS's buffers that may still run and may have recorded this network
+    /// ([`Self::local`]): one load, never below the true count (a hold counts from before it asks for the network).
+    fn network_holds(&self) -> usize {
+        self.local.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn release_post(&self) {
         use std::sync::atomic::Ordering::SeqCst;
         self.last_post.store(epoch_ms(), SeqCst);
@@ -436,7 +461,7 @@ impl Claims {
     /// Whether a pre-upscaler hold's work may still use the network: a split hold's (its fence), or one
     /// recorded into DLSS's buffers.
     fn pre_running(&self) -> bool {
-        if self.holds_beyond(0) {
+        if self.network_holds() > 0 {
             return true;
         }
         let mut inflight = self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -458,12 +483,13 @@ impl Claims {
         self.pre_running() || self.post_busy.load(SeqCst) || stalled || epoch_ms() < self.pre_unfenced_until.load(SeqCst)
     }
 
-    /// Neither path uses the network: nothing [`Self::in_flight`], and neither path ran for [`PATH_SWITCH_MS`] (`last_pre`
-    /// the last hold's stamp).
-    fn unused(&self, last_pre: u64) -> bool {
+    /// Neither path uses the network: nothing [`Self::in_flight`], and neither path took it for [`PATH_SWITCH_MS`]
+    /// ([`Self::last_local`], [`Self::last_post`]). Holds whose model runs on a second GPU do not count: they record
+    /// nothing of it.
+    fn unused(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         let quiet = |at: u64| epoch_ms().saturating_sub(at) >= PATH_SWITCH_MS;
-        !self.in_flight() && quiet(last_pre) && quiet(self.last_post.load(SeqCst))
+        !self.in_flight() && quiet(self.last_local.load(SeqCst)) && quiet(self.last_post.load(SeqCst))
     }
 }
 
@@ -626,7 +652,7 @@ impl Loader {
     /// still run (shared with `super::inline::Inline`).
     /// The loader of `device`'s network, opened with counter chaining when `chain` (and `NEURAL_FORGE_NATIVE_CHAIN`
     /// allows it): `false` where the holds run inside DLSS's buffer, which needs barriers.
-    pub(crate) fn start(device: vk::Device, setup: Setup, holds: Arc<std::sync::atomic::AtomicUsize>, chain: bool) -> Self {
+    pub(crate) fn start(device: vk::Device, setup: Setup, holds: HoldCounts, chain: bool) -> Self {
         let shared: Arc<(Mutex<LoaderState>, Condvar)> = Arc::default();
         shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).barriers_from_start = !chain;
         Self {
@@ -635,7 +661,7 @@ impl Loader {
             pending: Mutex::new(Some((device, setup))),
             setup,
             device: device.as_raw(),
-            claims: Arc::new(Claims { holds, ..Default::default() }),
+            claims: Arc::new(Claims { holds: holds.all, local: holds.local, ..Default::default() }),
             #[cfg(test)]
             test_graph: None,
         }
@@ -644,7 +670,7 @@ impl Loader {
     /// Tests: a loader whose network is `built` (open, no worker), with `graph` recording into a hold's
     /// buffer in the graph's place.
     #[cfg(test)]
-    pub(crate) fn for_test(setup: Setup, built: Vec<Built>, holds: Arc<std::sync::atomic::AtomicUsize>, graph: TestGraph) -> Self {
+    pub(crate) fn for_test(setup: Setup, built: Vec<Built>, holds: HoldCounts, graph: TestGraph) -> Self {
         let mut loader = Self::start(vk::Device::null(), setup, holds, true);
         *loader.pending.get_mut().unwrap() = None;
         loader.test_graph = Some(graph);
@@ -658,11 +684,6 @@ impl Loader {
             st.built = built;
         }
         loader
-    }
-
-    /// Holds recorded into DLSS's buffers that may still run.
-    fn holds_out(&self) -> bool {
-        self.holds_beyond(0)
     }
 
     /// More than `reserved` holds recorded (or being recorded) into DLSS's buffers may still run: a hold being
@@ -747,7 +768,7 @@ impl Loader {
             shared: None,
             bda_ext: false,
         };
-        Self::start(vk::Device::null(), setup, Arc::default(), true)
+        Self::start(vk::Device::null(), setup, HoldCounts::default(), true)
     }
 
     /// Tests: the claims' stamps (the last hold's, the after-the-upscaler path's last frame's) and whether that path runs one.
@@ -842,11 +863,11 @@ impl Loader {
             let _ = self.claims.last_pre.compare_exchange(stamp, before, SeqCst, SeqCst);
             false
         };
-        if !self.unused(before) {
+        if !self.unused() {
             return refuse();
         }
         let mut st = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if st.network.is_none() || self.holds_out() || st.uses != uses {
+        if st.network.is_none() || self.claims.network_holds() > 0 || st.uses != uses {
             drop(st);
             return refuse();
         }
@@ -857,9 +878,9 @@ impl Loader {
         true
     }
 
-    /// Neither path uses the network ([`Self::lend`]'s condition), `last_pre` the last hold's stamp.
-    fn unused(&self, last_pre: u64) -> bool {
-        self.claims.unused(last_pre)
+    /// Neither path uses the network ([`Self::lend`]'s condition).
+    fn unused(&self) -> bool {
+        self.claims.unused()
     }
 
     /// The device is being destroyed: no other device's loader reaches this one from here on ([`Self::ask_owner`]
@@ -903,12 +924,14 @@ impl Loader {
 
     /// Opens the network the Network setting `choice` names ([`network_to_load`]); returns it with
     /// which network it is.
-    fn open(device: vk::Device, setup: Setup, choice: u32, chain: bool) -> Result<(nn::Network, u32), nn::OpenError> {
+    /// `said_substitute`: the choice whose stand-in network was said last, so a refused open asked again every second
+    /// does not say it each time.
+    fn open(device: vk::Device, setup: Setup, choice: u32, chain: bool, said_substitute: &mut Option<u32>) -> Result<(nn::Network, u32), nn::OpenError> {
         let Some(running) = network_to_load(choice, network_present) else {
             let message = format!("no model at {}: extract it in the Setup tab (neural-forge-cli extract-model)", network_dir(choice).display());
             return Err(nn::OpenError { message, stalled: false });
         };
-        if running != choice {
+        if running != choice && said_substitute.replace(choice) != Some(choice) {
             crate::log!(
                 "[native] the {} network is chosen but not extracted (the DLL has none); running the {} network",
                 network::name(choice),
@@ -955,6 +978,8 @@ impl Loader {
         // This device's VRAM readings for the build lines (it outlives this thread: `Drop` joins it).
         let vram = crate::vram::probe(setup.gipa, setup.instance, setup.physical, setup.properties2);
         let mut retry = BuildRetry::default();
+        // The Network setting whose stand-in network was said last ([`Self::open`]).
+        let mut said_substitute: Option<u32> = None;
         let mut inject = neural_forge_protocol::env::var(FailInject::ENV).and_then(|v| FailInject::parse(&v));
         if let Some(f) = inject {
             crate::log!("[native] {}: the next {} network builds will fail on purpose", FailInject::ENV, f.remaining());
@@ -1110,7 +1135,7 @@ impl Loader {
             let mut loaded = None;
             let result = match network.take() {
                 Some(n) => Ok(n),
-                None => Self::open(device, setup, choice, !barriers_from_start)
+                None => Self::open(device, setup, choice, !barriers_from_start, &mut said_substitute)
                     .map(|(n, running)| {
                         opened = Some((t.elapsed(), vram.as_ref().map(crate::vram::reading)));
                         loaded = Some(running);
@@ -1195,6 +1220,8 @@ impl Loader {
             }
             match result {
                 Ok((n, built)) => {
+                    // Opened or built: a later refusal by another device is a new run, said again.
+                    retry.owner_done();
                     state.barriers |= switched;
                     if let Some(built) = built {
                         // Unique in the process: a hold's buffers recorded for one build are never taken
@@ -1265,15 +1292,23 @@ impl Loader {
                     drop(network);
                 }
                 Err(why) => {
-                    let wait = retry.failed(Instant::now());
-                    match asked {
-                        Some(true) => {
-                            lines.push("[native] the network is open on another device of the game, which is not using it: it is asked to close it".into())
+                    // Another device has the network and was asked to lend it: asked again on the owner's cadence, not a
+                    // failure of this loader's (its streak would reach the 30 s wait), and said once per run of the same
+                    // answer ([`BuildRetry::wait_for_owner`]).
+                    let (wait, say) = match asked.filter(|_| refused) {
+                        Some(lending) => retry.wait_for_owner(Instant::now(), lending),
+                        None => (retry.failed(Instant::now()), true),
+                    };
+                    if say {
+                        match asked {
+                            Some(true) => {
+                                lines.push("[native] the network is open on another device of the game, which is not using it: it is asked to close it".into())
+                            }
+                            Some(false) => lines.push("[native] the network is open on another device of the game, which is using it".into()),
+                            None => {}
                         }
-                        Some(false) => lines.push("[native] the network is open on another device of the game, which is using it".into()),
-                        None => {}
+                        lines.push(format!("[native] {why}; frames go to DLSS untouched, trying again in {} ms", wait.as_millis()));
                     }
-                    lines.push(format!("[native] {why}; frames go to DLSS untouched, trying again in {} ms", wait.as_millis()));
                     state.failed = Some(why);
                     state.network = network;
                     // A failed build leaves no graph; the switch to barriers, once made, stays, and one the
@@ -1285,7 +1320,9 @@ impl Loader {
             for line in &lines {
                 crate::log!("{line}");
             }
-            crate::logging::flush();
+            if !lines.is_empty() {
+                crate::logging::flush();
+            }
             state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
@@ -1327,6 +1364,7 @@ impl Loader {
         if built.is_some() {
             st.uses += 1;
             st.last_use = Some(Instant::now());
+            self.claims.last_local.store(epoch_ms(), std::sync::atomic::Ordering::SeqCst);
         }
         drop(st);
         if woken {
@@ -1365,6 +1403,11 @@ impl Loader {
     }
 
     /// Why the network is not usable right now, if a load or build failed.
+    /// A wait on the network's own queue timed out: its work may still run, so nothing of it may be freed.
+    pub(crate) fn dead(&self) -> bool {
+        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dead
+    }
+
     pub(crate) fn failed(&self) -> Option<String> {
         self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).failed.clone()
     }
@@ -3500,6 +3543,17 @@ impl NativePass {
         }
     }
 
+    /// A network frame on another device (`super::offload_server`) begins: the history's rule as the hold applies
+    /// it. `asked`: the hold had motion vectors and nothing on its side resets the history. Returns whether the
+    /// frame runs with its history.
+    pub(crate) fn begin_frame(&mut self, network: u32, asked: bool) -> bool {
+        if note_network(&mut self.gap, &mut self.history_network, network) {
+            crate::log!("[native] resetting the history (the {} network runs from here)", network::name(network));
+        }
+        let stale = self.gap.begin(hold_now());
+        self.frames > 0 && stale.is_none() && asked && !no_history()
+    }
+
     /// The command buffers for this frame, in submission order: the initialisation until one was
     /// submitted, then `N[parity]`. Writes the frame's parameters. Each buffer submitted is reported
     /// to [`Self::submitted`] (only then is the initialisation done and the timer pending).
@@ -4123,15 +4177,24 @@ fn fake_chain_timeout(frames: u64) -> Option<(u32, String)> {
 /// What the Status tab says about the native backend after a hold: running, or why not.
 pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     if result.evaluated {
-        return match loader.guard_note() {
-            Some(why) => format!("native network running ({why})"),
-            None => "native network running".to_string(),
-        };
+        return running_line(loader.guard_note().as_deref(), result.after_dlss_on_game_gpu);
     }
     match (loader.failed(), result.miss) {
         (Some(why), _) => format!("native network not running: {why}"),
         (None, Some(miss)) => format!("native network: {miss}"),
         (None, None) => String::new(),
+    }
+}
+
+/// The Status line of a hold whose network ran: `guard`, the VRAM guard's note; `after_dlss_on_game_gpu`, a hold after
+/// DLSS's output while the model on a second GPU is asked for, which says where the model runs and what the second
+/// GPU covers (the native line alone read as if the second GPU were not asked for).
+fn running_line(guard: Option<&str>, after_dlss_on_game_gpu: bool) -> String {
+    let guard = guard.map(|why| format!(" ({why})")).unwrap_or_default();
+    if after_dlss_on_game_gpu {
+        format!("second GPU: not used here: the model runs on the game's GPU after DLSS{guard}; the second GPU covers only before DLSS")
+    } else {
+        format!("native network running{guard}")
     }
 }
 
@@ -4221,7 +4284,7 @@ pub(crate) fn apply_scene_cut(effect: super::scene_cut::Effect, native: Option<&
 fn apply_game_reset<F: Copy + PartialEq>(gap: &mut HistoryGap<F>, edit: Option<&mut super::cache::State>) {
     gap.game_reset();
     if let Some(e) = edit {
-        e.drop_edit();
+        e.reset_edit();
     }
 }
 
@@ -4402,6 +4465,30 @@ unsafe fn native_hold(
         result.miss = Some("the network is serving the after-the-upscaler path");
         return result;
     }
+    // The network on a second GPU (`super::offload_pre`): this hold sends its frame there and carries the edit of
+    // the frame before it, as a cached hold does. Only the hold before DLSS, with the edit cache on (it is what
+    // carries the edit), and not for a cache dump (which needs the network's answer to its own frame).
+    let before_dlss = ctx.as_ref().is_none_or(|c| c.point.hold.stage != super::placement::Stage::Upscaled);
+    if !before_dlss && super::offload_pre::wanted() {
+        result.after_dlss_on_game_gpu = true;
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[offload] NEURAL_FORGE_OFFLOAD_GPU: the hold after DLSS's output (the placement with Ray Reconstruction) runs the model on the game's GPU; the other GPU takes the hold before DLSS and the finished frame");
+        }
+    }
+    let offloaded = super::offload_pre::wanted()
+        && before_dlss
+        && arm.is_none()
+        && {
+            let cache = ask.interval > 1;
+            if !cache {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::log!("[offload] NEURAL_FORGE_EDIT_CACHE=off: the edit cache is what carries the other GPU's edit to the next frame; the model runs on the game's GPU");
+                }
+            }
+            cache
+        };
     // Every frame that ran the graph has completed (this path's: the hold waited above; the other
     // path's: `claim_pre` says none ran for a second): the chain watchdog's count is final for them.
     let fake = fake_chain_timeout(res.native.as_ref().map_or(0, |n| n.frames));
@@ -4427,7 +4514,9 @@ unsafe fn native_hold(
     // was waited for above, the other path's is kept off by `claim_pre`, and the holds recorded into DLSS's
     // buffers keep it until they are done: `Loader::ready_sizes`), and the frames go to DLSS untouched until
     // the chosen network is built. So does another set of sizes.
-    let Some(builts) = loader.ready_sizes(sizes, choice, reserved) else {
+    // Offloaded: no network on this device (the process's one network is on the other).
+    let ready = if offloaded { Some(Vec::new()) } else { loader.ready_sizes(sizes, choice, reserved) };
+    let Some(builts) = ready else {
         // Paused by the VRAM guard: the hold's own frame resources go too. Idle: this path's last hold was waited
         // for above, or no hold recorded into DLSS's buffers with them may still run; this hold records nothing.
         // SAFETY: as just said.
@@ -4447,7 +4536,9 @@ unsafe fn native_hold(
         return result;
     };
     // Pass 1's: its network, its generation and its input features (where the edit cache's buffers live).
-    let built = builts[own];
+    let built = builts.get(own).copied();
+    let features = built.map_or((vk::Buffer::null(), 0), |b| (b.frame.features, b.frame.features_bytes));
+    let generation = built.map_or(0, |b| b.generation);
     // Counter chaining faulted the GPU from the hold inside DLSS's buffer (Black Myth: Wukong, 3 runs
     // of 4: Xid 13 then 32 within seconds; none of 2 with barriers): that hold rebuilds the network
     // with barriers between its launches, for the rest of the process (`fall_back_to_barriers`).
@@ -4506,7 +4597,10 @@ unsafe fn native_hold(
             return result;
         }
     } else {
-        pass.clear_exposure();
+        if !offloaded {
+            // Offloaded, the capture clears it itself, after the late capture read the previous hold's.
+            pass.clear_exposure();
+        }
         // SAFETY: nothing of the pass is pending; the colour input is a live RGBA16F storage image.
         if !unsafe { pass.bind_colour(device, target.colour) } {
             result.miss = Some("a storage view of the colour input could not be created");
@@ -4610,7 +4704,7 @@ unsafe fn native_hold(
     unsafe { native.prepare_colour(device, instance, physical_device, &passes, lut) };
     // SAFETY: nothing of the pass is pending (`wait_idle` above), or its sets are not written now; the HDR
     // pass outlives it in `res`.
-    if !unsafe { native.record_graphs(device, instance, physical_device, &graphs, encoded, exposure, depth_buffer) } {
+    if !offloaded && !unsafe { native.record_graphs(device, instance, physical_device, &graphs, encoded, exposure, depth_buffer) } {
         res.native = Some(native);
         result.miss = Some(frozen.blocked().map_or("recording the native frame failed", |_| WAITING));
         return result;
@@ -4633,6 +4727,66 @@ unsafe fn native_hold(
         res.native = Some(native);
         result.miss = Some("the edit cache's passes could not be built");
         return result;
+    }
+    // The offload's side of the hold: the exchange with the other device and its worker, made on the first hold.
+    if res.offpre.as_ref().is_some_and(super::offload_pre::HoldSide::released) && !others_outstanding {
+        // Its worker was ended for another set of hold resources while these had no hold: built again below.
+        if let Some(side) = res.offpre.take() {
+            // SAFETY: nothing recorded with these resources may still run.
+            unsafe { side.destroy(device) };
+        }
+    }
+    if offloaded && res.offpre.is_none() {
+        if matches!(super::offload::state(), super::offload::State::Stalled(_)) || super::offload::is_busy(device.handle()) {
+            // A frame on the other GPU never finished: its device is not used again and the network cannot be taken
+            // back, so no side is built; the frames go to DLSS as they are (said when it stalled).
+            res.native = Some(native);
+            result.miss = Some("a frame on the second GPU never finished: the model is off for this session");
+            return result;
+        }
+        if others_outstanding {
+            // Not while holds recorded with these resources may still run (the cache's sets are written for it).
+            res.native = Some(native);
+            result.miss = Some(WAITING);
+            return result;
+        }
+        if super::offload_pre::serving_device(device.handle()) && !super::offload_pre::release_idle(device.handle(), super::offload_pre::IDLE_SIDE) {
+            // Another set of hold resources of this device has the offload device (and with it the process's one
+            // network) and holds with it: these wait until it has had no hold for a few seconds, and say so once.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!(
+                    "[offload] before DLSS: the other GPU serves another render size of this game; frames of this one go to DLSS as they are until it is free"
+                );
+            }
+            res.native = Some(native);
+            result.miss = Some("the second GPU is serving another render size");
+            return result;
+        }
+        // SAFETY: the game's live device; the offload device was made with it.
+        match unsafe { super::offload_pre::HoldSide::build(device, instance, physical_device, res.id, target.width, target.height) } {
+            Ok(side) => res.offpre = Some(side),
+            Err(why) => {
+                crate::log!("[offload] the model stays on the game's GPU: {why}");
+                crate::logging::flush();
+                super::offload::note_state(super::offload::State::FellBack(why));
+                res.native = Some(native);
+                result.miss = Some("the second GPU could not take the network; it runs on the game's GPU from the next frame");
+                return result;
+            }
+        }
+    }
+    // Given up meanwhile (the worker's rules): this hold still goes as an offloaded one, without an answer; the
+    // next runs the network here.
+    let offloaded = offloaded && res.offpre.is_some();
+    if !offloaded && res.offpre.is_some() && !super::offload_pre::wanted() && !others_outstanding {
+        // Given up for the process, this hold is not an offloaded one, and nothing recorded with these resources may
+        // still run (inside DLSS's buffer: none outstanding; the split hold's work was waited for above): the
+        // offload's side goes (its worker ends and the other device's side is freed).
+        if let Some(side) = res.offpre.take() {
+            // SAFETY: idle, as just said.
+            unsafe { side.destroy(device) };
+        }
     }
     // The scene-cut detector, unless switched off (`NEURAL_FORGE_SCENE_CUT=off`). Without it (a failed
     // build, tried again on the retry schedule) the history resets on the other rules only.
@@ -4657,8 +4811,10 @@ unsafe fn native_hold(
     native.gap.note_format(format_of(target));
     // A frame of another network than the history's (the Network setting switched) resets the history
     // (`frame_passes` below then runs with no history: seed 0, no blend toward it, in every pass).
-    if note_network(&mut native.gap, &mut native.history_network, built.network) {
-        crate::log!("[native] resetting the history (the {} network runs from here)", network::name(built.network));
+    if let Some(b) = built {
+        if note_network(&mut native.gap, &mut native.history_network, b.network) {
+            crate::log!("[native] resetting the history (the {} network runs from here)", network::name(b.network));
+        }
     }
     // The game reset DLSS's history for this frame: the network's history starts afresh too, at this hold's
     // network frame or the next one, and the edit cache refreshes rather than carry the old scene's edit here.
@@ -4678,11 +4834,12 @@ unsafe fn native_hold(
             let bytes = edit.scratch_bytes();
             // SAFETY: `device` is live; nothing of the pass is pending (`wait_idle` above), or its buffers are
             // not replaced now.
-            unsafe { native.cache_scratch(device, instance, physical_device, (built.frame.features, built.frame.features_bytes), bytes) }
-                .unwrap_or((built.frame.features, built.frame.features_bytes))
+            unsafe { native.cache_scratch(device, instance, physical_device, features, bytes) }.unwrap_or(features)
         }
-        None => (built.frame.features, built.frame.features_bytes),
+        None => features,
     };
+    let mut off_plan: Option<super::offload_pre::HoldPlan> = None;
+    let mut late_bound = false;
     if let Some(edit) = res.edit.as_mut().filter(|_| cache_on) {
         chained = edit.chain(scratch.1);
         if !chained {
@@ -4694,10 +4851,11 @@ unsafe fn native_hold(
             jitter,
             mvec: mvec.is_some(),
             depth: depth.is_some(),
-            history_ok,
+            // Offloaded, the network's history is the other device's: the stored edit is one hold old at most.
+            history_ok: history_ok || offloaded,
             armed: arm.is_some(),
             debug_mask: ask.debug_mask,
-            generation: built.generation,
+            generation,
         };
         let hdr_ref = res.hdr.as_ref().expect("built above");
         let bindings = super::cache::Bindings {
@@ -4711,12 +4869,24 @@ unsafe fn native_hold(
             scratch,
             // The split hold makes a view of the colour input every hold (`HdrPass::bind_colour`): the set is
             // written every hold, as the view's handle often comes back for the next one.
-            made: [hdr_ref.colour_binding(), native.id(), built.generation],
+            made: [hdr_ref.colour_binding(), native.id(), generation],
         };
         // SAFETY: nothing of the pass is pending, or its set is not written now; every handle is live.
         unsafe { edit.bind(device, &bindings) };
+        if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
+            // SAFETY: as above; the kept image and the counters are live.
+            unsafe {
+                late_bound = edit.bind_late(device, side.snapshot_view());
+                side.exchange.bind_gate(device, edit.stats_buffer());
+            }
+        }
         // A hold that records nothing (below) must not have taken the stored edit out of the plan.
         if frozen.blocked().is_none() {
+            edit.state.set_offloaded(offloaded);
+            if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
+                // Its frame can be sent when the next hold can carry its edit: vectors, jitter, a chained cache.
+                off_plan = Some(side.plan(&mut edit.state, &h, chained && mvec.is_some() && jitter.is_some()));
+            }
             let p = edit.state.plan(&h);
             if !inline {
                 edit.clear_counters();
@@ -4732,6 +4902,25 @@ unsafe fn native_hold(
         }
     }
     let cached = plan.is_some_and(|p| p.kind == super::cache::Kind::Cached);
+    // Offloaded: the answer to the frame sent before this hold is taken when this hold is the cached one after it.
+    let take_seq = off_plan.filter(|p| p.take && cached && late_bound).and_then(|p| p.settle);
+    let late_push = res.offpre.as_ref().and_then(super::offload_pre::HoldSide::sent_push);
+    // The network frame of this hold runs on the other device: the history's rule, decided here as for a frame here.
+    let off_history = offloaded && off_plan.is_some_and(|p| p.send.is_some()) && native.gap.begin(hold_now()).is_none() && mvec.is_some() && !no_history();
+    let off_meta = off_plan.and_then(|p| p.send).map(|seq| super::offload_server::FrameMeta {
+        seq,
+        width: target.width,
+        height: target.height,
+        extents,
+        sizes: sizes.to_vec(),
+        choice,
+        history: off_history,
+        jitter,
+        mvec_scale: target.mvec_scale,
+        passes,
+        depth: depth.is_some(),
+        lut: lut.cloned(),
+    });
     // The motion pass while the cache runs (its prep and the accumulated field the network reads), at
     // interval 1 whenever there are vectors to convert.
     let run_motion = push.is_some() && (chained || mvec.is_some());
@@ -4813,11 +5002,46 @@ unsafe fn native_hold(
         }
     };
     let more = more && !cached;
+    let off_side = res.offpre.as_ref().filter(|_| offloaded);
+    let state_buffer = native.state_buffer();
+    // Offloaded, first in the hold: the answer to the frame sent last into its image, the capture of its edit
+    // against that frame (still in place: before this hold's own capture), and the gate.
+    let receive = |cmd: vk::CommandBuffer| {
+        let (Some(side), Some(seq), Some(hp), Some(e), Some(push)) = (off_side, take_seq, hdr_pass, edit, late_push.as_ref()) else { return };
+        // SAFETY: recording into the hold's own buffer or DLSS's; everything bound above and live.
+        unsafe {
+            side.exchange.record_receive(device, cmd, &[hp.answer_to_general()], &|region, at| hp.record_answer_in(device, cmd, region, at));
+            e.record_capture_late(device, cmd, push);
+            side.exchange.record_gate(device, cmd, seq);
+        }
+    };
+    // Offloaded, after the capture: the colour input kept for the next hold's capture, and the frame sent.
+    let send = |cmd: vk::CommandBuffer| {
+        let (Some(side), Some(seq), Some(hp)) = (off_side, off_plan.and_then(|p| p.send), hdr_pass) else { return };
+        let (pw, ph) = super::padded(target.width, target.height);
+        let side_buffers = [(exposure, hdr::HdrPass::EXPOSURE_BYTES), (state_buffer, 16)];
+        let from = super::offload_pre::Sources {
+            frame: super::offload_pre::FrameSource::Image { image: hp.encoded_image(), width: pw, height: ph },
+            motion: Some(acc),
+            depth: depth_buffer,
+            side: &side_buffers,
+        };
+        // SAFETY: as above; the colour input is in GENERAL for the hold, the encode in its image.
+        unsafe {
+            side.record_snapshot(device, cmd, target.colour, target.width, target.height);
+            side.exchange.record_send(device, cmd, seq, &from);
+        }
+    };
+    let after_encode = |cmd: vk::CommandBuffer| {
+        after_encode(cmd);
+        send(cmd);
+    };
+    let run_extra = scene.is_some() || run_motion || offloaded;
     if let Some(ctx) = ctx {
         // ---- Inside DLSS's buffer: everything recorded into it, in the split hold's order. ----
         let cmd = ctx.cb;
         // The frame's plan (its parameters, its history, its parity), as the split hold makes it.
-        let (history, frame_plan) = if cached {
+        let (history, frame_plan) = if cached || offloaded {
             (false, None)
         } else {
             let stale = native.gap.begin(hold_now());
@@ -4838,6 +5062,7 @@ unsafe fn native_hold(
         // stays so while the buffer may run (nothing is destroyed or rewritten while a hold may run).
         unsafe {
             ctx.open();
+            receive(cmd);
             let verdict = if ctx.verdicts == vk::Buffer::null() { NO_VERDICT } else { ctx.slot };
             res.guard.as_ref().expect("bound above").record(device, cmd, seq, verdict);
             // What the split hold writes from the host before it submits: here, in the buffer's order.
@@ -4877,7 +5102,8 @@ unsafe fn native_hold(
                 mvec.map(|_| native.mvec.buffer),
                 depth_copy,
                 cache.map(|c| c.colour),
-                (scene.is_some() || run_motion).then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
+                run_extra.then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
+                None,
                 Some(cmd),
             );
             ctx.stamp(1);
@@ -4913,7 +5139,7 @@ unsafe fn native_hold(
         // SAFETY: as above.
         unsafe {
             ctx.stamp(2);
-            if network_ok {
+            if network_ok && (cached || !offloaded) {
                 let _ = if cached {
                     super::record_cached_writeback(device, res, &apply, Some(cmd))
                 } else {
@@ -4982,6 +5208,8 @@ unsafe fn native_hold(
             exposure_source: Some(source),
             cache_dump: None,
             timed: ctx.queries != vk::QueryPool::null(),
+            offload: off_plan.filter(|_| offloaded),
+            remote: offloaded,
         };
         if !network_ok {
             if let Some(e) = res.edit.as_mut() {
@@ -4999,6 +5227,13 @@ unsafe fn native_hold(
         }
         if let (Some(edit), Some(h), Some(p)) = (res.edit.as_mut(), cache_hold.as_ref(), plan.as_ref()) {
             edit.state.went_through(h, p);
+            if offloaded && !cached {
+                // Nothing was stored by this hold: only the next hold's late capture stores this frame's edit.
+                edit.state.drop_edit();
+            }
+        }
+        if let (Some(side), Some(h), Some(q), Some(p)) = (res.offpre.as_mut().filter(|_| offloaded), cache_hold.as_ref(), push.as_ref(), off_plan.as_ref()) {
+            side.went_through(h, q, p, off_meta);
         }
         let pending = arm.filter(|_| cache.is_some()).map(|arm| super::cache_dump::Pending {
             arm,
@@ -5020,6 +5255,8 @@ unsafe fn native_hold(
         });
         result.meta = Some(super::inline::Meta { cache_dump: pending, ..meta });
         result.evaluated = true;
+        // Offloaded without an edit to carry yet (the first frame sent, the network still loading there): the hold ran
+        // as planned, the frame goes to DLSS as it is.
         result.wrote_back = true;
         result.cached = cached;
         result.cache_still = cache_hold.is_some_and(|h| h.interval > 1) && res.edit.as_ref().is_some_and(|e| e.state.regime.still());
@@ -5027,6 +5264,31 @@ unsafe fn native_hold(
         return result;
     }
     let submit = submit.expect("the split hold submits");
+    // Offloaded: the wait for the answer to the frame sent last is here, where the frame's own rendering is
+    // already on the queue (`offload_pre::Exchange::at_submit`).
+    if let (Some(side), Some(p)) = (off_side, off_plan.as_ref()) {
+        side.exchange.at_submit(p);
+    }
+    let first = |cmd: vk::CommandBuffer| {
+        receive(cmd);
+        // What the host clears before the capture when the network runs here, after the late capture read it.
+        let cleared = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+        // SAFETY: recording the capture; the exposure buffer is the HDR pass's.
+        unsafe {
+            device.cmd_fill_buffer(cmd, exposure, 0, hdr::HdrPass::EXPOSURE_BYTES, 0);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[cleared],
+                &[],
+                &[],
+            );
+        }
+    };
     // SAFETY: the capture buffer is idle; the colour view was bound above. The encode stays in the HDR
     // pass's image: the network reads it there (no copy into slot 0's proxy, the after-the-upscaler
     // path's).
@@ -5041,7 +5303,8 @@ unsafe fn native_hold(
             mvec.map(|_| native.mvec.buffer),
             depth_copy,
             cache.map(|c| c.colour),
-            (scene.is_some() || run_motion).then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
+            run_extra.then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
+            offloaded.then_some(&first as &dyn Fn(vk::CommandBuffer)),
             None,
         )
     };
@@ -5066,6 +5329,9 @@ unsafe fn native_hold(
     let recorded = unsafe {
         if cached {
             super::record_cached_writeback(device, res, &apply, None)
+        } else if offloaded {
+            // No edit to carry on this hold: the frame goes to DLSS as it is (the write-back's buffer and fence stay).
+            super::record_cached_writeback(device, res, &|_| {}, None)
         } else {
             super::record_writeback(
                 device,
@@ -5086,7 +5352,7 @@ unsafe fn native_hold(
     }
     // A cached hold keeps the network's history as it is (no frame of the network): its parity,
     // seed and jitter stay the last refresh's.
-    let (history, frame_cmds, later) = if cached {
+    let (history, frame_cmds, later) = if cached || offloaded {
         (false, [None, None], Vec::new())
     } else {
         let stale = native.gap.begin(hold_now());
@@ -5104,9 +5370,19 @@ unsafe fn native_hold(
     if let Some(d) = res.depth.as_mut() {
         d.valid = None;
     }
+    // Offloaded: the frame's parameters are there before its send can run.
+    if let (Some(side), Some(meta)) = (res.offpre.as_mut().filter(|_| offloaded), off_meta.clone()) {
+        side.queue_meta(meta);
+    }
     if crate::note_vk(device.handle(), submit(super::Which::Capture, res.capture_cmd, vk::Fence::null())).is_err() {
+        if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
+            side.dropped();
+        }
         result.miss = Some("the capture submit failed");
         return result;
+    }
+    if let Some(side) = res.offpre.as_ref().filter(|_| offloaded) {
+        side.exchange.handed();
     }
     if let Some(d) = res.depth.as_mut() {
         d.valid = depth;
@@ -5204,6 +5480,19 @@ unsafe fn native_hold(
     if let (Some(edit), Some(h), Some(p)) = (res.edit.as_mut(), cache_hold.as_ref(), plan.as_ref()) {
         edit.state.went_through(h, p);
         edit.submitted(run_motion, cached || chained);
+        if offloaded && !cached {
+            // Nothing was stored by this hold: only the next hold's late capture stores this frame's edit.
+            edit.state.drop_edit();
+        }
+    }
+    if let (Some(side), Some(h), Some(q), Some(p)) = (res.offpre.as_mut().filter(|_| offloaded), cache_hold.as_ref(), push.as_ref(), off_plan.as_ref()) {
+        // Its parameters were queued before the capture's submit.
+        side.went_through(h, q, p, None);
+    }
+    if offloaded && !cached {
+        if let Some(n) = res.native.as_mut() {
+            n.gap.touch(hold_now());
+        }
     }
     if let (Some(arm), Some(c)) = (arm.filter(|_| cache.is_some()), res.cache.as_mut()) {
         c.pending = Some(super::cache_dump::Pending {
@@ -5235,6 +5524,22 @@ unsafe fn native_hold(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_running_line_says_where_the_model_runs_with_ray_reconstruction_and_a_second_gpu() {
+        assert_eq!(super::running_line(None, false), "native network running");
+        assert_eq!(super::running_line(Some("lower"), false), "native network running (lower)");
+        let rr = super::running_line(None, true);
+        assert!(rr.starts_with("second GPU: "), "doctor reports it with the second GPU's lines: {rr}");
+        assert!(rr.contains("the game's GPU after DLSS") && rr.contains("covers only before DLSS"), "{rr}");
+        assert!(super::running_line(Some("lower"), true).contains("after DLSS (lower);"));
+        // Every variant fits the channel's field whole (a cut line would read as changed at every hold).
+        for guard in [None, Some(super::super::vram_guard::NOTE_SMALL), Some(super::super::vram_guard::NOTE_PAUSED)] {
+            for after in [false, true] {
+                let line = super::running_line(guard, after);
+                assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
+            }
+        }
+    }
     use super::*;
 
     /// Resources built untimed (inside DLSS's buffer the hold times its slot) make no GPU timer at all: a timer
@@ -5284,7 +5589,7 @@ mod tests {
             shared: None,
             bda_ext: false,
         };
-        let loader = Loader::start(vk::Device::null(), setup, Arc::default(), true);
+        let loader = Loader::start(vk::Device::null(), setup, HoldCounts::default(), true);
         // No hold for longer than the path switch: the post path may claim.
         loader.claims.last_pre.store(0, std::sync::atomic::Ordering::SeqCst);
         let _ = epoch_ms();
@@ -5320,27 +5625,75 @@ mod tests {
             shared: None,
             bda_ext: false,
         };
-        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holds = HoldCounts::default();
         let loader = Loader::start(vk::Device::null(), setup, holds.clone(), true);
         use std::sync::atomic::Ordering::SeqCst;
         let _ = epoch_ms();
         std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
-        let unused = || loader.unused(loader.claims.last_pre.load(SeqCst));
+        let unused = || loader.unused();
         assert!(unused(), "nothing ran");
-        holds.store(1, SeqCst);
+        holds.all.store(1, SeqCst);
+        holds.local.store(1, SeqCst);
         assert!(!unused(), "a hold in DLSS's buffers may still run");
-        holds.store(0, SeqCst);
+        holds.all.store(0, SeqCst);
+        holds.local.store(0, SeqCst);
         loader.claims.post_busy.store(true, SeqCst);
         assert!(!unused(), "an after-the-upscaler frame runs");
         loader.release_post();
         assert!(!unused(), "within a path switch of it");
         loader.claims.last_post.store(0, SeqCst);
-        loader.claims.last_pre.store(epoch_ms(), SeqCst);
-        assert!(!unused(), "within a path switch of a hold");
-        loader.claims.last_pre.store(0, SeqCst);
+        loader.claims.last_local.store(epoch_ms(), SeqCst);
+        assert!(!unused(), "within a path switch of a hold that took it");
+        loader.claims.last_local.store(0, SeqCst);
         assert!(unused());
         assert!(!loader.lend(), "no network open here: nothing to lend");
         assert_eq!(loader.claims.last_pre.load(SeqCst), 0, "a refused lend leaves the hold's stamp as it was: the other path is not kept off");
+    }
+
+    /// #63: holds before DLSS whose model runs on a second GPU record nothing of the game's network. A network the
+    /// after-the-upscaler path opened on the game's device beside them is not in use, so it is lent to the second GPU's
+    /// loader; before, their stamp and their count kept it here for good, and the second GPU never got the network
+    /// back after a change of DLSS's render size (the model off until the offload fell back 30 s later).
+    #[test]
+    fn holds_whose_model_runs_on_a_second_gpu_do_not_keep_the_network_here() {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup {
+            gipa,
+            instance: vk::Instance::null(),
+            physical: vk::PhysicalDevice::null(),
+            frame_family: 0,
+            family: 0,
+            index: 0,
+            post_index: 0,
+            properties2: crate::vram::Properties2::None,
+            flow: None,
+            shared: None,
+            bda_ext: false,
+        };
+        use std::sync::atomic::Ordering::SeqCst;
+        let holds = HoldCounts::default();
+        let loader = Loader::for_test(setup, vec![built((64, 32), 1, network::FULL)], holds.clone(), Box::new(|_, _| {}));
+        // The after-the-upscaler path opened it and stopped a path switch ago.
+        let _ = epoch_ms();
+        std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
+        loader.claims.last_post.store(0, SeqCst);
+        // Offloaded holds come on and on: each stamps the hold (keeping that path off) and is outstanding.
+        assert!(loader.claim_pre(), "a hold before DLSS");
+        assert!(!loader.claim_post(), "the after-the-upscaler path stays off beside the holds");
+        holds.all.store(3, SeqCst);
+        holds.local.store(0, SeqCst);
+        assert!(loader.unused(), "holds that record nothing of the network are no use of it");
+        // One of them recorded the network after all: in use.
+        holds.local.store(1, SeqCst);
+        assert!(!loader.unused(), "a hold that recorded the network may still run");
+        holds.local.store(0, SeqCst);
+        // A hold that took a build here is a use, whatever the count says.
+        assert!(loader.ready_sizes(&[(64, 32)], network::FULL, 0).is_some());
+        assert!(!loader.unused(), "within a path switch of a hold that took the network");
+        loader.claims.last_local.store(0, SeqCst);
+        assert!(loader.unused());
     }
 
     /// While the network is being lent to another device, neither path takes it, and each use is counted (a
@@ -5365,7 +5718,7 @@ mod tests {
             bda_ext: false,
         };
         use std::sync::atomic::Ordering::SeqCst;
-        let loader = Loader::for_test(setup, vec![built((64, 32), 1, network::FULL)], Arc::default(), Box::new(|_, _| {}));
+        let loader = Loader::for_test(setup, vec![built((64, 32), 1, network::FULL)], HoldCounts::default(), Box::new(|_, _| {}));
         assert!(loader.ready_sizes(&[(64, 32)], network::FULL, 0).is_some());
         assert_eq!(loader.shared.0.lock().unwrap().uses, 1, "a path took it");
         loader.shared.0.lock().unwrap().lend = true;
@@ -5434,8 +5787,10 @@ mod tests {
         s.last_use = Some(now);
         assert_eq!(s.apply_idle_step(&claims, now + Duration::from_secs(2)), None, "a path took it 2 s ago");
         claims.holds.store(1, std::sync::atomic::Ordering::SeqCst);
+        claims.local.store(1, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP), None, "a hold recorded with the build may run");
         claims.holds.store(0, std::sync::atomic::Ordering::SeqCst);
+        claims.local.store(0, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP), Some(Level::Paused));
         assert!(s.pausing() && s.wants_work(), "the loader thread closes the network");
         assert_eq!(s.apply_idle_step(&claims, now + IDLE_STEP * 2), None, "nothing pending any more");
@@ -5498,7 +5853,7 @@ mod tests {
         let _ = epoch_ms();
         std::thread::sleep(Duration::from_millis(PATH_SWITCH_MS + 5));
         let claims = Claims::default();
-        assert!(claims.unused(0) && !claims.in_flight());
+        assert!(claims.unused() && !claims.in_flight());
         claims
     }
 
@@ -5548,11 +5903,11 @@ mod tests {
             bda_ext: false,
         };
         use std::sync::atomic::Ordering::SeqCst;
-        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holds = HoldCounts::default();
         let loader = Loader::for_test(setup, vec![built((3840, 2160), 1, network::FULL)], holds.clone(), Box::new(|_, _| {}));
         let size = [(3840, 2160)];
         // Another hold outstanding, nothing decided: the build is served as before.
-        holds.store(2, SeqCst);
+        holds.all.store(2, SeqCst);
         assert!(loader.ready_sizes(&size, network::FULL, 1).is_some());
         // The build ended at the budget: a pause is decided.
         {
@@ -5565,7 +5920,7 @@ mod tests {
         assert_eq!(loader.shared.0.lock().unwrap().uses, uses, "not taken");
         assert!(!loader.paused(), "not applied under the other hold");
         // The other hold is done with: the asking one applies the pause, and nothing is served.
-        holds.store(1, SeqCst);
+        holds.all.store(1, SeqCst);
         assert!(loader.ready_sizes(&size, network::FULL, 1).is_none());
         assert!(loader.paused());
     }

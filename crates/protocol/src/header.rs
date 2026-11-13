@@ -2426,13 +2426,26 @@ pub fn store64(lo: &AtomicU32, hi: &AtomicU32, v: u64) {
 ///
 /// There is exactly one writer per field. If a previous writer died mid-write and left
 /// the sequence odd, it is simply carried through to the next even value.
-fn store_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W], s: &str) {
-    let bytes = s.as_bytes();
-    // Cut at a character boundary: half a UTF-8 sequence would read back as U+FFFD.
-    let mut n = bytes.len().min(W * 4 - 1);
+/// What a reason field ([`ShmHeader::layer_reason`], [`ShmHeader::preupscale_reason`]) keeps of `s`: at most
+/// `REASON_BYTES - 1` bytes, cut at a character boundary. A writer that compares its line with the field's compares
+/// this, or a line longer than the field never matches and is written again every time.
+pub fn stored_reason(s: &str) -> &str {
+    &s[..stored_len(s, REASON_BYTES - 1)]
+}
+
+/// The bytes of `s` a field of `max` bytes keeps, cut at a character boundary (half a UTF-8 sequence would read back
+/// as U+FFFD).
+fn stored_len(s: &str, max: usize) -> usize {
+    let mut n = s.len().min(max);
     while !s.is_char_boundary(n) {
         n -= 1;
     }
+    n
+}
+
+fn store_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W], s: &str) {
+    let bytes = s.as_bytes();
+    let n = stored_len(s, W * 4 - 1);
     let odd = seq.load(Ordering::Relaxed) | 1;
     seq.store(odd, Ordering::Relaxed);
     // Keeps the odd store ordered before the data writes below, as far as a reader
@@ -3503,6 +3516,13 @@ mod tests {
         let long = "x".repeat(REASON_BYTES + 50);
         h.set_layer_reason(&long);
         assert_eq!(h.layer_reason().len(), REASON_BYTES - 1);
+        assert_eq!(h.layer_reason(), stored_reason(&long));
+        // Cut at a character boundary, as stored.
+        let wide = format!("{}é", "x".repeat(REASON_BYTES - 2));
+        h.set_layer_reason(&wide);
+        assert_eq!(h.layer_reason(), stored_reason(&wide));
+        assert_eq!(stored_reason(&wide).len(), REASON_BYTES - 2);
+        assert_eq!(stored_reason("short"), "short");
     }
 
     #[test]

@@ -358,13 +358,20 @@ impl Guard {
             _ => "the network is paused (frames go to DLSS untouched) until there is room again",
         };
         let line = format!("[native] VRAM guard: {why}; {what} (no step up for at least {} s)", self.backoff.as_secs());
-        self.why = Some(match down {
-            Level::Small => "too little VRAM for the full network: running the small one".to_string(),
-            _ => "paused: too little VRAM for the network; it resumes once there is room".to_string(),
-        });
+        self.why = Some(
+            match down {
+                Level::Small => NOTE_SMALL,
+                _ => NOTE_PAUSED,
+            }
+            .to_string(),
+        );
         Some(line)
     }
 }
+
+/// The guard's notes on the Status line ([`VramGuard::why`]).
+pub(crate) const NOTE_SMALL: &str = "too little VRAM for the full network: running the small one";
+pub(crate) const NOTE_PAUSED: &str = "paused: too little VRAM for the network; it resumes once there is room";
 
 #[cfg(test)]
 mod tests {

@@ -4,6 +4,26 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.2.0 — 2026-11-13
+
+**The model on a second GPU**
+
+- With two GPUs, the model can run on the second one while the game renders on the first: add
+  `NEURAL_FORGE_OFFLOAD_GPU=<index or vendor:device>` to the game's launch options; the log lists the GPUs and their
+  indices (the user guide's "The model on a second GPU").
+- Before DLSS (Placement on Auto or Before DLSS): each frame goes to the second GPU and its edit is applied to the
+  next frame, carried along the game's motion vectors, before DLSS runs. No frame is shown later and DLSS and frame
+  generation get every frame in its own turn; the edit is one frame old. It needs the edit cache (on by default).
+- On the finished frame (Placement set to Finished frame): each frame is shown one frame later than on one GPU.
+- Either way the frame rate is bounded by the second GPU's time per frame. If the second GPU
+  cannot run or build the network, is far too slow for the game, or takes over a second for a frame, the model goes
+  back to the game's GPU for the session; if a frame never finishes there, the model goes back once it has, and stays
+  off until the game restarts if it never does. The log, the Status tab and `doctor` say which.
+- It works at any Model resolution (below Full the frames pass through the CPU on the game's side). Keep the display
+  on the game's GPU: with it on the second GPU every frame is also copied across for the screen.
+- Every 600 frames the log says how the second GPU is doing (its time per frame, the time from sending a frame to
+  its answer, frames shown with and without the model, and frames that had to wait for their own answer).
+
 ## 4.1.3 — 2026-11-12
 
 **God of War no longer goes black with the model before the upscaler**

@@ -204,6 +204,18 @@ pub(crate) fn device_lost(device: vk::Device) -> bool {
     ANY_DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed) && LOST_DEVICES.lock().unwrap_or_else(|e| e.into_inner()).contains(&device)
 }
 
+/// Devices the layer made itself (`preupscale::offload`): a loss there is not the game's ([`note_vk`]).
+static SECONDARY_DEVICES: Mutex<Vec<vk::Device>> = Mutex::new(Vec::new());
+
+/// Notes `device` as one the layer made itself (`on`), or no longer (destroyed).
+pub(crate) fn note_secondary_device(device: vk::Device, on: bool) {
+    let mut all = SECONDARY_DEVICES.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|&d| d != device);
+    if on {
+        all.push(device);
+    }
+}
+
 /// Whether a device of this process is lost now (the channel's session record, `device_lost_at`). A
 /// game that recovered by destroying the lost device and creating another is no longer reported.
 pub(crate) fn any_device_lost() -> bool {
@@ -227,6 +239,16 @@ pub(crate) fn forget_lost_device(device: vk::Device) {
 /// Passes a Vulkan result of a call on `device` through unchanged, latching the layer inert on that
 /// device on `DEVICE_LOST`.
 pub(crate) fn note_vk<T>(device: vk::Device, result: ash::prelude::VkResult<T>) -> ash::prelude::VkResult<T> {
+    if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) && SECONDARY_DEVICES.lock().unwrap_or_else(|e| e.into_inner()).contains(&device) {
+        // A device the layer made for the model on another GPU (`preupscale::offload`): the game's devices are not
+        // lost, and the session is not marked so; the offload falls back on its own.
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[offload] VK_ERROR_DEVICE_LOST on the other GPU's device {:#x}", vk::Handle::as_raw(device));
+            crate::logging::flush();
+        }
+        return result;
+    }
     if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) {
         let first_of_device = {
             let mut lost = LOST_DEVICES.lock().unwrap_or_else(|e| e.into_inner());
@@ -828,6 +850,12 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         p_device: &mut std::mem::MaybeUninit<vk::Device>,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         self.remember(physical_device);
+        // The device the layer makes for the model on a second GPU, should the loader route it through this layer:
+        // made as asked (`preupscale::offload`).
+        #[cfg(target_arch = "x86_64")]
+        if preupscale::offload::making() {
+            return LayerResult::Unhandled;
+        }
         // A process the layer is off in, or one the target filter excludes (launchers, overlays),
         // gets its device exactly as it asked for it: no queues, features, extensions or worker.
         if !(layer_enabled() && ownership::eligible()) {
@@ -987,16 +1015,29 @@ impl NeuralForgeInstanceHooks {
             static OFF_NOTED: std::sync::Once = std::sync::Once::new();
             OFF_NOTED.call_once(|| log!("[native] NEURAL_FORGE_PREUPSCALE=off: the network is not loaded, so frames are presented as the game made them; the model on the finished frame is the placement setting's `present`"));
         }
+        // The instance's GPUs in the log (once per process, where there is more than one), whatever this device turns
+        // out to be: the indices `NEURAL_FORGE_OFFLOAD_GPU` takes.
+        // SAFETY: `physical_device` belongs to this instance.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            preupscale::offload::log_gpus(&instance.instance, physical_device, instance.properties2 == vram::Properties2::Core)
+        };
+        // Why the model cannot move to another GPU from this device, where the network does not run on it.
+        #[cfg(target_arch = "x86_64")]
+        let no_offload: std::cell::RefCell<String> = std::cell::RefCell::new("the game's GPU is not NVIDIA, or the network is off".into());
         let create = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| -> vk::Result {
             #[cfg(target_arch = "x86_64")]
             if native {
                 let gipa = layer_device_link.pfnNextGetInstanceProcAddr;
                 // Two more: the network's loading, and the after-the-upscaler path's frames.
                 match extra_queues(&families, app_queues, 2).or_else(|| shared_queues(&families, app_queues)) {
-                    None => log!(
-                        "[native] no compute queue to spare for the network's loading{}; native backend off on this device",
-                        if shared_queue::allowed() { " and none of the application's to share" } else { " (NEURAL_FORGE_SHARE_QUEUE=off)" }
-                    ),
+                    None => {
+                        *no_offload.borrow_mut() = "the game's device has no compute queue to spare for the network".into();
+                        log!(
+                            "[native] no compute queue to spare for the network's loading{}; native backend off on this device",
+                            if shared_queue::allowed() { " and none of the application's to share" } else { " (NEURAL_FORGE_SHARE_QUEUE=off)" }
+                        )
+                    }
                     Some(ExtraQueues { app_family: frame_family, family, index, post_index, shared, infos: queues, .. }) => {
                         if shared.is_some() {
                             log!("[native] no compute queue to spare: the network shares the application's queue {index} of family {family}, every submit to it locked (NEURAL_FORGE_SHARE_QUEUE=off turns it off)");
@@ -1008,6 +1049,7 @@ impl NeuralForgeInstanceHooks {
                         // points to outlive the extension, which outlives the call.
                         match unsafe { neural_forge_native::device_extend(gipa, instance.instance.handle(), instance.api_version, physical_device, &with) } {
                             Err(why) => {
+                                *no_offload.borrow_mut() = format!("the game's device cannot run the network ({why})");
                                 log!("[native] the device cannot run the network: {why}; native backend off on this device");
                                 note_native_unavailable(&why);
                             }
@@ -1059,13 +1101,31 @@ impl NeuralForgeInstanceHooks {
                                         bda_ext: requests_extension(info, c"VK_EXT_buffer_device_address"),
                                     };
                                     NATIVE_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().insert(device, setup);
+                                    // The device for the model on another GPU, made now: inside vkCreateDevice the loader
+                                    // holds the lock its device callbacks need (`preupscale::offload::make_for`).
+                                    // SAFETY: inside vkCreateDevice for `device`, with its request.
+                                    // Only for a device that presents (a game makes several; the one it draws its frames
+                                    // with asks for swapchains).
+                                    if requests_extension(info, c"VK_KHR_swapchain") {
+                                        unsafe { preupscale::offload::make_for(&instance.instance, setup, device, info) };
+                                    }
                                     log!("[native] device created with the network's extensions and features, loading queue {index} of family {family}");
                                     return result;
                                 }
                                 log!("[native] creating the device with the network's additions was refused ({result:?}); creating it without");
+                                *no_offload.borrow_mut() = format!("the game's device with the network's additions was refused ({result:?})");
                             }
                         }
                     }
+                }
+            }
+            // The model on another GPU needs the network on the game's device too (the fall-back, and the device's setup it is
+            // made from): said once where it was asked for.
+            #[cfg(target_arch = "x86_64")]
+            if preupscale::offload::Choice::current() != preupscale::offload::Choice::Off && requests_extension(info, c"VK_KHR_swapchain") {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log!("[offload] NEURAL_FORGE_OFFLOAD_GPU is set, but the model cannot move to another GPU from this device: {}", no_offload.borrow());
                 }
             }
             next_create_device(info, p_device)
@@ -1231,6 +1291,12 @@ impl Layer for NeuralForgeLayer {
             api_version = api_version.max(vk::API_VERSION_1_3);
         }
         let surface_maintenance = swapchain_maintenance::take_instance(instance.handle());
+        // The loader's device callback, for the model on a second GPU (`preupscale::offload`).
+        // SAFETY: the application's create info, valid for the call, its chain the loader's.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            preupscale::offload::note_instance(instance.handle(), create_info)
+        };
         NeuralForgeInstanceHooks {
             ctx: Some(InstanceContext {
                 instance,
@@ -1450,6 +1516,19 @@ mod device_lost_tests {
 
     /// Held by the tests that latch devices lost: the latch is process-wide.
     static LOST_STATE: Mutex<()> = Mutex::new(());
+
+    /// A lost device the layer made for the model on another GPU marks neither the game's devices nor the session.
+    #[test]
+    fn a_lost_offload_device_is_not_the_sessions_loss() {
+        let _state = LOST_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        use ash::vk::Handle;
+        let offload = vk::Device::from_raw(0xdead_0003);
+        note_secondary_device(offload, true);
+        assert_eq!(note_vk::<()>(offload, Err(vk::Result::ERROR_DEVICE_LOST)), Err(vk::Result::ERROR_DEVICE_LOST));
+        assert!(!any_device_lost(), "the session is not marked lost");
+        assert!(!device_lost(offload));
+        note_secondary_device(offload, false);
+    }
 
     #[test]
     fn note_vk_passes_results_through_and_latches_only_the_lost_device() {

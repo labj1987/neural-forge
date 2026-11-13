@@ -106,6 +106,12 @@ pub(crate) mod inline;
 pub(crate) mod native;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native_post;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod offload;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod offload_pre;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod offload_server;
 pub(crate) mod placement;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_flow;
@@ -276,6 +282,20 @@ static SR_LAUNCHES: Mutex<Option<SrLaunches>> = Mutex::new(None);
 pub(crate) struct SrLaunches {
     pub since: Instant,
     pub last: Instant,
+}
+
+/// Whether the native backend's Status line is written after a hold: when it changed or the channel holds something else,
+/// but never while the model on another GPU is serving (its line is the Status tab's then).
+fn native_line_due(status: &str, last: &str, channel: &str, offload_active: bool) -> bool {
+    !offload_active && (status != last || (!status.is_empty() && channel != neural_forge_protocol::stored_reason(status)))
+}
+
+/// The offload's Status line a hold writes (`line`, [`offload::status_line`]): while the hold before DLSS sends its
+/// frames to the other GPU (`serving_pre`, with the offload `active`) and the channel says something else. The
+/// present's writer ([`Session::ensure_post_server`]) does not run while frames are held before the upscaler, so
+/// without this the channel kept the native line a hold wrote before the offload started.
+fn hold_offload_line<'a>(line: Option<&'a str>, active: bool, serving_pre: bool, channel: &str) -> Option<&'a str> {
+    line.filter(|l| active && serving_pre && neural_forge_protocol::stored_reason(l) != channel)
 }
 
 impl SrLaunches {
@@ -1455,6 +1475,71 @@ fn plans_before(plan: &placement::Plan) -> bool {
         note_not_held(NO_PASS_BEFORE);
     }
     before
+}
+
+/// `NEURAL_FORGE_TEST_REBUILD_AT=<launch>[:<seconds>][,...]` (a test switch): from that DLSS launch the hook holds
+/// nothing for `<seconds>` (as in a game's settings menu where DLSS still runs but no frame is held: after 30 s the
+/// after-the-upscaler path takes the network), then the hold's resources are built again as for another render extent
+/// (the game's change of DLSS mode, which needs the game's menu), so what that does to the hold's state (the offload's
+/// side, the network on the other GPU) can be seen in a game ([`test_holds_off`], [`test_rebuild_due`]).
+static TEST_REBUILD: LazyLock<Vec<(u64, u64)>> = LazyLock::new(|| {
+    let Some(v) = neural_forge_protocol::env::var("NEURAL_FORGE_TEST_REBUILD_AT") else { return Vec::new() };
+    let at = parse_test_rebuild(&v);
+    if at.is_empty() {
+        crate::log!("[preupscale] NEURAL_FORGE_TEST_REBUILD_AT={v:?} names no DLSS launch (<launch>[:<seconds>][,...]); ignored");
+    }
+    at
+});
+
+/// [`TEST_REBUILD`]'s entries: each `<launch>[:<seconds>]` that parses.
+fn parse_test_rebuild(v: &str) -> Vec<(u64, u64)> {
+    v.split(',')
+        .filter_map(|e| {
+            let mut it = e.trim().split(':');
+            let at = it.next()?.parse().ok()?;
+            Some((at, it.next().and_then(|s| s.parse().ok()).unwrap_or(0)))
+        })
+        .collect()
+}
+
+/// [`TEST_REBUILD`]'s state: when the holds were kept off from, for how long, and a rebuild due.
+static TEST_STATE: Mutex<(Option<(Instant, u64)>, bool)> = Mutex::new((None, false));
+
+/// Whether [`TEST_REBUILD`] keeps this DLSS launch from being held (counted per launch the hook sees).
+pub(crate) fn test_holds_off() -> bool {
+    static LAUNCHES: AtomicU64 = AtomicU64::new(0);
+    if TEST_REBUILD.is_empty() {
+        return false;
+    }
+    let n = LAUNCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut st = lock(&TEST_STATE);
+    if let Some(&(_, pause)) = TEST_REBUILD.iter().find(|(at, _)| *at == n) {
+        crate::log!("[preupscale] NEURAL_FORGE_TEST_REBUILD_AT: no hold for {pause} s from DLSS launch {n}, then the hold's resources are built again");
+        st.0 = Some((Instant::now(), pause));
+    }
+    match st.0 {
+        Some((since, pause)) if since.elapsed() < Duration::from_secs(pause) => true,
+        Some(_) => {
+            st.0 = None;
+            st.1 = true;
+            false
+        }
+        None => false,
+    }
+}
+
+/// Whether [`TEST_REBUILD`] has the hold's resources built again now (once nothing recorded with them may still run).
+fn test_rebuild_due(outstanding: usize) -> bool {
+    if TEST_REBUILD.is_empty() {
+        return false;
+    }
+    let mut st = lock(&TEST_STATE);
+    if !st.1 || outstanding > 0 {
+        return st.1;
+    }
+    st.1 = false;
+    crate::log!("[preupscale] NEURAL_FORGE_TEST_REBUILD_AT: the hold's resources are built again, as for another render extent");
+    true
 }
 
 /// Holds that ran, for the tally line ([`Tracking::scan`]): split holds that wrote back, and holds recorded
@@ -4008,6 +4093,9 @@ pub(crate) struct Resources {
     /// The edit cache's passes (`cache`), built on the first native hold.
     #[cfg(target_arch = "x86_64")]
     pub(crate) edit: Option<cache::CachePass>,
+    /// The network on a second GPU for the hold before DLSS (`offload_pre`), made on its first offloaded hold.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) offpre: Option<offload_pre::HoldSide>,
     /// The scene-cut detector (`scene_cut`), built on the first native hold unless it is switched off.
     #[cfg(target_arch = "x86_64")]
     pub(crate) scene: Option<scene_cut::ScenePass>,
@@ -4173,6 +4261,8 @@ impl Resources {
             #[cfg(target_arch = "x86_64")]
             edit: None,
             #[cfg(target_arch = "x86_64")]
+            offpre: None,
+            #[cfg(target_arch = "x86_64")]
             scene: None,
             cache: None,
             #[cfg(target_arch = "x86_64")]
@@ -4303,6 +4393,10 @@ impl Resources {
             #[cfg(target_arch = "x86_64")]
             if let Some(depth) = &self.depth {
                 depth.destroy(device);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(side) = self.offpre.take() {
+                side.destroy(device);
             }
             #[cfg(target_arch = "x86_64")]
             if let Some(edit) = &self.edit {
@@ -4559,6 +4653,9 @@ pub(crate) struct HoldResult {
     pub timing: HoldTiming,
     /// The native backend ran this hold (`evaluated` means the network ran).
     pub native: bool,
+    /// The native backend: a hold after DLSS's output (Ray Reconstruction's placement, or the one set there) while the model on a second GPU is asked
+    /// for: the network runs on the game's GPU here, the second GPU takes only the holds before DLSS.
+    pub after_dlss_on_game_gpu: bool,
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
     /// network, composite), read when its fence was found signalled here.
     pub network_gpu_ms: Option<f32>,
@@ -4754,6 +4851,7 @@ unsafe fn record_capture(
     native_depth: Option<(vk::Buffer, Option<&crate::gpu_timer::GpuTimer>)>,
     colour_before: Option<vk::Buffer>,
     extra: Option<&dyn Fn(vk::CommandBuffer)>,
+    first: Option<&dyn Fn(vk::CommandBuffer)>,
     into: Option<vk::CommandBuffer>,
 ) -> ash::prelude::VkResult<()> {
     let relative = ExposureSource::of(target) == ExposureSource::Game;
@@ -4768,6 +4866,10 @@ unsafe fn record_capture(
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         }
+    }
+    // Before anything of this hold's capture (`native`, the offloaded hold: what the previous hold left is read first).
+    if let Some(first) = first {
+        first(cmd);
     }
     // The game's texel is copied in whenever it is the source, also when the auto-exposure lifts it after.
     let aux: Vec<DumpRead> =
@@ -5139,7 +5241,7 @@ pub(crate) unsafe fn run_hold(
     let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
     let dump_bufs = if dump { res.dump.as_ref() } else { None };
     // SAFETY: the capture buffer is idle (`wait_idle` above); the colour view was bound above.
-    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, Some(res.proxy.buffer), None, None, None, None, None) }.is_err() {
+    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, Some(res.proxy.buffer), None, None, None, None, None, None) }.is_err() {
         result.miss = Some("recording the capture failed");
         return result;
     }
@@ -5606,6 +5708,9 @@ pub(crate) struct Session {
     /// The server stalled on a frame: nothing starts on this device again.
     #[cfg(target_arch = "x86_64")]
     post_stalled: bool,
+    /// The server running is the one on another GPU.
+    #[cfg(target_arch = "x86_64")]
+    post_offload: bool,
     /// `NEURAL_FORGE_CAPTURE_AT`: how many times DLSS frames resumed after a gap, when the last resume was,
     /// and which of its entries were taken, one bit each ([`Self::capture_at_due`]).
     resumes: u32,
@@ -5931,7 +6036,7 @@ impl Session {
         outstanding: usize,
     ) -> Result<(), &'static str> {
         let slot = self.res_inline(stage);
-        if slot.as_ref().is_some_and(|r| r.inline && r.matches(queue_family, width, height)) {
+        if slot.as_ref().is_some_and(|r| r.inline && r.matches(queue_family, width, height)) && !test_rebuild_due(outstanding) {
             return Ok(());
         }
         if slot.is_some() && outstanding > 0 {
@@ -6532,6 +6637,25 @@ impl Session {
         import: bool,
         shm: &ShmClient,
     ) {
+        // The model on another GPU's state, on the Status tab's line and for `doctor` (`layer_reason`).
+        #[cfg(target_arch = "x86_64")]
+        // Only while the offload is what runs (serving at the finished-frame placement, or the hold before DLSS sending
+        // its frames) or not running (starting, stalled, given up): when the placement left it, the native backend's
+        // line has the channel (`offload::shows_line`).
+        let at_present = shm.view().is_some_and(|v| {
+            let (count, placements) = v.header().placements();
+            placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT)
+        });
+        let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_pre());
+        if let Some(line) = offload::status_line().filter(|_| offload_line) {
+            // Against what the channel holds (the native backend's line shares it): written when it says something else,
+            // except that once the offload was given up the native backend's own line (the network running here, or why
+            // not) is the one to keep.
+            let now = shm.layer_reason();
+            if now != neural_forge_protocol::stored_reason(&line) && !(offload::given_up() && now.starts_with("native network")) {
+                shm.set_layer_reason(&line);
+            }
+        }
         #[cfg(target_arch = "x86_64")]
         if !self.post_stalled && native_on(self.native.as_ref()) {
             use native_post::Status;
@@ -6544,13 +6668,24 @@ impl Session {
                     }
                     return;
                 }
+                // The server on another GPU waits for a frame that did not finish (`native_post::work`): it ends on its
+                // own, with the network back here (Unavailable) once that frame is done.
+                Some(Status::Stalled) if self.post_offload => return,
                 Some(Status::Stalled) => {
                     self.post_stalled = true;
                     drop(self.post_server.take());
                     return;
                 }
+                // The second GPU could not start, stalled, was lost or was too slow (`offload`, logged there): the
+                // network runs on this device's GPU from the next present on.
+                Some(Status::Unavailable) => {
+                    self.post_offload = false;
+                    drop(self.post_server.take());
+                    return;
+                }
                 Some(Status::Retry) => {
                     // The worker has ended: joining it does not wait.
+                    self.post_offload = false;
                     drop(self.post_server.take());
                     self.post_retry.failed(now);
                     return;
@@ -6561,6 +6696,22 @@ impl Session {
                 return;
             }
             let (Some(loader), Some(view)) = (self.native.clone(), shm.view()) else { return };
+            // The model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`, `offload`): only at the finished-frame placement, and
+            // until it is given up for the session.
+            // Given up for the process (`offload::given_up`): every device runs the network on its own GPU from then on.
+            if offload::Choice::current() != offload::Choice::Off && !offload::given_up() {
+                let (count, placements) = view.header().placements();
+                if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
+                    self.post_offload = true;
+                    self.post_server = native_post::PostServer::start_offload(instance.clone(), device.handle(), view);
+                    return;
+                }
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::log!("[offload] NEURAL_FORGE_OFFLOAD_GPU: not every pass is at the Placement setting `present`: the holds before DLSS send their frames to the other GPU themselves; a pass after DLSS's output or on the finished frame beside them runs on the game's GPU");
+                }
+            }
+
             // The network's queue is the application's, shared (`crate::shared_queue`): no after-the-upscaler server.
             // Its frames are waited for at the present, and on that queue they run behind the application's own work,
             // which can wait on what the application does only after that present: Red Dead Redemption 2 froze at its
@@ -6631,7 +6782,13 @@ impl Session {
                 loader.note_gpu_ms(ms);
             }
             let status = native::status(result, loader);
-            if status != self.native_status {
+            // Against what the channel holds too: the offload's line shares it, and while the offload serves the line is
+            // its own (the hold's "native network running" would overwrite it on every frame).
+            let offload_active = matches!(offload::state(), offload::State::Active(_));
+            if let Some(line) = hold_offload_line(offload::status_line().as_deref(), offload_active, offload_pre::serving_pre(), &shm.layer_reason()) {
+                shm.set_layer_reason(line);
+            }
+            if native_line_due(&status, &self.native_status, &shm.layer_reason(), offload_active) {
                 shm.set_layer_reason(&status);
                 self.native_status = status;
             }
@@ -6985,6 +7142,14 @@ pub(crate) fn write_dump_async(frame: DumpFrame, capture: Option<(neural_forge_p
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `NEURAL_FORGE_TEST_REBUILD_AT`'s entries: a launch with an optional pause; what does not parse is left out.
+    #[test]
+    fn the_rebuild_test_switch_reads_its_entries() {
+        assert_eq!(parse_test_rebuild("60:40, 900"), vec![(60, 40), (900, 0)]);
+        assert_eq!(parse_test_rebuild("60:x,abc"), vec![(60, 0)]);
+        assert!(parse_test_rebuild("on").is_empty());
+    }
 
     fn sem(raw: u64) -> vk::Semaphore {
         vk::Semaphore::from_raw(raw)
@@ -10569,7 +10734,7 @@ mod tests {
         let d = &gpu.device;
         let shm = scratch_shm("prefence");
         let setup = native::Setup::for_test(&gpu._entry, &gpu.instance, gpu.physical, gpu.family);
-        let loader: NativeLoader = Arc::new(native::Loader::for_test(setup, Vec::new(), Arc::default(), Box::new(|_, _| {})));
+        let loader: NativeLoader = Arc::new(native::Loader::for_test(setup, Vec::new(), native::HoldCounts::default(), Box::new(|_, _| {})));
         // SAFETY: a fresh device; each submit below is waited on before the resources are destroyed.
         unsafe {
             let mut first = Resources::build(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false).expect("resources");
@@ -11726,8 +11891,21 @@ mod tests {
             identification: 1,
         };
         let run = |res: &Resources, target: &Target, cache: Option<&CacheCopies>| unsafe {
-            record_capture(d, res, target, None, None, Some(res.proxy.buffer), None, Some((depth_copy.buffer, None)), cache.map(|c| c.colour), None, None)
-                .unwrap();
+            record_capture(
+                d,
+                res,
+                target,
+                None,
+                None,
+                Some(res.proxy.buffer),
+                None,
+                Some((depth_copy.buffer, None)),
+                cache.map(|c| c.colour),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
             record_writeback(d, res, target, res.proxy.buffer, None, cache, None, None).unwrap();
             let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
             d.queue_submit(gpu.queue, &[vk::SubmitInfo::default().command_buffers(&[res.capture_cmd, res.writeback_cmd])], fence).unwrap();
@@ -11971,5 +12149,40 @@ mod tests {
         t.forget_image(i(1));
         t.forget_image(i(4));
         assert_eq!(t.exposure_names.keys().copied().collect::<Vec<_>>(), [i(5)]);
+    }
+}
+
+#[cfg(test)]
+mod native_line_tests {
+    use super::{hold_offload_line, native_line_due};
+
+    #[test]
+    fn a_hold_writes_the_offloads_line_while_it_sends_its_frames() {
+        let offload = "second GPU: the model runs on X before DLSS, its edit applied one frame later";
+        // The native line a hold wrote before the offload started is replaced (the present's writer is off while held).
+        assert_eq!(hold_offload_line(Some(offload), true, true, "native network running"), Some(offload));
+        assert_eq!(hold_offload_line(Some(offload), true, true, ""), Some(offload));
+        // Already there: nothing written.
+        assert_eq!(hold_offload_line(Some(offload), true, true, offload), None);
+        // Not the hold before DLSS serving (the finished frame, after DLSS, off, given up): not the hold's to write.
+        assert_eq!(hold_offload_line(Some(offload), true, false, "native network running"), None);
+        assert_eq!(hold_offload_line(Some(offload), false, true, "native network running"), None);
+        assert_eq!(hold_offload_line(None, false, false, ""), None);
+    }
+
+    #[test]
+    fn the_offloads_line_is_not_overwritten_while_it_serves() {
+        let offload = "second GPU: the model runs on X before DLSS, its edit applied one frame later";
+        assert!(!native_line_due("native network running", "native network running", offload, true));
+        assert!(!native_line_due("native network running", "", offload, true));
+        // Not serving (off, given up): the native backend's line comes back.
+        assert!(native_line_due("native network running", "native network running", offload, false));
+        assert!(native_line_due("native network running", "", "", false));
+        assert!(!native_line_due("native network running", "native network running", "native network running", false));
+        // A line longer than the channel's field is compared as the field keeps it: written once, not at every hold.
+        let long = "x".repeat(neural_forge_protocol::REASON_BYTES + 20);
+        let kept = neural_forge_protocol::stored_reason(&long);
+        assert!(!native_line_due(&long, &long, kept, false));
+        assert_eq!(hold_offload_line(Some(&long), true, true, kept), None);
     }
 }

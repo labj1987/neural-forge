@@ -23,6 +23,8 @@
 #   edit_file, edit_kind, edits   game settings for the run, restored afterwards byte for byte: the file relative to
 #                the game's Proton user folder (compatdata/<appid>/pfx/drive_c/users/steamuser), "json-option"
 #                (Cyberpunk 2077's UserSettings.json option names) or "xml-value" (<Name value="..."/>), NAME=VALUE
+#   env          more variables for the game's launch options, NAME=VALUE (a setting only a variable switches, as
+#                NEURAL_FORGE_OFFLOAD_GPU=same)
 #
 # Every run sets the game's own resolution to 2560x1440 (the desktop stays at 3840x2160; at 4K the 12 GB card ran out
 # of video memory with Ray Reconstruction); games with HDR run with it on.

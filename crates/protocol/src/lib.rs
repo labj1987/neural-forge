@@ -52,8 +52,8 @@ pub mod state_log;
 pub mod vram_need;
 
 pub use header::{
-    load64, pass_setting, resolved_scale, setting_bounds, store64, ColourSettings, EditColour, HudRegion, HudRegionWords, HudSettings, MaskSettings,
-    PassColour, PassControl, PassTunings, SharpenSettings, ShmHeader, Tuning, HDR_VERDICT_BYTES, MAX_HUD_REGIONS, SETTING_BOUNDS,
+    load64, pass_setting, resolved_scale, setting_bounds, store64, stored_reason, ColourSettings, EditColour, HudRegion, HudRegionWords, HudSettings,
+    MaskSettings, PassColour, PassControl, PassTunings, SharpenSettings, ShmHeader, Tuning, HDR_VERDICT_BYTES, MAX_HUD_REGIONS, SETTING_BOUNDS,
 };
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub use slot::{next_request, Slot};

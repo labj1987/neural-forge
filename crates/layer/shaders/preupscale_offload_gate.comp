@@ -1,0 +1,25 @@
+#version 450
+// The before-DLSS placement on a second GPU (preupscale::offload_pre): the gate of a hold that takes the other
+// GPU's answer to the frame the hold before it sent. The edit cache's capture has just stored that answer's
+// edit; where the answer is not that frame's (the other GPU was over its budget or failed and the worker let the
+// hold through, the send never ran, or another frame's answer is in the region), the edit is marked not stored
+// (STAT_EDIT_STORED cleared) and the cached write-back passes this hold's frame through as it is.
+layout(local_size_x = 1) in;
+
+// The answer region's header (offload_pre::IN_VALID, IN_SEQ), written by the worker once the answer is complete
+// and cleared by every send.
+layout(set = 0, binding = 0, std430) readonly buffer Answer { uint valid; uint seq; } u_answer;
+// The edit cache's counters (preupscale::cache).
+layout(set = 0, binding = 1, std430) buffer Stats { uint v[16]; } u_stats;
+
+layout(push_constant) uniform Push {
+  uint seq;  // the sequence number of the frame whose answer this hold takes
+} p;
+
+const uint STAT_EDIT_STORED = 14u;
+
+void main() {
+  if (u_answer.valid != 1u || u_answer.seq != p.seq) {
+    u_stats.v[STAT_EDIT_STORED] = 0u;
+  }
+}

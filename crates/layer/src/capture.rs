@@ -508,9 +508,818 @@ pub struct Inflight {
     /// that answer against this, never against `model_scratch`, which a later capture may have
     /// refilled with another frame.
     answer_proxy: Vec<u8>,
+    /// The delayed present's request (the model on a second GPU): the frame posted at the last present, whose answer
+    /// this present composes ([`delayed_present`]).
+    delayed: Option<DelayedRequest>,
+    /// Presents in a row whose frame could be captured for the other GPU and was not ([`delayed_present`]).
+    unsent: u32,
+    /// The CPU delayed present's two pairs ([`delayed_present_cpu`]), and the answer it reads (kept between presents).
+    kept_cpu: [KeptCpu; 2],
+    answer_cpu: Vec<u8>,
 }
 
 impl Inflight {}
+
+/// A frame the delayed present kept ([`delayed_present`]), sent to the other GPU or not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DelayedRequest {
+    /// The frame's size and format (the answer is composed only onto a frame of the same).
+    dims: (u32, u32, u32),
+    /// The pair [`crate::composition::gpu::GpuCompose::keep_delayed`] kept it in.
+    parity: usize,
+    encoded: bool,
+    /// When it was kept (and posted, when `sent`).
+    posted: std::time::Instant,
+    /// It was posted to the other GPU (else only kept: it is shown as it was).
+    sent: bool,
+    /// Kept on the CPU ([`delayed_present_cpu`], `Inflight::kept_cpu`), not in the compose's GPU pairs.
+    cpu: bool,
+    /// The size of the proxy it was sent as (its answer's: the Model resolution's), which the server echoes.
+    proxy: (u32, u32),
+    /// The white point and reversible mode its proxy was encoded with: its answer is composed with those, not with
+    /// what the settings (or the white meter) say by the next present.
+    white_point: f32,
+    reversible_mode: u32,
+    /// Kept as a raw frame on the GPU only (`GpuCompose::keep_delayed` without its proxy): shown as it was.
+    raw_gpu: bool,
+}
+
+/// A frame the CPU delayed present kept ([`delayed_present_cpu`]): the frame as captured, the proxy it was sent as when
+/// that was the model scratch (at the Model resolution), and that proxy's size.
+#[derive(Default)]
+struct KeptCpu {
+    original: Vec<u8>,
+    proxy_small: Vec<u8>,
+    sent: (u32, u32),
+}
+
+/// What the delayed present did.
+enum Delayed {
+    /// Composed the previous frame's answer into this image.
+    Composed(vk::Semaphore),
+    /// Wrote the previous frame into this image as it was (no answer for it in time): the stream keeps its cadence.
+    Shown(vk::Semaphore),
+    /// Presented this image untouched (`why`); `Some` when a submission of this present must be waited by it.
+    Untouched(u32, Option<vk::Semaphore>),
+    /// Not possible here (no zero-copy pair): the synchronous present runs.
+    NotHere,
+}
+
+/// What the previous present's kept frame becomes at this present ([`delayed_present`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Previous {
+    /// Nothing kept (the delay starts, or starts again).
+    None,
+    /// Its answer came and fits: composed.
+    Answer(DelayedRequest),
+    /// No usable answer (not sent, not back in time, another size, an HDR10 frame the model was not run on): shown as it was.
+    Raw(DelayedRequest),
+    /// Kept before a stall of the game (posted longer than the budget ago): dropped, the delay starts again.
+    Stale,
+}
+
+/// The decision for the previous present's frame: `pending` it, `answered` whether its answer came back, `answer_fits`
+/// whether that answer is for a frame of this present's size and kind, `since` how long ago it was kept.
+fn previous_frame(pending: Option<DelayedRequest>, answered: bool, answer_fits: bool, dims: (u32, u32, u32), since: std::time::Duration) -> Previous {
+    let Some(req) = pending else { return Previous::None };
+    if since > SYNC_BUDGET {
+        return Previous::Stale;
+    }
+    if req.dims != dims {
+        return Previous::None;
+    }
+    if req.sent && answered && answer_fits {
+        Previous::Answer(req)
+    } else {
+        Previous::Raw(req)
+    }
+}
+
+/// After this many presents in a row whose frame could not be captured for the other GPU, the synchronous present has
+/// the frames for [`UNSENT_RETRY`] presents before the delayed one tries again.
+const UNSENT_GIVE_WAY: u32 = 3;
+const UNSENT_RETRY: u32 = 30;
+
+/// Whether the delayed present keeps this present's frame: when it was captured (it is sent), when it could not be sent
+/// at all (the answer to the frame before is still out), or after a capture that failed while fewer than
+/// [`UNSENT_GIVE_WAY`] failed in a row before it (`unsent`): kept as it is, it is shown in its turn.
+fn keeps_frame(captured: bool, can_send: bool, unsent: u32) -> bool {
+    captured || !can_send || unsent + 1 < UNSENT_GIVE_WAY
+}
+
+/// A frame the delayed present could capture and did not (logged a few times).
+fn note_unsent() {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+        crate::log!("[offload] a frame could not be captured for the other GPU: the frame waiting is shown, and the next present starts again");
+    }
+}
+
+/// Whether an answer is the one to a kept frame: the server echoes the size of the proxy it answered (`answered`, `None`
+/// from a server that does not), which is the size the frame was sent at (`proxy`: the Model resolution's, not the
+/// frame's); an HDR10 frame's must also have run through the network (`evaluated`: else it is the frame's own words).
+fn answer_fits(answered: Option<(u32, u32)>, proxy: (u32, u32), pq10: bool, evaluated: bool) -> bool {
+    answered.is_none_or(|d| d == proxy) && (!pq10 || evaluated)
+}
+
+/// The pair this present's frame is kept in: the other one than the frame waiting to be shown (whose pair the compose
+/// or the show still reads).
+fn next_parity(pending: Option<DelayedRequest>) -> usize {
+    pending.map_or(0, |r| 1 - r.parity)
+}
+
+/// The delayed present's previous frame ([`delayed_present`], [`delayed_present_cpu`]): taken from `inflight`, its answer
+/// waited for until `deadline` (only while its request is out), the late rule fed, and what becomes of it.
+#[cfg(target_arch = "x86_64")]
+fn take_previous(
+    shm: &mut ShmClient,
+    inflight: &mut [Inflight; 2],
+    deadline: std::time::Instant,
+    pq10: bool,
+    dims: (u32, u32, u32),
+) -> (Option<DelayedRequest>, Previous) {
+    use crate::preupscale::offload::STATS;
+    use std::sync::atomic::Ordering::Relaxed;
+    const SLOT: Slot = Slot::Primary;
+    let pending = inflight[SLOT.index()].delayed.take();
+    let arrived = std::time::Instant::now();
+    let mut round_trip = None;
+    let mut answered = false;
+    let mut fits = false;
+    if pending.is_some_and(|r| r.sent) {
+        // Only while a request is out: with none (its budget ran out in the channel) there is nothing to wait for.
+        while shm.has_pending_request(SLOT) {
+            match shm.poll_async_request(SLOT) {
+                Some(true) => {
+                    answered = true;
+                    let req = pending.expect("checked");
+                    fits = answer_fits(shm.answered_dims(), req.proxy, pq10, shm.answer_evaluated(SLOT));
+                    round_trip = Some(req.posted.elapsed());
+                    if fits {
+                        STATS.round_trip_us.fetch_add(req.posted.elapsed().as_micros() as u64, Relaxed);
+                        STATS.round_trips.fetch_add(1, Relaxed);
+                    }
+                    break;
+                }
+                Some(false) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_micros(100)),
+                _ => break,
+            }
+        }
+    } else if shm.has_pending_request(SLOT) {
+        // A late answer to a request whose frame was shown without it lands here and is dropped (polling it ends it).
+        let _ = shm.poll_async_request(SLOT);
+    }
+    // Judged where the game waits: a frame late against the present interval counts toward giving the other GPU up.
+    // Not in the `same` test, where the other device shares the game's GPU: it is as slow as the network there.
+    if let Some(req) = pending.filter(|r| r.sent && crate::preupscale::offload::Choice::current() != crate::preupscale::offload::Choice::Same) {
+        let interval = arrived.saturating_duration_since(req.posted);
+        let verdict = crate::preupscale::offload::LATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_default().note(
+            round_trip,
+            interval,
+            (dims.0, dims.1),
+        );
+        if let Some(why) = verdict {
+            crate::preupscale::offload::give_up(why);
+        }
+    }
+    // How long the game took from that present to this one, not counting the wait above: a late answer is not a stall.
+    let previous = previous_frame(pending, answered, fits, dims, pending.map_or(std::time::Duration::ZERO, |r| arrived.saturating_duration_since(r.posted)));
+    (pending, previous)
+}
+
+/// The model on a second GPU (`preupscale::offload`): the present composes the answer to the frame the last present
+/// kept and posted, onto that frame as it was kept, and the result replaces this image; then it keeps and posts this
+/// frame. The game's GPU renders the next frame while the other GPU runs this one's network: every frame is shown one
+/// present late, with exactly the composition it would have had without the delay (the original and the proxy it was
+/// computed for, not the live frame). A frame whose answer is missing is shown as it was in its turn, so each frame is
+/// shown once. Where the delay starts (the first present, or after a stall of the game) the frame is shown live and
+/// once more, composed, at the next present. Needs the zero-copy pair (direct capture at the frame's size, the answer
+/// region imported); [`Delayed::NotHere`] otherwise.
+///
+/// # Safety
+/// As [`run`].
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn delayed_present(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue: vk::Queue,
+    queue_family: u32,
+    capture_image: vk::Image,
+    capture_layout: vk::ImageLayout,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    proxy_format: u32,
+    frame_bytes: u64,
+    use_direct: bool,
+    external_memory_host: &mut bool,
+    pipeline: &mut Option<CapturePipeline>,
+    direct: &mut [Option<DirectCapture>; 2],
+    gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
+    answer_import: Option<(*mut u8, u64)>,
+    shm: &mut ShmClient,
+    original_scratch: &mut Vec<u8>,
+    model_scratch: &mut Vec<u8>,
+    inflight: &mut [Inflight; 2],
+    model_request: Option<(u32, u32, vk::Format, bool)>,
+    encode_push: crate::composition::encode_pass::EncodePush,
+    deadline: std::time::Instant,
+    pq10: bool,
+    raw_answer_generation: &mut u64,
+    settings: &crate::shm::CompositionSettings,
+) -> Delayed {
+    use crate::preupscale::offload::STATS;
+    use std::sync::atomic::Ordering::Relaxed;
+    const SLOT: Slot = Slot::Primary;
+    let Some((answer_ptr, import_bytes)) = answer_import.filter(|_| zero_copy_allowed()) else {
+        // No zero-copy pair (the Model resolution below Full, an odd size, no host-memory import): the CPU pairs.
+        return delayed_present_cpu(
+            device,
+            instance,
+            physical_device,
+            queue,
+            queue_family,
+            capture_image,
+            capture_layout,
+            image,
+            width,
+            height,
+            proxy_format,
+            frame_bytes,
+            use_direct,
+            external_memory_host,
+            pipeline,
+            direct,
+            gpu_compose,
+            shm,
+            original_scratch,
+            model_scratch,
+            inflight,
+            model_request,
+            encode_push,
+            deadline,
+            pq10,
+            raw_answer_generation,
+            settings,
+        );
+    };
+    if gpu_compose.is_none() {
+        *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
+    }
+    let Some(gpu) = gpu_compose.as_mut() else { return Delayed::NotHere };
+    if !gpu.ensure_answer_import(device, instance, physical_device, answer_ptr, import_bytes) {
+        return Delayed::NotHere;
+    }
+    let dims = (width, height, proxy_format);
+    // 1. The previous present's frame: its answer, waited for within the budget (the other GPU had a whole frame).
+    let (pending, previous) = take_previous(shm, inflight, deadline, pq10, dims);
+    // The CPU pairs of `delayed_present_cpu`, if the path changed under them.
+    if inflight[SLOT.index()].kept_cpu.iter().any(|k| !k.original.is_empty()) || !inflight[SLOT.index()].answer_cpu.is_empty() {
+        inflight[SLOT.index()].kept_cpu = Default::default();
+        inflight[SLOT.index()].answer_cpu = Vec::new();
+    }
+    // A frame the CPU pairs kept (the path changed under it) is not in the GPU pairs: the delay starts again.
+    let (pending, previous) = if pending.is_some_and(|r| r.cpu) { (None, Previous::None) } else { (pending, previous) };
+    // 2. This frame, kept in the other pair; captured and sent only when the server is done with the proxy region. After
+    // captures that keep failing, the synchronous present has the frames for a while (no capture tried here twice).
+    let parity = next_parity(pending);
+    let unsent = inflight[SLOT.index()].unsent;
+    if pending.is_none() && unsent >= UNSENT_GIVE_WAY {
+        inflight[SLOT.index()].unsent = if unsent >= UNSENT_GIVE_WAY + UNSENT_RETRY { 0 } else { unsent + 1 };
+        return Delayed::NotHere;
+    }
+    let can_send = !shm.has_pending_request(SLOT);
+    let mut sent_dims = None;
+    let mut encoded = false;
+    let mut gpu_original = false;
+    if can_send {
+        let capture_idle = direct[SLOT.index()].as_ref().is_none_or(|d| d.pending.is_none());
+        if let Some(zc_target) = gpu.zero_copy_capture_target(device, instance, physical_device, queue, frame_bytes, capture_idle) {
+            let t_start = std::time::Instant::now();
+            loop {
+                match poll_or_submit_capture(
+                    SLOT,
+                    use_direct,
+                    external_memory_host,
+                    pipeline,
+                    direct,
+                    device,
+                    instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    capture_image,
+                    capture_layout,
+                    width,
+                    height,
+                    proxy_format,
+                    frame_bytes,
+                    model_request,
+                    encode_push,
+                    shm,
+                    original_scratch,
+                    model_scratch,
+                    Some(zc_target),
+                    Some(t_start),
+                ) {
+                    CaptureStep::Captured(captured) => {
+                        sent_dims = Some(captured.sent);
+                        encoded = captured.encoded;
+                        gpu_original = captured.gpu_original;
+                        break;
+                    }
+                    CaptureStep::Failed => break,
+                    CaptureStep::Pending => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+        } else if pending.is_none() {
+            return Delayed::NotHere;
+        }
+    }
+    let captured = sent_dims == Some((width, height)) && gpu_original;
+    // The white meter (as the synchronous present's, every 8th frame): the proxy region holds this frame now.
+    if captured && !pq10 {
+        static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if METER_FRAME.fetch_add(1, Relaxed).is_multiple_of(8) {
+            // SAFETY: the capture that wrote it was just seen complete (its fence, host-coherent memory) and no request is out.
+            let frame =
+                shm.proxy_region(SLOT).map_or(&[][..], |(ptr, capacity)| unsafe { std::slice::from_raw_parts(ptr, capacity.min(frame_bytes as usize)) });
+            if let Some(white) = meter_white(frame, width, height, proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8) {
+                shm.publish_measured_white(white);
+            }
+        }
+    }
+    let Some(gpu) = gpu_compose.as_mut() else { return Delayed::NotHere };
+    // 3. Kept before anything is written into the image: this frame as it is (and the proxy it is sent as). After a
+    // stall the delay starts again with this frame, kept and sent like the first one's. A frame that could be captured
+    // but was not is kept as it is (shown in its turn, without the model) once or twice; after
+    // [`UNSENT_GIVE_WAY`] in a row it is not kept: with nothing waiting the synchronous present takes it, else the frame
+    // waiting is shown and the synchronous present has the next ones for a while.
+    let shows_after = matches!(previous, Previous::Answer(_) | Previous::Raw(_));
+    inflight[SLOT.index()].unsent = if captured || !can_send { 0 } else { unsent + 1 };
+    let keeps = keeps_frame(captured, can_send, unsent);
+    if !keeps {
+        if pending.is_none() || previous == Previous::Stale {
+            return Delayed::NotHere;
+        }
+        note_unsent();
+    }
+    let keep = if keeps { gpu.keep_delayed(device, instance, physical_device, queue, image, width, height, parity, captured, !shows_after) } else { None };
+    // 4. The previous frame into this image: composed with its answer, or as it was.
+    let mut result = None;
+    if let Previous::Answer(req) = previous {
+        *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
+        result = gpu
+            .present_temporal_delta_async(
+                device,
+                instance,
+                physical_device,
+                queue,
+                width,
+                height,
+                width,
+                height,
+                crate::composition::gpu::ComposeInputs::Delayed { parity: req.parity },
+                *raw_answer_generation,
+                proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+                image,
+                crate::composition::gpu::ComposeParams {
+                    colour_strength: settings.colour_strength,
+                    transfer_strength: settings.transfer_strength,
+                    max_ratio: settings.max_ratio,
+                    ghost_guard: 0.0,
+                    transfer: settings.transfer,
+                    model_small: false,
+                    white_point: req.white_point,
+                    compare: settings.compare,
+                    colour_trust: settings.colour_trust,
+                    ratio_smooth: settings.ratio_smooth,
+                    debug_view: settings.debug_view,
+                    debug_scale: settings.debug_scale,
+                    proxy_encoded: req.encoded,
+                    reversible_mode: req.reversible_mode,
+                    pq10: pq10.then(crate::hdr_present::reference_nits),
+                },
+            )
+            .map(Delayed::Composed);
+        if let Some(ms) = gpu.take_compose_gpu_ms() {
+            shm.publish_compose_gpu_ms(ms);
+        }
+    }
+    if result.is_none() {
+        if let Previous::Answer(req) | Previous::Raw(req) = previous {
+            result = gpu.show_kept(device, queue, image, width, height, req.parity).map(Delayed::Shown);
+        }
+    }
+    // 5. This frame posted, once the compose's read of the answer region is done (the server writes it next).
+    let kept = keep.is_some();
+    let posted = kept && captured && can_send && gpu.wait_answer_region_reads(device) && shm.begin_async_request(SLOT);
+    if kept {
+        inflight[SLOT.index()].dims = Some(dims);
+        inflight[SLOT.index()].proxy_dims = None;
+        inflight[SLOT.index()].delayed = Some(DelayedRequest {
+            dims,
+            parity,
+            encoded,
+            posted: std::time::Instant::now(),
+            sent: posted,
+            cpu: false,
+            proxy: (width, height),
+            white_point: encode_push.white_point,
+            reversible_mode: encode_push.reversible_mode,
+            raw_gpu: false,
+        });
+    }
+    let result = match result {
+        Some(r) => r,
+        None => {
+            // Nothing of the previous frame went into the image: this present shows its own frame. The keep's
+            // submission signalled the present semaphore when nothing was to follow it; when something was and failed,
+            // its copy is waited for here (the present must not read the image while it is copied).
+            let signalled = keep.flatten();
+            if signalled.is_none() && kept && !gpu.wait_keep(device, parity) {
+                inflight[SLOT.index()].delayed = None;
+            }
+            Delayed::Untouched(if shows_after { reason::NOT_COMPOSED } else { reason::NO_ANSWER }, signalled)
+        }
+    };
+    match &result {
+        Delayed::Composed(_) => STATS.shown.fetch_add(1, Relaxed),
+        _ => STATS.fell_back.fetch_add(1, Relaxed),
+    };
+    if kept && !posted {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, Relaxed) < 3 {
+            crate::log!("[offload] a frame was kept but not sent to the other GPU (captured {sent_dims:?} of {width}x{height}; the channel may not answer yet): it is shown as it was");
+        }
+    }
+    result
+}
+
+/// [`delayed_present`] without the zero-copy pair: the Model resolution below Full (the proxy is the scaled model scratch),
+/// an odd frame size or no host-memory import. The frames go through the CPU, as the synchronous present's do there:
+/// each present keeps its frame and proxy in one of two CPU pairs (`Inflight::kept_cpu`), and composes the previous
+/// frame's answer onto that frame as it was (the compose's held frame, as frame hold does), which replaces the live
+/// image. A frame whose answer is missing is shown as itself ([`show_kept_cpu`]). A frame that cannot be captured (the
+/// answer before it still out: the capture would write the proxy region the other GPU still reads; or a failed capture)
+/// is kept as a raw frame on the GPU and shown in its turn.
+///
+/// # Safety
+/// As [`run`].
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn delayed_present_cpu(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue: vk::Queue,
+    queue_family: u32,
+    capture_image: vk::Image,
+    capture_layout: vk::ImageLayout,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    proxy_format: u32,
+    frame_bytes: u64,
+    use_direct: bool,
+    external_memory_host: &mut bool,
+    pipeline: &mut Option<CapturePipeline>,
+    direct: &mut [Option<DirectCapture>; 2],
+    gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
+    shm: &mut ShmClient,
+    original_scratch: &mut Vec<u8>,
+    model_scratch: &mut Vec<u8>,
+    inflight: &mut [Inflight; 2],
+    model_request: Option<(u32, u32, vk::Format, bool)>,
+    encode_push: crate::composition::encode_pass::EncodePush,
+    deadline: std::time::Instant,
+    pq10: bool,
+    raw_answer_generation: &mut u64,
+    settings: &crate::shm::CompositionSettings,
+) -> Delayed {
+    use crate::preupscale::offload::STATS;
+    use std::sync::atomic::Ordering::Relaxed;
+    const SLOT: Slot = Slot::Primary;
+    // An HDR10 frame composes only a full-size answer, which this path is not for.
+    if pq10 {
+        return Delayed::NotHere;
+    }
+    if gpu_compose.is_none() {
+        *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
+    }
+    if gpu_compose.is_none() {
+        return Delayed::NotHere;
+    }
+    let dims = (width, height, proxy_format);
+    // 1. The previous present's frame and its answer.
+    let (pending, previous) = take_previous(shm, inflight, deadline, false, dims);
+    let (pending, previous) = if pending.is_some_and(|r| !r.cpu) { (None, Previous::None) } else { (pending, previous) };
+    // A frame kept only as a raw frame on the GPU has no proxy or answer here: shown as it was.
+    let previous = match previous {
+        Previous::Answer(req) if req.raw_gpu => Previous::Raw(req),
+        p => p,
+    };
+    let bpp = neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format);
+    if let Previous::Answer(req) = previous {
+        let (aw, ah) = inflight[SLOT.index()].kept_cpu[req.parity].sent;
+        let answer = &mut inflight[SLOT.index()].answer_cpu;
+        answer.resize(aw as usize * ah as usize * bpp, 0);
+        shm.read_answer(SLOT, answer);
+    }
+    // 2. This frame, captured and sent when the server is done with the proxy region. After captures that keep failing,
+    // the synchronous present has the frames for a while.
+    let parity = next_parity(pending);
+    let unsent = inflight[SLOT.index()].unsent;
+    if pending.is_none() && unsent >= UNSENT_GIVE_WAY {
+        inflight[SLOT.index()].unsent = if unsent >= UNSENT_GIVE_WAY + UNSENT_RETRY { 0 } else { unsent + 1 };
+        return Delayed::NotHere;
+    }
+    let can_send = !shm.has_pending_request(SLOT);
+    let mut captured = None;
+    if can_send {
+        let t_start = std::time::Instant::now();
+        loop {
+            match poll_or_submit_capture(
+                SLOT,
+                use_direct,
+                external_memory_host,
+                pipeline,
+                direct,
+                device,
+                instance,
+                physical_device,
+                queue,
+                queue_family,
+                capture_image,
+                capture_layout,
+                width,
+                height,
+                proxy_format,
+                frame_bytes,
+                model_request,
+                encode_push,
+                shm,
+                original_scratch,
+                model_scratch,
+                None,
+                Some(t_start),
+            ) {
+                CaptureStep::Captured(c) => {
+                    captured = Some(c);
+                    break;
+                }
+                CaptureStep::Failed => break,
+                CaptureStep::Pending => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+    // The frame and its proxy, kept (swapped: these are full frames).
+    let kept = captured.as_ref().filter(|c| original_scratch.len() >= frame_bytes as usize && (!c.from_model_scratch || !model_scratch.is_empty())).map(|c| {
+        static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if METER_FRAME.fetch_add(1, Relaxed).is_multiple_of(8) {
+            if let Some(white) = meter_white(original_scratch, width, height, proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8) {
+                shm.publish_measured_white(white);
+            }
+        }
+        let k = &mut inflight[SLOT.index()].kept_cpu[parity];
+        std::mem::swap(&mut k.original, original_scratch);
+        if c.from_model_scratch {
+            std::mem::swap(&mut k.proxy_small, model_scratch);
+        } else {
+            k.proxy_small.clear();
+        }
+        k.sent = c.sent;
+        c.encoded
+    });
+    let shows_after = matches!(previous, Previous::Answer(_) | Previous::Raw(_));
+    // A frame not captured (the answer before it still out, or a capture that failed) is kept as a raw frame on the GPU
+    // and shown as it was in its turn, as on the zero-copy path; after [`UNSENT_GIVE_WAY`] failed captures in a row it is
+    // not kept, and the synchronous present takes the frames for a while.
+    inflight[SLOT.index()].unsent = if kept.is_some() || !can_send { 0 } else { unsent + 1 };
+    let mut raw_keep = None;
+    if kept.is_none() {
+        if !keeps_frame(false, can_send, unsent) {
+            if pending.is_none() || previous == Previous::Stale {
+                return Delayed::NotHere;
+            }
+            note_unsent();
+        } else if previous != Previous::Stale {
+            let gpu = gpu_compose.as_mut().expect("made above");
+            raw_keep = gpu.keep_delayed(device, instance, physical_device, queue, image, width, height, parity, false, !shows_after);
+        }
+    }
+    // 3. The previous frame into this image: composed with its answer (with the white point and reversible mode its
+    // proxy was encoded with), or as it was.
+    let mut result = None;
+    if let Previous::Answer(req) = previous {
+        let k = &inflight[SLOT.index()].kept_cpu[req.parity];
+        let small = k.sent != (width, height);
+        *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
+        let gpu = gpu_compose.as_mut().expect("made above");
+        result = gpu
+            .present_temporal_delta_async(
+                device,
+                instance,
+                physical_device,
+                queue,
+                width,
+                height,
+                k.sent.0,
+                k.sent.1,
+                crate::composition::gpu::ComposeInputs::Cpu {
+                    base: &k.original,
+                    answer: &inflight[SLOT.index()].answer_cpu,
+                    proxy_small: small.then_some(&k.proxy_small[..]),
+                    held_original: Some(&k.original),
+                },
+                *raw_answer_generation,
+                proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+                image,
+                crate::composition::gpu::ComposeParams {
+                    colour_strength: settings.colour_strength,
+                    transfer_strength: settings.transfer_strength,
+                    max_ratio: settings.max_ratio,
+                    ghost_guard: 0.0,
+                    transfer: settings.transfer,
+                    model_small: false,
+                    white_point: req.white_point,
+                    compare: settings.compare,
+                    colour_trust: settings.colour_trust,
+                    ratio_smooth: settings.ratio_smooth,
+                    debug_view: settings.debug_view,
+                    debug_scale: settings.debug_scale,
+                    proxy_encoded: req.encoded,
+                    reversible_mode: req.reversible_mode,
+                    pq10: None,
+                },
+            )
+            .map(Delayed::Composed);
+        if let Some(ms) = gpu.take_compose_gpu_ms() {
+            shm.publish_compose_gpu_ms(ms);
+        }
+    }
+    if result.is_none() {
+        if let Previous::Answer(req) | Previous::Raw(req) = previous {
+            let gpu = gpu_compose.as_mut().expect("made above");
+            result = if req.raw_gpu {
+                gpu.show_kept(device, queue, image, width, height, req.parity).map(Delayed::Shown)
+            } else {
+                // As it was: the kept frame itself, written into the image (never the enlarged proxy).
+                show_kept_cpu(
+                    gpu,
+                    device,
+                    instance,
+                    physical_device,
+                    queue,
+                    image,
+                    width,
+                    height,
+                    proxy_format,
+                    &inflight[SLOT.index()].kept_cpu[req.parity],
+                    raw_answer_generation,
+                    settings,
+                )
+                .map(Delayed::Shown)
+            };
+        }
+    }
+    // 4. This frame posted once nothing reads the answer region any more (the compose read it into memory above; a
+    // zero-copy compose before the switch may still).
+    let posted = kept.is_some() && can_send && gpu_compose.as_mut().is_some_and(|g| g.wait_answer_region_reads(device)) && shm.begin_async_request(SLOT);
+    if let Some(encoded) = kept {
+        let sent = inflight[SLOT.index()].kept_cpu[parity].sent;
+        inflight[SLOT.index()].dims = Some(dims);
+        inflight[SLOT.index()].proxy_dims = (sent != (width, height)).then_some(sent);
+        inflight[SLOT.index()].delayed = Some(DelayedRequest {
+            dims,
+            parity,
+            encoded,
+            posted: std::time::Instant::now(),
+            sent: posted,
+            cpu: true,
+            proxy: sent,
+            white_point: encode_push.white_point,
+            reversible_mode: encode_push.reversible_mode,
+            raw_gpu: false,
+        });
+    } else if raw_keep.is_some() {
+        inflight[SLOT.index()].delayed = Some(DelayedRequest {
+            dims,
+            parity,
+            encoded: false,
+            posted: std::time::Instant::now(),
+            sent: false,
+            cpu: true,
+            proxy: (width, height),
+            white_point: encode_push.white_point,
+            reversible_mode: encode_push.reversible_mode,
+            raw_gpu: true,
+        });
+    }
+    let result = match result {
+        Some(r) => r,
+        None => {
+            // Nothing of the previous frame went into the image: the raw keep signalled the present semaphore when
+            // nothing was to follow it; when something was and failed, its copy is waited for here.
+            let signalled = raw_keep.flatten();
+            if signalled.is_none() && raw_keep.is_some() {
+                if let Some(gpu) = gpu_compose.as_mut() {
+                    if !gpu.wait_keep(device, parity) {
+                        inflight[SLOT.index()].delayed = None;
+                    }
+                }
+            }
+            Delayed::Untouched(if shows_after { reason::NOT_COMPOSED } else { reason::NO_ANSWER }, signalled)
+        }
+    };
+    match &result {
+        Delayed::Composed(_) => STATS.shown.fetch_add(1, Relaxed),
+        _ => STATS.fell_back.fetch_add(1, Relaxed),
+    };
+    result
+}
+
+/// A frame the CPU delayed present kept, written into `image` as it was (its answer missing): composed with itself as
+/// the answer and the proxy at the frame's size, so every composition mode gives the frame back (never the enlarged
+/// small proxy).
+///
+/// # Safety
+/// As [`run`].
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn show_kept_cpu(
+    gpu: &mut crate::composition::gpu::GpuCompose,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue: vk::Queue,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    proxy_format: u32,
+    kept: &KeptCpu,
+    raw_answer_generation: &mut u64,
+    settings: &crate::shm::CompositionSettings,
+) -> Option<vk::Semaphore> {
+    let bytes = width as usize * height as usize * neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format);
+    let frame = kept.original.get(..bytes)?;
+    *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
+    gpu.present_temporal_delta_async(
+        device,
+        instance,
+        physical_device,
+        queue,
+        width,
+        height,
+        width,
+        height,
+        crate::composition::gpu::ComposeInputs::Cpu { base: frame, answer: frame, proxy_small: None, held_original: Some(frame) },
+        *raw_answer_generation,
+        proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+        image,
+        crate::composition::gpu::ComposeParams {
+            colour_strength: settings.colour_strength,
+            transfer_strength: settings.transfer_strength,
+            max_ratio: settings.max_ratio,
+            ghost_guard: 0.0,
+            transfer: settings.transfer,
+            model_small: false,
+            white_point: 1.0,
+            compare: Default::default(),
+            colour_trust: settings.colour_trust,
+            ratio_smooth: settings.ratio_smooth,
+            debug_view: 0,
+            debug_scale: settings.debug_scale,
+            proxy_encoded: false,
+            reversible_mode: 0,
+            pq10: None,
+        },
+    )
+}
+
+/// Leaves the delayed present (the model is back on this GPU, or frame hold took over): the frame kept last is dropped,
+/// so the stream steps over one frame, as it would on any switch of path; the kept frames are freed.
+#[cfg(target_arch = "x86_64")]
+fn leave_delayed(device: &ash::Device, gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>, shm: &mut ShmClient, inflight: &mut [Inflight; 2]) {
+    if inflight[Slot::Primary.index()].delayed.take().is_some_and(|r| r.sent) && shm.has_pending_request(Slot::Primary) {
+        let _ = shm.poll_async_request(Slot::Primary);
+    }
+    if let Some(gpu) = gpu_compose.as_mut() {
+        gpu.release_delayed(device);
+    }
+    inflight[Slot::Primary.index()].kept_cpu = Default::default();
+    inflight[Slot::Primary.index()].answer_cpu = Vec::new();
+}
 
 /// Whether the zero-copy capture of wire slot `slot` still has a GPU write into that slot's
 /// proxy region in flight. The pre-upscaler path (`crate::preupscale`) writes the same region and
@@ -1091,6 +1900,18 @@ thread_local! {
     static UNTOUCHED: std::cell::Cell<u32> = const { std::cell::Cell::new(reason::NONE) };
 }
 
+thread_local! {
+    /// The last [`run`] on this thread wrote the previous present's frame into its image (the delayed present of the
+    /// model on a second GPU): a capture pairs it with that frame's original (`crate::series`).
+    static PREVIOUS_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last [`run`] on this thread showed the previous present's frame ([`PREVIOUS_FRAME`]); cleared by the read.
+pub(crate) fn presented_previous_frame() -> bool {
+    // Read once: a present that never reaches `run` (a capture of an untouched frame) does not see an older one's.
+    PREVIOUS_FRAME.with(|p| p.replace(false))
+}
+
 /// Records why this present goes out untouched and returns the no-compose result.
 fn untouched(why: u32) -> Option<vk::Semaphore> {
     UNTOUCHED.with(|u| u.set(why));
@@ -1147,6 +1968,7 @@ pub unsafe fn run(
     // an undated list of wait completions. See `breadcrumbs`' own doc comment.
     crate::breadcrumbs::mark("capture::run enter");
     UNTOUCHED.with(|u| u.set(reason::NOT_COMPOSED));
+    PREVIOUS_FRAME.with(|p| p.set(false));
     let pipeline_start = std::time::Instant::now();
     // `composition_settings()` (and everything else below) only ever reads through an
     // already-open mapping -- nothing about it opens one. Every real path that DOES
@@ -1213,6 +2035,11 @@ pub unsafe fn run(
     let disabled = !settings.apply_model || !settings.neural_enabled || shm.model_known_unavailable();
     if disabled {
         UNTOUCHED.with(|u| u.set(if shm.model_known_unavailable() { reason::MODEL_UNAVAILABLE } else { reason::EFFECT_OFF }));
+        // The effect off: the delayed present's kept frames go (it starts afresh when the effect is back).
+        #[cfg(target_arch = "x86_64")]
+        if inflight[Slot::Primary.index()].delayed.is_some() || gpu_compose.as_ref().is_some_and(crate::composition::gpu::GpuCompose::has_delayed) {
+            leave_delayed(device, gpu_compose, shm, inflight);
+        }
     }
     // The model server cannot allocate its NGX images until it knows the game's actual
     // swapchain dimensions.  Waiting until the user enables NR often means GTA has
@@ -1513,7 +2340,21 @@ pub unsafe fn run(
         inflight[SLOT.index()].presents = present_no.wrapping_add(1);
         // An answer to carry is either the CPU pair or, after a zero-copy present, the GPU's.
         let answer_held = !last_answer.is_empty() || gpu_compose.as_ref().is_some_and(|gpu| gpu.holds_generation(*raw_answer_generation));
+        // The delayed present of the model on a second GPU composes every frame's own answer: no carried ones.
+        #[cfg(target_arch = "x86_64")]
+        let offloaded = crate::preupscale::offload::active() && !settings.hold_frame;
+        #[cfg(not(target_arch = "x86_64"))]
+        let offloaded = false;
+        #[cfg(target_arch = "x86_64")]
+        if !offloaded
+            && (inflight[SLOT.index()].delayed.is_some()
+                || inflight[SLOT.index()].kept_cpu.iter().any(|k| !k.original.is_empty())
+                || gpu_compose.as_ref().is_some_and(crate::composition::gpu::GpuCompose::has_delayed))
+        {
+            leave_delayed(device, gpu_compose, shm, inflight);
+        }
         let carry = settings.model_interval > 1
+            && !offloaded
             && !present_no.is_multiple_of(u64::from(settings.model_interval))
             && !settings.hold_frame
             && answer_held
@@ -1529,6 +2370,86 @@ pub unsafe fn run(
         }
         if !carry {
             let deadline = std::time::Instant::now() + SYNC_BUDGET;
+            // The model on a second GPU: each frame composed one present late (`delayed_present`), before the left-over
+            // rule below, which would discard the request every present makes for the next.
+            #[cfg(target_arch = "x86_64")]
+            if offloaded && (neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) || pq10) {
+                let encode_push = crate::composition::encode_pass::EncodePush {
+                    white_point: settings.white_point,
+                    bgr_order: u32::from(bgr_order),
+                    reversible_mode: settings.reversible_mode,
+                };
+                // SAFETY: as this function's own contract.
+                let delayed = unsafe {
+                    delayed_present(
+                        device,
+                        instance,
+                        physical_device,
+                        queue,
+                        queue_family,
+                        capture_image,
+                        capture_layout,
+                        image,
+                        width,
+                        height,
+                        proxy_format,
+                        frame_bytes,
+                        use_direct,
+                        external_memory_host,
+                        pipeline,
+                        direct,
+                        gpu_compose,
+                        answer_import,
+                        shm,
+                        original_scratch,
+                        model_scratch,
+                        inflight,
+                        model_request,
+                        encode_push,
+                        deadline,
+                        pq10,
+                        raw_answer_generation,
+                        &settings,
+                    )
+                };
+                match delayed {
+                    Delayed::Composed(sem) => {
+                        shm.publish_frame_timing(pipeline_start.elapsed(), true);
+                        crate::preupscale::offload::note_present();
+                        UNTOUCHED.with(|u| u.set(reason::NONE));
+                        PREVIOUS_FRAME.with(|p| p.set(true));
+                        return Some(sem);
+                    }
+                    Delayed::Shown(sem) => {
+                        shm.publish_frame_timing(pipeline_start.elapsed(), false);
+                        crate::preupscale::offload::note_present();
+                        UNTOUCHED.with(|u| u.set(reason::NO_ANSWER));
+                        PREVIOUS_FRAME.with(|p| p.set(true));
+                        return Some(sem);
+                    }
+                    Delayed::Untouched(why, signalled) => {
+                        shm.publish_frame_timing(pipeline_start.elapsed(), false);
+                        crate::preupscale::offload::note_present();
+                        UNTOUCHED.with(|u| u.set(why));
+                        return signalled;
+                    }
+                    Delayed::NotHere => {
+                        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            crate::log!(
+                                "[offload] presents wait for their own answer here ({}): the game's GPU saves nothing on them",
+                                if pq10 {
+                                    "an HDR10 frame needs direct capture at its own size, which this swapchain does not give"
+                                } else {
+                                    "the delay could not be set up (its composition or kept frames could not be made), or frames could not be captured for it three times in a row"
+                                }
+                            );
+                        }
+                        crate::preupscale::offload::STATS.sync.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::preupscale::offload::note_present();
+                    }
+                }
+            }
             // Left over from a frame that ran out of time (or from pipelined mode): its answer
             // belongs to an old frame. Discard it when it lands; never block on it.
             for slot in Slot::ALL {
@@ -2959,6 +3880,72 @@ pub(crate) unsafe fn import_host_buffer(
 
 #[cfg(test)]
 mod tests {
+
+    fn kept(parity: usize, sent: bool, dims: (u32, u32, u32)) -> DelayedRequest {
+        DelayedRequest {
+            dims,
+            parity,
+            encoded: false,
+            posted: std::time::Instant::now(),
+            sent,
+            cpu: false,
+            proxy: (dims.0, dims.1),
+            white_point: 1.0,
+            reversible_mode: 0,
+            raw_gpu: false,
+        }
+    }
+
+    /// The delayed present (the model on a second GPU): the previous frame is composed with its answer, shown as it was
+    /// when the answer is missing (so no frame is dropped or shown twice), dropped after a stall, and nothing when the
+    /// delay starts or the size changed.
+    #[test]
+    fn the_delayed_present_shows_each_kept_frame_once() {
+        let d = (64, 64, 0);
+        let fast = std::time::Duration::from_millis(16);
+        let r = kept(1, true, d);
+        assert_eq!(previous_frame(None, false, false, d, fast), Previous::None);
+        assert_eq!(previous_frame(Some(r), true, true, d, fast), Previous::Answer(r));
+        assert_eq!(previous_frame(Some(r), false, false, d, fast), Previous::Raw(r), "a late answer: the frame as it was");
+        assert_eq!(previous_frame(Some(r), true, false, d, fast), Previous::Raw(r), "an answer for another frame");
+        let unsent = kept(0, false, d);
+        assert_eq!(previous_frame(Some(unsent), true, true, d, fast), Previous::Raw(unsent), "a frame never sent has no answer");
+        assert_eq!(previous_frame(Some(r), true, true, (32, 32, 0), fast), Previous::None, "another size: the delay starts again");
+        assert_eq!(previous_frame(Some(r), true, true, d, SYNC_BUDGET + fast), Previous::Stale);
+    }
+
+    /// A frame is kept when it is sent, or when it could not be (the answer before it is still out: it is shown in its
+    /// turn); a frame that could have been captured and was not is never kept, so a capture that keeps failing does not
+    /// leave the stream late with no model.
+    #[test]
+    fn a_frame_is_kept_only_when_sent_or_unsendable() {
+        assert!(keeps_frame(true, true, 5));
+        assert!(keeps_frame(false, false, 5), "the answer before is still out: kept as it is");
+        assert!(keeps_frame(false, true, 0), "an isolated failed capture is kept as it is (no skip, no repeat)");
+        assert!(keeps_frame(false, true, UNSENT_GIVE_WAY - 2));
+        assert!(!keeps_frame(false, true, UNSENT_GIVE_WAY - 1), "captures that keep failing give way");
+    }
+
+    /// An answer at the Model resolution is the frame's: compared with the size the frame was sent at, not its own.
+    #[test]
+    fn an_answer_fits_the_size_its_frame_was_sent_at() {
+        assert!(answer_fits(Some((1024, 768)), (1024, 768), false, false), "Half of 2048x1536");
+        assert!(!answer_fits(Some((2048, 1536)), (1024, 768), false, false), "another frame's answer");
+        assert!(answer_fits(None, (1024, 768), false, false), "a server that echoes no size");
+        assert!(!answer_fits(Some((1024, 768)), (1024, 768), true, false), "an HDR10 frame echoed, not run");
+        assert!(answer_fits(Some((1024, 768)), (1024, 768), true, true));
+    }
+
+    /// The pair a frame is kept in is never the one the frame waiting to be shown is in, whatever the presents count.
+    #[test]
+    fn the_kept_pair_never_collides_with_the_waiting_one() {
+        let d = (64, 64, 0);
+        assert_eq!(next_parity(None), 0);
+        for p in 0..2 {
+            assert_eq!(next_parity(Some(kept(p, true, d))), 1 - p);
+            assert_eq!(next_parity(Some(kept(p, false, d))), 1 - p);
+        }
+    }
     use super::*;
     use crate::EXTERNAL_MEMORY_HOST_EXTENSION;
     use std::ffi::CStr;
@@ -4078,6 +5065,12 @@ mod tests {
 
     impl PresentRig {
         fn new(tag: &str, width: u32, height: u32) -> Option<Self> {
+            Self::new_with(tag, width, height, None)
+        }
+
+        /// [`Self::new`] whose server writes each answer itself: the proxy it was sent, through `answer` (the stand-in
+        /// for the model).
+        fn new_with(tag: &str, width: u32, height: u32, answer: Option<fn(&mut [u8])>) -> Option<Self> {
             let (entry, instance, physical_device, device, queue, queue_family) = test_device()?;
             let path = scratch_path(tag);
             let cleanup = RemoveScratch(path.clone());
@@ -4090,6 +5083,7 @@ mod tests {
             let (answering, stop) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
             let (answering_clone, stop_clone) = (Arc::clone(&answering), Arc::clone(&stop));
             let first_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
+            let regions = (shm.proxy_region(Slot::Primary).map_or(0, |(p, _)| p as usize), shm.answer_region(Slot::Primary).map_or(0, |(p, _)| p as usize));
             let server = std::thread::spawn(move || {
                 // SAFETY: the mapping outlives this thread (joined in `finish`).
                 let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
@@ -4099,6 +5093,14 @@ mod tests {
                     let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
                     if req != 0 && req != last_seen && answering_clone.load(AtomicOrdering::Relaxed) {
                         last_seen = req;
+                        if let (Some(f), (proxy, answer)) = (answer, regions) {
+                            let n = hdr.width.load(AtomicOrdering::Relaxed) as usize * hdr.height.load(AtomicOrdering::Relaxed) as usize * 4;
+                            // SAFETY: both regions are mapped for the rig's life and hold the request's raster.
+                            let (src, dst) =
+                                unsafe { (std::slice::from_raw_parts(proxy as *const u8, n), std::slice::from_raw_parts_mut(answer as *mut u8, n)) };
+                            dst.copy_from_slice(src);
+                            f(dst);
+                        }
                         hdr.answered_w.store(hdr.width.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
                         hdr.answered_h.store(hdr.height.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
                         hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
@@ -4231,6 +5233,168 @@ mod tests {
                 self.instance.destroy_instance(None);
             }
         }
+    }
+
+    /// The delayed present's offload switched on for one test (process-wide: under the present-mode lock).
+    struct Offloaded<'a>(#[allow(dead_code)] std::sync::MutexGuard<'a, ()>);
+
+    impl Offloaded<'_> {
+        fn on() -> Self {
+            let guard = TEST_MODE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::preupscale::offload::set_active_for_test(true);
+            Self(guard)
+        }
+    }
+
+    impl Drop for Offloaded<'_> {
+        fn drop(&mut self) {
+            crate::preupscale::offload::set_active_for_test(false);
+        }
+    }
+
+    fn flat(width: u32, height: u32, c: [u8; 3]) -> Vec<u8> {
+        (0..width * height).flat_map(|_| [c[0], c[1], c[2], 255]).collect()
+    }
+
+    fn colour_of(k: usize) -> [u8; 3] {
+        [(40 + k * 7 % 170) as u8, (200 - k * 5 % 150) as u8, (60 + k * 11 % 120) as u8]
+    }
+
+    fn near(a: &[u8], c: [u8; 3], tol: i32) -> bool {
+        a.chunks(4).all(|p| (0..3).all(|i| (i32::from(p[i]) - i32::from(c[i])).abs() <= tol))
+    }
+
+    /// The delayed present without the zero-copy pair (the Model resolution at Half, `delayed_present_cpu`): every
+    /// present shows exactly the frame before it, composed, never the live one, through a late answer (shown as it was,
+    /// in its turn) and changes of the Model resolution (Half, Full, Half).
+    #[test]
+    fn the_cpu_delayed_present_shows_each_frame_one_present_late() {
+        let _offloaded = Offloaded::on();
+        let (w, h) = (128u32, 96u32);
+        let Some(mut rig) = PresentRig::new_with("delayed-cpu", w, h, Some(|_| {})) else {
+            eprintln!("the_cpu_delayed_present_shows_each_frame_one_present_late: no Vulkan device, skipping");
+            return;
+        };
+        rig.hdr().working_scale_bits.store(0.5f32.to_bits(), AtomicOrdering::Relaxed);
+        let mut composed = 0;
+        let mut checked = 0;
+        let mut starts = 0;
+        for k in 0..90usize {
+            if k == 30 {
+                rig.answering.store(false, AtomicOrdering::Relaxed);
+            }
+            if k == 31 {
+                rig.answering.store(true, AtomicOrdering::Relaxed);
+            }
+            if k == 50 {
+                rig.hdr().working_scale_bits.store(1.0f32.to_bits(), AtomicOrdering::Relaxed);
+            }
+            if k == 65 {
+                rig.hdr().working_scale_bits.store(0.5f32.to_bits(), AtomicOrdering::Relaxed);
+            }
+            rig.upload(&flat(w, h, colour_of(k)));
+            if rig.present() {
+                let shown = rig.read_back();
+                if near(&shown, colour_of(k), 3) {
+                    // Where the delay starts, this present's own frame (once).
+                    starts += 1;
+                } else {
+                    assert!(k > 0 && near(&shown, colour_of(k - 1), 3), "present {k} shows {:?}, not frame {}", &shown[..4], k.saturating_sub(1));
+                    composed += 1;
+                }
+                checked += 1;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(starts <= 1, "the delay started {starts} times: a late answer or a change of the Model resolution restarted it");
+        assert!(composed >= 70 && checked >= 70, "only {composed} of 90 presents were delayed");
+        rig.finish();
+    }
+
+    /// A frame whose answer did not come is shown as it was in a Replace mode below Full: the kept frame itself, never
+    /// the enlarged half-size proxy (which would blur it).
+    #[test]
+    fn a_frame_without_its_answer_is_shown_as_it_was_in_a_replace_mode() {
+        let _offloaded = Offloaded::on();
+        let (w, h) = (128u32, 96u32);
+        let Some(mut rig) = PresentRig::new_with("delayed-raw", w, h, Some(|_| {})) else {
+            eprintln!("a_frame_without_its_answer_is_shown_as_it_was_in_a_replace_mode: no Vulkan device, skipping");
+            return;
+        };
+        rig.hdr().working_scale_bits.store(0.5f32.to_bits(), AtomicOrdering::Relaxed);
+        rig.hdr().reversible_mode.store(neural_forge_protocol::enums::reversible_mode::NEUTWO_REPLACE, AtomicOrdering::Relaxed);
+        let frame = |k: usize| -> Vec<u8> { test_game_frame(w, h).chunks(4).flat_map(|p| [p[0].wrapping_add(k as u8 * 3), p[1], p[2], 255]).collect() };
+        let mut seen = false;
+        let mut seen_unsent = false;
+        for k in 0..40usize {
+            rig.answering.store(!(20..=21).contains(&k), AtomicOrdering::Relaxed);
+            rig.upload(&frame(k));
+            let presented = rig.present();
+            if k == 22 && presented {
+                // Frame 21 could not be sent (the answer to 20 was still out): kept on the GPU as it was, shown now.
+                let shown = rig.read_back();
+                let want = frame(21);
+                let worst = shown.iter().zip(&want).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap_or(0);
+                assert!(worst <= 2, "the unsent frame 21 came back changed (worst {worst})");
+                seen_unsent = true;
+            }
+            if k == 21 && presented {
+                let shown = rig.read_back();
+                let want = frame(20);
+                let worst = shown.iter().zip(&want).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap_or(0);
+                assert!(worst <= 2, "the frame without its answer came back changed (worst {worst}): the enlarged proxy, not the frame");
+                seen = true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(seen, "present 21 was not delayed");
+        assert!(seen_unsent, "present 22 was not delayed");
+        rig.finish();
+    }
+
+    /// A kept frame's answer is composed with the white point its proxy was encoded with, not the one the next present
+    /// has: the same frames with the white point changed in between come out as without the change.
+    #[test]
+    fn a_kept_frame_is_composed_with_its_own_white_point() {
+        let _offloaded = Offloaded::on();
+        let (w, h) = (128u32, 96u32);
+        let run = |change: bool| -> Option<Vec<u8>> {
+            let mut rig = PresentRig::new_with(
+                if change { "delayed-white-b" } else { "delayed-white-a" },
+                w,
+                h,
+                Some(|a| {
+                    for p in a.chunks_mut(4) {
+                        p[0] /= 2;
+                        p[1] = p[1] / 2 + 20;
+                    }
+                }),
+            )?;
+            let hdr = rig.hdr();
+            hdr.working_scale_bits.store(0.5f32.to_bits(), AtomicOrdering::Relaxed);
+            hdr.white_point_source.store(neural_forge_protocol::enums::white_point_source::MANUAL, AtomicOrdering::Relaxed);
+            hdr.white_point_bits.store(1.0f32.to_bits(), AtomicOrdering::Relaxed);
+            let mut out = None;
+            for k in 0..30usize {
+                if change && k == 25 {
+                    rig.hdr().white_point_bits.store(4.0f32.to_bits(), AtomicOrdering::Relaxed);
+                }
+                rig.upload(&test_game_frame(w, h));
+                if rig.present() && k == 25 {
+                    out = Some(rig.read_back());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            rig.finish();
+            out
+        };
+        let Some(a) = run(false) else {
+            eprintln!("a_kept_frame_is_composed_with_its_own_white_point: no Vulkan device, skipping");
+            return;
+        };
+        let b = run(true).expect("present 25 composes");
+        let worst = a.iter().zip(&b).map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs()).max().unwrap_or(0);
+        assert!(worst <= 1, "the white point changed after the frame was sent changed its composite (worst {worst})");
     }
 
     /// The model scratch is rebuilt when the frame's channel order changes at the same size: the
@@ -4793,6 +5957,183 @@ mod tests {
             instance.destroy_instance(None);
         }
         Some(out)
+    }
+
+    /// The delayed present across its paths (the model on a second GPU): zero-copy, then the CPU pairs (zero-copy
+    /// refused), then zero-copy again, with an answer withheld and a stall of the game. Every present shows the frame
+    /// before it, or, where the delay starts again (the first present, each switch of path, the stall), its own frame
+    /// once.
+    #[test]
+    fn the_delayed_present_keeps_its_cadence_across_paths_and_stalls() {
+        let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_entry, instance, physical_device, device, queue, queue_family, supported)) = test_device_with_external_memory_host() else {
+            eprintln!("the_delayed_present_keeps_its_cadence_across_paths_and_stalls: no Vulkan device, skipping");
+            return;
+        };
+        if !supported {
+            unsafe {
+                device.destroy_device(None);
+                instance.destroy_instance(None);
+            }
+            eprintln!("the_delayed_present_keeps_its_cadence_across_paths_and_stalls: no VK_EXT_external_memory_host, skipping");
+            return;
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_NO_ZERO_COPY.store(false, AtomicOrdering::Relaxed);
+                crate::preupscale::offload::set_active_for_test(false);
+            }
+        }
+        let _reset = Reset;
+        crate::preupscale::offload::set_active_for_test(true);
+        let path = scratch_path("delayed-paths");
+        let _cleanup = RemoveScratch(path.clone());
+        let (width, height) = (16u32, 16u32);
+        let frame_bytes = (width * height * 4) as usize;
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path));
+        let hdr_ptr = shm.test_header_ptr();
+        let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+        hdr.model_interval.store(1, AtomicOrdering::Relaxed);
+        hdr.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
+        hdr.white_point_source.store(neural_forge_protocol::enums::white_point_source::MANUAL, AtomicOrdering::Relaxed);
+        let proxy_region = shm.proxy_region(Slot::Primary).unwrap().0 as usize;
+        let answer_region = shm.answer_region(Slot::Primary).unwrap().0 as usize;
+        let (stop, withhold) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (stop_clone, withhold_clone) = (Arc::clone(&stop), Arc::clone(&withhold));
+        let first_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
+        let server = std::thread::spawn(move || {
+            // SAFETY: the mapping outlives this thread (joined below).
+            let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+            let mut last_seen = first_seen;
+            while !stop_clone.load(AtomicOrdering::Relaxed) {
+                hdr.server_heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
+                if req != 0 && req != last_seen {
+                    last_seen = req;
+                    if withhold_clone.swap(false, AtomicOrdering::Relaxed) {
+                        continue;
+                    }
+                    std::sync::atomic::fence(AtomicOrdering::Acquire);
+                    // SAFETY: both regions hold the frame; the layer reads neither while the request is out.
+                    unsafe { std::ptr::copy_nonoverlapping(proxy_region as *const u8, answer_region as *mut u8, frame_bytes) };
+                    hdr.answered_w.store(hdr.width.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+                    hdr.answered_h.store(hdr.height.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+                    std::sync::atomic::fence(AtomicOrdering::Release);
+                    hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_micros(300));
+            }
+        });
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
+        let mut s = RunState::default();
+        let (mut own, mut previous, mut starts_allowed) = (0, 0, 1);
+        let mut own_at = Vec::new();
+        for k in 0..120usize {
+            match k {
+                30 => {
+                    TEST_NO_ZERO_COPY.store(true, AtomicOrdering::Relaxed);
+                    starts_allowed += 1;
+                }
+                50 => withhold.store(true, AtomicOrdering::Relaxed),
+                70 => {
+                    TEST_NO_ZERO_COPY.store(false, AtomicOrdering::Relaxed);
+                    starts_allowed += 1;
+                }
+                90 => {
+                    std::thread::sleep(Duration::from_millis(300));
+                    starts_allowed += 1;
+                }
+                _ => {}
+            }
+            upload_present_src(&device, &mem_props, queue, pool, image, width, height, &flat(width, height, colour_of(k)));
+            // SAFETY: `image` is this test's own, PRESENT_SRC_KHR; one thread.
+            let sem = unsafe {
+                run(
+                    &device,
+                    &instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    image,
+                    width,
+                    height,
+                    neural_forge_protocol::enums::proxy_format::RGBA8,
+                    false,
+                    ScratchSource::default(),
+                    &mut s.pipeline,
+                    &mut s.direct,
+                    &mut true,
+                    &mut s.gpu_compose,
+                    &mut shm,
+                    &mut s.original_scratch,
+                    &mut s.model_scratch,
+                    &mut s.inflight,
+                    &mut s.bootstrap_complete,
+                    &mut s.answer_scratch,
+                    &mut s.raw_answer_base,
+                    &mut s.raw_answer_generation,
+                    &mut s.last_answer,
+                    &mut s.last_answer_dims,
+                    &mut s.last_answer_encoded,
+                )
+            };
+            if let Some(sem) = sem {
+                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+                let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+                unsafe {
+                    device
+                        .queue_submit(
+                            queue,
+                            &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))],
+                            wait_fence,
+                        )
+                        .unwrap();
+                    device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                    device.destroy_fence(wait_fence, None);
+                }
+            }
+            let shown = read_back_present_src(&device, &mem_props, queue, pool, image, width, height);
+            if k == 0 {
+                // The first present opens the channel: nothing is delayed yet.
+                continue;
+            }
+            if near(&shown, colour_of(k - 1), 3) {
+                previous += 1;
+            } else {
+                assert!(near(&shown, colour_of(k), 3), "present {k} shows {:?}: neither frame {k} nor the frame before it", &shown[..4]);
+                own += 1;
+                own_at.push(k);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // CPU path: its pairs were freed when the zero-copy path came back.
+        assert!(s.inflight[0].kept_cpu.iter().all(|k| k.original.is_empty()), "the CPU pairs are freed on the zero-copy path");
+        assert!(own <= starts_allowed, "{own} presents showed their own frame (at {own_at:?}); the delay starts only {starts_allowed} times");
+        assert!(previous >= 110, "only {previous} of 120 presents showed the frame before them");
+        stop.store(true, AtomicOrdering::Relaxed);
+        server.join().unwrap();
+        unsafe {
+            device.device_wait_idle().unwrap();
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy_pipeline(s.pipeline.take(), &device);
+            for slot in std::mem::take(&mut s.direct) {
+                destroy_direct_capture(slot, &device);
+            }
+            if let Some(gpu) = s.gpu_compose.take() {
+                gpu.destroy(&device);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
     }
 
     /// The synchronous present's zero-copy compose (direct capture, answer region imported,
