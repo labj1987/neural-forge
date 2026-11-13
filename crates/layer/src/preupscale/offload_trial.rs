@@ -38,9 +38,15 @@ pub(crate) const FRAME_GAP: Duration = Duration::from_millis(250);
 /// keep coming; and how many holds in a row it may then miss. Past either the other GPU gets the frames back.
 pub(crate) const BUILD_BUDGET: Duration = Duration::from_secs(15);
 pub(crate) const MISSES: u32 = 30;
-/// Frame times of the model on the game's GPU longer than [`FRAME_GAP`] (below 4 frames a second) after which the trial
-/// gives the frames back: no window would ever fill.
+/// Frame times of the model on the game's GPU longer than [`FRAME_GAP`] in a row (below 4 frames a second) after which
+/// the trial gives the frames back: no window would ever fill. Scattered ones (pauses, a throttled window) do not.
 pub(crate) const SLOW: u32 = 30;
+/// Holds of the trial, whether they ran the model or not, after which it gives the frames back unmeasured: runs of
+/// a few frames between misses never fill a window, nor trip [`MISSES`].
+pub(crate) const MAX_HOLDS: u32 = 2 * (LOCAL_WARM + 2 * LOCAL_MAX as u32);
+/// The most the pauses between holds may move the build budget's start ([`BUILD_BUDGET`]): past it wall time counts,
+/// so holds that all come a quarter second apart or more cannot keep the budget open for ever.
+pub(crate) const PAUSES_MAX: Duration = Duration::from_secs(60);
 /// Trials cut short by a change of what is held (another size, another pass count) before the offload keeps the
 /// model for good.
 pub(crate) const ABORTS: u32 = 3;
@@ -81,6 +87,8 @@ fn forced_offload() -> bool {
 
 /// What is held, which a window's frame times belong to: the hold's extent and the frame's pass count.
 pub(crate) type Key = ((u32, u32), usize);
+
+const UNMEASURED: &str = "the game's GPU could not be measured (too few frames in a row with the model on it): it goes back to the other GPU";
 
 /// What a local hold brought the trial.
 #[derive(Clone, Debug, PartialEq)]
@@ -147,13 +155,16 @@ struct Local {
     off: Duration,
     wait: Duration,
     began: Instant,
-    /// Holds that ran the model here (the warm-up counts them), the misses in a row since, the last hold's time, the
-    /// last hold's that ran the model while the one before it did too (an interval is only between two such), and
-    /// the intervals too long to be frame times.
+    /// Holds that ran the model here (the warm-up counts them), every hold of the trial, the misses in a row since the
+    /// last that ran, the last hold's time, and how far the pauses moved `began` (at most [`PAUSES_MAX`]).
     ran: u32,
+    holds: u32,
     missed: u32,
     last: Option<Instant>,
+    paused: Duration,
+    /// The last hold's time if it ran the model; `None` after a miss (an interval is only between two holds that ran).
     last_ran: Option<Instant>,
+    /// Intervals in a row too long to be frame times.
     slow: u32,
     intervals: Vec<Duration>,
 }
@@ -190,8 +201,10 @@ impl Trial {
             wait,
             began: now,
             ran: 0,
+            holds: 0,
             missed: 0,
             last: None,
+            paused: Duration::ZERO,
             last_ran: None,
             slow: 0,
             intervals: Vec::with_capacity(LOCAL_MAX),
@@ -220,7 +233,14 @@ impl Trial {
         // A pause between holds (a menu, a loading screen) moves the budget's start: it counts holds that keep coming.
         let gap = l.last.map(|t| now.saturating_duration_since(t)).filter(|&d| d >= FRAME_GAP);
         if let Some(gap) = gap {
-            l.began += gap;
+            let moved = gap.min(PAUSES_MAX.saturating_sub(l.paused));
+            l.began += moved;
+            l.paused += moved;
+        }
+        l.holds += 1;
+        if l.holds > MAX_HOLDS {
+            self.phase = Phase::Decided;
+            return Some(Verdict::Offload(UNMEASURED.into()));
         }
         if !ran {
             l.missed += 1;
@@ -245,16 +265,17 @@ impl Trial {
             return None;
         }
         match previous.map(|t| now.saturating_duration_since(t)) {
-            Some(d) if d < FRAME_GAP => l.intervals.push(d),
+            Some(d) if d < FRAME_GAP => {
+                l.intervals.push(d);
+                l.slow = 0;
+            }
             Some(_) => l.slow += 1,
             None => {}
         }
         // No window fills: the model runs below 4 frames a second here, or too few of its frames come in a row.
         if l.slow >= SLOW || l.ran > LOCAL_WARM + 2 * LOCAL_MAX as u32 {
             self.phase = Phase::Decided;
-            return Some(Verdict::Offload(
-                "the game's GPU could not be measured (too few frames in a row with the model on it): it goes back to the other GPU".into(),
-            ));
+            return Some(Verdict::Offload(UNMEASURED.into()));
         }
         let n = l.intervals.len();
         if n < LOCAL_WINDOW {
@@ -594,6 +615,54 @@ mod tests {
             v => panic!("{v:?}"),
         }
         assert!(!t.running() && !t.keeps_local() && t.status_line().is_none());
+    }
+
+    #[test]
+    fn runs_between_misses_end_unmeasured() {
+        // One hold with the model, then 29 without, over and over: never 30 misses in a row, never a window.
+        let (mut t, mut now) = started(MS(36), MS(16));
+        let mut verdict = None;
+        for i in 0..(2 * MAX_HOLDS) {
+            now += MS(10);
+            if let Some(v) = t.local(KEY, now, i % 30 == 0, Some("miss"), false) {
+                verdict = Some((i, v));
+                break;
+            }
+        }
+        let (i, v) = verdict.expect("decided");
+        assert_eq!(i, MAX_HOLDS, "after the cap on the trial's holds");
+        assert!(matches!(v, Verdict::Offload(ref why) if why.contains("could not be measured")), "{v:?}");
+    }
+
+    #[test]
+    fn pauses_keep_the_build_budget_open_only_so_long() {
+        // Never built, every hold a second apart: the pauses move the start by 60 s at most, then the budget runs out.
+        let (mut t, mut now) = started(MS(36), MS(16));
+        let mut decided_after = None;
+        for i in 1..=200u32 {
+            now += Duration::from_secs(1);
+            if t.local(KEY, now, false, Some("loading"), false).is_some() {
+                decided_after = Some(i);
+                break;
+            }
+        }
+        let n = decided_after.expect("decided");
+        assert!((60..=80).contains(&n), "60 s of pauses, then 15 s of budget: {n}");
+    }
+
+    #[test]
+    fn scattered_slow_frames_do_not_end_the_trial() {
+        // 30 pauses spread over the window (every 10th interval 300 ms): measured, not given up.
+        let (mut t, mut now) = started(MS(36), MS(16));
+        let mut verdict = None;
+        for i in 0..5000u32 {
+            now += if i > LOCAL_WARM && i % 10 == 0 { MS(300) } else { MS(13) };
+            if let Some(v) = t.local(KEY, now, true, None, false) {
+                verdict = Some(v);
+                break;
+            }
+        }
+        assert!(matches!(verdict, Some(Verdict::Local { .. })), "{verdict:?}");
     }
 
     #[test]
