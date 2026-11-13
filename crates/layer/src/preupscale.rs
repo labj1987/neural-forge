@@ -287,7 +287,7 @@ pub(crate) struct SrLaunches {
 /// Whether the native backend's Status line is written after a hold: when it changed or the channel holds something else,
 /// but never while the model on another GPU is serving (its line is the Status tab's then).
 fn native_line_due(status: &str, last: &str, channel: &str, offload_active: bool) -> bool {
-    !offload_active && (status != last || (!status.is_empty() && channel != status))
+    !offload_active && (status != last || (!status.is_empty() && channel != neural_forge_protocol::stored_reason(status)))
 }
 
 /// The offload's Status line a hold writes (`line`, [`offload::status_line`]): while the hold before DLSS sends its
@@ -295,7 +295,7 @@ fn native_line_due(status: &str, last: &str, channel: &str, offload_active: bool
 /// present's writer ([`Session::ensure_post_server`]) does not run while frames are held before the upscaler, so
 /// without this the channel kept the native line a hold wrote before the offload started.
 fn hold_offload_line<'a>(line: Option<&'a str>, active: bool, serving_pre: bool, channel: &str) -> Option<&'a str> {
-    line.filter(|l| active && serving_pre && *l != channel)
+    line.filter(|l| active && serving_pre && neural_forge_protocol::stored_reason(l) != channel)
 }
 
 impl SrLaunches {
@@ -4653,7 +4653,7 @@ pub(crate) struct HoldResult {
     pub timing: HoldTiming,
     /// The native backend ran this hold (`evaluated` means the network ran).
     pub native: bool,
-    /// The native backend: a hold after DLSS's output (Ray Reconstruction) while the model on a second GPU is asked
+    /// The native backend: a hold after DLSS's output (Ray Reconstruction's placement, or the one set there) while the model on a second GPU is asked
     /// for: the network runs on the game's GPU here, the second GPU takes only the holds before DLSS.
     pub after_dlss_on_game_gpu: bool,
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
@@ -6652,7 +6652,7 @@ impl Session {
             // except that once the offload was given up the native backend's own line (the network running here, or why
             // not) is the one to keep.
             let now = shm.layer_reason();
-            if now != line && !(offload::given_up() && now.starts_with("native network")) {
+            if now != neural_forge_protocol::stored_reason(&line) && !(offload::given_up() && now.starts_with("native network")) {
                 shm.set_layer_reason(&line);
             }
         }
@@ -12179,5 +12179,10 @@ mod native_line_tests {
         assert!(native_line_due("native network running", "native network running", offload, false));
         assert!(native_line_due("native network running", "", "", false));
         assert!(!native_line_due("native network running", "native network running", "native network running", false));
+        // A line longer than the channel's field is compared as the field keeps it: written once, not at every hold.
+        let long = "x".repeat(neural_forge_protocol::REASON_BYTES + 20);
+        let kept = neural_forge_protocol::stored_reason(&long);
+        assert!(!native_line_due(&long, &long, kept, false));
+        assert_eq!(hold_offload_line(Some(&long), true, true, kept), None);
     }
 }
