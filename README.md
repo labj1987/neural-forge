@@ -9,7 +9,7 @@ NVIDIA's own runtime. Read [Legal](#legal) before you use it.
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab with the per-game Settings for bar, the switch, style, strength preset and its values](screenshots/settings.png) | ![Setup tab with the model, the network choice and the Steam games with a switch each and where each was tested](screenshots/setup.png) | ![Status tab while Hogwarts Legacy runs: the model before the upscaler, the frame rate and the graph of frame time and the model's GPU time](screenshots/status.png) |
+| ![Model tab with the per-game Settings for bar, the switch, style, strength preset and its values](screenshots/settings.png) | ![Setup tab with the model, the network choice and the Steam games with a switch each and where each was tested](screenshots/setup.png) | ![Status tab while Cyberpunk 2077 runs with Ray Reconstruction: the model after DLSS, the frame rate and the graph of frame time and the model's GPU time](screenshots/status.png) |
 
 | Composition | Debug | Setup: Proton copies and Uninstall |
 |---|---|---|
@@ -126,8 +126,9 @@ From a terminal: `~/.local/share/neural-forge/bin/neural-forge-cli uninstall --p
 At 4K on an RTX 5070 the model costs frame rate; the small network costs about half as much as the
 full one. Numbers per game: [docs/MEASURED_RESULTS.md](docs/MEASURED_RESULTS.md).
 
-With two GPUs, the model can run on the second one while the game renders on the first, before DLSS or on the
-finished frame (`NEURAL_FORGE_OFFLOAD_GPU`): see
+With two GPUs, the model can run on the second one while the game renders on the first: before DLSS, after DLSS (in
+games with Ray Reconstruction, or with Placement set to After DLSS), or on the finished frame
+(`NEURAL_FORGE_OFFLOAD_GPU`): see
 [the user guide](docs/USER_GUIDE.md#the-model-on-a-second-gpu).
 
 ## Reporting a bug

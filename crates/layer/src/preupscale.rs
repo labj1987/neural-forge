@@ -112,6 +112,8 @@ pub(crate) mod offload;
 pub(crate) mod offload_pre;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod offload_server;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod offload_trial;
 pub(crate) mod placement;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_flow;
@@ -213,7 +215,7 @@ pub(crate) unsafe fn run_native(
         passes.mask = shm.mask_settings().map_or_else(native::Mask::default, native::Mask::from);
         // The edit cache's interval (its own, not `model_interval`: that is the after-the-upscaler
         // path's), and the debug view of its rejection mask.
-        let ask = native::CacheAsk { hold, interval: cache::interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW };
+        let ask = native::CacheAsk { hold, interval: cache::interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW, at };
         // Told when this hold's work is waited on (`Resources::wait_idle`): until then the
         // after-the-upscaler path keeps off the network.
         res.pre_loader = Some(loader.clone());
@@ -290,12 +292,12 @@ fn native_line_due(status: &str, last: &str, channel: &str, offload_active: bool
     !offload_active && (status != last || (!status.is_empty() && channel != neural_forge_protocol::stored_reason(status)))
 }
 
-/// The offload's Status line a hold writes (`line`, [`offload::status_line`]): while the hold before DLSS sends its
-/// frames to the other GPU (`serving_pre`, with the offload `active`) and the channel says something else. The
-/// present's writer ([`Session::ensure_post_server`]) does not run while frames are held before the upscaler, so
+/// The offload's Status line a hold writes (`line`, [`offload::status_line`]): while a hold (before DLSS or after
+/// its output) sends its frames to the other GPU (`serving_hold`, with the offload `active`) and the channel says something else. The
+/// present's writer ([`Session::ensure_post_server`]) does not run while frames are held, so
 /// without this the channel kept the native line a hold wrote before the offload started.
-fn hold_offload_line<'a>(line: Option<&'a str>, active: bool, serving_pre: bool, channel: &str) -> Option<&'a str> {
-    line.filter(|l| active && serving_pre && neural_forge_protocol::stored_reason(l) != channel)
+fn hold_offload_line<'a>(line: Option<&'a str>, active: bool, serving_hold: bool, channel: &str) -> Option<&'a str> {
+    line.filter(|l| active && serving_hold && neural_forge_protocol::stored_reason(l) != channel)
 }
 
 impl SrLaunches {
@@ -701,6 +703,27 @@ impl ColourWatch {
     }
 }
 
+/// The motion vectors of DLSS's learnt output ([`Tracker::mvec_watch`]): that image, and every 2D single-sample image of
+/// its extent and format (Cyberpunk 2077 hands DLSS two in turn). Ray Reconstruction identifies nothing
+/// ([`Tracker::refresh`]), so without this nothing watched them there: vectors a game renders (not `STORAGE`, so not taken
+/// as `GENERAL`) had no layout for the hold after DLSS, which then neither copied them nor could send its frames to a
+/// second GPU (#63: Cyberpunk 2077 started with Ray Reconstruction on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MvecWatch {
+    pub image: vk::Image,
+    pub shape: Option<ColourWatch>,
+}
+
+impl MvecWatch {
+    fn of(o: &DlssOutput, images: &HashMap<vk::Image, ImageDesc>) -> Self {
+        Self { image: o.mvec, shape: images.get(&o.mvec).map(ColourWatch::of) }
+    }
+
+    fn covers(&self, image: vk::Image, d: Option<&ImageDesc>) -> bool {
+        image == self.image || self.shape.is_some_and(|w| d.is_some_and(|d| w.covers(d)))
+    }
+}
+
 /// At most one line per this long with the counts of the ordinary hold-inside refusals ([`InlineRefusal::quiet`]).
 const QUIET_REFUSALS_EVERY: Duration = Duration::from_secs(5);
 
@@ -761,6 +784,12 @@ pub(crate) struct ImageSync {
 /// copy or transition of the image is recorded from it ([`aux_copy_layout`], [`depth_copy_layout`])
 /// until a barrier on both aspects says where they are.
 pub(crate) const ASPECTS_APART: vk::ImageLayout = vk::ImageLayout::from_raw(0x7fff_0001);
+
+/// [`Tracker::layout_when_run`] of DLSS's output's motion vectors (watched for them alone, [`MvecWatch`]) where a buffer
+/// begun before they were watched runs in front, in the same submission or an earlier one, or nothing is known: their
+/// layout then may be anything, so a hold that guessed one is taken as wrong (`inline::Inline::check`), as the split
+/// refuses a buffer recorded before the identification ([`Hazard::RecordedBefore`]).
+pub(crate) const MVEC_UNSEEN: vk::ImageLayout = vk::ImageLayout::from_raw(0x7fff_0002);
 
 impl ImageSync {
     pub(crate) fn from_barrier(b: &vk::ImageMemoryBarrier, src_stage: vk::PipelineStageFlags, dst_stage: vk::PipelineStageFlags) -> Self {
@@ -1031,6 +1060,13 @@ const SEEN_KEYS: usize = 64;
 pub(crate) struct Tracker {
     /// DLSS's output as its last evaluate wrote it ([`DlssOutput`]).
     dlss_output: Option<DlssOutput>,
+    /// Its motion vectors, watched from the first output learnt on ([`MvecWatch`], [`Self::watch_mvec`]).
+    mvec_watch: Option<MvecWatch>,
+    /// Command buffers whose whole recording so far happened while [`Self::mvec_watch`] (as it is now) was watched, as
+    /// [`Self::recorded_watched`] is for the identification: only in these is the motion vectors' layout read after DLSS
+    /// (a buffer begun before may have moved them unseen), and a buffer not among them that is submitted leaves their
+    /// layout unknown ([`Self::commit_submitted`]).
+    recorded_mvec: HashSet<vk::CommandBuffer>,
     /// The launch just recorded is the last of its evaluate to write DLSS's output, and passes run after DLSS
     /// ([`placement`]): the hold goes right after it, for those passes (taken by [`Tracking::launch_with_after`]).
     after_at: Option<(vk::CommandBuffer, DlssOutput, placement::Plan)>,
@@ -1707,6 +1743,10 @@ impl Tracker {
         self.owners.remove(&image);
         self.launch_layouts.remove(&image);
         self.colour_barriers.remove(&image);
+        // The watched motion vectors' handle may come back for another image; their shape stays watched.
+        if let Some(m) = self.mvec_watch.as_mut().filter(|m| m.image == image) {
+            m.image = vk::Image::null();
+        }
         self.exposure_names.retain(|c, (e, _)| *c != image && *e != image);
     }
 
@@ -2087,9 +2127,14 @@ impl Tracker {
 
     /// `image`'s layout when a buffer submitted right after `earlier` (the buffers in front of it in the same
     /// submission, in order) starts: what the last of them to set it left, else what the buffers submitted
-    /// before left. `None` when nothing is known (an image not watched, or never seen in a barrier).
+    /// before left. `None` when nothing is known (an image not watched, or never seen in a barrier); for DLSS's output's
+    /// motion vectors then, or behind a buffer begun before they were watched, [`MVEC_UNSEEN`].
     pub(crate) fn layout_when_run(&self, earlier: &[vk::CommandBuffer], image: vk::Image) -> Option<vk::ImageLayout> {
-        earlier
+        let mvec_only = self.watched_for_mvec_only(image);
+        if mvec_only && earlier.iter().any(|cb| !self.recorded_mvec.contains(cb)) {
+            return Some(MVEC_UNSEEN);
+        }
+        let known = earlier
             .iter()
             .rev()
             .find_map(|cb| {
@@ -2099,7 +2144,8 @@ impl Tracker {
                     .and_then(|p| p.iter().rev().filter(|s| s.image == image).find_map(ImageSync::layout_after))
                     .or_else(|| self.attached.get(cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
             })
-            .or_else(|| self.committed.get(&image).copied())
+            .or_else(|| self.committed.get(&image).copied());
+        known.or(mvec_only.then_some(MVEC_UNSEEN))
     }
 
     /// [`Self::inline_point`] refused a hold inside DLSS's buffer at a launch naming the colour input `colour`:
@@ -2313,8 +2359,10 @@ impl Tracker {
                 _ => Some(crate::ngx_ring::Rect::whole(extent)),
             }
         });
+        // Begun before the motion vectors were watched: what it recorded on them was not seen ([`Self::recorded_mvec`]).
+        let seen_whole = self.recorded_mvec.contains(&cb);
         let mvec_input = mvec.map(|d| {
-            let known = layout_of(o.mvec, &d);
+            let known = layout_of(o.mvec, &d).filter(|_| seen_whole);
             guessed.mvec = known.filter(|(_, set)| !set).map(|(l, _)| l);
             let layout = known.map(|(l, _)| l);
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
@@ -2355,14 +2403,19 @@ impl Tracker {
             || !self.rendering.is_empty()
             || !self.attached.is_empty()
             || !self.recorded_watched.is_empty()
+            || !self.recorded_mvec.is_empty()
     }
 
     /// `vkBeginCommandBuffer` (or a reset): the earlier recording is gone, and the new one is seen
-    /// whole from here on when inputs are watched ([`Self::recorded_watched`]).
+    /// whole from here on when inputs are watched ([`Self::recorded_watched`]), or DLSS's output's motion vectors
+    /// ([`Self::recorded_mvec`]).
     pub(crate) fn begin(&mut self, command_buffer: vk::CommandBuffer) {
         self.free(&[command_buffer]);
         if self.inputs.is_some() {
             self.recorded_watched.insert(command_buffer);
+        }
+        if self.mvec_watch.is_some() {
+            self.recorded_mvec.insert(command_buffer);
         }
     }
 
@@ -2376,6 +2429,7 @@ impl Tracker {
             self.rendering.remove(cb);
             self.attached.remove(cb);
             self.recorded_watched.remove(cb);
+            self.recorded_mvec.remove(cb);
             self.inline_tried.remove(cb);
         }
     }
@@ -2434,6 +2488,9 @@ impl Tracker {
             // A secondary recorded (in part) before the identification makes the primary so too.
             if !self.recorded_watched.contains(secondary) {
                 self.recorded_watched.remove(&primary);
+            }
+            if !self.recorded_mvec.contains(secondary) {
+                self.recorded_mvec.remove(&primary);
             }
             // Where the secondary's recording starts in the primary's.
             let base = Before {
@@ -2496,15 +2553,18 @@ impl Tracker {
 
     /// Whether barriers on `image` are recorded now.
     fn watched(&self, image: vk::Image) -> bool {
-        self.watched_by(self.inputs, self.colour_watch, image)
+        self.watched_by(self.inputs, self.colour_watch, self.mvec_watch, image)
     }
 
-    /// Whether barriers on `image` are recorded with `inputs` identified and `watch` the colour shape watched.
-    fn watched_by(&self, inputs: Option<Inputs>, watch: Option<ColourWatch>, image: vk::Image) -> bool {
+    /// Whether barriers on `image` are recorded with `inputs` identified, `watch` the colour shape watched and `mvec`
+    /// DLSS's output's motion vectors watched.
+    fn watched_by(&self, inputs: Option<Inputs>, watch: Option<ColourWatch>, mvec: Option<MvecWatch>, image: vk::Image) -> bool {
         let desc = self.images.get(&image);
         // Every image of the colour input's shape: an evaluate may name another one than the identified (Remnant II and
         // Expedition 33 alternate between several).
         watch.is_some_and(|w| desc.is_some_and(|d| w.covers(d)))
+            // The motion vectors of the output the hold after DLSS goes after ([`MvecWatch`]).
+            || mvec.is_some_and(|m| m.covers(image, desc))
             || inputs.is_some_and(|i| {
                 i.colour.0 == image
                     || i.depth.0 == image
@@ -2530,16 +2590,29 @@ impl Tracker {
     /// was not seen.
     fn keep_watched_across(&mut self, inputs: Option<Inputs>, watch: Option<ColourWatch>) {
         let (old, old_watch) = (self.inputs, self.colour_watch);
-        let seen: HashSet<vk::Image> = self
-            .committed
+        let seen = self.tracked_images();
+        let mvec = self.mvec_watch;
+        let keep: HashSet<vk::Image> =
+            seen.into_iter().filter(|&i| self.watched_by(old, old_watch, mvec, i) && self.watched_by(inputs, watch, mvec, i)).collect();
+        self.retain_tracked(&keep);
+        self.colour_watch = watch;
+    }
+
+    /// Every image something is recorded on: a committed layout or owner, a layout at DLSS's launch, barriers or
+    /// attachments in buffers not yet submitted.
+    fn tracked_images(&self) -> HashSet<vk::Image> {
+        self.committed
             .keys()
             .chain(self.owners.keys())
             .chain(self.launch_layouts.keys())
             .copied()
             .chain(self.pending.values().flatten().map(|s| s.image))
             .chain(self.attached.values().flatten().map(|a| a.0))
-            .collect();
-        let keep: HashSet<vk::Image> = seen.into_iter().filter(|&i| self.watched_by(old, old_watch, i) && self.watched_by(inputs, watch, i)).collect();
+            .collect()
+    }
+
+    /// Drops what was recorded on every image but `keep`'s.
+    fn retain_tracked(&mut self, keep: &HashSet<vk::Image>) {
         self.committed.retain(|i, _| keep.contains(i));
         self.owners.retain(|i, _| keep.contains(i));
         self.launch_layouts.retain(|i, _| keep.contains(i));
@@ -2551,7 +2624,30 @@ impl Tracker {
             attached.retain(|a| keep.contains(&a.0));
         }
         self.attached.retain(|_, attached| !attached.is_empty());
-        self.colour_watch = watch;
+    }
+
+    /// A new DLSS output was learnt ([`Self::observe`]): its motion vectors are watched from here on. When that changes
+    /// what is watched, it is handled as a new identification is ([`Self::keep_watched_across`]): what was recorded on
+    /// images watched both before and after is kept, everything else dropped (vectors of an earlier output watched
+    /// again later start with no layout, not with the one they had then), and only buffers begun from here on are seen
+    /// whole for them ([`Self::recorded_mvec`]).
+    fn watch_mvec(&mut self, mvec: MvecWatch) {
+        let old = self.mvec_watch;
+        // The same image, or another of the same shape (Cyberpunk 2077 alternates two): the watch is unchanged.
+        if old == Some(mvec) || old.is_some_and(|o| o.shape.is_some() && o.shape == mvec.shape) {
+            return;
+        }
+        let (inputs, watch) = (self.inputs, self.colour_watch);
+        let keep: HashSet<vk::Image> =
+            self.tracked_images().into_iter().filter(|&i| self.watched_by(inputs, watch, old, i) && self.watched_by(inputs, watch, Some(mvec), i)).collect();
+        self.retain_tracked(&keep);
+        self.mvec_watch = Some(mvec);
+        self.recorded_mvec.clear();
+    }
+
+    /// Whether `image` is watched only for DLSS's output's motion vectors, not for the identification.
+    fn watched_for_mvec_only(&self, image: vk::Image) -> bool {
+        !self.watched_by(self.inputs, self.colour_watch, None, image) && self.mvec_watch.is_some_and(|m| m.covers(image, self.images.get(&image)))
     }
 
     pub(crate) fn barrier(&mut self, command_buffer: vk::CommandBuffer, sync: ImageSync) {
@@ -2587,6 +2683,13 @@ impl Tracker {
     /// passed once it was accepted ([`submit_around`]).
     pub(crate) fn commit_submitted(&mut self, command_buffers: impl IntoIterator<Item = vk::CommandBuffer>) {
         for cb in command_buffers {
+            // Begun before DLSS's output's motion vectors were watched: it may have moved them unseen.
+            if self.mvec_watch.is_some() && !self.recorded_mvec.contains(&cb) {
+                let unseen: Vec<vk::Image> = self.committed.keys().copied().filter(|&i| self.watched_for_mvec_only(i)).collect();
+                for image in unseen {
+                    self.committed.remove(&image);
+                }
+            }
             // Attachment layouts first, then the buffer's barriers (which follow its rendering).
             if let Some(attached) = self.attached.get(&cb) {
                 for &(image, layout) in attached {
@@ -2747,6 +2850,7 @@ impl Tracker {
                 lines.push(format!("DLSS's output is written in {} launches, not {}: a hold in this frame went after part of it", seen.writes, l.writes));
             }
             self.dlss_output = Some(seen);
+            self.watch_mvec(MvecWatch::of(&seen, &self.images));
             let desc = |i: vk::Image| self.images.get(&i).map_or("unregistered".to_string(), |d| format!("{}x{} {:?}", d.width, d.height, d.format));
             lines.push(format!(
                 "DLSS's output: image {} ({}), written by {} launch(es) of its evaluate on {} ({}; depth {}, motion vectors {}){}",
@@ -3014,7 +3118,8 @@ impl Tracker {
 
 /// A device's [`Tracker`] plus lock-free flags, so that on a device with NVX but no DLSS (a
 /// vkd3d-proton game without DLSS) the per-command-buffer and per-submit hooks cost one relaxed
-/// load: `watching` (an input is identified, so barriers on it are worth recording), `armed` (some
+/// load: `watching` (an input is identified, or DLSS's output's motion vectors are watched, so barriers on them are
+/// worth recording), `armed` (some
 /// command buffer carries a launch or recorded layouts, so begin/free/execute/submit have something
 /// to do) and the identified extent for the present hook.
 #[derive(Default)]
@@ -3096,7 +3201,8 @@ impl Tracking {
         lock(&self.tracker)
     }
 
-    /// Whether any input is identified (so barriers on it are worth recording).
+    /// Whether any input is identified, or DLSS's output's motion vectors are watched ([`MvecWatch`]): barriers on them
+    /// are worth recording. Without the latter, a game started with Ray Reconstruction on recorded none (#63).
     pub(crate) fn watching(&self) -> bool {
         self.watching.load(Ordering::Relaxed)
     }
@@ -3196,8 +3302,8 @@ impl Tracking {
         self.lock().forget_function(function);
     }
 
-    /// `vkBeginCommandBuffer`: forgets the buffer's earlier recording, and while inputs are watched
-    /// notes that the new one is seen whole ([`Tracker::recorded_watched`]). Nothing to do (no lock)
+    /// `vkBeginCommandBuffer`: forgets the buffer's earlier recording, and while inputs or DLSS's output's motion vectors
+    /// are watched notes that the new one is seen whole for them ([`Tracker::recorded_watched`], [`Tracker::recorded_mvec`]). Nothing to do (no lock)
     /// while nothing is armed or watched: a buffer begun then is not in that set, and none of it is.
     pub(crate) fn begin(&self, command_buffer: vk::CommandBuffer) {
         if self.armed() || self.watching() {
@@ -3275,7 +3381,7 @@ impl Tracking {
         self.rearm(&t);
     }
 
-    /// An image copy ([`Tracker::copy`]), while inputs are watched.
+    /// An image copy ([`Tracker::copy`]), while inputs or DLSS's output's motion vectors are watched.
     pub(crate) fn copy(&self, command_buffer: vk::CommandBuffer, src: vk::Image, dst: vk::Image) {
         if !self.watching.load(Ordering::Relaxed) {
             return;
@@ -3285,7 +3391,8 @@ impl Tracking {
         self.rearm(&t);
     }
 
-    /// `vkCmdBeginRendering`'s attachments ([`Tracker::attachments`]), while inputs are watched.
+    /// `vkCmdBeginRendering`'s attachments ([`Tracker::attachments`]), while inputs or DLSS's output's motion vectors are
+    /// watched.
     pub(crate) fn attachments(&self, command_buffer: vk::CommandBuffer, views: &[(vk::ImageView, vk::ImageLayout)]) {
         if !self.watching.load(Ordering::Relaxed) || views.is_empty() {
             return;
@@ -3326,7 +3433,7 @@ impl Tracking {
             let observed = t.observe(batches);
             let line = t.refresh().map(|l| format!("{l} [device {device:#x}]"));
             let identified = line.is_some().then(|| t.inputs.map(|i| i.colour.0));
-            self.watching.store(t.inputs.is_some() || t.colour_watch.is_some(), Ordering::Relaxed);
+            self.watching.store(t.inputs.is_some() || t.colour_watch.is_some() || t.mvec_watch.is_some(), Ordering::Relaxed);
             self.extent.store(t.inputs.map_or(0, |i| u64::from(i.colour.1.width) << 32 | u64::from(i.colour.1.height)), Ordering::Relaxed);
             let foreign_before = t.foreign_submits;
             let scan = t.scan(batches);
@@ -4093,7 +4200,8 @@ pub(crate) struct Resources {
     /// The edit cache's passes (`cache`), built on the first native hold.
     #[cfg(target_arch = "x86_64")]
     pub(crate) edit: Option<cache::CachePass>,
-    /// The network on a second GPU for the hold before DLSS (`offload_pre`), made on its first offloaded hold.
+    /// The network on a second GPU for these hold resources (`offload_pre`: the hold before DLSS, or the one after
+    /// its output), made on their first offloaded hold.
     #[cfg(target_arch = "x86_64")]
     pub(crate) offpre: Option<offload_pre::HoldSide>,
     /// The scene-cut detector (`scene_cut`), built on the first native hold unless it is switched off.
@@ -4653,9 +4761,9 @@ pub(crate) struct HoldResult {
     pub timing: HoldTiming,
     /// The native backend ran this hold (`evaluated` means the network ran).
     pub native: bool,
-    /// The native backend: a hold after DLSS's output (Ray Reconstruction's placement, or the one set there) while the model on a second GPU is asked
-    /// for: the network runs on the game's GPU here, the second GPU takes only the holds before DLSS.
-    pub after_dlss_on_game_gpu: bool,
+    /// The native backend: a hold of a frame with passes before DLSS and after its output while the model on a second
+    /// GPU is asked for: neither hold is offloaded (`placement::Hold::offload_takes`), every pass runs on the game's GPU.
+    pub mixed_on_game_gpu: bool,
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
     /// network, composite), read when its fence was found signalled here.
     pub network_gpu_ms: Option<f32>,
@@ -5638,6 +5746,40 @@ fn hold_clock() -> Instant {
     Instant::now()
 }
 
+/// The network's GPU time a frame costs, for the Status tab's graph: the last time each hold of the frame reported,
+/// summed. The holds before the upscaler and after DLSS's output are told apart by their size (render and output);
+/// where the two are the same size (DLAA with passes at both holds) they share a slot and the time is one hold's. A
+/// hold that has not reported for [`Self::FRESH`] (its passes moved to the other hold, a pause) no longer counts.
+#[derive(Debug, Default)]
+pub(crate) struct NetworkMs {
+    slots: [Option<NetworkSlot>; 2],
+}
+
+/// One hold's last report: its size, the time, and when.
+#[derive(Clone, Copy, Debug)]
+struct NetworkSlot {
+    extent: (u32, u32),
+    ms: f32,
+    at: Instant,
+}
+
+impl NetworkMs {
+    const FRESH: Duration = Duration::from_secs(1);
+
+    /// The hold of `extent` reports `ms` at `now`: the frame's time.
+    pub(crate) fn note(&mut self, extent: (u32, u32), ms: f32, now: Instant) -> f32 {
+        for slot in &mut self.slots {
+            if slot.is_some_and(|s| now.saturating_duration_since(s.at) > Self::FRESH) {
+                *slot = None;
+            }
+        }
+        let own = self.slots.iter().position(|s| s.is_some_and(|s| s.extent == extent));
+        let at = own.or_else(|| self.slots.iter().position(Option::is_none)).unwrap_or(0);
+        self.slots[at] = Some(NetworkSlot { extent, ms, at: now });
+        self.slots.iter().flatten().map(|s| s.ms).sum()
+    }
+}
+
 /// One device's pre-upscaler state, kept in its `State` (so holds and presents are serialized by
 /// the same lock).
 #[derive(Default)]
@@ -5652,6 +5794,8 @@ pub(crate) struct Session {
     /// in the same frame.
     pub(crate) res_after: Option<Resources>,
     stats: Stats,
+    /// The network's GPU time of the frame's holds, for the Status tab ([`NetworkMs`]).
+    network_ms: NetworkMs,
     last_hold: Option<Instant>,
     /// The last hold ran the native backend (for `native_running`).
     last_hold_native: bool,
@@ -6473,6 +6617,12 @@ impl Session {
         if result.native && result.evaluated {
             self.engaged = true;
         }
+        // While the trial against the other GPU measures the game's GPU: every hold, whether the model ran on it.
+        #[cfg(target_arch = "x86_64")]
+        if offload_trial::running() && !offload_pre::serving_hold() {
+            let ran = result.native && result.evaluated && result.wrote_back;
+            offload_trial::local_hold((extent, placement::settings().0), now, ran, result.miss);
+        }
         self.share_post_off();
         let holding = self.holding();
         let s = &mut self.stats;
@@ -6547,7 +6697,8 @@ impl Session {
             shm.publish_cache(s.refresh_holds, s.cached_holds, s.last_rejected, gpu);
             shm.publish_scene_cuts(s.scene_cuts);
             if let Some(g) = result.network_gpu_ms {
-                shm.publish_network_gpu_ms(g);
+                // A frame with holds before the upscaler and after DLSS runs the network twice: the frame's time is both.
+                shm.publish_network_gpu_ms(self.network_ms.note(extent, g, now));
             }
         }
         shm.publish_preupscale_state(hold_state(holding), self.last_hold_native, extent.0, extent.1);
@@ -6639,14 +6790,14 @@ impl Session {
     ) {
         // The model on another GPU's state, on the Status tab's line and for `doctor` (`layer_reason`).
         #[cfg(target_arch = "x86_64")]
-        // Only while the offload is what runs (serving at the finished-frame placement, or the hold before DLSS sending
+        // Only while the offload is what runs (serving at the finished-frame placement, or a hold sending
         // its frames) or not running (starting, stalled, given up): when the placement left it, the native backend's
         // line has the channel (`offload::shows_line`).
         let at_present = shm.view().is_some_and(|v| {
             let (count, placements) = v.header().placements();
             placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT)
         });
-        let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_pre());
+        let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_hold());
         if let Some(line) = offload::status_line().filter(|_| offload_line) {
             // Against what the channel holds (the native backend's line shares it): written when it says something else,
             // except that once the offload was given up the native backend's own line (the network running here, or why
@@ -6785,7 +6936,7 @@ impl Session {
             // Against what the channel holds too: the offload's line shares it, and while the offload serves the line is
             // its own (the hold's "native network running" would overwrite it on every frame).
             let offload_active = matches!(offload::state(), offload::State::Active(_));
-            if let Some(line) = hold_offload_line(offload::status_line().as_deref(), offload_active, offload_pre::serving_pre(), &shm.layer_reason()) {
+            if let Some(line) = hold_offload_line(offload::status_line().as_deref(), offload_active, offload_pre::serving_hold(), &shm.layer_reason()) {
                 shm.set_layer_reason(line);
             }
             if native_line_due(&status, &self.native_status, &shm.layer_reason(), offload_active) {
@@ -7656,6 +7807,169 @@ mod tests {
         assert!(scan.is_some_and(|s| s.identified_now) && !t.frame().rr);
     }
 
+    /// #63: Ray Reconstruction identifies nothing (`Tracker::refresh`), so only the output it learns watches its motion
+    /// vectors. Cyberpunk 2077 with ray tracing and path tracing off hands DLSS vectors it renders (no `STORAGE`, so
+    /// not taken as `GENERAL`), two in turn: the hold after DLSS reads the one its evaluate names in the layout the
+    /// game's barrier left it in. Without the watch their layout was unknown, nothing was copied, and the offload
+    /// gave up on every frame ("DLSS names no motion vectors").
+    #[test]
+    fn the_hold_after_ray_reconstruction_knows_its_rendered_motion_vectors_layout() {
+        use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let rendered = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut set = gta_registered();
+        for raw in [0x300, 0x310] {
+            set.insert(raw, (img(raw), desc(1707, 960, rgba, rendered)));
+        }
+        let mut t = tracker_with(&set);
+        let rr = |seq, mvec| parse_record(&record_bytes(seq, FEATURE_RR, 1, [0x100, mvec, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        let a = rr(1, 0x300);
+        inject(vec![a]);
+        t.begin(cb(1));
+        t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        t.launch(cb(1), Some(&param_block(&[0x1400])));
+        inject(vec![a, end_of(&a, 2)]);
+        submit(&mut t, &[vec![cb(1)]]);
+        assert!(t.dlss_output.is_some_and(|o| o.rr && o.mvec == img(0x300)), "the output learnt");
+        assert!(t.inputs.is_none(), "Ray Reconstruction identifies nothing");
+        // The next frame's vectors are the other image of their shape, moved to be read in a buffer before DLSS's.
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        t.begin(cb(2));
+        t.barrier(cb(2), ImageSync::to(img(0x310), read));
+        submit(&mut t, &[vec![cb(2)]]);
+        let b = rr(3, 0x310);
+        inject(vec![a, end_of(&a, 2), b]);
+        t.begin(cb(3));
+        t.launch(cb(3), Some(&param_block(&[0x1100, 0x1200, 0x1310])));
+        t.launch(cb(3), Some(&param_block(&[0x1400])));
+        let (c, o, plan) = t.after_at.take().expect("the hold after DLSS's output");
+        let point = t.after_point_at(c, o, &plan).expect("a point on the output");
+        let mv = point.mvec_input.expect("the evaluate's motion vectors");
+        assert_eq!((mv.image, mv.layout, mv.readable), (img(0x310), Some(read), true), "{mv:?}");
+        assert_eq!(point.guessed.mvec, Some(read), "set before DLSS's buffer: checked at its submit");
+    }
+
+    /// The hold inside DLSS's buffer guessed the motion vectors' committed layout: a buffer begun before they were
+    /// watched, in front in the same submission or submitted in between, may have moved them unseen, so the check at the
+    /// submit finds the guess wrong ([`MVEC_UNSEEN`]) rather than keeping it (the same layout still committed, or none).
+    #[test]
+    fn a_buffer_begun_before_the_motion_vector_watch_makes_their_guessed_layout_wrong() {
+        use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let rendered = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut set = gta_registered();
+        set.insert(0x300, (img(0x300), desc(1707, 960, rgba, rendered)));
+        let mut t = tracker_with(&set);
+        t.begin(cb(9));
+        let a = parse_record(&record_bytes(1, FEATURE_RR, 1, [0x100, 0x300, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        inject(vec![a]);
+        t.begin(cb(1));
+        t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        t.launch(cb(1), Some(&param_block(&[0x1400])));
+        inject(vec![a, end_of(&a, 2)]);
+        submit(&mut t, &[vec![cb(1)]]);
+        assert!(t.mvec_watch.is_some());
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        t.begin(cb(2));
+        t.barrier(cb(2), ImageSync::to(img(0x300), read));
+        submit(&mut t, &[vec![cb(2)]]);
+        t.begin(cb(3));
+        assert_eq!(t.layout_when_run(&[], img(0x300)), Some(read), "what the buffers seen whole left");
+        assert_eq!(t.layout_when_run(&[cb(3)], img(0x300)), Some(read));
+        assert_eq!(t.layout_when_run(&[cb(9)], img(0x300)), Some(MVEC_UNSEEN), "behind a buffer begun before, in the same submission");
+        assert_eq!(t.layout_when_run(&[cb(9)], img(0x400)), None, "an image not watched keeps its rule");
+        submit(&mut t, &[vec![cb(9)]]);
+        assert_eq!(t.layout_when_run(&[], img(0x300)), Some(MVEC_UNSEEN), "after it was submitted");
+        assert_eq!(t.layout_when_run(&[cb(3)], img(0x300)), Some(MVEC_UNSEEN));
+    }
+
+    /// #63 through the device's hooks: a game started with Ray Reconstruction on identifies nothing, so the hooks record
+    /// barriers and attachments (gated on [`Tracking::watching`]) only because the learnt output's motion vectors are
+    /// watched. Rendered vectors' layout then comes from a render pass's attachments or a barrier; never from a buffer
+    /// begun before they were watched (its unseen commands may have moved them), and vectors of an earlier output watched
+    /// again start with no layout.
+    #[test]
+    fn rendered_motion_vectors_after_ray_reconstruction_through_the_hooks() {
+        use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let rendered = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut set = gta_registered();
+        for raw in [0x300, 0x310] {
+            set.insert(raw, (img(raw), desc(1707, 960, rgba, rendered)));
+        }
+        // Another output's vectors, of another shape.
+        set.insert(0x320, (img(0x320), desc(1280, 720, rgba, rendered)));
+        let t = Tracking::default();
+        *t.lock() = tracker_with(&set);
+        let null = vk::CuFunctionNVX::null();
+        let rr = |seq, mvec| parse_record(&record_bytes(seq, FEATURE_RR, 1, [0x100, mvec, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        let mut records = Vec::new();
+        let mut seq = 0;
+        // One evaluate in `c` naming `mvec`: its colour launch and its one write of the output, ended at the submit.
+        // Returns the hold after DLSS's output's motion vectors as that point reads them.
+        let mut evaluate = |c: vk::CommandBuffer, mvec: u64, begin: bool| -> Option<Aux> {
+            seq += 2;
+            let r = rr(seq - 1, mvec);
+            records.push(r);
+            inject(records.clone());
+            if begin {
+                t.begin(c);
+            }
+            t.launch(c, null, Some(&param_block(&[0x1100, 0x1200, mvec + 0x1000])));
+            let (_, after) = t.launch_with_after(c, null, Some(&param_block(&[0x1400])));
+            records.push(end_of(&r, seq));
+            inject(records.clone());
+            let _ = t.submit_ok(&[vec![c]]);
+            after.and_then(|p| p.mvec_input)
+        };
+        // A buffer begun before anything was watched, submitted later.
+        t.begin(cb(9));
+        assert!(evaluate(cb(1), 0x300, true).is_none(), "the first evaluate only teaches the output");
+        assert!(t.watching(), "the output's motion vectors are watched: the hooks record barriers");
+        assert!(t.lock().inputs.is_none() && t.lock().mvec_watch.is_some());
+        // Rendered under dynamic rendering in a buffer begun since: their layout is the attachment's.
+        t.begin(cb(2));
+        t.attachments(cb(2), &[(vk::ImageView::from_raw(0x311), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)]);
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        let mv = evaluate(cb(3), 0x310, true).expect("the evaluate's motion vectors");
+        assert_eq!((mv.image, mv.layout, mv.readable), (img(0x310), Some(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL), true), "{mv:?}");
+        // Moved to be read by a barrier the device's hook records (it records only while watching).
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        t.begin(cb(2));
+        if t.watching() {
+            t.barriers(cb(2), [ImageSync::to(img(0x310), read)].into_iter(), None);
+        }
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        let mv = evaluate(cb(3), 0x310, true).expect("the evaluate's motion vectors");
+        assert_eq!((mv.layout, mv.readable), (Some(read), true), "{mv:?}");
+        // The buffer begun before they were watched is submitted: what it did to them is unknown.
+        let _ = t.submit_ok(&[vec![cb(9)]]);
+        let mv = evaluate(cb(3), 0x310, true).expect("the evaluate's motion vectors");
+        assert_eq!((mv.layout, mv.readable), (None, false), "{mv:?}");
+        // DLSS's own buffer begun before they were watched: not read there either, whatever is committed.
+        t.begin(cb(2));
+        t.barriers(cb(2), [ImageSync::to(img(0x310), read)].into_iter(), None);
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        t.begin(cb(4));
+        // Another output (its vectors of another shape): what was recorded on the first one's vectors is dropped.
+        assert!(evaluate(cb(5), 0x320, true).is_none(), "learnt anew");
+        assert!(t.lock().mvec_watch.is_some_and(|m| m.image == img(0x320)));
+        assert!(!t.lock().committed.contains_key(&img(0x310)), "the earlier output's vectors are not watched now");
+        // Back to the first output: its vectors start with no layout, and cb(4), begun before, never reads them.
+        assert!(evaluate(cb(5), 0x310, true).is_none(), "learnt anew");
+        t.begin(cb(2));
+        t.barriers(cb(2), [ImageSync::to(img(0x310), read)].into_iter(), None);
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        let mv = evaluate(cb(4), 0x310, false).expect("the evaluate's motion vectors");
+        assert_eq!((mv.layout, mv.readable), (None, false), "begun before the watch: {mv:?}");
+        assert!(!t.lock().committed.contains_key(&img(0x310)), "and its submit left their layout unknown");
+        t.begin(cb(2));
+        t.barriers(cb(2), [ImageSync::to(img(0x310), read)].into_iter(), None);
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        let mv = evaluate(cb(6), 0x310, true).expect("the evaluate's motion vectors");
+        assert_eq!((mv.layout, mv.readable), (Some(read), true), "{mv:?}");
+    }
+
     /// A game handing DLSS another colour image of the same shape every frame (Remnant II, Expedition 33): every
     /// buffer is held with its own evaluate's colour input, and the identification stays the first one.
     #[test]
@@ -8199,6 +8513,44 @@ mod tests {
         assert!(shm.preupscale_reason_is(&header.preupscale_reason()));
         publish_reason(&shm, "");
         assert_eq!(header.preupscale_reason(), "");
+    }
+
+    /// The trial against the second GPU (`offload_trial`), wired as the holds drive it: two offloaded windows that
+    /// show the game waiting start it (the held placements then stay on the game's GPU, `offload_pre::wanted`), the
+    /// holds on the game's GPU go through `Session::note`, the Status line is the trial's, and a game's GPU that is
+    /// faster keeps the model, with its line reaching the channel over the native one.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_trial_runs_through_the_holds_notes_and_status() {
+        let _state = offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        offload_trial::reset_for_test();
+        let key = ((1485, 836), placement::settings().0);
+        assert!(offload_trial::offloaded(key, Duration::from_millis(23), Duration::from_millis(5)).is_none());
+        assert!(offload_trial::offloaded(key, Duration::from_millis(23), Duration::from_millis(5)).is_some());
+        assert!(offload_trial::running() && offload_trial::keeps_local());
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.init_defaults();
+        let shm = ShmClient::test_over_header(&header);
+        let mut session = Session::default();
+        let held = HoldResult { wrote_back: true, waits_consumed: true, native: true, evaluated: true, ..Default::default() };
+        let trying = native::running_line(None, false, offload_trial::status_line().as_deref());
+        assert!(trying.starts_with("second GPU: trying the game's GPU"), "{trying}");
+        assert!(native_line_due(&trying, "native network running", "native network running", false));
+        // Holds every 2 ms on the game's GPU (much faster than 23 ms): the warm-up, the window, the verdict.
+        for _ in 0..(offload_trial::LOCAL_WARM as usize + offload_trial::LOCAL_WINDOW + 50) {
+            if !offload_trial::running() {
+                break;
+            }
+            session.note(&shm, &held, Duration::ZERO, (1485, 836));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!offload_trial::running(), "decided");
+        assert!(offload_trial::keeps_local(), "kept on the game's GPU");
+        let kept = native::running_line(None, false, offload_trial::status_line().as_deref());
+        assert!(kept.starts_with("second GPU: not used: the game's GPU is faster ("), "{kept}");
+        shm.set_layer_reason("native network running");
+        assert!(native_line_due(&kept, "native network running", &shm.layer_reason(), false));
+        offload_trial::reset_for_test();
     }
 
     /// A hold that runs and holds nothing gives the status its reason (#59): with the VRAM guard's pause in Cyberpunk 2077 at
@@ -12156,6 +12508,26 @@ mod tests {
 mod native_line_tests {
     use super::{hold_offload_line, native_line_due};
 
+    /// The Status tab's model time is the frame's: both holds' in a frame with passes before the upscaler and after
+    /// DLSS, one hold's otherwise, and a hold that stopped reporting drops out.
+    #[test]
+    fn the_published_network_time_adds_the_frames_two_holds() {
+        use std::time::{Duration, Instant};
+        let mut n = super::NetworkMs::default();
+        let t = Instant::now();
+        let (render, output) = ((1485, 835), (2560, 1440));
+        assert_eq!(n.note(render, 7.5, t), 7.5);
+        assert_eq!(n.note(render, 8.0, t + Duration::from_millis(20)), 8.0, "one hold: its last time");
+        assert_eq!(n.note(output, 17.0, t + Duration::from_millis(21)), 25.0, "both holds of a frame");
+        assert_eq!(n.note(render, 7.0, t + Duration::from_millis(40)), 24.0);
+        // The passes all moved after DLSS: the hold before the upscaler reports no more.
+        assert_eq!(n.note(output, 17.5, t + Duration::from_millis(900)), 24.5);
+        assert_eq!(n.note(output, 17.5, t + Duration::from_millis(1500)), 17.5);
+        // Another size (DLSS's quality changed): the stale slot is taken, never a third added.
+        assert_eq!(n.note((1280, 720), 6.0, t + Duration::from_millis(1510)), 23.5);
+        assert_eq!(n.note((1707, 960), 9.0, t + Duration::from_millis(1520)), 26.5, "a third size replaces one");
+    }
+
     #[test]
     fn a_hold_writes_the_offloads_line_while_it_sends_its_frames() {
         let offload = "second GPU: the model runs on X before DLSS, its edit applied one frame later";
@@ -12164,10 +12536,30 @@ mod native_line_tests {
         assert_eq!(hold_offload_line(Some(offload), true, true, ""), Some(offload));
         // Already there: nothing written.
         assert_eq!(hold_offload_line(Some(offload), true, true, offload), None);
-        // Not the hold before DLSS serving (the finished frame, after DLSS, off, given up): not the hold's to write.
+        // No hold serving (the finished frame, off, given up): not the hold's to write.
         assert_eq!(hold_offload_line(Some(offload), true, false, "native network running"), None);
         assert_eq!(hold_offload_line(Some(offload), false, true, "native network running"), None);
         assert_eq!(hold_offload_line(None, false, false, ""), None);
+    }
+
+    /// A frame with passes before and after DLSS: no hold is offloaded (the state is not `Active`), so the hold's own
+    /// line, which says the second GPU is not used and why, is the one written: over the native line, over a line a
+    /// side left behind before the plan changed, and once.
+    #[test]
+    fn a_mixed_frames_line_reaches_the_channel() {
+        let mixed = crate::preupscale::native::running_line(None, true, None);
+        let before = "second GPU: the model runs on X before DLSS, its edit applied one frame later";
+        assert!(mixed.len() < neural_forge_protocol::REASON_BYTES);
+        // No side serves: the offload's line is not written by the hold,
+        assert_eq!(hold_offload_line(None, false, false, "native network running"), None);
+        assert_eq!(hold_offload_line(Some(before), false, false, before), None);
+        // and the hold's line is due against whatever the channel holds,
+        for channel in ["", "native network running", before] {
+            assert!(native_line_due(&mixed, "", channel, false), "over {channel:?}");
+            assert!(native_line_due(&mixed, &mixed, channel, false), "again when the channel lost it: {channel:?}");
+        }
+        // until it is there.
+        assert!(!native_line_due(&mixed, &mixed, neural_forge_protocol::stored_reason(&mixed), false));
     }
 
     #[test]

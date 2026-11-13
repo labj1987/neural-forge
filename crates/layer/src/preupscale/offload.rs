@@ -198,11 +198,11 @@ pub(crate) fn state() -> State {
 
 /// Whether the Status tab's line is the offload's ([`status_line`]) in `state`: while it starts, stalled or was given
 /// up; and while it runs, only when the offload is what runs the model: the finished-frame server serving with every
-/// pass at the placement `present` (`finished`), or the hold before DLSS sending its frames (`before_dlss`). When the
+/// pass at the placement `present` (`finished`), or a hold (before DLSS or after its output) sending its frames (`hold`). When the
 /// placement left the finished frame and nothing is offloaded, the native backend's line has the channel.
-pub(crate) fn shows_line(state: &State, finished: bool, before_dlss: bool) -> bool {
+pub(crate) fn shows_line(state: &State, finished: bool, hold: bool) -> bool {
     match state {
-        State::Active(_) => finished || before_dlss,
+        State::Active(_) => finished || hold,
         _ => true,
     }
 }
@@ -212,7 +212,9 @@ pub(crate) fn status_line() -> Option<String> {
     match state() {
         State::Off => None,
         State::Starting(gpu) => Some(format!("second GPU: starting on {gpu}")),
-        State::Active(gpu) if super::offload_pre::serving_pre() => Some(super::offload_pre::status_line(&gpu)),
+        State::Active(gpu) if super::offload_pre::serving_hold() => {
+            Some(super::offload_pre::status_line(&gpu, super::offload_pre::serving_where().unwrap_or(super::offload_pre::Where::Before)))
+        }
         State::Active(gpu) => Some(format!("second GPU: the model runs on {gpu}, each frame shown one frame later")),
         State::Stalled(gpu) => Some(format!("second GPU: stalled: a frame on {gpu} did not finish; waiting for it, the frames go out without the model")),
         State::FellBack(why) => Some(format!("second GPU: given up ({why}); the model runs on the game's GPU")),
@@ -666,6 +668,8 @@ pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk:
     let choice = Choice::current();
     // Given up for the process, or a frame on an offload device never finished (the model is off for the session):
     // no more devices for it.
+    // A trial that kept the held placements on the game's GPU (`offload_trial::keeps_local`) does not stop this on
+    // purpose: the finished-frame placement may still ask for the offload device.
     if choice == Choice::Off || given_up() || matches!(state(), State::Stalled(_)) {
         return;
     }
@@ -1326,7 +1330,7 @@ mod tests {
     fn the_status_line_is_the_offloads_while_either_path_serves() {
         let active = State::Active("GPU".into());
         assert!(shows_line(&active, true, false), "the finished-frame server serving at `present`");
-        assert!(shows_line(&active, false, true), "the hold before DLSS sending its frames");
+        assert!(shows_line(&active, false, true), "a hold sending its frames");
         assert!(!shows_line(&active, false, false), "the placement left the offload: the native backend's line");
         for other in [State::Starting("GPU".into()), State::Stalled("GPU".into()), State::FellBack("why".into())] {
             assert!(shows_line(&other, false, false));

@@ -50,7 +50,8 @@ struct Frame {
     extents: [(u32, u32); neural_forge_protocol::MAX_PASSES],
     hdr: super::hdr::HdrPass,
     native: NativePass,
-    depth: super::native::DepthCopy,
+    /// DLSS's depth as the hold sent it: only for the hold before DLSS (after DLSS's output there is none).
+    depth: Option<super::native::DepthCopy>,
 }
 
 pub(crate) struct PreRunner {
@@ -76,12 +77,38 @@ pub(crate) struct PreRunner {
     said_loading: bool,
     /// Frames asked of the runner so far.
     frames: u64,
+    /// The hold it serves (the log's words).
+    at: super::offload_pre::Where,
+    /// The pass count last said in the log (more than one pass asked).
+    said_more: Option<usize>,
+}
+
+/// The passes a frame runs on the other device: every pass of the stage the hold sent (`asked`) when the later passes'
+/// buffers are built there (`more`), else pass 1 alone (`native::runnable`, as on the game's GPU).
+fn server_passes(asked: Passes, more: bool) -> Passes {
+    super::native::runnable(asked, more)
+}
+
+/// One frame's buffers on the other device, in submission order: the copies in (`up`), pass 1 (`frame`: its first
+/// frame's buffer and its parity's), the later passes with the copies between them (`later`:
+/// `NativePass::later_sequence`), the answer's copy out (`down`).
+fn frame_submits(
+    up: vk::CommandBuffer,
+    frame: &[Option<vk::CommandBuffer>; 2],
+    later: &[vk::CommandBuffer],
+    down: vk::CommandBuffer,
+) -> Vec<vk::CommandBuffer> {
+    let mut all = vec![up];
+    all.extend(frame.iter().flatten().copied());
+    all.extend_from_slice(later);
+    all.push(down);
+    all
 }
 
 // SAFETY: plain handles of the offload device and its own mappings, used on the worker's thread only.
 unsafe impl Send for PreRunner {}
 
-/// `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (a test switch): that frame of the before-DLSS offload fails on the other
+/// `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (a test switch): that frame of a hold's offload (before DLSS or after its output) fails on the other
 /// GPU, so the fall-back to the game's GPU can be seen in a game.
 fn test_fail_at() -> Option<u64> {
     static AT: std::sync::LazyLock<Option<u64>> =
@@ -92,7 +119,14 @@ fn test_fail_at() -> Option<u64> {
 impl PreRunner {
     /// On the offload device made with the game's device `game` (`offload::take`): its loader, queue and command
     /// buffers. `Err` with why it cannot serve (the device is given back).
-    pub(crate) fn start(instance: ash::Instance, game: vk::Device, shared: bool, capacity: (usize, usize), metas: Metas) -> Result<(Self, String), String> {
+    pub(crate) fn start(
+        instance: ash::Instance,
+        game: vk::Device,
+        shared: bool,
+        capacity: (usize, usize),
+        metas: Metas,
+        at: super::offload_pre::Where,
+    ) -> Result<(Self, String), String> {
         let off = match super::offload::take(game) {
             Some(Ok(off)) => off,
             Some(Err(why)) => return Err(why),
@@ -105,7 +139,11 @@ impl PreRunner {
         }
         let name = off.name.clone();
         crate::log!("[offload] {}", off.plan);
-        crate::log!("[offload] before DLSS: each frame's edit comes from the other GPU and is applied one frame later, carried by DLSS's motion vectors; nothing DLSS reads is delayed");
+        crate::log!(
+            "[offload] {}: each frame's edit comes from the other GPU and is applied one frame later, carried by DLSS's motion vectors; {}",
+            at.name(),
+            if at == super::offload_pre::Where::Before { "nothing DLSS reads is delayed" } else { "DLSS's output is not delayed" }
+        );
         crate::logging::flush();
         let device = &off.device;
         let setup = off.setup;
@@ -161,6 +199,8 @@ impl PreRunner {
                 leaked: false,
                 said_loading: false,
                 frames: 0,
+                at,
+                said_more: None,
             },
             name,
         ))
@@ -186,7 +226,8 @@ impl PreRunner {
             match (o, i) {
                 (Some(o), Some(i)) => {
                     crate::log!(
-                        "[offload] before DLSS: the frame crosses system memory, {} on the other GPU ({:.1} MB out, {:.1} MB back per frame)",
+                        "[offload] {}: the frame crosses system memory, {} on the other GPU ({:.1} MB out, {:.1} MB back per frame)",
+                        self.at.name(),
                         if o.staged || i.staged { "copied once more there" } else { "imported there without a copy" },
                         layout.out_bytes as f64 / 1048576.0,
                         layout.in_bytes as f64 / 1048576.0
@@ -214,7 +255,9 @@ impl PreRunner {
                 unsafe {
                     f.native.destroy(device);
                     f.hdr.destroy(device);
-                    f.depth.destroy(device);
+                    if let Some(d) = f.depth {
+                        d.destroy(device);
+                    }
                 }
             }
         }
@@ -223,9 +266,14 @@ impl PreRunner {
             let built = unsafe {
                 let hdr = super::hdr::HdrPass::build(device, instance, physical, meta.width, meta.height);
                 let native = NativePass::build_at(device, instance, physical, setup.family, meta.width, meta.height, meta.extents, false, false);
-                let depth = super::native::DepthCopy::build(device, instance, physical, setup.family, meta.width, meta.height, false);
+                // No depth crosses for the hold after DLSS's output: no buffer for it there.
+                let wants_depth = layout.sizes.depth > 0;
+                let depth =
+                    if wants_depth { super::native::DepthCopy::build(device, instance, physical, setup.family, meta.width, meta.height, false) } else { None };
                 match (hdr, native, depth) {
-                    (Some(hdr), Some(native), Some(depth)) => Some(Frame { width: meta.width, height: meta.height, extents: meta.extents, hdr, native, depth }),
+                    (Some(hdr), Some(native), depth) if depth.is_some() == wants_depth => {
+                        Some(Frame { width: meta.width, height: meta.height, extents: meta.extents, hdr, native, depth })
+                    }
                     (hdr, native, depth) => {
                         if let Some(x) = hdr {
                             x.destroy(device);
@@ -249,7 +297,7 @@ impl PreRunner {
         }
         let Some(builts) = loader.ready_sizes(&meta.sizes, meta.choice, 0) else {
             if !std::mem::replace(&mut self.said_loading, true) {
-                crate::log!("[offload] before DLSS: the network is loading on the other GPU; the frames go to DLSS as they are until it runs");
+                crate::log!("[offload] {}: the network is loading on the other GPU; the frames go on as they are until it runs", self.at.name());
                 crate::logging::flush();
             }
             let why = loader.failed().or_else(|| loader.paused().then(|| "the VRAM guard paused it".to_string()));
@@ -263,9 +311,19 @@ impl PreRunner {
         let built = builts[own];
         // Its own compute family: the graph recorded for it.
         let graphs: Vec<Graph> = builts.iter().map(|&b| Graph { built: b, graph: b.graph_own }).collect();
-        // One pass there (the first of the stage).
-        let passes = super::native::runnable(meta.passes, false);
-        let depth = meta.depth.then(|| f.depth.buffer());
+        // Every pass of the stage there, as on the game's GPU: the later passes' buffers built once (a failure runs one).
+        // SAFETY: nothing of the pass is pending (every frame is waited for); the frames' family is the setup's.
+        let more = meta.passes.count > 1 && unsafe { f.native.ensure_more(device, instance, physical, setup.family, meta.passes.count) };
+        let passes = server_passes(meta.passes, more);
+        if meta.passes.count > 1 && self.said_more != Some(passes.count) {
+            if more {
+                crate::log!("[offload] {}: all {} passes of the stage run on the other GPU", self.at.name(), passes.count);
+            } else {
+                crate::log!("[offload] {}: the later passes' buffers could not be made on the other GPU: it runs pass 1 alone", self.at.name());
+            }
+        }
+        self.said_more = (meta.passes.count > 1).then_some(passes.count);
+        let depth = f.depth.as_ref().filter(|_| meta.depth && layout.sizes.depth > 0).map(super::native::DepthCopy::buffer);
         // SAFETY: nothing of the pass is pending (every frame is waited for); every handle is this device's.
         unsafe {
             if !f.native.ensure_lanes(device, instance, physical, passes.count) {
@@ -277,7 +335,16 @@ impl PreRunner {
             }
         }
         let history = f.native.begin_frame(built.network, meta.history);
-        let (frame_cmds, _) = f.native.frame_graphs(&graphs, history, meta.jitter, meta.mvec_scale, &passes);
+        let (frame_cmds, later) = f.native.frame_graphs(&graphs, history, meta.jitter, meta.mvec_scale, &passes);
+        let later = if more { later } else { Vec::new() };
+        // The copies between the passes, recorded for this frame (as the split hold does): `X` saves the capture and
+        // puts pass 1's answer (or its blend at a pass feedback below 1) where pass 2 reads, `Y` the same for each
+        // further pass, `R` puts the capture back. The encoded image is in GENERAL once `up` ran.
+        // SAFETY: built above and not pending (every frame is waited for); the encoded image is this device's.
+        let sequence = match unsafe { f.native.record_later(device, f.hdr.encoded_image(), f.hdr.encoded_view(), f.hdr.padded_region(), &passes, &later) } {
+            Ok(s) => s,
+            Err(_) => return Err(failed("recording the copies between the network's passes failed on the other GPU")),
+        };
         let (o, i) = self.regions.as_ref().expect("made above");
         let texels = u64::from(meta.width) * u64::from(meta.height);
         // SAFETY: the regions as the contract; the device's own command buffers, not pending.
@@ -320,8 +387,8 @@ impl PreRunner {
                     device.cmd_copy_buffer(up, o.buffer, dst, &[vk::BufferCopy { src_offset: at, dst_offset: to, size }])
                 };
                 copy(f.native.acc.buffer, layout.motion_at, 0, (texels * 8).min(layout.sizes.motion));
-                if meta.depth {
-                    copy(f.depth.buffer(), layout.depth_at, 0, (texels * 4).min(layout.sizes.depth));
+                if let Some(depth) = depth {
+                    copy(depth, layout.depth_at, 0, (texels * 4).min(layout.sizes.depth));
                 }
                 // The scene cut the game's GPU decided in its capture: the state's third word.
                 copy(f.native.state_buffer(), layout.side_at + super::hdr::HdrPass::EXPOSURE_BYTES + 8, 8, 4);
@@ -371,9 +438,7 @@ impl PreRunner {
             if recorded.is_err() {
                 return Err(failed("recording the frame's copies failed on the other GPU"));
             }
-            let mut all = vec![up];
-            all.extend(frame_cmds.into_iter().flatten());
-            all.push(down);
+            let all = frame_submits(up, &frame_cmds, &sequence, down);
             let started = Instant::now();
             if crate::note_vk(device.handle(), device.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&all)], self.fence)).is_err() {
                 f.native.gap.skipped();
@@ -382,6 +447,7 @@ impl PreRunner {
             for cmd in frame_cmds.into_iter().flatten() {
                 f.native.submitted(cmd);
             }
+            f.native.later_submitted(later.len());
             loader.pre_submitted(device, self.fence);
             let waited = device.wait_for_fences(&[self.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64);
             if waited.is_err() {
@@ -458,14 +524,16 @@ impl Runner for PreRunner {
             unsafe {
                 f.native.destroy(&off.device);
                 f.hdr.destroy(&off.device);
-                f.depth.destroy(&off.device);
+                if let Some(d) = f.depth {
+                    d.destroy(&off.device);
+                }
             }
         }
         if let Some(loader) = self.loader.take() {
             loader.retire();
             loader.stop_worker();
             drop(loader);
-            crate::log!("[offload] before DLSS: the network is closed on the other GPU; the game's GPU loads it");
+            crate::log!("[offload] {}: the network is closed on the other GPU; the game's GPU loads it", self.at.name());
             crate::logging::flush();
         }
     }
@@ -494,7 +562,9 @@ impl Drop for PreRunner {
             if let Some(f) = self.frame.take() {
                 f.native.destroy(device);
                 f.hdr.destroy(device);
-                f.depth.destroy(device);
+                if let Some(d) = f.depth {
+                    d.destroy(device);
+                }
             }
             if let Some((o, i)) = self.regions.take() {
                 o.destroy(device);
@@ -506,5 +576,29 @@ impl Drop for PreRunner {
         drop(loader);
         // Destroyed with the game's device (inside its vkDestroyDevice, the loader's lock held).
         super::offload::give_back(self.game, off, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pass of the stage the hold sent runs on the other GPU once the later passes' buffers are there (#63: only
+    /// pass 1 ran there, the others were dropped); without them pass 1 alone.
+    #[test]
+    fn the_other_gpu_runs_every_pass_of_the_stage() {
+        let asked = Passes { count: 3, ..Passes::default() };
+        assert_eq!(server_passes(asked, true).count, 3);
+        assert_eq!(server_passes(asked, false).count, 1);
+        assert_eq!(server_passes(Passes::default(), false).count, 1);
+    }
+
+    /// The later passes run after pass 1 and before the answer is copied out.
+    #[test]
+    fn the_answer_is_copied_out_after_the_last_pass() {
+        let cb = |n: u64| <vk::CommandBuffer as ash::vk::Handle>::from_raw(n);
+        let (up, down) = (cb(1), cb(9));
+        assert_eq!(frame_submits(up, &[None, Some(cb(2))], &[], down), vec![up, cb(2), down]);
+        assert_eq!(frame_submits(up, &[Some(cb(3)), Some(cb(2))], &[cb(5), cb(6), cb(7)], down), vec![up, cb(3), cb(2), cb(5), cb(6), cb(7), down]);
     }
 }
