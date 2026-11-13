@@ -252,8 +252,29 @@ pub enum ComposeInputs<'a> {
     ///
     /// `gate`: the answer is not in yet, but the other device has submitted the frame's work: the sync fd of that
     /// submission (`super::pace::Submitted`). It is imported into a semaphore of this device and the compose's
-    /// submission waits for it on the GPU. The fd is consumed, whatever the outcome.
-    Delayed { parity: usize, gate: Option<std::os::fd::RawFd> },
+    /// submission waits for it on the GPU. The fd is consumed, whatever the outcome. Where the import is refused,
+    /// the compose waits for the relay to resolve the frame instead, and composes only a good answer ([`Gate`]).
+    Delayed { parity: usize, gate: Option<Gate> },
+}
+
+/// The other device's sync fd a delayed present's compose or send waits for on the GPU, and what to wait for instead
+/// when this device cannot: the relay's resolution of frame `token` (`super::pace::Pacer::wait_resolved`), until
+/// `until`.
+#[derive(Clone, Copy, Debug)]
+pub struct Gate {
+    pub fd: std::os::fd::RawFd,
+    pub token: u64,
+    pub until: std::time::Instant,
+}
+
+/// What a compose or a send does with its [`Gate`] ([`Paced::take_gate`]).
+#[cfg(target_arch = "x86_64")]
+enum Gated {
+    /// Imported: the submission waits on this semaphore.
+    Wait(vk::Semaphore),
+    /// Not imported (none can be here, or the import was refused): the relay's resolution of the frame, waited for
+    /// on this thread (`Some(true)`: the answer is in and fits).
+    Resolved(Option<bool>),
 }
 
 /// `compose_hdr.comp`'s pipeline over `layout` (compose.comp's).
@@ -389,6 +410,14 @@ struct Paced {
     /// The semaphores the other device's sync fds are imported into, on a device with
     /// `VK_KHR_external_semaphore_fd`.
     sync: Option<SyncFd>,
+    /// This device refused an import: no compose or send waits on the GPU again on this compose ([`Self::take_gate`]).
+    refused: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The next this many sync-fd imports on this thread are refused, as a driver may refuse one.
+    pub(crate) static REFUSE_IMPORTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Binary semaphores of this device that take the other device's sync fds as temporary payloads: one per async slot
@@ -411,6 +440,12 @@ impl SyncFd {
             .flags(vk::SemaphoreImportFlags::TEMPORARY)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
             .fd(fd);
+        #[cfg(test)]
+        if REFUSE_IMPORTS.with(|r| r.get() > 0 && (r.set(r.get() - 1), true).1) {
+            // SAFETY: the caller's, handed over to this function.
+            unsafe { libc::close(fd) };
+            return false;
+        }
         // SAFETY: a semaphore of this device with no pending operation (its last wait's submission was waited for);
         // `fd` is a sync fd the caller owns.
         let imported = unsafe { self.api.import_semaphore_fd(&info) }.is_ok();
@@ -424,6 +459,47 @@ impl SyncFd {
 
 #[cfg(target_arch = "x86_64")]
 impl Paced {
+    /// Imports `gate` into the semaphore `pick` names, for a submission to wait on; or, where this compose has no
+    /// semaphores or this device refused an import (the first refusal is logged and ends the gating for this compose:
+    /// [`GpuCompose::can_gate`] is false from then on), waits for the relay to resolve the frame. The fd is consumed.
+    fn take_gate(&mut self, pick: impl FnOnce(&SyncFd) -> vk::Semaphore, gate: Gate) -> Gated {
+        match self.sync.as_ref().filter(|_| !self.refused) {
+            Some(sync) => {
+                let semaphore = pick(sync);
+                if sync.import(semaphore, gate.fd) {
+                    return Gated::Wait(semaphore);
+                }
+                self.refused = true;
+                crate::log!(
+                    "[offload] this GPU refused the other GPU's sync fd: the presents wait for the answers on the game's thread from here (no more waits on the GPU)"
+                );
+            }
+            // SAFETY: the caller's fd, handed over and not imported.
+            None => unsafe {
+                libc::close(gate.fd);
+            },
+        }
+        Gated::Resolved(self.pacer.wait_resolved(gate.token, gate.until))
+    }
+
+    /// Replaces `semaphore` (one of [`SyncFd`]'s) with a new one, after a submission that was to wait on its imported
+    /// payload failed: the payload is never consumed, and the next import needs a semaphore with none. Where a new one
+    /// cannot be made, the gating ends for this compose.
+    ///
+    /// # Safety
+    /// No submission that was made waits on `semaphore` (the one that was to failed).
+    unsafe fn renew(&mut self, device: &ash::Device, semaphore: vk::Semaphore) {
+        let Some(sync) = self.sync.as_mut() else { return };
+        let Some(at) = sync.compose.iter_mut().chain(sync.send.iter_mut()).find(|s| **s == semaphore) else { return };
+        // SAFETY: the contract: nothing pending uses it.
+        unsafe { device.destroy_semaphore(*at, None) };
+        // SAFETY: a plain creation on the live device.
+        *at = unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.unwrap_or_default();
+        if *at == vk::Semaphore::null() {
+            self.refused = true;
+        }
+    }
+
     /// # Safety
     /// The relay has ended and every send was waited.
     unsafe fn destroy(&self, device: &ash::Device) {
@@ -1650,7 +1726,7 @@ impl GpuCompose {
         #[cfg(target_arch = "x86_64")]
         let mut gate_fd = match inputs {
             // SAFETY: the caller hands the fd over (`ComposeInputs::Delayed`).
-            ComposeInputs::Delayed { gate: Some(fd), .. } => Some(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) }),
+            ComposeInputs::Delayed { gate: Some(gate), .. } => Some((unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(gate.fd) }, gate)),
             _ => None,
         };
         // An HDR10 frame composes only a full-size answer (the 8-bit enlargement would blur the frame's own
@@ -1828,16 +1904,15 @@ impl GpuCompose {
         // Gated: the other device's submission of this answer, imported, is what this submission waits for on the GPU.
         // That signal is submitted already (the fd exists), so the present's wait on `semaphore` depends on nothing
         // that is not (VUID-vkQueuePresentKHR-pWaitSemaphores-03268).
+        // Refused (or nothing to import into): the frame's answer is waited for here instead, and composed ungated
+        // only when it is in and fits; otherwise nothing is submitted and the caller shows the kept frame.
         #[cfg(target_arch = "x86_64")]
-        let gate = match gate_fd.take().map(std::os::fd::IntoRawFd::into_raw_fd) {
-            Some(fd) => match self.zc.paced.as_ref().and_then(|p| p.sync.as_ref()) {
-                Some(sync) if sync.import(sync.compose[idx], fd) => Some(sync.compose[idx]),
-                Some(_) => return None,
-                None => {
-                    // SAFETY: taken out of its guard just above, and not imported.
-                    unsafe { libc::close(fd) };
-                    return None;
-                }
+        let gate = match gate_fd.take() {
+            Some((fd, gate)) => match self.zc.paced.as_mut()?.take_gate(|sync| sync.compose[idx], Gate { fd: std::os::fd::IntoRawFd::into_raw_fd(fd), ..gate })
+            {
+                Gated::Wait(semaphore) => Some(semaphore),
+                Gated::Resolved(Some(true)) => None,
+                Gated::Resolved(_) => return None,
             },
             None => None,
         };
@@ -1848,6 +1923,11 @@ impl GpuCompose {
             submit = submit.wait_semaphores(&waits).wait_dst_stage_mask(&stages);
         }
         if !slot.slot.submit(device, queue, submit) {
+            #[cfg(target_arch = "x86_64")]
+            if let (Some(semaphore), Some(p)) = (gate, self.zc.paced.as_mut()) {
+                // SAFETY: the submission that was to wait on it failed.
+                unsafe { p.renew(device, semaphore) };
+            }
             return None;
         }
         if let Some(timer) = slot.timer.as_mut() {
@@ -2366,7 +2446,7 @@ impl GpuCompose {
                             }
                         })
                         .flatten();
-                    Some(Paced { cmd: [cmds[0], cmds[1]], fence: [fences[0], fences[1]], armed: [false; 2], pacer, sent: 0, sync })
+                    Some(Paced { cmd: [cmds[0], cmds[1]], fence: [fences[0], fences[1]], armed: [false; 2], pacer, sent: 0, sync, refused: false })
                 }
                 (_, cmds) => {
                     for f in fences {
@@ -2388,7 +2468,7 @@ impl GpuCompose {
     /// `gate`, [`Self::send_delayed`]'s `after`): this device has `VK_KHR_external_semaphore_fd`.
     #[cfg(target_arch = "x86_64")]
     pub fn can_gate(&self) -> bool {
-        self.zc.paced.as_ref().is_some_and(|p| p.sync.is_some())
+        self.zc.paced.as_ref().is_some_and(|p| p.sync.is_some() && !p.refused)
     }
 
     /// The delayed present's relay, once [`Self::ensure_paced`] made it.
@@ -2413,12 +2493,12 @@ impl GpuCompose {
         parity: usize,
         proxy: vk::Buffer,
         bytes: u64,
-        after: Option<std::os::fd::RawFd>,
+        after: Option<Gate>,
     ) -> Option<(u64, vk::Fence)> {
-        let close = |fd: Option<std::os::fd::RawFd>| {
-            if let Some(fd) = fd {
+        let close = |gate: Option<Gate>| {
+            if let Some(gate) = gate {
                 // SAFETY: the caller's fd, handed over to this function and not used yet.
-                unsafe { libc::close(fd) };
+                unsafe { libc::close(gate.fd) };
             }
         };
         let Some(base) =
@@ -2431,11 +2511,6 @@ impl GpuCompose {
             close(after);
             return None;
         };
-        if after.is_some() && p.sync.is_none() {
-            // Nothing to wait with: the copy must not run under the server's read.
-            close(after);
-            return None;
-        }
         // The pair's last send is two frames old, and the relay is done with its fence (its frame was resolved).
         if p.armed[parity] && !wait_armed(device, &[Some(p.fence[parity])], "gpu::send_delayed reuse") {
             close(after);
@@ -2479,14 +2554,15 @@ impl GpuCompose {
             return None;
         }
         let mut submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-        let gate = match (after, p.sync.as_ref()) {
-            (Some(fd), Some(sync)) => {
-                if !sync.import(sync.send[parity], fd) {
-                    return None;
-                }
-                Some(sync.send[parity])
-            }
-            _ => None,
+        // Nothing to import into, or refused: the copy must not run under the server's read, so the frame before is
+        // waited for here; resolved, the server is done with the region (answered or given up).
+        let gate = match after {
+            Some(after) => match p.take_gate(|sync| sync.send[parity], after) {
+                Gated::Wait(semaphore) => Some(semaphore),
+                Gated::Resolved(Some(_)) => None,
+                Gated::Resolved(None) => return None,
+            },
+            None => None,
         };
         let (waits, stages) = ([gate.unwrap_or_default()], [vk::PipelineStageFlags::ALL_COMMANDS]);
         if gate.is_some() {
@@ -2495,6 +2571,10 @@ impl GpuCompose {
         // SAFETY: the fence was waited and is reset here; the caller holds the queue (the present's).
         let submitted = unsafe { device.reset_fences(&[p.fence[parity]]).and_then(|()| device.queue_submit(queue, &[submit], p.fence[parity])) };
         if crate::note_vk(device.handle(), submitted).is_err() {
+            if let Some(semaphore) = gate {
+                // SAFETY: the submission that was to wait on it failed.
+                unsafe { p.renew(device, semaphore) };
+            }
             return None;
         }
         p.armed[parity] = true;
@@ -4395,14 +4475,59 @@ mod tests {
                     upload(&frame_b, true);
                     unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
                     let (gate, after) = (other.submit(), other.submit());
-                    let shown = present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: Some(gate.into_raw_fd()) }, 20 + round)
-                        .expect("the gated compose is submitted");
+                    let gate = Gate { fd: gate.into_raw_fd(), token: 0, until: std::time::Instant::now() };
+                    let shown = present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: Some(gate) }, 20 + round).expect("the gated compose is submitted");
                     assert_eq!(shown, composed, "the gated compose is the same compose");
-                    let sent = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes, Some(after.into_raw_fd())).expect("the gated send is submitted");
+                    let after = Gate { fd: after.into_raw_fd(), token: 0, until: std::time::Instant::now() };
+                    let sent = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes, Some(after)).expect("the gated send is submitted");
                     unsafe { device.wait_for_fences(&[sent.1], true, 30_000_000_000) }.expect("the send ran once the other device's work was done");
                 }
+                // An import the driver refuses: the compose waits for the relay's resolution of the frame instead and
+                // composes the good answer ungated, and nothing waits on the GPU on this compose again (the send after
+                // it, and the next frame, wait here: their frame before is resolved).
+                assert!(gpu.can_gate());
+                fake.good.store(true, Ordering::SeqCst);
+                let post = |gpu: &GpuCompose, (number, copied): (u64, vk::Fence)| {
+                    assert!(gpu.pacer().expect("made").post(super::super::pace::Token {
+                        number,
+                        copied,
+                        proxy: (width, height),
+                        pq10: false,
+                        dims: (width, height),
+                        budget: std::time::Duration::from_secs(30),
+                        posted: std::time::Instant::now(),
+                        judged: false,
+                        meter: None,
+                    }));
+                    number
+                };
+                upload(&current, true);
+                assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, true).is_some());
+                let sent = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes, None).expect("the frame is sent");
+                let mut number = post(&gpu, sent);
+                for round in 0..2u64 {
+                    upload(&frame_b, true);
+                    unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
+                    REFUSE_IMPORTS.with(|r| r.set(1));
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    let gate = Gate { fd: other.submit().into_raw_fd(), token: number, until };
+                    let shown = present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: Some(gate) }, 40 + round)
+                        .expect("a refused import composes the answer once the relay has it");
+                    assert_eq!(shown, composed, "the same compose, ungated");
+                    assert!(!gpu.can_gate(), "no wait on the GPU after a refused import");
+                    assert_eq!(REFUSE_IMPORTS.with(std::cell::Cell::get), u32::from(round == 1), "the first refusal ends the imports");
+                    REFUSE_IMPORTS.with(|r| r.set(0));
+                    // The next frame, kept and sent behind that compose, ungated.
+                    upload(&current, true);
+                    assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, true).is_some());
+                    let after = Gate { fd: other.submit().into_raw_fd(), token: number, until };
+                    let sent = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes, Some(after)).expect("the send goes ungated");
+                    number = post(&gpu, sent);
+                }
+                assert_eq!(gpu.pacer().expect("made").wait_resolved(number, std::time::Instant::now() + std::time::Duration::from_secs(30)), Some(true));
                 // A pair that was never kept: the fd is consumed all the same (nothing is left open or imported).
-                assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0, gate: Some(other.submit().into_raw_fd()) }, 30).is_none());
+                let gate = Gate { fd: other.submit().into_raw_fd(), token: 0, until: std::time::Instant::now() };
+                assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0, gate: Some(gate) }, 30).is_none());
                 assert!(gpu.wait_in_flight(&device));
                 other.close();
             }
