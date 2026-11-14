@@ -514,6 +514,17 @@ fn target_for_enable(game: &neural_forge_supervisor::steam::Game, chosen: &str) 
 /// `anti_cheat_ok`: switch on a game that ships anti-cheat (`enable --anti-cheat-ok`).
 /// The game's Proton after its launch options ([`neural_forge_supervisor::compat`]): a Neural Forge Proton when
 /// switched on (its copy made first, with the notice), the earlier one back when switched off.
+/// What `proton-tool update` says after a copy was renamed, merged or made again: the games moved and any note.
+fn print_update_extras(done: &neural_forge_supervisor::compat_tool::Updated) {
+    use neural_forge_supervisor::compat_tool::app_label;
+    if !done.moved.is_empty() {
+        println!("  moved to it: {}", done.moved.iter().map(|a| app_label(a)).collect::<Vec<_>>().join(", "));
+    }
+    if let Some(note) = &done.note {
+        println!("  note: {note}");
+    }
+}
+
 fn set_game_proton(game: &neural_forge_supervisor::steam::Game, on: bool) -> ExitCode {
     use neural_forge_supervisor::{compat_tool, proton_tool, steam};
     let root = &game.root.path;
@@ -529,6 +540,9 @@ fn set_game_proton(game: &neural_forge_supervisor::steam::Game, on: bool) -> Exi
                     println!("{}\n", proton_tool::NOTICE);
                 }
                 println!("{} runs with {} now (it ran with {}).", game.name, done.tool, done.previous.as_deref().unwrap_or("Steam's default Proton"));
+                if let Some(note) = &done.note {
+                    println!("Note: {note}");
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -861,14 +875,16 @@ fn command_usage(command: &str) -> Option<&'static str> {
             "usage: neural-forge-cli proton-tool [list | create SOURCE | update | remove NAME]\n  \
              list: the Protons a copy can be made from and the copies Neural Forge made (outdated ones marked).\n  \
              create SOURCE: copy the installed Proton SOURCE (its name in Steam, its version name or its folder)\n  \
-             into Steam's compatibilitytools.d as <version>-NeuralForge: hard links on the same drive, with\n  \
-             Neural Forge's NGX wrapper as _nvngx.dll so the layer reads DLSS's own parameters. Restart Steam,\n  \
-             then choose it per game in Properties > Compatibility. PROTON_NO_NEURAL_FORGE_NGX=1 in a game's\n  \
+             into Steam's compatibilitytools.d as <version>-NeuralForge (Proton-<version>-NeuralForge when the\n  \
+             version does not say Proton: Steam syncs Steam Cloud saves in the prefix only for a tool named so):\n  \
+             hard links on the same drive, with Neural Forge's NGX wrapper as _nvngx.dll so the layer reads\n  \
+             DLSS's own parameters. Restart Steam, then choose it per game in Properties > Compatibility. PROTON_NO_NEURAL_FORGE_NGX=1 in a game's\n  \
              launch options turns the wrapper off for that game. Only a Proton built on Wine 10 or newer\n  \
              (Proton 10 or newer, GE-Proton10 or newer) can be copied.\n  \
              update: make every outdated copy again from its source's current version, with the installed\n  \
-             NGX wrapper. A copy of a new version gets a new name: with Steam closed, the games set to the\n  \
-             old copy are moved to the new one and the old copy is removed (never one a running game uses).\n  \
+             NGX wrapper. A copy of a new version, or one named without Proton, gets a new name: with Steam\n  \
+             closed, the games set to the old copy are moved to the new one and the old copy is removed (never one a running game uses).\n  \
+             A copy named without Proton whose source is gone is renamed in place instead (Steam closed), its games moved.\n  \
              remove NAME: delete a copy Neural Forge made (not while a game runs with it)"
         }
         "shmctl" => "",
@@ -908,7 +924,14 @@ fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
             }
             println!("Copies made by Neural Forge:");
             for t in proton_tool::tools(root) {
-                println!("  {}{} from {}", t.name, if proton_tool::outdated(&t) { " (outdated: `proton-tool update`)" } else { "" }, t.source.display());
+                let note = if proton_tool::steam_cloud_blind(&t) {
+                    " (outdated: `proton-tool update`; its name lacks \"Proton\", so Steam Cloud does not sync the saves games keep in its prefix)"
+                } else if proton_tool::outdated(&t) {
+                    " (outdated: `proton-tool update`)"
+                } else {
+                    ""
+                };
+                println!("  {}{note} from {}", t.name, t.source.display());
             }
             ExitCode::SUCCESS
         }
@@ -943,14 +966,43 @@ fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
         ProtonToolCmd::Update => {
             let mut failed = false;
             let running = steam::steam_running(std::path::Path::new("/proc"));
+            // Games left on a name a rename stopped before moving them go to the renamed copy.
+            match neural_forge_supervisor::compat_tool::repair_orphans(root, running) {
+                Ok(found) => {
+                    for o in found {
+                        let games: Vec<String> = o.games.iter().map(|g| neural_forge_supervisor::compat_tool::app_label(g)).collect();
+                        println!("{}: moved to {} (the copy was renamed already): {}", o.name, o.to, games.join(", "));
+                    }
+                }
+                Err(e) => {
+                    failed = true;
+                    eprintln!("{e}");
+                }
+            }
             for t in proton_tool::tools(root).into_iter().filter(proton_tool::outdated) {
-                match neural_forge_supervisor::compat_tool::update(root, &libraries, &t, &wrapper, running) {
-                    Ok(done) if done.to == done.from => println!("{}: made again (its source's current version, the installed NGX wrapper)", t.name),
+                match neural_forge_supervisor::compat_tool::update(root, &t, &wrapper, running) {
+                    Ok(done) if done.to == done.from => {
+                        println!("{}: made again (its source's current version, the installed NGX wrapper)", t.name);
+                        print_update_extras(&done);
+                    }
+                    Ok(done) if done.renamed => {
+                        println!("{}: renamed to {} (its source is gone; the copy holds its own files)", t.name, done.to);
+                        print_update_extras(&done);
+                    }
+                    Ok(done) if done.merged => {
+                        println!("{}: moved its games to {} (a copy of the same version)", t.name, done.to);
+                        print_update_extras(&done);
+                        match done.kept {
+                            Some(why) => {
+                                failed = true;
+                                eprintln!("  {} is kept: {why}", t.name);
+                            }
+                            None => println!("  removed {}", t.name),
+                        }
+                    }
                     Ok(done) => {
                         println!("{}: made {} from the current version", t.name, done.to);
-                        if !done.moved.is_empty() {
-                            println!("  moved to it: app {}", done.moved.join(", app "));
-                        }
+                        print_update_extras(&done);
                         match done.kept {
                             Some(why) => {
                                 failed = true;

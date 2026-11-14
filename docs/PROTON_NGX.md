@@ -168,7 +168,13 @@ and removes the file once mapped, so nothing else can take a live game's ring.
 ## The Proton copy (`crates/supervisor/src/proton_tool.rs`, `neural-forge-cli proton-tool`, the Setup tab)
 
 Nothing of Proton is rebuilt. The app copies an installed Proton (GE-Proton, Proton-CachyOS, Valve's Proton or Proton
-Experimental) into Steam's `compatibilitytools.d` as `<version>-NeuralForge`, with hard links where it is on the same
+Experimental) into Steam's `compatibilitytools.d` as `proton_copy::copy_name(<version>)`: the source's version name
+made safe for a folder, with `Proton-` before it when it does not say "proton", and `-NeuralForge`
+(`GE-Proton11-12-NeuralForge`, `Proton-experimental-11.0-20261105c-x86_64-NeuralForge`; `Proton-NeuralForge` for a
+version with nothing left once made safe). Steam's client maps the Windows folders Steam Cloud saves live in (AppData,
+Saved Games, Documents) into the game's prefix only for a compatibility tool whose name contains "proton" (any case); for
+any other it logs "Unable to resolve path with root WinAppDataLocal" and syncs none of those saves (#71), so every copy's
+name says Proton (`proton_copy::cloud_name`). It is made with hard links where the source is on the same
 filesystem (no space), and writes three files new: `proton` with the two overrides after Valve's `NVIDIA_WINE_DLL_DIR`
 block (refused unless that block is there exactly once), `compatibilitytool.vdf` with the new name, and
 `files/lib/wine/x86_64-windows/_nvngx.dll`. The `version` file stays the source's, so a game's prefix is not upgraded
@@ -188,23 +194,45 @@ running game uses (a process whose executable or arguments lie in it) is neither
   chosen, Proton Experimental. A native Linux game (its installed launch executable is the Linux one) with no Proton
   chosen is left without Proton. The game's earlier choice is recorded (`config.vdf.neural-forge.compat`) before
   `config.vdf` is edited; a `config.vdf` without a `CompatToolMapping` block gets one.
-- **Updates.** When the source changes (a new GE-Proton in a "Latest" folder, a Proton Experimental update), the copy
-  is listed as outdated, and `proton-tool update` (or Make again) makes a copy of the new version; with Steam closed,
-  every game set to the old copy is moved to the new one and the old copy is removed. The copy's name holds the
-  source's version name, so a new version is a new name (the games' `CompatToolMapping` moves with it); the same
-  name (a wrapper-only update) is made again in place. **One check, four places:** `proton_copy::newer_source`
-  (`crates/protocol/src/proton_copy.rs`: the copy's marker names its source and the source's version then; the
-  source's version now is its `version` file's second word) is behind `proton_tool::source_changed`, `doctor`, the
-  Status tab's **Proton copies out of date** group and Setup's Make again (`compat_tool::stale_copies` adds the
-  games set to each copy), and the layer's launch notice. At launch only the layer runs (the launch options are
-  environment variables), so it reads Steam's `STEAM_COMPAT_TOOL_PATHS` (the compat tool folders the game runs with),
-  and for a copy among them whose source has another version than its marker names, logs once per process
-  (`proton_notice.rs`): `[proton] this game runs with <copy>, made from <old> but <source> has <new> now: close Steam
-  and use Make again ...`. Nothing is logged when the source is unreachable from the game's container or gone. When Neural Forge itself is
+- **Updates.** A copy is made again (`proton_tool::remake`, the one check behind switching a game on, Make again,
+  `proton-tool update`, `doctor`, the Status tab's **Proton copies out of date** group and the Setup tab) for one of two
+  reasons. `Remake::Source`: its source changed (a new GE-Proton in a "Latest" folder, a Proton Experimental update;
+  `proton_copy::newer_source`, in `crates/protocol/src/proton_copy.rs`: the copy's marker names its source and the
+  source's version then, the source's version now is its `version` file's second word). `Remake::Name`: its name lacks
+  "Proton" (made by Neural Forge 4.2.0 or older from Proton Experimental, Proton Hotfix or Proton-CachyOS), whether or
+  not its source is still there. Whether the source is there is one test too, `proton_tool::source_of` (the folder the
+  marker names, read directly whatever library holds it, listed or not). `proton-tool update` (or Make again) then makes
+  a copy of the source's current version; with Steam closed, every game set to the old copy (the default entry `0`
+  too) is moved to the new one in one edit of `config.vdf` and the old copy is removed. A new version or a name that
+  now says Proton is a new name (the games' `CompatToolMapping` moves with it); the same name (a wrapper-only update)
+  is made again in place. With Steam running, the new copy is made and the old one kept, nothing moved; the next update
+  with Steam closed finishes. A copy named without Proton whose source is gone is renamed in place instead
+  (`proton_tool::rename_in`: it holds its own files): its `compatibilitytool.vdf` written new with `copy_name` of its
+  own version first, then its folder renamed (a stop in between leaves a folder Make again renames; a manifest that
+  cannot be written changes nothing), its games moved (folder and manifest put back exactly if they cannot be) and
+  its wrapper renewed (a wrapper that cannot be renewed after the move is a note, Make again offers it again); refused
+  while Steam runs, while a game runs with it, and when another tool has the new name (a Neural Forge copy of the same
+  version there, made from the same source path or another, takes its games instead and the old copy goes:
+  `proton_tool::rename_plan`, which `describe()` and `doctor` read too). Games a stopped rename left on the old name
+  (no folder of that name, the renamed copy there: `compat_tool::orphaned_mappings`) are moved to the renamed copy by
+  `proton-tool update`, by Make again and by switching any game on, and `doctor` reports them. Switching a game on that
+  is set to a copy to be made again does the same for the copy; when the rename is refused (a game runs with the copy,
+  another tool has the name) the game stays on its copy with its wrapper renewed and a note says the rename is pending. `compat_tool::stale_copies` adds the games
+  set to each copy for the Status and Setup tabs; the Setup tab offers no **Make copy** for a source that has a copy to
+  be made again (its Make again is the way). `doctor` names the copy Make again will give (`proton_tool::remade_name`).
+  At launch only the layer runs (the launch options are environment variables), so it reads Steam's
+  `STEAM_COMPAT_TOOL_PATHS` (the compat tool folders the game runs with), and for a copy among them logs once per
+  process (`proton_notice.rs`, `proton_copy::stale_notice`) one of two lines: for a source with another version than
+  the marker names, `[proton] this game runs with <copy>, made from <old> but <source> has <new> now: close Steam and
+  use Make again ... to renew the copy (the new one is named <name>)`, which also says that Steam Cloud does not sync the
+  saves in the prefix when the name lacks Proton; for a name without Proton alone, `[proton] this game runs with
+  <copy>, whose name lacks "Proton": Steam Cloud does not sync the saves the game keeps in its Wine prefix with it;
+  close Steam and use Make again ...: the copy is named <name> then and the game moves to it`. A source that is
+  unreachable from the game's container or gone gives no first line. When Neural Forge itself is
   installed or updated (the app at start, `install --appdir`), each copy whose marker names another wrapper
   (`wrapper_sha256=`) gets the installed one; `doctor` warns about a copy that still holds another. A copy whose
-  source folder is gone (ProtonUp replaced GE-Proton11-12 with 11-13) is not outdated: it holds its own files and keeps
-  working, switching a game on and `update` only renew its wrapper, and `doctor` notes it.
+  source folder is gone (ProtonUp replaced GE-Proton11-12 with 11-13) and whose name says Proton is not outdated: it
+  holds its own files and keeps working, switching a game on and `update` only renew its wrapper, and `doctor` notes it.
 - **Purge.** `uninstall --purge` is refused before it changes anything while a game runs with a copy (the games are
   named). Otherwise it puts back each recorded game's Proton, takes any other game still set to a copy (a marked one,
   or a `-NeuralForge` name whose folder is gone; never another tool with that suffix) off it, then removes only marked

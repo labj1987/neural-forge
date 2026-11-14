@@ -698,8 +698,10 @@ pub(crate) struct CachePass {
     /// The set of the capture run a hold late (`super::offload_pre`): as `set`, with the sent frame's kept colour
     /// in place of the colour input; what it points at ([`Self::bind_late`]).
     late_set: vk::DescriptorSet,
-    late_bound: Option<(Bindings, bool, vk::ImageView)>,
+    late_bound: Option<(Bindings, bool, vk::ImageView, u64)>,
     stats: HostBuffer,
+    /// Which pass this is, counted over the process ([`Self::stats_made`]).
+    stats_made: u64,
     /// Bound where the scratch or the depth is not there (the shaders do not read it then).
     dummy: OwnBuffer,
     /// The interval is above 1 and the network's input features hold the [`ScratchLayout`].
@@ -804,6 +806,10 @@ impl CachePass {
                 late_set,
                 late_bound: None,
                 stats,
+                stats_made: {
+                    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                    MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                },
                 dummy,
                 chained: false,
                 layout: ScratchLayout::new(width, height),
@@ -879,20 +885,33 @@ impl CachePass {
     /// `GENERAL`) as the colour input. `false` when it cannot be written now ([`super::may_rewrite`]) or nothing
     /// is bound.
     ///
+    /// `made` names the image behind `colour` (the offload side's kept copy, `offload_pre::HoldSide::snapshot_made`:
+    /// counted, never a handle). The view's handle alone does not: a side destroyed and built again (the hand-over
+    /// between hold resource sets, `offload_pre::release_idle`, when the game's resolution or DLSS mode changes back
+    /// and forth: the side is rebuilt with them) often gets its new view under the old handle, and a set left as it
+    /// was then pointed at the freed image, where the late capture's dispatch read (#63: Xid 13, MMU fault and a
+    /// lost device on the game's GPU).
+    ///
     /// # Safety
     /// As [`Self::bind`], called before; `colour` is a live RGBA16F storage view.
-    pub(crate) unsafe fn bind_late(&mut self, device: &ash::Device, colour: vk::ImageView) -> bool {
+    pub(crate) unsafe fn bind_late(&mut self, device: &ash::Device, colour: vk::ImageView, made: u64) -> bool {
         let Some((b, chained)) = self.bound else { return false };
-        if self.late_bound == Some((b, chained, colour)) {
+        if self.late_bound == Some((b, chained, colour, made)) {
             return true;
         }
         if !super::may_rewrite("the edit cache's late capture set") {
             return false;
         }
-        self.late_bound = Some((b, chained, colour));
+        self.late_bound = Some((b, chained, colour, made));
         // SAFETY: the contract.
         unsafe { self.write_set(device, self.late_set, &Bindings { colour, ..b }) };
         true
+    }
+
+    /// The image the late capture's set points at is going (its offload side is destroyed): the set is written
+    /// again before it is next used, whatever the next side's handles are.
+    pub(crate) fn forget_late(&mut self) {
+        self.late_bound = None;
     }
 
     /// # Safety
@@ -1201,6 +1220,13 @@ impl CachePass {
     /// out for the host, and the hold guard clears [`STAT_EDIT_STORED`] in it.
     pub(crate) fn stats_buffer(&self) -> vk::Buffer {
         self.stats.buffer
+    }
+
+    /// Names the buffer behind [`Self::stats_buffer`]: another number for every pass built, so a set bound to a
+    /// destroyed pass's counters is never taken for this one's when the driver gives the buffer its handle again
+    /// (`offload_pre::Exchange::bind_gate`).
+    pub(crate) fn stats_made(&self) -> u64 {
+        self.stats_made
     }
 
     /// Reads what the last submitted hold's passes counted (its fence was waited on): the stored
@@ -1753,6 +1779,21 @@ mod tests {
             // SAFETY: as above.
             unsafe { rig.pass.bind(&device, &again) };
             assert_eq!(rig.pass.bound.map(|(b, _)| b.made), Some(made), "another object behind the same handles ({k}): written again");
+        }
+        // The late capture's set (the offload side's kept colour): written again for another side's image under the
+        // same view handle, and after a side was destroyed, whatever comes next.
+        let view = first.colour;
+        // SAFETY: as above; the view is the rig's live colour view, standing in for a side's kept copy.
+        unsafe {
+            assert!(rig.pass.bind_late(&device, view, 1));
+            let written = rig.pass.late_bound;
+            assert!(rig.pass.bind_late(&device, view, 1));
+            assert_eq!(rig.pass.late_bound, written, "the same side's image: nothing to write");
+            assert!(rig.pass.bind_late(&device, view, 2));
+            assert_eq!(rig.pass.late_bound.map(|l| l.3), Some(2), "another side's image under the same handle: written again");
+            rig.pass.forget_late();
+            assert_eq!(rig.pass.late_bound, None, "its side destroyed: nothing is taken as bound");
+            assert!(rig.pass.bind_late(&device, view, 2) && rig.pass.late_bound.is_some());
         }
         // HdrPass::bind_colour counts every view it makes, whatever handle the driver gives it.
         let (instance, physical) = (rig.gpu.1.clone(), rig.gpu.2);

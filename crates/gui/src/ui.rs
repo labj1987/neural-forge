@@ -2555,9 +2555,10 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                                             match d {
                                                 None => "; a native Linux game: it runs without Proton".to_string(),
                                                 Some(d) => format!(
-                                                    "; it runs with {} now{}",
+                                                    "; it runs with {} now{}{}",
                                                     d.tool,
-                                                    if d.made { " (a copy made for Neural Forge: restart Steam to see it)" } else { "" }
+                                                    if d.made { " (a copy made for Neural Forge: restart Steam to see it)" } else { "" },
+                                                    d.note.map(|n| format!(". Note: {n}")).unwrap_or_default()
                                                 ),
                                             }
                                         }))
@@ -2685,7 +2686,8 @@ struct ProtonScan {
     root: Option<std::path::PathBuf>,
     sources: Vec<neural_forge_supervisor::proton_tool::Source>,
     tools: Vec<(neural_forge_supervisor::proton_tool::Tool, bool)>,
-    /// The copies older than their source (`compat_tool::stale_copies`, the check `doctor` makes).
+    /// The copies made again (`compat_tool::stale_copies`, the check `doctor` makes): older than their source, or
+    /// named without "Proton".
     stale: Vec<neural_forge_supervisor::compat_tool::StaleCopy>,
 }
 
@@ -2696,9 +2698,13 @@ fn scan_protons() -> ProtonScan {
     };
     let libraries = steam::libraries(&root);
     let tools: Vec<(proton_tool::Tool, bool)> = proton_tool::tools(&root).into_iter().map(|t| (t.clone(), proton_tool::outdated(&t))).collect();
-    // A source whose current copy exists is not offered again.
-    let sources = proton_tool::sources(&root, &libraries).into_iter().filter(|s| !tools.iter().any(|(t, _)| t.name == s.tool_name())).collect();
     let stale = neural_forge_supervisor::compat_tool::stale_copies(&root);
+    // A source whose current copy exists is not offered again, nor one with a copy Make again makes again (an older
+    // version, or a name without "Proton"): that row's Make again is the one way to it.
+    let sources = proton_tool::sources(&root, &libraries)
+        .into_iter()
+        .filter(|s| !tools.iter().any(|(t, _)| t.name == s.tool_name()) && !stale.iter().any(|c| c.tool.source == s.dir))
+        .collect();
     ProtonScan { root: Some(root), sources, tools, stale }
 }
 
@@ -2731,7 +2737,12 @@ fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                 row.set_use_markup(false);
                 row.set_title(&tool.name);
                 row.set_subtitle(&if let Some(stale) = scan.stale.iter().find(|s| s.tool.name == tool.name) {
-                    format!("Out of date: {}. Close Steam and make it again: its games move to the new copy", stale.describe())
+                    // (A copy renamed or merged in place says what happens to its games itself.)
+                    if stale.in_place() {
+                        format!("Out of date: {}. Close Steam and make it again", stale.describe())
+                    } else {
+                        format!("Out of date: {}. Close Steam and make it again: its games move to the new copy", stale.describe())
+                    }
                 } else if *outdated {
                     format!("from {}; Neural Forge's NGX wrapper has changed since: close Steam and make it again", tool.source.display())
                 } else {
@@ -2748,12 +2759,19 @@ fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                             let done = gio::spawn_blocking(move || {
                                 use neural_forge_supervisor::{compat_tool, steam};
                                 let running = steam::steam_running(std::path::Path::new("/proc"));
-                                compat_tool::update(&root, &steam::libraries(&root), &tool, &proton_tool::installed_wrapper(), running).map(|u| {
+                                compat_tool::update(&root, &tool, &proton_tool::installed_wrapper(), running).map(|u| {
+                                    let note = u.note.as_ref().map(|n| format!(". Note: {n}")).unwrap_or_default();
                                     if u.to == u.from {
-                                        format!("Made {} again", u.to)
+                                        format!("Made {} again{note}", u.to)
+                                    } else if u.renamed {
+                                        format!("Renamed {} to {}, its games moved with it{note}. Restart Steam to see it", u.from, u.to)
                                     } else {
                                         let kept = u.kept.map(|k| format!("; {} is kept: {k}", u.from)).unwrap_or_else(|| format!("; removed {}", u.from));
-                                        format!("Made {}, its games moved to it{kept}. Restart Steam to see it", u.to)
+                                        if u.merged {
+                                            format!("Moved its games to {}{kept}{note}. Restart Steam to see it", u.to)
+                                        } else {
+                                            format!("Made {}, its games moved to it{kept}{note}. Restart Steam to see it", u.to)
+                                        }
                                     }
                                 })
                             })
@@ -3404,13 +3422,15 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     group
 }
 
-/// The Status tab's notice for Neural Forge Proton copies older than the Proton they were made from
-/// (`compat_tool::stale_copies`, the check `doctor` makes): one row per copy naming it, its source and the games
+/// The Status tab's notice for Neural Forge Proton copies older than the Proton they were made from, or named without
+/// "Proton" so Steam Cloud skips their games' saves in the prefix (`compat_tool::stale_copies`, the check `doctor` makes): one row per copy naming it, its source and the games
 /// that run with it. Hidden while every copy is current; read again every 30 s on a worker.
 fn build_stale_proton_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Proton copies out of date");
-    group.set_description(Some("A game running with one of these keeps the older Proton's files. Close Steam and use Make again in the Setup tab."));
+    group.set_description(Some(
+        "A game running with one of these keeps an older Proton's files, or cannot sync its Steam Cloud saves. Close Steam and use Make again in the Setup tab.",
+    ));
     group.set_visible(false);
     let rows: std::rc::Rc<std::cell::RefCell<Vec<adw::ActionRow>>> = std::rc::Rc::default();
     every(&group, std::time::Duration::from_secs(30), move |group| {

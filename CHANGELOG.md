@@ -4,6 +4,31 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.2.1 — 2026-11-14
+
+**Steam Cloud saves sync with the Neural Forge copies of Proton Experimental, Proton Hotfix and Proton-CachyOS (#71)**
+
+- Steam syncs the Steam Cloud saves a game keeps in its Wine prefix (AppData, Saved Games, Documents) only when the
+  Proton's name contains "Proton". The copies of Proton Experimental, Proton Hotfix and Proton-CachyOS were named
+  after their version (`experimental-…-NeuralForge`), so Steam left those saves unsynced. Their copies are now named
+  `Proton-<version>-NeuralForge`; GE-Proton's copies keep their names.
+- A copy with the old name shows under "Proton copies out of date" on the Status tab, and Diagnose and the game's
+  layer log say Steam Cloud can't sync its saves. Close Steam and press **Make again** next to it in the Setup tab (or
+  run `neural-forge-cli proton-tool update`, or switch one of its games on again): its games, Steam's default Proton
+  included, move to the new copy and the old one is removed. If the Proton it was made from is no longer installed, the
+  copy is renamed in place instead (it holds its own files) and its games move with it; where a copy of the same
+  version already has the new name, the games move to it and the old copy is removed. If a rename stops half way,
+  Make again, `proton-tool update` or switching a game on moves the games it left behind, and Diagnose reports them.
+  Switching a game on when the rename cannot happen yet keeps it on its copy and says the rename is pending. Steam
+  syncs the waiting saves when Steam starts or the game next runs.
+- The Setup tab no longer offers **Make copy** for a Proton whose copy is waiting for **Make again**.
+
+**The model on a second GPU no longer crashes the game when the resolution or DLSS mode changes back and forth (#63)**
+
+- Fixed a crash where the game's GPU could lose its device (the game froze or closed) after the game's resolution or
+  DLSS mode changed back and forth while the model ran on a second GPU before DLSS. The same could possibly happen
+  when the model paused because video memory ran short and then came back.
+
 ## 4.2.0 — 2026-11-13
 
 **The model on a second GPU**

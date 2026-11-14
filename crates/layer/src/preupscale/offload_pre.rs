@@ -333,8 +333,9 @@ pub(crate) struct Exchange {
     pipeline: vk::Pipeline,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
-    /// The counters the gate's set points at.
-    gated: vk::Buffer,
+    /// The counters the gate's set points at: their buffer and which edit cache's they are
+    /// (`cache::CachePass::stats_made`).
+    gated: Option<(vk::Buffer, u64)>,
 }
 
 /// Page-aligned zeroed memory.
@@ -491,21 +492,7 @@ impl Exchange {
                 inn.destroy(device);
                 return None;
             };
-            Some(Self {
-                layout,
-                out,
-                inn,
-                regions,
-                shared,
-                sent,
-                progress: Arc::default(),
-                set_layout,
-                pipeline_layout,
-                pipeline,
-                pool,
-                set,
-                gated: vk::Buffer::null(),
-            })
+            Some(Self { layout, out, inn, regions, shared, sent, progress: Arc::default(), set_layout, pipeline_layout, pipeline, pool, set, gated: None })
         }
     }
 
@@ -525,10 +512,15 @@ impl Exchange {
 
     /// Points the gate at the edit cache's counters `stats`, when they changed.
     ///
+    /// `made` names the edit cache `stats` belongs to (`cache::CachePass::stats_made`: counted, never a handle). The
+    /// buffer's handle alone does not: an edit cache destroyed and built again while this side lives (the VRAM
+    /// guard's pause frees it) can get its new counters under the old handle, and a set left as it was then pointed
+    /// at the freed buffer, where the gate's dispatch writes.
+    ///
     /// # Safety
     /// `stats` is live and at least 64 bytes; nothing that may run uses the set unless it is unchanged.
-    pub(crate) unsafe fn bind_gate(&mut self, device: &ash::Device, stats: vk::Buffer) {
-        if self.gated == stats {
+    pub(crate) unsafe fn bind_gate(&mut self, device: &ash::Device, stats: vk::Buffer, made: u64) {
+        if self.gated == Some((stats, made)) {
             return;
         }
         let header = [vk::DescriptorBufferInfo { buffer: self.inn.buffer, offset: 0, range: HEADER_BYTES }];
@@ -537,7 +529,13 @@ impl Exchange {
             |n: u32, i| vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i);
         // SAFETY: the contract.
         unsafe { device.update_descriptor_sets(&[w(0, &header), w(1, &counters)], &[]) };
-        self.gated = stats;
+        self.gated = Some((stats, made));
+    }
+
+    /// The counters the gate's set points at are going (their edit cache is destroyed): the set is written again
+    /// before it is next used, whatever the next cache's handles are.
+    pub(crate) fn forget_gate(&mut self) {
+        self.gated = None;
     }
 
     /// Before the buffer of a hold planned as `plan` goes to the driver (in the order of the submit's buffers):
@@ -1061,6 +1059,8 @@ pub(crate) struct HoldSide {
     /// The colour input of the frame sent last, as the game left it: what the late capture measures the edit
     /// against (the hold's write-back has written the colour input since).
     snapshot: super::hdr::OwnImage,
+    /// Which kept copy this is, counted over the process ([`Self::snapshot_made`]).
+    snapshot_made: u64,
     /// The hold that sent last and its cache push, for the capture at the next hold.
     sent: Option<(super::cache::Hold, super::cache::CachePush)>,
     resources: u64,
@@ -1199,6 +1199,10 @@ impl HoldSide {
             worker,
             metas,
             snapshot,
+            snapshot_made: {
+                static MADE: AtomicU64 = AtomicU64::new(1);
+                MADE.fetch_add(1, Ordering::Relaxed)
+            },
             sent: None,
             resources,
             holds: 0,
@@ -1219,6 +1223,13 @@ impl HoldSide {
 
     pub(crate) fn snapshot_view(&self) -> vk::ImageView {
         self.snapshot.view
+    }
+
+    /// Names the kept copy behind [`Self::snapshot_view`]: another number for every side built, so a set bound to a
+    /// destroyed side's view is never taken for this one's when the driver gives the view its handle again
+    /// (`cache::CachePass::bind_late`).
+    pub(crate) fn snapshot_made(&self) -> u64 {
+        self.snapshot_made
     }
 
     /// The cache push of the hold that sent last (the late capture's).
@@ -1747,7 +1758,7 @@ mod tests {
             unsafe {
                 let mut exchange = Exchange::build(&dev.device, &dev.instance, dev.physical, dev.import, SIZES)?;
                 let (frame, side, answer, stats) = (own(SIZES.frame)?, own(SIZES.side)?, own(SIZES.answer)?, own(64)?);
-                exchange.bind_gate(&dev.device, stats.buffer);
+                exchange.bind_gate(&dev.device, stats.buffer, 1);
                 let pool = dev.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(dev.family), None).ok()?;
                 let fence = dev.device.create_fence(&vk::FenceCreateInfo::default(), None).ok()?;
                 Some(Self { dev, exchange, frame, side, answer, stats, pool, fence })
@@ -1808,6 +1819,11 @@ mod tests {
 
         fn close(self, mut worker: Worker) {
             worker.stop();
+            self.free();
+        }
+
+        /// Frees the game's side (every hold was waited for, and the worker, if any, stopped).
+        fn free(self) {
             // SAFETY: every hold was waited for and the worker stopped.
             unsafe {
                 let d = &self.dev.device;
@@ -1847,6 +1863,80 @@ mod tests {
         let g = gave_up.clone();
         let worker = Worker::start(link, Box::new(runner), None, (64, 64), Box::new(move |why, _| g.lock().unwrap().push(why)))?;
         Some((game, worker, ran, gave_up, abandoned))
+    }
+
+    /// An edit cache destroyed and built again while the side lives (the VRAM guard's pause frees it) can get its
+    /// counters under the old buffer handle: the gate's set is written again for the new cache's counters, and after
+    /// a cache was destroyed, whatever comes next. Left on the freed buffer, the gate's dispatch wrote through it.
+    #[test]
+    fn the_gate_is_written_again_for_another_edit_cache_under_the_same_handle() {
+        let Some(mut game) = Game::new() else {
+            assert_ne!(neural_forge_protocol::env::var("NEURAL_FORGE_REQUIRE_VULKAN").as_deref(), Some("1"), "no Vulkan device for the exchange's tests");
+            return;
+        };
+        let d = game.dev.device.clone();
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
+        // Stands in for the destroyed cache's counters: what a stale set still names.
+        let freed = crate::preupscale::own_host_buffer_with(&d, &game.dev.instance, game.dev.physical, 64, usage).expect("a buffer");
+        let stored = |b: &HostBuffer| {
+            // SAFETY: host-visible, 64 bytes; nothing pending writes it.
+            unsafe { b.ptr.cast::<u32>().add(14).read_volatile() == 1 }
+        };
+        // Points the set at `freed` behind the exchange's back (what the driver's reused handle leaves), marks the
+        // edit stored in both buffers, binds the gate as the hold would and runs it for a frame whose answer is not
+        // there (the IN header is clear): the gate clears the mark where its set points.
+        let gate = |game: &mut Game, made: Option<u64>| {
+            // SAFETY: the test's own objects; the set is not in use (every run was waited for).
+            unsafe {
+                let header = [vk::DescriptorBufferInfo { buffer: game.exchange.inn.buffer, offset: 0, range: HEADER_BYTES }];
+                let counters = [vk::DescriptorBufferInfo { buffer: freed.buffer, offset: 0, range: vk::WHOLE_SIZE }];
+                let w = |n: u32, i| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(game.exchange.set)
+                        .dst_binding(n)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(i)
+                };
+                d.update_descriptor_sets(&[w(0, &header), w(1, &counters)], &[]);
+                for b in [&game.stats, &freed] {
+                    b.ptr.cast::<u32>().add(14).write_volatile(1);
+                }
+                if let Some(made) = made {
+                    game.exchange.bind_gate(&d, game.stats.buffer, made);
+                }
+                let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(game.pool).command_buffer_count(1)).unwrap()[0];
+                d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+                game.exchange.record_gate(&d, cmd, 7);
+                let to_host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[to_host],
+                    &[],
+                    &[],
+                );
+                d.end_command_buffer(cmd).unwrap();
+                d.queue_submit(game.dev.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], game.fence).unwrap();
+                d.wait_for_fences(&[game.fence], true, 30_000_000_000).expect("the gate ran");
+                d.reset_fences(&[game.fence]).unwrap();
+                d.free_command_buffers(game.pool, &[cmd]);
+            }
+            (stored(&game.stats), stored(&freed))
+        };
+        // The rig bound the gate for cache 1: the same cache again writes nothing (the stale set keeps its buffer).
+        assert_eq!(gate(&mut game, Some(1)), (true, false), "the same cache's counters: nothing to write");
+        // Another cache's counters under the same handle: written again, and the gate writes there.
+        assert_eq!(gate(&mut game, Some(2)), (false, true), "another cache under the same handle: the gate writes the new counters");
+        assert_eq!(game.exchange.gated, Some((game.stats.buffer, 2)));
+        // Its cache destroyed: nothing is taken as bound, and the next bind writes the set even for the same key.
+        game.exchange.forget_gate();
+        assert_eq!(game.exchange.gated, None, "its cache destroyed: nothing is taken as bound");
+        assert_eq!(gate(&mut game, Some(2)), (false, true), "after a forget: written again");
+        // SAFETY: idle; nothing uses it.
+        unsafe { freed.destroy(&d) };
+        game.free();
     }
 
     /// Two devices: every hold gets exactly the frame the hold before it sent, through the second device.

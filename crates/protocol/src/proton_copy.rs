@@ -7,6 +7,34 @@ use std::path::{Path, PathBuf};
 /// In a copy: what it was made from (`source=`, `source_version=`, `wrapper_sha256=`, `wine=`).
 pub const MARKER: &str = "neural-forge-proton.txt";
 
+/// What a copy's name ends with ([`copy_name`]).
+pub const SUFFIX: &str = "-NeuralForge";
+
+/// The name of the copy made from a Proton whose version name is `version`: its folder in `compatibilitytools.d` and
+/// its name in Steam (`compatibilitytool.vdf`'s key and `display_name`). The version (`/` and other characters a
+/// folder or Steam name should not hold made `-`), with `Proton-` before it when it does not already say "proton"
+/// ([`cloud_name`]), and [`SUFFIX`]: `GE-Proton11-12-NeuralForge`, `Proton-experimental-11.0-20261105c-x86_64-NeuralForge`.
+/// A version with nothing left once made safe (empty, only `/` or spaces) gives `Proton-NeuralForge`.
+pub fn copy_name(version: &str) -> String {
+    let base: String = version.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect();
+    let base = base.trim_matches('-');
+    if base.is_empty() {
+        format!("Proton{SUFFIX}")
+    } else if cloud_name(base) {
+        format!("{base}{SUFFIX}")
+    } else {
+        format!("Proton-{base}{SUFFIX}")
+    }
+}
+
+/// Whether Steam syncs Steam Cloud saves kept in the Wine prefix for a compatibility tool named `name`. Steam's client
+/// (its compat manager) maps the Windows folders Steam Cloud saves live in (AppData, Saved Games, Documents,
+/// ProgramData) into `<compatdata>/pfx/drive_c/users/steamuser` only for a tool whose name contains "proton" (any
+/// case); for any other it logs "Unable to resolve path with root WinAppDataLocal" and syncs nothing there (issue #71).
+pub fn cloud_name(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("proton")
+}
+
 /// The fields of a copy's marker.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Marker {
@@ -81,19 +109,31 @@ pub fn newer_source(source: &Path, was: &str) -> Option<String> {
     source_version(source).filter(|now| now != was)
 }
 
-/// The line the layer writes to a game's log when the copy in `copy_dir` is older than its source; `None` when it
-/// is not a copy or is current.
+/// The line the layer writes to a game's log when the copy in `copy_dir` is older than its source, or named without
+/// "Proton" ([`cloud_name`]: made by an older Neural Forge); `None` when it is not a copy or is current. A copy named
+/// without "Proton" is made again under its new name while its source is there, else renamed in place (it holds its
+/// own files): either way Make again fixes it.
 pub fn stale_notice(copy_dir: &Path) -> Option<String> {
     let marker = Marker::read(copy_dir)?;
-    let now = newer_source(&marker.source, &marker.source_version)?;
-    Some(format!(
-        "[proton] this game runs with {}, made from {} but {} has {} now: close Steam and use Make again in Neural Forge's Setup tab \
-         (or `neural-forge-cli proton-tool update`) to renew the copy",
-        copy_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        marker.source_version,
-        marker.source.display(),
-        now
-    ))
+    let name = copy_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let fix = "close Steam and use Make again in Neural Forge's Setup tab (or `neural-forge-cli proton-tool update`)";
+    let cloud = "Steam Cloud does not sync the saves the game keeps in its Wine prefix with it";
+    if let Some(now) = newer_source(&marker.source, &marker.source_version) {
+        let also = if cloud_name(&name) { String::new() } else { format!("; its name also lacks \u{201c}Proton\u{201d}, so {cloud}") };
+        return Some(format!(
+            "[proton] this game runs with {name}, made from {} but {} has {now} now{also}: {fix} to renew the copy (the new one is named {})",
+            marker.source_version,
+            marker.source.display(),
+            copy_name(&now),
+        ));
+    }
+    (!cloud_name(&name)).then(|| {
+        format!(
+            "[proton] this game runs with {name}, whose name lacks \u{201c}Proton\u{201d}: {cloud}; {fix}: the copy is named {} then and the \
+             game moves to it",
+            copy_name(&marker.source_version)
+        )
+    })
 }
 
 /// The Proton folders a game process runs with: Steam's `STEAM_COMPAT_TOOL_PATHS` (a `:`-separated list of the compat
@@ -191,6 +231,57 @@ mod tests {
                 PathBuf::from("/home/alex/.local/share/Steam/compatibilitytools.d/GE-Proton11-12-NeuralForge")
             ]
         );
+    }
+
+    /// Steam syncs Steam Cloud saves in the prefix only for a tool whose name says "proton" (#71): Valve's and
+    /// CachyOS's version names do not, GE's does.
+    #[test]
+    fn copy_names_always_say_proton() {
+        for (version, name) in [
+            ("experimental-11.0-20261105c-x86_64", "Proton-experimental-11.0-20261105c-x86_64-NeuralForge"),
+            ("hotfix-20261110-x86_64", "Proton-hotfix-20261110-x86_64-NeuralForge"),
+            ("cachyos-11.0-20261015-slr", "Proton-cachyos-11.0-20261015-slr-NeuralForge"),
+            ("proton-10.0-3", "proton-10.0-3-NeuralForge"),
+            ("GE-Proton11-12", "GE-Proton11-12-NeuralForge"),
+            // A source without a version file is named by its folder.
+            ("Proton - Experimental", "Proton---Experimental-NeuralForge"),
+            ("My Wine/build", "Proton-My-Wine-build-NeuralForge"),
+            // Nothing left once made safe: still a name that says Proton, never `Proton--NeuralForge`.
+            ("", "Proton-NeuralForge"),
+            ("/ /", "Proton-NeuralForge"),
+        ] {
+            let got = copy_name(version);
+            assert_eq!(got, name);
+            assert!(cloud_name(&got), "{got}");
+        }
+        assert!(!cloud_name("experimental-11.0-20261105c-x86_64-NeuralForge") && !cloud_name("hotfix-20261110-x86_64-NeuralForge"));
+    }
+
+    /// A copy an older Neural Forge named without "Proton" gets the notice, naming the new name, also once its source is
+    /// gone (Make again renames it in place then); one that is also behind its source says both.
+    #[test]
+    fn the_launch_notice_names_a_copy_named_without_proton() {
+        let d = scratch("cloud");
+        let src = d.join("Proton - Experimental");
+        proton(&src, "experimental-11.0-20261105c-x86_64");
+        let (old, new) = (d.join("experimental-11.0-20261105c-x86_64-NeuralForge"), d.join("Proton-experimental-11.0-20261105c-x86_64-NeuralForge"));
+        copy(&old, &src, "experimental-11.0-20261105c-x86_64");
+        copy(&new, &src, "experimental-11.0-20261105c-x86_64");
+        let line = stale_notice(&old).expect("named without Proton");
+        assert!(line.contains("Steam Cloud") && line.contains("Make again") && line.contains(&*new.file_name().unwrap().to_string_lossy()), "{line}");
+        assert_eq!(stale_notice(&new), None);
+        // Behind its source too: both, and the name the remade copy gets.
+        proton(&src, "experimental-11.0-20261112a-x86_64");
+        let line = stale_notice(&old).expect("behind its source");
+        assert!(line.contains("experimental-11.0-20261112a-x86_64 now") && line.contains("Steam Cloud"), "{line}");
+        assert!(line.contains("Proton-experimental-11.0-20261112a-x86_64-NeuralForge"), "{line}");
+        let line = stale_notice(&new).expect("behind its source");
+        assert!(!line.contains("Steam Cloud"), "{line}");
+        std::fs::remove_dir_all(&src).unwrap();
+        let line = stale_notice(&old).expect("renamed in place once its source is gone");
+        assert!(line.contains("Steam Cloud") && line.contains(&*new.file_name().unwrap().to_string_lossy()), "{line}");
+        assert_eq!(stale_notice(&new), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
