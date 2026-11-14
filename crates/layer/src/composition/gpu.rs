@@ -102,6 +102,10 @@ struct PushConstants {
     debug_scale: f32,
     /// Matches `compose.comp`'s `params.reversible_mode`: the encode's curve.
     reversible_mode: u32,
+    /// The small proxy's own size while `model_small` (0 otherwise): `compose.comp`'s ghost guard reduces and
+    /// enlarges the current frame the same way to compare it with the proxy input.
+    proxy_width: u32,
+    proxy_height: u32,
 }
 
 /// `compose_hdr.comp`'s `Params` block, field for field: pushed through `compose.comp`'s pipeline layout
@@ -1360,6 +1364,8 @@ impl ComposeSlot {
                     debug_view: compose.debug_view,
                     debug_scale: compose.debug_scale,
                     reversible_mode: compose.reversible_mode,
+                    proxy_width: if compose.model_small { answer_width } else { 0 },
+                    proxy_height: if compose.model_small { answer_height } else { 0 },
                 };
                 let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
                 device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
@@ -3918,6 +3924,150 @@ mod tests {
         let unguarded = compose_once_scaled(width, height, &moved, &moved, &answer, (sw, sh), Some(&small), None, carried_params(0.0)).unwrap();
         assert!(green(&unguarded) > 15, "without the guard the old answer's green lies on the moved frame ({})", green(&unguarded));
         assert!(green(&guarded) <= 5, "the guard keeps it off ({})", green(&guarded));
+    }
+
+    /// The small proxy of `frame` as the capture makes it: the frame reduced to `small` with a linear blit of its
+    /// stored values, then encoded (`encode::reference_encode_pixel`, white point 1, the soft knee).
+    fn reduced(frame: &[u8], (w, h): (u32, u32), (sw, sh): (u32, u32)) -> Vec<u8> {
+        let at =
+            |x: i64, y: i64, c: usize| f32::from(frame[((y.clamp(0, i64::from(h) - 1) as u32 * w + x.clamp(0, i64::from(w) - 1) as u32) * 4) as usize + c]);
+        let mut out = Vec::with_capacity((sw * sh * 4) as usize);
+        for j in 0..sh {
+            for i in 0..sw {
+                let (u, v) = ((i as f32 + 0.5) * w as f32 / sw as f32 - 0.5, (j as f32 + 0.5) * h as f32 / sh as f32 - 0.5);
+                let (x0, y0) = (u.floor(), v.floor());
+                let (a, b) = (u - x0, v - y0);
+                let (x0, y0) = (x0 as i64, y0 as i64);
+                let px: [u8; 3] = std::array::from_fn(|c| {
+                    let top = at(x0, y0, c) * (1.0 - a) + at(x0 + 1, y0, c) * a;
+                    let bottom = at(x0, y0 + 1, c) * (1.0 - a) + at(x0 + 1, y0 + 1, c) * a;
+                    (top * (1.0 - b) + bottom * b).round() as u8
+                });
+                out.extend_from_slice(&crate::composition::encode::reference_encode_pixel([px[0], px[1], px[2], 255], false, 1.0, 0));
+            }
+        }
+        out
+    }
+
+    /// The model's stand-in for the carried-frame tests: it turns what is bright in the small proxy magenta and
+    /// leaves the rest as it is, so its edit is tied to where things were.
+    fn magenta_where_bright(small: &[u8]) -> Vec<u8> {
+        small.as_chunks::<4>().0.iter().flat_map(|p| if p[1] > 120 { [p[0].saturating_add(40), p[1] - 45, p[2].saturating_add(40), 255] } else { *p }).collect()
+    }
+
+    /// The ghost guard at every Model resolution (#63, review S1): a still frame with what an enlarged proxy
+    /// softens most (one-pixel lines along both axes and both diagonals, corners, an edge between two colours of
+    /// one brightness) composes as it does without the guard, at a half, a third and a quarter of the frame, in
+    /// every transfer mode. The guard compares the frame as the proxy would hold it, so nothing of the enlargement
+    /// is left to read as motion.
+    #[test]
+    fn ghost_guard_reads_no_motion_into_a_still_frame_at_any_model_resolution() {
+        let (w, h) = (96u32, 48u32);
+        let frame: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                let bright = [175u8, 150, 140];
+                // One-pixel diagonals, a horizontal and a vertical line; a block (four corners).
+                let lines = x < 30 && (x == y || x + y == 29) || (y == 40 && x < 60) || (x == 70 && y < 30);
+                let block = (36..52).contains(&x) && (6..22).contains(&y);
+                let c = if lines || block {
+                    bright
+                } else if x >= 76 && y >= 30 {
+                    if x < 86 {
+                        [150, 60, 60]
+                    } else {
+                        [40, 100, 60]
+                    } // red against green, about one brightness
+                } else {
+                    [55, 48, 44]
+                };
+                [c[0], c[1], c[2], 255]
+            })
+            .collect();
+        for divisor in [2u32, 3, 4] {
+            let small_size = (w / divisor, h / divisor);
+            let small = reduced(&frame, (w, h), small_size);
+            let answer = magenta_where_bright(&small);
+            for transfer in [0u32, 1, 2] {
+                let run = |guard: f32| {
+                    let params = ComposeParams { transfer, ..carried_params(guard) };
+                    compose_once_scaled(w, h, &frame, &frame, &answer, small_size, Some(&small), None, params)
+                };
+                let Some(guarded) = run(1.0) else {
+                    eprintln!("ghost_guard still-frame test: no Vulkan loader/ICD, skipping");
+                    return;
+                };
+                let unguarded = run(0.0).unwrap();
+                let worst = guarded.iter().zip(&unguarded).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+                assert!(worst <= 2, "1/{divisor} of the frame, transfer {transfer}: a still frame differs by {worst} of 255 with the guard");
+                let edited = unguarded.iter().zip(&frame).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+                assert!(edited > 15, "1/{divisor}, transfer {transfer}: the answer edits the frame at all ({edited})");
+            }
+        }
+    }
+
+    /// A pan over texture at a Model resolution below Full (#63, review S2): bright and dark patches of 6 px, moved
+    /// on by 2 px since the frame the model answered (less than the old test's reach, and inside the texture's own
+    /// range of values). The answer's magenta belongs to where the bright patches were. With the guard none of it
+    /// lies on what is dark now; without it, it does. At a half and a quarter of the frame.
+    #[test]
+    fn ghost_guard_keeps_a_stale_answer_off_texture_that_moved_a_little() {
+        let (w, h) = (96u32, 48u32);
+        let patch = |x: u32, y: u32| ((x / 6).wrapping_mul(2654435761) ^ (y / 6).wrapping_mul(40503)).wrapping_mul(2246822519) >> 16 & 1 == 1;
+        let texture = |shift: u32| -> Vec<u8> {
+            (0..w * h).flat_map(|i| if patch(i % w + shift, i / w + shift) { [190u8, 165, 150, 255] } else { [105, 80, 60, 255] }).collect()
+        };
+        let (old, now) = (texture(0), texture(2));
+        for divisor in [2u32, 4] {
+            let small_size = (w / divisor, h / divisor);
+            let small = reduced(&old, (w, h), small_size);
+            let answer = magenta_where_bright(&small);
+            let run = |guard: f32| compose_once_scaled(w, h, &now, &now, &answer, small_size, Some(&small), None, carried_params(guard));
+            let Some(guarded) = run(1.0) else {
+                eprintln!("ghost_guard texture test: no Vulkan loader/ICD, skipping");
+                return;
+            };
+            let unguarded = run(0.0).unwrap();
+            // Magenta over the frame's own colour, on pixels that are dark now and well inside a dark patch.
+            let inside_dark = |x: u32, y: u32| (0..3).all(|d| !patch(x + 2 + d - 1, y + 2) && !patch(x + 2, y + 2 + d - 1)) && !patch(x + 2, y + 2);
+            let excess = |out: &[u8]| -> (i32, usize) {
+                let mut worst = 0;
+                let mut n = 0;
+                for y in 1..h - 1 {
+                    for x in 1..w - 1 {
+                        if !inside_dark(x, y) {
+                            continue;
+                        }
+                        let o = ((y * w + x) * 4) as usize;
+                        let m = |p: &[u8]| (i32::from(p[0]) - i32::from(p[1])) + (i32::from(p[2]) - i32::from(p[1]));
+                        let e = m(&out[o..o + 3]) - m(&now[o..o + 3]);
+                        worst = worst.max(e);
+                        n += 1;
+                    }
+                }
+                (worst, n)
+            };
+            let ((with, n), (without, _)) = (excess(&guarded), excess(&unguarded));
+            eprintln!("texture moved 2 px, 1/{divisor} of the frame: stale magenta on {n} dark pixels: {without} of 255 without the guard, {with} with it");
+            assert!(n > 100, "the texture has dark pixels to look at ({n})");
+            assert!(without >= 12, "1/{divisor}: without the guard the old patches' magenta lies on what is dark now ({without})");
+            // Not all of it: a strip narrower than the guard's taps are apart (3 px), right beside a pixel that did
+            // not change, is seen only through the softness of the two reduced pictures, which holds part of the
+            // colour back. Counted over the dark pixels, most of what was stale is gone.
+            let total = |out: &[u8]| -> i64 {
+                let m = |p: &[u8]| (i64::from(p[0]) - i64::from(p[1])) + (i64::from(p[2]) - i64::from(p[1]));
+                (0..w * h)
+                    .filter(|i| inside_dark(i % w, i / w) && i % w > 0 && i / w > 0 && i % w < w - 1 && i / w < h - 1)
+                    .map(|i| (m(&out[(i * 4) as usize..]) - m(&now[(i * 4) as usize..])).max(0))
+                    .sum()
+            };
+            let (sum_with, sum_without) = (total(&guarded), total(&unguarded));
+            eprintln!("  summed over them: {sum_without} without the guard, {sum_with} with it");
+            assert!(
+                sum_with * 4 <= sum_without,
+                "1/{divisor}: at least three quarters of the stale colour is gone ({sum_with} against {sum_without}; the worst pixel {with} against {without})"
+            );
+        }
     }
 
     /// Mode 2, on a real (lavapipe) device: the model brightened a dark stroke at x=20..22 of

@@ -114,6 +114,10 @@ layout(push_constant) uniform Params {
   // the model's verdict. 2 and 4 are the replace modes: in mode 2 the model's answer comes
   // straight back through the exact inverse of its curve, with no composition.
   uint reversible_mode;
+  // The small proxy's own size (the model's raster), when `model_small`: the ghost guard puts the current frame
+  // through the same reduction and enlargement the proxy input went through, to compare the two like for like.
+  uint proxy_width;
+  uint proxy_height;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -319,6 +323,39 @@ vec3 GamutCompressReversible(vec3 rgb) {
   return XYZ_TO_LINEAR_SRGB * (HPE_LMS_TO_XYZ * compressed_lms);
 }
 
+// One texel of the current frame as the small proxy would hold it: reduced as the capture reduces the frame (a
+// linear blit of the stored values to the proxy's size), then encoded as `encode.comp` stores it. In the frame's
+// stored channel order made RGB.
+vec3 SmallTexel(ivec2 t, ivec2 small, ivec2 size, bool bgr, float wp) {
+  t = clamp(t, ivec2(0), small - ivec2(1));
+  vec2 u = (vec2(t) + 0.5) * vec2(size) / vec2(small) - 0.5;
+  ivec2 i0 = ivec2(floor(u));
+  vec2 a = u - vec2(i0);
+  ivec2 last = size - ivec2(1);
+  vec3 c00 = imageLoad(u_original, clamp(i0, ivec2(0), last)).rgb;
+  vec3 c10 = imageLoad(u_original, clamp(i0 + ivec2(1, 0), ivec2(0), last)).rgb;
+  vec3 c01 = imageLoad(u_original, clamp(i0 + ivec2(0, 1), ivec2(0), last)).rgb;
+  vec3 c11 = imageLoad(u_original, clamp(i0 + ivec2(1, 1), ivec2(0), last)).rgb;
+  vec3 raw = mix(mix(c00, c10, a.x), mix(c01, c11, a.x), a.y);
+  raw = bgr ? raw.bgr : raw;
+  return SrgbEncode(clamp(EncodeProxy(SrgbDecode(raw) / wp), 0.0, 1.0));
+}
+
+// The current frame at `q` as the proxy input holds the frame the model answered: reduced to the small proxy
+// ([`SmallTexel`]) and enlarged again with the linear blit the composition enlarges the proxy with. On a frame that
+// has not changed this is the proxy input itself (to the last bit of an 8-bit texel), whatever the size and
+// whatever is in the picture; where it differs, the frame has changed.
+vec3 FrameAsProxy(ivec2 q, ivec2 small, ivec2 size, bool bgr, float wp) {
+  vec2 u = (vec2(q) + 0.5) * vec2(small) / vec2(size) - 0.5;
+  ivec2 t0 = ivec2(floor(u));
+  vec2 a = u - vec2(t0);
+  vec3 s00 = SmallTexel(t0, small, size, bgr, wp);
+  vec3 s10 = SmallTexel(t0 + ivec2(1, 0), small, size, bgr, wp);
+  vec3 s01 = SmallTexel(t0 + ivec2(0, 1), small, size, bgr, wp);
+  vec3 s11 = SmallTexel(t0 + ivec2(1, 1), small, size, bgr, wp);
+  return SrgbDecode(mix(mix(s00, s10, a.x), mix(s01, s11, a.x), a.y));
+}
+
 void main() {
   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
   ivec2 size = imageSize(u_output);
@@ -506,6 +543,8 @@ void main() {
       if (params.ghost_guard > 0.0) {
         const int kGhostStep = 3;
         ivec2 last = size - ivec2(1);
+        ivec2 small = ivec2(int(params.proxy_width), int(params.proxy_height));
+        bool small_proxy = params.model_small != 0u && small.x > 0 && small.y > 0;
         float proxy_sum = 0.0;
         float model_sum = 0.0;
         float worst = 0.0;
@@ -514,28 +553,19 @@ void main() {
             ivec2 q = clamp(src + ivec2(i, j) * kGhostStep, ivec2(0), last);
             vec3 pq = ProxyTap(q, bgr, wp);
             vec3 mq = SrgbDecode(bgr ? imageLoad(u_model_answer, q).bgr : imageLoad(u_model_answer, q).rgb);
-            vec3 oq = clamp(EncodeProxy(SrgbDecode(bgr ? imageLoad(u_original, q).bgr : imageLoad(u_original, q).rgb) / wp), 0.0, 1.0);
             float pl = Luminance(pq);
             proxy_sum += pl;
             model_sum += Luminance(mq);
             float valid = 1.0 - smoothstep(0.5, 0.7, pl);
-            float ol = Luminance(oq);
-            float mismatch = abs(ol - pl);
-            if (params.model_small != 0u) {
-              // The proxy is the small one, enlarged: softer than the frame at every edge, which is no motion.
-              // Each of its pixels is a mix of the frame's pixels around it, so on a frame that has not moved it
-              // lies within their range; only what falls outside that range is a mismatch.
-              float lo = ol;
-              float hi = ol;
-              for (int k = 0; k < 8; ++k) {
-                int reach = (k & 1) == 0 ? 1 : 3;
-                ivec2 d = (k & 2) == 0 ? ivec2(reach, 0) : ivec2(0, reach);
-                ivec2 n = clamp(q + ((k & 4) == 0 ? d : -d), ivec2(0), last);
-                float nl = Luminance(clamp(EncodeProxy(SrgbDecode(bgr ? imageLoad(u_original, n).bgr : imageLoad(u_original, n).rgb) / wp), 0.0, 1.0));
-                lo = min(lo, nl);
-                hi = max(hi, nl);
-              }
-              mismatch = max(max(pl - hi, lo - pl), 0.0);
+            float mismatch = 0.0;
+            if (!small_proxy) {
+              vec3 oq = clamp(EncodeProxy(SrgbDecode(bgr ? imageLoad(u_original, q).bgr : imageLoad(u_original, q).rgb) / wp), 0.0, 1.0);
+              mismatch = abs(Luminance(oq) - pl);
+            } else {
+              // The proxy is the small one, enlarged: the frame is compared as the proxy would hold it, so the
+              // enlargement's softness is on both sides and only a change of the picture is left. At every tap:
+              // a strip that changed is as narrow as the motion, and falls between taps spaced any wider.
+              mismatch = abs(Luminance(FrameAsProxy(q, small, size, bgr, wp)) - pl);
             }
             worst = max(worst, valid * mismatch / (0.03 + 0.5 * pl));
           }
