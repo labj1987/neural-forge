@@ -107,6 +107,37 @@ pub struct SwitchedOn {
     pub note: Option<String>,
 }
 
+/// `e` with what was repaired before it failed, so the user still sees that games were moved.
+fn carry_note(repaired: &Option<String>, e: String) -> String {
+    match repaired {
+        Some(r) => format!("{e} (before that: {r})"),
+        None => e,
+    }
+}
+
+/// Whether a failed rename of `t` was a refusal that waits for the user (a game runs with the copy, or another tool
+/// or an incomplete copy has the new name), not a failure of its own.
+fn rename_refused(t: &Tool, proc_root: &Path) -> bool {
+    matches!(proton_tool::rename_plan(t), proton_tool::RenamePlan::Clash(_)) || !proton_tool::in_use(&t.dir, proc_root).is_empty()
+}
+
+/// What a failed rename of `t` (error `e`) means: the note that it is pending (the folder is still there and the rename
+/// was refused: the game stays on `t`), else the real error; when the folder is gone (the rename and its undo both
+/// failed) the error says the games are stranded and how they are repaired.
+fn rename_failure(t: &Tool, e: String, refused: bool) -> Result<String, String> {
+    let to = proton_tool::remade_name(t);
+    if !t.dir.exists() {
+        return Err(format!(
+            "{e}; {} is gone and its games are stranded on that name: the next Make again, or `neural-forge-cli proton-tool update`, moves them to {to}",
+            t.name
+        ));
+    }
+    if !refused {
+        return Err(e);
+    }
+    Ok(format!("{e}; the rename to {to} is still pending: the game stays on {} until Make again has run", t.name))
+}
+
 /// Two optional notes as one.
 fn join_notes(a: Option<String>, b: Option<String>) -> Option<String> {
     match (a, b) {
@@ -219,11 +250,7 @@ pub fn switch_on(root: &Path, libraries: &[PathBuf], appid: &str, wrapper: &Path
     if steam_running {
         return Err("Steam is running: close it to let Neural Forge choose the game's Proton".into());
     }
-    // A game left on the old name by a rename that stopped half way moves to the renamed copy first.
-    let repaired = repair_note(root, steam_running);
-    let tools = proton_tool::tools(root);
-    let now = current(root, appid);
-    if now.is_none() {
+    if current(root, appid).is_none() {
         // Nothing chosen for the game: Steam runs a native Linux build without Proton.
         let game = crate::steam::games(&[crate::steam::Root { path: root.to_path_buf(), flatpak: false }]).into_iter().find(|g| g.appid == appid);
         match game.as_ref().map(crate::steam::installed_build) {
@@ -236,6 +263,16 @@ pub fn switch_on(root: &Path, libraries: &[PathBuf], appid: &str, wrapper: &Path
             }
         }
     }
+    // A game left on the old name by a rename that stopped half way moves to the renamed copy first (after the native
+    // check: a native game returns nothing to carry the note in); a later failure carries the note.
+    let repaired = repair_note(root, steam_running);
+    switch_on_core(root, libraries, appid, wrapper, repaired.clone()).map_err(|e| carry_note(&repaired, e))
+}
+
+/// [`switch_on`] once the stranded games are repaired (`repaired`, the note to give the user).
+fn switch_on_core(root: &Path, libraries: &[PathBuf], appid: &str, wrapper: &Path, repaired: Option<String>) -> Result<Option<SwitchedOn>, String> {
+    let tools = proton_tool::tools(root);
+    let now = current(root, appid);
     let dll = || std::fs::read(wrapper).map_err(|e| format!("Neural Forge's NGX wrapper {}: {e}", wrapper.display()));
     let from_tool: Option<&Tool> = now.as_ref().and_then(|n| tools.iter().find(|t| &t.name == n));
     if let Some(t) = from_tool.filter(|t| !proton_tool::needs_remake(t)) {
@@ -258,14 +295,11 @@ pub fn switch_on(root: &Path, libraries: &[PathBuf], appid: &str, wrapper: &Path
                     // Refused (the copy is in use, another tool has the new name, its games could not move): the game
                     // stays on its copy, with the wrapper renewed, and Make again does the rename later.
                     Err(e) => {
+                        let refused = rename_refused(t, Path::new("/proc"));
+                        let pending = rename_failure(t, e, refused)?;
                         if proton_tool::wrapper_changed(t, wrapper) {
                             proton_tool::refresh_wrapper(t, &dll()?)?;
                         }
-                        let pending = format!(
-                            "{e}; the rename to {} is still pending: the game stays on {} until Make again has run",
-                            proton_tool::remade_name(t),
-                            t.name
-                        );
                         Ok(Some(SwitchedOn { tool: t.name.clone(), made: false, previous: now, note: join_notes(repaired, Some(pending)) }))
                     }
                 };
@@ -483,7 +517,7 @@ pub fn update(root: &Path, tool: &Tool, wrapper: &Path, steam_running: bool) -> 
 fn update_in(root: &Path, tool: &Tool, wrapper: &Path, steam_running: bool, proc_root: &Path) -> Result<Updated, String> {
     // A game left on the old name by a rename that stopped half way moves to the renamed copy first.
     let repaired = repair_note(root, steam_running);
-    let mut done = update_core(root, tool, wrapper, steam_running, proc_root)?;
+    let mut done = update_core(root, tool, wrapper, steam_running, proc_root).map_err(|e| carry_note(&repaired, e))?;
     done.note = join_notes(repaired, done.note);
     Ok(done)
 }
@@ -895,6 +929,8 @@ mod tests {
         std::fs::create_dir_all(&new_dir).unwrap();
         std::fs::copy(old_dir.join(proton_tool::MARKER), new_dir.join(proton_tool::MARKER)).unwrap();
         std::fs::write(new_dir.join("compatibilitytool.vdf"), proton_tool::manifest(new_name)).unwrap();
+        std::fs::create_dir_all(new_dir.join("files")).unwrap();
+        std::fs::write(new_dir.join("proton"), "#!/usr/bin/env python3\n").unwrap();
         let old = proton_tool::tools(&root).into_iter().find(|t| t.name == old_name).unwrap();
         let done = update_in(&root, &old, &w, false, &procs).unwrap();
         assert_eq!((done.to.as_str(), done.renamed, done.kept), (new_name, false, None));
@@ -1022,6 +1058,8 @@ mod tests {
                 marker.lines().map(|l| if l.starts_with("source=") { format!("source={}", source.display()) } else { l.to_string() } + "\n").collect();
             std::fs::write(self.new_dir.join(proton_tool::MARKER), marker).unwrap();
             std::fs::write(self.new_dir.join("compatibilitytool.vdf"), proton_tool::manifest(NEW)).unwrap();
+            std::fs::create_dir_all(self.new_dir.join("files")).unwrap();
+            std::fs::write(self.new_dir.join("proton"), "#!/usr/bin/env python3\n").unwrap();
         }
     }
 
@@ -1194,5 +1232,93 @@ mod tests {
         let t = proton_tool::tools(&g.root).remove(0);
         assert!(proton_tool::outdated(&t) || proton_tool::wrapper_changed(&t, &g.wrapper), "the wrapper is still to be renewed");
         std::fs::remove_dir_all(&g.root).unwrap();
+    }
+
+    /// A copy of the same version under the new name that lacks its `proton` script, its `files/` or its manifest entry
+    /// is not merged into: the plan is a clash, so the games and the working copy stay as they are.
+    #[test]
+    fn a_damaged_copy_under_the_new_name_never_takes_the_games() {
+        for damage in ["proton", "files", "manifest"] {
+            let g = Gone::new(&format!("damaged-{damage}"));
+            g.merge_target(Path::new("/elsewhere/Proton - Experimental"));
+            assert!(matches!(proton_tool::rename_plan(&g.old()), proton_tool::RenamePlan::Merge(_)));
+            match damage {
+                "proton" => std::fs::remove_file(g.new_dir.join("proton")).unwrap(),
+                "files" => std::fs::remove_dir_all(g.new_dir.join("files")).unwrap(),
+                _ => std::fs::write(g.new_dir.join("compatibilitytool.vdf"), proton_tool::manifest("something-else")).unwrap(),
+            }
+            assert!(matches!(proton_tool::rename_plan(&g.old()), proton_tool::RenamePlan::Clash(_)), "{damage}");
+            let before = g.config();
+            let e = update_in(&g.root, &g.old(), &g.wrapper, false, &g.procs).unwrap_err();
+            assert!(e.contains("already exists"), "{e}");
+            assert!(g.old_dir.is_dir() && g.games_on(OLD) && g.config() == before, "{damage}: nothing moved or deleted");
+            std::fs::remove_dir_all(&g.root).unwrap();
+        }
+    }
+
+    /// Only a refusal with the folder still there is "pending"; any other failure is the real error, and a vanished
+    /// folder says the games are stranded and how they are repaired.
+    #[test]
+    fn a_failed_rename_is_pending_only_when_refused() {
+        let g = Gone::new("failure");
+        let old = g.old();
+        let pending = rename_failure(&old, "refused".into(), true).unwrap();
+        assert!(pending.contains("still pending") && pending.contains(NEW), "{pending}");
+        assert_eq!(rename_failure(&old, "disk error".into(), false).unwrap_err(), "disk error");
+        // The refusal check: another tool with the new name.
+        assert!(!rename_refused(&old, &g.procs));
+        std::fs::create_dir_all(&g.new_dir).unwrap();
+        assert!(rename_refused(&old, &g.procs));
+        std::fs::remove_dir_all(&g.new_dir).unwrap();
+        // The folder gone: both the rename and its undo failed.
+        std::fs::remove_dir_all(&g.old_dir).unwrap();
+        let e = rename_failure(&old, "disk error".into(), true).unwrap_err();
+        assert!(e.contains("disk error") && e.contains("stranded") && e.contains("Make again") && e.contains("proton-tool update") && e.contains(NEW), "{e}");
+        std::fs::remove_dir_all(&g.root).unwrap();
+    }
+
+    /// A rename that fails for another reason than a refusal is an error, not a pending note, and the games stay put.
+    #[test]
+    fn switching_on_surfaces_a_rename_that_fails_for_another_reason() {
+        if is_root() {
+            return;
+        }
+        let g = Gone::new("realerror");
+        let before = g.config();
+        let config_dir = config_vdf(&g.root).parent().unwrap().to_path_buf();
+        chmod(&config_dir, 0o555);
+        let e = switch_on(&g.root, std::slice::from_ref(&g.lib), "1174180", &g.wrapper, false);
+        chmod(&config_dir, 0o755);
+        let e = e.unwrap_err();
+        assert!(!e.contains("still pending"), "{e}");
+        assert!(g.old_dir.is_dir() && g.games_on(OLD) && g.config() == before);
+        std::fs::remove_dir_all(&g.root).unwrap();
+    }
+
+    /// The repair of stranded games is not lost when the switch-on or the update fails afterwards: the error says it.
+    #[test]
+    fn a_failure_after_the_repair_still_says_games_were_moved() {
+        let (root, lib, w) = steam("repairfail");
+        let libs = std::slice::from_ref(&lib);
+        fake_app(&root, "1174180", "RDR2", Some(("RDR2.exe", "MZ")));
+        fake_app(&root, "777", "Other", Some(("Other.exe", "MZ")));
+        switch_on(&root, libs, "1174180", &w, false).unwrap().unwrap();
+        for a in ["0", "1174180"] {
+            edit(&root, |old| set_name(old, a, OLD)).unwrap();
+        }
+        edit(&root, |old| set_name(old, "777", "Missing Proton")).unwrap();
+        let e = switch_on(&root, libs, "777", &w, false).unwrap_err();
+        assert!(e.contains("not found among the installed") && e.contains("before that: moved") && e.contains(OLD), "{e}");
+        assert!(orphaned_mappings(&root).is_empty(), "the repair itself stands");
+        // The same for Make again: a wrapper that cannot be read fails it after the repair.
+        for a in ["0", "1174180"] {
+            edit(&root, |old| set_name(old, a, OLD)).unwrap();
+        }
+        let copy = proton_tool::tools(&root).remove(0);
+        let procs = root.join("proc");
+        std::fs::create_dir_all(&procs).unwrap();
+        let e = update_in(&root, &copy, &root.join("missing.dll"), false, &procs).unwrap_err();
+        assert!(e.contains("before that: moved") && e.contains(OLD), "{e}");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

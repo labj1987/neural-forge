@@ -234,6 +234,17 @@ impl Roots {
     }
 }
 
+/// The finding for games left on a renamed copy's old name: "is" for one entry, "are" for several.
+fn orphan_message(o: &crate::compat_tool::Orphaned) -> String {
+    format!(
+        "{} {} set to {}, which is not installed, while its renamed copy {} is: a rename stopped before their games moved, so Steam runs them with another Proton",
+        o.games.iter().map(|g| crate::compat_tool::app_label(g)).collect::<Vec<_>>().join(", "),
+        if o.games.len() == 1 { "is" } else { "are" },
+        o.name,
+        o.to
+    )
+}
+
 /// Every finding, worst first.
 pub fn run(roots: &Roots) -> Vec<Finding> {
     let mut out = vec![check_config(roots), check_ngx_dll(roots), check_model(roots), check_user_dirs(roots)];
@@ -958,12 +969,7 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
             out.push(Finding::new(
                 CHECK,
                 Severity::Warning,
-                format!(
-                    "{} are set to {}, which is not installed, while its renamed copy {} is: a rename stopped before their games moved, so Steam runs them with another Proton",
-                    o.games.iter().map(|g| crate::compat_tool::app_label(g)).collect::<Vec<_>>().join(", "),
-                    o.name,
-                    o.to
-                ),
+                orphan_message(&o),
                 proton_tool::tools_dir(&root.path).join(&o.to).display().to_string(),
                 Some(format!(
                     "Close Steam, then run `neural-forge-cli proton-tool update` (or switch the game off and on again in Neural Forge): the games move to {}.",
@@ -1631,6 +1637,14 @@ fn check_session_log(roots: &Roots, events: Result<&[state_log::Event], std::io:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_orphan_finding_agrees_in_number() {
+        let one = crate::compat_tool::Orphaned { name: "a-NeuralForge".into(), to: "Proton-a-NeuralForge".into(), games: vec!["0".into()] };
+        assert!(orphan_message(&one).starts_with("the default for every game is set to a-NeuralForge,"), "{}", orphan_message(&one));
+        let two = crate::compat_tool::Orphaned { games: vec!["0".into(), "5".into()], ..one };
+        assert!(orphan_message(&two).starts_with("the default for every game, app 5 are set to"), "{}", orphan_message(&two));
+    }
+
     use super::*;
     use std::sync::atomic::AtomicU64;
 
@@ -1819,6 +1833,8 @@ mod tests {
         let new = tools.join("Proton-experimental-11.0-NeuralForge");
         write(&new.join(crate::proton_tool::MARKER), &marker("/elsewhere/Proton - Experimental"));
         write(&new.join("files/lib/wine/x86_64-unix/ntdll.so"), "\0wine-11.0\0");
+        write(&new.join("proton"), "#!/usr/bin/env python3\n");
+        write(&new.join("compatibilitytool.vdf"), &crate::proton_tool::manifest("Proton-experimental-11.0-NeuralForge"));
         let text = fix(&f);
         assert!(text.contains("the games move to Proton-experimental-11.0-NeuralForge and this copy is removed"), "{text}");
         // Another tool under the name: not renamed.

@@ -676,8 +676,17 @@ pub enum RenamePlan {
     Clash(PathBuf),
 }
 
+/// Whether the copy has what Steam and Make again need of it: its `proton` script, its `files/` and a manifest that
+/// names it. A damaged copy never takes the games of a working one.
+fn looks_complete(t: &Tool) -> bool {
+    t.dir.join("proton").is_file()
+        && t.dir.join("files").is_dir()
+        && std::fs::read_to_string(t.dir.join("compatibilitytool.vdf")).is_ok_and(|m| m.contains(&format!("\"{}\"", t.name)))
+}
+
 /// The one decision behind [`rename_in`], Make again's description in the Setup tab and `doctor`: what happens to `tool`
-/// (named without "Proton") given what is in its `compatibilitytools.d` now.
+/// (named without "Proton") given what is in its `compatibilitytools.d` now. A copy of the same version under the new
+/// name that is not complete ([`looks_complete`]) is a [`RenamePlan::Clash`].
 pub fn rename_plan(tool: &Tool) -> RenamePlan {
     let name = neural_forge_protocol::proton_copy::copy_name(&tool.source_version);
     if name == tool.name {
@@ -686,7 +695,7 @@ pub fn rename_plan(tool: &Tool) -> RenamePlan {
     let target = tool.dir.with_file_name(&name);
     if target.exists() || target.is_symlink() {
         return match tool_at(&target) {
-            Some(t) if t.source_version == tool.source_version => RenamePlan::Merge(t),
+            Some(t) if t.source_version == tool.source_version && looks_complete(&t) => RenamePlan::Merge(t),
             _ => RenamePlan::Clash(target),
         };
     }
@@ -705,7 +714,7 @@ pub fn rename_in(tool: &Tool, proc_root: &Path) -> Result<Renamed, String> {
         RenamePlan::Same => Ok(Renamed::To(tool.clone())),
         RenamePlan::Merge(t) => Ok(Renamed::Existing(t)),
         RenamePlan::Clash(target) => {
-            Err(format!("{} already exists and is another tool: remove or rename it, then make {} again", target.display(), tool.name))
+            Err(format!("{} already exists and is another tool or an incomplete copy: remove or rename it, then make {} again", target.display(), tool.name))
         }
         RenamePlan::Rename(name) => {
             refuse_in_use(&tool.dir, proc_root, "rename it")?;

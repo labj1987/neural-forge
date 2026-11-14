@@ -981,7 +981,10 @@ fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
             }
             for t in proton_tool::tools(root).into_iter().filter(proton_tool::outdated) {
                 match neural_forge_supervisor::compat_tool::update(root, &t, &wrapper, running) {
-                    Ok(done) if done.to == done.from => println!("{}: made again (its source's current version, the installed NGX wrapper)", t.name),
+                    Ok(done) if done.to == done.from => {
+                        println!("{}: made again (its source's current version, the installed NGX wrapper)", t.name);
+                        print_update_extras(&done);
+                    }
                     Ok(done) if done.renamed => {
                         println!("{}: renamed to {} (its source is gone; the copy holds its own files)", t.name, done.to);
                         print_update_extras(&done);
