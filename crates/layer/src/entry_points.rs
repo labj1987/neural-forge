@@ -46,6 +46,11 @@ impl EntryPoints {
         // never reads a null one (`noop_bind`): in every process the layer works in, on devices that have the command.
         let original =
             unsafe { crate::noop_bind::intercept(device, CStr::from_ptr(name).to_bytes(), original, crate::layer_enabled() && crate::ownership::eligible()) };
+        // The commands newer than the framework that name a swapchain, answered for a swapchain the layer owns
+        // (`gpu2_present`): only with a second GPU asked for.
+        #[cfg(target_arch = "x86_64")]
+        let original =
+            unsafe { crate::gpu2_present::intercept(device, CStr::from_ptr(name).to_bytes(), original, crate::second_gpu_asked() && crate::layer_enabled()) };
         unsafe { Self::intercept(name, original) }
     }
     /// `vkGetImageViewHandle64NVX` is newer than the pinned ash and `vulkan-layer`, so the

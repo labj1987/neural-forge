@@ -128,7 +128,8 @@ full one. Numbers per game: [docs/MEASURED_RESULTS.md](docs/MEASURED_RESULTS.md)
 
 With two GPUs, the model can run on the second one while the game renders on the first: before DLSS, after DLSS (in
 games with Ray Reconstruction, or with Placement set to After DLSS), or on the finished frame
-(`NEURAL_FORGE_OFFLOAD_GPU`): see
+(`NEURAL_FORGE_OFFLOAD_GPU`). On the finished frame the second GPU can also show the frame itself, so the game never
+waits for it (the monitor is then plugged into the second GPU): see
 [the user guide](docs/USER_GUIDE.md#the-model-on-a-second-gpu).
 
 ## Reporting a bug

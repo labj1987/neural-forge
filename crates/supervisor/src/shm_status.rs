@@ -104,6 +104,8 @@ pub fn status_text_with(header: &ShmHeader, desktop: Option<&str>) -> String {
         }
     }));
     line(format_args!("hdr_verdict={}", hdr_line(header, desktop)));
+    line(format_args!("second_gpu_present={}", header.second_gpu_present.load(Ordering::Relaxed)));
+    line(format_args!("second_gpu_present_line={}", header.second_gpu_present_line()));
     line(format_args!("device_lost_at={}", header.device_lost_at.load(Ordering::Relaxed)));
     line(format_args!("preupscale_extent={}x{}", header.preupscale_width.load(Ordering::Relaxed), header.preupscale_height.load(Ordering::Relaxed)));
     line(format_args!("preupscale_hold_ms={}", f32::from_bits(header.preupscale_hold_ms_bits.load(Ordering::Relaxed))));

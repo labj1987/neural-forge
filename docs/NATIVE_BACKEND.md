@@ -1755,6 +1755,17 @@ per summary, video memory at 11.8 of 12 GB; in 24 captured frames each composite
 and after each stall the capture's own writing caused (2.7 s) one frame went out live and was then shown once more,
 composed.
 
+## The second GPU shows the frame (#63, 2026-11-14)
+
+With the model on the finished frame, the setting `second_gpu_present` moves the present itself to the second
+device: the game gets a swapchain the layer owns (plain images on its device), the real swapchain is created on the
+second device, the game's present copies its image into one of three host-memory slots and returns, and a presenter
+thread uploads the newest slot and presents it through this same finished-frame path, run on the second device by a
+device record of its own (so the network's server is the local one there, never the round trip). Nothing comes back
+to the game's GPU and the game never waits; frames that find no slot, or are overtaken, are skipped. The design, the
+swapchain semantics and the fall-backs are in [SECOND_GPU_PRESENT_DESIGN.md](SECOND_GPU_PRESENT_DESIGN.md); the code
+is `crates/layer/src/gpu2_present.rs` and the `gpu2_*` parts of `device.rs`.
+
 ## Finished-frame pacing: the relay and the wait on the GPU (4.4.0, 2026-11-13)
 
 `composition::pace`, `capture::paced_present`, `GpuCompose::send_delayed`, `native_post`'s `Export`. The delayed

@@ -498,6 +498,13 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     ));
     let (placement, set_placement) = bind_u32(&shm, Some("placement"), |h| &h.placement);
     model_group.add(&placement_row(placement, set_placement));
+    let (v, set) = bind_bool(&shm, Some("second_gpu_present"), |h| &h.second_gpu_present);
+    model_group.add(&switch_row(
+        "Second GPU shows the frame",
+        "With the model on a second GPU (NEURAL_FORGE_OFFLOAD_GPU) and Placement Finished frame: that GPU shows the frame itself, so each frame crosses once and the game never waits; frames it cannot carry are skipped. The monitor must be plugged into the second GPU. Applies when the game starts",
+        v,
+        set,
+    ));
     let (scale, set_scale) = bind_float(&shm, Some("preupscale_scale"), |h| &h.preupscale_scale_bits);
     model_group.add(&scale_row(
         "Model resolution",
@@ -3242,6 +3249,12 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     group.add(&preupscale_row);
     group.add(&tested_row);
     group.add(&hdr_row);
+    // The second GPU showing the frames itself (`second_gpu_present`): which GPU, frames shown and skipped and the
+    // copy's time, or why not; hidden while there is nothing to say.
+    let second_row = adw::ActionRow::new();
+    second_row.set_title("Second GPU's present");
+    second_row.set_visible(false);
+    group.add(&second_row);
 
     // The desktop's HDR state asks the compositor (a D-Bus call): on a worker, every 30 s.
     let desktop: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::default();
@@ -3268,6 +3281,9 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         tested_row.set_subtitle(&tested);
         tested_row.set_tooltip_text(notes.as_deref());
         hdr_row.set_subtitle(&neural_forge_supervisor::shm_status::hdr_line(hdr, desktop.borrow().as_deref()));
+        let second = hdr.second_gpu_present_line();
+        second_row.set_visible(!second.is_empty());
+        second_row.set_subtitle(&second);
         // A header laid out by another build is refused at open (see `Shm::open`), so the
         // version needs no check here.
         let layer_active = live.alive(hdr);

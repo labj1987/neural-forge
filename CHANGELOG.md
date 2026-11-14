@@ -29,6 +29,22 @@ first shipped them; their phase is kept as a subheading.
 - None of this is measured on two different cards yet: the test machine has one GPU, where a second device of the
   same card shows that the paths work and what they add, not what a second card saves.
 
+**The second GPU can show the frame itself (asked for in #63)**
+
+- New setting "Second GPU shows the frame" (Model tab; `second_gpu_present`), for the model on a second GPU with
+  Placement set to Finished frame. The second GPU then runs the model and shows the frame itself. Each frame crosses
+  to it once and nothing comes back, so the game no longer waits for the second GPU: when the link or the second GPU
+  cannot keep up, frames are skipped instead of the game's frame rate dropping.
+- To use it: plug the monitor into the second GPU, set `NEURAL_FORGE_OFFLOAD_GPU`, set Placement to Finished frame,
+  switch the setting on and start the game (it takes effect when the game starts).
+- What it costs: the frame is shown later by the copy and the model's time on the second GPU. The game's V-Sync no
+  longer limits the game (use its frame limiter), and Reflex's sleep and latency statistics do nothing in this mode.
+- The Status tab's "Second GPU's present" row says which GPU shows the frames, how many were shown and skipped, and
+  the copy's time, or why the mode is not used. When the second GPU cannot show the game's window, or anything fails
+  while it runs, the game gets its usual swapchain back and the frames return to the game's GPU as before.
+- Not tested on two different cards yet: on the test machine's one GPU a second device of the same card shows that
+  the path works, not what a second card gains.
+
 ## 4.3.0 — 2026-11-13
 
 **The second GPU with Ray Reconstruction**

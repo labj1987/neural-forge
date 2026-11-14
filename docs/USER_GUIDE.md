@@ -196,7 +196,8 @@ is below 0.000001 or too wide to give a usable grid, which the Choose button and
 frame), **After DLSS** (on DLSS's output, before the game's HUD and post-processing, at the output
 resolution, so it costs more than before the upscaler; where a game's DLSS output cannot be held, it runs
 where Auto would) or **Finished frame** (on the presented frame, HUD included; DLSS gets its input
-untouched). Model resolution applies after DLSS too, as a share of the output size. Each pass can have its
+untouched). **Second GPU shows the frame** (Model tab, with a second GPU and Finished frame): see
+[The model on a second GPU](#the-model-on-a-second-gpu). Model resolution applies after DLSS too, as a share of the output size. Each pass can have its
 own placement in the per-pass settings, so pass 1 can run before the upscaler and pass 2 after DLSS, each
 with its own settings and history. Passes run in the frame's order: a pass placed earlier than the pass
 before it runs where that one does, and passes on the finished frame after passes held in the game's frame
@@ -471,6 +472,27 @@ and 66 MB at 3840x2160), and the frame rate is bounded by that time: expect a la
 game's GPU does better with the model on it, the model goes back there (below).
 Consider the small network or a lower Model resolution at 4K. The Status tab says "the model runs on ... after DLSS,
 its edit applied one frame later".
+
+**The second GPU shows the frame.** With Placement at Finished frame, the Model tab's **Second GPU shows the frame**
+(`set_second_gpu_present=1`) makes the second GPU run the model and show the frame on its own, so nothing comes back
+to the game's GPU:
+
+1. Plug the monitor into the second GPU.
+2. Set `NEURAL_FORGE_OFFLOAD_GPU`, set Placement to Finished frame for every pass, switch the setting on, then start
+   the game (the setting is read when the game creates its window's swapchain).
+
+Each frame crosses to the second GPU once (about 15 MB at 2560x1440 and 33 MB at 3840x2160 in SDR or HDR10) and the
+game never waits for it. When the link or the second GPU cannot carry every frame, the newest frame wins and the
+others are skipped: the game keeps its frame rate, and what you see has the second GPU's rate. The frame is shown
+later than on one GPU, by the copy and the model's time. The game's V-Sync no longer limits the game (the second
+GPU's swapchain has the game's present mode, but the game is not held to it): use the game's frame limiter. Reflex's
+sleep and latency statistics do nothing in this mode, and Frame Generation's frames are handed over like any other.
+The Status tab's **Second GPU's present** row says "second GPU shows the frames: <GPU>; N shown, M skipped (P%), copy
+X ms" (the copy is one frame's way from the game's GPU into the second GPU), or "second GPU does not show the frames:
+<why>". When the second GPU cannot present to the game's window (the monitor is on the other card), does not offer the
+game's format, or anything fails while it runs, the game gets its usual swapchain and the frames come back to the
+game's GPU as described below; after a failure while it ran, the mode stays off until the game restarts. Not yet
+tested on two different cards.
 
 **Finished frame.** The Model interval setting is ignored while the second GPU runs the model (every frame gets its own answer).
 Each frame goes to it and back
