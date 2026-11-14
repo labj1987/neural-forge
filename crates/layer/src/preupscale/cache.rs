@@ -699,6 +699,8 @@ pub(crate) struct CachePass {
     /// in place of the colour input; what it points at ([`Self::bind_late`]).
     late_set: vk::DescriptorSet,
     late_bound: Option<(Bindings, bool, vk::ImageView, u64)>,
+    /// Which edit cache this is, counted over the process ([`Self::made`]).
+    made: u64,
     stats: HostBuffer,
     /// Which pass this is, counted over the process ([`Self::stats_made`]).
     stats_made: u64,
@@ -805,6 +807,10 @@ impl CachePass {
                 set,
                 late_set,
                 late_bound: None,
+                made: {
+                    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                    MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                },
                 stats,
                 stats_made: {
                     static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1218,6 +1224,12 @@ impl CachePass {
 
     /// The counters' buffer: the hold inside DLSS's buffer clears it there ([`CLEARED_BYTES`]) and copies it
     /// out for the host, and the hold guard clears [`STAT_EDIT_STORED`] in it.
+    /// Names this edit cache: another number for every one built, so a set bound to a destroyed cache's counters is
+    /// never taken for this one's when the driver gives the buffer its handle again (`offload_pre::Exchange::bind_gate`).
+    pub(crate) fn made(&self) -> u64 {
+        self.made
+    }
+
     pub(crate) fn stats_buffer(&self) -> vk::Buffer {
         self.stats.buffer
     }

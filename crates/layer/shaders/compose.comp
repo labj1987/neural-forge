@@ -566,11 +566,13 @@ void main() {
         if (small_proxy) {
           // The proxy input is the small proxy enlarged, softer than the frame at every edge, which is no motion.
           // So the comparison is made where both are the same picture: the small proxy's own texels against the
-          // current frame reduced the way the capture reduced it. Texels about 3 px of the frame apart (every
-          // texel at a half and below, where a texel is that wide or wider), two each way: the pixel's own texel
-          // and the eight around it alone left stale colour on a 2 px pan (30 of 255 in the texture test).
+          // current frame reduced the way the capture reduced it. Two texels each way, every texel where a texel
+          // is 1.7 px of the frame or wider (a Model resolution of 58% and below), every second one up to 2.7 px
+          // and every third at the frame's own size, so the taps are 2 to 4 px of the frame apart. (The pixel's
+          // own texel and the eight around it alone left stale colour on a 2 px pan: 30 of 255 in the texture
+          // test.) The step is a floor, never a rounding of a half, which the implementations round differently.
           ivec2 tc = clamp(ivec2((vec2(src) + 0.5) * vec2(small) / vec2(size)), ivec2(0), small - ivec2(1));
-          int tstep = max(1, int(round(3.0 * float(small.x) / float(size.x))));
+          int tstep = max(1, int(floor(3.0 * float(small.x) / float(size.x) + 0.25)));
           for (int j = -2; j <= 2; ++j) {
             for (int i = -2; i <= 2; ++i) {
               ivec2 t = clamp(tc + ivec2(i, j) * tstep, ivec2(0), small - ivec2(1));

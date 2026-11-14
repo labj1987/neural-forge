@@ -429,8 +429,8 @@ struct Pack {
     set: vk::DescriptorSet,
     packed: super::native::OwnBuffer,
     texels: u64,
-    /// The field the set points at.
-    bound: vk::Buffer,
+    /// The field the set points at, with which native pass's it is (`native::NativePass::id`).
+    bound: Option<(vk::Buffer, u64)>,
 }
 
 impl Pack {
@@ -458,7 +458,7 @@ impl Pack {
                 device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout])).ok()
             });
             match (pool, set) {
-                (Some(pool), Some(sets)) => Some(Self { pipeline, pool, set: sets[0], packed, texels, bound: vk::Buffer::null() }),
+                (Some(pool), Some(sets)) => Some(Self { pipeline, pool, set: sets[0], packed, texels, bound: None }),
                 (pool, _) => {
                     if let Some(pool) = pool {
                         device.destroy_descriptor_pool(pool, None);
@@ -681,7 +681,10 @@ impl Exchange {
         }
     }
 
-    /// Points the gate at the edit cache's counters `stats`, when they changed.
+    /// Points the gate at the edit cache's counters `stats`, when they changed. `made` names the edit cache they
+    /// belong to (`cache::CachePass::made`): a cache destroyed and built again under this side (the VRAM guard's
+    /// pause frees it, `Resources::release_native`) often gets its counters under the old handle, and a set left as
+    /// it was then pointed at the freed buffer (the fault `CachePass::bind_late` had, #63).
     ///
     /// `made` names the edit cache `stats` belongs to (`cache::CachePass::stats_made`: counted, never a handle). The
     /// buffer's handle alone does not: an edit cache destroyed and built again while this side lives (the VRAM
@@ -710,19 +713,36 @@ impl Exchange {
     }
 
     /// Points the motion's pack at the accumulated field `field` (2 x f32 a texel), when it changed and the motion
-    /// crosses packed.
+    /// crosses packed. `made` names the native pass it belongs to (`native::NativePass::id`): a pass built again
+    /// under this side (a change of the Model resolution in a running game, `native::take_other_extents`) often gets
+    /// its field under the old handle.
     ///
     /// # Safety
     /// `field` is live and holds the layout's packed texels; nothing that may run uses the set unless it is unchanged.
-    pub(crate) unsafe fn bind_pack(&mut self, device: &ash::Device, field: vk::Buffer) {
-        let Some(pack) = self.pack.as_mut().filter(|p| p.bound != field) else { return };
+    pub(crate) unsafe fn bind_pack(&mut self, device: &ash::Device, field: vk::Buffer, made: u64) {
+        let Some(pack) = self.pack.as_mut().filter(|p| p.bound != Some((field, made))) else { return };
         let from = [vk::DescriptorBufferInfo { buffer: field, offset: 0, range: pack.texels * 8 }];
         let to = [vk::DescriptorBufferInfo { buffer: pack.packed.buffer, offset: 0, range: vk::WHOLE_SIZE }];
         let w =
             |n: u32, i| vk::WriteDescriptorSet::default().dst_set(pack.set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i);
         // SAFETY: the contract.
         unsafe { device.update_descriptor_sets(&[w(0, &from), w(1, &to)], &[]) };
-        pack.bound = field;
+        pack.bound = Some((field, made));
+    }
+
+    /// The edit cache or the native pass the gate's and the pack's sets point into is going: both are written again
+    /// before they are next used.
+    pub(crate) fn forget_bound(&mut self) {
+        self.gated = None;
+        if let Some(pack) = self.pack.as_mut() {
+            pack.bound = None;
+        }
+    }
+
+    /// Tests: what the gate's and the pack's sets are taken to point at.
+    #[cfg(test)]
+    pub(crate) fn bound_for_test(&self) -> (Option<(vk::Buffer, u64)>, Option<(vk::Buffer, u64)>) {
+        (self.gated, self.pack.as_ref().and_then(|p| p.bound))
     }
 
     /// Whether the motion crosses packed to halves.
@@ -850,7 +870,7 @@ impl Exchange {
         // The motion packed to halves first: what is copied below is the packed field.
         let motion = match (from.motion, self.pack.as_ref()) {
             (Some(field), Some(pack)) => {
-                debug_assert_eq!(pack.bound, field, "the pack is bound to the hold's field");
+                debug_assert_eq!(pack.bound.map(|b| b.0), Some(field), "the pack is bound to the hold's field");
                 let field_ready = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
@@ -1016,10 +1036,13 @@ fn release(pick: impl Fn(&Running) -> bool) -> bool {
 }
 static WORKERS: Mutex<Vec<Running>> = Mutex::new(Vec::new());
 
+/// Ends a worker's thread and waits for it. The handle's lock is held across the join: a second caller (the side's
+/// own [`Worker::stop`] while another thread releases the worker, [`release`]), and [`Worker::ended`], wait here until
+/// the thread has ended, never return while it still runs with the exchange they are about to free.
 fn join(quit: &AtomicBool, thread: &Mutex<Option<std::thread::JoinHandle<()>>>) {
     quit.store(true, Ordering::Release);
-    let handle = thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-    if let Some(t) = handle {
+    let mut handle = thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(t) = handle.take() {
         let _ = t.join();
     }
 }
@@ -2548,6 +2571,56 @@ mod tests {
         game.close(worker);
     }
 
+    /// The gate's set over an edit cache destroyed and built again under the same side (#63, review: the VRAM
+    /// guard's pause frees the cache, `Resources::release_native`): the new cache's counters are another buffer,
+    /// often under the old handle. The set is keyed on which cache they are, written again for the new one, and the
+    /// holds after it run their gate on live counters (under the validation layer a set left on the destroyed
+    /// buffer is an error at the dispatch). The pack's set is keyed the same way on the native pass.
+    #[test]
+    fn the_gate_is_written_again_for_another_caches_counters_under_the_same_handle() {
+        let Some((mut game, worker, _, gave_up, _)) = rig(Vec::new(), None) else { return };
+        let d = game.dev.device.clone();
+        let mut cadence = Cadence::default();
+        let hold = |game: &Game, cadence: &mut Cadence, hold: u64| {
+            let plan = cadence.hold(hold, true);
+            if hold > 1 {
+                wait_finished(game, hold as u32 - 1);
+            }
+            game.run(&[game.record(plan, 100 + hold as u32)]);
+        };
+        for k in 1..=3u64 {
+            hold(&game, &mut cadence, k);
+        }
+        assert_eq!(game.landed(), (Some(102), true));
+        let first = game.stats.buffer;
+        assert_eq!(game.exchange.bound_for_test().0, Some((first, 1)), "bound by the rig to the first cache's counters");
+        // SAFETY: the test's own objects; every hold recorded with the set was waited for (`run`).
+        unsafe {
+            game.exchange.bind_gate(&d, first, 1);
+            assert_eq!(game.exchange.bound_for_test().0, Some((first, 1)), "the same cache: nothing to write");
+            // Another cache's counters under the very same handle: not the same, written again.
+            game.exchange.bind_gate(&d, first, 2);
+            assert_eq!(game.exchange.bound_for_test().0, Some((first, 2)));
+            // The cache is destroyed: nothing is taken as bound, whatever comes next.
+            game.exchange.forget_bound();
+            assert_eq!(game.exchange.bound_for_test(), (None, None));
+            // And really: the counters go, new ones are made (the driver may hand out the old handle) and bound.
+            let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
+            let new = crate::preupscale::own_host_buffer_with(&d, &game.dev.instance, game.dev.physical, 64, usage).expect("new counters");
+            std::mem::replace(&mut game.stats, new).destroy(&d);
+            game.exchange.bind_gate(&d, game.stats.buffer, 3);
+            assert_eq!(game.exchange.bound_for_test().0, Some((game.stats.buffer, 3)));
+        }
+        // The holds go on over the new counters, each with the answer to the frame before it.
+        for k in 4..=6u64 {
+            hold(&game, &mut cadence, k);
+        }
+        assert_eq!(game.landed(), (Some(105), true), "the gate ran on the new counters");
+        assert!(gave_up.lock().unwrap().is_empty());
+        wait_finished(&game, 6);
+        game.close(worker);
+    }
+
     /// DLSS's buffers recorded ahead and submitted one by one: what counts is the order they run in.
     #[test]
     fn holds_recorded_ahead_carry_their_answers_when_submitted_in_turn() {
@@ -3070,7 +3143,7 @@ mod tests {
                 unsafe {
                     let mut exchange = Exchange::build(&dev.device, &dev.instance, dev.physical, dev.import, sizes)?;
                     let (frame, side, answer, stats) = (own(sizes.frame)?, own(sizes.side)?, own(sizes.answer)?, own(64)?);
-                    exchange.bind_gate(&dev.device, stats.buffer);
+                    exchange.bind_gate(&dev.device, stats.buffer, 1);
                     Some(HoldRig { exchange, sizes, frame, side, answer, stats })
                 }
             };
@@ -3438,7 +3511,15 @@ mod tests {
             assert!(exchange.motion_half());
             let (source, frame, side) = (own(texels * 8), own(sizes.frame), own(sizes.side));
             std::ptr::copy_nonoverlapping(field.as_ptr().cast::<u8>(), source.ptr, field.len() * 8);
-            exchange.bind_pack(&dev.device, source.buffer);
+            exchange.bind_pack(&dev.device, source.buffer, 1);
+            // Keyed on which native pass the field is: another pass's field under the same handle is written again,
+            // and a pass that goes leaves nothing taken as bound.
+            assert_eq!(exchange.bound_for_test().1, Some((source.buffer, 1)));
+            exchange.bind_pack(&dev.device, source.buffer, 2);
+            assert_eq!(exchange.bound_for_test().1, Some((source.buffer, 2)));
+            exchange.forget_bound();
+            assert_eq!(exchange.bound_for_test().1, None);
+            exchange.bind_pack(&dev.device, source.buffer, 2);
             let d = &dev.device;
             let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(dev.family), None).unwrap();
             let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];

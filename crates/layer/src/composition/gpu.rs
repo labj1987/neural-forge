@@ -2663,14 +2663,14 @@ impl GpuCompose {
         true
     }
 
-    /// Whether `gen_*` hold this answer generation, so a zero-copy compose can present it again
-    /// (a carried frame) with no CPU copy of the answer anywhere.
     /// Whether the frames this composes come from an `*_SRGB` swapchain: the capture's blit to a small proxy then
     /// filters in linear light, and the ghost guard reduces the current frame the same way (`compose.comp`).
     pub fn set_capture_srgb(&mut self, srgb: bool) {
         self.capture_srgb = srgb;
     }
 
+    /// Whether `gen_*` hold this answer generation, so a zero-copy compose can present it again
+    /// (a carried frame) with no CPU copy of the answer anywhere.
     pub fn holds_generation(&self, generation: u64) -> bool {
         generation != 0 && self.zc.generation == generation && self.zc.frames.is_some()
     }

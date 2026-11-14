@@ -654,6 +654,10 @@ const IN_FLIGHT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 /// How often the loader thread checks the VRAM budget for the guard ([`super::vram_guard`]) while it has no other work.
 const GUARD_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// A hold's miss while the network is still being loaded and built on its device (the finished frame's trial gives
+/// such holds the build's budget, `offload_trial::is_loading`).
+pub(crate) const LOADING: &str = "the native network is still loading";
+
 /// The words of `nf_native_open`'s refusal while another network is open in the process (crates/native/cpp/nf_native.cpp).
 const OPEN_ELSEWHERE: &str = "another network is open in this process";
 
@@ -4703,7 +4707,7 @@ unsafe fn native_hold(
         } else if loader.waiting_for_holds(reserved) {
             WAITING
         } else {
-            "the native network is still loading"
+            LOADING
         });
         return result;
     };
@@ -4821,6 +4825,10 @@ unsafe fn native_hold(
         unsafe { old.destroy(device) };
         if let Some(e) = res.edit.as_mut() {
             e.state.drop_edit();
+        }
+        // The offload's side stays: its pack's set pointed at the pass's field that just went.
+        if let Some(side) = res.offpre.as_mut() {
+            side.exchange.forget_bound();
         }
     }
     let mut native = match res.native.take() {
@@ -5090,7 +5098,7 @@ unsafe fn native_hold(
             unsafe {
                 late_bound = edit.bind_late(device, side.snapshot_view(), side.snapshot_made());
                 side.exchange.bind_gate(device, edit.stats_buffer(), edit.stats_made());
-                side.exchange.bind_pack(device, native.acc.buffer);
+                side.exchange.bind_pack(device, native.acc.buffer, native.id());
             }
         }
         // A hold that records nothing (below) must not have taken the stored edit out of the plan.

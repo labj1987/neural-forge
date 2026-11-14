@@ -283,7 +283,7 @@ enum PostAction {
 /// [`PostAction`] for a server in `status` (`None`: none), on the other GPU (`offload`) or not, with the finished
 /// frame's trial running or keeping the model on the game's GPU (`trial_local`) and a give-back pending (`back`).
 #[cfg(target_arch = "x86_64")]
-fn post_action(status: Option<native_post::Status>, offload: bool, trial_local: bool, back: bool) -> PostAction {
+fn post_action(status: Option<native_post::Status>, offload: bool, trial_local: bool, back: bool, moved: bool) -> PostAction {
     use native_post::Status;
     match status {
         Some(Status::Starting) => PostAction::Wait,
@@ -298,9 +298,11 @@ fn post_action(status: Option<native_post::Status>, offload: bool, trial_local: 
         Some(Status::Unavailable) => PostAction::Drop { stalled: false, failed: false, handed: false },
         // Ended for a reason that may pass; or the other GPU's server ended for the finished frame's trial: no failure,
         // the game's GPU's starts at the next present.
+        // (Or it ended because Placement left the finished frame and a hold took the second GPU, `moved`: no failure
+        // either, and nothing handed to the game's GPU.)
         Some(Status::Retry) => {
             let handed = offload && trial_local;
-            PostAction::Drop { stalled: false, failed: !handed, handed }
+            PostAction::Drop { stalled: false, failed: !handed && !(offload && moved), handed }
         }
         None => PostAction::Start,
     }
@@ -4690,6 +4692,11 @@ impl Resources {
     #[cfg(target_arch = "x86_64")]
     pub(crate) unsafe fn release_native(&mut self, device: &ash::Device) -> bool {
         let mut any = false;
+        // The offload's side stays: its gate's and pack's sets point into the edit cache and the native pass that go.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(side) = self.offpre.as_mut() {
+            side.exchange.forget_bound();
+        }
         // SAFETY (each destroy): nothing recorded with them may still run (this function's contract).
         if let Some(n) = self.native.take() {
             unsafe { n.destroy(device) };
@@ -7029,7 +7036,8 @@ impl Session {
             } else {
                 (false, false)
             };
-            match post_action(status, self.post_offload, trial, back) {
+            let moved = choice_on && self.post_offload && offload::moved_to_hold(device.handle());
+            match post_action(status, self.post_offload, trial, back, moved) {
                 PostAction::Wait => {
                     if status == Some(Status::Serving) && self.post_retry.failing() {
                         self.post_retry.succeeded();
@@ -7658,20 +7666,24 @@ mod tests {
         use native_post::Status::*;
         let drop = |stalled, failed, handed| PostAction::Drop { stalled, failed, handed };
         // The other GPU's server ended for the trial: handed over, no failure booked.
-        assert_eq!(post_action(Some(Retry), true, true, false), drop(false, false, true));
+        assert_eq!(post_action(Some(Retry), true, true, false, false), drop(false, false, true));
         // Any other end that may pass waits for the retry schedule; the game's GPU's own Retry is never a hand-over.
-        assert_eq!(post_action(Some(Retry), true, false, false), drop(false, true, false));
-        assert_eq!(post_action(Some(Retry), false, true, false), drop(false, true, false));
+        assert_eq!(post_action(Some(Retry), true, false, false, false), drop(false, true, false));
+        assert_eq!(post_action(Some(Retry), false, true, false, false), drop(false, true, false));
         // The trial gave the model back: the game's GPU's server ends, not the other GPU's, and not while the trial
         // keeps the model here (a give-back from before a re-trial).
-        assert_eq!(post_action(Some(Serving), false, false, true), PostAction::EndForSwitch);
-        assert_eq!(post_action(Some(Serving), true, false, true), PostAction::Wait);
-        assert_eq!(post_action(Some(Serving), false, true, true), PostAction::Wait);
-        assert_eq!(post_action(Some(Serving), false, false, false), PostAction::Wait);
-        assert_eq!(post_action(Some(Stalled), true, false, false), PostAction::Wait);
-        assert_eq!(post_action(Some(Stalled), false, false, false), drop(true, false, false));
-        assert_eq!(post_action(Some(Unavailable), true, true, false), drop(false, false, false));
-        assert_eq!(post_action(None, false, false, false), PostAction::Start);
+        assert_eq!(post_action(Some(Serving), false, false, true, false), PostAction::EndForSwitch);
+        assert_eq!(post_action(Some(Serving), true, false, true, false), PostAction::Wait);
+        assert_eq!(post_action(Some(Serving), false, true, true, false), PostAction::Wait);
+        assert_eq!(post_action(Some(Serving), false, false, false, false), PostAction::Wait);
+        assert_eq!(post_action(Some(Stalled), true, false, false, false), PostAction::Wait);
+        assert_eq!(post_action(Some(Stalled), false, false, false, false), drop(true, false, false));
+        assert_eq!(post_action(Some(Unavailable), true, true, false, false), drop(false, false, false));
+        assert_eq!(post_action(None, false, false, false, false), PostAction::Start);
+        // Ended because Placement left the finished frame and a hold took the second GPU (`offload::moved_to_hold`):
+        // dropped without a failure, so the next start waits for no retry; the game's GPU's own retry still fails.
+        assert_eq!(post_action(Some(Retry), true, false, false, true), drop(false, false, false));
+        assert_eq!(post_action(Some(Retry), false, false, false, true), drop(false, true, false));
     }
 
     /// `NEURAL_FORGE_TEST_REBUILD_AT`'s entries: a launch with an optional pause; what does not parse is left out.
@@ -11064,7 +11076,7 @@ mod tests {
         let mut session = Session::default();
         session.saw_dlss();
         assert!(!post_off(session.engaged, session.last_hold, None, Instant::now()), "not before the first hold ran the network");
-        let skipped = HoldResult { miss: Some("the native network is still loading"), waits_consumed: true, native: true, ..Default::default() };
+        let skipped = HoldResult { miss: Some(native::LOADING), waits_consumed: true, native: true, ..Default::default() };
         session.note(&shm, &skipped, Duration::from_millis(1), (64, 64));
         assert!(!session.engaged, "a hold that did not run the network does not engage the device");
         assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 1, "a held frame that went untouched is a miss");

@@ -764,6 +764,9 @@ struct Made {
     /// A hold asked the finished frame's server to let the device go ([`ask_back`]): the placement left the finished
     /// frame while the game ran.
     wanted: bool,
+    /// The finished frame's server gave the device back because a hold asked ([`moved_to_hold`]): its end is the
+    /// placement's change, no failure of the server's.
+    moved: bool,
 }
 
 /// Who has the offload device made with a game's device ([`holder`]).
@@ -807,19 +810,34 @@ pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk:
     }
     let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     all.retain(|m| m.game != device);
-    all.push(Made { game: device, offload: Some(made), busy: false, finished: false, wanted: false });
+    all.push(Made { game: device, offload: Some(made), busy: false, finished: false, wanted: false, moved: false });
 }
 
 /// The offload device made with `game` ([`make_for`]), for the server to run on; `None` when none was asked for, the
 /// error when it could not be made. Given back with [`give_back`].
 pub(crate) fn take(game: vk::Device) -> Option<Result<Offload, String>> {
     let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let m = all.iter_mut().find(|m| m.game == game)?;
+    take_from(all.iter_mut().find(|m| m.game == game)?, false)
+}
+
+/// [`take`] from `m`, under the registry's lock; `finished`: for the finished frame's server ([`take_for_finished`]),
+/// noted with the take. A device that could not be made stays as its error (why, for whoever asks next): only a
+/// made device leaves the entry, so [`holder`] never reads an error once taken as a device in someone's hands.
+fn take_from(m: &mut Made, finished: bool) -> Option<Result<Offload, String>> {
     if m.busy {
         // A frame on it never finished: it is not handed out again (and never destroyed).
         return Some(Err("a frame on the other GPU never finished: its device is not used again this session".into()));
     }
-    m.offload.take()
+    if let Some(Err(why)) = &m.offload {
+        return Some(Err(why.clone()));
+    }
+    let taken = m.offload.take();
+    if taken.is_some() {
+        m.finished = finished;
+        m.wanted = false;
+        m.moved = false;
+    }
+    taken
 }
 
 /// Whether a frame on the offload device made with `game` never finished ([`give_back`] with `busy`): for the life
@@ -836,10 +854,13 @@ pub(crate) fn give_back(game: vk::Device, offload: Offload, busy: bool) {
         Some(m) => {
             m.offload = Some(Ok(offload));
             m.busy |= busy;
+            // Given back by the finished frame's server because a hold asked for it: said to the present, which
+            // finds that server ended ([`moved_to_hold`]).
+            m.moved = m.finished && m.wanted;
             m.finished = false;
             m.wanted = false;
         }
-        None => all.push(Made { game, offload: Some(Ok(offload)), busy, finished: false, wanted: false }),
+        None => all.push(Made { game, offload: Some(Ok(offload)), busy, finished: false, wanted: false, moved: false }),
     }
 }
 
@@ -848,15 +869,14 @@ pub(crate) fn give_back(game: vk::Device, offload: Offload, busy: bool) {
 /// second GPU up for the session (#63: Finished frame to Before DLSS in a running game put the model on the game's
 /// GPU).
 pub(crate) fn take_for_finished(game: vk::Device) -> Option<Result<Offload, String>> {
-    let taken = take(game);
-    if matches!(taken, Some(Ok(_))) {
-        let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(m) = all.iter_mut().find(|m| m.game == game) {
-            m.finished = true;
-            m.wanted = false;
-        }
-    }
-    taken
+    let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    take_from(all.iter_mut().find(|m| m.game == game)?, true)
+}
+
+/// Whether the finished frame's server last gave `game`'s device back because a hold asked for it ([`ask_back`]):
+/// the present, finding that server ended, counts no failure and waits for no retry.
+pub(crate) fn moved_to_hold(game: vk::Device) -> bool {
+    MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|m| m.game == game && m.moved)
 }
 
 /// Who has the offload device made with `game`.
@@ -889,7 +909,7 @@ pub(crate) fn asked_back(game: vk::Device) -> bool {
 pub(crate) fn made_for_test(game: vk::Device, why: &str) {
     let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     all.retain(|m| m.game != game);
-    all.push(Made { game, offload: Some(Err(why.into())), busy: false, finished: false, wanted: false });
+    all.push(Made { game, offload: Some(Err(why.into())), busy: false, finished: false, wanted: false, moved: false });
 }
 
 /// Tests: forgets `game`'s entry.
@@ -1391,29 +1411,38 @@ mod tests {
         made_for_test(game, "a stand-in for the device");
         assert_eq!(holder(game), Holder::Free);
         assert!(!ask_back(game) && !asked_back(game), "nobody has it: nothing to ask back");
-        // (The stand-in entry is an error to take; a made device is noted the same way.)
-        assert!(matches!(take(game), Some(Err(_))));
-        assert_eq!(holder(game), Holder::Holds, "taken by a hold's runner");
-        assert!(!ask_back(game), "a hold's own: its other hold joins it, nothing is asked");
-        // The finished frame's server has it; Placement becomes Before DLSS: the hold asks, once.
-        {
-            let mut all = MADE.lock().unwrap();
-            let m = all.iter_mut().find(|m| m.game == game).unwrap();
-            m.finished = true;
+        // A device that could not be made is nobody's: its error is there for every taker, however often.
+        for _ in 0..2 {
+            assert!(matches!(take(game), Some(Err(why)) if why == "a stand-in for the device"));
+            assert!(matches!(take_for_finished(game), Some(Err(_))));
+            assert_eq!(holder(game), Holder::Free, "an error taken is no device in anyone's hands");
         }
+        let poke = |f: &dyn Fn(&mut Made)| f(MADE.lock().unwrap().iter_mut().find(|m| m.game == game).unwrap());
+        // A made device, taken by a hold's runner: its other hold joins it, nothing is asked.
+        poke(&|m| m.offload = None);
+        assert_eq!(holder(game), Holder::Holds);
+        assert!(!ask_back(game), "a hold's own");
+        // The finished frame's server has it; Placement becomes Before DLSS: the hold asks, once.
+        poke(&|m| m.finished = true);
         assert_eq!(holder(game), Holder::Finished);
-        assert!(!asked_back(game));
+        assert!(!asked_back(game) && !moved_to_hold(game));
         assert!(ask_back(game), "asked now");
         assert!(!ask_back(game), "and only once");
         assert!(asked_back(game), "the server sees it at its next look and ends");
-        // It never finished a frame: busy devices are nobody's to take.
-        {
-            let mut all = MADE.lock().unwrap();
-            let m = all.iter_mut().find(|m| m.game == game).unwrap();
+        // It gives the device back (as `give_back` notes it): free again, and its end is the placement's change.
+        poke(&|m| {
+            m.moved = m.finished && m.wanted;
             m.finished = false;
             m.wanted = false;
+            m.offload = Some(Err("given back".into()));
+        });
+        assert_eq!(holder(game), Holder::Free);
+        assert!(moved_to_hold(game) && !asked_back(game));
+        // A frame that never finished: busy devices are nobody's to wait for.
+        poke(&|m| {
+            m.offload = None;
             m.busy = true;
-        }
+        });
         assert_eq!(holder(game), Holder::Free, "a device whose frame never finished is not waited for");
         forget_for_test(game);
         assert_eq!(holder(game), Holder::Free);
@@ -1551,7 +1580,7 @@ mod tests {
         let game = vk::Device::from_raw(0x5757_0001);
         assert!(!is_busy(game));
         assert!(take(game).is_none(), "no device was made with it");
-        MADE.lock().unwrap().push(Made { game, offload: None, busy: true, finished: false, wanted: false });
+        MADE.lock().unwrap().push(Made { game, offload: None, busy: true, finished: false, wanted: false, moved: false });
         assert!(is_busy(game));
         assert!(matches!(take(game), Some(Err(_))));
         assert!(is_busy(game), "asking for it changes nothing");

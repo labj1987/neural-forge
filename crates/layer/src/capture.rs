@@ -706,8 +706,28 @@ fn compose_bgr_order(encode_push: &crate::composition::encode_pass::EncodePush) 
 fn compose_cost_line(carried: bool, ms: f32) -> Option<String> {
     thread_local! {
         static READINGS: std::cell::RefCell<[Vec<f32>; 2]> = const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+        static SAID: std::cell::Cell<[(u32, Option<std::time::Instant>); 2]> = const { std::cell::Cell::new([(0, None); 2]) };
     }
-    READINGS.with(|r| compose_cost(&mut r.borrow_mut()[usize::from(carried)], carried, ms))
+    let line = READINGS.with(|r| compose_cost(&mut r.borrow_mut()[usize::from(carried)], carried, ms))?;
+    let mut said = SAID.get();
+    let now = std::time::Instant::now();
+    let say = compose_cost_due(&mut said[usize::from(carried)], now);
+    SAID.set(said);
+    say.then_some(line)
+}
+
+/// How many of a kind's lines are logged as they come, and how far apart the ones after them are: a line every 300
+/// presents is one every few seconds for a whole session otherwise.
+const COMPOSE_COST_FIRST: u32 = 3;
+const COMPOSE_COST_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether a kind's line is logged now (`said`: how many were, and when the last was).
+fn compose_cost_due(said: &mut (u32, Option<std::time::Instant>), now: std::time::Instant) -> bool {
+    let due = said.0 < COMPOSE_COST_FIRST || said.1.is_none_or(|t| now.saturating_duration_since(t) >= COMPOSE_COST_EVERY);
+    if due {
+        *said = (said.0.saturating_add(1), Some(now));
+    }
+    due
 }
 
 const COMPOSE_COST_FRAMES: usize = 300;
@@ -5889,6 +5909,14 @@ mod tests {
         let line = compose_cost(&mut readings, true, 9.5).expect("the 300th reading");
         assert_eq!(line, "[compose] gpu_ms of presents carrying the last answer (model interval): median=2.000 max=9.500 (300 frames)");
         assert!(readings.is_empty(), "the next line starts afresh");
+        // Throttled: the first three lines of a kind as they come, then one every ten minutes.
+        let t0 = std::time::Instant::now();
+        let mut said = (0, None);
+        let due: Vec<bool> = (0..6u64).map(|k| compose_cost_due(&mut said, t0 + Duration::from_secs(5 * k))).collect();
+        assert_eq!(due, [true, true, true, false, false, false]);
+        assert!(!compose_cost_due(&mut said, t0 + Duration::from_secs(10) + COMPOSE_COST_EVERY - Duration::from_secs(1)));
+        assert!(compose_cost_due(&mut said, t0 + Duration::from_secs(10) + COMPOSE_COST_EVERY));
+        assert!(!compose_cost_due(&mut said, t0 + Duration::from_secs(20) + COMPOSE_COST_EVERY));
         let mut own = vec![0.9; COMPOSE_COST_FRAMES - 1];
         assert!(compose_cost(&mut own, false, 0.9).is_some_and(|l| l.contains("with their own answer: median=0.900 max=0.900")));
     }

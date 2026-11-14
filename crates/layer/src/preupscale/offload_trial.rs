@@ -111,10 +111,10 @@ fn forced_offload() -> bool {
     *ON
 }
 
-/// Whether a hold's miss is the network's build on the game's GPU (`native`'s words for it): "the native network is
-/// still loading", "the game is loading".
+/// Whether a hold's miss is the network's build on the game's GPU (`native::LOADING`, the miss itself: no other
+/// miss that happens to speak of loading).
 fn is_loading(miss: &str) -> bool {
-    miss.contains("still loading") || miss.contains("is loading")
+    miss == super::native::LOADING
 }
 
 /// What is held, which a window's frame times belong to: the hold's extent and the frame's pass count.
@@ -213,6 +213,8 @@ pub(crate) struct Trial {
     /// The previous offloaded window that showed the game waiting (its key and frame time): a trial starts on two in
     /// a row that agree.
     waiting: Option<(Key, Duration)>,
+    /// Whether the game waited for the other GPU for half its frame or more in that window ([`WAIT_HEAVY`]).
+    waiting_heavy: bool,
     aborts: u32,
     /// The trial was started by the finished frame ([`Trial::finished_window`]): its local frames are the presents'.
     finished: bool,
@@ -298,16 +300,18 @@ impl Trial {
         }
         if wait < WAIT_MIN || wait.as_secs_f64() < frame.as_secs_f64() * WAIT_SHARE {
             self.waiting = None;
+            self.waiting_heavy = false;
             return None;
         }
+        let heavy = wait.as_secs_f64() >= frame.as_secs_f64() * WAIT_HEAVY;
+        let last_heavy = std::mem::replace(&mut self.waiting_heavy, heavy);
         let before = self.waiting.replace((key, frame));
         let (_, last) = before.filter(|&(k, _)| k == key)?;
         // Two windows that agree are one scene, and its frame time is what the game's GPU is measured against. Where
-        // the game waits for the other GPU for half its frame or more, two windows that differ start the trial too,
-        // against the shorter of them (the other GPU at its best): after DLSS at 2048x1536 a second GPU held the game
-        // to 37-48 fps, its two windows 21 and 27 ms apart, and no trial ever came (#63).
-        let heavy = wait.as_secs_f64() >= frame.as_secs_f64() * WAIT_HEAVY;
-        if !agree(last, frame) && !heavy {
+        // the game waits for the other GPU for half its frame or more in both, two windows that differ start the
+        // trial too, against the shorter of them (the other GPU at its best): after DLSS at 2048x1536 a second GPU
+        // held the game to 37-48 fps, its two windows 21 and 27 ms apart, and no trial ever came (#63).
+        if !agree(last, frame) && !(heavy && last_heavy) {
             return None;
         }
         let frame = if agree(last, frame) { frame } else { frame.min(last) };
@@ -576,6 +580,10 @@ impl Trial {
             let moved = gap.min(PAUSES_MAX.saturating_sub(l.paused));
             l.began += moved;
             l.paused += moved;
+            // The build's budget too: a load that began before a menu has its 15 s of holds, not of wall time.
+            if let Some(since) = l.loading.as_mut() {
+                *since += moved;
+            }
         }
         l.holds += 1;
         if l.holds > MAX_HOLDS {
@@ -694,6 +702,7 @@ impl Trial {
     const NEW: Self = Self {
         phase: Phase::Watching,
         waiting: None,
+        waiting_heavy: false,
         aborts: 0,
         finished: false,
         back: false,
@@ -1048,6 +1057,15 @@ mod tests {
         let why = t.offloaded(KEY, us(27_300), us(27_000), true, now).expect("the second, 30% longer, starts it");
         assert!(why.contains("a frame every 21.0 ms"), "against the shorter window: {why}");
         assert!(t.running());
+        // Heavy in one window only (the other 8 of 20 ms): two scenes, nothing starts; a third that is heavy again does.
+        let mut t = Trial::default();
+        assert!(t.offloaded(KEY, MS(20), MS(8), true, now).is_none());
+        assert!(t.offloaded(KEY, us(27_300), us(27_000), true, now).is_none(), "only this window is heavy");
+        assert!(!t.running());
+        assert!(t.offloaded(KEY, us(21_000), us(20_200), true, now).is_some(), "two heavy windows in a row");
+        let mut t = Trial::default();
+        assert!(t.offloaded(KEY, us(21_000), us(20_200), true, now).is_none());
+        assert!(t.offloaded(KEY, MS(30), MS(8), true, now).is_none(), "heavy before, light now: nothing starts");
         // A light wait: windows that differ are two scenes, as before.
         let mut t = Trial::default();
         assert!(t.offloaded(KEY, MS(20), MS(8), true, now).is_none());
@@ -1069,17 +1087,28 @@ mod tests {
         assert!(t.local(KEY, now, true, None, false).is_none(), "a hold that ran");
         for k in 0..600 {
             now += MS(3);
-            assert!(t.local(KEY, now, false, Some("the native network is still loading"), false).is_none(), "hold {k} of the build: no verdict");
+            assert!(t.local(KEY, now, false, Some(super::super::native::LOADING), false).is_none(), "hold {k} of the build: no verdict");
         }
         assert!(t.running() && t.keeps_local(), "1.8 s into the build the trial still runs on the game's GPU");
         // Built: the holds run, and the trial measures as ever.
         now += MS(13);
         assert!(t.local(KEY, now, true, None, false).is_none());
+        // A pause in the middle of a build (a menu) is not the build's time: 14 s of holds, 20 s of menu, 0.9 s more.
+        let (mut t, mut now) = started(MS(36), MS(16));
+        for _ in 0..700 {
+            now += MS(20);
+            assert!(t.local(KEY, now, false, Some(super::super::native::LOADING), false).is_none());
+        }
+        now += Duration::from_secs(20);
+        for _ in 0..45 {
+            assert!(t.local(KEY, now, false, Some(super::super::native::LOADING), false).is_none(), "the menu did not use the build's budget up");
+            now += MS(20);
+        }
         // A build that never ends still gives the frames back, after its budget.
         let mut verdict = None;
         for _ in 0..2000 {
             now += MS(20);
-            verdict = t.local(KEY, now, false, Some("the native network is still loading"), false);
+            verdict = t.local(KEY, now, false, Some(super::super::native::LOADING), false);
             if verdict.is_some() {
                 break;
             }
@@ -1106,7 +1135,7 @@ mod tests {
         let mut verdict = None;
         for _ in 0..2000 {
             now += MS(20);
-            if let Some(v) = t.local(KEY, now, false, Some("the native network is still loading"), false) {
+            if let Some(v) = t.local(KEY, now, false, Some(super::super::native::LOADING), false) {
                 verdict = Some(v);
                 break;
             }
