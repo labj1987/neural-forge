@@ -4732,6 +4732,10 @@ unsafe fn native_hold(
     if res.offpre.as_ref().is_some_and(super::offload_pre::HoldSide::released) && !others_outstanding {
         // Its worker was ended for another set of hold resources while these had no hold: built again below.
         if let Some(side) = res.offpre.take() {
+            // The late capture's set points at this side's kept copy: written again for the next side's.
+            if let Some(edit) = res.edit.as_mut() {
+                edit.forget_late();
+            }
             // SAFETY: nothing recorded with these resources may still run.
             unsafe { side.destroy(device) };
         }
@@ -4784,6 +4788,10 @@ unsafe fn native_hold(
         // still run (inside DLSS's buffer: none outstanding; the split hold's work was waited for above): the
         // offload's side goes (its worker ends and the other device's side is freed).
         if let Some(side) = res.offpre.take() {
+            // The late capture's set points at this side's kept copy: written again for the next side's.
+            if let Some(edit) = res.edit.as_mut() {
+                edit.forget_late();
+            }
             // SAFETY: idle, as just said.
             unsafe { side.destroy(device) };
         }
@@ -4876,8 +4884,8 @@ unsafe fn native_hold(
         if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
             // SAFETY: as above; the kept image and the counters are live.
             unsafe {
-                late_bound = edit.bind_late(device, side.snapshot_view());
-                side.exchange.bind_gate(device, edit.stats_buffer());
+                late_bound = edit.bind_late(device, side.snapshot_view(), side.snapshot_made());
+                side.exchange.bind_gate(device, edit.stats_buffer(), edit.stats_made());
             }
         }
         // A hold that records nothing (below) must not have taken the stored edit out of the plan.

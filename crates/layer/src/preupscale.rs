@@ -4448,6 +4448,10 @@ impl Resources {
             any = true;
         }
         if let Some(e) = self.edit.take() {
+            // The offload's gate points at this cache's counters: written again for the next cache's.
+            if let Some(side) = self.offpre.as_mut() {
+                side.exchange.forget_gate();
+            }
             unsafe { e.destroy(device) };
             any = true;
         }

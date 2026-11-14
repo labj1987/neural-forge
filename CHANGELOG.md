@@ -23,6 +23,12 @@ first shipped them; their phase is kept as a subheading.
   syncs the waiting saves when Steam starts or the game next runs.
 - The Setup tab no longer offers **Make copy** for a Proton whose copy is waiting for **Make again**.
 
+**The model on a second GPU no longer crashes the game when the resolution or DLSS mode changes**
+
+- Fixed a crash where the game's GPU lost its device (the game froze or closed) when the model ran on a second GPU
+  before DLSS and the game's resolution or DLSS mode changed, above all when it changed back and forth. The same
+  could happen when the model paused because video memory ran short and then came back.
+
 ## 4.2.0 — 2026-11-13
 
 **The model on a second GPU**
