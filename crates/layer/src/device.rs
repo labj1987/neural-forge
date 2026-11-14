@@ -2327,7 +2327,9 @@ pub(crate) fn gpu2_hosts(device: vk::Device) -> bool {
 /// the record's teardown asks the registry itself.
 ///
 /// # Safety
-/// Nothing of the game presents concurrently (its `vkCreateSwapchainKHR` or `vkDestroyDevice`).
+/// Nothing of the game presents concurrently (its `vkCreateSwapchainKHR` or `vkDestroyDevice`), and no other thread
+/// creates a swapchain for the game's device meanwhile: one thread creates swapchains for a game device at a time
+/// (the mode supports one window), so nothing is about to be shown on the side torn down here.
 #[cfg(target_arch = "x86_64")]
 unsafe fn gpu2_teardown(game: vk::Device, second: Arc<crate::gpu2_present::Second>, device: Gpu2Device) {
     if let Some(why) = second.failed() {
@@ -2450,19 +2452,10 @@ impl NeuralForgeDeviceInfo {
 
     /// The second GPU's side for this device: the one there is, or made now from the device `preupscale::offload` made.
     fn gpu2_host(&self, header: Option<&'static neural_forge_protocol::ShmHeader>) -> Result<Arc<crate::gpu2_present::Second>, String> {
-        use crate::preupscale::offload;
         let game = self.device.handle();
-        // Made and, on a failure, undone with the registry unlocked (`Hosts::get_or_make`): the record's teardown asks
-        // the registry itself (`destroy_private_resources`).
-        GPU2_HOSTS.get_or_make(
-            game,
-            || self.gpu2_make_host(header),
-            |second, device| {
-                // SAFETY: another thread's host won: nothing of this one was used.
-                unsafe { destroy_private_resources(second.device.handle()) };
-                offload::give_back(game, device.0, false);
-            },
-        )
+        // Made with the registry unlocked (`Hosts::get_or_make`): the teardown of a half-made record asks the registry
+        // itself (`destroy_private_resources`).
+        GPU2_HOSTS.get_or_make(game, || self.gpu2_make_host(header))
     }
 
     /// Makes the second GPU's side for this device from the device `preupscale::offload` made.
