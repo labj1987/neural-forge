@@ -96,8 +96,9 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// `clarity_strength`, `clarity_radius`, `clarity_midtones`, `clarity_edges`); v25 appends why no hold ran
 /// while DLSS's input is identified (`preupscale_reason`, with `preupscale_state` `IDENTIFIED`); v26 appends the HDR
 /// verdict (`hdr_verdict`); v27 appends the
-/// NGX wrapper ring's counters (`ngx_records`, `ngx_matched`); v29 appends the presented frame's own size (`frame_width`, `frame_height`); v28 appends the second GPU showing the frame itself
-/// (`second_gpu_present` and the layer's line about it)).
+/// NGX wrapper ring's counters (`ngx_records`, `ngx_matched`); v28 appends the second GPU showing the frame itself
+/// (`second_gpu_present` and the layer's line about it); v29 appends the presented frame's own size (`frame_width`,
+/// `frame_height`)).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.

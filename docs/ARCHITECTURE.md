@@ -208,6 +208,10 @@ be private.
 | 23 | `edit_hue_protection`, `edit_neutral_protection`, `edit_shadow_protection` and `edit_highlight_protection` (the Oklab protections of each pass's result against its input) appended | 3.10.0 |
 | 24 | `settings_game` (whose settings the header holds: all games or one game's) and `running_game` (the game whose layer holds the channel), then `sharpen_cas`, `clarity_strength`, `clarity_radius`, `clarity_midtones` and `clarity_edges` (the sharpening of the finished frame: FidelityFX CAS and Clarity) appended | 3.12.0 |
 | 25 | `preupscale_reason` (why no hold ran while DLSS's input is identified; `preupscale_state` 5, `IDENTIFIED`) appended | 3.14.0 |
+| 26 | `hdr_verdict` (what the game's swapchain gives the display: HDR10, SDR and why) appended | 4.0.0 |
+| 27 | `ngx_records` and `ngx_matched` (the NGX wrapper ring's counters) appended | 4.0.0 |
+| 28 | `second_gpu_present` (the second GPU shows the frame itself) and the layer's line about it appended | 4.4.0 |
+| 29 | `frame_width` and `frame_height` (the presented frame's own size, beside `layer_width`/`layer_height`, the raster the model is shown) appended | 4.4.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.

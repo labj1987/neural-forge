@@ -229,22 +229,23 @@ impl GiveBack {
 
     /// One present: `needed_here` (the trial runs or kept the model on the game's GPU, or its server runs) drops the
     /// request; otherwise `give` is tried, and once it agreed `open` says whether the network is still open here.
-    /// Whether the network was given back now (the loader agreed).
+    /// Whether the network closed now (said once, when it has, never when the loader only agreed).
     fn step(&mut self, needed_here: bool, give: impl FnOnce() -> bool, open: impl FnOnce() -> bool) -> bool {
         if needed_here {
             *self = Self::default();
             return false;
         }
-        let mut given = false;
+        let mut agreed = false;
         if self.pending && give() {
             self.pending = false;
             self.closing = true;
-            given = true;
+            agreed = true;
         }
         if self.closing {
             if !open() {
                 *self = Self::default();
-            } else if !given {
+                return true;
+            } else if !agreed {
                 self.waited += 1;
                 if self.waited >= Self::REASK {
                     // The worker declined (a path took the network after the loader agreed): asked again.
@@ -254,7 +255,7 @@ impl GiveBack {
                 }
             }
         }
-        given
+        false
     }
 
     /// Whether the other GPU's server waits at this present: the network is still open here, and not for longer
@@ -7561,16 +7562,19 @@ mod tests {
             },
             || panic!("not agreed yet")
         ));
-        assert!(g.step(
-            false,
-            || {
-                tries += 1;
-                true
-            },
-            || true
-        ));
+        assert!(
+            !g.step(
+                false,
+                || {
+                    tries += 1;
+                    true
+                },
+                || true
+            ),
+            "the loader agreed: nothing is closed yet, nothing said"
+        );
         assert_eq!(tries, 3);
-        assert!(!g.step(false, || panic!("agreed already"), || false), "said once");
+        assert!(g.step(false, || panic!("agreed already"), || false), "closed: said now, once");
         assert!(!g.step(false, || panic!("done"), || panic!("done")));
         // The trial takes the model back here first: dropped.
         g.ask(t0);
@@ -7606,15 +7610,15 @@ mod tests {
         let mut g = GiveBack::default();
         g.ask(t0);
         assert!(g.holds_start(t0), "asked: the other GPU's server waits");
-        assert!(g.step(false, || true, || true), "the loader agreed at the first present");
+        assert!(!g.step(false, || true, || true), "the loader agreed at the first present: nothing is closed yet");
         assert!(g.holds_start(t0 + Duration::from_millis(40)), "still open here: it waits");
-        assert!(!g.step(false, || panic!("agreed already"), || false));
+        assert!(g.step(false, || panic!("agreed already"), || false), "closed now");
         assert!(!g.holds_start(t0 + Duration::from_millis(80)), "closed: it starts at this present");
         // The worker declines after the loader agreed (a path took the network in between): the network stays open,
         // and after a few presents the loader is asked again instead of the server waiting out its limit.
         let mut g = GiveBack::default();
         g.ask(t0);
-        assert!(g.step(false, || true, || true), "agreed");
+        assert!(!g.step(false, || true, || true), "agreed, still open");
         let mut asked_again = 0;
         for _ in 0..GiveBack::REASK {
             assert!(!g.step(
@@ -7628,7 +7632,7 @@ mod tests {
         }
         assert_eq!(asked_again, 0, "the worker has its presents to close it");
         assert!(
-            g.step(
+            !g.step(
                 false,
                 || {
                     asked_again += 1;
@@ -7636,10 +7640,10 @@ mod tests {
                 },
                 || true
             ),
-            "asked again, and it agrees again"
+            "asked again, and it agrees again (still open, nothing said twice)"
         );
         assert_eq!(asked_again, 1);
-        assert!(!g.step(false, || panic!("agreed"), || false) && !g.holds_start(t0), "closed this time: the other GPU's server starts");
+        assert!(g.step(false, || panic!("agreed"), || false) && !g.holds_start(t0), "closed this time: the other GPU's server starts");
         // A network that never closes (a hold keeps using it) does not hold the other GPU's server for ever.
         let mut g = GiveBack::default();
         g.ask(t0);

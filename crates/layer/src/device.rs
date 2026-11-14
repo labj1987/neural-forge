@@ -1362,6 +1362,18 @@ unsafe fn preupscale_slice<'a, T>(ptr: *const T, len: u32) -> &'a [T] {
     }
 }
 
+/// Whether the effect is off by the settings (`neural_enabled`, `apply_model`; `None`: the mapping is not open yet), and
+/// the log's line when it was switched since the last present (`capture::effect_switch_line`; `last`: a test's own
+/// record of the last state in place of the process's).
+fn effect_off_and_switch(settings: Option<(bool, bool)>, last: Option<&std::sync::atomic::AtomicU8>) -> (Option<bool>, Option<String>) {
+    let Some((neural_enabled, apply_model)) = settings else { return (None, None) };
+    let line = match last {
+        Some(last) => crate::capture::effect_switch_change(last, neural_enabled, apply_model),
+        None => crate::capture::effect_switch_line(neural_enabled, apply_model),
+    };
+    (Some(!apply_model || !neural_enabled), line)
+}
+
 /// Whether the post path has nothing to do on this present: the effect is off (the model not applied, or the
 /// Enabled toggle off), the one-shot bootstrap request is done, and no capture or series is asked for or
 /// running. Unknown settings (the mapping not open yet) are not idle: `capture::run` opens it.
@@ -1373,6 +1385,24 @@ fn post_path_idle(effect_off: Option<bool>, bootstrap_complete: bool, capture_re
 mod primary_claim_tests {
     use super::*;
     use vk::Handle;
+
+    /// The present's own way to the idle exit (#63, review): with the effect switched off in the middle of a session
+    /// the present leaves before `capture::run`, and the switch is still said, off and on, once each.
+    #[test]
+    fn the_present_says_the_effect_was_switched_before_it_goes_idle() {
+        let last = std::sync::atomic::AtomicU8::new(u8::MAX);
+        let (off, line) = effect_off_and_switch(Some((true, true)), Some(&last));
+        assert!(line.is_none() && !post_path_idle(off, true, false, false), "on: the present runs the post path, nothing to say");
+        // Switched off (the toggle key): this present is idle, and says why first.
+        let (off, line) = effect_off_and_switch(Some((false, true)), Some(&last));
+        assert!(post_path_idle(off, true, false, false), "the idle exit is taken");
+        assert!(line.is_some_and(|l| l.contains("switched off") && l.contains("toggle key")));
+        let (off, line) = effect_off_and_switch(Some((false, true)), Some(&last));
+        assert!(post_path_idle(off, true, false, false) && line.is_none(), "said once while it stays off");
+        let (off, line) = effect_off_and_switch(Some((true, true)), Some(&last));
+        assert!(!post_path_idle(off, true, false, false) && line.is_some_and(|l| l.contains("switched on")));
+        assert_eq!(effect_off_and_switch(None, Some(&last)), (None, None), "no mapping yet: nothing known, nothing said");
+    }
 
     /// A recreation with `oldSwapchain` takes the retired swapchain's claim, at the same size or a smaller
     /// one, and the retired swapchain no longer holds it; the claim stays where it is when the retired one
@@ -4944,7 +4974,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 if let Some(frames) = readable.then(|| preupscale.capture_at_due()).flatten() {
                     series.start(neural_forge_protocol::capture::Request { id: 0, frames }, &crate::dump::captures_dir(), shm.channel(), false);
                 }
-                let effect_off = shm.composition_settings().map(|s| !s.apply_model || !s.neural_enabled);
+                // Said here, before the idle exit: once the effect is off `capture::run` is not reached, and neither
+                // would its line be.
+                let (effect_off, switched) = effect_off_and_switch(shm.composition_settings().map(|s| (s.neural_enabled, s.apply_model)), None);
+                if let Some(line) = switched {
+                    crate::log!("{line}");
+                    crate::logging::flush();
+                }
                 if post_path_idle(effect_off, *bootstrap_complete, shm.capture_requested(), series.running()) {
                     break;
                 }

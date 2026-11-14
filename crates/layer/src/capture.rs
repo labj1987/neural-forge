@@ -703,12 +703,12 @@ fn compose_bgr_order(encode_push: &crate::composition::encode_pass::EncodePush) 
 /// The log's line when the effect was switched off or on since the last present (`neural_enabled`: the Neural rendering
 /// switch and the toggle key; `apply_model`: Apply model edit), `None` while nothing changed. The first present says
 /// it only when it starts switched off.
-fn effect_switch_line(neural_enabled: bool, apply_model: bool) -> Option<String> {
+pub(crate) fn effect_switch_line(neural_enabled: bool, apply_model: bool) -> Option<String> {
     static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
     effect_switch_change(&LAST, neural_enabled, apply_model)
 }
 
-fn effect_switch_change(last: &std::sync::atomic::AtomicU8, neural_enabled: bool, apply_model: bool) -> Option<String> {
+pub(crate) fn effect_switch_change(last: &std::sync::atomic::AtomicU8, neural_enabled: bool, apply_model: bool) -> Option<String> {
     let now = u8::from(neural_enabled) | u8::from(apply_model) << 1;
     let before = last.swap(now, std::sync::atomic::Ordering::Relaxed);
     if before == now || (before == u8::MAX && now == 3) {
@@ -3192,6 +3192,7 @@ pub unsafe fn run(
                 held_original: compose_held.then_some(raw_answer_base.as_slice()),
             }
         };
+        gpu.set_capture_srgb(scratch_source.srgb);
         let sem = gpu.present_temporal_delta_async(
             device,
             instance,

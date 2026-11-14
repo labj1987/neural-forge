@@ -106,6 +106,8 @@ struct PushConstants {
     /// enlarges the current frame the same way to compare it with the proxy input.
     proxy_width: u32,
     proxy_height: u32,
+    /// The capture's reduction ran in linear light (an `*_SRGB` swapchain, [`GpuCompose::set_capture_srgb`]).
+    proxy_srgb: u32,
 }
 
 /// `compose_hdr.comp`'s `Params` block, field for field: pushed through `compose.comp`'s pipeline layout
@@ -996,6 +998,7 @@ impl ComposeSlot {
         update_src: (vk::Buffer, u64, vk::Buffer, u64),
         fresh_copy: Option<[(vk::Buffer, vk::Buffer); 2]>,
         timer: Option<&crate::gpu_timer::GpuTimer>,
+        capture_srgb: bool,
     ) {
         let s = self.sized.as_ref().expect("caller already ensured this");
         let cached_before = self.cached_generation != 0;
@@ -1366,6 +1369,7 @@ impl ComposeSlot {
                     reversible_mode: compose.reversible_mode,
                     proxy_width: if compose.model_small { answer_width } else { 0 },
                     proxy_height: if compose.model_small { answer_height } else { 0 },
+                    proxy_srgb: u32::from(capture_srgb),
                 };
                 let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
                 device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
@@ -1518,6 +1522,8 @@ pub struct GpuCompose {
     timers_built: bool,
     /// The latest compose GPU reading not yet taken by [`Self::take_compose_gpu_ms`].
     compose_gpu_ms: Option<f32>,
+    /// The captured swapchain is `*_SRGB` ([`Self::set_capture_srgb`]).
+    capture_srgb: bool,
 }
 
 // SAFETY: every field is either a plain Vulkan handle or (inside a slot's own
@@ -1689,6 +1695,7 @@ impl GpuCompose {
             queue_family,
             timers_built: false,
             compose_gpu_ms: None,
+            capture_srgb: false,
         })
     }
 
@@ -1726,6 +1733,7 @@ impl GpuCompose {
         target_image: vk::Image,
         compose: ComposeParams,
     ) -> Option<vk::Semaphore> {
+        let srgb = self.capture_srgb;
         let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
         let answer_bytes = (u64::from(answer_width) * u64::from(answer_height) * 4) as usize;
         // The gate's sync fd is this call's from here: closed on every way out that does not import it.
@@ -1896,6 +1904,7 @@ impl GpuCompose {
                 update_src,
                 fresh_copy,
                 slot.timer.as_ref(),
+                srgb,
             );
         }
         if let Some(timer) = &slot.timer {
@@ -2611,6 +2620,12 @@ impl GpuCompose {
 
     /// Whether `gen_*` hold this answer generation, so a zero-copy compose can present it again
     /// (a carried frame) with no CPU copy of the answer anywhere.
+    /// Whether the frames this composes come from an `*_SRGB` swapchain: the capture's blit to a small proxy then
+    /// filters in linear light, and the ghost guard reduces the current frame the same way (`compose.comp`).
+    pub fn set_capture_srgb(&mut self, srgb: bool) {
+        self.capture_srgb = srgb;
+    }
+
     pub fn holds_generation(&self, generation: u64) -> bool {
         generation != 0 && self.zc.generation == generation && self.zc.frames.is_some()
     }
@@ -2884,6 +2899,12 @@ mod tests {
         compose_once_ordered(width, height, current, proxy, answer, answer_dims, proxy_small, held, params, false)
     }
 
+    thread_local! {
+        /// Tests: the next [`compose_once_ordered`] on this thread composes as for an `*_SRGB` swapchain
+        /// ([`GpuCompose::set_capture_srgb`]).
+        static COMPOSE_SRGB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     /// [`compose_once_scaled`] with the frame's channel order: `bgr_order` for a `B8G8R8A8` swapchain.
     #[allow(clippy::too_many_arguments)]
     fn compose_once_ordered(
@@ -2903,6 +2924,7 @@ mod tests {
         let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
         let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
+        gpu.set_capture_srgb(COMPOSE_SRGB.with(std::cell::Cell::get));
         let target = make_target_image(&device, &mem_props, width, height);
         let staging = build_upload_staging(&device, &mem_props, current);
         let cmd = unsafe {
@@ -3928,9 +3950,18 @@ mod tests {
 
     /// The small proxy of `frame` as the capture makes it: the frame reduced to `small` with a linear blit of its
     /// stored values, then encoded (`encode::reference_encode_pixel`, white point 1, the soft knee).
-    fn reduced(frame: &[u8], (w, h): (u32, u32), (sw, sh): (u32, u32)) -> Vec<u8> {
-        let at =
-            |x: i64, y: i64, c: usize| f32::from(frame[((y.clamp(0, i64::from(h) - 1) as u32 * w + x.clamp(0, i64::from(w) - 1) as u32) * 4) as usize + c]);
+    fn reduced(frame: &[u8], (w, h): (u32, u32), (sw, sh): (u32, u32), srgb: bool) -> Vec<u8> {
+        // An `*_SRGB` image is filtered in linear light and stored encoded again; a UNORM one as it is stored.
+        let decode = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        let encode = |v: f32| if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+        let at = |x: i64, y: i64, c: usize| {
+            let v = f32::from(frame[((y.clamp(0, i64::from(h) - 1) as u32 * w + x.clamp(0, i64::from(w) - 1) as u32) * 4) as usize + c]);
+            if srgb {
+                decode(v / 255.0) * 255.0
+            } else {
+                v
+            }
+        };
         let mut out = Vec::with_capacity((sw * sh * 4) as usize);
         for j in 0..sh {
             for i in 0..sw {
@@ -3941,7 +3972,8 @@ mod tests {
                 let px: [u8; 3] = std::array::from_fn(|c| {
                     let top = at(x0, y0, c) * (1.0 - a) + at(x0 + 1, y0, c) * a;
                     let bottom = at(x0, y0 + 1, c) * (1.0 - a) + at(x0 + 1, y0 + 1, c) * a;
-                    (top * (1.0 - b) + bottom * b).round() as u8
+                    let v = top * (1.0 - b) + bottom * b;
+                    (if srgb { encode(v / 255.0) * 255.0 } else { v }).round() as u8
                 });
                 out.extend_from_slice(&crate::composition::encode::reference_encode_pixel([px[0], px[1], px[2], 255], false, 1.0, 0));
             }
@@ -3962,11 +3994,17 @@ mod tests {
     /// is left to read as motion.
     #[test]
     fn ghost_guard_reads_no_motion_into_a_still_frame_at_any_model_resolution() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                COMPOSE_SRGB.with(|s| s.set(false));
+            }
+        }
         let (w, h) = (96u32, 48u32);
         let frame: Vec<u8> = (0..w * h)
             .flat_map(|i| {
                 let (x, y) = (i % w, i / w);
-                let bright = [175u8, 150, 140];
+                let bright = [235u8, 215, 200];
                 // One-pixel diagonals, a horizontal and a vertical line; a block (four corners).
                 let lines = x < 30 && (x == y || x + y == 29) || (y == 40 && x < 60) || (x == 70 && y < 30);
                 let block = (36..52).contains(&x) && (6..22).contains(&y);
@@ -3979,14 +4017,19 @@ mod tests {
                         [40, 100, 60]
                     } // red against green, about one brightness
                 } else {
-                    [55, 48, 44]
+                    [18, 16, 16]
                 };
                 [c[0], c[1], c[2], 255]
             })
             .collect();
-        for divisor in [2u32, 3, 4] {
+        // On a UNORM swapchain and on an `*_SRGB` one, whose capture reduces the frame in linear light: there a bright
+        // line on black comes out of the reduction brighter than the mean of its stored values, and a guard that mixed
+        // the stored values read that as motion.
+        for (divisor, srgb) in [(2u32, false), (3, false), (4, false), (2, true), (3, true), (4, true)] {
+            COMPOSE_SRGB.with(|s| s.set(srgb));
+            let _reset = Reset;
             let small_size = (w / divisor, h / divisor);
-            let small = reduced(&frame, (w, h), small_size);
+            let small = reduced(&frame, (w, h), small_size, srgb);
             let answer = magenta_where_bright(&small);
             for transfer in [0u32, 1, 2] {
                 let run = |guard: f32| {
@@ -3999,7 +4042,7 @@ mod tests {
                 };
                 let unguarded = run(0.0).unwrap();
                 let worst = guarded.iter().zip(&unguarded).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
-                assert!(worst <= 2, "1/{divisor} of the frame, transfer {transfer}: a still frame differs by {worst} of 255 with the guard");
+                assert!(worst <= 2, "1/{divisor} of the frame, sRGB {srgb}, transfer {transfer}: a still frame differs by {worst} of 255 with the guard");
                 let edited = unguarded.iter().zip(&frame).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
                 assert!(edited > 15, "1/{divisor}, transfer {transfer}: the answer edits the frame at all ({edited})");
             }
@@ -4020,7 +4063,7 @@ mod tests {
         let (old, now) = (texture(0), texture(2));
         for divisor in [2u32, 4] {
             let small_size = (w / divisor, h / divisor);
-            let small = reduced(&old, (w, h), small_size);
+            let small = reduced(&old, (w, h), small_size, false);
             let answer = magenta_where_bright(&small);
             let run = |guard: f32| compose_once_scaled(w, h, &now, &now, &answer, small_size, Some(&small), None, carried_params(guard));
             let Some(guarded) = run(1.0) else {

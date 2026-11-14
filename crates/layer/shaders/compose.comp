@@ -118,6 +118,9 @@ layout(push_constant) uniform Params {
   // through the same reduction and enlargement the proxy input went through, to compare the two like for like.
   uint proxy_width;
   uint proxy_height;
+  // The capture reduced the frame in linear light (an `*_SRGB` swapchain: its blit to the small proxy decodes,
+  // filters and encodes again); 0 for a UNORM one, whose blit filters the stored values.
+  uint proxy_srgb;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -324,7 +327,8 @@ vec3 GamutCompressReversible(vec3 rgb) {
 }
 
 // One texel of the current frame as the small proxy would hold it: reduced as the capture reduces the frame (a
-// linear blit of the stored values to the proxy's size), then encoded as `encode.comp` stores it. In the frame's
+// linear blit to the proxy's size: of the stored values, or in linear light for an sRGB swapchain), then encoded
+// as `encode.comp` stores it. In the frame's
 // stored channel order made RGB.
 vec3 SmallTexel(ivec2 t, ivec2 small, ivec2 size, bool bgr, float wp) {
   t = clamp(t, ivec2(0), small - ivec2(1));
@@ -336,9 +340,15 @@ vec3 SmallTexel(ivec2 t, ivec2 small, ivec2 size, bool bgr, float wp) {
   vec3 c10 = imageLoad(u_original, clamp(i0 + ivec2(1, 0), ivec2(0), last)).rgb;
   vec3 c01 = imageLoad(u_original, clamp(i0 + ivec2(0, 1), ivec2(0), last)).rgb;
   vec3 c11 = imageLoad(u_original, clamp(i0 + ivec2(1, 1), ivec2(0), last)).rgb;
-  vec3 raw = mix(mix(c00, c10, a.x), mix(c01, c11, a.x), a.y);
-  raw = bgr ? raw.bgr : raw;
-  return SrgbEncode(clamp(EncodeProxy(SrgbDecode(raw) / wp), 0.0, 1.0));
+  vec3 linear;
+  if (params.proxy_srgb != 0u) {
+    // An sRGB image is filtered in linear light.
+    linear = mix(mix(SrgbDecode(c00), SrgbDecode(c10), a.x), mix(SrgbDecode(c01), SrgbDecode(c11), a.x), a.y);
+  } else {
+    linear = SrgbDecode(mix(mix(c00, c10, a.x), mix(c01, c11, a.x), a.y));
+  }
+  linear = bgr ? linear.bgr : linear;
+  return SrgbEncode(clamp(EncodeProxy(linear / wp), 0.0, 1.0));
 }
 
 // The current frame at `q` as the proxy input holds the frame the model answered: reduced to the small proxy
