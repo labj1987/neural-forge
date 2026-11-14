@@ -2697,9 +2697,13 @@ fn scan_protons() -> ProtonScan {
     };
     let libraries = steam::libraries(&root);
     let tools: Vec<(proton_tool::Tool, bool)> = proton_tool::tools(&root).into_iter().map(|t| (t.clone(), proton_tool::outdated(&t))).collect();
-    // A source whose current copy exists is not offered again.
-    let sources = proton_tool::sources(&root, &libraries).into_iter().filter(|s| !tools.iter().any(|(t, _)| t.name == s.tool_name())).collect();
     let stale = neural_forge_supervisor::compat_tool::stale_copies(&root);
+    // A source whose current copy exists is not offered again, nor one with a copy Make again makes again (an older
+    // version, or a name without "Proton"): that row's Make again is the one way to it.
+    let sources = proton_tool::sources(&root, &libraries)
+        .into_iter()
+        .filter(|s| !tools.iter().any(|(t, _)| t.name == s.tool_name()) && !stale.iter().any(|c| c.tool.source == s.dir))
+        .collect();
     ProtonScan { root: Some(root), sources, tools, stale }
 }
 
@@ -2749,9 +2753,11 @@ fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                             let done = gio::spawn_blocking(move || {
                                 use neural_forge_supervisor::{compat_tool, steam};
                                 let running = steam::steam_running(std::path::Path::new("/proc"));
-                                compat_tool::update(&root, &steam::libraries(&root), &tool, &proton_tool::installed_wrapper(), running).map(|u| {
+                                compat_tool::update(&root, &tool, &proton_tool::installed_wrapper(), running).map(|u| {
                                     if u.to == u.from {
                                         format!("Made {} again", u.to)
+                                    } else if u.renamed {
+                                        format!("Renamed {} to {}, its games moved with it. Restart Steam to see it", u.from, u.to)
                                     } else {
                                         let kept = u.kept.map(|k| format!("; {} is kept: {k}", u.from)).unwrap_or_else(|| format!("; removed {}", u.from));
                                         format!("Made {}, its games moved to it{kept}. Restart Steam to see it", u.to)

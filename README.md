@@ -80,7 +80,8 @@ says what to do.
 - **"Proton copies out of date" on the Status tab.** The Proton a copy was made from has been updated
   since, or the copy's name lacks "Proton": Steam then does not sync the Steam Cloud saves a game keeps in
   its Wine prefix (AppData, Saved Games, Documents). Close Steam and press **Make again** next to the copy
-  in the Setup tab: its games move to the new copy, and Steam syncs their saves when it starts.
+  in the Setup tab: its games move to the new copy (or, when the Proton it was made from is gone, the copy is renamed
+  and they move with it), and Steam syncs their saves when Steam starts or the game next runs.
 - **The model runs on the finished frame in a DLSS game.** DLSS is not upscaling there: switched off,
   another upscaler, Frame Generation only, or DLAA. Loading screens and menus before DLSS's first frame
   stay untouched; the finished frame takes over after 5 minutes without DLSS, or 30 s of DLSS with no

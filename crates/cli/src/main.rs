@@ -870,6 +870,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
              update: make every outdated copy again from its source's current version, with the installed\n  \
              NGX wrapper. A copy of a new version, or one named without Proton, gets a new name: with Steam\n  \
              closed, the games set to the old copy are moved to the new one and the old copy is removed (never one a running game uses).\n  \
+             A copy named without Proton whose source is gone is renamed in place instead (Steam closed), its games moved.\n  \
              remove NAME: delete a copy Neural Forge made (not while a game runs with it)"
         }
         "shmctl" => "",
@@ -909,7 +910,14 @@ fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
             }
             println!("Copies made by Neural Forge:");
             for t in proton_tool::tools(root) {
-                println!("  {}{} from {}", t.name, if proton_tool::outdated(&t) { " (outdated: `proton-tool update`)" } else { "" }, t.source.display());
+                let note = if proton_tool::steam_cloud_blind(&t) {
+                    " (outdated: `proton-tool update`; its name lacks \"Proton\", so Steam Cloud does not sync the saves games keep in its prefix)"
+                } else if proton_tool::outdated(&t) {
+                    " (outdated: `proton-tool update`)"
+                } else {
+                    ""
+                };
+                println!("  {}{note} from {}", t.name, t.source.display());
             }
             ExitCode::SUCCESS
         }
@@ -945,8 +953,14 @@ fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
             let mut failed = false;
             let running = steam::steam_running(std::path::Path::new("/proc"));
             for t in proton_tool::tools(root).into_iter().filter(proton_tool::outdated) {
-                match neural_forge_supervisor::compat_tool::update(root, &libraries, &t, &wrapper, running) {
+                match neural_forge_supervisor::compat_tool::update(root, &t, &wrapper, running) {
                     Ok(done) if done.to == done.from => println!("{}: made again (its source's current version, the installed NGX wrapper)", t.name),
+                    Ok(done) if done.renamed => {
+                        println!("{}: renamed to {} (its source is gone; the copy holds its own files), the installed NGX wrapper put in", t.name, done.to);
+                        if !done.moved.is_empty() {
+                            println!("  moved to it: app {}", done.moved.join(", app "));
+                        }
+                    }
                     Ok(done) => {
                         println!("{}: made {} from the current version", t.name, done.to);
                         if !done.moved.is_empty() {

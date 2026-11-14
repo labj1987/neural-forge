@@ -12,10 +12,13 @@ first shipped them; their phase is kept as a subheading.
   Proton's name contains "Proton". The copies of Proton Experimental, Proton Hotfix and Proton-CachyOS were named
   after their version (`experimental-…-NeuralForge`), so Steam left those saves unsynced. Their copies are now named
   `Proton-<version>-NeuralForge`; GE-Proton's copies keep their names.
-- A copy with the old name shows under "Proton copies out of date" on the Status tab, and Diagnose says Steam Cloud
-  can't sync its saves. Close Steam and press **Make again** next to it in the Setup tab (or run
-  `neural-forge-cli proton-tool update`): its games move to the new copy and the old one is removed. Steam uploads the
-  waiting saves when it starts.
+- A copy with the old name shows under "Proton copies out of date" on the Status tab, and Diagnose and the game's
+  layer log say Steam Cloud can't sync its saves. Close Steam and press **Make again** next to it in the Setup tab (or
+  run `neural-forge-cli proton-tool update`, or switch one of its games on again): its games, Steam's default Proton
+  included, move to the new copy and the old one is removed. If the Proton it was made from is no longer installed, the
+  copy is renamed in place instead (it holds its own files) and its games move with it. Steam syncs the waiting saves
+  when Steam starts or the game next runs.
+- The Setup tab no longer offers **Make copy** for a Proton whose copy is waiting for **Make again**.
 
 ## 4.2.0 — 2026-11-13
 

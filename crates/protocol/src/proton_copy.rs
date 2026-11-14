@@ -14,10 +14,13 @@ pub const SUFFIX: &str = "-NeuralForge";
 /// its name in Steam (`compatibilitytool.vdf`'s key and `display_name`). The version (`/` and other characters a
 /// folder or Steam name should not hold made `-`), with `Proton-` before it when it does not already say "proton"
 /// ([`cloud_name`]), and [`SUFFIX`]: `GE-Proton11-12-NeuralForge`, `Proton-experimental-11.0-20261105c-x86_64-NeuralForge`.
+/// A version with nothing left once made safe (empty, only `/` or spaces) gives `Proton-NeuralForge`.
 pub fn copy_name(version: &str) -> String {
     let base: String = version.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect();
     let base = base.trim_matches('-');
-    if cloud_name(base) {
+    if base.is_empty() {
+        format!("Proton{SUFFIX}")
+    } else if cloud_name(base) {
         format!("{base}{SUFFIX}")
     } else {
         format!("Proton-{base}{SUFFIX}")
@@ -107,23 +110,27 @@ pub fn newer_source(source: &Path, was: &str) -> Option<String> {
 }
 
 /// The line the layer writes to a game's log when the copy in `copy_dir` is older than its source, or named without
-/// "Proton" ([`cloud_name`]: made by an older Neural Forge) while its source is still there to make it again from;
-/// `None` when it is not a copy or is current.
+/// "Proton" ([`cloud_name`]: made by an older Neural Forge); `None` when it is not a copy or is current. A copy named
+/// without "Proton" is made again under its new name while its source is there, else renamed in place (it holds its
+/// own files): either way Make again fixes it.
 pub fn stale_notice(copy_dir: &Path) -> Option<String> {
     let marker = Marker::read(copy_dir)?;
     let name = copy_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let fix = "close Steam and use Make again in Neural Forge's Setup tab (or `neural-forge-cli proton-tool update`)";
+    let cloud = "Steam Cloud does not sync the saves the game keeps in its Wine prefix with it";
     if let Some(now) = newer_source(&marker.source, &marker.source_version) {
+        let also = if cloud_name(&name) { String::new() } else { format!("; its name also lacks \u{201c}Proton\u{201d}, so {cloud}") };
         return Some(format!(
-            "[proton] this game runs with {name}, made from {} but {} has {now} now: {fix} to renew the copy",
+            "[proton] this game runs with {name}, made from {} but {} has {now} now{also}: {fix} to renew the copy (the new one is named {})",
             marker.source_version,
             marker.source.display(),
+            copy_name(&now),
         ));
     }
-    (!cloud_name(&name) && source_version(&marker.source).is_some()).then(|| {
+    (!cloud_name(&name)).then(|| {
         format!(
-            "[proton] this game runs with {name}, whose name lacks \u{201c}Proton\u{201d}: Steam Cloud does not sync the saves the game keeps \
-             in its Wine prefix with it. {fix}: the new copy is named {} and the game moves to it",
+            "[proton] this game runs with {name}, whose name lacks \u{201c}Proton\u{201d}: {cloud}; {fix}: the copy is named {} then and the \
+             game moves to it",
             copy_name(&marker.source_version)
         )
     })
@@ -239,6 +246,9 @@ mod tests {
             // A source without a version file is named by its folder.
             ("Proton - Experimental", "Proton---Experimental-NeuralForge"),
             ("My Wine/build", "Proton-My-Wine-build-NeuralForge"),
+            // Nothing left once made safe: still a name that says Proton, never `Proton--NeuralForge`.
+            ("", "Proton-NeuralForge"),
+            ("/ /", "Proton-NeuralForge"),
         ] {
             let got = copy_name(version);
             assert_eq!(got, name);
@@ -247,8 +257,8 @@ mod tests {
         assert!(!cloud_name("experimental-11.0-20261105c-x86_64-NeuralForge") && !cloud_name("hotfix-20261110-x86_64-NeuralForge"));
     }
 
-    /// A copy an older Neural Forge named without "Proton" gets the notice while its source is there, naming the new
-    /// name; once its source is gone there is nothing to make it again from.
+    /// A copy an older Neural Forge named without "Proton" gets the notice, naming the new name, also once its source is
+    /// gone (Make again renames it in place then); one that is also behind its source says both.
     #[test]
     fn the_launch_notice_names_a_copy_named_without_proton() {
         let d = scratch("cloud");
@@ -260,8 +270,17 @@ mod tests {
         let line = stale_notice(&old).expect("named without Proton");
         assert!(line.contains("Steam Cloud") && line.contains("Make again") && line.contains(&*new.file_name().unwrap().to_string_lossy()), "{line}");
         assert_eq!(stale_notice(&new), None);
+        // Behind its source too: both, and the name the remade copy gets.
+        proton(&src, "experimental-11.0-20261112a-x86_64");
+        let line = stale_notice(&old).expect("behind its source");
+        assert!(line.contains("experimental-11.0-20261112a-x86_64 now") && line.contains("Steam Cloud"), "{line}");
+        assert!(line.contains("Proton-experimental-11.0-20261112a-x86_64-NeuralForge"), "{line}");
+        let line = stale_notice(&new).expect("behind its source");
+        assert!(!line.contains("Steam Cloud"), "{line}");
         std::fs::remove_dir_all(&src).unwrap();
-        assert_eq!(stale_notice(&old), None, "its source is gone");
+        let line = stale_notice(&old).expect("renamed in place once its source is gone");
+        assert!(line.contains("Steam Cloud") && line.contains(&*new.file_name().unwrap().to_string_lossy()), "{line}");
+        assert_eq!(stale_notice(&new), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -890,15 +890,16 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
                 ));
             }
             if proton_tool::steam_cloud_blind(t) {
+                // The name Make again gives it: its source's current version's while the source is there, else its own.
+                let to = proton_tool::remade_name(t);
                 let fix = if proton_tool::source_gone(t) {
                     format!(
-                        "Its source {} is no longer installed: switch its games off, choose another Proton for them in Steam, and switch them on again; then remove it.",
+                        "Close Steam, then use Make again in the Setup tab (or `neural-forge-cli proton-tool update`): its source {} is no longer installed, so the copy (which holds its own files) is renamed to {to} in place and its games move with it. Steam syncs their saves when Steam starts or the game next runs.",
                         t.source.display()
                     )
                 } else {
                     format!(
-                        "Close Steam, then use Make again in the Setup tab (or `neural-forge-cli proton-tool update`): the new copy is named {} and its games move to it. Start Steam to sync.",
-                        neural_forge_protocol::proton_copy::copy_name(&t.source_version)
+                        "Close Steam, then use Make again in the Setup tab (or `neural-forge-cli proton-tool update`): the new copy is named {to} and its games move to it. Steam syncs their saves when Steam starts or the game next runs."
                     )
                 };
                 out.push(Finding::new(
@@ -920,7 +921,8 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
                     t.dir.display().to_string(),
                     Some("Close Steam, then make it again in the Setup tab (or `neural-forge-cli proton-tool update`): its games move to the new copy.".into()),
                 ));
-            } else if proton_tool::source_gone(t) {
+            } else if proton_tool::source_gone(t) && !proton_tool::steam_cloud_blind(t) {
+                // (Named without "Proton", it is renamed: the Steam Cloud finding above says so.)
                 out.push(Finding::new(
                     CHECK,
                     Severity::Info,
@@ -1784,6 +1786,25 @@ mod tests {
         let found = v.iter().find(|x| x.severity == Severity::Warning && x.summary.contains("Steam Cloud can't sync")).unwrap_or_else(|| panic!("{v:#?}"));
         assert!(found.summary.contains("experimental-11.0-20261105c-x86_64-NeuralForge"), "{found:#?}");
         assert!(found.fix.as_deref().unwrap().contains("Proton-experimental-11.0-20261105c-x86_64-NeuralForge"), "{found:#?}");
+        // The source moved on since: Make again makes the copy of its current version, so that is the name said.
+        write(&source.join("version"), "1 experimental-11.0-20261112a-x86_64\n");
+        let v = check_proton(&f.roots);
+        let found = v.iter().find(|x| x.severity == Severity::Warning && x.summary.contains("Steam Cloud can't sync")).unwrap_or_else(|| panic!("{v:#?}"));
+        let fix = found.fix.as_deref().unwrap();
+        assert!(fix.contains("the new copy is named Proton-experimental-11.0-20261112a-x86_64-NeuralForge"), "{found:#?}");
+        assert!(!fix.contains("20261105c"), "{found:#?}");
+        assert!(v.iter().any(|x| x.severity == Severity::Info && x.summary.contains("was made from an older")), "{v:#?}");
+        // The source gone: renamed in place under its own version's name.
+        std::fs::remove_dir_all(&source).unwrap();
+        let v = check_proton(&f.roots);
+        let found = v.iter().find(|x| x.severity == Severity::Warning && x.summary.contains("Steam Cloud can't sync")).unwrap_or_else(|| panic!("{v:#?}"));
+        let fix = found.fix.as_deref().unwrap();
+        assert!(
+            fix.contains("is no longer installed") && fix.contains("renamed to Proton-experimental-11.0-20261105c-x86_64-NeuralForge in place"),
+            "{found:#?}"
+        );
+        assert!(fix.contains("Make again") && fix.contains("when Steam starts or the game next runs"), "{found:#?}");
+        assert!(!v.iter().any(|x| x.summary.contains("the copy keeps working as it is")), "not \"nothing to do\": {v:#?}");
     }
 
     /// A running game whose copy still holds the wrapper of the ring version before (no subrects) is said; one of the

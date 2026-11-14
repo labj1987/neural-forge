@@ -285,9 +285,13 @@ Status tab says so (**Proton copies out of date**: the copy, its two versions or
 that run with it), the game's layer log gets a
 `[proton]` line at launch (`NEURAL_FORGE_LOG`, see Files), `doctor` reports it (and warns when Steam changed a Proton's files in place after a copy was made from it), and the Setup tab marks it with
 **Make again** (`proton-tool update`; so is a copy that holds another NGX wrapper than the installed Neural Forge): with
-Steam closed it makes the copy again (a new version or a name without "Proton" under its new name, its games moved
-over and the old copy removed; Steam syncs their saves when it starts), or puts the new wrapper in place. A copy whose original was deleted (ProtonUp replaced it with a newer
-version) keeps working as it is. Updating Neural Forge puts its wrapper into every copy by itself. A copy a
+Steam closed it makes the copy again (a new version or a name without "Proton" under its new name, its games, Steam's
+default Proton included, moved over and the old copy removed; Steam syncs their saves when Steam starts or the game next
+runs), or puts the new wrapper in place. With Steam running it makes the new copy and keeps the old one; press it again
+once Steam is closed. Switching on a game that is set to such a copy does the same. While a copy waits for **Make
+again**, its Proton has no **Make copy** button. A copy whose original was deleted (ProtonUp replaced it with a newer
+version) keeps working as it is; if its name lacks "Proton", **Make again** renames it in place (it holds its own
+files) and moves its games with it. Updating Neural Forge puts its wrapper into every copy by itself. A copy a
 running game uses is never replaced or removed. `PROTON_NO_NEURAL_FORGE_NGX=1 %command%` in a game's launch options turns the wrapper off for
 that game while it keeps the copy. Online games with anti-cheat may refuse a changed module: use the copy for
 single-player games. From the CLI: `neural-forge-cli proton-tool list|create SOURCE|update|remove NAME`.

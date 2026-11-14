@@ -239,15 +239,16 @@ pub enum Remake {
     Source(String),
     /// Its name lacks "Proton" (made by Neural Forge 4.2.0 or older from Proton Experimental, Proton Hotfix or
     /// Proton-CachyOS): Steam Cloud does not sync the saves a game keeps in its prefix with it
-    /// (`neural_forge_protocol::proton_copy::cloud_name`). Made again, it gets [`Source::tool_name`] and its games move.
+    /// (`neural_forge_protocol::proton_copy::cloud_name`). Made again from its source under [`Source::tool_name`] while
+    /// the source is there, else renamed in place ([`rename_in`]); its games move either way.
     Name,
 }
 
-/// Whether `tool` is made again from its source, and why: its source's version moved on, or its name lacks "Proton"
-/// ([`steam_cloud_blind`]) while its source is still installed. The one check behind switching a game on, Make again,
-/// `proton-tool update`, `doctor` and the Status and Setup tabs.
+/// Whether `tool` is made again, and why: its source's version moved on, or its name lacks "Proton"
+/// ([`steam_cloud_blind`], with or without its source: a copy whose source is gone is renamed in place). The one check
+/// behind switching a game on, Make again, `proton-tool update`, `doctor` and the Status and Setup tabs.
 pub fn remake(tool: &Tool) -> Option<Remake> {
-    newer_source_version(tool).map(Remake::Source).or_else(|| (steam_cloud_blind(tool) && !source_gone(tool)).then_some(Remake::Name))
+    newer_source_version(tool).map(Remake::Source).or_else(|| steam_cloud_blind(tool).then_some(Remake::Name))
 }
 
 /// [`remake`] says it is made again.
@@ -260,10 +261,23 @@ pub fn steam_cloud_blind(tool: &Tool) -> bool {
     !neural_forge_protocol::proton_copy::cloud_name(&tool.name)
 }
 
-/// Whether the Proton `tool` was made from is no longer installed. The copy keeps working as it is; it is only
-/// never made again from a newer version.
+/// The Proton `tool` was made from as it is installed now, read from the folder its marker names (whatever library
+/// holds it, listed or not): the one test of "the source is there" behind [`remake`], [`source_gone`], Make again,
+/// switching a game on and the notice the layer logs at launch. `None` when it is gone (or is no Proton any more).
+pub fn source_of(tool: &Tool) -> Option<Source> {
+    source_at(&tool.source)
+}
+
+/// The name `tool` has once Make again has run ([`remake`]): its source's current copy name while the source is there
+/// (made again from it), else its own version's ([`rename_in`]).
+pub fn remade_name(tool: &Tool) -> String {
+    source_of(tool).map_or_else(|| neural_forge_protocol::proton_copy::copy_name(&tool.source_version), |s| s.tool_name())
+}
+
+/// Whether the Proton `tool` was made from is no longer installed ([`source_of`]). The copy keeps working as it is; it
+/// is only never made again from a newer version.
 pub fn source_gone(tool: &Tool) -> bool {
-    !tool.source.join("proton").is_file()
+    source_of(tool).is_none()
 }
 
 /// Whether `tool` holds another wrapper than `wrapper` (Neural Forge was updated since it was made): its
@@ -639,6 +653,49 @@ pub fn remove_in(root: &Path, name: &str, proc_root: &Path) -> Result<Tool, Stri
     Ok(tool)
 }
 
+/// What [`rename_in`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Renamed {
+    /// The copy is now this one, under its new name.
+    To(Tool),
+    /// A copy of the same source and version already had the new name: the old one is to go once its games moved.
+    Existing(Tool),
+}
+
+/// Gives `tool`, named without "Proton" ([`steam_cloud_blind`]), the name a copy of its version gets now
+/// ([`neural_forge_protocol::proton_copy::copy_name`]) in place: its folder renamed and its `compatibilitytool.vdf`
+/// written new with that name (as [`create`] writes it). Its source is not needed: the copy holds its own files. Never
+/// while a game runs with it, and refused when another tool holds the new name; a Neural Forge copy of the same
+/// source and version there is [`Renamed::Existing`]. The caller (`compat_tool::update`) checks that Steam is closed
+/// and moves the games.
+pub fn rename_in(root: &Path, tool: &Tool, proc_root: &Path) -> Result<Renamed, String> {
+    let name = neural_forge_protocol::proton_copy::copy_name(&tool.source_version);
+    if name == tool.name {
+        return Ok(Renamed::To(tool.clone()));
+    }
+    let target = tools_dir(root).join(&name);
+    if target.exists() || target.is_symlink() {
+        return match tool_at(&target) {
+            Some(t) if t.source == tool.source && t.source_version == tool.source_version => Ok(Renamed::Existing(t)),
+            _ => Err(format!("{} already exists and is another tool: remove or rename it, then make {} again", target.display(), tool.name)),
+        };
+    }
+    refuse_in_use(&tool.dir, proc_root, "rename it")?;
+    rename_dir(tool, &name).map(Renamed::To)
+}
+
+/// `tool`'s folder renamed to `name` beside it and its `compatibilitytool.vdf` written for that name; the folder is put
+/// back when the manifest cannot be written.
+pub(crate) fn rename_dir(tool: &Tool, name: &str) -> Result<Tool, String> {
+    let to = tool.dir.with_file_name(name);
+    std::fs::rename(&tool.dir, &to).map_err(|e| format!("renaming {} to {name}: {e}", tool.dir.display()))?;
+    if let Err(e) = write_new(&to.join("compatibilitytool.vdf"), manifest(name).as_bytes(), 0o644) {
+        let _ = std::fs::rename(&to, &tool.dir);
+        return Err(format!("{}: {e}", to.join("compatibilitytool.vdf").display()));
+    }
+    tool_at(&to).ok_or_else(|| format!("{} has no marker after the rename", to.display()))
+}
+
 /// The pid a ring file is named by (`neural-forge-ngx-<pid>.ring`).
 fn ring_pid(name: &str) -> Option<u32> {
     name.strip_prefix("neural-forge-ngx-")?.strip_suffix(".ring")?.parse().ok()
@@ -985,7 +1042,8 @@ mod tests {
     }
 
     /// A copy an older Neural Forge named without "Proton" (#71) is made again under the new name while its source is
-    /// there; the new copy is current, and a copy whose source is gone keeps working as it is.
+    /// there (under the name of the source's current version once that moved on); the new copy is current, and a copy
+    /// whose source is gone is still made again (renamed in place).
     #[test]
     fn a_copy_named_without_proton_is_made_again_under_the_new_name() {
         let root = scratch("cloud");
@@ -1010,9 +1068,11 @@ mod tests {
         std::fs::remove_file(src.join("version")).unwrap();
         std::fs::write(src.join("version"), "1793687165 experimental-11.0-20261112a-x86_64\n").unwrap();
         assert_eq!(remake(&old), Some(Remake::Source("experimental-11.0-20261112a-x86_64".into())));
+        assert_eq!(remade_name(&old), "Proton-experimental-11.0-20261112a-x86_64-NeuralForge");
         std::fs::remove_dir_all(&src).unwrap();
-        assert_eq!(remake(&old), None, "nothing to make it again from");
-        assert!(steam_cloud_blind(&old));
+        assert_eq!(remake(&old), Some(Remake::Name), "its source is gone: renamed in place");
+        assert!(steam_cloud_blind(&old) && source_gone(&old));
+        assert_eq!(remade_name(&old), "Proton-experimental-11.0-20261105c-x86_64-NeuralForge", "its own version's name");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

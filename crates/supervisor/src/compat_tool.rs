@@ -125,8 +125,9 @@ pub fn source_for(root: &Path, libraries: &[PathBuf], appid: &str) -> Result<Sou
 }
 
 /// Sets `appid`'s Proton to a Neural Forge copy: the game's own Proton's copy (made now when there is none, made
-/// again when its source changed or its name lacks "Proton" ([`proton_tool::remake`]), its wrapper renewed when Neural Forge's changed), or the one already chosen (kept
-/// as it is, its wrapper renewed, when its source is gone: it holds its own files).
+/// again when its source changed or its name lacks "Proton" ([`proton_tool::remake`]), its wrapper renewed when Neural
+/// Forge's changed), or the one already chosen (kept as it is, its wrapper renewed, when its source is gone: it holds its
+/// own files; renamed in place with all its games when its name lacks "Proton", as Make again does).
 /// `Ok(None)` for a native Linux game with no Proton chosen: it runs without Proton, where the wrapper does not
 /// apply. Refused while Steam runs, and for a game whose installed build cannot be told. The game's earlier choice
 /// is recorded (before `config.vdf` is edited) for [`switch_off`].
@@ -159,10 +160,14 @@ pub fn switch_on(root: &Path, libraries: &[PathBuf], appid: &str, wrapper: &Path
     }
     // The source: what the copy the game is set to was made from, else the game's own Proton.
     let source = match from_tool {
-        Some(t) => proton_tool::sources(root, libraries)
-            .into_iter()
-            .find(|s| s.dir == t.source)
-            .ok_or_else(|| format!("{} was made from {}, which is gone: choose another Proton for the game in Steam first", t.name, t.source.display()))?,
+        Some(t) => match proton_tool::source_of(t) {
+            Some(s) => s,
+            // Gone, so the copy is made again only for its name: renamed in place, with every game set to it.
+            None => {
+                let done = rename(root, t, wrapper, false, Path::new("/proc"))?;
+                return Ok(Some(SwitchedOn { tool: done.to, made: false, previous: now }));
+            }
+        },
         None => source_for(root, libraries, appid)?,
     };
     let name = source.tool_name();
@@ -278,14 +283,23 @@ pub struct StaleCopy {
 }
 
 impl StaleCopy {
-    /// One line for the user: the copy, its source's two versions and the games that run with it.
+    /// One line for the user: the copy, its source's two versions or the Steam Cloud problem (both when both apply), and
+    /// the games that run with it.
     pub fn describe(&self) -> String {
         let games = if self.games.is_empty() { "no game is set to it".to_string() } else { format!("used by {}", self.games.join(", ")) };
+        let cloud = "Steam Cloud does not sync the saves games keep in its Wine prefix";
         match &self.why {
+            proton_tool::Remake::Source(now) if proton_tool::steam_cloud_blind(&self.tool) => format!(
+                "made from {}, but {} has {now} now, and its name lacks \u{201c}Proton\u{201d}, so {cloud}; {games}",
+                self.tool.source_version,
+                self.tool.source.display()
+            ),
             proton_tool::Remake::Source(now) => format!("made from {}, but {} has {now} now; {games}", self.tool.source_version, self.tool.source.display()),
-            proton_tool::Remake::Name => {
-                format!("its name lacks \u{201c}Proton\u{201d}, so Steam Cloud does not sync the saves games keep in its Wine prefix; {games}")
-            }
+            proton_tool::Remake::Name if proton_tool::source_gone(&self.tool) => format!(
+                "its name lacks \u{201c}Proton\u{201d}, so {cloud}; its source is gone, so Make again renames it to {}; {games}",
+                proton_tool::remade_name(&self.tool)
+            ),
+            proton_tool::Remake::Name => format!("its name lacks \u{201c}Proton\u{201d}, so {cloud}; {games}"),
         }
     }
 }
@@ -320,46 +334,98 @@ pub struct Updated {
     pub moved: Vec<String>,
     /// Why `from` is still there when it was to go (Steam is running, a game runs with it).
     pub kept: Option<String>,
+    /// `from` was renamed to `to` in place (its source is gone: [`proton_tool::rename_in`]), not made again.
+    pub renamed: bool,
 }
 
 /// Updates `tool` (`proton-tool update`, Make again): the new wrapper put in when only that changed, or when its
-/// source is gone (the copy keeps working as it is); else ([`proton_tool::remake`]) the copy
-/// made again from its source's current version, and when that is a new name (a new version, or a name that now
-/// says "Proton"), every game set to the old copy
-/// moved to the new one and the old copy removed (both only while Steam is closed, and never a copy a game runs
-/// with).
-pub fn update(root: &Path, libraries: &[PathBuf], tool: &Tool, wrapper: &Path, steam_running: bool) -> Result<Updated, String> {
-    update_in(root, libraries, tool, wrapper, steam_running, Path::new("/proc"))
+/// source is gone and its name says "Proton" (the copy keeps working as it is); else ([`proton_tool::remake`]) the
+/// copy made again from its source's current version, and when that is a new name (a new version, or a name that now
+/// says "Proton"), every game set to the old copy (the default for all games, "0", too) moved to the new one and the
+/// old copy removed (both only while Steam is closed, and never a copy a game runs with). A copy named without
+/// "Proton" whose source is gone is renamed in place instead ([`proton_tool::rename_in`]: it holds its own files),
+/// its games moved, its wrapper renewed: refused while Steam runs.
+pub fn update(root: &Path, tool: &Tool, wrapper: &Path, steam_running: bool) -> Result<Updated, String> {
+    update_in(root, tool, wrapper, steam_running, Path::new("/proc"))
 }
 
-fn update_in(root: &Path, libraries: &[PathBuf], tool: &Tool, wrapper: &Path, steam_running: bool, proc_root: &Path) -> Result<Updated, String> {
-    let same = |moved| Updated { from: tool.name.clone(), to: tool.name.clone(), moved, kept: None };
+fn update_in(root: &Path, tool: &Tool, wrapper: &Path, steam_running: bool, proc_root: &Path) -> Result<Updated, String> {
+    let same = |moved| Updated { from: tool.name.clone(), to: tool.name.clone(), moved, kept: None, renamed: false };
     if !proton_tool::needs_remake(tool) {
         let dll = std::fs::read(wrapper).map_err(|e| format!("Neural Forge's NGX wrapper {}: {e}", wrapper.display()))?;
         proton_tool::refresh_wrapper(tool, &dll)?;
         return Ok(same(Vec::new()));
     }
-    let source = proton_tool::sources(root, libraries)
-        .into_iter()
-        .find(|s| s.dir == tool.source)
-        .ok_or_else(|| format!("its source {} is gone: remove it, and choose another Proton for its games", tool.source.display()))?;
+    // The source as `remake` read it (its folder, whichever library holds it); gone, the copy is made again only for
+    // its name.
+    let Some(source) = proton_tool::source_of(tool) else { return rename(root, tool, wrapper, steam_running, proc_root) };
     let made = proton_tool::create_in(root, &source, wrapper, proc_root)?;
     if made.tool.name == tool.name {
         return Ok(same(Vec::new()));
     }
-    let mut out = Updated { from: tool.name.clone(), to: made.tool.name.clone(), moved: Vec::new(), kept: None };
+    let mut out = Updated { from: tool.name.clone(), to: made.tool.name.clone(), moved: Vec::new(), kept: None, renamed: false };
     if steam_running {
         out.kept = Some("Steam is running: close it and update again to move its games to the new copy and remove the old one".into());
         return Ok(out);
     }
-    for appid in games_on(root, |n| n == tool.name) {
-        edit(root, |old| set_name(old, &appid, &made.tool.name))?;
-        out.moved.push(appid);
-    }
+    out.moved = move_games(root, &tool.name, &made.tool.name)?;
     if let Err(e) = proton_tool::remove_in(root, &tool.name, proc_root) {
         out.kept = Some(e);
     }
     Ok(out)
+}
+
+/// Every game set to the tool `from` (the default for all games, "0", too) set to `to`, in one edit of `config.vdf`:
+/// the games moved.
+fn move_games(root: &Path, from: &str, to: &str) -> Result<Vec<String>, String> {
+    let games = games_on(root, |n| n == from);
+    if !games.is_empty() {
+        edit(root, |old| {
+            let mut now = old.to_vec();
+            for appid in &games {
+                if let Some(next) = set_name(&now, appid, to)? {
+                    now = next;
+                }
+            }
+            Ok((now != old).then_some(now))
+        })?;
+    }
+    Ok(games)
+}
+
+/// [`update`] for a copy named without "Proton" whose source is gone: renamed in place ([`proton_tool::rename_in`]),
+/// its games moved to the new name (the folder renamed back when they cannot be) and its wrapper renewed; where a copy
+/// of the same version already has the new name, the games move to it and the old copy goes. Refused while Steam
+/// runs (it would not see the rename, and writes its own `config.vdf` back), while a game runs with the copy, and when
+/// another tool has the new name.
+fn rename(root: &Path, tool: &Tool, wrapper: &Path, steam_running: bool, proc_root: &Path) -> Result<Updated, String> {
+    if steam_running {
+        return Err(format!(
+            "Steam is running: close it to rename {} to {} (its source is gone, so it is renamed in place) and move its games",
+            tool.name,
+            proton_tool::remade_name(tool)
+        ));
+    }
+    let dll = std::fs::read(wrapper).map_err(|e| format!("Neural Forge's NGX wrapper {}: {e}", wrapper.display()))?;
+    match proton_tool::rename_in(root, tool, proc_root)? {
+        proton_tool::Renamed::To(new) => {
+            let moved = match move_games(root, &tool.name, &new.name) {
+                Ok(moved) => moved,
+                Err(e) => {
+                    let _ = proton_tool::rename_dir(&new, &tool.name);
+                    return Err(e);
+                }
+            };
+            proton_tool::refresh_wrapper(&new, &dll)?;
+            Ok(Updated { from: tool.name.clone(), to: new.name, moved, kept: None, renamed: true })
+        }
+        proton_tool::Renamed::Existing(there) => {
+            let moved = move_games(root, &tool.name, &there.name)?;
+            proton_tool::refresh_wrapper(&there, &dll)?;
+            let kept = proton_tool::remove_in(root, &tool.name, proc_root).err();
+            Ok(Updated { from: tool.name.clone(), to: there.name, moved, kept, renamed: false })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -529,7 +595,7 @@ mod tests {
         let procs = root.join("proc");
         std::fs::create_dir_all(&procs).unwrap();
         let t = proton_tool::tools(&root).remove(0);
-        let up = update_in(&root, libs, &t, &w, false, &procs).unwrap();
+        let up = update_in(&root, &t, &w, false, &procs).unwrap();
         assert_eq!((up.from.as_str(), up.to.as_str(), up.kept), (t.name.as_str(), t.name.as_str(), None));
         assert!(t.dir.is_dir() && !proton_tool::wrapper_changed(&proton_tool::tools(&root)[0], &w));
         std::fs::remove_dir_all(&root).unwrap();
@@ -545,35 +611,155 @@ mod tests {
         fake_app(&root, "1174180", "RDR2", Some(("RDR2.exe", "MZ")));
         fake_app(&root, "990080", "Hogwarts Legacy", Some(("HogwartsLegacy.exe", "MZ")));
         switch_on(&root, libs, "1174180", &w, false).unwrap().unwrap();
-        // Back to how 4.2.0 named and mapped it.
-        let made = proton_tool::tools(&root).remove(0);
         let (old_name, new_name) = ("experimental-11.0-NeuralForge", "Proton-experimental-11.0-NeuralForge");
-        assert_eq!(made.name, new_name);
-        let old_dir = proton_tool::tools_dir(&root).join(old_name);
-        std::fs::rename(&made.dir, &old_dir).unwrap();
-        std::fs::remove_file(old_dir.join("compatibilitytool.vdf")).unwrap();
-        std::fs::write(old_dir.join("compatibilitytool.vdf"), proton_tool::manifest(old_name)).unwrap();
-        for appid in ["1174180", "990080"] {
-            edit(&root, |old| set_name(old, appid, old_name)).unwrap();
-        }
+        let old_dir = as_named_by_4_2_0(&root, new_name, old_name, &["1174180", "990080"]);
         let stale = stale_copies(&root);
         assert_eq!(stale.len(), 1);
         assert_eq!((stale[0].tool.name.as_str(), &stale[0].why), (old_name, &proton_tool::Remake::Name));
         let line = stale[0].describe();
         assert!(line.contains("Steam Cloud") && line.contains("RDR2") && line.contains("Hogwarts Legacy"), "{line}");
-        // Switching one game on again moves that game.
-        let on = switch_on(&root, libs, "990080", &w, false).unwrap().unwrap();
+        // Switching one game on again moves that game: its source is read from the folder the copy names, also when
+        // that library is not among those listed.
+        let on = switch_on(&root, &[], "990080", &w, false).unwrap().unwrap();
         assert_eq!((on.tool.as_str(), on.made), (new_name, true));
         assert_eq!(current(&root, "990080").as_deref(), Some(new_name));
         // Make again moves the rest and removes the old copy.
         let procs = root.join("proc");
         std::fs::create_dir_all(&procs).unwrap();
-        let done = update_in(&root, libs, &stale[0].tool, &w, false, &procs).unwrap();
+        let done = update_in(&root, &stale[0].tool, &w, false, &procs).unwrap();
         assert_eq!((done.to.as_str(), done.moved, done.kept), (new_name, vec!["1174180".to_string()], None));
         assert_eq!(current(&root, "1174180").as_deref(), Some(new_name));
         assert!(!old_dir.exists() && stale_copies(&root).is_empty());
         // Switched off, the game gets the Proton it had before Neural Forge (none).
         assert_eq!(switch_off(&root, "1174180", false).unwrap().as_deref(), Some(""));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Puts the copy named `new_name` back under the name Neural Forge 4.2.0 gave it (`old_name`: its folder and its
+    /// `compatibilitytool.vdf`) and sets `games` to it: the old copy's folder.
+    fn as_named_by_4_2_0(root: &Path, new_name: &str, old_name: &str, games: &[&str]) -> PathBuf {
+        let made = proton_tool::tools(root).into_iter().find(|t| t.name == new_name).expect("the copy");
+        let old_dir = proton_tool::tools_dir(root).join(old_name);
+        std::fs::rename(&made.dir, &old_dir).unwrap();
+        std::fs::remove_file(old_dir.join("compatibilitytool.vdf")).unwrap();
+        std::fs::write(old_dir.join("compatibilitytool.vdf"), proton_tool::manifest(old_name)).unwrap();
+        for appid in games {
+            edit(root, |old| set_name(old, appid, old_name)).unwrap();
+        }
+        old_dir
+    }
+
+    /// Make again on a copy named without "Proton" while Steam runs makes the new copy and keeps the old one, moving
+    /// nothing; with Steam closed it finishes: every game set to it moves, the default for all games ("0") too, and a
+    /// game switched off afterwards gets the Proton it had before Neural Forge.
+    #[test]
+    fn a_name_remake_while_steam_runs_waits_for_steam_to_close_and_moves_the_default_too() {
+        let (root, lib, w) = steam("cloudrun");
+        let libs = std::slice::from_ref(&lib);
+        fake_app(&root, "1174180", "RDR2", Some(("RDR2.exe", "MZ")));
+        // The game had Proton Experimental chosen by name before Neural Forge.
+        edit(&root, |old| set_name(old, "1174180", "proton_experimental")).unwrap();
+        let on = switch_on(&root, libs, "1174180", &w, false).unwrap().unwrap();
+        assert_eq!(on.previous.as_deref(), Some("proton_experimental"));
+        let (old_name, new_name) = ("experimental-11.0-NeuralForge", "Proton-experimental-11.0-NeuralForge");
+        let old_dir = as_named_by_4_2_0(&root, new_name, old_name, &["0", "1174180"]);
+        let old = proton_tool::tools(&root).remove(0);
+        assert_eq!(proton_tool::remake(&old), Some(proton_tool::Remake::Name));
+        let procs = root.join("proc");
+        std::fs::create_dir_all(&procs).unwrap();
+        let running = update_in(&root, &old, &w, true, &procs).unwrap();
+        assert_eq!((running.to.as_str(), running.moved.len(), running.renamed), (new_name, 0, false));
+        assert!(running.kept.unwrap().contains("Steam is running"));
+        assert!(old_dir.is_dir() && proton_tool::tools_dir(&root).join(new_name).is_dir());
+        assert_eq!((current(&root, "0").as_deref(), current(&root, "1174180").as_deref()), (Some(old_name), Some(old_name)), "nothing moved");
+        // Steam closed: the copy is there already; the games move and the old copy goes.
+        let done = update_in(&root, &old, &w, false, &procs).unwrap();
+        assert_eq!((done.to.as_str(), done.moved, done.kept), (new_name, vec!["0".to_string(), "1174180".to_string()], None));
+        assert_eq!((current(&root, "0").as_deref(), current(&root, "1174180").as_deref()), (Some(new_name), Some(new_name)));
+        assert!(!old_dir.exists() && stale_copies(&root).is_empty());
+        assert_eq!(switch_off(&root, "1174180", false).unwrap().as_deref(), Some("proton_experimental"));
+        assert_eq!(current(&root, "1174180").as_deref(), Some("proton_experimental"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A copy named without "Proton" whose source is gone is renamed in place (it holds its own files): its folder and
+    /// `compatibilitytool.vdf` get the new name, every game set to it moves (the default "0" too) and its wrapper is
+    /// renewed; refused while Steam runs, while a game runs with it and when another tool has the new name. Switching a
+    /// game on does the same; a copy of the same version under the new name takes its games instead. Switched off, a
+    /// game gets its earlier Proton back.
+    #[test]
+    fn a_copy_named_without_proton_whose_source_is_gone_is_renamed_in_place() {
+        let (root, lib, w) = steam("rename");
+        let libs = std::slice::from_ref(&lib);
+        fake_app(&root, "1174180", "RDR2", Some(("RDR2.exe", "MZ")));
+        fake_app(&root, "990080", "Hogwarts Legacy", Some(("HogwartsLegacy.exe", "MZ")));
+        edit(&root, |old| set_name(old, "990080", "proton_experimental")).unwrap();
+        switch_on(&root, libs, "1174180", &w, false).unwrap().unwrap();
+        switch_on(&root, libs, "990080", &w, false).unwrap().unwrap();
+        let (old_name, new_name) = ("experimental-11.0-NeuralForge", "Proton-experimental-11.0-NeuralForge");
+        let games = ["0", "1174180", "990080"];
+        let old_dir = as_named_by_4_2_0(&root, new_name, old_name, &games);
+        let new_dir = proton_tool::tools_dir(&root).join(new_name);
+        std::fs::remove_dir_all(lib.join("steamapps/common/Proton - Experimental")).unwrap();
+        let stale = stale_copies(&root);
+        assert_eq!((stale.len(), &stale[0].why), (1, &proton_tool::Remake::Name));
+        assert!(stale[0].describe().contains(&format!("renames it to {new_name}")), "{}", stale[0].describe());
+        let old = stale[0].tool.clone();
+        let on_old = |root: &Path| games.iter().all(|a| current(root, a).as_deref() == Some(old_name));
+        let procs = root.join("proc");
+        std::fs::create_dir_all(&procs).unwrap();
+        // Refused while Steam runs.
+        let e = update_in(&root, &old, &w, true, &procs).unwrap_err();
+        assert!(e.contains("Steam is running") && e.contains(new_name), "{e}");
+        assert!(old_dir.is_dir() && !new_dir.exists() && on_old(&root));
+        // Refused while a game runs with it.
+        let pid = procs.join("4242");
+        std::fs::create_dir_all(&pid).unwrap();
+        std::os::unix::fs::symlink(old_dir.join("files/lib/wine/x86_64-unix/wine64"), pid.join("exe")).unwrap();
+        let e = update_in(&root, &old, &w, false, &procs).unwrap_err();
+        assert!(e.contains("in use by a running game") && e.contains("4242"), "{e}");
+        assert!(old_dir.is_dir() && !new_dir.exists() && on_old(&root));
+        std::fs::remove_dir_all(&pid).unwrap();
+        // Refused when another tool has the new name.
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("compatibilitytool.vdf"), proton_tool::manifest(new_name)).unwrap();
+        let e = update_in(&root, &old, &w, false, &procs).unwrap_err();
+        assert!(e.contains("already exists and is another tool"), "{e}");
+        assert!(old_dir.is_dir() && on_old(&root));
+        std::fs::remove_dir_all(&new_dir).unwrap();
+        // Renamed, with a new wrapper to put in.
+        std::fs::write(&w, [std::fs::read(&w).unwrap(), vec![1]].concat()).unwrap();
+        let done = update_in(&root, &old, &w, false, &procs).unwrap();
+        assert_eq!((done.from.as_str(), done.to.as_str(), done.renamed, done.kept), (old_name, new_name, true, None));
+        let mut moved = done.moved.clone();
+        moved.sort();
+        assert_eq!(moved, ["0", "1174180", "990080"].map(String::from), "every game, in config.vdf's order");
+        assert!(!old_dir.exists() && new_dir.is_dir());
+        let vdf = std::fs::read_to_string(new_dir.join("compatibilitytool.vdf")).unwrap();
+        assert_eq!(vdf, proton_tool::manifest(new_name));
+        let t = proton_tool::tools(&root).remove(0);
+        assert_eq!((t.name.as_str(), t.source_version.as_str()), (new_name, "experimental-11.0"));
+        assert!(!proton_tool::wrapper_changed(&t, &w) && stale_copies(&root).is_empty());
+        assert!(games.iter().all(|a| current(&root, a).as_deref() == Some(new_name)));
+        // Switching a game on renames it the same way, with all its games.
+        as_named_by_4_2_0(&root, new_name, old_name, &games);
+        let on = switch_on(&root, libs, "1174180", &w, false).unwrap().unwrap();
+        assert_eq!((on.tool.as_str(), on.made, on.previous.as_deref()), (new_name, false, Some(old_name)));
+        assert!(!old_dir.exists() && games.iter().all(|a| current(&root, a).as_deref() == Some(new_name)));
+        // A copy of the same version already under the new name: the games move to it and the old one goes.
+        as_named_by_4_2_0(&root, new_name, old_name, &games);
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::copy(old_dir.join(proton_tool::MARKER), new_dir.join(proton_tool::MARKER)).unwrap();
+        std::fs::write(new_dir.join("compatibilitytool.vdf"), proton_tool::manifest(new_name)).unwrap();
+        let old = proton_tool::tools(&root).into_iter().find(|t| t.name == old_name).unwrap();
+        let done = update_in(&root, &old, &w, false, &procs).unwrap();
+        assert_eq!((done.to.as_str(), done.renamed, done.kept), (new_name, false, None));
+        assert!(!old_dir.exists() && games.iter().all(|a| current(&root, a).as_deref() == Some(new_name)));
+        // Switched off: the earlier Proton back, or none.
+        assert_eq!(switch_off(&root, "990080", false).unwrap().as_deref(), Some("proton_experimental"));
+        assert_eq!(current(&root, "990080").as_deref(), Some("proton_experimental"));
+        assert_eq!(switch_off(&root, "1174180", false).unwrap().as_deref(), Some(""));
+        assert_eq!(current(&root, "1174180"), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -589,10 +775,10 @@ mod tests {
         assert!(proton_tool::source_changed(&old));
         let procs = root.join("proc");
         std::fs::create_dir_all(&procs).unwrap();
-        let running = update_in(&root, libs, &old, &w, true, &procs).unwrap();
+        let running = update_in(&root, &old, &w, true, &procs).unwrap();
         assert_eq!((running.to.as_str(), running.moved.len()), ("GE-Proton11-13-NeuralForge", 0));
         assert!(running.kept.unwrap().contains("Steam is running") && old.dir.is_dir());
-        let done = update_in(&root, libs, &old, &w, false, &procs).unwrap();
+        let done = update_in(&root, &old, &w, false, &procs).unwrap();
         assert_eq!((done.moved, done.kept), (vec!["1091500".to_string()], None));
         assert_eq!(current(&root, "1091500").as_deref(), Some("GE-Proton11-13-NeuralForge"));
         assert!(!old.dir.exists());
@@ -601,7 +787,7 @@ mod tests {
         // Only the wrapper changed: put in, same copy.
         let t = proton_tool::tools(&root).remove(0);
         std::fs::write(&w, [std::fs::read(&w).unwrap(), vec![1]].concat()).unwrap();
-        let fresh = update_in(&root, libs, &t, &w, false, &procs).unwrap();
+        let fresh = update_in(&root, &t, &w, false, &procs).unwrap();
         assert_eq!(fresh.to, t.name);
         assert!(!proton_tool::wrapper_changed(&proton_tool::tools(&root)[0], &w));
         std::fs::remove_dir_all(&root).unwrap();
@@ -632,7 +818,7 @@ mod tests {
         assert!(neural_forge_protocol::proton_copy::stale_notice(&stale[0].tool.dir).is_some());
         let procs = root.join("proc");
         std::fs::create_dir_all(&procs).unwrap();
-        let done = update_in(&root, libs, &stale[0].tool, &w, false, &procs).unwrap();
+        let done = update_in(&root, &stale[0].tool, &w, false, &procs).unwrap();
         assert_eq!((done.to.as_str(), done.moved.clone()), ("GE-Proton11-13-NeuralForge", vec!["1091500".to_string()]));
         assert!(stale_copies(&root).is_empty());
         // A source that is gone is no stale copy: it keeps working.
