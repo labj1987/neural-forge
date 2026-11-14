@@ -414,12 +414,15 @@ pub(crate) struct Exchange {
     pipeline: vk::Pipeline,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
-    /// The counters the gate's set points at: their buffer and which edit cache's they are
-    /// (`cache::CachePass::stats_made`).
-    gated: Option<(vk::Buffer, u64)>,
+    /// The counters the gate's set points at, with which edit cache's they are (`cache::CachePass::stats_made`: counted,
+    /// never the handle alone, which the driver gives the next buffer made).
+    gated: Bound,
     /// The motion's pack (`Sizes::packed_texels`).
     pack: Option<Pack>,
 }
+
+/// What a set of the exchange points at: the buffer, and which object's it is (counted, never the handle alone).
+type Bound = Option<(vk::Buffer, u64)>;
 
 /// The pack of the accumulated motion to halves before it is sent (`preupscale_offload_pack.comp`): its pipeline (over
 /// the gate's layout: two storage buffers and one pushed word), its set and the packed field.
@@ -430,7 +433,7 @@ struct Pack {
     packed: super::native::OwnBuffer,
     texels: u64,
     /// The field the set points at, with which native pass's it is (`native::NativePass::id`).
-    bound: Option<(vk::Buffer, u64)>,
+    bound: Bound,
 }
 
 impl Pack {
@@ -709,7 +712,7 @@ impl Exchange {
     /// The counters the gate's set points at are going (their edit cache is destroyed): the set is written again
     /// before it is next used, whatever the next cache's handles are.
     pub(crate) fn forget_gate(&mut self) {
-        self.gated = None;
+        self.gated = Bound::default();
     }
 
     /// Points the motion's pack at the accumulated field `field` (2 x f32 a texel), when it changed and the motion
@@ -733,7 +736,7 @@ impl Exchange {
     /// The edit cache or the native pass the gate's and the pack's sets point into is going: both are written again
     /// before they are next used.
     pub(crate) fn forget_bound(&mut self) {
-        self.gated = None;
+        self.gated = Bound::default();
         if let Some(pack) = self.pack.as_mut() {
             pack.bound = None;
         }
@@ -741,7 +744,7 @@ impl Exchange {
 
     /// Tests: what the gate's and the pack's sets are taken to point at.
     #[cfg(test)]
-    pub(crate) fn bound_for_test(&self) -> (Option<(vk::Buffer, u64)>, Option<(vk::Buffer, u64)>) {
+    pub(crate) fn bound_for_test(&self) -> (Bound, Bound) {
         (self.gated, self.pack.as_ref().and_then(|p| p.bound))
     }
 
@@ -2618,6 +2621,34 @@ mod tests {
         assert_eq!(game.landed(), (Some(105), true), "the gate ran on the new counters");
         assert!(gave_up.lock().unwrap().is_empty());
         wait_finished(&game, 6);
+        game.close(worker);
+    }
+
+    /// Placement became Finished frame in a running game (`native_post` on its own thread): every hold's worker of
+    /// the game's device is ended for it. A side asking meanwhile whether its worker has ended is answered only
+    /// once the thread is gone (the join holds the handle's lock), never while it still runs with the exchange the
+    /// side is about to free.
+    #[test]
+    fn the_holds_workers_end_for_the_finished_frame_and_no_one_sees_them_ended_early() {
+        let Some((game, worker, _, gave_up, _)) = rig(Vec::new(), None) else { return };
+        let device = worker.game;
+        assert!(!worker.ended() && worker.serving());
+        let registered = |d: vk::Device| WORKERS.lock().unwrap().iter().filter(|r| r.game == d).count();
+        assert_eq!(registered(device), 1);
+        let thread = worker.thread.clone();
+        let releasing = std::thread::spawn(move || release_for_finished(device));
+        let t0 = Instant::now();
+        while !worker.ended() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the worker never ended");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Ended as the side sees it: the handle is gone, and whoever joined it has returned from the join (the lock is
+        // free only then).
+        assert!(thread.try_lock().is_ok_and(|h| h.is_none()), "the thread was joined before `ended` said so");
+        assert!(releasing.join().unwrap(), "ended for the finished frame");
+        assert_eq!(registered(device), 0);
+        assert!(!release_for_finished(device), "none is left to end");
+        assert!(gave_up.lock().unwrap().is_empty(), "a release is no failure of the second GPU");
         game.close(worker);
     }
 
