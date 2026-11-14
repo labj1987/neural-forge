@@ -493,8 +493,16 @@ its edit applied one frame later".
 to the game's GPU:
 
 1. Plug the monitor into the second GPU.
-2. Set `NEURAL_FORGE_OFFLOAD_GPU`, set Placement to Finished frame for every pass, switch the setting on, then start
-   the game (the setting is read when the game creates its window's swapchain).
+2. Start the game once and read the `[offload] GPU N` lines again: the driver often lists the GPU the monitor is on
+   first, and the game takes the first GPU it is offered, so it would now render on the card meant for the model
+   (the line of the game's GPU ends in "the game's"). Keep the game on the other card by its name, for DirectX 12
+   and DirectX 11 games alike, and name the second GPU by its PCI IDs rather than its index, which changes with the
+   order: `DXVK_FILTER_DEVICE_NAME="RTX 4090" VKD3D_FILTER_DEVICE_NAME="RTX 4090" NEURAL_FORGE_OFFLOAD_GPU=10de:2c02
+   %command%` (the game on the RTX 4090, the model and the monitor on the RTX 5080 `10de:2c02`; use your cards' names
+   and IDs from those lines). The filters only change what the game is offered: the layer still sees every GPU.
+3. Set Placement to Finished frame for every pass, switch the setting on, then start the game (the setting is read
+   when the game creates its window's swapchain). The log's `[offload] GPU` line of the game's GPU then names the
+   first card, and `[present2]` the second.
 
 Each frame crosses to the second GPU once (about 15 MB at 2560x1440 and 33 MB at 3840x2160 in SDR or HDR10) and the
 game never waits for it. When the link or the second GPU cannot carry every frame, the newest frame wins and the
