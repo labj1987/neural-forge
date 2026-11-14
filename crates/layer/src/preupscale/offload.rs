@@ -657,12 +657,50 @@ impl Offload {
     }
 }
 
+/// The instance's real GPUs (not CPU renderers such as llvmpipe) and their names, kept when the game creates a device
+/// (inside its `vkCreateDevice`, the loader's lock held): `gpu2_present` asks them which may present to a window
+/// without enumerating outside that lock.
+static GPUS: Mutex<Vec<(vk::PhysicalDevice, String)>> = Mutex::new(Vec::new());
+
+/// Keeps [`GPUS`] once per process.
+///
+/// # Safety
+/// `instance` is the game's live instance.
+unsafe fn note_gpus(instance: &ash::Instance) {
+    let mut gpus = GPUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !gpus.is_empty() {
+        return;
+    }
+    // SAFETY: the game's live instance and its own physical devices.
+    let Ok(physicals) = (unsafe { instance.enumerate_physical_devices() }) else { return };
+    *gpus = physicals
+        .into_iter()
+        .filter_map(|p| {
+            // SAFETY: as above.
+            let props = unsafe { instance.get_physical_device_properties(p) };
+            real_gpu(props.device_type).then(|| (p, props.device_name_as_c_str().map_or_else(|_| "a GPU".into(), |n| n.to_string_lossy().into_owned())))
+        })
+        .collect();
+}
+
+/// Whether a device of this type is a GPU (a CPU renderer is not).
+pub(crate) fn real_gpu(kind: vk::PhysicalDeviceType) -> bool {
+    kind != vk::PhysicalDeviceType::CPU
+}
+
+/// The instance's real GPUs ([`GPUS`]).
+pub(crate) fn gpus() -> Vec<(vk::PhysicalDevice, String)> {
+    GPUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
 /// The GPUs of the instance, in the log once per process (where there is more than one): the indices and IDs
 /// `NEURAL_FORGE_OFFLOAD_GPU` takes.
 ///
 /// # Safety
 /// `game` is a physical device of `instance`; `core2` only where the instance has Vulkan 1.1.
 pub(crate) unsafe fn log_gpus(instance: &ash::Instance, game: vk::PhysicalDevice, core2: bool) {
+    // SAFETY: as the contract.
+    unsafe { note_gpus(instance) };
     static SAID: AtomicBool = AtomicBool::new(false);
     if SAID.load(Ordering::Relaxed) {
         return;

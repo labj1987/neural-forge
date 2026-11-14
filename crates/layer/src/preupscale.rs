@@ -183,6 +183,47 @@ pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
     loader.is_some()
 }
 
+/// What the present does with the after-the-upscaler server ([`Session::ensure_post_server`]).
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostAction {
+    /// Nothing now: it starts, serves, or (on the other GPU) waits for a frame that did not finish.
+    Wait,
+    /// The finished frame's trial gave the model back to the other GPU: the game's GPU's server ends.
+    EndForSwitch,
+    /// It ended: dropped. `stalled`: nothing starts on this device again; `failed`: the next start waits for the
+    /// retry schedule; `handed`: the other GPU's server ended for the finished frame's trial.
+    Drop { stalled: bool, failed: bool, handed: bool },
+    /// None runs: one starts (here or on the other GPU).
+    Start,
+}
+
+/// [`PostAction`] for a server in `status` (`None`: none), on the other GPU (`offload`) or not, with the finished
+/// frame's trial running or keeping the model on the game's GPU (`trial_local`) and a give-back pending (`back`).
+#[cfg(target_arch = "x86_64")]
+fn post_action(status: Option<native_post::Status>, offload: bool, trial_local: bool, back: bool) -> PostAction {
+    use native_post::Status;
+    match status {
+        Some(Status::Starting) => PostAction::Wait,
+        Some(Status::Serving) if !offload && back && !trial_local => PostAction::EndForSwitch,
+        Some(Status::Serving) => PostAction::Wait,
+        // The server on another GPU waits for a frame that did not finish (`native_post::work`): it ends on its own,
+        // with the network back here (Unavailable) once that frame is done.
+        Some(Status::Stalled) if offload => PostAction::Wait,
+        Some(Status::Stalled) => PostAction::Drop { stalled: true, failed: false, handed: false },
+        // The second GPU could not start, stalled, was lost or was too slow (`offload`, logged there): the network runs
+        // on this device's GPU from the next present on.
+        Some(Status::Unavailable) => PostAction::Drop { stalled: false, failed: false, handed: false },
+        // Ended for a reason that may pass; or the other GPU's server ended for the finished frame's trial: no failure,
+        // the game's GPU's starts at the next present.
+        Some(Status::Retry) => {
+            let handed = offload && trial_local;
+            PostAction::Drop { stalled: false, failed: !handed, handed }
+        }
+        None => PostAction::Start,
+    }
+}
+
 /// A native hold ([`native::run_native_hold`]).
 ///
 /// # Safety
@@ -5870,6 +5911,10 @@ pub(crate) struct Session {
     /// The native backend's after-the-upscaler server (`native_post`), once the mapping is open.
     #[cfg(target_arch = "x86_64")]
     pub(crate) post_server: Option<native_post::PostServer>,
+    /// The game's GPU's server, ending after the finished frame's trial gave the model back to the other GPU
+    /// ([`PostAction::EndForSwitch`]): not joined in the present; the other GPU's server starts once it has ended.
+    #[cfg(target_arch = "x86_64")]
+    post_ending: Option<native_post::PostServer>,
     /// When to start the server again after it ended for a reason that may pass (its pipelines could not be
     /// built, another server held the channel): the native loader's schedule.
     #[cfg(target_arch = "x86_64")]
@@ -6823,7 +6868,10 @@ impl Session {
             placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT)
         });
         let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_hold());
-        if let Some(line) = offload::status_line().filter(|_| offload_line) {
+        // The finished frame's trial on the game's GPU, or its verdict for it (`offload_trial`): the offload's state
+        // still says Active there, but the game's GPU runs the model.
+        let trial_line = offload_trial::finished_status_line().filter(|_| at_present && !offload::active() && !offload::given_up());
+        if let Some(line) = trial_line.or_else(|| offload::status_line().filter(|_| offload_line)) {
             // Against what the channel holds (the native backend's line shares it): written when it says something else,
             // except that once the offload was given up the native backend's own line (the network running here, or why
             // not) is the one to keep.
@@ -6836,47 +6884,54 @@ impl Session {
         if !self.post_stalled && native_on(self.native.as_ref()) {
             use native_post::Status;
             let now = Instant::now();
-            match self.post_server.as_ref().map(native_post::PostServer::status) {
-                Some(Status::Starting) => return,
-                Some(Status::Serving) => {
-                    if self.post_retry.failing() {
+            // The game's GPU's server ending for the other GPU's (`post_ending`): its network is closed once it has.
+            if let Some(ending) = self.post_ending.take() {
+                if !ending.ended() {
+                    self.post_ending = Some(ending);
+                    return;
+                }
+                drop(ending);
+                if let Some(loader) = &self.native {
+                    if !loader.give_back_network() {
+                        crate::log!("[offload] the game's GPU's network stays open: a path here still uses it");
+                    }
+                }
+            }
+            let status = self.post_server.as_ref().map(native_post::PostServer::status);
+            if offload::given_up() {
+                offload_trial::clear_back();
+            }
+            match post_action(status, self.post_offload, offload_trial::finished_local(), offload_trial::back_pending()) {
+                PostAction::Wait => {
+                    if status == Some(Status::Serving) && self.post_retry.failing() {
                         self.post_retry.succeeded();
                     }
-                    // The finished frame's trial gave the model back to the other GPU (`offload_trial::take_back`):
-                    // the game's GPU's server ends here, and the other GPU's starts below.
-                    if self.post_offload || !offload_trial::take_back() {
-                        return;
+                    return;
+                }
+                // The finished frame's trial gave the model back to the other GPU (`offload_trial::take_back`): the game's
+                // GPU's server ends without the present waiting for it, and the other GPU's starts once it has.
+                PostAction::EndForSwitch => {
+                    offload_trial::take_back();
+                    if let Some(server) = self.post_server.take() {
+                        server.stop_soon();
+                        self.post_ending = Some(server);
                     }
-                    drop(self.post_server.take());
-                }
-                // The server on another GPU waits for a frame that did not finish (`native_post::work`): it ends on its
-                // own, with the network back here (Unavailable) once that frame is done.
-                Some(Status::Stalled) if self.post_offload => return,
-                Some(Status::Stalled) => {
-                    self.post_stalled = true;
-                    drop(self.post_server.take());
                     return;
                 }
-                // The second GPU could not start, stalled, was lost or was too slow (`offload`, logged there): the
-                // network runs on this device's GPU from the next present on.
-                Some(Status::Unavailable) => {
+                PostAction::Drop { stalled, failed, handed } => {
+                    // The worker has ended (or, stalled, ends on its own): joining it does not wait.
                     self.post_offload = false;
+                    self.post_stalled |= stalled;
                     drop(self.post_server.take());
-                    return;
-                }
-                Some(Status::Retry) => {
-                    // The worker has ended: joining it does not wait.
-                    let trial = self.post_offload && offload_trial::finished_local();
-                    self.post_offload = false;
-                    drop(self.post_server.take());
-                    // The other GPU's server ended for the finished frame's trial: no failure, the game's GPU's starts
-                    // at the next present (the trial's build budget runs meanwhile).
-                    if !trial {
+                    if handed {
+                        offload_trial::handed_over();
+                    }
+                    if failed {
                         self.post_retry.failed(now);
                     }
                     return;
                 }
-                None => {}
+                PostAction::Start => {}
             }
             if matches!(self.post_retry.step(now), neural_forge_protocol::rebuild::Step::Wait(_)) {
                 return;
@@ -6895,6 +6950,7 @@ impl Session {
                 let (count, placements) = view.header().placements();
                 if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
                     self.post_offload = true;
+                    offload_trial::clear_back();
                     self.post_server = native_post::PostServer::start_offload(instance.clone(), device.handle(), view);
                     return;
                 }
@@ -6925,6 +6981,8 @@ impl Session {
     pub(crate) fn stop_native(&mut self) {
         #[cfg(target_arch = "x86_64")]
         drop(self.post_server.take());
+        #[cfg(target_arch = "x86_64")]
+        drop(self.post_ending.take());
         #[cfg(target_arch = "x86_64")]
         if let Some(loader) = &self.native {
             // First: no other device's loader can reach it once this returns.
@@ -7334,6 +7392,28 @@ pub(crate) fn write_dump_async(frame: DumpFrame, capture: Option<(neural_forge_p
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_finished_frames_server_steps_for_the_trial() {
+        use native_post::Status::*;
+        let drop = |stalled, failed, handed| PostAction::Drop { stalled, failed, handed };
+        // The other GPU's server ended for the trial: handed over, no failure booked.
+        assert_eq!(post_action(Some(Retry), true, true, false), drop(false, false, true));
+        // Any other end that may pass waits for the retry schedule; the game's GPU's own Retry is never a hand-over.
+        assert_eq!(post_action(Some(Retry), true, false, false), drop(false, true, false));
+        assert_eq!(post_action(Some(Retry), false, true, false), drop(false, true, false));
+        // The trial gave the model back: the game's GPU's server ends, not the other GPU's, and not while the trial
+        // keeps the model here (a give-back from before a re-trial).
+        assert_eq!(post_action(Some(Serving), false, false, true), PostAction::EndForSwitch);
+        assert_eq!(post_action(Some(Serving), true, false, true), PostAction::Wait);
+        assert_eq!(post_action(Some(Serving), false, true, true), PostAction::Wait);
+        assert_eq!(post_action(Some(Serving), false, false, false), PostAction::Wait);
+        assert_eq!(post_action(Some(Stalled), true, false, false), PostAction::Wait);
+        assert_eq!(post_action(Some(Stalled), false, false, false), drop(true, false, false));
+        assert_eq!(post_action(Some(Unavailable), true, true, false), drop(false, false, false));
+        assert_eq!(post_action(None, false, false, false), PostAction::Start);
+    }
 
     /// `NEURAL_FORGE_TEST_REBUILD_AT`'s entries: a launch with an optional pause; what does not parse is left out.
     #[test]

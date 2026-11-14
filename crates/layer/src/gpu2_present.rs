@@ -550,27 +550,28 @@ impl Second {
     /// # Safety
     /// `surface` is a live surface of the instance.
     unsafe fn presenters(&self, surface: vk::SurfaceKHR) -> Vec<String> {
-        // SAFETY: the instance's own enumeration and queries.
-        let Ok(all) = (unsafe { self.instance.enumerate_physical_devices() }) else { return Vec::new() };
-        all.into_iter()
-            .filter(|&p| p != self.physical)
-            .filter(|&p| {
-                // SAFETY: as above.
-                let families = unsafe { self.instance.get_physical_device_queue_family_properties(p) }.len() as u32;
-                (0..families).any(|f| {
-                    let mut yes = vk::FALSE;
-                    // SAFETY: as above.
-                    let r = unsafe { (self.surface.support)(p, f, surface, &mut yes) };
-                    r == vk::Result::SUCCESS && yes == vk::TRUE
-                })
-            })
-            .map(|p| {
-                // SAFETY: as above.
-                let props = unsafe { self.instance.get_physical_device_properties(p) };
-                props.device_name_as_c_str().map_or_else(|_| "another GPU".into(), |n| n.to_string_lossy().into_owned())
-            })
-            .collect()
+        let families = |p: vk::PhysicalDevice| {
+            // SAFETY: the instance's own physical device.
+            unsafe { self.instance.get_physical_device_queue_family_properties(p) }.len() as u32
+        };
+        let support = |p: vk::PhysicalDevice, f: u32| {
+            let mut yes = vk::FALSE;
+            // SAFETY: the instance's own physical device and the game's live surface.
+            unsafe { (self.surface.support)(p, f, surface, &mut yes) == vk::Result::SUCCESS && yes == vk::TRUE }
+        };
+        can_present(&crate::preupscale::offload::gpus(), self.physical, families, support)
     }
+}
+
+/// The names of `gpus` (the instance's real GPUs, `offload::gpus`) other than `own` with a queue family that `support`
+/// says may present: [`Second::presenters`].
+fn can_present(
+    gpus: &[(vk::PhysicalDevice, String)],
+    own: vk::PhysicalDevice,
+    families: impl Fn(vk::PhysicalDevice) -> u32,
+    support: impl Fn(vk::PhysicalDevice, u32) -> bool,
+) -> Vec<String> {
+    gpus.iter().filter(|(p, _)| *p != own && (0..families(*p)).any(|f| support(*p, f))).map(|(_, n)| n.clone()).collect()
 }
 
 /// Why the second GPU (`gpu`) cannot show the game's window, with what to do, in the user's words: `presenters` are
@@ -1883,6 +1884,18 @@ mod tests {
         }
         ring.close();
         assert_eq!(t.join().unwrap(), (Take::Frame(k, seq), Take::Closed));
+    }
+
+    #[test]
+    fn only_real_gpus_that_report_support_are_named() {
+        use ash::vk::Handle;
+        let (a, b, c) = (vk::PhysicalDevice::from_raw(1), vk::PhysicalDevice::from_raw(2), vk::PhysicalDevice::from_raw(3));
+        let gpus = vec![(a, "RTX 5080".to_string()), (b, "RTX 4090".to_string()), (c, "RX 7600".to_string())];
+        let named = can_present(&gpus, a, |_| 2, |p, f| (p == b && f == 1) || p == a);
+        assert_eq!(named, ["RTX 4090"], "the second GPU itself and GPUs without support are left out");
+        assert!(!crate::preupscale::offload::real_gpu(vk::PhysicalDeviceType::CPU), "llvmpipe is never kept");
+        assert!(crate::preupscale::offload::real_gpu(vk::PhysicalDeviceType::DISCRETE_GPU));
+        assert!(cannot_present("RTX 5080", &can_present(&gpus, a, |_| 1, |_, _| false)).contains("is the monitor plugged into it?"));
     }
 
     #[test]

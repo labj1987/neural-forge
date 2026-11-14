@@ -218,6 +218,8 @@ struct LoaderState {
     /// [`Loader::lend`] decided on: the worker closes the network only while they agree.
     uses: u64,
     lend_uses: u64,
+    /// Why the network is closed on [`Self::lend`] when no other device asked for it ([`Loader::give_back_network`]).
+    lend_why: Option<&'static str>,
     /// The network is opened without counter chaining ([`Loader::start`]'s `chain` false): the holds run inside
     /// DLSS's buffer, which needs barriers between its launches, so a chained build would be built again at once.
     barriers_from_start: bool,
@@ -858,6 +860,17 @@ impl Loader {
     /// flag is read (that path sets its flag before it reads the stamp, [`Self::claim_post`], so one of the two
     /// sees the other); and once lent, neither path takes the network until the worker closed it.
     fn lend(&self) -> bool {
+        self.lend_for(None)
+    }
+
+    /// The finished frame's trial gave the model back to the second GPU (`offload_trial::take_back`): the network is
+    /// closed here as a lend closes it, so its video memory goes back to the game, and opened again when a path here
+    /// asks for it. Whether it will be (not while a path uses it).
+    pub(crate) fn give_back_network(&self) -> bool {
+        self.lend_for(Some("the model runs on the second GPU: the faster GPU keeps it"))
+    }
+
+    fn lend_for(&self, why: Option<&'static str>) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         let (lock, wake) = &*self.shared;
         let uses = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).uses;
@@ -879,6 +892,7 @@ impl Loader {
         }
         st.lend = true;
         st.lend_uses = uses;
+        st.lend_why = why;
         drop(st);
         wake.notify_all();
         true
@@ -1010,13 +1024,17 @@ impl Loader {
                     continue;
                 }
                 if let Some(network) = state.network.take() {
+                    let why = state.lend_why.take();
                     state.built = Vec::new();
                     state.wanted = None;
-                    state.failed = Some("lent to another device of the game, which runs the model".into());
+                    state.failed = Some(why.unwrap_or("lent to another device of the game, which runs the model").into());
                     drop(state);
                     drop(network);
                     disown(device.as_raw());
-                    crate::log!("[native] the network is closed on this device: another device of the game asked for it (one network per process)");
+                    match why {
+                        Some(why) => crate::log!("[native] the network is closed on this device, its video memory back to the game: {why}"),
+                        None => crate::log!("[native] the network is closed on this device: another device of the game asked for it (one network per process)"),
+                    }
                     crate::logging::flush();
                     state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 }

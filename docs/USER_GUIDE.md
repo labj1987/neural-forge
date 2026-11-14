@@ -559,9 +559,16 @@ The model goes back to the game's GPU for the rest of the session, and the log s
   model is off from that frame on for the rest of the session, and the log says so.
 
 On the finished frame the game never waits for the answer, so nothing above notices a second GPU that makes the whole
-frame slow (the copies across a narrow PCIe link, the second GPU also driving the monitor): after two windows of
-presents with about the same frame rate (120 frames or 5 seconds each), the model is tried once on the game's GPU,
-the same trial as below, and the faster keeps it. The log's `[offload]` lines give both frame rates.
+frame slow (the copies across a narrow PCIe link, the second GPU also driving the monitor). Once DLSS runs (in
+gameplay, not in menus; in a game without DLSS from the start) and two windows of presents have about the same frame
+rate (120 frames or 5 seconds each, also at 3 fps), the model is tried on the game's GPU, the same trial as below,
+and the faster keeps it. Each switch shows a second or so of frames without the model (the network is built on the
+GPU that takes over); when the model goes back to the second GPU, the game's GPU frees the network's video memory.
+Frames with the effect switched off do not count. If the GPU that kept the model later runs at less than 60% of the
+frame rate it was measured at for two windows in a row, the other is tried once more, and never again after that.
+The Status tab says "second GPU: trying the game's GPU for a few seconds" during a trial and "second GPU: not used:
+the game's GPU is faster (...)" while the game's GPU keeps the model; the log's `[offload]` lines give both frame
+rates. `NEURAL_FORGE_OFFLOAD_TRIAL=off` tries nothing.
 
 Before or after DLSS the game waits for the second GPU's answer to the frame before, so a second GPU slower than the
 game's frame sets the frame rate. Once the game has waited for it (2 ms a frame or more, and a tenth of its frame time)

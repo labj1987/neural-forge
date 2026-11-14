@@ -622,6 +622,33 @@ pub(crate) fn newest(known: impl Fn(vk::Image) -> bool) -> Option<Record> {
     s.recent.iter().rev().find(|k| known(k.record.colour)).map(|k| k.record)
 }
 
+/// How recent DLSS's newest evaluate must be for [`evaluating`].
+const EVALUATING: Duration = Duration::from_secs(1);
+
+/// The newest evaluate's sequence number [`evaluating`] saw, and when it first saw it.
+static NEWEST_EVALUATE: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+
+/// Whether DLSS evaluates now: a new evaluate record within the last second (gameplay; menus and loading screens
+/// mostly run without DLSS). `None` while no evaluate was ever read (a game without DLSS, or no wrapper). Polls the
+/// ring: the finished frame's trial (`preupscale::offload_trial`) asks at every present.
+pub(crate) fn evaluating() -> Option<bool> {
+    let newest = {
+        let mut s = lock();
+        s.poll();
+        s.recent.iter().rev().find(|k| k.record.is_evaluate()).map(|k| k.record.seq)
+    };
+    fresh(&mut NEWEST_EVALUATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner), newest, Instant::now())
+}
+
+/// [`evaluating`] on `seen`, the newest evaluate's sequence number and when it was first seen.
+fn fresh(seen: &mut Option<(u64, Instant)>, newest: Option<u64>, now: Instant) -> Option<bool> {
+    let newest = newest?;
+    if seen.is_none_or(|(seq, _)| seq != newest) {
+        *seen = Some((newest, now));
+    }
+    seen.map(|(_, at)| now.saturating_duration_since(at) < EVALUATING)
+}
+
 /// Said once per process: an evaluate's colour input is not HDR.
 static SAID_NOT_HDR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -847,6 +874,17 @@ pub(crate) fn end_of(evaluate: &Record, seq: u64) -> Record {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn dlss_evaluates_while_new_evaluates_come() {
+        let mut seen = None;
+        let t = std::time::Instant::now();
+        assert_eq!(super::fresh(&mut seen, None, t), None, "no evaluate ever: no DLSS to go by");
+        assert_eq!(super::fresh(&mut seen, Some(7), t), Some(true));
+        assert_eq!(super::fresh(&mut seen, Some(7), t + std::time::Duration::from_millis(900)), Some(true));
+        assert_eq!(super::fresh(&mut seen, Some(7), t + std::time::Duration::from_secs(2)), Some(false), "a menu: DLSS stopped");
+        assert_eq!(super::fresh(&mut seen, Some(9), t + std::time::Duration::from_secs(3)), Some(true));
+    }
+
     use super::*;
 
     /// A record's bytes as the wrapper lays them out (`crates/ngx-wrapper/src/ring.rs`, whose test checks the same

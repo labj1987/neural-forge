@@ -2466,6 +2466,12 @@ impl NeuralForgeDeviceInfo {
         if offload::given_up() || matches!(offload::state(), offload::State::Stalled(_)) {
             return say("the second GPU was given up for this session".into());
         }
+        // The finished frame's trial runs on the game's GPU, or kept the model there (`offload_trial`): the other GPU's
+        // device is the offload's, and the game's GPU is the faster here.
+        #[cfg(target_arch = "x86_64")]
+        if crate::preupscale::offload_trial::finished_local() {
+            return say("the model runs on the game's GPU for the second GPU trial, or stays there after it (it was faster)".into());
+        }
         let (count, placements) = header.placements();
         if !placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
             return say("Placement is not Finished frame for every pass".into());
@@ -4484,8 +4490,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // The frame the sharpening may work on (`sharpen_frame`), and its semaphore once it did.
         let mut sharpen_target: Option<SharpenTarget> = None;
         let mut sharpened: Option<vk::Semaphore> = None;
-        // The present's first swapchain's size, for the finished frame's trial (`offload_trial::finished_present`).
-        let mut trial_dims: Option<(u32, u32)> = None;
+        // The size of the swapchain the finished-frame path works on in this present, while it does (the effect on,
+        // the path not idle), for the finished frame's trial (`offload_trial::finished_present`).
+        let mut trial_frame: Option<(u32, u32)> = None;
         if crate::layer_enabled() {
             // The channel's lease follows presenting (`ownership`): an atomic store.
             crate::ownership::note_present();
@@ -4507,7 +4514,6 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 )
             };
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            trial_dims = swapchains.first().and_then(|s| state.swapchains.get(s)).map(|s| (s.width, s.height));
             // Retired present semaphores whose present's fence signalled since: freed (no wait).
             let (freed, left) = state.reclaim_present_semaphores(&self.device);
             if freed > 0 {
@@ -4933,6 +4939,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 if post_path_idle(effect_off, *bootstrap_complete, shm.capture_requested(), series.running()) {
                     break;
                 }
+                trial_frame = Some((width, height));
                 // The application's present waits (its "rendering finished" semaphores)
                 // are what make the swapchain image safe to read. Every capture/compose
                 // submission below goes onto `queue` *before* the real present is
@@ -5092,14 +5099,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         note_present_rate(wait_semaphore.is_some() || series_composed);
         // The finished frame's measured choice between the second GPU and the game's (`offload_trial`, #63).
         #[cfg(target_arch = "x86_64")]
-        if let Some(dims) = trial_dims {
-            crate::preupscale::offload_trial::finished_present(
-                dims,
-                std::time::Instant::now(),
-                crate::preupscale::offload::active(),
-                wait_semaphore.is_some() || series_composed,
-            );
-        }
+        crate::preupscale::offload_trial::finished_present(
+            trial_frame.unwrap_or_default(),
+            std::time::Instant::now(),
+            crate::preupscale::offload::active(),
+            wait_semaphore.is_some() || series_composed,
+            trial_frame.is_some(),
+        );
 
         // SAFETY: `present_info` is valid for the duration of this call; `next_present`
         // was resolved from the next layer/driver's own proc-addr table.

@@ -287,6 +287,17 @@ impl PostServer {
         Some(Self { quit, status, worker: Some(worker) })
     }
 
+    /// Asks the worker to end without waiting for it (the present must not join it): [`Self::ended`] says when it
+    /// has, and dropping it then does not wait.
+    pub(crate) fn stop_soon(&self) {
+        self.quit.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the worker has ended.
+    pub(crate) fn ended(&self) -> bool {
+        self.worker.as_ref().is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
     pub(crate) fn status(&self) -> Status {
         Status::from_u8(self.status.load(Ordering::Acquire))
     }
