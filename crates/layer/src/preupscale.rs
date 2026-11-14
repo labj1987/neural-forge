@@ -210,6 +210,8 @@ struct GiveBack {
     closing: bool,
     /// When it was asked ([`Self::holds_start`]'s limit).
     since: Option<Instant>,
+    /// Presents since the loader agreed with the network still open ([`Self::REASK`]).
+    waited: u32,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -217,10 +219,12 @@ impl GiveBack {
     /// The longest the other GPU's server waits for the network to close here.
     const HOLD_MAX: Duration = Duration::from_secs(3);
 
+    /// Presents the loader's worker has to close the network after it agreed, before it is asked again: the worker
+    /// declines when a path took the network in between, and nothing else would ask it a second time.
+    const REASK: u32 = 8;
+
     fn ask(&mut self, now: Instant) {
-        self.pending = true;
-        self.closing = false;
-        self.since = Some(now);
+        *self = Self { pending: true, closing: false, since: Some(now), waited: 0 };
     }
 
     /// One present: `needed_here` (the trial runs or kept the model on the game's GPU, or its server runs) drops the
@@ -237,8 +241,18 @@ impl GiveBack {
             self.closing = true;
             given = true;
         }
-        if self.closing && !open() {
-            *self = Self::default();
+        if self.closing {
+            if !open() {
+                *self = Self::default();
+            } else if !given {
+                self.waited += 1;
+                if self.waited >= Self::REASK {
+                    // The worker declined (a path took the network after the loader agreed): asked again.
+                    self.pending = true;
+                    self.closing = false;
+                    self.waited = 0;
+                }
+            }
         }
         given
     }
@@ -6994,7 +7008,12 @@ impl Session {
             // The game's GPU's network after a give-back: closed once no path here has used it for a while (asked again at
             // every present until then), unless the trial takes the model back here first.
             if let Some(loader) = self.native.as_ref().filter(|_| choice_on) {
-                let needed_here = offload_trial::finished_local() || (self.post_server.is_some() && !self.post_offload);
+                // Needed here: the trial runs or kept the model on the game's GPU, its server runs, or the next server
+                // to start is the game's GPU's own (the offload given up, a placement off the finished frame, the
+                // second GPU showing the frames from this device): the same decision the start below makes, taken
+                // first, so a give-back never closes the network at the present that starts a server on it.
+                let offload_next = !offload::given_up() && !offload_trial::finished_local() && !crate::device::gpu2_hosts(device.handle()) && at_present;
+                let needed_here = !offload_next || (self.post_server.is_some() && !self.post_offload);
                 if self.give_back.step(needed_here, || loader.give_back_network(), || loader.network_open()) {
                     crate::log!("[offload] the game's GPU's network is closed: the model runs on the other GPU");
                     crate::logging::flush();
@@ -7591,6 +7610,36 @@ mod tests {
         assert!(g.holds_start(t0 + Duration::from_millis(40)), "still open here: it waits");
         assert!(!g.step(false, || panic!("agreed already"), || false));
         assert!(!g.holds_start(t0 + Duration::from_millis(80)), "closed: it starts at this present");
+        // The worker declines after the loader agreed (a path took the network in between): the network stays open,
+        // and after a few presents the loader is asked again instead of the server waiting out its limit.
+        let mut g = GiveBack::default();
+        g.ask(t0);
+        assert!(g.step(false, || true, || true), "agreed");
+        let mut asked_again = 0;
+        for _ in 0..GiveBack::REASK {
+            assert!(!g.step(
+                false,
+                || {
+                    asked_again += 1;
+                    false
+                },
+                || true
+            ));
+        }
+        assert_eq!(asked_again, 0, "the worker has its presents to close it");
+        assert!(
+            g.step(
+                false,
+                || {
+                    asked_again += 1;
+                    true
+                },
+                || true
+            ),
+            "asked again, and it agrees again"
+        );
+        assert_eq!(asked_again, 1);
+        assert!(!g.step(false, || panic!("agreed"), || false) && !g.holds_start(t0), "closed this time: the other GPU's server starts");
         // A network that never closes (a hold keeps using it) does not hold the other GPU's server for ever.
         let mut g = GiveBack::default();
         g.ask(t0);

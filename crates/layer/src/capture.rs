@@ -700,6 +700,32 @@ fn compose_bgr_order(encode_push: &crate::composition::encode_pass::EncodePush) 
     encode_push.bgr_order != 0
 }
 
+/// The log's line when the effect was switched off or on since the last present (`neural_enabled`: the Neural rendering
+/// switch and the toggle key; `apply_model`: Apply model edit), `None` while nothing changed. The first present says
+/// it only when it starts switched off.
+fn effect_switch_line(neural_enabled: bool, apply_model: bool) -> Option<String> {
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+    effect_switch_change(&LAST, neural_enabled, apply_model)
+}
+
+fn effect_switch_change(last: &std::sync::atomic::AtomicU8, neural_enabled: bool, apply_model: bool) -> Option<String> {
+    let now = u8::from(neural_enabled) | u8::from(apply_model) << 1;
+    let before = last.swap(now, std::sync::atomic::Ordering::Relaxed);
+    if before == now || (before == u8::MAX && now == 3) {
+        return None;
+    }
+    Some(match (neural_enabled, apply_model) {
+        (true, true) => "[layer] the effect is switched on: frames are composed with the model again".to_string(),
+        (false, _) => {
+            "[layer] the effect is switched off (Neural rendering: the app's switch or the toggle key): frames go out without the model until it is switched on"
+                .to_string()
+        }
+        (true, false) => {
+            "[layer] the effect is switched off (Apply model edit, in the Composition tab): frames go out without the model until it is switched on".to_string()
+        }
+    })
+}
+
 /// The model on a second GPU (`preupscale::offload`): the present composes the answer to the frame the last present
 /// kept and posted, onto that frame as it was kept, and the result replaces this image; then it keeps and posts this
 /// frame. The game's GPU renders the next frame while the other GPU runs this one's network: every frame is shown one
@@ -2473,6 +2499,11 @@ pub unsafe fn run(
     }
 
     let disabled = !settings.apply_model || !settings.neural_enabled || shm.model_known_unavailable();
+    // Said on every change: a session's log otherwise shows presents without the model and no reason (#63: stretches
+    // of a few seconds at 20 to 40 composited frames a second among 85 presented were the toggle key).
+    if let Some(line) = effect_switch_line(settings.neural_enabled, settings.apply_model) {
+        crate::log!("{line}");
+    }
     if disabled {
         UNTOUCHED.with(|u| u.set(if shm.model_known_unavailable() { reason::MODEL_UNAVAILABLE } else { reason::EFFECT_OFF }));
         // The effect off: the delayed present's kept frames go (it starts afresh when the effect is back).
@@ -5809,6 +5840,22 @@ mod tests {
         assert!(starts <= 1, "the delay started {starts} times: a late answer or a change of the Model resolution restarted it");
         assert!(composed >= 70 && checked >= 70, "only {composed} of 90 presents were delayed");
         rig.finish();
+    }
+
+    /// Every switch of the effect is in the log (#63): off and on by the toggle key or the app's switch, and by Apply
+    /// model edit; nothing while it stays as it is, and nothing for a session that starts switched on.
+    #[test]
+    fn the_log_says_when_the_effect_is_switched_off_and_on() {
+        let last = std::sync::atomic::AtomicU8::new(u8::MAX);
+        assert_eq!(effect_switch_change(&last, true, true), None, "starts on: nothing to say");
+        assert_eq!(effect_switch_change(&last, true, true), None);
+        let off = effect_switch_change(&last, false, true).expect("switched off");
+        assert!(off.contains("switched off") && off.contains("toggle key"), "{off}");
+        assert_eq!(effect_switch_change(&last, false, true), None, "said once per change");
+        assert!(effect_switch_change(&last, true, true).expect("switched on").contains("switched on"));
+        assert!(effect_switch_change(&last, true, false).expect("apply model off").contains("Apply model edit"));
+        let last = std::sync::atomic::AtomicU8::new(u8::MAX);
+        assert!(effect_switch_change(&last, false, true).is_some(), "a session that starts switched off says so");
     }
 
     /// What the Status tab reads for the finished frame's size (#63: its line said "full size" at half): the frame's own

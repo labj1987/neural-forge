@@ -139,8 +139,10 @@ impl Preset {
     /// look at its defaults where the preset resets it.
     pub fn matches(&self, header: &neural_forge_protocol::ShmHeader) -> bool {
         let ended = self.ended_overrides();
+        // The passes that run (`passes`): what a pass past them holds of its own changes no picture.
+        let active = (header.passes.load(Ordering::Relaxed) as usize).clamp(1, header.pass.len());
         self.knobs.close_to(&Knobs::from_header(header))
-            && header.pass.iter().all(|p| p.overrides.load(Ordering::Relaxed) & ended == 0)
+            && header.pass[..active].iter().all(|p| p.overrides.load(Ordering::Relaxed) & ended == 0)
             && (!self.resets_look || {
                 let stored = header.persisted_settings();
                 LOOK.iter().all(|&(name, v)| stored.iter().any(|&(n, _, bits)| n == name && v.is(bits)))
@@ -272,6 +274,21 @@ mod tests {
         assert_eq!(bits("pass2_overrides"), pass_override::SCALE | pass_override::PLACEMENT | pass_override::AUTO_MASK);
         assert_eq!(bits("pass3_overrides"), 0);
         assert_eq!(bits("passes"), 2);
+    }
+
+    #[test]
+    fn a_pass_that_does_not_run_does_not_decide_the_preset() {
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.init_defaults();
+        assert!(header.write_settings(&[("passes", 2), ("pass3_overrides", pass_override::STYLE | pass_override::INTENSITY), ("pass3_style", 2)]));
+        assert_eq!(matching(&header), Some(2), "pass 3 does not run: the header holds Reference");
+        assert!(header.write_settings(&[("passes", 3)]));
+        assert_eq!(matching(&header), None, "now it runs, on its own style and intensity");
+        // Choosing the preset still ends them, so adding the pass later brings nothing back.
+        assert!(header.write_settings(&[("passes", 2)]));
+        assert!(PRESETS[2].write(&header).is_some());
+        assert!(header.write_settings(&[("passes", 3)]));
+        assert_eq!(matching(&header), Some(2));
     }
 
     #[test]
