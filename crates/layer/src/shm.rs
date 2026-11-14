@@ -648,7 +648,9 @@ impl ShmClient {
         }
     }
 
-    pub fn set_frame_info(&mut self, slot: Slot, width: u32, height: u32, proxy_format: u32) {
+    /// The raster the model is shown on `slot` (`width`, `height`: the frame's, or smaller at a Model resolution below
+    /// Full) and its format; `frame` is the presented frame's own size, published beside it (`frame_width`).
+    pub fn set_frame_info(&mut self, slot: Slot, width: u32, height: u32, proxy_format: u32, frame: (u32, u32)) {
         let bytes = u64::from(width) * u64::from(height) * neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
         self.frame_backed[slot.index()] = self.reserve(slot, bytes);
         let Some(hdr) = self.header() else { return };
@@ -661,6 +663,8 @@ impl ShmClient {
         hdr.layer_width.store(width, Ordering::Relaxed);
         hdr.layer_height.store(height, Ordering::Relaxed);
         hdr.layer_format.store(proxy_format, Ordering::Relaxed);
+        hdr.frame_width.store(frame.0, Ordering::Relaxed);
+        hdr.frame_height.store(frame.1, Ordering::Relaxed);
     }
 
     /// Publishes the layer's host-observed cost for a frame. This is deliberately a
@@ -1442,7 +1446,7 @@ mod tests {
         assert!(a.open_at(&path) && b.open_at(&path));
         assert_eq!(a.header as usize, b.header as usize, "the second device reuses the first's mapping");
         assert_eq!(MAPPINGS.lock().unwrap().iter().filter(|m| m.path == path).count(), 1);
-        a.set_frame_info(Slot::Primary, 64, 32, neural_forge_protocol::enums::proxy_format::RGBA8);
+        a.set_frame_info(Slot::Primary, 64, 32, neural_forge_protocol::enums::proxy_format::RGBA8, (64, 32));
         assert!(a.frame_backed[0] && a.reserved[0] >= 64 * 32 * 4);
         // The file's allocated blocks now cover the proxy region's start (it was a hole before).
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1450,7 +1454,7 @@ mod tests {
         assert_eq!(unsafe { libc::stat(c.as_ptr(), &mut st) }, 0);
         assert!(st.st_blocks as u64 * 512 >= (neural_forge_protocol::HEADER_BYTES + 2 * 64 * 32 * 4) as u64, "{} blocks", st.st_blocks);
         // What another client backed is known to the next one without another call into the file.
-        b.set_frame_info(Slot::Primary, 64, 32, neural_forge_protocol::enums::proxy_format::RGBA8);
+        b.set_frame_info(Slot::Primary, 64, 32, neural_forge_protocol::enums::proxy_format::RGBA8, (64, 32));
         assert!(b.frame_backed[0]);
         // A write longer than what is backed is not made.
         let before = header_of(&a).seq_req.load(Ordering::Relaxed);
@@ -1472,16 +1476,16 @@ mod tests {
         let calls = || TEST_FALLOCATE_CALLS.with(std::cell::Cell::get);
         TEST_FALLOCATE_ERROR.with(|e| e.set(Some(libc::ENOSPC)));
         let before = calls();
-        client.set_frame_info(Slot::Secondary, 640, 480, rgba);
+        client.set_frame_info(Slot::Secondary, 640, 480, rgba, (640, 480));
         assert!(!client.frame_backed[1], "a frame the file cannot back is not sent");
         assert_eq!(calls() - before, 1, "the first attempt failed at the proxy region");
         for _ in 0..10 {
-            client.set_frame_info(Slot::Secondary, 640, 480, rgba);
-            client.set_frame_info(Slot::Secondary, 800, 600, rgba);
+            client.set_frame_info(Slot::Secondary, 640, 480, rgba, (640, 480));
+            client.set_frame_info(Slot::Secondary, 800, 600, rgba, (800, 600));
         }
         assert!(!client.frame_backed[1]);
         assert_eq!(calls() - before, 1, "neither that size nor a larger one is tried again at once");
-        client.set_frame_info(Slot::Secondary, 320, 240, rgba);
+        client.set_frame_info(Slot::Secondary, 320, 240, rgba, (320, 240));
         assert_eq!(calls() - before, 2, "a smaller frame may fit and is tried");
         // The retry interval passed: tried again, and with space back the frame is backed.
         TEST_FALLOCATE_ERROR.with(|e| e.set(None));
@@ -1491,7 +1495,7 @@ mod tests {
             let (size, at) = mapped.refused[1].unwrap();
             mapped.refused[1] = Some((size, at - RESERVE_RETRY));
         }
-        client.set_frame_info(Slot::Secondary, 640, 480, rgba);
+        client.set_frame_info(Slot::Secondary, 640, 480, rgba, (640, 480));
         assert!(client.frame_backed[1], "backed once the space is there");
         assert!(MAPPINGS.lock().unwrap().iter().find(|m| m.path == path).unwrap().refused[1].is_none());
     }

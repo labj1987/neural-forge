@@ -705,18 +705,23 @@ fn network_resident(hdr: &neural_forge_protocol::ShmHeader) -> bool {
     (network_runs(hdr.preupscale_state.load(Ordering::Relaxed)) || server) && layer_alive(hdr)
 }
 
+/// The size the network runs at: DLSS's input before the upscaler, else on the finished frame the size of the
+/// model's last answer there (`answered_w`), else the raster the layer sends it (`layer_width`: the frame scaled
+/// by the Model resolution at the finished frame, not the frame itself, which is `frame_width`).
+fn network_size(h: &neural_forge_protocol::ShmHeader) -> Option<(u32, u32)> {
+    let pre = (h.preupscale_width.load(Ordering::Relaxed), h.preupscale_height.load(Ordering::Relaxed));
+    let answered = (h.answered_w.load(Ordering::Relaxed), h.answered_h.load(Ordering::Relaxed));
+    let sent = (h.layer_width.load(Ordering::Relaxed), h.layer_height.load(Ordering::Relaxed));
+    [pre, answered, sent].into_iter().find(|&(w, h)| w != 0 && h != 0)
+}
+
 /// `running`: the network is resident in a game that is running now (`native_running` and [`layer_alive`]).
 fn check_vram(gpus: &Gpus, hdr: Option<&neural_forge_protocol::ShmHeader>, running: bool) -> Vec<Finding> {
     const CHECK: &str = "vram";
     let Gpus::Listed(list) = gpus else { return Vec::new() };
     let Some(gpu) = list.iter().find(|g| g.compute.is_some_and(|c| c >= MIN_COMPUTE_CAPABILITY)).or(list.first()) else { return Vec::new() };
     let (Some(total), Some(free)) = (gpu.total_mib, gpu.free_mib) else { return Vec::new() };
-    // The size the network runs at: DLSS's input before the upscaler, else the captured frame.
-    let size = hdr.and_then(|h| {
-        let pre = (h.preupscale_width.load(Ordering::Relaxed), h.preupscale_height.load(Ordering::Relaxed));
-        let post = (h.layer_width.load(Ordering::Relaxed), h.layer_height.load(Ordering::Relaxed));
-        [pre, post].into_iter().find(|&(w, h)| w != 0 && h != 0)
-    });
+    let size = hdr.and_then(network_size);
     let evidence = format!("nvidia-smi: {}: {free} MiB free of {total} MiB", gpu.name);
     let Some((w, h)) = size else {
         return vec![Finding::new(
@@ -1706,6 +1711,29 @@ mod tests {
     }
 
     use super::*;
+
+    /// The network's size for the VRAM check: on the finished frame the model's own raster (#63: half the frame at
+    /// the Model resolution Performance), never the presented frame's.
+    #[test]
+    fn the_networks_size_is_the_models_raster_not_the_frames() {
+        let h = neural_forge_protocol::ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(network_size(&h), None);
+        h.frame_width.store(2048, Ordering::Relaxed);
+        h.frame_height.store(1536, Ordering::Relaxed);
+        assert_eq!(network_size(&h), None, "the frame's size alone says nothing of the network's");
+        h.layer_width.store(1024, Ordering::Relaxed);
+        h.layer_height.store(768, Ordering::Relaxed);
+        assert_eq!(network_size(&h), Some((1024, 768)));
+        h.answered_w.store(1024, Ordering::Relaxed);
+        h.answered_h.store(768, Ordering::Relaxed);
+        h.layer_width.store(2048, Ordering::Relaxed);
+        h.layer_height.store(1536, Ordering::Relaxed);
+        assert_eq!(network_size(&h), Some((1024, 768)), "what the model answered at, over a raster just changed");
+        h.preupscale_width.store(1188, Ordering::Relaxed);
+        h.preupscale_height.store(891, Ordering::Relaxed);
+        assert_eq!(network_size(&h), Some((1188, 891)), "held before the upscaler: DLSS's input");
+    }
     use std::sync::atomic::AtomicU64;
 
     /// A fixture tree: every root under one temporary directory, the commands answering `smi`/`journal`.

@@ -807,7 +807,7 @@ unsafe fn delayed_present(
             && gpu.zero_copy_capture_target(device, instance, physical_device, queue, frame_bytes, true).is_some();
         let mut done = None;
         if ready {
-            shm.set_frame_info(SLOT, width, height, proxy_format);
+            shm.set_frame_info(SLOT, width, height, proxy_format, (width, height));
             // SAFETY: the proxy region is `shm`'s own.
             let proxy = if use_direct && shm.can_request(SLOT) {
                 unsafe { idle_proxy_buffer(direct, device, instance, physical_device, queue_family, shm, SLOT, frame_bytes) }
@@ -2015,7 +2015,7 @@ fn poll_or_submit_capture(
                     // The same submission wrote the frame into the capture target the compose
                     // reads, so there is nothing to copy out here.
                     original_scratch.clear();
-                    shm.set_frame_info(slot, width, height, proxy_format);
+                    shm.set_frame_info(slot, width, height, proxy_format, (width, height));
                     return CaptureStep::Captured(Captured {
                         sent: (width, height),
                         gpu_original: true,
@@ -2033,7 +2033,7 @@ fn poll_or_submit_capture(
                 // CPU (host-coherent memory backs every capture buffer in this module,
                 // imported or not).
                 original_scratch.extend_from_slice(unsafe { std::slice::from_raw_parts(host_ptr, n) });
-                shm.set_frame_info(slot, width, height, proxy_format);
+                shm.set_frame_info(slot, width, height, proxy_format, (width, height));
                 return CaptureStep::Captured(Captured {
                     sent: (width, height),
                     gpu_original: false,
@@ -2091,12 +2091,12 @@ fn poll_or_submit_capture(
                     }
                     crate::logging::flush();
                 }
-                shm.set_frame_info(slot, mw, mh, proxy_format);
+                shm.set_frame_info(slot, mw, mh, proxy_format, (width, height));
                 shm.write_proxy(slot, model_scratch);
                 let encoded = p.slots[slot.index()].model.as_ref().is_some_and(|m| m.encode_set.is_some());
                 return CaptureStep::Captured(Captured { sent: (mw, mh), gpu_original: false, copy_out: t_copy.elapsed(), encoded, from_model_scratch: true });
             }
-            shm.set_frame_info(slot, width, height, proxy_format);
+            shm.set_frame_info(slot, width, height, proxy_format, (width, height));
             shm.write_proxy(slot, original_scratch);
             return CaptureStep::Captured(Captured {
                 sent: (width, height),
@@ -2948,7 +2948,7 @@ pub unsafe fn run(
                     let t_copy = std::time::Instant::now();
                     original_scratch.clone_from(&h.original);
                     model_scratch.clone_from(&h.proxy);
-                    shm.set_frame_info(SLOT, h.sent.0, h.sent.1, proxy_format);
+                    shm.set_frame_info(SLOT, h.sent.0, h.sent.1, proxy_format, (width, height));
                     shm.write_proxy(SLOT, &h.proxy);
                     sent = Some(h.sent);
                     encoded = h.encoded;
@@ -5808,6 +5808,36 @@ mod tests {
         }
         assert!(starts <= 1, "the delay started {starts} times: a late answer or a change of the Model resolution restarted it");
         assert!(composed >= 70 && checked >= 70, "only {composed} of 90 presents were delayed");
+        rig.finish();
+    }
+
+    /// What the Status tab reads for the finished frame's size (#63: its line said "full size" at half): the frame's own
+    /// size is published beside the raster the model is shown, at the Model resolution Half and back at Full.
+    #[test]
+    fn the_channel_says_the_frames_size_beside_the_models_raster() {
+        let (w, h) = (256u32, 192u32);
+        let Some(mut rig) = PresentRig::new_with("frame-size", w, h, Some(|_| {})) else {
+            eprintln!("the_channel_says_the_frames_size_beside_the_models_raster: no Vulkan device, skipping");
+            return;
+        };
+        let read = |hdr: &neural_forge_protocol::ShmHeader| {
+            let l = |a: &std::sync::atomic::AtomicU32| a.load(AtomicOrdering::Relaxed);
+            ((l(&hdr.frame_width), l(&hdr.frame_height)), (l(&hdr.layer_width), l(&hdr.layer_height)), (l(&hdr.answered_w), l(&hdr.answered_h)))
+        };
+        for (scale, model) in [(0.5f32, (w / 2, h / 2)), (1.0, (w, h)), (0.5, (w / 2, h / 2))] {
+            rig.hdr().working_scale_bits.store(scale.to_bits(), AtomicOrdering::Relaxed);
+            let mut composed = 0;
+            for k in 0..8usize {
+                rig.upload(&flat(w, h, colour_of(k)));
+                composed += usize::from(rig.present());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(composed >= 4, "scale {scale}: only {composed} of 8 presents composed");
+            let (frame, sent, answered) = read(rig.hdr());
+            assert_eq!(frame, (w, h), "scale {scale}: the frame's own size");
+            assert_eq!(sent, model, "scale {scale}: the raster the model is shown");
+            assert_eq!(answered, model, "scale {scale}: the size the model answered at");
+        }
         rig.finish();
     }
 
