@@ -119,7 +119,13 @@ in the previous scene. The model's answer is written straight back (there is no
 composition step), so "Model every Nth frame" and the Composition tab only change the after-the-upscaler
 path. The Model tab's tuning and the switch apply to both.
 
-**Strength presets** set intensity, local tone, local structure and skin structure together:
+**Strength presets** set intensity, local tone, local structure and skin structure together, in every pass: a
+pass that had its own values for those four follows the preset again. **Reference** is Neural Forge's reference
+look, so it also puts the style and the colour of the edit back to their defaults (style Default; saturation,
+contrast and detail of the edit at 1; the hue, grey, shadow and highlight protections and the LUT at 0; the gamut
+guard on), for every pass. The other presets leave the style and the colour of the edit as they are. The menu
+shows a preset only while everything it sets is in place, and "Custom" otherwise: with a saturation of 2 or a
+style on, the four values at 1.00 are not Reference, and choosing Reference resets them.
 
 | Preset | Intensity | Local tone | Local structure | Skin structure | What it matches |
 |---|---|---|---|---|---|
@@ -492,16 +498,25 @@ its edit applied one frame later".
 (`set_second_gpu_present=1`) makes the second GPU run the model and show the frame on its own, so nothing comes back
 to the game's GPU:
 
-1. Plug the monitor into the second GPU, and make the desktop render on it: only the GPU the desktop draws the game's
-   window on may present to it (a game under Proton is an X11 window, shown through Xwayland, which uses the
-   desktop's GPU), whichever card the monitor is plugged into. On KDE Plasma (Wayland) KWin renders on the first card
-   of `KWIN_DRM_DEVICES`: find the second GPU's card with `readlink -f /dev/dri/by-path/pci-0000:05:00.0-card` (your
-   card's PCI address from the `[offload] GPU N` lines; here `/dev/dri/card1`) and the game's GPU's the same way, then
-   put `export KWIN_DRM_DEVICES=/dev/dri/card1:/dev/dri/card0` (the second GPU first) in
+1. Plug the monitor into the second GPU. Only the GPU the desktop draws the game's window on may present to it (a
+   game under Proton is an X11 window, shown through Xwayland, which uses the desktop's GPU), whichever card the
+   monitor is plugged into. Where the desktop draws the window on the other card, the log's `[present2]` line and
+   the Status tab name that card ("the desktop draws the game's window on <GPU>, so <second GPU> cannot present to
+   it"), the game gets its usual swapchain and the frames come back to the game's GPU: nothing else changes, and
+   the model still runs on the second GPU.
+
+   *Optional, on KDE Plasma (Wayland), and untested on two cards:* KWin renders the desktop on the first card of
+   `KWIN_DRM_DEVICES`, so naming the second GPU's card first may let it present. **This moves all of the desktop's
+   drawing to that card**, not only the game's window: every window, video and the compositor itself then render
+   on the second GPU, which also has the model to run. On the one two-card machine it was tried on, the mode still
+   did not engage with it. To try it: find the second GPU's card with
+   `readlink -f /dev/dri/by-path/pci-0000:05:00.0-card` (your card's PCI address from the `[offload] GPU N` lines;
+   here `/dev/dri/card1`) and the game's GPU's the same way, put
+   `export KWIN_DRM_DEVICES=/dev/dri/card1:/dev/dri/card0` (the second GPU first) in
    `~/.config/plasma-workspace/env/kwin-gpu.sh` and log in again. The card numbers can change when cards are added
-   or the kernel changes: check them again then. Where the desktop still draws the window on the other card, the
-   log's `[present2]` line and the Status tab say so ("the desktop draws the game's window on <GPU>, so <second GPU>
-   cannot present to it") and the frames come back to the game's GPU.
+   or the kernel changes: check them again then. **Undo it** (delete that file and log in again) if the Status tab
+   still says the desktop draws the window on the other card, or if the frame rate of the game or the desktop
+   drops.
 2. Start the game once and read the `[offload] GPU N` lines again: the driver often lists the GPU the monitor is on
    first, and the game takes the first GPU it is offered, so it would now render on the card meant for the model
    (the line of the game's GPU ends in "the game's"). Keep the game on the other card by its name, for DirectX 12

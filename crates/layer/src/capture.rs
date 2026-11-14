@@ -5811,6 +5811,73 @@ mod tests {
         rig.finish();
     }
 
+    /// The model on a second GPU never lays one frame's answer on another frame (#63): with a bar that moves every
+    /// present and an answer that depends on the picture (the stand-in turns it red), each delayed present shows
+    /// exactly what the synchronous present composes for the frame before it, pixel for pixel, at the Model
+    /// resolution Half (the CPU pairs) and Full. An answer laid on the next frame would leave the old bar's red
+    /// where the bar no longer is.
+    #[test]
+    fn the_delayed_present_composes_each_frame_with_its_own_answer() {
+        fn redden(answer: &mut [u8]) {
+            for px in answer.as_chunks_mut::<4>().0 {
+                px[0] = (u16::from(px[0]) * 3 / 2).min(255) as u8;
+                px[1] = (u16::from(px[1]) * 3 / 4) as u8;
+            }
+        }
+        let _offloaded = Offloaded::on();
+        let (w, h) = (128u32, 96u32);
+        let bar = |k: usize| -> Vec<u8> {
+            let at = (k as u32 * 12) % (w - 16);
+            (0..w * h).flat_map(|i| if (at..at + 16).contains(&(i % w)) { [150, 140, 120, 255] } else { [60, 70, 80, 255] }).collect()
+        };
+        for scale in [0.5f32, 1.0] {
+            // What each frame composes to with its own answer: the synchronous present.
+            crate::preupscale::offload::set_active_for_test(false);
+            let Some(mut rig) = PresentRig::new_with("own-answer-sync", w, h, Some(redden)) else {
+                eprintln!("the_delayed_present_composes_each_frame_with_its_own_answer: no Vulkan device, skipping");
+                return;
+            };
+            rig.hdr().working_scale_bits.store(scale.to_bits(), AtomicOrdering::Relaxed);
+            let mut own = Vec::new();
+            for k in 0..24usize {
+                rig.upload(&bar(k));
+                own.push(rig.present().then(|| rig.read_back()));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            rig.finish();
+            assert!(own.iter().flatten().count() >= 20, "the synchronous present composed too few frames");
+            let edit = own
+                .iter()
+                .flatten()
+                .zip((0..24).map(bar))
+                .map(|(o, f)| o.iter().zip(&f).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap())
+                .max()
+                .unwrap();
+            assert!(edit > 30, "the stand-in's answer changes the picture ({edit} of 255)");
+            // The same frames, delayed.
+            crate::preupscale::offload::set_active_for_test(true);
+            let mut rig = PresentRig::new_with("own-answer-delayed", w, h, Some(redden)).expect("a device, as above");
+            rig.hdr().working_scale_bits.store(scale.to_bits(), AtomicOrdering::Relaxed);
+            let (mut checked, mut worst) = (0, 0);
+            for k in 0..24usize {
+                rig.upload(&bar(k));
+                if rig.present() && k > 0 {
+                    let shown = rig.read_back();
+                    if let Some(want) = own[k - 1].as_ref().filter(|_| shown != bar(k)) {
+                        let diff = shown.iter().zip(want).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+                        worst = worst.max(diff);
+                        assert!(diff <= 1, "scale {scale}: present {k} differs from frame {}'s own composition by {diff} of 255", k - 1);
+                        checked += 1;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            rig.finish();
+            eprintln!("own answer, scale {scale}: {checked} delayed presents compared with the synchronous composition, worst difference {worst} of 255");
+            assert!(checked >= 18, "scale {scale}: only {checked} delayed presents were compared");
+        }
+    }
+
     /// A frame whose answer did not come is shown as it was in a Replace mode below Full: the kept frame itself, never
     /// the enlarged half-size proxy (which would blur it).
     #[test]

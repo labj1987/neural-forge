@@ -3787,6 +3787,139 @@ mod tests {
         }
     }
 
+    /// The parameters of a carried answer (the model interval's presents between two runs of the model): mode 2 with
+    /// the model's colour, the ghost guard as given.
+    fn carried_params(guard: f32) -> ComposeParams {
+        ComposeParams {
+            colour_strength: 1.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: guard,
+            compare: Default::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 1.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+            pq10: None,
+        }
+    }
+
+    /// A carried answer's colour (#63: model interval 2 left pink and orange edges on whatever moved): the model
+    /// turned a dark stroke at x=20..22 magenta. On a frame where the stroke has moved to x=40..42, the model's hue
+    /// at the old place would tint what is there now; with the ghost guard nothing of it stays, and what did not
+    /// move keeps the model's colour whole.
+    #[test]
+    fn ghost_guard_keeps_a_stale_colour_edit_off_what_moved() {
+        let (width, height) = (64u32, 32u32);
+        // A warm grey with a 3 px darker stroke: every pixel has some colour of its own for the model's hue to turn.
+        let frame = |stroke_x: u32| -> Vec<u8> {
+            (0..width * height).flat_map(|i| if (stroke_x..stroke_x + 3).contains(&(i % width)) { [70, 50, 40, 255] } else { [150, 120, 100, 255] }).collect()
+        };
+        let proxy = frame(20);
+        let mut answer = proxy.clone();
+        for px in answer.as_chunks_mut::<4>().0.iter_mut().enumerate().filter(|(i, _)| (20..23).contains(&(*i as u32 % width))).map(|(_, px)| px) {
+            px[..3].copy_from_slice(&[90, 30, 90]);
+        }
+        let Some(still) = compose_once(width, height, &proxy, &proxy, &answer, carried_params(1.0)) else {
+            eprintln!("ghost_guard colour test: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let unguarded_still = compose_once(width, height, &proxy, &proxy, &answer, carried_params(0.0)).unwrap();
+        assert_eq!(still, unguarded_still, "nothing moved: the guard changes nothing");
+        let at = |out: &[u8], x: u32| -> [i32; 3] {
+            let o = ((height / 2 * width + x) * 4) as usize;
+            [i32::from(out[o]), i32::from(out[o + 1]), i32::from(out[o + 2])]
+        };
+        let magenta = |c: [i32; 3]| (c[0] - c[1]) + (c[2] - c[1]);
+        assert!(magenta(at(&still, 21)) > 25, "the still stroke takes the model's magenta: {:?}", at(&still, 21));
+        let moved = frame(40);
+        let guarded = compose_once(width, height, &moved, &proxy, &answer, carried_params(1.0)).unwrap();
+        let unguarded = compose_once(width, height, &moved, &proxy, &answer, carried_params(0.0)).unwrap();
+        // The frame's own colour at the stroke's old place: red over green by 30, blue under it by 20.
+        eprintln!("moved: unguarded {:?}, guarded {:?}, the frame {:?}", at(&unguarded, 21), at(&guarded, 21), at(&moved, 21));
+        assert!(
+            magenta(at(&unguarded, 21)) > magenta(at(&moved, 21)) + 20,
+            "without the guard the old stroke's magenta lies on the new frame: {:?}",
+            at(&unguarded, 21)
+        );
+        let (now, own) = (at(&guarded, 21), at(&moved, 21));
+        assert!((0..3).all(|c| (now[c] - own[c]).abs() <= 4), "the guard keeps the stale colour off: {now:?} against the frame's {own:?}");
+        // And the stroke at its new place is the frame's own, not tinted by anything.
+        let (now, own) = (at(&guarded, 41), at(&moved, 41));
+        assert!((0..3).all(|c| (now[c] - own[c]).abs() <= 6), "the moved stroke keeps its colour: {now:?} against {own:?}");
+    }
+
+    /// A carried answer at a Model resolution below Full (#63: model interval 2 at half size): the proxy the guard
+    /// compares the frame with is the enlarged small one, softer than the frame at every edge. On a frame that did
+    /// not move the guard must not read that softness as motion: the composition is the one without the guard.
+    #[test]
+    fn ghost_guard_reads_no_motion_into_an_enlarged_proxy() {
+        let (width, height) = (64u32, 32u32);
+        let (sw, sh) = (width / 2, height / 2);
+        // Bars of 9 px, dark and bright, with a colour of their own: their edges fall inside the small proxy's pixels.
+        let shade = |x: u32| if (x / 9).is_multiple_of(2) { [60u8, 45, 40] } else { [190, 160, 150] };
+        let frame: Vec<u8> = (0..width * height)
+            .flat_map(|i| {
+                let c = shade(i % width);
+                [c[0], c[1], c[2], 255]
+            })
+            .collect();
+        // The half-size proxy and the model's answer: brighter, and greener.
+        let small: Vec<u8> = (0..sw * sh)
+            .flat_map(|i| {
+                let (a, b) = (shade(i % sw * 2), shade(i % sw * 2 + 1));
+                [
+                    ((u16::from(a[0]) + u16::from(b[0])) / 2) as u8,
+                    ((u16::from(a[1]) + u16::from(b[1])) / 2) as u8,
+                    ((u16::from(a[2]) + u16::from(b[2])) / 2) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let answer: Vec<u8> = small
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [(f32::from(p[0]) * 1.1) as u8, (f32::from(p[1]) * 1.45).min(255.0) as u8, (f32::from(p[2]) * 1.1) as u8, 255])
+            .collect();
+        let run = |guard: f32| compose_once_scaled(width, height, &frame, &frame, &answer, (sw, sh), Some(&small), None, carried_params(guard));
+        let Some(guarded) = run(1.0) else {
+            eprintln!("ghost_guard small-proxy test: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let unguarded = run(0.0).unwrap();
+        let worst = guarded.iter().zip(&unguarded).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+        assert!(worst <= 2, "a still frame at half size composes as without the guard; it differs by {worst} of 255");
+        let edited = unguarded.iter().zip(&frame).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+        assert!(edited > 20, "the answer edits the frame at all ({edited})");
+        // The bars moved on by their own width (dark where it was bright): there the guard still holds the answer's
+        // green off, at half size too.
+        let moved: Vec<u8> = (0..width * height)
+            .flat_map(|i| {
+                let c = shade(i % width + 9);
+                [c[0], c[1], c[2], 255]
+            })
+            .collect();
+        let green = |out: &[u8]| {
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(moved.as_chunks::<4>().0.iter())
+                .map(|(o, f)| (i32::from(o[1]) - i32::from(o[0])) - (i32::from(f[1]) - i32::from(f[0])))
+                .max()
+                .unwrap()
+        };
+        let guarded = compose_once_scaled(width, height, &moved, &moved, &answer, (sw, sh), Some(&small), None, carried_params(1.0)).unwrap();
+        let unguarded = compose_once_scaled(width, height, &moved, &moved, &answer, (sw, sh), Some(&small), None, carried_params(0.0)).unwrap();
+        assert!(green(&unguarded) > 15, "without the guard the old answer's green lies on the moved frame ({})", green(&unguarded));
+        assert!(green(&guarded) <= 5, "the guard keeps it off ({})", green(&guarded));
+    }
+
     /// Mode 2, on a real (lavapipe) device: the model brightened a dark stroke at x=20..22 of
     /// the frame it was shown. When the current frame has moved on (the stroke is now at
     /// x=40..42), the per-pixel ratio would lay a pale copy of the old stroke at x=21 --

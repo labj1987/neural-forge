@@ -501,6 +501,8 @@ void main() {
       // both are compared in one space; taps over highlights, where the encode compresses the
       // differences, are still ignored. The mask is soft, not a hard threshold, so a
       // pixel hovering near it does not flicker between the two ratios.
+      // How far the guard holds this pixel's answer to be stale (0 with the guard off, or nothing moved).
+      float stale = 0.0;
       if (params.ghost_guard > 0.0) {
         const int kGhostStep = 3;
         ivec2 last = size - ivec2(1);
@@ -517,12 +519,31 @@ void main() {
             proxy_sum += pl;
             model_sum += Luminance(mq);
             float valid = 1.0 - smoothstep(0.5, 0.7, pl);
-            worst = max(worst, valid * abs(Luminance(oq) - pl) / (0.03 + 0.5 * pl));
+            float ol = Luminance(oq);
+            float mismatch = abs(ol - pl);
+            if (params.model_small != 0u) {
+              // The proxy is the small one, enlarged: softer than the frame at every edge, which is no motion.
+              // Each of its pixels is a mix of the frame's pixels around it, so on a frame that has not moved it
+              // lies within their range; only what falls outside that range is a mismatch.
+              float lo = ol;
+              float hi = ol;
+              for (int k = 0; k < 8; ++k) {
+                int reach = (k & 1) == 0 ? 1 : 3;
+                ivec2 d = (k & 2) == 0 ? ivec2(reach, 0) : ivec2(0, reach);
+                ivec2 n = clamp(q + ((k & 4) == 0 ? d : -d), ivec2(0), last);
+                float nl = Luminance(clamp(EncodeProxy(SrgbDecode(bgr ? imageLoad(u_original, n).bgr : imageLoad(u_original, n).rgb) / wp), 0.0, 1.0));
+                lo = min(lo, nl);
+                hi = max(hi, nl);
+              }
+              mismatch = max(max(pl - hi, lo - pl), 0.0);
+            }
+            worst = max(worst, valid * mismatch / (0.03 + 0.5 * pl));
           }
         }
         float smooth_ratio = (model_sum / 25.0 + kRatioFloor) / (proxy_sum / 25.0 + kRatioFloor);
         float moved = smoothstep(0.35, 1.2, worst);
-        edit_ratio = mix(edit_ratio, smooth_ratio, moved * clamp(params.ghost_guard, 0.0, 1.0));
+        stale = moved * clamp(params.ghost_guard, 0.0, 1.0);
+        edit_ratio = mix(edit_ratio, smooth_ratio, stale);
       }
       // Detail strength as a power on the ratio, not a blend: 0 leaves the frame as it is, 1 takes
       // the model's ratio, and above 1 amplifies it. It cannot go negative, leaves an unchanged
@@ -576,7 +597,11 @@ void main() {
         colour_allow_debug = vec3(1.0 - colour_allow, colour_allow, 0.0);
         pre_bound_debug = fully_upgraded;
         // The model's colour follows the detail strength below 1 as its light does (none at 0).
-        float colour_weight = clamp(params.colour_strength, 0.0, 1.0) * hue_trust * clamp(params.transfer_strength, 0.0, 1.0);
+        // And not where the guard found the frame moved on from the one the model answered: the hue above is the
+        // model's at this position of the old frame, and laid on what is here now it tints it with whatever was here
+        // (pink and orange edges behind anything that moves, at a model interval above 1). The light's broad ratio
+        // has a neighbourhood to fall back to; a hue has none that is this pixel's, so there the frame keeps its own.
+        float colour_weight = clamp(params.colour_strength, 0.0, 1.0) * hue_trust * clamp(params.transfer_strength, 0.0, 1.0) * (1.0 - stale);
         result = GamutCompressReversible(mix(luminance_only, bounded_colour, colour_weight));
       }
     }
