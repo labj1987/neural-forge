@@ -606,12 +606,14 @@ fn can_present(
 /// the GPUs that can ([`Second::presenters`]). On Linux the window's server decides: an X11 window (Xwayland under a
 /// Wayland desktop) can only be presented to from the GPU the desktop itself renders on (KDE's KWin: its first DRM
 /// device; #63's 4090 and 5080: the 4090 presented where the 5080 could not, with the monitor on the 5080), whichever
-/// card the monitor is plugged into. The first words are what the Status line keeps.
+/// card the monitor is plugged into. The first words are what the Status line keeps. It names no desktop setting:
+/// moving KWin's rendering (`KWIN_DRM_DEVICES`) did not make the mode work on #63's machine and moves all of the
+/// desktop's drawing, so that step is the user guide's, as an option with its warning.
 pub(crate) fn cannot_present(gpu: &str, presenters: &[String]) -> String {
     match presenters {
         [] => format!("{gpu} cannot present to the game's window, and no other GPU says it can (is the monitor plugged into it?)"),
         some => format!(
-            "the desktop draws the game's window on {}, so {gpu} cannot present to it: make the desktop render on {gpu} (KDE: KWIN_DRM_DEVICES with its card first; see the user guide's second GPU steps), then log in again",
+            "the desktop draws the game's window on {}, so {gpu} cannot present to it: this mode needs the desktop to draw the window on {gpu} (the user guide's second GPU steps say what can be tried)",
             some.join(", ")
         ),
     }
@@ -1939,7 +1941,8 @@ mod tests {
         let gpu = "NVIDIA GeForce RTX 5080 [10de:2c02@0000:05:00.0], NVIDIA 620.70.06";
         let why = cannot_present(gpu, &["NVIDIA GeForce RTX 4090".into()]);
         assert!(why.starts_with("the desktop draws the game's window on NVIDIA GeForce RTX 4090, so NVIDIA GeForce RTX 5080"), "{why}");
-        assert!(why.contains("KWIN_DRM_DEVICES"), "{why}");
+        assert!(why.contains("the user guide's second GPU steps"), "{why}");
+        assert!(!why.contains("KWIN_DRM_DEVICES") && !why.contains("log in again"), "no desktop setting is prescribed: {why}");
         let line = not_showing_line(&why);
         assert!(line.len() < neural_forge_protocol::REASON_BYTES && line.contains("RTX 4090, so"), "{line}");
         let none = cannot_present(gpu, &[]);
