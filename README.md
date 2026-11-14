@@ -44,7 +44,8 @@ the `input` group (log out and in again afterwards): `sudo usermod -aG input "$U
 
 A Vulkan layer inside the game runs the network on the game's GPU. In a DLSS game it needs to know
 exactly what the game hands DLSS, so Neural Forge makes a copy of your Proton
-(`<version>-NeuralForge`, next to the original, no extra space on the same drive) with a small hook
+(`GE-Proton11-12-NeuralForge`, `Proton-experimental-11.0-20261105c-x86_64-NeuralForge`, next to the
+original, no extra space on the same drive) with a small hook
 in the NGX module that reports it. The layer then runs the network on DLSS's input and DLSS upscales
 the result (with Ray Reconstruction it runs right after DLSS). Switching a game on sets its Proton to
 the copy automatically, which needs Steam closed; switching it off puts the old one back. Your own
@@ -77,8 +78,9 @@ says what to do.
   restart Steam. If the line says the game *is* on a Neural Forge Proton but no record of DLSS reached
   the layer, run **Diagnose**: the copy's NGX wrapper is outdated or did not load.
 - **"Proton copies out of date" on the Status tab.** The Proton a copy was made from has been updated
-  since. Close Steam and press **Make again** next to the copy in the Setup tab: its games move to the
-  new copy.
+  since, or the copy's name lacks "Proton": Steam then does not sync the Steam Cloud saves a game keeps in
+  its Wine prefix (AppData, Saved Games, Documents). Close Steam and press **Make again** next to the copy
+  in the Setup tab: its games move to the new copy, and Steam syncs their saves when it starts.
 - **The model runs on the finished frame in a DLSS game.** DLSS is not upscaling there: switched off,
   another upscaler, Frame Generation only, or DLAA. Loading screens and menus before DLSS's first frame
   stay untouched; the finished frame takes over after 5 minutes without DLSS, or 30 s of DLSS with no

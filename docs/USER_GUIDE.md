@@ -92,7 +92,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, the HUD group: finding the HUD and HUD regions on the finished frame, and the Sharpening group: adaptive sharpening (CAS) and Clarity on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
-| Status | **Proton copies out of date** (shown only when a Neural Forge Proton copy is older than the Proton it was made from: the copy, both versions and the games that run with it; see [Proton with DLSS parameters](#proton-with-dlss-parameters)), Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
+| Status | **Proton copies out of date** (shown only when a Neural Forge Proton copy is older than the Proton it was made from, or its name lacks "Proton" so Steam Cloud skips the saves in its prefix: the copy, both versions or the Steam Cloud problem, and the games that run with it; see [Proton with DLSS parameters](#proton-with-dlss-parameters)), Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
 | Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on; a tested game says where the model runs in it), the launch option to copy by hand for a game you pick, **Proton with DLSS parameters** (below) and **Uninstall…** (see [Uninstall](#uninstall)). |
 
 ![Status tab, lower half, while Hogwarts Legacy runs: where the model ran in the game in testing, the HDR verdict saying why the game presents SDR and how to offer it HDR, the model, reset and profiles, and Diagnosis](../screenshots/status-details.png)
@@ -266,7 +266,11 @@ ProtonUp-Qt do, only while Steam is closed, with a backup beside it. Restart Ste
 
 The Setup tab also lists your installed Protons (GE-Proton, Proton-CachyOS, Valve's Proton and Proton Experimental) with
 **Make copy**. The copy is made next to the original in Steam's `compatibilitytools.d`, named `<version>-NeuralForge`
-(`GE-Proton11-12-NeuralForge`); on the same drive it takes no space (hard links). It differs from the original in one
+(`GE-Proton11-12-NeuralForge`), with `Proton-` before it when the version name does not say Proton
+(`Proton-experimental-11.0-20261105c-x86_64-NeuralForge`, `Proton-hotfix-20261110-x86_64-NeuralForge`,
+`Proton-cachyos-11.0-20261015-slr-NeuralForge`): Steam maps a game's Steam Cloud save folders (AppData, Saved Games,
+Documents) into its Wine prefix only for a tool whose name contains "Proton", and syncs none of those saves with any
+other. On the same drive it takes no space (hard links). It differs from the original in one
 thing: NVIDIA's NGX core (`_nvngx.dll`) is reached through Neural Forge's small wrapper, which passes every DLSS call on
 unchanged. Your original Proton is not changed. Then:
 
@@ -275,12 +279,14 @@ unchanged. Your original Proton is not changed. Then:
    choose the copy.
 
 A copy whose original has changed since (a new GE-Proton in a "Latest" folder, a Proton Experimental update) is out of
-date: it keeps the older Proton's files, so a fix the new version brings is missing from it. The Status tab says so
-(**Proton copies out of date**: the copy, its two versions and the games that run with it), the game's layer log gets a
+date: it keeps the older Proton's files, so a fix the new version brings is missing from it. So is a copy whose name
+lacks "Proton": Steam Cloud does not sync the saves its games keep in the prefix. The
+Status tab says so (**Proton copies out of date**: the copy, its two versions or the Steam Cloud problem, and the games
+that run with it), the game's layer log gets a
 `[proton]` line at launch (`NEURAL_FORGE_LOG`, see Files), `doctor` reports it (and warns when Steam changed a Proton's files in place after a copy was made from it), and the Setup tab marks it with
 **Make again** (`proton-tool update`; so is a copy that holds another NGX wrapper than the installed Neural Forge): with
-Steam closed it makes the copy again (a new version under its new name, its games moved over and the old copy
-removed), or puts the new wrapper in place. A copy whose original was deleted (ProtonUp replaced it with a newer
+Steam closed it makes the copy again (a new version or a name without "Proton" under its new name, its games moved
+over and the old copy removed; Steam syncs their saves when it starts), or puts the new wrapper in place. A copy whose original was deleted (ProtonUp replaced it with a newer
 version) keeps working as it is. Updating Neural Forge puts its wrapper into every copy by itself. A copy a
 running game uses is never replaced or removed. `PROTON_NO_NEURAL_FORGE_NGX=1 %command%` in a game's launch options turns the wrapper off for
 that game while it keeps the copy. Online games with anti-cheat may refuse a changed module: use the copy for
@@ -530,7 +536,7 @@ Valve's VAC) cannot be seen.
 | `~/.local/state/neural-forge/layer.log` | The layer's session log: state changes and errors only, never per frame (kept to 256 KiB, the previous one as `layer.log.1`). Diagnose and the report read it. |
 | `/tmp/neural-forge-$UID/shm.bin` | The shared memory the layer and the GUI talk through. |
 | `~/.local/share/neural-forge/lib/neural-forge/proton/_nvngx.dll` | The NGX wrapper the Proton copies get. |
-| `<Steam>/compatibilitytools.d/<version>-NeuralForge/` | A Proton copy (`neural-forge-proton.txt` in it says what it was made from). |
+| `<Steam>/compatibilitytools.d/<version>-NeuralForge/` | A Proton copy (`Proton-<version>-NeuralForge/` when the version name does not say Proton) (`neural-forge-proton.txt` in it says what it was made from). |
 | `/dev/shm/neural-forge-ngx-<pid>.ring` | The wrapper's records for one game process; the layer removes the file when it opens it. |
 
 ## Uninstall

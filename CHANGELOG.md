@@ -4,6 +4,19 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.2.1 — 2026-11-14
+
+**Steam Cloud saves sync with the Neural Forge copies of Proton Experimental, Proton Hotfix and Proton-CachyOS (#71)**
+
+- Steam syncs the Steam Cloud saves a game keeps in its Wine prefix (AppData, Saved Games, Documents) only when the
+  Proton's name contains "Proton". The copies of Proton Experimental, Proton Hotfix and Proton-CachyOS were named
+  after their version (`experimental-…-NeuralForge`), so Steam left those saves unsynced. Their copies are now named
+  `Proton-<version>-NeuralForge`; GE-Proton's copies keep their names.
+- A copy with the old name shows under "Proton copies out of date" on the Status tab, and Diagnose says Steam Cloud
+  can't sync its saves. Close Steam and press **Make again** next to it in the Setup tab (or run
+  `neural-forge-cli proton-tool update`): its games move to the new copy and the old one is removed. Steam uploads the
+  waiting saves when it starts.
+
 ## 4.2.0 — 2026-11-13
 
 **The model on a second GPU**

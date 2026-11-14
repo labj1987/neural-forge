@@ -889,6 +889,29 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
                     Some("Start Neural Forge (or run `neural-forge-cli install --appdir` or `neural-forge-cli proton-tool update`): that puts the new wrapper in every copy.".into()),
                 ));
             }
+            if proton_tool::steam_cloud_blind(t) {
+                let fix = if proton_tool::source_gone(t) {
+                    format!(
+                        "Its source {} is no longer installed: switch its games off, choose another Proton for them in Steam, and switch them on again; then remove it.",
+                        t.source.display()
+                    )
+                } else {
+                    format!(
+                        "Close Steam, then use Make again in the Setup tab (or `neural-forge-cli proton-tool update`): the new copy is named {} and its games move to it. Start Steam to sync.",
+                        neural_forge_protocol::proton_copy::copy_name(&t.source_version)
+                    )
+                };
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Warning,
+                    format!(
+                        "Steam Cloud can't sync the saves games keep in the Proton prefix while they run with {}: Steam does that only for a tool whose name contains \u{201c}Proton\u{201d}",
+                        t.name
+                    ),
+                    t.dir.display().to_string(),
+                    Some(fix),
+                ));
+            }
             if proton_tool::source_changed(t) {
                 out.push(Finding::new(
                     CHECK,
@@ -906,7 +929,7 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
                     Some("Nothing to do. For a newer Proton, switch the game off, choose that Proton for it in Steam, and switch it on again.".into()),
                 ));
             }
-            if !proton_tool::source_changed(t) && !proton_tool::source_gone(t) && proton_tool::links_changed(t) {
+            if !proton_tool::needs_remake(t) && !proton_tool::source_gone(t) && proton_tool::links_changed(t) {
                 out.push(Finding::new(
                     CHECK,
                     Severity::Warning,
@@ -1738,6 +1761,29 @@ mod tests {
         assert!(has(Severity::Info, "which is no longer installed: the copy keeps working"), "{v:#?}");
         assert!(!has(Severity::Info, "was made from an older"), "a source that is gone is not a newer one: {v:#?}");
         assert!(v.iter().any(|x| x.check == "ngx-ring" && x.summary.contains("ring version 1")), "{v:#?}");
+        assert!(!has(Severity::Warning, "Steam Cloud"), "a GE copy's name says Proton: {v:#?}");
+    }
+
+    /// A copy an older Neural Forge named without "Proton" (#71) is said, with the name Make again gives it.
+    #[test]
+    fn a_copy_named_without_proton_is_reported_for_steam_cloud() {
+        let mut f = quiet();
+        write(&f.roots.data_dir.join(crate::proton_tool::WRAPPER), "MZ");
+        let steam = f.dir.join("steam");
+        let source = f.dir.join("lib/steamapps/common/Proton - Experimental");
+        write(&source.join("proton"), "#!/bin/sh\n");
+        write(&source.join("version"), "1 experimental-11.0-20261105c-x86_64\n");
+        let copy = steam.join("compatibilitytools.d/experimental-11.0-20261105c-x86_64-NeuralForge");
+        write(
+            &copy.join(crate::proton_tool::MARKER),
+            &format!("source={}\nsource_version=experimental-11.0-20261105c-x86_64\nwrapper_sha256=ab\n", source.display()),
+        );
+        write(&copy.join("files/lib/wine/x86_64-unix/ntdll.so"), "\0wine-11.0\0");
+        f.roots.steam_roots = vec![crate::steam::Root { path: steam, flatpak: false }];
+        let v = check_proton(&f.roots);
+        let found = v.iter().find(|x| x.severity == Severity::Warning && x.summary.contains("Steam Cloud can't sync")).unwrap_or_else(|| panic!("{v:#?}"));
+        assert!(found.summary.contains("experimental-11.0-20261105c-x86_64-NeuralForge"), "{found:#?}");
+        assert!(found.fix.as_deref().unwrap().contains("Proton-experimental-11.0-20261105c-x86_64-NeuralForge"), "{found:#?}");
     }
 
     /// A running game whose copy still holds the wrapper of the ring version before (no subrects) is said; one of the

@@ -861,14 +861,15 @@ fn command_usage(command: &str) -> Option<&'static str> {
             "usage: neural-forge-cli proton-tool [list | create SOURCE | update | remove NAME]\n  \
              list: the Protons a copy can be made from and the copies Neural Forge made (outdated ones marked).\n  \
              create SOURCE: copy the installed Proton SOURCE (its name in Steam, its version name or its folder)\n  \
-             into Steam's compatibilitytools.d as <version>-NeuralForge: hard links on the same drive, with\n  \
-             Neural Forge's NGX wrapper as _nvngx.dll so the layer reads DLSS's own parameters. Restart Steam,\n  \
-             then choose it per game in Properties > Compatibility. PROTON_NO_NEURAL_FORGE_NGX=1 in a game's\n  \
+             into Steam's compatibilitytools.d as <version>-NeuralForge (Proton-<version>-NeuralForge when the\n  \
+             version does not say Proton: Steam syncs Steam Cloud saves in the prefix only for a tool named so):\n  \
+             hard links on the same drive, with Neural Forge's NGX wrapper as _nvngx.dll so the layer reads\n  \
+             DLSS's own parameters. Restart Steam, then choose it per game in Properties > Compatibility. PROTON_NO_NEURAL_FORGE_NGX=1 in a game's\n  \
              launch options turns the wrapper off for that game. Only a Proton built on Wine 10 or newer\n  \
              (Proton 10 or newer, GE-Proton10 or newer) can be copied.\n  \
              update: make every outdated copy again from its source's current version, with the installed\n  \
-             NGX wrapper. A copy of a new version gets a new name: with Steam closed, the games set to the\n  \
-             old copy are moved to the new one and the old copy is removed (never one a running game uses).\n  \
+             NGX wrapper. A copy of a new version, or one named without Proton, gets a new name: with Steam\n  \
+             closed, the games set to the old copy are moved to the new one and the old copy is removed (never one a running game uses).\n  \
              remove NAME: delete a copy Neural Forge made (not while a game runs with it)"
         }
         "shmctl" => "",

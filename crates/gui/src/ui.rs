@@ -2685,7 +2685,8 @@ struct ProtonScan {
     root: Option<std::path::PathBuf>,
     sources: Vec<neural_forge_supervisor::proton_tool::Source>,
     tools: Vec<(neural_forge_supervisor::proton_tool::Tool, bool)>,
-    /// The copies older than their source (`compat_tool::stale_copies`, the check `doctor` makes).
+    /// The copies made again (`compat_tool::stale_copies`, the check `doctor` makes): older than their source, or
+    /// named without "Proton".
     stale: Vec<neural_forge_supervisor::compat_tool::StaleCopy>,
 }
 
@@ -3404,13 +3405,15 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     group
 }
 
-/// The Status tab's notice for Neural Forge Proton copies older than the Proton they were made from
-/// (`compat_tool::stale_copies`, the check `doctor` makes): one row per copy naming it, its source and the games
+/// The Status tab's notice for Neural Forge Proton copies older than the Proton they were made from, or named without
+/// "Proton" so Steam Cloud skips their games' saves in the prefix (`compat_tool::stale_copies`, the check `doctor` makes): one row per copy naming it, its source and the games
 /// that run with it. Hidden while every copy is current; read again every 30 s on a worker.
 fn build_stale_proton_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Proton copies out of date");
-    group.set_description(Some("A game running with one of these keeps the older Proton's files. Close Steam and use Make again in the Setup tab."));
+    group.set_description(Some(
+        "A game running with one of these keeps an older Proton's files, or cannot sync its Steam Cloud saves. Close Steam and use Make again in the Setup tab.",
+    ));
     group.set_visible(false);
     let rows: std::rc::Rc<std::cell::RefCell<Vec<adw::ActionRow>>> = std::rc::Rc::default();
     every(&group, std::time::Duration::from_secs(30), move |group| {
