@@ -1942,6 +1942,31 @@ builds pass 1's lanes only; the log says "all N passes of the stage run on the o
 other device, as one does). One `HoldSide` (exchange, worker, runner, loader) per hold
 resources: a change of render extent loads the network again on the other device.
 
+**The measured trial** (`offload_trial`, #63, #70). The submit waits for the answer to the frame before
+(`Progress::settle`), so a second GPU slower than the game's frame sets the frame rate, and `LateRule` never sees it:
+the frames slow down to the answers, none is late. The submits' waits are summed (`Progress::waited_us`); each
+600-hold summary logs the hold interval (the mean of the intervals with the lowest and highest tenth left out, pauses
+over 250 ms dropped: with the edit cache the local frames are two kinds, which a median would pick one of) and the mean
+wait per hold. From the second window on (the first has the network loading on the other GPU), two windows in a row of
+the same key (the hold's extent and the pass count) whose frame times agree within 10% and whose mean wait is 2 ms or
+more and a tenth of the frame start the trial (`Trial::offloaded`): the worker stops serving (its give-up callback
+sets `State::Off`, not `FellBack`: the trial is not a fall-back, and the finished-frame offload stays available) and
+`offload_pre::wanted` is false while `offload_trial::keeps_local`. Every hold while it runs goes through
+`Session::note` to `offload_trial::local_hold`: after 60 holds that ran the model here, the frame time of at least 300
+intervals, extended up to 900 while the window's halves disagree by more than 10%, is compared: 10% shorter keeps the
+model here until the game restarts; otherwise the next hold builds its side again (a side whose worker no longer serves
+counts as released). The game's GPU that cannot run the model (not built within 15 s of holds that keep coming, or 30
+misses in a row once it ran) or cannot be measured (30 frame times over 250 ms, or 1860 holds that ran without a
+window; an interval counts only between two holds that both ran the model) sends the frames back; a hold of another key aborts (a later pair of windows may try
+again, three times at most). The Status line is the native line's (`native::running_line`'s `trial`): "second GPU:
+trying the game's GPU for a few seconds: the faster one keeps the model", then "second GPU: not used: the game's GPU is
+faster (18.6 ms vs 22.8 ms a frame)". `NEURAL_FORGE_OFFLOAD_TRIAL=off` (`0`, `false`) never tries; with `same` it is off
+unless `on`; `NEURAL_FORGE_OFFLOAD_TRIAL_VERDICT=offload` (tests) forces the way back. The #63 reporter's numbers (RTX
+4090 with an RTX 5080, the frames crossing system memory at about 3.5 GB/s): Cyberpunk 2077 with Ray Reconstruction
+after DLSS at 2048x1536, 72 MB a frame, 28.6 ms a frame on the 5080 and 27-36 fps, against its 75 fps cap with the
+network on the 4090 (7.2 ms, one pass); Red Dead Redemption 2 (Vulkan) before DLSS at 1365x1024, 37 MB a frame, 15.1 ms
+and 48.5 fps.
+
 **Fall-back** as on the finished frame (`ServerRule`, `LateRule` on the answers, `State::FellBack` for the process),
 and when 30 holds in a row, over at least a second of holds that keep coming (a pause of more than 250 ms between two
 of them starts the row again), cannot send their frame (no motion vectors, motion vectors whose layout the layer never saw set, no jitter, no

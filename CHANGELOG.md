@@ -40,8 +40,16 @@ first shipped them; their phase is kept as a subheading.
 - It works as before DLSS does: each of DLSS's output frames goes to the second GPU and its edit is applied to the
   next one, carried along the game's motion vectors. No frame is shown later; the edit is one frame old.
 - The network runs at the output resolution there, so the second GPU needs longer per frame than before DLSS, and
-  the frame rate is bounded by it. This is not yet measured at 4K or on two different cards; if the second GPU is too
-  slow, the model returns to the game's GPU. At 4K the small network or a lower Model resolution helps.
+  the frame rate is bounded by it. At 4K the small network or a lower Model resolution helps.
+- Before or after DLSS, when the game keeps waiting for the second GPU, the model is now tried once on the game's GPU
+  for a few seconds, and stays where the frame rate is higher until the game restarts (the log gives both, and the
+  Status tab says which). Where the frames cross system
+  memory slowly, the game's own GPU is often faster: on an RTX 4090 with an RTX 5080 beside it, Cyberpunk 2077 with
+  Ray Reconstruction ran at 27-36 fps with the 5080 and at its 75 fps cap on the 4090.
+  `NEURAL_FORGE_OFFLOAD_TRIAL=off` keeps the model on the second GPU.
+- When building the network failed on one GPU after the model was loaded there (it is tried again later), no other
+  GPU or device of the game could take the model until that retry: the second GPU gave up after 30 seconds. The
+  network is now handed over on request.
 - The Status tab says "second GPU: the model runs on ... after DLSS, its edit applied one frame later". The same
   rules send the model back to the game's GPU when the second GPU cannot keep up or fails.
 - With passes both before and after DLSS in one frame, the second GPU is not used: every pass runs on the game's GPU,
@@ -51,6 +59,9 @@ first shipped them; their phase is kept as a subheading.
   ran there and the others were left out.
 - When the model goes back to the game's GPU because its frames cannot be sent to the second GPU, the Status tab and
   the log now say what was missing (the game's motion vectors, their layout, the jitter or the edit cache's room).
+- When a game is started with Ray Reconstruction already on, the model after DLSS now gets the game's motion vectors.
+  Without them it could not run on a second GPU and ran without its history, which could show as a slight flicker
+  with one pass (#63).
 - The Status tab's Model row says where the model runs: before the upscaler, after DLSS, or on the second GPU before
   DLSS, after DLSS or on the finished frame. The frame-time graph shows the model's time after DLSS too.
 

@@ -621,6 +621,12 @@ fn no_history() -> bool {
 /// holds were refused it for good (2026-10-23).
 static NETWORK_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `device` closed the network: it owns it no longer (unless another device opened it since).
+fn disown(device: u64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _ = NETWORK_OWNER.compare_exchange(device, 0, SeqCst, SeqCst);
+}
+
 /// The longest a build waits for the game to stop loading ([`Loader::work`]).
 const LOADING_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -1006,6 +1012,7 @@ impl Loader {
                     state.failed = Some("lent to another device of the game, which runs the model".into());
                     drop(state);
                     drop(network);
+                    disown(device.as_raw());
                     crate::log!("[native] the network is closed on this device: another device of the game asked for it (one network per process)");
                     crate::logging::flush();
                     state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1075,6 +1082,9 @@ impl Loader {
                 note_failure(&why);
                 state.failed = Some(why);
                 drop(state);
+                if n.is_some() {
+                    disown(device.as_raw());
+                }
                 drop(n);
                 crate::log!("[native] VRAM guard: the network is closed; frames go to DLSS untouched until there is room again");
                 crate::logging::flush();
@@ -1118,6 +1128,8 @@ impl Loader {
             state.built = Vec::new();
             drop(state);
             if step == Step::ReinitThenBuild && network.take().is_some() {
+                // Owned again only if the reopen keeps a network ([`owns_network`]).
+                disown(device.as_raw());
                 crate::log!("[native] {} failed attempts in a row: closing the network and loading it again", retry.streak());
             }
             // Another network chosen: this one is closed and the chosen one opened (and built for the
@@ -1125,6 +1137,7 @@ impl Loader {
             // asks for another network only in `ready`, after the frames that used this one were drained,
             // and neither path takes the network while the other's work may run).
             if switching && network.take().is_some() {
+                disown(device.as_raw());
                 crate::log!("[native] the {} network is chosen: closing the open one and loading it", network::name(choice));
             }
             let t = Instant::now();
@@ -1181,7 +1194,11 @@ impl Loader {
                     }
                 }
             });
-            if opened.is_some() && result.is_ok() {
+            // Opened here, built or not: a build that failed after the open keeps the network open on this device
+            // (tried again on the retry schedule), and another device's loader must be able to ask for it. Unowned,
+            // it was asked of nobody: the second GPU's loader, back after the trial on the game's GPU failed its
+            // build (`offload_trial`), was refused for 30 s and the offload given up.
+            if owns_network(opened.is_some(), result.is_ok(), network.is_some()) {
                 NETWORK_OWNER.store(device.as_raw(), std::sync::atomic::Ordering::SeqCst);
             }
             // Refused because another device's loader has the network: that one is asked to lend it.
@@ -1456,7 +1473,9 @@ impl Drop for Loader {
     fn drop(&mut self) {
         self.stop_worker();
         // The network (closed here) must not be pending: the device's teardown waited for its work.
-        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.take();
+        if self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.take().is_some() {
+            disown(self.device);
+        }
     }
 }
 
@@ -4232,7 +4251,7 @@ fn fake_chain_timeout(frames: u64) -> Option<(u32, String)> {
 /// What the Status tab says about the native backend after a hold: running, or why not.
 pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     if result.evaluated {
-        return running_line(loader.guard_note().as_deref());
+        return running_line(loader.guard_note().as_deref(), super::offload_trial::status_line().as_deref());
     }
     match (loader.failed(), result.miss) {
         (Some(why), _) => format!("native network not running: {why}"),
@@ -4241,10 +4260,23 @@ pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     }
 }
 
-/// The Status line of a hold whose network ran: `guard`, the VRAM guard's note.
-pub(crate) fn running_line(guard: Option<&str>) -> String {
+/// The Status line of a hold whose network ran: `guard`, the VRAM guard's note; `trial`, the line of the trial against
+/// the second GPU (`super::offload_trial`), while it runs or once it kept the model here.
+pub(crate) fn running_line(guard: Option<&str>, trial: Option<&str>) -> String {
     let guard = guard.map(|why| format!(" ({why})")).unwrap_or_default();
-    format!("native network running{guard}")
+    match trial {
+        Some(trial) => format!("{trial}{guard}"),
+        None => format!("native network running{guard}"),
+    }
+}
+
+/// Whether a loader's work leaves this device the process's network owner (`NETWORK_OWNER`, which another device's
+/// loader asks to lend it, [`Loader::ask_owner`]): it opened the network (`opened`) and either built it (`built`) or
+/// kept it open after a failed build (`kept`, tried again on the retry schedule). A kept network that is nobody's is
+/// asked of nobody, and every other device is refused it until this one's next build (the second GPU given up after
+/// 30 s of refusals, #63).
+fn owns_network(opened: bool, built: bool, kept: bool) -> bool {
+    opened && (built || kept)
 }
 
 /// The last network failure written to the state log, so a retry schedule that keeps failing the same
@@ -4812,7 +4844,9 @@ unsafe fn native_hold(
         return result;
     }
     // The offload's side of the hold: the exchange with the other device and its worker, made on the first hold.
-    if res.offpre.as_ref().is_some_and(super::offload_pre::HoldSide::released) && !others_outstanding {
+    // A side whose worker stopped serving (the trial on the game's GPU gave it up) while the offload is wanted again: the
+    // same.
+    if res.offpre.as_ref().is_some_and(|s| s.released() || (!s.serving() && super::offload_pre::wanted())) && !others_outstanding {
         // Its worker was ended for another set of hold resources while these had no hold: built again below.
         if let Some(side) = res.offpre.take() {
             // SAFETY: nothing recorded with these resources may still run.
@@ -5624,14 +5658,38 @@ mod tests {
         assert_eq!(unsendable(true, aux(Some(vk::ImageLayout::GENERAL)), true, false), Some("DLSS's jitter is unknown"));
     }
 
+    /// #63: a build that fails after the open keeps the network on its device; that device must own it, so another
+    /// device's loader asks it to lend the network instead of being refused for good.
     #[test]
-    fn the_running_line_fits_the_channel_with_every_note_of_the_vram_guard() {
-        assert_eq!(super::running_line(None), "native network running");
-        assert_eq!(super::running_line(Some("lower")), "native network running (lower)");
+    fn a_network_kept_after_a_failed_build_is_owned() {
+        assert!(super::owns_network(true, true, true), "opened and built");
+        assert!(super::owns_network(true, false, true), "opened, the build failed, the network kept");
+        assert!(!super::owns_network(true, false, false), "opened, failed and dropped: nothing to lend");
+        assert!(!super::owns_network(false, true, true), "not opened here (a rebuild of one opened before)");
+        assert!(!super::owns_network(false, false, false));
+        // Closed: owned no longer, unless another device opened it since.
+        super::NETWORK_OWNER.store(0xA, std::sync::atomic::Ordering::SeqCst);
+        super::disown(0xB);
+        assert_eq!(super::NETWORK_OWNER.load(std::sync::atomic::Ordering::SeqCst), 0xA);
+        super::disown(0xA);
+        assert_eq!(super::NETWORK_OWNER.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_running_line_fits_the_channel_with_every_note_of_the_vram_guard_and_of_the_trial() {
+        assert_eq!(super::running_line(None, None), "native network running");
+        assert_eq!(super::running_line(Some("lower"), None), "native network running (lower)");
+        // The trial against the second GPU (`offload_trial`) names itself while it runs and once it kept the model here.
+        let trying = "second GPU: trying the game's GPU for a few seconds: the faster one keeps the model";
+        let kept = "second GPU: not used: the game's GPU is faster (188.6 ms vs 222.8 ms a frame)";
+        assert_eq!(super::running_line(None, Some(trying)), trying);
+        assert_eq!(super::running_line(Some("lower"), Some(kept)), format!("{kept} (lower)"));
         // Every variant fits the channel's field whole (a cut line would read as changed at every hold).
         for guard in [None, Some(super::super::vram_guard::NOTE_SMALL), Some(super::super::vram_guard::NOTE_PAUSED)] {
-            let line = super::running_line(guard);
-            assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
+            for trial in [None, Some(trying), Some(kept)] {
+                let line = super::running_line(guard, trial);
+                assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
+            }
         }
     }
     use super::*;
