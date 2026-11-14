@@ -24,6 +24,9 @@ layout(binding = 0, rgba8) uniform readonly image2D u_original;
 layout(binding = 1, rgba8) uniform readonly image2D u_proxy;
 layout(binding = 2, rgba8) uniform readonly image2D u_model_answer;
 layout(binding = 3, rgba8) uniform writeonly image2D u_output;
+// The small proxy the model was shown, at its own size, while `model_small` (else any image: not read). The ghost
+// guard compares it with the current frame reduced the same way.
+layout(binding = 4, rgba8) uniform readonly image2D u_proxy_small;
 
 // IEC 61966-2-1 sRGB EOTF/OETF -- the exact same formulas as
 // `composition::apply`'s `srgb_decode`/`srgb_encode`, which is the CPU reference this
@@ -326,12 +329,12 @@ vec3 GamutCompressReversible(vec3 rgb) {
   return XYZ_TO_LINEAR_SRGB * (HPE_LMS_TO_XYZ * compressed_lms);
 }
 
-// One texel of the current frame as the small proxy would hold it: reduced as the capture reduces the frame (a
-// linear blit to the proxy's size: of the stored values, or in linear light for an sRGB swapchain), then encoded
-// as `encode.comp` stores it. In the frame's
-// stored channel order made RGB.
+// One texel of the current frame as the small proxy would hold it, in the encoded space the proxy is compared in:
+// reduced as the capture reduces the frame (a linear blit to the proxy's size: of the stored values, or in linear
+// light for an sRGB swapchain), then encoded as `encode.comp` encodes it. On a frame that has not changed this is the
+// small proxy's own texel (to the last bit of its 8), whatever the size and whatever is in the picture; where it
+// differs, the frame has changed.
 vec3 SmallTexel(ivec2 t, ivec2 small, ivec2 size, bool bgr, float wp) {
-  t = clamp(t, ivec2(0), small - ivec2(1));
   vec2 u = (vec2(t) + 0.5) * vec2(size) / vec2(small) - 0.5;
   ivec2 i0 = ivec2(floor(u));
   vec2 a = u - vec2(i0);
@@ -348,22 +351,7 @@ vec3 SmallTexel(ivec2 t, ivec2 small, ivec2 size, bool bgr, float wp) {
     linear = SrgbDecode(mix(mix(c00, c10, a.x), mix(c01, c11, a.x), a.y));
   }
   linear = bgr ? linear.bgr : linear;
-  return SrgbEncode(clamp(EncodeProxy(linear / wp), 0.0, 1.0));
-}
-
-// The current frame at `q` as the proxy input holds the frame the model answered: reduced to the small proxy
-// ([`SmallTexel`]) and enlarged again with the linear blit the composition enlarges the proxy with. On a frame that
-// has not changed this is the proxy input itself (to the last bit of an 8-bit texel), whatever the size and
-// whatever is in the picture; where it differs, the frame has changed.
-vec3 FrameAsProxy(ivec2 q, ivec2 small, ivec2 size, bool bgr, float wp) {
-  vec2 u = (vec2(q) + 0.5) * vec2(small) / vec2(size) - 0.5;
-  ivec2 t0 = ivec2(floor(u));
-  vec2 a = u - vec2(t0);
-  vec3 s00 = SmallTexel(t0, small, size, bgr, wp);
-  vec3 s10 = SmallTexel(t0 + ivec2(1, 0), small, size, bgr, wp);
-  vec3 s01 = SmallTexel(t0 + ivec2(0, 1), small, size, bgr, wp);
-  vec3 s11 = SmallTexel(t0 + ivec2(1, 1), small, size, bgr, wp);
-  return SrgbDecode(mix(mix(s00, s10, a.x), mix(s01, s11, a.x), a.y));
+  return clamp(EncodeProxy(linear / wp), 0.0, 1.0);
 }
 
 void main() {
@@ -571,13 +559,27 @@ void main() {
             if (!small_proxy) {
               vec3 oq = clamp(EncodeProxy(SrgbDecode(bgr ? imageLoad(u_original, q).bgr : imageLoad(u_original, q).rgb) / wp), 0.0, 1.0);
               mismatch = abs(Luminance(oq) - pl);
-            } else {
-              // The proxy is the small one, enlarged: the frame is compared as the proxy would hold it, so the
-              // enlargement's softness is on both sides and only a change of the picture is left. At every tap:
-              // a strip that changed is as narrow as the motion, and falls between taps spaced any wider.
-              mismatch = abs(Luminance(FrameAsProxy(q, small, size, bgr, wp)) - pl);
             }
             worst = max(worst, valid * mismatch / (0.03 + 0.5 * pl));
+          }
+        }
+        if (small_proxy) {
+          // The proxy input is the small proxy enlarged, softer than the frame at every edge, which is no motion.
+          // So the comparison is made where both are the same picture: the small proxy's own texels against the
+          // current frame reduced the way the capture reduced it. Texels about 3 px of the frame apart (every
+          // texel at a half and below, where a texel is that wide or wider), two each way: the pixel's own texel
+          // and the eight around it alone left stale colour on a 2 px pan (30 of 255 in the texture test).
+          ivec2 tc = clamp(ivec2((vec2(src) + 0.5) * vec2(small) / vec2(size)), ivec2(0), small - ivec2(1));
+          int tstep = max(1, int(round(3.0 * float(small.x) / float(size.x))));
+          for (int j = -2; j <= 2; ++j) {
+            for (int i = -2; i <= 2; ++i) {
+              ivec2 t = clamp(tc + ivec2(i, j) * tstep, ivec2(0), small - ivec2(1));
+              vec3 was = imageLoad(u_proxy_small, t).rgb;
+              float wl = Luminance(SrgbDecode(bgr ? was.bgr : was));
+              float nl = Luminance(SmallTexel(t, small, size, bgr, wp));
+              float valid = 1.0 - smoothstep(0.5, 0.7, wl);
+              worst = max(worst, valid * abs(nl - wl) / (0.03 + 0.5 * wl));
+            }
           }
         }
         float smooth_ratio = (model_sum / 25.0 + kRatioFloor) / (proxy_sum / 25.0 + kRatioFloor);

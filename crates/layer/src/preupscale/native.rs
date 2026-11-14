@@ -4933,6 +4933,21 @@ unsafe fn native_hold(
             result.miss = Some("a frame on the second GPU never finished: the model is off for this session");
             return result;
         }
+        if super::offload::holder(device.handle()) == super::offload::Holder::Finished {
+            // Placement left Finished frame while the game runs: the finished frame's server still has the other GPU's
+            // device. It is asked to let it go (it ends within a frame or two and gives it back); until then the
+            // frames go to DLSS as they are, and the second GPU is not given up.
+            if super::offload::ask_back(device.handle()) {
+                crate::log!(
+                    "[offload] {}: Placement changed while the game runs; the second GPU's device is still with the finished frame's server, which is asked to let it go",
+                    offload_at.name()
+                );
+                crate::logging::flush();
+            }
+            res.native = Some(native);
+            result.miss = Some("the second GPU is changing over from the finished frame");
+            return result;
+        }
         if others_outstanding {
             // Not while holds recorded with these resources may still run (the cache's sets are written for it).
             res.native = Some(native);

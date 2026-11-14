@@ -700,6 +700,36 @@ fn compose_bgr_order(encode_push: &crate::composition::encode_pass::EncodePush) 
     encode_push.bgr_order != 0
 }
 
+/// The composition's GPU time by kind of present, for the log: every [`COMPOSE_COST_FRAMES`] readings of a kind (`carried`:
+/// a present between two runs of the model, which composes the last answer with the ghost guard; else a present with
+/// its own answer), its median and its longest. `None` between lines.
+fn compose_cost_line(carried: bool, ms: f32) -> Option<String> {
+    thread_local! {
+        static READINGS: std::cell::RefCell<[Vec<f32>; 2]> = const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+    }
+    READINGS.with(|r| compose_cost(&mut r.borrow_mut()[usize::from(carried)], carried, ms))
+}
+
+const COMPOSE_COST_FRAMES: usize = 300;
+
+fn compose_cost(readings: &mut Vec<f32>, carried: bool, ms: f32) -> Option<String> {
+    if !ms.is_finite() {
+        return None;
+    }
+    readings.push(ms);
+    if readings.len() < COMPOSE_COST_FRAMES {
+        return None;
+    }
+    readings.sort_by(f32::total_cmp);
+    let (median, max) = (readings[readings.len() / 2], readings[readings.len() - 1]);
+    let n = readings.len();
+    readings.clear();
+    Some(format!(
+        "[compose] gpu_ms of presents {}: median={median:.3} max={max:.3} ({n} frames)",
+        if carried { "carrying the last answer (model interval)" } else { "with their own answer" }
+    ))
+}
+
 /// The log's line when the effect was switched off or on since the last present (`neural_enabled`: the Neural rendering
 /// switch and the toggle key; `apply_model`: Apply model edit), `None` while nothing changed. The first present says
 /// it only when it starts switched off.
@@ -3231,6 +3261,11 @@ pub unsafe fn run(
         // compose itself was refused.
         if let Some(ms) = gpu.take_compose_gpu_ms() {
             shm.publish_compose_gpu_ms(ms);
+            // The reading is the reused slot's last compose: with the two slots alternating at a model interval of 2,
+            // a carried frame's slot last composed a carried frame.
+            if let Some(line) = compose_cost_line(carried_answer, ms) {
+                crate::log!("{line}");
+            }
         }
         if let Some(sem) = sem {
             if let Some(t) = SYNC_TIMING.with(|t| t.take()) {
@@ -5841,6 +5876,21 @@ mod tests {
         assert!(starts <= 1, "the delay started {starts} times: a late answer or a change of the Model resolution restarted it");
         assert!(composed >= 70 && checked >= 70, "only {composed} of 90 presents were delayed");
         rig.finish();
+    }
+
+    /// The composition's cost is logged by kind of present, a line every 300 readings with their median and longest.
+    #[test]
+    fn the_compose_cost_is_said_by_kind_of_present() {
+        let mut readings = Vec::new();
+        for k in 0..COMPOSE_COST_FRAMES - 1 {
+            assert_eq!(compose_cost(&mut readings, true, 1.0 + (k % 3) as f32), None);
+        }
+        assert_eq!(compose_cost(&mut readings, true, f32::NAN), None, "no reading");
+        let line = compose_cost(&mut readings, true, 9.5).expect("the 300th reading");
+        assert_eq!(line, "[compose] gpu_ms of presents carrying the last answer (model interval): median=2.000 max=9.500 (300 frames)");
+        assert!(readings.is_empty(), "the next line starts afresh");
+        let mut own = vec![0.9; COMPOSE_COST_FRAMES - 1];
+        assert!(compose_cost(&mut own, false, 0.9).is_some_and(|l| l.contains("with their own answer: median=0.900 max=0.900")));
     }
 
     /// Every switch of the effect is in the log (#63): off and on by the toggle key or the app's switch, and by Apply

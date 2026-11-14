@@ -214,7 +214,13 @@ impl PostServer {
             // The channel first: a retry while another server holds it makes no device.
             let Some(claim) = claim_channel(view, u64::MAX, st) else { return };
             // Made with the game's device (`offload::make_for`, inside its vkCreateDevice, where the loader's lock is held).
-            let off = match super::offload::take(game_device) {
+            // The holds' runners have the device (Placement was before or after DLSS and became Finished frame while the
+            // game runs): they are ended, which gives it back, and it is taken here.
+            if super::offload::holder(game_device) == super::offload::Holder::Holds && super::offload_pre::release_for_finished(game_device) {
+                crate::log!("[offload] Placement is Finished frame now: the holds' work on the other GPU ended, the finished frame's starts there");
+                crate::logging::flush();
+            }
+            let off = match super::offload::take_for_finished(game_device) {
                 Some(Ok(off)) => {
                     crate::log!("[offload] {}", off.plan);
                     crate::log!("[offload] the present shows each frame's answer one frame later: the game's GPU renders the next frame while the other GPU runs this one");
@@ -228,6 +234,12 @@ impl PostServer {
                     }
                     drop(claim);
                     return end(Status::Unavailable);
+                }
+                None if super::offload::holder(game_device) == super::offload::Holder::Holds => {
+                    // Still with a hold's runner (it could not be ended yet): tried again on the retry schedule, the
+                    // second GPU not given up.
+                    drop(claim);
+                    return end(Status::Retry);
                 }
                 None => {
                     let why = "no device was made for it with the game's device".to_string();
@@ -260,7 +272,7 @@ impl PostServer {
             } else {
                 None
             };
-            let extra = Offloaded { standin, name: off.name.clone() };
+            let extra = Offloaded { standin, name: off.name.clone(), game: game_device };
             let ended = work(&off.device, &instance, off.physical, off.setup, off.import, &loader, view, q, st, claim, Some(extra));
             loader.retire();
             loader.stop_worker();
@@ -307,6 +319,8 @@ impl PostServer {
 struct Offloaded {
     standin: Option<super::offload::Standin>,
     name: String,
+    /// The game's device the offload device was made with (`offload::asked_back`).
+    game: vk::Device,
 }
 
 /// Takes the channel for `token` ([`Owner`]) and checks that nothing outside the process answers it (its heartbeat
@@ -392,6 +406,7 @@ fn work(
     let stalled_name = offloaded.as_ref().map(|o| o.name.clone());
     if let Some(o) = offloaded {
         gpu.standin = o.standin;
+        gpu.offload_game = Some(o.game);
         gpu.slow = Some(super::offload::ServerRule::default());
         crate::log!("[offload] answering the after-the-upscaler path's requests on {}", o.name);
         super::offload::note_state(super::offload::State::Active(o.name));
@@ -549,6 +564,8 @@ struct Gpu {
     /// On another GPU: the rule that gives it up (a hung frame, the network not running), and why it was given up (the
     /// server ends).
     slow: Option<super::offload::ServerRule>,
+    /// On another GPU: the game's device its device was made with (`offload::asked_back`).
+    offload_game: Option<vk::Device>,
     give_up: Option<String>,
     /// On another GPU with sync-fd semaphores: each frame's submission signals this device's exportable semaphore,
     /// and its sync fd is published for the game's present to wait on (`composition::pace::publish`).
@@ -849,6 +866,7 @@ impl Gpu {
             synthetic_flow: None,
             standin: None,
             slow: None,
+            offload_game: None,
             give_up: None,
             export: None,
             publish_for: None,
@@ -959,6 +977,13 @@ fn serve(
             // server answers from the next present.
             if super::offload_trial::finished_local() {
                 crate::log!("[offload] the other GPU's server stops for the trial: the game's GPU runs the model on the finished frame");
+                crate::logging::flush();
+                break;
+            }
+            // Placement left the finished frame while the game runs, and a hold needs the other GPU's device
+            // (`offload::ask_back`): this server ends and gives it back, the second GPU not given up.
+            if gpu.offload_game.is_some_and(super::offload::asked_back) {
+                crate::log!("[offload] the other GPU's server ends: Placement left Finished frame, and the model's hold takes the second GPU");
                 crate::logging::flush();
                 break;
             }

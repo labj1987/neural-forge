@@ -878,6 +878,7 @@ impl ComposeSlot {
         // `writes`' layout (4 storage-image bindings); every image view is live for at
         // least as long as `self.sized` holds its owning `Image`.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let proxy_view = proxy.view;
 
         self.sized = Some(Sized_ {
             width,
@@ -895,7 +896,23 @@ impl ComposeSlot {
             current_buffer,
             current_memory,
         });
+        self.bind_small_proxy(device, proxy_view);
         true
+    }
+
+    /// Binding 4 (`u_proxy_small`): the small proxy's image while there is one, else `fallback` (the proxy's own
+    /// view: the binding is always valid, and not read while the model runs at the frame's size). Called whenever
+    /// either changes, with nothing of this slot pending.
+    fn bind_small_proxy(&self, device: &ash::Device, fallback: vk::ImageView) {
+        let view = self.small_proxy.as_ref().map_or(fallback, |(image, _, _)| image.view);
+        let info = vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.descriptor_set)
+            .dst_binding(4)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(std::slice::from_ref(&info));
+        // SAFETY: this slot's own set, with a live view; no submission of the slot's is pending (its callers' contract).
+        unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
     }
 
     /// `working_scale`'s compose-side counterpart to `capture::CapturePipeline`'s own
@@ -909,13 +926,22 @@ impl ComposeSlot {
                 return true;
             }
         }
+        let fallback = self.sized.as_ref().map(|s| s.proxy.view);
         if let Some((old, _, _)) = self.small_proxy.take() {
+            // The binding leaves the image before it goes.
+            if let Some(view) = fallback {
+                self.bind_small_proxy(device, view);
+            }
             // SAFETY: as in `ensure_small_answer`: only after this slot's fence was waited on.
             unsafe { old.destroy(device) };
         }
         let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
         let Some(image) = create_storage_image(device, mem_props, width, height, usage) else { return false };
         self.small_proxy = Some((image, width, height));
+        // Bound for the ghost guard, which reads it at its own size (the frame's images are sized before this).
+        if let Some(view) = fallback {
+            self.bind_small_proxy(device, view);
+        }
         true
     }
 
@@ -1168,6 +1194,24 @@ impl ComposeSlot {
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[blit],
                         vk::Filter::LINEAR,
+                    );
+                    // The pass reads the small proxy itself too (binding 4, the ghost guard), on this and on the
+                    // carried presents after it.
+                    let sp_to_read = image_barrier(
+                        sp.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::ImageLayout::GENERAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::AccessFlags::SHADER_READ,
+                    );
+                    device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[sp_to_read],
                     );
                 } else {
                     device.cmd_copy_buffer_to_image(
@@ -1538,7 +1582,8 @@ impl GpuCompose {
     /// that as "the GPU compose path isn't available", falling back to
     /// [`super::apply`]'s CPU path, never a reason to stop presenting frames.
     pub fn new(device: &ash::Device, queue_family: u32) -> Option<Self> {
-        let bindings: Vec<_> = (0..4)
+        // The four images of the pass, and the small proxy at its own size (`compose.comp`'s ghost guard).
+        let bindings: Vec<_> = (0..5)
             .map(|i| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(i)
@@ -1615,7 +1660,7 @@ impl GpuCompose {
         // One sync slot plus `ASYNC_SLOTS` async ones, each needing its own 4
         // storage-image descriptors.
         let total_sets = 1 + ASYNC_SLOTS as u32;
-        let pool_size = vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(4 * total_sets);
+        let pool_size = vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(5 * total_sets);
         let pool_info = vk::DescriptorPoolCreateInfo::default().max_sets(total_sets).pool_sizes(std::slice::from_ref(&pool_size));
         // SAFETY: `pool_info` is valid.
         let descriptor_pool = match unsafe { device.create_descriptor_pool(&pool_info, None) } {
@@ -4094,9 +4139,9 @@ mod tests {
             eprintln!("texture moved 2 px, 1/{divisor} of the frame: stale magenta on {n} dark pixels: {without} of 255 without the guard, {with} with it");
             assert!(n > 100, "the texture has dark pixels to look at ({n})");
             assert!(without >= 12, "1/{divisor}: without the guard the old patches' magenta lies on what is dark now ({without})");
-            // Not all of it: a strip narrower than the guard's taps are apart (3 px), right beside a pixel that did
-            // not change, is seen only through the softness of the two reduced pictures, which holds part of the
-            // colour back. Counted over the dark pixels, most of what was stale is gone.
+            // The guard compares the small proxy's own texels, every one of them two each way around the pixel at
+            // these sizes, so a strip two pixels wide is never between two taps.
+            assert!(with <= 4, "1/{divisor}: the guard keeps it off ({with} of 255)");
             let total = |out: &[u8]| -> i64 {
                 let m = |p: &[u8]| (i64::from(p[0]) - i64::from(p[1])) + (i64::from(p[2]) - i64::from(p[1]));
                 (0..w * h)
@@ -4106,10 +4151,7 @@ mod tests {
             };
             let (sum_with, sum_without) = (total(&guarded), total(&unguarded));
             eprintln!("  summed over them: {sum_without} without the guard, {sum_with} with it");
-            assert!(
-                sum_with * 4 <= sum_without,
-                "1/{divisor}: at least three quarters of the stale colour is gone ({sum_with} against {sum_without}; the worst pixel {with} against {without})"
-            );
+            assert!(sum_with * 20 <= sum_without, "1/{divisor}: nineteen twentieths of the stale colour is gone ({sum_with} against {sum_without})");
         }
     }
 

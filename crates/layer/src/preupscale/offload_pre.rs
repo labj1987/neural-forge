@@ -989,6 +989,13 @@ pub(crate) fn release_idle(game: vk::Device, at: Where, idle: Duration) -> bool 
     release(|r| r.game == game && r.at == at && now.saturating_sub(r.touched.load(Ordering::Relaxed)) >= idle.as_millis() as u64)
 }
 
+/// Ends every hold's worker of the game's device `game` (Placement became Finished frame while the game runs: the
+/// finished frame's server takes the other GPU's device, which the last runner gives back as it ends). Whether any
+/// ended.
+pub(crate) fn release_for_finished(game: vk::Device) -> bool {
+    release(|r| r.game == game)
+}
+
 /// Ends the workers `pick` names. A released worker's hold is no longer served: its place on the Status line goes
 /// (the side that takes its place, if one does, sets it again when it is built).
 fn release(pick: impl Fn(&Running) -> bool) -> bool {

@@ -482,6 +482,10 @@ game's GPU no longer spends its frame time on the network:
 3. Add `NEURAL_FORGE_OFFLOAD_GPU=1` (that GPU's index) or its PCI IDs (`NEURAL_FORGE_OFFLOAD_GPU=10de:2c02`) to the
    game's launch options.
 
+Placement can be changed while the game runs: the second GPU follows it. Its device is with one placement at a
+time (the finished frame, or the holds before and after DLSS), so on a change the one that had it ends first; a
+few frames go out without the model meanwhile, and the network is loaded again at the new size.
+
 The second GPU needs everything the network needs (an NVIDIA RTX 40 series or newer), and so does the game's GPU: the
 model goes back to it when the second GPU is given up (the log says so at start where the game's GPU cannot run the
 network).

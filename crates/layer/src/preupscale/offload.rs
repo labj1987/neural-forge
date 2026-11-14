@@ -620,7 +620,7 @@ impl Offload {
             bda_ext: false,
         };
         let name = described[k].line();
-        crate::log!("[offload] a device made on GPU {k} ({name}) for the model on the finished frame: used once Placement is Finished frame");
+        crate::log!("[offload] a device made on GPU {k} ({name}) for the model: used by the placement that runs it (the finished frame, or the holds before and after DLSS), also after Placement changes while the game runs");
         crate::logging::flush();
         let plan = format!(
             "the network runs on GPU {k}: {name}{}; the game's GPU: {}; queue family {family}; the frame crosses system memory: {} on the other GPU, host copies on the game's",
@@ -759,6 +759,22 @@ struct Made {
     game: vk::Device,
     offload: Option<Result<Offload, String>>,
     busy: bool,
+    /// The finished frame's server has the device ([`take_for_finished`]), not a hold's runner.
+    finished: bool,
+    /// A hold asked the finished frame's server to let the device go ([`ask_back`]): the placement left the finished
+    /// frame while the game ran.
+    wanted: bool,
+}
+
+/// Who has the offload device made with a game's device ([`holder`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Holder {
+    /// Nobody: it waits to be taken, or none was made.
+    Free,
+    /// The finished frame's server (`native_post`).
+    Finished,
+    /// The holds' runners (before DLSS, after its output: `offload_server`).
+    Holds,
 }
 
 // SAFETY: the handles and function pointers inside are plain values; the device is used by one thread at a time (the
@@ -791,7 +807,7 @@ pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk:
     }
     let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     all.retain(|m| m.game != device);
-    all.push(Made { game: device, offload: Some(made), busy: false });
+    all.push(Made { game: device, offload: Some(made), busy: false, finished: false, wanted: false });
 }
 
 /// The offload device made with `game` ([`make_for`]), for the server to run on; `None` when none was asked for, the
@@ -820,9 +836,66 @@ pub(crate) fn give_back(game: vk::Device, offload: Offload, busy: bool) {
         Some(m) => {
             m.offload = Some(Ok(offload));
             m.busy |= busy;
+            m.finished = false;
+            m.wanted = false;
         }
-        None => all.push(Made { game, offload: Some(Ok(offload)), busy }),
+        None => all.push(Made { game, offload: Some(Ok(offload)), busy, finished: false, wanted: false }),
     }
+}
+
+/// [`take`] for the finished frame's server: noted as its holder, so that a hold that needs the device after a
+/// change of Placement while the game runs can ask for it ([`ask_back`]) instead of finding nothing and giving the
+/// second GPU up for the session (#63: Finished frame to Before DLSS in a running game put the model on the game's
+/// GPU).
+pub(crate) fn take_for_finished(game: vk::Device) -> Option<Result<Offload, String>> {
+    let taken = take(game);
+    if matches!(taken, Some(Ok(_))) {
+        let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(m) = all.iter_mut().find(|m| m.game == game) {
+            m.finished = true;
+            m.wanted = false;
+        }
+    }
+    taken
+}
+
+/// Who has the offload device made with `game`.
+pub(crate) fn holder(game: vk::Device) -> Holder {
+    let all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match all.iter().find(|m| m.game == game) {
+        Some(m) if m.offload.is_none() && m.finished => Holder::Finished,
+        Some(m) if m.offload.is_none() && !m.busy => Holder::Holds,
+        _ => Holder::Free,
+    }
+}
+
+/// A hold of `game` needs the device the finished frame's server has: that server ends at its next look
+/// ([`asked_back`]) and gives it back. Whether it was asked now (the first time).
+pub(crate) fn ask_back(game: vk::Device) -> bool {
+    let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match all.iter_mut().find(|m| m.game == game && m.offload.is_none() && m.finished) {
+        Some(m) => !std::mem::replace(&mut m.wanted, true),
+        None => false,
+    }
+}
+
+/// Whether a hold asked for the device the finished frame's server has ([`ask_back`]).
+pub(crate) fn asked_back(game: vk::Device) -> bool {
+    MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|m| m.game == game && m.finished && m.wanted)
+}
+
+/// Tests: an entry for `game` whose device could not be made (`why`), to be taken like a made one.
+#[cfg(test)]
+pub(crate) fn made_for_test(game: vk::Device, why: &str) {
+    let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    all.retain(|m| m.game != game);
+    all.push(Made { game, offload: Some(Err(why.into())), busy: false, finished: false, wanted: false });
+}
+
+/// Tests: forgets `game`'s entry.
+#[cfg(test)]
+pub(crate) fn forget_for_test(game: vk::Device) {
+    MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|m| m.game != game);
 }
 
 /// Called inside the game's `vkDestroyDevice` for `game` (the loader's lock held), once its server was joined:
@@ -1308,6 +1381,44 @@ pub(crate) static LATE: Mutex<Option<LateRule>> = Mutex::new(None);
 mod tests {
     use super::*;
 
+    /// A change of Placement while the game runs (#63): the device made with the game's device goes from the
+    /// finished frame's server to a hold and back, asked for, never "no device was made" and a second GPU given up.
+    #[test]
+    fn the_offload_device_changes_hands_with_the_placement() {
+        use ash::vk::Handle;
+        let _state = TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let game = vk::Device::from_raw(0x63_0001);
+        made_for_test(game, "a stand-in for the device");
+        assert_eq!(holder(game), Holder::Free);
+        assert!(!ask_back(game) && !asked_back(game), "nobody has it: nothing to ask back");
+        // (The stand-in entry is an error to take; a made device is noted the same way.)
+        assert!(matches!(take(game), Some(Err(_))));
+        assert_eq!(holder(game), Holder::Holds, "taken by a hold's runner");
+        assert!(!ask_back(game), "a hold's own: its other hold joins it, nothing is asked");
+        // The finished frame's server has it; Placement becomes Before DLSS: the hold asks, once.
+        {
+            let mut all = MADE.lock().unwrap();
+            let m = all.iter_mut().find(|m| m.game == game).unwrap();
+            m.finished = true;
+        }
+        assert_eq!(holder(game), Holder::Finished);
+        assert!(!asked_back(game));
+        assert!(ask_back(game), "asked now");
+        assert!(!ask_back(game), "and only once");
+        assert!(asked_back(game), "the server sees it at its next look and ends");
+        // It never finished a frame: busy devices are nobody's to take.
+        {
+            let mut all = MADE.lock().unwrap();
+            let m = all.iter_mut().find(|m| m.game == game).unwrap();
+            m.finished = false;
+            m.wanted = false;
+            m.busy = true;
+        }
+        assert_eq!(holder(game), Holder::Free, "a device whose frame never finished is not waited for");
+        forget_for_test(game);
+        assert_eq!(holder(game), Holder::Free);
+    }
+
     #[test]
     fn the_gpu_list_belongs_to_one_instance() {
         use ash::vk::Handle;
@@ -1440,7 +1551,7 @@ mod tests {
         let game = vk::Device::from_raw(0x5757_0001);
         assert!(!is_busy(game));
         assert!(take(game).is_none(), "no device was made with it");
-        MADE.lock().unwrap().push(Made { game, offload: None, busy: true });
+        MADE.lock().unwrap().push(Made { game, offload: None, busy: true, finished: false, wanted: false });
         assert!(is_busy(game));
         assert!(matches!(take(game), Some(Err(_))));
         assert!(is_busy(game), "asking for it changes nothing");
