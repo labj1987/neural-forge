@@ -1393,7 +1393,7 @@ fn preupscale_hooks(mode_on: bool, tracked: Option<bool>) -> bool {
 
 /// Whether a second GPU is asked for (`NEURAL_FORGE_OFFLOAD_GPU`): the commands that name a swapchain are hooked
 /// only then (`gpu2_present::commands`), for the swapchain the layer may own when that GPU shows the frames.
-fn second_gpu_asked() -> bool {
+pub(crate) fn second_gpu_asked() -> bool {
     #[cfg(target_arch = "x86_64")]
     return preupscale::offload::Choice::current() != preupscale::offload::Choice::Off;
     #[cfg(not(target_arch = "x86_64"))]

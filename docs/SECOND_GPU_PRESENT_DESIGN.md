@@ -1,4 +1,7 @@
-# The second GPU shows the frame (one-way offload)
+# The second GPU shows the frame (one-way offload, #63, 2026-11-14)
+
+Code: `crates/layer/src/gpu2_present.rs` (the hand-off, both sides) and `crates/layer/src/device.rs` (`gpu2_*`: the
+hooks, the second device's record).
 
 Requested in #63. With the model on the finished frame, the second GPU runs the model and presents the frame
 itself. Each frame crosses the link once and the game never waits for an answer; frames the link or the second GPU
@@ -27,8 +30,8 @@ the second device, and the game has to get something else to render into.
    swapchain on the second device and presents it through the layer's own finished-frame path, run on that device.
    The second device gets a device record of its own (`NeuralForgeDeviceInfo`), so capture, network, composition,
    HDR path, sharpening, hotkey, captures and Status work there exactly as they do on a game's device. The staging
-   memory is imported on both devices (`VK_EXT_external_memory_host`) where both allow it, else copied once on the
-   presenter thread.
+   memory is one mapped buffer per device and slot, copied once on the presenter thread (importing the same pages on
+   both devices with `VK_EXT_external_memory_host` would save that copy: not done yet).
 
 Rejected: a headless shadow swapchain for the game (NVIDIA's driver has no `VK_EXT_headless_surface`: asked on the
 5070, no queue family presents to one); keeping the game's swapchain and adding a second one on the same surface
@@ -48,6 +51,10 @@ Rejected: a headless shadow swapchain for the game (NVIDIA's driver has no `VK_E
 - **Frame Generation**: its frames are ordinary presents of the game's swapchain and are handed off like any other.
 - **Low latency (Reflex)**: sleep requests return at once, markers are dropped, timings report none.
 - **Wayland and X11**: nothing of the surface is touched; only the device that owns its swapchain changes.
+- **Commands newer than the layer framework** that name a swapchain (`VK_EXT_present_timing`'s four,
+  `vkWaitForPresent2KHR`, `vkReleaseSwapchainImagesKHR`) are wrapped through `vkGetDeviceProcAddr`: vkd3d-proton asks
+  the present timing of every swapchain, and NVIDIA's driver hung on the layer's handle (the first game run). A
+  command that names a swapchain and is in neither list would reach the driver with a handle it does not know.
 
 ## Fallback
 
@@ -69,3 +76,19 @@ Rejected: a headless shadow swapchain for the game (NVIDIA's driver has no `VK_E
 Hand-off ring (newest wins, skipped counts), acquire/present image states, a full run with a real swapchain on a
 second lavapipe device (headless surface): frames arrive unchanged, skip under a slow presenter, recreate, failure
 falls back with `OUT_OF_DATE`.
+
+## Measured (2026-11-14, one GPU)
+
+The test machine has one GPU, so the second device is a second device of the same RTX 5070
+(`NEURAL_FORGE_OFFLOAD_GPU=same`): it shows that the path works, not what a second card gains. Cyberpunk 2077's
+benchmark through Steam, 2560x1440, HDR10 (Proton's Wayland driver), Frame Generation on, the full network at full
+resolution on the finished frame: the real swapchain was created on the second device as A2B10G10R10 HDR10 with the
+game's HDR metadata, the game recreated its swapchain once at start, and over the run the game presented 10626
+frames (about 97 a second in the benchmark) of which 4084 were shown and 6542 skipped (62%); the second device
+showed about 20 to 26 frames a second in the benchmark, each taking about 50 ms for the model there (the game and
+the model share the one card); the copy took 3 to 7 ms a frame; video memory peaked at 10.3 GB of 12. The recording
+(vw, 18 s) has no black or alternating frames and its contact sheet is the benchmark's picture; it flags 6 frames
+of colour change at scene cuts and one 205 ms stretch without a new frame.
+
+Not tested: two different cards (the copy over a real link, a monitor on the second card, `vkGetPhysicalDevice
+SurfaceSupportKHR` refusing the surface), X11/Xwayland surfaces, scRGB swapchains, a resize while it runs.

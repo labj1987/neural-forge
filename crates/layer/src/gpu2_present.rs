@@ -1409,8 +1409,8 @@ unsafe fn present_loop(
         if said.elapsed() >= Duration::from_secs(1) {
             said = Instant::now();
             let (n, us) = (shared.copies.swap(0, Ordering::Relaxed), shared.copy_us.swap(0, Ordering::Relaxed));
-            if n > 0 {
-                shared.last_copy_us.store(us / n, Ordering::Relaxed);
+            if let Some(mean) = us.checked_div(n) {
+                shared.last_copy_us.store(mean, Ordering::Relaxed);
             }
             let (shown, skipped) = ring.counts();
             let copy_ms = shared.last_copy_us.load(Ordering::Relaxed) as f64 / 1000.0;
@@ -1426,6 +1426,157 @@ unsafe fn present_loop(
     let (shown, skipped) = ring.counts();
     crate::log!("[present2] the swapchain's presenter ended: {shown} frames shown, {skipped} skipped");
     side
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Commands that name a swapchain and are newer than the layer framework (it hands out the next layer's pointer for
+// them): wrapped through `vkGetDeviceProcAddr`, so the driver never sees a handle of the layer's. Found with
+// vkd3d-proton, which asks `VK_EXT_present_timing` about every swapchain: NVIDIA's driver hung on the layer's handle.
+
+type PfnSwapchainU32 = unsafe extern "system" fn(vk::Device, vk::SwapchainKHR, u32) -> vk::Result;
+type PfnSwapchainOut = unsafe extern "system" fn(vk::Device, vk::SwapchainKHR, *mut std::ffi::c_void, *mut u64) -> vk::Result;
+type PfnInfoOut = unsafe extern "system" fn(vk::Device, *const std::ffi::c_void, *mut std::ffi::c_void) -> vk::Result;
+type PfnSwapchainInfo = unsafe extern "system" fn(vk::Device, vk::SwapchainKHR, *const std::ffi::c_void) -> vk::Result;
+type PfnRelease = unsafe extern "system" fn(vk::Device, *const vk::ReleaseSwapchainImagesInfoEXT) -> vk::Result;
+
+/// The wrapped commands, by name: the index is the command's place in [`NEXT`]'s keys.
+const NEWER: [&[u8]; 6] = [
+    b"vkSetSwapchainPresentTimingQueueSizeEXT",
+    b"vkGetSwapchainTimingPropertiesEXT",
+    b"vkGetSwapchainTimeDomainPropertiesEXT",
+    b"vkGetPastPresentationTimingEXT",
+    b"vkWaitForPresent2KHR",
+    b"vkReleaseSwapchainImagesKHR",
+];
+
+/// The next layer's pointer per device (its dispatch key) and command.
+static NEXT: RwLock<Vec<(usize, usize, usize)>> = RwLock::new(Vec::new());
+
+/// A device's dispatch key (what every handle of one device shares, whichever layer wrapped it).
+unsafe fn dispatch_key(device: vk::Device) -> usize {
+    // SAFETY: a dispatchable handle points at its dispatch table pointer.
+    unsafe { *(device.as_raw() as *const usize) }
+}
+
+fn next_of(device: vk::Device, which: usize) -> Option<usize> {
+    // SAFETY: the application's live device.
+    let key = unsafe { dispatch_key(device) };
+    NEXT.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(|(k, w, _)| *k == key && *w == which).map(|(_, _, f)| *f)
+}
+
+/// `vkGetDeviceProcAddr`'s result for `name`, wrapped when it is one of [`NEWER`] and a second GPU is asked for (`on`).
+///
+/// # Safety
+/// `original` is the next layer's pointer for `name` on `device`.
+pub(crate) unsafe fn intercept(device: vk::Device, name: &[u8], original: vk::PFN_vkVoidFunction, on: bool) -> vk::PFN_vkVoidFunction {
+    let Some(next) = original else { return original };
+    let Some(which) = NEWER.iter().position(|n| *n == name).filter(|_| on && device != vk::Device::null()) else { return original };
+    let own: [usize; 6] = [
+        set_timing_queue_size as PfnSwapchainU32 as usize,
+        get_timing_properties as PfnSwapchainOut as usize,
+        get_time_domains as PfnSwapchainOut as usize,
+        get_past_timing as PfnInfoOut as usize,
+        wait_for_present2 as PfnSwapchainInfo as usize,
+        release_images as PfnRelease as usize,
+    ];
+    if next as usize == own[which] {
+        return original;
+    }
+    // SAFETY: the application's live device.
+    let key = unsafe { dispatch_key(device) };
+    let mut all = NEXT.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    all.retain(|(k, w, _)| !(*k == key && *w == which));
+    all.push((key, which, next as usize));
+    // SAFETY: the wrapper has the command's signature; the pointer is only called as that command.
+    Some(unsafe { std::mem::transmute::<usize, unsafe extern "system" fn()>(own[which]) })
+}
+
+unsafe extern "system" fn set_timing_queue_size(device: vk::Device, swapchain: vk::SwapchainKHR, size: u32) -> vk::Result {
+    if lookup(swapchain).is_some() {
+        return vk::Result::SUCCESS;
+    }
+    match next_of(device, 0) {
+        // SAFETY: the next layer's pointer for this command.
+        Some(f) => unsafe { std::mem::transmute::<usize, PfnSwapchainU32>(f)(device, swapchain, size) },
+        None => vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+    }
+}
+
+/// The layer's swapchain has no refresh cycle to report: not ready, as a swapchain that has not presented yet.
+unsafe extern "system" fn get_timing_properties(device: vk::Device, swapchain: vk::SwapchainKHR, out: *mut std::ffi::c_void, counter: *mut u64) -> vk::Result {
+    if lookup(swapchain).is_some() {
+        return vk::Result::NOT_READY;
+    }
+    match next_of(device, 1) {
+        // SAFETY: the next layer's pointer for this command.
+        Some(f) => unsafe { std::mem::transmute::<usize, PfnSwapchainOut>(f)(device, swapchain, out, counter) },
+        None => vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+    }
+}
+
+/// No time domains: `VkSwapchainTimeDomainPropertiesEXT::timeDomainCount` (after `sType` and `pNext`) is 0.
+unsafe extern "system" fn get_time_domains(device: vk::Device, swapchain: vk::SwapchainKHR, out: *mut std::ffi::c_void, counter: *mut u64) -> vk::Result {
+    if lookup(swapchain).is_some() {
+        if !out.is_null() {
+            // SAFETY: the application's struct: sType (4, padded to 8), pNext (8), then the count.
+            unsafe { *out.cast::<u8>().add(16).cast::<u32>() = 0 };
+        }
+        return vk::Result::SUCCESS;
+    }
+    match next_of(device, 2) {
+        // SAFETY: the next layer's pointer for this command.
+        Some(f) => unsafe { std::mem::transmute::<usize, PfnSwapchainOut>(f)(device, swapchain, out, counter) },
+        None => vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+    }
+}
+
+/// No past presentation timings: `VkPastPresentationTimingInfoEXT::swapchain` is at 24, and
+/// `VkPastPresentationTimingPropertiesEXT::presentationTimingCount` at 32.
+unsafe extern "system" fn get_past_timing(device: vk::Device, info: *const std::ffi::c_void, out: *mut std::ffi::c_void) -> vk::Result {
+    // SAFETY: the application's struct: sType, pNext, flags (4, padded), then the swapchain.
+    if !info.is_null() && lookup(unsafe { *info.cast::<u8>().add(24).cast::<vk::SwapchainKHR>() }).is_some() {
+        if !out.is_null() {
+            // SAFETY: the application's struct: sType, pNext, two counters, then the count.
+            unsafe { *out.cast::<u8>().add(32).cast::<u32>() = 0 };
+        }
+        return vk::Result::SUCCESS;
+    }
+    match next_of(device, 3) {
+        // SAFETY: the next layer's pointer for this command.
+        Some(f) => unsafe { std::mem::transmute::<usize, PfnInfoOut>(f)(device, info, out) },
+        None => vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+    }
+}
+
+/// A present of the layer's swapchain is handed over at once and never waited for.
+unsafe extern "system" fn wait_for_present2(device: vk::Device, swapchain: vk::SwapchainKHR, info: *const std::ffi::c_void) -> vk::Result {
+    if lookup(swapchain).is_some() {
+        return vk::Result::SUCCESS;
+    }
+    match next_of(device, 4) {
+        // SAFETY: the next layer's pointer for this command.
+        Some(f) => unsafe { std::mem::transmute::<usize, PfnSwapchainInfo>(f)(device, swapchain, info) },
+        None => vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+    }
+}
+
+/// `vkReleaseSwapchainImagesKHR` (the EXT command's promoted name, with the same struct).
+unsafe extern "system" fn release_images(device: vk::Device, info: *const vk::ReleaseSwapchainImagesInfoEXT) -> vk::Result {
+    // SAFETY: the application's valid struct.
+    if let Some(v) = unsafe { info.as_ref() }.and_then(|i| lookup(i.swapchain).map(|v| (v, i))).map(|(v, i)| {
+        if i.image_index_count > 0 && !i.p_image_indices.is_null() {
+            // SAFETY: the application's array of that many indices.
+            v.release(unsafe { std::slice::from_raw_parts(i.p_image_indices, i.image_index_count as usize) });
+        }
+    }) {
+        let () = v;
+        return vk::Result::SUCCESS;
+    }
+    match next_of(device, 5) {
+        // SAFETY: the next layer's pointer for this command.
+        Some(f) => unsafe { std::mem::transmute::<usize, PfnRelease>(f)(device, info) },
+        None => vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+    }
 }
 
 #[cfg(test)]
@@ -1540,6 +1691,36 @@ mod tests {
         assert_eq!(showing_line("X", 0, 0, 0.0), "second GPU shows the frames: X; 0 shown, 0 skipped (0%), copy 0.0 ms");
         let not = not_showing_line(&"why ".repeat(100));
         assert!(not.starts_with("second GPU does not show the frames: why") && not.len() < neural_forge_protocol::REASON_BYTES);
+    }
+
+    /// The commands newer than the framework answer for the layer's swapchain themselves and forward any other.
+    #[test]
+    fn the_newer_swapchain_commands_never_pass_the_layers_handle_on() {
+        unsafe extern "system" fn next_timing(_: vk::Device, _: vk::SwapchainKHR, _: *mut std::ffi::c_void, _: *mut u64) -> vk::Result {
+            vk::Result::ERROR_SURFACE_LOST_KHR
+        }
+        // A stand-in device handle: a pointer to its dispatch key.
+        let key: usize = 0x1234;
+        let device = vk::Device::from_raw(std::ptr::from_ref(&key) as u64);
+        let next = unsafe { std::mem::transmute::<PfnSwapchainOut, unsafe extern "system" fn()>(next_timing) };
+        unsafe {
+            assert_eq!(intercept(device, b"vkGetSwapchainTimingPropertiesEXT", Some(next), false).map(|f| f as usize), Some(next as usize), "off: untouched");
+            assert_eq!(intercept(device, b"vkQueueSubmit", Some(next), true).map(|f| f as usize), Some(next as usize), "another command");
+            assert!(intercept(device, b"vkGetSwapchainTimingPropertiesEXT", None, true).is_none(), "an absent command stays absent");
+            let wrapped = intercept(device, b"vkGetSwapchainTimingPropertiesEXT", Some(next), true).expect("wrapped");
+            assert_ne!(wrapped as usize, next as usize);
+            let wrapped = std::mem::transmute::<unsafe extern "system" fn(), PfnSwapchainOut>(wrapped);
+            // Not the layer's: the next layer answers.
+            let other = vk::SwapchainKHR::from_raw(0xdead);
+            assert_eq!(wrapped(device, other, std::ptr::null_mut(), std::ptr::null_mut()), vk::Result::ERROR_SURFACE_LOST_KHR);
+            // The struct offsets the answers are written at.
+            let mut domains = [0xffff_ffffu32; 8];
+            assert_eq!(
+                get_time_domains(device, other, domains.as_mut_ptr().cast(), std::ptr::null_mut()),
+                vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+                "never asked for"
+            );
+        }
     }
 
     #[test]
