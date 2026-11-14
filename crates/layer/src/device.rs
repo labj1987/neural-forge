@@ -2509,6 +2509,7 @@ impl NeuralForgeDeviceInfo {
             surface,
             Box::new(HostShower { info, hdr }),
             off.name.clone(),
+            off.import,
             header,
         ));
         crate::log!("[present2] {} is set up to show the game's frames itself (queue family {family}); the network runs there on the finished frame", off.name);
@@ -2529,6 +2530,7 @@ impl NeuralForgeDeviceInfo {
                     instance: self.instance.as_deref().expect("checked by gpu2_wanted"),
                     physical: self.physical_device,
                     signal: self.gpu2_signal.clone().expect("checked by gpu2_wanted"),
+                    import: self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).external_memory_host,
                 };
                 // A swapchain of the layer's still on this surface that the game did not name as the old one.
                 for other in crate::gpu2_present::on_surface(info.surface) {

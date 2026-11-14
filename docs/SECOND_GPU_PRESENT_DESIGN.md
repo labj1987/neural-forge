@@ -29,9 +29,10 @@ the second device, and the game has to get something else to render into.
 4. **A presenter thread** takes the newest slot once its copy finished, uploads it into the next image of the real
    swapchain on the second device and presents it through the layer's own finished-frame path, run on that device.
    The second device gets a device record of its own (`NeuralForgeDeviceInfo`), so capture, network, composition,
-   HDR path, sharpening, hotkey, captures and Status work there exactly as they do on a game's device. The staging
-   memory is one mapped buffer per device and slot, copied once on the presenter thread (importing the same pages on
-   both devices with `VK_EXT_external_memory_host` would save that copy: not done yet).
+   HDR path, sharpening, hotkey, captures and Status work there exactly as they do on a game's device. Each slot's
+   staging is host memory both devices import (`VK_EXT_external_memory_host`), so the game's GPU writes the frame
+   where the second GPU reads it and the CPU copies nothing; where either device cannot import, the slot is a mapped
+   buffer per device and the presenter copies it once.
 
 Rejected: a headless shadow swapchain for the game (NVIDIA's driver has no `VK_EXT_headless_surface`: asked on the
 5070, no queue family presents to one); keeping the game's swapchain and adding a second one on the same surface
@@ -64,6 +65,8 @@ Rejected: a headless shadow swapchain for the game (NVIDIA's driver has no `VK_E
 - While it runs (a present or upload fails, the second device is lost): the presenter stops, the game's next
   acquire/present returns `VK_ERROR_OUT_OF_DATE_KHR`, and the swapchain it then creates is a real one on its own
   device. The mode stays off for the session. No frame is shown black: the game recreates before it shows another.
+  The second device's record is torn down and its device given back, so the round trip can use it.
+  `NEURAL_FORGE_OFFLOAD_TEST_FAIL=N` fails the second device's `N`th present, to see this in a game.
 
 ## Settings and Status
 
@@ -73,9 +76,10 @@ Rejected: a headless shadow swapchain for the game (NVIDIA's driver has no `VK_E
 
 ## Tests (lavapipe)
 
-Hand-off ring (newest wins, skipped counts), acquire/present image states, a full run with a real swapchain on a
-second lavapipe device (headless surface): frames arrive unchanged, skip under a slow presenter, recreate, failure
-falls back with `OUT_OF_DATE`.
+Hand-off ring (newest wins, skipped counts), acquire/present image states, the newer commands' wrappers, and full
+runs with a real swapchain on a second lavapipe device (headless surface): frames arrive unchanged (copied, and
+through imported host memory), skip under a slow presenter, recreate, failure falls back with `OUT_OF_DATE` and
+leaves the surface free, a swapchain that cannot be shown is refused.
 
 ## Measured (2026-11-14, one GPU)
 
@@ -90,5 +94,18 @@ the model share the one card); the copy took 3 to 7 ms a frame; video memory pea
 (vw, 18 s) has no black or alternating frames and its contact sheet is the benchmark's picture; it flags 6 frames
 of colour change at scene cuts and one 205 ms stretch without a new frame.
 
-Not tested: two different cards (the copy over a real link, a monitor on the second card, `vkGetPhysicalDevice
-SurfaceSupportKHR` refusing the surface), X11/Xwayland surfaces, scRGB swapchains, a resize while it runs.
+Why 62% were skipped on one card: the presenter shows a frame only when the model is done with it, and the model
+at 2560x1440 took about 50 ms there because it shares the card with the game. So it showed 17 to 20 frames a second
+against the game's 97 presents (about 80% skipped in the benchmark, almost none in the menus before the model
+engages). The copy (2 to 6 ms) and the swapchain's FIFO at 288 Hz were not the limit. On a second card the shown
+rate is one over the upload plus that card's own model time.
+
+Two more runs the same day: with `NEURAL_FORGE_OFFLOAD_TEST_FAIL=1500` the second device's 1500th present failed,
+the game recreated its swapchain, got one of its own device, the second device's record was torn down and the round
+trip took over on it for the remaining 70 s (no black frame in the recording across the switch, one 382 ms stretch
+without a new frame). And with the staging as host memory both devices import: 3887 shown, 5823 skipped, the same
+picture (its recording starts in the game's own black loading screen).
+
+Not tested: two different cards (the copy over a real link, a monitor on the second card,
+`vkGetPhysicalDeviceSurfaceSupportKHR` refusing the surface), X11/Xwayland surfaces, scRGB swapchains, a resize
+while it runs.

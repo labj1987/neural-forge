@@ -151,8 +151,9 @@ fn frame_submits(
 unsafe impl Send for PreRunner {}
 
 /// `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (a test switch): that frame of a hold's offload (before DLSS or after its output) fails on the other
-/// GPU, so the fall-back to the game's GPU can be seen in a game.
-fn test_fail_at() -> Option<u64> {
+/// GPU, so the fall-back to the game's GPU can be seen in a game; where the second GPU shows the frames itself
+/// (`crate::gpu2_present`), that frame's present fails there.
+pub(crate) fn test_fail_at() -> Option<u64> {
     static AT: std::sync::LazyLock<Option<u64>> =
         std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_TEST_FAIL").and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0));
     *AT
