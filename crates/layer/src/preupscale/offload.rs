@@ -657,23 +657,23 @@ impl Offload {
     }
 }
 
-/// The instance's real GPUs (not CPU renderers such as llvmpipe) and their names, kept when the game creates a device
-/// (inside its `vkCreateDevice`, the loader's lock held): `gpu2_present` asks them which may present to a window
-/// without enumerating outside that lock.
-static GPUS: Mutex<Vec<(vk::PhysicalDevice, String)>> = Mutex::new(Vec::new());
+/// The real GPUs (not CPU renderers such as llvmpipe) of the instance the game last created a device on, and their
+/// names, kept inside that `vkCreateDevice` (the loader's lock held) with the instance's handle: `gpu2_present` asks
+/// them which may present to a window without enumerating outside that lock, and only for the same instance (a probe
+/// instance made first, by the game or DXVK/vkd3d, is gone by then; its handles must never reach another).
+static GPUS: Mutex<Option<KnownGpus>> = Mutex::new(None);
 
-/// Keeps [`GPUS`] once per process.
+/// [`GPUS`]: an instance's handle and its real GPUs.
+pub(crate) type KnownGpus = (vk::Instance, Vec<(vk::PhysicalDevice, String)>);
+
+/// Keeps [`GPUS`] for `instance`, at every device the game creates (devices are few; the list follows the instance).
 ///
 /// # Safety
 /// `instance` is the game's live instance.
 unsafe fn note_gpus(instance: &ash::Instance) {
-    let mut gpus = GPUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !gpus.is_empty() {
-        return;
-    }
     // SAFETY: the game's live instance and its own physical devices.
     let Ok(physicals) = (unsafe { instance.enumerate_physical_devices() }) else { return };
-    *gpus = physicals
+    let list = physicals
         .into_iter()
         .filter_map(|p| {
             // SAFETY: as above.
@@ -681,6 +681,25 @@ unsafe fn note_gpus(instance: &ash::Instance) {
             real_gpu(props.device_type).then(|| (p, props.device_name_as_c_str().map_or_else(|_| "a GPU".into(), |n| n.to_string_lossy().into_owned())))
         })
         .collect();
+    keep_gpus(&mut GPUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner), instance.handle(), list);
+}
+
+/// [`note_gpus`] on `known`: the list now belongs to `instance`.
+pub(crate) fn keep_gpus(known: &mut Option<KnownGpus>, instance: vk::Instance, list: Vec<(vk::PhysicalDevice, String)>) {
+    *known = Some((instance, list));
+}
+
+/// The real GPUs `known` holds for `instance` ([`GPUS`]); none for another instance.
+pub(crate) fn gpus_of(known: &Option<KnownGpus>, instance: vk::Instance) -> Vec<(vk::PhysicalDevice, String)> {
+    known.as_ref().filter(|(i, _)| *i == instance).map(|(_, l)| l.clone()).unwrap_or_default()
+}
+
+/// The instance is destroyed: its GPUs are forgotten (a later instance may get its handle).
+pub(crate) fn forget_gpus(instance: vk::Instance) {
+    let mut known = GPUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if known.as_ref().is_some_and(|(i, _)| *i == instance) {
+        *known = None;
+    }
 }
 
 /// Whether a device of this type is a GPU (a CPU renderer is not).
@@ -688,9 +707,9 @@ pub(crate) fn real_gpu(kind: vk::PhysicalDeviceType) -> bool {
     kind != vk::PhysicalDeviceType::CPU
 }
 
-/// The instance's real GPUs ([`GPUS`]).
-pub(crate) fn gpus() -> Vec<(vk::PhysicalDevice, String)> {
-    GPUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+/// The real GPUs of `instance` ([`GPUS`]).
+pub(crate) fn gpus(instance: vk::Instance) -> Vec<(vk::PhysicalDevice, String)> {
+    gpus_of(&GPUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner), instance)
 }
 
 /// The GPUs of the instance, in the log once per process (where there is more than one): the indices and IDs
@@ -1280,6 +1299,18 @@ pub(crate) static LATE: Mutex<Option<LateRule>> = Mutex::new(None);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gpu_list_belongs_to_one_instance() {
+        use ash::vk::Handle;
+        let (probe, game) = (vk::Instance::from_raw(0x10), vk::Instance::from_raw(0x20));
+        let mut known = None;
+        keep_gpus(&mut known, probe, vec![(vk::PhysicalDevice::from_raw(1), "RTX 4090".into())]);
+        assert!(gpus_of(&known, game).is_empty(), "a probe instance's handles never reach the game's");
+        keep_gpus(&mut known, game, vec![(vk::PhysicalDevice::from_raw(7), "RTX 5080".into())]);
+        assert_eq!(gpus_of(&known, game), [(vk::PhysicalDevice::from_raw(7), "RTX 5080".to_string())]);
+        assert!(gpus_of(&known, probe).is_empty());
+    }
 
     #[test]
     fn the_choice_parses_every_form_and_refuses_the_rest() {

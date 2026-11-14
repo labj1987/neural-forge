@@ -842,6 +842,9 @@ impl Drop for NeuralForgeInstanceHooks {
             let handle = ctx.instance.handle();
 
             PHYSICAL_DEVICE_INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|_, owner| owner.instance.handle() != handle);
+            // Its GPUs' handles die with it (`gpu2_present`'s refusal must never query them).
+            #[cfg(target_arch = "x86_64")]
+            preupscale::offload::forget_gpus(handle);
         }
     }
 }

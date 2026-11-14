@@ -331,6 +331,10 @@ impl<T> Hosts<T> {
     }
 }
 
+/// What a refusal says while the finished frame's trial keeps the model on the game's GPU (`device`'s `gpu2_wanted`);
+/// the line is cleared when the trial gives the model back.
+pub(crate) const TRIAL_REFUSAL: &str = "the model runs on the game's GPU for the second GPU trial, or stays there after it (it was faster)";
+
 /// The Status tab's line while the second GPU shows the frames (`ShmHeader::second_gpu_present_line`).
 pub(crate) fn showing_line(gpu: &str, shown: u64, skipped: u64, copy_ms: f64) -> String {
     let total = shown + skipped;
@@ -559,7 +563,7 @@ impl Second {
             // SAFETY: the instance's own physical device and the game's live surface.
             unsafe { (self.surface.support)(p, f, surface, &mut yes) == vk::Result::SUCCESS && yes == vk::TRUE }
         };
-        can_present(&crate::preupscale::offload::gpus(), self.physical, families, support)
+        can_present(&crate::preupscale::offload::gpus(self.instance.handle()), self.physical, families, support)
     }
 }
 

@@ -29,6 +29,11 @@ struct Primary {
 
 static PRIMARY: Mutex<Option<Primary>> = Mutex::new(None);
 
+/// Whether `swapchain` of `device` is the primary one: the swapchain the finished-frame path works on.
+fn is_primary(device: vk::Device, swapchain: vk::SwapchainKHR) -> bool {
+    PRIMARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_some_and(|p| p.device == device && p.swapchain == swapchain)
+}
+
 fn claim_primary(device: vk::Device, swapchain: vk::SwapchainKHR, width: u32, height: u32) -> bool {
     claim(&mut PRIMARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner), device, swapchain, width, height)
 }
@@ -2470,7 +2475,7 @@ impl NeuralForgeDeviceInfo {
         // device is the offload's, and the game's GPU is the faster here.
         #[cfg(target_arch = "x86_64")]
         if crate::preupscale::offload_trial::finished_local() {
-            return say("the model runs on the game's GPU for the second GPU trial, or stays there after it (it was faster)".into());
+            return say(crate::gpu2_present::TRIAL_REFUSAL.into());
         }
         let (count, placements) = header.placements();
         if !placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
@@ -5099,13 +5104,26 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         note_present_rate(wait_semaphore.is_some() || series_composed);
         // The finished frame's measured choice between the second GPU and the game's (`offload_trial`, #63).
         #[cfg(target_arch = "x86_64")]
-        crate::preupscale::offload_trial::finished_present(
-            trial_frame.unwrap_or_default(),
-            std::time::Instant::now(),
-            crate::preupscale::offload::active(),
-            wait_semaphore.is_some() || series_composed,
-            trial_frame.is_some(),
-        );
+        // A present of another window or device (a launcher, a second swapchain) pauses nothing: only the primary
+        // swapchain's presents count, and its idle ones (the effect off, the path not engaged) pause the trial.
+        if crate::preupscale::offload::Choice::current() != crate::preupscale::offload::Choice::Off
+            && (trial_frame.is_some() || {
+                // SAFETY: `p_swapchains` holds `swapchain_count` handles for the duration of this call.
+                let swapchains = if present_info.p_swapchains.is_null() {
+                    &[][..]
+                } else {
+                    unsafe { std::slice::from_raw_parts(present_info.p_swapchains, present_info.swapchain_count as usize) }
+                };
+                swapchains.iter().any(|&s| is_primary(self.device.handle(), s))
+            })
+        {
+            crate::preupscale::offload_trial::finished_present(
+                trial_frame,
+                std::time::Instant::now(),
+                crate::preupscale::offload::active(),
+                wait_semaphore.is_some() || series_composed,
+            );
+        }
 
         // SAFETY: `present_info` is valid for the duration of this call; `next_present`
         // was resolved from the next layer/driver's own proc-addr table.

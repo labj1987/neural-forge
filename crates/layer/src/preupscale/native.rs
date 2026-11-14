@@ -526,6 +526,12 @@ pub(crate) fn stop_clock() {
 }
 
 /// Milliseconds since the first call in this process (a monotonic stamp for [`Loader`]'s claims).
+/// Tests: [`epoch_ms`].
+#[cfg(test)]
+pub(crate) fn epoch_ms_for_test() -> u64 {
+    epoch_ms()
+}
+
 fn epoch_ms() -> u64 {
     static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
     START.elapsed().as_millis() as u64 + 1
@@ -777,6 +783,12 @@ impl Loader {
             bda_ext: false,
         };
         Self::start(vk::Device::null(), setup, HoldCounts::default(), true)
+    }
+
+    /// Tests: [`Self::unused`] (what [`Self::give_back_network`] waits for).
+    #[cfg(test)]
+    pub(crate) fn unused_for_test(&self) -> bool {
+        self.unused()
     }
 
     /// Tests: the claims' stamps (the last hold's, the after-the-upscaler path's last frame's) and whether that path runs one.
