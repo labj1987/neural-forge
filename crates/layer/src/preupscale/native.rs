@@ -493,6 +493,15 @@ impl Claims {
         let quiet = |at: u64| epoch_ms().saturating_sub(at) >= PATH_SWITCH_MS;
         !self.in_flight() && quiet(self.last_local.load(SeqCst)) && quiet(self.last_post.load(SeqCst))
     }
+
+    /// [`Self::unused`] once the after-the-upscaler server has ended (its worker is gone, so no frame of that path
+    /// can come): its last frame's stamp does not count, only that none is in flight and that the holds are quiet.
+    fn unused_without_post(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        // A hold that never recorded here (0) has nothing to wait out.
+        let last_local = self.last_local.load(SeqCst);
+        !self.in_flight() && (last_local == 0 || epoch_ms().saturating_sub(last_local) >= PATH_SWITCH_MS)
+    }
 }
 
 /// [`Loader::holds_took_over`] for the last hold's and the last after-the-upscaler frame's stamps (ms since [`epoch_ms`]'s
@@ -785,10 +794,16 @@ impl Loader {
         Self::start(vk::Device::null(), setup, HoldCounts::default(), true)
     }
 
-    /// Tests: [`Self::unused`] (what [`Self::give_back_network`] waits for).
+    /// Tests: [`Self::unused`] (what [`Self::lend`] waits for).
     #[cfg(test)]
     pub(crate) fn unused_for_test(&self) -> bool {
         self.unused()
+    }
+
+    /// Tests: [`Claims::unused_without_post`] (what [`Self::give_back_network`] waits for).
+    #[cfg(test)]
+    pub(crate) fn unused_without_post_for_test(&self) -> bool {
+        self.claims.unused_without_post()
     }
 
     /// Tests: the claims' stamps (the last hold's, the after-the-upscaler path's last frame's) and whether that path runs one.
@@ -878,15 +893,30 @@ impl Loader {
     /// The finished frame's trial gave the model back to the second GPU (`offload_trial::take_back`): the network is
     /// closed here as a lend closes it, so its video memory goes back to the game, and opened again when a path here
     /// asks for it. Whether it will be (not while a path uses it).
+    ///
+    /// The caller's after-the-upscaler server has ended (`Session::ensure_post_server` asks only then), so that
+    /// path's last frame does not make the network wait out [`PATH_SWITCH_MS`]: in #63 that second, and the second
+    /// GPU's loader finding the network still open here and trying again a second later, were two seconds of frames
+    /// without the model at every hand-back.
     pub(crate) fn give_back_network(&self) -> bool {
         // Nothing open (never built here, or closed already): nothing to give back.
-        if self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.is_none() {
+        if !self.network_open() {
             return true;
         }
-        self.lend_for(Some("the model runs on the second GPU: the faster GPU keeps it"))
+        self.lend_with(Some("the model runs on the second GPU: the faster GPU keeps it"), true)
+    }
+
+    /// Whether this device has the process's network open (or is still closing it).
+    pub(crate) fn network_open(&self) -> bool {
+        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.is_some()
     }
 
     fn lend_for(&self, why: Option<&'static str>) -> bool {
+        self.lend_with(why, false)
+    }
+
+    /// [`Self::lend`], with why; `post_ended`: the after-the-upscaler server is gone ([`Claims::unused_without_post`]).
+    fn lend_with(&self, why: Option<&'static str>, post_ended: bool) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         let (lock, wake) = &*self.shared;
         let uses = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).uses;
@@ -898,7 +928,7 @@ impl Loader {
             let _ = self.claims.last_pre.compare_exchange(stamp, before, SeqCst, SeqCst);
             false
         };
-        if !self.unused() {
+        if !(if post_ended { self.claims.unused_without_post() } else { self.unused() }) {
             return refuse();
         }
         let mut st = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

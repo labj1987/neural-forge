@@ -194,35 +194,59 @@ enum Ending {
 }
 
 /// The game's GPU's network to be closed after the finished frame's trial gave the model back to the other GPU: the
-/// loader closes it only once no path here has used it for a while (`native::Loader::give_back_network`), so it is
-/// asked again at every present until it does, or until the game's GPU needs it again.
+/// loader closes it once no path here uses it (`native::Loader::give_back_network`), so it is asked again at every
+/// present until it does, or until the game's GPU needs it again.
+///
+/// The other GPU's server starts only once the network is closed here ([`Self::holds_start`]): one network is open
+/// in the process at a time, and a server started before that found it still open, was refused and tried again a
+/// second later (#63: about two seconds of frames without the model at every hand-back). Not for ever: past
+/// [`Self::HOLD_MAX`] it starts anyway and waits on its own schedule, as before.
 #[cfg(target_arch = "x86_64")]
 #[derive(Debug, Default)]
 struct GiveBack {
+    /// Asked, and the loader has not agreed to close the network yet.
     pending: bool,
+    /// The loader agreed; its worker has not closed the network yet.
+    closing: bool,
+    /// When it was asked ([`Self::holds_start`]'s limit).
+    since: Option<Instant>,
 }
 
 #[cfg(target_arch = "x86_64")]
 impl GiveBack {
-    fn ask(&mut self) {
+    /// The longest the other GPU's server waits for the network to close here.
+    const HOLD_MAX: Duration = Duration::from_secs(3);
+
+    fn ask(&mut self, now: Instant) {
         self.pending = true;
+        self.closing = false;
+        self.since = Some(now);
     }
 
     /// One present: `needed_here` (the trial runs or kept the model on the game's GPU, or its server runs) drops the
-    /// request; otherwise `give` is tried. Whether the network was given back now.
-    fn step(&mut self, needed_here: bool, give: impl FnOnce() -> bool) -> bool {
-        if !self.pending {
-            return false;
-        }
+    /// request; otherwise `give` is tried, and once it agreed `open` says whether the network is still open here.
+    /// Whether the network was given back now (the loader agreed).
+    fn step(&mut self, needed_here: bool, give: impl FnOnce() -> bool, open: impl FnOnce() -> bool) -> bool {
         if needed_here {
-            self.pending = false;
+            *self = Self::default();
             return false;
         }
-        if give() {
+        let mut given = false;
+        if self.pending && give() {
             self.pending = false;
-            return true;
+            self.closing = true;
+            given = true;
         }
-        false
+        if self.closing && !open() {
+            *self = Self::default();
+        }
+        given
+    }
+
+    /// Whether the other GPU's server waits at this present: the network is still open here, and not for longer
+    /// than [`Self::HOLD_MAX`].
+    fn holds_start(&self, now: Instant) -> bool {
+        (self.pending || self.closing) && self.since.is_some_and(|t| now.saturating_duration_since(t) < Self::HOLD_MAX)
     }
 }
 
@@ -6959,7 +6983,7 @@ impl Session {
                         self.post_stalled = true;
                         return;
                     }
-                    Ending::Switch => self.give_back.ask(),
+                    Ending::Switch => self.give_back.ask(now),
                     Ending::Dropped { offload: false } if stalled => {
                         self.post_stalled = true;
                         return;
@@ -6971,7 +6995,7 @@ impl Session {
             // every present until then), unless the trial takes the model back here first.
             if let Some(loader) = self.native.as_ref().filter(|_| choice_on) {
                 let needed_here = offload_trial::finished_local() || (self.post_server.is_some() && !self.post_offload);
-                if self.give_back.step(needed_here, || loader.give_back_network()) {
+                if self.give_back.step(needed_here, || loader.give_back_network(), || loader.network_open()) {
                     crate::log!("[offload] the game's GPU's network is closed: the model runs on the other GPU");
                     crate::logging::flush();
                 }
@@ -7041,6 +7065,10 @@ impl Session {
             {
                 let (count, placements) = view.header().placements();
                 if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
+                    // After a hand-back: once the game's GPU's network is closed (one is open in the process at a time).
+                    if self.give_back.holds_start(now) {
+                        return;
+                    }
                     self.post_offload = true;
                     offload_trial::clear_back();
                     self.post_server = native_post::PostServer::start_offload(instance.clone(), device.handle(), view);
@@ -7491,34 +7519,84 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_game_gpus_network_is_given_back_once_it_is_quiet() {
+        let t0 = Instant::now();
         let mut g = GiveBack::default();
-        assert!(!g.step(false, || panic!("nothing asked")));
-        g.ask();
-        // The loader refuses while the path used it moments ago: asked again at the next presents.
+        assert!(!g.step(false, || panic!("nothing asked"), || panic!("nothing asked")));
+        assert!(!g.holds_start(t0));
+        g.ask(t0);
+        // The loader refuses while a path uses the network: asked again at the next presents.
         let mut tries = 0;
-        assert!(!g.step(false, || {
-            tries += 1;
-            false
-        }));
-        assert!(!g.step(false, || {
-            tries += 1;
-            false
-        }));
-        assert!(g.step(false, || {
-            tries += 1;
-            true
-        }));
+        assert!(!g.step(
+            false,
+            || {
+                tries += 1;
+                false
+            },
+            || panic!("not agreed yet")
+        ));
+        assert!(!g.step(
+            false,
+            || {
+                tries += 1;
+                false
+            },
+            || panic!("not agreed yet")
+        ));
+        assert!(g.step(
+            false,
+            || {
+                tries += 1;
+                true
+            },
+            || true
+        ));
         assert_eq!(tries, 3);
-        assert!(!g.step(false, || panic!("done")));
+        assert!(!g.step(false, || panic!("agreed already"), || false), "said once");
+        assert!(!g.step(false, || panic!("done"), || panic!("done")));
         // The trial takes the model back here first: dropped.
-        g.ask();
-        assert!(!g.step(true, || panic!("needed here")));
-        assert!(!g.step(false, || panic!("dropped")));
-        // A loader whose after-the-upscaler frame came just now refuses (the present then asks again).
+        g.ask(t0);
+        assert!(!g.step(true, || panic!("needed here"), || panic!("needed here")));
+        assert!(!g.step(false, || panic!("dropped"), || panic!("dropped")));
+        assert!(!g.holds_start(t0), "nothing holds the other GPU's server");
+        // A loader with no network open has nothing to give back.
         let loader = native::Loader::idle_for_test();
         loader.stamp_for_test(0, native::epoch_ms_for_test(), false);
-        assert!(!loader.unused_for_test(), "a fresh frame of the path");
+        assert!(!loader.network_open());
         assert!(loader.give_back_network(), "no network open: nothing to give back, the request is done");
+    }
+
+    /// The hand-back of #63 (the finished frame's trial gives the model back to the second GPU): the game's GPU's
+    /// server has ended and its last frame was moments ago. The network is given back at that present, not a second
+    /// later, and the second GPU's server starts only once it is closed here, so its loader never finds it open and
+    /// waits out its retry.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_hand_back_closes_the_network_before_the_other_gpus_server_starts() {
+        // The claims: a frame of the after-the-upscaler path just now, none in flight, no hold recorded here.
+        let loader = native::Loader::idle_for_test();
+        let now_ms = native::epoch_ms_for_test();
+        loader.stamp_for_test(0, now_ms, false);
+        assert!(!loader.unused_for_test(), "another device's loader would be refused: the path ran moments ago");
+        assert!(loader.unused_without_post_for_test(), "the server has ended: its last frame does not hold the network");
+        // A frame of it still running does.
+        loader.stamp_for_test(0, now_ms, true);
+        assert!(!loader.unused_without_post_for_test(), "a frame in flight keeps the network");
+        // The present's sequence: asked when the server has ended; the loader agrees at once; its worker closes the
+        // network a few milliseconds later; only then does the other GPU's server start.
+        let t0 = Instant::now();
+        let mut g = GiveBack::default();
+        g.ask(t0);
+        assert!(g.holds_start(t0), "asked: the other GPU's server waits");
+        assert!(g.step(false, || true, || true), "the loader agreed at the first present");
+        assert!(g.holds_start(t0 + Duration::from_millis(40)), "still open here: it waits");
+        assert!(!g.step(false, || panic!("agreed already"), || false));
+        assert!(!g.holds_start(t0 + Duration::from_millis(80)), "closed: it starts at this present");
+        // A network that never closes (a hold keeps using it) does not hold the other GPU's server for ever.
+        let mut g = GiveBack::default();
+        g.ask(t0);
+        assert!(!g.step(false, || false, || panic!("not agreed")));
+        assert!(g.holds_start(t0 + GiveBack::HOLD_MAX - Duration::from_millis(1)));
+        assert!(!g.holds_start(t0 + GiveBack::HOLD_MAX), "past the limit it starts and waits on its own schedule");
     }
 
     #[cfg(target_arch = "x86_64")]
