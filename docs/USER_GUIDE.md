@@ -560,14 +560,15 @@ The model goes back to the game's GPU for the rest of the session, and the log s
 
 On the finished frame the game never waits for the answer, so nothing above notices a second GPU that makes the whole
 frame slow (the copies across a narrow PCIe link, the second GPU also driving the monitor). Once DLSS runs (in
-gameplay, not in menus; in a game without DLSS from the start, and in a DLSS game that has not run DLSS for five
-minutes, for example with another upscaler) and two windows of presents have about the same frame rate (120 frames or
-5 seconds each, also at 3 fps), the model is tried on the game's GPU, the same trial as below, and the faster keeps
-it. Each switch shows a second or so of frames without the model (the network is built on the GPU that takes over);
-when the model goes back to the second GPU, the game's GPU frees the network's video memory a moment later. Frames
-with the effect switched off do not count. If the GPU that kept the model later becomes slower than the other one was
-measured at, for two windows in a row, the other is tried once more (a tie keeps the earlier choice), and never again
-after that: a slowdown that leaves it still faster (alt-tab, a heavier scene) changes nothing.
+gameplay, not in menus or a long pause menu; in a game without DLSS from the start, and in a game that ships DLSS but
+has not run it for five minutes, for example with another upscaler) and two windows of presents have about the same
+frame rate (120 frames or 5 seconds each, also at 3 fps), the model is tried on the game's GPU, the same trial as
+below, and the faster keeps it. Until then the log says the trial waits for gameplay. Each switch shows a second or
+so of frames without the model (the network is built on the GPU that takes over); when the model goes back to the
+second GPU, the game's GPU frees the network's video memory a moment later. Frames with the effect switched off do not
+count. If the other GPU would later win by the same 10% margin (the GPU that kept the model got slower than that for
+two windows in a row), it is tried once more (a tie keeps the earlier choice), and never again after that: a
+slowdown that leaves the kept GPU ahead (alt-tab, a heavier scene) and small differences change nothing.
 The Status tab says "second GPU: trying the game's GPU for a few seconds" during a trial and "second GPU: not used:
 the game's GPU is faster (...)" while the game's GPU keeps the model; the log's `[offload]` lines give both frame
 rates. `NEURAL_FORGE_OFFLOAD_TRIAL=off` tries nothing.

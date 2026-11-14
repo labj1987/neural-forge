@@ -221,6 +221,8 @@ pub(crate) struct Trial {
     drift: u32,
     retried: bool,
     prefer_local: bool,
+    /// A trial was given up for want of a hand-over ([`HANDOVER_MAX`]): the other GPU's server may still end for it.
+    orphan: bool,
 }
 
 /// Offloaded finished-frame presents as [`Trial::finished_window`] takes them: the key they were of, the last one
@@ -363,8 +365,27 @@ impl Trial {
 
     /// The other GPU's server ended for the trial (`Session::ensure_post_server` saw it end): the game's GPU's presents
     /// are the trial's frames from now on.
-    pub(crate) fn handed_over(&mut self) {
+    pub(crate) fn handed_over(&mut self, now: Instant) {
+        let was = self.handed;
         self.handed = self.running();
+        if !self.running() {
+            // A hand-over after the trial was given up for want of one (`HANDOVER_MAX`): expected, not a failure.
+            self.orphan = false;
+        }
+        if self.handed && !was {
+            // The trial's budgets count from here: the game's GPU only now serves (its network is built from now on).
+            if let Phase::Local(l) = &mut self.phase {
+                l.began = now;
+                l.last = None;
+                l.last_ran = None;
+            }
+        }
+    }
+
+    /// The other GPU's server ending now is the hand-over a trial waited for (running), or one that a trial given up
+    /// for want of it waited for ([`HANDOVER_MAX`]): no failure.
+    pub(crate) fn expects_handover(&self) -> bool {
+        self.finished_local() || self.orphan
     }
 
     /// The other GPU's server starts (again): a give-back not acted on is stale.
@@ -409,10 +430,13 @@ impl Trial {
             if self.finished && !self.handed {
                 if let Phase::Local(l) = &self.phase {
                     if now.saturating_duration_since(l.began) > HANDOVER_MAX {
-                        self.phase = Phase::Watching;
-                        self.waiting = None;
-                        self.back = true;
+                        // The game's GPU never served it: nothing to end there, the other GPU's server starts again.
                         self.aborts += 1;
+                        self.phase = if self.aborts >= ABORTS { Phase::Decided } else { Phase::Watching };
+                        self.waiting = None;
+                        self.back = false;
+                        self.prefer_local = false;
+                        self.orphan = true;
                         let why = "the trial on the game's GPU stopped: the other GPU's server did not hand over; the model goes back to it".to_string();
                         return (None, Some(Verdict::Aborted(why)));
                     }
@@ -425,7 +449,10 @@ impl Trial {
             let verdict = self.local(key, now, composited, (!composited).then_some("no answer from the game's GPU yet"), forced);
             if verdict.is_some() {
                 self.handed = false;
-                self.prefer_local = false;
+                // A re-trial cut short by a change of what is held keeps its tie rule for the next try.
+                if !matches!(verdict, Some(Verdict::Aborted(_))) {
+                    self.prefer_local = false;
+                }
                 self.presents = Presents::default();
                 self.drift = 0;
                 self.decided = match (&self.phase, self.measured) {
@@ -461,13 +488,14 @@ impl Trial {
         }
     }
 
-    /// After the finished frame's verdict: the side that kept the model measured again, window by window, against the
-    /// other side's measured frame time. Once it is no longer the faster in [`DRIFT_WINDOWS`] windows in a row (a game's
-    /// GPU no longer [`MARGIN`] faster than the other GPU was; another GPU slower than the game's GPU was), the other
-    /// is tried once more, never again after: a game's GPU that kept the model gives it back to the other GPU and the
-    /// windows there start the trial again (a tie then keeps it on the game's GPU); another GPU that kept it starts the
-    /// trial on the game's GPU now. A slowdown that hits both (an alt-tab, a throttled card, a heavier scene that is
-    /// still faster than the other side was) spends nothing.
+    /// After the finished frame's verdict, the side that kept the model is measured again, window by window, against
+    /// the frame time measured for the other side. A window counts against it only when the other side would now win
+    /// by the trial's own rule: the game's GPU slower than [`MARGIN`] times the other GPU's measured time, or the other
+    /// GPU slower than [`MARGIN`] times the game's GPU's ([`decide`]). After [`DRIFT_WINDOWS`] such windows in a row the
+    /// other side is tried once more, and never again: a game's GPU that kept the model gives it back to the other GPU,
+    /// whose windows start the trial again (a tie then keeps the game's GPU); another GPU that kept it starts the trial
+    /// on the game's GPU at once. Near-tie noise, and a slowdown that leaves the kept side ahead (an alt-tab, a
+    /// throttled card, a heavier scene), spend nothing.
     fn drifted(&mut self, key: Key, now: Instant, offloaded: bool, composited: bool, enabled: bool) -> Option<String> {
         let (local, local_ms, off_ms) = self.decided?;
         if self.retried || !enabled || offloaded == local {
@@ -475,7 +503,7 @@ impl Trial {
             return None;
         }
         let window = self.presents.note(key, now, composited)?;
-        let lost = if local { !decide(off_ms, window) } else { window > local_ms };
+        let lost = if local { window.as_secs_f64() > off_ms.as_secs_f64() * MARGIN } else { decide(window, local_ms) };
         self.drift = if lost { self.drift + 1 } else { 0 };
         if self.drift < DRIFT_WINDOWS {
             return None;
@@ -639,6 +667,7 @@ impl Trial {
         drift: 0,
         retried: false,
         prefer_local: false,
+        orphan: false,
     };
 }
 
@@ -741,7 +770,12 @@ pub(crate) fn back_pending() -> bool {
 
 /// The other GPU's server ended for the finished frame's trial ([`Trial::handed_over`]).
 pub(crate) fn handed_over() {
-    with_finished(Trial::handed_over);
+    with_finished(|t| t.handed_over(Instant::now()));
+}
+
+/// Whether the other GPU's server ending now is a hand-over ([`Trial::expects_handover`]).
+pub(crate) fn expects_handover() -> bool {
+    with_finished(|t| t.expects_handover())
 }
 
 /// The other GPU's server starts ([`Trial::clear_back`]).
@@ -765,8 +799,20 @@ pub(crate) fn finished_present(frame: Option<(u32, u32)>, now: Instant, offloade
     }
     let key = (frame.unwrap_or_default(), super::placement::settings().0);
     let (enabled, forced) = (enabled(), forced_offload());
-    let gameplay = frame.is_some() && in_gameplay(now);
-    let (started, verdict) = with_finished(|t| t.finished_step(key, now, offloaded, composited, frame.is_some(), gameplay, enabled, forced));
+    let state = if frame.is_some() { in_gameplay(now) } else { Gameplay::No };
+    let (started, verdict, waits) = with_finished(|t| {
+        let gameplay = t.counts_as_gameplay(state);
+        let waits = offloaded && !gameplay && matches!(t.phase, Phase::Watching) && t.decided.is_none();
+        let (started, verdict) = t.finished_step(key, now, offloaded, composited, frame.is_some(), gameplay, enabled, forced);
+        (started, verdict, waits)
+    });
+    if waits {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[offload] the finished frame's trial waits for gameplay (DLSS running) before it measures the second GPU");
+            crate::logging::flush();
+        }
+    }
     if let Some(line) = started {
         crate::log!("[offload] {line}");
         crate::logging::flush();
@@ -777,31 +823,59 @@ pub(crate) fn finished_present(frame: Option<(u32, u32)>, now: Instant, offloade
 /// How often [`in_gameplay`] reads NGX's ring again.
 const GAMEPLAY_EVERY: Duration = Duration::from_millis(100);
 
-/// Whether the game is in gameplay for the finished frame's windows ([`gameplay`]), read at most every
-/// [`GAMEPLAY_EVERY`].
-fn in_gameplay(now: Instant) -> bool {
-    static LAST: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
+/// Whether the game is in gameplay for the finished frame's windows ([`gameplay`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gameplay {
+    /// DLSS runs, or the game has none (or never ran it past the hand-back): every window counts.
+    Yes,
+    /// DLSS ran and has not for [`super::PAUSE_HAND_BACK`]: switched off, or a long pause menu. Only the windows after a
+    /// verdict count ([`Trial::counts_as_gameplay`]): a pause menu must never be a first trial's measurement.
+    HandBack,
+    /// A menu, a loading screen, an intro, or the effect off.
+    No,
+}
+
+impl Trial {
+    /// Whether windows count in `state`: [`Gameplay::HandBack`] only once a verdict was made (its drift windows).
+    pub(crate) fn counts_as_gameplay(&self, state: Gameplay) -> bool {
+        match state {
+            Gameplay::Yes => true,
+            Gameplay::HandBack => self.decided.is_some(),
+            Gameplay::No => false,
+        }
+    }
+}
+
+/// [`gameplay`] now, read at most every [`GAMEPLAY_EVERY`].
+fn in_gameplay(now: Instant) -> Gameplay {
+    static LAST: std::sync::Mutex<Option<(Instant, Gameplay)>> = std::sync::Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((at, was)) = *last {
         if now.saturating_duration_since(at) < GAMEPLAY_EVERY {
             return was;
         }
     }
-    let is = gameplay(crate::ngx_ring::newest_evaluate_seen(), super::dlss_game::since(), now);
+    // DLSS's launches seen without NGX's records (no wrapper) count as evaluates too.
+    let evaluate = crate::ngx_ring::newest_evaluate_seen().max(super::sr_launches_last());
+    let is = gameplay(evaluate, super::dlss_game::since(), now);
     *last = Some((now, is));
     is
 }
 
-/// Gameplay for the finished frame's windows: DLSS evaluates ([`crate::ngx_ring::EVALUATING`]: a new evaluate within
-/// the last second; `evaluate` is when the newest was first seen). Where it does not, the post path's own hand-back
-/// rule decides, as it does for the model (`super::PAUSE_HAND_BACK`): no evaluate for that long since the last one, or
-/// since the process was seen to be a DLSS game (`sign`) when none ever came (Streamline with another upscaler, DLSS
-/// switched off), is gameplay too. A game without DLSS (no sign, no evaluate) is gameplay throughout.
-pub(crate) fn gameplay(evaluate: Option<Instant>, sign: Option<Instant>, now: Instant) -> bool {
+/// Gameplay for the finished frame's windows: DLSS evaluates (`evaluate`, when its newest evaluate or launch was first
+/// seen, within [`crate::ngx_ring::EVALUATING`]). A DLSS game that never ran DLSS (`sign`, when it was seen to be one)
+/// is gameplay once the post path's own hand-back rule says so ([`super::PAUSE_HAND_BACK`] after the sign: Streamline
+/// with another upscaler, Frame Generation only). Once DLSS has run, a long quiet is [`Gameplay::HandBack`]: DLSS
+/// switched off counts after a verdict, but a long pause menu never starts the first trial. A game without DLSS is
+/// gameplay throughout.
+pub(crate) fn gameplay(evaluate: Option<Instant>, sign: Option<Instant>, now: Instant) -> Gameplay {
     let quiet_since = |t: Instant| now.saturating_duration_since(t);
     match evaluate {
-        Some(e) => quiet_since(e) < crate::ngx_ring::EVALUATING || quiet_since(e) >= super::PAUSE_HAND_BACK,
-        None => sign.is_none_or(|s| quiet_since(s) >= super::PAUSE_HAND_BACK),
+        Some(e) if quiet_since(e) < crate::ngx_ring::EVALUATING => Gameplay::Yes,
+        Some(e) if quiet_since(e) >= super::PAUSE_HAND_BACK => Gameplay::HandBack,
+        Some(_) => Gameplay::No,
+        None if sign.is_none_or(|s| quiet_since(s) >= super::PAUSE_HAND_BACK) => Gameplay::Yes,
+        None => Gameplay::No,
     }
 }
 
@@ -1155,7 +1229,7 @@ mod tests {
             let (started, verdict) = t.finished_step(KEY, *now, offloaded, true, true, true, true, false);
             *now += if i % 2 == 0 { every + jitter } else { every - jitter };
             if started.is_some() {
-                t.handed_over();
+                t.handed_over(*now);
             }
             if started.is_some() || verdict.is_some() {
                 return (i, started, verdict);
@@ -1257,7 +1331,7 @@ mod tests {
             now += MS(5);
         }
         assert!(t.running());
-        t.handed_over();
+        t.handed_over(now);
         assert!(present(&mut t, &mut now, MS(5), false, 3000).2.is_some_and(|v| matches!(v, Verdict::Local { .. })));
     }
 
@@ -1329,7 +1403,7 @@ mod tests {
         let (_, line, _) = present(&mut t, &mut now, MS(30), true, 2000);
         assert!(line.is_some_and(|l| l.contains("the other GPU got slower") && l.contains("trying the model on the game's GPU")));
         assert!(t.running() && t.finished_local());
-        t.handed_over();
+        t.handed_over(now);
         // A tie here keeps the other GPU, as the first verdict did.
         assert!(matches!(present(&mut t, &mut now, MS(30), false, 3000).2, Some(Verdict::Offload(_))));
         assert!(t.take_back());
@@ -1347,44 +1421,6 @@ mod tests {
         }
         let (_, started, _) = present(&mut t, &mut now, MS(20), true, 1000);
         assert!(started.is_some_and(|s| s.contains("every 20.0 ms (50 fps)")));
-    }
-
-    #[test]
-    fn gameplay_is_dlss_evaluating_or_the_post_paths_hand_back() {
-        let now = Instant::now() + Duration::from_secs(1000);
-        let ago = |s: u64| Some(now - Duration::from_secs(s));
-        let ms_ago = |ms: u64| Some(now - MS(ms));
-        assert!(gameplay(ms_ago(500), ago(900), now), "DLSS evaluating");
-        assert!(!gameplay(ago(2), ago(900), now), "DLSS paused: a menu");
-        assert!(gameplay(ago(301), ago(900), now), "DLSS off for longer than the hand-back");
-        assert!(!gameplay(None, ago(10), now), "a DLSS game before its first evaluate");
-        assert!(gameplay(None, ago(301), now), "a DLSS game that never evaluates (another upscaler, Frame Generation only)");
-        assert!(gameplay(None, None, now), "a game without DLSS");
-    }
-
-    #[test]
-    fn a_trial_the_other_gpus_server_never_hands_over_ends() {
-        let mut t = Trial::default();
-        let mut now = Instant::now();
-        for _ in 0..100_000 {
-            let (started, _) = t.finished_step(KEY, now, true, true, true, true, true, false);
-            now += MS(20);
-            if started.is_some() {
-                break;
-            }
-        }
-        assert!(t.running());
-        let mut verdict = None;
-        for _ in 0..2000 {
-            verdict = t.finished_step(KEY, now, false, true, true, true, true, false).1;
-            now += MS(20);
-            if verdict.is_some() {
-                break;
-            }
-        }
-        assert!(matches!(verdict, Some(Verdict::Aborted(ref w)) if w.contains("did not hand over")), "{verdict:?}");
-        assert!(!t.running() && !t.finished_local() && t.take_back());
-        assert!(t.finished_status_line().is_none(), "no \"trying\" line for good");
     }
 
     #[test]
@@ -1408,6 +1444,108 @@ mod tests {
         local_hold(KEY, now, true, None);
         assert!(with_finished(|t| t.running()));
         reset_for_test();
+    }
+
+    #[test]
+    fn gameplay_is_dlss_evaluating_or_the_post_paths_hand_back() {
+        let now = Instant::now() + Duration::from_secs(1000);
+        let ago = |s: u64| Some(now - Duration::from_secs(s));
+        let ms_ago = |ms: u64| Some(now - MS(ms));
+        assert_eq!(gameplay(ms_ago(500), ago(900), now), Gameplay::Yes, "DLSS evaluating (or its launches seen)");
+        assert_eq!(gameplay(ago(2), ago(900), now), Gameplay::No, "DLSS paused: a menu");
+        assert_eq!(gameplay(ago(301), ago(900), now), Gameplay::HandBack, "DLSS quiet past the hand-back: switched off, or a long pause");
+        assert_eq!(gameplay(None, ago(10), now), Gameplay::No, "a DLSS game before its first evaluate");
+        assert_eq!(gameplay(None, ago(301), now), Gameplay::Yes, "a DLSS game that never evaluates (another upscaler, Frame Generation only)");
+        assert_eq!(gameplay(None, None, now), Gameplay::Yes, "a game without DLSS");
+        // A pause menu of five minutes never measures a first trial; after a verdict, DLSS switched off counts.
+        let mut t = Trial::default();
+        assert!(!t.counts_as_gameplay(Gameplay::HandBack) && t.counts_as_gameplay(Gameplay::Yes) && !t.counts_as_gameplay(Gameplay::No));
+        t.decided = Some((true, MS(10), MS(20)));
+        assert!(t.counts_as_gameplay(Gameplay::HandBack));
+    }
+
+    #[test]
+    fn near_ties_never_spend_the_re_trial() {
+        // The other GPU kept it at 10.0 ms against the game's GPU's 9.5 ms (within the margin): noise around 10 ms.
+        let mut t = Trial { phase: Phase::Decided, decided: Some((false, Duration::from_micros(9_500), MS(10))), ..Default::default() };
+        let mut now = Instant::now();
+        assert!(present_j(&mut t, &mut now, Duration::from_micros(10_300), MS(1), true, 5000).1.is_none());
+        // The game's GPU kept it at 9.0 ms against the other GPU's 10.0 ms: noise up to 10.5 ms.
+        let mut t = Trial { phase: Phase::KeptLocal("kept".into()), decided: Some((true, MS(9), MS(10))), ..Default::default() };
+        let mut now = Instant::now();
+        assert!(present_j(&mut t, &mut now, Duration::from_micros(10_500), MS(1), false, 5000).1.is_none());
+        assert!(!t.retried);
+    }
+
+    #[test]
+    fn a_late_hand_over_starts_the_build_budget_then() {
+        let mut t = Trial::default();
+        let mut now = Instant::now();
+        for _ in 0..100_000 {
+            let (started, _) = t.finished_step(KEY, now, true, true, true, true, true, false);
+            now += MS(20);
+            if started.is_some() {
+                break;
+            }
+        }
+        // The hand-over comes 14 s later (the other GPU's server took long to end).
+        for _ in 0..700 {
+            assert!(t.finished_step(KEY, now, false, true, true, true, true, false).1.is_none());
+            now += MS(20);
+        }
+        t.handed_over(now);
+        // Then the network is built on the game's GPU: two seconds without the answer.
+        for _ in 0..100 {
+            let v = t.finished_step(KEY, now, false, false, true, true, true, false).1;
+            assert!(v.is_none(), "the build budget counts from the hand-over: {v:?}");
+            now += MS(20);
+        }
+        assert!(matches!(present(&mut t, &mut now, MS(5), false, 3000).2, Some(Verdict::Local { .. })));
+    }
+
+    #[test]
+    fn a_trial_the_other_gpus_server_never_hands_over_ends() {
+        let mut t = Trial::default();
+        let mut now = Instant::now();
+        for _ in 0..100_000 {
+            let (started, _) = t.finished_step(KEY, now, true, true, true, true, true, false);
+            now += MS(20);
+            if started.is_some() {
+                break;
+            }
+        }
+        assert!(t.running());
+        let mut verdict = None;
+        for _ in 0..2000 {
+            verdict = t.finished_step(KEY, now, false, true, true, true, true, false).1;
+            now += MS(20);
+            if verdict.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(verdict, Some(Verdict::Aborted(ref w)) if w.contains("did not hand over")), "{verdict:?}");
+        assert!(!t.running() && !t.finished_local() && !t.take_back(), "nothing to end on the game's GPU");
+        assert!(t.finished_status_line().is_none(), "no \"trying\" line for good");
+        assert_eq!(t.aborts, 1, "counts toward the aborts");
+        // The other GPU's server ending late is the hand-over it was: no failure; then nothing is expected.
+        assert!(t.expects_handover());
+        t.handed_over(now);
+        assert!(!t.expects_handover());
+    }
+
+    #[test]
+    fn a_re_trial_cut_short_keeps_its_tie_rule() {
+        let mut t = Trial::default();
+        let mut now = Instant::now();
+        assert!(present(&mut t, &mut now, MS(200), true, 1000).1.is_some());
+        assert!(matches!(present(&mut t, &mut now, Duration::from_micros(12_500), false, 2000).2, Some(Verdict::Local { .. })));
+        assert!(present(&mut t, &mut now, MS(250), false, 2000).1.is_some_and(|l| l.contains("tried once more")));
+        assert!(t.take_back() && t.prefer_local);
+        assert!(present(&mut t, &mut now, MS(200), true, 1000).1.is_some());
+        // Another size during the re-trial: aborted, and the tie rule stays for the next try.
+        let other = ((1920, 1080), 1);
+        assert!(matches!(t.finished_step(other, now, false, true, true, true, true, false).1, Some(Verdict::Aborted(_))));
+        assert!(t.prefer_local);
     }
 
     #[test]

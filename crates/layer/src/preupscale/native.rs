@@ -879,6 +879,10 @@ impl Loader {
     /// closed here as a lend closes it, so its video memory goes back to the game, and opened again when a path here
     /// asks for it. Whether it will be (not while a path uses it).
     pub(crate) fn give_back_network(&self) -> bool {
+        // Nothing open (never built here, or closed already): nothing to give back.
+        if self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.is_none() {
+            return true;
+        }
         self.lend_for(Some("the model runs on the second GPU: the faster GPU keeps it"))
     }
 

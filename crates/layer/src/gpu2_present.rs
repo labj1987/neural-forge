@@ -332,8 +332,32 @@ impl<T> Hosts<T> {
 }
 
 /// What a refusal says while the finished frame's trial keeps the model on the game's GPU (`device`'s `gpu2_wanted`);
-/// the line is cleared when the trial gives the model back.
+/// the line is cleared when the trial gives the model back ([`clear_trial_refusal`]).
 pub(crate) const TRIAL_REFUSAL: &str = "the model runs on the game's GPU for the second GPU trial, or stays there after it (it was faster)";
+
+/// A Status line of the trial's refusal ([`TRIAL_REFUSAL`]) was written and not yet cleared.
+static TRIAL_LINE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the trial's refusal may be the Status line now: never over another refusal (the real reason, such as the
+/// desktop drawing the window on the other GPU, stays). Notes that it is the line from now on.
+pub(crate) fn trial_refusal_may_show(current: &str) -> bool {
+    let free = current.is_empty() || current.contains(TRIAL_REFUSAL) || current.starts_with("second GPU shows the frames");
+    if free {
+        TRIAL_LINE.store(true, Ordering::Release);
+    }
+    free
+}
+
+/// Clears the trial's refusal from the Status line, if it is there (the trial no longer keeps the model on the game's
+/// GPU). Cheap while it never was written.
+pub(crate) fn clear_trial_refusal(header: &neural_forge_protocol::ShmHeader) {
+    if TRIAL_LINE.swap(false, Ordering::AcqRel) {
+        let line = header.second_gpu_present_line();
+        if line.contains(TRIAL_REFUSAL) {
+            header.set_second_gpu_present_line("");
+        }
+    }
+}
 
 /// The Status tab's line while the second GPU shows the frames (`ShmHeader::second_gpu_present_line`).
 pub(crate) fn showing_line(gpu: &str, shown: u64, skipped: u64, copy_ms: f64) -> String {
@@ -1900,6 +1924,14 @@ mod tests {
         assert!(!crate::preupscale::offload::real_gpu(vk::PhysicalDeviceType::CPU), "llvmpipe is never kept");
         assert!(crate::preupscale::offload::real_gpu(vk::PhysicalDeviceType::DISCRETE_GPU));
         assert!(cannot_present("RTX 5080", &can_present(&gpus, a, |_| 1, |_, _| false)).contains("is the monitor plugged into it?"));
+    }
+
+    #[test]
+    fn the_trials_refusal_never_hides_the_real_one() {
+        let real = not_showing_line(&cannot_present("RTX 5080", &["RTX 4090".into()]));
+        assert!(!trial_refusal_may_show(&real), "the desktop's GPU and its fix stay");
+        assert!(trial_refusal_may_show(""));
+        assert!(trial_refusal_may_show(&not_showing_line(TRIAL_REFUSAL)));
     }
 
     #[test]

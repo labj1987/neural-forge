@@ -2475,6 +2475,10 @@ impl NeuralForgeDeviceInfo {
         // device is the offload's, and the game's GPU is the faster here.
         #[cfg(target_arch = "x86_64")]
         if crate::preupscale::offload_trial::finished_local() {
+            // Never over the real refusal (the desktop's GPU and its fix): that one stays the Status line.
+            if !crate::gpu2_present::trial_refusal_may_show(&header.second_gpu_present_line()) {
+                return Err(Some(crate::gpu2_present::TRIAL_REFUSAL.into()));
+            }
             return say(crate::gpu2_present::TRIAL_REFUSAL.into());
         }
         let (count, placements) = header.placements();

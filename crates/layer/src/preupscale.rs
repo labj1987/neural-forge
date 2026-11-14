@@ -403,6 +403,11 @@ fn note_sr_launch() {
     *run = Some(SrLaunches::after(*run, Instant::now()));
 }
 
+/// When DLSS's launches were last seen (held or not, with or without NGX's records): `offload_trial`'s gameplay.
+pub(crate) fn sr_launches_last() -> Option<Instant> {
+    sr_launches().map(|r| r.last)
+}
+
 fn sr_launches() -> Option<SrLaunches> {
     *lock(&SR_LAUNCHES)
 }
@@ -6916,7 +6921,16 @@ impl Session {
         let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_hold());
         // The finished frame's trial on the game's GPU, or its verdict for it (`offload_trial`): the offload's state
         // still says Active there, but the game's GPU runs the model.
-        let trial_line = offload_trial::finished_status_line().filter(|_| at_present && !offload::active() && !offload::given_up());
+        let choice_on = offload::Choice::current() != offload::Choice::Off;
+        let trial_line = if choice_on && at_present && !offload::active() && !offload::given_up() { offload_trial::finished_status_line() } else { None };
+        // present2's refusal made for the trial (`gpu2_present::TRIAL_REFUSAL`) no longer holds once the trial does not
+        // keep the model on the game's GPU, whichever way it ended.
+        #[cfg(target_arch = "x86_64")]
+        if choice_on && !offload_trial::finished_local() {
+            if let Some(v) = shm.view() {
+                crate::gpu2_present::clear_trial_refusal(v.header());
+            }
+        }
         if let Some(line) = trial_line.or_else(|| offload::status_line().filter(|_| offload_line)) {
             // Against what the channel holds (the native backend's line shares it): written when it says something else,
             // except that once the offload was given up the native backend's own line (the network running here, or why
@@ -6955,7 +6969,7 @@ impl Session {
             }
             // The game's GPU's network after a give-back: closed once no path here has used it for a while (asked again at
             // every present until then), unless the trial takes the model back here first.
-            if let Some(loader) = &self.native {
+            if let Some(loader) = self.native.as_ref().filter(|_| choice_on) {
                 let needed_here = offload_trial::finished_local() || (self.post_server.is_some() && !self.post_offload);
                 if self.give_back.step(needed_here, || loader.give_back_network()) {
                     crate::log!("[offload] the game's GPU's network is closed: the model runs on the other GPU");
@@ -6963,10 +6977,15 @@ impl Session {
                 }
             }
             let status = self.post_server.as_ref().map(native_post::PostServer::status);
-            if offload::given_up() {
-                offload_trial::clear_back();
-            }
-            match post_action(status, self.post_offload, offload_trial::finished_local(), offload_trial::back_pending()) {
+            let (trial, back) = if choice_on {
+                if offload::given_up() {
+                    offload_trial::clear_back();
+                }
+                (offload_trial::expects_handover(), offload_trial::back_pending())
+            } else {
+                (false, false)
+            };
+            match post_action(status, self.post_offload, trial, back) {
                 PostAction::Wait => {
                     if status == Some(Status::Serving) && self.post_retry.failing() {
                         self.post_retry.succeeded();
@@ -6980,13 +6999,6 @@ impl Session {
                     if let Some(server) = self.post_server.take() {
                         server.stop_soon();
                         self.post_ending = Some((server, Ending::Switch));
-                    }
-                    // A refusal of the second GPU's present made for the trial no longer holds.
-                    if let Some(v) = shm.view() {
-                        let h = v.header();
-                        if h.second_gpu_present_line().contains(crate::gpu2_present::TRIAL_REFUSAL) {
-                            h.set_second_gpu_present_line("");
-                        }
                     }
                     return;
                 }
@@ -7506,7 +7518,7 @@ mod tests {
         let loader = native::Loader::idle_for_test();
         loader.stamp_for_test(0, native::epoch_ms_for_test(), false);
         assert!(!loader.unused_for_test(), "a fresh frame of the path");
-        assert!(!loader.give_back_network());
+        assert!(loader.give_back_network(), "no network open: nothing to give back, the request is done");
     }
 
     #[cfg(target_arch = "x86_64")]
