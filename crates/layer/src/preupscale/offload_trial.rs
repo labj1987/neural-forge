@@ -301,7 +301,7 @@ impl Trial {
             return None;
         }
         let before = self.waiting.replace((key, frame));
-        let Some((_, last)) = before.filter(|&(k, _)| k == key) else { return None };
+        let (_, last) = before.filter(|&(k, _)| k == key)?;
         // Two windows that agree are one scene, and its frame time is what the game's GPU is measured against. Where
         // the game waits for the other GPU for half its frame or more, two windows that differ start the trial too,
         // against the shorter of them (the other GPU at its best): after DLSS at 2048x1536 a second GPU held the game
