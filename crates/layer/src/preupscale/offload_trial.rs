@@ -29,6 +29,9 @@ use std::time::{Duration, Instant};
 pub(crate) const WAIT_MIN: Duration = Duration::from_millis(2);
 /// The share of the frame time the mean wait must reach as well.
 pub(crate) const WAIT_SHARE: f64 = 0.10;
+/// The share of the frame time the wait reaches where the other GPU sets the frame rate outright: the trial then
+/// starts on two windows in a row even when their frame times differ ([`Trial::offloaded`]).
+pub(crate) const WAIT_HEAVY: f64 = 0.50;
 /// How far two windows (two offloaded ones in a row, or the local window's halves) may differ and still agree.
 pub(crate) const AGREE: f64 = 0.10;
 /// Local holds after the trial began that count for nothing: the network's build on the game's GPU, the first
@@ -108,6 +111,12 @@ fn forced_offload() -> bool {
     *ON
 }
 
+/// Whether a hold's miss is the network's build on the game's GPU (`native`'s words for it): "the native network is
+/// still loading", "the game is loading".
+fn is_loading(miss: &str) -> bool {
+    miss.contains("still loading") || miss.contains("is loading")
+}
+
 /// What is held, which a window's frame times belong to: the hold's extent and the frame's pass count.
 pub(crate) type Key = ((u32, u32), usize);
 
@@ -185,6 +194,9 @@ struct Local {
     ran: u32,
     holds: u32,
     missed: u32,
+    /// Since when the holds miss because the network is still loading on the game's GPU ([`is_loading`]): its build's
+    /// budget ([`BUILD_BUDGET`]) counts from there (from the trial's start before anything ran).
+    loading: Option<Instant>,
     last: Option<Instant>,
     paused: Duration,
     /// The last hold's time if it ran the model; `None` after a miss (an interval is only between two holds that ran).
@@ -289,9 +301,16 @@ impl Trial {
             return None;
         }
         let before = self.waiting.replace((key, frame));
-        if !before.is_some_and(|(k, f)| k == key && agree(f, frame)) {
+        let Some((_, last)) = before.filter(|&(k, _)| k == key) else { return None };
+        // Two windows that agree are one scene, and its frame time is what the game's GPU is measured against. Where
+        // the game waits for the other GPU for half its frame or more, two windows that differ start the trial too,
+        // against the shorter of them (the other GPU at its best): after DLSS at 2048x1536 a second GPU held the game
+        // to 37-48 fps, its two windows 21 and 27 ms apart, and no trial ever came (#63).
+        let heavy = wait.as_secs_f64() >= frame.as_secs_f64() * WAIT_HEAVY;
+        if !agree(last, frame) && !heavy {
             return None;
         }
+        let frame = if agree(last, frame) { frame } else { frame.min(last) };
         self.waiting = None;
         self.finished = false;
         self.phase = Phase::Local(Local {
@@ -303,6 +322,7 @@ impl Trial {
             ran: 0,
             holds: 0,
             missed: 0,
+            loading: None,
             last: None,
             paused: Duration::ZERO,
             last_ran: None,
@@ -339,6 +359,7 @@ impl Trial {
             ran: 0,
             holds: 0,
             missed: 0,
+            loading: None,
             last: None,
             paused: Duration::ZERO,
             last_ran: None,
@@ -563,10 +584,25 @@ impl Trial {
             return Some(Verdict::Offload(UNMEASURED.into()));
         }
         if !ran {
-            l.missed += 1;
             // A frame without the model: the next interval would span it.
             l.last_ran = None;
-            let failed = if l.ran == 0 { now.saturating_duration_since(l.began) > BUILD_BUDGET } else { l.missed >= MISSES };
+            // The network still loading on the game's GPU is its build, which has its budget and nothing else: such
+            // holds are not misses of a model that runs. (#63: a hold recorded for the other GPU before the trial
+            // reported "ran" after it began, and the 30 holds of the build's first quarter second then read as 30
+            // misses: "could not run the model" 0.25 s into a load that takes one or two, the model sent straight
+            // back, and the offload's side torn down and built again under it.)
+            let failed = if miss.is_some_and(is_loading) {
+                let since = *l.loading.get_or_insert(if l.ran == 0 { l.began } else { now });
+                now.saturating_duration_since(since) > BUILD_BUDGET
+            } else {
+                l.loading = None;
+                l.missed += 1;
+                if l.ran == 0 {
+                    now.saturating_duration_since(l.began) > BUILD_BUDGET
+                } else {
+                    l.missed >= MISSES
+                }
+            };
             l.last = Some(now);
             if failed {
                 self.back = l.finished;
@@ -579,6 +615,7 @@ impl Trial {
             return None;
         }
         l.missed = 0;
+        l.loading = None;
         l.ran += 1;
         l.last = Some(now);
         let previous = l.last_ran.replace(now);
@@ -997,6 +1034,69 @@ mod tests {
             assert!(t.offloaded(KEY, MS(36), MS(16), false, now).is_none());
         }
         assert!(!t.running());
+    }
+
+    /// After DLSS with Ray Reconstruction at 2048x1536 (#63): the game waited 20 and 27 ms of its 21 and 27 ms frames
+    /// for the other GPU, and the two windows, more than a tenth apart, never started the trial. A wait of half the
+    /// frame or more starts it, measured against the shorter window; a light wait still needs two that agree.
+    #[test]
+    fn a_game_held_up_for_most_of_its_frame_is_tried_though_its_windows_differ() {
+        let now = Instant::now();
+        let us = Duration::from_micros;
+        let mut t = Trial::default();
+        assert!(t.offloaded(KEY, us(21_000), us(20_200), true, now).is_none(), "one window starts nothing");
+        let why = t.offloaded(KEY, us(27_300), us(27_000), true, now).expect("the second, 30% longer, starts it");
+        assert!(why.contains("a frame every 21.0 ms"), "against the shorter window: {why}");
+        assert!(t.running());
+        // A light wait: windows that differ are two scenes, as before.
+        let mut t = Trial::default();
+        assert!(t.offloaded(KEY, MS(20), MS(8), true, now).is_none());
+        assert!(t.offloaded(KEY, MS(30), MS(8), true, now).is_none(), "8 of 30 ms: not held up for most of the frame");
+        assert!(!t.running());
+        // Another size between them starts nothing, however heavy.
+        let mut t = Trial::default();
+        assert!(t.offloaded(KEY, MS(21), MS(20), true, now).is_none());
+        assert!(t.offloaded(((2048, 1536), 1), MS(27), MS(26), true, now).is_none());
+    }
+
+    /// #63's lost device began here: a hold that "ran" (recorded for the other GPU before the trial) and then the
+    /// build's first holds, 30 of them in a quarter of a second, were taken for a model that stopped running. The
+    /// build has its 15 s, however many holds come meanwhile, and the trial then measures.
+    #[test]
+    fn the_networks_build_on_the_game_gpu_is_not_thirty_misses() {
+        let (mut t, mut now) = started(MS(36), MS(16));
+        now += MS(3);
+        assert!(t.local(KEY, now, true, None, false).is_none(), "a hold that ran");
+        for k in 0..600 {
+            now += MS(3);
+            assert!(t.local(KEY, now, false, Some("the native network is still loading"), false).is_none(), "hold {k} of the build: no verdict");
+        }
+        assert!(t.running() && t.keeps_local(), "1.8 s into the build the trial still runs on the game's GPU");
+        // Built: the holds run, and the trial measures as ever.
+        now += MS(13);
+        assert!(t.local(KEY, now, true, None, false).is_none());
+        // A build that never ends still gives the frames back, after its budget.
+        let mut verdict = None;
+        for _ in 0..2000 {
+            now += MS(20);
+            verdict = t.local(KEY, now, false, Some("the native network is still loading"), false);
+            if verdict.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(verdict, Some(Verdict::Offload(why)) if why.contains("still loading")), "after {BUILD_BUDGET:?} of loading");
+        // Misses for another reason, once it ran, are still 30 in a row.
+        let (mut t, mut now) = started(MS(36), MS(16));
+        assert!(t.local(KEY, now, true, None, false).is_none());
+        let mut after = 0;
+        for k in 1..=MISSES {
+            now += MS(13);
+            if t.local(KEY, now, false, Some("the VRAM guard paused the network"), false).is_some() {
+                after = k;
+                break;
+            }
+        }
+        assert_eq!(after, MISSES);
     }
 
     #[test]
