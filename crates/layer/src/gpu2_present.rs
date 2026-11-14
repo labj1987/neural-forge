@@ -341,6 +341,8 @@ pub(crate) struct Second {
     pub shower: Box<dyn Shower>,
     /// For the Status tab and the log.
     pub name: String,
+    /// `VK_EXT_external_memory_host` is enabled on it: the staging can be host memory both devices import.
+    pub import: bool,
     /// A swapchain of the game is being shown on it (one at a time: its queue is one presenter's).
     busy: AtomicBool,
     /// Why it stopped showing frames, for the session.
@@ -364,9 +366,10 @@ impl Second {
         surface: SurfaceFns,
         shower: Box<dyn Shower>,
         name: String,
+        import: bool,
         header: Option<&'static neural_forge_protocol::ShmHeader>,
     ) -> Self {
-        Self { device, instance, physical, queue, family, surface, shower, name, busy: AtomicBool::new(false), failed: Mutex::new(None), header }
+        Self { device, instance, physical, queue, family, surface, shower, name, import, busy: AtomicBool::new(false), failed: Mutex::new(None), header }
     }
 
     /// Why the second GPU stopped showing frames this session, if it did.
@@ -540,6 +543,54 @@ impl Stage {
     }
 }
 
+/// Host memory for one staging slot that both devices import (`VK_EXT_external_memory_host`): the game's GPU writes
+/// the frame into it and the second GPU reads it from there, with no copy by the CPU.
+struct Pages {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Pages {
+    fn new(len: usize) -> Option<Self> {
+        // SAFETY: an anonymous private mapping of `len` bytes (page-aligned by the kernel).
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        (ptr != libc::MAP_FAILED).then_some(Self { ptr: ptr.cast(), len })
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        // SAFETY: this mapping, made by `new`; every buffer imported from it was destroyed (or it was leaked instead).
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
+/// One slot's staging on both devices from the same host pages, where both import host memory: the game's side, the
+/// second device's and the pages. `None`: this slot is staged in a buffer per device and copied by the presenter.
+///
+/// # Safety
+/// Both devices are live and have `VK_EXT_external_memory_host` enabled.
+unsafe fn shared_stage(game: &GameDevice, second: &Second, bytes: u64) -> Option<(Stage, Stage, Pages)> {
+    let a = crate::capture::min_imported_host_pointer_alignment(game.instance, game.physical)?;
+    let b = crate::capture::min_imported_host_pointer_alignment(&second.instance, second.physical)?;
+    let align = a.max(b).max(4096);
+    let len = bytes.div_ceil(align) * align;
+    let pages = Pages::new(len as usize)?;
+    // SAFETY: the pages are `len` bytes, aligned to both devices' import alignment, and outlive both buffers.
+    unsafe {
+        let (buffer, memory) =
+            crate::capture::import_host_buffer(game.device, game.instance, game.physical, pages.ptr, len, vk::BufferUsageFlags::TRANSFER_DST)?;
+        let ours = Stage { buffer, memory, ptr: pages.ptr };
+        match crate::capture::import_host_buffer(&second.device, &second.instance, second.physical, pages.ptr, len, vk::BufferUsageFlags::TRANSFER_SRC) {
+            Some((buffer, memory)) => Some((ours, Stage { buffer, memory, ptr: pages.ptr }, pages)),
+            None => {
+                ours.destroy(game.device);
+                None
+            }
+        }
+    }
+}
+
 fn color_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 }
 }
@@ -684,6 +735,8 @@ pub(crate) struct Virtual {
     pub extent: vk::Extent2D,
     images: Vec<(vk::Image, vk::DeviceMemory)>,
     stages: Vec<GameStage>,
+    /// The host pages of the slots both devices import (the others are copied by the presenter).
+    pages: Mutex<Vec<Pages>>,
     bytes: u64,
     ring: Arc<Ring>,
     pub shared: Arc<Shared>,
@@ -731,6 +784,8 @@ pub(crate) struct GameDevice<'a> {
     pub instance: &'a ash::Instance,
     pub physical: vk::PhysicalDevice,
     pub signal: Signal,
+    /// `VK_EXT_external_memory_host` is enabled on it.
+    pub import: bool,
 }
 
 impl Virtual {
@@ -799,7 +854,7 @@ impl Virtual {
                 VIRTUALS.write().unwrap_or_else(std::sync::PoisonError::into_inner).push((handle, v.clone()));
                 LIVE.fetch_add(1, Ordering::AcqRel);
                 crate::log!(
-                    "[present2] the game's swapchain {}x{} {:?} {:?} is shown by {}: {} images for the game, present mode {mode:?} there{}; each frame crosses once ({:.1} MB), the game never waits",
+                    "[present2] the game's swapchain {}x{} {:?} {:?} is shown by {}: {} images for the game, present mode {mode:?} there{}; each frame crosses once ({:.1} MB, {}), the game never waits",
                     extent.width,
                     extent.height,
                     info.image_format,
@@ -807,7 +862,12 @@ impl Virtual {
                     second.name,
                     v.images.len(),
                     if mode == info.present_mode { String::new() } else { format!(" (the game asked for {:?})", info.present_mode) },
-                    bytes as f64 / 1e6
+                    bytes as f64 / 1e6,
+                    match v.shared_slots() {
+                        SLOTS => "through host memory both GPUs import, no CPU copy",
+                        0 => "through a buffer on each GPU and one CPU copy",
+                        _ => "some slots through host memory both GPUs import, the others with one CPU copy",
+                    }
                 );
                 crate::logging::flush();
                 second.publish(&showing_line(&second.name, 0, 0, 0.0));
@@ -835,6 +895,8 @@ impl Virtual {
         let mut images: Vec<(vk::Image, vk::DeviceMemory)> = Vec::new();
         let mut stages: Vec<GameStage> = Vec::new();
         let mut second_stages: Vec<Stage> = Vec::new();
+        // Dropped (unmapped) after `undo` destroyed the buffers imported from them, on every failure below.
+        let mut pages: Vec<Pages> = Vec::new();
         // SAFETY: valid create infos on live devices; `undo` destroys what was made.
         unsafe {
             let undo = |images: &[(vk::Image, vk::DeviceMemory)], stages: &[GameStage], second_stages: &[Stage]| {
@@ -911,10 +973,26 @@ impl Virtual {
                 }
             }
             for _ in 0..SLOTS {
-                let made = Stage::new(d, game.instance, game.physical, bytes, vk::BufferUsageFlags::TRANSFER_DST, true).and_then(|stage| {
-                    d.create_fence(&vk::FenceCreateInfo::default(), None).map(|fence| GameStage { stage, fence }).map_err(|e| format!("a fence failed ({e:?})"))
+                // Host pages both devices import, where both can: nothing is copied by the CPU. Else a buffer per
+                // device, copied by the presenter.
+                let both = if game.import && second.import { shared_stage(game, second, bytes) } else { None };
+                let (ours, other) = match both {
+                    Some((ours, other, host)) => {
+                        pages.push(host);
+                        (Ok(ours), Ok(other))
+                    }
+                    None => (
+                        Stage::new(d, game.instance, game.physical, bytes, vk::BufferUsageFlags::TRANSFER_DST, true),
+                        Stage::new(&second.device, &second.instance, second.physical, bytes, vk::BufferUsageFlags::TRANSFER_SRC, false),
+                    ),
+                };
+                let made = ours.and_then(|stage| match d.create_fence(&vk::FenceCreateInfo::default(), None) {
+                    Ok(fence) => Ok(GameStage { stage, fence }),
+                    Err(e) => {
+                        stage.destroy(d);
+                        Err(format!("a fence failed ({e:?})"))
+                    }
                 });
-                let other = Stage::new(&second.device, &second.instance, second.physical, bytes, vk::BufferUsageFlags::TRANSFER_SRC, false);
                 match (made, other) {
                     (Ok(a), Ok(b)) => {
                         stages.push(a);
@@ -978,6 +1056,7 @@ impl Virtual {
                 }),
                 images,
                 stages,
+                pages: Mutex::new(pages),
                 bytes,
                 ring: Arc::new(Ring::new()),
                 shared: Arc::new(Shared::new()),
@@ -1013,6 +1092,11 @@ impl Virtual {
                 self.shared.fail(&self.second, format!("the presenter thread could not start ({e})"));
             }
         }
+    }
+
+    /// How many staging slots are host memory both devices import.
+    pub(crate) fn shared_slots(&self) -> usize {
+        self.pages.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     /// The game's images.
@@ -1264,6 +1348,8 @@ impl Virtual {
                     .is_err()
             {
                 crate::log!("[present2] the copies of a destroyed swapchain did not finish: its staging is left to the device's end");
+                // The pages too: the GPU may still write them.
+                std::mem::forget(std::mem::take(&mut *self.pages.lock().unwrap_or_else(std::sync::PoisonError::into_inner)));
                 return;
             }
             if let Some((_, pool, _)) = inner.pool.take() {
@@ -1278,6 +1364,8 @@ impl Virtual {
                 d.free_memory(*m, None);
             }
         }
+        // The buffers imported from them are gone on both devices (the second side went first): unmapped.
+        self.pages.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 }
 
@@ -1312,6 +1400,7 @@ unsafe fn present_loop(
     let d = &second.device;
     let mut said = Instant::now();
     let mut logged = 0u64;
+    let mut presents = 0u64;
     loop {
         let (k, _seq) = match ring.take(Duration::from_millis(100)) {
             Take::Closed => break,
@@ -1340,9 +1429,12 @@ unsafe fn present_loop(
             unsafe { second.shower.set_hdr_metadata(side.swapchain, &m) };
         }
         let t = Instant::now();
-        // SAFETY: both mappings are `bytes` long and distinct; the game's copy finished and nothing reads the
-        // second device's buffer (its last upload was waited for).
-        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, side.stages[k].ptr, bytes as usize) };
+        // A slot both devices import is the same memory: nothing to copy.
+        if src as *const u8 != side.stages[k].ptr.cast_const() {
+            // SAFETY: both mappings are `bytes` long and distinct; the game's copy finished and nothing reads the
+            // second device's buffer (its last upload was waited for).
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, side.stages[k].ptr, bytes as usize) };
+        }
         // SAFETY: the real swapchain and the presenter's own objects, on this thread only.
         let shown = unsafe {
             (|| -> Result<bool, vk::Result> {
@@ -1383,6 +1475,11 @@ unsafe fn present_loop(
                 shared.copies.fetch_add(1, Ordering::Relaxed);
                 let (swapchains, indices) = ([side.swapchain], [index]);
                 let info = vk::PresentInfoKHR::default().swapchains(&swapchains).image_indices(&indices);
+                presents += 1;
+                if crate::preupscale::offload_server::test_fail_at() == Some(presents) {
+                    // The test's failure (`NEURAL_FORGE_OFFLOAD_TEST_FAIL`): the fall-back, seen in a game.
+                    return Err(vk::Result::ERROR_UNKNOWN);
+                }
                 match second.shower.present(second.queue, &info) {
                     vk::Result::SUCCESS => Ok(suboptimal),
                     vk::Result::SUBOPTIMAL_KHR => Ok(true),
@@ -1830,6 +1927,7 @@ mod tests {
         fail: Arc<AtomicBool>,
         metadata: Arc<AtomicUsize>,
         other: (ash::Device, vk::CommandPool, vk::Buffer, vk::DeviceMemory),
+        import: bool,
     }
 
     const EXTENT: vk::Extent2D = vk::Extent2D { width: 64, height: 48 };
@@ -1837,6 +1935,11 @@ mod tests {
     impl Rig {
         /// `None` without a Vulkan device that has a headless surface and swapchains (lavapipe has both).
         fn new() -> Option<Self> {
+            Self::with(false)
+        }
+
+        /// With `import`, both devices have `VK_EXT_external_memory_host` (`None` where it is not offered).
+        fn with(import: bool) -> Option<Self> {
             unsafe {
                 let entry = ash::Entry::load().ok()?;
                 let offered = entry.enumerate_instance_extension_properties(None).ok()?;
@@ -1857,9 +1960,19 @@ mod tests {
                 if supported == vk::FALSE {
                     return None;
                 }
+                if import
+                    && !instance
+                        .enumerate_device_extension_properties(physical)
+                        .is_ok_and(|e| e.iter().any(|x| x.extension_name_as_c_str() == Ok(crate::EXTERNAL_MEMORY_HOST_EXTENSION)))
+                {
+                    return None;
+                }
                 let device = || {
                     let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&[1.0])];
-                    let exts = [ash::khr::swapchain::NAME.as_ptr()];
+                    let mut exts = vec![ash::khr::swapchain::NAME.as_ptr()];
+                    if import {
+                        exts.push(crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr());
+                    }
                     instance.create_device(physical, &vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&exts), None).ok()
                 };
                 let (game, other) = (device()?, device()?);
@@ -1887,8 +2000,18 @@ mod tests {
                 };
                 let _ = shower.pool;
                 let other_queue = other.get_device_queue(0, 0);
-                let second =
-                    Arc::new(Second::new(other, instance.clone(), physical, other_queue, 0, fns, Box::new(shower), "the test's second device".into(), None));
+                let second = Arc::new(Second::new(
+                    other,
+                    instance.clone(),
+                    physical,
+                    other_queue,
+                    0,
+                    fns,
+                    Box::new(shower),
+                    "the test's second device".into(),
+                    import,
+                    None,
+                ));
                 Some(Self {
                     _entry: entry,
                     instance,
@@ -1905,6 +2028,7 @@ mod tests {
                     fail,
                     metadata,
                     other: other_parts,
+                    import,
                 })
             }
         }
@@ -1931,6 +2055,7 @@ mod tests {
                 physical: self.physical,
                 // The test's one queue, used by one thread: the game's and the layer's own.
                 signal: Signal { queue: self.queue, lock: Arc::default() },
+                import: self.import,
             };
             unsafe { Virtual::create(&game, &self.second, info, old) }.map(|h| lookup(h).expect("registered"))
         }
@@ -2034,11 +2159,31 @@ mod tests {
         }
         assert_eq!(rig.shades(), (0..8).map(|n| 10 + 20 * n).collect::<Vec<u8>>());
         assert_eq!(v.ring.counts(), (8, 0));
+        assert_eq!(v.shared_slots(), 0, "without host-memory import on both devices each slot is copied once");
         assert_eq!(rig.metadata.load(Ordering::Relaxed), 1, "the game's HDR metadata reached the real swapchain once");
         assert!(rig.second.failed().is_none());
         assert!(unsafe { destroy(Rig::handle(&v)) });
         assert!(lookup(Rig::handle(&v)).is_none());
         assert!(!rig.second.busy.load(Ordering::Acquire));
+    }
+
+    /// Where both devices import host memory, every slot is the same pages on both and the frames arrive the same,
+    /// with nothing copied by the CPU.
+    #[test]
+    fn frames_cross_through_host_memory_both_devices_import() {
+        let Some(rig) = Rig::with(true) else { return };
+        let v = rig.create(&rig.info(vk::SwapchainKHR::null()), None).expect("the swapchain");
+        assert_eq!(v.shared_slots(), SLOTS);
+        for n in 0..9u64 {
+            assert_eq!(rig.frame(&v, 10 + 20 * n as u8), vk::Result::SUCCESS);
+            rig.wait_for(&v, n + 1);
+        }
+        assert_eq!(rig.shades(), (0..9).map(|n| 10 + 20 * n).collect::<Vec<u8>>());
+        assert!(unsafe { destroy(Rig::handle(&v)) });
+        // Another swapchain gets and frees its own pages.
+        let v = rig.create(&rig.info(vk::SwapchainKHR::null()), None).expect("another");
+        assert_eq!(v.shared_slots(), SLOTS);
+        assert!(unsafe { destroy(Rig::handle(&v)) });
     }
 
     #[test]
