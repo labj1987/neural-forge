@@ -259,6 +259,91 @@ pub(crate) fn verdict(result: vk::Result) -> Verdict {
     }
 }
 
+/// [`verdict`] of an error while a frame is shown: only the acquire itself may find the swapchain busy (the frame is
+/// skipped and the next tried). Once an image is acquired (`acquired`), a timeout before its present leaves that
+/// image unpresented and the acquire's semaphore signalled, which the next acquire may not find: the second GPU
+/// cannot go on.
+pub(crate) fn frame_verdict(result: vk::Result, acquired: bool) -> Verdict {
+    match verdict(result) {
+        Verdict::Busy if acquired => Verdict::Failed,
+        v => v,
+    }
+}
+
+/// Why the mode cannot start for a swapchain, known before the second GPU's device is taken for it: the game names
+/// an old swapchain (`names_old`) that is not the layer's (`old_is_layers`), so a swapchain of the game's own device
+/// has the window, and the second GPU can only take a window from the start.
+pub(crate) fn early_refusal(names_old: bool, old_is_layers: bool) -> Option<&'static str> {
+    (names_old && !old_is_layers).then_some("the game already has a swapchain of its own on this window; it starts with the next game start")
+}
+
+/// The second GPU's side per game device, with what its owner keeps with it (`T`: the device taken for it, given
+/// back at the end). The lock is never held while a side is made or torn down: both ask the registry themselves
+/// (the second device's record is torn down like any device's, which looks its own handle up here).
+pub(crate) struct Hosts<T> {
+    all: Mutex<Vec<(vk::Device, Arc<Second>, T)>>,
+}
+
+impl<T> Hosts<T> {
+    pub(crate) const fn new() -> Self {
+        Self { all: Mutex::new(Vec::new()) }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(vk::Device, Arc<Second>, T)>> {
+        self.all.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `game`'s side: the one there is, else the one `make` makes (called unlocked). Should another thread have made
+    /// one meanwhile, that one is returned and `unmake` (unlocked) undoes this call's.
+    pub(crate) fn get_or_make(
+        &self,
+        game: vk::Device,
+        make: impl FnOnce() -> Result<(Arc<Second>, T), String>,
+        unmake: impl FnOnce(Arc<Second>, T),
+    ) -> Result<Arc<Second>, String> {
+        let find = |all: &Vec<(vk::Device, Arc<Second>, T)>| all.iter().find(|(g, _, _)| *g == game).map(|(_, s, _)| s.clone());
+        if let Some(second) = find(&self.lock()) {
+            return Ok(second);
+        }
+        let (second, kept) = make()?;
+        let lost = {
+            let mut all = self.lock();
+            match find(&all) {
+                Some(other) => Some((other, second, kept)),
+                None => {
+                    all.push((game, second.clone(), kept));
+                    return Ok(second);
+                }
+            }
+        };
+        let (other, second, kept) = lost.expect("returned above otherwise");
+        unmake(second, kept);
+        Ok(other)
+    }
+
+    /// Whether `device` is the second device of some game's side.
+    pub(crate) fn hosts(&self, device: vk::Device) -> bool {
+        self.lock().iter().any(|(_, s, _)| s.device.handle() == device)
+    }
+
+    /// Takes `game`'s side out, whatever it shows.
+    pub(crate) fn take(&self, game: vk::Device) -> Option<(Arc<Second>, T)> {
+        let mut all = self.lock();
+        let k = all.iter().position(|(g, _, _)| *g == game)?;
+        let (_, second, kept) = all.remove(k);
+        Some((second, kept))
+    }
+
+    /// Takes `game`'s side out if it shows no swapchain (any more): after a refused create or a fall-back its device
+    /// must go back to whoever lent it, or nothing else can use the second GPU for the rest of the session.
+    pub(crate) fn take_if_idle(&self, game: vk::Device) -> Option<(Arc<Second>, T)> {
+        let mut all = self.lock();
+        let k = all.iter().position(|(g, s, _)| *g == game && !s.busy.load(Ordering::Acquire))?;
+        let (_, second, kept) = all.remove(k);
+        Some((second, kept))
+    }
+}
+
 /// The Status tab's line while the second GPU shows the frames (`ShmHeader::second_gpu_present_line`).
 pub(crate) fn showing_line(gpu: &str, shown: u64, skipped: u64, copy_ms: f64) -> String {
     let total = shown + skipped;
@@ -803,7 +888,9 @@ impl Virtual {
     ) -> Result<vk::SwapchainKHR, String> {
         // The old swapchain's presenter first: the second device's queue and the surface are then this call's.
         let mut old_side = old.and_then(|o| o.retire());
-        let held = old.is_some();
+        // Whether the old swapchain still had the second device (not when it was released before: another swapchain
+        // may have it by now).
+        let held = old_side.is_some();
         let refuse = |side: &mut Option<SecondSide>, why: String| {
             if let Some(side) = side.take() {
                 // SAFETY: the old presenter was joined by `retire`.
@@ -841,6 +928,8 @@ impl Virtual {
                 return Err(why);
             }
         };
+        // Whatever `old` was: the second device shows this swapchain from here on.
+        second.busy.store(true, Ordering::Release);
         let extent = info.image_extent;
         let bytes = u64::from(extent.width) * u64::from(extent.height) * texel;
         // SAFETY: both devices are live; everything made is destroyed on failure.
@@ -1177,6 +1266,12 @@ impl Virtual {
         let live = !inner.retired && matches!(verdict(status), Verdict::Shown | Verdict::Suboptimal);
         // SAFETY: the game device is live; the pool and buffers are this swapchain's own.
         let pool_ok = live && family.is_some_and(|family| unsafe { self.ensure_pool(&mut inner, family) });
+        if live && !pool_ok {
+            // No way to copy the frames out (the queue's family is unknown or another than the first present's, or
+            // its pool could not be made): nothing would ever be shown again, so the game gets its own swapchain.
+            self.shared.fail(&self.second, format!("the game's frames cannot be copied out on the queue it presents on (family {family:?})"));
+        }
+        let status = self.shared.status();
         let seqs = inner.slot_seq;
         let slot = if pool_ok { self.ring.claim(|k| seqs[k] == 0 || self.fence_done(k)) } else { None };
         let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
@@ -1436,9 +1531,11 @@ unsafe fn present_loop(
             unsafe { std::ptr::copy_nonoverlapping(src as *const u8, side.stages[k].ptr, bytes as usize) };
         }
         // SAFETY: the real swapchain and the presenter's own objects, on this thread only.
+        let acquired = std::cell::Cell::new(false);
         let shown = unsafe {
             (|| -> Result<bool, vk::Result> {
                 let (index, suboptimal) = fns.acquire_next_image(side.swapchain, 1_000_000_000, side.acquired, vk::Fence::null())?;
+                acquired.set(true);
                 let image = side.images[index as usize];
                 d.reset_fences(&[side.fence])?;
                 d.begin_command_buffer(side.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
@@ -1496,7 +1593,7 @@ unsafe fn present_loop(
             }
             Err(e) => {
                 ring.done(k, false);
-                match verdict(e) {
+                match frame_verdict(e, acquired.get()) {
                     Verdict::Stale(r) => shared.note(r),
                     Verdict::Busy => {}
                     _ => shared.fail(second, format!("showing a frame failed ({e:?})")),
@@ -1778,6 +1875,26 @@ mod tests {
         assert_eq!(shared.status(), vk::Result::ERROR_OUT_OF_DATE_KHR);
     }
 
+    /// F4: a timeout is "busy, try the next frame" only from the acquire itself.
+    #[test]
+    fn a_timeout_after_the_acquire_is_a_failure_not_a_busy_swapchain() {
+        for busy in [vk::Result::TIMEOUT, vk::Result::NOT_READY] {
+            assert_eq!(frame_verdict(busy, false), Verdict::Busy);
+            assert_eq!(frame_verdict(busy, true), Verdict::Failed);
+        }
+        assert_eq!(frame_verdict(vk::Result::ERROR_OUT_OF_DATE_KHR, true), Verdict::Stale(vk::Result::ERROR_OUT_OF_DATE_KHR));
+        assert_eq!(frame_verdict(vk::Result::ERROR_DEVICE_LOST, false), Verdict::Failed);
+    }
+
+    /// F2: a real old swapchain has the window; the layer's own old one, or none, does not stop the mode.
+    #[test]
+    fn a_real_old_swapchain_refuses_the_mode_before_the_second_device_is_taken() {
+        assert!(early_refusal(true, false).is_some_and(|why| why.contains("next game start")));
+        assert_eq!(early_refusal(true, true), None);
+        assert_eq!(early_refusal(false, false), None);
+        assert!(not_showing_line(early_refusal(true, false).unwrap()).len() < neural_forge_protocol::REASON_BYTES);
+    }
+
     #[test]
     fn the_status_lines_fit_the_channel() {
         let long = "NVIDIA GeForce RTX 5080 (10de:2c02) at 0000:05:00.0, driver 620.70.06, a very long description indeed";
@@ -1841,6 +1958,7 @@ mod tests {
         seen: Arc<Mutex<Vec<[u8; 4]>>>,
         hold: Arc<Mutex<()>>,
         fail: Arc<AtomicBool>,
+        timeout: Arc<AtomicBool>,
         metadata: Arc<AtomicUsize>,
     }
 
@@ -1859,6 +1977,9 @@ mod tests {
             let _held = self.hold.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if self.fail.load(Ordering::Acquire) {
                 return vk::Result::ERROR_DEVICE_LOST;
+            }
+            if self.timeout.load(Ordering::Acquire) {
+                return vk::Result::TIMEOUT;
             }
             unsafe {
                 let (swapchain, index) = (*info.p_swapchains, *info.p_image_indices);
@@ -1925,6 +2046,7 @@ mod tests {
         seen: Arc<Mutex<Vec<[u8; 4]>>>,
         hold: Arc<Mutex<()>>,
         fail: Arc<AtomicBool>,
+        timeout: Arc<AtomicBool>,
         metadata: Arc<AtomicUsize>,
         other: (ash::Device, vk::CommandPool, vk::Buffer, vk::DeviceMemory),
         import: bool,
@@ -1985,7 +2107,7 @@ mod tests {
                 let other_cmd =
                     other.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(other_pool).command_buffer_count(1)).ok()?[0];
                 let stage = Stage::new(&other, &instance, physical, 4, vk::BufferUsageFlags::TRANSFER_DST, true).ok()?;
-                let (seen, hold, fail, metadata) = (Arc::default(), Arc::default(), Arc::default(), Arc::default());
+                let (seen, hold, fail, timeout, metadata) = (Arc::default(), Arc::default(), Arc::default(), Arc::default(), Arc::default());
                 let other_parts = (other.clone(), other_pool, stage.buffer, stage.memory);
                 let shower = Plain {
                     fns: ash::khr::swapchain::Device::new(&instance, &other),
@@ -1996,6 +2118,7 @@ mod tests {
                     seen: Arc::clone(&seen),
                     hold: Arc::clone(&hold),
                     fail: Arc::clone(&fail),
+                    timeout: Arc::clone(&timeout),
                     metadata: Arc::clone(&metadata),
                 };
                 let _ = shower.pool;
@@ -2026,6 +2149,7 @@ mod tests {
                     seen,
                     hold,
                     fail,
+                    timeout,
                     metadata,
                     other: other_parts,
                     import,
@@ -2066,6 +2190,11 @@ mod tests {
 
         /// The game's frame: acquire, clear the image to `shade`, present. Returns the present's result.
         fn frame(&self, v: &Virtual, shade: u8) -> vk::Result {
+            self.frame_on(v, shade, Some(0))
+        }
+
+        /// [`Self::frame`], presented as on a queue of `family` (as the layer knows it).
+        fn frame_on(&self, v: &Virtual, shade: u8, family: Option<u32>) -> vk::Result {
             unsafe {
                 let d = &self.game;
                 let index = match v.acquire(5_000_000_000, self.semaphores[0], vk::Fence::null()) {
@@ -2102,7 +2231,7 @@ mod tests {
                 let submit =
                     [vk::SubmitInfo::default().wait_semaphores(&waits).wait_dst_stage_mask(&stages).command_buffers(&cmds).signal_semaphores(&signals)];
                 d.queue_submit(self.queue, &submit, vk::Fence::null()).unwrap();
-                let r = v.present(self.queue, Some(0), index, &[self.semaphores[1]], vk::Fence::null());
+                let r = v.present(self.queue, family, index, &[self.semaphores[1]], vk::Fence::null());
                 // The test's one command buffer is recorded again for the next frame.
                 d.queue_wait_idle(self.queue).unwrap();
                 r
@@ -2251,6 +2380,118 @@ mod tests {
         let own = unsafe { fns.create_swapchain(&rig.info(vk::SwapchainKHR::null()), None) }.expect("the game's own swapchain on the freed surface");
         unsafe { fns.destroy_swapchain(own, None) };
         assert!(unsafe { destroy(Rig::handle(&v)) });
+    }
+
+    /// F1: after the first swapchain is refused, the second device's side shows nothing and is taken out of the
+    /// registry, so what was lent for it (the offload device) goes back and can be taken again; a side that shows a
+    /// swapchain stays.
+    #[test]
+    fn a_refused_first_swapchain_gives_the_second_device_back() {
+        let Some(rig) = Rig::new() else { return };
+        static HOSTS: Hosts<&'static str> = Hosts::new();
+        let game = rig.game.handle();
+        let second = HOSTS.get_or_make(game, || Ok((rig.second.clone(), "the lent device")), |_, _| panic!("nothing to undo")).unwrap();
+        assert!(HOSTS.hosts(rig.second.device.handle()));
+        let mut info = rig.info(vk::SwapchainKHR::null());
+        info.image_format = vk::Format::R5G6B5_UNORM_PACK16;
+        assert!(rig.create(&info, None).is_err());
+        let (back, lent) = HOSTS.take_if_idle(game).expect("idle after the refusal: given back");
+        assert!(Arc::ptr_eq(&back, &second));
+        assert_eq!(lent, "the lent device");
+        assert!(!HOSTS.hosts(rig.second.device.handle()) && HOSTS.take(game).is_none());
+        // While a swapchain is shown, the side is not idle and stays.
+        HOSTS.get_or_make(game, || Ok((rig.second.clone(), "again")), |_, _| panic!("nothing to undo")).unwrap();
+        let v = rig.create(&rig.info(vk::SwapchainKHR::null()), None).expect("the swapchain");
+        assert!(HOSTS.take_if_idle(game).is_none());
+        assert!(unsafe { destroy(Rig::handle(&v)) });
+        assert_eq!(HOSTS.take_if_idle(game).map(|(_, lent)| lent), Some("again"));
+    }
+
+    /// F3: making a side, and undoing one, may ask the registry (the second device's record does when it is torn
+    /// down): neither runs under the registry's lock. With the lock held this test never returns.
+    #[test]
+    fn a_side_is_made_and_undone_with_the_registry_unlocked() {
+        let Some(rig) = Rig::new() else { return };
+        static HOSTS: Hosts<u32> = Hosts::new();
+        let game = rig.game.handle();
+        let other = rig.second.device.handle();
+        // A failed make that looks itself up (as the teardown of a half-made record does) leaves nothing behind.
+        let failed = HOSTS.get_or_make(
+            game,
+            || {
+                assert!(!HOSTS.hosts(other));
+                assert!(HOSTS.take(game).is_none());
+                Err("the present queue could not be taken".into())
+            },
+            |_, _| panic!("nothing was made"),
+        );
+        assert_eq!(failed.err().as_deref(), Some("the present queue could not be taken"));
+        // A make that lost to another thread's is undone unlocked, and the other's side is the one returned.
+        let won = HOSTS.get_or_make(
+            game,
+            || {
+                HOSTS.get_or_make(game, || Ok((rig.second.clone(), 1)), |_, _| panic!("the first")).unwrap();
+                Ok((rig.second.clone(), 2))
+            },
+            |_, kept| {
+                assert_eq!(kept, 2);
+                assert!(HOSTS.hosts(other), "asked with the lock free");
+            },
+        );
+        assert!(won.is_ok());
+        assert_eq!(HOSTS.take(game).map(|(_, kept)| kept), Some(1));
+    }
+
+    /// F4 in a run: a timeout from the present of an acquired image is a failure (the game gets its own swapchain),
+    /// not a busy swapchain that is tried again with the image still acquired.
+    #[test]
+    fn a_timeout_showing_an_acquired_image_falls_back() {
+        let Some(rig) = Rig::new() else { return };
+        let v = rig.create(&rig.info(vk::SwapchainKHR::null()), None).expect("the swapchain");
+        rig.timeout.store(true, Ordering::Release);
+        assert_eq!(rig.frame(&v, 30), vk::Result::SUCCESS);
+        rig.wait_for(&v, 1);
+        assert!(rig.second.failed().is_some_and(|why| why.contains("TIMEOUT")), "{:?}", rig.second.failed());
+        assert_eq!(v.acquire(0, vk::Semaphore::null(), vk::Fence::null()), Err(vk::Result::ERROR_OUT_OF_DATE_KHR));
+        assert!(unsafe { destroy(Rig::handle(&v)) });
+    }
+
+    /// F5: a present on a queue whose frames cannot be copied out (its family unknown, or another than the first
+    /// present's) asks the game for its own swapchain instead of returning success with a frozen picture.
+    #[test]
+    fn a_present_that_cannot_be_copied_out_falls_back() {
+        let Some(rig) = Rig::new() else { return };
+        let v = rig.create(&rig.info(vk::SwapchainKHR::null()), None).expect("the swapchain");
+        assert_eq!(rig.frame_on(&v, 30, None), vk::Result::ERROR_OUT_OF_DATE_KHR, "the queue's family is unknown");
+        assert!(rig.second.failed().is_some_and(|why| why.contains("cannot be copied out")));
+        assert_eq!(v.acquire(0, vk::Semaphore::null(), vk::Fence::null()), Err(vk::Result::ERROR_OUT_OF_DATE_KHR));
+        assert!(unsafe { destroy(Rig::handle(&v)) });
+        // Another family than the first present's.
+        let Some(rig) = Rig::new() else { return };
+        let v = rig.create(&rig.info(vk::SwapchainKHR::null()), None).expect("the swapchain");
+        assert_eq!(rig.frame(&v, 30), vk::Result::SUCCESS);
+        rig.wait_for(&v, 1);
+        assert_eq!(rig.frame_on(&v, 60, Some(7)), vk::Result::ERROR_OUT_OF_DATE_KHR);
+        assert!(rig.second.failed().is_some());
+        assert_eq!(rig.shades(), vec![30]);
+        assert!(unsafe { destroy(Rig::handle(&v)) });
+    }
+
+    /// F7: a swapchain that replaces one already released has the second device like any other: a second one
+    /// beside it is refused.
+    #[test]
+    fn a_swapchain_replacing_a_released_one_holds_the_second_device() {
+        let Some(rig) = Rig::new() else { return };
+        let old = rig.create(&rig.info(vk::SwapchainKHR::null()), None).expect("the swapchain");
+        old.release_second();
+        assert!(!rig.second.busy.load(Ordering::Acquire));
+        let new = rig.create(&rig.info(Rig::handle(&old)), Some(&old)).expect("the replacement");
+        assert!(rig.second.busy.load(Ordering::Acquire));
+        assert!(rig.create(&rig.info(vk::SwapchainKHR::null()), None).is_err_and(|why| why.contains("already shows")));
+        assert_eq!(rig.frame(&new, 40), vk::Result::SUCCESS);
+        rig.wait_for(&new, 1);
+        assert_eq!(rig.shades(), vec![40]);
+        assert!(unsafe { destroy(Rig::handle(&old)) } && unsafe { destroy(Rig::handle(&new)) });
     }
 
     #[test]

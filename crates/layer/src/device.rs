@@ -2299,20 +2299,17 @@ impl NeuralForgeDeviceInfo {
     }
 }
 
-/// The second GPU's side of one game device while it shows that device's frames (`crate::gpu2_present`): its device
-/// (taken from `preupscale::offload`, given back at the end), and the layer's record of it.
+/// The second GPU's side per game device while it shows that device's frames (`crate::gpu2_present::Hosts`): its
+/// device, taken from `preupscale::offload` and given back at the end.
 #[cfg(target_arch = "x86_64")]
-struct Gpu2Host {
-    second: Arc<crate::gpu2_present::Second>,
-    offload: crate::preupscale::offload::Offload,
-}
-
-// SAFETY: handles and function pointers; used under `GPU2_HOSTS`' lock or by the presenter it owns.
-#[cfg(target_arch = "x86_64")]
-unsafe impl Send for Gpu2Host {}
+static GPU2_HOSTS: crate::gpu2_present::Hosts<Gpu2Device> = crate::gpu2_present::Hosts::new();
 
 #[cfg(target_arch = "x86_64")]
-static GPU2_HOSTS: Mutex<Vec<(vk::Device, Gpu2Host)>> = Mutex::new(Vec::new());
+struct Gpu2Device(crate::preupscale::offload::Offload);
+
+// SAFETY: handles and function pointers, used by whoever took the host out of the registry.
+#[cfg(target_arch = "x86_64")]
+unsafe impl Send for Gpu2Device {}
 
 /// Why the second GPU stopped showing frames this session (`gpu2_present::Shared::fail`): not tried again.
 #[cfg(target_arch = "x86_64")]
@@ -2322,32 +2319,40 @@ static GPU2_GIVEN_UP: Mutex<Option<String>> = Mutex::new(None);
 /// the network on that device itself, never the round trip to "another" GPU.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn gpu2_hosts(device: vk::Device) -> bool {
-    GPU2_HOSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(_, h)| h.second.device.handle() == device)
+    GPU2_HOSTS.hosts(device)
 }
 
-/// Ends the second GPU's showing of `game`'s frames: its swapchains there are released, its record torn down, its
-/// device given back to `preupscale::offload` (for the round trip, or the teardown).
+/// Tears a host taken out of the registry down: its swapchains there are released, its record torn down, its device
+/// given back to `preupscale::offload` (for the round trip, or the teardown). Never called with the registry locked:
+/// the record's teardown asks the registry itself.
 ///
 /// # Safety
 /// Nothing of the game presents concurrently (its `vkCreateSwapchainKHR` or `vkDestroyDevice`).
 #[cfg(target_arch = "x86_64")]
-unsafe fn gpu2_release_host(game: vk::Device) {
-    let host = {
-        let mut hosts = GPU2_HOSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        hosts.iter().position(|(g, _)| *g == game).map(|k| hosts.remove(k).1)
-    };
-    let Some(host) = host else { return };
-    if let Some(why) = host.second.failed() {
+unsafe fn gpu2_teardown(game: vk::Device, second: Arc<crate::gpu2_present::Second>, device: Gpu2Device) {
+    if let Some(why) = second.failed() {
         GPU2_GIVEN_UP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(why);
     }
     for v in crate::gpu2_present::all() {
-        v.release_second_of(&host.second);
+        v.release_second_of(&second);
     }
     // SAFETY: the presenters were joined: nothing uses the second device but this teardown.
-    unsafe { destroy_private_resources(host.second.device.handle()) };
-    crate::log!("[present2] {} no longer shows the game's frames: its device is given back", host.second.name);
+    unsafe { destroy_private_resources(second.device.handle()) };
+    crate::log!("[present2] {} no longer shows the game's frames: its device is given back", second.name);
     crate::logging::flush();
-    crate::preupscale::offload::give_back(game, host.offload, false);
+    crate::preupscale::offload::give_back(game, device.0, false);
+}
+
+/// Ends the second GPU's showing of `game`'s frames, whatever it shows (the game's device is being destroyed).
+///
+/// # Safety
+/// As [`gpu2_teardown`].
+#[cfg(target_arch = "x86_64")]
+unsafe fn gpu2_release_host(game: vk::Device) {
+    if let Some((second, device)) = GPU2_HOSTS.take(game) {
+        // SAFETY: forwarded.
+        unsafe { gpu2_teardown(game, second, device) };
+    }
 }
 
 /// The second device's presents, through the layer's own record of it.
@@ -2447,10 +2452,23 @@ impl NeuralForgeDeviceInfo {
     fn gpu2_host(&self, header: Option<&'static neural_forge_protocol::ShmHeader>) -> Result<Arc<crate::gpu2_present::Second>, String> {
         use crate::preupscale::offload;
         let game = self.device.handle();
-        let mut hosts = GPU2_HOSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, h)) = hosts.iter().find(|(g, _)| *g == game) {
-            return Ok(h.second.clone());
-        }
+        // Made and, on a failure, undone with the registry unlocked (`Hosts::get_or_make`): the record's teardown asks
+        // the registry itself (`destroy_private_resources`).
+        GPU2_HOSTS.get_or_make(
+            game,
+            || self.gpu2_make_host(header),
+            |second, device| {
+                // SAFETY: another thread's host won: nothing of this one was used.
+                unsafe { destroy_private_resources(second.device.handle()) };
+                offload::give_back(game, device.0, false);
+            },
+        )
+    }
+
+    /// Makes the second GPU's side for this device from the device `preupscale::offload` made.
+    fn gpu2_make_host(&self, header: Option<&'static neural_forge_protocol::ShmHeader>) -> Result<(Arc<crate::gpu2_present::Second>, Gpu2Device), String> {
+        use crate::preupscale::offload;
+        let game = self.device.handle();
         let instance = self.instance.clone().ok_or("the game's instance is unknown")?;
         let off = match offload::take(game) {
             Some(Ok(off)) => off,
@@ -2514,8 +2532,7 @@ impl NeuralForgeDeviceInfo {
         ));
         crate::log!("[present2] {} is set up to show the game's frames itself (queue family {family}); the network runs there on the finished frame", off.name);
         crate::logging::flush();
-        hosts.push((game, Gpu2Host { second: second.clone(), offload: off }));
-        Ok(second)
+        Ok((second, Gpu2Device(off)))
     }
 
     /// The game's `vkCreateSwapchainKHR` when the second GPU may show the swapchain: `Some` with the layer's own
@@ -2523,7 +2540,22 @@ impl NeuralForgeDeviceInfo {
     /// with `info.oldSwapchain` then cleared if it was the layer's.
     fn gpu2_create_swapchain(&self, info: &mut vk::SwapchainCreateInfoKHR) -> Option<vk::SwapchainKHR> {
         let old = crate::gpu2_present::lookup(info.old_swapchain);
-        let made = match self.gpu2_wanted(info) {
+        let wanted = self.gpu2_wanted(info).and_then(|header| {
+            // Before the second GPU's device is taken: the round trip keeps it when the mode cannot start here.
+            match crate::gpu2_present::early_refusal(info.old_swapchain != vk::SwapchainKHR::null(), old.is_some()) {
+                Some(why) => {
+                    let line = crate::gpu2_present::not_showing_line(why);
+                    if let Some(h) = header.filter(|h| h.second_gpu_present_line() != line) {
+                        crate::log!("[present2] {line}; the frames come back to the game's GPU as before");
+                        crate::logging::flush();
+                        h.set_second_gpu_present_line(&line);
+                    }
+                    Err(Some(why.to_string()))
+                }
+                None => Ok(header),
+            }
+        });
+        let made = match wanted {
             Ok(header) => self.gpu2_host(header).and_then(|second| {
                 let game = crate::gpu2_present::GameDevice {
                     device: &self.device,
@@ -2562,19 +2594,15 @@ impl NeuralForgeDeviceInfo {
                 if old.is_some() {
                     info.old_swapchain = vk::SwapchainKHR::null();
                 }
-                if !held.is_empty() || old.is_some() || self.gpu2_given_up() {
+                // The second GPU's device goes back whenever it shows nothing any more (also when the very first
+                // swapchain was refused): the round trip, or a later game start, can then take it.
+                if let Some((second, device)) = GPU2_HOSTS.take_if_idle(self.device.handle()) {
                     // SAFETY: inside the game's vkCreateSwapchainKHR; its presents are not concurrent with it.
-                    unsafe { gpu2_release_host(self.device.handle()) };
+                    unsafe { gpu2_teardown(self.device.handle(), second, device) };
                 }
                 None
             }
         }
-    }
-
-    /// The second GPU stopped showing this device's frames (a failure while it ran).
-    fn gpu2_given_up(&self) -> bool {
-        let game = self.device.handle();
-        GPU2_HOSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(g, h)| *g == game && h.second.failed().is_some())
     }
 
     /// The game's present where every swapchain of it is the layer's: handed to the second GPU. `None`: none is.

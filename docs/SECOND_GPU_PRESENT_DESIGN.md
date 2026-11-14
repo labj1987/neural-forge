@@ -42,6 +42,9 @@ Rejected: a headless shadow swapchain for the game (NVIDIA's driver has no `VK_E
 
 - **Acquire**: an image that is neither acquired nor still being copied out; waits (up to the timeout) for a copy to
   finish when there is none. The game's semaphore and fence are signalled by an empty submit on the layer's own queue.
+  That queue is the after-the-upscaler server's, and its lock here is the swapchain's own: this assumes the game's
+  device has no real swapchain of its own beside the layer's (whose finished-frame server would use the same queue
+  under another lock). One window per game is what the mode supports.
 - **Present result**: `VK_SUCCESS`, or what the real swapchain last said (`SUBOPTIMAL`, `OUT_OF_DATE`,
   `SURFACE_LOST`), which stays until the game recreates the swapchain. The present's wait semaphores are always
   consumed; present fences (`VK_EXT_swapchain_maintenance1`) are signalled by the copy's submit.
@@ -66,6 +69,13 @@ Rejected: a headless shadow swapchain for the game (NVIDIA's driver has no `VK_E
   acquire/present returns `VK_ERROR_OUT_OF_DATE_KHR`, and the swapchain it then creates is a real one on its own
   device. The mode stays off for the session. No frame is shown black: the game recreates before it shows another.
   The second device's record is torn down and its device given back, so the round trip can use it.
+  A present whose frames cannot be copied out (its queue's family unknown, or another than the first present's) and a
+  timeout after the real swapchain's image was acquired are failures of this kind too, not frames to skip.
+- A recreate that names a real swapchain of the game's own as the old one (the mode was switched on while the game
+  ran) is refused before the second GPU's device is taken: that swapchain has the window. The mode starts with the
+  next game start.
+- Whenever the second GPU's side shows nothing any more (the first swapchain refused, a fall-back), its device goes
+  back to `preupscale::offload`, so the round trip can take it.
   `NEURAL_FORGE_OFFLOAD_TEST_FAIL=N` fails the second device's `N`th present, to see this in a game.
 
 ## Settings and Status
