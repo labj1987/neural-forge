@@ -293,32 +293,16 @@ impl<T> Hosts<T> {
         self.all.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// `game`'s side: the one there is, else the one `make` makes (called unlocked). Should another thread have made
-    /// one meanwhile, that one is returned and `unmake` (unlocked) undoes this call's.
-    pub(crate) fn get_or_make(
-        &self,
-        game: vk::Device,
-        make: impl FnOnce() -> Result<(Arc<Second>, T), String>,
-        unmake: impl FnOnce(Arc<Second>, T),
-    ) -> Result<Arc<Second>, String> {
-        let find = |all: &Vec<(vk::Device, Arc<Second>, T)>| all.iter().find(|(g, _, _)| *g == game).map(|(_, s, _)| s.clone());
-        if let Some(second) = find(&self.lock()) {
+    /// `game`'s side: the one there is, else the one `make` makes (called unlocked: it may ask the registry). One
+    /// thread creates swapchains for a game device at a time, and what `make` takes (the one device
+    /// `preupscale::offload` made for the game's) is handed out once, so two sides are never made for one game.
+    pub(crate) fn get_or_make(&self, game: vk::Device, make: impl FnOnce() -> Result<(Arc<Second>, T), String>) -> Result<Arc<Second>, String> {
+        if let Some(second) = self.lock().iter().find(|(g, _, _)| *g == game).map(|(_, s, _)| s.clone()) {
             return Ok(second);
         }
         let (second, kept) = make()?;
-        let lost = {
-            let mut all = self.lock();
-            match find(&all) {
-                Some(other) => Some((other, second, kept)),
-                None => {
-                    all.push((game, second.clone(), kept));
-                    return Ok(second);
-                }
-            }
-        };
-        let (other, second, kept) = lost.expect("returned above otherwise");
-        unmake(second, kept);
-        Ok(other)
+        self.lock().push((game, second.clone(), kept));
+        Ok(second)
     }
 
     /// Whether `device` is the second device of some game's side.
@@ -336,6 +320,9 @@ impl<T> Hosts<T> {
 
     /// Takes `game`'s side out if it shows no swapchain (any more): after a refused create or a fall-back its device
     /// must go back to whoever lent it, or nothing else can use the second GPU for the rest of the session.
+    /// Called from the game's `vkCreateSwapchainKHR` only, and assumes a single creator: one thread creates swapchains
+    /// for a game device at a time (the mode supports one window), so no other create is about to show a swapchain
+    /// on the side taken here.
     pub(crate) fn take_if_idle(&self, game: vk::Device) -> Option<(Arc<Second>, T)> {
         let mut all = self.lock();
         let k = all.iter().position(|(g, s, _)| *g == game && !s.busy.load(Ordering::Acquire))?;
@@ -2390,7 +2377,7 @@ mod tests {
         let Some(rig) = Rig::new() else { return };
         static HOSTS: Hosts<&'static str> = Hosts::new();
         let game = rig.game.handle();
-        let second = HOSTS.get_or_make(game, || Ok((rig.second.clone(), "the lent device")), |_, _| panic!("nothing to undo")).unwrap();
+        let second = HOSTS.get_or_make(game, || Ok((rig.second.clone(), "the lent device"))).unwrap();
         assert!(HOSTS.hosts(rig.second.device.handle()));
         let mut info = rig.info(vk::SwapchainKHR::null());
         info.image_format = vk::Format::R5G6B5_UNORM_PACK16;
@@ -2400,45 +2387,37 @@ mod tests {
         assert_eq!(lent, "the lent device");
         assert!(!HOSTS.hosts(rig.second.device.handle()) && HOSTS.take(game).is_none());
         // While a swapchain is shown, the side is not idle and stays.
-        HOSTS.get_or_make(game, || Ok((rig.second.clone(), "again")), |_, _| panic!("nothing to undo")).unwrap();
+        HOSTS.get_or_make(game, || Ok((rig.second.clone(), "again"))).unwrap();
         let v = rig.create(&rig.info(vk::SwapchainKHR::null()), None).expect("the swapchain");
         assert!(HOSTS.take_if_idle(game).is_none());
         assert!(unsafe { destroy(Rig::handle(&v)) });
         assert_eq!(HOSTS.take_if_idle(game).map(|(_, lent)| lent), Some("again"));
     }
 
-    /// F3: making a side, and undoing one, may ask the registry (the second device's record does when it is torn
-    /// down): neither runs under the registry's lock. With the lock held this test never returns.
+    /// F3: making a side may ask the registry (the teardown of a half-made record of the second device does): it
+    /// does not run under the registry's lock. With the lock held this test never returns.
     #[test]
-    fn a_side_is_made_and_undone_with_the_registry_unlocked() {
+    fn a_side_is_made_with_the_registry_unlocked() {
         let Some(rig) = Rig::new() else { return };
         static HOSTS: Hosts<u32> = Hosts::new();
         let game = rig.game.handle();
         let other = rig.second.device.handle();
-        // A failed make that looks itself up (as the teardown of a half-made record does) leaves nothing behind.
-        let failed = HOSTS.get_or_make(
-            game,
-            || {
-                assert!(!HOSTS.hosts(other));
-                assert!(HOSTS.take(game).is_none());
-                Err("the present queue could not be taken".into())
-            },
-            |_, _| panic!("nothing was made"),
-        );
+        // A failed make that looks itself up leaves nothing behind.
+        let failed = HOSTS.get_or_make(game, || {
+            assert!(!HOSTS.hosts(other));
+            assert!(HOSTS.take(game).is_none());
+            Err("the present queue could not be taken".into())
+        });
         assert_eq!(failed.err().as_deref(), Some("the present queue could not be taken"));
-        // A make that lost to another thread's is undone unlocked, and the other's side is the one returned.
-        let won = HOSTS.get_or_make(
-            game,
-            || {
-                HOSTS.get_or_make(game, || Ok((rig.second.clone(), 1)), |_, _| panic!("the first")).unwrap();
-                Ok((rig.second.clone(), 2))
-            },
-            |_, kept| {
-                assert_eq!(kept, 2);
-                assert!(HOSTS.hosts(other), "asked with the lock free");
-            },
-        );
-        assert!(won.is_ok());
+        assert!(!HOSTS.hosts(other));
+        // One that succeeds is there afterwards, and the next call returns it without making another.
+        let made = HOSTS.get_or_make(game, || {
+            assert!(!HOSTS.hosts(other));
+            Ok((rig.second.clone(), 1))
+        });
+        assert!(made.is_ok() && HOSTS.hosts(other));
+        let again = HOSTS.get_or_make(game, || panic!("there is one")).unwrap();
+        assert!(Arc::ptr_eq(&again, &rig.second));
         assert_eq!(HOSTS.take(game).map(|(_, kept)| kept), Some(1));
     }
 
