@@ -886,10 +886,11 @@ impl CachePass {
     /// is bound.
     ///
     /// `made` names the image behind `colour` (the offload side's kept copy, `offload_pre::HoldSide::snapshot_made`:
-    /// counted, never a handle). The view's handle alone does not: a side destroyed and built again (the trial's
-    /// switch to the game's GPU and back, a change of Placement) often gets its new view under the old handle, and a
-    /// set left as it was then pointed at the freed image, where the late capture's dispatch read (#63: Xid 13, MMU
-    /// fault and a lost device on the game's GPU about a second after the offload restarted).
+    /// counted, never a handle). The view's handle alone does not: a side destroyed and built again (the hand-over
+    /// between hold resource sets, `offload_pre::release_idle`, when the game's resolution or DLSS mode changes back
+    /// and forth: the side is rebuilt with them) often gets its new view under the old handle, and a set left as it
+    /// was then pointed at the freed image, where the late capture's dispatch read (#63: Xid 13, MMU fault and a
+    /// lost device on the game's GPU).
     ///
     /// # Safety
     /// As [`Self::bind`], called before; `colour` is a live RGBA16F storage view.

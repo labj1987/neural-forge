@@ -514,7 +514,8 @@ model resolution, the resources rebuilt for another extent) records nothing (`ma
 "waiting for the holds recorded in DLSS's buffers ..."), and the change is made at the first hold
 recorded once they are done, normally a frame or two later. Every bind skips a write that changes
 nothing, judged by the objects the handles name as well as the handles (`cache::Bindings::made`,
-`HoldGuard`'s pass id): a destroyed object's handle comes back for the next one made. The split hold
+`HoldGuard`'s pass id, `offload_pre::HoldSide::snapshot_made` for the late capture's set,
+`cache::CachePass::stats_made` for the offload gate's): a destroyed object's handle comes back for the next one made. The split hold
 makes a view of the colour input every hold, often under the last one's handle; skipped on the handle
 alone, the edit cache's set kept a destroyed view, and GTA V Enhanced hung after a loading screen
 (Xid 109, 4 runs of 4; none of 3 once it was written again). The network's build is kept the same way: while any hold may run, the loader does not rebuild
