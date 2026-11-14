@@ -207,11 +207,17 @@ running game uses (a process whose executable or arguments lie in it) is neither
   now says Proton is a new name (the games' `CompatToolMapping` moves with it); the same name (a wrapper-only update)
   is made again in place. With Steam running, the new copy is made and the old one kept, nothing moved; the next update
   with Steam closed finishes. A copy named without Proton whose source is gone is renamed in place instead
-  (`proton_tool::rename_in`: it holds its own files): its folder renamed to `copy_name` of its own version, its
-  `compatibilitytool.vdf` written new with that name, its games moved (the folder renamed back if they cannot be) and
-  its wrapper renewed; refused while Steam runs, while a game runs with it, and when another tool has the new name (a
-  Neural Forge copy of the same source and version there takes its games instead, and the old copy goes). Switching a
-  game on that is set to a copy to be made again does the same for the copy. `compat_tool::stale_copies` adds the games
+  (`proton_tool::rename_in`: it holds its own files): its `compatibilitytool.vdf` written new with `copy_name` of its
+  own version first, then its folder renamed (a stop in between leaves a folder Make again renames; a manifest that
+  cannot be written changes nothing), its games moved (folder and manifest put back exactly if they cannot be) and
+  its wrapper renewed (a wrapper that cannot be renewed after the move is a note, Make again offers it again); refused
+  while Steam runs, while a game runs with it, and when another tool has the new name (a Neural Forge copy of the same
+  version there, made from the same source path or another, takes its games instead and the old copy goes:
+  `proton_tool::rename_plan`, which `describe()` and `doctor` read too). Games a stopped rename left on the old name
+  (no folder of that name, the renamed copy there: `compat_tool::orphaned_mappings`) are moved to the renamed copy by
+  `proton-tool update`, by Make again and by switching any game on, and `doctor` reports them. Switching a game on that
+  is set to a copy to be made again does the same for the copy; when the rename is refused (a game runs with the copy,
+  another tool has the name) the game stays on its copy with its wrapper renewed and a note says the rename is pending. `compat_tool::stale_copies` adds the games
   set to each copy for the Status and Setup tabs; the Setup tab offers no **Make copy** for a source that has a copy to
   be made again (its Make again is the way). `doctor` names the copy Make again will give (`proton_tool::remade_name`).
   At launch only the layer runs (the launch options are environment variables), so it reads Steam's

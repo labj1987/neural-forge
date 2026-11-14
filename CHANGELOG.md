@@ -16,8 +16,11 @@ first shipped them; their phase is kept as a subheading.
   layer log say Steam Cloud can't sync its saves. Close Steam and press **Make again** next to it in the Setup tab (or
   run `neural-forge-cli proton-tool update`, or switch one of its games on again): its games, Steam's default Proton
   included, move to the new copy and the old one is removed. If the Proton it was made from is no longer installed, the
-  copy is renamed in place instead (it holds its own files) and its games move with it. Steam syncs the waiting saves
-  when Steam starts or the game next runs.
+  copy is renamed in place instead (it holds its own files) and its games move with it; where a copy of the same
+  version already has the new name, the games move to it and the old copy is removed. If a rename stops half way,
+  Make again, `proton-tool update` or switching a game on moves the games it left behind, and Diagnose reports them.
+  Switching a game on when the rename cannot happen yet keeps it on its copy and says the rename is pending. Steam
+  syncs the waiting saves when Steam starts or the game next runs.
 - The Setup tab no longer offers **Make copy** for a Proton whose copy is waiting for **Make again**.
 
 ## 4.2.0 — 2026-11-13

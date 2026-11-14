@@ -514,6 +514,17 @@ fn target_for_enable(game: &neural_forge_supervisor::steam::Game, chosen: &str) 
 /// `anti_cheat_ok`: switch on a game that ships anti-cheat (`enable --anti-cheat-ok`).
 /// The game's Proton after its launch options ([`neural_forge_supervisor::compat`]): a Neural Forge Proton when
 /// switched on (its copy made first, with the notice), the earlier one back when switched off.
+/// What `proton-tool update` says after a copy was renamed, merged or made again: the games moved and any note.
+fn print_update_extras(done: &neural_forge_supervisor::compat_tool::Updated) {
+    use neural_forge_supervisor::compat_tool::app_label;
+    if !done.moved.is_empty() {
+        println!("  moved to it: {}", done.moved.iter().map(|a| app_label(a)).collect::<Vec<_>>().join(", "));
+    }
+    if let Some(note) = &done.note {
+        println!("  note: {note}");
+    }
+}
+
 fn set_game_proton(game: &neural_forge_supervisor::steam::Game, on: bool) -> ExitCode {
     use neural_forge_supervisor::{compat_tool, proton_tool, steam};
     let root = &game.root.path;
@@ -529,6 +540,9 @@ fn set_game_proton(game: &neural_forge_supervisor::steam::Game, on: bool) -> Exi
                     println!("{}\n", proton_tool::NOTICE);
                 }
                 println!("{} runs with {} now (it ran with {}).", game.name, done.tool, done.previous.as_deref().unwrap_or("Steam's default Proton"));
+                if let Some(note) = &done.note {
+                    println!("Note: {note}");
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -952,20 +966,40 @@ fn cmd_proton_tool(sub: ProtonToolCmd) -> ExitCode {
         ProtonToolCmd::Update => {
             let mut failed = false;
             let running = steam::steam_running(std::path::Path::new("/proc"));
+            // Games left on a name a rename stopped before moving them go to the renamed copy.
+            match neural_forge_supervisor::compat_tool::repair_orphans(root, running) {
+                Ok(found) => {
+                    for o in found {
+                        let games: Vec<String> = o.games.iter().map(|g| neural_forge_supervisor::compat_tool::app_label(g)).collect();
+                        println!("{}: moved to {} (the copy was renamed already): {}", o.name, o.to, games.join(", "));
+                    }
+                }
+                Err(e) => {
+                    failed = true;
+                    eprintln!("{e}");
+                }
+            }
             for t in proton_tool::tools(root).into_iter().filter(proton_tool::outdated) {
                 match neural_forge_supervisor::compat_tool::update(root, &t, &wrapper, running) {
                     Ok(done) if done.to == done.from => println!("{}: made again (its source's current version, the installed NGX wrapper)", t.name),
                     Ok(done) if done.renamed => {
-                        println!("{}: renamed to {} (its source is gone; the copy holds its own files), the installed NGX wrapper put in", t.name, done.to);
-                        if !done.moved.is_empty() {
-                            println!("  moved to it: app {}", done.moved.join(", app "));
+                        println!("{}: renamed to {} (its source is gone; the copy holds its own files)", t.name, done.to);
+                        print_update_extras(&done);
+                    }
+                    Ok(done) if done.merged => {
+                        println!("{}: moved its games to {} (a copy of the same version)", t.name, done.to);
+                        print_update_extras(&done);
+                        match done.kept {
+                            Some(why) => {
+                                failed = true;
+                                eprintln!("  {} is kept: {why}", t.name);
+                            }
+                            None => println!("  removed {}", t.name),
                         }
                     }
                     Ok(done) => {
                         println!("{}: made {} from the current version", t.name, done.to);
-                        if !done.moved.is_empty() {
-                            println!("  moved to it: app {}", done.moved.join(", app "));
-                        }
+                        print_update_extras(&done);
                         match done.kept {
                             Some(why) => {
                                 failed = true;

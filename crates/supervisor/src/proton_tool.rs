@@ -658,42 +658,92 @@ pub fn remove_in(root: &Path, name: &str, proc_root: &Path) -> Result<Tool, Stri
 pub enum Renamed {
     /// The copy is now this one, under its new name.
     To(Tool),
-    /// A copy of the same source and version already had the new name: the old one is to go once its games moved.
+    /// A Neural Forge copy of the same version already had the new name (made from the same source or another path to
+    /// it): the old one is to go once its games moved.
     Existing(Tool),
 }
 
-/// Gives `tool`, named without "Proton" ([`steam_cloud_blind`]), the name a copy of its version gets now
-/// ([`neural_forge_protocol::proton_copy::copy_name`]) in place: its folder renamed and its `compatibilitytool.vdf`
-/// written new with that name (as [`create`] writes it). Its source is not needed: the copy holds its own files. Never
-/// while a game runs with it, and refused when another tool holds the new name; a Neural Forge copy of the same
-/// source and version there is [`Renamed::Existing`]. The caller (`compat_tool::update`) checks that Steam is closed
-/// and moves the games.
-pub fn rename_in(root: &Path, tool: &Tool, proc_root: &Path) -> Result<Renamed, String> {
-    let name = neural_forge_protocol::proton_copy::copy_name(&tool.source_version);
-    if name == tool.name {
-        return Ok(Renamed::To(tool.clone()));
-    }
-    let target = tools_dir(root).join(&name);
-    if target.exists() || target.is_symlink() {
-        return match tool_at(&target) {
-            Some(t) if t.source == tool.source && t.source_version == tool.source_version => Ok(Renamed::Existing(t)),
-            _ => Err(format!("{} already exists and is another tool: remove or rename it, then make {} again", target.display(), tool.name)),
-        };
-    }
-    refuse_in_use(&tool.dir, proc_root, "rename it")?;
-    rename_dir(tool, &name).map(Renamed::To)
+/// What Make again does with a copy named without "Proton" whose source is gone ([`rename_plan`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenamePlan {
+    /// The name is right already.
+    Same,
+    /// The folder is renamed to this name.
+    Rename(String),
+    /// A Neural Forge copy of the same version has the new name: the games move to it and the old copy goes.
+    Merge(Tool),
+    /// Another tool has the new name (this path): the copy is not renamed.
+    Clash(PathBuf),
 }
 
-/// `tool`'s folder renamed to `name` beside it and its `compatibilitytool.vdf` written for that name; the folder is put
-/// back when the manifest cannot be written.
+/// The one decision behind [`rename_in`], Make again's description in the Setup tab and `doctor`: what happens to `tool`
+/// (named without "Proton") given what is in its `compatibilitytools.d` now.
+pub fn rename_plan(tool: &Tool) -> RenamePlan {
+    let name = neural_forge_protocol::proton_copy::copy_name(&tool.source_version);
+    if name == tool.name {
+        return RenamePlan::Same;
+    }
+    let target = tool.dir.with_file_name(&name);
+    if target.exists() || target.is_symlink() {
+        return match tool_at(&target) {
+            Some(t) if t.source_version == tool.source_version => RenamePlan::Merge(t),
+            _ => RenamePlan::Clash(target),
+        };
+    }
+    RenamePlan::Rename(name)
+}
+
+/// Gives `tool`, named without "Proton" ([`steam_cloud_blind`]), the name a copy of its version gets now
+/// ([`neural_forge_protocol::proton_copy::copy_name`]) in place: its `compatibilitytool.vdf` written new with that name
+/// first, then its folder renamed (a stop between the two leaves a copy under its old folder name that Make again
+/// renames; no folder is put back when the manifest cannot be written). Its source is not needed: the copy holds its own
+/// files. Never while a game runs with it, and refused when another tool holds the new name; a Neural Forge copy of the
+/// same version there ([`RenamePlan::Merge`]) is [`Renamed::Existing`]. The caller (`compat_tool::update`) checks that
+/// Steam is closed and moves the games.
+pub fn rename_in(tool: &Tool, proc_root: &Path) -> Result<Renamed, String> {
+    match rename_plan(tool) {
+        RenamePlan::Same => Ok(Renamed::To(tool.clone())),
+        RenamePlan::Merge(t) => Ok(Renamed::Existing(t)),
+        RenamePlan::Clash(target) => {
+            Err(format!("{} already exists and is another tool: remove or rename it, then make {} again", target.display(), tool.name))
+        }
+        RenamePlan::Rename(name) => {
+            refuse_in_use(&tool.dir, proc_root, "rename it")?;
+            rename_dir(tool, &name).map(Renamed::To)
+        }
+    }
+}
+
+/// `tool`'s `compatibilitytool.vdf` written for `name`, then its folder renamed to `name` beside it. The manifest goes
+/// first: when it cannot be written nothing has changed, and when the folder cannot be renamed the manifest is put back
+/// as it was.
 pub(crate) fn rename_dir(tool: &Tool, name: &str) -> Result<Tool, String> {
     let to = tool.dir.with_file_name(name);
-    std::fs::rename(&tool.dir, &to).map_err(|e| format!("renaming {} to {name}: {e}", tool.dir.display()))?;
-    if let Err(e) = write_new(&to.join("compatibilitytool.vdf"), manifest(name).as_bytes(), 0o644) {
-        let _ = std::fs::rename(&to, &tool.dir);
-        return Err(format!("{}: {e}", to.join("compatibilitytool.vdf").display()));
+    let vdf = tool.dir.join("compatibilitytool.vdf");
+    let original = std::fs::read(&vdf).ok();
+    write_new(&vdf, manifest(name).as_bytes(), 0o644).map_err(|e| format!("{}: {e}", vdf.display()))?;
+    if let Err(e) = std::fs::rename(&tool.dir, &to) {
+        match &original {
+            Some(bytes) => {
+                let _ = write_new(&vdf, bytes, 0o644);
+            }
+            None => {
+                let _ = std::fs::remove_file(&vdf);
+            }
+        }
+        return Err(format!("renaming {} to {name}: {e}", tool.dir.display()));
     }
     tool_at(&to).ok_or_else(|| format!("{} has no marker after the rename", to.display()))
+}
+
+/// [`rename_dir`] undone after a later step failed: `new` renamed back to `old`'s name with its manifest as it was
+/// (`manifest`, the bytes read before the rename).
+pub(crate) fn undo_rename(new: &Tool, old: &Tool, manifest: Option<&[u8]>) {
+    if rename_dir(new, &old.name).is_ok() {
+        if let Some(bytes) = manifest {
+            let _ = write_new(&old.dir.join("compatibilitytool.vdf"), bytes, 0o644);
+        }
+    }
 }
 
 /// The pid a ring file is named by (`neural-forge-ngx-<pid>.ring`).

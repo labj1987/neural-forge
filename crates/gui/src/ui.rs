@@ -2555,9 +2555,10 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                                             match d {
                                                 None => "; a native Linux game: it runs without Proton".to_string(),
                                                 Some(d) => format!(
-                                                    "; it runs with {} now{}",
+                                                    "; it runs with {} now{}{}",
                                                     d.tool,
-                                                    if d.made { " (a copy made for Neural Forge: restart Steam to see it)" } else { "" }
+                                                    if d.made { " (a copy made for Neural Forge: restart Steam to see it)" } else { "" },
+                                                    d.note.map(|n| format!(". Note: {n}")).unwrap_or_default()
                                                 ),
                                             }
                                         }))
@@ -2736,7 +2737,12 @@ fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                 row.set_use_markup(false);
                 row.set_title(&tool.name);
                 row.set_subtitle(&if let Some(stale) = scan.stale.iter().find(|s| s.tool.name == tool.name) {
-                    format!("Out of date: {}. Close Steam and make it again: its games move to the new copy", stale.describe())
+                    // (A copy renamed or merged in place says what happens to its games itself.)
+                    if stale.in_place() {
+                        format!("Out of date: {}. Close Steam and make it again", stale.describe())
+                    } else {
+                        format!("Out of date: {}. Close Steam and make it again: its games move to the new copy", stale.describe())
+                    }
                 } else if *outdated {
                     format!("from {}; Neural Forge's NGX wrapper has changed since: close Steam and make it again", tool.source.display())
                 } else {
@@ -2754,13 +2760,18 @@ fn build_proton_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                                 use neural_forge_supervisor::{compat_tool, steam};
                                 let running = steam::steam_running(std::path::Path::new("/proc"));
                                 compat_tool::update(&root, &tool, &proton_tool::installed_wrapper(), running).map(|u| {
+                                    let note = u.note.as_ref().map(|n| format!(". Note: {n}")).unwrap_or_default();
                                     if u.to == u.from {
-                                        format!("Made {} again", u.to)
+                                        format!("Made {} again{note}", u.to)
                                     } else if u.renamed {
-                                        format!("Renamed {} to {}, its games moved with it. Restart Steam to see it", u.from, u.to)
+                                        format!("Renamed {} to {}, its games moved with it{note}. Restart Steam to see it", u.from, u.to)
                                     } else {
                                         let kept = u.kept.map(|k| format!("; {} is kept: {k}", u.from)).unwrap_or_else(|| format!("; removed {}", u.from));
-                                        format!("Made {}, its games moved to it{kept}. Restart Steam to see it", u.to)
+                                        if u.merged {
+                                            format!("Moved its games to {}{kept}{note}. Restart Steam to see it", u.to)
+                                        } else {
+                                            format!("Made {}, its games moved to it{kept}{note}. Restart Steam to see it", u.to)
+                                        }
                                     }
                                 })
                             })
