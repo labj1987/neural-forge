@@ -152,7 +152,14 @@ unsafe fn resolve<F: Copy>(get_proc: vk::PFN_vkGetDeviceProcAddr, device: vk::De
 }
 
 pub struct NeuralForgeDeviceInfo {
-    _loader_data: crate::loader_data::Registration,
+    /// `None` for the record of a device the layer made itself (the second GPU's, `crate::gpu2_present`): its maker
+    /// registered it.
+    _loader_data: Option<crate::loader_data::Registration>,
+    /// The layer's own queue on this device for the acquires of a swapchain the second GPU shows
+    /// (`crate::gpu2_present`): the after-the-upscaler server's, which does not run while the game has no swapchain
+    /// of its own here. `None` where the layer has no queue of its own.
+    #[cfg(target_arch = "x86_64")]
+    gpu2_signal: Option<crate::gpu2_present::Signal>,
     device: Arc<ash::Device>,
     /// `None` only in the hypothetical case `create_device_info`'s own doc comment
     /// notes (a device created against an instance from before this layer loaded,
@@ -800,6 +807,13 @@ static CLEANUP: std::sync::LazyLock<Mutex<HashMap<vk::Device, CleanupState>>> = 
 /// # Safety
 /// The caller must meet vkDestroyDevice's external synchronization requirements.
 pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
+    // The second GPU's record and presenter, where it showed this device's frames: stopped and torn down first, its
+    // device given back for the teardown below.
+    // SAFETY: forwarded; inside vkDestroyDevice nothing of the game's presents any more.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        gpu2_release_host(handle)
+    };
     let owned = CLEANUP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&handle);
     // The order: first every thread that submits (the network's own: the after-the-upscaler model
     // server and the loader; then the hold inside DLSS's buffer's worker), joined, because
@@ -1584,11 +1598,26 @@ impl NeuralForgeDeviceInfo {
         create_info: &vk::DeviceCreateInfo,
         extended_usage: bool,
     ) -> Self {
+        Self::make(instance, surface, physical_device, device, next_get_device_proc_addr, Some(create_info), extended_usage)
+    }
+
+    /// [`Self::new`], or with no `create_info` the record of a device the layer made itself: the second GPU's when it
+    /// shows the frames (`crate::gpu2_present`), whose presenter calls this record's swapchain hooks as a game's
+    /// loader would, so the finished-frame path runs on that device as on a game's.
+    fn make(
+        instance: Option<Arc<ash::Instance>>,
+        surface: SurfaceQueries,
+        physical_device: vk::PhysicalDevice,
+        device: Arc<ash::Device>,
+        next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
+        create_info: Option<&vk::DeviceCreateInfo>,
+        extended_usage: bool,
+    ) -> Self {
         let handle = device.handle();
         // The empty pipeline layout DXVK's binds of nothing go on with (`noop_bind`), in every process the layer works in;
         // not for the device the layer makes for the model on another GPU (no game command reaches it).
         #[cfg(target_arch = "x86_64")]
-        let own_device = crate::preupscale::offload::making();
+        let own_device = crate::preupscale::offload::making() || create_info.is_none();
         #[cfg(not(target_arch = "x86_64"))]
         let own_device = false;
         if crate::layer_enabled() && crate::ownership::eligible() && !own_device {
@@ -1680,7 +1709,7 @@ impl NeuralForgeDeviceInfo {
         let hold = Arc::new(Mutex::new(HoldState { external_memory_host, ..HoldState::default() }));
         CLEANUP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(handle, (device.clone(), state.clone(), hold.clone()));
         // SAFETY: create_info is the loader chain for this newly created device.
-        let loader_data = unsafe { crate::loader_data::register(handle, create_info) };
+        let loader_data = create_info.map(|info| unsafe { crate::loader_data::register(handle, info) });
         let nvidia = match &instance {
             // SAFETY: `physical_device` is the handle this device was just created from.
             Some(instance) => {
@@ -1706,7 +1735,17 @@ impl NeuralForgeDeviceInfo {
         let mut frame_family = None;
         let mut shared_queue = None;
         #[cfg(target_arch = "x86_64")]
+        let mut gpu2_signal = None;
+        #[cfg(target_arch = "x86_64")]
         if let Some(setup) = crate::take_native(handle) {
+            // The layer's own second queue, for a swapchain the second GPU shows (never on that GPU's own record).
+            if setup.shared.is_none() && create_info.is_some() && crate::preupscale::offload::Choice::current() != crate::preupscale::offload::Choice::Off {
+                // SAFETY: a queue this device's creation asked for; the loader's dispatch is set on it.
+                let queue = unsafe { device.get_device_queue(setup.family, setup.post_index) };
+                if queue != vk::Queue::null() && unsafe { crate::loader_data::initialize_queue(handle, queue) }.is_ok() {
+                    gpu2_signal = Some(crate::gpu2_present::Signal { queue, lock: Arc::new(Mutex::new(())) });
+                }
+            }
             // The application's queue the network shares: the same handle the application gets for it.
             if let (Some(shared), Some(get)) = (setup.shared, get_queue) {
                 let mut queue = vk::Queue::null();
@@ -1758,6 +1797,8 @@ impl NeuralForgeDeviceInfo {
         let inline = None;
         Self {
             _loader_data: loader_data,
+            #[cfg(target_arch = "x86_64")]
+            gpu2_signal,
             device,
             instance,
             surface_caps: surface.caps,
@@ -2258,6 +2299,349 @@ impl NeuralForgeDeviceInfo {
     }
 }
 
+/// The second GPU's side of one game device while it shows that device's frames (`crate::gpu2_present`): its device
+/// (taken from `preupscale::offload`, given back at the end), and the layer's record of it.
+#[cfg(target_arch = "x86_64")]
+struct Gpu2Host {
+    second: Arc<crate::gpu2_present::Second>,
+    offload: crate::preupscale::offload::Offload,
+}
+
+// SAFETY: handles and function pointers; used under `GPU2_HOSTS`' lock or by the presenter it owns.
+#[cfg(target_arch = "x86_64")]
+unsafe impl Send for Gpu2Host {}
+
+#[cfg(target_arch = "x86_64")]
+static GPU2_HOSTS: Mutex<Vec<(vk::Device, Gpu2Host)>> = Mutex::new(Vec::new());
+
+/// Why the second GPU stopped showing frames this session (`gpu2_present::Shared::fail`): not tried again.
+#[cfg(target_arch = "x86_64")]
+static GPU2_GIVEN_UP: Mutex<Option<String>> = Mutex::new(None);
+
+/// Whether `device` is a second GPU's device showing a game's frames: its record runs the finished-frame path with
+/// the network on that device itself, never the round trip to "another" GPU.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn gpu2_hosts(device: vk::Device) -> bool {
+    GPU2_HOSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(_, h)| h.second.device.handle() == device)
+}
+
+/// Ends the second GPU's showing of `game`'s frames: its swapchains there are released, its record torn down, its
+/// device given back to `preupscale::offload` (for the round trip, or the teardown).
+///
+/// # Safety
+/// Nothing of the game presents concurrently (its `vkCreateSwapchainKHR` or `vkDestroyDevice`).
+#[cfg(target_arch = "x86_64")]
+unsafe fn gpu2_release_host(game: vk::Device) {
+    let host = {
+        let mut hosts = GPU2_HOSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        hosts.iter().position(|(g, _)| *g == game).map(|k| hosts.remove(k).1)
+    };
+    let Some(host) = host else { return };
+    if let Some(why) = host.second.failed() {
+        GPU2_GIVEN_UP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(why);
+    }
+    for v in crate::gpu2_present::all() {
+        v.release_second_of(&host.second);
+    }
+    // SAFETY: the presenters were joined: nothing uses the second device but this teardown.
+    unsafe { destroy_private_resources(host.second.device.handle()) };
+    crate::log!("[present2] {} no longer shows the game's frames: its device is given back", host.second.name);
+    crate::logging::flush();
+    crate::preupscale::offload::give_back(game, host.offload, false);
+}
+
+/// The second device's presents, through the layer's own record of it.
+#[cfg(target_arch = "x86_64")]
+struct HostShower {
+    info: NeuralForgeDeviceInfo,
+    hdr: Option<ash::ext::hdr_metadata::Device>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl crate::gpu2_present::Shower for HostShower {
+    unsafe fn create_swapchain(&self, info: &vk::SwapchainCreateInfoKHR) -> ash::prelude::VkResult<vk::SwapchainKHR> {
+        match self.info.create_swapchain_khr(info, None) {
+            LayerResult::Handled(r) => r,
+            LayerResult::Unhandled => Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT),
+        }
+    }
+
+    unsafe fn present(&self, queue: vk::Queue, info: &vk::PresentInfoKHR) -> vk::Result {
+        match self.info.queue_present_khr(queue, info) {
+            LayerResult::Handled(Ok(())) => vk::Result::SUCCESS,
+            LayerResult::Handled(Err(e)) => e,
+            LayerResult::Unhandled => vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+        }
+    }
+
+    unsafe fn destroy_swapchain(&self, swapchain: vk::SwapchainKHR) {
+        let _ = self.info.destroy_swapchain_khr(swapchain, None);
+    }
+
+    unsafe fn set_hdr_metadata(&self, swapchain: vk::SwapchainKHR, metadata: &vk::HdrMetadataEXT) {
+        // The record notes it for the HDR verdict; the call itself is forwarded here.
+        let _ = self.info.set_hdr_metadata_ext(&[swapchain], std::slice::from_ref(metadata));
+        if let Some(hdr) = &self.hdr {
+            // SAFETY: the real swapchain, the presenter's alone.
+            unsafe { hdr.set_hdr_metadata(&[swapchain], std::slice::from_ref(metadata)) };
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl NeuralForgeDeviceInfo {
+    /// Whether the second GPU is to show this swapchain itself, and with what: `Err(None)` when it is not asked for,
+    /// `Err(Some(why))` when it is asked for and cannot be.
+    fn gpu2_wanted(&self, info: &vk::SwapchainCreateInfoKHR) -> Result<Option<&'static neural_forge_protocol::ShmHeader>, Option<String>> {
+        use crate::preupscale::offload;
+        if !crate::layer_enabled()
+            || !self.nvidia
+            || self._loader_data.is_none()
+            || !crate::ownership::eligible()
+            || offload::Choice::current() == offload::Choice::Off
+            || !swapchain::is_plausible_game_size(info.image_extent.width, info.image_extent.height)
+        {
+            return Err(None);
+        }
+        let header = {
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.shm.open();
+            state.shm.header()
+        };
+        let Some(header) = header else { return Err(None) };
+        if header.second_gpu_present.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            if !header.second_gpu_present_line().is_empty() {
+                header.set_second_gpu_present_line("");
+            }
+            return Err(None);
+        }
+        let say = |why: String| {
+            let line = crate::gpu2_present::not_showing_line(&why);
+            if header.second_gpu_present_line() != line {
+                crate::log!("[present2] {line}; the frames come back to the game's GPU as before");
+                crate::logging::flush();
+                header.set_second_gpu_present_line(&line);
+            }
+            Err(Some(why))
+        };
+        if let Some(why) = GPU2_GIVEN_UP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+            return say(format!("given up earlier ({why})"));
+        }
+        if offload::given_up() || matches!(offload::state(), offload::State::Stalled(_)) {
+            return say("the second GPU was given up for this session".into());
+        }
+        let (count, placements) = header.placements();
+        if !placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
+            return say("Placement is not Finished frame for every pass".into());
+        }
+        if self.gpu2_signal.is_none() {
+            return say("the layer has no queue of its own on the game's device".into());
+        }
+        if self.instance.is_none() {
+            return say("the game's instance is unknown".into());
+        }
+        Ok(Some(header))
+    }
+
+    /// The second GPU's side for this device: the one there is, or made now from the device `preupscale::offload` made.
+    fn gpu2_host(&self, header: Option<&'static neural_forge_protocol::ShmHeader>) -> Result<Arc<crate::gpu2_present::Second>, String> {
+        use crate::preupscale::offload;
+        let game = self.device.handle();
+        let mut hosts = GPU2_HOSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, h)) = hosts.iter().find(|(g, _)| *g == game) {
+            return Ok(h.second.clone());
+        }
+        let instance = self.instance.clone().ok_or("the game's instance is unknown")?;
+        let off = match offload::take(game) {
+            Some(Ok(off)) => off,
+            Some(Err(why)) => return Err(why),
+            None => return Err("no device on the second GPU is free for it (none was made, or the round trip uses it)".into()),
+        };
+        let refuse = |off: offload::Offload, why: &str| {
+            offload::give_back(game, off, false);
+            Err(why.to_string())
+        };
+        if off.standin {
+            return refuse(off, "the stand-in copy runs on the second GPU, not the network");
+        }
+        let Some((family, index)) = off.present else {
+            return refuse(off, "the second GPU's device has no queue for a swapchain (no VK_KHR_swapchain or no graphics queue)");
+        };
+        // SAFETY: the next layer's gipa for the game's instance.
+        let Some(surface) = (unsafe { crate::gpu2_present::SurfaceFns::load(off.setup.gipa, off.setup.instance) }) else {
+            return refuse(off, "the instance has no VK_KHR_surface queries");
+        };
+        let handle = off.device.handle();
+        // The second device's record takes these as a game's device's does.
+        crate::note_native(handle, off.setup);
+        if off.import {
+            crate::note_external_memory_host(handle);
+        }
+        let info = Self::make(
+            Some(instance.clone()),
+            SurfaceQueries { caps: self.surface_caps, formats: self.surface_formats },
+            off.physical,
+            Arc::new(off.device.clone()),
+            off.gdpa,
+            None,
+            true,
+        );
+        // Its present queue, taken through the record's hook, which learns the queue's family as from a game.
+        let queue = match info.get_device_queue(family, index) {
+            LayerResult::Handled(q) => q,
+            // SAFETY: a queue the device was made with.
+            LayerResult::Unhandled => unsafe { off.device.get_device_queue(family, index) },
+        };
+        // SAFETY: the queue just taken from below the loader.
+        if queue == vk::Queue::null() || unsafe { crate::loader_data::initialize_queue(handle, queue) }.is_err() {
+            drop(info);
+            // SAFETY: nothing of the record was used.
+            unsafe { destroy_private_resources(handle) };
+            return refuse(off, "the second GPU's present queue could not be taken");
+        }
+        let hdr = off.hdr_metadata.then(|| ash::ext::hdr_metadata::Device::new(&instance, &off.device));
+        let second = Arc::new(crate::gpu2_present::Second::new(
+            off.device.clone(),
+            (*instance).clone(),
+            off.physical,
+            queue,
+            family,
+            surface,
+            Box::new(HostShower { info, hdr }),
+            off.name.clone(),
+            header,
+        ));
+        crate::log!("[present2] {} is set up to show the game's frames itself (queue family {family}); the network runs there on the finished frame", off.name);
+        crate::logging::flush();
+        hosts.push((game, Gpu2Host { second: second.clone(), offload: off }));
+        Ok(second)
+    }
+
+    /// The game's `vkCreateSwapchainKHR` when the second GPU may show the swapchain: `Some` with the layer's own
+    /// swapchain; `None` for the game's own as always (not asked for, or not possible: said in the log and Status),
+    /// with `info.oldSwapchain` then cleared if it was the layer's.
+    fn gpu2_create_swapchain(&self, info: &mut vk::SwapchainCreateInfoKHR) -> Option<vk::SwapchainKHR> {
+        let old = crate::gpu2_present::lookup(info.old_swapchain);
+        let made = match self.gpu2_wanted(info) {
+            Ok(header) => self.gpu2_host(header).and_then(|second| {
+                let game = crate::gpu2_present::GameDevice {
+                    device: &self.device,
+                    instance: self.instance.as_deref().expect("checked by gpu2_wanted"),
+                    physical: self.physical_device,
+                    signal: self.gpu2_signal.clone().expect("checked by gpu2_wanted"),
+                };
+                // A swapchain of the layer's still on this surface that the game did not name as the old one.
+                for other in crate::gpu2_present::on_surface(info.surface) {
+                    if old.as_ref().is_none_or(|o| !Arc::ptr_eq(o, &other)) {
+                        other.release_second();
+                    }
+                }
+                // SAFETY: the game's create info for this device; the second device's queue is idle (one swapchain).
+                unsafe { crate::gpu2_present::Virtual::create(&game, &second, info, old.as_ref()) }.inspect_err(|why| {
+                    let line = crate::gpu2_present::not_showing_line(why);
+                    crate::log!("[present2] {line}; the game gets a swapchain of its own GPU");
+                    crate::logging::flush();
+                    if let Some(h) = header {
+                        h.set_second_gpu_present_line(&line);
+                    }
+                })
+            }),
+            Err(None) => Err(String::new()),
+            Err(Some(why)) => Err(why),
+        };
+        match made {
+            Ok(swapchain) => Some(swapchain),
+            Err(_) => {
+                // The game's own swapchain, on a surface nothing of the layer's holds any more.
+                let held = crate::gpu2_present::on_surface(info.surface);
+                for v in &held {
+                    v.release_second();
+                }
+                if old.is_some() {
+                    info.old_swapchain = vk::SwapchainKHR::null();
+                }
+                if !held.is_empty() || old.is_some() || self.gpu2_given_up() {
+                    // SAFETY: inside the game's vkCreateSwapchainKHR; its presents are not concurrent with it.
+                    unsafe { gpu2_release_host(self.device.handle()) };
+                }
+                None
+            }
+        }
+    }
+
+    /// The second GPU stopped showing this device's frames (a failure while it ran).
+    fn gpu2_given_up(&self) -> bool {
+        let game = self.device.handle();
+        GPU2_HOSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(g, h)| *g == game && h.second.failed().is_some())
+    }
+
+    /// The game's present where every swapchain of it is the layer's: handed to the second GPU. `None`: none is.
+    fn gpu2_present(&self, queue: vk::Queue, present_info: &vk::PresentInfoKHR) -> Option<ash::prelude::VkResult<()>> {
+        if !crate::gpu2_present::any() || present_info.swapchain_count == 0 || present_info.p_swapchains.is_null() || present_info.p_image_indices.is_null() {
+            return None;
+        }
+        let n = present_info.swapchain_count as usize;
+        // SAFETY: the present info's parallel arrays, valid for the call.
+        let (swapchains, indices) =
+            unsafe { (std::slice::from_raw_parts(present_info.p_swapchains, n), std::slice::from_raw_parts(present_info.p_image_indices, n)) };
+        let virtuals: Vec<_> = swapchains.iter().map(|&s| crate::gpu2_present::lookup(s)).collect();
+        if virtuals.iter().all(Option::is_none) {
+            return None;
+        }
+        crate::ownership::note_present();
+        // SAFETY: as above.
+        let waits: &[vk::Semaphore] = if present_info.wait_semaphore_count == 0 || present_info.p_wait_semaphores.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(present_info.p_wait_semaphores, present_info.wait_semaphore_count as usize) }
+        };
+        // The present's fences (`VK_EXT_swapchain_maintenance1`), one per swapchain.
+        let mut fences: &[vk::Fence] = &[];
+        let mut node = present_info.p_next.cast::<vk::BaseInStructure>();
+        while !node.is_null() {
+            // SAFETY: the application's chain: every struct starts with its type and the next pointer.
+            unsafe {
+                if (*node).s_type == vk::StructureType::SWAPCHAIN_PRESENT_FENCE_INFO_EXT {
+                    let f = &*node.cast::<vk::SwapchainPresentFenceInfoEXT>();
+                    if f.swapchain_count as usize == n && !f.p_fences.is_null() {
+                        fences = std::slice::from_raw_parts(f.p_fences, n);
+                    }
+                }
+                node = (*node).p_next;
+            }
+        }
+        if virtuals.iter().any(Option::is_none) {
+            // Never seen: a present of the layer's swapchain together with one of the game's own. The layer's are
+            // skipped, the present goes on untouched for the rest (the driver refuses the handles it does not know).
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!("[present2] a present names the second GPU's swapchain together with another: not supported, its frames are not shown");
+            }
+            for (v, &i) in virtuals.iter().zip(indices) {
+                if let Some(v) = v {
+                    v.release(&[i]);
+                }
+            }
+            return Some(Err(vk::Result::ERROR_OUT_OF_DATE_KHR));
+        }
+        let family = self.queue_family(queue);
+        let mut worst = vk::Result::SUCCESS;
+        for (k, (v, &index)) in virtuals.iter().zip(indices).enumerate() {
+            let v = v.as_ref().expect("all are the layer's");
+            // SAFETY: the game's present queue, synchronized by the game for this call; its waits go with the first copy.
+            let r = unsafe { v.present(queue, family, index, if k == 0 { waits } else { &[] }, fences.get(k).copied().unwrap_or_default()) };
+            if !present_info.p_results.is_null() {
+                // SAFETY: the application's results array, one per swapchain.
+                unsafe { *present_info.p_results.add(k) = r };
+            }
+            if r != vk::Result::SUCCESS && (worst == vk::Result::SUCCESS || worst == vk::Result::SUBOPTIMAL_KHR) {
+                worst = r;
+            }
+        }
+        Some(worst.result())
+    }
+}
+
 impl DeviceInfo for NeuralForgeDeviceInfo {
     type HooksType = Self;
     type HooksRefType<'a> = &'a Self;
@@ -2312,6 +2696,17 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // own next-in-chain dispatch handle it exactly as if we weren't here.
         let Some(next_create) = self.next_create_swapchain_khr else {
             return LayerResult::Unhandled;
+        };
+        // The second GPU shows this swapchain itself (`crate::gpu2_present`): the game gets one the layer owns. Else
+        // its own, as always (its `oldSwapchain` cleared when that was the layer's).
+        #[cfg(target_arch = "x86_64")]
+        let mut own_info = *create_info;
+        #[cfg(target_arch = "x86_64")]
+        let create_info = {
+            if let Some(swapchain) = self.gpu2_create_swapchain(&mut own_info) {
+                return LayerResult::Handled(Ok(swapchain));
+            }
+            &own_info
         };
         if crate::layer_enabled()
             && !crate::ownership::eligible()
@@ -3038,7 +3433,129 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Handled(result.result())
     }
 
+    fn get_swapchain_images_khr(&self, swapchain: vk::SwapchainKHR) -> LayerResult<ash::prelude::VkResult<Vec<vk::Image>>> {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(v) = crate::gpu2_present::lookup(swapchain) {
+            return LayerResult::Handled(Ok(v.images()));
+        }
+        let _ = swapchain;
+        LayerResult::Unhandled
+    }
+
+    fn acquire_next_image_khr(
+        &self,
+        swapchain: vk::SwapchainKHR,
+        timeout: u64,
+        semaphore: vk::Semaphore,
+        fence: vk::Fence,
+    ) -> LayerResult<ash::prelude::VkResult<u32>> {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(v) = crate::gpu2_present::lookup(swapchain) {
+            return LayerResult::Handled(v.acquire(timeout, semaphore, fence));
+        }
+        let _ = (swapchain, timeout, semaphore, fence);
+        LayerResult::Unhandled
+    }
+
+    fn acquire_next_image2_khr(&self, info: &vk::AcquireNextImageInfoKHR) -> LayerResult<ash::prelude::VkResult<u32>> {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(v) = crate::gpu2_present::lookup(info.swapchain) {
+            return LayerResult::Handled(v.acquire(info.timeout, info.semaphore, info.fence));
+        }
+        let _ = info;
+        LayerResult::Unhandled
+    }
+
+    fn get_swapchain_status_khr(&self, swapchain: vk::SwapchainKHR) -> LayerResult<ash::prelude::VkResult<()>> {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(v) = crate::gpu2_present::lookup(swapchain) {
+            return LayerResult::Handled(v.shared.status().result());
+        }
+        let _ = swapchain;
+        LayerResult::Unhandled
+    }
+
+    /// A present of the layer's swapchain is handed over at once and never waited for.
+    fn wait_for_present_khr(&self, swapchain: vk::SwapchainKHR, _present_id: u64, _timeout: u64) -> LayerResult<ash::prelude::VkResult<()>> {
+        #[cfg(target_arch = "x86_64")]
+        if crate::gpu2_present::lookup(swapchain).is_some() {
+            return LayerResult::Handled(Ok(()));
+        }
+        let _ = swapchain;
+        LayerResult::Unhandled
+    }
+
+    fn release_swapchain_images_ext(&self, info: &vk::ReleaseSwapchainImagesInfoEXT) -> LayerResult<ash::prelude::VkResult<()>> {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(v) = crate::gpu2_present::lookup(info.swapchain) {
+            if info.image_index_count > 0 && !info.p_image_indices.is_null() {
+                // SAFETY: the application's array of that many indices.
+                v.release(unsafe { std::slice::from_raw_parts(info.p_image_indices, info.image_index_count as usize) });
+            }
+            return LayerResult::Handled(Ok(()));
+        }
+        let _ = info;
+        LayerResult::Unhandled
+    }
+
+    // `VK_NV_low_latency2` on the layer's swapchain: the driver does not know the handle, and nothing of the game's
+    // frame pacing reaches the second GPU's swapchain. Sleeps return at once, markers are dropped, no timings.
+    fn set_latency_sleep_mode_nv(&self, swapchain: vk::SwapchainKHR, _info: &vk::LatencySleepModeInfoNV) -> LayerResult<ash::prelude::VkResult<()>> {
+        #[cfg(target_arch = "x86_64")]
+        if crate::gpu2_present::lookup(swapchain).is_some() {
+            return LayerResult::Handled(Ok(()));
+        }
+        let _ = swapchain;
+        LayerResult::Unhandled
+    }
+
+    fn latency_sleep_nv(&self, swapchain: vk::SwapchainKHR, info: &vk::LatencySleepInfoNV) -> LayerResult<ash::prelude::VkResult<()>> {
+        #[cfg(target_arch = "x86_64")]
+        if crate::gpu2_present::lookup(swapchain).is_some() {
+            // The game waits on this timeline semaphore for the time to wake: now.
+            let signal = vk::SemaphoreSignalInfo::default().semaphore(info.signal_semaphore).value(info.value);
+            // SAFETY: the game's own timeline semaphore on its device.
+            return LayerResult::Handled(unsafe { self.device.signal_semaphore(&signal) });
+        }
+        let _ = (swapchain, info);
+        LayerResult::Unhandled
+    }
+
+    fn set_latency_marker_nv(&self, swapchain: vk::SwapchainKHR, _info: &vk::SetLatencyMarkerInfoNV) -> LayerResult<()> {
+        #[cfg(target_arch = "x86_64")]
+        if crate::gpu2_present::lookup(swapchain).is_some() {
+            return LayerResult::Handled(());
+        }
+        let _ = swapchain;
+        LayerResult::Unhandled
+    }
+
+    fn get_latency_timings_nv(&self, swapchain: vk::SwapchainKHR, info: &mut std::mem::MaybeUninit<vk::GetLatencyMarkerInfoNV>) -> LayerResult<()> {
+        #[cfg(target_arch = "x86_64")]
+        if crate::gpu2_present::lookup(swapchain).is_some() {
+            // SAFETY: the application's in/out struct: its count is the only thing written.
+            unsafe { (*info.as_mut_ptr()).timing_count = 0 };
+            return LayerResult::Handled(());
+        }
+        let _ = (swapchain, info);
+        LayerResult::Unhandled
+    }
+
     fn set_hdr_metadata_ext(&self, swapchains: &[vk::SwapchainKHR], metadata: &[vk::HdrMetadataEXT]) -> LayerResult<()> {
+        // The layer's own swapchains (`crate::gpu2_present`): the metadata goes to the real one on the second GPU.
+        #[cfg(target_arch = "x86_64")]
+        if crate::gpu2_present::any() && swapchains.iter().any(|s| crate::gpu2_present::lookup(*s).is_some()) {
+            for (s, m) in swapchains.iter().zip(metadata) {
+                if let Some(v) = crate::gpu2_present::lookup(*s) {
+                    v.set_hdr_metadata(m);
+                }
+            }
+            if swapchains.iter().all(|s| crate::gpu2_present::lookup(*s).is_some()) {
+                return LayerResult::Handled(());
+            }
+            crate::log!("[present2] HDR metadata names the second GPU's swapchain together with another: the other's is not forwarded");
+            return LayerResult::Handled(());
+        }
         let lines: Vec<String> = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = &mut *state;
@@ -3077,6 +3594,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next_destroy) = self.next_destroy_swapchain_khr else {
             return LayerResult::Unhandled;
         };
+        // One of the layer's own (`crate::gpu2_present`): nothing of it is the driver's.
+        // SAFETY: the game's destroy of its swapchain.
+        #[cfg(target_arch = "x86_64")]
+        if unsafe { crate::gpu2_present::destroy(swapchain) } {
+            return LayerResult::Handled(());
+        }
         release_primary(self.device.handle(), swapchain);
         {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3857,6 +4380,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next_present) = self.next_queue_present_khr else {
             return LayerResult::Unhandled;
         };
+        #[cfg(target_arch = "x86_64")]
+        if let Some(result) = self.gpu2_present(queue, present_info) {
+            return LayerResult::Handled(result);
+        }
         // A present on the queue the network shares: forwarded under its lock with nothing of the layer's (its work
         // here would wait on the network, which waits on the lock). Never seen: games present on their graphics queue.
         if let Some(_shared) = crate::shared_queue::guard_if(self.shared_queue, queue) {

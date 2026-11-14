@@ -6847,7 +6847,8 @@ impl Session {
             // The model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`, `offload`): only at the finished-frame placement, and
             // until it is given up for the session.
             // Given up for the process (`offload::given_up`): every device runs the network on its own GPU from then on.
-            if offload::Choice::current() != offload::Choice::Off && !offload::given_up() {
+            // (Never from the second GPU's own device while it shows the frames, `crate::gpu2_present`: the network runs on it.)
+            if offload::Choice::current() != offload::Choice::Off && !offload::given_up() && !crate::device::gpu2_hosts(device.handle()) {
                 let (count, placements) = view.header().placements();
                 if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
                     self.post_offload = true;

@@ -23,6 +23,8 @@ mod composition;
 mod device;
 mod dump;
 mod entry_points;
+#[cfg(target_arch = "x86_64")]
+mod gpu2_present;
 mod gpu_timer;
 mod hdr_present;
 mod hdr_verdict;
@@ -591,6 +593,19 @@ pub(crate) fn take_external_memory_host_enabled(device: vk::Device) -> bool {
 /// `NeuralForgeDeviceInfo::new`.
 #[cfg(target_arch = "x86_64")]
 static NATIVE_DEVICES: Mutex<Option<HashMap<vk::Device, preupscale::native::Setup>>> = Mutex::new(None);
+
+/// Notes the native backend's setup for a device the layer made itself (the second GPU's, when it shows the frames:
+/// `gpu2_present`), for its record to take as a game's device's does.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn note_native(device: vk::Device, setup: preupscale::native::Setup) {
+    NATIVE_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(device, setup);
+}
+
+/// Notes that `VK_EXT_external_memory_host` is enabled on a device the layer made itself ([`note_native`]).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn note_external_memory_host(device: vk::Device) {
+    EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashSet::new).insert(device);
+}
 
 /// Checks and clears the native backend's setup for `device`.
 #[cfg(target_arch = "x86_64")]
@@ -1290,7 +1305,11 @@ impl Layer for NeuralForgeLayer {
         _instance_info: &Self::InstanceInfo,
         device_info: Option<&Self::DeviceInfo>,
     ) -> Box<dyn Iterator<Item = LayerVulkanCommand>> {
-        device_commands(probe_ngx::enabled(), preupscale_hooks(preupscale::active(), device_info.map(NeuralForgeDeviceInfo::preupscale_tracked)))
+        device_commands(
+            probe_ngx::enabled(),
+            preupscale_hooks(preupscale::active(), device_info.map(NeuralForgeDeviceInfo::preupscale_tracked)),
+            second_gpu_asked(),
+        )
     }
 
     fn create_instance_info(
@@ -1372,12 +1391,29 @@ fn preupscale_hooks(mode_on: bool, tracked: Option<bool>) -> bool {
     mode_on && tracked.unwrap_or(true)
 }
 
+/// Whether a second GPU is asked for (`NEURAL_FORGE_OFFLOAD_GPU`): the commands that name a swapchain are hooked
+/// only then (`gpu2_present::commands`), for the swapchain the layer may own when that GPU shows the frames.
+fn second_gpu_asked() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return preupscale::offload::Choice::current() != preupscale::offload::Choice::Off;
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
 /// The device commands the framework routes to this layer's hooks: the default set, then the
 /// probe's and the pre-upscaler path's when they are on, each command once.
-fn device_commands(probe: bool, preupscale: bool) -> Box<dyn Iterator<Item = LayerVulkanCommand>> {
+fn device_commands(probe: bool, preupscale: bool, second_gpu: bool) -> Box<dyn Iterator<Item = LayerVulkanCommand>> {
     use vulkan_layer::DeviceInfo;
     let mut seen: Vec<LayerVulkanCommand> = Vec::new();
-    for command in NeuralForgeDeviceInfo::hooked_commands().iter().chain(probe_ngx::probe_commands(probe)).chain(preupscale::commands(preupscale)) {
+    #[cfg(target_arch = "x86_64")]
+    let present2 = gpu2_present::commands(second_gpu);
+    #[cfg(not(target_arch = "x86_64"))]
+    let present2: &[LayerVulkanCommand] = &[];
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = second_gpu;
+    for command in
+        NeuralForgeDeviceInfo::hooked_commands().iter().chain(probe_ngx::probe_commands(probe)).chain(preupscale::commands(preupscale)).chain(present2)
+    {
         if !seen.contains(command) {
             seen.push(command.clone());
         }
@@ -1392,22 +1428,22 @@ mod probe_command_tests {
 
     #[test]
     fn probe_off_hooks_exactly_the_default_set() {
-        let off: Vec<_> = device_commands(false, false).collect();
+        let off: Vec<_> = device_commands(false, false, false).collect();
         assert_eq!(off, NeuralForgeDeviceInfo::hooked_commands().to_vec());
         for command in probe_ngx::PROBE_COMMANDS {
             assert!(!off.contains(command), "{command:?} must not be hooked with the probe off");
         }
-        let on: Vec<_> = device_commands(true, false).collect();
+        let on: Vec<_> = device_commands(true, false, false).collect();
         assert_eq!(on.len(), off.len() + probe_ngx::PROBE_COMMANDS.len());
         assert!(probe_ngx::PROBE_COMMANDS.iter().all(|command| on.contains(command)));
         for command in preupscale::COMMANDS {
             assert!(!off.contains(command), "{command:?} must not be hooked with the pre-upscaler path off");
         }
-        let pre: Vec<_> = device_commands(false, true).collect();
+        let pre: Vec<_> = device_commands(false, true, false).collect();
         assert_eq!(pre.len(), off.len() + preupscale::COMMANDS.len());
         assert!(preupscale::COMMANDS.iter().all(|command| pre.contains(command)));
         // Both: the union, each command once.
-        let both: Vec<_> = device_commands(true, true).collect();
+        let both: Vec<_> = device_commands(true, true, false).collect();
         let only_pre = preupscale::COMMANDS.iter().filter(|command| !probe_ngx::PROBE_COMMANDS.contains(command)).count();
         assert_eq!(both.len(), on.len() + only_pre);
         assert!(preupscale::COMMANDS.iter().all(|command| both.contains(command)));
@@ -1416,6 +1452,21 @@ mod probe_command_tests {
 
     /// `NEURAL_FORGE_PREUPSCALE=off` hooks exactly 1.1.0's list everywhere; the default mode hooks
     /// the tracking commands only on a device that got the tracking (one with NVX).
+    /// The commands that name a swapchain are hooked only with a second GPU asked for, each once, after the default set.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_swapchain_commands_are_hooked_only_with_a_second_gpu() {
+        let off: Vec<_> = device_commands(false, false, false).collect();
+        let on: Vec<_> = device_commands(false, false, true).collect();
+        assert_eq!(off, NeuralForgeDeviceInfo::hooked_commands().to_vec());
+        assert_eq!(on[..off.len()], off[..]);
+        assert_eq!(on[off.len()..], *gpu2_present::commands(true));
+        for c in [LayerVulkanCommand::AcquireNextImageKhr, LayerVulkanCommand::GetSwapchainImagesKhr, LayerVulkanCommand::LatencySleepNv] {
+            assert_eq!(on.iter().filter(|x| **x == c).count(), 1, "{c:?}");
+            assert!(!off.contains(&c));
+        }
+    }
+
     #[test]
     fn the_pre_upscaler_commands_follow_the_mode_and_the_device() {
         assert!(!preupscale_hooks(false, None));
@@ -1424,7 +1475,7 @@ mod probe_command_tests {
         assert!(preupscale_hooks(true, None), "instance level: the mode alone");
         assert!(preupscale_hooks(true, Some(true)));
         assert!(!preupscale_hooks(true, Some(false)), "a device without NVX keeps the default list");
-        assert_eq!(device_commands(false, preupscale_hooks(true, Some(false))).collect::<Vec<_>>(), NeuralForgeDeviceInfo::hooked_commands().to_vec());
+        assert_eq!(device_commands(false, preupscale_hooks(true, Some(false)), false).collect::<Vec<_>>(), NeuralForgeDeviceInfo::hooked_commands().to_vec());
         assert!(preupscale::wanted_on_device(true, true));
         assert!(!preupscale::wanted_on_device(true, false));
         assert!(!preupscale::wanted_on_device(false, true));

@@ -469,6 +469,13 @@ pub(crate) struct Offload {
     pub name: String,
     /// For the log when the server starts on it: which GPU, the game's, and how the frame crosses.
     pub plan: String,
+    /// The next layer's `vkGetDeviceProcAddr` for it.
+    pub gdpa: vk::PFN_vkGetDeviceProcAddr,
+    /// The queue (family, index) made for a swapchain of its own (`crate::gpu2_present`); `None` where the GPU has no
+    /// `VK_KHR_swapchain` or no graphics queue to spare.
+    pub present: Option<(u32, u32)>,
+    /// `VK_EXT_hdr_metadata` is enabled on it (with [`Self::present`]).
+    pub hdr_metadata: bool,
     destroy: PfnLayerDestroyDevice,
     _registration: crate::loader_data::Registration,
 }
@@ -480,6 +487,17 @@ fn family(families: &[vk::QueueFamilyProperties], wanted: u32) -> Option<u32> {
     let pick =
         |no_graphics: bool| (0..families.len()).find(|&i| fits(&families[i]) && (!no_graphics || !families[i].queue_flags.contains(vk::QueueFlags::GRAPHICS)));
     pick(true).or_else(|| pick(false)).map(|i| i as u32)
+}
+
+/// The queue (family, index) for a swapchain on the offload device: the first graphics family's first queue, or,
+/// where that is the network's family (`family`, which takes `taken` queues), the next one of it if it has one.
+fn present_queue(families: &[vk::QueueFamilyProperties], family: u32, taken: u32) -> Option<(u32, u32)> {
+    let g = families.iter().position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS) && f.queue_count > 0)? as u32;
+    if g != family {
+        Some((g, 0))
+    } else {
+        (families[g as usize].queue_count > taken).then_some((g, taken))
+    }
 }
 
 impl Offload {
@@ -519,11 +537,20 @@ impl Offload {
         let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
         let queues_wanted = if run_network { 2 } else { 1 };
         let family = family(&families, queues_wanted).ok_or_else(|| format!("{} has no compute family with {queues_wanted} queue(s)", described[k].name))?;
-        let priorities = [1.0f32; 2];
-        let queue = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities[..queues_wanted as usize])];
         // SAFETY: as above.
         let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
         let offers = |name: &CStr| extensions.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == name);
+        // The second GPU may show the frames itself (`crate::gpu2_present`): a queue of a graphics family for its
+        // swapchain and the finished-frame path, where the GPU has `VK_KHR_swapchain`. Whether that queue presents to
+        // the game's surface is asked when the game creates its swapchain.
+        let present = present_queue(&families, family, queues_wanted).filter(|_| offers(ash::khr::swapchain::NAME));
+        let priorities = [1.0f32; 3];
+        let mut queue = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities[..queues_wanted as usize])];
+        match present {
+            Some((f, index)) if f == family => queue[0] = queue[0].queue_priorities(&priorities[..=index as usize]),
+            Some((f, _)) => queue.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&priorities[..1])),
+            None => {}
+        }
         let host = offers(crate::EXTERNAL_MEMORY_HOST_EXTENSION);
         // Sync-fd semaphores, where the GPU can export them (asked of the driver) and the GPU wait is chosen
         // (`NEURAL_FORGE_OFFLOAD_PACING=gpu`): each frame's submission is exported for the game's present to wait on
@@ -533,6 +560,13 @@ impl Offload {
         let mut names: Vec<*const c_char> = if host { vec![crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()] } else { Vec::new() };
         if semaphore_fd {
             names.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
+        }
+        let hdr_metadata = present.is_some() && offers(ash::ext::hdr_metadata::NAME);
+        if present.is_some() {
+            names.push(ash::khr::swapchain::NAME.as_ptr());
+        }
+        if hdr_metadata {
+            names.push(ash::ext::hdr_metadata::NAME.as_ptr());
         }
         let base = vk::DeviceCreateInfo::default().queue_create_infos(&queue).enabled_extension_names(&names);
         // The network's extensions and features on top (they outlive the call).
@@ -602,6 +636,9 @@ impl Offload {
             standin: !run_network,
             name,
             plan,
+            gdpa,
+            present,
+            hdr_metadata,
             destroy: callbacks.destroy,
             _registration: registration,
         })
@@ -1360,6 +1397,18 @@ mod tests {
         assert!(given_up(), "another device's server cannot start it again");
         assert!(status_line().is_some_and(|l| l.contains("given up (too slow)")));
         *STATE.lock().unwrap() = State::Off;
+    }
+
+    #[test]
+    fn the_present_queue_is_a_graphics_one_beside_the_networks() {
+        let f = |flags, queue_count| vk::QueueFamilyProperties { queue_flags: flags, queue_count, ..Default::default() };
+        let (g, c) = (vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE, vk::QueueFlags::COMPUTE);
+        // NVIDIA: graphics family 0, the network on the compute family 2.
+        assert_eq!(present_queue(&[f(g, 16), f(vk::QueueFlags::TRANSFER, 2), f(c, 8)], 2, 2), Some((0, 0)));
+        // One family for everything: the queue after the network's, if there is one.
+        assert_eq!(present_queue(&[f(g, 3)], 0, 2), Some((0, 2)));
+        assert_eq!(present_queue(&[f(g, 2)], 0, 2), None);
+        assert_eq!(present_queue(&[f(c, 4)], 0, 2), None, "no graphics family");
     }
 
     #[test]

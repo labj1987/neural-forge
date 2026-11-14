@@ -433,7 +433,7 @@ impl ShmClient {
         Self { header: std::ptr::from_ref(header).cast_mut(), reserved: [REGION_CAP as u64; Slot::COUNT], ..Self::default() }
     }
 
-    fn header(&self) -> Option<&'static neural_forge_protocol::ShmHeader> {
+    pub(crate) fn header(&self) -> Option<&'static neural_forge_protocol::ShmHeader> {
         // SAFETY: non-null only after a successful `open()`, which mmaps
         // `neural_forge_protocol::shm_total_bytes()` at this address and never unmaps it for
         // the lifetime of the process. The real channel is this process's only while it holds the

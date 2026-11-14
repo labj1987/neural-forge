@@ -729,6 +729,18 @@ pub struct ShmHeader {
     /// (saturating). Both 0 without a wrapper.
     pub ngx_records: AtomicU32,
     pub ngx_matched: AtomicU32,
+
+    // --- v28 -----------------------------------------------------------------------------
+    /// The second GPU shows the frame itself (`second_gpu_present`; the layer's `gpu2_present`): with the model on
+    /// a second GPU and every pass on the finished frame, that GPU presents the model's output on a swapchain of its
+    /// own and the game's GPU only copies each frame out, never waiting for an answer. 0 off (the frame comes back to
+    /// the game's GPU), 1 on. Read when the game creates its swapchain.
+    pub second_gpu_present: AtomicU32,
+    /// What the layer says about it: which GPU shows the frames, how many were shown and skipped and the copy's
+    /// time, or why the frames come back to the game's GPU. Empty while the setting is off. Sequence-guarded like
+    /// `layer_reason`.
+    pub second_gpu_present_seq: AtomicU32,
+    second_gpu_present_line: [AtomicU32; REASON_BYTES / 4],
 }
 
 /// The room for [`ShmHeader::hdr_verdict`]'s text, in bytes.
@@ -851,7 +863,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 3300, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 3500, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_verdict_seq) == 2776, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_verdict) == 2780, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, ngx_records) == 3292, "layout changed -- bump SHM_VERSION");
@@ -915,7 +927,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 187] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 188] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -1116,6 +1128,8 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 187] = [
     ("pass10_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
     // The HUD at present: its detection.
     ("hud_detect", 0.0, 1.0),
+    // The second GPU shows the frame itself.
+    ("second_gpu_present", 0.0, 1.0),
     // What the network sees before the upscaler: its brightness, and where the exposure comes from
     // (`enums::exposure_source`).
     ("preupscale_brightness", 0.25, 4.0),
@@ -1246,6 +1260,7 @@ impl ShmHeader {
             p.store(crate::enums::placement::AUTO, Ordering::Relaxed);
         }
         self.hud_detect.store(1, Ordering::Relaxed);
+        self.second_gpu_present.store(0, Ordering::Relaxed);
         self.store_hud_regions(&[]);
         self.preupscale_brightness_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.preupscale_exposure.store(crate::enums::exposure_source::GAME, Ordering::Relaxed);
@@ -1300,6 +1315,8 @@ impl ShmHeader {
         self.set_game_name("");
         self.set_preupscale_reason("");
         self.set_hdr_verdict("");
+        self.second_gpu_present_seq.store(0, Ordering::Relaxed);
+        self.set_second_gpu_present_line("");
         for n in [&self.ngx_records, &self.ngx_matched] {
             n.store(0, Ordering::Relaxed);
         }
@@ -1506,13 +1523,13 @@ impl ShmHeader {
     /// under `/tmp` and does not). Add to [`Self::setting_slots`] (and [`SETTING_BOUNDS`]), not just
     /// to the GUI, whenever a new tunable needs to survive a restart -- that is the one list that
     /// decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 187] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 188] {
         self.setting_slots().map(|(name, kind, field)| (name, kind == Kind::Float, field.load(Ordering::Relaxed)))
     }
 
     /// Every persisted setting's name, kind and field, in [`SETTING_BOUNDS`]'s order (a test holds
     /// the two lists to the same names at the same places). Only addresses: nothing is loaded.
-    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 187] {
+    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 188] {
         [
             ("white_point", Kind::Float, &self.white_point_bits),
             ("white_point_scale", Kind::Float, &self.white_point_scale_bits),
@@ -1701,6 +1718,7 @@ impl ShmHeader {
             ("pass9_placement", Kind::Whole, &self.pass_placement[8]),
             ("pass10_placement", Kind::Whole, &self.pass_placement[9]),
             ("hud_detect", Kind::Whole, &self.hud_detect),
+            ("second_gpu_present", Kind::Whole, &self.second_gpu_present),
             ("preupscale_brightness", Kind::Float, &self.preupscale_brightness_bits),
             ("preupscale_exposure", Kind::Whole, &self.preupscale_exposure),
         ]
@@ -1710,7 +1728,7 @@ impl ShmHeader {
     /// clamped to the setting's range in [`SETTING_BOUNDS`] (`None` for one that is not finite), a
     /// whole number clamped to it, and an override mask with the bits that name no override cleared.
     /// `None` for a name that is no setting.
-    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 187], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
+    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 188], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
         let at = SETTING_BOUNDS.iter().position(|(n, ..)| *n == name)?;
         let (_, min, max) = SETTING_BOUNDS[at];
         let (slot_name, kind, field) = slots[at];
@@ -2143,6 +2161,14 @@ impl ShmHeader {
     /// [`ShmHeader::hdr_verdict`]'s writer (the layer).
     pub fn set_hdr_verdict(&self, s: &str) {
         store_seq_guarded(&self.hdr_verdict_seq, &self.hdr_verdict, s);
+    }
+    /// [`ShmHeader::second_gpu_present_line`]'s writer (the layer).
+    pub fn set_second_gpu_present_line(&self, s: &str) {
+        store_seq_guarded(&self.second_gpu_present_seq, &self.second_gpu_present_line, s);
+    }
+    /// What the layer says about the second GPU showing the frames, or empty.
+    pub fn second_gpu_present_line(&self) -> String {
+        load_seq_guarded(&self.second_gpu_present_seq, &self.second_gpu_present_line)
     }
     /// The HDR verdict for the game's swapchain, or empty before a game has created one.
     pub fn hdr_verdict(&self) -> String {
@@ -2949,7 +2975,7 @@ mod tests {
         // v26 appends the HDR verdict: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, hdr_verdict_seq), std::mem::offset_of!(ShmHeader, preupscale_reason) + REASON_BYTES);
         assert_eq!(std::mem::offset_of!(ShmHeader, hdr_verdict) + HDR_VERDICT_BYTES, std::mem::offset_of!(ShmHeader, ngx_records));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 28);
         let h = ShmHeader::default();
         h.set_hdr_verdict("game outputs SDR");
         assert_eq!(h.hdr_verdict(), "game outputs SDR");
@@ -2966,7 +2992,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_sky), std::mem::offset_of!(ShmHeader, network) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_motion_structure_bits) + 4, std::mem::offset_of!(ShmHeader, pass_feedback_bits));
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4, std::mem::offset_of!(ShmHeader, scene_cuts));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 28);
         let h = ShmHeader::default();
         h.init_defaults();
         let m = h.mask_settings();
@@ -2990,7 +3016,7 @@ mod tests {
         // v20 appends the Network setting: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, network), std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28);
         assert_eq!(std::mem::offset_of!(ShmHeader, network) + 4, std::mem::offset_of!(ShmHeader, mask_sky));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 28);
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.network.load(Ordering::Relaxed), crate::enums::network::FULL, "the full network is the default");
@@ -3001,7 +3027,7 @@ mod tests {
         // v20's last word: every earlier field keeps its offset, and v21's fields follow it.
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts), std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts) + 4, std::mem::offset_of!(ShmHeader, preupscale_scale_bits));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 28);
         let h = ShmHeader::default();
         h.scene_cuts.store(5, Ordering::Relaxed);
         h.init_defaults();
@@ -3016,7 +3042,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<PassColour>(), 12);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour), std::mem::offset_of!(ShmHeader, edit_lut_seq) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour) + crate::MAX_PASSES * 12, std::mem::offset_of!(ShmHeader, placement));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 28);
         let h = ShmHeader::default();
         h.edit_lut_seq.store(9, Ordering::Relaxed);
         h.init_defaults();
@@ -3158,7 +3184,7 @@ mod tests {
     fn the_settings_game_is_appended_and_written_with_its_settings() {
         assert_eq!(std::mem::offset_of!(ShmHeader, settings_game), std::mem::offset_of!(ShmHeader, edit_highlight_protection_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, running_game) + 4, std::mem::offset_of!(ShmHeader, sharpen_cas_bits));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 28);
         let h = ShmHeader::default();
         h.settings_game.store(7, Ordering::Relaxed);
         h.running_game.store(7, Ordering::Relaxed);
@@ -3203,15 +3229,33 @@ mod tests {
     /// session starts them at 0.
     #[test]
     fn the_ngx_counters_are_appended_after_the_hdr_verdict() {
-        assert_eq!(crate::SHM_VERSION, 27);
         let at = std::mem::offset_of!(ShmHeader, ngx_records);
         assert_eq!(std::mem::offset_of!(ShmHeader, hdr_verdict) + HDR_VERDICT_BYTES, at);
         assert_eq!(std::mem::offset_of!(ShmHeader, ngx_matched), at + 4);
-        assert_eq!(at + 8, std::mem::size_of::<ShmHeader>());
+        assert_eq!(at + 8, std::mem::offset_of!(ShmHeader, second_gpu_present));
         let h = ShmHeader::default();
         h.ngx_matched.store(7, Ordering::Relaxed);
         h.init_defaults();
         assert_eq!(h.ngx_matched.load(Ordering::Relaxed), 0);
+    }
+
+    /// v28 appends the second GPU's present after the NGX counters: the setting is off by default, a persisted
+    /// setting, and its line is the layer's and starts empty with every session.
+    #[test]
+    fn the_second_gpus_present_is_appended_off_and_its_line_starts_empty() {
+        assert_eq!(crate::SHM_VERSION, 28);
+        let at = std::mem::offset_of!(ShmHeader, second_gpu_present);
+        assert_eq!(at, 3300);
+        assert_eq!(std::mem::offset_of!(ShmHeader, second_gpu_present_seq), at + 4);
+        assert_eq!(at + 8 + REASON_BYTES, std::mem::size_of::<ShmHeader>());
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(h.second_gpu_present.load(Ordering::Relaxed), 0);
+        assert!(SETTING_BOUNDS.iter().any(|(name, _, _)| *name == "second_gpu_present"));
+        h.set_second_gpu_present_line("second GPU shows the frames: X; 10 shown, 1 skipped (9%), copy 1.2 ms");
+        assert!(h.second_gpu_present_line().starts_with("second GPU shows the frames: X"));
+        h.init_defaults();
+        assert_eq!(h.second_gpu_present_line(), "");
     }
 
     /// v25 appends why no hold ran while DLSS's input is identified (`preupscale_reason`), after the sharpening: every
@@ -3222,7 +3266,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_reason_seq), std::mem::offset_of!(ShmHeader, clarity_edges_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_reason), std::mem::offset_of!(ShmHeader, preupscale_reason_seq) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_reason) + REASON_BYTES, std::mem::offset_of!(ShmHeader, hdr_verdict_seq));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 28);
         assert_eq!(crate::enums::preupscale_state::IDENTIFIED, 5);
         let h = ShmHeader::default();
         h.set_preupscale_reason("the colour input lacks TRANSFER_DST");
@@ -3240,7 +3284,7 @@ mod tests {
     fn the_sharpening_is_appended_and_starts_off() {
         assert_eq!(std::mem::offset_of!(ShmHeader, clarity_strength_bits), std::mem::offset_of!(ShmHeader, sharpen_cas_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, clarity_edges_bits) + 4, std::mem::offset_of!(ShmHeader, preupscale_reason_seq));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 28);
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.sharpen_settings_for_frame(), SharpenSettings::DEFAULT);
@@ -3337,7 +3381,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_scale_bits), std::mem::offset_of!(ShmHeader, scene_cuts) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits), std::mem::offset_of!(ShmHeader, preupscale_scale_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits) + crate::MAX_PASSES * 4, std::mem::offset_of!(ShmHeader, edit_saturation_bits));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 28);
         let h = ShmHeader::default();
         h.preupscale_scale_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
         h.pass_scale_bits[2].store(0.5f32.to_bits(), Ordering::Relaxed);
