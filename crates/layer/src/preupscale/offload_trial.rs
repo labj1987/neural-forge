@@ -5,9 +5,17 @@
 //! with the network on it is measured, not guessed: once two windows of offloaded holds in a row show the game waiting
 //! for the other GPU ([`Trial::offloaded`]), the held placements go to the game's GPU for one trial ([`Trial::local`]);
 //! the frame rate there decides, once per process ([`decide`]). A game's GPU that is no faster, or cannot run the
-//! model, gives the frames back to the other GPU, and nothing is tried again. The trial only steers the held
-//! placements ([`keeps_local`], read by `offload_pre::wanted`): the offload's own state (`super::offload::State`, the
-//! finished-frame placement) is left alone.
+//! model, gives the frames back to the other GPU, and nothing is tried again. The trial steers the held placements
+//! ([`keeps_local`], read by `offload_pre::wanted`).
+//!
+//! The finished frame is tried too ([`finished_present`], #63): there the present shows each answer one frame late
+//! and never waits for it, so the game's wait says nothing; a second GPU that drags the whole frame down (the reporter's
+//! RTX 5080 on a PCIe 4.0 x4 link, also driving the monitor: 5-20 fps against 87-98 fps with the model off, while its
+//! own frames took 7-16 ms and no present waited for an answer) went unnoticed by every rule. Two agreeing windows of
+//! offloaded presents start the trial whatever the wait, once per process: the server on the other GPU ends for it
+//! (`native_post`, without giving the other GPU up), the network runs on the game's GPU for the trial
+//! ([`finished_local`]), and the faster keeps the model. The offload's own state (`super::offload::State`) is left
+//! alone either way.
 //!
 //! On the #63 reporter's machine (RTX 4090 with an RTX 5080 beside it, the frames crossing system memory at about
 //! 3.5 GB/s): Cyberpunk 2077 with Ray Reconstruction at 2048x1536 ran at 27-36 fps with the 5080's 28.6 ms frames
@@ -50,6 +58,11 @@ pub(crate) const PAUSES_MAX: Duration = Duration::from_secs(60);
 /// Trials cut short by a change of what is held (another size, another pass count) before the offload keeps the
 /// model for good.
 pub(crate) const ABORTS: u32 = 3;
+/// A window of offloaded finished-frame presents ([`finished_present`]): this many frame times, or as many as came in
+/// [`FINISHED_SPAN`] once there are at least [`FINISHED_MIN`] (a slow second GPU fills a window in seconds too).
+pub(crate) const FINISHED_WINDOW: usize = 120;
+pub(crate) const FINISHED_SPAN: Duration = Duration::from_secs(5);
+pub(crate) const FINISHED_MIN: usize = 20;
 
 /// `NEURAL_FORGE_OFFLOAD_TRIAL`: `off` (or `0`, `false`) never tries the game's GPU (the second GPU keeps the model
 /// whatever the frame rate); `on` (`1`, `true`) tries it with `same` too (tests); unset: tried with a real second GPU,
@@ -151,6 +164,8 @@ enum Phase {
 
 #[derive(Debug)]
 struct Local {
+    /// Started by the finished frame's presents ([`Trial::finished_window`]), not by the holds.
+    finished: bool,
     key: Key,
     off: Duration,
     wait: Duration,
@@ -177,6 +192,57 @@ pub(crate) struct Trial {
     /// a row that agree.
     waiting: Option<(Key, Duration)>,
     aborts: u32,
+    /// The trial was started by the finished frame ([`Trial::finished_window`]): its local frames are the presents'.
+    finished: bool,
+    /// The finished frame's trial ended with the model back on the other GPU, not yet acted on ([`Trial::take_back`]).
+    back: bool,
+    /// The window of offloaded finished-frame presents being filled.
+    presents: Presents,
+}
+
+/// Offloaded finished-frame presents as [`Trial::finished_window`] takes them: the key they were of, the last one
+/// that showed an answer, when the window began, and the frame times so far.
+#[derive(Debug, Default)]
+struct Presents {
+    key: Option<Key>,
+    last: Option<Instant>,
+    began: Option<Instant>,
+    intervals: Vec<Duration>,
+}
+
+impl Presents {
+    /// An offloaded present of `key` at `now`, `composited` when it showed an answer; `Some` frame time
+    /// ([`trimmed_mean`]) once a window is full.
+    fn note(&mut self, key: Key, now: Instant, composited: bool) -> Option<Duration> {
+        if self.key != Some(key) {
+            *self = Self { key: Some(key), ..Self::default() };
+        }
+        if !composited {
+            // A frame without the answer: the next interval would span it.
+            self.last = None;
+            return None;
+        }
+        if let Some(d) = self.last.replace(now).map(|t| now.saturating_duration_since(t)) {
+            if d < FRAME_GAP {
+                self.intervals.push(d);
+                self.began.get_or_insert(now);
+            }
+        }
+        let n = self.intervals.len();
+        let spanned = self.began.is_some_and(|b| now.saturating_duration_since(b) >= FINISHED_SPAN);
+        if n >= FINISHED_WINDOW || (spanned && n >= FINISHED_MIN) {
+            let frame = trimmed_mean(&mut self.intervals);
+            self.intervals.clear();
+            self.began = None;
+            return Some(frame);
+        }
+        if spanned {
+            // Too few frames in a row over the span (pauses, frames without the answer): start the window again.
+            self.intervals.clear();
+            self.began = None;
+        }
+        None
+    }
 }
 
 impl Trial {
@@ -195,7 +261,9 @@ impl Trial {
             return None;
         }
         self.waiting = None;
+        self.finished = false;
         self.phase = Phase::Local(Local {
+            finished: false,
             key,
             off: frame,
             wait,
@@ -217,6 +285,52 @@ impl Trial {
         ))
     }
 
+    /// A window of offloaded finished-frame presents of `key`, a frame every `frame`: two in a row that agree start the
+    /// trial whatever the game waited (it never waits for the answer there). `Some(why)` starts it: the caller ends the
+    /// server on the other GPU, and the game's GPU runs the network from the next present ([`Self::finished_local`]).
+    pub(crate) fn finished_window(&mut self, key: Key, frame: Duration, enabled: bool, now: Instant) -> Option<String> {
+        if !enabled || !matches!(self.phase, Phase::Watching) || frame.is_zero() {
+            return None;
+        }
+        let before = self.waiting.replace((key, frame));
+        if !before.is_some_and(|(k, f)| k == key && agree(f, frame)) {
+            return None;
+        }
+        self.waiting = None;
+        self.finished = true;
+        self.phase = Phase::Local(Local {
+            finished: true,
+            key,
+            off: frame,
+            wait: Duration::ZERO,
+            began: now,
+            ran: 0,
+            holds: 0,
+            missed: 0,
+            last: None,
+            paused: Duration::ZERO,
+            last_ran: None,
+            slow: 0,
+            intervals: Vec::with_capacity(LOCAL_MAX),
+        });
+        Some(format!(
+            "trying the model on the game's GPU: the finished frame came every {:.1} ms ({:.0} fps) with the model on the other GPU; the frame rate there decides where the model runs",
+            ms(frame),
+            fps(frame)
+        ))
+    }
+
+    /// The finished frame's trial runs, or kept the model on the game's GPU: the finished frame's server runs there.
+    pub(crate) fn finished_local(&self) -> bool {
+        self.finished && self.keeps_local()
+    }
+
+    /// Whether the finished frame's trial just gave the model back to the other GPU (once: the caller ends the server
+    /// on the game's GPU, and the other GPU's starts again).
+    pub(crate) fn take_back(&mut self) -> bool {
+        std::mem::take(&mut self.back)
+    }
+
     /// A hold of `key` at `now` during the trial, on the game's GPU: `ran` when the model ran on it, else `miss`, why
     /// not. `Some` once the trial is over.
     pub(crate) fn local(&mut self, key: Key, now: Instant, ran: bool, miss: Option<&str>, forced_offload: bool) -> Option<Verdict> {
@@ -227,6 +341,7 @@ impl Trial {
                 key.0 .0, key.0 .1, key.1, l.key.0 .0, l.key.0 .1, l.key.1
             );
             self.aborts += 1;
+            self.back = l.finished;
             self.phase = if self.aborts >= ABORTS { Phase::Decided } else { Phase::Watching };
             return Some(Verdict::Aborted(why));
         }
@@ -239,6 +354,7 @@ impl Trial {
         }
         l.holds += 1;
         if l.holds > MAX_HOLDS {
+            self.back = l.finished;
             self.phase = Phase::Decided;
             return Some(Verdict::Offload(UNMEASURED.into()));
         }
@@ -249,6 +365,7 @@ impl Trial {
             let failed = if l.ran == 0 { now.saturating_duration_since(l.began) > BUILD_BUDGET } else { l.missed >= MISSES };
             l.last = Some(now);
             if failed {
+                self.back = l.finished;
                 self.phase = Phase::Decided;
                 return Some(Verdict::Offload(format!(
                     "the game's GPU could not run the model ({}): it goes back to the other GPU",
@@ -274,6 +391,7 @@ impl Trial {
         }
         // No window fills: the model runs below 4 frames a second here, or too few of its frames come in a row.
         if l.slow >= SLOW || l.ran > LOCAL_WARM + 2 * LOCAL_MAX as u32 {
+            self.back = l.finished;
             self.phase = Phase::Decided;
             return Some(Verdict::Offload(UNMEASURED.into()));
         }
@@ -288,20 +406,21 @@ impl Trial {
             return None;
         }
         let local = trimmed_mean(&mut l.intervals);
-        let (off, wait) = (l.off, l.wait);
+        let (off, wait, finished) = (l.off, l.wait, l.finished);
+        let waited = if finished { String::new() } else { format!(", which the game waited {:.1} ms a frame for", ms(wait)) };
         let numbers = format!(
-            "a frame every {:.1} ms ({:.0} fps) with the model on the game's GPU, every {:.1} ms ({:.0} fps) with it on the other GPU, which the game waited {:.1} ms a frame for",
+            "a frame every {:.1} ms ({:.0} fps) with the model on the game's GPU, every {:.1} ms ({:.0} fps) with it on the other GPU{waited}",
             ms(local),
             fps(local),
             ms(off),
             fps(off),
-            ms(wait)
         );
         if decide(off, local) && !forced_offload {
             let status = format!("second GPU: not used: the game's GPU is faster ({:.1} ms vs {:.1} ms a frame)", ms(local), ms(off));
             self.phase = Phase::KeptLocal(status.clone());
             Some(Verdict::Local { log: format!("the game's GPU is faster here ({numbers}): the model stays on it until the game restarts"), status })
         } else {
+            self.back = finished;
             self.phase = Phase::Decided;
             Some(Verdict::Offload(format!("the other GPU is as fast or faster here ({numbers}): the model goes back to it")))
         }
@@ -328,7 +447,14 @@ impl Trial {
 }
 
 #[cfg(not(test))]
-static TRIAL: std::sync::Mutex<Trial> = std::sync::Mutex::new(Trial { phase: Phase::Watching, waiting: None, aborts: 0 });
+static TRIAL: std::sync::Mutex<Trial> = std::sync::Mutex::new(Trial {
+    phase: Phase::Watching,
+    waiting: None,
+    aborts: 0,
+    finished: false,
+    back: false,
+    presents: Presents { key: None, last: None, began: None, intervals: Vec::new() },
+});
 
 /// The process's trial.
 #[cfg(not(test))]
@@ -377,7 +503,62 @@ pub(crate) fn status_line() -> Option<String> {
 /// follow [`keeps_local`] from the next hold on.
 pub(crate) fn local_hold(key: Key, now: Instant, ran: bool, miss: Option<&str>) {
     let forced = forced_offload();
-    let verdict = with(|t| if t.running() { t.local(key, now, ran, miss, forced) } else { None });
+    // A finished-frame trial measures the presents, not the holds ([`finished_present`]).
+    let verdict = with(|t| if t.running() && !t.finished { t.local(key, now, ran, miss, forced) } else { None });
+    say(verdict);
+}
+
+/// Whether the finished frame runs on the game's GPU for the trial or after it ([`Trial::finished_local`]): the
+/// finished frame's server starts there, not on the other GPU.
+pub(crate) fn finished_local() -> bool {
+    with(|t| t.finished_local())
+}
+
+/// Whether the finished frame's trial just gave the model back to the other GPU ([`Trial::take_back`]).
+pub(crate) fn take_back() -> bool {
+    with(Trial::take_back)
+}
+
+/// A present of the finished-frame path (`device`'s present, every one) of `dims` at `now`: `offloaded` while the
+/// server on the other GPU answers it (`super::offload::active`), `composited` when the frame showed the model's
+/// answer. Offloaded presents fill the windows that start the trial ([`Trial::finished_window`]); during the trial
+/// the presents on the game's GPU are its frames ([`Trial::local`]). Nothing without `NEURAL_FORGE_OFFLOAD_GPU`.
+pub(crate) fn finished_present(dims: (u32, u32), now: Instant, offloaded: bool, composited: bool) {
+    if super::offload::Choice::current() == super::offload::Choice::Off {
+        return;
+    }
+    let key = (dims, super::placement::settings().0);
+    let forced = forced_offload();
+    let enabled = enabled();
+    let (started, verdict) = with(|t| finished_step(t, key, now, offloaded, composited, enabled, forced));
+    if let Some(line) = started {
+        crate::log!("[offload] {line}");
+        crate::logging::flush();
+    }
+    say(verdict);
+}
+
+/// [`finished_present`] on `t`: the line that started the trial, or the trial's verdict.
+fn finished_step(t: &mut Trial, key: Key, now: Instant, offloaded: bool, composited: bool, enabled: bool, forced: bool) -> (Option<String>, Option<Verdict>) {
+    if t.running() {
+        // The game's GPU's frames: only once the other GPU's server is gone (its last answers say nothing).
+        let verdict =
+            (t.finished && !offloaded).then(|| t.local(key, now, composited, (!composited).then_some("no answer from the game's GPU yet"), forced)).flatten();
+        return (None, verdict);
+    }
+    if !offloaded || !matches!(t.phase, Phase::Watching) {
+        t.presents = Presents::default();
+        return (None, None);
+    }
+    let started = t.presents.note(key, now, composited).and_then(|frame| t.finished_window(key, frame, enabled, now));
+    if started.is_some() {
+        t.presents = Presents::default();
+    }
+    (started, None)
+}
+
+/// Logs a trial's verdict.
+fn say(verdict: Option<Verdict>) {
     let line = match verdict {
         Some(Verdict::Local { log, .. }) => log,
         Some(Verdict::Offload(why) | Verdict::Aborted(why)) => why,
@@ -715,5 +896,78 @@ mod tests {
         let mut v: Vec<Duration> = (0..10).map(|_| MS(10)).chain([MS(100)]).collect();
         assert_eq!(trimmed_mean(&mut v), MS(10));
         assert_eq!(trimmed_mean(&mut []), Duration::ZERO);
+    }
+
+    /// Presents of the finished frame every `every` from `now`, `offloaded` or not, each with the answer, until one
+    /// starts the trial or brings a verdict (or `n` of them): which present, and what.
+    fn present(t: &mut Trial, now: &mut Instant, every: Duration, offloaded: bool, n: usize) -> (usize, Option<String>, Option<Verdict>) {
+        for i in 0..n {
+            let (started, verdict) = finished_step(t, KEY, *now, offloaded, true, true, false);
+            *now += every;
+            if started.is_some() || verdict.is_some() {
+                return (i, started, verdict);
+            }
+        }
+        (n, None, None)
+    }
+
+    #[test]
+    fn the_finished_frame_is_tried_and_the_reporters_5_fps_go_back_to_the_game_gpu() {
+        // #63: the finished frame at 5 fps with the model on the RTX 5080, and nothing ever waited for its answers.
+        let mut t = Trial::default();
+        let mut now = Instant::now();
+        let (i, started, _) = present(&mut t, &mut now, MS(200), true, 1000);
+        let started = started.expect("two windows of the same frame rate start the trial");
+        assert!(started.contains("every 200.0 ms (5 fps)"), "{started}");
+        assert!(i < 60, "two windows of 5 s at 5 fps, not two of 120 frames: {i}");
+        assert!(t.running() && t.finished_local());
+        // The other GPU's last answers count for nothing; the game's GPU at 80 fps keeps the model.
+        assert!(present(&mut t, &mut now, MS(200), true, 50).2.is_none());
+        let (_, _, verdict) = present(&mut t, &mut now, Duration::from_micros(12_500), false, 2000);
+        match verdict {
+            Some(Verdict::Local { log, status }) => {
+                assert!(log.contains("80 fps) with the model on the game's GPU") && !log.contains("waited"), "{log}");
+                assert!(status.contains("game's GPU is faster"), "{status}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(t.finished_local() && !t.take_back(), "kept on the game's GPU for good");
+        assert!(present(&mut t, &mut now, MS(200), true, 1000).1.is_none(), "never tried again");
+    }
+
+    #[test]
+    fn a_second_gpu_that_keeps_up_gets_the_finished_frame_back() {
+        let mut t = Trial::default();
+        let mut now = Instant::now();
+        assert!(present(&mut t, &mut now, MS(10), true, 1000).1.is_some());
+        let (_, _, verdict) = present(&mut t, &mut now, MS(11), false, 3000);
+        assert!(matches!(verdict, Some(Verdict::Offload(_))), "{verdict:?}");
+        assert!(!t.finished_local() && t.take_back(), "the game's GPU's server ends once");
+        assert!(!t.take_back());
+        assert!(present(&mut t, &mut now, MS(10), true, 1000).1.is_none(), "nothing is tried again");
+    }
+
+    #[test]
+    fn finished_frame_presents_start_nothing_unless_offloaded_and_the_holds_leave_its_trial_alone() {
+        let mut t = Trial::default();
+        let mut now = Instant::now();
+        assert!(present(&mut t, &mut now, MS(200), false, 1000).1.is_none(), "the game's GPU's own frames start nothing");
+        let mut off = Trial::default();
+        assert!(finished_step(&mut off, KEY, now, true, true, false, false).0.is_none());
+        assert!(present(&mut t, &mut now, MS(200), true, 1000).1.is_some());
+        // A held trial's frames never come from the presents, and a finished one's never from the holds.
+        let (mut held, start) = started(MS(23), MS(5));
+        assert!(finished_step(&mut held, KEY, start, false, true, true, false).1.is_none() && held.running() && !held.finished_local());
+    }
+
+    #[test]
+    fn a_window_of_scattered_presents_starts_again() {
+        let mut p = Presents::default();
+        let now = Instant::now();
+        // Answers every other frame only: no interval between two that showed one.
+        for i in 0..200u64 {
+            assert!(p.note(KEY, now + MS(20 * i), i % 2 == 0).is_none());
+        }
+        assert!(p.intervals.is_empty());
     }
 }

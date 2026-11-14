@@ -6842,7 +6842,12 @@ impl Session {
                     if self.post_retry.failing() {
                         self.post_retry.succeeded();
                     }
-                    return;
+                    // The finished frame's trial gave the model back to the other GPU (`offload_trial::take_back`):
+                    // the game's GPU's server ends here, and the other GPU's starts below.
+                    if self.post_offload || !offload_trial::take_back() {
+                        return;
+                    }
+                    drop(self.post_server.take());
                 }
                 // The server on another GPU waits for a frame that did not finish (`native_post::work`): it ends on its
                 // own, with the network back here (Unavailable) once that frame is done.
@@ -6861,9 +6866,14 @@ impl Session {
                 }
                 Some(Status::Retry) => {
                     // The worker has ended: joining it does not wait.
+                    let trial = self.post_offload && offload_trial::finished_local();
                     self.post_offload = false;
                     drop(self.post_server.take());
-                    self.post_retry.failed(now);
+                    // The other GPU's server ended for the finished frame's trial: no failure, the game's GPU's starts
+                    // at the next present (the trial's build budget runs meanwhile).
+                    if !trial {
+                        self.post_retry.failed(now);
+                    }
                     return;
                 }
                 None => {}
@@ -6876,7 +6886,12 @@ impl Session {
             // until it is given up for the session.
             // Given up for the process (`offload::given_up`): every device runs the network on its own GPU from then on.
             // (Never from the second GPU's own device while it shows the frames, `crate::gpu2_present`: the network runs on it.)
-            if offload::Choice::current() != offload::Choice::Off && !offload::given_up() && !crate::device::gpu2_hosts(device.handle()) {
+            // Not while the finished frame's trial runs on the game's GPU or kept the model there (`offload_trial`).
+            if offload::Choice::current() != offload::Choice::Off
+                && !offload::given_up()
+                && !offload_trial::finished_local()
+                && !crate::device::gpu2_hosts(device.handle())
+            {
                 let (count, placements) = view.header().placements();
                 if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
                     self.post_offload = true;

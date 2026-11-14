@@ -425,7 +425,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_OFFLOAD_GPU=same\|N\|vendor:device[@pci-address]` | layer | Runs the model on another GPU (before DLSS, after DLSS with Ray Reconstruction or with Placement set to After DLSS, or on the finished frame): the one at index `N` (decimal) of the list the layer log prints when the game creates its device on a machine with more than one GPU (`[offload] GPU N: ...`), or the one with that PCI vendor and device ID (4 hexadecimal digits each, `10de:2c02`; add `@0000:73:00.0` where two cards share the ID). `same` puts it on a second device of the game's own GPU, which tests the path and saves nothing. Unset or `off`: the game's GPU. See [The model on a second GPU](#the-model-on-a-second-gpu). |
 | `NEURAL_FORGE_OFFLOAD_PACING=cpu\|relay\|gpu` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model on the finished frame. Unset or `relay`: a helper thread waits for the game's GPU to copy each frame out, the game's thread for the answer. `cpu`: the game's thread makes every wait of a present itself, as before 4.4.0. `gpu` (experimental, for two-GPU systems, not measured on two different cards): the game's GPU waits for the answer instead of the game's thread, where both GPUs have sync-file semaphores; a late second GPU then holds the game's GPU for as long as it is late (a visible hitch), and one that hangs freezes the game. |
 | `NEURAL_FORGE_OFFLOAD_MOTION=float` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: the motion vectors cross to the other GPU as two floats a texel (twice the bytes), as before 4.4.0. Unset, they cross as two halves a texel, which is what DLSS's vectors are. |
-| `NEURAL_FORGE_OFFLOAD_TRIAL=off\|on` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: `off` (or `0`, `false`) never tries the game's GPU when the game waits for the second GPU (see [The model on a second GPU](#the-model-on-a-second-gpu)); `on` tries it with `same` too (tests; unset, `same` is not tried). `NEURAL_FORGE_OFFLOAD_TRIAL_VERDICT=offload` (tests only) sends the model back to the other GPU whatever the trial measured. |
+| `NEURAL_FORGE_OFFLOAD_TRIAL=off\|on` | layer | With `NEURAL_FORGE_OFFLOAD_GPU`: `off` (or `0`, `false`) never tries the game's GPU (before or after DLSS when the game waits for the second GPU, on the finished frame once it runs there) (see [The model on a second GPU](#the-model-on-a-second-gpu)); `on` tries it with `same` too (tests; unset, `same` is not tried). `NEURAL_FORGE_OFFLOAD_TRIAL_VERDICT=offload` (tests only) sends the model back to the other GPU whatever the trial measured. |
 | `NEURAL_FORGE_OFFLOAD_TEST_FAIL=N` | layer | Tests only, with `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: the `N`th frame fails on the other GPU, so the model goes back to the game's GPU. Where the second GPU shows the frames itself, its `N`th present fails, so the game gets its own swapchain back. |
 | `NEURAL_FORGE_TEST_REBUILD_AT=N:S` | layer | Tests only: from the `N`th DLSS launch nothing is held for `S` seconds, then the hold's resources are built again as for a change of DLSS's render size. |
 | `NEURAL_FORGE_OFFLOAD_STANDIN=1` | layer | Tests only, with `NEURAL_FORGE_OFFLOAD_GPU`: a copy in and back out of the other GPU runs in place of the network (for a GPU that cannot run it), so every frame comes back unchanged. |
@@ -492,7 +492,16 @@ its edit applied one frame later".
 (`set_second_gpu_present=1`) makes the second GPU run the model and show the frame on its own, so nothing comes back
 to the game's GPU:
 
-1. Plug the monitor into the second GPU.
+1. Plug the monitor into the second GPU, and make the desktop render on it: only the GPU the desktop draws the game's
+   window on may present to it (a game under Proton is an X11 window, shown through Xwayland, which uses the
+   desktop's GPU), whichever card the monitor is plugged into. On KDE Plasma (Wayland) KWin renders on the first card
+   of `KWIN_DRM_DEVICES`: find the second GPU's card with `readlink -f /dev/dri/by-path/pci-0000:05:00.0-card` (your
+   card's PCI address from the `[offload] GPU N` lines; here `/dev/dri/card1`) and the game's GPU's the same way, then
+   put `export KWIN_DRM_DEVICES=/dev/dri/card1:/dev/dri/card0` (the second GPU first) in
+   `~/.config/plasma-workspace/env/kwin-gpu.sh` and log in again. The card numbers can change when cards are added
+   or the kernel changes: check them again then. Where the desktop still draws the window on the other card, the
+   log's `[present2]` line and the Status tab say so ("the desktop draws the game's window on <GPU>, so <second GPU>
+   cannot present to it") and the frames come back to the game's GPU.
 2. Start the game once and read the `[offload] GPU N` lines again: the driver often lists the GPU the monitor is on
    first, and the game takes the first GPU it is offered, so it would now render on the card meant for the model
    (the line of the game's GPU ends in "the game's"). Keep the game on the other card by its name, for DirectX 12
@@ -512,7 +521,8 @@ GPU's swapchain has the game's present mode, but the game is not held to it): us
 sleep and latency statistics do nothing in this mode, and Frame Generation's frames are handed over like any other.
 The Status tab's **Second GPU's present** row says "second GPU shows the frames: <GPU>; N shown, M skipped (P%), copy
 X ms" (the copy is one frame's way from the game's GPU into the second GPU), or "second GPU does not show the frames:
-<why>". When the second GPU cannot present to the game's window (the monitor is on the other card), does not offer the
+<why>". When the second GPU cannot present to the game's window (the desktop draws the window on the other card: step
+1), does not offer the
 game's format, or anything fails while it runs, the game gets its usual swapchain and the frames come back to the
 game's GPU as described below; after a failure while it ran, the mode stays off until the game restarts. Not yet
 tested on two different cards.
@@ -548,6 +558,11 @@ The model goes back to the game's GPU for the rest of the session, and the log s
   the model stays off until the game restarts (the Status tab says the second GPU stalled). Before or after DLSS the
   model is off from that frame on for the rest of the session, and the log says so.
 
+On the finished frame the game never waits for the answer, so nothing above notices a second GPU that makes the whole
+frame slow (the copies across a narrow PCIe link, the second GPU also driving the monitor): after two windows of
+presents with about the same frame rate (120 frames or 5 seconds each), the model is tried once on the game's GPU,
+the same trial as below, and the faster keeps it. The log's `[offload]` lines give both frame rates.
+
 Before or after DLSS the game waits for the second GPU's answer to the frame before, so a second GPU slower than the
 game's frame sets the frame rate. Once the game has waited for it (2 ms a frame or more, and a tenth of its frame time)
 in two windows of 600 frames in a row with about the same frame rate (so 1200 frames after the start at the earliest),
@@ -558,8 +573,7 @@ frames in a row miss it), it goes back to the second GPU, and nothing is tried a
 the trial (another size, another number of passes) sends the model back and lets a later window try again. The Status
 tab says "second GPU: trying the game's GPU for a few seconds" during the trial and "second GPU: not used: the game's GPU
 is faster (18.6 ms vs 22.8 ms a frame)" once it kept the model there; the log's `[offload]` lines give both frame times,
-and the summaries every 600 frames say how long the game waited a frame. Only the model before and after DLSS is
-tried: the finished frame's placement keeps its own rules. Where the frames cross system
+and the summaries every 600 frames say how long the game waited a frame. Where the frames cross system
 memory slowly (a second GPU in a slot with fewer PCIe lanes, or behind the chipset), the copies alone can take longer
 than the network: Cyberpunk 2077 with Ray Reconstruction at 2048x1536 moved 72 MB a frame and took 28.6 ms a frame on
 an RTX 5080 beside an RTX 4090, where the 4090 ran the network itself in 7.2 ms. `NEURAL_FORGE_OFFLOAD_TRIAL=off`

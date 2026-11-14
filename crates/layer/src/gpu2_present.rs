@@ -341,8 +341,13 @@ pub(crate) fn showing_line(gpu: &str, shown: u64, skipped: u64, copy_ms: f64) ->
 
 /// The line when it does not (the frames come back to the game's GPU, or the model runs there).
 pub(crate) fn not_showing_line(why: &str) -> String {
-    let why: String = why.chars().take(120).collect();
-    format!("second GPU does not show the frames: {why}")
+    const HEAD: &str = "second GPU does not show the frames: ";
+    let room = neural_forge_protocol::REASON_BYTES - 1 - HEAD.len();
+    let mut end = why.len().min(room);
+    while !why.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{HEAD}{}", &why[..end])
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -473,7 +478,9 @@ impl Second {
         // SAFETY: the instance's own physical device and the game's surface (an instance object).
         let r = unsafe { (s.support)(self.physical, self.family, info.surface, &mut supported) };
         if r != vk::Result::SUCCESS || supported == vk::FALSE {
-            return Err(format!("{} cannot present to the game's window (is the monitor plugged into it?)", self.name));
+            // SAFETY: the instance's own physical devices and the game's surface.
+            let presenters = unsafe { self.presenters(info.surface) };
+            return Err(cannot_present(&self.name, &presenters));
         }
         let mut caps = vk::SurfaceCapabilitiesKHR::default();
         // SAFETY: as above.
@@ -533,6 +540,51 @@ impl Second {
                 Err(format!("the second GPU's swapchain has no images ({:?})", other.err()))
             }
         }
+    }
+}
+
+impl Second {
+    /// The names of the instance's GPUs that may present to `surface` (any queue family): the GPU the desktop draws
+    /// the window on, for [`cannot_present`].
+    ///
+    /// # Safety
+    /// `surface` is a live surface of the instance.
+    unsafe fn presenters(&self, surface: vk::SurfaceKHR) -> Vec<String> {
+        // SAFETY: the instance's own enumeration and queries.
+        let Ok(all) = (unsafe { self.instance.enumerate_physical_devices() }) else { return Vec::new() };
+        all.into_iter()
+            .filter(|&p| p != self.physical)
+            .filter(|&p| {
+                // SAFETY: as above.
+                let families = unsafe { self.instance.get_physical_device_queue_family_properties(p) }.len() as u32;
+                (0..families).any(|f| {
+                    let mut yes = vk::FALSE;
+                    // SAFETY: as above.
+                    let r = unsafe { (self.surface.support)(p, f, surface, &mut yes) };
+                    r == vk::Result::SUCCESS && yes == vk::TRUE
+                })
+            })
+            .map(|p| {
+                // SAFETY: as above.
+                let props = unsafe { self.instance.get_physical_device_properties(p) };
+                props.device_name_as_c_str().map_or_else(|_| "another GPU".into(), |n| n.to_string_lossy().into_owned())
+            })
+            .collect()
+    }
+}
+
+/// Why the second GPU (`gpu`) cannot show the game's window, with what to do, in the user's words: `presenters` are
+/// the GPUs that can ([`Second::presenters`]). On Linux the window's server decides: an X11 window (Xwayland under a
+/// Wayland desktop) can only be presented to from the GPU the desktop itself renders on (KDE's KWin: its first DRM
+/// device; #63's 4090 and 5080: the 4090 presented where the 5080 could not, with the monitor on the 5080), whichever
+/// card the monitor is plugged into. The first words are what the Status line keeps.
+pub(crate) fn cannot_present(gpu: &str, presenters: &[String]) -> String {
+    match presenters {
+        [] => format!("{gpu} cannot present to the game's window, and no other GPU says it can (is the monitor plugged into it?)"),
+        some => format!(
+            "the desktop draws the game's window on {}, so {gpu} cannot present to it: make the desktop render on {gpu} (KDE: KWIN_DRM_DEVICES with its card first; see the user guide's second GPU steps), then log in again",
+            some.join(", ")
+        ),
     }
 }
 
@@ -1831,6 +1883,21 @@ mod tests {
         }
         ring.close();
         assert_eq!(t.join().unwrap(), (Take::Frame(k, seq), Take::Closed));
+    }
+
+    #[test]
+    fn the_refusal_names_the_desktops_gpu_and_the_fix() {
+        let gpu = "NVIDIA GeForce RTX 5080 [10de:2c02@0000:05:00.0], NVIDIA 620.70.06";
+        let why = cannot_present(gpu, &["NVIDIA GeForce RTX 4090".into()]);
+        assert!(why.starts_with("the desktop draws the game's window on NVIDIA GeForce RTX 4090, so NVIDIA GeForce RTX 5080"), "{why}");
+        assert!(why.contains("KWIN_DRM_DEVICES"), "{why}");
+        let line = not_showing_line(&why);
+        assert!(line.len() < neural_forge_protocol::REASON_BYTES && line.contains("RTX 4090, so"), "{line}");
+        let none = cannot_present(gpu, &[]);
+        assert!(none.contains("no other GPU") && none.contains("monitor"), "{none}");
+        // Cut on a character's boundary.
+        let wide = not_showing_line(&"é".repeat(200));
+        assert!(wide.len() < neural_forge_protocol::REASON_BYTES);
     }
 
     #[test]

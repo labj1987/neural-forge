@@ -943,6 +943,14 @@ fn serve(
                 gpu.give_up = Some(why);
                 break;
             }
+            // The finished frame's trial on the game's GPU (`offload_trial::finished_present`): this server ends
+            // without giving the other GPU up (its device is given back and may serve again), and the game's GPU's
+            // server answers from the next present.
+            if super::offload_trial::finished_local() {
+                crate::log!("[offload] the other GPU's server stops for the trial: the game's GPU runs the model on the finished frame");
+                crate::logging::flush();
+                break;
+            }
         }
         if !view.usable() {
             // The process let the channel go (it stopped presenting): another game's layer may own
