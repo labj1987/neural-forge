@@ -1279,6 +1279,8 @@ pub(crate) struct Tracker {
     /// The newest upscaling evaluate on this device is Ray Reconstruction's ([`Self::rr_running`]), as of the last
     /// [`Self::refresh`].
     rr: bool,
+    /// The Ray Reconstruction evaluate noted last ([`Self::rr_evaluate`]): its record's sequence number.
+    rr_seq: Option<u64>,
     /// Registered images whose last registered view was destroyed. They stay registered until the image itself is
     /// destroyed: Black Myth: Wukong's benchmark with DLSS Frame Generation on destroys and re-creates the views it
     /// hands DLSS every frame (about 65 a second, the images never), and its launches still name the images.
@@ -1926,6 +1928,13 @@ impl Tracker {
 
     pub(crate) fn forget_function(&mut self, function: vk::CuFunctionNVX) {
         self.functions.remove(&function);
+    }
+
+    /// A Ray Reconstruction record with sequence number `seq` is the newest: whether it is another evaluate than the
+    /// one noted last (Ray Reconstruction was evaluated since), which is what keeps its run going
+    /// ([`note_ray_reconstruction`]).
+    fn rr_evaluate(&mut self, seq: u64) -> bool {
+        self.rr_seq.replace(seq) != Some(seq)
     }
 
     /// Whether DLSS Ray Reconstruction runs: the newest upscaling evaluate on this device is Ray Reconstruction's (NGX's
@@ -2894,8 +2903,15 @@ impl Tracker {
     pub(crate) fn refresh(&mut self) -> Option<String> {
         let record = crate::ngx_ring::newest(|i| self.images.contains_key(&i));
         let rr = record.is_some_and(|r| r.is_rr());
-        if rr {
-            note_ray_reconstruction();
+        // Ray Reconstruction runs while it is evaluated: a new record. The newest record alone says nothing once the
+        // game paused DLSS (a menu, a map): other launch-bearing submits go on (Frame Generation's), every one of them
+        // comes here, and counting them kept "Ray Reconstruction runs" true through the pause. With no hold after
+        // DLSS recorded meanwhile, auto then put every pass at present, and the after-the-upscaler path took the
+        // frames (and the process's one network) from the live hold a second after its last frame (#63).
+        if let Some(r) = record.filter(|r| r.is_rr()) {
+            if self.rr_evaluate(r.seq) {
+                note_ray_reconstruction();
+            }
         }
         let inputs = record.filter(|r| !r.is_rr()).and_then(|r| self.inputs_of(&r));
         let key = inputs.map(|i| (ColourWatch::of(&i.colour.1), ColourWatch::of(&i.mvec.1), i.exposure_input.map(|e| ColourWatch::of(&e.1))));
@@ -8392,6 +8408,42 @@ mod tests {
     /// between their record and their end wrote it in (Cyberpunk 2077's Ray Reconstruction: 12): learnt from an
     /// evaluate that ended, then taken at that write. A later evaluate writing it in more parts says so and is
     /// learnt again. The motion vectors' units there are NGX's `MV.Scale` carried to the output's pixels.
+    /// #63, test build 145: Ray Reconstruction with the model held after DLSS, and a pause menu. DLSS is not evaluated
+    /// there, but other launch-bearing submits go on (Frame Generation's), each of them a `refresh`. The run of Ray
+    /// Reconstruction is kept by its evaluates (a new record), never by those submits: counted as running through the
+    /// pause, with no hold recorded meanwhile, it put every pass of an auto placement at present a second after the
+    /// last hold, and the after-the-upscaler path took the frames and the process's network from the live hold.
+    #[test]
+    fn ray_reconstruction_runs_while_it_is_evaluated_not_while_other_launches_go_on() {
+        use crate::ngx_ring::{inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rr = |seq| parse_record(&record_bytes(seq, FEATURE_RR, 1, [0x100, 0x300, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        let mut t = tracker_with(&gta_registered());
+        inject(vec![rr(1)]);
+        t.refresh();
+        assert!(t.rr_running() && t.rr_seq == Some(1), "its first evaluate: noted");
+        // The pause: the same record is the newest at every other launch-bearing submit.
+        for _ in 0..50 {
+            t.refresh();
+            assert!(!t.rr_evaluate(1), "no new evaluate: the run is not kept going");
+        }
+        assert!(t.rr_running(), "the newest evaluate is still Ray Reconstruction's (nothing is held before it)");
+        // The game resumes: another evaluate.
+        inject(vec![rr(1), rr(3)]);
+        t.refresh();
+        assert_eq!(t.rr_seq, Some(3), "noted again");
+        // What the pause then looks like to the after-the-upscaler path: the run's last evaluate more than a second
+        // ago, no hold after DLSS lately. Auto puts the pass before the upscaler (where it waits for DLSS), not at
+        // present: the post path does not serve, and the hand-back's rules keep it off as in any pause.
+        let t0 = Instant::now();
+        let s = |secs: f32| t0 + Duration::from_secs_f32(secs);
+        let paused = Some(SrLaunches { since: s(0.0), last: s(40.0) });
+        let auto = (1, [neural_forge_protocol::enums::placement::AUTO; neural_forge_protocol::MAX_PASSES]);
+        assert!(!post_serves_for(auto, ray_reconstruction_settled(paused, s(41.2)), false), "1.2 s into the pause: the hold keeps the frames");
+        assert!(post_off(true, Some(s(40.0)), None, s(41.2)) && post_off(true, Some(s(40.0)), None, s(40.0) + PAUSE_HAND_BACK - Duration::from_secs(1)));
+        // (Kept going by the menu's submits, as before the fix, it read as running with no hold: every pass at present.)
+        assert!(post_serves_for(auto, ray_reconstruction_settled(Some(SrLaunches { since: s(0.0), last: s(41.1) }), s(41.2)), false));
+    }
+
     #[test]
     fn the_hold_after_dlss_goes_after_the_evaluate_s_last_write_of_its_output() {
         use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};

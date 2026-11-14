@@ -111,10 +111,12 @@ fn forced_offload() -> bool {
     *ON
 }
 
-/// Whether a hold's miss is the network's build on the game's GPU (`native::LOADING`, the miss itself: no other
-/// miss that happens to speak of loading).
+/// Whether a hold's miss is the network's build on the game's GPU, which has the build's budget and nothing else:
+/// still loading (`native::LOADING`), a load or build that failed and is tried again (`native::NOT_BUILT`: a failure
+/// from before the trial is still the loader's state while it builds), or the process's one network still open on
+/// another device (`native::OPEN_WAIT`).
 fn is_loading(miss: &str) -> bool {
-    miss == super::native::LOADING
+    miss == super::native::LOADING || miss == super::native::NOT_BUILT || miss == super::native::OPEN_WAIT
 }
 
 /// What is held, which a window's frame times belong to: the hold's extent and the frame's pass count.
@@ -612,6 +614,17 @@ impl Trial {
                 }
             };
             l.last = Some(now);
+            if failed && miss == Some(super::native::OPEN_WAIT) {
+                // The network never left the other device within the budget: a matter of the order things closed in,
+                // not of what the game's GPU can run. The frames go back, and a later window may try again.
+                self.aborts += 1;
+                self.back = l.finished;
+                self.handed = false;
+                self.phase = if self.aborts >= ABORTS { Phase::Decided } else { Phase::Watching };
+                return Some(Verdict::Aborted(
+                    "the trial on the game's GPU stopped: the network was still open on another device; the model goes back to the other GPU".into(),
+                ));
+            }
             if failed {
                 self.back = l.finished;
                 self.phase = Phase::Decided;
@@ -1075,6 +1088,56 @@ mod tests {
         let mut t = Trial::default();
         assert!(t.offloaded(KEY, MS(21), MS(20), true, now).is_none());
         assert!(t.offloaded(((2048, 1536), 1), MS(27), MS(26), true, now).is_none());
+    }
+
+    /// #63, test build 145: the trial's local phase found the process's network still open elsewhere (the
+    /// after-the-upscaler path had taken it in a pause), and the loader's state, a failure from before the trial,
+    /// read "could not be loaded or built" while it built: a verdict for the other GPU 0.4 s in. Both are the
+    /// build's time. A network that never comes free ends the trial without a verdict, to be tried again; one that
+    /// cannot be built is a verdict only after the build's budget.
+    #[test]
+    fn a_network_open_elsewhere_or_a_stale_failure_is_no_verdict() {
+        use super::super::native::{NOT_BUILT, OPEN_WAIT};
+        for miss in [OPEN_WAIT, NOT_BUILT] {
+            let (mut t, mut now) = started(MS(22), MS(21));
+            now += MS(3);
+            assert!(t.local(KEY, now, true, None, false).is_none(), "a hold that ran");
+            for k in 0..200 {
+                now += MS(2);
+                assert!(t.local(KEY, now, false, Some(miss), false).is_none(), "{miss}: hold {k}, 0.4 s in: no verdict");
+            }
+            assert!(t.running(), "{miss}: the trial goes on while the network comes");
+            // It comes: the holds run and the trial measures.
+            now += MS(13);
+            assert!(t.local(KEY, now, true, None, false).is_none());
+        }
+        // Never free within the budget: aborted, not decided; the next windows may start another trial.
+        let (mut t, mut now) = started(MS(22), MS(21));
+        let mut verdict = None;
+        for _ in 0..2000 {
+            now += MS(20);
+            verdict = t.local(KEY, now, false, Some(OPEN_WAIT), false);
+            if verdict.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(verdict, Some(Verdict::Aborted(ref why)) if why.contains("still open on another device")), "{verdict:?}");
+        assert!(!t.running() && !t.keeps_local());
+        assert!(t.offloaded(KEY, MS(22), MS(21), true, now).is_none());
+        assert!(t.offloaded(KEY, MS(22), MS(21), true, now).is_some(), "tried again on two more windows");
+        // A network that cannot be built here: a verdict, once the build's budget is spent.
+        let (mut t, mut now) = started(MS(22), MS(21));
+        let began = now;
+        let mut verdict = None;
+        for _ in 0..2000 {
+            now += MS(20);
+            verdict = t.local(KEY, now, false, Some(NOT_BUILT), false);
+            if verdict.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(verdict, Some(Verdict::Offload(ref why)) if why.contains("could not be loaded or built")), "{verdict:?}");
+        assert!(now.saturating_duration_since(began) > BUILD_BUDGET, "only after the build's budget");
     }
 
     /// #63's lost device began here: a hold that "ran" (recorded for the other GPU before the trial) and then the

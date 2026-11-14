@@ -658,6 +658,12 @@ const GUARD_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// such holds the build's budget, `offload_trial::is_loading`).
 pub(crate) const LOADING: &str = "the native network is still loading";
 
+/// A hold's miss while the last load or build on its device failed (it is tried again on the loader's schedule).
+pub(crate) const NOT_BUILT: &str = "the native network could not be loaded or built";
+
+/// A hold's miss while the process's one network is open on another device, which the loader waits for.
+pub(crate) const OPEN_WAIT: &str = "the network is open on another device of the game, which is closing it";
+
 /// The words of `nf_native_open`'s refusal while another network is open in the process (crates/native/cpp/nf_native.cpp).
 const OPEN_ELSEWHERE: &str = "another network is open in this process";
 
@@ -4702,8 +4708,14 @@ unsafe fn native_hold(
         }
         result.miss = Some(if loader.paused() {
             super::VRAM_PAUSED
-        } else if loader.failed().is_some() {
-            "the native network could not be loaded or built"
+        } else if let Some(why) = loader.failed() {
+            // Open on another device of the process (one at a time): that device is asked to close it and the loader
+            // tries again; not a network that cannot be built here.
+            if why.contains(OPEN_ELSEWHERE) {
+                OPEN_WAIT
+            } else {
+                NOT_BUILT
+            }
         } else if loader.waiting_for_holds(reserved) {
             WAITING
         } else {
