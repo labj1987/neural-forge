@@ -90,7 +90,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Tab | What it has |
 |---|---|
 | Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, the HUD group: finding the HUD and HUD regions on the finished frame, and the Sharpening group: adaptive sharpening (CAS) and Clarity on the finished frame. |
-| Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
+| Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (the Model tab's Model resolution at the finished frame as a percent; shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | **Proton copies out of date** (shown only when a Neural Forge Proton copy is older than the Proton it was made from, or its name lacks "Proton" so Steam Cloud skips the saves in its prefix: the copy, both versions or the Steam Cloud problem, and the games that run with it; see [Proton with DLSS parameters](#proton-with-dlss-parameters)), Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
 | Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on; a tested game says where the model runs in it), the launch option to copy by hand for a game you pick, **Proton with DLSS parameters** (below) and **Uninstall…** (see [Uninstall](#uninstall)). |
@@ -160,9 +160,22 @@ change or placement instead of the Model tab's.
 **Pass feedback** (0 to 1, default 1) sets how much of a pass's picture the next pass works on; lower
 values keep more of the pass's own input, so the passes add less to each other.
 
-**Model resolution** (Model tab) sets the size the model runs at, as a share of the frame it works on
-(DLSS's input before the upscaler, DLSS's output after it): **Full** (the default), **Quality** (66.7%),
-**Balanced** (58%), **Performance** (50%) or **Ultra Performance** (33.3%). Below Full the model works on a
+**Model resolution** is two settings in the Model tab, one under the other, because the model works on
+different pictures:
+
+- **Model resolution before and after DLSS** is the size with Placement Before the upscaler or After DLSS, as a
+  share of the picture the model works on there (DLSS's input before the upscaler, DLSS's output after it). Each
+  pass can have its own in the per-pass settings.
+- **Model resolution at the finished frame** is the size with Placement Finished frame, and wherever the model
+  runs on the finished frame because it cannot run before or after DLSS, as a share of the frame. It is for every
+  pass there, and the Composition tab's "Model resolution after the upscaler" is the same setting as a percent.
+
+"Full" in the first row says nothing about the second: with Placement Finished frame only the second one counts.
+The Status tab's Model placement line says the size in use on the finished frame ("the model runs at 1024x768,
+50% of the 2048x1536 frame").
+
+Both take **Full** (the default), **Quality** (66.7%), **Balanced** (58%), **Performance** (50%) or
+**Ultra Performance** (33.3%). Below Full the model works on a
 downscaled copy of the frame and its change is brought back to full size, following the frame's own edges,
 so the frame keeps its own detail; the model costs less GPU time and memory but adds less detail of its own.
 Before the upscaler the frame is already small (2228x1253 in GTA V at 4K with DLSS Balanced, 1486x836 at
@@ -207,7 +220,7 @@ frame), **After DLSS** (on DLSS's output, before the game's HUD and post-process
 resolution, so it costs more than before the upscaler; where a game's DLSS output cannot be held, it runs
 where Auto would) or **Finished frame** (on the presented frame, HUD included; DLSS gets its input
 untouched). **Second GPU shows the frame** (Model tab, with a second GPU and Finished frame): see
-[The model on a second GPU](#the-model-on-a-second-gpu). Model resolution applies after DLSS too, as a share of the output size. Each pass can have its
+[The model on a second GPU](#the-model-on-a-second-gpu). Model resolution before and after DLSS applies after DLSS too, as a share of the output size; at Finished frame the Model tab's other row, Model resolution at the finished frame, does. Each pass can have its
 own placement in the per-pass settings, so pass 1 can run before the upscaler and pass 2 after DLSS, each
 with its own settings and history. Passes run in the frame's order: a pass placed earlier than the pass
 before it runs where that one does, and passes on the finished frame after passes held in the game's frame
