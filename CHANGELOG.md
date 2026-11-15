@@ -4,6 +4,28 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.3.0 — 2026-11-15
+
+**Neural Forge looks and starts right on KDE Plasma, Hyprland and COSMIC**
+
+- The tab and button icons ship with the app, so they look the same under any icon theme. Under KDE's Breeze, the
+  Composition and Status tabs showed a missing-image placeholder and the Model tab a grey blob.
+- The window opens wide enough to show the tabs at the top (on a smaller screen, at 90% of it, with the tabs at the
+  bottom), and has a minimum size, so COSMIC no longer prints a warning about it at startup.
+- **Runs on desktops without GTK 4 or libadwaita.** The AppImage now brings its own GTK 4 and libadwaita, so it starts
+  on a stock KDE Plasma or Hyprland install (a fresh Fedora KDE, for one), where it used to not open at all. Where the
+  desktop has GTK 4 and libadwaita that are new enough, Neural Forge still uses those, so it keeps the desktop's newer
+  look (accent colours on GNOME, for one); it follows the desktop's dark mode either way. If a basic system library is
+  missing (graphics drivers, fonts), it names it in a dialog instead of not opening. The AppImage is larger: about
+  37 MB instead of 5 MB.
+
+**The HDR line knows more desktops**
+
+- The Status tab's HDR line, `shmctl status` and Save report now show whether the desktop's HDR is on for
+  each display on Hyprland and sway too, as they did on GNOME, KDE Plasma and in a gamescope session.
+- Where the desktop's HDR state cannot be read (COSMIC, which does not report HDR yet, another desktop, or a missing
+  `kscreen-doctor`, `hyprctl` or `swaymsg`), the line says it was not detected and why instead of leaving it out.
+
 ## 4.2.1 — 2026-11-14
 
 **Steam Cloud saves sync with the Neural Forge copies of Proton Experimental, Proton Hotfix and Proton-CachyOS (#71)**

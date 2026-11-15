@@ -5,7 +5,8 @@
 # Only its from-scratch system package install below needs root, through sudo.
 #
 # Packaging is appimagetool run directly on a hand-built AppDir, plus zsyncmake for the
-# update sidecar. GTK 4 and libadwaita come from the host system and are not bundled.
+# update sidecar. The GUI ships twice: usr/bin/neural-forge uses the host's GTK 4 and libadwaita,
+# usr/bin/bundled/neural-forge the GTK runtime bundled here (bundle_gtk_runtime); AppRun picks one.
 set -euo pipefail
 
 # LIBDIR/LIB/MANIFEST are the layer's install identity (VK_LAYER_neuralforge_neural, libneural_forge_layer.so,
@@ -21,6 +22,210 @@ APPDIR="$BUILD_DIR/AppDir"
 
 echo "==> Building $NAME $VERSION AppImage"
 
+# ── Bundled GTK 4 / libadwaita runtime ───────────────────────────────
+# The AppImage carries GTK 4, libadwaita and everything they link, taken from the build machine
+# (the release runner, Ubuntu 24.04, glibc 2.39), for desktops that ship neither (a stock KDE or
+# Hyprland install). Only the GUI's second copy, usr/bin/bundled/neural-forge, uses it: AppRun runs the
+# host copy (usr/bin/neural-forge, unpatched) whenever the host's own GTK and libadwaita resolve,
+# so an up-to-date desktop keeps its newer libadwaita (accent colours and the like). The CLI, the
+# Vulkan layer and the NGX wrapper are never patched and never load a bundled library.
+# What stays on the host is the AppImage project's excludelist
+# (github.com/AppImageCommunity/pkg2appimage, file `excludelist` at commit 15a64c2, 2024-11-03):
+# glibc, libstdc++/libgcc_s, the GL/EGL/GLX/glvnd and DRM/GBM stack, libX11/libxcb, Wayland's
+# client library, fontconfig/freetype/harfbuzz/fribidi, zlib, expat and the rest of that list,
+# plus our own additions below: the Vulkan loader (its drivers and layers are the host's) and
+# Wayland's other client libraries (they pair with the host's libwayland-client and Mesa).
+# Nothing is found through LD_LIBRARY_PATH: every bundled ELF file gets an rpath relative to
+# itself ($ORIGIN), so the programs the GUI starts never load a bundled library.
+BUNDLE_EXCLUDE=(
+    ld-linux.so.2 ld-linux-x86-64.so.2 libanl.so.1 libBrokenLocale.so.1 libcidn.so.1 libc.so.6
+    libdl.so.2 libm.so.6 libmvec.so.1 libnss_compat.so.2 libnss_dns.so.2 libnss_files.so.2
+    libnss_hesiod.so.2 libnss_nisplus.so.2 libnss_nis.so.2 libpthread.so.0 libresolv.so.2
+    librt.so.1 libthread_db.so.1 libutil.so.1 libstdc++.so.6 libGL.so.1 libEGL.so.1
+    libGLdispatch.so.0 libGLX.so.0 libOpenGL.so.0 libdrm.so.2 libglapi.so.0 libgbm.so.1
+    libxcb.so.1 libX11.so.6 libX11-xcb.so.1 libwayland-client.so.0 libasound.so.2
+    libfontconfig.so.1 libfreetype.so.6 libharfbuzz.so.0 libcom_err.so.2 libexpat.so.1
+    libgcc_s.so.1 libgpg-error.so.0 libICE.so.6 libSM.so.6 libusb-1.0.so.0 libuuid.so.1
+    libz.so.1 libjack.so.0 libpipewire-0.3.so.0 libxcb-dri3.so.0 libxcb-dri2.so.0
+    libfribidi.so.0 libgmp.so.10
+    # Ours:
+    libvulkan.so.1 libwayland-egl.so.1 libwayland-cursor.so.0 libwayland-server.so.0
+)
+
+bundle_excluded() { [[ " ${BUNDLE_EXCLUDE[*]} " == *" $1 "* ]]; }
+
+# bundle_ldd FILE: prints "soname path" for each library FILE loads (its whole closure, as ldd
+# resolves it right now); fails, naming them, when one cannot be found.
+bundle_ldd() {
+    local out
+    out="$(ldd "$1")" || return 1
+    if grep -q '=> not found' <<<"$out"; then
+        echo "==> ERROR: $1 needs libraries this machine does not have:" >&2
+        grep '=> not found' <<<"$out" >&2
+        return 1
+    fi
+    awk '$2 == "=>" && $3 ~ /^\// { print $1, $3 }' <<<"$out"
+}
+
+# bundle_gtk_runtime APPDIR BINARY...: puts the GTK 4 + libadwaita runtime the given binaries
+# (paths relative to APPDIR/usr, already copied there) need into APPDIR/usr:
+#   lib/                                the libraries (rpath $ORIGIN)
+#   lib/gdk-pixbuf-2.0/2.10.0/          image loaders (SVG icons) and their loaders.cache
+#   lib/gio/modules/                    the dconf GSettings backend, so settings live in the
+#                                       host's dconf like every other GTK app's
+#   lib/gtk-4.0/4.0.0/immodules/        the IBus input method module (X11 sessions; on Wayland
+#                                       GTK speaks to the input method itself)
+#   share/glib-2.0/schemas/             GTK's and the desktop's GSettings schemas, compiled
+#   share/doc/neural-forge/bundled-libraries/   the bundled packages' copyright files
+# The layer's directory, lib/neural-forge/, is not touched (the installer copies all of it).
+# AppRun's bundle_env block points GTK at them (GTK_EXE_PREFIX, GDK_PIXBUF_MODULE_FILE,
+# GIO_MODULE_DIR, GSETTINGS_SCHEMA_DIR), and the GUI gives every program it starts the host's
+# values of those back (neural_forge_supervisor::host_env).
+bundle_gtk_runtime() {
+    local appdir="$1"; shift
+    local usr="$appdir/usr" syslib pixver pixdir loaders giomods immods f soname path pkg
+    local work="$appdir/.."
+    syslib="$(pkg-config --variable=libdir gtk4)"
+    pixver="$(pkg-config --variable=gdk_pixbuf_binary_version gdk-pixbuf-2.0)"
+    pixdir="$(pkg-config --variable=gdk_pixbuf_moduledir gdk-pixbuf-2.0)"
+    # AppRun's bundle_env names the loader cache's directory: it must be this gdk-pixbuf's binary version.
+    if ! grep -qF "/usr/lib/gdk-pixbuf-2.0/$pixver/loaders.cache" data/AppRun; then
+        echo "==> ERROR: data/AppRun's GDK_PIXBUF_MODULE_FILE does not name gdk-pixbuf-2.0/$pixver" >&2
+        return 1
+    fi
+    loaders="$usr/lib/gdk-pixbuf-2.0/$pixver/loaders"
+    giomods="$usr/lib/gio/modules"
+    immods="$usr/lib/gtk-4.0/4.0.0/immodules"
+    local modules=("$pixdir/libpixbufloader-svg.so" "$syslib/gio/modules/libdconfsettings.so"
+        "$syslib/gtk-4.0/4.0.0/immodules/libim-ibus.so")
+    # GIO 2.80 starts every program it launches itself (a file manager for FileLauncher, without an OpenURI portal)
+    # through gio-launch-desktop, looked up at its build path (/usr/lib/x86_64-linux-gnu/glib-2.0, absent outside
+    # Debian and Ubuntu), then in PATH: AppRun puts usr/bin first in PATH. It links only libc.
+    local launcher="$syslib/glib-2.0/gio-launch-desktop"
+    for f in "${modules[@]}" "$launcher" "$syslib/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders"; do
+        [[ -e "$f" ]] && continue
+        echo "==> ERROR: $f is missing (packages librsvg2-common, dconf-gsettings-backend, ibus-gtk4, libgdk-pixbuf2.0-bin)" >&2
+        return 1
+    done
+    for f in patchelf glib-compile-schemas gio-querymodules dpkg; do
+        command -v "$f" >/dev/null 2>&1 || { echo "==> ERROR: $f is not installed" >&2; return 1; }
+    done
+
+    echo "==> Bundling GTK 4 and libadwaita for the GUI's second copy"
+    mkdir -p "$usr/lib" "$loaders" "$giomods" "$immods" "$usr/share/glib-2.0/schemas"
+    cp "$pixdir"/*.so "$loaders/"
+    cp "$syslib/gio/modules/libdconfsettings.so" "$giomods/"
+    cp "$syslib/gtk-4.0/4.0.0/immodules/libim-ibus.so" "$immods/"
+    # The real one goes in usr/libexec; usr/bin gets data/gio-launch-desktop, which first gives the launched program
+    # the environment it would have had without the AppImage (PATH, the NEURAL_FORGE_* markers).
+    mkdir -p "$usr/libexec"
+    cp "$launcher" "$usr/libexec/"
+    install -m 755 data/gio-launch-desktop "$usr/bin/gio-launch-desktop"
+    printf '%s\n' "$pixdir"/*.so "${modules[@]:1}" "$launcher" > "$work/bundle-sources"
+    bundle_ldd "$usr/libexec/gio-launch-desktop" > "$work/bundle-closure" || return 1
+    while read -r soname path; do
+        bundle_excluded "$soname" || { echo "==> ERROR: gio-launch-desktop needs $soname, which is not the host's" >&2; return 1; }
+    done < "$work/bundle-closure"
+
+    # The libraries: the ldd closure of the binaries and the modules, minus the excludelist.
+    local elves=()
+    for f in "$@"; do elves+=("$usr/$f"); done
+    elves+=("$loaders"/*.so "$giomods"/*.so "$immods"/*.so)
+    for f in "${elves[@]}"; do
+        bundle_ldd "$f" > "$work/bundle-closure" || return 1
+        while read -r soname path; do
+            bundle_excluded "$soname" && continue
+            if [[ ! -e "$usr/lib/$soname" ]]; then
+                cp -L "$path" "$usr/lib/$soname"
+                echo "$path" >> "$work/bundle-sources"
+            fi
+        done < "$work/bundle-closure"
+    done
+
+    # rpath, not LD_LIBRARY_PATH. DT_RPATH (--force-rpath), not DT_RUNPATH, so that a
+    # LD_LIBRARY_PATH the user has set cannot swap in a host library the bundle wasn't built with.
+    # The binaries' rpath also names the loader directory: loaders.cache lists bare file names,
+    # which dlopen() finds there wherever the AppImage is mounted. The binaries live two directories
+    # below usr/ (usr/bin/bundled/).
+    for f in "$@"; do
+        patchelf --force-rpath --set-rpath "\$ORIGIN/../../lib:\$ORIGIN/../../lib/gdk-pixbuf-2.0/$pixver/loaders" "$usr/$f"
+    done
+    # shellcheck disable=SC2016 # $ORIGIN is for the dynamic linker, not the shell
+    for f in "$usr/lib"/*.so*; do patchelf --force-rpath --set-rpath '$ORIGIN' "$f"; done
+    # shellcheck disable=SC2016
+    for f in "$loaders"/*.so "$immods"/*.so; do patchelf --force-rpath --set-rpath '$ORIGIN/../../..' "$f"; done
+    # shellcheck disable=SC2016
+    for f in "$giomods"/*.so; do patchelf --force-rpath --set-rpath '$ORIGIN/../..' "$f"; done
+
+    # Check: everything bundled now loads its libraries from the AppDir, or from the host only
+    # when the excludelist says so.
+    local inside bad=0
+    inside="$(realpath "$usr/lib")"
+    for f in "${elves[@]}" "$usr/lib"/*.so*; do
+        bundle_ldd "$f" > "$work/bundle-closure" || return 1
+        while read -r soname path; do
+            bundle_excluded "$soname" && continue
+            [[ "$(realpath "$path")" == "$inside/"* ]] && continue
+            echo "==> ERROR: $f loads $soname from $path, not from the AppDir" >&2
+            bad=1
+        done < "$work/bundle-closure"
+    done
+    rm -f "$work/bundle-closure"
+    [[ $bad -eq 0 ]] || return 1
+
+    local cache
+    cache="$("$syslib/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders" "$loaders"/*.so)"
+    cache="${cache//\"$(realpath "$loaders")\//\"}"
+    cache="${cache//\"$loaders\//\"}"
+    printf '%s\n' "$cache" > "$loaders/../loaders.cache"
+    if grep -q '^"/.*\.so"$' "$loaders/../loaders.cache"; then
+        echo "==> ERROR: loaders.cache still names absolute paths" >&2
+        return 1
+    fi
+    gio-querymodules "$giomods"
+
+    # GSettings schemas: GTK's own (its file, colour and emoji choosers abort without them) and the
+    # desktop ones GTK reads when there is no settings portal.
+    cp /usr/share/glib-2.0/schemas/org.gtk.gtk4.*.gschema.xml \
+       /usr/share/glib-2.0/schemas/org.gnome.desktop.*.xml "$usr/share/glib-2.0/schemas/"
+    glib-compile-schemas --strict "$usr/share/glib-2.0/schemas"
+
+    # The bundled libraries' copyright and licence notices, from their packages.
+    local docs="$usr/share/doc/$NAME/bundled-libraries"
+    mkdir -p "$docs"
+    while read -r path; do
+        pkg="$(dpkg -S "$path" 2>/dev/null || dpkg -S "$(realpath "$path")" 2>/dev/null \
+            || dpkg -S "${path#/usr}" 2>/dev/null || true)"
+        pkg="${pkg%%:*}"
+        if [[ -z "$pkg" || ! -f "/usr/share/doc/$pkg/copyright" ]]; then
+            echo "==> ERROR: no copyright notice found for $path" >&2
+            return 1
+        fi
+        cp "/usr/share/doc/$pkg/copyright" "$docs/$pkg.copyright"
+        echo "$pkg" >> "$work/bundle-packages"
+    done < <(sort -u "$work/bundle-sources")
+    rm -f "$work/bundle-sources"
+    # The licence texts those notices refer to by path (Debian keeps the common ones in /usr/share/common-licenses).
+    local lic
+    mkdir -p "$docs/common-licenses"
+    while read -r lic; do
+        [[ -f "$lic" ]] || { echo "==> ERROR: a bundled library's copyright file names $lic, which is missing" >&2; return 1; }
+        cp "$lic" "$docs/common-licenses/"
+    done < <(grep -ohE '/usr/share/common-licenses/[A-Za-z0-9.+_-]*[A-Za-z0-9+_-]' "$docs"/*.copyright | sort -u)
+    # Which packages, at which version, from which source package.
+    {
+        echo "The libraries and modules in usr/lib, and usr/libexec/gio-launch-desktop, are these Ubuntu 24.04 packages' files,"
+        echo "unmodified apart from the run-time search path (rpath) patchelf set on the libraries and modules."
+        echo "Their sources are the Ubuntu source packages named here, at these versions."
+        echo
+        printf 'package\tversion\tsource package\n'
+        # shellcheck disable=SC2016 # dpkg-query's format, not the shell's
+        sort -u "$work/bundle-packages" | xargs dpkg-query -W -f '${Package}\t${Version}\t${source:Package}\n'
+    } > "$docs/PACKAGES.txt"
+    rm -f "$work/bundle-packages"
+    echo "==> Bundled $(find "$usr/lib" -path "$usr/lib/$LIBDIR" -prune -o -name '*.so*' -print | wc -l) libraries and modules"
+}
+
 # ── Build dependencies ────────────────────────────────────────────────
 SUDO=""
 if [[ "$(id -u)" -ne 0 ]]; then SUDO="sudo"; fi
@@ -28,10 +233,19 @@ if [[ "$(id -u)" -ne 0 ]]; then SUDO="sudo"; fi
 # Python generators), so a missing one is installed before the long release build, not found after it.
 missing_deps() {
     local tool
-    for tool in g++ curl patch python3 pkg-config desktop-file-validate zsyncmake; do
+    for tool in g++ curl patch python3 pkg-config desktop-file-validate zsyncmake patchelf glib-compile-schemas gio-querymodules; do
         command -v "$tool" >/dev/null 2>&1 || { echo "$tool"; return 0; }
     done
     pkg-config --exists gtk4 libadwaita-1 2>/dev/null || { echo "gtk4/libadwaita-1"; return 0; }
+    # What bundle_gtk_runtime copies besides the libraries.
+    local f
+    for f in "$(pkg-config --variable=gdk_pixbuf_moduledir gdk-pixbuf-2.0)/libpixbufloader-svg.so" \
+        "$(pkg-config --variable=libdir gtk4)/gio/modules/libdconfsettings.so" \
+        "$(pkg-config --variable=libdir gtk4)/gtk-4.0/4.0.0/immodules/libim-ibus.so" \
+        "$(pkg-config --variable=libdir gtk4)/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders" \
+        /usr/share/glib-2.0/schemas/org.gnome.desktop.interface.gschema.xml; do
+        [[ -e "$f" ]] || { echo "$f"; return 0; }
+    done
     return 1
 }
 if missing="$(missing_deps)"; then
@@ -43,8 +257,10 @@ if missing="$(missing_deps)"; then
     $SUDO apt-get update -qq || true
     # g++ brings the static libstdc++ that crates/native links; curl, patch and python3 are what
     # scripts/fetch-native-tools.sh and the crate's build script run.
+    # patchelf and the rest are for the bundled GTK runtime (bundle_gtk_runtime).
     $SUDO apt-get install -y -qq g++ curl patch python3 libgtk-4-dev libadwaita-1-dev \
-        pkg-config desktop-file-utils zsync
+        pkg-config desktop-file-utils zsync \
+        patchelf librsvg2-common dconf-gsettings-backend ibus-gtk4 libgdk-pixbuf2.0-bin gsettings-desktop-schemas
     if missing="$(missing_deps)"; then
         echo "error: $missing is still missing after installing the build dependencies" >&2
         exit 1
@@ -73,6 +289,7 @@ bash scripts/build-ngx-wrapper.sh "${CARGO_TARGET_DIR:-target}/ngx-wrapper/_nvng
 # ── AppDir layout ─────────────────────────────────────────────────────
 rm -rf "$BUILD_DIR"
 mkdir -p "$APPDIR/usr/bin" \
+         "$APPDIR/usr/bin/bundled" \
          "$APPDIR/usr/lib/$LIBDIR" \
          "$APPDIR/usr/share/applications" \
          "$APPDIR/usr/share/icons/hicolor/scalable/apps" \
@@ -80,7 +297,14 @@ mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/share/vulkan/implicit_layer.d"
 
 RELEASE="${CARGO_TARGET_DIR:-target}/release"
+# The GUI twice: as built (the host's GTK) and with the bundled GTK runtime (AppRun picks one).
 cp "$RELEASE/$NAME"                                 "$APPDIR/usr/bin/"
+cp "$RELEASE/$NAME"                                 "$APPDIR/usr/bin/bundled/"
+bundle_gtk_runtime "$APPDIR" "bin/bundled/$NAME"
+if [[ -n "$(patchelf --print-rpath "$APPDIR/usr/bin/$NAME")" ]]; then
+    echo "==> ERROR: usr/bin/$NAME must load the system's libraries, but it has an rpath" >&2
+    exit 1
+fi
 cp "$RELEASE/$NAME-cli"                             "$APPDIR/usr/bin/"
 cp "$RELEASE/$LIB"                                  "$APPDIR/usr/lib/$LIBDIR/"
 mkdir -p "$APPDIR/usr/lib/$LIBDIR/proton"
@@ -123,12 +347,9 @@ cp data/io.github.labj1987.NeuralForge.desktop "$APPDIR/"
 cp data/icon.svg "$APPDIR/$NAME.svg"
 
 # ── AppRun ────────────────────────────────────────────────────────────
-cat > "$APPDIR/AppRun" << 'APPRUN'
-#!/usr/bin/env bash
-HERE="$(dirname "$(readlink -f "$0")")"
-export PATH="$HERE/usr/bin:$PATH"
-exec "$HERE/usr/bin/neural-forge" "$@"
-APPRUN
+# data/AppRun: starts the host-GTK GUI when the host's GTK and libadwaita resolve, else the bundled one after
+# checking the libraries it takes from the host (scripts/test_apprun.sh).
+cp data/AppRun "$APPDIR/AppRun"
 chmod 755 "$APPDIR/AppRun"
 
 # ── appimagetool ──────────────────────────────────────────────────────

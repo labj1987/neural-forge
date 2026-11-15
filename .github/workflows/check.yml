@@ -95,13 +95,16 @@ jobs:
       # layer's real-device tests run (NEURAL_FORGE_REQUIRE_VULKAN makes that an assertion);
       # vulkan-validationlayers (Ubuntu's Khronos validation layer) to run them under it;
       # spirv-tools for check_shaders.py's validation; zsync and desktop-file-utils for the
-      # AppImage; numpy and Pillow for the scripts' self-tests.
+      # AppImage, patchelf and the GTK runtime pieces it bundles for the GUI's second copy
+      # (bundle_gtk_runtime); numpy and Pillow for the scripts' self-tests.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
             libvulkan1 mesa-vulkan-drivers vulkan-tools vulkan-validationlayers spirv-tools \
-            zsync desktop-file-utils patch python3-numpy python3-pil libclang-dev gcc-mingw-w64-x86-64
+            zsync desktop-file-utils patch python3-numpy python3-pil libclang-dev gcc-mingw-w64-x86-64 \
+            patchelf librsvg2-common dconf-gsettings-backend ibus-gtk4 libgdk-pixbuf2.0-bin gsettings-desktop-schemas \
+            xvfb xdotool dbus-daemon
 
       # Only lavapipe, never whatever other ICD the runner image happens to carry.
       - name: Select the lavapipe Vulkan driver
@@ -259,6 +262,8 @@ jobs:
           bash scripts/gta-bench.sh --self-test
           bash scripts/build-ngx-wrapper.sh --self-test
           bash scripts/game-sweep.sh --self-test
+          bash scripts/test_apprun.sh
+          bash scripts/smoke-gui.sh --self-test
 
       - name: Shader sources match committed SPIR-V
         run: python3 scripts/check_shaders.py
@@ -298,6 +303,9 @@ jobs:
           rm -rf squashfs-root
           "./$appimage" --appimage-extract > /dev/null
           test -x squashfs-root/usr/bin/neural-forge-cli
+          test -x squashfs-root/usr/bin/bundled/neural-forge
+          # The bundled GUI resolves every library from the AppImage or the excludelist's host libraries.
+          if ldd squashfs-root/usr/bin/bundled/neural-forge | grep 'not found'; then exit 1; fi
           test -s squashfs-root/usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt
 
       # The README documents the oldest glibc a release runs on; a build on a newer base image
@@ -306,17 +314,31 @@ jobs:
         run: |
           documented="$(grep -o 'glibc [0-9][0-9.]* or newer' README.md | head -1 | cut -d' ' -f2)"
           test -n "$documented"
-          for bin in squashfs-root/usr/bin/neural-forge squashfs-root/usr/bin/neural-forge-cli \
-              squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so; do
-              needed="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1)"
+          # Both GUI copies, the CLI, the layer, and everything the bundled GTK runtime ships (its libraries, modules
+          # and the real gio-launch-desktop).
+          for bin in squashfs-root/usr/bin/neural-forge squashfs-root/usr/bin/bundled/neural-forge squashfs-root/usr/bin/neural-forge-cli \
+              squashfs-root/usr/libexec/gio-launch-desktop squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so \
+              $(find squashfs-root/usr/lib -path squashfs-root/usr/lib/neural-forge -prune -o -name '*.so*' -type f -print | sort); do
+              # `|| true`: under pipefail a grep that finds nothing would end the step here, before the check below.
+              needed="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1 || true)"
+              if [ -z "$needed" ]; then
+                  # Only a data library (ICU's) calls nothing in glibc; the programs and the layer always do.
+                  case "$bin" in squashfs-root/usr/lib/neural-forge/*) ;; squashfs-root/usr/lib/*.so*) echo "$bin needs nothing from glibc"; continue ;; esac
+                  echo "error: no glibc version found in $bin" >&2
+                  exit 1
+              fi
               echo "$bin needs glibc $needed (README documents $documented)"
-              test -n "$needed"
               highest="$(printf '%s\n%s\n' "$needed" "$documented" | sort -V | tail -1)"
               if [ "$highest" != "$documented" ]; then
                   echo "error: $bin needs glibc $needed, newer than the documented $documented" >&2
                   exit 1
               fi
           done
+
+      # Both GUI copies start and reach their main loop on a virtual display (the runner has GTK 4 and libadwaita,
+      # so the host copy is the one AppRun picks; NEURAL_FORGE_GTK forces each), under scratch HOME and XDG dirs.
+      - name: The GUI starts with the host's and the bundled GTK
+        run: bash scripts/smoke-gui.sh squashfs-root host bundled
 
       # Install the extracted AppImage's files with its own CLI into scratch XDG directories (never
       # the runner user's real ones), then run the smoke example through the Vulkan loader against

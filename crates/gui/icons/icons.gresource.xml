@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The symbolic icons the GUI uses, from the Adwaita icon theme 50.0 (GNOME Project, https://gitlab.gnome.org/GNOME/adwaita-icon-theme,
+     tag 50.0; LGPL-3.0-or-later or CC-BY-SA-3.0, see COPYING here), renamed with an nf- prefix so the desktop's own icon
+     theme can never stand in for them. Compiled into the GUI by build.rs; GtkApplication adds <resource base>/icons to the icon theme. -->
+<gresources>
+  <gresource prefix="/io/github/labj1987/NeuralForge/icons/scalable/actions">
+    <file>nf-help-about-symbolic.svg</file>
+    <file>nf-preferences-system-symbolic.svg</file>
+    <file>nf-network-transmit-receive-symbolic.svg</file>
+    <file>nf-edit-find-symbolic.svg</file>
+    <file>nf-view-paged-symbolic.svg</file>
+    <file>nf-applications-graphics-symbolic.svg</file>
+    <file>nf-dialog-error-symbolic.svg</file>
+    <file>nf-object-select-symbolic.svg</file>
+    <file>nf-dialog-information-symbolic.svg</file>
+    <file>nf-dialog-warning-symbolic.svg</file>
+    <file>nf-view-refresh-symbolic.svg</file>
+    <file>nf-document-edit-symbolic.svg</file>
+    <file>nf-list-remove-symbolic.svg</file>
+    <file>nf-edit-clear-symbolic.svg</file>
+    <file>nf-edit-undo-symbolic.svg</file>
+  </gresource>
+</gresources>

@@ -441,7 +441,7 @@ The `# live status` block:
 | `preupscale_extent`, `preupscale_hold_ms`, `preupscale_misses` | DLSS's render size, the last hold's CPU time, and holds whose answer did not make it. |
 | `layer_measured_white`, `layer_composition_up` | The white meter, whether the compose is up. |
 | `capture_request`, `capture_result`, `capture_path` | A capture waiting for the game, and what became of the latest one: written, failed or cancelled, why, and its files. |
-| `hdr_verdict` | The layer's HDR verdict for the game's swapchain (the `[layer] HDR:` line), then `; desktop:` and the desktop's HDR state per display, read from GNOME (`org.gnome.Mutter.DisplayConfig`'s `color-mode`) or KDE Plasma (`kscreen-doctor -j`); "no game swapchain seen yet" before a game made one. |
+| `hdr_verdict` | The layer's HDR verdict for the game's swapchain (the `[layer] HDR:` line), then `; desktop:` and the desktop's HDR state per display, read from GNOME (`org.gnome.Mutter.DisplayConfig`'s `color-mode`), KDE Plasma (`kscreen-doctor -j`), Hyprland (`hyprctl monitors -j`'s `colorManagementPreset`: `hdr`/`hdredid` is on; another preset is named as it is, since with `render:cm_auto_hdr` a fullscreen HDR game switches the display to HDR) or sway (`swaymsg -t get_outputs -r`'s `hdr`), or "gamescope session"; on COSMIC (no HDR yet), another desktop, or when the tool is missing or fails, "HDR state not detected" and why; "no game swapchain seen yet" before a game made one. |
 
 The `# settings` block lists every live setting by name; `shmctl set NAME VALUE` and
 `shmctl toggle NAME` change them.

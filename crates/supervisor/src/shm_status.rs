@@ -41,7 +41,7 @@ pub fn preupscale_state_name(v: u32) -> &'static str {
 pub fn look(cfg: &crate::Config) -> (String, String) {
     let path = crate::channel_path(cfg);
     match neural_forge_protocol::mapping::open_existing(&path) {
-        Ok(Some(mapping)) => (status_text_with(mapping.header(), crate::desktop_hdr::read().as_deref()), mapping.header().game_name()),
+        Ok(Some(mapping)) => (status_text_with(mapping.header(), Some(&crate::desktop_hdr::read())), mapping.header().game_name()),
         Ok(None) => (format!("no channel at {path}: no game and no Neural Forge window has opened it since the computer started\n"), String::new()),
         Err(e) => (format!("channel not readable: {e}: {path}\n"), String::new()),
     }
@@ -53,7 +53,7 @@ pub fn status_text(header: &ShmHeader) -> String {
 }
 
 /// The HDR verdict as one line: the layer's (`ShmHeader::hdr_verdict`) and the desktop's output state
-/// (`crate::desktop_hdr::read`), when known.
+/// (`crate::desktop_hdr::read`, which says so when it cannot tell), when it was asked for.
 pub fn hdr_line(header: &ShmHeader, desktop: Option<&str>) -> String {
     let game = header.hdr_verdict();
     let game = if game.is_empty() { "no game swapchain seen yet".to_string() } else { game };

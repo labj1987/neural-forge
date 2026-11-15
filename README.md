@@ -9,16 +9,19 @@ NVIDIA's own runtime. Read [Legal](#legal) before you use it.
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab with the per-game Settings for bar, the switch, style, strength preset and its values](screenshots/settings.png) | ![Setup tab with the model, the network choice and the Steam games with a switch each and where each was tested](screenshots/setup.png) | ![Status tab while Hogwarts Legacy runs: the model before the upscaler, the frame rate and the graph of frame time and the model's GPU time](screenshots/status.png) |
+| ![Model tab with the per-game Settings for bar, the switch, style, strength preset and its values](screenshots/settings.png) | ![Setup tab with the model, the network choice and the Steam games with a switch each and where each was tested](screenshots/setup.png) | ![Status tab while Cyberpunk 2077 runs: the model before the upscaler, the frame rate, the graph of frame time and the model's GPU time, and the layer and placement rows](screenshots/status.png) |
 
 | Composition | Debug | Setup: Proton copies and Uninstall |
 |---|---|---|
-| ![Composition tab: colour trust, ratio smoothing, ghost guard, apply model edit and hold frame](screenshots/composition.png) | ![Debug tab: compare mode, split, zoom and swap, the debug view, the edit cache and scene cuts](screenshots/debug.png) | ![End of the Setup tab: installed Protons with Make copy (and why Proton 8 and 9 cannot be copied), and Uninstall Neural Forge](screenshots/setup-proton.png) |
+| ![Composition tab: detail and colour strength, highlight guard, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit and hold frame](screenshots/composition.png) | ![Debug tab: compare mode, split, zoom and swap, the debug view, the edit cache and scene cuts, and Captures](screenshots/debug.png) | ![End of the Setup tab: installed Protons with Make copy (and why Proton 8 and 9 cannot be copied), and Uninstall Neural Forge](screenshots/setup-proton.png) |
 
 ## Requirements
 
-- x86_64 Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40 or later), GTK 4.12 and
-  libadwaita 1.5 or newer.
+- x86_64 Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40 or later). Nothing else to install for the
+  window: Neural Forge uses the desktop's own GTK 4 and libadwaita when they are new enough (so it follows the
+  desktop's accent colour), and otherwise the ones it brings with it, so it also runs where neither is installed (a
+  stock KDE Plasma or Hyprland install). It takes the basics every desktop has from the system: OpenGL/EGL drivers,
+  X11 or Wayland client libraries, and fontconfig, freetype, harfbuzz and fribidi.
 - An NVIDIA RTX 40-series or newer GPU with a Vulkan driver that offers `VK_NV_cuda_kernel_launch`,
   `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2` and `VK_EXT_shader_float8` (tested with
   615.71.09, 615.78.08 and 620.70.06). On other GPUs the layer does nothing.
@@ -93,9 +96,15 @@ says what to do.
 - **"The network is paused: too little video memory".** The model resumes once there is room. A 12 GB
   card is at its limit at 4K: close programs that hold video memory (browsers with hardware
   acceleration).
+- **Neural Forge does not open.** If a basic system library is missing (graphics drivers, fonts) it says
+  which, in a dialog where one can be shown. Started from a terminal, its first line says whether it uses the
+  desktop's GTK or its own, and why; `NEURAL_FORGE_GTK=bundled` (or `=host`) picks one.
 - **HDR does not come on.** The Status tab's HDR line says why. Under Proton add
   `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` to the launch options (Proton-GE), or start gamescope
-  with `--hdr-enabled`; if HDR10 was available, switch on the game's own HDR setting.
+  with `--hdr-enabled`; if HDR10 was available, switch on the game's own HDR setting. The line also
+  shows whether the desktop's HDR is on for each display, on GNOME, KDE Plasma, Hyprland, sway and in a
+  gamescope session; COSMIC does not report HDR yet, and on other desktops it says the state was not
+  detected.
 - **Something looks wrong.** Press F11 to compare. `NEURAL_FORGE_PREUPSCALE=off` in the launch
   options keeps the network from loading at all.
 - **A game refuses to start or go online.** `PROTON_NO_NEURAL_FORGE_NGX=1` in its launch options runs
