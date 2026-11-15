@@ -275,7 +275,8 @@ mod tests {
         }
         let out = String::from_utf8(cmd.output().unwrap().stdout).unwrap();
         assert!(out.lines().any(|l| l == "GTK_EXE_PREFIX=/opt/gtk"), "{out}");
-        assert!(!out.contains("GIO_MODULE_DIR=") && !out.contains("NEURAL_FORGE_"), "{out}");
+        // Only the markers go: other NEURAL_FORGE_* variables in the test's own environment (CI sets some) stay.
+        assert!(!out.contains("GIO_MODULE_DIR=") && !out.contains("NEURAL_FORGE_ORIG_") && !out.contains("NEURAL_FORGE_BUNDLE_ENV"), "{out}");
     }
 
     #[test]
