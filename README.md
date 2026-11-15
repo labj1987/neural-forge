@@ -17,8 +17,11 @@ NVIDIA's own runtime. Read [Legal](#legal) before you use it.
 
 ## Requirements
 
-- x86_64 Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40 or later), GTK 4.12 and
-  libadwaita 1.5 or newer.
+- x86_64 Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40 or later). Nothing else to install for the
+  window: Neural Forge uses the desktop's own GTK 4 and libadwaita when they are new enough (so it follows the
+  desktop's accent colour), and otherwise the ones it brings with it, so it also runs where neither is installed (a
+  stock KDE Plasma or Hyprland install). It takes the basics every desktop has from the system: OpenGL/EGL drivers,
+  X11 or Wayland client libraries, and fontconfig, freetype, harfbuzz and fribidi.
 - An NVIDIA RTX 40-series or newer GPU with a Vulkan driver that offers `VK_NV_cuda_kernel_launch`,
   `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2` and `VK_EXT_shader_float8` (tested with
   615.71.09, 615.78.08 and 620.70.06). On other GPUs the layer does nothing.
@@ -93,10 +96,9 @@ says what to do.
 - **"The network is paused: too little video memory".** The model resumes once there is room. A 12 GB
   card is at its limit at 4K: close programs that hold video memory (browsers with hardware
   acceleration).
-- **Neural Forge does not open.** If GTK 4 or libadwaita is missing it says which libraries and the
-  package to install (`sudo apt install libgtk-4-1 libadwaita-1-0`, `sudo dnf install gtk4 libadwaita`,
-  `sudo pacman -S gtk4 libadwaita` or `sudo zypper install libgtk-4-1 libadwaita-1-0`); stock KDE Plasma
-  and Hyprland installs often lack them.
+- **Neural Forge does not open.** If a basic system library is missing (graphics drivers, fonts) it says
+  which, in a dialog where one can be shown. Started from a terminal, its first line says whether it uses the
+  desktop's GTK or its own, and why; `NEURAL_FORGE_GTK=bundled` (or `=host`) picks one.
 - **HDR does not come on.** The Status tab's HDR line says why. Under Proton add
   `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` to the launch options (Proton-GE), or start gamescope
   with `--hdr-enabled`; if HDR10 was available, switch on the game's own HDR setting. The line also

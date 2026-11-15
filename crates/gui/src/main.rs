@@ -24,6 +24,18 @@ fn main() {
     // Rings the NGX wrapper left for games that are gone (the layer never opened them): never a running game's.
     neural_forge_supervisor::proton_tool::sweep_dead_rings(std::path::Path::new(neural_forge_supervisor::proton_tool::RING_DIR));
 
+    // The bundled GTK's variables (AppRun's bundle_env): once GTK and what it loads lazily have read them, the host's
+    // values go back into this process's environment, so a program GTK or GIO starts for the GUI (the file manager a
+    // FileLauncher opens) never sees the bundle. A no-op with the host's GTK.
+    app.connect_startup(|_| {
+        neural_forge_supervisor::host_env::release_bundle_env(|| {
+            let _ = gio::SettingsSchemaSource::default();
+            let _ = gio::Vfs::default();
+            let _ = gio::SettingsBackend::default();
+            let _ = gtk4::gdk_pixbuf::Pixbuf::formats();
+        });
+    });
+
     app.connect_activate(move |app| {
         if let Some(window) = app.windows().first() {
             window.present();

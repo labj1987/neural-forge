@@ -12,9 +12,12 @@ first shipped them; their phase is kept as a subheading.
   Composition and Status tabs showed a missing-image placeholder and the Model tab a grey blob.
 - The window opens wide enough to show the tabs at the top (on a smaller screen, at 90% of it, with the tabs at the
   bottom), and has a minimum size, so COSMIC no longer prints a warning about it at startup.
-- When GTK 4 or libadwaita is not installed (as on a stock Fedora KDE or Hyprland install), Neural Forge now says which
-  libraries are missing and the command that installs them, in a dialog where one can be shown, instead of not opening
-  at all.
+- **Runs on desktops without GTK 4 or libadwaita.** The AppImage now brings its own GTK 4 and libadwaita, so it starts
+  on a stock KDE Plasma or Hyprland install (a fresh Fedora KDE, for one), where it used to not open at all. Where the
+  desktop has GTK 4 and libadwaita that are new enough, Neural Forge still uses those, so it keeps the desktop's newer
+  look (accent colours on GNOME, for one); it follows the desktop's dark mode either way. If a basic system library is
+  missing (graphics drivers, fonts), it names it in a dialog instead of not opening. The AppImage is larger: about
+  37 MB instead of 5 MB.
 
 **The HDR line knows more desktops**
 

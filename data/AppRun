@@ -2,11 +2,43 @@
 # The AppImage's entry point: build-appimage.sh copies it to the AppDir's root.
 HERE="$(dirname "$(readlink -f "$0")")"
 
-# ── Libraries the GUI takes from the system ──────────────────────────
-# GTK 4 and libadwaita come from the system. When a library the GUI links does not resolve, the dynamic loader
-# ends it with one line on stderr, which nobody sees when it was started from a menu: name the missing libraries
-# and the packages to install instead, in a dialog where one can be shown, and stop. This block is the whole check:
-# a build that ships the libraries itself adjusts it here (its own library path first).
+# ── Which GUI: the host's GTK or the bundled one ─────────────────────
+# The GUI ships twice (build-appimage.sh): usr/bin/neural-forge as built, which uses the host's GTK 4 and
+# libadwaita, and usr/bin/bundled/neural-forge, which finds the GTK runtime bundled in the AppImage through its rpath.
+# The host copy runs whenever the host's libraries resolve it completely (`ldd -r`: no library or symbol version
+# missing, no symbol undefined), so an up-to-date desktop keeps its newer libadwaita (accent colours, newer widgets);
+# otherwise, or without ldd to ask (or when ldd itself fails), the bundled copy. NEURAL_FORGE_GTK=host or =bundled forces one. One line on
+# stderr says which, and why.
+nf_host_problem() {
+    local out missing
+    command -v ldd >/dev/null 2>&1 || { echo "no ldd to check the host's libraries"; return 0; }
+    out="$(LC_ALL=C ldd -r "$1" 2>&1)" || { echo "ldd could not check the host's libraries"; return 0; }
+    if grep -q 'not found' <<<"$out"; then
+        missing="$(sed -n -e 's/^[[:space:]]*\([^[:space:]]*\) => not found.*/\1/p' \
+            -e "s/.*version \`\([^']*\)' not found.*/\1/p" <<<"$out" | sort -u | paste -sd, - | sed 's/,/, /g')"
+        echo "the host lacks ${missing:-a library}"
+    elif grep -q 'undefined symbol' <<<"$out"; then
+        echo "the host's libraries lack $(grep -c 'undefined symbol' <<<"$out") symbols the GUI needs"
+    fi
+    return 0
+}
+case "${NEURAL_FORGE_GTK:-}" in
+    host) nf_gtk=host; nf_why="NEURAL_FORGE_GTK=host" ;;
+    bundled) nf_gtk=bundled; nf_why="NEURAL_FORGE_GTK=bundled" ;;
+    *)
+        nf_why="$(nf_host_problem "$HERE/usr/bin/neural-forge")"
+        if [ -n "$nf_why" ]; then nf_gtk=bundled; else nf_gtk=host; nf_why="the host's GTK 4 and libadwaita resolve"; fi
+        [ -z "${NEURAL_FORGE_GTK:-}" ] || nf_why="$nf_why; NEURAL_FORGE_GTK=$NEURAL_FORGE_GTK is neither host nor bundled"
+        ;;
+esac
+printf 'neural-forge: GTK: %s (%s)\n' "$nf_gtk" "$nf_why" >&2
+unset nf_why
+
+# ── Libraries the bundled GUI takes from the system ──────────────────
+# The bundled copy brings GTK 4 and libadwaita but takes from the system what every desktop has: glibc, the graphics
+# stack (OpenGL/EGL, DRM), X11/xcb and Wayland client libraries, fonts (fontconfig, freetype, harfbuzz, fribidi),
+# zlib and expat. When one of those does not resolve, the dynamic loader ends it with one line on stderr, which nobody
+# sees when it was started from a menu: name the missing libraries in a dialog where one can be shown, and stop.
 nf_missing_libraries() {
     command -v ldd >/dev/null 2>&1 || return 0
     LC_ALL=C ldd "$1" 2>/dev/null | awk '$2 == "=>" && $3 == "not" && $4 == "found" { print $1 }' | sort -u
@@ -30,20 +62,45 @@ nf_show_error() {
     fi
     return 0
 }
-nf_missing="$(nf_missing_libraries "$HERE/usr/bin/neural-forge")"
-if [ -n "$nf_missing" ]; then
-    nf_show_error "Neural Forge cannot start: libraries are missing" "These libraries it needs are not installed: $(printf '%s' "$nf_missing" | paste -sd, - | sed 's/,/, /g').
 
-Neural Forge needs GTK 4 (4.12 or newer) and libadwaita (1.5 or newer) from the system. Install them with the package manager:
-  Debian, Ubuntu, Pop!_OS: sudo apt install libgtk-4-1 libadwaita-1-0
-  Fedora: sudo dnf install gtk4 libadwaita
-  Arch, CachyOS: sudo pacman -S gtk4 libadwaita
-  openSUSE: sudo zypper install libgtk-4-1 libadwaita-1-0
-then start Neural Forge again."
+# ── The bundled GTK's environment ────────────────────────────────────
+# Points the bundled GTK at its own modules, image loaders and schemas (build-appimage.sh, bundle_gtk_runtime). The
+# names go in APPIMAGE_BUNDLE_ENV and each one's earlier value in APPIMAGE_ORIG_<NAME> (left unset when it had none):
+# the GUI puts those back once GTK has read them and before it starts any program (neural_forge_supervisor::host_env),
+# so nothing it starts sees the bundle. The host copy gets none of this.
+bundle_env() {
+    local var
+    export APPIMAGE_BUNDLE_ENV="GTK_EXE_PREFIX GDK_PIXBUF_MODULE_FILE GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR"
+    for var in $APPIMAGE_BUNDLE_ENV; do
+        if [ -n "${!var+set}" ]; then
+            export "APPIMAGE_ORIG_$var=${!var}"
+        else
+            unset "APPIMAGE_ORIG_$var"
+        fi
+    done
+    export GTK_EXE_PREFIX="$1/usr"
+    export GDK_PIXBUF_MODULE_FILE="$1/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+    export GIO_MODULE_DIR="$1/usr/lib/gio/modules"
+    export GSETTINGS_SCHEMA_DIR="$1/usr/share/glib-2.0/schemas${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+}
+
+export PATH="$HERE/usr/bin:$PATH"
+if [ "$nf_gtk" = host ]; then
+    unset nf_gtk
+    exec "$HERE/usr/bin/neural-forge" "$@"
+fi
+unset nf_gtk
+
+nf_missing="$(nf_missing_libraries "$HERE/usr/bin/bundled/neural-forge")"
+if [ -n "$nf_missing" ]; then
+    nf_list="$(printf '%s' "$nf_missing" | paste -sd, - | sed 's/,/, /g')"
+    nf_dnf="$(printf '%s' "$nf_missing" | sed "s/.*/'&()(64bit)'/" | paste -sd' ' -)"
+    nf_show_error "Neural Forge cannot start: libraries are missing" "These libraries it needs are not installed: $nf_list.
+
+Neural Forge brings GTK 4 and libadwaita with it, but takes these from the system: graphics, windowing and font libraries every desktop normally has. Install the packages that provide them with the package manager (on Fedora and openSUSE by library name: sudo dnf install $nf_dnf), then start Neural Forge again."
     exit 1
 fi
 unset nf_missing
-# ─────────────────────────────────────────────────────────────────────
 
-export PATH="$HERE/usr/bin:$PATH"
-exec "$HERE/usr/bin/neural-forge" "$@"
+bundle_env "$HERE"
+exec "$HERE/usr/bin/bundled/neural-forge" "$@"

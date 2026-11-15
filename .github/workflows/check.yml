@@ -95,13 +95,15 @@ jobs:
       # layer's real-device tests run (NEURAL_FORGE_REQUIRE_VULKAN makes that an assertion);
       # vulkan-validationlayers (Ubuntu's Khronos validation layer) to run them under it;
       # spirv-tools for check_shaders.py's validation; zsync and desktop-file-utils for the
-      # AppImage; numpy and Pillow for the scripts' self-tests.
+      # AppImage, patchelf and the GTK runtime pieces it bundles for the GUI's second copy
+      # (bundle_gtk_runtime); numpy and Pillow for the scripts' self-tests.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
             libvulkan1 mesa-vulkan-drivers vulkan-tools vulkan-validationlayers spirv-tools \
-            zsync desktop-file-utils patch python3-numpy python3-pil libclang-dev gcc-mingw-w64-x86-64
+            zsync desktop-file-utils patch python3-numpy python3-pil libclang-dev gcc-mingw-w64-x86-64 \
+            patchelf librsvg2-common dconf-gsettings-backend ibus-gtk4 libgdk-pixbuf2.0-bin gsettings-desktop-schemas
 
       # Only lavapipe, never whatever other ICD the runner image happens to carry.
       - name: Select the lavapipe Vulkan driver
@@ -299,6 +301,9 @@ jobs:
           rm -rf squashfs-root
           "./$appimage" --appimage-extract > /dev/null
           test -x squashfs-root/usr/bin/neural-forge-cli
+          test -x squashfs-root/usr/bin/bundled/neural-forge
+          # The bundled GUI resolves every library from the AppImage or the excludelist's host libraries.
+          if ldd squashfs-root/usr/bin/bundled/neural-forge | grep 'not found'; then exit 1; fi
           test -s squashfs-root/usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt
 
       # The README documents the oldest glibc a release runs on; a build on a newer base image
@@ -307,7 +312,7 @@ jobs:
         run: |
           documented="$(grep -o 'glibc [0-9][0-9.]* or newer' README.md | head -1 | cut -d' ' -f2)"
           test -n "$documented"
-          for bin in squashfs-root/usr/bin/neural-forge squashfs-root/usr/bin/neural-forge-cli \
+          for bin in squashfs-root/usr/bin/neural-forge squashfs-root/usr/bin/bundled/neural-forge squashfs-root/usr/bin/neural-forge-cli \
               squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so; do
               needed="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1)"
               echo "$bin needs glibc $needed (README documents $documented)"
