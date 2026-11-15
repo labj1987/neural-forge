@@ -3,7 +3,7 @@
 # (Xvfb, its own D-Bus session) with each GTK copy (default: both) and checks that it reaches its main loop: its window
 # is mapped (xdotool), it is still running, and its stderr names the copy and holds no loader or GTK error. Everything
 # it writes goes to a scratch HOME, XDG directories and XDG_RUNTIME_DIR, never the user's.
-# Needs xvfb-run, dbus-run-session and xdotool.
+# Needs xvfb-run (xvfb), dbus-run-session (dbus-daemon) and xdotool. A copy that fails is reported, and the next still runs.
 #   --self-test   check the stderr verdicts, no GUI
 set -euo pipefail
 
@@ -38,7 +38,7 @@ for copy in "$@"; do
     # shellcheck disable=SC2016 # the inner script's own variables
     env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$s/home" XDG_RUNTIME_DIR="$s/run" XDG_CONFIG_HOME="$s/home/.config" \
         XDG_DATA_HOME="$s/home/.local/share" XDG_STATE_HOME="$s/home/.local/state" XDG_CACHE_HOME="$s/home/.cache" \
-        NEURAL_FORGE_GTK="$copy" GDK_BACKEND=x11 LANG=C.UTF-8 \
+        NEURAL_FORGE_GTK="$copy" GDK_BACKEND=x11 GTK_A11Y=none LANG=C.UTF-8 \
         xvfb-run -a -s "-screen 0 1920x1080x24" dbus-run-session -- bash -c '
             "$1/AppRun" > "$2/out" 2> "$2/err" & gui=$!
             for _ in $(seq 60); do
@@ -49,11 +49,14 @@ for copy in "$@"; do
             sleep 2
             kill -0 "$gui" 2>/dev/null && echo running >> "$2/state"
             kill "$gui" 2>/dev/null; wait "$gui" 2>/dev/null || true' _ "$appdir" "$s" 2> "$s/session" || true
-    state="$(cat "$s/state" 2>/dev/null | paste -sd' ' -)"
+    state="$( { cat "$s/state" 2>/dev/null || true; } | paste -sd' ' -)"
     why="$(verdict "$copy" "$s/err")"
     if [ "$state" != "mapped running" ] || [ -n "$why" ]; then
         echo "smoke-gui: $copy: FAILED (${state:-no window}; ${why:-stderr clean})" >&2
-        sed 's/^/  /' "$s/err" >&2
+        echo "  the GUI's stderr:" >&2
+        sed 's/^/    /' "$s/err" >&2 || true
+        echo "  the session's (Xvfb, D-Bus):" >&2
+        sed 's/^/    /' "$s/session" >&2 || true
         fail=1
     else
         echo "smoke-gui: $copy: window mapped, main loop running, stderr clean"

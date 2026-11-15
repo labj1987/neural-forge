@@ -77,12 +77,13 @@ printf '%s\n' "$resolved" "undefined symbol: g_private_helper	(/usr/lib/libfoo.s
 run || fail "a host library's own symbol: AppRun failed"
 ran_host "a host library's own symbol"
 
-# A GTK_PATH and GIO_EXTRA_MODULES the user had point at host modules: the bundled copy runs without them, and their
-# values are saved for children.
+# A GTK_PATH and GIO_EXTRA_MODULES the user had point at host modules: the bundled copy gets the bundle's own module
+# directories in their place (set, not unset, so restoring them later is an overwrite), and their values are saved.
 printf '\tlibadwaita-1.so.0 => not found\n' > "$tmp/ldd-host"
 run GTK_PATH=/usr/lib/gtk GIO_EXTRA_MODULES=/usr/lib/gio || fail "host module paths: AppRun failed"
 ran_bundled "host module paths"
-if grep -qE '^(GTK_PATH|GIO_EXTRA_MODULES)=' "$tmp/out"; then fail "host module paths: still set: $(cat "$tmp/out")"; fi
+grep -qx "GTK_PATH=$tmp/app/usr/lib/gtk-4.0" "$tmp/out" || fail "host module paths: GTK_PATH: $(cat "$tmp/out")"
+grep -qx "GIO_EXTRA_MODULES=$tmp/app/usr/lib/gio/modules" "$tmp/out" || fail "host module paths: GIO_EXTRA_MODULES: $(cat "$tmp/out")"
 grep -qx "NEURAL_FORGE_ORIG_GTK_PATH=/usr/lib/gtk" "$tmp/out" || fail "host module paths: GTK_PATH not saved: $(cat "$tmp/out")"
 grep -qx "NEURAL_FORGE_ORIG_GIO_EXTRA_MODULES=/usr/lib/gio" "$tmp/out" || fail "host module paths: GIO_EXTRA_MODULES not saved: $(cat "$tmp/out")"
 # A stale saved value from another environment is not passed on.
@@ -143,4 +144,18 @@ if run DISPLAY=:0; then fail "kdialog: AppRun exited 0"; fi
 rm "$tmp/shown" "$tmp/bin/kdialog"
 if run DISPLAY=:0; then fail "notify-send: AppRun exited 0"; fi
 [ "$(cat "$tmp/shown")" = notify-send ] || fail "notify-send: got $(cat "$tmp/shown")"
+# data/gio-launch-desktop: the program GIO launches gets PATH and every listed variable back, none of the markers, and
+# the real gio-launch-desktop (usr/libexec) runs it.
+mkdir -p "$tmp/app/usr/libexec"
+cp "$ROOT/data/gio-launch-desktop" "$tmp/app/usr/bin/gio-launch-desktop"
+printf '#!/bin/sh\necho "real: $*"\nenv\n' > "$tmp/app/usr/libexec/gio-launch-desktop"
+chmod 755 "$tmp/app/usr/bin/gio-launch-desktop" "$tmp/app/usr/libexec/gio-launch-desktop"
+env -i PATH="$tmp/app/usr/bin:/usr/bin:/bin" NEURAL_FORGE_BUNDLE_ENV="PATH GTK_PATH" NEURAL_FORGE_ORIG_PATH=/usr/bin:/bin \
+    GTK_PATH=/b/gtk NEURAL_FORGE_ORIG_GTK_EXE_PREFIX=/stale KEEP=1 \
+    "$tmp/app/usr/bin/gio-launch-desktop" nautilus /x > "$tmp/out" || fail "gio-launch-desktop: failed"
+grep -qx "real: nautilus /x" "$tmp/out" || fail "gio-launch-desktop: the real one did not run: $(cat "$tmp/out")"
+grep -qx "PATH=/usr/bin:/bin" "$tmp/out" || fail "gio-launch-desktop: PATH: $(cat "$tmp/out")"
+grep -q "^GTK_PATH=" "$tmp/out" && fail "gio-launch-desktop: GTK_PATH kept"
+grep -q "NEURAL_FORGE_" "$tmp/out" && fail "gio-launch-desktop: markers kept: $(cat "$tmp/out")"
+grep -qx "KEEP=1" "$tmp/out" || fail "gio-launch-desktop: another variable was lost"
 echo "test_apprun: ok"

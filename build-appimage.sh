@@ -116,9 +116,13 @@ bundle_gtk_runtime() {
     cp "$pixdir"/*.so "$loaders/"
     cp "$syslib/gio/modules/libdconfsettings.so" "$giomods/"
     cp "$syslib/gtk-4.0/4.0.0/immodules/libim-ibus.so" "$immods/"
-    cp "$launcher" "$usr/bin/"
+    # The real one goes in usr/libexec; usr/bin gets data/gio-launch-desktop, which first gives the launched program
+    # the environment it would have had without the AppImage (PATH, the NEURAL_FORGE_* markers).
+    mkdir -p "$usr/libexec"
+    cp "$launcher" "$usr/libexec/"
+    install -m 755 data/gio-launch-desktop "$usr/bin/gio-launch-desktop"
     printf '%s\n' "$pixdir"/*.so "${modules[@]:1}" "$launcher" > "$work/bundle-sources"
-    bundle_ldd "$usr/bin/gio-launch-desktop" > "$work/bundle-closure" || return 1
+    bundle_ldd "$usr/libexec/gio-launch-desktop" > "$work/bundle-closure" || return 1
     while read -r soname path; do
         bundle_excluded "$soname" || { echo "==> ERROR: gio-launch-desktop needs $soname, which is not the host's" >&2; return 1; }
     done < "$work/bundle-closure"
@@ -210,7 +214,7 @@ bundle_gtk_runtime() {
     done < <(grep -ohE '/usr/share/common-licenses/[A-Za-z0-9.+_-]*[A-Za-z0-9+_-]' "$docs"/*.copyright | sort -u)
     # Which packages, at which version, from which source package.
     {
-        echo "The libraries and modules in usr/lib, and usr/bin/gio-launch-desktop, are these Ubuntu 24.04 packages' files,"
+        echo "The libraries and modules in usr/lib, and usr/libexec/gio-launch-desktop, are these Ubuntu 24.04 packages' files,"
         echo "unmodified apart from the run-time search path (rpath) patchelf set on the libraries and modules."
         echo "Their sources are the Ubuntu source packages named here, at these versions."
         echo

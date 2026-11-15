@@ -97,9 +97,11 @@ fn release_plan(get: impl Fn(&str) -> Option<OsString>, names: &[&str]) -> Vec<(
 ///
 /// Changing the environment races with a `getenv` on another thread: while glibc (2.39, 2.40) removes a
 /// variable it moves the later entries down one by one, so a concurrent reader can miss a variable or briefly
-/// see the array end early. [`GLIB_VARS`] are released at the top of `main()`, while the process has one
-/// thread. [`GTK_VARS`] can only go once GTK is initialised, at the application's startup, when GDBus's worker
-/// thread exists; it does not read the environment there, so the window is accepted for these two.
+/// see the array end early, and adding a variable can move the whole array. [`GLIB_VARS`] are released at the
+/// top of `main()`, while the process has one thread. [`GTK_VARS`] can only go once GTK is initialised, at the
+/// application's startup, when GDBus's worker thread exists: AppRun sets both of them (never leaves one unset), so
+/// that release only overwrites a value in place or removes one, and the worker does not read the environment
+/// there, so the window of a removal is accepted for these two.
 pub fn release(names: &[&str], load: impl FnOnce()) {
     let plan = release_plan(|name| std::env::var_os(name), names);
     if plan.is_empty() {

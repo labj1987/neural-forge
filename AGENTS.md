@@ -68,7 +68,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   GTK 4 and libadwaita; the build fails if it has an rpath) and `usr/bin/bundled/neural-forge` with a bundled GTK
   runtime (`bundle_gtk_runtime`: the ldd closure minus the AppImage excludelist, which the script cites, plus the
   Vulkan loader and Wayland libraries kept on the host; the gdk-pixbuf loaders, the dconf GIO module, the IBus IM
-  module, GIO's `gio-launch-desktop` in `usr/bin`, compiled schemas, and the packages' copyright files, the licence
+  module, GIO's `gio-launch-desktop` in `usr/libexec` behind `data/gio-launch-desktop` in `usr/bin` (which gives the
+  launched program the host's `PATH` and drops the markers), compiled schemas, and the packages' copyright files, the licence
   texts they name and a package manifest). Its libraries are found through `$ORIGIN` rpaths set with patchelf, never
   `LD_LIBRARY_PATH`. Only that copy is patched: the CLI, the layer and the NGX wrapper never load a bundled library,
   and nothing goes in `usr/lib/neural-forge/` (the installer copies all of it).
