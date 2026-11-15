@@ -1515,8 +1515,10 @@ impl<T> Drop for Seat<T> {
     }
 }
 
-/// Holds between two `[offload]` summaries (and the windows of `super::offload_trial`).
+/// Holds between two `[offload]` summaries (and the two-window rule of `super::offload_trial`).
 const SUMMARY_HOLDS: u64 = 600;
+// The short windows end where the summaries do.
+const _: () = assert!(SUMMARY_HOLDS.is_multiple_of(super::offload_trial::SHORT_HOLDS));
 
 /// The hold's side of the offload, for one set of hold resources (one render extent): the exchange, the worker
 /// with the network on the other device, the sent frame's kept colour, and the cadence.
@@ -1541,6 +1543,10 @@ pub(crate) struct HoldSide {
     /// offloaded frame time `super::offload_trial` measures.
     last_hold: Option<Instant>,
     intervals: Vec<Duration>,
+    /// Where the current short window's intervals begin in `intervals`, and the exchange's wait (µs), taken and
+    /// untaken counts summed over the short windows since the last summary (`super::offload_trial::SHORT_HOLDS`).
+    short_from: usize,
+    summed: [u64; 3],
     /// The extent its frames have (the trial's key).
     extent: (u32, u32),
     /// The hold planned last has not gone through yet: if it never does, what it planned is dropped at the next plan.
@@ -1701,6 +1707,8 @@ impl HoldSide {
             last_hold: None,
             extent: (width, height),
             intervals: Vec::with_capacity(SUMMARY_HOLDS as usize),
+            short_from: 0,
+            summed: [0; 3],
             pending: false,
             unsendable: Unsendable::default(),
         })
@@ -1797,14 +1805,35 @@ impl HoldSide {
                 self.intervals.push(d);
             }
         }
+        if self.holds.is_multiple_of(super::offload_trial::SHORT_HOLDS) {
+            self.windows();
+        }
+    }
+
+    /// A short window of holds ended (`super::offload_trial::SHORT_HOLDS`), and every third a summary's: the exchange's
+    /// counters are read for both, and the windows go to `super::offload_trial`, which may start its trial.
+    fn windows(&mut self) {
+        let p = &self.exchange.progress;
+        let part = [p.waited_us.swap(0, Ordering::Relaxed), p.taken.swap(0, Ordering::Relaxed), p.untaken.swap(0, Ordering::Relaxed)];
+        for (sum, v) in self.summed.iter_mut().zip(part) {
+            *sum += v;
+        }
+        let key = (self.extent, super::placement::settings().0);
+        let short = std::mem::replace(&mut self.short_from, self.intervals.len());
+        let mut started = None;
+        if self.serving() {
+            let frame = super::offload_trial::trimmed_mean(&mut self.intervals[short..].to_vec());
+            let waited = Duration::from_micros(part[0] / super::offload_trial::SHORT_HOLDS);
+            started = super::offload_trial::short_window(key, frame, waited, super::offload_trial::answered(part[1], part[2]));
+        }
         if self.holds.is_multiple_of(SUMMARY_HOLDS) {
-            let p = &self.exchange.progress;
-            let (taken, untaken) = (p.taken.swap(0, Ordering::Relaxed), p.untaken.swap(0, Ordering::Relaxed));
+            let [waited_us, taken, untaken] = std::mem::take(&mut self.summed);
+            let waited = Duration::from_micros(waited_us / SUMMARY_HOLDS);
             let [frames, us] = &SERVER_TIME[usize::from(self.at.bit() - 1)];
             let (frames, us) = (frames.swap(0, Ordering::Relaxed), us.swap(0, Ordering::Relaxed));
-            let waited = Duration::from_micros(p.waited_us.swap(0, Ordering::Relaxed) / SUMMARY_HOLDS);
             let frame = super::offload_trial::trimmed_mean(&mut self.intervals);
             self.intervals.clear();
+            self.short_from = 0;
             crate::log!(
                 "[offload] {}; {taken} holds carried the edit of the frame before them, {untaken} found no answer; the network's frame on the other GPU {:.2} ms (copies included); a hold every {:.1} ms, the game waiting {:.1} ms a frame for the answer",
                 self.worker.counters.summary(self.at),
@@ -1813,21 +1842,21 @@ impl HoldSide {
                 waited.as_secs_f64() * 1000.0
             );
             // Not the first window: the network was still loading on the other GPU for part of it.
-            if self.holds > SUMMARY_HOLDS && self.serving() {
-                let key = (self.extent, super::placement::settings().0);
-                if let Some(why) = super::offload_trial::offloaded(key, frame, waited) {
-                    // The trial on the game's GPU: not a fall-back. The held placements follow
-                    // `offload_trial::keeps_local` from the next hold, and the Status line is the native one's (the
-                    // offload's state is off, unless something else, a stall, already took it).
-                    crate::log!("[offload] {why}");
-                    crate::logging::flush();
-                    set_serving(None);
-                    if matches!(super::offload::state(), super::offload::State::Active(_)) {
-                        super::offload::note_state(super::offload::State::Off);
-                    }
-                    self.worker.stop_for_trial();
-                }
+            if started.is_none() && self.holds > SUMMARY_HOLDS && self.serving() {
+                started = super::offload_trial::offloaded(key, frame, waited);
             }
+        }
+        if let Some(why) = started {
+            // The trial on the game's GPU: not a fall-back. The held placements follow `offload_trial::keeps_local`
+            // from the next hold, and the Status line is the native one's (the offload's state is off, unless
+            // something else, a stall, already took it).
+            crate::log!("[offload] {why}");
+            crate::logging::flush();
+            clear_serving();
+            if matches!(super::offload::state(), super::offload::State::Active(_)) {
+                super::offload::note_state(super::offload::State::Off);
+            }
+            self.worker.stop_for_trial();
         }
     }
 

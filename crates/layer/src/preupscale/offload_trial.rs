@@ -3,7 +3,8 @@
 //! slower than the game's frame it sets the frame rate. The present's late rule (`super::offload::LateRule`) never
 //! sees that: the frames get as slow as the answers, so no answer is ever late. Whether the game's GPU does better
 //! with the network on it is measured, not guessed: once two windows of offloaded holds in a row show the game waiting
-//! for the other GPU ([`Trial::offloaded`]), the held placements go to the game's GPU for one trial ([`Trial::local`]);
+//! for the other GPU ([`Trial::offloaded`]), or one short window shows it waiting for most of each frame
+//! ([`Trial::short_window`]), the held placements go to the game's GPU for one trial ([`Trial::local`]);
 //! the frame rate there decides, once per process ([`decide`]). A game's GPU that is no faster, or cannot run the
 //! model, gives the frames back to the other GPU, and nothing is tried again. The trial steers the held placements
 //! ([`keeps_local`], read by `offload_pre::wanted`).
@@ -32,6 +33,16 @@ pub(crate) const WAIT_SHARE: f64 = 0.10;
 /// The share of the frame time the wait reaches where the other GPU sets the frame rate outright: the trial then
 /// starts on two windows in a row even when their frame times differ ([`Trial::offloaded`]).
 pub(crate) const WAIT_HEAVY: f64 = 0.50;
+/// Holds in a short window of offloaded holds ([`Trial::short_window`]), a third of the summaries' 600: about 6 s at
+/// the #63 reporter's 36 fps, where two 600-hold windows after the first took 33 s at the earliest.
+pub(crate) const SHORT_HOLDS: u64 = 200;
+/// The share of the frame time the game waits for the other GPU in a short window where that window alone starts the
+/// trial: the other GPU clearly sets the frame rate (the #63 reporter's game waited 24.1 ms of its 27.5 ms frames).
+/// Below it the two-window rule decides ([`WAIT_SHARE`], [`WAIT_HEAVY`]).
+pub(crate) const WAIT_CLEAR: f64 = 0.60;
+/// The share of a short window's holds that must have taken the other GPU's answer for the window to count: the
+/// network runs there (not still loading), so the wait is its frames'.
+pub(crate) const ANSWERED: f64 = 0.90;
 /// How far two windows (two offloaded ones in a row, or the local window's halves) may differ and still agree.
 pub(crate) const AGREE: f64 = 0.10;
 /// Local holds after the trial began that count for nothing: the network's build on the game's GPU, the first
@@ -164,6 +175,18 @@ pub(crate) fn trimmed_mean(v: &mut [Duration]) -> Duration {
     kept.iter().sum::<Duration>() / kept.len() as u32
 }
 
+/// Whether the game waited `wait` a hold for the other GPU's answer in frames every `frame`: at least [`WAIT_MIN`] and
+/// [`WAIT_SHARE`] of the frame.
+fn waits(frame: Duration, wait: Duration) -> bool {
+    wait >= WAIT_MIN && wait.as_secs_f64() >= frame.as_secs_f64() * WAIT_SHARE
+}
+
+/// Whether a short window's holds, `taken` of which took the other GPU's answer and `untaken` found none, count as
+/// answered ([`ANSWERED`]).
+pub(crate) fn answered(taken: u64, untaken: u64) -> bool {
+    taken > 0 && taken as f64 >= (taken + untaken) as f64 * ANSWERED
+}
+
 /// Whether two frame times agree within [`AGREE`].
 fn agree(a: Duration, b: Duration) -> bool {
     let (a, b) = (a.as_secs_f64(), b.as_secs_f64());
@@ -211,6 +234,29 @@ struct Local {
     intervals: Vec<Duration>,
 }
 
+impl Local {
+    /// A trial of `key` begun at `now` against the other GPU's frame time `off` and wait `wait`.
+    fn new(finished: bool, key: Key, off: Duration, wait: Duration, now: Instant) -> Self {
+        Self {
+            finished,
+            key,
+            off,
+            wait,
+            began: now,
+            ran: 0,
+            holds: 0,
+            missed: 0,
+            loading: None,
+            open_waited: false,
+            last: None,
+            paused: Duration::ZERO,
+            last_ran: None,
+            slow: 0,
+            intervals: Vec::with_capacity(LOCAL_MAX),
+        }
+    }
+}
+
 /// The process's trial ([`TRIAL`]); its own type so tests drive one of their own.
 #[derive(Debug, Default)]
 pub(crate) struct Trial {
@@ -220,6 +266,12 @@ pub(crate) struct Trial {
     waiting: Option<(Key, Duration)>,
     /// Whether the game waited for the other GPU for half its frame or more in that window ([`WAIT_HEAVY`]).
     waiting_heavy: bool,
+    /// The key of the previous short window if the other GPU answered its holds ([`Trial::short_window`]): a short
+    /// window counts only after one that was answered too, so the network's first frames there are left out.
+    answered: Option<Key>,
+    /// The last window showed the game waiting for the other GPU and no trial has started yet: the Status tab says the
+    /// trial is measuring ([`Trial::pending`]).
+    pending: bool,
     aborts: u32,
     /// The trial was started by the finished frame ([`Trial::finished_window`]): its local frames are the presents'.
     finished: bool,
@@ -306,7 +358,8 @@ impl Trial {
         if !enabled || !matches!(self.phase, Phase::Watching) || frame.is_zero() {
             return None;
         }
-        if wait < WAIT_MIN || wait.as_secs_f64() < frame.as_secs_f64() * WAIT_SHARE {
+        self.pending = waits(frame, wait);
+        if !self.pending {
             self.waiting = None;
             self.waiting_heavy = false;
             return None;
@@ -323,31 +376,58 @@ impl Trial {
             return None;
         }
         let frame = if agree(last, frame) { frame } else { frame.min(last) };
+        Some(self.start(key, frame, wait, now))
+    }
+
+    /// A short window of [`SHORT_HOLDS`] offloaded holds of `key` (its frame time `frame`, the mean wait per hold
+    /// `wait`), `answered` when the other GPU answered its holds ([`answered`]). Where the game waited for the other
+    /// GPU for [`WAIT_CLEAR`] of its frame or more, the window starts the trial on its own, provided the short window
+    /// before it was answered too (of the same key): the #63 reporter's game waited 24.1 ms of its 27.5 ms frames, and
+    /// two 600-hold windows after the first started the trial only 75 s in. A lighter wait leaves it to the two-window
+    /// rule ([`Self::offloaded`]). `Some(why)` starts the trial, as there.
+    pub(crate) fn short_window(&mut self, key: Key, frame: Duration, wait: Duration, answered: bool, enabled: bool, now: Instant) -> Option<String> {
+        if !enabled || !matches!(self.phase, Phase::Watching) || frame.is_zero() {
+            return None;
+        }
+        if !answered {
+            self.answered = None;
+            return None;
+        }
+        let before = self.answered.replace(key);
+        self.pending = waits(frame, wait);
+        if before != Some(key) || !self.pending || wait.as_secs_f64() < frame.as_secs_f64() * WAIT_CLEAR {
+            return None;
+        }
+        Some(self.start(key, frame, wait, now))
+    }
+
+    /// Starts the held placements' trial of `key` against the other GPU's frames every `frame`, the game waiting `wait`
+    /// a frame for them: the log's line.
+    fn start(&mut self, key: Key, frame: Duration, wait: Duration, now: Instant) -> String {
         self.waiting = None;
+        self.answered = None;
+        self.pending = false;
         self.finished = false;
-        self.phase = Phase::Local(Local {
-            finished: false,
-            key,
-            off: frame,
-            wait,
-            began: now,
-            ran: 0,
-            holds: 0,
-            missed: 0,
-            loading: None,
-            open_waited: false,
-            last: None,
-            paused: Duration::ZERO,
-            last_ran: None,
-            slow: 0,
-            intervals: Vec::with_capacity(LOCAL_MAX),
-        });
-        Some(format!(
+        self.phase = Phase::Local(Local::new(false, key, frame, wait, now));
+        format!(
             "trying the model on the game's GPU: the game waited {:.1} ms a frame for the other GPU's answer (a frame every {:.1} ms, {:.0} fps); the frame rate there decides where the model runs",
             ms(wait),
             ms(frame),
             fps(frame)
-        ))
+        )
+    }
+
+    /// The game waits for the other GPU and the trial has not decided yet: it is measuring (the Status tab says so).
+    pub(crate) fn pending(&self) -> bool {
+        self.pending && matches!(self.phase, Phase::Watching)
+    }
+
+    /// A side of the held placements was built on the other GPU: windows from before it say nothing of its frames.
+    fn side_built(&mut self) {
+        self.waiting = None;
+        self.waiting_heavy = false;
+        self.answered = None;
+        self.pending = false;
     }
 
     /// A window of offloaded finished-frame presents of `key`, a frame every `frame`: two in a row that agree start the
@@ -363,23 +443,7 @@ impl Trial {
         }
         self.waiting = None;
         self.finished = true;
-        self.phase = Phase::Local(Local {
-            finished: true,
-            key,
-            off: frame,
-            wait: Duration::ZERO,
-            began: now,
-            ran: 0,
-            holds: 0,
-            missed: 0,
-            loading: None,
-            open_waited: false,
-            last: None,
-            paused: Duration::ZERO,
-            last_ran: None,
-            slow: 0,
-            intervals: Vec::with_capacity(LOCAL_MAX),
-        });
+        self.phase = Phase::Local(Local::new(true, key, frame, Duration::ZERO, now));
         Some(format!(
             "trying the model on the game's GPU: the finished frame came every {:.1} ms ({:.0} fps) with the model on the other GPU; the frame rate there decides where the model runs",
             ms(frame),
@@ -743,6 +807,8 @@ impl Trial {
         phase: Phase::Watching,
         waiting: None,
         waiting_heavy: false,
+        answered: None,
+        pending: false,
         aborts: 0,
         finished: false,
         back: false,
@@ -804,7 +870,21 @@ fn with_finished<R>(f: impl FnOnce(&mut Trial) -> R) -> R {
 
 /// A side of the held placements was built on the other GPU: windows from before it say nothing of its frames.
 pub(crate) fn side_built() {
-    with(|t| t.waiting = None);
+    with(Trial::side_built);
+}
+
+/// [`Trial::short_window`] for the process.
+pub(crate) fn short_window(key: Key, frame: Duration, wait: Duration, answered: bool) -> Option<String> {
+    with(|t| t.short_window(key, frame, wait, answered, enabled(), Instant::now()))
+}
+
+/// The Status tab's words while the held placements' trial is pending ([`Trial::pending`]): appended to the offload's
+/// line.
+pub(crate) const PENDING: &str = "the game waits for it: measuring whether the game's GPU is faster";
+
+/// [`PENDING`] while the process's trial is pending ([`Trial::pending`]).
+pub(crate) fn pending_note() -> Option<&'static str> {
+    with(|t| t.pending()).then_some(PENDING)
 }
 
 /// [`Trial::offloaded`] for the process.
@@ -1500,6 +1580,125 @@ mod tests {
         assert!(offloaded(KEY, MS(36), MS(16)).is_none(), "the window before the side counts for nothing");
         assert!(offloaded(KEY, MS(36), MS(16)).is_some());
         reset_for_test();
+    }
+
+    /// #63: Cyberpunk 2077 with Ray Reconstruction, the model after DLSS on an RTX 5080 beside an RTX 4090: the game
+    /// waited 24.1 ms of its 27.5 ms frames, and the trial started 75 s in. Where the game waits for most of its frame,
+    /// one short window starts it, once the window before it was answered too (the network's first frames left out).
+    #[test]
+    fn a_game_waiting_most_of_its_frame_is_tried_after_one_short_window() {
+        let now = Instant::now();
+        let us = Duration::from_micros;
+        let mut t = Trial::default();
+        assert!(t.short_window(KEY, us(27_500), us(24_100), false, true, now).is_none(), "still loading: no answers");
+        assert!(!t.pending());
+        assert!(t.short_window(KEY, us(27_500), us(24_100), true, true, now).is_none(), "the first answered window is warm-up");
+        assert!(t.pending(), "the Status tab says the trial measures");
+        let why = t.short_window(KEY, us(27_500), us(24_100), true, true, now).expect("the next one starts it");
+        assert!(why.contains("waited 24.1 ms") && why.contains("a frame every 27.5 ms"), "{why}");
+        assert!(t.running() && t.keeps_local() && !t.pending());
+        // Started: the long windows and the short ones start nothing more.
+        assert!(t.short_window(KEY, us(27_500), us(24_100), true, true, now).is_none());
+        assert!(t.offloaded(KEY, us(27_500), us(24_100), true, now).is_none());
+        // The verdict as before: the 4090 at about 56 fps keeps the model.
+        let (_, v) = run_local(&mut t, now, us(17_800), false);
+        assert!(matches!(v, Verdict::Local { .. }), "{v:?}");
+        // Exactly the share: 60% starts it, just below does not.
+        let mut t = Trial::default();
+        assert!(t.short_window(KEY, MS(20), MS(12), true, true, now).is_none());
+        assert!(t.short_window(KEY, MS(20), MS(12), true, true, now).is_some());
+    }
+
+    /// A borderline wait (a tenth to 60% of the frame) is never started by short windows: the two 600-hold windows
+    /// decide, as before.
+    #[test]
+    fn a_borderline_wait_still_needs_two_windows() {
+        let now = Instant::now();
+        let mut t = Trial::default();
+        for _ in 0..6 {
+            assert!(t.short_window(KEY, MS(20), MS(8), true, true, now).is_none(), "8 of 20 ms: borderline");
+        }
+        assert!(t.pending(), "it waits: measuring");
+        assert!(!t.running());
+        assert!(t.offloaded(KEY, MS(20), MS(8), true, now).is_none(), "one long window starts nothing");
+        assert!(t.short_window(KEY, MS(20), MS(9), true, true, now).is_none());
+        assert!(t.offloaded(KEY, MS(20), MS(8), true, now).is_some(), "two that agree do");
+        // A heavy wait below the clear share (55%) is the two-window rule's too.
+        let mut t = Trial::default();
+        for _ in 0..4 {
+            assert!(t.short_window(KEY, MS(20), MS(11), true, true, now).is_none());
+        }
+        assert!(!t.running());
+        // No wait at all is not pending, and off tries nothing.
+        let mut t = Trial::default();
+        assert!(t.short_window(KEY, MS(13), us_300(), true, true, now).is_none());
+        assert!(!t.pending());
+        for _ in 0..3 {
+            assert!(t.short_window(KEY, MS(36), MS(30), true, false, now).is_none());
+        }
+        assert!(!t.running() && !t.pending());
+    }
+
+    fn us_300() -> Duration {
+        Duration::from_micros(300)
+    }
+
+    /// What resets the two-window rule resets the short one: a new side (the effect toggled, the hold built again), a
+    /// window without the other GPU's answers (a pause, a load), another size, a window without the wait.
+    #[test]
+    fn an_interruption_resets_the_short_windows() {
+        let now = Instant::now();
+        let us = Duration::from_micros;
+        let clear = |t: &mut Trial, answered: bool| t.short_window(KEY, us(27_500), us(24_100), answered, true, now);
+        // A new side between the warm window and the clear one.
+        reset_for_test();
+        assert!(short_window(KEY, us(27_500), us(24_100), true).is_none());
+        assert!(pending_note().is_some());
+        side_built();
+        assert!(pending_note().is_none(), "the new side's windows are measured afresh");
+        assert!(short_window(KEY, us(27_500), us(24_100), true).is_none(), "warm-up again");
+        assert!(short_window(KEY, us(27_500), us(24_100), true).is_some());
+        reset_for_test();
+        // A window without answers between.
+        let mut t = Trial::default();
+        assert!(clear(&mut t, true).is_none());
+        assert!(clear(&mut t, false).is_none());
+        assert!(clear(&mut t, true).is_none(), "warm-up again");
+        assert!(clear(&mut t, true).is_some());
+        // Another size between.
+        let mut t = Trial::default();
+        assert!(clear(&mut t, true).is_none());
+        assert!(t.short_window(((2048, 1536), 1), us(27_500), us(24_100), true, true, now).is_none());
+        assert!(clear(&mut t, true).is_none(), "the size changed between");
+        assert!(clear(&mut t, true).is_some());
+        // A window without the wait clears the pending line; the next clear one starts the trial (its key answered).
+        let mut t = Trial::default();
+        assert!(clear(&mut t, true).is_none());
+        assert!(t.short_window(KEY, MS(13), us_300(), true, true, now).is_none());
+        assert!(!t.pending());
+        assert!(clear(&mut t, true).is_some());
+        // A trial cut short by a change of what is held starts afresh: warm-up, then a clear window.
+        let mut t = Trial::default();
+        assert!(clear(&mut t, true).is_none());
+        assert!(clear(&mut t, true).is_some());
+        assert!(matches!(t.local(((2048, 1536), 1), now, true, None, false), Some(Verdict::Aborted(_))));
+        assert!(!t.pending());
+        assert!(clear(&mut t, true).is_none(), "warm-up again after the abort");
+        assert!(clear(&mut t, true).is_some());
+    }
+
+    /// The pending note fits the Status channel after the offload's longest line.
+    #[test]
+    fn the_pending_line_fits_the_status_channel() {
+        let both = super::super::offload_pre::Serving { before: true, after: true };
+        let line = format!("{}; {PENDING}", super::super::offload_pre::status_line("NVIDIA GeForce RTX 5080 Laptop GPU", both));
+        assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
+    }
+
+    #[test]
+    fn a_short_window_counts_as_answered_from_nine_tenths() {
+        assert!(answered(90, 10) && answered(300, 0));
+        assert!(!answered(89, 11) && !answered(0, 0) && !answered(0, 200));
     }
 
     #[test]

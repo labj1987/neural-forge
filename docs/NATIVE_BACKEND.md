@@ -1972,7 +1972,12 @@ the frames slow down to the answers, none is late. The submits' waits are summed
 over 250 ms dropped: with the edit cache the local frames are two kinds, which a median would pick one of) and the mean
 wait per hold. From the second window on (the first has the network loading on the other GPU), two windows in a row of
 the same key (the hold's extent and the pass count) whose frame times agree within 10% and whose mean wait is 2 ms or
-more and a tenth of the frame start the trial (`Trial::offloaded`): the worker stops serving (its give-up callback
+more and a tenth of the frame start the trial (`Trial::offloaded`). Every 200 holds a short window is taken too
+(`Trial::short_window`): where 90% of its holds took the answer, the short window before it (same key) did too, and
+the mean wait is 60% of the frame or more, that window alone starts the trial (#63: Cyberpunk 2077 with Ray
+Reconstruction waited 24.1 ms of 27.5 ms frames, and the two-window rule started the trial 75 s in). Until it starts,
+a window that showed the wait adds "the game waits for it: measuring whether the game's GPU is faster" to the
+offload's Status line (`offload_trial::pending_note`). Either way the worker stops serving (its give-up callback
 sets `State::Off`, not `FellBack`: the trial is not a fall-back, and the finished-frame offload stays available) and
 `offload_pre::wanted` is false while `offload_trial::keeps_local`. Every hold while it runs goes through
 `Session::note` to `offload_trial::local_hold`: after 60 holds that ran the model here, the frame time of at least 300

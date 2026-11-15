@@ -641,15 +641,17 @@ the game's GPU is faster (...)" while the game's GPU keeps the model; the log's 
 rates. `NEURAL_FORGE_OFFLOAD_TRIAL=off` tries nothing.
 
 Before or after DLSS the game waits for the second GPU's answer to the frame before, so a second GPU slower than the
-game's frame sets the frame rate. Once the game has waited for it (2 ms a frame or more, and a tenth of its frame time)
-in two windows of 600 frames in a row with about the same frame rate (so 1200 frames after the start at the earliest),
-the model is tried once on the game's GPU: a few seconds of frames there (the network is built there first, about a
+game's frame sets the frame rate. Where the game waits for it for 60% of each frame or more, 200 frames of that (once
+the second GPU has answered 200 frames before them) are enough: 12 to 17 seconds after the start at 36 fps, depending on how long the network takes to load there. A lighter
+wait (2 ms a frame or more, and a tenth of its frame time) needs two windows of 600 frames in a row with about the same
+frame rate (so 1200 frames after the start at the earliest). Then the model is tried once on the game's GPU: a few seconds of frames there (the network is built there first, about a
 second without the model) decide. A game's GPU whose frames come at least 10% faster keeps the model until the game
 restarts; otherwise, or when the game's GPU cannot run the model (it is not built within 15 seconds of frames, or 30
 frames in a row miss it), it goes back to the second GPU, and nothing is tried again. A change of what is held during
 the trial (another size, another number of passes) sends the model back and lets a later window try again. The Status
-tab says "second GPU: trying the game's GPU for a few seconds" during the trial and "second GPU: not used: the game's GPU
-is faster (18.6 ms vs 22.8 ms a frame)" once it kept the model there; the log's `[offload]` lines give both frame times,
+tab says "the game waits for it: measuring whether the game's GPU is faster" after the second GPU's line while the game
+waits for it and the trial has not started yet, "second GPU: trying the game's GPU for a few seconds" during the trial
+and "second GPU: not used: the game's GPU is faster (18.6 ms vs 22.8 ms a frame)" once it kept the model there; the log's `[offload]` lines give both frame times,
 and the summaries every 600 frames say how long the game waited a frame. Where the frames cross system
 memory slowly (a second GPU in a slot with fewer PCIe lanes, or behind the chipset), the copies alone can take longer
 than the network: Cyberpunk 2077 with Ray Reconstruction at 2048x1536 moved 72 MB a frame and took 28.6 ms a frame on
