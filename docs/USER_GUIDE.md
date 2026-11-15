@@ -294,7 +294,7 @@ prepared for the new size first, as on any change of size). A pass's own value i
 first, after DLSS too. A frame with pass 1 before the upscaler runs the Passes setting's count; its passes placed
 after DLSS in the per-pass settings use the group's image settings and model resolution. The strength presets also
 end the group's own strengths, as they do for the passes. The Status tab's **Settings in use** line says which
-group the model's frames use. They are saved as `set_after_passes`, `set_after_scale` (0 for the same as before
+group the current placement uses. They are saved as `set_after_passes`, `set_after_scale` (0 for the same as before
 DLSS), `set_after_overrides` and `set_after_intensity`, ... in `config.ini`, can be set per game, and
 `neural-forge-cli shmctl set after_passes 1` (or `after_scale 0.5`) does the same from a terminal.
 

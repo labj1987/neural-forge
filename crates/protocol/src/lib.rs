@@ -100,7 +100,7 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// NGX wrapper ring's counters (`ngx_records`, `ngx_matched`); v28 appends the second GPU showing the frame itself
 /// (`second_gpu_present` and the layer's line about it); v29 appends the presented frame's own size (`frame_width`,
 /// `frame_height`); v30 appends the After DLSS / finished frame settings group (`after_passes`, `after_scale`,
-/// `after_overrides` and its values) and which group the model's latest frame used (`settings_group`)).
+/// `after_overrides` and its values) and which group the current placement uses (`settings_group`)).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.

@@ -2511,9 +2511,8 @@ impl NeuralForgeDeviceInfo {
             }
             return say(crate::gpu2_present::TRIAL_REFUSAL.into());
         }
-        // A frame on the finished frame runs the After DLSS group's passes (`Placements::after`).
-        let p = header.placements();
-        if !p.each[..p.after.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
+        // Pass 1 on the finished frame puts every pass there (`placement::finished_frame_only`).
+        if !crate::preupscale::placement::finished_frame_only(&header.placements()) {
             return say("Placement is not Finished frame for every pass".into());
         }
         if self.gpu2_signal.is_none() {

@@ -1818,7 +1818,7 @@ impl HoldSide {
         for (sum, v) in self.summed.iter_mut().zip(part) {
             *sum += v;
         }
-        let key = (self.extent, super::placement::settings().0);
+        let key = (self.extent, super::placement::active_count());
         let short = std::mem::replace(&mut self.short_from, self.intervals.len());
         let mut started = None;
         if self.serving() {

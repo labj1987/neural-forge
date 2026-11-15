@@ -6810,7 +6810,7 @@ impl Session {
         #[cfg(target_arch = "x86_64")]
         if offload_trial::running() && !offload_pre::serving_hold() {
             let ran = result.native && result.evaluated && result.wrote_back;
-            offload_trial::local_hold((extent, placement::settings().0), now, ran, result.miss);
+            offload_trial::local_hold((extent, placement::active_count()), now, ran, result.miss);
         }
         self.share_post_off();
         let holding = self.holding();
@@ -6982,11 +6982,8 @@ impl Session {
         // Only while the offload is what runs (serving at the finished-frame placement, or a hold sending
         // its frames) or not running (starting, stalled, given up): when the placement left it, the native backend's
         // line has the channel (`offload::shows_line`).
-        let at_present = shm.view().is_some_and(|v| {
-            // A frame on the finished frame runs the After DLSS group's passes (`Placements::after`).
-            let p = v.header().placements();
-            p.each[..p.after.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT)
-        });
+        // Pass 1 on the finished frame puts every pass there (`placement::finished_frame_only`).
+        let at_present = shm.view().is_some_and(|v| placement::finished_frame_only(&v.header().placements()));
         let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_hold());
         // The finished frame's trial on the game's GPU, or its verdict for it (`offload_trial`): the offload's state
         // still says Active there, but the game's GPU runs the model.
@@ -7114,8 +7111,7 @@ impl Session {
                 && !offload_trial::finished_local()
                 && !crate::device::gpu2_hosts(device.handle())
             {
-                let p = view.header().placements();
-                if p.each[..p.after.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
+                if placement::finished_frame_only(&view.header().placements()) {
                     // After a hand-back: once the game's GPU's network is closed (one is open in the process at a time).
                     if self.give_back.holds_start(now) {
                         return;
@@ -9010,7 +9006,7 @@ mod tests {
     fn the_trial_runs_through_the_holds_notes_and_status() {
         let _state = offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         offload_trial::reset_for_test();
-        let key = ((1485, 836), placement::settings().0);
+        let key = ((1485, 836), placement::active_count());
         assert!(offload_trial::offloaded(key, Duration::from_millis(23), Duration::from_millis(5)).is_none());
         assert!(offload_trial::offloaded(key, Duration::from_millis(23), Duration::from_millis(5)).is_some());
         assert!(offload_trial::running() && offload_trial::keeps_local());

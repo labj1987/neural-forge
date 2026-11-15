@@ -811,8 +811,8 @@ pub struct ShmHeader {
     /// on the finished frame, and a pass's own override still wins over it. Default none.
     pub after: PassControl,
     pub after_colour: PassColour,
-    /// Which group the model's latest frame used ([`crate::enums::settings_group`]), for the Status tab. Written by
-    /// the layer; [`crate::enums::settings_group::NONE`] when a session starts.
+    /// Which group the current placement uses ([`crate::enums::settings_group`]), for the Status tab. Written by
+    /// the layer when it plans a frame's passes; [`crate::enums::settings_group::NONE`] when a session starts.
     pub settings_group: AtomicU32,
 }
 
@@ -3597,7 +3597,7 @@ mod tests {
     }
 
     /// v30 appends the After DLSS / finished frame group (#73) after the presented frame's size, and which group the
-    /// model's latest frame used: every earlier field keeps its offset. By default the group is the same as before
+    /// current placement uses: every earlier field keeps its offset. By default the group is the same as before
     /// the upscaler in everything: the passes, the model resolutions and every pass's settings and colour.
     #[test]
     fn the_after_dlss_group_is_appended_and_starts_as_before() {

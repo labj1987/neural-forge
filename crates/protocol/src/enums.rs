@@ -229,11 +229,12 @@ pub mod exposure_source {
     }
 }
 
-/// Which settings group the model's latest frame used (`ShmHeader::settings_group`, #73): the Model tab's own
+/// Which settings group the current placement uses (`ShmHeader::settings_group`, #73; written when the layer plans a
+/// frame's passes, before the model runs it): the Model tab's own
 /// values where the model runs before the upscaler, the "After DLSS / finished frame" group's where it runs after
 /// DLSS's output or on the finished frame (by Placement, by Auto, or by a fall-back).
 pub mod settings_group {
-    /// No frame of the model yet (or the channel's session just started).
+    /// No placement planned yet (or the channel's session just started).
     pub const NONE: u32 = 0;
     /// Before the upscaler: the Model tab's Passes, Model resolution and image settings.
     pub const BEFORE: u32 = 1;

@@ -969,7 +969,8 @@ pub(crate) fn finished_present(frame: Option<(u32, u32)>, now: Instant, offloade
     if super::offload::Choice::current() == super::offload::Choice::Off {
         return;
     }
-    let key = (frame.unwrap_or_default(), super::placement::settings().0);
+    // The finished frame runs the After DLSS group's passes (`Placements::after`).
+    let key = (frame.unwrap_or_default(), super::placement::placements().after);
     let (enabled, forced) = (enabled(), forced_offload());
     let state = if frame.is_some() { in_gameplay(now) } else { Gameplay::No };
     let (started, verdict, waits) = with_finished(|t| {

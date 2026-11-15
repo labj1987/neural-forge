@@ -144,8 +144,9 @@ impl Preset {
     /// the preset sets, and the look at its defaults where the preset resets it.
     pub fn matches(&self, header: &neural_forge_protocol::ShmHeader) -> bool {
         let ended = self.ended_overrides();
-        // The passes that run (`passes`): what a pass past them holds of its own changes no picture.
-        let active = (header.passes.load(Ordering::Relaxed) as usize).clamp(1, header.pass.len());
+        // The passes that run (`passes` before DLSS, `after_passes` after it): what a pass past both holds of its own
+        // changes no picture.
+        let active = (header.resolved_passes() as usize).max(header.resolved_after_passes()).clamp(1, header.pass.len());
         self.knobs.close_to(&Knobs::from_header(header))
             && header.pass[..active].iter().all(|p| p.overrides.load(Ordering::Relaxed) & ended == 0)
             && header.after.overrides.load(Ordering::Relaxed) & ended == 0
@@ -294,6 +295,19 @@ mod tests {
         assert!(header.write_settings(&[("passes", 2)]));
         assert!(PRESETS[2].write(&header).is_some());
         assert!(header.write_settings(&[("passes", 3)]));
+        assert_eq!(matching(&header), Some(2));
+    }
+
+    /// A pass past the Passes setting that runs after DLSS (`after_passes`, #73) decides the preset as one before it does.
+    #[test]
+    fn a_pass_that_runs_after_dlss_decides_the_preset() {
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.init_defaults();
+        assert!(header.write_settings(&[("passes", 1), ("pass3_overrides", pass_override::STYLE | pass_override::INTENSITY), ("pass3_style", 2)]));
+        assert_eq!(matching(&header), Some(2), "pass 3 does not run: the header holds Reference");
+        assert!(header.write_settings(&[("after_passes", 3)]));
+        assert_eq!(matching(&header), None, "pass 3 runs after DLSS, on its own style and intensity");
+        assert!(PRESETS[2].write(&header).is_some());
         assert_eq!(matching(&header), Some(2));
     }
 
