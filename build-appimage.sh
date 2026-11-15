@@ -123,12 +123,8 @@ cp data/io.github.labj1987.NeuralForge.desktop "$APPDIR/"
 cp data/icon.svg "$APPDIR/$NAME.svg"
 
 # ── AppRun ────────────────────────────────────────────────────────────
-cat > "$APPDIR/AppRun" << 'APPRUN'
-#!/usr/bin/env bash
-HERE="$(dirname "$(readlink -f "$0")")"
-export PATH="$HERE/usr/bin:$PATH"
-exec "$HERE/usr/bin/neural-forge" "$@"
-APPRUN
+# data/AppRun: checks that the GUI's system libraries resolve, then starts it (scripts/test_apprun.sh).
+cp data/AppRun "$APPDIR/AppRun"
 chmod 755 "$APPDIR/AppRun"
 
 # ── appimagetool ──────────────────────────────────────────────────────

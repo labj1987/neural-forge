@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# The AppImage's entry point: build-appimage.sh copies it to the AppDir's root.
+HERE="$(dirname "$(readlink -f "$0")")"
+
+# ── Libraries the GUI takes from the system ──────────────────────────
+# GTK 4 and libadwaita come from the system. When a library the GUI links does not resolve, the dynamic loader
+# ends it with one line on stderr, which nobody sees when it was started from a menu: name the missing libraries
+# and the packages to install instead, in a dialog where one can be shown, and stop. This block is the whole check:
+# a build that ships the libraries itself adjusts it here (its own library path first).
+nf_missing_libraries() {
+    command -v ldd >/dev/null 2>&1 || return 0
+    LC_ALL=C ldd "$1" 2>/dev/null | awk '$2 == "=>" && $3 == "not" && $4 == "found" { print $1 }' | sort -u
+}
+nf_show_error() {
+    local title="$1" text="$2" rc
+    printf '%s\n\n%s\n' "$title" "$text" >&2
+    [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] || return 0
+    # zenity and kdialog exit 0 or 1 once their dialog was shown (closed or confirmed); anything else (127: not
+    # runnable, e.g. a zenity built on the same missing libraries) tries the next.
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --no-markup --title="$title" --text="$title"$'\n\n'"$text" 2>/dev/null; rc=$?
+        [ "$rc" -le 1 ] && return 0
+    fi
+    if command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "$title" --error "$text" 2>/dev/null; rc=$?
+        [ "$rc" -le 1 ] && return 0
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send --urgency=critical --app-name="Neural Forge" "$title" "$text" 2>/dev/null || true
+    fi
+    return 0
+}
+nf_missing="$(nf_missing_libraries "$HERE/usr/bin/neural-forge")"
+if [ -n "$nf_missing" ]; then
+    nf_show_error "Neural Forge cannot start: libraries are missing" "These libraries it needs are not installed: $(printf '%s' "$nf_missing" | paste -sd, - | sed 's/,/, /g').
+
+Neural Forge needs GTK 4 (4.12 or newer) and libadwaita (1.5 or newer) from the system. Install them with the package manager:
+  Debian, Ubuntu, Pop!_OS: sudo apt install libgtk-4-1 libadwaita-1-0
+  Fedora: sudo dnf install gtk4 libadwaita
+  Arch, CachyOS: sudo pacman -S gtk4 libadwaita
+  openSUSE: sudo zypper install libgtk-4-1 libadwaita-1-0
+then start Neural Forge again."
+    exit 1
+fi
+unset nf_missing
+# ─────────────────────────────────────────────────────────────────────
+
+export PATH="$HERE/usr/bin:$PATH"
+exec "$HERE/usr/bin/neural-forge" "$@"

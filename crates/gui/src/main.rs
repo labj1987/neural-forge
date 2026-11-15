@@ -1,9 +1,10 @@
+mod icons;
 mod shm;
 mod ui;
 
 use gtk4::prelude::*;
 
-const APP_ID: &str = "io.github.labj1987.NeuralForge";
+pub(crate) const APP_ID: &str = "io.github.labj1987.NeuralForge";
 
 fn main() {
     // Set program name before GTK init. On Wayland the app_id the compositor sees is the
@@ -12,6 +13,8 @@ fn main() {
     // window match the desktop file on either backend.
     glib::set_prgname(Some(APP_ID));
     glib::set_application_name("Neural Forge");
+    // The GUI's own icons, before the application starts (it adds them to the icon theme at startup).
+    icons::register();
 
     let app = libadwaita::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::FLAGS_NONE).build();
 

@@ -93,6 +93,10 @@ says what to do.
 - **"The network is paused: too little video memory".** The model resumes once there is room. A 12 GB
   card is at its limit at 4K: close programs that hold video memory (browsers with hardware
   acceleration).
+- **Neural Forge does not open.** If GTK 4 or libadwaita is missing it says which libraries and the
+  package to install (`sudo apt install libgtk-4-1 libadwaita-1-0`, `sudo dnf install gtk4 libadwaita`,
+  `sudo pacman -S gtk4 libadwaita` or `sudo zypper install libgtk-4-1 libadwaita-1-0`); stock KDE Plasma
+  and Hyprland installs often lack them.
 - **HDR does not come on.** The Status tab's HDR line says why. Under Proton add
   `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` to the launch options (Proton-GE), or start gamescope
   with `--hdr-enabled`; if HDR10 was available, switch on the game's own HDR setting. The line also

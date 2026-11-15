@@ -805,7 +805,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_page.add(&build_colour_group(&shm, &toasts));
     model_page.add(&build_hud_group(&shm));
     model_page.add(&build_sharpen_group(&shm));
-    view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", "applications-graphics-symbolic");
+    view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", crate::icons::MODEL);
 
     // Model resolution and model-every-Nth-frame apply after the upscaler only: shown while a game runs
     // and the model is not running before the upscaler.
@@ -824,7 +824,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let composition_page = adw::PreferencesPage::new();
     composition_page.add(&comp_group);
     composition_page.add(&hdr_group);
-    view_stack.add_titled_with_icon(&composition_page, Some("composition"), "Composition", "view-paged-symbolic");
+    view_stack.add_titled_with_icon(&composition_page, Some("composition"), "Composition", crate::icons::COMPOSITION);
 
     let debug_page = adw::PreferencesPage::new();
     debug_page.add(&debug_group);
@@ -832,7 +832,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // Short tab label -- the group's own title inside the page ("Compare and debug")
     // carries the full wording; ViewSwitcher button labels are cramped for five tabs
     // and (like AdwPreferencesGroup::title) are Pango markup, so no bare "&" either.
-    view_stack.add_titled_with_icon(&debug_page, Some("debug"), "Debug", "edit-find-symbolic");
+    view_stack.add_titled_with_icon(&debug_page, Some("debug"), "Debug", crate::icons::DEBUG);
 
     let setup_page = build_setup_page(&shm, &toasts);
 
@@ -842,9 +842,9 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let status_group = build_status_group(&shm, &toasts);
     status_page.add(&status_group);
     status_page.add(&build_diagnosis_group(&shm, &toasts));
-    view_stack.add_titled_with_icon(&status_page, Some("status"), "Status", "network-transmit-receive-symbolic");
+    view_stack.add_titled_with_icon(&status_page, Some("status"), "Status", crate::icons::STATUS);
 
-    view_stack.add_titled_with_icon(&setup_page, Some("setup"), "Setup", "preferences-system-symbolic");
+    view_stack.add_titled_with_icon(&setup_page, Some("setup"), "Setup", crate::icons::SETUP);
 
     // First-run flow: no model means neural rendering can't work at all yet (fail-open just
     // presents untouched frames, which a first-time user would never notice) -- land on Setup
@@ -888,7 +888,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&switcher));
-    let about_btn = gtk4::Button::builder().icon_name("help-about-symbolic").tooltip_text("About").build();
+    let about_btn = gtk4::Button::builder().icon_name(crate::icons::ABOUT).tooltip_text("About").build();
     header.pack_end(&about_btn);
 
     // Reveals this bottom bar and hides the header's own switcher when the window
@@ -934,7 +934,16 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // instance appears here within a second instead of needing an app restart.
     every(&toasts, SECOND, |_| refresh_all_rows());
 
-    let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").default_width(620).default_height(700).content(&toasts).build();
+    let (width, height) = default_window_size(first_monitor_size());
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("Neural Forge")
+        .default_width(width)
+        .default_height(height)
+        .width_request(MIN_WIDTH)
+        .height_request(MIN_HEIGHT)
+        .content(&toasts)
+        .build();
 
     {
         let toasts = toasts.clone();
@@ -1034,7 +1043,7 @@ fn mark_game_override(row: &adw::ActionRow) {
     tag.add_css_class("caption-heading");
     tag.add_css_class("accent");
     tag.set_tooltip_text(Some("This game's own value: the All games value does not apply to it"));
-    let drop = gtk4::Button::from_icon_name("edit-undo-symbolic");
+    let drop = gtk4::Button::from_icon_name(crate::icons::UNDO);
     drop.add_css_class("flat");
     drop.add_css_class("circular");
     drop.set_valign(gtk4::Align::Center);
@@ -1442,7 +1451,7 @@ fn build_colour_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     lut_row.set_subtitle(&glib::markup_escape_text(&describe(current())));
     let choose = gtk4::Button::with_label("Choose…");
     choose.set_valign(gtk4::Align::Center);
-    let clear = gtk4::Button::from_icon_name("edit-clear-symbolic");
+    let clear = gtk4::Button::from_icon_name(crate::icons::CLEAR);
     clear.set_valign(gtk4::Align::Center);
     clear.set_tooltip_text(Some("No look-up table"));
     lut_row.add_suffix(&choose);
@@ -1716,7 +1725,7 @@ fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>
                 }
                 row.add_suffix(&mode);
                 spin(r.strength, "Soften: how much of the edit stays, percent", (0.0, 100.0), |r, v| r.strength = v);
-                let remove = gtk4::Button::from_icon_name("list-remove-symbolic");
+                let remove = gtk4::Button::from_icon_name(crate::icons::REMOVE);
                 remove.set_valign(gtk4::Align::Center);
                 remove.set_tooltip_text(Some("Remove this region"));
                 {
@@ -2174,7 +2183,7 @@ async fn extract_model(path: std::path::PathBuf, rows: ModelRows) {
     }
     let (text, present) = model_status();
     rows.status_row.set_subtitle(&text);
-    rows.icon.set_icon_name(Some(if present { "object-select-symbolic" } else { "dialog-warning-symbolic" }));
+    rows.icon.set_icon_name(Some(if present { crate::icons::OK } else { crate::icons::WARNING }));
     rows.button.set_sensitive(true);
     model_changed();
 }
@@ -2189,7 +2198,7 @@ fn build_model_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappin
     let status_row = adw::ActionRow::new();
     status_row.set_title("Model");
     status_row.set_subtitle(&text);
-    let icon = gtk4::Image::from_icon_name(if present { "object-select-symbolic" } else { "dialog-warning-symbolic" });
+    let icon = gtk4::Image::from_icon_name(if present { crate::icons::OK } else { crate::icons::WARNING });
     status_row.add_prefix(&icon);
     group.add(&status_row);
 
@@ -2508,7 +2517,7 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                 row.add_suffix(&switch);
                 row.set_activatable_widget(Some(&switch));
                 if game.unsupported().is_none() {
-                    let edit = gtk4::Button::from_icon_name("document-edit-symbolic");
+                    let edit = gtk4::Button::from_icon_name(crate::icons::EDIT);
                     edit.set_tooltip_text(Some("Choose the executable Neural Forge targets for this game"));
                     edit.add_css_class("flat");
                     edit.set_valign(gtk4::Align::Center);
@@ -2647,7 +2656,7 @@ fn switch_usable(game: &neural_forge_supervisor::steam::Game, target: &str, on: 
 fn build_setup_page(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     page.add(&build_model_group(shm, toasts));
-    let refresh = gtk4::Button::from_icon_name("view-refresh-symbolic");
+    let refresh = gtk4::Button::from_icon_name(crate::icons::REFRESH);
     refresh.set_tooltip_text(Some("Look for games again"));
     refresh.add_css_class("flat");
     refresh.set_valign(gtk4::Align::Center);
@@ -3732,10 +3741,10 @@ fn finding_row(finding: &neural_forge_supervisor::doctor::Finding) -> adw::Actio
     row.set_subtitle_selectable(true);
     row.set_tooltip_text(Some(finding.check));
     let (icon, class) = match finding.severity {
-        Severity::Failure => ("dialog-error-symbolic", "error"),
-        Severity::Warning => ("dialog-warning-symbolic", "warning"),
-        Severity::Info => ("dialog-information-symbolic", "dim-label"),
-        Severity::Ok => ("object-select-symbolic", "success"),
+        Severity::Failure => (crate::icons::ERROR, "error"),
+        Severity::Warning => (crate::icons::WARNING, "warning"),
+        Severity::Info => (crate::icons::INFORMATION, "dim-label"),
+        Severity::Ok => (crate::icons::OK, "success"),
     };
     let image = gtk4::Image::from_icon_name(icon);
     image.add_css_class(class);
@@ -3790,9 +3799,50 @@ fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::map
                 .to_string(),
         ),
     };
-    let status = adw::StatusPage::builder().icon_name("dialog-error-symbolic").title(title).description(description).build();
-    let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").content(&status).build();
+    let status = adw::StatusPage::builder().icon_name(crate::icons::ERROR).title(title).description(description).build();
+    let window =
+        adw::ApplicationWindow::builder().application(app).title("Neural Forge").width_request(MIN_WIDTH).height_request(MIN_HEIGHT).content(&status).build();
     window.present();
+}
+
+/// The narrowest and lowest the window goes. libadwaita asks every window for a minimum size (it warns at startup
+/// without one); this is its own recommended smallest (360 wide), and tall enough for the header, a banner and a row.
+const MIN_WIDTH: i32 = 360;
+const MIN_HEIGHT: i32 = 400;
+
+/// The window's first size: wide enough to show the tabs in the header (past the 1400sp breakpoint in `build_ui`)
+/// and 900 high, but no more than 90% of the screen (`screen`, logical pixels; unknown: as if large enough), never below
+/// the minimum. A screen narrower than ~1560 gets the bottom tab bar, which is what fits there.
+fn default_window_size(screen: Option<(i32, i32)>) -> (i32, i32) {
+    const WIDE: i32 = 1440;
+    const HIGH: i32 = 900;
+    let (w, h) = screen.map(|(w, h)| (w * 9 / 10, h * 9 / 10)).unwrap_or((WIDE, HIGH));
+    (w.clamp(MIN_WIDTH, WIDE), h.clamp(MIN_HEIGHT, HIGH))
+}
+
+/// The first monitor's size in logical pixels (on Wayland the window's own monitor is known only once it is shown).
+fn first_monitor_size() -> Option<(i32, i32)> {
+    let display = gtk4::gdk::Display::default()?;
+    let monitor = display.monitors().item(0)?.downcast::<gtk4::gdk::Monitor>().ok()?;
+    let area = monitor.geometry();
+    Some((area.width(), area.height()))
+}
+
+#[cfg(test)]
+mod window_size_tests {
+    use super::{default_window_size, MIN_HEIGHT, MIN_WIDTH};
+
+    #[test]
+    fn the_window_opens_wide_enough_for_the_header_tabs_where_the_screen_allows() {
+        // 1440 is past the 1400sp breakpoint at the default text scale: the tabs sit in the header.
+        assert_eq!(default_window_size(Some((2560, 1440))), (1440, 900));
+        assert_eq!(default_window_size(Some((1920, 1080))), (1440, 900));
+        assert_eq!(default_window_size(None), (1440, 900));
+        // A smaller screen: 90% of it, and the bottom tab bar.
+        assert_eq!(default_window_size(Some((1366, 768))), (1229, 691));
+        // Never below the minimum.
+        assert_eq!(default_window_size(Some((300, 200))), (MIN_WIDTH, MIN_HEIGHT));
+    }
 }
 
 #[cfg(test)]

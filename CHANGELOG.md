@@ -6,6 +6,16 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+**Neural Forge looks and starts right on KDE Plasma, Hyprland and COSMIC**
+
+- The tab and button icons ship with the app, so they look the same under any icon theme. Under KDE's Breeze, the
+  Composition and Status tabs showed a missing-image placeholder and the Model tab a grey blob.
+- The window opens wide enough to show the tabs at the top (on a smaller screen, at 90% of it, with the tabs at the
+  bottom), and has a minimum size, so COSMIC no longer prints a warning about it at startup.
+- When GTK 4 or libadwaita is not installed (as on a stock Fedora KDE or Hyprland install), Neural Forge now says which
+  libraries are missing and the command that installs them, in a dialog where one can be shown, instead of not opening
+  at all.
+
 **The HDR line knows more desktops**
 
 - The Status tab's HDR line, `shmctl status` and Save report now show whether the desktop's HDR is on for
