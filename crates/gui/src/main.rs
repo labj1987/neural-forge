@@ -7,6 +7,16 @@ use gtk4::prelude::*;
 pub(crate) const APP_ID: &str = "io.github.labj1987.NeuralForge";
 
 fn main() {
+    // The bundled GTK's GLib-level variables (AppRun's bundle_env): GLib reads each of them once, when it first loads the
+    // GSettings schemas, its GIO modules and gdk-pixbuf's loaders. Those loads happen here, first thing, while this
+    // process has one thread, and then the host's values go back into its environment, so no program the GUI starts sees
+    // them. A no-op with the host's GTK.
+    neural_forge_supervisor::host_env::release(neural_forge_supervisor::host_env::GLIB_VARS, || {
+        let _ = gio::SettingsSchemaSource::default();
+        let _ = gio::Vfs::default();
+        let _ = gtk4::gdk_pixbuf::Pixbuf::formats();
+    });
+
     // Set program name before GTK init. On Wayland the app_id the compositor sees is the
     // GApplication ID, not prgname; on X11 it's prgname. Setting both prgname and
     // StartupWMClass (in the .desktop file) to the application ID makes the running
@@ -24,17 +34,11 @@ fn main() {
     // Rings the NGX wrapper left for games that are gone (the layer never opened them): never a running game's.
     neural_forge_supervisor::proton_tool::sweep_dead_rings(std::path::Path::new(neural_forge_supervisor::proton_tool::RING_DIR));
 
-    // The bundled GTK's variables (AppRun's bundle_env): once GTK and what it loads lazily have read them, the host's
+    // The bundled GTK's GTK-level variables (GTK_EXE_PREFIX, GTK_PATH), once GTK has read them at its init: the host's
     // values go back into this process's environment, so a program GTK or GIO starts for the GUI (the file manager a
-    // FileLauncher opens) never sees the bundle. A no-op with the host's GTK.
-    app.connect_startup(|_| {
-        neural_forge_supervisor::host_env::release_bundle_env(|| {
-            let _ = gio::SettingsSchemaSource::default();
-            let _ = gio::Vfs::default();
-            let _ = gio::SettingsBackend::default();
-            let _ = gtk4::gdk_pixbuf::Pixbuf::formats();
-        });
-    });
+    // FileLauncher opens) never sees the bundle. A no-op with the host's GTK. The GLib-level ones went back at the top of
+    // main().
+    app.connect_startup(|_| neural_forge_supervisor::host_env::release(neural_forge_supervisor::host_env::GTK_VARS, || {}));
 
     app.connect_activate(move |app| {
         if let Some(window) = app.windows().first() {

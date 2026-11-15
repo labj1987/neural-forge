@@ -88,12 +88,21 @@ bundle_gtk_runtime() {
     syslib="$(pkg-config --variable=libdir gtk4)"
     pixver="$(pkg-config --variable=gdk_pixbuf_binary_version gdk-pixbuf-2.0)"
     pixdir="$(pkg-config --variable=gdk_pixbuf_moduledir gdk-pixbuf-2.0)"
+    # AppRun's bundle_env names the loader cache's directory: it must be this gdk-pixbuf's binary version.
+    if ! grep -qF "/usr/lib/gdk-pixbuf-2.0/$pixver/loaders.cache" data/AppRun; then
+        echo "==> ERROR: data/AppRun's GDK_PIXBUF_MODULE_FILE does not name gdk-pixbuf-2.0/$pixver" >&2
+        return 1
+    fi
     loaders="$usr/lib/gdk-pixbuf-2.0/$pixver/loaders"
     giomods="$usr/lib/gio/modules"
     immods="$usr/lib/gtk-4.0/4.0.0/immodules"
     local modules=("$pixdir/libpixbufloader-svg.so" "$syslib/gio/modules/libdconfsettings.so"
         "$syslib/gtk-4.0/4.0.0/immodules/libim-ibus.so")
-    for f in "${modules[@]}" "$syslib/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders"; do
+    # GIO 2.80 starts every program it launches itself (a file manager for FileLauncher, without an OpenURI portal)
+    # through gio-launch-desktop, looked up at its build path (/usr/lib/x86_64-linux-gnu/glib-2.0, absent outside
+    # Debian and Ubuntu), then in PATH: AppRun puts usr/bin first in PATH. It links only libc.
+    local launcher="$syslib/glib-2.0/gio-launch-desktop"
+    for f in "${modules[@]}" "$launcher" "$syslib/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders"; do
         [[ -e "$f" ]] && continue
         echo "==> ERROR: $f is missing (packages librsvg2-common, dconf-gsettings-backend, ibus-gtk4, libgdk-pixbuf2.0-bin)" >&2
         return 1
@@ -107,7 +116,12 @@ bundle_gtk_runtime() {
     cp "$pixdir"/*.so "$loaders/"
     cp "$syslib/gio/modules/libdconfsettings.so" "$giomods/"
     cp "$syslib/gtk-4.0/4.0.0/immodules/libim-ibus.so" "$immods/"
-    printf '%s\n' "$pixdir"/*.so "${modules[@]:1}" > "$work/bundle-sources"
+    cp "$launcher" "$usr/bin/"
+    printf '%s\n' "$pixdir"/*.so "${modules[@]:1}" "$launcher" > "$work/bundle-sources"
+    bundle_ldd "$usr/bin/gio-launch-desktop" > "$work/bundle-closure" || return 1
+    while read -r soname path; do
+        bundle_excluded "$soname" || { echo "==> ERROR: gio-launch-desktop needs $soname, which is not the host's" >&2; return 1; }
+    done < "$work/bundle-closure"
 
     # The libraries: the ldd closure of the binaries and the modules, minus the excludelist.
     local elves=()
@@ -184,8 +198,27 @@ bundle_gtk_runtime() {
             return 1
         fi
         cp "/usr/share/doc/$pkg/copyright" "$docs/$pkg.copyright"
+        echo "$pkg" >> "$work/bundle-packages"
     done < <(sort -u "$work/bundle-sources")
     rm -f "$work/bundle-sources"
+    # The licence texts those notices refer to by path (Debian keeps the common ones in /usr/share/common-licenses).
+    local lic
+    mkdir -p "$docs/common-licenses"
+    while read -r lic; do
+        [[ -f "$lic" ]] || { echo "==> ERROR: a bundled library's copyright file names $lic, which is missing" >&2; return 1; }
+        cp "$lic" "$docs/common-licenses/"
+    done < <(grep -ohE '/usr/share/common-licenses/[A-Za-z0-9.+_-]*[A-Za-z0-9+_-]' "$docs"/*.copyright | sort -u)
+    # Which packages, at which version, from which source package.
+    {
+        echo "The libraries and modules in usr/lib, and usr/bin/gio-launch-desktop, are these Ubuntu 24.04 packages' files,"
+        echo "unmodified apart from the run-time search path (rpath) patchelf set on the libraries and modules."
+        echo "Their sources are the Ubuntu source packages named here, at these versions."
+        echo
+        printf 'package\tversion\tsource package\n'
+        # shellcheck disable=SC2016 # dpkg-query's format, not the shell's
+        sort -u "$work/bundle-packages" | xargs dpkg-query -W -f '${Package}\t${Version}\t${source:Package}\n'
+    } > "$docs/PACKAGES.txt"
+    rm -f "$work/bundle-packages"
     echo "==> Bundled $(find "$usr/lib" -path "$usr/lib/$LIBDIR" -prune -o -name '*.so*' -print | wc -l) libraries and modules"
 }
 

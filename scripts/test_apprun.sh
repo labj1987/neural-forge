@@ -14,7 +14,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/app/usr/bin/bundled" "$tmp/bin"
 cp "$ROOT/data/AppRun" "$tmp/app/AppRun"
 for copy in bin bin/bundled; do
-    printf '#!/bin/sh\necho "%s ran: $*"\nenv | grep -E "^(GTK_EXE_PREFIX|GIO_MODULE_DIR|GDK_PIXBUF_MODULE_FILE|GSETTINGS_SCHEMA_DIR|APPIMAGE_[A-Z_]*)=" || true\n' \
+    printf '#!/bin/sh\necho "%s ran: $*"\nenv | grep -E "^(PATH|GTK_EXE_PREFIX|GTK_PATH|GIO_MODULE_DIR|GIO_EXTRA_MODULES|GDK_PIXBUF_MODULE_FILE|GSETTINGS_SCHEMA_DIR|NEURAL_FORGE_BUNDLE_ENV|NEURAL_FORGE_ORIG_[A-Z_]*)=" || true\n' \
         "$copy" > "$tmp/app/usr/$copy/neural-forge"
     chmod 755 "$tmp/app/usr/$copy/neural-forge"
 done
@@ -23,22 +23,28 @@ for tool in dirname readlink awk sort paste sed cat grep env; do ln -s "$(comman
 fail() { echo "test_apprun: $*" >&2; exit 1; }
 stub() { printf '#!/bin/sh\n%s\n' "$2" > "$tmp/bin/$1"; chmod 755 "$tmp/bin/$1"; }
 run() { env -i PATH="$tmp/bin" "$@" "$BASH" "$tmp/app/AppRun" --flag > "$tmp/out" 2> "$tmp/err"; }
-# ldd: `ldd -r` (the host copy) prints $tmp/ldd-host, plain ldd (the bundled copy) prints $tmp/ldd-bundled.
-stub ldd "if [ \"\$1\" = -r ]; then cat '$tmp/ldd-host'; else cat '$tmp/ldd-bundled'; fi"
+# ldd: `ldd -r` (the host copy) prints $tmp/ldd-host with @BIN@ as the path it was given (the loader names the object
+# that needs a symbol that way), plain ldd (the bundled copy) prints $tmp/ldd-bundled.
+lddstub="if [ \"\$1\" = -r ]; then sed \"s#@BIN@#\$2#\" '$tmp/ldd-host'; else cat '$tmp/ldd-bundled'; fi"
+stub ldd "$lddstub"
 resolved=$'\tlibadwaita-1.so.0 => /usr/lib/libadwaita-1.so.0 (0x1)\n\tlibc.so.6 => /usr/lib/libc.so.6 (0x2)'
 printf '%s\n' "$resolved" > "$tmp/ldd-host"
 printf '%s\n' "$resolved" > "$tmp/ldd-bundled"
 ran_host() {
     grep -qx "bin ran: --flag" "$tmp/out" || fail "$1: the host copy did not run with its arguments: $(cat "$tmp/out" "$tmp/err")"
-    if grep -q '=' "$tmp/out"; then fail "$1: the host copy got bundle variables: $(cat "$tmp/out")"; fi
+    if grep -E '^(GTK|GIO|GDK|GSETTINGS)' "$tmp/out"; then fail "$1: the host copy got bundle variables: $(cat "$tmp/out")"; fi
+    # PATH has the AppImage's usr/bin first, and its earlier value is saved for the programs the GUI starts.
+    grep -qx "PATH=$tmp/app/usr/bin:$tmp/bin" "$tmp/out" || fail "$1: PATH: $(cat "$tmp/out")"
+    grep -qx "NEURAL_FORGE_BUNDLE_ENV=PATH" "$tmp/out" || fail "$1: only PATH is listed: $(cat "$tmp/out")"
+    grep -qx "NEURAL_FORGE_ORIG_PATH=$tmp/bin" "$tmp/out" || fail "$1: PATH not saved: $(cat "$tmp/out")"
     grep -q "^neural-forge: GTK: host (" "$tmp/err" || fail "$1: no 'GTK: host' line: $(cat "$tmp/err")"
 }
 ran_bundled() {
     grep -qx "bin/bundled ran: --flag" "$tmp/out" || fail "$1: the bundled copy did not run with its arguments: $(cat "$tmp/out" "$tmp/err")"
     grep -qx "GTK_EXE_PREFIX=$tmp/app/usr" "$tmp/out" || fail "$1: no GTK_EXE_PREFIX for the bundled copy: $(cat "$tmp/out")"
     grep -qx "GIO_MODULE_DIR=$tmp/app/usr/lib/gio/modules" "$tmp/out" || fail "$1: no GIO_MODULE_DIR: $(cat "$tmp/out")"
-    grep -qx "APPIMAGE_BUNDLE_ENV=GTK_EXE_PREFIX GDK_PIXBUF_MODULE_FILE GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR" "$tmp/out" \
-        || fail "$1: no APPIMAGE_BUNDLE_ENV: $(cat "$tmp/out")"
+    grep -qx "NEURAL_FORGE_BUNDLE_ENV=PATH GTK_EXE_PREFIX GTK_PATH GDK_PIXBUF_MODULE_FILE GIO_MODULE_DIR GIO_EXTRA_MODULES GSETTINGS_SCHEMA_DIR" "$tmp/out" \
+        || fail "$1: no NEURAL_FORGE_BUNDLE_ENV: $(cat "$tmp/out")"
     grep -q "^neural-forge: GTK: bundled (" "$tmp/err" || fail "$1: no 'GTK: bundled' line: $(cat "$tmp/err")"
 }
 
@@ -59,17 +65,35 @@ run || fail "missing symbol version: AppRun failed"
 ran_bundled "missing symbol version"
 grep -q "the host lacks LIBADWAITA_1_5" "$tmp/err" || fail "missing symbol version: not named: $(cat "$tmp/err")"
 
-# Undefined symbols (a host GTK older than the one the GUI was built with): bundled.
-printf '%s\n' "$resolved" "undefined symbol: adw_about_dialog_new	(./neural-forge)" "undefined symbol: gtk_file_dialog_new	(./neural-forge)" > "$tmp/ldd-host"
+# Undefined symbols the GUI needs (a host GTK older than the one it was built with), in the loader's three forms:
+# bundled. A host library's own unresolved symbol does not count.
+printf '%s\n' "$resolved" "undefined symbol: adw_about_dialog_new	(@BIN@)" "undefined symbol: gtk_file_dialog_new, version GTK_4	(@BIN@)" \
+    "symbol adw_toast_new version LIBADWAITA_1 not defined in file libadwaita-1.so.0 with link time reference	(@BIN@)" \
+    "undefined symbol: g_private_helper	(/usr/lib/libfoo.so.1)" > "$tmp/ldd-host"
 run || fail "undefined symbols: AppRun failed"
 ran_bundled "undefined symbols"
-grep -q "lack 2 symbols" "$tmp/err" || fail "undefined symbols: not counted: $(cat "$tmp/err")"
+grep -q "lack 3 symbols" "$tmp/err" || fail "undefined symbols: not counted: $(cat "$tmp/err")"
+printf '%s\n' "$resolved" "undefined symbol: g_private_helper	(/usr/lib/libfoo.so.1)" "undefined symbol: x	(@BIN@-other)" > "$tmp/ldd-host"
+run || fail "a host library's own symbol: AppRun failed"
+ran_host "a host library's own symbol"
+
+# A GTK_PATH and GIO_EXTRA_MODULES the user had point at host modules: the bundled copy runs without them, and their
+# values are saved for children.
+printf '\tlibadwaita-1.so.0 => not found\n' > "$tmp/ldd-host"
+run GTK_PATH=/usr/lib/gtk GIO_EXTRA_MODULES=/usr/lib/gio || fail "host module paths: AppRun failed"
+ran_bundled "host module paths"
+if grep -qE '^(GTK_PATH|GIO_EXTRA_MODULES)=' "$tmp/out"; then fail "host module paths: still set: $(cat "$tmp/out")"; fi
+grep -qx "NEURAL_FORGE_ORIG_GTK_PATH=/usr/lib/gtk" "$tmp/out" || fail "host module paths: GTK_PATH not saved: $(cat "$tmp/out")"
+grep -qx "NEURAL_FORGE_ORIG_GIO_EXTRA_MODULES=/usr/lib/gio" "$tmp/out" || fail "host module paths: GIO_EXTRA_MODULES not saved: $(cat "$tmp/out")"
+# A stale saved value from another environment is not passed on.
+run NEURAL_FORGE_ORIG_FOO=x || fail "stale saved value: AppRun failed"
+if grep -q NEURAL_FORGE_ORIG_FOO "$tmp/out"; then fail "stale saved value: kept"; fi
 
 # A GSETTINGS_SCHEMA_DIR the user had is kept behind the bundle's, and its value saved for children.
 run GSETTINGS_SCHEMA_DIR=/home/u/schemas || fail "user schemas: AppRun failed"
 grep -qx "GSETTINGS_SCHEMA_DIR=$tmp/app/usr/share/glib-2.0/schemas:/home/u/schemas" "$tmp/out" || fail "user schemas: $(cat "$tmp/out")"
-grep -qx "APPIMAGE_ORIG_GSETTINGS_SCHEMA_DIR=/home/u/schemas" "$tmp/out" || fail "user schemas: not saved: $(cat "$tmp/out")"
-if grep -q "^APPIMAGE_ORIG_GTK_EXE_PREFIX=" "$tmp/out"; then fail "user schemas: an unset variable got an ORIG value"; fi
+grep -qx "NEURAL_FORGE_ORIG_GSETTINGS_SCHEMA_DIR=/home/u/schemas" "$tmp/out" || fail "user schemas: not saved: $(cat "$tmp/out")"
+if grep -q "^NEURAL_FORGE_ORIG_GTK_EXE_PREFIX=" "$tmp/out"; then fail "user schemas: an unset variable got an ORIG value"; fi
 
 # Overrides: host even though the host lacks symbols; bundled even though the host resolves.
 run NEURAL_FORGE_GTK=host || fail "forced host: AppRun failed"
@@ -98,7 +122,7 @@ grep -q "no ldd" "$tmp/err" || fail "no ldd: not said: $(cat "$tmp/err")"
 
 # The bundled path, with host-only libraries missing and no display: stderr names them once each and how to install
 # them, the GUI does not run, the exit is non-zero.
-stub ldd "if [ \"\$1\" = -r ]; then cat '$tmp/ldd-host'; else cat '$tmp/ldd-bundled'; fi"
+stub ldd "$lddstub"
 printf '\tlibadwaita-1.so.0 => not found\n' > "$tmp/ldd-host"
 printf '\tlibEGL.so.1 => not found\n\tlibfontconfig.so.1 => not found\n\tlibEGL.so.1 => not found\n\tlibc.so.6 => /usr/lib/libc.so.6 (0x2)\n' > "$tmp/ldd-bundled"
 if run; then fail "missing libraries: AppRun exited 0"; fi

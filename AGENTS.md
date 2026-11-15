@@ -65,19 +65,24 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - `cargo test` and `cargo build --release` build every crate (x86_64 Linux only; there is no
   Windows helper and no 32-bit layer since 3.0).
 - `bash build-appimage.sh` packages Neural Forge. The GUI ships twice: `usr/bin/neural-forge` as built (the host's
-  GTK 4 and libadwaita) and `usr/bin/bundled/neural-forge` with a bundled GTK runtime (`bundle_gtk_runtime`: the ldd
-  closure minus the AppImage excludelist, which the script cites, plus the Vulkan loader and Wayland libraries kept
-  on the host; the gdk-pixbuf loaders, the dconf GIO module and the IBus IM module, compiled schemas and the
-  libraries' copyright files). Its libraries are found through `$ORIGIN` rpaths set with patchelf, never
-  `LD_LIBRARY_PATH` (the build fails if the plain copy has an rpath). Only that copy is patched: the CLI, the layer and the NGX wrapper never load a bundled library,
-  and nothing goes in `usr/lib/neural-forge/` (the installer copies all of it). `data/AppRun` runs the host copy when
-  `ldd -r` resolves it completely (no missing library, no undefined symbol, ldd itself succeeds) (so an up-to-date desktop keeps its newer libadwaita), else the bundled one with
-  `bundle_env`; `NEURAL_FORGE_GTK=host|bundled` forces one (`scripts/test_apprun.sh`). `bundle_env` keeps the
-  earlier values in `APPIMAGE_ORIG_*`; the GUI puts them back in its own environment at startup
-  (`host_env::release_bundle_env`, so what GTK/GIO launch never sees them), and every program the GUI or the
-  supervisor starts is built with `neural_forge_supervisor::host_env::command` (a test fails on a bare
-  `Command::new` outside test code). Release builds run on Ubuntu 24.04, whose GTK 4.14 / libadwaita 1.5 the
-  bundle carries: keep the GUI's `v4_12`/`v1_5` features within that.
+  GTK 4 and libadwaita; the build fails if it has an rpath) and `usr/bin/bundled/neural-forge` with a bundled GTK
+  runtime (`bundle_gtk_runtime`: the ldd closure minus the AppImage excludelist, which the script cites, plus the
+  Vulkan loader and Wayland libraries kept on the host; the gdk-pixbuf loaders, the dconf GIO module, the IBus IM
+  module, GIO's `gio-launch-desktop` in `usr/bin`, compiled schemas, and the packages' copyright files, the licence
+  texts they name and a package manifest). Its libraries are found through `$ORIGIN` rpaths set with patchelf, never
+  `LD_LIBRARY_PATH`. Only that copy is patched: the CLI, the layer and the NGX wrapper never load a bundled library,
+  and nothing goes in `usr/lib/neural-forge/` (the installer copies all of it).
+- `data/AppRun` runs the host copy when `ldd -r` resolves it completely (no missing library or symbol version, no
+  undefined symbol the GUI itself refers to, ldd itself succeeds), so an up-to-date desktop keeps its newer
+  libadwaita; else the bundled one with `bundle_env`. `NEURAL_FORGE_GTK=host|bundled` forces one
+  (`scripts/test_apprun.sh`; `scripts/smoke-gui.sh` starts both on Xvfb). Every variable AppRun changes (`PATH`, and
+  for the bundled copy the GTK/GIO/pixbuf/schema paths) is listed in `NEURAL_FORGE_BUNDLE_ENV` with its earlier value
+  in `NEURAL_FORGE_ORIG_*`. The GUI puts the GLib-level ones back in its own environment at the top of `main()` and
+  the GTK-level ones at startup (`host_env::release`, so what GTK/GIO launch never sees them; `PATH` stays, for
+  `gio-launch-desktop`), and every program the GUI or the supervisor starts is built with
+  `neural_forge_supervisor::host_env::command`, which restores all of them (a test fails on a bare `Command::new`
+  outside test modules). Release builds run on Ubuntu 24.04, whose GTK 4.14 / libadwaita 1.5 the bundle carries:
+  keep the GUI's `v4_12`/`v1_5` features within that.
 - The layer's GPU tests run on lavapipe: set `VK_DRIVER_FILES` to the `lvp_icd*.json` manifests, as
   CI does. On a machine with an NVIDIA GPU, never run them without it. Under validation:
   `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` and `--test-threads=1` (CI's step shows the settings;
@@ -134,9 +139,12 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   CHANGELOG.md and the docs.
 - Every release re-reads all three and updates or removes what the release changed, including the
   screenshots and the measured results. A new environment variable gets a row in the user guide's table.
-- Screenshots are always the dark theme, 1240x1400 (the window at 2x). A headless run (Xvfb) has no
-  portal and falls back to light: set `ADW_DEBUG_COLOR_SCHEME=prefer-dark`, and look at every image
-  before committing it.
+- Screenshots are always the dark theme, 2880x1800: the window at its default size on a large screen
+  (1440x900, the tabs in the header bar) at 2x. A headless run (Xvfb, `dbus-run-session`) has no portal and falls
+  back to light: set `ADW_DEBUG_COLOR_SCHEME=prefer-dark`. Give it a scratch `HOME`, XDG directories and a private
+  `XDG_RUNTIME_DIR` (the GUI's startup updates the NGX wrapper in the Proton copies it finds through `$HOME`, and a
+  second session's helpers in the real runtime directory disturb the desktop's). Look at every image before
+  committing it.
 
 ## Tested games and the sweep
 

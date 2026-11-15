@@ -1,43 +1,59 @@
-//! Programs the GUI starts get the system's environment, not the AppImage's bundled GTK's.
+//! Programs the GUI starts get the system's environment, not the AppImage's.
 //!
 //! The AppImage carries a second copy of the GUI that uses a bundled GTK 4 and libadwaita, for desktops
 //! without them (`build-appimage.sh`, `bundle_gtk_runtime`). When AppRun starts that copy it points the
 //! bundled GTK at its own modules, image loaders and schemas through a few environment variables
-//! (`GTK_EXE_PREFIX`, `GIO_MODULE_DIR`, ...), names them in `APPIMAGE_BUNDLE_ENV` and keeps each one's
-//! earlier value in `APPIMAGE_ORIG_<NAME>` (absent when it had none). A program started with those set
-//! would load the bundle's modules into its own GTK or GLib (a file manager, Steam's helpers, a game).
+//! ([`GLIB_VARS`], [`GTK_VARS`]), and it puts the AppImage's `usr/bin` first in `PATH` for either copy. It names
+//! every variable it changed in `NEURAL_FORGE_BUNDLE_ENV` and keeps each one's earlier value in
+//! `NEURAL_FORGE_ORIG_<NAME>` (absent when it had none). A program started with the bundle's values would load
+//! its modules into its own GTK or GLib (a file manager, Steam's helpers, a game).
 //!
-//! Two guards, so nothing the GUI starts ever sees them:
-//! - [`release_bundle_env`]: once GTK has read them (at the application's startup), the GUI puts the
-//!   host's values back in its own environment. That covers what GTK and GIO start on the GUI's behalf
-//!   (`gtk::FileLauncher` hands the process environment to the file manager it launches).
-//! - [`command`]: every [`std::process::Command`] the GUI and the supervisor code it runs build is made
-//!   with the host's values (a test fails on a bare `Command::new` outside test code), whether or not
-//!   the process environment was released yet.
+//! Two guards:
+//! - [`release`]: once GLib and GTK have read their variables, the GUI puts the host's values back in its
+//!   own environment: [`GLIB_VARS`] first thing in `main()` (one thread), [`GTK_VARS`] at the application's
+//!   startup. That covers what GTK and GIO start on the GUI's behalf (`gtk::FileLauncher` hands the process
+//!   environment to the program it launches). `PATH` stays as AppRun set it in the process: the bundled GIO
+//!   finds the AppImage's `gio-launch-desktop` through it.
+//! - [`command`]: every [`std::process::Command`] the GUI and the supervisor code it runs build gets the
+//!   host's value of everything still listed, `PATH` included (a test fails on a bare `Command::new` outside
+//!   test code).
 //!
 //! The bundled libraries themselves are found through the bundled binary's rpath, never
-//! `LD_LIBRARY_PATH`, so nothing else leaks. With the host's GTK (the usual case) or outside the
-//! AppImage nothing is set and nothing changes.
+//! `LD_LIBRARY_PATH`. Outside the AppImage nothing is listed and nothing changes.
 
 use std::ffi::{OsStr, OsString};
 
-const LIST: &str = "APPIMAGE_BUNDLE_ENV";
-const ORIG: &str = "APPIMAGE_ORIG_";
+const LIST: &str = "NEURAL_FORGE_BUNDLE_ENV";
+const ORIG: &str = "NEURAL_FORGE_ORIG_";
 
-/// What a child's environment needs: each variable with the value to set, or `None` to remove it.
-/// Empty outside the bundled GUI.
+/// The bundle's variables GLib and gdk-pixbuf read, each once: the GSettings schema source, GIO's module
+/// loading and gdk-pixbuf's loader list. Released at the top of `main()`.
+pub const GLIB_VARS: &[&str] = &["GDK_PIXBUF_MODULE_FILE", "GIO_MODULE_DIR", "GIO_EXTRA_MODULES", "GSETTINGS_SCHEMA_DIR"];
+/// The bundle's variables GTK reads at its init (its module directory, which it caches). Released at startup.
+pub const GTK_VARS: &[&str] = &["GTK_EXE_PREFIX", "GTK_PATH"];
+
+/// What a child's environment needs: each listed variable with the value to set, or `None` to remove it.
+/// Empty outside the AppImage.
 pub fn restored() -> Vec<(OsString, Option<OsString>)> {
     restored_from(|name| std::env::var_os(name))
 }
 
+/// The listed names AppRun wrote: plain variable names only, anything else is not ours to touch.
+fn listed(get: &impl Fn(&str) -> Option<OsString>) -> Option<Vec<String>> {
+    let list = get(LIST)?;
+    Some(
+        list.to_string_lossy()
+            .split_whitespace()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'))
+            .map(String::from)
+            .collect(),
+    )
+}
+
 fn restored_from(get: impl Fn(&str) -> Option<OsString>) -> Vec<(OsString, Option<OsString>)> {
-    let Some(list) = get(LIST) else { return Vec::new() };
+    let Some(names) = listed(&get) else { return Vec::new() };
     let mut out = Vec::new();
-    for name in list.to_string_lossy().split_whitespace() {
-        // AppRun only ever lists plain variable names; anything else is not ours to touch.
-        if !name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
-            continue;
-        }
+    for name in names {
         let orig = format!("{ORIG}{name}");
         out.push((name.into(), get(&orig)));
         out.push((orig.into(), None));
@@ -58,25 +74,39 @@ pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
     cmd
 }
 
-/// Puts the host's values of the bundle's variables back into this process's environment, once the
-/// bundled GTK has read them; a no-op with the host's GTK. Call it on the main thread from the
-/// application's `startup` handler (GTK is initialised by then: its module directory, read from
-/// `GTK_EXE_PREFIX`, is cached, and its input method modules are loaded).
+/// The changes [`release`] makes for `names`: each listed one's host value (or its removal), its saved value
+/// removed, and the list without them (removed when empty). Empty when none of `names` is listed.
+fn release_plan(get: impl Fn(&str) -> Option<OsString>, names: &[&str]) -> Vec<(OsString, Option<OsString>)> {
+    let Some(listed) = listed(&get) else { return Vec::new() };
+    let (go, stay): (Vec<String>, Vec<String>) = listed.into_iter().partition(|n| names.contains(&n.as_str()));
+    if go.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for name in go {
+        let orig = format!("{ORIG}{name}");
+        out.push((name.into(), get(&orig)));
+        out.push((orig.into(), None));
+    }
+    out.push((LIST.into(), (!stay.is_empty()).then(|| stay.join(" ").into())));
+    out
+}
+
+/// Puts the host's values of `names` back into this process's environment, after `load` has made whatever
+/// reads them read them (a no-op, `load` not called, when AppRun listed none of them).
 ///
-/// The rest of what reads these variables does so lazily, once: GLib's GSettings schema source
-/// (`GSETTINGS_SCHEMA_DIR`), GIO's module loading (`GIO_MODULE_DIR`) and gdk-pixbuf's loaders
-/// (`GDK_PIXBUF_MODULE_FILE`). Each is made to happen here first, so none reads the host's value later.
-///
-/// Changing the environment of a process with threads (GDBus's worker exists by then) is safe here:
-/// every variable is already set, so glibc overwrites or removes its slot in place, never moving the
-/// environment array a concurrent `getenv` may be reading, and none of these threads reads them.
-pub fn release_bundle_env(load_lazy_readers: impl FnOnce()) {
-    let restore = restored();
-    if restore.is_empty() {
+/// Changing the environment races with a `getenv` on another thread: while glibc (2.39, 2.40) removes a
+/// variable it moves the later entries down one by one, so a concurrent reader can miss a variable or briefly
+/// see the array end early. [`GLIB_VARS`] are released at the top of `main()`, while the process has one
+/// thread. [`GTK_VARS`] can only go once GTK is initialised, at the application's startup, when GDBus's worker
+/// thread exists; it does not read the environment there, so the window is accepted for these two.
+pub fn release(names: &[&str], load: impl FnOnce()) {
+    let plan = release_plan(|name| std::env::var_os(name), names);
+    if plan.is_empty() {
         return;
     }
-    load_lazy_readers();
-    for (name, value) in restore {
+    load();
+    for (name, value) in plan {
         match value {
             Some(value) => std::env::set_var(name, value),
             None => std::env::remove_var(name),
@@ -95,23 +125,28 @@ mod tests {
     }
 
     #[test]
-    fn outside_the_bundled_gui_nothing_changes() {
+    fn outside_the_appimage_nothing_changes() {
         assert!(restored_from(env(&[("GIO_MODULE_DIR", "/x")])).is_empty());
+        assert!(release_plan(env(&[("GIO_MODULE_DIR", "/x")]), GLIB_VARS).is_empty());
     }
 
     #[test]
     fn earlier_values_come_back_and_unset_ones_go() {
         let got = restored_from(env(&[
-            (LIST, "GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR"),
+            (LIST, "PATH GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR"),
+            ("PATH", "/tmp/.mount_x/usr/bin:/usr/bin"),
+            ("NEURAL_FORGE_ORIG_PATH", "/usr/bin"),
             ("GIO_MODULE_DIR", "/tmp/.mount_x/usr/lib/gio/modules"),
             ("GSETTINGS_SCHEMA_DIR", "/tmp/.mount_x/usr/share/glib-2.0/schemas:/home/u/schemas"),
-            ("APPIMAGE_ORIG_GSETTINGS_SCHEMA_DIR", "/home/u/schemas"),
+            ("NEURAL_FORGE_ORIG_GSETTINGS_SCHEMA_DIR", "/home/u/schemas"),
         ]));
         let want: Vec<(OsString, Option<OsString>)> = vec![
+            ("PATH".into(), Some("/usr/bin".into())),
+            ("NEURAL_FORGE_ORIG_PATH".into(), None),
             ("GIO_MODULE_DIR".into(), None),
-            ("APPIMAGE_ORIG_GIO_MODULE_DIR".into(), None),
+            ("NEURAL_FORGE_ORIG_GIO_MODULE_DIR".into(), None),
             ("GSETTINGS_SCHEMA_DIR".into(), Some("/home/u/schemas".into())),
-            ("APPIMAGE_ORIG_GSETTINGS_SCHEMA_DIR".into(), None),
+            ("NEURAL_FORGE_ORIG_GSETTINGS_SCHEMA_DIR".into(), None),
             (LIST.into(), None),
         ];
         assert_eq!(got, want);
@@ -125,18 +160,75 @@ mod tests {
     }
 
     #[test]
+    fn a_release_takes_only_its_names_off_the_list() {
+        let vars = [
+            (LIST, "PATH GTK_EXE_PREFIX GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR"),
+            ("GIO_MODULE_DIR", "/b/gio"),
+            ("GSETTINGS_SCHEMA_DIR", "/b/schemas:/home/u/schemas"),
+            ("NEURAL_FORGE_ORIG_GSETTINGS_SCHEMA_DIR", "/home/u/schemas"),
+        ];
+        let want: Vec<(OsString, Option<OsString>)> = vec![
+            ("GIO_MODULE_DIR".into(), None),
+            ("NEURAL_FORGE_ORIG_GIO_MODULE_DIR".into(), None),
+            ("GSETTINGS_SCHEMA_DIR".into(), Some("/home/u/schemas".into())),
+            ("NEURAL_FORGE_ORIG_GSETTINGS_SCHEMA_DIR".into(), None),
+            (LIST.into(), Some("PATH GTK_EXE_PREFIX".into())),
+        ];
+        assert_eq!(release_plan(env(&vars), GLIB_VARS), want);
+        // GTK's go at startup; PATH is never released (command() still restores it).
+        let after = [(LIST, "PATH GTK_EXE_PREFIX"), ("GTK_EXE_PREFIX", "/b/usr")];
+        let want: Vec<(OsString, Option<OsString>)> =
+            vec![("GTK_EXE_PREFIX".into(), None), ("NEURAL_FORGE_ORIG_GTK_EXE_PREFIX".into(), None), (LIST.into(), Some("PATH".into()))];
+        assert_eq!(release_plan(env(&after), GTK_VARS), want);
+        assert!(release_plan(env(&[(LIST, "PATH")]), GTK_VARS).is_empty());
+        assert_eq!(release_plan(env(&[(LIST, "GTK_PATH")]), GTK_VARS).last().unwrap(), &(OsString::from(LIST), None));
+    }
+
+    /// `text` with every `#[cfg(test)]` module's body left out (each test module ends where its braces close).
+    fn without_test_modules(text: &str) -> String {
+        let mut out = String::new();
+        let mut lines = text.lines().peekable();
+        while let Some(line) = lines.next() {
+            let starts_test_module =
+                line.trim() == "#[cfg(test)]" && lines.peek().is_some_and(|next| next.trim_start().starts_with("mod ") && next.trim_end().ends_with('{'));
+            if !starts_test_module {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            let mut depth = 0i32;
+            for line in lines.by_ref() {
+                depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+                out.push('\n'); // keep the line numbers
+                if depth <= 0 {
+                    break;
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn only_test_modules_are_skipped() {
+        let src = "#[cfg(test)]\nconst A: u8 = 1;\nfn a() { Command::new(\"x\"); }\n#[cfg(test)]\nmod tests {\n    fn t() { if x { Command::new(\"y\"); } }\n}\nfn b() {}\n";
+        let kept = without_test_modules(src);
+        assert!(kept.contains("Command::new(\"x\")") && !kept.contains("Command::new(\"y\")") && kept.contains("fn b()"), "{kept}");
+        assert_eq!(kept.lines().count(), src.lines().count());
+    }
+
+    #[test]
     fn every_program_is_started_through_command() {
-        // Outside test code, nothing the GUI runs may build a Command directly: it would inherit the
-        // bundle's variables. The GUI's own crate, and the supervisor and protocol code it runs in-process
-        // (build scripts and examples are not part of the GUI).
+        // Outside test modules, nothing the GUI runs may build a Command directly: it would inherit the bundle's
+        // variables. The GUI's own crate, and the supervisor and protocol code it runs in-process (build scripts
+        // and examples are not part of the GUI).
         fn scan(dir: &std::path::Path, bad: &mut Vec<String>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     scan(&path, bad);
                 } else if path.extension().is_some_and(|e| e == "rs") && !path.ends_with("host_env.rs") {
-                    let text = std::fs::read_to_string(&path).unwrap();
-                    let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+                    let code = without_test_modules(&std::fs::read_to_string(&path).unwrap());
                     for (n, line) in code.lines().enumerate() {
                         let line = line.trim_start();
                         if !line.starts_with("//") && (line.contains("Command::new(") || line.contains("Command::new ")) {
@@ -163,7 +255,7 @@ mod tests {
             (LIST, "GIO_MODULE_DIR GTK_EXE_PREFIX"),
             ("GIO_MODULE_DIR", "/bundle/gio"),
             ("GTK_EXE_PREFIX", "/bundle/usr"),
-            ("APPIMAGE_ORIG_GTK_EXE_PREFIX", "/opt/gtk"),
+            ("NEURAL_FORGE_ORIG_GTK_EXE_PREFIX", "/opt/gtk"),
         ];
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", "env"]);
@@ -179,37 +271,52 @@ mod tests {
         }
         let out = String::from_utf8(cmd.output().unwrap().stdout).unwrap();
         assert!(out.lines().any(|l| l == "GTK_EXE_PREFIX=/opt/gtk"), "{out}");
-        assert!(!out.contains("GIO_MODULE_DIR=") && !out.contains("APPIMAGE_"), "{out}");
+        assert!(!out.contains("GIO_MODULE_DIR=") && !out.contains("NEURAL_FORGE_"), "{out}");
     }
 
     #[test]
     fn released_env_reaches_children_started_any_way() {
-        // The process environment itself, as the bundled GUI's startup leaves it: a child started without
-        // `command` (as GIO starts a file manager) sees the host's values too. In a child process of the
-        // test binary, so the test's own environment is not changed under the other tests.
+        // The process environment itself, as the bundled GUI leaves it after both releases: a child started
+        // without `command` (as GIO starts a file manager) sees the host's values, except PATH, which only
+        // `command` restores. In a child process of the test binary, so the test's own environment is not
+        // changed under the other tests.
         if std::env::var_os("NEURAL_FORGE_HOST_ENV_CHILD").is_some() {
-            let mut loaded = false;
-            release_bundle_env(|| loaded = true);
-            assert!(loaded, "the lazy readers were not loaded first");
-            let out = std::process::Command::new("sh").args(["-c", "env"]).output().unwrap();
-            print!("{}", String::from_utf8(out.stdout).unwrap());
+            let mut loaded = 0;
+            release(GLIB_VARS, || loaded += 1);
+            release(GTK_VARS, || loaded += 1);
+            assert_eq!(loaded, 2, "the lazy readers were not loaded first");
+            let plain = std::process::Command::new("sh").args(["-c", "env"]).output().unwrap();
+            let through = command("sh").args(["-c", "env"]).output().unwrap();
+            print!("PLAIN\n{}THROUGH\n{}", String::from_utf8(plain.stdout).unwrap(), String::from_utf8(through.stdout).unwrap());
             return;
         }
         let exe = std::env::current_exe().unwrap();
         let out = std::process::Command::new(exe)
             .args(["--exact", "host_env::tests::released_env_reaches_children_started_any_way", "--nocapture", "--test-threads=1"])
             .env("NEURAL_FORGE_HOST_ENV_CHILD", "1")
-            .env(LIST, "GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR")
+            .env(LIST, "PATH GTK_EXE_PREFIX GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR")
+            .env("PATH", "/bundle/usr/bin:/usr/bin:/bin")
+            .env("NEURAL_FORGE_ORIG_PATH", "/usr/bin:/bin")
+            .env("GTK_EXE_PREFIX", "/bundle/usr")
             .env("GIO_MODULE_DIR", "/bundle/gio")
             .env("GSETTINGS_SCHEMA_DIR", "/bundle/schemas:/home/u/schemas")
-            .env("APPIMAGE_ORIG_GSETTINGS_SCHEMA_DIR", "/home/u/schemas")
+            .env("NEURAL_FORGE_ORIG_GSETTINGS_SCHEMA_DIR", "/home/u/schemas")
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
-        assert!(text.lines().any(|l| l == "GSETTINGS_SCHEMA_DIR=/home/u/schemas"), "{text}");
-        assert!(text.lines().any(|l| l == "NEURAL_FORGE_HOST_ENV_CHILD=1"), "the child did not run: {text}");
-        assert!(!text.contains("GIO_MODULE_DIR=") && !text.contains("APPIMAGE_"), "{text}");
+        let (plain, through) = text.split_once("THROUGH\n").expect("the child did not run");
+        let plain = plain.split_once("PLAIN\n").unwrap().1;
+        for env in [plain, through] {
+            assert!(env.lines().any(|l| l == "GSETTINGS_SCHEMA_DIR=/home/u/schemas"), "{env}");
+            assert!(!env.contains("GIO_MODULE_DIR=") && !env.contains("GTK_EXE_PREFIX="), "{env}");
+        }
+        // GIO's children keep the AppImage's PATH (its gio-launch-desktop); `command`'s get the host's.
+        assert!(plain.lines().any(|l| l == "PATH=/bundle/usr/bin:/usr/bin:/bin"), "{plain}");
+        assert!(
+            through.lines().any(|l| l == "PATH=/usr/bin:/bin") && !through.contains("NEURAL_FORGE_ORIG_") && !through.contains("NEURAL_FORGE_BUNDLE_ENV"),
+            "{through}"
+        );
     }
 
     #[test]
@@ -218,7 +325,7 @@ mod tests {
             return; // the test binary itself runs under the bundled GUI's environment: not this case
         }
         let mut loaded = false;
-        release_bundle_env(|| loaded = true);
+        release(GLIB_VARS, || loaded = true);
         assert!(!loaded);
     }
 }
