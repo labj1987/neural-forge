@@ -105,8 +105,9 @@ each followed by why the window had no HDR when it had none (gamescope without `
 `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`, or the desktop's HDR off). In brackets follow the window's format and
 colour space, whether its surface offered an HDR colour space, the first HDR metadata the game sent, whether
 gamescope's layer is loaded and Proton's two HDR switches; after them the desktop's HDR state per display, read from
-GNOME (Mutter's display configuration), KDE Plasma (`kscreen-doctor`), Hyprland (`hyprctl`, its colour-management
-preset `hdr` or `hdredid`) or sway (`swaymsg`); a gamescope session says so. COSMIC does not report HDR yet. On any
+GNOME (Mutter's display configuration), KDE Plasma (`kscreen-doctor`), Hyprland (`hyprctl`: the colour-management
+preset `hdr` or `hdredid` is HDR on; any other preset is named as it is, because with `render:cm_auto_hdr`, on by
+default, a fullscreen HDR game switches the display to HDR) or sway (`swaymsg`); a gamescope session says so. COSMIC does not report HDR yet. On any
 other desktop, or when the desktop's tool is missing or does not answer, the line says the state was not detected and
 why, rather than calling it off.
 

@@ -5,11 +5,17 @@
 //! - GNOME: `org.gnome.Mutter.DisplayConfig.GetCurrentState` over the session bus (`gdbus`; each monitor's
 //!   `color-mode`, 1 being BT.2100);
 //! - KDE Plasma: `kscreen-doctor -j` (each output's `hdr`);
-//! - Hyprland: `hyprctl monitors -j` (each monitor's `colorManagementPreset`, `hdr` or `hdredid` meaning HDR);
+//! - Hyprland: `hyprctl monitors -j` (each monitor's `colorManagementPreset`: `hdr` or `hdredid` is HDR; any other
+//!   preset is not HDR itself, but with `render:cm_auto_hdr`, on by default, a fullscreen HDR game switches the display
+//!   to HDR while the preset still reads the same, so that is said rather than "off");
 //! - sway: `swaymsg -t get_outputs -r` (each output's `hdr`);
-//! - a gamescope session, from its environment;
-//! - COSMIC: cosmic-comp has no HDR output yet and nothing reports one, so it says so. When it gets one, its
-//!   reader is one more [`Probe`] in [`Desktop::probe`].
+//! - a gamescope session, from its environment.
+//!
+//! Hyprland and sway are told by their own variables only while the socket they name exists: a stale one left in the
+//! systemd user manager's environment after the compositor ended must not override the desktop that runs now.
+//!
+//! COSMIC: cosmic-comp has no HDR output yet and nothing reports one, so it says so. When it gets one, its
+//! reader is one more [`Probe`] in [`Desktop::probe`].
 //!
 //! Where none of them answers the text says the state was not detected and why; it never guesses "off".
 
@@ -21,14 +27,16 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub name: String,
-    pub hdr: bool,
-    /// Said in brackets after its state (Hyprland's colour-management preset); empty: nothing.
+    /// HDR on or off; `None` where the compositor's answer does not say (a Hyprland preset that is not HDR itself).
+    pub hdr: Option<bool>,
+    /// Said after the name instead of "HDR on/off" when `hdr` is `None`, and in brackets after "HDR on" otherwise
+    /// (Hyprland's preset); empty: nothing.
     pub detail: String,
 }
 
 /// The compositors whose HDR state can be asked for (or, for COSMIC, is known not to be reported).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Desktop {
+enum Desktop {
     Gamescope,
     Gnome,
     Kde,
@@ -38,19 +46,19 @@ pub enum Desktop {
 }
 
 /// How a desktop's HDR state is read: the command, and the parser for what it prints.
-pub struct Probe {
-    pub program: &'static str,
-    pub args: &'static [&'static str],
-    pub parse: fn(&str) -> Vec<Output>,
+struct Probe {
+    program: &'static str,
+    args: &'static [&'static str],
+    parse: fn(&str) -> Vec<Output>,
     /// Said after "HDR on" (GNOME's mode is named BT.2100).
-    pub on_detail: &'static str,
-    /// Said after the list when a display is off (what can still turn HDR on there); empty: nothing.
-    pub off_note: &'static str,
+    on_detail: &'static str,
+    /// Said after the list when a display's state is not known as on or off (what can still turn HDR on there).
+    unknown_note: &'static str,
 }
 
 impl Desktop {
     /// The name the text gives it.
-    pub fn name(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Desktop::Gamescope => "gamescope session",
             Desktop::Gnome => "GNOME",
@@ -61,20 +69,26 @@ impl Desktop {
         }
     }
 
-    /// The session's compositor from its environment (`var` reads a variable; empty counts as unset): a gamescope
-    /// session (`GAMESCOPE_WAYLAND_DISPLAY`), Hyprland (`HYPRLAND_INSTANCE_SIGNATURE`) and sway (`SWAYSOCK`) by
-    /// the variables they set for their clients, which are there even when a session started from a console has no
-    /// `XDG_CURRENT_DESKTOP`; then `XDG_CURRENT_DESKTOP`'s colon-separated names (`ubuntu:GNOME`, `KDE`,
-    /// `Hyprland`, `sway`, `COSMIC`), the first one known.
-    pub fn from_env(var: &dyn Fn(&str) -> Option<String>) -> Option<Desktop> {
-        let set = |name: &str| var(name).is_some_and(|v| !v.is_empty());
-        if set("GAMESCOPE_WAYLAND_DISPLAY") {
+    /// The session's compositor from its environment (`var` reads a variable, empty counting as unset; `exists`
+    /// says whether a path exists): a gamescope session (`GAMESCOPE_WAYLAND_DISPLAY`), Hyprland
+    /// (`HYPRLAND_INSTANCE_SIGNATURE`, while `$XDG_RUNTIME_DIR/hypr/<signature>/.socket.sock`, or before Hyprland 0.40
+    /// `/tmp/hypr/<signature>/.socket.sock`, exists) and sway (`SWAYSOCK`, while that socket exists) by the variables
+    /// they set for their clients, which are there even when a session started from a console has no
+    /// `XDG_CURRENT_DESKTOP` (and a nested Hyprland keeps its parent's); then `XDG_CURRENT_DESKTOP`'s
+    /// colon-separated names (`ubuntu:GNOME`, `KDE`, `Hyprland`, `sway:wlroots`, `COSMIC`), the first one known.
+    fn from_env(var: &dyn Fn(&str) -> Option<String>, exists: &dyn Fn(&std::path::Path) -> bool) -> Option<Desktop> {
+        let get = |name: &str| var(name).filter(|v| !v.is_empty());
+        if get("GAMESCOPE_WAYLAND_DISPLAY").is_some() {
             return Some(Desktop::Gamescope);
         }
-        if set("HYPRLAND_INSTANCE_SIGNATURE") {
-            return Some(Desktop::Hyprland);
+        if let Some(signature) = get("HYPRLAND_INSTANCE_SIGNATURE") {
+            let runtime = get("XDG_RUNTIME_DIR").map(|dir| std::path::Path::new(&dir).join("hypr"));
+            let dirs = runtime.into_iter().chain([std::path::PathBuf::from("/tmp/hypr")]);
+            if dirs.map(|dir| dir.join(&signature).join(".socket.sock")).any(|socket| exists(&socket)) {
+                return Some(Desktop::Hyprland);
+            }
         }
-        if set("SWAYSOCK") {
+        if get("SWAYSOCK").is_some_and(|socket| exists(std::path::Path::new(&socket))) {
             return Some(Desktop::Sway);
         }
         let current = var("XDG_CURRENT_DESKTOP").unwrap_or_default();
@@ -89,7 +103,7 @@ impl Desktop {
     }
 
     /// How its HDR state is read; `Err` says why it cannot be.
-    pub fn probe(self) -> Result<Probe, &'static str> {
+    fn probe(self) -> Result<Probe, &'static str> {
         match self {
             Desktop::Gamescope => Err("HDR is gamescope's (--hdr-enabled) and the display's"),
             Desktop::Gnome => Ok(Probe {
@@ -106,33 +120,34 @@ impl Desktop {
                 ],
                 parse: parse_mutter,
                 on_detail: " (BT.2100)",
-                off_note: "",
+                unknown_note: "",
             }),
-            Desktop::Kde => Ok(Probe { program: "kscreen-doctor", args: &["-j"], parse: parse_kscreen, on_detail: "", off_note: "" }),
-            // A monitor's preset is what its rule asks for; `render:cm_auto_hdr` can still give a fullscreen game HDR.
+            Desktop::Kde => Ok(Probe { program: "kscreen-doctor", args: &["-j"], parse: parse_kscreen, on_detail: "", unknown_note: "" }),
+            // A monitor's preset is what its rule asks for: with `render:cm_auto_hdr` (on by default) Hyprland's renderer
+            // switches a monitor to HDR for a fullscreen HDR client while the preset reads the same.
             Desktop::Hyprland => Ok(Probe {
                 program: "hyprctl",
                 args: &["monitors", "-j"],
                 parse: parse_hyprland,
                 on_detail: "",
-                off_note: "; with render:cm_auto_hdr a fullscreen HDR game can still get HDR",
+                unknown_note: "; with render:cm_auto_hdr, on by default, a fullscreen HDR game switches the display to HDR",
             }),
-            Desktop::Sway => Ok(Probe { program: "swaymsg", args: &["-t", "get_outputs", "-r"], parse: parse_sway, on_detail: "", off_note: "" }),
+            Desktop::Sway => Ok(Probe { program: "swaymsg", args: &["-t", "get_outputs", "-r"], parse: parse_sway, on_detail: "", unknown_note: "" }),
             Desktop::Cosmic => Err("HDR state not detected (COSMIC does not report HDR yet: cosmic-comp has no HDR output)"),
         }
     }
 }
 
 /// The desktop's HDR state per display: "GNOME: HDMI-1 HDR on (BT.2100)", "KDE: DP-1 HDR on, HDMI-A-1 HDR off",
-/// "Hyprland: DP-1 HDR off", or why it is not known ("sway: HDR state not detected (swaymsg is not installed)",
+/// "Hyprland: DP-1 preset srgb (not HDR itself); with render:cm_auto_hdr, ...", or why it is not known ("sway: HDR state not detected (swaymsg is not installed)",
 /// "HDR state not detected on this desktop (XDG_CURRENT_DESKTOP=X-Cinnamon)").
 pub fn read() -> String {
-    read_with(&|name| std::env::var(name).ok(), &|program, args| run_command(program, args, TIMEOUT))
+    read_with(&|name| std::env::var(name).ok(), &|path| path.exists(), &|program, args| run_command(program, args, TIMEOUT))
 }
 
-/// [`read`] with the environment and the commands given.
-pub fn read_with(var: &dyn Fn(&str) -> Option<String>, run: &dyn Fn(&str, &[&str]) -> CommandOutput) -> String {
-    match Desktop::from_env(var) {
+/// [`read`] with the environment, the file system's answer to "does this path exist" and the commands given.
+fn read_with(var: &dyn Fn(&str) -> Option<String>, exists: &dyn Fn(&std::path::Path) -> bool, run: &dyn Fn(&str, &[&str]) -> CommandOutput) -> String {
+    match Desktop::from_env(var, exists) {
         Some(desktop) => match desktop.probe() {
             Ok(probe) => match ask(&probe, run) {
                 Ok(outputs) => describe(desktop.name(), &outputs, &probe),
@@ -163,16 +178,12 @@ fn ask(probe: &Probe, run: &dyn Fn(&str, &[&str]) -> CommandOutput) -> Result<Ve
         CommandOutput::Ran(text) => {
             let outputs = (probe.parse)(&text);
             if outputs.is_empty() {
-                Err(format!("{} listed no display", probe.program))
+                Err(format!("{} reported no HDR state for any display", probe.program))
             } else {
                 Ok(outputs)
             }
         }
-        CommandOutput::Failed(why) => {
-            let first = why.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no message");
-            let first: String = first.chars().take(120).collect();
-            Err(format!("{} failed: {first}", probe.program))
-        }
+        CommandOutput::Failed(why) => Err(format!("{} failed: {why}", probe.program)),
         CommandOutput::Missing => Err(format!("{} is not installed", probe.program)),
     }
 }
@@ -181,12 +192,15 @@ fn describe(desktop: &str, outputs: &[Output], probe: &Probe) -> String {
     let list: Vec<String> = outputs
         .iter()
         .map(|o| {
-            let state = if o.hdr { format!("on{}", probe.on_detail) } else { "off".into() };
             let detail = if o.detail.is_empty() { String::new() } else { format!(" ({})", o.detail) };
-            format!("{} HDR {state}{detail}", o.name)
+            match o.hdr {
+                Some(true) => format!("{} HDR on{}{detail}", o.name, probe.on_detail),
+                Some(false) => format!("{} HDR off", o.name),
+                None => format!("{} {}", o.name, o.detail),
+            }
         })
         .collect();
-    let note = if outputs.iter().any(|o| !o.hdr) { probe.off_note } else { "" };
+    let note = if outputs.iter().any(|o| o.hdr.is_none()) { probe.unknown_note } else { "" };
     format!("{desktop}: {}{note}", list.join(", "))
 }
 
@@ -203,7 +217,7 @@ pub fn parse_mutter(text: &str) -> Vec<Output> {
         let Some(at) = part.find("'color-mode': <uint32 ") else { continue };
         let mode = part[at + 22..].split('>').next().and_then(|v| v.trim().parse::<u32>().ok());
         if let Some(mode) = mode {
-            out.push(Output { name: name.to_string(), hdr: mode == 1, detail: String::new() });
+            out.push(Output { name: name.to_string(), hdr: Some(mode == 1), detail: String::new() });
         }
     }
     out
@@ -217,7 +231,11 @@ pub fn parse_kscreen(text: &str) -> Vec<Output> {
         .iter()
         .filter(|o| o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true))
         .filter_map(|o| {
-            Some(Output { name: o.get("name")?.as_str()?.to_string(), hdr: o.get("hdr").and_then(|h| h.as_bool()).unwrap_or(false), detail: String::new() })
+            Some(Output {
+                name: o.get("name")?.as_str()?.to_string(),
+                hdr: Some(o.get("hdr").and_then(|h| h.as_bool()).unwrap_or(false)),
+                detail: String::new(),
+            })
         })
         .collect()
 }
@@ -225,17 +243,21 @@ pub fn parse_kscreen(text: &str) -> Vec<Output> {
 /// The monitors in `hyprctl monitors -j`'s JSON array (it lists only enabled ones; `disabled` is skipped anyway),
 /// each with its colour-management preset `colorManagementPreset` (Hyprland 0.52 and newer; `NCMType::toString`:
 /// `auto`, `srgb`, `wide`, `edid`, `hdr`, `hdredid`, `dcip3`, `dp3`, `adobe`): `hdr` and `hdredid` (PQ with BT.2020
-/// primaries) are HDR output, the others are not. Without the field (Hyprland before 0.52, which had no HDR
-/// output) it is off.
+/// primaries) are HDR output. Any other preset is not HDR itself, but with `render:cm_auto_hdr` (on by default) a
+/// fullscreen HDR game switches the monitor to HDR while the preset reads the same, so its state is not known: the
+/// preset is said as what it is. Without the field (Hyprland before 0.52, which had no HDR output) it is off.
 pub fn parse_hyprland(text: &str) -> Vec<Output> {
     let Ok(serde_json::Value::Array(monitors)) = serde_json::from_str::<serde_json::Value>(text) else { return Vec::new() };
     monitors
         .iter()
         .filter(|m| !m.get("disabled").and_then(|d| d.as_bool()).unwrap_or(false))
         .filter_map(|m| {
-            let preset = m.get("colorManagementPreset").and_then(|p| p.as_str()).unwrap_or("");
-            let detail = if preset.is_empty() { String::new() } else { format!("cm {preset}") };
-            Some(Output { name: m.get("name")?.as_str()?.to_string(), hdr: matches!(preset, "hdr" | "hdredid"), detail })
+            let name = m.get("name")?.as_str()?.to_string();
+            Some(match m.get("colorManagementPreset").and_then(|p| p.as_str()) {
+                None => Output { name, hdr: Some(false), detail: String::new() },
+                Some(preset @ ("hdr" | "hdredid")) => Output { name, hdr: Some(true), detail: format!("cm {preset}") },
+                Some(preset) => Output { name, hdr: None, detail: format!("preset {preset} (not HDR itself)") },
+            })
         })
         .collect()
 }
@@ -248,7 +270,11 @@ pub fn parse_sway(text: &str) -> Vec<Output> {
         .iter()
         .filter(|o| o.get("active").and_then(|a| a.as_bool()).unwrap_or(true))
         .filter_map(|o| {
-            Some(Output { name: o.get("name")?.as_str()?.to_string(), hdr: o.get("hdr").and_then(|h| h.as_bool()).unwrap_or(false), detail: String::new() })
+            Some(Output {
+                name: o.get("name")?.as_str()?.to_string(),
+                hdr: Some(o.get("hdr").and_then(|h| h.as_bool()).unwrap_or(false)),
+                detail: String::new(),
+            })
         })
         .collect()
 }
@@ -258,7 +284,12 @@ mod tests {
     use super::*;
 
     fn out(name: &str, hdr: bool) -> Output {
-        Output { name: name.into(), hdr, detail: String::new() }
+        Output { name: name.into(), hdr: Some(hdr), detail: String::new() }
+    }
+
+    /// Every path exists: the compositors' sockets are there.
+    fn live(_: &std::path::Path) -> bool {
+        true
     }
 
     fn env(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
@@ -307,14 +338,21 @@ mod tests {
         let outputs = parse_hyprland(text);
         assert_eq!(
             outputs,
-            vec![Output { name: "DP-1".into(), hdr: true, detail: "cm hdr".into() }, Output { name: "HDMI-A-1".into(), hdr: false, detail: "cm srgb".into() }]
+            vec![
+                Output { name: "DP-1".into(), hdr: Some(true), detail: "cm hdr".into() },
+                Output { name: "HDMI-A-1".into(), hdr: None, detail: "preset srgb (not HDR itself)".into() }
+            ]
         );
         assert_eq!(
             describe("Hyprland", &outputs, &Desktop::Hyprland.probe().unwrap()),
-            "Hyprland: DP-1 HDR on (cm hdr), HDMI-A-1 HDR off (cm srgb); with render:cm_auto_hdr a fullscreen HDR game can still get HDR"
+            "Hyprland: DP-1 HDR on (cm hdr), HDMI-A-1 preset srgb (not HDR itself); with render:cm_auto_hdr, on by default, a fullscreen HDR game \
+             switches the display to HDR"
         );
-        // `hdredid` is HDR too; a Hyprland before 0.52 has no preset at all.
-        assert!(parse_hyprland(r#"[{"name": "DP-2", "colorManagementPreset": "hdredid"}]"#)[0].hdr);
+        // `hdredid` is HDR too; `auto` (the default) is never said to be off; a Hyprland before 0.52 has no preset at all.
+        assert_eq!(parse_hyprland(r#"[{"name": "DP-2", "colorManagementPreset": "hdredid"}]"#)[0].hdr, Some(true));
+        let auto = parse_hyprland(r#"[{"name": "DP-2", "colorManagementPreset": "auto"}]"#);
+        assert_eq!(auto[0].hdr, None);
+        assert!(!describe("Hyprland", &auto, &Desktop::Hyprland.probe().unwrap()).contains("HDR off"));
         assert_eq!(parse_hyprland(r#"[{"name": "DP-2", "currentFormat": "XRGB8888"}]"#), vec![out("DP-2", false)]);
         assert!(parse_hyprland("HYPRLAND_INSTANCE_SIGNATURE was not set! (Is Hyprland running?)").is_empty());
     }
@@ -342,43 +380,60 @@ mod tests {
 
     #[test]
     fn the_desktop_is_told_by_its_environment() {
-        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "ubuntu:GNOME")])), Some(Desktop::Gnome));
-        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "KDE")])), Some(Desktop::Kde));
+        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "ubuntu:GNOME")]), &live), Some(Desktop::Gnome));
+        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "KDE")]), &live), Some(Desktop::Kde));
         // sway's session file names `sway:wlroots`; Hyprland sets `Hyprland`; cosmic-session sets `COSMIC`.
-        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "sway:wlroots")])), Some(Desktop::Sway));
-        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "Hyprland")])), Some(Desktop::Hyprland));
-        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "COSMIC")])), Some(Desktop::Cosmic));
+        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "sway:wlroots")]), &live), Some(Desktop::Sway));
+        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "Hyprland")]), &live), Some(Desktop::Hyprland));
+        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "COSMIC")]), &live), Some(Desktop::Cosmic));
         // A session started from a console names none, but the compositor's own variable is there.
-        assert_eq!(Desktop::from_env(&env(&[("HYPRLAND_INSTANCE_SIGNATURE", "abc_123_456")])), Some(Desktop::Hyprland));
-        assert_eq!(Desktop::from_env(&env(&[("SWAYSOCK", "/run/user/1000/sway-ipc.1000.42.sock")])), Some(Desktop::Sway));
-        assert_eq!(Desktop::from_env(&env(&[("GAMESCOPE_WAYLAND_DISPLAY", "gamescope-0"), ("XDG_CURRENT_DESKTOP", "KDE")])), Some(Desktop::Gamescope));
-        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "X-Cinnamon"), ("SWAYSOCK", "")])), None);
-        assert_eq!(Desktop::from_env(&env(&[])), None);
+        assert_eq!(Desktop::from_env(&env(&[("HYPRLAND_INSTANCE_SIGNATURE", "abc_123_456")]), &live), Some(Desktop::Hyprland));
+        assert_eq!(Desktop::from_env(&env(&[("SWAYSOCK", "/run/user/1000/sway-ipc.1000.42.sock")]), &live), Some(Desktop::Sway));
+        assert_eq!(Desktop::from_env(&env(&[("GAMESCOPE_WAYLAND_DISPLAY", "gamescope-0"), ("XDG_CURRENT_DESKTOP", "KDE")]), &live), Some(Desktop::Gamescope));
+        assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "X-Cinnamon"), ("SWAYSOCK", "")]), &live), None);
+        assert_eq!(Desktop::from_env(&env(&[]), &live), None);
+    }
+
+    #[test]
+    fn a_stale_compositor_variable_does_not_override_the_desktop_that_runs() {
+        let sockets =
+            |path: &std::path::Path| path == std::path::Path::new("/run/user/1000/hypr/abc_123/.socket.sock") || path == std::path::Path::new("/run/s.sock");
+        let gone = |_: &std::path::Path| false;
+        // A nested Hyprland keeps its parent's XDG_CURRENT_DESKTOP, so the live socket wins over it; a stale variable
+        // (left in the systemd user manager's environment) does not. Hyprland's socket is under $XDG_RUNTIME_DIR/hypr/<signature>/; sway's is $SWAYSOCK itself.
+        let hypr = env(&[("HYPRLAND_INSTANCE_SIGNATURE", "abc_123"), ("XDG_RUNTIME_DIR", "/run/user/1000"), ("XDG_CURRENT_DESKTOP", "GNOME")]);
+        assert_eq!(Desktop::from_env(&hypr, &sockets), Some(Desktop::Hyprland));
+        assert_eq!(Desktop::from_env(&hypr, &gone), Some(Desktop::Gnome));
+        let sway = env(&[("SWAYSOCK", "/run/s.sock"), ("XDG_CURRENT_DESKTOP", "KDE")]);
+        assert_eq!(Desktop::from_env(&sway, &sockets), Some(Desktop::Sway));
+        assert_eq!(Desktop::from_env(&sway, &gone), Some(Desktop::Kde));
+        // Hyprland before 0.40 kept its socket under /tmp/hypr.
+        assert_eq!(Desktop::from_env(&hypr, &|p: &std::path::Path| p == std::path::Path::new("/tmp/hypr/abc_123/.socket.sock")), Some(Desktop::Hyprland));
     }
 
     #[test]
     fn an_unknown_state_is_said_never_guessed_off() {
         let missing = |_: &str, _: &[&str]| CommandOutput::Missing;
-        assert_eq!(read_with(&env(&[("SWAYSOCK", "/run/s.sock")]), &missing), "sway: HDR state not detected (swaymsg is not installed)");
+        assert_eq!(read_with(&env(&[("SWAYSOCK", "/run/s.sock")]), &live, &missing), "sway: HDR state not detected (swaymsg is not installed)");
         assert_eq!(
-            read_with(&env(&[("XDG_CURRENT_DESKTOP", "Hyprland")]), &|_, _| CommandOutput::Failed("Couldn't connect to socket\nmore".into())),
-            "Hyprland: HDR state not detected (hyprctl failed: Couldn't connect to socket)"
+            read_with(&env(&[("XDG_CURRENT_DESKTOP", "Hyprland")]), &live, &|_, _| CommandOutput::Failed("did not finish within 3 s and was stopped".into())),
+            "Hyprland: HDR state not detected (hyprctl failed: did not finish within 3 s and was stopped)"
         );
         assert_eq!(
-            read_with(&env(&[("XDG_CURRENT_DESKTOP", "KDE")]), &|_, _| CommandOutput::Ran("{}".into())),
-            "KDE: HDR state not detected (kscreen-doctor listed no display)"
+            read_with(&env(&[("XDG_CURRENT_DESKTOP", "KDE")]), &live, &|_, _| CommandOutput::Ran("{}".into())),
+            "KDE: HDR state not detected (kscreen-doctor reported no HDR state for any display)"
         );
         assert_eq!(
-            read_with(&env(&[("XDG_CURRENT_DESKTOP", "COSMIC")]), &missing),
+            read_with(&env(&[("XDG_CURRENT_DESKTOP", "COSMIC")]), &live, &missing),
             "COSMIC: HDR state not detected (COSMIC does not report HDR yet: cosmic-comp has no HDR output)"
         );
         assert_eq!(
-            read_with(&env(&[("XDG_CURRENT_DESKTOP", "X-Cinnamon")]), &missing),
+            read_with(&env(&[("XDG_CURRENT_DESKTOP", "X-Cinnamon")]), &live, &missing),
             "HDR state not detected on this desktop (XDG_CURRENT_DESKTOP=X-Cinnamon)"
         );
-        assert_eq!(read_with(&env(&[]), &missing), "HDR state not detected on this desktop (it names none: XDG_CURRENT_DESKTOP is not set)");
+        assert_eq!(read_with(&env(&[]), &live, &missing), "HDR state not detected on this desktop (it names none: XDG_CURRENT_DESKTOP is not set)");
         assert_eq!(
-            read_with(&env(&[("GAMESCOPE_WAYLAND_DISPLAY", "gamescope-0")]), &missing),
+            read_with(&env(&[("GAMESCOPE_WAYLAND_DISPLAY", "gamescope-0")]), &live, &missing),
             "gamescope session: HDR is gamescope's (--hdr-enabled) and the display's"
         );
     }
@@ -394,10 +449,10 @@ mod tests {
                 _ => CommandOutput::Missing,
             }
         };
-        assert_eq!(read_with(&env(&[("XDG_CURRENT_DESKTOP", "sway:wlroots")]), &run), "sway: DP-1 HDR on");
+        assert_eq!(read_with(&env(&[("XDG_CURRENT_DESKTOP", "sway:wlroots")]), &live, &run), "sway: DP-1 HDR on");
         assert_eq!(*asked.borrow(), ["swaymsg"]);
         asked.borrow_mut().clear();
-        assert_eq!(read_with(&env(&[]), &run), "KDE: DP-1 HDR off");
+        assert_eq!(read_with(&env(&[]), &live, &run), "KDE: DP-1 HDR off");
         assert_eq!(*asked.borrow(), ["gdbus", "kscreen-doctor"]);
     }
 }
