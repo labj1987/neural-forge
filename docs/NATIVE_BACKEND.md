@@ -1314,6 +1314,18 @@ ranges from the moment it is recorded (`placement::Hold`, in `InlinePoint::hold`
 plan at the submit, `Tracking::split_hold`), so the two holds of one buffer always split the passes the
 same way.
 
+**The After DLSS / finished frame group** (#73; header v30: `after_passes`, `after_scale`, `after_overrides` and
+`after_<field>`). The passes after DLSS and at present take the group's values: `ShmHeader::pass_tunings` gives both
+sets (`PassTunings::after`, each pass's own overrides applied on top of the group's, as on the Model tab's), the hold
+after DLSS takes them in `native::stage_passes` (`Passes::after_dlss`; `None` while the group sets nothing, so the
+default path is the one it was), and the after-the-upscaler path in `native_post` (`PassTunings::after_dlss`). The
+pass count follows pass 1's stage (`placement::plan_for`): before the upscaler the Passes setting's, else
+`after_passes` (0: the Passes setting). Since passes never run earlier than pass 1, pass 1's stage is the same with
+either count. `after_scale` (0: `preupscale_scale`) is the model resolution after DLSS; at present
+`working_scale` stays the size. The layer writes the group a frame used (`settings_group`) for the Status tab. A
+switch between the groups is a change of stage (or, after DLSS, of size and count), which the holds and the network's
+build already follow: nothing new is built or freed for it.
+
 **Two holds in one buffer.** A command buffer can carry the hold before the upscaler and the hold after
 DLSS's output (`inline::Slots::by_cb` holds a list): each has its own staging slot and events, the jobs
 are handed to the worker in the order recorded, and the worker runs them one after the other, waiting for

@@ -1792,6 +1792,20 @@ pub(crate) struct Passes {
     pub scales: [f32; neural_forge_protocol::MAX_PASSES],
     /// The colour of each pass's edit, and the stack's colour controls.
     pub colour: neural_forge_protocol::ColourSettings,
+    /// The After DLSS group's pass count (#73; `placement::plan_for`): a frame none of whose passes runs before the
+    /// upscaler runs this many. `count` is the Passes setting's.
+    pub after_count: usize,
+    /// The passes' values where they run after DLSS's output, where the After DLSS group makes them differ from
+    /// the ones above ([`Passes::after_dlss`]); `None` for the same.
+    pub after: Option<AfterValues>,
+}
+
+/// Each pass's conditioning, model resolution and colour of the edit after DLSS ([`Passes::after`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AfterValues {
+    pub each: [Conditioning; neural_forge_protocol::MAX_PASSES],
+    pub scales: [f32; neural_forge_protocol::MAX_PASSES],
+    pub colour: [neural_forge_protocol::EditColour; neural_forge_protocol::MAX_PASSES],
 }
 
 impl Passes {
@@ -1803,6 +1817,19 @@ impl Passes {
             feedback: 1.0,
             scales: [1.0; neural_forge_protocol::MAX_PASSES],
             colour: neural_forge_protocol::ColourSettings::DEFAULT,
+            after_count: 1,
+            after: None,
+        }
+    }
+
+    /// These passes with the values they run with after DLSS's output (the After DLSS group's, where it sets any).
+    /// The counts stay.
+    pub(crate) fn after_dlss(&self) -> Self {
+        match self.after {
+            Some(a) => {
+                Self { each: a.each, scales: a.scales, colour: neural_forge_protocol::ColourSettings { each: a.colour, ..self.colour }, after: None, ..*self }
+            }
+            None => *self,
         }
     }
 }
@@ -1841,9 +1868,16 @@ impl Passes {
     }
 }
 
-/// The passes the hold `at` runs ([`Passes::stage`]); `None` when none of the frame's passes is at its stage.
+/// The passes the hold `at` runs ([`Passes::stage`]); `None` when none of the frame's passes is at its stage. A hold
+/// after DLSS runs them with the After DLSS group's values (#73). Before the upscaler the frame runs the Passes
+/// setting's count; after DLSS the plan's range says how many (the After DLSS group's count where no pass runs
+/// before the upscaler), and it is the frame's last stage, so its last pass is the stack's.
 pub(crate) fn stage_passes(all: &Passes, at: super::placement::Hold) -> Option<Passes> {
     let (first, end) = at.passes();
+    if at.stage == super::placement::Stage::Upscaled {
+        let end = end.min(all.count.max(all.after_count));
+        return (first < end).then(|| Passes { count: end, ..all.after_dlss() }.stage(first, end));
+    }
     let end = end.min(all.count);
     (first < end).then(|| all.stage(first, end))
 }
@@ -1882,6 +1916,14 @@ impl From<neural_forge_protocol::PassTunings> for Passes {
         for (c, &tuning) in each.iter_mut().zip(t.tunings.iter()) {
             *c = Conditioning::from(tuning);
         }
+        // The After DLSS group's values, kept only where they differ from the ones before the upscaler.
+        let after = (t.after.tunings != t.tunings || t.after.scales != t.scales || t.after.colour != t.colour.each).then(|| {
+            let mut each = [Conditioning::default(); neural_forge_protocol::MAX_PASSES];
+            for (c, &tuning) in each.iter_mut().zip(t.after.tunings.iter()) {
+                *c = Conditioning::from(tuning);
+            }
+            AfterValues { each, scales: t.after.scales, colour: t.after.colour }
+        });
         Self {
             count: t.count.clamp(1, neural_forge_protocol::MAX_PASSES),
             each,
@@ -1889,6 +1931,8 @@ impl From<neural_forge_protocol::PassTunings> for Passes {
             feedback: t.feedback,
             scales: t.scales,
             colour: t.colour,
+            after_count: t.after.count.clamp(1, neural_forge_protocol::MAX_PASSES),
+            after,
         }
     }
 }
@@ -9033,6 +9077,50 @@ mod tests {
             device.destroy_command_pool(graph_pool, None);
             device.destroy_command_pool(pool, None);
         }
+    }
+
+    /// The After DLSS group (#73): a hold after DLSS runs the group's values (its intensity, model resolution and colour,
+    /// a pass's own override still first) and as many passes as the plan gives it, while a hold before the upscaler runs
+    /// the Model tab's and the Passes setting's count; with the group at its defaults nothing differs.
+    #[test]
+    fn a_hold_after_dlss_runs_the_after_dlss_groups_values() {
+        use super::super::placement::{plan_for, Frame, Hold, Stage};
+        use neural_forge_protocol::enums::pass_override as po;
+        let h = neural_forge_protocol::ShmHeader::default();
+        h.init_defaults();
+        let defaults = Passes::from(h.pass_tunings());
+        assert!(defaults.after.is_none(), "the same values after DLSS by default");
+        assert!(h.write_settings(&[
+            ("passes", 2),
+            ("intensity", 0.8f32.to_bits()),
+            ("pass2_overrides", po::INTENSITY),
+            ("pass2_intensity", 0.4f32.to_bits()),
+            ("after_passes", 3),
+            ("after_scale", 0.5f32.to_bits()),
+            ("after_overrides", po::INTENSITY | po::EDIT_DETAIL),
+            ("after_intensity", 0.3f32.to_bits()),
+            ("after_edit_detail", 2.0f32.to_bits()),
+            ("edit_lut_strength", 0.5f32.to_bits()),
+        ]));
+        let all = Passes::from(h.pass_tunings());
+        let (render, output) = ((960, 540), (1920, 1080));
+        let placements = h.placements();
+        // Ray Reconstruction: every pass after DLSS, three of them, with the group's values.
+        let plan = plan_for(&placements, Frame { rr: true, output: true, hook: false });
+        let after = stage_passes(&all, Hold::of(&plan, Stage::Upscaled, render, output)).expect("passes after DLSS");
+        assert_eq!(after.count, 3);
+        assert_eq!([after.each[0].intensity, after.each[1].intensity, after.each[2].intensity], [0.3, 0.4, 0.3], "pass 2's own intensity first");
+        assert_eq!(&after.scales[..3], &[0.5; 3]);
+        assert_eq!((after.colour.each[0].detail, after.colour.lut_strength), (2.0, 0.5), "the stack's last pass keeps the table");
+        assert_eq!(frame_sizes(&all, Hold::of(&plan, Stage::Upscaled, render, output), output), vec![(960, 540)], "the network at the group's size");
+        // Without it: before the upscaler, two passes with the Model tab's values at full size.
+        let plan = plan_for(&placements, Frame { rr: false, output: true, hook: true });
+        let before = stage_passes(&all, Hold::of(&plan, Stage::Before, render, output)).expect("passes before the upscaler");
+        assert_eq!((before.count, before.each[0].intensity, before.each[1].intensity, before.scales[0]), (2, 0.8, 0.4, 1.0));
+        assert_eq!(before.colour.each[0].detail, 1.0);
+        assert!(stage_passes(&all, Hold::of(&plan, Stage::Upscaled, render, output)).is_none());
+        // A hold that names every pass before the upscaler still runs the Passes setting's count, not the group's.
+        assert_eq!(stage_passes(&all, Hold::ALL_BEFORE).expect("passes").count, 2);
     }
 
     /// The per-pass split: two passes, one placed before the upscaler and one after DLSS. Each stage's hold

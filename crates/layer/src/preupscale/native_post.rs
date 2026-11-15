@@ -1096,7 +1096,8 @@ fn process(
         // A size or format change resets the history (`post_history`).
         gpu.history[slot.index()].note_request(width, height, format);
     }
-    let tunings = hdr.pass_tunings();
+    // The finished frame is after DLSS: the After DLSS group's passes and values (#73).
+    let tunings = hdr.pass_tunings().after_dlss();
     let passes: Vec<Conditioning> = tunings.passes().iter().map(|&t| Conditioning::from(t)).collect();
     let feedback = tunings.feedback;
     // The colour of the edit, and its look-up table (read from config.ini's `edit_lut` in the background).
@@ -1168,6 +1169,10 @@ fn process(
             ok
         }
     };
+    if evaluated && hdr.settings_group.load(Ordering::Relaxed) != neural_forge_protocol::enums::settings_group::AFTER {
+        // For the Status tab: this frame used the After DLSS group.
+        hdr.settings_group.store(neural_forge_protocol::enums::settings_group::AFTER, Ordering::Relaxed);
+    }
     if evaluated && gpu.slow.is_some() {
         super::offload::STATS.server_frames.fetch_add(1, Ordering::Relaxed);
         super::offload::STATS.server_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);

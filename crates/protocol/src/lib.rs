@@ -52,8 +52,9 @@ pub mod state_log;
 pub mod vram_need;
 
 pub use header::{
-    load64, pass_setting, resolved_scale, setting_bounds, store64, stored_reason, ColourSettings, EditColour, HudRegion, HudRegionWords, HudSettings,
-    MaskSettings, PassColour, PassControl, PassTunings, SharpenSettings, ShmHeader, Tuning, HDR_VERDICT_BYTES, MAX_HUD_REGIONS, SETTING_BOUNDS,
+    after_setting, load64, pass_setting, resolved_scale, setting_bounds, store64, stored_reason, ColourSettings, EditColour, GroupTunings, HudRegion,
+    HudRegionWords, HudSettings, MaskSettings, PassColour, PassControl, PassTunings, Placements, SharpenSettings, ShmHeader, Tuning, HDR_VERDICT_BYTES,
+    MAX_HUD_REGIONS, SETTING_BOUNDS,
 };
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub use slot::{next_request, Slot};
@@ -98,11 +99,12 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// verdict (`hdr_verdict`); v27 appends the
 /// NGX wrapper ring's counters (`ngx_records`, `ngx_matched`); v28 appends the second GPU showing the frame itself
 /// (`second_gpu_present` and the layer's line about it); v29 appends the presented frame's own size (`frame_width`,
-/// `frame_height`)).
+/// `frame_height`); v30 appends the After DLSS / finished frame settings group (`after_passes`, `after_scale`,
+/// `after_overrides` and its values) and which group the model's latest frame used (`settings_group`)).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
-pub const SHM_VERSION: u32 = 29;
+pub const SHM_VERSION: u32 = 30;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;

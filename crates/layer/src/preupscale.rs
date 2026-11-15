@@ -6983,8 +6983,9 @@ impl Session {
         // its frames) or not running (starting, stalled, given up): when the placement left it, the native backend's
         // line has the channel (`offload::shows_line`).
         let at_present = shm.view().is_some_and(|v| {
-            let (count, placements) = v.header().placements();
-            placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT)
+            // A frame on the finished frame runs the After DLSS group's passes (`Placements::after`).
+            let p = v.header().placements();
+            p.each[..p.after.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT)
         });
         let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_hold());
         // The finished frame's trial on the game's GPU, or its verdict for it (`offload_trial`): the offload's state
@@ -7113,8 +7114,8 @@ impl Session {
                 && !offload_trial::finished_local()
                 && !crate::device::gpu2_hosts(device.handle())
             {
-                let (count, placements) = view.header().placements();
-                if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
+                let p = view.header().placements();
+                if p.each[..p.after.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
                     // After a hand-back: once the game's GPU's network is closed (one is open in the process at a time).
                     if self.give_back.holds_start(now) {
                         return;
@@ -7443,8 +7444,7 @@ fn hold_state(holding: bool) -> u32 {
     // Holds after DLSS recorded lately, by [`rr_and_after`]'s clock (their own mark alone: a hold only tried is not
     // one that holds). Ray Reconstruction here is whether it runs at all, with its hold or without.
     let (_, after) = rr_and_after(None, *lock(&AFTER_DLSS_AT), now);
-    let (count, settings) = placement::settings();
-    let plan = placement::Plan::of(count, &settings, placement::Frame { rr: ray_reconstruction_running(now), output: after, hook: true });
+    let plan = placement::plan_for(&placement::placements(), placement::Frame { rr: ray_reconstruction_running(now), output: after, hook: true });
     hold_state_of(plan.has(placement::Stage::Before), after && plan.has(placement::Stage::Upscaled))
 }
 

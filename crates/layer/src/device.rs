@@ -2511,8 +2511,9 @@ impl NeuralForgeDeviceInfo {
             }
             return say(crate::gpu2_present::TRIAL_REFUSAL.into());
         }
-        let (count, placements) = header.placements();
-        if !placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
+        // A frame on the finished frame runs the After DLSS group's passes (`Placements::after`).
+        let p = header.placements();
+        if !p.each[..p.after.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
             return say("Placement is not Finished frame for every pass".into());
         }
         if self.gpu2_signal.is_none() {

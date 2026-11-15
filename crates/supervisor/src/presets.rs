@@ -111,7 +111,8 @@ impl Preset {
     }
 
     /// Everything the preset writes to `header`, by setting name with its bits: the four knobs, each pass's
-    /// `overrides` without the ones it ends (only the passes that have one), and the look where it resets it.
+    /// `overrides` without the ones it ends (only the passes that have one), the After DLSS group's likewise, and the
+    /// look where it resets it.
     pub fn settings(&self, header: &neural_forge_protocol::ShmHeader) -> Vec<(&'static str, u32)> {
         let mut out: Vec<(&'static str, u32)> = self.knobs.settings().iter().map(|&(name, v)| (name, v.to_bits())).collect();
         if self.resets_look {
@@ -125,6 +126,10 @@ impl Preset {
                 out.push((name, mask & !ended));
             }
         }
+        let mask = header.after.overrides.load(Ordering::Relaxed);
+        if mask & ended != 0 {
+            out.push(("after_overrides", mask & !ended));
+        }
         out
     }
 
@@ -135,14 +140,15 @@ impl Preset {
         header.write_settings(&settings).then(|| settings.iter().map(|&(name, _)| name).collect())
     }
 
-    /// Whether `header` holds this preset: its knobs, no pass on its own values for what the preset sets, and the
-    /// look at its defaults where the preset resets it.
+    /// Whether `header` holds this preset: its knobs, no pass (and not the After DLSS group) on its own values for what
+    /// the preset sets, and the look at its defaults where the preset resets it.
     pub fn matches(&self, header: &neural_forge_protocol::ShmHeader) -> bool {
         let ended = self.ended_overrides();
         // The passes that run (`passes`): what a pass past them holds of its own changes no picture.
         let active = (header.passes.load(Ordering::Relaxed) as usize).clamp(1, header.pass.len());
         self.knobs.close_to(&Knobs::from_header(header))
             && header.pass[..active].iter().all(|p| p.overrides.load(Ordering::Relaxed) & ended == 0)
+            && header.after.overrides.load(Ordering::Relaxed) & ended == 0
             && (!self.resets_look || {
                 let stored = header.persisted_settings();
                 LOOK.iter().all(|&(name, v)| stored.iter().any(|&(n, _, bits)| n == name && v.is(bits)))
@@ -304,6 +310,29 @@ mod tests {
         assert_eq!(bits("pass2_overrides") & LOOK_OVERRIDES, LOOK_OVERRIDES, "its own style and colour stay");
         let t = header.pass_tunings();
         assert_eq!(t.tunings[1].local_tone, PRESETS[0].knobs.local_tone);
+    }
+
+    /// The After DLSS group's own strengths and look are ended by a preset like a pass's: the preset reaches the
+    /// frames after DLSS too. Its passes and model resolution are not a preset's.
+    #[test]
+    fn a_preset_ends_the_after_dlss_groups_strengths_too() {
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.init_defaults();
+        assert!(header.write_settings(&[
+            ("after_passes", 2),
+            ("after_scale", 0.5f32.to_bits()),
+            ("after_overrides", pass_override::INTENSITY | pass_override::EDIT_SATURATION),
+            ("after_intensity", 0.3f32.to_bits()),
+        ]));
+        assert_eq!(matching(&header), None, "the frames after DLSS run their own intensity");
+        let wrote = PRESETS[0].write(&header).expect("stored");
+        assert!(wrote.contains(&"after_overrides"));
+        assert_eq!(header.after.overrides.load(Ordering::Relaxed), pass_override::EDIT_SATURATION, "Light keeps the look");
+        assert_eq!(matching(&header), Some(0));
+        assert_eq!(header.pass_tunings().after_dlss().tunings[0].intensity, PRESETS[0].knobs.intensity);
+        assert!(PRESETS[2].write(&header).is_some());
+        assert_eq!(header.after.overrides.load(Ordering::Relaxed), 0, "Reference puts the look back");
+        assert_eq!((header.resolved_after_passes(), header.pass_tunings().after.scales[0]), (2, 0.5), "not a preset's");
     }
 
     #[test]
