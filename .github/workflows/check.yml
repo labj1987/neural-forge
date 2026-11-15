@@ -319,7 +319,8 @@ jobs:
           for bin in squashfs-root/usr/bin/neural-forge squashfs-root/usr/bin/bundled/neural-forge squashfs-root/usr/bin/neural-forge-cli \
               squashfs-root/usr/libexec/gio-launch-desktop squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so \
               $(find squashfs-root/usr/lib -path squashfs-root/usr/lib/neural-forge -prune -o -name '*.so*' -type f -print | sort); do
-              needed="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1)"
+              # `|| true`: under pipefail a grep that finds nothing would end the step here, before the check below.
+              needed="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1 || true)"
               if [ -z "$needed" ]; then
                   # Only a data library (ICU's) calls nothing in glibc; the programs and the layer always do.
                   case "$bin" in squashfs-root/usr/lib/neural-forge/*) ;; squashfs-root/usr/lib/*.so*) echo "$bin needs nothing from glibc"; continue ;; esac
