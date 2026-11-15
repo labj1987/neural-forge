@@ -104,8 +104,11 @@ SDR although HDR metadata was sent" (the game's HDR setting is on but its window
 each followed by why the window had no HDR when it had none (gamescope without `--hdr-enabled`, Proton without
 `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`, or the desktop's HDR off). In brackets follow the window's format and
 colour space, whether its surface offered an HDR colour space, the first HDR metadata the game sent, whether
-gamescope's layer is loaded and Proton's two HDR switches; after them the desktop's HDR state per display, where
-GNOME or KDE Plasma can tell (a gamescope session says so).
+gamescope's layer is loaded and Proton's two HDR switches; after them the desktop's HDR state per display, read from
+GNOME (Mutter's display configuration), KDE Plasma (`kscreen-doctor`), Hyprland (`hyprctl`, its colour-management
+preset `hdr` or `hdredid`) or sway (`swaymsg`); a gamescope session says so. COSMIC does not report HDR yet. On any
+other desktop, or when the desktop's tool is missing or does not answer, the line says the state was not detected and
+why, rather than calling it off.
 
 Before the upscaler the network runs on every frame while the camera is still and on every second
 frame while it moves; the frame in between reuses its last result, moved with the game's motion and

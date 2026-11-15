@@ -3225,7 +3225,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     group.add(&tested_row);
     group.add(&hdr_row);
 
-    // The desktop's HDR state asks the compositor (a D-Bus call): on a worker, every 30 s.
+    // The desktop's HDR state asks the compositor (a D-Bus call or its own tool): on a worker, every 30 s.
     let desktop: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::default();
     {
         let desktop = std::rc::Rc::clone(&desktop);
@@ -3233,7 +3233,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             let desktop = std::rc::Rc::clone(&desktop);
             glib::spawn_future_local(async move {
                 if let Ok(state) = gio::spawn_blocking(neural_forge_supervisor::desktop_hdr::read).await {
-                    *desktop.borrow_mut() = state;
+                    *desktop.borrow_mut() = Some(state);
                 }
             });
         });

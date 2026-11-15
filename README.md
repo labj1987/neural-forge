@@ -95,7 +95,10 @@ says what to do.
   acceleration).
 - **HDR does not come on.** The Status tab's HDR line says why. Under Proton add
   `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` to the launch options (Proton-GE), or start gamescope
-  with `--hdr-enabled`; if HDR10 was available, switch on the game's own HDR setting.
+  with `--hdr-enabled`; if HDR10 was available, switch on the game's own HDR setting. The line also
+  shows whether the desktop's HDR is on for each display, on GNOME, KDE Plasma, Hyprland, sway and in a
+  gamescope session; COSMIC does not report HDR yet, and on other desktops it says the state was not
+  detected.
 - **Something looks wrong.** Press F11 to compare. `NEURAL_FORGE_PREUPSCALE=off` in the launch
   options keeps the network from loading at all.
 - **A game refuses to start or go online.** `PROTON_NO_NEURAL_FORGE_NGX=1` in its launch options runs

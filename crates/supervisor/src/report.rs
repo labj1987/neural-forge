@@ -543,7 +543,7 @@ pub fn save(channel_status: &str, game: &str, steam_appid: Option<&str>, trace: 
         crate::doctor::CommandOutput::Ran(out) => Some(out),
         _ => None,
     };
-    let hdr = hdr_line(channel_status, crate::desktop_hdr::read().as_deref());
+    let hdr = hdr_line(channel_status, Some(&crate::desktop_hdr::read()));
     let switched_on = switched_on_games(&games, &sources.steam_roots);
     let env_trace = std::env::var_os("NEURAL_FORGE_TRACE").map(PathBuf::from);
     let inputs = Inputs {

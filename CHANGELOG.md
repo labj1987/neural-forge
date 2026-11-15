@@ -4,6 +4,15 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## Unreleased
+
+**The HDR line knows more desktops**
+
+- The Status tab's HDR line, `shmctl status` and Save report now show whether the desktop's HDR is on for
+  each display on Hyprland and sway too, as they did on GNOME, KDE Plasma and in a gamescope session.
+- Where the desktop's HDR state cannot be read (COSMIC, which does not report HDR yet, another desktop, or a missing
+  `kscreen-doctor`, `hyprctl` or `swaymsg`), the line says it was not detected and why instead of leaving it out.
+
 ## 4.2.1 — 2026-11-14
 
 **Steam Cloud saves sync with the Neural Forge copies of Proton Experimental, Proton Hotfix and Proton-CachyOS (#71)**
