@@ -661,8 +661,33 @@ pub(crate) const LOADING: &str = "the native network is still loading";
 /// A hold's miss while the last load or build on its device failed (it is tried again on the loader's schedule).
 pub(crate) const NOT_BUILT: &str = "the native network could not be loaded or built";
 
-/// A hold's miss while the process's one network is open on another device, which the loader waits for.
-pub(crate) const OPEN_WAIT: &str = "the network is open on another device of the game, which is closing it";
+/// A hold's miss while the process's one network is open on another device (which is closing it, or still using it):
+/// the loader waits for it and tries again.
+pub(crate) const OPEN_WAIT: &str = "the network is open on another device of the game, which is closing it or using it";
+
+/// A hold's miss on a device whose network is off for the session (a wait on its queue timed out: nothing is tried
+/// again there until the game restarts).
+pub(crate) const DEAD: &str = "the network is off on this device until the game restarts";
+
+/// The loader's reason once it lent the network to another device of the process ([`Loader::lend`]).
+const LENT: &str = "lent to another device of the game, which runs the model";
+
+/// The loader's reason once it gave the network back to the second GPU ([`Loader::give_back_network`]).
+const GIVEN_BACK: &str = "the model runs on the second GPU: the faster GPU keeps it";
+
+/// A hold's miss for a loader whose last load or build left the reason `why` ([`Loader::failed`]), on a device
+/// whose network is off for the session or not (`dead`): [`DEAD`]; [`OPEN_WAIT`] where the network is another
+/// device's (refused as open elsewhere, [`OPEN_ELSEWHERE`], lent, [`LENT`], or given back to the second GPU,
+/// [`GIVEN_BACK`]), which passes; else [`NOT_BUILT`].
+fn failed_miss(why: &str, dead: bool) -> &'static str {
+    if dead {
+        DEAD
+    } else if why.contains(OPEN_ELSEWHERE) || why == LENT || why == GIVEN_BACK {
+        OPEN_WAIT
+    } else {
+        NOT_BUILT
+    }
+}
 
 /// The words of `nf_native_open`'s refusal while another network is open in the process (crates/native/cpp/nf_native.cpp).
 const OPEN_ELSEWHERE: &str = "another network is open in this process";
@@ -913,7 +938,7 @@ impl Loader {
         if !self.network_open() {
             return true;
         }
-        self.lend_with(Some("the model runs on the second GPU: the faster GPU keeps it"), true)
+        self.lend_with(Some(GIVEN_BACK), true)
     }
 
     /// Whether this device has the process's network open (or is still closing it).
@@ -1083,7 +1108,7 @@ impl Loader {
                     let why = state.lend_why.take();
                     state.built = Vec::new();
                     state.wanted = None;
-                    state.failed = Some(why.unwrap_or("lent to another device of the game, which runs the model").into());
+                    state.failed = Some(why.unwrap_or(LENT).into());
                     drop(state);
                     drop(network);
                     disown(device.as_raw());
@@ -4709,13 +4734,7 @@ unsafe fn native_hold(
         result.miss = Some(if loader.paused() {
             super::VRAM_PAUSED
         } else if let Some(why) = loader.failed() {
-            // Open on another device of the process (one at a time): that device is asked to close it and the loader
-            // tries again; not a network that cannot be built here.
-            if why.contains(OPEN_ELSEWHERE) {
-                OPEN_WAIT
-            } else {
-                NOT_BUILT
-            }
+            failed_miss(&why, loader.dead())
         } else if loader.waiting_for_holds(reserved) {
             WAITING
         } else {
@@ -5780,6 +5799,24 @@ mod tests {
         }
     }
     use super::*;
+
+    /// A hold's miss for the loader's last failure (#63): the network being another device's, refused as open elsewhere
+    /// (the native library's own words, [`OPEN_ELSEWHERE`]) or lent to it, is a wait; a device whose network is off for
+    /// the session is that, whatever it failed with; anything else is a build that failed.
+    #[test]
+    fn the_holds_miss_says_whether_the_network_is_another_devices_dead_or_not_built() {
+        let refused = format!("the model at /x could not be loaded: {OPEN_ELSEWHERE} (one at a time: its Vulkan function table is process-wide)");
+        assert_eq!(failed_miss(&refused, false), OPEN_WAIT);
+        assert_eq!(failed_miss(LENT, false), OPEN_WAIT, "lent to another device: it is that device's now");
+        assert_eq!(failed_miss("the model at /x could not be loaded: no such file", false), NOT_BUILT);
+        assert_eq!(failed_miss(GIVEN_BACK, false), OPEN_WAIT, "given back to the second GPU: that device's until it closes it");
+        for why in [refused.as_str(), LENT, "a wait on the network's queue timed out"] {
+            assert_eq!(failed_miss(why, true), DEAD, "{why}");
+        }
+        // Each is its own miss: the trial tells them apart by the constant, not by wording.
+        let all = [LOADING, NOT_BUILT, OPEN_WAIT, DEAD, WAITING];
+        assert!(all.iter().enumerate().all(|(i, a)| all.iter().skip(i + 1).all(|b| a != b)));
+    }
 
     /// Resources built untimed (inside DLSS's buffer the hold times its slot) make no GPU timer at all: a timer
     /// has no destructor, so one made and dropped left its query pool behind, past `vkDestroyDevice` (which the

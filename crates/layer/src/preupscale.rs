@@ -2908,8 +2908,14 @@ impl Tracker {
         // comes here, and counting them kept "Ray Reconstruction runs" true through the pause. With no hold after
         // DLSS recorded meanwhile, auto then put every pass at present, and the after-the-upscaler path took the
         // frames (and the process's one network) from the live hold a second after its last frame (#63).
+        //
+        // Where no hold after DLSS was ever recorded or tried in the process (its output cannot be learnt: the
+        // after-the-upscaler path is where the model runs with Ray Reconstruction there), the run is kept through
+        // pauses as before: ended by each, it would begin again at every resume and leave the frames without the
+        // model for [`RAY_RECONSTRUCTION_SETTLE`], with nothing to protect.
         if let Some(r) = record.filter(|r| r.is_rr()) {
-            if self.rr_evaluate(r.seq) {
+            let evaluated = self.rr_evaluate(r.seq);
+            if keeps_rr_run(evaluated, after_dlss_last().is_some()) {
                 note_ray_reconstruction();
             }
         }
@@ -7386,8 +7392,16 @@ pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
 type Held = (Instant, u32, bool, (u32, u32));
 static LAST_HELD: Mutex<Option<Held>> = Mutex::new(None);
 
-/// The current run of DLSS Ray Reconstruction's launch-bearing submits a device of the process saw ([`Tracker::rr_running`]):
-/// when it began (submits less than [`RAY_RECONSTRUCTION_HAND_BACK`] apart) and the last one.
+/// Whether a launch-bearing submit whose newest record is Ray Reconstruction's keeps its run going
+/// ([`note_ray_reconstruction`]): when it carries another evaluate than the last (`evaluated`), and, in a process that
+/// never had a hold after DLSS (`held_after`), every such submit, as before the holds after DLSS.
+fn keeps_rr_run(evaluated: bool, held_after: bool) -> bool {
+    evaluated || !held_after
+}
+
+/// The current run of DLSS Ray Reconstruction a device of the process saw ([`Tracker::refresh`]): when it began (its
+/// evaluates less than [`RAY_RECONSTRUCTION_HAND_BACK`] apart; where no hold after DLSS ever was, its launch-bearing
+/// submits, [`keeps_rr_run`]) and the last one.
 static RAY_RECONSTRUCTION_RUN: Mutex<Option<SrLaunches>> = Mutex::new(None);
 
 /// When a hold after DLSS's output last got as far as asking for the network ([`note_after_dlss_tried`]).
@@ -7409,12 +7423,6 @@ pub(crate) fn note_after_dlss() {
 /// frame for nothing.
 pub(crate) fn note_after_dlss_tried() {
     *lock(&AFTER_DLSS_TRIED_AT) = Some(Instant::now());
-}
-
-/// Whether holds after DLSS's output were recorded or tried within [`RAY_RECONSTRUCTION_HAND_BACK`] of `now`.
-fn after_dlss_lately(now: Instant) -> bool {
-    let recent = |at: Option<Instant>| at.is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK);
-    recent(*lock(&AFTER_DLSS_AT)) || recent(*lock(&AFTER_DLSS_TRIED_AT))
 }
 
 /// The header's `preupscale_state` for a device that is `holding` or not: where its holds are, from the
@@ -7450,7 +7458,32 @@ fn hold_state_of(before: bool, after: bool) -> u32 {
 /// first hold after DLSS can be recorded (DLSS's output is learned from them), and the post path that took them built
 /// the network at the output size and held it while the holds waited (#59).
 pub(crate) fn post_serves(now: Instant) -> bool {
-    post_serves_for(placement::settings(), ray_reconstruction_settled(*lock(&RAY_RECONSTRUCTION_RUN), now), after_dlss_lately(now))
+    let (rr, after) = rr_and_after(*lock(&RAY_RECONSTRUCTION_RUN), after_dlss_last(), now);
+    post_serves_for(placement::settings(), rr, after)
+}
+
+/// What [`post_serves`] plans with at `now`: whether Ray Reconstruction counts as running without its hold (`rr`), and
+/// whether holds after DLSS are recorded or tried lately (`after`), from the Ray Reconstruction `run` and the newest
+/// such hold's mark `held`.
+///
+/// One clock for both. The hold's marks are set when it is recorded, the run's when its buffer is submitted, a few
+/// milliseconds to a frame later, and each expires [`RAY_RECONSTRUCTION_HAND_BACK`] after its own: for the last frame
+/// before a pause there was a moment with the hold's expired and the run's not, "Ray Reconstruction runs and no hold
+/// after DLSS" for a few milliseconds, in which a present started the after-the-upscaler server under the hold (#63:
+/// last hold at 735.785, the post path at 736.786, "another network is open" at 736.862). Ray Reconstruction counts
+/// as running without its hold only once it was evaluated for [`RAY_RECONSTRUCTION_HAND_BACK`] past the newest hold's
+/// mark: it went on, and no hold came with it.
+fn rr_and_after(run: Option<SrLaunches>, held: Option<Instant>, now: Instant) -> (bool, bool) {
+    let after = held.is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK);
+    let past_hold = |r: SrLaunches| held.is_none_or(|at| r.last.saturating_duration_since(at) >= RAY_RECONSTRUCTION_HAND_BACK);
+    (ray_reconstruction_settled(run, now) && run.is_some_and(past_hold), after)
+}
+
+/// The newest mark of a hold after DLSS's output, recorded ([`note_after_dlss`]) or tried ([`note_after_dlss_tried`]);
+/// `None` while the process never had one.
+fn after_dlss_last() -> Option<Instant> {
+    let (recorded, tried) = (*lock(&AFTER_DLSS_AT), *lock(&AFTER_DLSS_TRIED_AT));
+    recorded.into_iter().chain(tried).max()
 }
 
 /// How long Ray Reconstruction runs before the post path may take its frames ([`post_serves`]).
@@ -7470,8 +7503,8 @@ fn post_serves_for((count, settings): (usize, [u32; neural_forge_protocol::MAX_P
     placement::Plan::of(count, &settings, placement::Frame { rr, output: after, hook: true }).all_present()
 }
 
-/// How long after Ray Reconstruction's last launch-bearing submit the post path keeps running in its
-/// place. Its submits come several times per real frame; a second covers a hitch.
+/// How long after Ray Reconstruction's last evaluate (or launch-bearing submit, [`keeps_rr_run`]) its run goes on, and
+/// the post path with it where it serves Ray Reconstruction's frames. A second covers a hitch.
 const RAY_RECONSTRUCTION_HAND_BACK: Duration = Duration::from_secs(1);
 
 fn note_ray_reconstruction() {
@@ -8404,10 +8437,6 @@ mod tests {
         assert_eq!(t.generation, 1);
     }
 
-    /// The hold after DLSS goes after the last of the launches that write DLSS's output, as many as the evaluates
-    /// between their record and their end wrote it in (Cyberpunk 2077's Ray Reconstruction: 12): learnt from an
-    /// evaluate that ended, then taken at that write. A later evaluate writing it in more parts says so and is
-    /// learnt again. The motion vectors' units there are NGX's `MV.Scale` carried to the output's pixels.
     /// #63, test build 145: Ray Reconstruction with the model held after DLSS, and a pause menu. DLSS is not evaluated
     /// there, but other launch-bearing submits go on (Frame Generation's), each of them a `refresh`. The run of Ray
     /// Reconstruction is kept by its evaluates (a new record), never by those submits: counted as running through the
@@ -8444,6 +8473,10 @@ mod tests {
         assert!(post_serves_for(auto, ray_reconstruction_settled(Some(SrLaunches { since: s(0.0), last: s(41.1) }), s(41.2)), false));
     }
 
+    /// The hold after DLSS goes after the last of the launches that write DLSS's output, as many as the evaluates
+    /// between their record and their end wrote it in (Cyberpunk 2077's Ray Reconstruction: 12): learnt from an
+    /// evaluate that ended, then taken at that write. A later evaluate writing it in more parts says so and is
+    /// learnt again. The motion vectors' units there are NGX's `MV.Scale` carried to the output's pixels.
     #[test]
     fn the_hold_after_dlss_goes_after_the_evaluate_s_last_write_of_its_output() {
         use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};
@@ -11260,6 +11293,53 @@ mod tests {
 
     /// Ray Reconstruction's first frames do not hand the frames to the post path: only once it has run for
     /// RAY_RECONSTRUCTION_SETTLE (the hold after DLSS is learned from its first frames), and only while running.
+    /// #63, the last frame before a pause: its hold after DLSS is recorded at 40.000 s and its buffer, with Ray
+    /// Reconstruction's evaluate, submitted 6 ms later. A second on, the hold's mark has expired and the run's has
+    /// not. That is not "Ray Reconstruction runs without its hold": the post path must not serve in that moment (it
+    /// started its server there, under the live hold), nor in any other of the pause.
+    #[test]
+    fn the_last_frame_before_a_pause_gives_the_post_path_no_moment_to_start() {
+        let t0 = Instant::now();
+        let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
+        let run = Some(SrLaunches { since: s(0.0), last: s(40.006) });
+        let held = Some(s(40.0));
+        let auto = (1, [neural_forge_protocol::enums::placement::AUTO; neural_forge_protocol::MAX_PASSES]);
+        let serves = |now: f64| {
+            let (rr, after) = rr_and_after(run, held, s(now));
+            post_serves_for(auto, rr, after)
+        };
+        assert_eq!(rr_and_after(run, held, s(40.5)), (false, true), "in play: the hold has the frames");
+        // Each millisecond from the hold's expiry to past the run's.
+        for ms in 0..=20 {
+            let now = 41.0 + f64::from(ms) / 1000.0;
+            assert!(!rr_and_after(run, held, s(now)).0, "at {now} s Ray Reconstruction does not count as running without its hold");
+            assert!(!serves(now), "at {now} s the post path does not serve");
+        }
+        assert!(!serves(41.001) && !serves(45.0) && !serves(200.0), "nor later in the pause");
+        // Ray Reconstruction that goes on for a second past the last hold, with no hold: the post path has its frames.
+        let on = Some(SrLaunches { since: s(0.0), last: s(41.2) });
+        assert_eq!(rr_and_after(on, held, s(41.21)), (true, false));
+        assert!(post_serves_for(auto, true, false));
+        assert_eq!(rr_and_after(Some(SrLaunches { since: s(0.0), last: s(40.9) }), held, s(41.05)), (false, false), "not yet a second past it");
+        // Where no hold after DLSS ever was, Ray Reconstruction counts once settled, as before.
+        assert_eq!(rr_and_after(run, None, s(40.5)), (true, false));
+    }
+
+    /// Ray Reconstruction where the hold after DLSS cannot be recorded (never was, in this process): the
+    /// after-the-upscaler path is where the model runs, and a pause must not end the run, or every resume would go
+    /// 2 s without the model while it settles again. Its launch-bearing submits keep it going there, as before; once a
+    /// hold after DLSS was recorded or tried, only its evaluates do.
+    #[test]
+    fn a_game_never_held_after_dlss_keeps_its_ray_reconstruction_run_through_pauses() {
+        assert!(keeps_rr_run(true, false) && keeps_rr_run(true, true), "an evaluate keeps the run going either way");
+        assert!(keeps_rr_run(false, false), "never held after DLSS: the pause's other launches keep it going");
+        assert!(!keeps_rr_run(false, true), "held after DLSS: a pause ends the run");
+        // And such a run, a pause long, still hands the post path the frames (no hold's mark to wait past).
+        let t0 = Instant::now();
+        let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
+        assert_eq!(rr_and_after(Some(SrLaunches { since: s(0.0), last: s(99.9) }), None, s(100.0)), (true, false));
+    }
+
     #[test]
     fn ray_reconstruction_hands_the_post_path_its_frames_only_once_settled() {
         let t0 = Instant::now();
