@@ -71,8 +71,7 @@ impl Desktop {
 
     /// The session's compositor from its environment (`var` reads a variable, empty counting as unset; `exists`
     /// says whether a path exists): a gamescope session (`GAMESCOPE_WAYLAND_DISPLAY`), Hyprland
-    /// (`HYPRLAND_INSTANCE_SIGNATURE`, while `$XDG_RUNTIME_DIR/hypr/<signature>/.socket.sock`, or before Hyprland 0.40
-    /// `/tmp/hypr/<signature>/.socket.sock`, exists) and sway (`SWAYSOCK`, while that socket exists) by the variables
+    /// (`HYPRLAND_INSTANCE_SIGNATURE`, while `$XDG_RUNTIME_DIR/hypr/<signature>/.socket.sock` exists) and sway (`SWAYSOCK`, while that socket exists) by the variables
     /// they set for their clients, which are there even when a session started from a console has no
     /// `XDG_CURRENT_DESKTOP` (and a nested Hyprland keeps its parent's); then `XDG_CURRENT_DESKTOP`'s
     /// colon-separated names (`ubuntu:GNOME`, `KDE`, `Hyprland`, `sway:wlroots`, `COSMIC`), the first one known.
@@ -82,9 +81,8 @@ impl Desktop {
             return Some(Desktop::Gamescope);
         }
         if let Some(signature) = get("HYPRLAND_INSTANCE_SIGNATURE") {
-            let runtime = get("XDG_RUNTIME_DIR").map(|dir| std::path::Path::new(&dir).join("hypr"));
-            let dirs = runtime.into_iter().chain([std::path::PathBuf::from("/tmp/hypr")]);
-            if dirs.map(|dir| dir.join(&signature).join(".socket.sock")).any(|socket| exists(&socket)) {
+            let socket = get("XDG_RUNTIME_DIR").map(|dir| std::path::Path::new(&dir).join("hypr").join(&signature).join(".socket.sock"));
+            if socket.is_some_and(|socket| exists(&socket)) {
                 return Some(Desktop::Hyprland);
             }
         }
@@ -245,7 +243,8 @@ pub fn parse_kscreen(text: &str) -> Vec<Output> {
 /// `auto`, `srgb`, `wide`, `edid`, `hdr`, `hdredid`, `dcip3`, `dp3`, `adobe`): `hdr` and `hdredid` (PQ with BT.2020
 /// primaries) are HDR output. Any other preset is not HDR itself, but with `render:cm_auto_hdr` (on by default) a
 /// fullscreen HDR game switches the monitor to HDR while the preset reads the same, so its state is not known: the
-/// preset is said as what it is. Without the field (Hyprland before 0.52, which had no HDR output) it is off.
+/// preset is said as what it is. Without the field (Hyprland before 0.52, which already had HDR
+/// presets and `render:cm_auto_hdr` but did not report them) the state is not known either.
 pub fn parse_hyprland(text: &str) -> Vec<Output> {
     let Ok(serde_json::Value::Array(monitors)) = serde_json::from_str::<serde_json::Value>(text) else { return Vec::new() };
     monitors
@@ -254,7 +253,7 @@ pub fn parse_hyprland(text: &str) -> Vec<Output> {
         .filter_map(|m| {
             let name = m.get("name")?.as_str()?.to_string();
             Some(match m.get("colorManagementPreset").and_then(|p| p.as_str()) {
-                None => Output { name, hdr: Some(false), detail: String::new() },
+                None => Output { name, hdr: None, detail: "HDR state not reported (Hyprland before 0.52)".into() },
                 Some(preset @ ("hdr" | "hdredid")) => Output { name, hdr: Some(true), detail: format!("cm {preset}") },
                 Some(preset) => Output { name, hdr: None, detail: format!("preset {preset} (not HDR itself)") },
             })
@@ -348,12 +347,15 @@ mod tests {
             "Hyprland: DP-1 HDR on (cm hdr), HDMI-A-1 preset srgb (not HDR itself); with render:cm_auto_hdr, on by default, a fullscreen HDR game \
              switches the display to HDR"
         );
-        // `hdredid` is HDR too; `auto` (the default) is never said to be off; a Hyprland before 0.52 has no preset at all.
+        // `hdredid` is HDR too; `auto` (the default) is never said to be off; a Hyprland before 0.52 reports no preset at all.
         assert_eq!(parse_hyprland(r#"[{"name": "DP-2", "colorManagementPreset": "hdredid"}]"#)[0].hdr, Some(true));
         let auto = parse_hyprland(r#"[{"name": "DP-2", "colorManagementPreset": "auto"}]"#);
         assert_eq!(auto[0].hdr, None);
         assert!(!describe("Hyprland", &auto, &Desktop::Hyprland.probe().unwrap()).contains("HDR off"));
-        assert_eq!(parse_hyprland(r#"[{"name": "DP-2", "currentFormat": "XRGB8888"}]"#), vec![out("DP-2", false)]);
+        assert_eq!(
+            parse_hyprland(r#"[{"name": "DP-2", "currentFormat": "XRGB8888"}]"#),
+            vec![Output { name: "DP-2".into(), hdr: None, detail: "HDR state not reported (Hyprland before 0.52)".into() }]
+        );
         assert!(parse_hyprland("HYPRLAND_INSTANCE_SIGNATURE was not set! (Is Hyprland running?)").is_empty());
     }
 
@@ -387,7 +389,10 @@ mod tests {
         assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "Hyprland")]), &live), Some(Desktop::Hyprland));
         assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "COSMIC")]), &live), Some(Desktop::Cosmic));
         // A session started from a console names none, but the compositor's own variable is there.
-        assert_eq!(Desktop::from_env(&env(&[("HYPRLAND_INSTANCE_SIGNATURE", "abc_123_456")]), &live), Some(Desktop::Hyprland));
+        assert_eq!(
+            Desktop::from_env(&env(&[("HYPRLAND_INSTANCE_SIGNATURE", "abc_123_456"), ("XDG_RUNTIME_DIR", "/run/user/1000")]), &live),
+            Some(Desktop::Hyprland)
+        );
         assert_eq!(Desktop::from_env(&env(&[("SWAYSOCK", "/run/user/1000/sway-ipc.1000.42.sock")]), &live), Some(Desktop::Sway));
         assert_eq!(Desktop::from_env(&env(&[("GAMESCOPE_WAYLAND_DISPLAY", "gamescope-0"), ("XDG_CURRENT_DESKTOP", "KDE")]), &live), Some(Desktop::Gamescope));
         assert_eq!(Desktop::from_env(&env(&[("XDG_CURRENT_DESKTOP", "X-Cinnamon"), ("SWAYSOCK", "")]), &live), None);
@@ -407,8 +412,6 @@ mod tests {
         let sway = env(&[("SWAYSOCK", "/run/s.sock"), ("XDG_CURRENT_DESKTOP", "KDE")]);
         assert_eq!(Desktop::from_env(&sway, &sockets), Some(Desktop::Sway));
         assert_eq!(Desktop::from_env(&sway, &gone), Some(Desktop::Kde));
-        // Hyprland before 0.40 kept its socket under /tmp/hypr.
-        assert_eq!(Desktop::from_env(&hypr, &|p: &std::path::Path| p == std::path::Path::new("/tmp/hypr/abc_123/.socket.sock")), Some(Desktop::Hyprland));
     }
 
     #[test]
