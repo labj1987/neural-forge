@@ -298,6 +298,10 @@ group the current placement uses. They are saved as `set_after_passes`, `set_aft
 DLSS), `set_after_overrides` and `set_after_intensity`, ... in `config.ini`, can be set per game, and
 `neural-forge-cli shmctl set after_passes 1` (or `after_scale 0.5`) does the same from a terminal.
 
+![Model tab, the After DLSS / finished frame group opened: Passes after DLSS set to 1, Model resolution after DLSS set to Performance, and Image settings after DLSS with its Edit button](../screenshots/after-dlss.png)
+
+![After DLSS image settings: an own-value switch for each of intensity, local tone, local structure, skin structure, style, auto mask, edit saturation, edit contrast and edit detail, each off](../screenshots/after-dlss-settings.png)
+
 Settings are live: the GUI and the running layer share them through shared memory.
 `neural-forge-cli shmctl status|set|toggle|capture` does the same from a terminal. The Debug tab's
 Capture button (and `shmctl capture`) saves the next presented frame before and after Neural

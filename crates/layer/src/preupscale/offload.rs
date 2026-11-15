@@ -213,17 +213,28 @@ pub(crate) fn status_line() -> Option<String> {
         State::Off => None,
         State::Starting(gpu) => Some(format!("second GPU: starting on {gpu}")),
         State::Active(gpu) if super::offload_pre::serving_hold() => {
-            let line = super::offload_pre::status_line(&gpu, super::offload_pre::serving());
+            let serving = super::offload_pre::serving();
             // The game waits for the other GPU: the trial measures before it tries the game's GPU (`offload_trial`).
             Some(match super::offload_trial::pending_note() {
-                Some(note) => format!("{line}; {note}"),
-                None => line,
+                Some(note) => line_with_note(&gpu, serving, note),
+                None => super::offload_pre::status_line(&gpu, serving),
             })
         }
         State::Active(gpu) => Some(format!("second GPU: the model runs on {gpu}, each frame shown one frame later")),
         State::Stalled(gpu) => Some(format!("second GPU: stalled: a frame on {gpu} did not finish; waiting for it, the frames go out without the model")),
         State::FellBack(why) => Some(format!("second GPU: given up ({why}); the model runs on the game's GPU")),
     }
+}
+
+/// The hold's line on `gpu` with the trial's pending `note` after it. The channel keeps `REASON_BYTES - 1` bytes of the
+/// line: where the GPU's full description (name, IDs, PCI address, driver) would cut the note, the GPU goes by its name.
+pub(crate) fn line_with_note(gpu: &str, serving: super::offload_pre::Serving, note: &str) -> String {
+    let full = format!("{}; {note}", super::offload_pre::status_line(gpu, serving));
+    if full.len() < neural_forge_protocol::REASON_BYTES {
+        return full;
+    }
+    let name = gpu.split_once(" [").map_or(gpu, |(name, _)| name);
+    format!("{}; {note}", super::offload_pre::status_line(name, serving))
 }
 
 /// Whether frames are offloaded now: the server on the other device is serving. The present delays every frame by

@@ -1321,10 +1321,10 @@ after DLSS takes them in `native::stage_passes` (`Passes::after_dlss`; `None` wh
 default path is the one it was), and the after-the-upscaler path in `native_post` (`PassTunings::after_dlss`). The
 pass count follows pass 1's stage (`placement::plan_for`): before the upscaler the Passes setting's, else
 `after_passes` (0: the Passes setting). Since passes never run earlier than pass 1, pass 1's stage is the same with
-either count. `after_scale` (0: `preupscale_scale`) is the model resolution after DLSS; at present
-`working_scale` stays the size. The layer writes the group of the plan it made last (`settings_group`, the current placement's) for the Status tab. A
-switch between the groups is a change of stage (or, after DLSS, of size and count), which the holds and the network's
-build already follow: nothing new is built or freed for it.
+either count. `after_scale` (0: `preupscale_scale`) is the model resolution after DLSS; at present `working_scale`
+stays the size. The layer writes the group of the plan it made last (`settings_group`, the current placement's) for
+the Status tab. A switch between the groups is a change of stage (or, after DLSS, of size and count), which the holds
+and the network's build already follow: nothing new is built or freed for it.
 
 **Two holds in one buffer.** A command buffer can carry the hold before the upscaler and the hold after
 DLSS's output (`inline::Slots::by_cb` holds a list): each has its own staging slot and events, the jobs

@@ -1717,12 +1717,24 @@ mod tests {
         assert!(clear(&mut t, true).is_some());
     }
 
-    /// The pending note fits the Status channel after the offload's longest line.
+    /// The pending note fits the Status channel whole after the offload's line, with the GPU described as the log
+    /// does (Cyberpunk 2077 on an RTX 5070 cut it at "whether the gam"), and the full description stays where it fits.
     #[test]
     fn the_pending_line_fits_the_status_channel() {
-        let both = super::super::offload_pre::Serving { before: true, after: true };
-        let line = format!("{}; {PENDING}", super::super::offload_pre::status_line("NVIDIA GeForce RTX 5080 Laptop GPU", both));
-        assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
+        use super::super::offload_pre::Serving;
+        let line_with_note = super::super::offload::line_with_note;
+        for gpu in [
+            "NVIDIA GeForce RTX 5070 [10de:2f04@0000:01:00.0], NVIDIA 620.70.06",
+            "NVIDIA GeForce RTX 5080 Laptop GPU [10de:2c59@0000:01:00.0], NVIDIA 620.70.06",
+        ] {
+            for serving in [Serving { before: true, after: false }, Serving { before: false, after: true }, Serving { before: true, after: true }] {
+                let line = line_with_note(gpu, serving, PENDING);
+                assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
+                assert!(line.ends_with(PENDING) && line.contains(gpu.split_once(" [").unwrap().0), "{line}");
+            }
+        }
+        let short = line_with_note("GPU [10de:2f04], NVIDIA 1", Serving { before: false, after: true }, PENDING);
+        assert!(short.contains("GPU [10de:2f04], NVIDIA 1 after DLSS"), "{short}");
     }
 
     #[test]
