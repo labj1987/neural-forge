@@ -2909,13 +2909,13 @@ impl Tracker {
         // DLSS recorded meanwhile, auto then put every pass at present, and the after-the-upscaler path took the
         // frames (and the process's one network) from the live hold a second after its last frame (#63).
         //
-        // Where no hold after DLSS was ever recorded or tried in the process (its output cannot be learnt: the
+        // Where no hold after DLSS was recorded or tried in this run (its output cannot be learnt: the
         // after-the-upscaler path is where the model runs with Ray Reconstruction there), the run is kept through
         // pauses as before: ended by each, it would begin again at every resume and leave the frames without the
         // model for [`RAY_RECONSTRUCTION_SETTLE`], with nothing to protect.
         if let Some(r) = record.filter(|r| r.is_rr()) {
             let evaluated = self.rr_evaluate(r.seq);
-            if keeps_rr_run(evaluated, after_dlss_last().is_some()) {
+            if keeps_rr_run(evaluated, held_in_run(*lock(&RAY_RECONSTRUCTION_RUN), after_dlss_last())) {
                 note_ray_reconstruction();
             }
         }
@@ -7393,10 +7393,17 @@ type Held = (Instant, u32, bool, (u32, u32));
 static LAST_HELD: Mutex<Option<Held>> = Mutex::new(None);
 
 /// Whether a launch-bearing submit whose newest record is Ray Reconstruction's keeps its run going
-/// ([`note_ray_reconstruction`]): when it carries another evaluate than the last (`evaluated`), and, in a process that
-/// never had a hold after DLSS (`held_after`), every such submit, as before the holds after DLSS.
+/// ([`note_ray_reconstruction`]): when it carries another evaluate than the last (`evaluated`), and, in a run with no
+/// hold after DLSS (`held_after`, [`held_in_run`]), every such submit, as before the holds after DLSS.
 fn keeps_rr_run(evaluated: bool, held_after: bool) -> bool {
     evaluated || !held_after
+}
+
+/// Whether a hold after DLSS was recorded or tried (`held`, [`after_dlss_last`]) in the Ray Reconstruction `run`: since
+/// it began. Holds of an earlier run do not count, so a game whose hold after DLSS stopped being recordable (another
+/// output, a setting changed in a menu) gets its run kept through pauses again once a run began without one.
+fn held_in_run(run: Option<SrLaunches>, held: Option<Instant>) -> bool {
+    run.zip(held).is_some_and(|(r, h)| h >= r.since)
 }
 
 /// The current run of DLSS Ray Reconstruction a device of the process saw ([`Tracker::refresh`]): when it began (its
@@ -7433,7 +7440,9 @@ fn hold_state(holding: bool) -> u32 {
         return neural_forge_protocol::enums::preupscale_state::WAITING;
     }
     let now = Instant::now();
-    let after = lock(&AFTER_DLSS_AT).is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK);
+    // Holds after DLSS recorded lately, by [`rr_and_after`]'s clock (their own mark alone: a hold only tried is not
+    // one that holds). Ray Reconstruction here is whether it runs at all, with its hold or without.
+    let (_, after) = rr_and_after(None, *lock(&AFTER_DLSS_AT), now);
     let (count, settings) = placement::settings();
     let plan = placement::Plan::of(count, &settings, placement::Frame { rr: ray_reconstruction_running(now), output: after, hook: true });
     hold_state_of(plan.has(placement::Stage::Before), after && plan.has(placement::Stage::Upscaled))
@@ -11334,6 +11343,16 @@ mod tests {
         assert!(keeps_rr_run(true, false) && keeps_rr_run(true, true), "an evaluate keeps the run going either way");
         assert!(keeps_rr_run(false, false), "never held after DLSS: the pause's other launches keep it going");
         assert!(!keeps_rr_run(false, true), "held after DLSS: a pause ends the run");
+        // "Held" is of this run: a hold from before it began does not count (the output stopped being learnable, or
+        // the game came back from a pause into a run without one), and the run is kept through pauses again.
+        let t0 = Instant::now();
+        let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
+        let run = |since: f64, last: f64| Some(SrLaunches { since: s(since), last: s(last) });
+        assert!(held_in_run(run(10.0, 40.0), Some(s(39.9))), "a hold in this run");
+        assert!(held_in_run(run(10.0, 40.0), Some(s(10.0))));
+        assert!(!held_in_run(run(50.0, 60.0), Some(s(39.9))), "the last hold was in the run before this one");
+        assert!(!held_in_run(run(10.0, 40.0), None) && !held_in_run(None, Some(s(39.9))));
+        assert!(keeps_rr_run(false, held_in_run(run(50.0, 60.0), Some(s(39.9)))), "healed: the pause's launches keep the new run going");
         // And such a run, a pause long, still hands the post path the frames (no hold's mark to wait past).
         let t0 = Instant::now();
         let s = |secs: f64| t0 + Duration::from_secs_f64(secs);

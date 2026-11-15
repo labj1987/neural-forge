@@ -672,6 +672,28 @@ pub(crate) const DEAD: &str = "the network is off on this device until the game 
 /// The loader's reason once it lent the network to another device of the process ([`Loader::lend`]).
 const LENT: &str = "lent to another device of the game, which runs the model";
 
+/// Why the after-the-upscaler path of the game's device `device` has no answer now, where its loader says: its
+/// network is off for the session ([`DEAD`]), another device's ([`OPEN_WAIT`]), failed ([`NOT_BUILT`]) or not there
+/// yet ([`LOADING`]); `None` with a network open (the frame is only late) or no loader. For the finished frame's
+/// trial (`offload_trial::finished_present`).
+pub(crate) fn post_miss(device: vk::Device) -> Option<&'static str> {
+    let loader = {
+        let loaders = LOADERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loaders.iter().find(|(d, _)| *d == device.as_raw()).and_then(|(_, l)| l.upgrade())
+    }?;
+    post_miss_of(loader.dead(), loader.failed().as_deref(), loader.network_open())
+}
+
+/// [`post_miss`] for a loader that is `dead`, failed last with `failed`, and has a network `open` or not.
+fn post_miss_of(dead: bool, failed: Option<&str>, open: bool) -> Option<&'static str> {
+    match failed {
+        _ if dead => Some(DEAD),
+        _ if open => None,
+        Some(why) => Some(failed_miss(why, false)),
+        None => Some(LOADING),
+    }
+}
+
 /// The loader's reason once it gave the network back to the second GPU ([`Loader::give_back_network`]).
 const GIVEN_BACK: &str = "the model runs on the second GPU: the faster GPU keeps it";
 
@@ -5813,6 +5835,13 @@ mod tests {
         for why in [refused.as_str(), LENT, "a wait on the network's queue timed out"] {
             assert_eq!(failed_miss(why, true), DEAD, "{why}");
         }
+        // The finished frame's presents get the same from the game's device's loader.
+        assert_eq!(post_miss_of(true, Some(&refused), true), Some(DEAD));
+        assert_eq!(post_miss_of(false, Some(&refused), false), Some(OPEN_WAIT));
+        assert_eq!(post_miss_of(false, Some("no such file"), false), Some(NOT_BUILT));
+        assert_eq!(post_miss_of(false, None, false), Some(LOADING));
+        assert_eq!(post_miss_of(false, Some(&refused), true), None, "open again: the frame is only late");
+        assert_eq!(post_miss_of(false, None, true), None);
         // Each is its own miss: the trial tells them apart by the constant, not by wording.
         let all = [LOADING, NOT_BUILT, OPEN_WAIT, DEAD, WAITING];
         assert!(all.iter().enumerate().all(|(i, a)| all.iter().skip(i + 1).all(|b| a != b)));

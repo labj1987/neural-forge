@@ -240,6 +240,9 @@ pub(crate) struct Trial {
     drift: u32,
     retried: bool,
     prefer_local: bool,
+    /// Why the game's GPU's server has no answer for the finished frame's presents now, where its loader says
+    /// ([`finished_present`]'s `miss`); `None`: no reason known (it answers, or is only late).
+    finished_miss: Option<&'static str>,
     /// A trial was given up for want of a hand-over ([`HANDOVER_MAX`]): the other GPU's server may still end for it.
     orphan: bool,
 }
@@ -478,7 +481,10 @@ impl Trial {
             if !self.finished || offloaded || !self.handed {
                 return (None, None);
             }
-            let verdict = self.local(key, now, composited, (!composited).then_some("no answer from the game's GPU yet"), forced);
+            // Why the game's GPU's server did not answer, where its loader says (`native::post_miss`): the network
+            // still another device's is an abort there too, and one off for the session a verdict.
+            let miss = (!composited).then(|| self.finished_miss.unwrap_or("no answer from the game's GPU yet"));
+            let verdict = self.local(key, now, composited, miss, forced);
             if verdict.is_some() {
                 self.handed = false;
                 // A re-trial cut short by a change of what is held keeps its tie rule for the next try.
@@ -613,8 +619,15 @@ impl Trial {
                 return Some(Verdict::Offload(format!("the game's GPU could not run the model ({}): it goes back to the other GPU", super::native::DEAD)));
             }
             let failed = if miss.is_some_and(is_loading) {
+                if miss == Some(super::native::OPEN_WAIT) {
+                    l.open_waited = true;
+                } else if std::mem::take(&mut l.open_waited) {
+                    // The network came free, and the game's GPU loads it (or fails to) from here: its own budget, and
+                    // its own verdict. One early wait for the other device does not make 15 s of a build that cannot
+                    // be made an abort, tried three times and blamed on the other device.
+                    l.loading = Some(now);
+                }
                 let since = *l.loading.get_or_insert(if l.ran == 0 { l.began } else { now });
-                l.open_waited |= miss == Some(super::native::OPEN_WAIT);
                 now.saturating_duration_since(since) > BUILD_BUDGET
             } else {
                 l.open_waited = false;
@@ -628,9 +641,8 @@ impl Trial {
             };
             l.last = Some(now);
             if failed && l.open_waited {
-                // The network was another device's for some of the budget (whatever the last hold's miss says): a
-                // matter of the order things closed in, not of what the game's GPU can run. The frames go back, and
-                // a later window may try again.
+                // The network was still another device's when the budget ran out: a matter of the order things closed
+                // in, not of what the game's GPU can run. The frames go back, and a later window may try again.
                 self.aborts += 1;
                 self.back = l.finished;
                 self.handed = false;
@@ -741,6 +753,7 @@ impl Trial {
         drift: 0,
         retried: false,
         prefer_local: false,
+        finished_miss: None,
         orphan: false,
     };
 }
@@ -867,7 +880,7 @@ pub(crate) fn finished_status_line() -> Option<String> {
 /// answers it (`super::offload::active`), `composited` when the frame showed the model's answer
 /// ([`Trial::finished_step`]). Nothing without `NEURAL_FORGE_OFFLOAD_GPU`; `NEURAL_FORGE_OFFLOAD_TRIAL=off` tries
 /// nothing. The caller passes `None` only for the swapchain the path works on: another window's present pauses nothing.
-pub(crate) fn finished_present(frame: Option<(u32, u32)>, now: Instant, offloaded: bool, composited: bool) {
+pub(crate) fn finished_present(frame: Option<(u32, u32)>, now: Instant, offloaded: bool, composited: bool, miss: Option<&'static str>) {
     if super::offload::Choice::current() == super::offload::Choice::Off {
         return;
     }
@@ -877,6 +890,7 @@ pub(crate) fn finished_present(frame: Option<(u32, u32)>, now: Instant, offloade
     let (started, verdict, waits) = with_finished(|t| {
         let gameplay = t.counts_as_gameplay(state);
         let waits = offloaded && !gameplay && matches!(t.phase, Phase::Watching) && t.decided.is_none();
+        t.finished_miss = miss;
         let (started, verdict) = t.finished_step(key, now, offloaded, composited, frame.is_some(), gameplay, enabled, forced);
         (started, verdict, waits)
     });
@@ -1189,21 +1203,53 @@ mod tests {
             let again = t.offloaded(KEY, MS(22), MS(21), true, now).or_else(|| t.offloaded(KEY, MS(22), MS(21), true, now));
             assert_eq!(again.is_some(), round < ABORTS, "round {round}: tried again until the third abort");
         }
-        // Mostly the other device's, the last holds a failed build: aborted, not a verdict.
+        // The other device's for 14 s, then free, and the game's GPU cannot build it: its own budget from there (a
+        // second 15 s at the most), and its own verdict, not an abort blamed on the other device.
         let (mut t, mut now) = started(MS(22), MS(21));
+        let freed = now + MS(20) * 700;
         let verdict = spend(&mut t, &mut now, &|k| if k < 700 { OPEN_WAIT } else { NOT_BUILT });
+        assert!(matches!(verdict, Some(Verdict::Offload(ref why)) if why.contains("could not be loaded or built")), "{verdict:?}");
+        let built_for = now.saturating_duration_since(freed);
+        assert!(built_for > BUILD_BUDGET && built_for < BUILD_BUDGET + Duration::from_secs(1), "the build's own budget: {built_for:?}");
+        // One early wait, then a load that comes: no verdict from the wait, the trial measures.
+        let (mut t, mut now) = started(MS(22), MS(21));
+        for miss in [OPEN_WAIT, super::super::native::LOADING, super::super::native::LOADING] {
+            now += MS(20);
+            assert!(t.local(KEY, now, false, Some(miss), false).is_none());
+        }
+        now += MS(13);
+        assert!(t.local(KEY, now, true, None, false).is_none() && t.running());
+        // Still the other device's when the budget ends, after a load in between: aborted.
+        let (mut t, mut now) = started(MS(22), MS(21));
+        let verdict = spend(&mut t, &mut now, &|k| if k == 3 { NOT_BUILT } else { OPEN_WAIT });
         assert!(matches!(verdict, Some(Verdict::Aborted(_))), "{verdict:?}");
-        // The finished frame's trial: the game's GPU's server is to end and the other GPU's to start again.
-        let mut t = Trial::default();
-        let mut now = Instant::now();
-        assert!(t.finished_window(KEY, MS(22), true, now).is_none());
-        assert!(t.finished_window(KEY, MS(22), true, now).is_some(), "the finished frame's trial starts");
-        t.handed_over(now);
-        let verdict = spend(&mut t, &mut now, &|_| OPEN_WAIT);
+        // The finished frame's trial, through the presents (`finished_step`, with the loader's miss as
+        // `finished_present` passes it): the network still the other device's is an abort there too, the game's GPU's
+        // server is told to end and the other GPU's starts again; a network off for the session is a verdict at once.
+        let finished = |miss: &'static str| -> (Trial, Option<Verdict>) {
+            let mut t = Trial::default();
+            let mut now = Instant::now();
+            assert!(t.finished_window(KEY, MS(22), true, now).is_none());
+            assert!(t.finished_window(KEY, MS(22), true, now).is_some(), "the finished frame's trial starts");
+            t.handed_over(now);
+            t.finished_miss = Some(miss);
+            for _ in 0..2000 {
+                now += MS(20);
+                let (_, verdict) = t.finished_step(KEY, now, false, false, true, true, true, false);
+                if verdict.is_some() {
+                    return (t, verdict);
+                }
+            }
+            (t, None)
+        };
+        let (mut t, verdict) = finished(OPEN_WAIT);
         assert!(matches!(verdict, Some(Verdict::Aborted(_))), "{verdict:?}");
         assert!(!t.finished_local(), "the finished frame is the other GPU's again");
         assert!(t.take_back(), "and the game's GPU's server is told to end, once");
         assert!(!t.take_back());
+        let (t, verdict) = finished(super::super::native::DEAD);
+        assert!(matches!(verdict, Some(Verdict::Offload(ref why)) if why.contains("until the game restarts")), "{verdict:?}");
+        assert!(!t.finished_local());
     }
 
     /// #63's lost device began here: a hold that "ran" (recorded for the other GPU before the trial) and then the

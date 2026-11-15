@@ -5162,6 +5162,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 std::time::Instant::now(),
                 crate::preupscale::offload::active(),
                 wait_semaphore.is_some() || series_composed,
+                crate::preupscale::native::post_miss(self.device.handle()),
             );
         }
 
