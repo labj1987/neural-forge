@@ -4,7 +4,7 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
-## Unreleased
+## 4.3.0 — 2026-11-15
 
 **Neural Forge looks and starts right on KDE Plasma, Hyprland and COSMIC**
 
