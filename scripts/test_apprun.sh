@@ -158,4 +158,11 @@ grep -qx "PATH=/usr/bin:/bin" "$tmp/out" || fail "gio-launch-desktop: PATH: $(ca
 grep -q "^GTK_PATH=" "$tmp/out" && fail "gio-launch-desktop: GTK_PATH kept"
 grep -q "NEURAL_FORGE_" "$tmp/out" && fail "gio-launch-desktop: markers kept: $(cat "$tmp/out")"
 grep -qx "KEEP=1" "$tmp/out" || fail "gio-launch-desktop: another variable was lost"
+# A listed name is never globbed (a file named KEEP in the working directory) and a name starting with a digit is
+# skipped, not handed to unset.
+mkdir -p "$tmp/cwd" && : > "$tmp/cwd/KEEP"
+(cd "$tmp/cwd" && env -i PATH="$tmp/app/usr/bin:/usr/bin:/bin" NEURAL_FORGE_BUNDLE_ENV="* 9X PATH" NEURAL_FORGE_ORIG_PATH=/usr/bin:/bin \
+    KEEP=1 "$tmp/app/usr/bin/gio-launch-desktop" nautilus /x > "$tmp/out" 2>&1) || fail "gio-launch-desktop: odd names: $(cat "$tmp/out")"
+grep -qx "real: nautilus /x" "$tmp/out" || fail "gio-launch-desktop: odd names: the real one did not run: $(cat "$tmp/out")"
+grep -qx "KEEP=1" "$tmp/out" || fail "gio-launch-desktop: a listed name was globbed"
 echo "test_apprun: ok"

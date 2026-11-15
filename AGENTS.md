@@ -79,8 +79,9 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   (`scripts/test_apprun.sh`; `scripts/smoke-gui.sh` starts both on Xvfb). Every variable AppRun changes (`PATH`, and
   for the bundled copy the GTK/GIO/pixbuf/schema paths) is listed in `NEURAL_FORGE_BUNDLE_ENV` with its earlier value
   in `NEURAL_FORGE_ORIG_*`. The GUI puts the GLib-level ones back in its own environment at the top of `main()` and
-  the GTK-level ones at startup (`host_env::release`, so what GTK/GIO launch never sees them; `PATH` stays, for
-  `gio-launch-desktop`), and every program the GUI or the supervisor starts is built with
+  the GTK-level ones at startup (`host_env::release`, so what GTK/GIO launch never sees them; `PATH` stays, so the bundled GIO finds
+  `data/gio-launch-desktop`, which restores it for the launched program; under the host copy, GIO's children keep
+  the AppImage's `PATH`), and every program the GUI or the supervisor starts is built with
   `neural_forge_supervisor::host_env::command`, which restores all of them (a test fails on a bare `Command::new`
   outside test modules). Release builds run on Ubuntu 24.04, whose GTK 4.14 / libadwaita 1.5 the bundle carries:
   keep the GUI's `v4_12`/`v1_5` features within that.

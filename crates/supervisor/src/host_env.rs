@@ -13,7 +13,9 @@
 //!   own environment: [`GLIB_VARS`] first thing in `main()` (one thread), [`GTK_VARS`] at the application's
 //!   startup. That covers what GTK and GIO start on the GUI's behalf (`gtk::FileLauncher` hands the process
 //!   environment to the program it launches). `PATH` stays as AppRun set it in the process: the bundled GIO
-//!   finds the AppImage's `gio-launch-desktop` through it.
+//!   finds the AppImage's `gio-launch-desktop` through it, which gives the launched program the host's `PATH`.
+//!   Under the host copy, the host's GIO uses its own `gio-launch-desktop`, so its children keep the AppImage's
+//!   `PATH`.
 //! - [`command`]: every [`std::process::Command`] the GUI and the supervisor code it runs build gets the
 //!   host's value of everything still listed, `PATH` included (a test fails on a bare `Command::new` outside
 //!   test code).
@@ -313,7 +315,8 @@ mod tests {
             assert!(env.lines().any(|l| l == "GSETTINGS_SCHEMA_DIR=/home/u/schemas"), "{env}");
             assert!(!env.contains("GIO_MODULE_DIR=") && !env.contains("GTK_EXE_PREFIX="), "{env}");
         }
-        // GIO's children keep the AppImage's PATH (its gio-launch-desktop); `command`'s get the host's.
+        // The process keeps the AppImage's PATH (the bundled GIO finds its gio-launch-desktop through it, which
+        // restores the host's for the launched program); `command`'s children get the host's directly.
         assert!(plain.lines().any(|l| l == "PATH=/bundle/usr/bin:/usr/bin:/bin"), "{plain}");
         assert!(
             through.lines().any(|l| l == "PATH=/usr/bin:/bin") && !through.contains("NEURAL_FORGE_ORIG_") && !through.contains("NEURAL_FORGE_BUNDLE_ENV"),
