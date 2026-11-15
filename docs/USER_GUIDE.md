@@ -95,7 +95,7 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Status | **Proton copies out of date** (shown only when a Neural Forge Proton copy is older than the Proton it was made from, or its name lacks "Proton" so Steam Cloud skips the saves in its prefix: the copy, both versions or the Steam Cloud problem, and the games that run with it; see [Proton with DLSS parameters](#proton-with-dlss-parameters)), Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
 | Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on; a tested game says where the model runs in it), the launch option to copy by hand for a game you pick, **Proton with DLSS parameters** (below) and **Uninstall…** (see [Uninstall](#uninstall)). |
 
-![Status tab, lower half, while Hogwarts Legacy runs: where the model ran in the game in testing, the HDR verdict saying why the game presents SDR and how to offer it HDR, the model, reset and profiles, and Diagnosis](../screenshots/status-details.png)
+![Status tab, lower half, while Cyberpunk 2077 runs: the layer and the model's placement, where the model ran in the game in testing, the HDR line with the game's HDR10 output and the desktop's HDR state, the model, reset and profiles, and Diagnosis](../screenshots/status-details.png)
 
 **The HDR verdict** (the Status tab's HDR line, `hdr_verdict=` in `neural-forge-cli shmctl status`, Save report and the
 game's log as `[layer] HDR: ...`) says in one line whether the game presents HDR and, when it does not, why:
@@ -241,7 +241,7 @@ a game can have its own sharpening like any other setting ([Settings for one gam
 sharpened where the model runs in the game's frame (before the upscaler or after DLSS), and before the
 sharpening where the model runs on the finished frame.
 
-![Per-pass settings, scrolled to the end: an override switch for each of local tone, local structure, skin structure, style, auto mask, model resolution, edit saturation, edit contrast, edit detail and placement, each off](../screenshots/passes.png)
+![Per-pass settings: the pass, and an override switch for each of intensity, local tone, local structure, skin structure, style, auto mask, model resolution, edit saturation, edit contrast, edit detail and placement, each off](../screenshots/passes.png)
 
 Settings are live: the GUI and the running layer share them through shared memory.
 `neural-forge-cli shmctl status|set|toggle|capture` does the same from a terminal. The Debug tab's
@@ -250,7 +250,7 @@ Forge's composition and says what happened: where the files are and whether the 
 frame, or why nothing was written; clicking again while it waits cancels it, and a request no game
 takes is withdrawn after 5 seconds.
 
-![Debug tab, scrolled to the end: the debug view, the edit cache and scene cuts, and Captures with the Capture button and the captures folder](../screenshots/captures.png)
+![Debug tab: compare mode, split, zoom and swap, the debug view, the edit cache and scene cuts, and Captures with the Capture button and the captures folder](../screenshots/debug.png)
 
 ### Proton with DLSS parameters
 
