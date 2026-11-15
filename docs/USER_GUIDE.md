@@ -644,7 +644,7 @@ Before or after DLSS the game waits for the second GPU's answer to the frame bef
 game's frame sets the frame rate. Where the game waits for it for 60% of each frame or more, 200 frames of that (once
 the second GPU has answered 200 frames before them) are enough: 12 to 17 seconds after the start at 36 fps, depending on how long the network takes to load there. A lighter
 wait (2 ms a frame or more, and a tenth of its frame time) needs two windows of 600 frames in a row with about the same
-frame rate (so 1200 frames after the start at the earliest). Then the model is tried once on the game's GPU: a few seconds of frames there (the network is built there first, about a
+frame rate (so 1800 frames after the start at the earliest, the first window being skipped: about 50 seconds at 36 fps). Then the model is tried once on the game's GPU: a few seconds of frames there (the network is built there first, about a
 second without the model) decide. A game's GPU whose frames come at least 10% faster keeps the model until the game
 restarts; otherwise, or when the game's GPU cannot run the model (it is not built within 15 seconds of frames, or 30
 frames in a row miss it), it goes back to the second GPU, and nothing is tried again. A change of what is held during

@@ -34,7 +34,7 @@ pub(crate) const WAIT_SHARE: f64 = 0.10;
 /// starts on two windows in a row even when their frame times differ ([`Trial::offloaded`]).
 pub(crate) const WAIT_HEAVY: f64 = 0.50;
 /// Holds in a short window of offloaded holds ([`Trial::short_window`]), a third of the summaries' 600: about 6 s at
-/// the #63 reporter's 36 fps, where two 600-hold windows after the first took 33 s at the earliest.
+/// the #63 reporter's 36 fps, where two 600-hold windows after the first took 50 s at the earliest (1800 frames).
 pub(crate) const SHORT_HOLDS: u64 = 200;
 /// The share of the frame time the game waits for the other GPU in a short window where that window alone starts the
 /// trial: the other GPU clearly sets the frame rate (the #63 reporter's game waited 24.1 ms of its 27.5 ms frames).
@@ -373,6 +373,8 @@ impl Trial {
         // trial too, against the shorter of them (the other GPU at its best): after DLSS at 2048x1536 a second GPU
         // held the game to 37-48 fps, its two windows 21 and 27 ms apart, and no trial ever came (#63).
         if !agree(last, frame) && !(heavy && last_heavy) {
+            // No start can follow from these windows: the Status tab has nothing to wait for.
+            self.pending = false;
             return None;
         }
         let frame = if agree(last, frame) { frame } else { frame.min(last) };
@@ -391,11 +393,14 @@ impl Trial {
         }
         if !answered {
             self.answered = None;
+            self.pending = false;
             return None;
         }
         let before = self.answered.replace(key);
-        self.pending = waits(frame, wait);
-        if before != Some(key) || !self.pending || wait.as_secs_f64() < frame.as_secs_f64() * WAIT_CLEAR {
+        // The note shows only where a start can follow: a clear wait here, or a wait the two-window rule is measuring.
+        let clear = waits(frame, wait) && wait.as_secs_f64() >= frame.as_secs_f64() * WAIT_CLEAR;
+        self.pending = clear || (self.pending && waits(frame, wait));
+        if before != Some(key) || !clear {
             return None;
         }
         Some(self.start(key, frame, wait, now))
@@ -1609,6 +1614,29 @@ mod tests {
         assert!(t.short_window(KEY, MS(20), MS(12), true, true, now).is_some());
     }
 
+    /// Two long windows that disagree (and are not both heavy) can start nothing: the note must not stay.
+    #[test]
+    fn disagreeing_borderline_windows_clear_the_note() {
+        let now = Instant::now();
+        let mut t = Trial::default();
+        assert!(t.offloaded(KEY, MS(20), MS(8), true, now).is_none());
+        assert!(t.pending());
+        assert!(t.offloaded(KEY, MS(26), MS(8), true, now).is_none(), "26 ms against 20 ms: not one scene");
+        assert!(!t.pending(), "no start can follow");
+    }
+
+    /// A short window without the other GPU's answers leaves no note behind.
+    #[test]
+    fn an_unanswered_short_window_clears_the_note() {
+        let us = Duration::from_micros;
+        let now = Instant::now();
+        let mut t = Trial::default();
+        assert!(t.short_window(KEY, us(27_500), us(24_100), true, true, now).is_none());
+        assert!(t.pending());
+        assert!(t.short_window(KEY, us(27_500), us(24_100), false, true, now).is_none());
+        assert!(!t.pending());
+    }
+
     /// A borderline wait (a tenth to 60% of the frame) is never started by short windows: the two 600-hold windows
     /// decide, as before.
     #[test]
@@ -1618,9 +1646,10 @@ mod tests {
         for _ in 0..6 {
             assert!(t.short_window(KEY, MS(20), MS(8), true, true, now).is_none(), "8 of 20 ms: borderline");
         }
-        assert!(t.pending(), "it waits: measuring");
+        assert!(!t.pending(), "short windows alone start nothing here: no note");
         assert!(!t.running());
         assert!(t.offloaded(KEY, MS(20), MS(8), true, now).is_none(), "one long window starts nothing");
+        assert!(t.pending(), "it waits for a second long window: measuring");
         assert!(t.short_window(KEY, MS(20), MS(9), true, true, now).is_none());
         assert!(t.offloaded(KEY, MS(20), MS(8), true, now).is_some(), "two that agree do");
         // A heavy wait below the clear share (55%) is the two-window rule's too.
