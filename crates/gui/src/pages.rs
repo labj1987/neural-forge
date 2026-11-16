@@ -527,11 +527,14 @@ impl MainView {
         row("preset", "Strength preset", "Sets the four values below. Reference is Neural Forge's defaults", cx).child(menu).into_any_element()
     }
 
-    /// Asks the display server for the next key press itself where it will say (`keytap`), and reads the session's
-    /// keymap again (the layout may have been changed since the window opened).
+    /// Asks the display server for the next key press itself (`keytap`), and takes the session's keymap and the
+    /// layout in use from the same place (the layout may have been changed since the window opened).
     pub(crate) fn listen_for_key(&mut self, window: &Window) {
         self.pages.key_tap = crate::keytap::KeyTap::start(window);
-        self.read_session_keys(window);
+        match self.pages.key_tap.as_ref().and_then(crate::keytap::KeyTap::keys) {
+            Some(keys) => self.pages.keys = keys,
+            None => self.read_session_keys(window),
+        }
     }
 
     /// The session's keymap, for the toggle key's name and for finding a key by the toolkit's name for it.
@@ -578,6 +581,10 @@ impl MainView {
                     // Which key it was: the display server's own report of the press, else the key that carries the
                     // toolkit's name for it on the session's layout.
                     let pressed = this.pages.key_tap.take().and_then(|mut tap| tap.last_press());
+                    match pressed {
+                        Some(code) => log::info!("toggle key: the display server reported key {code} for \"{key}\""),
+                        None => log::info!("toggle key: no direct report of the press; \"{key}\" is looked up on the keymap"),
+                    }
                     match pressed.or_else(|| this.pages.keys.code_for(key)) {
                         _ if key == "escape" => cx.notify(),
                         Some(code) => this.set_bits(name, get, code, window, cx),
