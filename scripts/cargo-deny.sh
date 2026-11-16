@@ -7,9 +7,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOOLS="${NEURAL_FORGE_NATIVE_TOOLS:-$ROOT/tools/native}"
-CARGO_DENY_VERSION="0.20.2"
+CARGO_DENY_VERSION="0.21.0"
 URL="https://github.com/EmbarkStudios/cargo-deny/releases/download/$CARGO_DENY_VERSION/cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
-SHA="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+SHA="a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903"
 DEST="$TOOLS/cargo-deny"
 
 if [ ! -x "$DEST/cargo-deny" ] || [ "$(cat "$DEST/.fetched-sha256" 2>/dev/null)" != "$SHA" ]; then
