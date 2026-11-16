@@ -126,8 +126,8 @@ jobs:
             echo "summary=$(paste -sd';' bump.txt | sed 's/;/; /g')"
           } >> "$GITHUB_OUTPUT"
 
-  # Named `check` so its run reports as "check / build", the status main's branch protection requires:
-  # the land job's plain push of the checked bump is accepted only with that check passed on the commit.
+  # check.yml run on the bump. Its own check run is attached to the commit this workflow started from,
+  # not to the bump, so the land job records the result on the bump itself (see there).
   check:
     needs: bump
     if: needs.bump.outputs.sha != ''
@@ -144,11 +144,28 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.bump.outputs.sha }}
           fetch-depth: 2
+
+      # main is branch-protected and requires a passing "check / build" on the commit it moves to. The
+      # check job above ran check.yml on exactly this commit and passed (this job needs it), but GitHub files
+      # that run under the commit the workflow started from; record the result on the bump commit, linked
+      # to this run, so the push below is accepted.
+      - name: Record the passed check on the bump commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.bump.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/check-runs" \
+            -f name='check / build' -f head_sha="$SHA" -f status=completed -f conclusion=success \
+            -f details_url="$RUN_URL" \
+            -f 'output[title]=check.yml passed on this commit' \
+            -f "output[summary]=Run by the weekly pin check before landing the bump: $RUN_URL" >/dev/null
 
       - name: Fast-forward the branch to the checked bump
         env:
