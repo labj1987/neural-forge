@@ -70,9 +70,9 @@ struct Waits {
 pub enum Claim {
     /// This is the first copy; the receiver yields once per later launch.
     Primary(Activations),
-    /// Another copy is still starting (it said so) and had not shown its window when this launch stopped waiting: it
-    /// will, so this launch just ends.
-    Starting,
+    /// Another copy (its process id, where the socket tells) is still starting (it said so) and had not shown its
+    /// window when this launch stopped waiting.
+    Starting(Option<u32>),
     /// Another copy took the request and exited without answering, twice over: it is going away, and this launch
     /// ends without a word.
     Gone,
@@ -211,7 +211,7 @@ fn await_answer(stream: &UnixStream, waits: Waits) -> Option<Claim> {
         ACK => Claim::Shown,
         STARTING => match read_line(waits.start_up)?.as_str() {
             ACK => Claim::Shown,
-            _ => Claim::Starting,
+            _ => Claim::Starting(peer_pid(stream)),
         },
         _ => Claim::NotResponding(peer_pid(stream)),
     })
@@ -224,6 +224,12 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
     // SAFETY: SO_PEERCRED writes one `ucred` into the buffer of that size, on a socket this function borrows.
     let rc = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, std::ptr::from_mut(&mut cred).cast(), &mut len) };
     (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
+}
+
+/// What to tell the user when the running copy said it is starting and its window has not come up in the time waited.
+pub fn still_starting_message(pid: Option<u32>) -> String {
+    let which = pid.map(|pid| format!(" (process {pid})")).unwrap_or_default();
+    format!("Neural Forge is still starting{which}.")
 }
 
 /// What to tell the user when the running copy does not answer.
@@ -321,7 +327,13 @@ mod tests {
         let slow = scratch("starting-slow");
         let slow_path = slow.join("test.sock");
         let still_starting = primary(claim_at(&slow_path, None, SOON));
-        assert!(matches!(claim_at(&slow_path, None, SOON), Claim::Starting));
+        match claim_at(&slow_path, None, SOON) {
+            Claim::Starting(pid) => {
+                assert_eq!(pid, Some(std::process::id()));
+                assert_eq!(super::still_starting_message(pid), format!("Neural Forge is still starting (process {}).", std::process::id()));
+            }
+            _ => panic!("a copy that said it is starting is not stuck"),
+        }
         drop(still_starting);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&slow);

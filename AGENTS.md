@@ -211,7 +211,7 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   on a French layout the key in Q's place 16, shown as "A".
 - One window per login (`instance.rs`): a second launch sends its request and waits 2 s for an answer. Until the UI
   loop takes requests, the listener thread answers "starting" at once and the launch then waits up to 15 s for the
-  UI's "ok" (and ends quietly if the window is still not up); once the UI is up, 2 s without "ok" is reported as the
+  UI's "ok" (and says the first copy is still starting if the window is not up by then); once the UI is up, 2 s without "ok" is reported as the
   running copy not responding (`say_without_window`: stderr and the first of zenity, kdialog, notify-send, the
   notification service over D-Bus and xmessage, the order AppRun uses too). A copy that closes the connection
   unanswered has exited: the launch looks once more and takes its place, never calling it stuck.

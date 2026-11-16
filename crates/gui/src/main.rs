@@ -57,8 +57,14 @@ fn main() {
     // Only the first copy goes on: a second launch has asked the running one to show its window.
     let activations = match instance::claim() {
         instance::Claim::Primary(activations) => activations,
-        // Shown, still starting and about to show itself, or on its way out.
-        instance::Claim::Shown | instance::Claim::Starting | instance::Claim::Gone => return,
+        // Shown, or on its way out.
+        instance::Claim::Shown | instance::Claim::Gone => return,
+        // It said it is starting, and its window had not come up in the time waited: the user hears that rather than
+        // nothing (it is not stuck, so nothing is to be closed).
+        instance::Claim::Starting(pid) => {
+            ui::say_without_window(&instance::still_starting_message(pid));
+            return;
+        }
         // Its window is stuck (it listens, but its UI does not answer): starting a second one beside it would have two
         // copies writing the settings, so say what to do instead.
         instance::Claim::NotResponding(pid) => {

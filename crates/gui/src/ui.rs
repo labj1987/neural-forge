@@ -660,6 +660,17 @@ pub fn say_without_window(message: &str) {
     }
 }
 
+/// How long after the window's scale is known its size is fitted to the screen again, and how long after that the
+/// fit is checked (and made once more if it was undone).
+const REFIT_AFTER: Duration = Duration::from_millis(300);
+const REFIT_AGAIN_AFTER: Duration = Duration::from_millis(700);
+
+/// Whether `window` is on a Wayland compositor.
+fn on_wayland(window: &Window) -> bool {
+    use raw_window_handle::{HasDisplayHandle as _, RawDisplayHandle};
+    window.display_handle().is_ok_and(|display| matches!(display.as_raw(), RawDisplayHandle::Wayland(_)))
+}
+
 /// The display with the least room (by area), of several.
 fn smallest(displays: Vec<Rc<dyn gpui_kit::PlatformDisplay>>) -> Option<Rc<dyn gpui_kit::PlatformDisplay>> {
     displays.into_iter().min_by(|a, b| display_area(a.as_ref()).total_cmp(&display_area(b.as_ref())))
@@ -995,14 +1006,38 @@ impl MainView {
     /// Once the window can show messages and dialogs.
     fn started(&mut self, install_error: Option<String>, screen: Option<(i32, i32)>, window: &mut Window, cx: &mut Context<Self>) {
         // The window's first size was fitted to the screen as the toolkit reported it, which on a fractionally scaled
-        // Wayland screen is smaller than the screen is (`logical_screen`): fitted again, once, now that the window's
-        // scale is known.
-        if let Some(reported) = screen {
-            let real = crate::text::logical_screen(reported, window.scale_factor());
-            let (fitted, first) = (crate::text::default_window_size(Some(real)), crate::text::default_window_size(Some(reported)));
-            if fitted != first {
-                window.resize(size(px(fitted.0 as f32), px(fitted.1 as f32)));
-            }
+        // Wayland screen is smaller than the screen is (`logical_screen`). The window's scale is only known once the
+        // compositor has said it, after the window is up: it is fitted again then, and only while it still has its
+        // first size, so a size the user chose is never overridden. A moment later, not at once: a size the
+        // compositor sent before it heard of the new one would undo it (KWin does), which is also why it is done a
+        // second time if the first size comes back, and then left alone.
+        if let Some(reported) = screen.filter(|_| on_wayland(window)) {
+            let first = window.viewport_size();
+            let pending = Rc::new(Cell::new(true));
+            let refit = cx.observe_window_bounds(window, move |_, window, cx| {
+                if !pending.get() || window.scale_factor().fract().abs() < 0.01 {
+                    return;
+                }
+                pending.set(false);
+                cx.spawn_in(window, async move |_, cx| {
+                    for wait in [REFIT_AFTER, REFIT_AGAIN_AFTER] {
+                        cx.background_executor().timer(wait).await;
+                        let refitted = cx.update(|window, _| {
+                            let untouched = window.viewport_size() == first;
+                            let fitted = crate::text::refit(reported, window.scale_factor(), true, untouched);
+                            if let Some((width, height)) = fitted {
+                                window.resize(size(px(width as f32), px(height as f32)));
+                            }
+                            fitted.is_some()
+                        });
+                        if !matches!(refitted, Ok(true)) {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            });
+            self._subs.push(refit);
         }
         self.open_key_tap(window);
         // The layout in use is read again whenever the window gets the focus.

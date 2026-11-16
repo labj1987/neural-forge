@@ -152,6 +152,8 @@ impl WaylandGuest {
             return Err("the seat has no keyboard".into());
         }
         if self.keyboard.is_none() {
+            // What an earlier keyboard heard of the layout in use is not this one's news: unknown until it says.
+            self.state.layout = None;
             self.keyboard = Some(self.seat.get_keyboard(&self.queue.handle(), ()));
         }
         self.queue.roundtrip(&mut self.state)?;
