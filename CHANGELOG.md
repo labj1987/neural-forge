@@ -28,9 +28,10 @@ What works differently:
 - The file dialogs (the look-up table, `nvngx_dlssnr.dll`) list every file; a file that is not the right kind is
   refused with a message after you pick it.
 - The "Settings for" menu is a plain list (no type-to-search).
-- The toggle key: press the key as before; it is taken as the key in that place on your keyboard layout (AZERTY,
-  QWERTZ and the rest included) and shown by its name on it. In an X11 session the number pad's keys are told from
-  the main block's; in a Wayland session a number-pad key counts as the main-block key of the same name.
+- The toggle key: press the key as before. It is taken as the key in that place on your keyboard, whatever the
+  layout (AZERTY, QWERTZ and the rest included), with the number pad's keys told from the main block's, and shown
+  by its name on your layout. Where the desktop does not report the key itself, the key that carries its name on
+  your layout is taken instead.
 - The tabs sit in the title bar; in a window narrower than about 760 pixels they move to the bottom.
 - `NEURAL_FORGE_GTK` is gone (there is one window now, not a GTK to choose).
 

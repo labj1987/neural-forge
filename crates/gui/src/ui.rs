@@ -665,7 +665,8 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
     if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
         no_window("no display server to connect to");
     }
-    let screen = cx.primary_display().map(|display| {
+    // (A Wayland compositor names no primary display: the first one stands in, as the GTK window took the first monitor.)
+    let screen = cx.primary_display().or_else(|| cx.displays().into_iter().next()).map(|display| {
         let area = display.bounds().size;
         (f32::from(area.width) as i32, f32::from(area.height) as i32)
     });

@@ -197,13 +197,14 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - The file dialog (portal) has no file-type filter in GPUI: what was picked is checked afterwards
   (`cube::load`, `extract_all`). A menu is a button with a popup menu (`menu_button`), not a searchable list.
 - The toggle key: GPUI gives a key's name on the current layout, not its hardware code, and the layer reads evdev
-  codes. `keymap.rs` (xkbcommon) names a stored code on the session's layout and finds the key that carries a name on
-  it; `keytap.rs` gets the session's keymap (Wayland: a private connection's `wl_keyboard`, asked for only once the
-  seat says it has a keyboard; X11: `_XKB_RULES_NAMES`) and, on X11, the pressed key's own keycode from XInput 2 raw
-  events on a private connection while the row waits. Never ask a seat without the keyboard capability for a
-  keyboard, and never put a second keyboard on the toolkit's own connection: a headless GNOME Shell 50 segfaulted on
-  the first. Wayland things are tried in a private compositor (`gnome-shell --headless --virtual-monitor 1600x1000
-  --wayland-display NAME --no-x11` under `dbus-run-session`), never first on the desktop in use.
+  codes. While the row waits, `keytap.rs` hears the press from the display server itself: on Wayland a second
+  `wl_keyboard` on the toolkit's connection (it also brings the keymap and the layout in use), on X11 XInput 2 raw
+  key presses on a private connection. `keymap.rs` (xkbcommon) names a stored code on the session's layout, and finds
+  the key that carries a name on it where no direct report comes (the fallback: it cannot tell the number pad from
+  the main block). Never ask a seat for a keyboard before it has said it has one: a headless GNOME Shell 50
+  segfaulted on that. Wayland things are tried in a private compositor or a VM first, never first on the desktop in
+  use; key codes are tested with real ones (QEMU `sendkey` in a VM, `ydotool` on a session): KP_1 must store 79, and
+  on a French layout the key in Q's place 16, shown as "A".
 - One window per login (`instance.rs`): a second launch sends its request and waits 2 s for the "ok" the UI loop
   writes after raising the window; without it, it reports the running copy as not responding (`say_without_window`:
   stderr and the first of kdialog, zenity, notify-send, xmessage). `main` installs the layer before that check.
