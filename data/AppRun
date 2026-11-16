@@ -207,21 +207,38 @@ libcheck_plain() {
     echo "${t//>/›}"
 }
 
+# libcheck_no_display TEXT: whether a dialog program's stderr TEXT says it could not open the display.
+libcheck_no_display() {
+    [[ "$1" == *"Failed to open display"* || "$1" == *"annot open display"* ]]
+}
+
+# libcheck_dialog PROGRAM ARG...: runs a dialog program; 0 when it showed its message (it ended with 0 or 1, as it does
+# once its dialog was closed or confirmed, and did not say it could not open the display, which also ends zenity with
+# 1). Its stderr goes to a temporary file read once it has ended: reading a pipe to its end would also wait for anything
+# it left running.
+libcheck_dialog() {
+    local rc=0 errf err=""
+    errf="$(mktemp 2>/dev/null)" || errf=""
+    "$@" </dev/null >/dev/null 2>"${errf:-/dev/null}" || rc=$?
+    if [[ -n "$errf" ]]; then
+        err="$(<"$errf")"
+        rm -f "$errf"
+    fi
+    ((rc <= 1)) && ! libcheck_no_display "$err"
+}
+
 # libcheck_show TITLE TEXT: TEXT on stderr, and in the first dialog tool that can show it when there is a display.
-# zenity and kdialog exit 0 or 1 once their dialog was shown (closed or confirmed); anything else (127: not runnable,
-# e.g. a zenity built on the same missing libraries) tries the next.
+# zenity and kdialog count as shown when libcheck_dialog says so; anything else (127: not runnable, e.g. a zenity built
+# on the same missing libraries; no display) tries the next.
 libcheck_show() {
-    local rc
     printf '%s: %s\n' "$1" "$2" >&2
     [[ "${LIBCHECK_DIALOG:-}" == none ]] && return 0
     [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
     if command -v zenity >/dev/null 2>&1; then
-        zenity --error --no-markup --title="$1" --text="$2" --width=460 >/dev/null 2>&1; rc=$?
-        ((rc <= 1)) && return 0
+        libcheck_dialog zenity --error --no-markup --title="$1" --text="$2" --width=460 && return 0
     fi
     if command -v kdialog >/dev/null 2>&1; then
-        kdialog --error "$(libcheck_plain "$2")" --title "$1" >/dev/null 2>&1; rc=$?
-        ((rc <= 1)) && return 0
+        libcheck_dialog kdialog --error "$(libcheck_plain "$2")" --title "$1" && return 0
     fi
     if command -v notify-send >/dev/null 2>&1; then
         notify-send -u critical -t 0 -a "$1" "$1" "$(libcheck_plain "$2")" >/dev/null 2>&1 && return 0

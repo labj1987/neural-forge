@@ -13,14 +13,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-mkdir -p "$tmp/app/usr/bin" "$tmp/bin" "$tmp/lib"
+mkdir -p "$tmp/app/usr/bin" "$tmp/bin" "$tmp/lib" "$tmp/tmpdir"
 cp "$ROOT/data/AppRun" "$tmp/app/AppRun"
 GUI="$tmp/app/usr/bin/neural-forge"
 # The GUI stand-in: its arguments one per line, and its environment, sorted.
 printf '#!/bin/sh\nprintf "ran:%%s\\n" "$@"\nenv | sort > "%s/env"\n' "$tmp" > "$GUI"
 chmod 755 "$GUI"
 # Only the tools AppRun uses, so the machine's own ldd, zenity, kdialog or notify-send are never found.
-for tool in dirname readlink sort tail head sed cat env; do ln -s "$(command -v "$tool")" "$tmp/bin/$tool"; done
+for tool in dirname readlink sort tail head sed cat env mktemp rm; do ln -s "$(command -v "$tool")" "$tmp/bin/$tool"; done
 fail() { echo "test_apprun: $*" >&2; exit 1; }
 stub() { printf '#!/bin/sh\n%s\n' "$2" > "$tmp/bin/$1"; chmod 755 "$tmp/bin/$1"; }
 # ldd -r prints $tmp/ldd with @BIN@ as the path it was given (the loader names the object that needs a symbol that
@@ -42,7 +42,7 @@ printf 'ID=ubuntu\nID_LIKE=debian\n' > "$tmp/ubuntu"; printf 'ID=fedora\n' > "$t
 # run VAR=VALUE...: AppRun with only these variables (and PATH), the GUI given two arguments, one with a space.
 run() {
     rm -f "$tmp/out" "$tmp/err" "$tmp/env"
-    env -i PATH="$tmp/bin" LIBCHECK_OS_RELEASE="$tmp/ubuntu" LIBCHECK_GLIBC_HAVE=2.35 "$@" "$BASH" "$tmp/app/AppRun" --flag "a b" > "$tmp/out" 2> "$tmp/err"
+    env -i PATH="$tmp/bin" TMPDIR="$tmp/tmpdir" LIBCHECK_OS_RELEASE="$tmp/ubuntu" LIBCHECK_GLIBC_HAVE=2.35 "$@" "$BASH" "$tmp/app/AppRun" --flag "a b" > "$tmp/out" 2> "$tmp/err"
 }
 ran() {
     [ "$(cat "$tmp/out")" = $'ran:--flag\nran:a b' ] || fail "$1: the GUI did not run with its arguments: $(cat "$tmp/out" "$tmp/err")"
@@ -61,7 +61,7 @@ says() { grep -qF -- "$2" "$tmp/err" || fail "$1: stderr lacks '$2': $(cat "$tmp
 reset
 run FOO="x y" XDG_RUNTIME_DIR=/run/user/1 WAYLAND_DISPLAY=wayland-0 LD_LIBRARY_PATH=/opt/lib || fail "all fine: AppRun failed: $(cat "$tmp/err")"
 ran "all fine"
-expected="$(printf '%s\n' "FOO=x y" "LD_LIBRARY_PATH=/opt/lib" "LIBCHECK_GLIBC_HAVE=2.35" "LIBCHECK_OS_RELEASE=$tmp/ubuntu" "PATH=$tmp/bin" \
+expected="$(printf '%s\n' "FOO=x y" "LD_LIBRARY_PATH=/opt/lib" "LIBCHECK_GLIBC_HAVE=2.35" "LIBCHECK_OS_RELEASE=$tmp/ubuntu" "PATH=$tmp/bin" "TMPDIR=$tmp/tmpdir" \
     "WAYLAND_DISPLAY=wayland-0" "XDG_RUNTIME_DIR=/run/user/1" | sort)"
 got="$(grep -vE '^(PWD|SHLVL|_|OLDPWD)=' "$tmp/env")"
 [ "$got" = "$expected" ] || fail "all fine: the environment changed: $(diff <(echo "$expected") <(echo "$got") || true)"
@@ -166,6 +166,16 @@ if run WAYLAND_DISPLAY=wayland-0 LIBCHECK_DIALOG=none; then fail "dialogs off: A
 if run DISPLAY=:0; then fail "zenity: AppRun exited 0"; fi
 [ "$(cat "$tmp/shown")" = zenity ] || fail "zenity: expected zenity alone, got $(cat "$tmp/shown")"
 refused "zenity"
+# A zenity that cannot open the display ends with 1, as a closed dialog does, and says why on stderr: the next tool
+# shows the message. Its stderr is read once it has ended, not to the end of a pipe that something it left running
+# still holds; the temporary file it went to is removed.
+rm "$tmp/shown"
+stub zenity "echo '(zenity:42): Gtk-WARNING **: cannot open display: :0' >&2; $(command -v sleep) 5 & exit 1"
+started=$SECONDS
+if run DISPLAY=:0; then fail "zenity without a display: AppRun exited 0"; fi
+((SECONDS - started < 4)) || fail "zenity without a display: waited for what it left running"
+grep -q '^kdialog Neural Forge can.t start' "$tmp/shown" || fail "zenity without a display: got $(cat "$tmp/shown")"
+[ -z "$(ls -A "$tmp/tmpdir")" ] || fail "zenity without a display: left $(ls -A "$tmp/tmpdir")"
 rm "$tmp/shown"; stub zenity "exit 127"
 if run DISPLAY=:0; then fail "kdialog: AppRun exited 0"; fi
 grep -q '^kdialog Neural Forge can.t start' "$tmp/shown" || fail "kdialog: got $(cat "$tmp/shown")"

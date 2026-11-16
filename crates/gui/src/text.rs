@@ -402,18 +402,35 @@ pub(crate) const INFO_DIALOGS: &[MessageTool] = &[
     ("zenity", &["--info", "--no-markup", "--title=Neural Forge", "--width=480", "--text"], &[]),
     ("kdialog", &["--title", "Neural Forge", "--msgbox"], &[]),
     ("notify-send", &["--urgency=normal", "--app-name=Neural Forge", "Neural Forge"], &[]),
-    ("gdbus", NOTIFY_BEFORE, &["[]", "{\"urgency\": <byte 1>}", "0"]),
+    // (The desktop's own expiry: information need not stay up.)
+    ("gdbus", NOTIFY_BEFORE, &["[]", "{\"urgency\": <byte 1>}", "-1"]),
     ("xmessage", &["-center"], &[]),
 ];
 
 /// Whether `program`, having ended with exit `code`, did show the message, so the next one must not show it again.
 /// The dialogs end with 0 when the user pressed their button and 1 when the user closed them another way; both mean it
 /// was seen. Anything else (no display, a crash, a signal) does not. notify-send shows nothing itself: only 0 says the
-/// desktop took the message (the same for the notification service asked over D-Bus).
-pub(crate) fn helper_showed(program: &str, code: Option<i32>) -> bool {
+/// desktop took the message (the same for the notification service asked over D-Bus). xmessage ends with 1 when it
+/// could not open the display, and so does zenity, which then says so on its `stderr`.
+pub(crate) fn helper_showed(program: &str, code: Option<i32>, stderr: &str) -> bool {
     match program {
-        "notify-send" | "gdbus" => code == Some(0),
+        "notify-send" | "gdbus" | "xmessage" => code == Some(0),
+        _ if no_display(stderr) => false,
         _ => matches!(code, Some(0 | 1)),
+    }
+}
+
+/// Whether a dialog program's `stderr` says it could not open the display.
+fn no_display(stderr: &str) -> bool {
+    ["Failed to open display", "cannot open display", "Cannot open display"].iter().any(|text| stderr.contains(text))
+}
+
+/// The message as `program` is given it: zenity (`--no-markup`) and xmessage show it as it is; kdialog (Qt rich text)
+/// and the notification service (body markup) get it with nothing they would take as markup (no &, < or >).
+pub(crate) fn message_for(program: &str, message: &str) -> String {
+    match program {
+        "zenity" | "xmessage" => message.to_string(),
+        _ => message.replace('&', "and").replace('<', "‹").replace('>', "›"),
     }
 }
 
@@ -446,10 +463,15 @@ mod no_window_tests {
 
     #[test]
     fn an_error_dialog_that_was_seen_is_not_shown_twice() {
-        assert!(helper_showed("zenity", Some(0)) && helper_showed("kdialog", Some(1)));
-        assert!(!helper_showed("zenity", Some(127)) && !helper_showed("zenity", None));
-        assert!(helper_showed("notify-send", Some(0)) && !helper_showed("notify-send", Some(1)));
-        assert!(helper_showed("gdbus", Some(0)) && !helper_showed("gdbus", Some(1)));
+        let shown = |program, code| helper_showed(program, code, "");
+        assert!(shown("zenity", Some(0)) && shown("kdialog", Some(1)));
+        assert!(!shown("zenity", Some(127)) && !shown("zenity", None));
+        assert!(shown("notify-send", Some(0)) && !shown("notify-send", Some(1)));
+        assert!(shown("gdbus", Some(0)) && !shown("gdbus", Some(1)));
+        assert!(shown("xmessage", Some(0)) && !shown("xmessage", Some(1)), "xmessage ends with 1 when it can't open the display");
+        assert!(!helper_showed("zenity", Some(1), "(zenity:42): Gtk-WARNING **: cannot open display: :0\n"), "zenity with no display ends with 1 too");
+        assert!(!helper_showed("zenity", Some(1), "Failed to open display\n"));
+        assert!(!helper_showed("kdialog", Some(1), "qt.qpa.xcb: could not connect to display\nCannot open display\n"));
         for tools in [super::ERROR_DIALOGS, super::INFO_DIALOGS] {
             let order: Vec<&str> = tools.iter().map(|&(program, ..)| program).collect();
             assert_eq!(order, ["zenity", "kdialog", "notify-send", "gdbus", "xmessage"], "the order AppRun's libcheck_show tries them in");
@@ -461,6 +483,14 @@ mod no_window_tests {
         assert!(!said(super::INFO_DIALOGS, "--expire-time"));
         assert!(!said(super::INFO_DIALOGS, "--error") && !said(super::INFO_DIALOGS, "critical"), "a start that takes long is no error");
         assert!(said(super::INFO_DIALOGS, "--info") && said(super::INFO_DIALOGS, "--msgbox") && said(super::INFO_DIALOGS, "--urgency=normal"));
+        let expiry = |tools: &[super::MessageTool]| tools.iter().find(|(program, ..)| *program == "gdbus").map(|(_, _, after)| after[after.len() - 1]);
+        assert_eq!(expiry(super::ERROR_DIALOGS), Some("0"), "an error's notification stays until it is closed");
+        assert_eq!(expiry(super::INFO_DIALOGS), Some("-1"), "information gets the desktop's own expiry");
+        assert_eq!(super::message_for("zenity", "a <b> & c"), "a <b> & c");
+        assert_eq!(super::message_for("xmessage", "a <b> & c"), "a <b> & c");
+        for program in ["kdialog", "notify-send", "gdbus"] {
+            assert_eq!(super::message_for(program, "a <b> & c"), "a ‹b› and c");
+        }
     }
 }
 

@@ -192,8 +192,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Fonts: `ui::init` names installed families for the UI and fixed-width fonts before the toolkit starts; without that
   GPUI warns about ".SystemUIFont" on every Linux system. Nothing may log at warn level on a normal start
   (`NEURAL_FORGE_GUI_LOG=info` shows the renderer picked). On Xvfb GPUI logs "Found no xinput mouse pointers" at error
-  level, and in a D-Bus session with no desktop portal or accessibility bus its D-Bus crate warns that the service is
-  unknown: the session's lacks, which `scripts/smoke-gui.sh` lets through.
+  level, which `scripts/smoke-gui.sh` lets through (the D-Bus crate's warning that a service is unknown in a bare
+  session is no longer shown: the logger caps zbus at error).
 - The file dialog (portal) has no file-type filter in GPUI: what was picked is checked afterwards
   (`cube::load`, `extract_all`). A menu is a button with a popup menu (`menu_button`), not a searchable list.
 - The toggle key: GPUI gives a key's name on the current layout, not its hardware code, and the layer reads evdev
@@ -209,16 +209,28 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   segfaulted on that. Wayland things are tried in a private compositor or a VM first, never first on the desktop in
   use; key codes are tested with real ones (QEMU `sendkey` in a VM, `ydotool` on a session): KP_1 must store 79, and
   on a French layout the key in Q's place 16, shown as "A".
-- One window per login (`instance.rs`): a second launch sends its request and waits 2 s for an answer. Until the UI
-  loop takes requests, the listener thread answers "starting" at once and the launch then waits up to 15 s for the
-  UI's "ok" (and says the first copy is still starting if the window is not up by then); once the UI is up, 2 s without "ok" is reported as the
-  running copy not responding (`say_without_window`: stderr and the first of zenity, kdialog, notify-send, the
-  notification service over D-Bus and xmessage, the order AppRun uses too). A copy that closes the connection
-  unanswered has exited: the launch looks once more and takes its place, never calling it stuck.
-  `main` installs the layer before that check.
+- One window per login (`instance.rs`): a second launch sends its request and waits 2 s for an answer. Until the
+  window has drawn its first frame (`UiUp`, set from `window.on_next_frame` in `build_ui`, not from the UI loop's
+  first wait for a request), the listener thread answers "starting" at once and the launch waits up to 15 s from its
+  request for the UI's "ok"; if the window is not up by then it says the first copy is still starting, as information
+  (`tell_without_window`: zenity `--info`, kdialog `--msgbox`, a notification of normal urgency with the desktop's own
+  expiry) and exits 0. Once the window is up, 2 s without "ok" is reported as the running copy not responding, an error
+  (`say_without_window`: stderr and the first of zenity, kdialog, notify-send, the notification service over D-Bus
+  and xmessage, the order AppRun uses too) with exit 1. A dialog program counts as shown only if it ended with 0 or 1
+  and its stderr (a private unlinked temporary file, read after it exits, never a pipe read to its end) does not say
+  it could not open the display. A copy that closes the connection unanswered (end of file, reset, broken pipe) is
+  going away: the launch asks again every 75 ms for up to 2 s from the first such close, and takes its place once
+  nobody listens, never calling it stuck. `instance::release` removes the socket file, then shuts the listener down
+  (in that order); it runs when the last window closes and at the start of `no_window`, which also drops the
+  `Activations` so launches queued there hear the end at once; a connection accepted after the release is dropped
+  unanswered. `main` installs the layer before that check. Tests of the messages run stand-in programs on a private
+  `PATH` with `DISPLAY=:9999`, no `WAYLAND_DISPLAY` and a private `XDG_RUNTIME_DIR`, never a real dialog.
 - A dialog's continuation runs through `Once` from every way out: the toolkit's `close_dialog` (what a button calls)
   does not call the dialog's `on_close`.
-- The logger shows the toolkit's chatty dependencies (`chatty` in `main.rs`: zbus, tracing, ...) only from warn up.
+- The logger caps what each source may show (`CAPS` in `main.rs`, whatever `NEURAL_FORGE_GUI_LOG` asks for): the
+  toolkit's chatty dependencies (tracing, naga, ...) from warn up; zbus (its "Failed to populate properties cache"
+  warning for a service a desktop lacks) and `gpui::window::a11y` (its harmless "set_focus called more than once in a
+  single frame" with a screen reader on) from error up.
 - The window's first size is fitted to the screen (`default_window_size`). On Wayland the toolkit reports a
   fractionally scaled screen too small and the window's scale arrives only after it is up, so the fit is made again
   then (`refit`, `refit_armed` in `text.rs`: Wayland only, one screen, the window still at its first size, within its
