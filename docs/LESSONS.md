@@ -1405,6 +1405,24 @@ ReShade, dlssg-to-fsr3, the FSR 4 overrides, HelixSR), read for what Neural Forg
   `DLSS5_TEMPORAL_MODE`; DLSS5VKLayer measured an answer carried into newer frames as a dead end twice, ATTRIBUTION.md
   "The composition strategy", which argues against it unless the band split changes that), and HDR on the after-the-upscaler path (RenoDX's resource upgrade; HDR
   swapchains pass through untouched today).
+  Whoever builds the reactive-mask item checks the mask's format first: OptiScaler (GPL-3.0, `93866854`) found games
+  that pass a reactive or bias mask in an integer format, which can't be read as a float, and now ignores those; do the
+  same (log it once, treat it as no mask).
+
+November 16: when the HUD-less image arrives. ANR's nr-replay found hosts that copy `DLSSG.HUDLess` after the frame
+generation evaluate, so NGX gets the previous frame's. A test-only build of the wrapper (never merged) copied
+`DLSSG.HUDLess` and `DLSSG.Backbuffer` on the FG evaluate's own command list, right before NVIDIA's call (so in GPU
+order with what NGX reads), into readback buffers, in bursts of consecutive evaluates during the built-in benchmarks (FG
+on, Preset C, 2560x1440, SDR). Each real frame's first evaluate was compared with its own backbuffer and with the
+previous real frame's, HUD pixels left out (those that differ from both). Both games hand over the HUD-less image on
+time. Cyberpunk 2077 (FG 3x, 9 frame pairs in the benchmark's moving camera): mean abs error 0.0008 of 1 (PSNR 57 dB)
+against its own backbuffer, 0.017-0.032 (PSNR about 25 dB) against the previous one. GTA V Enhanced (FG 4x, 9 pairs):
+bit-identical outside the HUD in two moving passes (error 0.0000, PSNR 53-63 dB) against 0.025-0.046 (PSNR 20-26 dB) for
+the previous backbuffer, and still clearly current (0.015-0.039 against 0.084-0.099) in the fade at the benchmark's
+start. In both the difference image is only the HUD (the FPS counter, GTA's exit hint). The rule for any HUD-mask code:
+pair the HUD-less image with the backbuffer it matches, so check that per game (in these two, the same evaluate's); in a
+game where it is one frame late, pair it with the previous frame's backbuffer, never the current one, or every moving
+edge becomes "HUD".
 
 ## October 23: Metro Last Light Redux, NVIDIA's own NR as the reference
 
@@ -1994,6 +2012,34 @@ the fix (none reached a release):
 - **Decision (2026-11-12):** game tests set the games' own resolution to 2560x1440 (the desktop stays at 3840x2160);
   4K to be looked at again later. The same 12 GB limit applies to 4.1.0: the guard and the after-DLSS network are
   unchanged.
+
+## November 16: DLSS SR preset on the after-the-upscaler path
+
+- **The claim:** DLSS5-Feeder 2.0.0 (MIT) says the model run after DLSS leaves white text and bright areas speckled
+  with every DLSS Super Resolution preset except L and M. Neural Forge never sets the preset.
+- **Measured (RTX 5070, installed layer, GTA V Enhanced benchmark at 2560x1440, DLSS Quality, frame generation 4x with
+  Preset C, FrameLimit 120, `placement=upscaled`):** one launch through Steam per preset (the game's own, then
+  `DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE=on` with `DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION=render_preset_l`
+  or `render_preset_m`). Each was recorded with `vw`, and 2 s of the night pier scene (pass 3: strings of small bulbs,
+  neon) were measured at 60 frames a second, aligned by image match. "Isolated" pixels are pixels more than 32 levels
+  above both their 8 neighbours and a 7x7 ring around them. Flicker is the mean frame-to-frame change of the peak of
+  300 small tracked lights.
+
+  | SR preset | Isolated bright pixels per frame (mean / p95) | Strict (> 64 levels) | Light flicker (mean abs change / std) |
+  |---|---|---|---|
+  | game's own | 8.4 / 21 | 0.18 | 12.3 / 30.7 |
+  | L | 12.3 / 36 | 0.43 | 10.1 / 23.8 |
+  | M | 10.2 / 27 | 0.41 | 11.1 / 28.5 |
+
+  The "isolated" pixels are almost all real bulbs in the light strings, not speckles; none of the three recordings shows
+  speckles at full size. The flicker numbers move with the camera and the run-to-run timing, so their spread is noise
+  at this sample.
+- **Why L and M change little here:** dxvk-nvapi applied the override (its log: `Override DLSS-SR presets = 0xc` and
+  `0xd`), but the game ships `nvngx_dlss.dll` 310.4.0, and NGX's log confirmed only the frame-generation override
+  (`Feature [FrameGeneration] Override Reported ... Applied: Yes`), with no line for Super Resolution. The game's DLL
+  may not have L and M at all.
+- **Decision:** no change; Neural Forge keeps leaving the SR preset to the game. Look at this again only with a game
+  whose DLSS DLL has L and M, and with NGX's log confirming the override.
 
 ## Deliberately not done, or left open
 
