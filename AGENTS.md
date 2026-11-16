@@ -159,7 +159,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - The rows are drawn from the header: a switch or menu row reads its field when it is rendered and writes it with
   `MainView::set_bits`; nothing is kept in step by hand. A spin row is a `Spin` (a number field created once, in
   `add_setting_spins`, `FLOAT_SPINS`/`INT_SPINS`): a new float setting gets a line there and a `spin_row` in its page.
-  After anything writes the header call `MainView::changed`. What else can change it (shmctl, a profile, a game's
+  The toolkit's number field steps its own text by 1 unless told not to: `Spin::new` turns that off (`set_step(None)`) and
+  moves the value itself on the step event. After anything writes the header call `MainView::changed`. What else can change it (shmctl, a profile, a game's
   session) is picked up by `tick`, once a second, which compares `Live` (every status text and the settings'
   snapshot) with what is shown and redraws only on a difference.
 - The window must not cost a game anything. No continuous redraw: `cx.notify()` only from an edit, from `tick` on a
@@ -197,6 +198,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   (`cube::load`, `extract_all`). A menu is a button with a popup menu (`menu_button`), not a searchable list.
 - The toggle key: GPUI gives a key's name on the current layout, not its hardware code, and the layer reads evdev
   codes: `keys.rs` maps names to the code of the US-layout key.
+- Clicks, the wheel and typing can be tested on the private X display with `xdotool` (window-relative positions in
+  device pixels, twice the logical ones at 2x), reading the scratch `config.ini` afterwards for what was saved.
 - Before a release, on GNOME, KDE Plasma, Hyprland and COSMIC: start, every tab, a number field (type, step, Enter),
   a menu, the per-pass dialog, a question (Reset), the file dialog, light/dark switch, a second start; and with no
   GPU: lavapipe (`VK_DRIVER_FILES` at the `lvp_icd` manifest), OpenGL ES only (`VK_DRIVER_FILES=/dev/null`), no

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, InputState, NumberInput, NumberInputEvent, StepAction};
+use gpui_kit::component::input::{InputEvent, InputState, NumberInput, NumberInputEvent, NumberStep, StepAction};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tab::{Tab as TabItem, TabBar};
@@ -462,7 +462,12 @@ impl Spin {
         after: fn(&mut V, &mut Window, &mut Context<V>),
     ) -> (Self, [Subscription; 2]) {
         let text = Self::text_for(step, get());
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(text));
+        let input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).default_value(text);
+            // The toolkit's own stepping (by 1, on the text) is off: a step comes as an event and moves the value itself.
+            state.set_step(None::<NumberStep>, window, cx);
+            state
+        });
         let spin = Self { input: input.clone(), get, set, lower, upper, step };
         let typed = {
             let spin = spin.clone();
