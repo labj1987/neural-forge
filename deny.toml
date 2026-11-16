@@ -14,16 +14,31 @@ exclude-dev = true
 yanked = "deny"
 unmaintained = "all"
 unsound = "all"
-ignore = []
+# All of these come with the GUI's toolkit (gpui-kit, pinned in crates/gui/Cargo.toml) and are "unmaintained" notices,
+# not vulnerabilities; none can be updated away while the toolkit asks for them. Re-check each at a toolkit bump.
+ignore = [
+    { id = "RUSTSEC-2024-0384", reason = "instant (a clock shim): unmaintained, no known flaw; pulled in by the toolkit's dependencies" },
+    { id = "RUSTSEC-2024-0436", reason = "paste (a proc macro, runs only in the compiler): archived by its author, no known flaw" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz (text shaping of the system's own fonts): unmaintained, no known flaw; the toolkit's text stack uses it" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser (reads the system's own fonts): unmaintained, no known flaw; the toolkit's text stack uses it" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: now developed inside zbus; the toolkit's D-Bus crates (portals, accessibility) still name the standalone crate" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: now developed inside zbus; the toolkit's D-Bus crates still name the standalone crate" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: now developed inside zbus; the toolkit's D-Bus crates still name the standalone crate" },
+]
 
 [licenses]
 # The licences found in the dependency graph, each compatible with AGPL-3.0-or-later.
 allow = [
+    "0BSD",
     "AGPL-3.0-or-later",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
     "ISC",
     "MIT",
+    "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
 ]
@@ -31,7 +46,7 @@ confidence-threshold = 0.9
 
 [bans]
 # Two versions of one crate are reported, not refused: they come from dependencies' own requirements
-# (png's miniz_oxide 0.8, the GTK -sys crates' two system-deps, syn 2 and 3 in different proc macros).
+# (png's miniz_oxide 0.8, syn 2 and 3 in different proc macros).
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true

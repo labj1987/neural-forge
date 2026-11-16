@@ -137,11 +137,69 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Every release re-reads all three and updates or removes what the release changed, including the
   screenshots and the measured results. A new environment variable gets a row in the user guide's table.
 - Screenshots are always the dark theme, 2880x1800: the window at its default size on a large screen
-  (1440x900, the tabs in the header bar) at 2x. A headless run (Xvfb, `dbus-run-session`) has no portal and falls
-  back to light: set `ADW_DEBUG_COLOR_SCHEME=prefer-dark`. Give it a scratch `HOME`, XDG directories and a private
-  `XDG_RUNTIME_DIR` (the GUI's startup updates the NGX wrapper in the Proton copies it finds through `$HOME`, and a
-  second session's helpers in the real runtime directory disturb the desktop's). Look at every image before
-  committing it.
+  (1440x900, the tabs in the title bar) at 2x. On a private X display (Xvfb at 3200x2000, `dbus-run-session`):
+  `GPUI_X11_SCALE_FACTOR=2` for the scale, `NEURAL_FORGE_GUI_THEME=dark` (a headless session has no desktop preference to
+  follow), `NEURAL_FORGE_GUI_OPEN` for the tab or dialog and `NEURAL_FORGE_GUI_SCROLL` for a tab's lower part, the lavapipe
+  ICD in `VK_DRIVER_FILES`, and the window alone captured (`import -window`). Give it a scratch `HOME`, XDG directories
+  and a private `XDG_RUNTIME_DIR` (the GUI's startup updates the NGX wrapper in the Proton copies it finds through
+  `$HOME`, and a second session's helpers in the real runtime directory disturb the desktop's). Look at every image
+  before committing it.
+
+## UI (GPUI Kit)
+
+- The toolkit is `gpui-kit`, pinned to an exact version in `crates/gui/Cargo.toml` (0.9.x releases weekly and pins GPUI
+  itself as the `gpui-pre` snapshot crates). It draws with wgpu: Vulkan first, OpenGL ES through EGL second; Mesa's
+  software drivers count. Bump it on purpose, then re-run the checks below. Its sources are the reference:
+  `~/.cargo/registry/src/*/gpui-component-*`, `gpui-base-*`, `gpui-pre-*`.
+- Shape (`crates/gui/src`): `ui.rs` has the toolkit set-up, the pieces pages are made of (`group`, `row`, `Spin`,
+  `menu_button`, `ask`, `inform`, `toast`) and `MainView` with the title bar, tabs and periodic updates; `pages.rs` the
+  five pages, the "Settings for" bar, the per-pass dialog (`PassDialog`), the target editor (`TargetEditor`), About and
+  the error window; `text.rs` every text and decision that needs no window, with the tests; `keys.rs` the toggle
+  key's table; `shm.rs` the saving of settings; `instance.rs`/`activation.rs` the single instance.
+- The rows are drawn from the header: a switch or menu row reads its field when it is rendered and writes it with
+  `MainView::set_bits`; nothing is kept in step by hand. A spin row is a `Spin` (a number field created once, in
+  `add_setting_spins`, `FLOAT_SPINS`/`INT_SPINS`): a new float setting gets a line there and a `spin_row` in its page.
+  After anything writes the header call `MainView::changed`. What else can change it (shmctl, a profile, a game's
+  session) is picked up by `tick`, once a second, which compares `Live` (every status text and the settings'
+  snapshot) with what is shown and redraws only on a difference.
+- The window must not cost a game anything. No continuous redraw: `cx.notify()` only from an edit, from `tick` on a
+  difference, and from `sample_telemetry` (5 Hz) only while the Status tab shows a graph with samples in it. Before a
+  release that touches the GUI, measure the open, idle window beside a game (`nvidia-smi pmon` and `--query-compute-apps`
+  for its GPU time and memory, `top` for its CPU). `main` removes `NEURAL_FORGE_ENABLE` from its own environment
+  before anything else, so the layer is never loaded into the window's own Vulkan instance: check
+  `/proc/<pid>/maps` for `libneural_forge_layer` after a change there.
+- Work off the UI thread goes through `MainView::run` (a closure on the background executor, its result delivered to
+  the view). Nothing that reads Steam's files, runs a program or waits may run in `render` or a click handler.
+- Dialogs: always through `window.open_dialog` with `.overlay(false)` (the toolkit's dimming layer also paints the
+  client-side shadow margin, a dark frame around the window on KDE and GNOME), the content in `named_group(..)`, the
+  buttons in `dialog_buttons()` inside that group (not the toolkit's footer), a button given the focus when it opens
+  (`ask` gives it to Cancel: every question here removes or risks something), and the text above the buttons capped
+  with `dialog_room(window)` and scrollable: the toolkit cuts off a dialog taller than the window. Run what a button
+  starts with `window.defer` after `close_dialog`, so a follow-up dialog is not the one that gets closed. Dialog
+  builders run on every frame (`Fn`): one-shot state travels in `Rc<RefCell<Option<..>>>`, and content that changes
+  while open is its own view.
+- Enter in a dialog: the toolkit sends Enter to the dialog's `on_ok` before the focused button sees it. Every dialog
+  therefore sets `on_ok` and acts as the focused button (`enter_key`), returning false (stay open) anywhere else; the
+  per-pass dialog never closes on Enter (it belongs to its number fields).
+- Nothing may show a message before the window has the toolkit's root view (that is, from `MainView::new`):
+  `push_notification` panics there. `show_toast` prints to stderr instead, and what must be said at start runs from
+  `MainView::started`.
+- Screen readers: GPUI reports only elements with an id and a role. Use `label(id, text)` for text (never a bare
+  string child in a dialog or row), `accessibility_label` on icon buttons, switches, number fields and buttons that
+  repeat per row, and `toast()` for messages (it also feeds the `Announcer` live region; the toolkit's notifications
+  are not announced). Ids are scoped by the nearest element with an id, so each `row` has its own.
+- Fonts: `ui::init` names installed families for the UI and fixed-width fonts before the toolkit starts; without that
+  GPUI warns about ".SystemUIFont" on every Linux system. Nothing may log at warn level on a normal start
+  (`NEURAL_FORGE_GUI_LOG=info` shows the renderer picked). On Xvfb GPUI logs "Found no xinput mouse pointers" at error
+  level: that display's lack, which `scripts/smoke-gui.sh` lets through.
+- The file dialog (portal) has no file-type filter in GPUI: what was picked is checked afterwards
+  (`cube::load`, `extract_all`). A menu is a button with a popup menu (`menu_button`), not a searchable list.
+- The toggle key: GPUI gives a key's name on the current layout, not its hardware code, and the layer reads evdev
+  codes: `keys.rs` maps names to the code of the US-layout key.
+- Before a release, on GNOME, KDE Plasma, Hyprland and COSMIC: start, every tab, a number field (type, step, Enter),
+  a menu, the per-pass dialog, a question (Reset), the file dialog, light/dark switch, a second start; and with no
+  GPU: lavapipe (`VK_DRIVER_FILES` at the `lvp_icd` manifest), OpenGL ES only (`VK_DRIVER_FILES=/dev/null`), no
+  driver (the app's own message), no loader (AppRun's message). Retake the screenshots when a page's look changes.
 
 ## Tested games and the sweep
 

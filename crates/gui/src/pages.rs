@@ -684,6 +684,7 @@ impl MainView {
             .flex_1()
             .min_h_0()
             .w_full()
+            .track_scroll(&self.scroll[self.tab as usize])
             .overflow_y_scroll()
             .child(v_flex().w_full().max_w(px(1100.)).mx_auto().px_6().py_5().gap_6().children(groups))
             .into_any_element()

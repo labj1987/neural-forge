@@ -29,6 +29,11 @@ impl log::Log for StderrLog {
 }
 
 fn main() {
+    // The window is drawn with Vulkan, and Neural Forge is a Vulkan layer: its switch must never reach this process (a
+    // terminal or launcher that exported it for a game), or the window would load the layer into itself. First thing,
+    // while the process has one thread.
+    // SAFETY: no other thread exists yet to read or write the environment.
+    unsafe { std::env::remove_var("NEURAL_FORGE_ENABLE") };
     // Only the first copy goes on: a second launch has asked the running one to show its window.
     let Some(activations) = instance::claim() else {
         return;

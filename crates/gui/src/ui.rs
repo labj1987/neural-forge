@@ -622,6 +622,13 @@ fn no_window(error: &str) -> ! {
     std::process::exit(1);
 }
 
+/// Writes the settings changed a moment ago, which wait for their save (`shm::SAVE_DELAY`).
+fn save_pending_settings() {
+    if let Err(e) = crate::shm::flush_settings() {
+        eprintln!("neural-forge: saving config.ini failed: {e}");
+    }
+}
+
 pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<String>) {
     // With no display GPUI would run on with no window and no word about it.
     if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
@@ -687,6 +694,9 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
     };
 
     cx.on_window_closed(|cx, _| {
+        // However the window went (the title bar's close button removes it without asking `on_window_should_close`): a
+        // change made in the last moment is still saved.
+        save_pending_settings();
         if cx.windows().is_empty() {
             cx.quit();
         }
@@ -802,6 +812,8 @@ pub struct MainView {
     banner_closed: bool,
     pub(crate) telemetry: Telemetry,
     pub(crate) desktop_hdr: Option<String>,
+    /// Each tab's scroll position.
+    pub(crate) scroll: [gpui_kit::ScrollHandle; 5],
     pub(crate) pages: crate::pages::PageState,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
@@ -823,6 +835,7 @@ impl MainView {
             banner_closed: false,
             telemetry: Telemetry::default(),
             desktop_hdr: None,
+            scroll: Default::default(),
             pages,
             _tasks: Vec::new(),
             _subs: Vec::new(),
@@ -915,9 +928,7 @@ impl MainView {
         });
         // A change made in the last moment before closing is still saved.
         window.on_window_should_close(cx, |_, _| {
-            if let Err(e) = crate::shm::flush_settings() {
-                eprintln!("neural-forge: saving config.ini failed: {e}");
-            }
+            save_pending_settings();
             true
         });
         view.focus_handle.focus(window, cx);
@@ -935,6 +946,11 @@ impl MainView {
             crate::shm::on_save_error(move |message| {
                 let _ = handle.update(&mut async_cx.clone(), |_, window, cx| toast(window, cx, &message));
             });
+        }
+        // Developer aid, with `NEURAL_FORGE_GUI_OPEN`: `NEURAL_FORGE_GUI_SCROLL=<pixels>` starts the tab scrolled down
+        // that far, for a screenshot of its lower part.
+        if let Some(down) = neural_forge_protocol::env::var("NEURAL_FORGE_GUI_SCROLL").and_then(|v| v.parse::<f32>().ok()) {
+            self.scroll[self.tab as usize].set_offset(gpui_kit::point(px(0.), px(-down.max(0.))));
         }
         match neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
             Some("passes") => crate::pages::open_pass_dialog(&self.shm, window, cx),
@@ -1147,7 +1163,11 @@ impl MainView {
         TabBar::new(id)
             .segmented()
             .selected_index(selected)
-            .children(Tab::ALL.into_iter().map(|tab| TabItem::new().label(tab.title()).prefix(Icon::new(tab.icon()).small())))
+            .children(
+                Tab::ALL
+                    .into_iter()
+                    .map(|tab| TabItem::new().aria_label(tab.title()).child(h_flex().gap_1p5().child(Icon::new(tab.icon()).small()).child(tab.title()))),
+            )
             .on_click(cx.listener(|this, index: &usize, _, cx| this.pick_tab(Tab::ALL[(*index).min(Tab::ALL.len() - 1)], cx)))
     }
 }

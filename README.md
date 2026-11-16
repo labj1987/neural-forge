@@ -2,7 +2,7 @@
 
 Neural Forge runs NVIDIA's DLSS 5 neural-rendering network in Linux games, on your own GPU. In games
 that use DLSS the network works on the frame before DLSS upscales it; in other games it works on the
-finished frame. A GTK4 app (and a CLI) sets it up and tunes it.
+finished frame. A settings app (and a CLI) sets it up and tunes it.
 
 This is experimental, personal-use software that runs NVIDIA's proprietary model weights outside
 NVIDIA's own runtime. Read [Legal](#legal) before you use it.
@@ -18,10 +18,10 @@ NVIDIA's own runtime. Read [Legal](#legal) before you use it.
 ## Requirements
 
 - x86_64 Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40 or later). Nothing else to install for the
-  window: Neural Forge uses the desktop's own GTK 4 and libadwaita when they are new enough (so it follows the
-  desktop's accent colour), and otherwise the ones it brings with it, so it also runs where neither is installed (a
-  stock KDE Plasma or Hyprland install). It takes the basics every desktop has from the system: OpenGL/EGL drivers,
-  X11 or Wayland client libraries, and fontconfig, freetype, harfbuzz and fribidi.
+  window: it is drawn by Neural Forge itself (with GPUI), the same on GNOME, KDE Plasma, COSMIC, Hyprland and sway,
+  and needs no GTK or Qt. It takes the basics every desktop has from the system: the X11 or Wayland client
+  libraries (libxcb, libxkbcommon, libwayland-client), a Vulkan or OpenGL ES driver (Mesa's software drivers count)
+  and a file-dialog portal (xdg-desktop-portal) for the two file pickers.
 - An NVIDIA RTX 40-series or newer GPU with a Vulkan driver that offers `VK_NV_cuda_kernel_launch`,
   `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2` and `VK_EXT_shader_float8` (tested with
   615.71.09, 615.78.08 and 620.70.06). On other GPUs the layer does nothing.
@@ -96,9 +96,10 @@ says what to do.
 - **"The network is paused: too little video memory".** The model resumes once there is room. A 12 GB
   card is at its limit at 4K: close programs that hold video memory (browsers with hardware
   acceleration).
-- **Neural Forge does not open.** If a basic system library is missing (graphics drivers, fonts) it says
-  which, in a dialog where one can be shown. Started from a terminal, its first line says whether it uses the
-  desktop's GTK or its own, and why; `NEURAL_FORGE_GTK=bundled` (or `=host`) picks one.
+- **Neural Forge does not open.** If a system library is missing (the X11 or Wayland client libraries, a Vulkan
+  or OpenGL ES loader) it says which and how to install it, in a dialog where one can be shown; with no working
+  graphics driver at all it says so the same way. Started from a terminal with `NEURAL_FORGE_GUI_LOG=info`, it
+  prints which renderer it draws with. Games do not need the window: the layer and `neural-forge-cli` work without it.
 - **HDR does not come on.** The Status tab's HDR line says why. Under Proton add
   `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` to the launch options (Proton-GE), or start gamescope
   with `--hdr-enabled`; if HDR10 was available, switch on the game's own HDR setting. The line also

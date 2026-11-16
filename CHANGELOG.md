@@ -4,6 +4,33 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.5.0 — 2026-11-15
+
+**The same window on every desktop, and no GTK needed**
+
+- The settings window is drawn by Neural Forge itself now (with GPUI) instead of GTK 4 and libadwaita. It looks and
+  works the same on GNOME, KDE Plasma, COSMIC, Hyprland and sway, with its own title bar, and follows the desktop's
+  light or dark mode. Every tab, setting, status line and dialog is where it was; your settings, profiles and games
+  are untouched, and nothing changes in the games.
+- The AppImage no longer carries a copy of GTK and needs none on the system. It takes only the windowing and graphics
+  libraries every desktop has (libxcb, libxkbcommon, Wayland's client library, and Vulkan or OpenGL ES; Mesa's software
+  drivers count). If one is missing, it says which and how to install it instead of not opening.
+- The window is drawn with the graphics card only when something in it changes: left open beside a game it takes no
+  GPU time, and a little video memory. It never loads Neural Forge's own layer into itself.
+- Starting Neural Forge a second time shows the window that is already open.
+
+What works differently:
+
+- A dialog no longer dims the window behind it, and a click outside it does not close it: use its buttons, its close
+  button or Esc. While one is open, drag the window by the dialog's title.
+- The file dialogs (the look-up table, `nvngx_dlssnr.dll`) list every file; a file that is not the right kind is
+  refused with a message after you pick it.
+- The "Settings for" menu is a plain list (no type-to-search).
+- The toggle key: press the key as before. Function, navigation and lock keys are taken as they are; a letter, digit
+  or punctuation key is taken as the key that carries it on a US layout.
+- The tabs sit in the title bar; in a window narrower than about 760 pixels they move to the bottom.
+- `NEURAL_FORGE_GTK` is gone (there is one window now, not a GTK to choose).
+
 ## 4.3.0 — 2026-11-15
 
 **Neural Forge looks and starts right on KDE Plasma, Hyprland and COSMIC**

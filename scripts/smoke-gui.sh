@@ -11,7 +11,10 @@ set -euo pipefail
 
 # verdict STDERR-FILE: why the run's stderr fails (the offending lines, then a summary), or nothing.
 verdict() {
-    if grep -E "error while loading shared libraries|undefined symbol|panicked|can't start|^neural-forge: (WARN|ERROR) " "$1"; then
+    # Xvfb has no XInput pointer device, which the toolkit reports at error level and works without: that one line is
+    # the display's, not the GUI's.
+    if grep -v "Found no xinput mouse pointers" "$1" \
+        | grep -E "error while loading shared libraries|undefined symbol|panicked|can't start|^neural-forge: (WARN|ERROR) "; then
         echo "errors on stderr"
     fi
     return 0
@@ -21,6 +24,8 @@ if [ "${1:-}" = "--self-test" ]; then
     t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
     printf 'neural-forge: INFO [neural_forge::app] window opened\nneural-forge: DEBUG [x] WARN in a message is fine\n' > "$t/ok"
     [ -z "$(verdict "$t/ok")" ] || { echo "self-test: a clean run failed"; exit 1; }
+    printf 'neural-forge: ERROR [gpui_linux::linux::x11::client] Found no xinput mouse pointers.\n' > "$t/xvfb"
+    [ -z "$(verdict "$t/xvfb")" ] || { echo "self-test: Xvfb's missing pointer failed a run"; exit 1; }
     for bad in 'neural-forge: WARN [neural_forge::status] no channel' 'neural-forge: ERROR [gpui] boom' \
         "thread 'main' panicked at src/main.rs:1:1:" \
         './neural-forge: error while loading shared libraries: libxcb.so.1: cannot open shared object file' \
