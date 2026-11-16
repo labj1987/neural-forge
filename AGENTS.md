@@ -219,6 +219,13 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - A dialog's continuation runs through `Once` from every way out: the toolkit's `close_dialog` (what a button calls)
   does not call the dialog's `on_close`.
 - The logger shows the toolkit's chatty dependencies (`chatty` in `main.rs`: zbus, tracing, ...) only from warn up.
+- The window's first size is fitted to the screen (`default_window_size`). On Wayland the toolkit reports a
+  fractionally scaled screen too small and the window's scale arrives only after it is up, so the fit is made again
+  then (`refit`, `refit_armed` in `text.rs`: Wayland only, one screen, the window still at its first size, within its
+  first 3 s; a moment after the scale is known and once more if KWin's pending configure undoes it). A toolkit quirk
+  seen on KDE at 150%: after maximize and restore the window comes back at the first, too-small size, because the
+  toolkit restores to the bounds it remembers from before the refit (gpui-pre-linux `wayland/window.rs`,
+  `state.window_bounds`); not patched here.
 - Clicks, the wheel and typing can be tested on the private X display with `xdotool` (window-relative positions in
   device pixels, twice the logical ones at 2x), reading the scratch `config.ini` afterwards for what was saved.
 - Before a release, on GNOME, KDE Plasma, Hyprland and COSMIC: start, every tab, a number field (type, step, Enter),

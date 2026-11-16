@@ -364,32 +364,44 @@ pub(crate) fn default_window_size(screen: Option<(i32, i32)>) -> (i32, i32) {
     (w.clamp(MIN_WIDTH, WIDE), h.clamp(MIN_HEIGHT, HIGH))
 }
 
-/// The programs tried, in order, to show a message when the app has no window, each with the arguments before and
-/// after the message: the same order as AppRun's (zenity, kdialog, notify-send, the notification service over D-Bus,
-/// xmessage).
-pub(crate) const ERROR_DIALOGS: &[(&str, &[&str], &[&str])] = &[
+/// One program that can show a message when the app has no window: its name and the arguments before and after the
+/// message.
+pub(crate) type MessageTool = (&'static str, &'static [&'static str], &'static [&'static str]);
+
+/// The arguments that ask the desktop's notification service to show a message, before and after its text.
+const NOTIFY_BEFORE: &[&str] = &[
+    "call",
+    "--session",
+    "--dest",
+    "org.freedesktop.Notifications",
+    "--object-path",
+    "/org/freedesktop/Notifications",
+    "--method",
+    "org.freedesktop.Notifications.Notify",
+    "--",
+    "Neural Forge",
+    "0",
+    "",
+    "Neural Forge",
+];
+
+/// The programs tried, in order, to show an error when the app has no window: the same order as AppRun's (zenity,
+/// kdialog, notify-send, the notification service over D-Bus, xmessage).
+pub(crate) const ERROR_DIALOGS: &[MessageTool] = &[
     ("zenity", &["--error", "--no-markup", "--title=Neural Forge", "--width=480", "--text"], &[]),
     ("kdialog", &["--title", "Neural Forge", "--error"], &[]),
     ("notify-send", &["--urgency=critical", "--app-name=Neural Forge", "Neural Forge"], &[]),
-    (
-        "gdbus",
-        &[
-            "call",
-            "--session",
-            "--dest",
-            "org.freedesktop.Notifications",
-            "--object-path",
-            "/org/freedesktop/Notifications",
-            "--method",
-            "org.freedesktop.Notifications.Notify",
-            "--",
-            "Neural Forge",
-            "0",
-            "",
-            "Neural Forge",
-        ],
-        &["[]", "{\"urgency\": <byte 2>}", "0"],
-    ),
+    ("gdbus", NOTIFY_BEFORE, &["[]", "{\"urgency\": <byte 2>}", "0"]),
+    ("xmessage", &["-center"], &[]),
+];
+
+/// The same programs showing something that is no error (a first copy that is still starting): an information
+/// dialog, a notification of normal urgency.
+pub(crate) const INFO_DIALOGS: &[MessageTool] = &[
+    ("zenity", &["--info", "--no-markup", "--title=Neural Forge", "--width=480", "--text"], &[]),
+    ("kdialog", &["--title", "Neural Forge", "--msgbox"], &[]),
+    ("notify-send", &["--urgency=normal", "--app-name=Neural Forge", "Neural Forge"], &[]),
+    ("gdbus", NOTIFY_BEFORE, &["[]", "{\"urgency\": <byte 1>}", "0"]),
     ("xmessage", &["-center"], &[]),
 ];
 
@@ -437,8 +449,15 @@ mod no_window_tests {
         assert!(!helper_showed("zenity", Some(127)) && !helper_showed("zenity", None));
         assert!(helper_showed("notify-send", Some(0)) && !helper_showed("notify-send", Some(1)));
         assert!(helper_showed("gdbus", Some(0)) && !helper_showed("gdbus", Some(1)));
-        let order: Vec<&str> = super::ERROR_DIALOGS.iter().map(|&(program, ..)| program).collect();
-        assert_eq!(order, ["zenity", "kdialog", "notify-send", "gdbus", "xmessage"], "the order AppRun's libcheck_show tries them in");
+        for tools in [super::ERROR_DIALOGS, super::INFO_DIALOGS] {
+            let order: Vec<&str> = tools.iter().map(|&(program, ..)| program).collect();
+            assert_eq!(order, ["zenity", "kdialog", "notify-send", "gdbus", "xmessage"], "the order AppRun's libcheck_show tries them in");
+        }
+        let said =
+            |tools: &[super::MessageTool], word: &str| tools.iter().any(|(_, before, after)| before.iter().chain(after.iter()).any(|arg| arg.contains(word)));
+        assert!(said(super::ERROR_DIALOGS, "--error") && said(super::ERROR_DIALOGS, "critical"));
+        assert!(!said(super::INFO_DIALOGS, "--error") && !said(super::INFO_DIALOGS, "critical"), "a start that takes long is no error");
+        assert!(said(super::INFO_DIALOGS, "--info") && said(super::INFO_DIALOGS, "--msgbox") && said(super::INFO_DIALOGS, "--urgency=normal"));
     }
 }
 
@@ -472,6 +491,18 @@ pub(crate) fn logical_screen(reported: (i32, i32), window_scale: f32, wayland: b
     ((reported.0 as f32 * factor).round() as i32, (reported.1 as f32 * factor).round() as i32)
 }
 
+/// How long after the window is up the fit to the real screen may still be made: the compositor says the window's scale
+/// within its first moments. Later scale changes (the user changing the screen's scale, the window moving to another
+/// screen) are not what the first fit got wrong.
+pub(crate) const REFIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether the fit to the real screen may still be made: only for a window that still has its first size (`untouched`),
+/// within [`REFIT_WINDOW`] of its start, on a desktop that had one screen when it started (with several, the reported
+/// size is not known to be the one the window opened on).
+pub(crate) fn refit_armed(untouched: bool, since_start: std::time::Duration, screens_at_start: usize) -> bool {
+    untouched && since_start < REFIT_WINDOW && screens_at_start <= 1
+}
+
 /// The size to give the window once its scale is known, if its first size (fitted to the screen as reported) was
 /// fitted to a screen reported too small: only while the window still has that first size (`untouched`), so a size
 /// the user chose is never overridden. `None`: leave it.
@@ -503,6 +534,12 @@ mod window_size_tests {
         assert_eq!(refit((1280, 720), 1.5, true, false), None, "never over a size the user chose");
         assert_eq!(refit((1280, 720), 1.0, true, true), None, "the scale not known yet, or 100%: the first fit stands");
         assert_eq!(refit((2560, 1440), 1.5, true, true), None, "a screen large enough either way");
+        // The fit is only made early, on an untouched window, with one screen.
+        let (soon, late) = (std::time::Duration::from_millis(400), super::REFIT_WINDOW);
+        assert!(super::refit_armed(true, soon, 1));
+        assert!(!super::refit_armed(false, soon, 1), "the window has another size: the user's, or the compositor's");
+        assert!(!super::refit_armed(true, late, 1), "a scale that changes later is not the first fit's mistake");
+        assert!(!super::refit_armed(true, soon, 2), "two screens: which one was reported is not known");
         // X11: the toolkit reports the screen divided by the true scale (1920x1080 at 125% as 1536x864): no correction,
         // or the window would be made larger than the screen.
         assert_eq!(logical_screen((1536, 864), 1.25, false), (1536, 864));

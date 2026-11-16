@@ -641,11 +641,20 @@ fn no_window(error: &str) -> ! {
 /// Tells the user something when this process has no window to say it in: on stderr, and in the first dialog or
 /// notification tool the desktop has (with no display there is nowhere to show one).
 pub fn say_without_window(message: &str) {
+    say_with(crate::text::ERROR_DIALOGS, message);
+}
+
+/// The same for something that is no error (a first copy that is still starting): an information dialog.
+pub fn tell_without_window(message: &str) {
+    say_with(crate::text::INFO_DIALOGS, message);
+}
+
+fn say_with(tools: &[crate::text::MessageTool], message: &str) {
     eprintln!("neural-forge: {message}");
     if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
         return;
     }
-    for (program, before, after) in crate::text::ERROR_DIALOGS {
+    for (program, before, after) in tools {
         let status = std::process::Command::new(program)
             .args(*before)
             .arg(message)
@@ -1011,11 +1020,20 @@ impl MainView {
         // first size, so a size the user chose is never overridden. A moment later, not at once: a size the
         // compositor sent before it heard of the new one would undo it (KWin does), which is also why it is done a
         // second time if the first size comes back, and then left alone.
-        if let Some(reported) = screen.filter(|_| on_wayland(window)) {
+        let (wayland, screens, started_at) = (on_wayland(window), cx.displays().len(), Instant::now());
+        if let Some(reported) = screen.filter(|_| wayland && screens <= 1) {
             let first = window.viewport_size();
             let pending = Rc::new(Cell::new(true));
             let refit = cx.observe_window_bounds(window, move |_, window, cx| {
-                if !pending.get() || window.scale_factor().fract().abs() < 0.01 {
+                if !pending.get() {
+                    return;
+                }
+                // Over for good once the window has another size or its first moments have passed.
+                if !crate::text::refit_armed(window.viewport_size() == first, started_at.elapsed(), screens) {
+                    pending.set(false);
+                    return;
+                }
+                if window.scale_factor().fract().abs() < 0.01 {
                     return;
                 }
                 pending.set(false);
@@ -1024,7 +1042,7 @@ impl MainView {
                         cx.background_executor().timer(wait).await;
                         let refitted = cx.update(|window, _| {
                             let untouched = window.viewport_size() == first;
-                            let fitted = crate::text::refit(reported, window.scale_factor(), true, untouched);
+                            let fitted = crate::text::refit(reported, window.scale_factor(), wayland, untouched);
                             if let Some((width, height)) = fitted {
                                 window.resize(size(px(width as f32), px(height as f32)));
                             }

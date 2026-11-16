@@ -62,7 +62,7 @@ fn main() {
         // It said it is starting, and its window had not come up in the time waited: the user hears that rather than
         // nothing (it is not stuck, so nothing is to be closed).
         instance::Claim::Starting(pid) => {
-            ui::say_without_window(&instance::still_starting_message(pid));
+            ui::tell_without_window(&instance::still_starting_message(pid));
             return;
         }
         // Its window is stuck (it listens, but its UI does not answer): starting a second one beside it would have two
