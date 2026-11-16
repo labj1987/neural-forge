@@ -197,17 +197,25 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - The file dialog (portal) has no file-type filter in GPUI: what was picked is checked afterwards
   (`cube::load`, `extract_all`). A menu is a button with a popup menu (`menu_button`), not a searchable list.
 - The toggle key: GPUI gives a key's name on the current layout, not its hardware code, and the layer reads evdev
-  codes. While the row waits, `keytap.rs` hears the press from the display server itself: on Wayland a second
-  `wl_keyboard` on the toolkit's connection (it also brings the keymap and the layout in use), on X11 XInput 2 raw
-  key presses on a private connection. `keymap.rs` (xkbcommon) names a stored code on the session's layout, and finds
-  the key that carries a name on it where no direct report comes (the fallback: it cannot tell the number pad from
-  the main block). Never ask a seat for a keyboard before it has said it has one: a headless GNOME Shell 50
+  codes. `keytap.rs` keeps one second line to the display server's keyboard for the window's life (`KeyTap::open`): on
+  Wayland a guest registry and seat on the toolkit's connection, with a `wl_keyboard` taken only while the row waits
+  for a key (it receives the press with its evdev code) or for the moment it takes to read the keymap; on X11 a
+  private connection that selects XInput 2.1 raw key presses while the row waits. `keymap.rs` (xkbcommon) names a
+  stored code on the session's layout and, where no direct report comes, finds the key that carries a name on it (the
+  fallback: it cannot tell the number pad from the main block). The layout in use: X11's XKB state group; on Wayland
+  the group of a modifiers event if the compositor sends one to a new keyboard (Hyprland does not), else what the
+  last bound press showed (`layout_of_press`). The keymap is read at start, when the window gets the focus and when a
+  key is waited for. Never ask a seat for a keyboard before it has said it has one: a headless GNOME Shell 50
   segfaulted on that. Wayland things are tried in a private compositor or a VM first, never first on the desktop in
   use; key codes are tested with real ones (QEMU `sendkey` in a VM, `ydotool` on a session): KP_1 must store 79, and
   on a French layout the key in Q's place 16, shown as "A".
-- One window per login (`instance.rs`): a second launch sends its request and waits 2 s for the "ok" the UI loop
-  writes after raising the window; without it, it reports the running copy as not responding (`say_without_window`:
-  stderr and the first of kdialog, zenity, notify-send, xmessage). `main` installs the layer before that check.
+- One window per login (`instance.rs`): a second launch sends its request and waits 2 s for an answer. Until the UI
+  loop takes requests, the listener thread answers "starting" at once and the launch then waits up to 15 s for the
+  UI's "ok" (and ends quietly if the window is still not up); once the UI is up, 2 s without "ok" is reported as the
+  running copy not responding (`say_without_window`: stderr and the first of zenity, kdialog, notify-send, the
+  notification service over D-Bus and xmessage, the order AppRun uses too). A copy that closes the connection
+  unanswered has exited: the launch looks once more and takes its place, never calling it stuck.
+  `main` installs the layer before that check.
 - A dialog's continuation runs through `Once` from every way out: the toolkit's `close_dialog` (what a button calls)
   does not call the dialog's `on_close`.
 - The logger shows the toolkit's chatty dependencies (`chatty` in `main.rs`: zbus, tracing, ...) only from warn up.

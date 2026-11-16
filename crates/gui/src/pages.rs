@@ -119,10 +119,13 @@ pub(crate) struct PageState {
     mask_rules_open: bool,
     /// The toggle key row waits for a key.
     capturing_key: bool,
-    /// While it waits: the display server's own report of the key pressed (its hardware code).
+    /// A line to the display server's keyboard, for the window's life: the pressed key's hardware code while the row
+    /// waits, and the session's keymap.
     key_tap: Option<crate::keytap::KeyTap>,
     /// The session's keyboard layout: a stored code is shown by the key's name on it.
     keys: crate::keymap::SessionKeys,
+    /// The layout a key press showed to be in use, for a compositor that does not say.
+    pressed_layout: Option<u32>,
     hotkey_focus: FocusHandle,
     steam: Option<SteamScan>,
     scanning: bool,
@@ -157,8 +160,8 @@ impl PageState {
             cx.subscribe_in(&exe_input, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
             // Leaving the toggle key's button ends the wait for a key.
             cx.on_blur(&hotkey_focus, window, |this, _, cx| {
-                this.pages.key_tap = None;
                 if std::mem::take(&mut this.pages.capturing_key) {
+                    this.stop_listening_for_key();
                     cx.notify();
                 }
             }),
@@ -173,6 +176,7 @@ impl PageState {
             capturing_key: false,
             key_tap: None,
             keys: crate::keymap::SessionKeys::default_layout(),
+            pressed_layout: None,
             hotkey_focus,
             steam: None,
             scanning: false,
@@ -527,27 +531,44 @@ impl MainView {
         row("preset", "Strength preset", "Sets the four values below. Reference is Neural Forge's defaults", cx).child(menu).into_any_element()
     }
 
-    /// Asks the display server for the next key press itself (`keytap`), and takes the session's keymap and the
-    /// layout in use from the same place (the layout may have been changed since the window opened).
-    pub(crate) fn listen_for_key(&mut self, window: &Window) {
-        self.pages.key_tap = crate::keytap::KeyTap::start(window);
-        match self.pages.key_tap.as_ref().and_then(crate::keytap::KeyTap::keys) {
-            Some(keys) => self.pages.keys = keys,
-            None => self.read_session_keys(window),
+    /// Opens the line to the display server's keyboard, once the window is up, and reads the session's keymap.
+    pub(crate) fn open_key_tap(&mut self, window: &Window) {
+        self.pages.key_tap = crate::keytap::KeyTap::open(window);
+        self.read_session_keys();
+    }
+
+    /// Asks the display server for the next key press itself (`keytap`).
+    fn listen_for_key(&mut self) {
+        if let Some(tap) = &mut self.pages.key_tap {
+            tap.listen();
+        }
+        self.read_session_keys();
+    }
+
+    fn stop_listening_for_key(&mut self) {
+        if let Some(tap) = &mut self.pages.key_tap {
+            tap.stop();
         }
     }
 
-    /// The session's keymap, for the toggle key's name and for finding a key by the toolkit's name for it.
-    pub(crate) fn read_session_keys(&mut self, window: &Window) {
-        if let Some(keys) = crate::keytap::session_keys(window) {
-            self.pages.keys = keys;
+    /// The session's keymap and the layout in use now, for the toggle key's name and for finding a key by the
+    /// toolkit's name for it: read at start, whenever the window gets the focus (the layout may have been switched
+    /// meanwhile, and a Wayland compositor says which is in use only to the focused window) and when a key is waited
+    /// for.
+    pub(crate) fn read_session_keys(&mut self) {
+        let Some(tap) = self.pages.key_tap.as_mut() else { return };
+        if let Some(keys) = tap.keys() {
+            self.pages.keys = match self.pages.pressed_layout.filter(|_| !tap.layout_known()) {
+                Some(layout) => keys.in_layout(layout),
+                None => keys,
+            };
         }
     }
 
     /// The toggle key's button: the next key pressed is taken (Esc cancels).
     pub(crate) fn wait_for_toggle_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pages.capturing_key = true;
-        self.listen_for_key(window);
+        self.listen_for_key();
         // After the click has put the focus on the button itself.
         let focus = self.pages.hotkey_focus.clone();
         window.defer(cx, move |window, cx| focus.focus(window, cx));
@@ -580,7 +601,13 @@ impl MainView {
                     let key = event.keystroke.key.as_str();
                     // Which key it was: the display server's own report of the press, else the key that carries the
                     // toolkit's name for it on the session's layout.
-                    let pressed = this.pages.key_tap.take().and_then(|mut tap| tap.last_press());
+                    let pressed = this.pages.key_tap.as_mut().and_then(crate::keytap::KeyTap::last_press);
+                    this.stop_listening_for_key();
+                    // A press also shows which layout is in use, where the compositor has not said.
+                    if let Some(layout) = pressed.and_then(|code| this.pages.keys.layout_of_press(code, key)) {
+                        this.pages.pressed_layout = Some(layout);
+                        this.read_session_keys();
+                    }
                     match pressed {
                         Some(code) => log::info!("toggle key: the display server reported key {code} for \"{key}\""),
                         None => log::info!("toggle key: no direct report of the press; \"{key}\" is looked up on the keymap"),
@@ -604,7 +631,7 @@ impl MainView {
         )
         .child(Button::new("clear").small().label("Clear").on_click(cx.listener(move |this, _, window, cx| {
             this.pages.capturing_key = false;
-            this.pages.key_tap = None;
+            this.stop_listening_for_key();
             this.set_bits(name, get, 0, window, cx);
         })))
         .into_any_element()

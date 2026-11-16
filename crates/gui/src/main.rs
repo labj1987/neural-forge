@@ -57,7 +57,8 @@ fn main() {
     // Only the first copy goes on: a second launch has asked the running one to show its window.
     let activations = match instance::claim() {
         instance::Claim::Primary(activations) => activations,
-        instance::Claim::Shown => return,
+        // Shown, still starting and about to show itself, or on its way out.
+        instance::Claim::Shown | instance::Claim::Starting | instance::Claim::Gone => return,
         // Its window is stuck (it listens, but its UI does not answer): starting a second one beside it would have two
         // copies writing the settings, so say what to do instead.
         instance::Claim::NotResponding(pid) => {

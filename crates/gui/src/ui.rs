@@ -645,12 +645,29 @@ pub fn say_without_window(message: &str) {
     if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
         return;
     }
-    for (program, args) in crate::text::ERROR_DIALOGS {
-        let status = std::process::Command::new(program).args(*args).arg(message).stdin(std::process::Stdio::null()).status();
+    for (program, before, after) in crate::text::ERROR_DIALOGS {
+        let status = std::process::Command::new(program)
+            .args(*before)
+            .arg(message)
+            .args(*after)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         if status.is_ok_and(|status| crate::text::helper_showed(program, status.code())) {
             break;
         }
     }
+}
+
+/// The display with the least room (by area), of several.
+fn smallest(displays: Vec<Rc<dyn gpui_kit::PlatformDisplay>>) -> Option<Rc<dyn gpui_kit::PlatformDisplay>> {
+    displays.into_iter().min_by(|a, b| display_area(a.as_ref()).total_cmp(&display_area(b.as_ref())))
+}
+
+fn display_area(display: &dyn gpui_kit::PlatformDisplay) -> f32 {
+    let size = display.bounds().size;
+    f32::from(size.width) * f32::from(size.height)
 }
 
 /// Writes the settings changed a moment ago, which wait for their save (`shm::SAVE_DELAY`).
@@ -665,8 +682,9 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
     if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
         no_window("no display server to connect to");
     }
-    // (A Wayland compositor names no primary display: the first one stands in, as the GTK window took the first monitor.)
-    let screen = cx.primary_display().or_else(|| cx.displays().into_iter().next()).map(|display| {
+    // (A Wayland compositor names no primary display and does not say where a window will open: the smallest display
+    // stands in, so the window fits whichever it lands on.)
+    let screen = cx.primary_display().or_else(|| smallest(cx.displays())).map(|display| {
         let area = display.bounds().size;
         (f32::from(area.width) as i32, f32::from(area.height) as i32)
     });
@@ -709,7 +727,7 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
             };
             // What needs the window to be up: messages, and the dialogs a developer opens at start.
             let _ = window.update(cx, |_, window, cx| {
-                view.update(cx, |view, cx| view.started(install_error, window, cx));
+                view.update(cx, |view, cx| view.started(install_error, screen, window, cx));
             });
             window
         }
@@ -740,7 +758,7 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
     // GPUI's own request is what there is; a Wayland compositor then marks the window as wanting attention instead of
     // raising it.
     cx.spawn(async move |cx| {
-        while let Ok(request) = activations.recv().await {
+        while let Some(request) = activations.next().await {
             let shown = window.update(cx, |_, window, _| {
                 let raised = request.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
                 if !raised {
@@ -975,8 +993,26 @@ impl MainView {
     }
 
     /// Once the window can show messages and dialogs.
-    fn started(&mut self, install_error: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        self.read_session_keys(window);
+    fn started(&mut self, install_error: Option<String>, screen: Option<(i32, i32)>, window: &mut Window, cx: &mut Context<Self>) {
+        // The window's first size was fitted to the screen as the toolkit reported it, which on a fractionally scaled
+        // Wayland screen is smaller than the screen is (`logical_screen`): fitted again, once, now that the window's
+        // scale is known.
+        if let Some(reported) = screen {
+            let real = crate::text::logical_screen(reported, window.scale_factor());
+            let (fitted, first) = (crate::text::default_window_size(Some(real)), crate::text::default_window_size(Some(reported)));
+            if fitted != first {
+                window.resize(size(px(fitted.0 as f32), px(fitted.1 as f32)));
+            }
+        }
+        self.open_key_tap(window);
+        // The layout in use is read again whenever the window gets the focus.
+        let on_focus = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.read_session_keys();
+                cx.notify();
+            }
+        });
+        self._subs.push(on_focus);
         if let Some(message) = install_error {
             toast_kept(window, cx, &message);
         }

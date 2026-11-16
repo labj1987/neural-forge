@@ -33,6 +33,34 @@ impl SessionKeys {
         Self { keymap, layout: 0 }
     }
 
+    /// The same keymap read in its layout number `layout` (the one in use, of several).
+    pub fn in_layout(mut self, layout: u32) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Which layout of the keymap was in use when the key with evdev code `code` gave what the toolkit calls `key`:
+    /// the layout already taken to be in use if the key gives that there, else the first that does. `None` when no
+    /// layout's key gives it (or all of them would: nothing learnt). For a compositor that does not say which layout
+    /// is in use.
+    pub fn layout_of_press(&self, code: u32, key: &str) -> Option<u32> {
+        let keymap = self.keymap.as_ref()?;
+        let keycode = xkb::Keycode::new(code + EVDEV_OFFSET);
+        let key = key.to_lowercase();
+        let gives = |layout: u32| {
+            (0..keymap.num_levels_for_key(keycode, layout))
+                .any(|level| keymap.key_get_syms_by_level(keycode, layout, level).iter().any(|&symbol| toolkit_key_name(symbol) == key))
+        };
+        let layouts = keymap.num_layouts_for_key(keycode);
+        if layouts < 2 || (0..layouts).all(gives) {
+            return None;
+        }
+        if self.layout < layouts && gives(self.layout) {
+            return Some(self.layout);
+        }
+        (0..layouts).find(|&layout| gives(layout))
+    }
+
     /// The layout xkbcommon takes by default, where the session's own keymap could not be had.
     pub fn default_layout() -> Self {
         Self::from_names("", "", "", "", "")
@@ -188,6 +216,29 @@ mod tests {
             assert_eq!(keys.label(0), "Unbound");
             assert_eq!(keys.label(766), "Key 766", "a code the layout has no key for");
         }
+    }
+
+    #[test]
+    fn names_follow_the_layout_in_use_of_several() {
+        let both = SessionKeys::from_names("evdev", "pc105", "us,fr", "", "");
+        assert_eq!(both.label(KEY_Q), "Q");
+        assert_eq!(both.code_for("a"), Some(KEY_A));
+        let french = both.in_layout(1);
+        assert_eq!(french.label(KEY_Q), "A", "the second layout is the one in use");
+        assert_eq!(french.code_for("a"), Some(KEY_Q));
+        assert_eq!(french.in_layout(7).label(KEY_Q), "Q", "a layout the keymap does not have reads as its first");
+    }
+
+    #[test]
+    fn a_press_tells_which_layout_is_in_use() {
+        let both = SessionKeys::from_names("evdev", "pc105", "us,fr", "", "");
+        assert_eq!(both.layout_of_press(KEY_Q, "a"), Some(1), "the key in Q's place gave an a: the French layout");
+        assert_eq!(both.layout_of_press(KEY_1, "&"), Some(1));
+        assert_eq!(both.layout_of_press(KEY_Q, "q"), Some(0));
+        assert_eq!(both.in_layout(1).layout_of_press(KEY_A, "q"), Some(1), "the layout taken to be in use stays while it fits");
+        let both = SessionKeys::from_names("evdev", "pc105", "us,fr", "", "");
+        assert_eq!(both.layout_of_press(KEY_F11, "f11"), None, "a key that is the same on both says nothing");
+        assert_eq!(layout("fr").layout_of_press(KEY_Q, "a"), None, "one layout: nothing to tell");
     }
 
     #[test]

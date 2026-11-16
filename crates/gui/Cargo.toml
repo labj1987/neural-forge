@@ -33,4 +33,4 @@ wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # key events do not carry. xkbcommon is the library the toolkit reads keys with; x11rb here is its pure-Rust connection
 # (a second, private one to the X server).
 xkbcommon = "0.8"
-x11rb = { version = "0.13", features = ["xinput"] }
+x11rb = { version = "0.13", features = ["xinput", "xkb"] }

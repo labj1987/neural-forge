@@ -364,21 +364,42 @@ pub(crate) fn default_window_size(screen: Option<(i32, i32)>) -> (i32, i32) {
     (w.clamp(MIN_WIDTH, WIDE), h.clamp(MIN_HEIGHT, HIGH))
 }
 
-/// The programs tried, in order, to show an error when the app has no window.
-pub(crate) const ERROR_DIALOGS: &[(&str, &[&str])] = &[
-    ("kdialog", &["--title", "Neural Forge", "--error"]),
-    ("zenity", &["--error", "--no-markup", "--title=Neural Forge", "--width=480", "--text"]),
-    ("notify-send", &["--urgency=critical", "--app-name=Neural Forge", "Neural Forge"]),
-    ("xmessage", &["-center"]),
+/// The programs tried, in order, to show a message when the app has no window, each with the arguments before and
+/// after the message: the same order as AppRun's (zenity, kdialog, notify-send, the notification service over D-Bus,
+/// xmessage).
+pub(crate) const ERROR_DIALOGS: &[(&str, &[&str], &[&str])] = &[
+    ("zenity", &["--error", "--no-markup", "--title=Neural Forge", "--width=480", "--text"], &[]),
+    ("kdialog", &["--title", "Neural Forge", "--error"], &[]),
+    ("notify-send", &["--urgency=critical", "--app-name=Neural Forge", "Neural Forge"], &[]),
+    (
+        "gdbus",
+        &[
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.Notifications",
+            "--object-path",
+            "/org/freedesktop/Notifications",
+            "--method",
+            "org.freedesktop.Notifications.Notify",
+            "--",
+            "Neural Forge",
+            "0",
+            "",
+            "Neural Forge",
+        ],
+        &["[]", "{\"urgency\": <byte 2>}", "0"],
+    ),
+    ("xmessage", &["-center"], &[]),
 ];
 
 /// Whether `program`, having ended with exit `code`, did show the message, so the next one must not show it again.
 /// The dialogs end with 0 when the user pressed their button and 1 when the user closed them another way; both mean it
 /// was seen. Anything else (no display, a crash, a signal) does not. notify-send shows nothing itself: only 0 says the
-/// desktop took the message.
+/// desktop took the message (the same for the notification service asked over D-Bus).
 pub(crate) fn helper_showed(program: &str, code: Option<i32>) -> bool {
     match program {
-        "notify-send" => code == Some(0),
+        "notify-send" | "gdbus" => code == Some(0),
         _ => matches!(code, Some(0 | 1)),
     }
 }
@@ -415,6 +436,9 @@ mod no_window_tests {
         assert!(helper_showed("zenity", Some(0)) && helper_showed("kdialog", Some(1)));
         assert!(!helper_showed("zenity", Some(127)) && !helper_showed("zenity", None));
         assert!(helper_showed("notify-send", Some(0)) && !helper_showed("notify-send", Some(1)));
+        assert!(helper_showed("gdbus", Some(0)) && !helper_showed("gdbus", Some(1)));
+        let order: Vec<&str> = super::ERROR_DIALOGS.iter().map(|&(program, ..)| program).collect();
+        assert_eq!(order, ["zenity", "kdialog", "notify-send", "gdbus", "xmessage"], "the order AppRun's libcheck_show tries them in");
     }
 }
 
@@ -436,6 +460,18 @@ mod file_dialog_tests {
     }
 }
 
+/// The screen's size in the window's own units, from the size the toolkit reports for it and the window's scale. On
+/// Wayland the toolkit divides the screen's mode by the output's whole-number scale, which for a fractional scale is
+/// the next whole number up (150% arrives as 2): the reported size is then too small by that factor over the real
+/// one. A whole-number scale needs no correction.
+pub(crate) fn logical_screen(reported: (i32, i32), window_scale: f32) -> (i32, i32) {
+    if !window_scale.is_finite() || window_scale <= 0.0 || window_scale.fract().abs() < 0.01 {
+        return reported;
+    }
+    let factor = window_scale.ceil() / window_scale;
+    ((reported.0 as f32 * factor).round() as i32, (reported.1 as f32 * factor).round() as i32)
+}
+
 #[cfg(test)]
 mod window_size_tests {
     use super::{default_window_size, MIN_HEIGHT, MIN_WIDTH};
@@ -450,6 +486,12 @@ mod window_size_tests {
         assert_eq!(default_window_size(Some((1366, 768))), (1229, 691));
         // Never below the minimum.
         assert_eq!(default_window_size(Some((300, 200))), (MIN_WIDTH, MIN_HEIGHT));
+        // A 2560x1440 screen at 150%: reported as 1280x720 (divided by 2), really 1707x960 in the window's units.
+        assert_eq!(super::logical_screen((1280, 720), 1.5), (1707, 960));
+        assert_eq!(default_window_size(Some(super::logical_screen((1280, 720), 1.5))), (1440, 864));
+        assert_eq!(super::logical_screen((1280, 720), 1.25), (2048, 1152));
+        assert_eq!(super::logical_screen((1280, 720), 2.0), (1280, 720), "a whole-number scale is reported right");
+        assert_eq!(super::logical_screen((2560, 1440), 1.0), (2560, 1440));
     }
 }
 

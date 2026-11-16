@@ -16,6 +16,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// One later launch asking for the running window to be shown.
@@ -33,19 +35,47 @@ impl Request {
     }
 }
 
-/// Requests from later launches to show the running window.
-pub type Activations = UnboundedReceiver<Request>;
+/// Requests from later launches to show the running window, and the word to them that the window is up.
+pub struct Activations {
+    requests: UnboundedReceiver<Request>,
+    up: Arc<AtomicBool>,
+}
+
+impl Activations {
+    /// The next request. Asking for one says the UI is up: from then on a later launch is not told to wait for a
+    /// start-up any more.
+    pub async fn next(&self) -> Option<Request> {
+        self.up.store(true, Ordering::Relaxed);
+        self.requests.recv().await.ok()
+    }
+}
 
 /// What the running copy answers once its UI has handled a request.
 const ACK: &str = "ok\n";
 
-/// How long a later launch waits for that answer. A window that is still starting answers once it is up.
-const ACK_WAIT: Duration = Duration::from_secs(2);
+/// What the running copy's listener answers at once while its window is not up yet (the socket is bound before the
+/// graphics start, which can take seconds on a cold start or a software renderer).
+const STARTING: &str = "starting\n";
+
+/// How long a later launch waits for the first answer, and how long for the UI's once it heard the window is starting.
+const WAITS: Waits = Waits { first: Duration::from_secs(2), start_up: Duration::from_secs(15) };
+
+#[derive(Clone, Copy)]
+struct Waits {
+    first: Duration,
+    start_up: Duration,
+}
 
 /// What became of this launch.
 pub enum Claim {
     /// This is the first copy; the receiver yields once per later launch.
     Primary(Activations),
+    /// Another copy is still starting (it said so) and had not shown its window when this launch stopped waiting: it
+    /// will, so this launch just ends.
+    Starting,
+    /// Another copy took the request and exited without answering, twice over: it is going away, and this launch
+    /// ends without a word.
+    Gone,
     /// Another copy is running and has shown its window.
     Shown,
     /// Another copy is running (its process id, where the socket tells) but its UI did not answer.
@@ -78,13 +108,13 @@ fn valid_token(token: &str) -> bool {
 /// Finds the running copy and asks it to show its window, or makes this the first copy.
 pub fn claim() -> Claim {
     match runtime_dir() {
-        Some(dir) => claim_at(&dir.join("neural-forge.sock"), launch_token(), ACK_WAIT),
+        Some(dir) => claim_at(&dir.join("neural-forge.sock"), launch_token(), WAITS),
         None => {
             eprintln!("neural-forge: XDG_RUNTIME_DIR is not set, so a second launch can't find this one");
             let (tx, rx) = unbounded_channel();
             // Kept open for the life of the process: the receiver never ends.
             std::mem::forget(tx);
-            Claim::Primary(rx)
+            Claim::Primary(Activations { requests: rx, up: Arc::default() })
         }
     }
 }
@@ -108,31 +138,45 @@ fn nobody_listening(error: &std::io::Error) -> bool {
     matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
 }
 
-fn claim_at(path: &Path, token: Option<String>, wait: Duration) -> Claim {
+fn claim_at(path: &Path, token: Option<String>, waits: Waits) -> Claim {
     let _lock = lock(path);
-    match UnixStream::connect(path) {
-        Ok(mut stream) => {
-            let _ = writeln!(stream, "activate {}", token.as_deref().unwrap_or(""));
-            // The running copy answers from its UI loop: no answer in time means its window is stuck.
-            let _ = stream.set_read_timeout(Some(wait));
-            let mut answer = String::new();
-            let _ = BufReader::new(&stream).take(64).read_line(&mut answer);
-            return if answer == ACK { Claim::Shown } else { Claim::NotResponding(peer_pid(&stream)) };
-        }
-        Err(e) if nobody_listening(&e) => {
-            let _ = std::fs::remove_file(path);
-        }
-        Err(e) => {
-            // Something answers to that name but not to us: leave it alone and run without the check.
-            eprintln!("neural-forge: single-instance socket {}: {e}", path.display());
+    // Twice at most: a running copy that exits while this launch waits for its answer is looked for once more
+    // (usually nobody listens then, and this launch becomes the first copy).
+    for attempt in 0..2 {
+        match UnixStream::connect(path) {
+            Ok(mut stream) => {
+                let _ = writeln!(stream, "activate {}", token.as_deref().unwrap_or(""));
+                match await_answer(&stream, waits) {
+                    Some(claim) => return claim,
+                    None if attempt == 0 => continue,
+                    None => return Claim::Gone,
+                }
+            }
+            Err(e) if nobody_listening(&e) => {
+                let _ = std::fs::remove_file(path);
+                break;
+            }
+            Err(e) => {
+                // Something answers to that name but not to us: leave it alone and run without the check.
+                eprintln!("neural-forge: single-instance socket {}: {e}", path.display());
+                break;
+            }
         }
     }
     let (tx, rx) = unbounded_channel();
+    let up: Arc<AtomicBool> = Arc::default();
     match UnixListener::bind(path) {
         Ok(listener) => {
+            let up = Arc::clone(&up);
             std::thread::spawn(move || {
                 for connection in listener.incoming().flatten() {
-                    if tx.send_blocking(read_request(connection)).is_err() {
+                    let mut request = read_request(connection);
+                    // Until the UI is up, the launch that asks is told so here: the UI's own answer follows once the
+                    // window is there to show.
+                    if !up.load(Ordering::Relaxed) {
+                        let _ = request.reply.write_all(STARTING.as_bytes());
+                    }
+                    if tx.send_blocking(request).is_err() {
                         break;
                     }
                 }
@@ -144,7 +188,33 @@ fn claim_at(path: &Path, token: Option<String>, wait: Duration) -> Claim {
             std::mem::forget(tx);
         }
     }
-    Claim::Primary(rx)
+    Claim::Primary(Activations { requests: rx, up })
+}
+
+/// What the running copy made of this launch's request: its UI's answer (the window is shown), or silence. A copy
+/// that says it is still starting is given longer, and is not called stuck if its window takes longer still. `None`
+/// when the copy closed the connection without an answer: it has exited (or is exiting), which is not a stuck window.
+fn await_answer(stream: &UnixStream, waits: Waits) -> Option<Claim> {
+    let mut lines = BufReader::new(stream).take(64);
+    // A line, `Some("")` for none in time, `None` for a closed connection.
+    let mut read_line = |wait: Duration| {
+        let _ = stream.set_read_timeout(Some(wait));
+        let mut line = String::new();
+        match lines.read_line(&mut line) {
+            Ok(0) => None,
+            // (A connection closed with the request still unread is reset, not ended.)
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) => None,
+            _ => Some(line),
+        }
+    };
+    Some(match read_line(waits.first)?.as_str() {
+        ACK => Claim::Shown,
+        STARTING => match read_line(waits.start_up)?.as_str() {
+            ACK => Claim::Shown,
+            _ => Claim::Starting,
+        },
+        _ => Claim::NotResponding(peer_pid(stream)),
+    })
 }
 
 /// The process on the other end of the socket (the running copy), from the kernel's record of who bound it.
@@ -178,10 +248,11 @@ fn parse_request(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_at, nobody_listening, not_responding_message, parse_request, valid_token, Activations, Claim, MAX_TOKEN};
+    use super::{claim_at, nobody_listening, not_responding_message, parse_request, valid_token, Activations, Claim, Waits, MAX_TOKEN};
     use std::time::Duration;
 
-    const SOON: Duration = Duration::from_millis(300);
+    const SOON: Waits = Waits { first: Duration::from_millis(300), start_up: Duration::from_millis(600) };
+    const PATIENT: Waits = Waits { first: Duration::from_secs(5), start_up: Duration::from_secs(5) };
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("neural-forge-{name}-{}", std::process::id()));
@@ -197,16 +268,22 @@ mod tests {
         }
     }
 
-    /// A second launch at `path`, with a running copy whose UI answers each request (as `build_ui` does).
+    /// The running copy's UI taking one request, as `build_ui`'s loop does.
+    fn ui_takes_one(first: &Activations) -> super::Request {
+        first.up.store(true, std::sync::atomic::Ordering::Relaxed);
+        first.requests.recv_blocking().unwrap()
+    }
+
+    /// A second launch at `path`, with a running copy whose UI answers each request.
     fn second_launch(path: &std::path::Path, first: &Activations, token: Option<&str>) -> (Claim, Option<String>) {
         std::thread::scope(|scope| {
             let ui = scope.spawn(|| {
-                let request = first.recv_blocking().unwrap();
+                let request = ui_takes_one(first);
                 let token = request.token.clone();
                 request.acknowledge();
                 token
             });
-            let claim = claim_at(path, token.map(str::to_string), Duration::from_secs(5));
+            let claim = claim_at(path, token.map(str::to_string), PATIENT);
             (claim, ui.join().unwrap())
         })
     }
@@ -226,11 +303,37 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_that_is_still_starting_is_waited_for_and_never_called_stuck() {
+        let dir = scratch("starting");
+        let path = dir.join("test.sock");
+        // The first copy has bound its socket but its UI is not up yet (the graphics are still starting).
+        let first = primary(claim_at(&path, None, SOON));
+        // Its window comes up after the first wait has passed, within the start-up wait: the second launch hears "ok".
+        let claim = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(450));
+                ui_takes_one(&first).acknowledge();
+            });
+            claim_at(&path, None, SOON)
+        });
+        assert!(matches!(claim, Claim::Shown), "the start-up was waited for, past the first wait");
+        // A start-up slower than any wait: the second launch ends quietly, it does not report a stuck window.
+        let slow = scratch("starting-slow");
+        let slow_path = slow.join("test.sock");
+        let still_starting = primary(claim_at(&slow_path, None, SOON));
+        assert!(matches!(claim_at(&slow_path, None, SOON), Claim::Starting));
+        drop(still_starting);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&slow);
+    }
+
+    #[test]
     fn a_running_copy_whose_ui_does_not_answer_is_named() {
         let dir = scratch("stuck");
         let path = dir.join("test.sock");
-        // The first copy listens, but its UI never takes the request (a stuck window).
+        // The first copy's window was up (its UI took requests), and now takes none (a stuck window).
         let first = primary(claim_at(&path, None, SOON));
+        first.up.store(true, std::sync::atomic::Ordering::Relaxed);
         match claim_at(&path, Some("token-2".into()), SOON) {
             Claim::NotResponding(pid) => {
                 assert_eq!(pid, Some(std::process::id()), "the running copy's process, from the socket");
@@ -244,6 +347,42 @@ mod tests {
         assert_eq!(not_responding_message(None), "Neural Forge is already running but not responding. Close it and start it again.");
         drop(first);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_that_exits_while_a_second_launch_waits_is_not_called_stuck() {
+        use std::os::unix::net::UnixListener;
+        // A copy that takes the request and exits (its listener and socket file go with it): the second launch looks
+        // again, finds nobody and becomes the first copy.
+        let dir = scratch("gone");
+        let path = dir.join("test.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let exiting = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let (connection, _) = listener.accept().unwrap();
+                drop(listener);
+                let _ = std::fs::remove_file(&path);
+                drop(connection);
+            })
+        };
+        let claim = claim_at(&path, None, PATIENT);
+        exiting.join().unwrap();
+        assert!(matches!(claim, Claim::Primary(_)), "the copy that exited left the place free");
+        drop(claim);
+        // A copy that keeps closing connections unanswered (it is shutting down): no "not responding", just an end.
+        let dir2 = scratch("gone-twice");
+        let path2 = dir2.join("test.sock");
+        let listener = UnixListener::bind(&path2).unwrap();
+        let closing = std::thread::spawn(move || {
+            for _ in 0..2 {
+                drop(listener.accept().unwrap());
+            }
+        });
+        assert!(matches!(claim_at(&path2, None, PATIENT), Claim::Gone));
+        closing.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]
@@ -283,7 +422,7 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let path = path.clone();
-                std::thread::spawn(move || claim_at(&path, None, Duration::from_millis(50)))
+                std::thread::spawn(move || claim_at(&path, None, Waits { first: Duration::from_millis(50), start_up: Duration::from_millis(50) }))
             })
             .collect();
         let claims: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
