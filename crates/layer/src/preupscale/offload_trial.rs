@@ -124,10 +124,28 @@ fn forced_offload() -> bool {
 
 /// Whether a hold's miss is the network's build on the game's GPU, which has the build's budget and nothing else:
 /// still loading (`native::LOADING`), a load or build that failed and is tried again (`native::NOT_BUILT`: a failure
-/// from before the trial is still the loader's state while it builds), or the process's one network still open on
-/// another device (`native::OPEN_WAIT`).
+/// from before the trial is still the loader's state while it builds), the process's one network still open on
+/// another device (`native::OPEN_WAIT`), or the holds recorded into DLSS's buffers before the switch not done yet with
+/// what the build changes (`native::WAITING`).
 fn is_loading(miss: &str) -> bool {
-    miss == super::native::LOADING || miss == super::native::NOT_BUILT || miss == super::native::OPEN_WAIT
+    miss == super::native::LOADING || miss == super::native::NOT_BUILT || blocked_by(miss).is_some()
+}
+
+/// Why the build on the game's GPU cannot begin yet for a hold's `miss`, where the wait is on something other than the
+/// game's GPU: the network still open on another device (`native::OPEN_WAIT`), or the holds recorded into DLSS's
+/// buffers before the switch still running (`native::WAITING`). `None` for any other miss. A build budget that runs
+/// out on such a wait is no verdict on the game's GPU ([`Trial::local`] aborts, and a later window tries again).
+/// (#63: the hold switched to the game's GPU right after the other GPU's holds were recorded into DLSS's buffers;
+/// the next 30 holds waited for those to be done and read as 30 misses of a model that runs: "could not run the
+/// model", decided for the rest of the process, at 39 fps on the other GPU where the game's ran 103.)
+fn blocked_by(miss: &str) -> Option<&'static str> {
+    if miss == super::native::OPEN_WAIT {
+        Some("the network was still open on another device")
+    } else if miss == super::native::WAITING {
+        Some("the holds recorded in DLSS's buffers before it were not done")
+    } else {
+        None
+    }
 }
 
 /// What is held, which a window's frame times belong to: the hold's extent and the frame's pass count.
@@ -222,9 +240,9 @@ struct Local {
     /// Since when the holds miss because the network is still loading on the game's GPU ([`is_loading`]): its build's
     /// budget ([`BUILD_BUDGET`]) counts from there (from the trial's start before anything ran).
     loading: Option<Instant>,
-    /// The network was open on another device (`native::OPEN_WAIT`) for some hold of the build that [`Self::loading`]
-    /// times: a budget that then runs out is no verdict on the game's GPU.
-    open_waited: bool,
+    /// The last of the build's holds that [`Self::loading`] times waited for something other than the game's GPU
+    /// ([`blocked_by`], its words): a budget that then runs out is no verdict on the game's GPU.
+    blocked: Option<&'static str>,
     last: Option<Instant>,
     paused: Duration,
     /// The last hold's time if it ran the model; `None` after a miss (an interval is only between two holds that ran).
@@ -247,7 +265,7 @@ impl Local {
             holds: 0,
             missed: 0,
             loading: None,
-            open_waited: false,
+            blocked: None,
             last: None,
             paused: Duration::ZERO,
             last_ran: None,
@@ -688,9 +706,9 @@ impl Trial {
                 return Some(Verdict::Offload(format!("the game's GPU could not run the model ({}): it goes back to the other GPU", super::native::DEAD)));
             }
             let failed = if miss.is_some_and(is_loading) {
-                if miss == Some(super::native::OPEN_WAIT) {
-                    l.open_waited = true;
-                } else if std::mem::take(&mut l.open_waited) {
+                if let Some(why) = miss.and_then(blocked_by) {
+                    l.blocked = Some(why);
+                } else if l.blocked.take().is_some() {
                     // The network came free, and the game's GPU loads it (or fails to) from here: its own budget, and
                     // its own verdict. One early wait for the other device does not make 15 s of a build that cannot
                     // be made an abort, tried three times and blamed on the other device.
@@ -699,7 +717,7 @@ impl Trial {
                 let since = *l.loading.get_or_insert(if l.ran == 0 { l.began } else { now });
                 now.saturating_duration_since(since) > BUILD_BUDGET
             } else {
-                l.open_waited = false;
+                l.blocked = None;
                 l.loading = None;
                 l.missed += 1;
                 if l.ran == 0 {
@@ -709,16 +727,15 @@ impl Trial {
                 }
             };
             l.last = Some(now);
-            if failed && l.open_waited {
-                // The network was still another device's when the budget ran out: a matter of the order things closed
-                // in, not of what the game's GPU can run. The frames go back, and a later window may try again.
+            if let Some(why) = l.blocked.filter(|_| failed) {
+                // The build still waited for something other than the game's GPU when the budget ran out (the network
+                // still another device's, the holds in DLSS's buffers still running): a matter of the order things
+                // closed in, not of what the game's GPU can run. The frames go back, and a later window may try again.
                 self.aborts += 1;
                 self.back = l.finished;
                 self.handed = false;
                 self.phase = if self.aborts >= ABORTS { Phase::Decided } else { Phase::Watching };
-                return Some(Verdict::Aborted(
-                    "the trial on the game's GPU stopped: the network was still open on another device; the model goes back to the other GPU".into(),
-                ));
+                return Some(Verdict::Aborted(format!("the trial on the game's GPU stopped: {why}; the model goes back to the other GPU")));
             }
             if failed {
                 self.back = l.finished;
@@ -732,7 +749,7 @@ impl Trial {
         }
         l.missed = 0;
         l.loading = None;
-        l.open_waited = false;
+        l.blocked = None;
         l.ran += 1;
         l.last = Some(now);
         let previous = l.last_ran.replace(now);
@@ -1253,6 +1270,87 @@ mod tests {
         }
         assert!(matches!(verdict, Some(Verdict::Offload(ref why)) if why.contains("could not be loaded or built")), "{verdict:?}");
         assert!(now.saturating_duration_since(began) > BUILD_BUDGET, "only after the build's budget");
+    }
+
+    /// The game's GPU's holds at `now`, one every `every` that ran, until a verdict (at most the trial's longest).
+    fn run_until_verdict(t: &mut Trial, now: &mut Instant, every: Duration) -> Option<Verdict> {
+        for _ in 0..(LOCAL_WARM as usize + LOCAL_MAX + 10) {
+            *now += every;
+            if let Some(v) = t.local(KEY, *now, true, None, false) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// #63, the reporter's log (RTX 4090 with an RTX 5080, Cyberpunk 2077 with Ray Reconstruction, after DLSS): the
+    /// trial began right after the other GPU's holds were recorded into DLSS's buffers, and the holds on the game's GPU
+    /// then waited for those to be done (`native::WAITING`). After a hold that ran, 30 of them read as 30 misses of a
+    /// model that runs: "could not run the model (waiting for the holds ...)" 0.3 s in, decided for the process, and
+    /// the model stayed on the 5080 at 39 fps where the 4090 had run it at 103. The wait is the build's: the trial
+    /// goes on and reaches its verdict; one that never ends within the build's budget aborts and is tried again; a
+    /// real failure after it still sends the model back.
+    #[test]
+    fn holds_still_running_in_dlss_buffers_at_the_switch_are_no_verdict() {
+        use super::super::native::{DEAD, LOADING, NOT_BUILT, WAITING};
+        let (mut t, mut now) = started(MS(25), MS(24));
+        now += MS(3);
+        assert!(t.local(KEY, now, true, None, false).is_none(), "a hold that ran");
+        for k in 0..2 * MISSES {
+            now += MS(10);
+            assert!(t.local(KEY, now, false, Some(WAITING), false).is_none(), "hold {k} waiting for DLSS's buffers: no verdict");
+        }
+        for _ in 0..50 {
+            now += MS(10);
+            assert!(t.local(KEY, now, false, Some(LOADING), false).is_none(), "then the build");
+        }
+        assert!(t.running(), "the trial goes on");
+        let verdict = run_until_verdict(&mut t, &mut now, Duration::from_micros(9_700));
+        assert!(matches!(verdict, Some(Verdict::Local { .. })), "measured: the game's GPU is faster: {verdict:?}");
+        assert!(t.keeps_local());
+        // Holds that are never done within the build's budget: aborted, not decided, and the next short windows start
+        // the trial again, which measures.
+        let (mut t, mut now) = started(MS(25), MS(24));
+        let mut verdict = None;
+        for _ in 0..2000 {
+            now += MS(20);
+            verdict = t.local(KEY, now, false, Some(WAITING), false);
+            if verdict.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(verdict, Some(Verdict::Aborted(ref why)) if why.contains("DLSS's buffers")), "{verdict:?}");
+        assert!(!t.running() && !t.keeps_local());
+        assert!(t.short_window(KEY, MS(25), MS(24), true, true, now).is_none());
+        assert!(t.short_window(KEY, MS(25), MS(24), true, true, now).is_some(), "tried again");
+        let verdict = run_until_verdict(&mut t, &mut now, Duration::from_micros(9_700));
+        assert!(matches!(verdict, Some(Verdict::Local { .. })), "{verdict:?}");
+        // A real failure of the game's GPU after the wait still sends the model back: a network off for the session at
+        // once, one that cannot be built after its own budget, counted from the end of the wait.
+        let (mut t, mut now) = started(MS(25), MS(24));
+        for _ in 0..40 {
+            now += MS(10);
+            assert!(t.local(KEY, now, false, Some(WAITING), false).is_none());
+        }
+        let verdict = t.local(KEY, now + MS(10), false, Some(DEAD), false);
+        assert!(matches!(verdict, Some(Verdict::Offload(ref why)) if why.contains("until the game restarts")), "{verdict:?}");
+        let (mut t, mut now) = started(MS(25), MS(24));
+        for _ in 0..40 {
+            now += MS(10);
+            assert!(t.local(KEY, now, false, Some(WAITING), false).is_none());
+        }
+        let done = now;
+        let mut verdict = None;
+        for _ in 0..2000 {
+            now += MS(20);
+            verdict = t.local(KEY, now, false, Some(NOT_BUILT), false);
+            if verdict.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(verdict, Some(Verdict::Offload(ref why)) if why.contains("could not be loaded or built")), "{verdict:?}");
+        assert!(now.saturating_duration_since(done) > BUILD_BUDGET, "after the build's own budget");
+        assert!(t.short_window(KEY, MS(25), MS(24), true, true, now).is_none() && t.short_window(KEY, MS(25), MS(24), true, true, now).is_none(), "decided");
     }
 
     /// A network that is off for the session on the game's GPU is a verdict at once, not after the build's budget.

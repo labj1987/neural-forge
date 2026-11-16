@@ -4947,6 +4947,9 @@ pub(crate) struct HoldResult {
     pub timing: HoldTiming,
     /// The native backend ran this hold (`evaluated` means the network ran).
     pub native: bool,
+    /// The native backend sent this hold's frame to the second GPU (`offload_pre`): what it ran or carried was the
+    /// other GPU's, not the game's.
+    pub offloaded: bool,
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
     /// network, composite), read when its fence was found signalled here.
     pub network_gpu_ms: Option<f32>,
@@ -6806,9 +6809,12 @@ impl Session {
         if result.native && result.evaluated {
             self.engaged = true;
         }
-        // While the trial against the other GPU measures the game's GPU: every hold, whether the model ran on it.
+        // While the trial against the other GPU measures the game's GPU: every hold, whether the model ran on it. Not the
+        // hold whose window started the trial (`offload_pre`'s summary runs inside it): it was sent to the other GPU, and
+        // counted as the game's GPU's first run it turned the build's waits after it into misses of a running model
+        // (#63: "could not run the model" 0.3 s into the trial).
         #[cfg(target_arch = "x86_64")]
-        if offload_trial::running() && !offload_pre::serving_hold() {
+        if offload_trial::running() && !offload_pre::serving_hold() && !result.offloaded {
             let ran = result.native && result.evaluated && result.wrote_back;
             offload_trial::local_hold((extent, placement::active_count()), now, ran, result.miss);
         }
@@ -9032,6 +9038,48 @@ mod tests {
         assert!(kept.starts_with("second GPU: not used: the game's GPU is faster ("), "{kept}");
         shm.set_layer_reason("native network running");
         assert!(native_line_due(&kept, "native network running", &shm.layer_reason(), false));
+        offload_trial::reset_for_test();
+    }
+
+    /// #63: the hold whose window starts the trial was sent to the other GPU, and `Session::note` sees it after the
+    /// trial began. It is no run of the model on the game's GPU: the holds after it that wait for DLSS's buffers to be
+    /// done with the other GPU's holds, then for the build, are the build's time, and the trial measures and decides.
+    /// Counted as a run, 30 such waits read as 30 misses: "could not run the model", decided for the process.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_offloaded_hold_that_starts_the_trial_is_no_run_on_the_game_gpu() {
+        let _state = offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        offload_trial::reset_for_test();
+        let key = ((2048, 1536), placement::active_count());
+        assert!(offload_trial::offloaded(key, Duration::from_millis(25), Duration::from_millis(24)).is_none());
+        assert!(offload_trial::offloaded(key, Duration::from_millis(25), Duration::from_millis(24)).is_some());
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.init_defaults();
+        let shm = ShmClient::test_over_header(&header);
+        let mut session = Session::default();
+        let sent = HoldResult { wrote_back: true, waits_consumed: true, native: true, evaluated: true, offloaded: true, ..Default::default() };
+        session.note(&shm, &sent, Duration::ZERO, (2048, 1536));
+        let waiting = HoldResult { native: true, ..HoldResult::local(native::WAITING) };
+        for _ in 0..2 * offload_trial::MISSES {
+            session.note(&shm, &waiting, Duration::ZERO, (2048, 1536));
+        }
+        // Before the model first ran on the game's GPU every miss is the build's (its budget), whatever its reason;
+        // after a run, 30 in a row would be a verdict.
+        let missed = HoldResult { native: true, ..HoldResult::local("the network's sizes do not include this hold's") };
+        for _ in 0..offload_trial::MISSES {
+            session.note(&shm, &missed, Duration::ZERO, (2048, 1536));
+        }
+        assert!(offload_trial::running(), "the build's waits are no verdict");
+        let held = HoldResult { wrote_back: true, waits_consumed: true, native: true, evaluated: true, ..Default::default() };
+        for _ in 0..(offload_trial::LOCAL_WARM as usize + offload_trial::LOCAL_WINDOW + 50) {
+            if !offload_trial::running() {
+                break;
+            }
+            session.note(&shm, &held, Duration::ZERO, (2048, 1536));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!offload_trial::running(), "decided");
+        assert!(offload_trial::keeps_local(), "measured, and kept on the game's GPU");
         offload_trial::reset_for_test();
     }
 

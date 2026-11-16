@@ -4762,6 +4762,7 @@ unsafe fn native_hold(
             }
             cache
         };
+    result.offloaded = offloaded;
     // Every frame that ran the graph has completed (this path's: the hold waited above; the other
     // path's: `claim_pre` says none ran for a second): the chain watchdog's count is final for them.
     let fake = fake_chain_timeout(res.native.as_ref().map_or(0, |n| n.frames));
