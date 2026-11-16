@@ -64,27 +64,22 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   more than that one (each notification is an email).
 - `cargo test` and `cargo build --release` build every crate (x86_64 Linux only; there is no
   Windows helper and no 32-bit layer since 3.0).
-- `bash build-appimage.sh` packages Neural Forge. The GUI ships twice: `usr/bin/neural-forge` as built (the host's
-  GTK 4 and libadwaita; the build fails if it has an rpath) and `usr/bin/bundled/neural-forge` with a bundled GTK
-  runtime (`bundle_gtk_runtime`: the ldd closure minus the AppImage excludelist, which the script cites, plus the
-  Vulkan loader and Wayland libraries kept on the host; the gdk-pixbuf loaders, the dconf GIO module, the IBus IM
-  module, GIO's `gio-launch-desktop` in `usr/libexec` behind `data/gio-launch-desktop` in `usr/bin` (which gives the
-  launched program the host's `PATH` and drops the markers), compiled schemas, and the packages' copyright files, the licence
-  texts they name and a package manifest). Its libraries are found through `$ORIGIN` rpaths set with patchelf, never
-  `LD_LIBRARY_PATH`. Only that copy is patched: the CLI, the layer and the NGX wrapper never load a bundled library,
-  and nothing goes in `usr/lib/neural-forge/` (the installer copies all of it).
-- `data/AppRun` runs the host copy when `ldd -r` resolves it completely (no missing library or symbol version, no
-  undefined symbol the GUI itself refers to, ldd itself succeeds), so an up-to-date desktop keeps its newer
-  libadwaita; else the bundled one with `bundle_env`. `NEURAL_FORGE_GTK=host|bundled` forces one
-  (`scripts/test_apprun.sh`; `scripts/smoke-gui.sh` starts both on Xvfb). Every variable AppRun changes (`PATH`, and
-  for the bundled copy the GTK/GIO/pixbuf/schema paths) is listed in `NEURAL_FORGE_BUNDLE_ENV` with its earlier value
-  in `NEURAL_FORGE_ORIG_*`. The GUI puts the GLib-level ones back in its own environment at the top of `main()` and
-  the GTK-level ones at startup (`host_env::release`, so what GTK/GIO launch never sees them; `PATH` stays, so the bundled GIO finds
-  `data/gio-launch-desktop`, which restores it for the launched program; under the host copy, GIO's children keep
-  the AppImage's `PATH`), and every program the GUI or the supervisor starts is built with
-  `neural_forge_supervisor::host_env::command`, which restores all of them (a test fails on a bare `Command::new`
-  outside test modules). Release builds run on Ubuntu 24.04, whose GTK 4.14 / libadwaita 1.5 the bundle carries:
-  keep the GUI's `v4_12`/`v1_5` features within that.
+- `bash build-appimage.sh` packages Neural Forge. The AppImage bundles no libraries: the GUI ships once,
+  `usr/bin/neural-forge` as cargo built it, next to the CLI, the layer and the NGX wrapper. Its toolkit (GPUI) links
+  only glibc, libgcc_s, libxcb, libxkbcommon and libxkbcommon-x11, and loads `libwayland-client.so.0` (Wayland
+  sessions) and `libvulkan.so.1` or `libEGL.so.1` by name at run time, all from the system. The only shared object
+  in the AppImage is the layer, in `usr/lib/neural-forge/` (the installer copies all of it); CI checks that. Build
+  dependencies are the toolkit's headers (`libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev`).
+  Release builds run on Ubuntu 24.04, whose glibc is the floor the README states (CI's glibc baseline step).
+- `data/AppRun` checks the system, then `exec`s the GUI with its arguments, and changes no environment variable: the
+  GUI and every program it starts see the environment the AppImage was started with (start programs with a plain
+  `std::process::Command`). Its libcheck refuses to start, with the reason on stderr and in a dialog (zenity, else
+  kdialog, else notify-send) that names the distribution's install command, when `ldd -r` reports a missing library,
+  a missing symbol version (a glibc older than the build's) or an undefined symbol of the GUI, or when the run-time
+  libraries are missing (`ldconfig -p` or `LD_LIBRARY_PATH`: libwayland-client on a Wayland session, one of the
+  Vulkan and EGL loaders); without ldd it asks the dynamic loader. `scripts/test_apprun.sh` tests it with stand-ins;
+  `scripts/smoke-gui.sh APPDIR` starts the extracted AppImage's GUI on Xvfb (drawn on lavapipe) and fails on an
+  unmapped window, a loader error, a panic or a WARN/ERROR log line.
 - The layer's GPU tests run on lavapipe: set `VK_DRIVER_FILES` to the `lvp_icd*.json` manifests, as
   CI does. On a machine with an NVIDIA GPU, never run them without it. Under validation:
   `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` and `--test-threads=1` (CI's step shows the settings;

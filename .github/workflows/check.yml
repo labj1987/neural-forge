@@ -91,19 +91,19 @@ jobs:
           CHANNEL: ${{ steps.toolchain.outputs.channel }}
         run: rustc --version | tee /dev/stderr | grep -qF "rustc $CHANNEL "
 
-      # libgtk-4-dev/libadwaita-1-dev for the gui crate; a software Vulkan ICD (lavapipe) so the
-      # layer's real-device tests run (NEURAL_FORGE_REQUIRE_VULKAN makes that an assertion);
-      # vulkan-validationlayers (Ubuntu's Khronos validation layer) to run them under it;
-      # spirv-tools for check_shaders.py's validation; zsync and desktop-file-utils for the
-      # AppImage, patchelf and the GTK runtime pieces it bundles for the GUI's second copy
-      # (bundle_gtk_runtime); numpy and Pillow for the scripts' self-tests.
+      # The GUI toolkit's (GPUI's) build headers: libxcb, libxkbcommon and libxkbcommon-x11, which it links, and
+      # fontconfig, which one of its crates probes at build time; a software Vulkan ICD (lavapipe) so the
+      # layer's real-device tests run (NEURAL_FORGE_REQUIRE_VULKAN makes that an assertion) and the GUI's
+      # smoke test draws its window; vulkan-validationlayers (Ubuntu's Khronos validation layer) to run them
+      # under it; spirv-tools for check_shaders.py's validation; zsync and desktop-file-utils for the
+      # AppImage; xvfb, xdotool and dbus-daemon for the GUI's smoke test; numpy and Pillow for the scripts'
+      # self-tests.
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
+          sudo apt-get install -y pkg-config libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
             libvulkan1 mesa-vulkan-drivers vulkan-tools vulkan-validationlayers spirv-tools \
             zsync desktop-file-utils patch python3-numpy python3-pil libclang-dev gcc-mingw-w64-x86-64 \
-            patchelf librsvg2-common dconf-gsettings-backend ibus-gtk4 libgdk-pixbuf2.0-bin gsettings-desktop-schemas \
             xvfb xdotool dbus-daemon
 
       # Only lavapipe, never whatever other ICD the runner image happens to carry.
@@ -129,7 +129,7 @@ jobs:
         run: |
           sys="$( { echo "${ImageOS:-} ${ImageVersion:-}"; rustc -vV
                     dpkg-query -W -f '${Package}=${Version}\n' gcc g++ binutils libc6-dev pkg-config \
-                      libgtk-4-dev libadwaita-1-dev libglib2.0-dev libvulkan1; } | sha256sum | cut -c1-16)"
+                      libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libvulkan1; } | sha256sum | cut -c1-16)"
           echo "key=cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'rust-toolchain.toml', 'third_party/vk-layer-for-rust/Cargo.lock', 'third_party/vk-layer-for-rust/Cargo.toml', 'third_party/vk-layer-for-rust/*/Cargo.toml') }}-$sys" >> "$GITHUB_OUTPUT"
 
       - name: Restore the Cargo cache
@@ -302,10 +302,15 @@ jobs:
           appimage="$(ls neural-forge-*-x86_64.AppImage)"
           rm -rf squashfs-root
           "./$appimage" --appimage-extract > /dev/null
+          test -x squashfs-root/usr/bin/neural-forge
           test -x squashfs-root/usr/bin/neural-forge-cli
-          test -x squashfs-root/usr/bin/bundled/neural-forge
-          # The bundled GUI resolves every library from the AppImage or the excludelist's host libraries.
-          if ldd squashfs-root/usr/bin/bundled/neural-forge | grep 'not found'; then exit 1; fi
+          # The AppImage bundles no libraries: the only shared object it ships is the layer (in usr/lib/neural-forge/,
+          # which the installer copies), and the GUI resolves every library from the system.
+          if find squashfs-root -path squashfs-root/usr/lib/neural-forge -prune -o -name '*.so*' -print | grep .; then
+              echo "error: the AppImage ships shared libraries besides the layer" >&2
+              exit 1
+          fi
+          if ldd squashfs-root/usr/bin/neural-forge | grep 'not found'; then exit 1; fi
           test -s squashfs-root/usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt
 
       # The README documents the oldest glibc a release runs on; a build on a newer base image
@@ -314,16 +319,12 @@ jobs:
         run: |
           documented="$(grep -o 'glibc [0-9][0-9.]* or newer' README.md | head -1 | cut -d' ' -f2)"
           test -n "$documented"
-          # Both GUI copies, the CLI, the layer, and everything the bundled GTK runtime ships (its libraries, modules
-          # and the real gio-launch-desktop).
-          for bin in squashfs-root/usr/bin/neural-forge squashfs-root/usr/bin/bundled/neural-forge squashfs-root/usr/bin/neural-forge-cli \
-              squashfs-root/usr/libexec/gio-launch-desktop squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so \
-              $(find squashfs-root/usr/lib -path squashfs-root/usr/lib/neural-forge -prune -o -name '*.so*' -type f -print | sort); do
+          # The GUI, the CLI and the layer: the AppImage ships no other Linux binary.
+          for bin in squashfs-root/usr/bin/neural-forge squashfs-root/usr/bin/neural-forge-cli \
+              squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so; do
               # `|| true`: under pipefail a grep that finds nothing would end the step here, before the check below.
               needed="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1 || true)"
               if [ -z "$needed" ]; then
-                  # Only a data library (ICU's) calls nothing in glibc; the programs and the layer always do.
-                  case "$bin" in squashfs-root/usr/lib/neural-forge/*) ;; squashfs-root/usr/lib/*.so*) echo "$bin needs nothing from glibc"; continue ;; esac
                   echo "error: no glibc version found in $bin" >&2
                   exit 1
               fi
@@ -335,10 +336,10 @@ jobs:
               fi
           done
 
-      # Both GUI copies start and reach their main loop on a virtual display (the runner has GTK 4 and libadwaita,
-      # so the host copy is the one AppRun picks; NEURAL_FORGE_GTK forces each), under scratch HOME and XDG dirs.
-      - name: The GUI starts with the host's and the bundled GTK
-        run: bash scripts/smoke-gui.sh squashfs-root host bundled
+      # The GUI starts through AppRun and reaches its main loop on a virtual display (drawn on lavapipe), under
+      # scratch HOME and XDG dirs, with nothing at WARN or ERROR level on stderr.
+      - name: The GUI starts
+        run: bash scripts/smoke-gui.sh squashfs-root
 
       # Install the extracted AppImage's files with its own CLI into scratch XDG directories (never
       # the runner user's real ones), then run the smoke example through the Vulkan loader against

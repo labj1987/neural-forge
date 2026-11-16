@@ -1,168 +1,175 @@
 #!/usr/bin/env bash
-# Tests data/AppRun (the AppImage's entry point) in a scratch AppDir, with stand-ins for ldd, the dialog tools and the
-# two GUI copies (usr/bin: the host's GTK; usr/bin/bundled: the bundled one):
-# - the host copy runs, with no bundle variables, when `ldd -r` finds every library and symbol;
-# - the bundled copy runs, with them, when a library or symbol version is missing, a symbol is undefined, or there is
-#   no ldd or a failing one; NEURAL_FORGE_GTK=host|bundled forces either; one stderr line names the choice;
-# - on the bundled path, a missing host-only library stops it, named on stderr and in the first dialog tool that can
-#   show it.
+# Tests data/AppRun (the AppImage's entry point) in a scratch AppDir, with stand-ins for ldd, ldconfig, the dynamic
+# loader, the dialog tools and the GUI:
+# - when the system has everything, the GUI runs with its arguments and exactly the environment AppRun was given;
+# - it does not run, and stderr says why (once per library, with the install command for the distribution), when a
+#   linked library is missing, glibc is too old, a symbol the GUI needs is undefined, or the libraries it loads at
+#   run time are missing (libwayland-client only on a Wayland session; Vulkan's or EGL's loader, either is enough);
+# - without ldd, or when ldd fails without saying why, the dynamic loader is asked;
+# - with a display, the first dialog tool that can show the message does (zenity, kdialog, notify-send).
 # usage: bash scripts/test_apprun.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-mkdir -p "$tmp/app/usr/bin/bundled" "$tmp/bin"
+mkdir -p "$tmp/app/usr/bin" "$tmp/bin" "$tmp/lib"
 cp "$ROOT/data/AppRun" "$tmp/app/AppRun"
-for copy in bin bin/bundled; do
-    printf '#!/bin/sh\necho "%s ran: $*"\nenv | grep -E "^(PATH|GTK_EXE_PREFIX|GTK_PATH|GIO_MODULE_DIR|GIO_EXTRA_MODULES|GDK_PIXBUF_MODULE_FILE|GSETTINGS_SCHEMA_DIR|NEURAL_FORGE_BUNDLE_ENV|NEURAL_FORGE_ORIG_[A-Z_]*)=" || true\n' \
-        "$copy" > "$tmp/app/usr/$copy/neural-forge"
-    chmod 755 "$tmp/app/usr/$copy/neural-forge"
-done
-# Only the tools AppRun uses, so the machine's own zenity, kdialog or notify-send are never found.
-for tool in dirname readlink awk sort paste sed cat grep env; do ln -s "$(command -v "$tool")" "$tmp/bin/$tool"; done
+GUI="$tmp/app/usr/bin/neural-forge"
+# The GUI stand-in: its arguments one per line, and its environment, sorted.
+printf '#!/bin/sh\nprintf "ran:%%s\\n" "$@"\nenv | sort > "%s/env"\n' "$tmp" > "$GUI"
+chmod 755 "$GUI"
+# Only the tools AppRun uses, so the machine's own ldd, zenity, kdialog or notify-send are never found.
+for tool in dirname readlink sort tail head sed cat env; do ln -s "$(command -v "$tool")" "$tmp/bin/$tool"; done
 fail() { echo "test_apprun: $*" >&2; exit 1; }
 stub() { printf '#!/bin/sh\n%s\n' "$2" > "$tmp/bin/$1"; chmod 755 "$tmp/bin/$1"; }
-run() { env -i PATH="$tmp/bin" "$@" "$BASH" "$tmp/app/AppRun" --flag > "$tmp/out" 2> "$tmp/err"; }
-# ldd: `ldd -r` (the host copy) prints $tmp/ldd-host with @BIN@ as the path it was given (the loader names the object
-# that needs a symbol that way), plain ldd (the bundled copy) prints $tmp/ldd-bundled.
-lddstub="if [ \"\$1\" = -r ]; then sed \"s#@BIN@#\$2#\" '$tmp/ldd-host'; else cat '$tmp/ldd-bundled'; fi"
-stub ldd "$lddstub"
-resolved=$'\tlibadwaita-1.so.0 => /usr/lib/libadwaita-1.so.0 (0x1)\n\tlibc.so.6 => /usr/lib/libc.so.6 (0x2)'
-printf '%s\n' "$resolved" > "$tmp/ldd-host"
-printf '%s\n' "$resolved" > "$tmp/ldd-bundled"
-ran_host() {
-    grep -qx "bin ran: --flag" "$tmp/out" || fail "$1: the host copy did not run with its arguments: $(cat "$tmp/out" "$tmp/err")"
-    if grep -E '^(GTK|GIO|GDK|GSETTINGS)' "$tmp/out"; then fail "$1: the host copy got bundle variables: $(cat "$tmp/out")"; fi
-    # PATH has the AppImage's usr/bin first, and its earlier value is saved for the programs the GUI starts.
-    grep -qx "PATH=$tmp/app/usr/bin:$tmp/bin" "$tmp/out" || fail "$1: PATH: $(cat "$tmp/out")"
-    grep -qx "NEURAL_FORGE_BUNDLE_ENV=PATH" "$tmp/out" || fail "$1: only PATH is listed: $(cat "$tmp/out")"
-    grep -qx "NEURAL_FORGE_ORIG_PATH=$tmp/bin" "$tmp/out" || fail "$1: PATH not saved: $(cat "$tmp/out")"
-    grep -q "^neural-forge: GTK: host (" "$tmp/err" || fail "$1: no 'GTK: host' line: $(cat "$tmp/err")"
+# ldd -r prints $tmp/ldd with @BIN@ as the path it was given (the loader names the object that needs a symbol that
+# way) and exits with $tmp/ldd-rc; ldconfig -p prints $tmp/cache. The loader stand-in (LIBCHECK_LOADER) prints
+# $tmp/loader.
+stub ldd "[ \"\$1\" = -r ] || exit 2; sed \"s#@BIN@#\$2#g\" '$tmp/ldd'; exit \$(cat '$tmp/ldd-rc')"
+stub ldconfig "[ \"\$1\" = -p ] || exit 2; cat '$tmp/cache'"
+# shellcheck disable=SC2016 # the stand-in's own $1
+printf '#!/bin/sh\nsed "s#@BIN@#$1#g" "%s/loader"\n' "$tmp" > "$tmp/loader-stub"; chmod 755 "$tmp/loader-stub"
+linked=$'\tlinux-vdso.so.1 (0x1)\n\tlibxcb.so.1 => /usr/lib/libxcb.so.1 (0x2)\n\tlibxkbcommon.so.0 => /usr/lib/libxkbcommon.so.0 (0x3)\n\tlibxkbcommon-x11.so.0 => /usr/lib/libxkbcommon-x11.so.0 (0x4)\n\tlibgcc_s.so.1 => /usr/lib/libgcc_s.so.1 (0x5)\n\tlibc.so.6 => /usr/lib/libc.so.6 (0x6)'
+cache_line() { printf '\t%s (libc6,x86-64) => /usr/lib/%s\n' "$1" "$1"; }
+full_cache() { echo "9 libs found in cache \`/etc/ld.so.cache'"; for l in libc.so.6 libxcb.so.1 libvulkan.so.1 libEGL.so.1 libwayland-client.so.0; do cache_line "$l"; done; }
+reset() {
+    printf '%s\n' "$linked" > "$tmp/ldd"; echo 0 > "$tmp/ldd-rc"; full_cache > "$tmp/cache"
+    printf '%s\n' "$linked" > "$tmp/loader"; rm -f "$tmp/shown" "$tmp/env"
+    stub ldd "[ \"\$1\" = -r ] || exit 2; sed \"s#@BIN@#\$2#g\" '$tmp/ldd'; exit \$(cat '$tmp/ldd-rc')"
 }
-ran_bundled() {
-    grep -qx "bin/bundled ran: --flag" "$tmp/out" || fail "$1: the bundled copy did not run with its arguments: $(cat "$tmp/out" "$tmp/err")"
-    grep -qx "GTK_EXE_PREFIX=$tmp/app/usr" "$tmp/out" || fail "$1: no GTK_EXE_PREFIX for the bundled copy: $(cat "$tmp/out")"
-    grep -qx "GIO_MODULE_DIR=$tmp/app/usr/lib/gio/modules" "$tmp/out" || fail "$1: no GIO_MODULE_DIR: $(cat "$tmp/out")"
-    grep -qx "NEURAL_FORGE_BUNDLE_ENV=PATH GTK_EXE_PREFIX GTK_PATH GDK_PIXBUF_MODULE_FILE GIO_MODULE_DIR GIO_EXTRA_MODULES GSETTINGS_SCHEMA_DIR" "$tmp/out" \
-        || fail "$1: no NEURAL_FORGE_BUNDLE_ENV: $(cat "$tmp/out")"
-    grep -q "^neural-forge: GTK: bundled (" "$tmp/err" || fail "$1: no 'GTK: bundled' line: $(cat "$tmp/err")"
+printf 'ID=ubuntu\nID_LIKE=debian\n' > "$tmp/ubuntu"; printf 'ID=fedora\n' > "$tmp/fedora"; printf 'ID=gentoo\n' > "$tmp/gentoo"
+# run VAR=VALUE...: AppRun with only these variables (and PATH), the GUI given two arguments, one with a space.
+run() {
+    rm -f "$tmp/out" "$tmp/err" "$tmp/env"
+    env -i PATH="$tmp/bin" LIBCHECK_OS_RELEASE="$tmp/ubuntu" LIBCHECK_GLIBC_HAVE=2.35 "$@" "$BASH" "$tmp/app/AppRun" --flag "a b" > "$tmp/out" 2> "$tmp/err"
 }
+ran() {
+    [ "$(cat "$tmp/out")" = $'ran:--flag\nran:a b' ] || fail "$1: the GUI did not run with its arguments: $(cat "$tmp/out" "$tmp/err")"
+    [ ! -s "$tmp/err" ] || fail "$1: AppRun wrote to stderr: $(cat "$tmp/err")"
+}
+refused() {
+    [ ! -s "$tmp/out" ] || fail "$1: the GUI ran: $(cat "$tmp/out")"
+    [ ! -e "$tmp/env" ] || fail "$1: the GUI ran"
+    grep -q "^Neural Forge: Neural Forge can't start" "$tmp/err" || fail "$1: no message on stderr: $(cat "$tmp/err")"
+    [ "$(wc -l < "$tmp/err")" -eq 1 ] || fail "$1: more than one stderr line: $(cat "$tmp/err")"
+}
+says() { grep -qF -- "$2" "$tmp/err" || fail "$1: stderr lacks '$2': $(cat "$tmp/err")"; }
 
-# The host's libraries resolve everything: the host copy, with nothing of the bundle's.
-run || fail "host OK: AppRun failed"
-ran_host "host OK"
-[ "$(wc -l < "$tmp/err")" -eq 1 ] || fail "host OK: more than one stderr line: $(cat "$tmp/err")"
+# Everything is there: the GUI runs, and its environment is exactly the one AppRun got (the shells add only PWD,
+# SHLVL and _). No PATH change, no markers.
+reset
+run FOO="x y" XDG_RUNTIME_DIR=/run/user/1 WAYLAND_DISPLAY=wayland-0 LD_LIBRARY_PATH=/opt/lib || fail "all fine: AppRun failed: $(cat "$tmp/err")"
+ran "all fine"
+expected="$(printf '%s\n' "FOO=x y" "LD_LIBRARY_PATH=/opt/lib" "LIBCHECK_GLIBC_HAVE=2.35" "LIBCHECK_OS_RELEASE=$tmp/ubuntu" "PATH=$tmp/bin" \
+    "WAYLAND_DISPLAY=wayland-0" "XDG_RUNTIME_DIR=/run/user/1" | sort)"
+got="$(grep -vE '^(PWD|SHLVL|_|OLDPWD)=' "$tmp/env")"
+[ "$got" = "$expected" ] || fail "all fine: the environment changed: $(diff <(echo "$expected") <(echo "$got") || true)"
+# A system library's own unresolved symbol, and one of another object, are not the GUI's business.
+printf '%s\n' "$linked" "undefined symbol: xcb_private	(/usr/lib/libxcb.so.1)" "undefined symbol: x	(@BIN@-other)" > "$tmp/ldd"
+run || fail "foreign symbols: AppRun failed: $(cat "$tmp/err")"
+ran "foreign symbols"
 
-# The host lacks a library: the bundled copy, and the line names the library.
-printf '\tlibadwaita-1.so.0 => not found\n\tlibc.so.6 => /usr/lib/libc.so.6 (0x2)\n' > "$tmp/ldd-host"
-run || fail "host lacks a library: AppRun failed"
-ran_bundled "host lacks a library"
-grep -q "the host lacks libadwaita-1.so.0" "$tmp/err" || fail "host lacks a library: not named: $(cat "$tmp/err")"
+# A linked library is missing (named twice by ldd): refused, named once, with the distribution's install command.
+reset
+printf '%s\n' "$linked" $'\tlibxkbcommon-x11.so.0 => not found' $'\tlibxkbcommon-x11.so.0 => not found' > "$tmp/ldd"
+echo 1 > "$tmp/ldd-rc"
+if run; then fail "missing library: AppRun exited 0"; fi
+refused "missing library"
+says "missing library" "these system libraries are missing: libxkbcommon-x11.so.0."
+says "missing library" "Install them with: sudo apt install libxkbcommon-x11-0. Then start Neural Forge again."
+if run LIBCHECK_OS_RELEASE="$tmp/fedora"; then fail "missing library (Fedora): AppRun exited 0"; fi
+says "missing library (Fedora)" "Install them with: sudo dnf install 'libxkbcommon-x11.so.0()(64bit)'."
+if run LIBCHECK_OS_RELEASE="$tmp/gentoo"; then fail "missing library (unknown system): AppRun exited 0"; fi
+says "missing library (unknown system)" "Install the packages that provide them with your package manager, then start Neural Forge again."
+# A library the table does not know: the command that finds its package.
+printf '%s\n' "$linked" $'\tlibfoo.so.3 => not found' $'\tlibxcb.so.1 => not found' > "$tmp/ldd"
+if run; then fail "unknown library: AppRun exited 0"; fi
+says "unknown library" "Install them with: sudo apt install libxcb1. Find the package that provides each of the others with: apt-file search libfoo.so.3."
 
-# A symbol version the host's library does not have (an older libadwaita): bundled.
-printf '%s\n' "$resolved" "./neural-forge: /usr/lib/libadwaita-1.so.0: version \`LIBADWAITA_1_5' not found (required by ./neural-forge)" > "$tmp/ldd-host"
-run || fail "missing symbol version: AppRun failed"
-ran_bundled "missing symbol version"
-grep -q "the host lacks LIBADWAITA_1_5" "$tmp/err" || fail "missing symbol version: not named: $(cat "$tmp/err")"
+# glibc older than the build's: the newest version needed, and the system's.
+reset
+printf '%s\n' "$linked" "@BIN@: /lib/libc.so.6: version \`GLIBC_2.38' not found (required by @BIN@)" \
+    "@BIN@: /lib/libc.so.6: version \`GLIBC_2.39' not found (required by @BIN@)" > "$tmp/ldd"
+echo 1 > "$tmp/ldd-rc"
+if run; then fail "old glibc: AppRun exited 0"; fi
+refused "old glibc"
+says "old glibc" "it needs glibc 2.39 or newer; this system has 2.35."
 
-# Undefined symbols the GUI needs (a host GTK older than the one it was built with), in the loader's three forms:
-# bundled. A host library's own unresolved symbol does not count.
-printf '%s\n' "$resolved" "undefined symbol: adw_about_dialog_new	(@BIN@)" "undefined symbol: gtk_file_dialog_new, version GTK_4	(@BIN@)" \
-    "symbol adw_toast_new version LIBADWAITA_1 not defined in file libadwaita-1.so.0 with link time reference	(@BIN@)" \
-    "undefined symbol: g_private_helper	(/usr/lib/libfoo.so.1)" > "$tmp/ldd-host"
-run || fail "undefined symbols: AppRun failed"
-ran_bundled "undefined symbols"
-grep -q "lack 3 symbols" "$tmp/err" || fail "undefined symbols: not counted: $(cat "$tmp/err")"
-printf '%s\n' "$resolved" "undefined symbol: g_private_helper	(/usr/lib/libfoo.so.1)" "undefined symbol: x	(@BIN@-other)" > "$tmp/ldd-host"
-run || fail "a host library's own symbol: AppRun failed"
-ran_host "a host library's own symbol"
+# Symbols the GUI needs that the system's libraries lack, in the loader's forms: refused, the first three named.
+reset
+printf '%s\n' "$linked" "undefined symbol: xkb_a	(@BIN@)" "undefined symbol: xkb_b, version V_1	(@BIN@)" \
+    "symbol xkb_c version V_2 not defined in file libxkbcommon.so.0 with link time reference	(@BIN@)" "undefined symbol: xkb_d	(@BIN@)" \
+    "undefined symbol: xcb_private	(/usr/lib/libxcb.so.1)" > "$tmp/ldd"
+if run; then fail "missing symbols: AppRun exited 0"; fi
+refused "missing symbols"
+says "missing symbols" "the system's libraries are too old: they lack xkb_a, xkb_b, xkb_c and 1 more. Update the system"
 
-# A GTK_PATH and GIO_EXTRA_MODULES the user had point at host modules: the bundled copy gets the bundle's own module
-# directories in their place (set, not unset, so restoring them later is an overwrite), and their values are saved.
-printf '\tlibadwaita-1.so.0 => not found\n' > "$tmp/ldd-host"
-run GTK_PATH=/usr/lib/gtk GIO_EXTRA_MODULES=/usr/lib/gio || fail "host module paths: AppRun failed"
-ran_bundled "host module paths"
-grep -qx "GTK_PATH=$tmp/app/usr/lib/gtk-4.0" "$tmp/out" || fail "host module paths: GTK_PATH: $(cat "$tmp/out")"
-grep -qx "GIO_EXTRA_MODULES=$tmp/app/usr/lib/gio/modules" "$tmp/out" || fail "host module paths: GIO_EXTRA_MODULES: $(cat "$tmp/out")"
-grep -qx "NEURAL_FORGE_ORIG_GTK_PATH=/usr/lib/gtk" "$tmp/out" || fail "host module paths: GTK_PATH not saved: $(cat "$tmp/out")"
-grep -qx "NEURAL_FORGE_ORIG_GIO_EXTRA_MODULES=/usr/lib/gio" "$tmp/out" || fail "host module paths: GIO_EXTRA_MODULES not saved: $(cat "$tmp/out")"
-# A stale saved value from another environment is not passed on.
-run NEURAL_FORGE_ORIG_FOO=x || fail "stale saved value: AppRun failed"
-if grep -q NEURAL_FORGE_ORIG_FOO "$tmp/out"; then fail "stale saved value: kept"; fi
+# The run-time libraries. No Vulkan and no EGL loader: refused, both named, either is enough.
+reset
+{ echo "x libs"; cache_line libc.so.6; cache_line libwayland-client.so.0; } > "$tmp/cache"
+if run; then fail "no graphics loader: AppRun exited 0"; fi
+refused "no graphics loader"
+says "no graphics loader" "missing: libvulkan.so.1, libEGL.so.1. "
+says "no graphics loader" "one of libvulkan.so.1 and libEGL.so.1 is enough"
+says "no graphics loader" "sudo apt install libvulkan1 libegl1"
+# Either one is enough, from the cache or from LD_LIBRARY_PATH.
+{ echo "x libs"; cache_line libc.so.6; cache_line libEGL.so.1; } > "$tmp/cache"
+run || fail "EGL only: AppRun failed: $(cat "$tmp/err")"
+ran "EGL only"
+{ echo "x libs"; cache_line libc.so.6; } > "$tmp/cache"
+: > "$tmp/lib/libvulkan.so.1"
+run LD_LIBRARY_PATH="/nonexistent:$tmp/lib" || fail "Vulkan from LD_LIBRARY_PATH: AppRun failed: $(cat "$tmp/err")"
+ran "Vulkan from LD_LIBRARY_PATH"
+# libwayland-client: needed on a Wayland session only.
+{ echo "x libs"; cache_line libc.so.6; cache_line libvulkan.so.1; } > "$tmp/cache"
+run DISPLAY=:0 LIBCHECK_DIALOG=none || fail "X11 without libwayland-client: AppRun failed: $(cat "$tmp/err")"
+ran "X11 without libwayland-client"
+if run WAYLAND_DISPLAY=wayland-0 LIBCHECK_DIALOG=none; then fail "Wayland without libwayland-client: AppRun exited 0"; fi
+refused "Wayland without libwayland-client"
+says "Wayland without libwayland-client" "missing: libwayland-client.so.0."
+says "Wayland without libwayland-client" "sudo apt install libwayland-client0"
+# A cache that does not list glibc (libraries kept elsewhere, as on NixOS): nothing is said about run-time libraries.
+{ echo "0 libs"; cache_line libfoo.so.1; } > "$tmp/cache"
+run WAYLAND_DISPLAY=wayland-0 || fail "no usable cache: AppRun failed: $(cat "$tmp/err")"
+ran "no usable cache"
 
-# A GSETTINGS_SCHEMA_DIR the user had is kept behind the bundle's, and its value saved for children.
-run GSETTINGS_SCHEMA_DIR=/home/u/schemas || fail "user schemas: AppRun failed"
-grep -qx "GSETTINGS_SCHEMA_DIR=$tmp/app/usr/share/glib-2.0/schemas:/home/u/schemas" "$tmp/out" || fail "user schemas: $(cat "$tmp/out")"
-grep -qx "NEURAL_FORGE_ORIG_GSETTINGS_SCHEMA_DIR=/home/u/schemas" "$tmp/out" || fail "user schemas: not saved: $(cat "$tmp/out")"
-if grep -q "^NEURAL_FORGE_ORIG_GTK_EXE_PREFIX=" "$tmp/out"; then fail "user schemas: an unset variable got an ORIG value"; fi
-
-# Overrides: host even though the host lacks symbols; bundled even though the host resolves.
-run NEURAL_FORGE_GTK=host || fail "forced host: AppRun failed"
-ran_host "forced host"
-grep -q "NEURAL_FORGE_GTK=host" "$tmp/err" || fail "forced host: the reason is not the override: $(cat "$tmp/err")"
-printf '%s\n' "$resolved" > "$tmp/ldd-host"
-run NEURAL_FORGE_GTK=bundled || fail "forced bundled: AppRun failed"
-ran_bundled "forced bundled"
-grep -q "NEURAL_FORGE_GTK=bundled" "$tmp/err" || fail "forced bundled: the reason is not the override: $(cat "$tmp/err")"
-# An unknown value decides as if unset, and says so.
-run NEURAL_FORGE_GTK=sideways || fail "unknown override: AppRun failed"
-ran_host "unknown override"
-grep -q "NEURAL_FORGE_GTK=sideways is neither" "$tmp/err" || fail "unknown override: not said: $(cat "$tmp/err")"
-
-# ldd itself fails (the host's dynamic loader cannot run the check): bundled.
-stub ldd "if [ \"\$1\" = -r ]; then echo 'ldd: exited with unknown exit code (139)' >&2; exit 1; else cat '$tmp/ldd-bundled'; fi"
-run || fail "failing ldd: AppRun failed"
-ran_bundled "failing ldd"
-grep -q "ldd could not check" "$tmp/err" || fail "failing ldd: not said: $(cat "$tmp/err")"
-
-# No ldd: nothing can be checked, so the bundled copy.
+# No ldd: the dynamic loader is asked (LIBCHECK_LOADER stands in for running the GUI under LD_TRACE_LOADED_OBJECTS).
+reset
 rm "$tmp/bin/ldd"
-run || fail "no ldd: AppRun failed"
-ran_bundled "no ldd"
-grep -q "no ldd" "$tmp/err" || fail "no ldd: not said: $(cat "$tmp/err")"
+run LIBCHECK_LOADER="$tmp/loader-stub" || fail "no ldd: AppRun failed: $(cat "$tmp/err")"
+ran "no ldd"
+printf '%s\n' "$linked" $'\tlibxcb.so.1 => not found' > "$tmp/loader"
+if run LIBCHECK_LOADER="$tmp/loader-stub"; then fail "no ldd, missing library: AppRun exited 0"; fi
+refused "no ldd, missing library"
+says "no ldd, missing library" "missing: libxcb.so.1."
+# ldd fails without naming a problem: the loader is asked, and only what it names stops the GUI.
+reset
+printf 'ldd: exited with unknown exit code (139)\n' > "$tmp/ldd"; echo 1 > "$tmp/ldd-rc"
+run LIBCHECK_LOADER="$tmp/loader-stub" || fail "failing ldd, clean loader: AppRun failed: $(cat "$tmp/err")"
+ran "failing ldd, clean loader"
+printf '%s\n' "$linked" "@BIN@: /lib/libc.so.6: version \`GLIBC_2.40' not found (required by @BIN@)" > "$tmp/loader"
+if run LIBCHECK_LOADER="$tmp/loader-stub"; then fail "failing ldd, loader names glibc: AppRun exited 0"; fi
+says "failing ldd, loader names glibc" "needs glibc 2.40 or newer"
 
-# The bundled path, with host-only libraries missing and no display: stderr names them once each and how to install
-# them, the GUI does not run, the exit is non-zero.
-stub ldd "$lddstub"
-printf '\tlibadwaita-1.so.0 => not found\n' > "$tmp/ldd-host"
-printf '\tlibEGL.so.1 => not found\n\tlibfontconfig.so.1 => not found\n\tlibEGL.so.1 => not found\n\tlibc.so.6 => /usr/lib/libc.so.6 (0x2)\n' > "$tmp/ldd-bundled"
-if run; then fail "missing libraries: AppRun exited 0"; fi
-grep -q "ran:" "$tmp/out" && fail "missing libraries: a GUI ran"
-grep -q "not installed: libEGL.so.1, libfontconfig.so.1\.$" "$tmp/err" || fail "missing libraries: not named once each: $(cat "$tmp/err")"
-grep -qF "sudo dnf install 'libEGL.so.1()(64bit)' 'libfontconfig.so.1()(64bit)'" "$tmp/err" || fail "missing libraries: no install hint: $(cat "$tmp/err")"
-
-# With a display: zenity shows it.
+# The dialog: none without a display, or with LIBCHECK_DIALOG=none; else zenity; a zenity that cannot run (127)
+# falls through to kdialog; without kdialog, notify-send.
+reset
+printf '%s\n' "$linked" $'\tlibxcb.so.1 => not found' > "$tmp/ldd"
 stub zenity "echo zenity >> '$tmp/shown'"
-stub kdialog "echo kdialog >> '$tmp/shown'"
+stub kdialog "echo \"kdialog \$2\" >> '$tmp/shown'"
 stub notify-send "echo notify-send >> '$tmp/shown'"
-if run WAYLAND_DISPLAY=wayland-0; then fail "dialog: AppRun exited 0"; fi
-[ "$(cat "$tmp/shown")" = zenity ] || fail "dialog: expected zenity alone, got $(cat "$tmp/shown")"
-# A zenity that cannot run (127) falls through to kdialog; without kdialog, notify-send.
+if run; then fail "no display: AppRun exited 0"; fi
+[ ! -e "$tmp/shown" ] || fail "no display: a dialog was shown: $(cat "$tmp/shown")"
+if run WAYLAND_DISPLAY=wayland-0 LIBCHECK_DIALOG=none; then fail "dialogs off: AppRun exited 0"; fi
+[ ! -e "$tmp/shown" ] || fail "dialogs off: a dialog was shown: $(cat "$tmp/shown")"
+if run DISPLAY=:0; then fail "zenity: AppRun exited 0"; fi
+[ "$(cat "$tmp/shown")" = zenity ] || fail "zenity: expected zenity alone, got $(cat "$tmp/shown")"
+refused "zenity"
 rm "$tmp/shown"; stub zenity "exit 127"
 if run DISPLAY=:0; then fail "kdialog: AppRun exited 0"; fi
-[ "$(cat "$tmp/shown")" = kdialog ] || fail "kdialog: got $(cat "$tmp/shown")"
+grep -q '^kdialog Neural Forge can.t start' "$tmp/shown" || fail "kdialog: got $(cat "$tmp/shown")"
+[ "$(wc -l < "$tmp/shown")" -eq 1 ] || fail "kdialog: more than one dialog: $(cat "$tmp/shown")"
 rm "$tmp/shown" "$tmp/bin/kdialog"
-if run DISPLAY=:0; then fail "notify-send: AppRun exited 0"; fi
+if run WAYLAND_DISPLAY=wayland-0; then fail "notify-send: AppRun exited 0"; fi
 [ "$(cat "$tmp/shown")" = notify-send ] || fail "notify-send: got $(cat "$tmp/shown")"
-# data/gio-launch-desktop: the program GIO launches gets PATH and every listed variable back, none of the markers, and
-# the real gio-launch-desktop (usr/libexec) runs it.
-mkdir -p "$tmp/app/usr/libexec"
-cp "$ROOT/data/gio-launch-desktop" "$tmp/app/usr/bin/gio-launch-desktop"
-printf '#!/bin/sh\necho "real: $*"\nenv\n' > "$tmp/app/usr/libexec/gio-launch-desktop"
-chmod 755 "$tmp/app/usr/bin/gio-launch-desktop" "$tmp/app/usr/libexec/gio-launch-desktop"
-env -i PATH="$tmp/app/usr/bin:/usr/bin:/bin" NEURAL_FORGE_BUNDLE_ENV="PATH GTK_PATH" NEURAL_FORGE_ORIG_PATH=/usr/bin:/bin \
-    GTK_PATH=/b/gtk NEURAL_FORGE_ORIG_GTK_EXE_PREFIX=/stale KEEP=1 \
-    "$tmp/app/usr/bin/gio-launch-desktop" nautilus /x > "$tmp/out" || fail "gio-launch-desktop: failed"
-grep -qx "real: nautilus /x" "$tmp/out" || fail "gio-launch-desktop: the real one did not run: $(cat "$tmp/out")"
-grep -qx "PATH=/usr/bin:/bin" "$tmp/out" || fail "gio-launch-desktop: PATH: $(cat "$tmp/out")"
-grep -q "^GTK_PATH=" "$tmp/out" && fail "gio-launch-desktop: GTK_PATH kept"
-grep -q "NEURAL_FORGE_" "$tmp/out" && fail "gio-launch-desktop: markers kept: $(cat "$tmp/out")"
-grep -qx "KEEP=1" "$tmp/out" || fail "gio-launch-desktop: another variable was lost"
-# A listed name is never globbed (a file named KEEP in the working directory) and a name starting with a digit is
-# skipped, not handed to unset.
-mkdir -p "$tmp/cwd" && : > "$tmp/cwd/KEEP"
-(cd "$tmp/cwd" && env -i PATH="$tmp/app/usr/bin:/usr/bin:/bin" NEURAL_FORGE_BUNDLE_ENV="* 9X PATH" NEURAL_FORGE_ORIG_PATH=/usr/bin:/bin \
-    KEEP=1 "$tmp/app/usr/bin/gio-launch-desktop" nautilus /x > "$tmp/out" 2>&1) || fail "gio-launch-desktop: odd names: $(cat "$tmp/out")"
-grep -qx "real: nautilus /x" "$tmp/out" || fail "gio-launch-desktop: odd names: the real one did not run: $(cat "$tmp/out")"
-grep -qx "KEEP=1" "$tmp/out" || fail "gio-launch-desktop: a listed name was globbed"
 echo "test_apprun: ok"
