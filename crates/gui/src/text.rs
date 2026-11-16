@@ -390,7 +390,8 @@ const NOTIFY_BEFORE: &[&str] = &[
 pub(crate) const ERROR_DIALOGS: &[MessageTool] = &[
     ("zenity", &["--error", "--no-markup", "--title=Neural Forge", "--width=480", "--text"], &[]),
     ("kdialog", &["--title", "Neural Forge", "--error"], &[]),
-    ("notify-send", &["--urgency=critical", "--app-name=Neural Forge", "Neural Forge"], &[]),
+    // (No expiry: some desktops drop even a critical notification after a few seconds otherwise.)
+    ("notify-send", &["--urgency=critical", "--expire-time=0", "--app-name=Neural Forge", "Neural Forge"], &[]),
     ("gdbus", NOTIFY_BEFORE, &["[]", "{\"urgency\": <byte 2>}", "0"]),
     ("xmessage", &["-center"], &[]),
 ];
@@ -456,6 +457,8 @@ mod no_window_tests {
         let said =
             |tools: &[super::MessageTool], word: &str| tools.iter().any(|(_, before, after)| before.iter().chain(after.iter()).any(|arg| arg.contains(word)));
         assert!(said(super::ERROR_DIALOGS, "--error") && said(super::ERROR_DIALOGS, "critical"));
+        assert!(said(super::ERROR_DIALOGS, "--expire-time=0"), "an error's notification stays until it is closed");
+        assert!(!said(super::INFO_DIALOGS, "--expire-time"));
         assert!(!said(super::INFO_DIALOGS, "--error") && !said(super::INFO_DIALOGS, "critical"), "a start that takes long is no error");
         assert!(said(super::INFO_DIALOGS, "--info") && said(super::INFO_DIALOGS, "--msgbox") && said(super::INFO_DIALOGS, "--urgency=normal"));
     }

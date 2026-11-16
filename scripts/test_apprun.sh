@@ -158,7 +158,7 @@ reset
 printf '%s\n' "$linked" $'\tlibxcb.so.1 => not found' > "$tmp/ldd"
 stub zenity "echo zenity >> '$tmp/shown'"
 stub kdialog "echo \"kdialog \$2\" >> '$tmp/shown'"
-stub notify-send "echo notify-send >> '$tmp/shown'"
+stub notify-send "echo \"notify-send \$*\" >> '$tmp/shown'"
 if run; then fail "no display: AppRun exited 0"; fi
 [ ! -e "$tmp/shown" ] || fail "no display: a dialog was shown: $(cat "$tmp/shown")"
 if run WAYLAND_DISPLAY=wayland-0 LIBCHECK_DIALOG=none; then fail "dialogs off: AppRun exited 0"; fi
@@ -172,7 +172,9 @@ grep -q '^kdialog Neural Forge can.t start' "$tmp/shown" || fail "kdialog: got $
 [ "$(wc -l < "$tmp/shown")" -eq 1 ] || fail "kdialog: more than one dialog: $(cat "$tmp/shown")"
 rm "$tmp/shown" "$tmp/bin/kdialog"
 if run WAYLAND_DISPLAY=wayland-0; then fail "notify-send: AppRun exited 0"; fi
-[ "$(cat "$tmp/shown")" = notify-send ] || fail "notify-send: got $(cat "$tmp/shown")"
+grep -q '^notify-send -u critical -t 0 -a Neural Forge Neural Forge Neural Forge can.t start' "$tmp/shown" \
+    || fail "notify-send (critical, no expiry): got $(cat "$tmp/shown")"
+[ "$(wc -l < "$tmp/shown")" -eq 1 ] || fail "notify-send: more than one message: $(cat "$tmp/shown")"
 # A desktop with none of the three (a stock COSMIC): the notification service is asked over D-Bus, with the message
 # as the body; where that fails too (no service), xmessage on an X display.
 rm "$tmp/shown" "$tmp/bin/notify-send"
