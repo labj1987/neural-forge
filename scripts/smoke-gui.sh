@@ -11,9 +11,10 @@ set -euo pipefail
 
 # verdict STDERR-FILE: why the run's stderr fails (the offending lines, then a summary), or nothing.
 verdict() {
-    # Xvfb has no XInput pointer device, which the toolkit reports at error level and works without: that one line is
-    # the display's, not the GUI's.
-    if grep -v "Found no xinput mouse pointers" "$1" \
+    # What the bare session lacks is not the GUI's fault: Xvfb has no XInput pointer device (the toolkit reports that at
+    # error level and works without), and a D-Bus session with no desktop portal and no accessibility bus makes the
+    # toolkit's D-Bus crate warn that those services are unknown.
+    if grep -v -e "Found no xinput mouse pointers" -e "WARN \[zbus::proxy\] Failed to populate properties cache via GetAll: org.freedesktop.DBus.Error.ServiceUnknown" "$1" \
         | grep -E "error while loading shared libraries|undefined symbol|panicked|can't start|^neural-forge: (WARN|ERROR) "; then
         echo "errors on stderr"
     fi
@@ -25,7 +26,10 @@ if [ "${1:-}" = "--self-test" ]; then
     printf 'neural-forge: INFO [neural_forge::app] window opened\nneural-forge: DEBUG [x] WARN in a message is fine\n' > "$t/ok"
     [ -z "$(verdict "$t/ok")" ] || { echo "self-test: a clean run failed"; exit 1; }
     printf 'neural-forge: ERROR [gpui_linux::linux::x11::client] Found no xinput mouse pointers.\n' > "$t/xvfb"
-    [ -z "$(verdict "$t/xvfb")" ] || { echo "self-test: Xvfb's missing pointer failed a run"; exit 1; }
+    printf 'neural-forge: WARN [zbus::proxy] Failed to populate properties cache via GetAll: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files. Property change streams will not produce values.\n' >> "$t/xvfb"
+    [ -z "$(verdict "$t/xvfb")" ] || { echo "self-test: what the bare session lacks failed a run"; exit 1; }
+    printf 'neural-forge: WARN [zbus::proxy] something else\n' > "$t/zbus"
+    [ -n "$(verdict "$t/zbus")" ] || { echo "self-test: another D-Bus warning passed"; exit 1; }
     for bad in 'neural-forge: WARN [neural_forge::status] no channel' 'neural-forge: ERROR [gpui] boom' \
         "thread 'main' panicked at src/main.rs:1:1:" \
         './neural-forge: error while loading shared libraries: libxcb.so.1: cannot open shared object file' \

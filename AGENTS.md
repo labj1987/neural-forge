@@ -191,7 +191,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Fonts: `ui::init` names installed families for the UI and fixed-width fonts before the toolkit starts; without that
   GPUI warns about ".SystemUIFont" on every Linux system. Nothing may log at warn level on a normal start
   (`NEURAL_FORGE_GUI_LOG=info` shows the renderer picked). On Xvfb GPUI logs "Found no xinput mouse pointers" at error
-  level: that display's lack, which `scripts/smoke-gui.sh` lets through.
+  level, and in a D-Bus session with no desktop portal or accessibility bus its D-Bus crate warns that the service is
+  unknown: the session's lacks, which `scripts/smoke-gui.sh` lets through.
 - The file dialog (portal) has no file-type filter in GPUI: what was picked is checked afterwards
   (`cube::load`, `extract_all`). A menu is a button with a popup menu (`menu_button`), not a searchable list.
 - The toggle key: GPUI gives a key's name on the current layout, not its hardware code, and the layer reads evdev
