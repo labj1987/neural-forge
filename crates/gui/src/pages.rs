@@ -2811,12 +2811,12 @@ impl Render for ErrorView {
     }
 }
 
-/// Text in the theme's primary colour where it reads on the window's background (at least 4.5:1), else in its link
+/// Text in the theme's primary colour where it reads on the window's background (at least [`TEXT_CONTRAST`](crate::accent::TEXT_CONTRAST)), else in its link
 /// colour, which a desktop accent always keeps readable: a light accent (yellow, light blue) as primary would not read on
 /// white.
 fn tag_text(theme: &gpui_kit::component::Theme) -> Hsla {
-    use crate::accent::{contrast, Rgb};
-    if contrast(Rgb::from_hsla(theme.primary), Rgb::from_hsla(theme.background)) >= 4.5 {
+    use crate::accent::{contrast, Rgb, TEXT_CONTRAST};
+    if contrast(Rgb::from_hsla(theme.primary), Rgb::from_hsla(theme.background)) >= TEXT_CONTRAST {
         theme.primary
     } else {
         theme.link
@@ -2826,6 +2826,25 @@ fn tag_text(theme: &gpui_kit::component::Theme) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_text_uses_primary_where_it_reads_and_the_link_colour_where_it_does_not() {
+        use crate::accent::{paint, Rgb};
+        use gpui_kit::component::{Theme, ThemeColor};
+        let hex = |rgb: u32| Rgb { r: ((rgb >> 16) & 0xff) as f32 / 255., g: ((rgb >> 8) & 0xff) as f32 / 255., b: (rgb & 0xff) as f32 / 255. };
+        let painted = |accent: u32| {
+            let base = *ThemeColor::light();
+            let mut theme = Theme::default();
+            theme.colors = base;
+            paint(&mut theme.colors, Some(hex(accent)), &base);
+            theme
+        };
+        let yellow = painted(0xf6d32d);
+        assert_eq!(tag_text(&yellow), yellow.link, "a yellow primary does not read on white");
+        assert_ne!(yellow.link, yellow.primary);
+        let purple = painted(0x9141ac);
+        assert_eq!(tag_text(&purple), purple.primary, "a purple primary reads on white");
+    }
 
     #[test]
     fn a_folder_that_cannot_be_opened_says_why() {
