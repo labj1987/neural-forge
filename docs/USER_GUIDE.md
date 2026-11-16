@@ -293,7 +293,7 @@ game runs: Ray Reconstruction switched on in the game's menu moves the frames to
 prepared for the new size first, as on any change of size). A pass's own value in the per-pass settings still comes
 first, after DLSS too. A frame with pass 1 before the upscaler runs the Passes setting's count; its passes placed
 after DLSS in the per-pass settings use the group's image settings and model resolution. The strength presets also
-end the group's own strengths, as they do for the passes. The Status tab's **Settings in use** line says which
+reset the group's own strengths, as they do for the passes. The Status tab's **Settings in use** line says which
 group the current placement uses. They are saved as `set_after_passes`, `set_after_scale` (0 for the same as before
 DLSS), `set_after_overrides` and `set_after_intensity`, ... in `config.ini`, can be set per game, and
 `neural-forge-cli shmctl set after_passes 1` (or `after_scale 0.5`) does the same from a terminal.
@@ -481,7 +481,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_PROBE_IMAGE=<kernel>[+],...` | layer | Testing aid: copy the images a named CUDA launch reads, before it (or after it with `+`), once, into `captures/probe-<ms>/`. |
 | `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` | layer | Gives every network activation its own allocation again instead of sharing memory by lifetime (more video memory, same result). |
 | `NEURAL_FORGE_OFFLOAD_GPU=same\|N\|vendor:device[@pci-address]` | layer | Runs the model on another GPU (before DLSS, after DLSS with Ray Reconstruction or with Placement set to After DLSS, or on the finished frame): the one at index `N` (decimal) of the list the layer log prints when the game creates its device on a machine with more than one GPU (`[offload] GPU N: ...`), or the one with that PCI vendor and device ID (4 hexadecimal digits each, `10de:2c02`; add `@0000:73:00.0` where two cards share the ID). `same` puts it on a second device of the game's own GPU, which tests the path and saves nothing. Unset or `off`: the game's GPU. See [The model on a second GPU](#the-model-on-a-second-gpu). |
-| `NEURAL_FORGE_OFFLOAD_PACING=cpu\|relay\|gpu` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model on the finished frame. Unset or `relay`: a helper thread waits for the game's GPU to copy each frame out, the game's thread for the answer. `cpu`: the game's thread makes every wait of a present itself, as before 4.4.0. `gpu` (experimental, for two-GPU systems, not measured on two different cards): the game's GPU waits for the answer instead of the game's thread, where both GPUs have sync-file semaphores; a late second GPU then holds the game's GPU for as long as it is late (a visible hitch), and one that hangs freezes the game. |
+| `NEURAL_FORGE_OFFLOAD_PACING=cpu\|relay\|gpu` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model on the finished frame. Unset or `relay`: a helper thread waits for the game's GPU to copy each frame out, the game's thread for the answer. `cpu`: the game's thread makes every wait of a present itself, as before 4.4.0. `gpu` (experimental, for two-GPU systems): the game's GPU waits for the answer instead of the game's thread, where both GPUs have sync-file semaphores; a late second GPU then holds the game's GPU for as long as it is late (a visible hitch), and one that hangs freezes the game. |
 | `NEURAL_FORGE_OFFLOAD_MOTION=float` | layer | With `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: the motion vectors cross to the other GPU as two floats a texel (twice the bytes), as before 4.4.0. Unset, they cross as two halves a texel, which is what DLSS's vectors are. |
 | `NEURAL_FORGE_OFFLOAD_TRIAL=off\|on` | layer | With `NEURAL_FORGE_OFFLOAD_GPU`: `off` (or `0`, `false`) never tries the game's GPU (before or after DLSS when the game waits for the second GPU, on the finished frame once it runs there) (see [The model on a second GPU](#the-model-on-a-second-gpu)); `on` tries it with `same` too (tests; unset, `same` is not tried). `NEURAL_FORGE_OFFLOAD_TRIAL_VERDICT=offload` (tests only) sends the model back to the other GPU whatever the trial measured. |
 | `NEURAL_FORGE_OFFLOAD_TEST_FAIL=N` | layer | Tests only, with `NEURAL_FORGE_OFFLOAD_GPU` and the model before or after DLSS: the `N`th frame fails on the other GPU, so the model goes back to the game's GPU. Where the second GPU shows the frames itself, its `N`th present fails, so the game gets its own swapchain back. |
@@ -595,8 +595,7 @@ X ms" (the copy is one frame's way from the game's GPU into the second GPU), or 
 <why>". When the second GPU cannot present to the game's window (the desktop draws the window on the other card: step
 1), does not offer the
 game's format, or anything fails while it runs, the game gets its usual swapchain and the frames come back to the
-game's GPU as described below; after a failure while it ran, the mode stays off until the game restarts. Not yet
-tested on two different cards.
+game's GPU as described below; after a failure while it ran, the mode stays off until the game restarts.
 
 **Finished frame.** The Model interval setting is ignored while the second GPU runs the model (every frame gets its own answer).
 Each frame goes to it and back
@@ -606,7 +605,7 @@ copies): a second GPU that takes longer per frame than the game holds the game b
 come every frame (30 in a row), the game stops waiting at each present for its own GPU to copy the frame out (a helper
 thread does); it still waits for the answer. It steps back to its own waits when an answer is late
 (`NEURAL_FORGE_OFFLOAD_PACING=cpu` keeps all of them in the game). `NEURAL_FORGE_OFFLOAD_PACING=gpu` is an
-experiment for two-GPU systems, not yet measured on two different cards: where both GPUs' drivers have sync-file
+experiment for two-GPU systems: where both GPUs' drivers have sync-file
 semaphores (NVIDIA's do), the game's GPU waits for the answer before the frame is shown and the game prepares the
 next frame meanwhile. A late second GPU then holds the game's GPU until it is done (a visible hitch, with a few frames
 shown without their edit after it), and one that hangs freezes the game. Where a frame
