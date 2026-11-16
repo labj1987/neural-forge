@@ -40,7 +40,7 @@ defaults:
     shell: bash
 
 jobs:
-  check:
+  pins:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -80,8 +80,8 @@ jobs:
 
   # The only jobs that push (contents: write): this one the bump branch, land the checked bump.
   bump:
-    needs: check
-    if: needs.check.outputs.state == 'behind'
+    needs: pins
+    if: needs.pins.outputs.state == 'behind'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -126,7 +126,9 @@ jobs:
             echo "summary=$(paste -sd';' bump.txt | sed 's/;/; /g')"
           } >> "$GITHUB_OUTPUT"
 
-  ci:
+  # Named `check` so its run reports as "check / build", the status main's branch protection requires:
+  # the land job's plain push of the checked bump is accepted only with that check passed on the commit.
+  check:
     needs: bump
     if: needs.bump.outputs.sha != ''
     uses: ./.github/workflows/check.yml
@@ -136,8 +138,8 @@ jobs:
   # A plain push, never forced: if the branch moved on while the check ran, the push is refused and the
   # bump waits for next week's run, which starts from the new head.
   land:
-    needs: [bump, ci]
-    if: needs.ci.result == 'success'
+    needs: [bump, check]
+    if: needs.check.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -159,8 +161,8 @@ jobs:
   # One issue, labelled pin-check, for good: reopened when a pin falls behind again rather than a new one
   # opened, its body edited only when the report changed, closed when all are current.
   issue:
-    needs: [check, bump, ci, land]
-    if: always() && needs.check.result == 'success' && needs.check.outputs.state != 'unknown'
+    needs: [pins, bump, check, land]
+    if: always() && needs.pins.result == 'success' && needs.pins.outputs.state != 'unknown'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -179,12 +181,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
-          STATE: ${{ needs.check.outputs.state }}
-          REPORT: ${{ needs.check.outputs.report }}
+          STATE: ${{ needs.pins.outputs.state }}
+          REPORT: ${{ needs.pins.outputs.report }}
           BUMP: ${{ needs.bump.result }}
           BUMP_SHA: ${{ needs.bump.outputs.sha }}
           SUMMARY: ${{ needs.bump.outputs.summary }}
-          CI: ${{ needs.ci.result }}
+          CI: ${{ needs.check.result }}
           LAND: ${{ needs.land.result }}
         run: |
           printf '%s\n' "$REPORT" > report.md
