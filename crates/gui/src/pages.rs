@@ -119,6 +119,10 @@ pub(crate) struct PageState {
     mask_rules_open: bool,
     /// The toggle key row waits for a key.
     capturing_key: bool,
+    /// While it waits: the display server's own report of the key pressed (its hardware code).
+    key_tap: Option<crate::keytap::KeyTap>,
+    /// The session's keyboard layout: a stored code is shown by the key's name on it.
+    keys: crate::keymap::SessionKeys,
     hotkey_focus: FocusHandle,
     steam: Option<SteamScan>,
     scanning: bool,
@@ -153,6 +157,7 @@ impl PageState {
             cx.subscribe_in(&exe_input, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
             // Leaving the toggle key's button ends the wait for a key.
             cx.on_blur(&hotkey_focus, window, |this, _, cx| {
+                this.pages.key_tap = None;
                 if std::mem::take(&mut this.pages.capturing_key) {
                     cx.notify();
                 }
@@ -166,6 +171,8 @@ impl PageState {
             lut: None,
             mask_rules_open: false,
             capturing_key: false,
+            key_tap: None,
+            keys: crate::keymap::SessionKeys::default_layout(),
             hotkey_focus,
             steam: None,
             scanning: false,
@@ -193,6 +200,9 @@ fn profile_names() -> Vec<String> {
     names.sort();
     names
 }
+
+/// How to extract the model where the desktop has no file dialog.
+const EXTRACT_WITHOUT_DIALOG: &str = "run `neural-forge-cli extract-model DIR` instead, with the folder that holds nvngx_dlssnr.dll";
 
 /// The model's row text: present with each extracted network and the build it came from (and whether that is
 /// verified), or missing.
@@ -517,13 +527,36 @@ impl MainView {
         row("preset", "Strength preset", "Sets the four values below. Reference is Neural Forge's defaults", cx).child(menu).into_any_element()
     }
 
+    /// Asks the display server for the next key press itself where it will say (`keytap`), and reads the session's
+    /// keymap again (the layout may have been changed since the window opened).
+    pub(crate) fn listen_for_key(&mut self, window: &Window) {
+        self.pages.key_tap = crate::keytap::KeyTap::start(window);
+        self.read_session_keys(window);
+    }
+
+    /// The session's keymap, for the toggle key's name and for finding a key by the toolkit's name for it.
+    pub(crate) fn read_session_keys(&mut self, window: &Window) {
+        if let Some(keys) = crate::keytap::session_keys(window) {
+            self.pages.keys = keys;
+        }
+    }
+
+    /// The toggle key's button: the next key pressed is taken (Esc cancels).
+    pub(crate) fn wait_for_toggle_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pages.capturing_key = true;
+        self.listen_for_key(window);
+        // After the click has put the focus on the button itself.
+        let focus = self.pages.hotkey_focus.clone();
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        cx.notify();
+    }
+
     /// The toggle key: the button waits for the next key press (Esc cancels), Clear unbinds.
     fn hotkey_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let name = "toggle_key";
         let get: Get = |h| &h.toggle_key;
         let code = get(self.shm.header()).load(Ordering::Relaxed);
-        let shown = if self.pages.capturing_key { "Press a key (Esc cancels)".to_string() } else { crate::keys::key_label(code) };
-        let focus = self.pages.hotkey_focus.clone();
+        let shown = if self.pages.capturing_key { "Press a key (Esc cancels)".to_string() } else { self.pages.keys.label(code) };
         row(
             name,
             "Toggle key",
@@ -542,27 +575,29 @@ impl MainView {
                     cx.stop_propagation();
                     this.pages.capturing_key = false;
                     let key = event.keystroke.key.as_str();
-                    match crate::keys::evdev_code(key) {
+                    // Which key it was: the display server's own report of the press, else the key that carries the
+                    // toolkit's name for it on the session's layout.
+                    let pressed = this.pages.key_tap.take().and_then(|mut tap| tap.last_press());
+                    match pressed.or_else(|| this.pages.keys.code_for(key)) {
                         _ if key == "escape" => cx.notify(),
                         Some(code) => this.set_bits(name, get, code, window, cx),
                         None => {
-                            toast(window, cx, &format!("The {key} key cannot be the toggle key"));
+                            toast(window, cx, &format!("The {key} key cannot be the toggle key: the keyboard layout has no key by that name"));
                             cx.notify();
                         }
                     }
                 }))
-                .child(Button::new("key").small().label(shown.clone()).accessibility_label(format!("Toggle key: {shown}")).on_click(cx.listener(
-                    move |this, _, window, cx| {
-                        this.pages.capturing_key = true;
-                        // After the click has put the focus on the button itself.
-                        let focus = focus.clone();
-                        window.defer(cx, move |window, cx| focus.focus(window, cx));
-                        cx.notify();
-                    },
-                ))),
+                .child(
+                    Button::new("key")
+                        .small()
+                        .label(shown.clone())
+                        .accessibility_label(format!("Toggle key: {shown}"))
+                        .on_click(cx.listener(move |this, _, window, cx| this.wait_for_toggle_key(window, cx))),
+                ),
         )
         .child(Button::new("clear").small().label("Clear").on_click(cx.listener(move |this, _, window, cx| {
             this.pages.capturing_key = false;
+            this.pages.key_tap = None;
             this.set_bits(name, get, 0, window, cx);
         })))
         .into_any_element()
@@ -895,10 +930,12 @@ impl MainView {
     }
 
     /// Asks for one file with the desktop's file dialog and hands it to `picked`. The dialog has no file-type filter
-    /// in this toolkit: what was picked is checked afterwards.
+    /// in this toolkit: what was picked is checked afterwards. Where the desktop has no file dialog to offer (no
+    /// FileChooser portal), the message ends with `without`, the way to do the same without one.
     fn pick_file(
         &mut self,
         prompt: &'static str,
+        without: &'static str,
         window: &mut Window,
         cx: &mut Context<Self>,
         picked: fn(&mut Self, std::path::PathBuf, &mut Window, &mut Context<Self>),
@@ -913,14 +950,15 @@ impl MainView {
                     }
                 }
                 Ok(Ok(None)) | Err(_) => {}
-                Ok(Err(e)) => toast(window, cx, &format!("Could not open the file dialog: {e:#}")),
+                Ok(Err(e)) => toast(window, cx, &no_file_dialog(&format!("{e:#}"), without)),
             });
         })
         .detach();
     }
 
     fn choose_lut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.pick_file("Select a .cube look-up table", window, cx, |this, path, window, cx| {
+        let without = "name the file in config.ini instead (edit_lut=/path/to/table.cube)";
+        self.pick_file("Select a .cube look-up table", without, window, cx, |this, path, window, cx| {
             let path = path.to_string_lossy().into_owned();
             match neural_forge_protocol::cube::load(&path) {
                 Ok(cube) => {
@@ -1623,13 +1661,9 @@ impl MainView {
             // Which network runs: a persisted setting, so a running game switches over at its next frame.
             self.combo_row("network", "Network", subtitle, &NETWORK_CHOICES, |h| &h.network, true, cx),
             row("extract", "Extract from DLL", "Choose nvngx_dlssnr.dll; every network it has is written to Neural Forge's data folder", cx)
-                .child(
-                    Button::new("extract")
-                        .small()
-                        .label("Extract…")
-                        .disabled(self.pages.extracting)
-                        .on_click(cx.listener(|this, _, window, cx| this.pick_file("Select nvngx_dlssnr.dll", window, cx, Self::extract_model))),
-                )
+                .child(Button::new("extract").small().label("Extract…").disabled(self.pages.extracting).on_click(
+                    cx.listener(|this, _, window, cx| this.pick_file("Select nvngx_dlssnr.dll", EXTRACT_WITHOUT_DIALOG, window, cx, Self::extract_model)),
+                ))
                 .into_any_element(),
         ];
         group(
@@ -2207,13 +2241,38 @@ fn manual_toast(message: &str, manual: String, window: &mut Window, cx: &mut App
     toast_with_action(window, cx, message, "Copy launch options", copy);
 }
 
-/// Opens `dir` in the file manager, creating it first if it is missing.
+/// Opens `dir` in the file manager (`xdg-open`, off the UI thread), creating it first if it is missing; says so when
+/// that fails.
 fn open_folder(dir: &std::path::Path, window: &mut Window, cx: &mut App) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         toast(window, cx, &format!("Couldn't create {}: {e}", dir.display()));
         return;
     }
-    cx.open_with_system(dir);
+    let dir = dir.to_path_buf();
+    window
+        .spawn(cx, async move |cx| {
+            let opened = cx.background_executor().spawn(async move { open_with_file_manager(&dir, "xdg-open") }).await;
+            if let Err(why) = opened {
+                let _ = cx.update(|window, cx| toast(window, cx, &format!("Couldn't open the folder: {why}")));
+            }
+        })
+        .detach();
+}
+
+/// Runs `opener DIR` and waits for it: an error when it cannot be started or says it failed.
+fn open_with_file_manager(dir: &std::path::Path, opener: &str) -> Result<(), String> {
+    let status = std::process::Command::new(opener)
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("{opener} could not be started ({e})"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{opener} failed ({status})"))
+    }
 }
 
 /// One finding as a row: the severity's icon, the summary as the title, the evidence and the fix below; the check's
@@ -2715,5 +2774,20 @@ impl Render for ErrorView {
                     .child(div().text_xl().font_weight(FontWeight::BOLD).text_center().child(label("title", self.title)))
                     .child(div().text_center().text_color(cx.theme().muted_foreground).child(label("description", self.description.clone()))),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_that_cannot_be_opened_says_why() {
+        let dir = std::env::temp_dir();
+        assert_eq!(open_with_file_manager(&dir, "true"), Ok(()));
+        let failed = open_with_file_manager(&dir, "false").unwrap_err();
+        assert!(failed.starts_with("false failed ("), "{failed}");
+        let missing = open_with_file_manager(&dir, "/nonexistent/neural-forge-opener").unwrap_err();
+        assert!(missing.contains("could not be started"), "{missing}");
     }
 }

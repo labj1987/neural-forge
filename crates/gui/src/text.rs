@@ -418,6 +418,24 @@ mod no_window_tests {
     }
 }
 
+/// What is said when the desktop's file dialog cannot be opened (no FileChooser portal on this desktop): the error,
+/// what provides one, and `without`, the way to do the same without a dialog.
+pub(crate) fn no_file_dialog(error: &str, without: &str) -> String {
+    format!(
+        "Could not open the file dialog: {error}. The desktop offers none: install a file-chooser portal (xdg-desktop-portal-gtk, or your desktop's own), or {without}"
+    )
+}
+
+#[cfg(test)]
+mod file_dialog_tests {
+    #[test]
+    fn a_missing_file_dialog_names_the_way_forward() {
+        let said = super::no_file_dialog("no portal", "run `neural-forge-cli extract-model DIR` instead");
+        assert!(said.starts_with("Could not open the file dialog: no portal."));
+        assert!(said.contains("xdg-desktop-portal-gtk") && said.ends_with("neural-forge-cli extract-model DIR` instead"));
+    }
+}
+
 #[cfg(test)]
 mod window_size_tests {
     use super::{default_window_size, MIN_HEIGHT, MIN_WIDTH};
@@ -645,7 +663,7 @@ mod hotkey_tests {
         assert_eq!(format_key_label(30, Some("a")), "A");
         assert_eq!(format_key_label(70, Some("Scroll_Lock")), "Scroll_Lock");
         assert_eq!(format_key_label(87, None), "Key 87");
-        assert_eq!(crate::keys::key_label(0), "Unbound");
+        assert_eq!(format_key_label(30, Some("")), "Key 30");
     }
 }
 

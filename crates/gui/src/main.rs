@@ -1,6 +1,7 @@
 mod activation;
 mod instance;
-mod keys;
+mod keymap;
+mod keytap;
 mod pages;
 mod shm;
 mod text;
@@ -16,7 +17,7 @@ struct StderrLog;
 
 impl log::Log for StderrLog {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::max_level()
+        metadata.level() <= log::max_level() && (metadata.level() <= log::Level::Warn || !chatty(metadata.target()))
     }
 
     fn log(&self, record: &log::Record) {
@@ -28,26 +29,42 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
+/// The toolkit's dependencies that log every message they pass at info level (D-Bus handshakes byte by byte, each
+/// traced span): from them only warnings and errors are shown, whatever `NEURAL_FORGE_GUI_LOG` asks for.
+fn chatty(target: &str) -> bool {
+    ["zbus", "tracing", "naga", "polling", "async_io", "calloop"].iter().any(|noisy| target == *noisy || target.starts_with(&format!("{noisy}::")))
+}
+
 fn main() {
     // The window is drawn with Vulkan, and Neural Forge is a Vulkan layer: its switch must never reach this process (a
     // terminal or launcher that exported it for a game), or the window would load the layer into itself. First thing,
     // while the process has one thread.
     // SAFETY: no other thread exists yet to read or write the environment.
     unsafe { std::env::remove_var("NEURAL_FORGE_ENABLE") };
-    // Only the first copy goes on: a second launch has asked the running one to show its window.
-    let Some(activations) = instance::claim() else {
-        return;
-    };
     log::set_logger(&StderrLog).ok();
     // NEURAL_FORGE_GUI_LOG=info (or debug) also shows which renderer was picked.
     let level = neural_forge_protocol::env::var("NEURAL_FORGE_GUI_LOG").and_then(|level| level.parse().ok()).unwrap_or(log::LevelFilter::Warn);
     log::set_max_level(level);
 
-    // Keep the persistent layer copy (what Steam games load) in step with this
-    // AppImage on every launch, so an updated AppImage never runs against a stale layer.
+    // Keep the persistent layer copy (what Steam games load) in step with this AppImage on every launch, so an updated
+    // AppImage never runs against a stale layer. Before the single-instance check: a second launch from a newer AppImage
+    // still installs its layer while an older window is open (the installer replaces files by rename, so the running
+    // copy keeps the ones it has mapped).
     let install_error = auto_install();
     // Rings the NGX wrapper left for games that are gone (the layer never opened them): never a running game's.
     neural_forge_supervisor::proton_tool::sweep_dead_rings(std::path::Path::new(neural_forge_supervisor::proton_tool::RING_DIR));
+
+    // Only the first copy goes on: a second launch has asked the running one to show its window.
+    let activations = match instance::claim() {
+        instance::Claim::Primary(activations) => activations,
+        instance::Claim::Shown => return,
+        // Its window is stuck (it listens, but its UI does not answer): starting a second one beside it would have two
+        // copies writing the settings, so say what to do instead.
+        instance::Claim::NotResponding(pid) => {
+            ui::say_without_window(&instance::not_responding_message(pid));
+            std::process::exit(1);
+        }
+    };
 
     gpui_kit::application().with_assets(ui::Assets).run(move |cx| {
         ui::init(cx);
@@ -85,5 +102,15 @@ fn auto_install() -> Option<String> {
             eprintln!("neural-forge: installing the layer for Steam games failed: {e}");
             Some(format!("Installing the layer for Steam games failed: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_d_bus_crates_chatter_is_not_shown_at_info_level() {
+        assert!(super::chatty("zbus::connection::handshake::common") && super::chatty("tracing::span") && super::chatty("zbus"));
+        assert!(!super::chatty("gpui_wgpu::wgpu_context"), "which renderer was picked stays");
+        assert!(!super::chatty("neural_forge::keytap") && !super::chatty("zbus_names"));
     }
 }

@@ -50,29 +50,42 @@ icds="$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' 2>/dev/nu
 s="$(mktemp -d)"
 trap 'rm -rf "$s"' EXIT
 mkdir -p "$s/home" "$s/run"; chmod 700 "$s/run"
-# The run: start the GUI, wait up to 30 s for its window, check it still runs 2 s later, then end it.
-# shellcheck disable=SC2016 # the inner script's own variables
-env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$s/home" XDG_RUNTIME_DIR="$s/run" XDG_CONFIG_HOME="$s/home/.config" \
-    XDG_DATA_HOME="$s/home/.local/share" XDG_STATE_HOME="$s/home/.local/state" XDG_CACHE_HOME="$s/home/.cache" \
-    LANG=C.UTF-8 ${icds:+VK_DRIVER_FILES="$icds"} \
-    xvfb-run -a -s "-screen 0 1920x1080x24" dbus-run-session -- bash -c '
-        "$1/AppRun" > "$2/out" 2> "$2/err" & gui=$!
-        for _ in $(seq 60); do
-            xdotool search --onlyvisible --name "^Neural Forge$" >/dev/null 2>&1 && { echo mapped > "$2/state"; break; }
-            kill -0 "$gui" 2>/dev/null || break
-            sleep 0.5
-        done
-        sleep 2
-        kill -0 "$gui" 2>/dev/null && echo running >> "$2/state"
-        kill "$gui" 2>/dev/null; wait "$gui" 2>/dev/null || true' _ "$appdir" "$s" 2> "$s/session" || true
-state="$( { cat "$s/state" 2>/dev/null || true; } | paste -sd' ' -)"
-why="$(verdict "$s/err")"
+state=""
+why=""
+# One start: the GUI, up to 30 s for its window, a check that it still runs 2 s later, then its end.
+start_once() {
+    rm -f "$s/state" "$s/out" "$s/err"
+    # shellcheck disable=SC2016 # the inner script's own variables
+    env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$s/home" XDG_RUNTIME_DIR="$s/run" XDG_CONFIG_HOME="$s/home/.config" \
+        XDG_DATA_HOME="$s/home/.local/share" XDG_STATE_HOME="$s/home/.local/state" XDG_CACHE_HOME="$s/home/.cache" \
+        LANG=C.UTF-8 ${icds:+VK_DRIVER_FILES="$icds"} \
+        xvfb-run -a -s "-screen 0 1920x1080x24" dbus-run-session -- bash -c '
+            "$1/AppRun" > "$2/out" 2> "$2/err" & gui=$!
+            for _ in $(seq 60); do
+                xdotool search --onlyvisible --name "^Neural Forge$" >/dev/null 2>&1 && { echo mapped > "$2/state"; break; }
+                kill -0 "$gui" 2>/dev/null || break
+                sleep 0.5
+            done
+            sleep 2
+            kill -0 "$gui" 2>/dev/null && echo running >> "$2/state"
+            kill "$gui" 2>/dev/null; wait "$gui" 2>/dev/null || true' _ "$appdir" "$s" 2> "$s/session" || true
+        why="$(verdict "$s/err")"
+}
+start_once
+tries="first start"
+# The toolkit's X11 code has been seen to hang at start on Xvfb before its window shows (the process alive, nothing
+# on stderr): that one case gets a second start, and the output says so.
+if [ "$state" = running ] && [ -z "$why" ]; then
+    echo "smoke-gui: no window on the first start (the process was alive, stderr clean): starting it once more"
+    start_once
+    tries="second start, the first showed no window"
+fi
 if [ "$state" != "mapped running" ] || [ -n "$why" ]; then
-    echo "smoke-gui: FAILED (${state:-no window}; ${why:-stderr clean})" >&2
+    echo "smoke-gui: FAILED on the $tries (${state:-no window}; ${why:-stderr clean})" >&2
     echo "  the GUI's stderr:" >&2
     sed 's/^/    /' "$s/err" >&2 || true
     echo "  the session's (Xvfb, D-Bus):" >&2
     sed 's/^/    /' "$s/session" >&2 || true
     exit 1
 fi
-echo "smoke-gui: window mapped, main loop running, stderr clean"
+echo "smoke-gui: window mapped, main loop running, stderr clean ($tries)"

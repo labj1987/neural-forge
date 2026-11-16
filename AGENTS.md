@@ -197,7 +197,19 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - The file dialog (portal) has no file-type filter in GPUI: what was picked is checked afterwards
   (`cube::load`, `extract_all`). A menu is a button with a popup menu (`menu_button`), not a searchable list.
 - The toggle key: GPUI gives a key's name on the current layout, not its hardware code, and the layer reads evdev
-  codes: `keys.rs` maps names to the code of the US-layout key.
+  codes. `keymap.rs` (xkbcommon) names a stored code on the session's layout and finds the key that carries a name on
+  it; `keytap.rs` gets the session's keymap (Wayland: a private connection's `wl_keyboard`, asked for only once the
+  seat says it has a keyboard; X11: `_XKB_RULES_NAMES`) and, on X11, the pressed key's own keycode from XInput 2 raw
+  events on a private connection while the row waits. Never ask a seat without the keyboard capability for a
+  keyboard, and never put a second keyboard on the toolkit's own connection: a headless GNOME Shell 50 segfaulted on
+  the first. Wayland things are tried in a private compositor (`gnome-shell --headless --virtual-monitor 1600x1000
+  --wayland-display NAME --no-x11` under `dbus-run-session`), never first on the desktop in use.
+- One window per login (`instance.rs`): a second launch sends its request and waits 2 s for the "ok" the UI loop
+  writes after raising the window; without it, it reports the running copy as not responding (`say_without_window`:
+  stderr and the first of kdialog, zenity, notify-send, xmessage). `main` installs the layer before that check.
+- A dialog's continuation runs through `Once` from every way out: the toolkit's `close_dialog` (what a button calls)
+  does not call the dialog's `on_close`.
+- The logger shows the toolkit's chatty dependencies (`chatty` in `main.rs`: zbus, tracing, ...) only from warn up.
 - Clicks, the wheel and typing can be tested on the private X display with `xdotool` (window-relative positions in
   device pixels, twice the logical ones at 2x), reading the scratch `config.ini` afterwards for what was saved.
 - Before a release, on GNOME, KDE Plasma, Hyprland and COSMIC: start, every tab, a number field (type, step, Enter),

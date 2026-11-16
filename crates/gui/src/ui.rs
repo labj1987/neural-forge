@@ -294,7 +294,7 @@ pub(crate) fn ask(question: Question, on_ok: Continuation, on_cancel: Option<Con
                 }
             }
         };
-        let (enter, enter_cancel, on_close) = (confirm.clone(), dismiss.clone(), dismiss.clone());
+        let (enter, enter_cancel, on_close, cancel) = (confirm.clone(), dismiss.clone(), dismiss.clone(), dismiss);
         let (on_action, on_cancel) = (action_focus.clone(), cancel_focus.clone());
         let action = Button::new("ok").label(ok_text).track_focus(&action_focus).on_click(move |_, window, cx| {
             window.close_dialog(cx);
@@ -317,12 +317,38 @@ pub(crate) fn ask(question: Question, on_ok: Continuation, on_cancel: Option<Con
                 named_group(id, title.clone()).child(div().id("body").max_h(dialog_room(window)).overflow_y_scroll().child(label("text", body.clone()))).child(
                     dialog_buttons()
                         .child(Button::new("cancel").label("Cancel").track_focus(&cancel_focus).on_click(move |_, window, cx| {
+                            // `close_dialog` drops the dialog without calling its `on_close`: the button says it itself.
                             window.close_dialog(cx);
+                            cancel(window, cx);
                         }))
                         .child(if danger { action.danger() } else { action.primary() }),
                 ),
             )
     });
+}
+
+/// What follows a dialog, run at most once whichever way the dialog went (its button, Enter, Escape, the close
+/// button): the toolkit calls a dialog's `on_close` for some of those and not for `close_dialog`, so every way out
+/// asks this.
+#[derive(Clone)]
+pub(crate) struct Once(Rc<RefCell<Option<Continuation>>>);
+
+impl Once {
+    pub(crate) fn new(then: Option<Continuation>) -> Self {
+        Self(Rc::new(RefCell::new(then)))
+    }
+
+    /// The continuation, the first time only.
+    fn take(&self) -> Option<Continuation> {
+        self.0.borrow_mut().take()
+    }
+
+    /// Runs the continuation after the dialog is out of the way, the first time only.
+    pub(crate) fn run(&self, window: &mut Window, cx: &mut App) {
+        if let Some(callback) = self.take() {
+            window.defer(cx, move |window, cx| callback(window, cx));
+        }
+    }
 }
 
 /// Says something with one button; `on_close` runs once the dialog has closed, however it was closed.
@@ -335,26 +361,20 @@ pub(crate) fn inform(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let closed = Rc::new(RefCell::new(on_close));
+    let closed = Once::new(on_close);
     let focus = InitialFocus::new(cx);
     window.open_dialog(cx, move |dialog, window, cx| {
         focus.apply(window, cx);
-        let closed = closed.clone();
-        dialog
-            .title(dialog_title(title.clone()))
-            .overlay(false)
-            .w(px(520.))
-            .on_ok(|_, _, _| true)
-            .on_close(move |_, window, cx| {
-                if let Some(callback) = closed.borrow_mut().take() {
-                    window.defer(cx, move |window, cx| callback(window, cx));
-                }
-            })
-            .child(
-                named_group(id, title.clone()).child(div().id("body").max_h(dialog_room(window)).overflow_y_scroll().child(label("text", body.clone()))).child(
-                    dialog_buttons().child(Button::new("close").label(button).track_focus(&focus.handle).on_click(|_, window, cx| window.close_dialog(cx))),
-                ),
-            )
+        let (closed, pressed) = (closed.clone(), closed.clone());
+        dialog.title(dialog_title(title.clone())).overlay(false).w(px(520.)).on_ok(|_, _, _| true).on_close(move |_, window, cx| closed.run(window, cx)).child(
+            named_group(id, title.clone()).child(div().id("body").max_h(dialog_room(window)).overflow_y_scroll().child(label("text", body.clone()))).child(
+                dialog_buttons().child(Button::new("close").label(button).track_focus(&focus.handle).on_click(move |_, window, cx| {
+                    // `close_dialog` drops the dialog without calling its `on_close`: the button runs what follows.
+                    window.close_dialog(cx);
+                    pressed.run(window, cx);
+                })),
+            ),
+        )
     });
 }
 
@@ -614,17 +634,23 @@ fn forced_theme() -> Option<ThemeMode> {
 /// behind with no window would also keep later launches from starting.
 fn no_window(error: &str) -> ! {
     let has_display = ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
-    let message = crate::text::no_window_message(error, has_display);
+    say_without_window(&crate::text::no_window_message(error, has_display));
+    std::process::exit(1);
+}
+
+/// Tells the user something when this process has no window to say it in: on stderr, and in the first dialog or
+/// notification tool the desktop has (with no display there is nowhere to show one).
+pub fn say_without_window(message: &str) {
     eprintln!("neural-forge: {message}");
-    if has_display {
-        for (program, args) in crate::text::ERROR_DIALOGS {
-            let status = std::process::Command::new(program).args(*args).arg(&message).stdin(std::process::Stdio::null()).status();
-            if status.is_ok_and(|status| crate::text::helper_showed(program, status.code())) {
-                break;
-            }
+    if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
+        return;
+    }
+    for (program, args) in crate::text::ERROR_DIALOGS {
+        let status = std::process::Command::new(program).args(*args).arg(message).stdin(std::process::Stdio::null()).status();
+        if status.is_ok_and(|status| crate::text::helper_showed(program, status.code())) {
+            break;
         }
     }
-    std::process::exit(1);
 }
 
 /// Writes the settings changed a moment ago, which wait for their save (`shm::SAVE_DELAY`).
@@ -713,13 +739,17 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
     // GPUI's own request is what there is; a Wayland compositor then marks the window as wanting attention instead of
     // raising it.
     cx.spawn(async move |cx| {
-        while let Ok(token) = activations.recv().await {
-            let _ = window.update(cx, |_, window, _| {
-                let raised = token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
+        while let Ok(request) = activations.recv().await {
+            let shown = window.update(cx, |_, window, _| {
+                let raised = request.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
                 if !raised {
                     window.activate_window();
                 }
             });
+            // The launch that asked waits for this: it comes from the UI loop, so a stuck window never sends it.
+            if shown.is_ok() {
+                request.acknowledge();
+            }
         }
     })
     .detach();
@@ -945,6 +975,7 @@ impl MainView {
 
     /// Once the window can show messages and dialogs.
     fn started(&mut self, install_error: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.read_session_keys(window);
         if let Some(message) = install_error {
             toast_kept(window, cx, &message);
         }
@@ -1248,6 +1279,18 @@ mod tests {
         assert_eq!(enter_key(true, false), EnterKey::Confirm);
         assert_eq!(enter_key(false, true), EnterKey::Cancel);
         assert_eq!(enter_key(false, false), EnterKey::Nothing, "Enter on the close button or the text decides nothing");
+    }
+
+    #[test]
+    fn what_follows_a_dialog_runs_once_whichever_way_it_closed() {
+        let ran = Rc::new(Cell::new(0));
+        let counted = ran.clone();
+        let once = Once::new(Some(Box::new(move |_, _| counted.set(counted.get() + 1))));
+        let (button, on_close) = (once.clone(), once.clone());
+        assert!(button.take().is_some(), "the button gets it: close_dialog calls no on_close");
+        assert!(on_close.take().is_none(), "and a later on_close finds nothing to run twice");
+        assert!(Once::new(None).take().is_none());
+        assert_eq!(ran.get(), 0, "taking is not running");
     }
 
     #[test]

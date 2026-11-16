@@ -100,6 +100,7 @@ says what to do.
   or OpenGL ES loader) it says which and how to install it, in a dialog where one can be shown; with no working
   graphics driver at all it says so the same way. Started from a terminal with `NEURAL_FORGE_GUI_LOG=info`, it
   prints which renderer it draws with. Games do not need the window: the layer and `neural-forge-cli` work without it.
+  "Already running but not responding" means an earlier window is stuck: close the process it names and start again.
 - **HDR does not come on.** The Status tab's HDR line says why. Under Proton add
   `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` to the launch options (Proton-GE), or start gamescope
   with `--hdr-enabled`; if HDR10 was available, switch on the game's own HDR setting. The line also

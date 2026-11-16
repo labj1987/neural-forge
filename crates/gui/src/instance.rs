@@ -3,7 +3,8 @@
 //! The first copy listens on a socket in the user's runtime directory
 //! (`XDG_RUNTIME_DIR`, one per login, shared by every display of that login).
 //! A second launch finds it, hands over its activation token so the running
-//! window can be raised, and exits: two windows would both write the
+//! window can be raised, waits for the running copy's UI to say it has done so
+//! (a window that does not answer is reported to the user), and exits: two windows would both write the
 //! settings and both run the start-up install.
 //!
 //! Without `XDG_RUNTIME_DIR` there is no directory that is known to be the
@@ -17,9 +18,39 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Requests from later launches to show the running window, each with the
-/// activation token of that launch when it had one (see `launch_token`).
-pub type Activations = UnboundedReceiver<Option<String>>;
+/// One later launch asking for the running window to be shown.
+pub struct Request {
+    /// The activation token of that launch, when it had one (see `launch_token`).
+    pub token: Option<String>,
+    reply: UnixStream,
+}
+
+impl Request {
+    /// Tells the launch that asked that the UI has handled its request: it waits for this line, and takes silence
+    /// for a window that no longer responds.
+    pub fn acknowledge(mut self) {
+        let _ = self.reply.write_all(ACK.as_bytes());
+    }
+}
+
+/// Requests from later launches to show the running window.
+pub type Activations = UnboundedReceiver<Request>;
+
+/// What the running copy answers once its UI has handled a request.
+const ACK: &str = "ok\n";
+
+/// How long a later launch waits for that answer. A window that is still starting answers once it is up.
+const ACK_WAIT: Duration = Duration::from_secs(2);
+
+/// What became of this launch.
+pub enum Claim {
+    /// This is the first copy; the receiver yields once per later launch.
+    Primary(Activations),
+    /// Another copy is running and has shown its window.
+    Shown,
+    /// Another copy is running (its process id, where the socket tells) but its UI did not answer.
+    NotResponding(Option<u32>),
+}
 
 fn runtime_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from)
@@ -44,18 +75,16 @@ fn valid_token(token: &str) -> bool {
     !token.is_empty() && token.len() <= MAX_TOKEN && token.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// `None` when another copy is already running (it has been asked to show
-/// its window); otherwise this is the primary copy, and the receiver yields
-/// once per later launch.
-pub fn claim() -> Option<Activations> {
+/// Finds the running copy and asks it to show its window, or makes this the first copy.
+pub fn claim() -> Claim {
     match runtime_dir() {
-        Some(dir) => claim_at(&dir.join("neural-forge.sock"), launch_token()),
+        Some(dir) => claim_at(&dir.join("neural-forge.sock"), launch_token(), ACK_WAIT),
         None => {
             eprintln!("neural-forge: XDG_RUNTIME_DIR is not set, so a second launch can't find this one");
             let (tx, rx) = unbounded_channel();
             // Kept open for the life of the process: the receiver never ends.
             std::mem::forget(tx);
-            Some(rx)
+            Claim::Primary(rx)
         }
     }
 }
@@ -79,19 +108,22 @@ fn nobody_listening(error: &std::io::Error) -> bool {
     matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
 }
 
-fn claim_at(path: &Path, token: Option<String>) -> Option<Activations> {
+fn claim_at(path: &Path, token: Option<String>, wait: Duration) -> Claim {
     let _lock = lock(path);
     match UnixStream::connect(path) {
         Ok(mut stream) => {
             let _ = writeln!(stream, "activate {}", token.as_deref().unwrap_or(""));
-            return None;
+            // The running copy answers from its UI loop: no answer in time means its window is stuck.
+            let _ = stream.set_read_timeout(Some(wait));
+            let mut answer = String::new();
+            let _ = BufReader::new(&stream).take(64).read_line(&mut answer);
+            return if answer == ACK { Claim::Shown } else { Claim::NotResponding(peer_pid(&stream)) };
         }
         Err(e) if nobody_listening(&e) => {
             let _ = std::fs::remove_file(path);
         }
         Err(e) => {
-            // Something answers to that name but not to us: leave it alone and
-            // run without the check.
+            // Something answers to that name but not to us: leave it alone and run without the check.
             eprintln!("neural-forge: single-instance socket {}: {e}", path.display());
         }
     }
@@ -107,22 +139,36 @@ fn claim_at(path: &Path, token: Option<String>) -> Option<Activations> {
             });
         }
         Err(e) => {
-            // Without the socket the app still runs; it just can't be found
-            // by a second launch.
+            // Without the socket the app still runs; it just can't be found by a second launch.
             eprintln!("neural-forge: single-instance socket {}: {e}", path.display());
             std::mem::forget(tx);
         }
     }
-    Some(rx)
+    Claim::Primary(rx)
 }
 
-/// The token a second launch sent with its request, if any. A launch that
-/// sends nothing readable still counts as a request.
-fn read_request(connection: UnixStream) -> Option<String> {
+/// The process on the other end of the socket (the running copy), from the kernel's record of who bound it.
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED writes one `ucred` into the buffer of that size, on a socket this function borrows.
+    let rc = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, std::ptr::from_mut(&mut cred).cast(), &mut len) };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
+}
+
+/// What to tell the user when the running copy does not answer.
+pub fn not_responding_message(pid: Option<u32>) -> String {
+    let which = pid.map(|pid| format!(" (process {pid})")).unwrap_or_default();
+    format!("Neural Forge is already running but not responding. Close it{which} and start it again.")
+}
+
+/// The request a second launch sent: its token, if any (a launch that sends nothing readable still counts), and the
+/// connection to answer it on.
+fn read_request(connection: UnixStream) -> Request {
     let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
     let mut line = String::new();
-    let _ = BufReader::new(connection).take(8192).read_line(&mut line);
-    parse_request(&line)
+    let _ = BufReader::new(&connection).take(8192).read_line(&mut line);
+    Request { token: parse_request(&line), reply: connection }
 }
 
 fn parse_request(line: &str) -> Option<String> {
@@ -132,7 +178,10 @@ fn parse_request(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_at, nobody_listening, parse_request, valid_token, MAX_TOKEN};
+    use super::{claim_at, nobody_listening, not_responding_message, parse_request, valid_token, Activations, Claim, MAX_TOKEN};
+    use std::time::Duration;
+
+    const SOON: Duration = Duration::from_millis(300);
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("neural-forge-{name}-{}", std::process::id()));
@@ -141,15 +190,59 @@ mod tests {
         dir
     }
 
+    fn primary(claim: Claim) -> Activations {
+        match claim {
+            Claim::Primary(requests) => requests,
+            _ => panic!("the first copy is the primary"),
+        }
+    }
+
+    /// A second launch at `path`, with a running copy whose UI answers each request (as `build_ui` does).
+    fn second_launch(path: &std::path::Path, first: &Activations, token: Option<&str>) -> (Claim, Option<String>) {
+        std::thread::scope(|scope| {
+            let ui = scope.spawn(|| {
+                let request = first.recv_blocking().unwrap();
+                let token = request.token.clone();
+                request.acknowledge();
+                token
+            });
+            let claim = claim_at(path, token.map(str::to_string), Duration::from_secs(5));
+            (claim, ui.join().unwrap())
+        })
+    }
+
     #[test]
-    fn second_launch_reaches_the_first_with_its_token() {
+    fn second_launch_reaches_the_first_with_its_token_and_hears_back() {
         let dir = scratch("instance");
         let path = dir.join("test.sock");
-        let first = claim_at(&path, None).expect("the first copy is the primary");
-        assert!(claim_at(&path, Some("token-1".into())).is_none(), "a second copy finds the first and stands down");
-        assert_eq!(first.recv_blocking().ok(), Some(Some("token-1".to_string())), "and the first is told, with the token to raise its window with");
-        assert!(claim_at(&path, None).is_none());
-        assert_eq!(first.recv_blocking().ok(), Some(None), "no token: still a request");
+        let first = primary(claim_at(&path, None, SOON));
+        let (claim, token) = second_launch(&path, &first, Some("token-1"));
+        assert!(matches!(claim, Claim::Shown), "a second copy finds the first, is answered and stands down");
+        assert_eq!(token, Some("token-1".to_string()), "and the first is told, with the token to raise its window with");
+        let (claim, token) = second_launch(&path, &first, None);
+        assert!(matches!(claim, Claim::Shown));
+        assert_eq!(token, None, "no token: still a request");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_running_copy_whose_ui_does_not_answer_is_named() {
+        let dir = scratch("stuck");
+        let path = dir.join("test.sock");
+        // The first copy listens, but its UI never takes the request (a stuck window).
+        let first = primary(claim_at(&path, None, SOON));
+        match claim_at(&path, Some("token-2".into()), SOON) {
+            Claim::NotResponding(pid) => {
+                assert_eq!(pid, Some(std::process::id()), "the running copy's process, from the socket");
+                assert_eq!(
+                    not_responding_message(pid),
+                    format!("Neural Forge is already running but not responding. Close it (process {}) and start it again.", std::process::id())
+                );
+            }
+            _ => panic!("no answer in time is not a shown window"),
+        }
+        assert_eq!(not_responding_message(None), "Neural Forge is already running but not responding. Close it and start it again.");
+        drop(first);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -160,9 +253,9 @@ mod tests {
         // A socket nobody listens on any more.
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists());
-        let first = claim_at(&path, None).expect("a dead socket does not block startup");
-        assert!(claim_at(&path, None).is_none(), "and the new one answers");
-        assert_eq!(first.recv_blocking().ok(), Some(None));
+        let first = primary(claim_at(&path, None, SOON));
+        let (claim, _) = second_launch(&path, &first, None);
+        assert!(matches!(claim, Claim::Shown), "and the new one answers");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -178,7 +271,7 @@ mod tests {
         let path = dir.join("test.sock");
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("keep"), b"x").unwrap();
-        let _ = claim_at(&path, None);
+        let _ = claim_at(&path, None, SOON);
         assert!(path.join("keep").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -190,11 +283,11 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let path = path.clone();
-                std::thread::spawn(move || claim_at(&path, None))
+                std::thread::spawn(move || claim_at(&path, None, Duration::from_millis(50)))
             })
             .collect();
         let claims: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_eq!(claims.iter().filter(|c| c.is_some()).count(), 1);
+        assert_eq!(claims.iter().filter(|c| matches!(c, Claim::Primary(_))).count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

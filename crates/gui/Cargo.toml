@@ -29,3 +29,8 @@ raw-window-handle = "0.6"
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# The toggle key (keymap.rs, keytap.rs): the session's keymap and the pressed key's hardware code, which the toolkit's
+# key events do not carry. xkbcommon is the library the toolkit reads keys with; x11rb here is its pure-Rust connection
+# (a second, private one to the X server).
+xkbcommon = "0.8"
+x11rb = { version = "0.13", features = ["xinput"] }

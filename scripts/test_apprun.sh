@@ -6,7 +6,8 @@
 #   linked library is missing, glibc is too old, a symbol the GUI needs is undefined, or the libraries it loads at
 #   run time are missing (libwayland-client only on a Wayland session; Vulkan's or EGL's loader, either is enough);
 # - without ldd, or when ldd fails without saying why, the dynamic loader is asked;
-# - with a display, the first dialog tool that can show the message does (zenity, kdialog, notify-send).
+# - with a display, the first tool that can show the message does (zenity, kdialog, notify-send, the notification
+#   service over D-Bus, xmessage).
 # usage: bash scripts/test_apprun.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -172,4 +173,19 @@ grep -q '^kdialog Neural Forge can.t start' "$tmp/shown" || fail "kdialog: got $
 rm "$tmp/shown" "$tmp/bin/kdialog"
 if run WAYLAND_DISPLAY=wayland-0; then fail "notify-send: AppRun exited 0"; fi
 [ "$(cat "$tmp/shown")" = notify-send ] || fail "notify-send: got $(cat "$tmp/shown")"
+# A desktop with none of the three (a stock COSMIC): the notification service is asked over D-Bus, with the message
+# as the body; where that fails too (no service), xmessage on an X display.
+rm "$tmp/shown" "$tmp/bin/notify-send"
+stub gdbus "echo \"gdbus \$*\" >> '$tmp/shown'"
+stub xmessage "echo xmessage >> '$tmp/shown'"
+if run WAYLAND_DISPLAY=wayland-0; then fail "gdbus: AppRun exited 0"; fi
+grep -q "^gdbus call --session --dest org.freedesktop.Notifications .*Notify -- Neural Forge 0  Neural Forge Neural Forge can.t start" "$tmp/shown" \
+    || fail "gdbus: got $(cat "$tmp/shown")"
+[ "$(wc -l < "$tmp/shown")" -eq 1 ] || fail "gdbus: more than one message: $(cat "$tmp/shown")"
+rm "$tmp/shown"; stub gdbus "exit 1"
+if run DISPLAY=:0; then fail "xmessage: AppRun exited 0"; fi
+[ "$(cat "$tmp/shown")" = xmessage ] || fail "xmessage: got $(cat "$tmp/shown")"
+rm "$tmp/shown"
+if run WAYLAND_DISPLAY=wayland-0; then fail "no tool: AppRun exited 0"; fi
+[ ! -e "$tmp/shown" ] || fail "xmessage without an X display: $(cat "$tmp/shown")"
 echo "test_apprun: ok"

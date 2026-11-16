@@ -14,10 +14,12 @@ first shipped them; their phase is kept as a subheading.
   are untouched, and nothing changes in the games.
 - The AppImage no longer carries a copy of GTK and needs none on the system. It takes only the windowing and graphics
   libraries every desktop has (libxcb, libxkbcommon, Wayland's client library, and Vulkan or OpenGL ES; Mesa's software
-  drivers count). If one is missing, it says which and how to install it instead of not opening.
+  drivers count). If one is missing, it says which and how to install it instead of not opening, also on desktops
+  without zenity or kdialog (through the desktop's notifications).
 - The window is drawn with the graphics card only when something in it changes: left open beside a game it takes no
   GPU time, and a little video memory. It never loads Neural Forge's own layer into itself.
-- Starting Neural Forge a second time shows the window that is already open.
+- Starting Neural Forge a second time shows the window that is already open. If that window no longer responds,
+  the second start says so, with the process to close, instead of doing nothing.
 
 What works differently:
 
@@ -26,8 +28,9 @@ What works differently:
 - The file dialogs (the look-up table, `nvngx_dlssnr.dll`) list every file; a file that is not the right kind is
   refused with a message after you pick it.
 - The "Settings for" menu is a plain list (no type-to-search).
-- The toggle key: press the key as before. Function, navigation and lock keys are taken as they are; a letter, digit
-  or punctuation key is taken as the key that carries it on a US layout.
+- The toggle key: press the key as before; it is taken as the key in that place on your keyboard layout (AZERTY,
+  QWERTZ and the rest included) and shown by its name on it. In an X11 session the number pad's keys are told from
+  the main block's; in a Wayland session a number-pad key counts as the main-block key of the same name.
 - The tabs sit in the title bar; in a window narrower than about 760 pixels they move to the bottom.
 - `NEURAL_FORGE_GTK` is gone (there is one window now, not a GTK to choose).
 
