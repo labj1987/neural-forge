@@ -17,7 +17,7 @@ struct StderrLog;
 
 impl log::Log for StderrLog {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::max_level() && (metadata.level() <= log::Level::Warn || !chatty(metadata.target()))
+        shown(metadata.target(), metadata.level(), log::max_level())
     }
 
     fn log(&self, record: &log::Record) {
@@ -29,10 +29,27 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
-/// The toolkit's dependencies that log every message they pass at info level (D-Bus handshakes byte by byte, each
-/// traced span): from them only warnings and errors are shown, whatever `NEURAL_FORGE_GUI_LOG` asks for.
-fn chatty(target: &str) -> bool {
-    ["zbus", "tracing", "naga", "polling", "async_io", "calloop"].iter().any(|noisy| target == *noisy || target.starts_with(&format!("{noisy}::")))
+/// The most each source may show, whatever `NEURAL_FORGE_GUI_LOG` asks for (a module path and everything under it;
+/// the longest match counts). The toolkit's dependencies that log every message they pass at info level (D-Bus
+/// handshakes byte by byte, each traced span) show only warnings and errors. The D-Bus crate also warns about what a
+/// desktop simply lacks ("Failed to populate properties cache" for a service without properties), and GPUI's
+/// accessibility tree warns when two elements ask for the focus in one frame (harmless, seen with a screen reader on):
+/// only their errors are shown.
+const CAPS: &[(&str, log::LevelFilter)] = &[
+    ("zbus", log::LevelFilter::Error),
+    ("tracing", log::LevelFilter::Warn),
+    ("naga", log::LevelFilter::Warn),
+    ("polling", log::LevelFilter::Warn),
+    ("async_io", log::LevelFilter::Warn),
+    ("calloop", log::LevelFilter::Warn),
+    ("gpui::window::a11y", log::LevelFilter::Error),
+];
+
+/// Whether a line at `level` from `target` (a module path) is shown when `max` is asked for.
+fn shown(target: &str, level: log::Level, max: log::LevelFilter) -> bool {
+    let under = |prefix: &str| target == prefix || target.strip_prefix(prefix).is_some_and(|rest| rest.starts_with("::"));
+    let cap = CAPS.iter().filter(|(prefix, _)| under(prefix)).max_by_key(|(prefix, _)| prefix.len()).map_or(max, |&(_, cap)| max.min(cap));
+    level <= cap
 }
 
 fn main() {
@@ -114,10 +131,37 @@ fn auto_install() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use log::{Level, LevelFilter};
+
     #[test]
     fn the_d_bus_crates_chatter_is_not_shown_at_info_level() {
-        assert!(super::chatty("zbus::connection::handshake::common") && super::chatty("tracing::span") && super::chatty("zbus"));
-        assert!(!super::chatty("gpui_wgpu::wgpu_context"), "which renderer was picked stays");
-        assert!(!super::chatty("neural_forge::keytap") && !super::chatty("zbus_names"));
+        let shown = super::shown;
+        assert!(!shown("zbus::connection::handshake::common", Level::Info, LevelFilter::Info));
+        assert!(!shown("tracing::span", Level::Info, LevelFilter::Trace) && !shown("zbus", Level::Debug, LevelFilter::Debug));
+        assert!(shown("tracing::span", Level::Warn, LevelFilter::Info), "their warnings stay");
+        assert!(shown("gpui_wgpu::wgpu_context", Level::Info, LevelFilter::Info), "which renderer was picked stays");
+        assert!(shown("neural_forge::keytap", Level::Info, LevelFilter::Info) && shown("zbus_names", Level::Info, LevelFilter::Info), "whole names only");
+        assert!(!shown("neural_forge::keytap", Level::Info, LevelFilter::Warn), "the default stays warnings only");
+    }
+
+    #[test]
+    fn harmless_warnings_of_the_d_bus_crate_and_the_accessibility_tree_are_not_shown() {
+        let shown = super::shown;
+        // "Failed to populate properties cache via GetAll" and "a11y: set_focus called more than once in a single frame".
+        assert!(!shown("zbus::proxy", Level::Warn, LevelFilter::Warn));
+        assert!(!shown("zbus::connection", Level::Warn, LevelFilter::Info));
+        assert!(!shown("gpui::window::a11y", Level::Warn, LevelFilter::Trace));
+        assert!(shown("zbus::proxy", Level::Error, LevelFilter::Warn) && shown("gpui::window::a11y", Level::Error, LevelFilter::Warn), "errors stay");
+        assert!(
+            shown("gpui::window", Level::Warn, LevelFilter::Warn) && shown("gpui", Level::Warn, LevelFilter::Warn),
+            "the rest of the toolkit's warnings stay"
+        );
+        assert!(shown("gpui::window::a11y_extra", Level::Warn, LevelFilter::Warn), "whole module names only");
+        // Through the logger itself.
+        let metadata = |target| log::Metadata::builder().level(Level::Warn).target(target).build();
+        log::set_max_level(LevelFilter::Warn);
+        assert!(!log::Log::enabled(&super::StderrLog, &metadata("zbus::proxy")));
+        assert!(!log::Log::enabled(&super::StderrLog, &metadata("gpui::window::a11y")));
+        assert!(log::Log::enabled(&super::StderrLog, &metadata("gpui_wgpu::wgpu_context")));
     }
 }

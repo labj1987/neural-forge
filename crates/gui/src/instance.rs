@@ -5,7 +5,8 @@
 //! A second launch finds it, hands over its activation token so the running
 //! window can be raised, waits for the running copy's UI to say it has done so
 //! (a window that does not answer is reported to the user), and exits: two windows would both write the
-//! settings and both run the start-up install.
+//! settings. The start-up install is not what this guards: every launch runs it before it looks for a running copy
+//! (main.rs), so a newer AppImage installs its layer even while an older window is open.
 //!
 //! Without `XDG_RUNTIME_DIR` there is no directory that is known to be the
 //! user's alone, so the app runs without the single-instance check rather
@@ -18,7 +19,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One later launch asking for the running window to be shown.
 pub struct Request {
@@ -38,15 +39,78 @@ impl Request {
 /// Requests from later launches to show the running window, and the word to them that the window is up.
 pub struct Activations {
     requests: UnboundedReceiver<Request>,
-    up: Arc<AtomicBool>,
+    up: UiUp,
+    listening: Option<Listening>,
 }
 
 impl Activations {
-    /// The next request. Asking for one says the UI is up: from then on a later launch is not told to wait for a
-    /// start-up any more.
+    /// The handle that says the UI is up, set once the window's first frame has been presented.
+    pub fn up_signal(&self) -> UiUp {
+        self.up.clone()
+    }
+
+    /// The next request.
     pub async fn next(&self) -> Option<Request> {
-        self.up.store(true, Ordering::Relaxed);
         self.requests.recv().await.ok()
+    }
+}
+
+impl Drop for Activations {
+    /// Requests nobody will handle any more are closed unanswered: the launches waiting on them hear the end of the
+    /// connection at once (and look again) instead of waiting out the start-up wait.
+    fn drop(&mut self) {
+        self.requests.close();
+        while self.requests.try_recv().is_ok() {}
+    }
+}
+
+/// Says the first copy's UI is up (see `Activations::up_signal`). Set once the window's first frame has been drawn and
+/// presented: a window that has been created but never shown is not up yet, and a later launch is told to wait for it.
+#[derive(Clone, Default)]
+pub struct UiUp(Arc<AtomicBool>);
+
+impl UiUp {
+    pub fn set(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// The first copy's socket, closed (and its file removed) when the app is done with it: when its last window closes,
+/// or when it can't open one. Without that, a later launch would connect to a copy that no longer reads its requests,
+/// wait out the whole start-up wait, and call it stuck.
+#[derive(Clone)]
+struct Listening {
+    listener: Arc<UnixListener>,
+    path: PathBuf,
+    closed: Arc<AtomicBool>,
+}
+
+impl Listening {
+    fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // The file first: from here a launch finds nobody and becomes the first copy, instead of reaching a listener
+        // that is about to stop.
+        let _ = std::fs::remove_file(&self.path);
+        // Wakes the listener thread's accept with an error and refuses connections from here on; the thread then ends.
+        // SAFETY: shutdown on a socket this struct keeps open.
+        unsafe { libc::shutdown(self.listener.as_raw_fd(), libc::SHUT_RDWR) };
+    }
+}
+
+/// The first copy's socket, for `release`.
+static PRIMARY: std::sync::OnceLock<Listening> = std::sync::OnceLock::new();
+
+/// Stops answering later launches and removes the socket: call it when the app is about to end (its last window
+/// closed, or none could be opened), so the next launch becomes the first copy at once.
+pub fn release() {
+    if let Some(listening) = PRIMARY.get() {
+        listening.close();
     }
 }
 
@@ -57,24 +121,30 @@ const ACK: &str = "ok\n";
 /// graphics start, which can take seconds on a cold start or a software renderer).
 const STARTING: &str = "starting\n";
 
-/// How long a later launch waits for the first answer, and how long for the UI's once it heard the window is starting.
-const WAITS: Waits = Waits { first: Duration::from_secs(2), start_up: Duration::from_secs(15) };
-
+/// How long a later launch waits for an answer.
 #[derive(Clone, Copy)]
 struct Waits {
-    first: Duration,
-    start_up: Duration,
+    /// For any answer at all; also how long a copy that closes the connection unanswered (it is exiting) is asked
+    /// again, counted from the first time it did.
+    answer: Duration,
+    /// For "ok" from a copy that said it is starting, counted from the request.
+    start: Duration,
 }
+
+const WAITS: Waits = Waits { answer: Duration::from_secs(2), start: Duration::from_secs(15) };
+
+/// How often a copy that closed the connection unanswered is asked again.
+const RETRY_STEP: Duration = Duration::from_millis(75);
 
 /// What became of this launch.
 pub enum Claim {
     /// This is the first copy; the receiver yields once per later launch.
     Primary(Activations),
     /// Another copy (its process id, where the socket tells) is still starting (it said so) and had not shown its
-    /// window when this launch stopped waiting.
+    /// window when this launch stopped waiting. It has the request and shows its window when it is up.
     Starting(Option<u32>),
-    /// Another copy took the request and exited without answering, twice over: it is going away, and this launch
-    /// ends without a word.
+    /// Copies kept taking the request and closing the connection unanswered for the whole answer wait: they are going
+    /// away, and this launch ends without a word.
     Gone,
     /// Another copy is running and has shown its window.
     Shown,
@@ -108,13 +178,19 @@ fn valid_token(token: &str) -> bool {
 /// Finds the running copy and asks it to show its window, or makes this the first copy.
 pub fn claim() -> Claim {
     match runtime_dir() {
-        Some(dir) => claim_at(&dir.join("neural-forge.sock"), launch_token(), WAITS),
+        Some(dir) => {
+            let claim = claim_at(&dir.join("neural-forge.sock"), launch_token(), WAITS);
+            if let Claim::Primary(Activations { listening: Some(listening), .. }) = &claim {
+                let _ = PRIMARY.set(listening.clone());
+            }
+            claim
+        }
         None => {
             eprintln!("neural-forge: XDG_RUNTIME_DIR is not set, so a second launch can't find this one");
             let (tx, rx) = unbounded_channel();
             // Kept open for the life of the process: the receiver never ends.
             std::mem::forget(tx);
-            Claim::Primary(Activations { requests: rx, up: Arc::default() })
+            Claim::Primary(Activations { requests: rx, up: UiUp::default(), listening: None })
         }
     }
 }
@@ -138,83 +214,125 @@ fn nobody_listening(error: &std::io::Error) -> bool {
     matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
 }
 
+/// The running copy closed the connection without an answer (an end of file, a reset or a broken pipe).
+struct Closed;
+
 fn claim_at(path: &Path, token: Option<String>, waits: Waits) -> Claim {
-    let _lock = lock(path);
-    // Twice at most: a running copy that exits while this launch waits for its answer is looked for once more
-    // (usually nobody listens then, and this launch becomes the first copy).
-    for attempt in 0..2 {
-        match UnixStream::connect(path) {
-            Ok(mut stream) => {
-                let _ = writeln!(stream, "activate {}", token.as_deref().unwrap_or(""));
-                match await_answer(&stream, waits) {
-                    Some(claim) => return claim,
-                    None if attempt == 0 => continue,
-                    None => return Claim::Gone,
-                }
-            }
-            Err(e) if nobody_listening(&e) => {
-                let _ = std::fs::remove_file(path);
-                break;
-            }
-            Err(e) => {
-                // Something answers to that name but not to us: leave it alone and run without the check.
-                eprintln!("neural-forge: single-instance socket {}: {e}", path.display());
-                break;
-            }
+    // A copy that exits while it is being asked closes the connection unanswered. Its listener may take a moment more
+    // to go away, so it is asked again in short steps until nobody listens (this launch becomes the first copy) or a
+    // copy answers; if copies keep going away unanswered for the whole answer wait, this launch ends quietly rather
+    // than call one stuck. That wait counts from the first closed connection: a copy may have said "starting" for
+    // seconds before it went away.
+    let mut deadline = None;
+    loop {
+        if let Ok(claim) = try_claim(path, token.as_deref(), waits) {
+            return claim;
+        }
+        let deadline = *deadline.get_or_insert_with(|| Instant::now() + waits.answer);
+        if Instant::now() >= deadline {
+            return Claim::Gone;
+        }
+        std::thread::sleep(RETRY_STEP);
+    }
+}
+
+fn try_claim(path: &Path, token: Option<&str>, waits: Waits) -> Result<Claim, Closed> {
+    let lock = lock(path);
+    match UnixStream::connect(path) {
+        Ok(stream) => {
+            // The wait for the answer needs no lock: other launches may look meanwhile.
+            drop(lock);
+            return hand_over(&stream, token, waits);
+        }
+        Err(e) if nobody_listening(&e) => {
+            let _ = std::fs::remove_file(path);
+        }
+        Err(e) => {
+            // Something answers to that name but not to us: leave it alone and run without the check.
+            eprintln!("neural-forge: single-instance socket {}: {e}", path.display());
         }
     }
     let (tx, rx) = unbounded_channel();
-    let up: Arc<AtomicBool> = Arc::default();
-    match UnixListener::bind(path) {
+    let up = UiUp::default();
+    let listening = match UnixListener::bind(path) {
         Ok(listener) => {
-            let up = Arc::clone(&up);
-            std::thread::spawn(move || {
-                for connection in listener.incoming().flatten() {
-                    let mut request = read_request(connection);
-                    // Until the UI is up, the launch that asks is told so here: the UI's own answer follows once the
-                    // window is there to show.
-                    if !up.load(Ordering::Relaxed) {
-                        let _ = request.reply.write_all(STARTING.as_bytes());
-                    }
-                    if tx.send_blocking(request).is_err() {
-                        break;
-                    }
-                }
-            });
+            let listening = Listening { listener: Arc::new(listener), path: path.to_path_buf(), closed: Arc::default() };
+            let (thread_listening, thread_up) = (listening.clone(), up.clone());
+            std::thread::spawn(move || listen(&thread_listening, &thread_up, &tx));
+            Some(listening)
         }
         Err(e) => {
             // Without the socket the app still runs; it just can't be found by a second launch.
             eprintln!("neural-forge: single-instance socket {}: {e}", path.display());
             std::mem::forget(tx);
-        }
-    }
-    Claim::Primary(Activations { requests: rx, up })
-}
-
-/// What the running copy made of this launch's request: its UI's answer (the window is shown), or silence. A copy
-/// that says it is still starting is given longer, and is not called stuck if its window takes longer still. `None`
-/// when the copy closed the connection without an answer: it has exited (or is exiting), which is not a stuck window.
-fn await_answer(stream: &UnixStream, waits: Waits) -> Option<Claim> {
-    let mut lines = BufReader::new(stream).take(64);
-    // A line, `Some("")` for none in time, `None` for a closed connection.
-    let mut read_line = |wait: Duration| {
-        let _ = stream.set_read_timeout(Some(wait));
-        let mut line = String::new();
-        match lines.read_line(&mut line) {
-            Ok(0) => None,
-            // (A connection closed with the request still unread is reset, not ended.)
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) => None,
-            _ => Some(line),
+            None
         }
     };
-    Some(match read_line(waits.first)?.as_str() {
-        ACK => Claim::Shown,
-        STARTING => match read_line(waits.start_up)?.as_str() {
-            ACK => Claim::Shown,
-            _ => Claim::Starting(peer_pid(stream)),
-        },
-        _ => Claim::NotResponding(peer_pid(stream)),
-    })
+    Ok(Claim::Primary(Activations { requests: rx, up, listening }))
+}
+
+/// The first copy's listener thread: each later launch's request goes to the UI, answered "starting" at once while
+/// the window is not up. A connection accepted after the release, or one the UI no longer takes, is dropped unanswered,
+/// so that launch hears the end of the connection and asks again; only the accept error the release's shutdown causes
+/// once the backlog is empty ends the loop.
+fn listen(listening: &Listening, up: &UiUp, tx: &async_channel::Sender<Request>) {
+    for connection in listening.listener.incoming() {
+        let connection = match connection {
+            Ok(connection) => connection,
+            // Closed by `release`, and the backlog is empty: no more requests.
+            Err(_) if listening.closed.load(Ordering::Acquire) => break,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
+        // Released between the accept and now: dropped unanswered, so that launch asks again and finds nobody. The loop
+        // goes on: every launch already waiting in the backlog is dropped the same way.
+        if listening.closed.load(Ordering::Acquire) {
+            continue;
+        }
+        let mut request = read_request(connection);
+        // Until the UI is up, the launch that asks is told so here: the UI's own answer follows once the window is
+        // there to show.
+        if !up.is_set() {
+            let _ = request.reply.write_all(STARTING.as_bytes());
+        }
+        // A UI that no longer takes requests drops this one, unanswered.
+        let _ = tx.send_blocking(request);
+    }
+}
+
+/// Sends the request to the running copy and waits for its answer: "ok" within `waits.answer`, or "starting" within
+/// that and then "ok" within `waits.start` of the request. A copy that said it is starting is not called stuck if its
+/// window takes longer still. `Err(Closed)` when the running copy closed the connection without answering: it has
+/// exited (or is exiting), which is not a stuck window, and the claim is worth another try.
+fn hand_over(stream: &UnixStream, token: Option<&str>, waits: Waits) -> Result<Claim, Closed> {
+    let pid = peer_pid(stream);
+    let asked = Instant::now();
+    let _ = stream.set_write_timeout(Some(waits.answer));
+    if writeln!(&*stream, "activate {}", token.unwrap_or("")).is_err() {
+        return Err(Closed);
+    }
+    let mut reader = BufReader::new(stream).take(64);
+    let mut line = String::new();
+    let _ = stream.set_read_timeout(Some(waits.answer));
+    let mut read = reader.read_line(&mut line);
+    let starting = read.is_ok() && line == STARTING;
+    if starting {
+        line.clear();
+        let left = waits.start.saturating_sub(asked.elapsed()).max(Duration::from_millis(1));
+        let _ = stream.set_read_timeout(Some(left));
+        read = reader.read_line(&mut line);
+    }
+    match read {
+        _ if line == ACK => Ok(Claim::Shown),
+        // The end with nothing, or a reset (it closed before reading the request): the copy went away. A timeout is
+        // another error.
+        Ok(0) => Err(Closed),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) => Err(Closed),
+        _ if starting => Ok(Claim::Starting(pid)),
+        _ => Ok(Claim::NotResponding(pid)),
+    }
 }
 
 /// The process on the other end of the socket (the running copy), from the kernel's record of who bound it.
@@ -226,10 +344,11 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
     (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
 }
 
-/// What to tell the user when the running copy said it is starting and its window has not come up in the time waited.
+/// What to tell the user when the running copy said it is starting and its window has not come up in the time waited:
+/// information, not an error (it has the request, and its window comes up on its own).
 pub fn still_starting_message(pid: Option<u32>) -> String {
     let which = pid.map(|pid| format!(" (process {pid})")).unwrap_or_default();
-    format!("Neural Forge is still starting{which}.")
+    format!("Neural Forge is still starting{which}; its window will appear when it is ready.")
 }
 
 /// What to tell the user when the running copy does not answer.
@@ -254,17 +373,36 @@ fn parse_request(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_at, nobody_listening, not_responding_message, parse_request, valid_token, Activations, Claim, Waits, MAX_TOKEN};
-    use std::time::Duration;
+    use super::{
+        claim_at, listen, nobody_listening, not_responding_message, parse_request, still_starting_message, valid_token, Activations, Claim, Listening, UiUp,
+        Waits, MAX_TOKEN,
+    };
+    use std::path::Path;
+    use std::time::{Duration, Instant};
 
-    const SOON: Waits = Waits { first: Duration::from_millis(300), start_up: Duration::from_millis(600) };
-    const PATIENT: Waits = Waits { first: Duration::from_secs(5), start_up: Duration::from_secs(5) };
+    const WAIT: Waits = Waits { answer: Duration::from_secs(2), start: Duration::from_secs(15) };
+
+    /// Short waits: `answer` for any answer, `start` for "ok" after "starting".
+    fn waits(answer: u64, start: u64) -> Waits {
+        Waits { answer: Duration::from_millis(answer), start: Duration::from_millis(start) }
+    }
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("neural-forge-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    impl Activations {
+        fn recv_blocking(&self) -> super::Request {
+            self.requests.recv_blocking().expect("the first copy is told")
+        }
+
+        /// What `release` does for the first copy of the process.
+        fn close(&self) {
+            self.listening.as_ref().expect("listening").close();
+        }
     }
 
     fn primary(claim: Claim) -> Activations {
@@ -274,31 +412,37 @@ mod tests {
         }
     }
 
-    /// The running copy's UI taking one request, as `build_ui`'s loop does.
-    fn ui_takes_one(first: &Activations) -> super::Request {
-        first.up.store(true, std::sync::atomic::Ordering::Relaxed);
-        first.requests.recv_blocking().unwrap()
+    /// The first copy at `path`, with its window drawn.
+    fn up_primary(path: &Path) -> Activations {
+        let first = primary(claim_at(path, None, WAIT));
+        first.up_signal().set();
+        first
     }
 
     /// A second launch at `path`, with a running copy whose UI answers each request.
-    fn second_launch(path: &std::path::Path, first: &Activations, token: Option<&str>) -> (Claim, Option<String>) {
+    fn second_launch(path: &Path, first: &Activations, token: Option<&str>) -> (Claim, Option<String>) {
         std::thread::scope(|scope| {
             let ui = scope.spawn(|| {
-                let request = ui_takes_one(first);
+                let request = first.recv_blocking();
                 let token = request.token.clone();
                 request.acknowledge();
                 token
             });
-            let claim = claim_at(path, token.map(str::to_string), PATIENT);
+            let claim = claim_at(path, token.map(str::to_string), WAIT);
             (claim, ui.join().unwrap())
         })
+    }
+
+    fn launch(path: &Path, waits: Waits) -> std::thread::JoinHandle<Claim> {
+        let path = path.to_path_buf();
+        std::thread::spawn(move || claim_at(&path, None, waits))
     }
 
     #[test]
     fn second_launch_reaches_the_first_with_its_token_and_hears_back() {
         let dir = scratch("instance");
         let path = dir.join("test.sock");
-        let first = primary(claim_at(&path, None, SOON));
+        let first = up_primary(&path);
         let (claim, token) = second_launch(&path, &first, Some("token-1"));
         assert!(matches!(claim, Claim::Shown), "a second copy finds the first, is answered and stands down");
         assert_eq!(token, Some("token-1".to_string()), "and the first is told, with the token to raise its window with");
@@ -312,41 +456,77 @@ mod tests {
     fn a_copy_that_is_still_starting_is_waited_for_and_never_called_stuck() {
         let dir = scratch("starting");
         let path = dir.join("test.sock");
-        // The first copy has bound its socket but its UI is not up yet (the graphics are still starting).
-        let first = primary(claim_at(&path, None, SOON));
-        // Its window comes up after the first wait has passed, within the start-up wait: the second launch hears "ok".
-        let claim = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(450));
-                ui_takes_one(&first).acknowledge();
-            });
-            claim_at(&path, None, SOON)
-        });
-        assert!(matches!(claim, Claim::Shown), "the start-up was waited for, past the first wait");
-        // A start-up slower than any wait: the second launch ends quietly, it does not report a stuck window.
-        let slow = scratch("starting-slow");
-        let slow_path = slow.join("test.sock");
-        let still_starting = primary(claim_at(&slow_path, None, SOON));
-        match claim_at(&slow_path, None, SOON) {
+        // The first copy has bound its socket but its window is not drawn yet (the graphics are still starting).
+        let first = primary(claim_at(&path, None, WAIT));
+        let second = launch(&path, waits(300, 5000));
+        let request = first.recv_blocking();
+        // Its window comes up well after the answer wait, within the start-up wait: the second launch hears "ok".
+        std::thread::sleep(Duration::from_millis(800));
+        first.up_signal().set();
+        request.acknowledge();
+        assert!(matches!(second.join().unwrap(), Claim::Shown), "the start-up was waited for, past the answer wait");
+        // Once the window is drawn nothing says "starting": a stuck UI gets only the short wait.
+        let started = Instant::now();
+        let second = launch(&path, waits(300, 5000));
+        let request = first.recv_blocking();
+        assert!(matches!(second.join().unwrap(), Claim::NotResponding(Some(_))));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        drop(request);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_that_stays_starting_is_reported_as_starting_after_the_long_wait() {
+        let dir = scratch("starting-slow");
+        let path = dir.join("test.sock");
+        let first = primary(claim_at(&path, None, WAIT));
+        let started = Instant::now();
+        let second = launch(&path, waits(200, 900));
+        let request = first.recv_blocking();
+        // Never answered: the window never comes up. The start-up wait counts from the request.
+        let claim = second.join().unwrap();
+        let waited = started.elapsed();
+        match claim {
             Claim::Starting(pid) => {
                 assert_eq!(pid, Some(std::process::id()));
-                assert_eq!(super::still_starting_message(pid), format!("Neural Forge is still starting (process {}).", std::process::id()));
+                assert_eq!(
+                    still_starting_message(pid),
+                    format!("Neural Forge is still starting (process {}); its window will appear when it is ready.", std::process::id())
+                );
             }
             _ => panic!("a copy that said it is starting is not stuck"),
         }
-        drop(still_starting);
+        assert!(waited >= Duration::from_millis(900) && waited < Duration::from_secs(3), "{waited:?}");
+        assert_eq!(still_starting_message(None), "Neural Forge is still starting; its window will appear when it is ready.");
+        drop(request);
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&slow);
+    }
+
+    #[test]
+    fn waiting_for_requests_does_not_say_the_window_is_up() {
+        // The UI loop asks for requests before the window has drawn anything: a launch meanwhile still hears that this
+        // copy is starting (and waits for it), not silence that would call it stuck.
+        let dir = scratch("first-frame");
+        let path = dir.join("test.sock");
+        let first = primary(claim_at(&path, None, WAIT));
+        use std::future::Future as _;
+        let mut next = std::pin::pin!(first.next());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(next.as_mut().poll(&mut context).is_pending());
+        let second = launch(&path, waits(200, 600));
+        let claim = second.join().unwrap();
+        assert!(matches!(claim, Claim::Starting(Some(_))), "told \"starting\" until the first frame");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_running_copy_whose_ui_does_not_answer_is_named() {
         let dir = scratch("stuck");
         let path = dir.join("test.sock");
-        // The first copy's window was up (its UI took requests), and now takes none (a stuck window).
-        let first = primary(claim_at(&path, None, SOON));
-        first.up.store(true, std::sync::atomic::Ordering::Relaxed);
-        match claim_at(&path, Some("token-2".into()), SOON) {
+        // The first copy's window was drawn, and now its UI takes no requests (a stuck window).
+        let first = up_primary(&path);
+        let started = Instant::now();
+        match claim_at(&path, Some("token-2".into()), waits(300, 5000)) {
             Claim::NotResponding(pid) => {
                 assert_eq!(pid, Some(std::process::id()), "the running copy's process, from the socket");
                 assert_eq!(
@@ -356,45 +536,210 @@ mod tests {
             }
             _ => panic!("no answer in time is not a shown window"),
         }
+        assert!(started.elapsed() >= Duration::from_millis(300) && started.elapsed() < Duration::from_secs(2));
         assert_eq!(not_responding_message(None), "Neural Forge is already running but not responding. Close it and start it again.");
+        drop(first);
+        // An answer that is not "ok" is no answer either.
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let wrong = std::thread::spawn(move || {
+            use std::io::Write;
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"busy\n").unwrap();
+            stream
+        });
+        assert!(matches!(claim_at(&path, None, waits(300, 5000)), Claim::NotResponding(_)));
+        drop(wrong.join());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_that_exits_while_asked_is_not_called_stuck() {
+        let dir = scratch("exiting");
+        let path = dir.join("test.sock");
+        // A copy that takes the request and goes away without answering, in an app's order: the connection closes
+        // first, the listener and its socket file a moment later. Asking again at once still reaches that listener
+        // (its backlog); the launch keeps asking until it is gone.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let exiting = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                drop(stream);
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = std::fs::remove_file(&path);
+                drop(listener);
+            })
+        };
+        let claim = claim_at(&path, None, waits(2000, 5000));
+        exiting.join().unwrap();
+        assert!(matches!(claim, Claim::Primary(_)), "the copy that exited left the place free");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_that_dies_after_saying_starting_still_gets_the_retries() {
+        let dir = scratch("starting-dies");
+        let path = dir.join("test.sock");
+        // A copy says "starting", stays silent longer than the answer wait, then goes away (the connection first, the
+        // socket a moment later): the retry wait counts from that first close, not from the request.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let dying = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(b"starting\n").unwrap();
+                std::thread::sleep(Duration::from_millis(600));
+                drop(stream);
+                std::thread::sleep(Duration::from_millis(150));
+                let _ = std::fs::remove_file(&path);
+                drop(listener);
+            })
+        };
+        let claim = claim_at(&path, None, waits(300, 5000));
+        dying.join().unwrap();
+        assert!(matches!(claim, Claim::Primary(_)), "retried after the copy went away, and became the first copy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copies_that_keep_exiting_while_asked_end_the_launch_quietly() {
+        let dir = scratch("exiting-always");
+        let path = dir.join("test.sock");
+        // Every attempt finds a copy that takes the request and closes without answering, and keeps its socket: after
+        // the answer wait, asked again in short steps, the launch leaves quietly.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut taken = 0;
+                for stream in listener.incoming() {
+                    drop(stream);
+                    taken += 1;
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                }
+                taken
+            })
+        };
+        let started = Instant::now();
+        let claim = claim_at(&path, None, waits(500, 5000));
+        let waited = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        drop(std::os::unix::net::UnixStream::connect(&path));
+        let taken = closer.join().unwrap();
+        assert!(matches!(claim, Claim::Gone), "no stuck-copy message");
+        assert!(taken > 2, "asked again in short steps: {taken}");
+        assert!(waited >= Duration::from_millis(500) && waited < Duration::from_secs(2), "{waited:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launches_queued_at_a_copy_that_gives_up_start_at_once() {
+        let dir = scratch("gives-up");
+        let path = dir.join("test.sock");
+        // The first copy's window never comes up (no window could be opened).
+        let first = primary(claim_at(&path, None, WAIT));
+        let started = Instant::now();
+        let second = launch(&path, waits(2000, 15000));
+        // Its request is queued (told "starting"); then the copy gives up as `ui::no_window` does: release, and drop
+        // the requests.
+        std::thread::sleep(Duration::from_millis(300));
+        first.close();
+        drop(first);
+        let claim = second.join().unwrap();
+        assert!(matches!(claim, Claim::Primary(_)), "not \"still starting\" beside the other copy's error");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A primary copy's socket with nobody serving it yet.
+    fn bound(path: &Path) -> Listening {
+        Listening { listener: std::sync::Arc::new(std::os::unix::net::UnixListener::bind(path).unwrap()), path: path.to_path_buf(), closed: Default::default() }
+    }
+
+    /// What a launch heard before its connection ended; `None` when it is
+    /// still open a second later (nobody took the connection).
+    fn heard(mut stream: std::os::unix::net::UnixStream) -> Option<Vec<u8>> {
+        use std::io::Read;
+        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).ok().map(|_| bytes)
+    }
+
+    #[test]
+    fn every_launch_queued_at_a_released_socket_hears_the_end_at_once() {
+        let dir = scratch("backlog");
+        let path = dir.join("test.sock");
+        let listening = bound(&path);
+        // Three launches wait in the backlog when the copy releases its socket.
+        let waiting: Vec<_> = (0..3).map(|_| std::os::unix::net::UnixStream::connect(&path).unwrap()).collect();
+        listening.close();
+        let (tx, _rx) = async_channel::unbounded();
+        listen(&listening, &UiUp::default(), &tx);
+        for stream in waiting {
+            assert_eq!(heard(stream), Some(Vec::new()), "dropped unanswered, so that launch asks again");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_request_the_ui_no_longer_takes_is_dropped_unanswered() {
+        use std::io::Write;
+        let dir = scratch("no-ui");
+        let path = dir.join("test.sock");
+        let listening = bound(&path);
+        let (tx, rx) = async_channel::unbounded();
+        drop(rx);
+        let serving = {
+            let listening = listening.clone();
+            std::thread::spawn(move || listen(&listening, &UiUp::default(), &tx))
+        };
+        for _ in 0..3 {
+            let stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            writeln!(&stream, "activate").unwrap();
+            assert_eq!(heard(stream).as_deref(), Some(&b"starting\n"[..]));
+        }
+        listening.close();
+        serving.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_released_copy_lets_the_next_launch_start_at_once() {
+        let dir = scratch("released");
+        let path = dir.join("test.sock");
+        let first = primary(claim_at(&path, None, WAIT));
+        first.close();
+        assert!(!path.exists(), "the socket file is removed");
+        let error = std::os::unix::net::UnixStream::connect(&path).unwrap_err();
+        assert!(nobody_listening(&error), "{error}");
+        first.close();
+        let started = Instant::now();
+        assert!(matches!(claim_at(&path, None, waits(2000, 15000)), Claim::Primary(_)), "the next launch is the first copy");
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
         drop(first);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_copy_that_exits_while_a_second_launch_waits_is_not_called_stuck() {
-        use std::os::unix::net::UnixListener;
-        // A copy that takes the request and exits (its listener and socket file go with it): the second launch looks
-        // again, finds nobody and becomes the first copy.
-        let dir = scratch("gone");
+    fn a_connection_accepted_after_release_is_dropped_unanswered() {
+        // The listener thread may have accepted a connection just before the release: it is closed unanswered (not
+        // told "starting"), so that launch looks again at once.
+        let dir = scratch("released-race");
         let path = dir.join("test.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let exiting = {
-            let path = path.clone();
-            std::thread::spawn(move || {
-                let (connection, _) = listener.accept().unwrap();
-                drop(listener);
-                let _ = std::fs::remove_file(&path);
-                drop(connection);
-            })
-        };
-        let claim = claim_at(&path, None, PATIENT);
-        exiting.join().unwrap();
-        assert!(matches!(claim, Claim::Primary(_)), "the copy that exited left the place free");
-        drop(claim);
-        // A copy that keeps closing connections unanswered (it is shutting down): no "not responding", just an end.
-        let dir2 = scratch("gone-twice");
-        let path2 = dir2.join("test.sock");
-        let listener = UnixListener::bind(&path2).unwrap();
-        let closing = std::thread::spawn(move || {
-            for _ in 0..2 {
-                drop(listener.accept().unwrap());
-            }
-        });
-        assert!(matches!(claim_at(&path2, None, PATIENT), Claim::Gone));
-        closing.join().unwrap();
+        let first = primary(claim_at(&path, None, WAIT));
+        let listening = first.listening.clone().unwrap();
+        listening.closed.store(true, std::sync::atomic::Ordering::Release);
+        let mut stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut answer = String::new();
+        let _ = std::io::Read::read_to_string(&mut stream, &mut answer);
+        assert_eq!(answer, "", "no \"starting\" from a released copy");
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]
@@ -404,7 +749,7 @@ mod tests {
         // A socket nobody listens on any more.
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists());
-        let first = primary(claim_at(&path, None, SOON));
+        let first = up_primary(&path);
         let (claim, _) = second_launch(&path, &first, None);
         assert!(matches!(claim, Claim::Shown), "and the new one answers");
         let _ = std::fs::remove_dir_all(&dir);
@@ -422,7 +767,7 @@ mod tests {
         let path = dir.join("test.sock");
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("keep"), b"x").unwrap();
-        let _ = claim_at(&path, None, SOON);
+        let _ = claim_at(&path, None, waits(100, 100));
         assert!(path.join("keep").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -431,12 +776,8 @@ mod tests {
     fn two_copies_started_together_leave_one_primary() {
         let dir = scratch("race");
         let path = dir.join("test.sock");
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let path = path.clone();
-                std::thread::spawn(move || claim_at(&path, None, Waits { first: Duration::from_millis(50), start_up: Duration::from_millis(50) }))
-            })
-            .collect();
+        let handles: Vec<_> = (0..8).map(|_| launch(&path, waits(100, 100))).collect();
+        // All kept until counted: a dropped first copy would stop taking requests.
         let claims: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         assert_eq!(claims.iter().filter(|c| matches!(c, Claim::Primary(_))).count(), 1);
         let _ = std::fs::remove_dir_all(&dir);

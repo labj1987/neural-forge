@@ -4,6 +4,23 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.5.1 — 2026-11-16
+
+- **A second start while Neural Forge is still opening says so, kindly.** If the first window takes a while to appear
+  (a cold start, or a software renderer), the second start now tells you that Neural Forge is still starting, with its
+  process number, and that its window will appear when it is ready. It is information, not an error: nothing needs
+  closing.
+- Starting Neural Forge right after closing its window opens a new one at once, instead of waiting or calling the
+  closed one stuck. The same when a copy could not open its window: starts made meanwhile no longer say it is still
+  starting.
+- A start that catches the open copy while it is closing waits a moment and then opens the window itself.
+- Messages shown without a window (a missing library or graphics driver, a copy that does not respond) now fall back
+  to the next way of showing them when a dialog program cannot reach the display, instead of showing nothing.
+  Information disappears on its own like any notification; an error stays until you close it. On desktops without
+  notify-send, a message with backslashes or quotes in it (a Windows path) now reaches the notification as written.
+- The terminal no longer shows two harmless warnings: the D-Bus library's "Failed to populate properties cache", and
+  "set_focus called more than once" with a screen reader on.
+
 ## 4.5.0 — 2026-11-16
 
 **The same window on every desktop, and no GTK needed**
