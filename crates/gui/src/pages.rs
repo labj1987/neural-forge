@@ -399,7 +399,7 @@ impl MainView {
                 .child(with_tooltip(
                     "this-game",
                     "This game's own value: the All games value does not apply to it",
-                    div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(cx.theme().primary).child(label("tag", "This game")),
+                    div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(tag_text(cx.theme())).child(label("tag", "This game")),
                 ))
                 .child(
                     Button::new("follow-all")
@@ -2808,6 +2808,18 @@ impl Render for ErrorView {
                     .child(div().text_xl().font_weight(FontWeight::BOLD).text_center().child(label("title", self.title)))
                     .child(div().text_center().text_color(cx.theme().muted_foreground).child(label("description", self.description.clone()))),
             )
+    }
+}
+
+/// Text in the theme's primary colour where it reads on the window's background (at least 4.5:1), else in its link
+/// colour, which a desktop accent always keeps readable: a light accent (yellow, light blue) as primary would not read on
+/// white.
+fn tag_text(theme: &gpui_kit::component::Theme) -> Hsla {
+    use crate::accent::{contrast, Rgb};
+    if contrast(Rgb::from_hsla(theme.primary), Rgb::from_hsla(theme.background)) >= 4.5 {
+        theme.primary
+    } else {
+        theme.link
     }
 }
 

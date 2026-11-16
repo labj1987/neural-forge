@@ -3788,9 +3788,11 @@ dependencies = [
 
 [[package]]
 name = "neural-forge"
-version = "4.5.1"
+version = "4.5.2"
 dependencies = [
+ "ashpd",
  "async-channel",
+ "futures-util",
  "gpui-kit",
  "libc",
  "log",
@@ -3806,7 +3808,7 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-cli"
-version = "4.5.1"
+version = "4.5.2"
 dependencies = [
  "neural-forge-protocol",
  "neural-forge-supervisor",
@@ -3814,7 +3816,7 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-layer"
-version = "4.5.1"
+version = "4.5.2"
 dependencies = [
  "ash",
  "libc",
@@ -3826,7 +3828,7 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-native"
-version = "4.5.1"
+version = "4.5.2"
 dependencies = [
  "ash",
  "cc",
@@ -3837,14 +3839,14 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-protocol"
-version = "4.5.1"
+version = "4.5.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "neural-forge-supervisor"
-version = "4.5.1"
+version = "4.5.2"
 dependencies = [
  "libc",
  "miniz_oxide 0.9.1",

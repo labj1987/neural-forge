@@ -21,6 +21,10 @@ neural-forge-supervisor = { path = "../supervisor" }
 # The UI toolkit: GPUI Kit (GPUI + gpui-base + gpui-component + default icons). Pinned exactly: see AGENTS.md, "UI (GPUI Kit)".
 gpui-kit = "=0.9.1"
 async-channel = "2"
+futures-util = "0.3"
+# The desktop's accent colour (accent.rs), from the XDG desktop portal: the portal client the toolkit
+# already uses for its file dialogs and light/dark setting, with the same features.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "settings"] }
 libc = "0.2"
 log = "0.4"
 # Raising the window for a second launch (activation.rs): the request goes out on GPUI's own Wayland connection, so
