@@ -814,6 +814,8 @@ pub struct MainView {
     pub(crate) desktop_hdr: Option<String>,
     /// Each tab's scroll position.
     pub(crate) scroll: [gpui_kit::ScrollHandle; 5],
+    /// How many more ticks apply `NEURAL_FORGE_GUI_SCROLL`.
+    scroll_aid: u8,
     pub(crate) pages: crate::pages::PageState,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
@@ -836,6 +838,7 @@ impl MainView {
             telemetry: Telemetry::default(),
             desktop_hdr: None,
             scroll: Default::default(),
+            scroll_aid: 4,
             pages,
             _tasks: Vec::new(),
             _subs: Vec::new(),
@@ -947,11 +950,6 @@ impl MainView {
                 let _ = handle.update(&mut async_cx.clone(), |_, window, cx| toast(window, cx, &message));
             });
         }
-        // Developer aid, with `NEURAL_FORGE_GUI_OPEN`: `NEURAL_FORGE_GUI_SCROLL=<pixels>` starts the tab scrolled down
-        // that far, for a screenshot of its lower part.
-        if let Some(down) = neural_forge_protocol::env::var("NEURAL_FORGE_GUI_SCROLL").and_then(|v| v.parse::<f32>().ok()) {
-            self.scroll[self.tab as usize].set_offset(gpui_kit::point(px(0.), px(-down.max(0.))));
-        }
         match neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
             Some("passes") => crate::pages::open_pass_dialog(&self.shm, window, cx),
             Some("uninstall") => self.uninstall_clicked(window, cx),
@@ -995,6 +993,16 @@ impl MainView {
     /// The once-a-second check: follows a change made with `shmctl`, a loaded profile, a game's session starting or
     /// another program, and the layer's status. Draws only when something shown changed.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Developer aid, with `NEURAL_FORGE_GUI_OPEN`: `NEURAL_FORGE_GUI_SCROLL=<pixels>` shows the tab scrolled down that
+        // far, for a screenshot of its lower part. Applied in the first seconds, while the page's lists still fill.
+        if self.scroll_aid > 0 {
+            self.scroll_aid -= 1;
+            if let Some(down) = neural_forge_protocol::env::var("NEURAL_FORGE_GUI_SCROLL").and_then(|v| v.parse::<f32>().ok()) {
+                let handle = &self.scroll[self.tab as usize];
+                handle.set_offset(gpui_kit::point(px(0.), -px(down.max(0.)).min(handle.max_offset().y)));
+                cx.notify();
+            }
+        }
         let live = self.read_live();
         if live != self.live {
             self.live = live;
