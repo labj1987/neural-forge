@@ -207,6 +207,19 @@ libcheck_plain() {
     echo "${t//>/›}"
 }
 
+# libcheck_gvariant TEXT: TEXT as a GVariant text-format string (single-quoted; \\, ', newline, tab and carriage return
+# escaped), which is how gdbus reads its arguments.
+libcheck_gvariant() {
+    local t
+    # Unquoted on purpose: inside double quotes $'\n' is not a newline.
+    t=${1//\\/\\\\}
+    t=${t//\'/\\\'}
+    t=${t//$'\n'/\\n}
+    t=${t//$'\t'/\\t}
+    t=${t//$'\r'/\\r}
+    printf "'%s'" "$t"
+}
+
 # libcheck_no_display TEXT: whether a dialog program's stderr TEXT says it could not open the display.
 libcheck_no_display() {
     [[ "$1" == *"Failed to open display"* || "$1" == *"annot open display"* ]]
@@ -246,7 +259,8 @@ libcheck_show() {
     # A desktop with none of those (a stock COSMIC, for one) still has a notification service: asked directly.
     if command -v gdbus >/dev/null 2>&1; then
         gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
-            --method org.freedesktop.Notifications.Notify -- "$1" 0 "" "$1" "$(libcheck_plain "$2")" '[]' '{"urgency": <byte 2>}' 0 \
+            --method org.freedesktop.Notifications.Notify -- "$(libcheck_gvariant "$1")" 'uint32 0' "''" "$(libcheck_gvariant "$1")" \
+            "$(libcheck_gvariant "$(libcheck_plain "$2")")" '@as []' "{'urgency': <byte 2>}" 'int32 0' \
             >/dev/null 2>&1 && return 0
     fi
     if command -v xmessage >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then

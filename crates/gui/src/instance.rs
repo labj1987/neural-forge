@@ -5,7 +5,8 @@
 //! A second launch finds it, hands over its activation token so the running
 //! window can be raised, waits for the running copy's UI to say it has done so
 //! (a window that does not answer is reported to the user), and exits: two windows would both write the
-//! settings and both run the start-up install.
+//! settings. The start-up install is not what this guards: every launch runs it before it looks for a running copy
+//! (main.rs), so a newer AppImage installs its layer even while an older window is open.
 //!
 //! Without `XDG_RUNTIME_DIR` there is no directory that is known to be the
 //! user's alone, so the app runs without the single-instance check rather
@@ -43,7 +44,7 @@ pub struct Activations {
 }
 
 impl Activations {
-    /// The handle that says the UI is up, set from the window's first drawn frame.
+    /// The handle that says the UI is up, set once the window's first frame has been presented.
     pub fn up_signal(&self) -> UiUp {
         self.up.clone()
     }
@@ -63,8 +64,8 @@ impl Drop for Activations {
     }
 }
 
-/// Says the first copy's UI is up (see `Activations::up_signal`). Set from the window's first drawn frame: a window
-/// that has been created but never drawn is not up yet, and a later launch is told to wait for it.
+/// Says the first copy's UI is up (see `Activations::up_signal`). Set once the window's first frame has been drawn and
+/// presented: a window that has been created but never shown is not up yet, and a later launch is told to wait for it.
 #[derive(Clone, Default)]
 pub struct UiUp(Arc<AtomicBool>);
 
@@ -271,21 +272,24 @@ fn try_claim(path: &Path, token: Option<&str>, waits: Waits) -> Result<Claim, Cl
 }
 
 /// The first copy's listener thread: each later launch's request goes to the UI, answered "starting" at once while
-/// the window is not up. Ends when the socket is released or nobody takes requests any more.
+/// the window is not up. A connection accepted after the release, or one the UI no longer takes, is dropped unanswered,
+/// so that launch hears the end of the connection and asks again; only the accept error the release's shutdown causes
+/// once the backlog is empty ends the loop.
 fn listen(listening: &Listening, up: &UiUp, tx: &async_channel::Sender<Request>) {
     for connection in listening.listener.incoming() {
         let connection = match connection {
             Ok(connection) => connection,
-            // Closed by `release`: no more requests.
+            // Closed by `release`, and the backlog is empty: no more requests.
             Err(_) if listening.closed.load(Ordering::Acquire) => break,
             Err(_) => {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
         };
-        // Released between the accept and now: dropped unanswered, so that launch asks again and finds nobody.
+        // Released between the accept and now: dropped unanswered, so that launch asks again and finds nobody. The loop
+        // goes on: every launch already waiting in the backlog is dropped the same way.
         if listening.closed.load(Ordering::Acquire) {
-            break;
+            continue;
         }
         let mut request = read_request(connection);
         // Until the UI is up, the launch that asks is told so here: the UI's own answer follows once the window is
@@ -293,9 +297,8 @@ fn listen(listening: &Listening, up: &UiUp, tx: &async_channel::Sender<Request>)
         if !up.is_set() {
             let _ = request.reply.write_all(STARTING.as_bytes());
         }
-        if tx.send_blocking(request).is_err() {
-            break;
-        }
+        // A UI that no longer takes requests drops this one, unanswered.
+        let _ = tx.send_blocking(request);
     }
 }
 
@@ -370,7 +373,10 @@ fn parse_request(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_at, nobody_listening, not_responding_message, parse_request, still_starting_message, valid_token, Activations, Claim, Waits, MAX_TOKEN};
+    use super::{
+        claim_at, listen, nobody_listening, not_responding_message, parse_request, still_starting_message, valid_token, Activations, Claim, Listening, UiUp,
+        Waits, MAX_TOKEN,
+    };
     use std::path::Path;
     use std::time::{Duration, Instant};
 
@@ -647,6 +653,58 @@ mod tests {
         let claim = second.join().unwrap();
         assert!(matches!(claim, Claim::Primary(_)), "not \"still starting\" beside the other copy's error");
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A primary copy's socket with nobody serving it yet.
+    fn bound(path: &Path) -> Listening {
+        Listening { listener: std::sync::Arc::new(std::os::unix::net::UnixListener::bind(path).unwrap()), path: path.to_path_buf(), closed: Default::default() }
+    }
+
+    /// What a launch heard before its connection ended; `None` when it is
+    /// still open a second later (nobody took the connection).
+    fn heard(mut stream: std::os::unix::net::UnixStream) -> Option<Vec<u8>> {
+        use std::io::Read;
+        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).ok().map(|_| bytes)
+    }
+
+    #[test]
+    fn every_launch_queued_at_a_released_socket_hears_the_end_at_once() {
+        let dir = scratch("backlog");
+        let path = dir.join("test.sock");
+        let listening = bound(&path);
+        // Three launches wait in the backlog when the copy releases its socket.
+        let waiting: Vec<_> = (0..3).map(|_| std::os::unix::net::UnixStream::connect(&path).unwrap()).collect();
+        listening.close();
+        let (tx, _rx) = async_channel::unbounded();
+        listen(&listening, &UiUp::default(), &tx);
+        for stream in waiting {
+            assert_eq!(heard(stream), Some(Vec::new()), "dropped unanswered, so that launch asks again");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_request_the_ui_no_longer_takes_is_dropped_unanswered() {
+        use std::io::Write;
+        let dir = scratch("no-ui");
+        let path = dir.join("test.sock");
+        let listening = bound(&path);
+        let (tx, rx) = async_channel::unbounded();
+        drop(rx);
+        let serving = {
+            let listening = listening.clone();
+            std::thread::spawn(move || listen(&listening, &UiUp::default(), &tx))
+        };
+        for _ in 0..3 {
+            let stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            writeln!(&stream, "activate").unwrap();
+            assert_eq!(heard(stream).as_deref(), Some(&b"starting\n"[..]));
+        }
+        listening.close();
+        serving.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

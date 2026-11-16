@@ -671,33 +671,69 @@ fn show_with(tools: &[crate::text::MessageTool], message: &str, setup: impl Fn(&
         let mut command = std::process::Command::new(program);
         command.args(before).arg(crate::text::message_for(program, message)).args(after);
         setup(&mut command);
-        run_dialog(command).is_some_and(|(code, stderr)| crate::text::helper_showed(program, code, &stderr)).then_some(program)
+        run_dialog(command).is_some_and(|(code, stderr)| crate::text::helper_showed(program, code, stderr.as_deref())).then_some(program)
     })
 }
 
 /// Runs a dialog or notification program, waits for it, and returns its exit code and what it wrote on stderr. Its
 /// stderr goes to a private temporary file, read once the program has ended: reading a pipe to its end would also wait
 /// for any process the program started that kept the pipe open.
-fn run_dialog(mut command: std::process::Command) -> Option<(Option<i32>, String)> {
-    use std::io::{Read as _, Seek as _};
-    use std::os::unix::fs::OpenOptionsExt as _;
-    static SERIAL: AtomicU32 = AtomicU32::new(0);
-    let path = std::env::temp_dir().join(format!("neural-forge-message-{}-{}", std::process::id(), SERIAL.fetch_add(1, Ordering::Relaxed)));
-    let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path).ok();
-    // Removed at once: the open file is all that is needed, and nothing is left behind if this process is killed while
-    // the dialog is up.
-    if file.is_some() {
-        let _ = std::fs::remove_file(&path);
-    }
-    let stderr = file.as_ref().and_then(|file| file.try_clone().ok()).map_or_else(std::process::Stdio::null, std::process::Stdio::from);
+fn run_dialog(command: std::process::Command) -> Option<(Option<i32>, Option<String>)> {
+    run_dialog_with(command, stderr_file(&std::env::temp_dir()))
+}
+
+/// `run_dialog` with stderr going to `file`. Without a file, stderr is unknown (`None`), not empty.
+fn run_dialog_with(mut command: std::process::Command, file: Option<std::fs::File>) -> Option<(Option<i32>, Option<String>)> {
+    let (reader, stderr) = match file.and_then(|file| Some((file.try_clone().ok()?, file))) {
+        Some((writer, reader)) => (Some(reader), std::process::Stdio::from(writer)),
+        None => (None, std::process::Stdio::null()),
+    };
     let status = command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(stderr).status();
-    let mut bytes = Vec::new();
-    if let Some(mut file) = file {
-        if file.rewind().is_ok() {
-            let _ = file.read_to_end(&mut bytes);
+    let text = reader.and_then(|mut file| {
+        use std::io::{Read as _, Seek as _};
+        let mut bytes = Vec::new();
+        (file.rewind().is_ok() && file.read_to_end(&mut bytes).is_ok()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+    });
+    status.ok().map(|status| (status.code(), text))
+}
+
+/// A file in `dir` for a program's stderr that no other process can know the
+/// name of: an unnamed one (`O_TMPFILE`) where the file system has them,
+/// otherwise one with a random name (`named_file`). `None` when neither can
+/// be made.
+fn stderr_file(dir: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let unnamed = std::fs::OpenOptions::new().read(true).write(true).mode(0o600).custom_flags(libc::O_TMPFILE).open(dir);
+    unnamed.ok().or_else(|| named_file(dir))
+}
+
+/// A file in `dir` with a random name, removed as soon as it is open (nothing
+/// is left behind if this process is killed while the dialog is up); a name
+/// that is taken is tried again with another.
+fn named_file(dir: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    for _ in 0..16 {
+        let path = dir.join(format!("neural-forge-message-{:016x}", random()));
+        match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path) {
+            Ok(file) => {
+                let _ = std::fs::remove_file(&path);
+                return Some(file);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
         }
     }
-    status.ok().map(|status| (status.code(), String::from_utf8_lossy(&bytes).into_owned()))
+    None
+}
+
+/// 64 unpredictable bits: the standard library's hash keys (seeded from the
+/// system's random source) over the clock.
+fn random() -> u64 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    hasher.write_u128(now.map_or(0, |now| now.as_nanos()));
+    hasher.finish()
 }
 
 /// How long after the window's scale is known its size is fitted to the screen again, and how long after that the
@@ -810,9 +846,11 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
     // there is one: on Wayland only that raises the window (see activation.rs). Without a token, or off Wayland,
     // GPUI's own request is what there is; a Wayland compositor then marks the window as wanting attention instead of
     // raising it.
-    // From the first drawn frame on, later launches get "ok" without being told this copy is still starting.
+    // Once the first frame has been drawn and presented, later launches get "ok" without being told this copy is still
+    // starting. GPUI runs next-frame callbacks at the start of a frame request, before that frame is drawn: the first
+    // callback only asks for the next frame, and the second one (after the first frame is up on screen) sets `up`.
     let up = activations.up_signal();
-    let _ = window.update(cx, |_, window, _| window.on_next_frame(move |_, _| up.set()));
+    let _ = window.update(cx, |_, window, _| window.on_next_frame(move |window, _| window.on_next_frame(move |_, _| up.set())));
     cx.spawn(async move |cx| {
         while let Some(request) = activations.next().await {
             let shown = window.update(cx, |_, window, _| {
@@ -1444,7 +1482,7 @@ mod tests {
 
 #[cfg(test)]
 mod message_tests {
-    use super::{run_dialog, show_with};
+    use super::{named_file, random, run_dialog, run_dialog_with, show_with, stderr_file};
     use std::time::{Duration, Instant};
 
     /// A private directory of stand-in programs, the only one on the commands' PATH: no real dialog ever runs, and none
@@ -1512,16 +1550,44 @@ mod message_tests {
     }
 
     #[test]
-    fn a_dialogs_stderr_is_read_whatever_its_bytes_and_no_file_is_left() {
+    fn a_dialogs_stderr_is_read_whatever_its_bytes() {
         let mut command = std::process::Command::new("/bin/sh");
         command.args(["-c", "printf '\\377\\376 Failed to open display\\n' >&2; exit 1"]);
         let (code, stderr) = run_dialog(command).unwrap();
         assert_eq!(code, Some(1));
+        let stderr = stderr.unwrap();
         assert!(stderr.contains("Failed to open display"), "{stderr:?}");
-        assert!(!crate::text::helper_showed("zenity", code, &stderr));
-        let prefix = format!("neural-forge-message-{}-", std::process::id());
-        let left: Vec<_> =
-            std::fs::read_dir(std::env::temp_dir()).unwrap().flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix)).collect();
-        assert!(left.is_empty(), "{left:?}");
+        assert!(!crate::text::helper_showed("zenity", code, Some(&stderr)));
+    }
+
+    #[test]
+    fn a_named_stderr_file_is_gone_as_soon_as_it_is_open() {
+        let dir = std::env::temp_dir().join(format!("neural-forge-message-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file system without unnamed files gets the random names.
+        for _ in 0..3 {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", "echo seen >&2"]);
+            let (_, stderr) = run_dialog_with(command, named_file(&dir)).unwrap();
+            assert_eq!(stderr.as_deref(), Some("seen\n"));
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(random(), random());
+    }
+
+    #[test]
+    fn a_dialog_whose_stderr_could_not_be_kept_does_not_stop_the_chain() {
+        // Nowhere to put its stderr: a dialog's exit 1 may be "no display".
+        let nowhere = std::path::Path::new("/nonexistent/neural-forge");
+        assert!(stderr_file(nowhere).is_none() && named_file(nowhere).is_none());
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 1"]);
+        let (code, stderr) = run_dialog_with(command, None).unwrap();
+        assert_eq!((code, stderr.as_deref()), (Some(1), None));
+        assert!(!crate::text::helper_showed("zenity", code, None), "the next program is tried");
+        assert!(!crate::text::helper_showed("kdialog", code, None));
+        assert!(crate::text::helper_showed("zenity", Some(0), None), "0 is pressed, whatever stderr said");
     }
 }

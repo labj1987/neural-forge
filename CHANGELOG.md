@@ -16,7 +16,8 @@ first shipped them; their phase is kept as a subheading.
 - A start that catches the open copy while it is closing waits a moment and then opens the window itself.
 - Messages shown without a window (a missing library or graphics driver, a copy that does not respond) now fall back
   to the next way of showing them when a dialog program cannot reach the display, instead of showing nothing.
-  Information disappears on its own like any notification; an error stays until you close it.
+  Information disappears on its own like any notification; an error stays until you close it. On desktops without
+  notify-send, a message with backslashes or quotes in it (a Windows path) now reaches the notification as written.
 - The terminal no longer shows two harmless warnings: the D-Bus library's "Failed to populate properties cache", and
   "set_focus called more than once" with a screen reader on.
 

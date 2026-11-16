@@ -18,8 +18,8 @@ NVIDIA's own runtime. Read [Legal](#legal) before you use it.
 ## Requirements
 
 - x86_64 Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40 or later). Nothing else to install for the
-  window: it is drawn by Neural Forge itself (with GPUI), the same on GNOME, KDE Plasma, COSMIC, Hyprland and sway,
-  and needs no GTK or Qt. It takes the basics every desktop has from the system: the X11 or Wayland client
+  window: it is drawn by Neural Forge itself (with GPUI), the same on every desktop, and needs no GTK or Qt. It was
+  tested on GNOME, KDE Plasma, Hyprland and COSMIC; other Wayland and X11 desktops should work too. It takes the basics every desktop has from the system: the X11 or Wayland client
   libraries (libxcb, libxkbcommon, libwayland-client), a Vulkan or OpenGL ES driver (Mesa's software drivers count)
   and a file-dialog portal (xdg-desktop-portal) for the two file pickers.
 - An NVIDIA RTX 40-series or newer GPU with a Vulkan driver that offers `VK_NV_cuda_kernel_launch`,
@@ -101,6 +101,7 @@ says what to do.
   graphics driver at all it says so the same way. Started from a terminal with `NEURAL_FORGE_GUI_LOG=info`, it
   prints which renderer it draws with. Games do not need the window: the layer and `neural-forge-cli` work without it.
   "Already running but not responding" means an earlier window is stuck: close the process it names and start again.
+  "Still starting" needs nothing: the window that is opening appears when it is ready.
 - **HDR does not come on.** The Status tab's HDR line says why. Under Proton add
   `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` to the launch options (Proton-GE), or start gamescope
   with `--hdr-enabled`; if HDR10 was available, switch on the game's own HDR setting. The line also

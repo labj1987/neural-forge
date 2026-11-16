@@ -191,7 +191,7 @@ rm "$tmp/shown" "$tmp/bin/notify-send"
 stub gdbus "echo \"gdbus \$*\" >> '$tmp/shown'"
 stub xmessage "echo xmessage >> '$tmp/shown'"
 if run WAYLAND_DISPLAY=wayland-0; then fail "gdbus: AppRun exited 0"; fi
-grep -q "^gdbus call --session --dest org.freedesktop.Notifications .*Notify -- Neural Forge 0  Neural Forge Neural Forge can.t start" "$tmp/shown" \
+grep -q "^gdbus call --session --dest org.freedesktop.Notifications .*Notify -- 'Neural Forge' uint32 0 '' 'Neural Forge' 'Neural Forge can\\\\'t start.* @as \[\] {'urgency': <byte 2>} int32 0\$" "$tmp/shown" \
     || fail "gdbus: got $(cat "$tmp/shown")"
 [ "$(wc -l < "$tmp/shown")" -eq 1 ] || fail "gdbus: more than one message: $(cat "$tmp/shown")"
 rm "$tmp/shown"; stub gdbus "exit 1"

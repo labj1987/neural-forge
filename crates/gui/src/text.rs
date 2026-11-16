@@ -39,9 +39,9 @@ pub(crate) fn decimals(x: f64) -> u32 {
         .unwrap_or(3)
 }
 
-/// The value a spin row keeps when GTK re-reads its `text`: the current `value` while the text still
-/// shows it at `digits` decimals (either decimal mark), so precision the row does not show survives
-/// a focus change; `None` lets GTK parse an edited text as usual.
+/// The value a spin row keeps when its field's `text` is read back: the current `value` while the text
+/// still shows it at `digits` decimals (either decimal mark), so precision the row does not show
+/// survives a focus change; `None` for edited text, which the row then parses as a new value.
 pub(crate) fn kept_spin_value(text: &str, value: f64, digits: u32) -> Option<f64> {
     let typed: f64 = text.trim().replace(',', ".").parse().ok()?;
     let d = digits as usize;
@@ -348,8 +348,8 @@ pub(crate) fn preupscale_label(layer_active: bool, placement: u32, state: u32, w
     }
 }
 
-/// The narrowest and lowest the window goes. libadwaita asks every window for a minimum size (it warns at startup
-/// without one); this is its own recommended smallest (360 wide), and tall enough for the header, a banner and a row.
+/// The narrowest and lowest the window goes (its minimum size): 360 wide, and tall enough for the header, a banner and
+/// a row.
 pub(crate) const MIN_WIDTH: i32 = 360;
 
 pub(crate) const MIN_HEIGHT: i32 = 400;
@@ -379,10 +379,11 @@ const NOTIFY_BEFORE: &[&str] = &[
     "--method",
     "org.freedesktop.Notifications.Notify",
     "--",
-    "Neural Forge",
-    "0",
-    "",
-    "Neural Forge",
+    // Each argument is GVariant text, typed: app name, replaces id, icon, summary; the body (`message_for`) follows.
+    "'Neural Forge'",
+    "uint32 0",
+    "''",
+    "'Neural Forge'",
 ];
 
 /// The programs tried, in order, to show an error when the app has no window: the same order as AppRun's (zenity,
@@ -392,7 +393,7 @@ pub(crate) const ERROR_DIALOGS: &[MessageTool] = &[
     ("kdialog", &["--title", "Neural Forge", "--error"], &[]),
     // (No expiry: some desktops drop even a critical notification after a few seconds otherwise.)
     ("notify-send", &["--urgency=critical", "--expire-time=0", "--app-name=Neural Forge", "Neural Forge"], &[]),
-    ("gdbus", NOTIFY_BEFORE, &["[]", "{\"urgency\": <byte 2>}", "0"]),
+    ("gdbus", NOTIFY_BEFORE, &["@as []", "{'urgency': <byte 2>}", "int32 0"]),
     ("xmessage", &["-center"], &[]),
 ];
 
@@ -403,7 +404,7 @@ pub(crate) const INFO_DIALOGS: &[MessageTool] = &[
     ("kdialog", &["--title", "Neural Forge", "--msgbox"], &[]),
     ("notify-send", &["--urgency=normal", "--app-name=Neural Forge", "Neural Forge"], &[]),
     // (The desktop's own expiry: information need not stay up.)
-    ("gdbus", NOTIFY_BEFORE, &["[]", "{\"urgency\": <byte 1>}", "-1"]),
+    ("gdbus", NOTIFY_BEFORE, &["@as []", "{'urgency': <byte 1>}", "int32 -1"]),
     ("xmessage", &["-center"], &[]),
 ];
 
@@ -411,11 +412,13 @@ pub(crate) const INFO_DIALOGS: &[MessageTool] = &[
 /// The dialogs end with 0 when the user pressed their button and 1 when the user closed them another way; both mean it
 /// was seen. Anything else (no display, a crash, a signal) does not. notify-send shows nothing itself: only 0 says the
 /// desktop took the message (the same for the notification service asked over D-Bus). xmessage ends with 1 when it
-/// could not open the display, and so does zenity, which then says so on its `stderr`.
-pub(crate) fn helper_showed(program: &str, code: Option<i32>, stderr: &str) -> bool {
-    match program {
-        "notify-send" | "gdbus" | "xmessage" => code == Some(0),
-        _ if no_display(stderr) => false,
+/// could not open the display, and so does zenity, which then says so on its `stderr`; with `stderr` unknown (`None`),
+/// a dialog's 1 is not taken as seen.
+pub(crate) fn helper_showed(program: &str, code: Option<i32>, stderr: Option<&str>) -> bool {
+    match (program, stderr) {
+        ("notify-send" | "gdbus" | "xmessage", _) => code == Some(0),
+        (_, None) => code == Some(0),
+        (_, Some(stderr)) if no_display(stderr) => false,
         _ => matches!(code, Some(0 | 1)),
     }
 }
@@ -426,12 +429,33 @@ fn no_display(stderr: &str) -> bool {
 }
 
 /// The message as `program` is given it: zenity (`--no-markup`) and xmessage show it as it is; kdialog (Qt rich text)
-/// and the notification service (body markup) get it with nothing they would take as markup (no &, < or >).
+/// and the notification service (body markup) get it with nothing they would take as markup (no &, < or >), and gdbus
+/// as a GVariant text-format string, which is how it reads its arguments.
 pub(crate) fn message_for(program: &str, message: &str) -> String {
+    let plain = || message.replace('&', "and").replace('<', "‹").replace('>', "›");
     match program {
         "zenity" | "xmessage" => message.to_string(),
-        _ => message.replace('&', "and").replace('<', "‹").replace('>', "›"),
+        "gdbus" => gvariant_string(&plain()),
+        _ => plain(),
     }
+}
+
+/// `text` as a GVariant text-format string: single-quoted, with \, ', newline, tab and carriage return escaped.
+fn gvariant_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// What is said when the window cannot be opened: no graphics driver at all, or no display.
@@ -463,15 +487,15 @@ mod no_window_tests {
 
     #[test]
     fn an_error_dialog_that_was_seen_is_not_shown_twice() {
-        let shown = |program, code| helper_showed(program, code, "");
+        let shown = |program, code| helper_showed(program, code, Some(""));
         assert!(shown("zenity", Some(0)) && shown("kdialog", Some(1)));
         assert!(!shown("zenity", Some(127)) && !shown("zenity", None));
         assert!(shown("notify-send", Some(0)) && !shown("notify-send", Some(1)));
         assert!(shown("gdbus", Some(0)) && !shown("gdbus", Some(1)));
         assert!(shown("xmessage", Some(0)) && !shown("xmessage", Some(1)), "xmessage ends with 1 when it can't open the display");
-        assert!(!helper_showed("zenity", Some(1), "(zenity:42): Gtk-WARNING **: cannot open display: :0\n"), "zenity with no display ends with 1 too");
-        assert!(!helper_showed("zenity", Some(1), "Failed to open display\n"));
-        assert!(!helper_showed("kdialog", Some(1), "qt.qpa.xcb: could not connect to display\nCannot open display\n"));
+        assert!(!helper_showed("zenity", Some(1), Some("(zenity:42): Gtk-WARNING **: cannot open display: :0\n")), "zenity with no display ends with 1 too");
+        assert!(!helper_showed("zenity", Some(1), Some("Failed to open display\n")));
+        assert!(!helper_showed("kdialog", Some(1), Some("qt.qpa.xcb: could not connect to display\nCannot open display\n")));
         for tools in [super::ERROR_DIALOGS, super::INFO_DIALOGS] {
             let order: Vec<&str> = tools.iter().map(|&(program, ..)| program).collect();
             assert_eq!(order, ["zenity", "kdialog", "notify-send", "gdbus", "xmessage"], "the order AppRun's libcheck_show tries them in");
@@ -484,12 +508,58 @@ mod no_window_tests {
         assert!(!said(super::INFO_DIALOGS, "--error") && !said(super::INFO_DIALOGS, "critical"), "a start that takes long is no error");
         assert!(said(super::INFO_DIALOGS, "--info") && said(super::INFO_DIALOGS, "--msgbox") && said(super::INFO_DIALOGS, "--urgency=normal"));
         let expiry = |tools: &[super::MessageTool]| tools.iter().find(|(program, ..)| *program == "gdbus").map(|(_, _, after)| after[after.len() - 1]);
-        assert_eq!(expiry(super::ERROR_DIALOGS), Some("0"), "an error's notification stays until it is closed");
-        assert_eq!(expiry(super::INFO_DIALOGS), Some("-1"), "information gets the desktop's own expiry");
+        assert_eq!(expiry(super::ERROR_DIALOGS), Some("int32 0"), "an error's notification stays until it is closed");
+        assert_eq!(expiry(super::INFO_DIALOGS), Some("int32 -1"), "information gets the desktop's own expiry");
         assert_eq!(super::message_for("zenity", "a <b> & c"), "a <b> & c");
         assert_eq!(super::message_for("xmessage", "a <b> & c"), "a <b> & c");
-        for program in ["kdialog", "notify-send", "gdbus"] {
+        for program in ["kdialog", "notify-send"] {
             assert_eq!(super::message_for(program, "a <b> & c"), "a ‹b› and c");
+        }
+        assert_eq!(super::message_for("gdbus", "a <b> & c"), "'a ‹b› and c'");
+    }
+
+    /// The Notify call as gdbus gets it: every argument GVariant text of the method's types, the body included,
+    /// whatever it holds (a Windows path's backslashes, a quote, a trailing backslash, line breaks).
+    #[test]
+    fn gdbus_gets_every_notify_argument_as_typed_gvariant_text() {
+        let body = "it's at C:\\new\\x\ttab\r\nline 2 \\";
+        let quoted = super::message_for("gdbus", body);
+        assert_eq!(quoted, r"'it\'s at C:\\new\\x\ttab\r\nline 2 \\'");
+        for tools in [super::ERROR_DIALOGS, super::INFO_DIALOGS] {
+            let (_, before, after) = tools.iter().find(|(program, ..)| *program == "gdbus").unwrap();
+            let notify: Vec<&str> = before[before.len() - 4..].iter().copied().chain([quoted.as_str()]).chain(after.iter().copied()).collect();
+            // Notify(app_name s, replaces_id u, app_icon s, summary s, body s, actions as, hints a{sv}, expire_timeout i)
+            let types = ["s", "u", "s", "s", "s", "as", "a{sv}", "i"];
+            assert_eq!(notify.len(), types.len(), "{notify:?}");
+            // GLib's own parser where python3-gi is there; the exact text otherwise.
+            let script = "import sys\nfrom gi.repository import GLib\nfor t, a in zip(sys.argv[1::2], sys.argv[2::2]):\n    print(GLib.Variant.parse(GLib.VariantType(t), a).print_(True))\n";
+            let mut command = std::process::Command::new("python3");
+            command.args(["-I", "-c", script]);
+            for (t, a) in types.iter().zip(&notify) {
+                command.args([t, a]);
+            }
+            match command.stderr(std::process::Stdio::null()).output() {
+                Ok(out) if out.status.success() => {
+                    let printed = String::from_utf8(out.stdout).unwrap();
+                    let lines: Vec<&str> = printed.lines().collect();
+                    assert_eq!(lines.len(), 8, "{printed}");
+                    assert_eq!(lines[1], "uint32 0");
+                    let parsed = std::process::Command::new("python3")
+                        .args([
+                            "-I",
+                            "-c",
+                            "import sys\nfrom gi.repository import GLib\nsys.stdout.write(GLib.Variant.parse(GLib.VariantType('s'), sys.argv[1]).get_string())",
+                            &quoted,
+                        ])
+                        .output()
+                        .unwrap();
+                    assert_eq!(String::from_utf8(parsed.stdout).unwrap(), "it's at C:\\new\\x\ttab\r\nline 2 \\", "the body round-trips");
+                }
+                _ => {
+                    assert_eq!(&notify[..4], ["'Neural Forge'", "uint32 0", "''", "'Neural Forge'"]);
+                    assert_eq!(notify[5], "@as []");
+                }
+            }
         }
     }
 }
@@ -690,7 +760,7 @@ mod spin_precision_tests {
         assert_eq!(kept_spin_value("1.3", 1.26, 1), Some(1.26));
         assert_eq!(kept_spin_value(" 0.00 ", 0.004, 2), Some(0.004));
         assert_eq!(kept_spin_value("1,3", 1.26, 1), Some(1.26), "a comma decimal mark");
-        // Edited text is GTK's to parse.
+        // Edited text is parsed as a new value.
         assert_eq!(kept_spin_value("18", 16.6, 0), None);
         assert_eq!(kept_spin_value("1.2", 1.26, 1), None);
         assert_eq!(kept_spin_value("", 1.0, 1), None);
