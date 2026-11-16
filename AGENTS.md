@@ -59,8 +59,9 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   (`scripts/check_pins.py`, pin-check.yml) bumps every pin Dependabot cannot see that is behind upstream
   (`check_pins.py --bump`, which rewrites every place the pin is named: add a new place to its rewrite rules
   and self-test), runs check.yml on the bump and fast-forwards main to it only if that passes (pins only:
-  no version bump, no release). main is branch-protected and requires the status "check / build": the
-  job that runs check.yml on the bump must keep the job name `check`, or the fast-forward push is refused. Vulkan-Headers and volk are pinned to the same `vulkan-sdk-*` tag. It keeps
+  no version bump, no release). main is branch-protected and requires the status "check / build" on the
+  commit: a workflow's own check runs are filed under the commit it started from, so the land job records
+  the passed check.yml result on the bump commit (Checks API, linked to the run) before it pushes. Vulkan-Headers and volk are pinned to the same `vulkan-sdk-*` tag. It keeps
   one issue about pins behind upstream, left open only when a bump failed; it must never comment or open
   more than that one (each notification is an email).
 - `cargo test` and `cargo build --release` build every crate (x86_64 Linux only; there is no
