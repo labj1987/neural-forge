@@ -22,7 +22,7 @@ flowchart LR
     end
     model[("~/.local/share/neural-forge/model/full, model/small<br/>(extracted once from nvngx_dlssnr.dll)")]
     shm[("/tmp/neural-forge-$UID/shm.bin<br/>header + 4 frame regions")]
-    gui["neural-forge (GTK GUI)<br/>neural-forge-cli"]
+    gui["neural-forge (GUI)<br/>neural-forge-cli"]
     model --> layer
     layer <--> shm
     gui <--> shm
@@ -32,7 +32,7 @@ flowchart LR
 |---|---|---|
 | Vulkan layer, inside the game | `crates/layer` | Hooks device creation, command recording, `vkQueueSubmit` and `vkQueuePresentKHR`. Holds DLSS's input and runs the network on it before the upscaler; after the upscaler, captures frames, answers them with the network on a thread of its own (`preupscale/native_post.rs`) and composites the answer back. x86_64 only. |
 | Network | `crates/native` | OpenDLSS-NR's implementation of the DLSS 5 Neural Rendering network (C++, GLSL and PTX kernels, taken in and developed in `third_party/opendlss-nr`), built into the layer: loads the extracted weights, records the network's graph, runs it on the game's device. |
-| GUI | `crates/gui` | GTK4/libadwaita settings app. Reads and writes live settings in shared memory, shows status, extracts the model. |
+| GUI | `crates/gui` | Settings app (GPUI, through gpui-kit). Reads and writes live settings in shared memory, shows status, extracts the model. |
 | CLI | `crates/cli` | `neural-forge-cli`: install, model extraction, `doctor`, profiles, and `shmctl` for live settings. |
 | Supervisor | `crates/supervisor` | Library shared by GUI and CLI: paths, config, the channel's path, the model's extraction, installs the layer. |
 | Protocol | `crates/protocol` | The shared-memory contract: header layout, regions, version, paths, saved settings, environment variable access. |

@@ -1,4 +1,4 @@
-//! Binds GTK widgets to `neural_forge_protocol::ShmHeader` fields — this crate's equivalent
+//! Binds the GUI's rows to `neural_forge_protocol::ShmHeader` fields — this crate's equivalent
 //! of upstream's `shm_binder.h/.cpp`, written fresh against the protocol crate's Rust
 //! types (there's no logic in a per-field binder worth porting either way, just a
 //! mechanical widget<->field mapping).
@@ -15,53 +15,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use neural_forge_protocol::mapping::Mapping;
-
-/// How a bound field's raw bits are to be read back.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FieldKind {
-    Float,
-    Int,
-}
-
-/// A way to read a bound field's current raw bits, so a widget can follow changes made by
-/// something other than itself (`shmctl`, loading a profile, Reset, another GUI).
-pub type Reader = Box<dyn Fn() -> u32>;
-
-thread_local! {
-    /// The reader of the most recent `bind_*` call. Every row builder in `ui.rs` is called
-    /// immediately after the binding it displays and takes it from here.
-    static PENDING_READER: std::cell::RefCell<Option<(FieldKind, Reader, Option<&'static str>)>> = const { std::cell::RefCell::new(None) };
-    /// The setting name that came with the reader [`take_pending_reader`] last handed out, for the row's
-    /// per-game mark ([`take_pending_name`]).
-    static TAKEN_NAME: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
-}
-
-/// Takes the reader the last `bind_*` call left for the row being built now.
-pub fn take_pending_reader() -> Option<(FieldKind, Reader)> {
-    let (kind, read, name) = PENDING_READER.with(|p| p.borrow_mut().take())?;
-    TAKEN_NAME.with(|t| t.set(name));
-    Some((kind, read))
-}
-
-/// The persisted setting the row just built displays (the name its `bind_*` call was given), once.
-pub fn take_pending_name() -> Option<&'static str> {
-    TAKEN_NAME.with(std::cell::Cell::take)
-}
-
-fn leave_reader(
-    shm: &Arc<Mapping>,
-    kind: FieldKind,
-    name: Option<&'static str>,
-    get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
-) -> impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static {
-    let get = std::rc::Rc::new(get);
-    let reader_get = std::rc::Rc::clone(&get);
-    let reader_shm = Arc::clone(shm);
-    PENDING_READER.with(|p| {
-        *p.borrow_mut() = Some((kind, Box::new(move || reader_get(reader_shm.header()).load(Ordering::Relaxed)), name));
-    });
-    move |h| get(h)
-}
 
 /// Wraps the open mapping so the UI module can pass one `Arc` around to every
 /// callback instead of re-opening or re-threading raw pointers everywhere.
@@ -81,7 +34,7 @@ impl Shm {
 
 /// How long after the last change a setting is written to `config.ini`: a spin button held down
 /// or dragged changes the value many times a second, and each change was a full rewrite.
-const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+pub const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 use neural_forge_supervisor::game_settings::{stored_value, LiveScope};
 
@@ -106,7 +59,10 @@ struct PendingSave {
     /// did when the change was made ([`Change::stored`]).
     changes: std::collections::BTreeMap<(LiveScope, &'static str), Change>,
     mapping: Option<Arc<Mapping>>,
-    timer: Option<glib::SourceId>,
+    /// Counts the changes: the save a change asked for ([`save_due`]) runs only if no later one came.
+    generation: u64,
+    /// Starts the wait before a save (the UI's timer; none in tests, which flush themselves).
+    schedule: Option<std::rc::Rc<dyn Fn(u64)>>,
     on_error: Option<std::rc::Rc<dyn Fn(String)>>,
 }
 
@@ -124,7 +80,7 @@ fn persist_later(shm: &Arc<Mapping>, name: &'static str) {
     let header = shm.header();
     let Some(value) = neural_forge_protocol::persist::snapshot(header).remove(&format!("set_{name}")) else { return };
     let scope = LiveScope::of(header);
-    PENDING_SAVE.with(|p| {
+    let (generation, schedule) = PENDING_SAVE.with(|p| {
         let mut p = p.borrow_mut();
         match p.changes.entry((scope, name)) {
             std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().value = value,
@@ -134,20 +90,33 @@ fn persist_later(shm: &Arc<Mapping>, name: &'static str) {
             }
         }
         p.mapping = Some(Arc::clone(shm));
-        if let Some(timer) = p.timer.take() {
-            timer.remove();
-        }
-        p.timer = Some(glib::timeout_add_local_once(SAVE_DELAY, || {
-            PENDING_SAVE.with(|p| p.borrow_mut().timer = None);
-            if let Err(e) = flush_settings() {
-                let on_error = PENDING_SAVE.with(|p| p.borrow().on_error.clone());
-                match on_error {
-                    Some(report) => report(format!("Saving the settings failed: {e}")),
-                    None => eprintln!("neural-forge: saving the settings failed: {e}"),
-                }
-            }
-        }));
+        p.generation += 1;
+        (p.generation, p.schedule.clone())
     });
+    if let Some(schedule) = schedule {
+        schedule(generation);
+    }
+}
+
+/// How the UI starts the wait before a save: `schedule(generation)` must call [`save_due`] with that
+/// generation [`SAVE_DELAY`] later, on the UI thread.
+pub fn on_schedule(schedule: impl Fn(u64) + 'static) {
+    PENDING_SAVE.with(|p| p.borrow_mut().schedule = Some(std::rc::Rc::new(schedule)));
+}
+
+/// The save a change asked for [`SAVE_DELAY`] ago: runs unless a later change (which asked for its own) or a
+/// flush came in between.
+pub fn save_due(generation: u64) {
+    if PENDING_SAVE.with(|p| p.borrow().generation) != generation {
+        return;
+    }
+    if let Err(e) = flush_settings() {
+        let on_error = PENDING_SAVE.with(|p| p.borrow().on_error.clone());
+        match on_error {
+            Some(report) => report(format!("Saving the settings failed: {e}")),
+            None => eprintln!("neural-forge: saving the settings failed: {e}"),
+        }
+    }
 }
 
 /// Marks `names` changed for the next save: settings written to the header some other way than
@@ -166,9 +135,7 @@ pub fn persist_settings_later(shm: &Arc<Mapping>, names: &[&'static str]) {
 pub fn flush_settings() -> std::io::Result<()> {
     let (changes, mapping) = PENDING_SAVE.with(|p| {
         let mut p = p.borrow_mut();
-        if let Some(timer) = p.timer.take() {
-            timer.remove();
-        }
+        p.generation += 1;
         (std::mem::take(&mut p.changes), p.mapping.clone())
     });
     let Some(mapping) = mapping.filter(|_| !changes.is_empty()) else { return Ok(()) };
@@ -206,58 +173,25 @@ pub fn flush_settings() -> std::io::Result<()> {
     result
 }
 
-/// Binds a GTK `Scale`/`SpinButton`-shaped float control to one `f32`-bits field:
-/// reads the current value to initialize the widget, and writes back (bumping
-/// `control_seq` so the layer notices) whenever the widget changes. `name` must
-/// match one of `ShmHeader::persisted_settings`'s names for the value to survive a
-/// reboot; pass `None` for a field that isn't meant to (there are none of those among
-/// the GUI's rows today, but the option exists for e.g. a future debug-only control).
+/// Writes `bits` to one field of the header, bumps `control_seq` so the layer notices, and marks the
+/// persisted setting `name` (one of `ShmHeader::persisted_settings`'s names) for the next save.
+pub fn write_bits(shm: &Arc<Mapping>, name: &'static str, field: &std::sync::atomic::AtomicU32, bits: u32) {
+    field.store(bits, Ordering::Relaxed);
+    shm.header().control_seq.fetch_add(1, Ordering::Relaxed);
+    persist_later(shm, name);
+}
+
+/// A float setting's current value and its setter, as a spin row uses them.
+#[cfg(test)]
 pub fn bind_float(
     shm: &Arc<Mapping>,
     name: Option<&'static str>,
     get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (f32, impl Fn(f32) + 'static) {
-    let get = leave_reader(shm, FieldKind::Float, name, get);
     let initial = f32::from_bits(get(shm.header()).load(Ordering::Relaxed));
     let shm = Arc::clone(shm);
-    let setter = move |value: f32| {
-        get(shm.header()).store(value.to_bits(), Ordering::Relaxed);
-        shm.header().control_seq.fetch_add(1, Ordering::Relaxed);
-        if let Some(name) = name {
-            persist_later(&shm, name);
-        }
-    };
+    let setter = move |value: f32| write_bits(&shm, name.expect("a persisted setting"), get(shm.header()), value.to_bits());
     (initial, setter)
-}
-
-/// Same shape as [`bind_float`], for a plain `u32`-valued field (enable flags,
-/// enum-valued settings, etc).
-pub fn bind_u32(
-    shm: &Arc<Mapping>,
-    name: Option<&'static str>,
-    get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
-) -> (u32, impl Fn(u32) + 'static) {
-    let get = leave_reader(shm, FieldKind::Int, name, get);
-    let initial = get(shm.header()).load(Ordering::Relaxed);
-    let shm = Arc::clone(shm);
-    let setter = move |value: u32| {
-        get(shm.header()).store(value, Ordering::Relaxed);
-        shm.header().control_seq.fetch_add(1, Ordering::Relaxed);
-        if let Some(name) = name {
-            persist_later(&shm, name);
-        }
-    };
-    (initial, setter)
-}
-
-/// Same shape again, for a boolean flag stored as `0`/`1` in a `u32` field.
-pub fn bind_bool(
-    shm: &Arc<Mapping>,
-    name: Option<&'static str>,
-    get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
-) -> (bool, impl Fn(bool) + 'static) {
-    let (initial, setter) = bind_u32(shm, name, get);
-    (initial != 0, move |value: bool| setter(if value { 1 } else { 0 }))
 }
 
 #[cfg(test)]

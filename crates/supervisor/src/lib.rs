@@ -10,7 +10,6 @@ pub mod config;
 pub mod desktop_hdr;
 pub mod doctor;
 pub mod game_settings;
-pub mod host_env;
 pub mod install;
 pub mod launch_options;
 pub mod model;

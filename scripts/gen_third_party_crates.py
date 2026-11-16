@@ -5,7 +5,9 @@ The crates: every crate the workspace members (layer, native backend, supervisor
 walking normal (non-dev, non-build) dependencies only and leaving out proc-macro crates (they run in the
 compiler and are not linked), nor anything reached only through one. The C and C++ code compiled into
 the layer: the network from OpenDLSS-NR (third_party/opendlss-nr), and volk and the Vulkan-Headers from
-tools/native (scripts/fetch-native-tools.sh).
+tools/native (scripts/fetch-native-tools.sh). A crate that ships no licence text of its own gets the standard text
+of each licence its SPDX expression names, from scripts/spdx/ (for MIT, the copyright line of another crate from
+the same repository when one has it); one naming a licence scripts/spdx/ lacks fails: add the text there.
 
   gen_third_party_crates.py                  rewrite THIRD_PARTY_CRATES.md (the crate listing)
   gen_third_party_crates.py --check          exit 1, with a diff, if THIRD_PARTY_CRATES.md is out of date
@@ -37,10 +39,13 @@ NATIVE = [
     ("OpenDLSS-NR", "MIT", "repo", ["third_party/opendlss-nr/LICENSE", "third_party/opendlss-nr/NOTICE"]),
     ("volk", "MIT", "tools", ["volk/LICENSE.md"]),
     ("Vulkan-Headers", "Apache-2.0 OR MIT", "tools", ["Vulkan-Headers/LICENSE.md", "Vulkan-Headers/LICENSES/Apache-2.0.txt", "Vulkan-Headers/LICENSES/MIT.txt"]),
-    # The GUI's symbolic icons (crates/gui/icons, compiled into it as a GResource): used under the LGPL-3.0 option.
-    ("Adwaita icon theme 50.0 (GNOME Project)", "LGPL-3.0-or-later OR CC-BY-SA-3.0", "repo",
-     ["crates/gui/icons/COPYING", "crates/gui/icons/COPYING_LGPL", "crates/gui/icons/COPYING_CCBYSA3"], "embedded in the GUI"),
 ]
+
+# Licence files a crate must ship besides its own: works it embeds under another licence. The GUI toolkit's assets
+# crate compiles the Lucide icons (ISC) into the GUI, and their licence is a file of its own.
+REQUIRED_FILES = {"gpui-kit-assets": ["LICENSE-LUCIDE"]}
+
+SPDX_DIR = ROOT / "scripts" / "spdx"
 
 
 def source_url(pkg):
@@ -103,15 +108,70 @@ def listing(meta):
 def licence_files(pkg):
     """The crate's licence and notice files: its `license-file` and those in its own directory."""
     d = Path(pkg["manifest_path"]).parent
+    if not d.is_dir():
+        return []
     extra = [d / pkg["license_file"]] if pkg.get("license_file") else []
     found = sorted(f for f in d.iterdir() if f.is_file() and LICENCE_FILE.match(f.name))
     return list(dict.fromkeys([f.resolve() for f in extra if f.is_file()] + found))
 
 
+def spdx_ids(expression):
+    """The licence ids an SPDX expression names, in order, each once ("MIT/Apache-2.0" too); not the exception
+    after WITH."""
+    ids, skip = [], False
+    for word in re.split(r"[\s()/]+", expression or ""):
+        if skip:
+            skip = False
+        elif word.upper() == "WITH":
+            skip = True
+        elif word and word.upper() not in ("OR", "AND") and word not in ids:
+            ids.append(word)
+    return ids
+
+
+def copyright_lines(texts):
+    """The copyright lines of the MIT texts among `texts`, in order, each once."""
+    lines = []
+    for text in texts:
+        if "Permission is hereby granted, free of charge" not in text:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if re.match(r"(?i)copyright\b.*\S", line) and "permission notice" not in line.lower() and line not in lines:
+                lines.append(line)
+    return lines
+
+
+def standard_texts(pkg, same_repository):
+    """For a crate with no licence file of its own: (file name, text) of the standard text of each licence its SPDX
+    expression names, from scripts/spdx/, and the ids scripts/spdx/ lacks. The MIT text gets the copyright lines of
+    the other crates of its repository (`same_repository`), or a pointer to the repository."""
+    texts, missing = [], []
+    for licence_id in spdx_ids(pkg.get("license")):
+        path = SPDX_DIR / f"{licence_id}.txt"
+        if not path.is_file():
+            missing.append(licence_id)
+            continue
+        text = path.read_text().strip()
+        if licence_id == "MIT":
+            found = []
+            for other in same_repository:
+                for line in copyright_lines(f.read_text(errors="replace") for f in licence_files(other)):
+                    if line not in found:
+                        found.append(line)
+            where = pkg.get("repository") or f"https://crates.io/crates/{pkg['name']}"
+            notice = "\n".join(found) if found else f"Copyright: see {where}"
+            text = text.replace("MIT License\n", f"MIT License\n\n{notice}\n", 1)
+        texts.append((f"{licence_id} (standard text; the crate ships none)", text))
+    return texts, missing
+
+
 def section(title, files):
+    """A component's licence section: `files` are paths, or (name, text) pairs."""
     out = [f"{'=' * 78}\n{title}\n{'=' * 78}\n"]
     for f in files:
-        out.append(f"--- {f.name} ---\n{f.read_text(errors='replace').rstrip()}\n\n")
+        name, text = f if isinstance(f, tuple) else (f.name, f.read_text(errors="replace"))
+        out.append(f"--- {name} ---\n{text.rstrip()}\n\n")
     return "".join(out)
 
 
@@ -120,9 +180,9 @@ def licences(meta, out_path):
     parts = [
         "Third-party licences and notices for Neural Forge\n\n"
         "Neural Forge itself is AGPL-3.0-or-later (LICENSE). Below: every Rust crate statically linked into its\n"
-        "binaries (THIRD_PARTY_CRATES.md lists them), the C/C++ code compiled into its Vulkan layer and the icons\n"
-        "embedded in its GUI, each "
-        "with its licence and notice files as its source ships them. Generated by\n"
+        "binaries (THIRD_PARTY_CRATES.md lists them; the GUI toolkit's icons, Lucide, come with its gpui-kit-assets\n"
+        "crate) and the C/C++ code compiled into its Vulkan layer, each with its licence and notice files as its\n"
+        "source ships them (the standard text of its licence for a crate that ships none). Generated by\n"
         "scripts/gen_third_party_crates.py at build time; ATTRIBUTION.md says what each project contributed.\n\n"
     ]
     missing = []
@@ -134,11 +194,23 @@ def licences(meta, out_path):
             missing.append(f"{name}: {', '.join(absent)}{hint}")
             continue
         parts.append(section(f"{name} ({lic}), {into[0] if into else 'compiled into the Vulkan layer'}", files))
+    by_repository = {}
+    for p in sorted(meta["packages"], key=lambda p: (p["name"], p["version"])):
+        if p.get("repository"):
+            by_repository.setdefault(p["repository"].rstrip("/"), []).append(p)
     for pkg in sorted(linked(meta), key=lambda p: (p["name"], p["version"])):
         files = licence_files(pkg)
-        if not files:
-            missing.append(f"{pkg['name']} {pkg['version']}: no licence file in {Path(pkg['manifest_path']).parent}")
+        absent = [n for n in REQUIRED_FILES.get(pkg["name"], []) if n not in {f.name for f in files}]
+        if absent:
+            missing.append(f"{pkg['name']} {pkg['version']}: {', '.join(absent)} missing in {Path(pkg['manifest_path']).parent}")
             continue
+        if not files:
+            siblings = [p for p in by_repository.get((pkg.get("repository") or "").rstrip("/"), []) if p["id"] != pkg["id"]]
+            files, unknown = standard_texts(pkg, siblings)
+            if unknown or not files:
+                why = f"no text in scripts/spdx/ for {', '.join(unknown)}" if unknown else "no licence declared"
+                missing.append(f"{pkg['name']} {pkg['version']}: no licence file in {Path(pkg['manifest_path']).parent}, {why}")
+                continue
         parts.append(section(f"{pkg['name']} {pkg['version']} ({licence_of(pkg)}) {source_url(pkg)}".rstrip(), files))
     if missing:
         sys.exit("licence texts missing:\n  " + "\n  ".join(missing))
@@ -169,6 +241,20 @@ def self_test():
         assert LICENCE_FILE.match(name), name
     for name in ["README.md", "Cargo.toml", "licensing.rs", "AUTHORS", "AUTHORS.md"]:
         assert not LICENCE_FILE.match(name), name
+    assert LICENCE_FILE.match("LICENSE-LUCIDE")
+    assert spdx_ids("MIT OR Apache-2.0") == ["MIT", "Apache-2.0"]
+    assert spdx_ids("MIT/Apache-2.0") == ["MIT", "Apache-2.0"]
+    assert spdx_ids("(Apache-2.0 WITH LLVM-exception OR MIT) AND Zlib") == ["Apache-2.0", "MIT", "Zlib"]
+    mit = "MIT License\n\nCopyright (c) 2020 A. Author\n\nPermission is hereby granted, free of charge, to"
+    assert copyright_lines([mit, "Apache\nCopyright 2019 Nobody"]) == ["Copyright (c) 2020 A. Author"]
+    bare = {"id": "bare", "name": "bare", "version": "1", "license": "MIT OR Apache-2.0", "repository": "https://example.org/r",
+            "manifest_path": "/nonexistent/Cargo.toml"}
+    texts, unknown = standard_texts(bare, [])
+    assert unknown == [] and len(texts) == 2, (texts, unknown)
+    assert "Copyright: see https://example.org/r" in texts[0][1] and "Permission is hereby" in texts[0][1]
+    assert "Apache License" in texts[1][1]
+    assert standard_texts(dict(bare, license="MIT OR Made-Up-1.0"), [])[1] == ["Made-Up-1.0"]
+    assert "--- MIT (standard text" in section("bare", texts)
     print("gen_third_party_crates self-test ok")
 
 

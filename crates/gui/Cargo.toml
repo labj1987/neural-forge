@@ -6,7 +6,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "GTK4 + libadwaita settings GUI for Neural Forge"
+description = "Settings GUI for Neural Forge"
 
 [lints]
 workspace = true
@@ -18,7 +18,19 @@ path = "src/main.rs"
 [dependencies]
 neural-forge-protocol = { path = "../protocol" }
 neural-forge-supervisor = { path = "../supervisor" }
-gtk4 = { version = "0.11", features = ["v4_12"] }
-libadwaita = { version = "0.9", features = ["v1_5"] }
-glib = "0.22"
-gio = "0.22"
+# The UI toolkit: GPUI Kit (GPUI + gpui-base + gpui-component + default icons). Pinned exactly: see AGENTS.md, "UI (GPUI Kit)".
+gpui-kit = "=0.9.1"
+async-channel = "2"
+libc = "0.2"
+log = "0.4"
+# Raising the window for a second launch (activation.rs): the request goes out on GPUI's own Wayland connection, so
+# these are the versions and the system-library backend GPUI uses.
+raw-window-handle = "0.6"
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# The toggle key (keymap.rs, keytap.rs): the session's keymap and the pressed key's hardware code, which the toolkit's
+# key events do not carry. xkbcommon is the library the toolkit reads keys with; x11rb here is its pure-Rust connection
+# (a second, private one to the X server).
+xkbcommon = "0.8"
+x11rb = { version = "0.13", features = ["xinput", "xkb"] }

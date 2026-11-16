@@ -132,7 +132,7 @@ pub struct Roots {
 pub(crate) fn run_command(program: &str, args: &[&str], timeout: std::time::Duration) -> CommandOutput {
     use std::io::Read;
     use std::process::Stdio;
-    let mut child = match crate::host_env::command(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+    let mut child = match std::process::Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CommandOutput::Missing,
         Err(e) => return CommandOutput::Failed(e.to_string()),
         Ok(child) => child,

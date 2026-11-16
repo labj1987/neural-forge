@@ -3,7 +3,7 @@
 //!   the Vulkan layer   in each game: holds DLSS's input and runs the model (the native backend),
 //!                      or captures the frame after the upscaler and composes the model's answer,
 //!                      which its in-process model server (`native_post`) computes
-//!   the GTK4 GUI / CLI write settings and read status
+//!   the GUI / CLI write settings and read status
 //!
 //! Everything here is plain atomics in a file mapping, so a process dying leaves the others reading
 //! a consistent — if stale — picture. `ShmHeader` is `#[repr(C)]` and built entirely from

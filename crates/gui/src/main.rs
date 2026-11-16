@@ -1,54 +1,82 @@
-mod icons;
+mod activation;
+mod instance;
+mod keymap;
+mod keytap;
+mod pages;
 mod shm;
+mod text;
 mod ui;
 
-use gtk4::prelude::*;
-
+/// The Wayland app_id and X11 window class. It matches `StartupWMClass` in the .desktop file, so the running window
+/// is tied to the desktop file (name, icon) on either backend.
 pub(crate) const APP_ID: &str = "io.github.labj1987.NeuralForge";
 
+/// The UI toolkit reports renderer and display-server problems through the `log` crate; they go to stderr so a
+/// terminal or the journal shows them.
+struct StderrLog;
+
+impl log::Log for StderrLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level() && (metadata.level() <= log::Level::Warn || !chatty(metadata.target()))
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("neural-forge: {} [{}] {}", record.level(), record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// The toolkit's dependencies that log every message they pass at info level (D-Bus handshakes byte by byte, each
+/// traced span): from them only warnings and errors are shown, whatever `NEURAL_FORGE_GUI_LOG` asks for.
+fn chatty(target: &str) -> bool {
+    ["zbus", "tracing", "naga", "polling", "async_io", "calloop"].iter().any(|noisy| target == *noisy || target.starts_with(&format!("{noisy}::")))
+}
+
 fn main() {
-    // The bundled GTK's GLib-level variables (AppRun's bundle_env): GLib reads each of them once, when it first loads the
-    // GSettings schemas, its GIO modules and gdk-pixbuf's loaders. Those loads happen here, first thing, while this
-    // process has one thread, and then the host's values go back into its environment, so no program the GUI starts sees
-    // them. A no-op with the host's GTK.
-    neural_forge_supervisor::host_env::release(neural_forge_supervisor::host_env::GLIB_VARS, || {
-        let _ = gio::SettingsSchemaSource::default();
-        let _ = gio::Vfs::default();
-        let _ = gtk4::gdk_pixbuf::Pixbuf::formats();
-    });
+    // The window is drawn with Vulkan, and Neural Forge is a Vulkan layer: its switch must never reach this process (a
+    // terminal or launcher that exported it for a game), or the window would load the layer into itself. First thing,
+    // while the process has one thread.
+    // SAFETY: no other thread exists yet to read or write the environment.
+    unsafe { std::env::remove_var("NEURAL_FORGE_ENABLE") };
+    log::set_logger(&StderrLog).ok();
+    // NEURAL_FORGE_GUI_LOG=info (or debug) also shows which renderer was picked.
+    let level = neural_forge_protocol::env::var("NEURAL_FORGE_GUI_LOG").and_then(|level| level.parse().ok()).unwrap_or(log::LevelFilter::Warn);
+    log::set_max_level(level);
 
-    // Set program name before GTK init. On Wayland the app_id the compositor sees is the
-    // GApplication ID, not prgname; on X11 it's prgname. Setting both prgname and
-    // StartupWMClass (in the .desktop file) to the application ID makes the running
-    // window match the desktop file on either backend.
-    glib::set_prgname(Some(APP_ID));
-    glib::set_application_name("Neural Forge");
-    // The GUI's own icons, before the application starts (it adds them to the icon theme at startup).
-    icons::register();
-
-    let app = libadwaita::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::FLAGS_NONE).build();
-
-    // Keep the persistent layer copy (what Steam games load) in step with this
-    // AppImage on every launch, so an updated AppImage never runs against a stale layer.
+    // Keep the persistent layer copy (what Steam games load) in step with this AppImage on every launch, so an updated
+    // AppImage never runs against a stale layer. Before the single-instance check: a second launch from a newer AppImage
+    // still installs its layer while an older window is open (the installer replaces files by rename, so the running
+    // copy keeps the ones it has mapped).
     let install_error = auto_install();
     // Rings the NGX wrapper left for games that are gone (the layer never opened them): never a running game's.
     neural_forge_supervisor::proton_tool::sweep_dead_rings(std::path::Path::new(neural_forge_supervisor::proton_tool::RING_DIR));
 
-    // The bundled GTK's GTK-level variables (GTK_EXE_PREFIX, GTK_PATH), once GTK has read them at its init: the host's
-    // values go back into this process's environment, so a program GTK or GIO starts for the GUI (the file manager a
-    // FileLauncher opens) never sees the bundle. A no-op with the host's GTK. The GLib-level ones went back at the top of
-    // main().
-    app.connect_startup(|_| neural_forge_supervisor::host_env::release(neural_forge_supervisor::host_env::GTK_VARS, || {}));
-
-    app.connect_activate(move |app| {
-        if let Some(window) = app.windows().first() {
-            window.present();
+    // Only the first copy goes on: a second launch has asked the running one to show its window.
+    let activations = match instance::claim() {
+        instance::Claim::Primary(activations) => activations,
+        // Shown, or on its way out.
+        instance::Claim::Shown | instance::Claim::Gone => return,
+        // It said it is starting, and its window had not come up in the time waited: the user hears that rather than
+        // nothing (it is not stuck, so nothing is to be closed).
+        instance::Claim::Starting(pid) => {
+            ui::tell_without_window(&instance::still_starting_message(pid));
             return;
         }
-        ui::build_ui(app, install_error.clone());
-    });
+        // Its window is stuck (it listens, but its UI does not answer): starting a second one beside it would have two
+        // copies writing the settings, so say what to do instead.
+        instance::Claim::NotResponding(pid) => {
+            ui::say_without_window(&instance::not_responding_message(pid));
+            std::process::exit(1);
+        }
+    };
 
-    std::process::exit(app.run().get() as i32);
+    gpui_kit::application().with_assets(ui::Assets).run(move |cx| {
+        ui::init(cx);
+        ui::build_ui(cx, activations, install_error);
+    });
 }
 
 /// Installs this AppImage's layer into persistent user storage when they
@@ -81,5 +109,15 @@ fn auto_install() -> Option<String> {
             eprintln!("neural-forge: installing the layer for Steam games failed: {e}");
             Some(format!("Installing the layer for Steam games failed: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_d_bus_crates_chatter_is_not_shown_at_info_level() {
+        assert!(super::chatty("zbus::connection::handshake::common") && super::chatty("tracing::span") && super::chatty("zbus"));
+        assert!(!super::chatty("gpui_wgpu::wgpu_context"), "which renderer was picked stays");
+        assert!(!super::chatty("neural_forge::keytap") && !super::chatty("zbus_names"));
     }
 }
