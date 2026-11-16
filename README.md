@@ -21,7 +21,8 @@ NVIDIA's own runtime. Read [Legal](#legal) before you use it.
   window: it is drawn by Neural Forge itself (with GPUI), the same on every desktop, and needs no GTK or Qt. It was
   tested on GNOME, KDE Plasma, Hyprland and COSMIC; other Wayland and X11 desktops should work too. It takes the basics every desktop has from the system: the X11 or Wayland client
   libraries (libxcb, libxkbcommon, libwayland-client), a Vulkan or OpenGL ES driver (Mesa's software drivers count)
-  and a file-dialog portal (xdg-desktop-portal) for the two file pickers.
+  and a desktop portal (xdg-desktop-portal) for the two file pickers. The window follows the desktop's light or dark
+  mode and, where the desktop has one (GNOME, KDE Plasma, COSMIC), its accent colour.
 - An NVIDIA RTX 40-series or newer GPU with a Vulkan driver that offers `VK_NV_cuda_kernel_launch`,
   `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2` and `VK_EXT_shader_float8` (tested with
   615.71.09, 615.78.08 and 620.70.06). On other GPUs the layer does nothing.

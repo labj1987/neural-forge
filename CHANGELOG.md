@@ -4,6 +4,15 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.5.2 — 2026-11-16
+
+- **The window takes your desktop's accent colour.** On GNOME, KDE Plasma and COSMIC, primary buttons, switches,
+  checkboxes and radio buttons, sliders, focus rings, links and text selection now use the accent colour you picked, in
+  light and dark mode alike, and change with it at once. Text on accent-coloured buttons stays readable: it is white or
+  near-black, whichever stands out. On desktops without an accent colour (Hyprland, sway, GNOME before 47) the colours
+  stay as they were. The "This game" tag on a per-game value switches to the link colour when the accent is too light to
+  read on the window.
+
 ## 4.5.1 — 2026-11-16
 
 - **A second start while Neural Forge is still opening says so, kindly.** If the first window takes a while to appear

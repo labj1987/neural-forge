@@ -790,6 +790,7 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
         window_decorations: Some(WindowDecorations::Client),
         ..TitleBar::window_options()
     };
+    crate::accent::follow(cx);
     let prepare = |window: &mut Window, cx: &mut App| {
         window.set_window_title("Neural Forge");
         match forced_theme() {
@@ -797,9 +798,16 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
             None => {
                 // Follow the desktop's light/dark preference, now and when it changes.
                 Theme::sync_system_appearance(Some(window), cx);
-                window.observe_window_appearance(|window, cx| Theme::sync_system_appearance(Some(window), cx)).detach();
+                window
+                    .observe_window_appearance(|window, cx| {
+                        Theme::sync_system_appearance(Some(window), cx);
+                        crate::accent::apply(cx);
+                    })
+                    .detach();
             }
         }
+        // And its accent colour, in either mode.
+        crate::accent::apply(cx);
     };
     let window = match opened_shm {
         Ok(shm) => {
