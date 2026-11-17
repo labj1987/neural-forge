@@ -773,7 +773,7 @@ type PfnPushDescriptorSetWithTemplate = vk::PFN_vkCmdPushDescriptorSetWithTempla
 
 /// The next layer's pointers for the wrapped commands of one device, as handed out: each set once, when
 /// the application first asks for it ([`intercept`]), and read without a lock on every call after.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Next {
     bind_descriptor_sets2: OnceLock<Pfn2<BindDescriptorSetsInfo>>,
     push_constants2: OnceLock<Pfn2<PushConstantsInfo>>,
@@ -815,8 +815,11 @@ pub(crate) unsafe fn register(device: vk::Device, tracker: Arc<Tracker>) {
     // SAFETY: forwarded.
     let key = unsafe { key(device.as_raw()) };
     let mut w = WRAPPED.write().unwrap_or_else(PoisonError::into_inner);
+    // Registered again for a live device: the next layer's pointers already handed out stay (the wrappers given to
+    // the application before read them; an empty set would drop its calls).
+    let next = w.iter().find(|e| e.key == key).map(|e| e.next.clone()).unwrap_or_default();
     w.retain(|e| e.key != key);
-    w.push(Arc::new(Wrapped { key, tracker, next: Next::default() }));
+    w.push(Arc::new(Wrapped { key, tracker, next }));
 }
 
 /// Stops wrapping for `device` (its destruction).
@@ -907,9 +910,14 @@ pub(crate) unsafe fn intercept(device: vk::Device, name: &[u8], original: vk::PF
 /// device is gone, which the application may not do while recording.
 unsafe fn next_of<T: Copy>(cb: vk::CommandBuffer, pick: impl Fn(&Next) -> &OnceLock<T>) -> Option<(Arc<Wrapped>, T)> {
     // SAFETY: forwarded.
-    let w = unsafe { of(cb) }?;
-    let f = *pick(&w.next).get()?;
-    Some((w, f))
+    let found = unsafe { of(cb) }.and_then(|w| pick(&w.next).get().copied().map(|f| (w, f)));
+    if found.is_none() {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[preupscale] a wrapped binding command has no next layer's pointer to forward to (its device is not registered): the call is dropped");
+        }
+    }
+    found
 }
 
 /// Whether a `vkCmdBindDescriptorSets2` call changes the compute state: it reaches the compute stage and binds at
@@ -1148,6 +1156,26 @@ impl Tracker {
 mod tests {
     use super::*;
     use ash::vk::Handle;
+
+    /// Registered again for the same device: the next layer's pointers handed out before stay, so the wrappers the
+    /// application already holds still forward its calls.
+    #[test]
+    fn registering_a_device_again_keeps_the_pointers_handed_out() {
+        unsafe extern "system" fn next(_: vk::CommandBuffer, _: *const PushConstantsInfo) {}
+        // A stand-in dispatchable handle: its first word is the dispatch key.
+        let dispatch = Box::new(0x5eed_0000_usize);
+        let device = vk::Device::from_raw(std::ptr::from_ref(&*dispatch) as u64);
+        // SAFETY: the stand-in's first word is readable; the pointer handed in has the command's signature.
+        unsafe {
+            register(device, Arc::new(Tracker::new(Fns::default())));
+            let original = std::mem::transmute::<Pfn2<PushConstantsInfo>, unsafe extern "system" fn()>(next);
+            assert!(intercept(device, b"vkCmdPushConstants2", Some(original)).is_some());
+            register(device, Arc::new(Tracker::new(Fns::default())));
+            let kept = wrapped_for(*dispatch).is_some_and(|w| w.next.push_constants2.get().is_some());
+            unregister(device);
+            assert!(kept, "the pointer handed out before is kept");
+        }
+    }
 
     fn set(raw: u64) -> vk::DescriptorSet {
         vk::DescriptorSet::from_raw(raw)
