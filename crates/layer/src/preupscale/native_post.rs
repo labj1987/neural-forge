@@ -1475,7 +1475,7 @@ unsafe fn evaluate(
             unsafe { device.update_descriptor_sets(&writes, &[]) };
             let push = HudPush {
                 dims: [width, height, 0, hud.regions.len() as u32],
-                flags: [u32::from(hud.detect), 0, 0, 0],
+                flags: [u32::from(hud.detect), u32::from(bgra), 0, 0],
                 detect: [Hud::STILL, Hud::SHARP, Hud::RISE, Hud::FALL],
                 shape: [Hud::THRESHOLD, 0.0, Hud::region_feather(height), 0.0],
             };

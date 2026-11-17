@@ -18,8 +18,8 @@
 // moves the answer back toward the frame by it, and the preprocess rejects the history where it is below 1.
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// The frame's proxy and the previous frame's (RGBA8 or BGRA8: only differences and luma of the three colour
-// channels are read, and the order does not change them).
+// The frame's proxy and the previous frame's (RGBA8, or BGRA8 with flags.y set: rgb() puts the channels in RGB
+// order, which the luma's weights need).
 layout(set = 0, binding = 0, std430) readonly buffer Frame { uint texel[]; } u_frame;
 layout(set = 0, binding = 1, std430) readonly buffer Previous { uint texel[]; } u_previous;
 // Per pixel: the detection's confidence (0-1), kept from frame to frame.
@@ -33,14 +33,17 @@ layout(set = 0, binding = 5, std430) buffer Near { float d[]; } u_near;
 
 layout(push_constant) uniform Params {
   uvec4 dims;     // width, height, phase (0 detect, 1 rows, 2 scale), region count
-  uvec4 flags;    // detection on (1), unused x3
+  uvec4 flags;    // detection on (1), BGRA8 proxy (1), unused x2
   vec4 detect;    // static level (0-1, largest channel), contrast level (luma), rise, fall
   vec4 shape;     // confidence threshold, unused, region feather (pixels), unused
 } p;
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
-vec3 rgb(uint texel) { return unpackUnorm4x8(texel).rgb; }
+vec3 rgb(uint texel) {
+  vec3 c = unpackUnorm4x8(texel).rgb;
+  return p.flags.y != 0u ? c.bgr : c;
+}
 
 uint at(ivec2 q) {
   ivec2 c = clamp(q, ivec2(0), ivec2(p.dims.xy) - 1);
