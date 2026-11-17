@@ -310,6 +310,9 @@ pub struct ShmClient {
     /// Set when mapping the file failed (address space refused): not retried on every
     /// present for the rest of the process, since nothing about the next attempt differs.
     map_refused: bool,
+    /// After a mapping failure the next present may not have (open, fstat, ftruncate, fallocate): not tried again
+    /// (nor the lease claimed for it) before this, [`MAP_RETRY`] later.
+    map_retry_at: Option<Instant>,
     frames: u64,
     /// Per-slot: the request number and send time of a round trip issued via
     /// [`Self::begin_async_request`] that [`Self::poll_async_request`] hasn't yet
@@ -352,6 +355,7 @@ impl Default for ShmClient {
             alive_since: None,
             dead: false,
             map_refused: false,
+            map_retry_at: None,
             frames: 0,
             pending: [None, None],
             last_req: [0, 0],
@@ -911,7 +915,11 @@ impl ShmClient {
             return true;
         }
         let path = neural_forge_protocol::env::var("NEURAL_FORGE_SHM").filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
-        // A mapping refused once is refused for good: no claim for a channel this client can never use.
+        // A mapping refused once is refused for good: no claim for a channel this client can never use. One that
+        // failed for a reason that may pass is tried again only every few seconds, not at every present.
+        if self.map_retry_at.is_some_and(|at| Instant::now() < at) {
+            return false;
+        }
         if self.map_refused || !neural_forge_protocol::isolated_path(&path) || !ensure_private_parent_dir(&path) {
             return false;
         }
@@ -968,6 +976,7 @@ impl ShmClient {
                 }
                 Err(refused) => {
                     self.map_refused = refused;
+                    self.map_retry_at = (!refused).then(|| Instant::now() + MAP_RETRY);
                     return false;
                 }
             },
@@ -1157,13 +1166,35 @@ impl ShmClient {
 /// life. `Err(true)` when it must not be retried (a foreign file, or the address space refused);
 /// `Err(false)` for a failure the next present may not have.
 fn map_channel(path: &str) -> Result<(*mut u8, OwnedFd), bool> {
+    let mapped = map_channel_once(path);
+    if mapped.is_ok() {
+        TRANSIENT_SAID.store(false, Ordering::Relaxed);
+    }
+    mapped
+}
+
+/// How long after a mapping failure that may pass the channel is tried again ([`ShmClient::open`]).
+const MAP_RETRY: Duration = Duration::from_secs(5);
+
+/// A failure that may pass was logged since the channel was last mapped ([`say_transient`]).
+static TRANSIENT_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Logs a mapping failure that may pass once, until the channel is mapped again (it is retried every
+/// [`MAP_RETRY`]).
+fn say_transient(line: &str) {
+    if !TRANSIENT_SAID.swap(true, Ordering::Relaxed) {
+        crate::log!("{line} (tried again every {} s; said once)", MAP_RETRY.as_secs());
+    }
+}
+
+fn map_channel_once(path: &str) -> Result<(*mut u8, OwnedFd), bool> {
     let c_path = CString::new(path).map_err(|_| true)?;
     // SAFETY: `c_path` is a valid, NUL-terminated C string for the duration of the
     // call. `O_NOFOLLOW` refuses to open through a symlink -- this file lives under
     // a world-writable /tmp, so that refusal matters.
     let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
     if raw_fd < 0 {
-        crate::log!("[shm] open {path} failed");
+        say_transient(&format!("[shm] open {path} failed"));
         return Err(false);
     }
     // SAFETY: `raw_fd` was just returned by a successful `open()` and is owned nowhere else.
@@ -1194,7 +1225,7 @@ fn size_channel(path: &str, fd: &OwnedFd) -> Result<(), bool> {
         }
         Some(_) => {}
         None => {
-            crate::log!("[shm] cannot examine {path}");
+            say_transient(&format!("[shm] cannot examine {path}"));
             return Err(false);
         }
     }
@@ -1208,12 +1239,12 @@ fn size_channel(path: &str, fd: &OwnedFd) -> Result<(), bool> {
     // but the header is written on every present: it is backed now, or the channel is not used.
     // SAFETY: plain calls on the file just opened.
     if needs_truncate && unsafe { libc::ftruncate(fd.as_raw_fd(), total as libc::off_t) } != 0 {
-        crate::log!("[shm] ftruncate {path} failed");
+        say_transient(&format!("[shm] ftruncate {path} failed"));
         return Err(false);
     }
     let err = unsafe { libc::posix_fallocate(fd.as_raw_fd(), 0, neural_forge_protocol::HEADER_BYTES as libc::off_t) };
     if err != 0 {
-        crate::log!("[shm] cannot back the header of {path} (error {err}, is /tmp full?)");
+        say_transient(&format!("[shm] cannot back the header of {path} (error {err}, is /tmp full?)"));
         return Err(false);
     }
     Ok(())
