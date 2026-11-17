@@ -2774,8 +2774,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             i.restore.with(command_buffer, |s| s.bind(binding));
         }
         // Elsewhere they invalidate the offsets kept there (`restore::State::bind_other_sets`).
-        else if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
-            i.restore.with(command_buffer, |s| s.bind_other_sets(bind_point));
+        else if let Some(i) = self.inline.as_ref() {
+            i.restore.note_other(command_buffer, |s| s.bind_other_sets(bind_point));
         }
         LayerResult::Unhandled
     }
@@ -2839,13 +2839,16 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             i.restore.with(command_buffer, |s| s.bind(binding));
         }
         // Elsewhere too: the replay's buffer binding invalidates them (`restore::State::set_other_offsets`).
-        else if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
-            i.restore.with(command_buffer, |s| s.set_other_offsets(bind_point, layout, first_set, buffer_indices.to_vec(), offsets.to_vec()));
+        else if let Some(i) = self.inline.as_ref() {
+            i.restore.note_other(command_buffer, |s| s.set_other_offsets(bind_point, layout, first_set, buffer_indices, offsets));
         }
         LayerResult::Unhandled
     }
 
     fn cmd_bind_descriptor_buffers_ext(&self, command_buffer: vk::CommandBuffer, infos: &[vk::DescriptorBufferBindingInfoEXT]) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref() {
+            i.restore.buffers_bound();
+        }
         if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
             // SAFETY: the application's binding infos, valid for this call.
             i.restore.with(command_buffer, |s| unsafe { s.bind_buffers(infos) });

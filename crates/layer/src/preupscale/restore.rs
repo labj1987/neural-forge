@@ -205,21 +205,33 @@ impl State {
 
     /// `vkCmdSetDescriptorBufferOffsetsEXT` at `point`, not compute: kept, as the replay's buffer binding
     /// invalidates it. A call whose every set number is set again is gone.
+    ///
+    /// A dropped call's vectors are reused, so a game setting the same sets each draw allocates nothing.
     pub(crate) fn set_other_offsets(
         &mut self,
         point: vk::PipelineBindPoint,
         layout: vk::PipelineLayout,
         first: u32,
-        indices: Vec<u32>,
-        offsets: Vec<vk::DeviceSize>,
+        indices: &[u32],
+        offsets: &[vk::DeviceSize],
     ) {
         let s = self.next();
         let range = first..first + indices.len() as u32;
-        self.other_offsets.retain(|(_, p, old)| {
+        let mut reuse = None;
+        self.other_offsets.retain_mut(|(_, p, old)| {
             let r = old.sets();
-            *p != point || !(range.start <= r.start && r.end <= range.end)
+            let gone = *p == point && range.start <= r.start && r.end <= range.end;
+            if let (true, None, Binding::Offsets { indices, offsets, .. }) = (gone, &reuse, old) {
+                reuse = Some((std::mem::take(indices), std::mem::take(offsets)));
+            }
+            !gone
         });
-        self.other_offsets.push((s, point, Binding::Offsets { layout, first, indices, offsets }));
+        let (mut kept_indices, mut kept_offsets) = reuse.unwrap_or_default();
+        kept_indices.clear();
+        kept_indices.extend_from_slice(indices);
+        kept_offsets.clear();
+        kept_offsets.extend_from_slice(offsets);
+        self.other_offsets.push((s, point, Binding::Offsets { layout, first, indices: kept_indices, offsets: kept_offsets }));
         if self.other_offsets.len() > MAX_BINDINGS {
             self.unrestorable.get_or_insert("more descriptor binding calls than the layer keeps");
         }
@@ -576,6 +588,9 @@ pub(crate) struct Tracker {
     /// A push reaching the compute stage and other stages was noted: pushes for other stages only are noted
     /// from then on ([`Self::note_push`]).
     mixed: std::sync::atomic::AtomicBool,
+    /// The application called `vkCmdBindDescriptorBuffersEXT` on the device ([`Self::buffers_bound`]): until
+    /// then no offsets can be set, so the graphics binds' hooks ([`Self::note_other`]) return at once.
+    buffers_seen: std::sync::atomic::AtomicBool,
     /// Each push-descriptor template's data size, compute bind point only (`None`: not sizable).
     templates: Mutex<HashMap<vk::DescriptorUpdateTemplate, Option<usize>>>,
     pub(crate) fns: Fns,
@@ -601,6 +616,7 @@ impl Tracker {
             states: Mutex::default(),
             forgotten: std::sync::atomic::AtomicU64::new(0),
             mixed: std::sync::atomic::AtomicBool::new(false),
+            buffers_seen: std::sync::atomic::AtomicBool::new(false),
             templates: Mutex::default(),
             fns,
         }
@@ -655,6 +671,30 @@ impl Tracker {
             return;
         }
         self.with(cb, f);
+    }
+
+    /// `vkCmdBindDescriptorBuffersEXT`, noting on or not: offsets set at other bind points than compute are
+    /// noted from here on ([`Self::note_other`]).
+    pub(crate) fn buffers_bound(&self) {
+        // Loaded first: a game binding buffers every frame writes the flag once.
+        if !self.buffers_seen.load(std::sync::atomic::Ordering::Relaxed) {
+            self.buffers_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether binds at other bind points than compute are noted: noting is on and the application uses
+    /// descriptor buffers. Before it binds any, no offsets are kept ([`State::set_other_offsets`] follows a
+    /// buffer binding), so the binds that would drop them have nothing to do: a game without descriptor
+    /// buffers pays two atomic loads per graphics bind.
+    pub(crate) fn notes_other(&self) -> bool {
+        self.active() && self.buffers_seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Runs `f` on `cb`'s state when [`Self::notes_other`].
+    pub(crate) fn note_other(&self, cb: vk::CommandBuffer, f: impl FnOnce(&mut State)) {
+        if self.notes_other() {
+            self.with(cb, f);
+        }
     }
 
     /// Runs `f` on `cb`'s state while noting is on ([`Self::active`]).
@@ -1040,7 +1080,7 @@ unsafe extern "system" fn bind_descriptor_sets2(cb: vk::CommandBuffer, info: *co
             });
         }
         if let Some(i) = info.as_ref().filter(|i| i.descriptor_set_count > 0) {
-            w.tracker.note(cb, |s| other_bind_points(i.stage_flags).for_each(|p| s.bind_other_sets(p)));
+            w.tracker.note_other(cb, |s| other_bind_points(i.stage_flags).for_each(|p| s.bind_other_sets(p)));
         }
         next(cb, info);
     }
@@ -1119,13 +1159,13 @@ unsafe extern "system" fn set_descriptor_buffer_offsets2(cb: vk::CommandBuffer, 
             });
         }
         if let Some(i) = info.as_ref().filter(|i| i.set_count > 0 && other_bind_points(i.stage_flags).next().is_some()) {
-            w.tracker.note(cb, |s| {
+            w.tracker.note_other(cb, |s| {
                 if !i.p_next.is_null() || i.layout == vk::PipelineLayout::null() {
                     s.refuse("vkCmdSetDescriptorBufferOffsets2EXT with a chained structure");
                 } else {
-                    let indices = slice(i.p_buffer_indices, i.set_count).to_vec();
-                    let offsets = slice(i.p_offsets, i.set_count).to_vec();
-                    other_bind_points(i.stage_flags).for_each(|p| s.set_other_offsets(p, i.layout, i.first_set, indices.clone(), offsets.clone()));
+                    let indices = slice(i.p_buffer_indices, i.set_count);
+                    let offsets = slice(i.p_offsets, i.set_count);
+                    other_bind_points(i.stage_flags).for_each(|p| s.set_other_offsets(p, i.layout, i.first_set, indices, offsets));
                 }
             });
         }
@@ -1266,15 +1306,15 @@ mod tests {
     fn offsets_at_other_bind_points_are_kept_for_the_buffer_rebinding() {
         let g = vk::PipelineBindPoint::GRAPHICS;
         let mut s = State::default();
-        s.set_other_offsets(g, layout(1), 0, vec![0], vec![0]);
+        s.set_other_offsets(g, layout(1), 0, &[0], &[0]);
         // SAFETY: a binding info with no chain.
         unsafe { s.bind_buffers(&[vk::DescriptorBufferBindingInfoEXT::default().address(0x1000)]) };
         assert!(s.other_offsets.is_empty(), "the application's own buffer binding invalidated them");
-        s.set_other_offsets(g, layout(1), 0, vec![0, 0], vec![0, 256]);
-        s.set_other_offsets(vk::PipelineBindPoint::RAY_TRACING_KHR, layout(2), 0, vec![0], vec![512]);
-        s.set_other_offsets(g, layout(1), 1, vec![0], vec![1024]);
+        s.set_other_offsets(g, layout(1), 0, &[0, 0], &[0, 256]);
+        s.set_other_offsets(vk::PipelineBindPoint::RAY_TRACING_KHR, layout(2), 0, &[0], &[512]);
+        s.set_other_offsets(g, layout(1), 1, &[0], &[1024]);
         assert_eq!(s.other_offsets.len(), 3, "set 0 of the first graphics call is still set");
-        s.set_other_offsets(g, layout(1), 0, vec![0, 0], vec![0, 0]);
+        s.set_other_offsets(g, layout(1), 0, &[0, 0], &[0, 0]);
         assert_eq!(s.other_offsets.len(), 2, "setting both sets again replaces both graphics calls");
         let buffers = s.buffers.as_ref().map(|(seq, _)| *seq).unwrap();
         assert!(s.other_offsets.iter().all(|(seq, ..)| *seq > buffers), "replayed after the buffers, in call order");
@@ -1284,6 +1324,23 @@ mod tests {
         let stages = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::COMPUTE;
         assert_eq!(other_bind_points(stages).collect::<Vec<_>>(), vec![g]);
         assert_eq!(other_bind_points(vk::ShaderStageFlags::COMPUTE).count(), 0);
+    }
+
+    /// Graphics binds cost nothing until the application binds descriptor buffers: no offsets can be set before.
+    #[test]
+    fn graphics_binds_are_not_noted_before_descriptor_buffers_are_bound() {
+        let t = Tracker::new(Fns::default());
+        assert!(!t.notes_other(), "noting is off");
+        t.activate();
+        assert!(!t.notes_other(), "no descriptor buffers bound yet");
+        let cb = vk::CommandBuffer::from_raw(0x77);
+        t.note_other(cb, |_| panic!("noted before any descriptor buffer binding"));
+        t.buffers_bound();
+        assert!(t.notes_other());
+        let mut ran = false;
+        t.note_other(cb, |_| ran = true);
+        assert!(ran);
+        t.forget(cb);
     }
 
     #[test]
