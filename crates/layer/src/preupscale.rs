@@ -4285,6 +4285,10 @@ impl Resources {
 
     /// The next hold's work goes to `queue` (the application's DLSS submit's).
     pub(crate) fn on_queue(&mut self, queue: vk::Queue) {
+        // The fences seen were on the queue before: their signals cover nothing submitted on another.
+        if self.queue != Some(queue) {
+            self.fences_seen = 0;
+        }
         self.queue = Some(queue);
     }
 
@@ -10219,6 +10223,23 @@ mod tests {
         session.bury(d);
         assert_eq!(session.left_behind.len(), 1, "no fence of the new ones seen yet");
         assert!(session.res.as_mut().unwrap().wait_idle(d, &mut None));
+        // The holds moved to another queue (here a handle nothing is submitted to) where the old ones were left: the
+        // fence seen on the first queue covers nothing there.
+        let other = vk::Queue::from_raw(0xdead_0000);
+        session.left_behind[0].queue = Some(other);
+        session.res.as_mut().unwrap().on_queue(other);
+        session.bury(d);
+        assert_eq!(session.left_behind.len(), 1, "a fence seen on another queue does not free them");
+        session.left_behind[0].queue = Some(gpu.queue);
+        let res = session.res.as_mut().unwrap();
+        res.on_queue(gpu.queue);
+        // SAFETY: the fence was waited for (signalled, idle).
+        unsafe {
+            d.reset_fences(&[res.capture_fence]).unwrap();
+            d.queue_submit(gpu.queue, &[], res.capture_fence).unwrap();
+        }
+        res.capture_pending = true;
+        assert!(res.wait_idle(d, &mut None));
         session.bury(d);
         assert!(session.left_behind.is_empty(), "destroyed once a later fence on their queue signalled");
         // The split holds run before the upscaler only: no fenced resources are ever built into the
