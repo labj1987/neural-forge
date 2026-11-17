@@ -1651,9 +1651,12 @@ impl HoldSide {
             }
             clear_serving();
             if stop == Stop::Stuck {
-                // The network is still in use by that frame: it cannot go back to the game's GPU.
-                crate::log!("[offload] {why}: the network cannot be taken back while that frame may run; the model is off for the rest of the session");
-                crate::logging::flush();
+                // The network is still in use by that frame: it cannot go back to the game's GPU. (Said once: the
+                // other hold's worker finds the same frame stuck.)
+                if !matches!(super::offload::state(), super::offload::State::Stalled(_)) {
+                    crate::log!("[offload] {why}: the network cannot be taken back while that frame may run; the model is off for the rest of the session");
+                    crate::logging::flush();
+                }
                 super::offload::note_state(super::offload::State::Stalled(stalled.clone()));
                 return;
             }
