@@ -911,7 +911,7 @@ unsafe fn delayed_present(
                     debug_scale: settings.debug_scale,
                     proxy_encoded: req.encoded,
                     reversible_mode: req.reversible_mode,
-                    pq10: pq10.then(crate::hdr_present::reference_nits),
+                    pq10: pq10.then(|| crate::hdr_present::Transfer::Pq { reference_nits: crate::hdr_present::reference_nits() }),
                 },
             )
             .map(Delayed::Composed);
