@@ -85,6 +85,7 @@ pub fn store(game: &GameKey, values: &BTreeMap<String, String>) -> std::io::Resu
         return Err(std::io::Error::other(format!("{why}: the settings for all games are needed to tell what differs from them")));
     }
     let base = without_own(game, &cfg);
+    let _held = paths::lock_beside(&games_file());
     let mut all = load_for_update()?;
     let name = section_name(&all, game);
     let section = all.entry(name.clone()).or_default();
@@ -104,6 +105,7 @@ pub fn store(game: &GameKey, values: &BTreeMap<String, String>) -> std::io::Resu
 /// Removes `game`'s own settings: every one (`key` `None`, "Restore defaults"), or the one `key`
 /// (`set_<name>`). Lines that are not settings are kept. Returns how many were removed.
 pub fn clear(game: &GameKey, key: Option<&str>) -> std::io::Result<usize> {
+    let _held = paths::lock_beside(&games_file());
     let mut all = load_for_update()?;
     let name = section_name(&all, game);
     let Some(section) = all.get_mut(&name) else { return Ok(0) };
@@ -156,6 +158,7 @@ impl LiveScope {
 pub fn save_values(scope: &LiveScope, values: &BTreeMap<String, String>) -> std::io::Result<()> {
     match scope.scope {
         0 => {
+            let _held = paths::lock_beside(&paths::config_file());
             let mut cfg = Config::load();
             cfg.settings.extend(values.iter().map(|(k, v)| (k.clone(), v.clone())));
             cfg.save()

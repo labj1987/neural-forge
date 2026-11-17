@@ -34,6 +34,19 @@ pub fn state_home() -> String {
     xdg("XDG_STATE_HOME", ".local/state")
 }
 
+/// Holds `file`'s lock (`.<name>.lock` beside it, its directory made if missing) until dropped: a read-modify-write of
+/// `config.ini`, `games.ini` or `profiles.ini` by the GUI and the CLI at once runs one after the other, so neither
+/// change is lost. Not taken where the lock file cannot be made: the write then reports its own error there.
+pub fn lock_beside(file: &str) -> Option<std::fs::File> {
+    let path = Path::new(file);
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let dir = path.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
+    let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(dir.join(format!(".{name}.lock"))).ok()?;
+    lock.lock().ok()?;
+    Some(lock)
+}
+
 /// The directory of [`config_file`].
 pub fn config_dir() -> String {
     let file = config_file();
