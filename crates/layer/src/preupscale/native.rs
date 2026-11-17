@@ -621,6 +621,14 @@ fn no_history() -> bool {
 /// holds were refused it for good (2026-10-23).
 static NETWORK_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether this loader holds an open network after an attempt (built with it, or kept for the next one after its build
+/// failed), so it is the [`NETWORK_OWNER`] another device's loader asks to lend it. Not only after this attempt opened
+/// it: one that opened it and failed its first build keeps it open (the retry reuses it), and so does a borrower whose
+/// first build after a lend failed; another device's open is refused until this one gives it up.
+fn holds_network_after<T, E, N>(result: &Result<T, E>, kept: &Option<N>) -> bool {
+    result.is_ok() || kept.is_some()
+}
+
 /// The longest a build waits for the game to stop loading ([`Loader::work`]).
 const LOADING_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -1181,7 +1189,7 @@ impl Loader {
                     }
                 }
             });
-            if opened.is_some() && result.is_ok() {
+            if holds_network_after(&result, &network) {
                 NETWORK_OWNER.store(device.as_raw(), std::sync::atomic::Ordering::SeqCst);
             }
             // Refused because another device's loader has the network: that one is asked to lend it.
@@ -5610,6 +5618,15 @@ mod tests {
         loader.claims.pre_unfenced_until.store(epoch_ms().saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
         assert!(loader.claim_post(), "once a frame can no longer be running");
         loader.release_post();
+    }
+
+    /// The loader that keeps an open network after a failed build (opened by this attempt or an earlier one, or
+    /// borrowed) is the owner another device asks; one with no network is not.
+    #[test]
+    fn a_loader_keeping_the_network_after_a_failed_build_is_its_owner() {
+        assert!(holds_network_after::<(), String, ()>(&Err("building failed".into()), &Some(())), "kept after a failed build");
+        assert!(holds_network_after::<(), String, ()>(&Ok(()), &None), "built with it");
+        assert!(!holds_network_after::<(), String, ()>(&Err("refused".into()), &None), "no network open here");
     }
 
     /// The network is lent to another device only while neither path here uses it: not with a hold recorded into
