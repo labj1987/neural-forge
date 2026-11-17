@@ -4574,13 +4574,22 @@ pub(crate) enum ExposureSource {
 }
 
 impl ExposureSource {
-    /// The source for `target`: the game's image when it can be copied from, else the frame.
+    /// The source for `target`: the game's image when it can be copied from and its texel starts with the half the
+    /// pass reads ([`Self::readable_format`]), else the frame.
     pub(crate) fn of(target: &Target) -> Self {
-        if target.exposure_input.is_some_and(|a| a.readable && aux_copy_layout(a.layout).is_some()) {
+        if target.exposure_input.is_some_and(|a| a.readable && Self::readable_format(a.format) && aux_copy_layout(a.layout).is_some()) {
             Self::Game
         } else {
             Self::Auto
         }
+    }
+
+    /// Formats whose copied texel is the exposure as the pass reads it: R16F alone, as the hold inside DLSS's buffer
+    /// requires (`inline.rs`). A 32-bit float's low half is noise; RG16F's second channel would land in the word's
+    /// high half, which [`hdr::exposure_word`] reads as the game's own value; and a texel wider than 4 bytes (RGBA16F,
+    /// RG32F, RGBA32F) would write over the second word (the composite's exposure-jump word).
+    fn readable_format(format: vk::Format) -> bool {
+        format == vk::Format::R16_SFLOAT
     }
 
     /// Whether the capture measures the exposure from the frame for `target`: the source is the frame, or the
@@ -10822,10 +10831,12 @@ mod tests {
         assert_eq!(gpu.read(image, w, h), original, "the frame is untouched");
         let unreadable = Some(Aux { readable: false, ..exposure_aux(zero).unwrap() });
         let unknown_layout = Some(Aux { layout: None, ..exposure_aux(zero).unwrap() });
+        // A 32-bit float exposure: its low 16 bits are no half (and a wider texel writes over the jump word).
+        let wide = Some(Aux { format: vk::Format::R32_SFLOAT, ..exposure_aux(zero).unwrap() });
         let mut plain = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
         };
-        for exposure_input in [None, unreadable, unknown_layout] {
+        for exposure_input in [None, unreadable, unknown_layout, wide] {
             let target = Target { exposure_input, ..base };
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut plain) };
             assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{exposure_input:?}: {result:?}");
