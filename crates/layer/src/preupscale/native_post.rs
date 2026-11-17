@@ -573,14 +573,17 @@ impl FlowState {
         }
     }
 
-    /// A submit of the flow's failed: both queues (this thread's alone) drain, so nothing of the flow is
-    /// pending, and `zero` runs from here on. Never on a queue shared with the application: no after-the-upscaler
-    /// server runs there (`Session::ensure_post_server`); if one ever does, this wait needs that queue's lock.
-    fn give_up(&mut self, device: &ash::Device, compute: vk::Queue, why: &str) {
+    /// A submit of the flow's failed: both queues drain, so nothing of the flow is pending, and `zero` runs from
+    /// here on. `shared` is set when `compute` is the application's queue (`crate::shared_queue`): its wait is made
+    /// under that queue's lock, as every use of it is.
+    fn give_up(&mut self, device: &ash::Device, compute: vk::Queue, shared: Option<&'static crate::shared_queue::SharedQueue>, why: &str) {
         if let Self::Ready(fd) = std::mem::replace(self, Self::Off) {
-            // SAFETY: both queues are this thread's alone.
+            // SAFETY: the flow's queue is this thread's alone; `compute` is too, or used under its lock.
             unsafe {
-                let _ = device.queue_wait_idle(compute);
+                {
+                    let _shared = shared.map(|q| q.guard());
+                    let _ = device.queue_wait_idle(compute);
+                }
                 let _ = device.queue_wait_idle(fd.queue);
             }
             *self = Self::unavailable(why, Some(fd));
@@ -1774,7 +1777,7 @@ unsafe fn evaluate(
         match unsafe { flow_submits(device, gpu, s) } {
             Ok(waits) => Some(waits),
             Err(why) => {
-                gpu.flow.give_up(device, gpu.queue, &why);
+                gpu.flow.give_up(device, gpu.queue, gpu.shared, &why);
                 return false;
             }
         }
@@ -1797,7 +1800,7 @@ unsafe fn evaluate(
     if crate::note_vk(device.handle(), submitted).is_err() {
         if waits.is_some() {
             // The flow ran (or runs) with nothing waiting for it: its queue drains, and the flow is not used again.
-            gpu.flow.give_up(device, gpu.queue, "the frame's submit after the flow failed");
+            gpu.flow.give_up(device, gpu.queue, gpu.shared, "the frame's submit after the flow failed");
         }
         return false;
     }
