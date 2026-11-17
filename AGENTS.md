@@ -5,7 +5,7 @@ Repository: https://github.com/labj1987/neural-forge
 Read [docs/PHASE1.md](docs/PHASE1.md) for the current namespace, installation contract and
 target-ownership rules. Benchmarks run with `scripts/gta-bench.sh`
 ([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)) on the maintainer's desktop, which stays at
-3840x2160, 144 Hz, VRR with HDR on: never change the display mode for a test, set the game's own resolution. The
+2560x1440, 288 Hz, VRR with HDR on: never change the display mode for a test, set the game's own resolution. The
 game sweep sets it to 2560x1440 (since 2026-11-12: at 4K the 12 GB card runs out of video memory with Ray
 Reconstruction and the model after DLSS); `gta-bench.sh` sets none and uses GTA's `settings.xml` as found. Games that have HDR are tested with their HDR on; video memory is sampled. Every release is
 checked in Cyberpunk 2077, GTA V Enhanced, Red Dead Redemption 2 and Crimson Desert; the old Phase 1 plan is in
@@ -156,8 +156,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Shape (`crates/gui/src`): `ui.rs` has the toolkit set-up, the pieces pages are made of (`group`, `row`, `Spin`,
   `menu_button`, `ask`, `inform`, `toast`) and `MainView` with the title bar, tabs and periodic updates; `pages.rs` the
   five pages, the "Settings for" bar, the per-pass dialog (`PassDialog`), the target editor (`TargetEditor`), About and
-  the error window; `text.rs` every text and decision that needs no window, with the tests; `keys.rs` the toggle
-  key's table; `shm.rs` the saving of settings; `instance.rs`/`activation.rs` the single instance.
+  the error window; `text.rs` every text and decision that needs no window, with the tests; `keymap.rs` and `keytap.rs` the
+  toggle key's names and its line to the display server's keyboard; `shm.rs` the saving of settings; `instance.rs`/`activation.rs` the single instance.
 - The rows are drawn from the header: a switch or menu row reads its field when it is rendered and writes it with
   `MainView::set_bits`; nothing is kept in step by hand. A spin row is a `Spin` (a number field created once, in
   `add_setting_spins`, `FLOAT_SPINS`/`INT_SPINS`): a new float setting gets a line there and a `spin_row` in its page.
@@ -259,7 +259,7 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   (docs/RUNNING_AND_MEASURING.md, section 11), in tmux; it takes the GPU lock and puts back what it changes. Every
   run must pass (each run holds the GPU lock only while it runs), and each is recorded (`vw`, `--vw`): a run passes
   only when the recording flags nothing and its contact sheet looks right against the model off; log numbers alone never pass; record the passing games' `verified`/`verified_on` in `data/games.toml`. Runs set the game's own
-  resolution to 2560x1440 (the desktop stays at 3840x2160), with HDR for games that have it.
+  resolution to 2560x1440 (the desktop stays at 2560x1440, 288 Hz, VRR), with HDR for games that have it.
 
 ## Test builds
 
