@@ -20,7 +20,8 @@ ARCH="x86_64"
 BUILD_DIR="build-appimage"
 APPDIR="$BUILD_DIR/AppDir"
 
-echo "==> Building $NAME $VERSION AppImage"
+# --self-test: checks missing_deps against stand-in tools on a private PATH; builds and installs nothing.
+[ "${1:-}" = "--self-test" ] || echo "==> Building $NAME $VERSION AppImage"
 
 # ── Build dependencies ────────────────────────────────────────────────
 SUDO=""
@@ -29,7 +30,9 @@ if [[ "$(id -u)" -ne 0 ]]; then SUDO="sudo"; fi
 # Python generators), so a missing one is installed before the long release build, not found after it.
 missing_deps() {
     local tool
-    for tool in g++ curl patch python3 pkg-config desktop-file-validate zsyncmake; do
+    # x86_64-w64-mingw32-gcc: the NGX wrapper's linker (scripts/build-ngx-wrapper.sh); its package also brings the
+    # mingw-w64 runtime notices copied into the AppImage below.
+    for tool in g++ curl patch python3 pkg-config desktop-file-validate zsyncmake x86_64-w64-mingw32-gcc; do
         command -v "$tool" >/dev/null 2>&1 || { echo "$tool"; return 0; }
     done
     # The GUI's toolkit (GPUI) links libxcb, libxkbcommon and libxkbcommon-x11, and one of its crates probes
@@ -37,6 +40,20 @@ missing_deps() {
     pkg-config --exists xcb xkbcommon xkbcommon-x11 fontconfig 2>/dev/null || { echo "xcb/xkbcommon/xkbcommon-x11/fontconfig headers"; return 0; }
     return 1
 }
+if [ "${1:-}" = "--self-test" ]; then
+    stubs="$(mktemp -d)"
+    trap 'rm -rf "$stubs"' EXIT
+    for tool in g++ curl patch python3 pkg-config desktop-file-validate zsyncmake; do
+        printf '#!/bin/sh\nexit 0\n' > "$stubs/$tool"
+        chmod +x "$stubs/$tool"
+    done
+    got="$(PATH="$stubs" missing_deps)" || { echo "self-test: nothing reported missing without the mingw-w64 linker"; exit 1; }
+    [ "$got" = "x86_64-w64-mingw32-gcc" ] || { echo "self-test: reported $got missing, not the mingw-w64 linker"; exit 1; }
+    cp "$stubs/g++" "$stubs/x86_64-w64-mingw32-gcc"
+    if got="$(PATH="$stubs" missing_deps)"; then echo "self-test: $got reported missing with every tool present"; exit 1; fi
+    echo "build-appimage.sh self-test: ok"
+    exit 0
+fi
 if missing="$(missing_deps)"; then
     echo "==> Installing build dependencies ($missing is missing)"
     # Tolerate an unrelated third-party repo (e.g. a runner image's preinstalled
@@ -46,8 +63,10 @@ if missing="$(missing_deps)"; then
     $SUDO apt-get update -qq || true
     # g++ brings the static libstdc++ that crates/native links; curl, patch and python3 are what
     # scripts/fetch-native-tools.sh and the crate's build script run; the -dev packages are the GUI toolkit's.
+    # gcc-mingw-w64-x86-64 links the NGX wrapper (a Windows DLL) and brings mingw-w64-common and gcc-mingw-w64-base,
+    # whose copyright files ship as its runtime notices.
     $SUDO apt-get install -y -qq g++ curl patch python3 pkg-config desktop-file-utils zsync \
-        libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev
+        libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev gcc-mingw-w64-x86-64
     if missing="$(missing_deps)"; then
         echo "error: $missing is still missing after installing the build dependencies" >&2
         exit 1
@@ -63,6 +82,9 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
 rustup run "$TOOLCHAIN" rustc --version >/dev/null 2>&1 || rustup toolchain install "$TOOLCHAIN"
+# The NGX wrapper's target: an explicit `toolchain install` does not read rust-toolchain.toml's `targets`, and a
+# toolchain installed before has only what it was installed with. Nothing is fetched when it is there.
+rustup target add --toolchain "$TOOLCHAIN" x86_64-pc-windows-gnu
 # The pinned glslang, Vulkan-Headers and volk that crates/native builds with (SHA-256-checked,
 # skipped when already in tools/native/).
 bash scripts/fetch-native-tools.sh

@@ -261,6 +261,7 @@ jobs:
           python3 scripts/check_proton_scripts.py --self-test
           bash scripts/gta-bench.sh --self-test
           bash scripts/build-ngx-wrapper.sh --self-test
+          bash build-appimage.sh --self-test
           bash scripts/game-sweep.sh --self-test
           bash scripts/test_apprun.sh
           bash scripts/smoke-gui.sh --self-test
