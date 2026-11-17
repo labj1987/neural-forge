@@ -3317,7 +3317,14 @@ mod tests {
             let only = |x: Option<(usize, u32)>| x.filter(|(hold, _)| *hold == k).map(|(_, seq)| seq);
             let runner = SeatedRunner::new(game, &link, &log, only(fail), only(stick), ran[k].clone())?;
             let g = gave_up.clone();
-            workers.push(Worker::start(link, at, Box::new(runner), None, (64, 64), Box::new(move |why, stuck| g.lock().unwrap().push((k, why, stuck))))?);
+            workers.push(Worker::start(
+                link,
+                at,
+                Box::new(runner),
+                None,
+                (64, 64),
+                Box::new(move |why, stop| g.lock().unwrap().push((k, why, stop == Stop::Stuck))),
+            )?);
         }
         assert_eq!(OTHERS.seated(game), 2);
         assert_eq!(*log.lock().unwrap(), vec!["made"], "the second hold's runner joined the first's device");

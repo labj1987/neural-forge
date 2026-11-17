@@ -9021,7 +9021,7 @@ mod tests {
         let shm = ShmClient::test_over_header(&header);
         let mut session = Session::default();
         let held = HoldResult { wrote_back: true, waits_consumed: true, native: true, evaluated: true, ..Default::default() };
-        let trying = native::running_line(None, false, offload_trial::status_line().as_deref());
+        let trying = native::running_line(None, offload_trial::status_line().as_deref());
         assert!(trying.starts_with("second GPU: trying the game's GPU"), "{trying}");
         assert!(native_line_due(&trying, "native network running", "native network running", false));
         // Holds every 2 ms on the game's GPU (much faster than 23 ms): the warm-up, the window, the verdict.
@@ -9034,7 +9034,7 @@ mod tests {
         }
         assert!(!offload_trial::running(), "decided");
         assert!(offload_trial::keeps_local(), "kept on the game's GPU");
-        let kept = native::running_line(None, false, offload_trial::status_line().as_deref());
+        let kept = native::running_line(None, offload_trial::status_line().as_deref());
         assert!(kept.starts_with("second GPU: not used: the game's GPU is faster ("), "{kept}");
         shm.set_layer_reason("native network running");
         assert!(native_line_due(&kept, "native network running", &shm.layer_reason(), false));
