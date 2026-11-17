@@ -467,8 +467,14 @@ static TERM_PIPE: AtomicI32 = AtomicI32::new(-1);
 extern "C" fn on_sigterm(_: libc::c_int) {
     let fd = TERM_PIPE.load(Ordering::Relaxed);
     let byte = 1u8;
-    // SAFETY: write(2) is async-signal-safe; one byte from a local to the pipe this process made.
-    unsafe { libc::write(fd, std::ptr::from_ref(&byte).cast(), 1) };
+    // SAFETY: __errno_location and write(2) are async-signal-safe; one byte from a local to the pipe this process
+    // made. errno is put back as it was, so the code the signal interrupted does not see write's.
+    unsafe {
+        let errno = libc::__errno_location();
+        let saved = *errno;
+        libc::write(fd, std::ptr::from_ref(&byte).cast(), 1);
+        *errno = saved;
+    }
 }
 
 /// SIGTERM (a logout, `kill`, an older build's way of replacing a window) as a message to the UI, which saves the
@@ -503,8 +509,13 @@ pub fn terminations(fallback: Option<Duration>) -> Option<UnboundedReceiver<()>>
             let _ = tx.send_blocking(());
             if let Some(wait) = fallback {
                 std::thread::sleep(wait);
-                // SAFETY: ends the process as SIGTERM's default action would (128 + 15), without running anything else.
-                unsafe { libc::_exit(143) };
+                // SAFETY: SIGTERM's default action again, and the signal raised: the process ends by SIGTERM, as a
+                // parent waiting for it sees. Should it somehow return, the exit status says the same (128 + 15).
+                unsafe {
+                    libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                    libc::raise(libc::SIGTERM);
+                    libc::_exit(143);
+                }
             }
         }
     });
