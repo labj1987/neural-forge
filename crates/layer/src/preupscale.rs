@@ -33,9 +33,12 @@
 //!
 //! The game's call is submitted as: `head` (batches before the launch batch, plus the launch
 //! batch's command buffers before the launch buffer, with the launch batch's wait semaphores),
-//! then the layer's capture batch `C`, then (after the CPU waited for `C`'s fence) the layer's
-//! write-back batch `W`, then `tail` (the launch buffer onward,
-//! with the launch batch's signal semaphores, then the call's later batches, with the fence).
+//! then the layer's capture batch `C`, then the layer's write-back batch `W`, then `tail` (the launch
+//! buffer onward, with the launch batch's signal semaphores, then the call's later batches, with the
+//! fence). In the diagnostic modes (dump, identity, roundtrip) the CPU waits for `C`'s fence before
+//! `W` is submitted; in `model` mode `C` is submitted with no fence ([`native`]) and nothing on the CPU
+//! waits for it: `W` and the network's work follow it in submission order on the same queue, and the
+//! barriers below carry the chain.
 //!
 //! - Game work before the launch buffer -> `C`: every such command is earlier in submission order
 //!   on the same queue, and `C` opens with a pipeline barrier `ALL_COMMANDS/MEMORY_WRITE ->
@@ -47,10 +50,10 @@
 //!   scope also includes every command later in submission order, so `W` and `tail` stay ordered
 //!   after those signals exactly as the game asked. When the launch buffer is not first, the waits
 //!   stay on the prefix in `head`, which is earlier in submission order than `C`: same argument.
-//! - `C` -> host: `C` ends with `TRANSFER/TRANSFER_WRITE -> HOST/HOST_READ`; the CPU waits on `C`'s
-//!   fence before anyone reads the bytes.
+//! - `C` -> host (the diagnostic modes): `C` ends with `TRANSFER/TRANSFER_WRITE -> HOST/HOST_READ`; the
+//!   CPU waits on `C`'s fence before anyone reads the bytes.
 //! - `C` -> `W`: `W` opens with `ALL_COMMANDS|HOST -> TRANSFER` (write-after-read on the colour
-//!   input after `C`'s read; `C`'s fence was also waited on).
+//!   input after `C`'s read; in the diagnostic modes `C`'s fence was also waited on).
 //! - `W` -> DLSS: `W` ends with `TRANSFER/TRANSFER_WRITE -> ALL_COMMANDS/MEMORY_READ|MEMORY_WRITE`.
 //!   `tail` (the launch buffer, whose kernels read the colour input) is later in submission order,
 //!   so it is in that barrier's second scope: the write-back is visible to DLSS.
@@ -5431,7 +5434,8 @@ pub(crate) fn preview_rgba8(colour: &[u8], row_texels: u32, width: u32, height: 
 }
 
 impl DumpFrame {
-    /// Writes `colour.rgba16f` (padded), `depth.r32f` (or `depth.raw` for a non-float depth),
+    /// Writes `colour.rgba16f` (padded), `depth.r32f` (a 32-bit float depth, the `R32_SFLOAT` copy Frame
+    /// Generation games make included; `depth.raw` for any other),
     /// `mvec.rg16f`, `meta.json`, `colour-preview.png` and, with any 1x1 candidates,
     /// `exposure.json` under `dir`. Returns the files written.
     pub(crate) fn write(&self, dir: &std::path::Path) -> std::io::Result<Vec<String>> {
@@ -5440,7 +5444,8 @@ impl DumpFrame {
         let mut files = vec!["colour.rgba16f".to_string()];
         std::fs::write(dir.join("colour.rgba16f"), &self.colour)?;
         let depth_name = self.depth.as_ref().map(|(bytes, format)| {
-            let name = if matches!(*format, vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT) { "depth.r32f" } else { "depth.raw" };
+            let name =
+                if matches!(*format, vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT | vk::Format::R32_SFLOAT) { "depth.r32f" } else { "depth.raw" };
             (name, bytes, *format)
         });
         if let Some((name, bytes, _)) = &depth_name {
@@ -6254,8 +6259,6 @@ impl Session {
         }
     }
 
-    /// Logs, once per identification of DLSS's inputs (and again if it changes), where the HDR
-    /// encode's exposure comes from: the game's 1x1 R16F, or measured from the frame.
     /// Whether the game's exposure image may be used for `identification` (not after it read
     /// implausibly high, [`Self::check_exposure`]).
     pub(crate) fn game_exposure_trusted(&self, identification: u64) -> bool {
@@ -6455,6 +6458,8 @@ impl Session {
         view
     }
 
+    /// Logs, once per identification of DLSS's inputs (and again if it changes), where the HDR
+    /// encode's exposure comes from: the game's 1x1 R16F, or measured from the frame.
     pub(crate) fn note_exposure_source(&mut self, identification: u64, inputs: &Inputs, result: &HoldResult) {
         let Some(source) = result.exposure_source else { return };
         if self.exposure_said == Some((identification, source)) {
@@ -9983,6 +9988,9 @@ mod tests {
         ] {
             assert!(json.contains(needle), "{needle} in {json}");
         }
+        // A colour-format float depth (Cyberpunk 2077's Frame Generation copy) is the same 32-bit floats.
+        frame.depth = Some((vec![0u8; 12], vk::Format::R32_SFLOAT));
+        assert!(frame.write(&dir).unwrap().contains(&"depth.r32f".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
