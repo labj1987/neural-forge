@@ -205,6 +205,9 @@ void main() {
     u_exposure.jump = jumped ? (u_state.exposure[1u - p.frame.w] & 0xffffu) | ((u_exposure.bits & 0xffffu) << 16) : 0u;
   }
   vec3 proxy = imageLoad(u_encoded, ivec2(id)).rgb;
+  // As native_preprocess.comp: a NaN or an infinity in the proxy must not reach the answer through the clamps
+  // below (a clamp leaves a NaN undefined); a no-op on every valid frame, whose encode is in [0, 1].
+  proxy = clamp(mix(proxy, vec3(0.0), isnan(proxy)), 0.0, 1.0);
   uint feature = (id.y * p.dims.x + id.x) * 4u;
   vec3 h = vec3(u_head.head[feature], u_head.head[feature + 1u], u_head.head[feature + 2u]);
   vec3 neural = saturateOrZero(fma(h, vec3(0.03125), fma(proxy, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5);
