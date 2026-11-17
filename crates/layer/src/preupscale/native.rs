@@ -1254,7 +1254,8 @@ impl Loader {
             state.built = Vec::new();
             drop(state);
             if step == Step::ReinitThenBuild && network.take().is_some() {
-                // Owned again only if the reopen keeps a network ([`owns_network`]).
+                // Owned again ([`NETWORK_OWNER`]) only if the attempt after the reopen succeeds or the loader still holds
+                // a network then.
                 disown(device.as_raw());
                 crate::log!("[native] {} failed attempts in a row: closing the network and loading it again", retry.streak());
             }
