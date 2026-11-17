@@ -989,7 +989,10 @@ pub(crate) fn at_submit(plans: &[(u64, HoldPlan)]) {
     if plans.is_empty() {
         return;
     }
-    let all: Vec<(u64, Submits)> = SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    // Held throughout: an exchange whose host-memory import was refused has `inn` in its own buffer's mapping, which
+    // its `destroy` frees after removing the entry here, so the entry must not go while its header is written. No
+    // holder of this lock waits for anything else: `settle` waits (bounded) for the worker, which never takes it.
+    let all = SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut touched: Vec<&Submits> = Vec::new();
     for (id, plan) in plans {
         let Some((_, s)) = all.iter().find(|(i, _)| i == id) else { continue };
