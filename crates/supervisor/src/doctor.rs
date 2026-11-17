@@ -137,15 +137,20 @@ pub(crate) fn run_command(program: &str, args: &[&str], timeout: std::time::Dura
         Err(e) => return CommandOutput::Failed(e.to_string()),
         Ok(child) => child,
     };
-    // The pipes are drained while waiting, so a long output cannot block the child.
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut out = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut out);
+    // The pipes are drained while waiting, so a long output cannot block the child. Into a buffer the caller can take
+    // without the thread: a process the child started (and left running) can keep the pipe open after it exits.
+    type Drained = (std::thread::JoinHandle<()>, std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    let drain = |pipe: Option<Box<dyn Read + Send>>| -> Drained {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let into = buf.clone();
+        let thread = std::thread::spawn(move || {
+            let Some(mut pipe) = pipe else { return };
+            let mut chunk = [0u8; 8192];
+            while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                into.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend_from_slice(&chunk[..n]);
             }
-            out
-        })
+        });
+        (thread, buf)
     };
     let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
@@ -160,8 +165,8 @@ pub(crate) fn run_command(program: &str, args: &[&str], timeout: std::time::Dura
                 // on a thread of its own, so the caller returns now.
                 std::thread::spawn(move || {
                     let _ = child.wait();
-                    let _ = stdout.join();
-                    let _ = stderr.join();
+                    let _ = stdout.0.join();
+                    let _ = stderr.0.join();
                 });
                 return CommandOutput::Failed(format!("did not finish within {} s and was stopped", timeout.as_secs()));
             }
@@ -169,8 +174,14 @@ pub(crate) fn run_command(program: &str, args: &[&str], timeout: std::time::Dura
             Err(e) => break Err(e.to_string()),
         }
     };
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
+    // The child has ended: what is left in the pipes comes at once, unless a process it left running holds them. That
+    // one is not waited for (its drain threads end when it closes them); what was read by then is the output.
+    let grace = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while !(stdout.0.is_finished() && stderr.0.is_finished()) && std::time::Instant::now() < grace {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let take = |d: &Drained| std::mem::take(&mut *d.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    let (stdout, stderr) = (take(&stdout), take(&stderr));
     match status {
         Err(why) => CommandOutput::Failed(why),
         Ok(status) if status.success() => CommandOutput::Ran(String::from_utf8_lossy(&stdout).into_owned()),
@@ -984,13 +995,20 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
             ));
         }
         for game in crate::steam::games(std::slice::from_ref(root)).iter().filter(|g| enabled_options(g).is_some()) {
-            let mapped = proton_tool::mapped_tool(&root.path, &game.appid).filter(|m| !m.is_empty());
-            if mapped.is_none() && crate::steam::installed_build(game) == crate::steam::Build::Linux {
+            let own = proton_tool::mapped_tool(&root.path, &game.appid).filter(|m| !m.is_empty());
+            if own.is_none() && crate::steam::installed_build(game) == crate::steam::Build::Linux {
                 // A native Linux game runs without Proton: the wrapper does not apply.
                 continue;
             }
+            // Without a Proton of its own the game runs with Steam's default for every game (mapping "0").
+            let default = || proton_tool::mapped_tool(&root.path, "0").filter(|m| !m.is_empty());
+            let mapped = own.clone().or_else(default);
             let ok = mapped.as_ref().is_some_and(|m| tools.iter().any(|t| &t.name == m));
-            let evidence = format!("{} ({}): {}", game.name, game.appid, mapped.as_deref().unwrap_or("Steam's default Proton"));
+            let evidence = match (&own, &mapped) {
+                (Some(m), _) => format!("{} ({}): {m}", game.name, game.appid),
+                (None, Some(m)) => format!("{} ({}): {m} (Steam's default for every game)", game.name, game.appid),
+                (None, None) => format!("{} ({}): Steam's default Proton", game.name, game.appid),
+            };
             if ok {
                 out.push(Finding::new(CHECK, Severity::Ok, format!("{} runs with a Neural Forge Proton", game.name), evidence, None));
             } else {
@@ -1871,6 +1889,36 @@ mod tests {
         assert!(found.fix.as_deref().unwrap().contains("the games move to Proton-experimental-11.0-NeuralForge"), "{found:#?}");
     }
 
+    /// A switched-on game without a Proton of its own runs with Steam's default for every game: on a Neural Forge copy
+    /// there, it is on the Neural Forge Proton.
+    #[test]
+    fn a_game_on_the_default_neural_forge_proton_is_on_it() {
+        let mut f = quiet();
+        write(&f.roots.data_dir.join(crate::proton_tool::WRAPPER), "MZ");
+        let steam = f.dir.join("steam");
+        let copy = steam.join("compatibilitytools.d/Proton-experimental-11.0-NeuralForge");
+        write(&copy.join(crate::proton_tool::MARKER), "source=/gone\nsource_version=experimental-11.0\nwrapper_sha256=ab\n");
+        write(&copy.join("files/lib/wine/x86_64-unix/ntdll.so"), "\0wine-11.0\0");
+        write(
+            &steam.join("config/config.vdf"),
+            "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t\t\"CompatToolMapping\"\n\t\t\t\t{\n\t\t\t\t\t\"0\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"name\"\t\t\"Proton-experimental-11.0-NeuralForge\"\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n",
+        );
+        write(
+            &steam.join("steamapps/appmanifest_4242.acf"),
+            "\"AppState\"\n{\n\t\"appid\"\t\t\"4242\"\n\t\"name\"\t\t\"Game\"\n\t\"installdir\"\t\t\"Game\"\n}\n",
+        );
+        write(&steam.join("steamapps/common/Game/Game.exe"), "MZ");
+        write(
+            &steam.join("userdata/1/config/localconfig.vdf"),
+            "\"UserLocalConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t\t\"apps\"\n\t\t\t\t{\n\t\t\t\t\t\"4242\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"NEURAL_FORGE_ENABLE=1 %command%\"\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n",
+        );
+        f.roots.steam_roots = vec![crate::steam::Root { path: steam, flatpak: false }];
+        let v = check_proton(&f.roots);
+        let found = v.iter().find(|x| x.summary.starts_with("Game ")).unwrap_or_else(|| panic!("{v:#?}"));
+        assert_eq!((found.severity, found.summary.as_str()), (Severity::Ok, "Game runs with a Neural Forge Proton"), "{found:#?}");
+        assert!(found.evidence.contains("Steam's default for every game"), "{found:#?}");
+    }
+
     /// A copy an older Neural Forge named without "Proton" (#71) is said, with the name Make again gives it.
     #[test]
     fn a_copy_named_without_proton_is_reported_for_steam_cloud() {
@@ -2410,6 +2458,10 @@ mod tests {
         assert!(matches!(&out, CommandOutput::Failed(why) if why.contains("stopped")), "{out:?}");
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(run_command("printf", &["x"], COMMAND_TIMEOUT), CommandOutput::Ran("x".into()));
+        // Exited, but a process it left running holds its output open: not waited for, what it printed is the output.
+        let started = std::time::Instant::now();
+        assert_eq!(run_command("sh", &["-c", "sleep 30 & printf y"], COMMAND_TIMEOUT), CommandOutput::Ran("y".into()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
         assert_eq!(run_command("neural-forge-no-such-program", &[], COMMAND_TIMEOUT), CommandOutput::Missing);
     }
 
