@@ -4761,6 +4761,9 @@ fn aux_copy_layout(layout: Option<vk::ImageLayout>) -> Option<(vk::ImageLayout, 
     }
 }
 
+/// The subresource of a DLSS input the hold reads: mip 0 of layer 0, every aspect of its format. Only that is copied,
+/// and its layout is all that is tracked: a barrier over every mip and layer would move the others from a layout
+/// they may not be in.
 pub(crate) fn aux_range(format: vk::Format) -> vk::ImageSubresourceRange {
     let aspect = if DEPTH_FORMATS.contains(&format) {
         if has_stencil(format) {
@@ -4771,13 +4774,7 @@ pub(crate) fn aux_range(format: vk::Format) -> vk::ImageSubresourceRange {
     } else {
         vk::ImageAspectFlags::COLOR
     };
-    vk::ImageSubresourceRange {
-        aspect_mask: aspect,
-        base_mip_level: 0,
-        level_count: vk::REMAINING_MIP_LEVELS,
-        base_array_layer: 0,
-        layer_count: vk::REMAINING_ARRAY_LAYERS,
-    }
+    vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 }
 }
 
 /// What a dump reads besides colour.
