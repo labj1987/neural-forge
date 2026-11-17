@@ -1350,7 +1350,7 @@ unsafe fn paced_present(
             height,
             crate::composition::gpu::ComposeInputs::Delayed { parity: req.parity, gate: gate.map(|fd| as_gate(fd, req.token)) },
             *raw_answer_generation,
-            proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+            compose_bgr_order(&encode_push),
             image,
             crate::composition::gpu::ComposeParams {
                 colour_strength: settings.colour_strength,
@@ -1403,7 +1403,7 @@ unsafe fn paced_present(
             bytes: capacity.min(frame_bytes as usize),
             width,
             height,
-            bgr: proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+            bgr: compose_bgr_order(&encode_push),
         }
     });
     let posted = sent.is_some_and(|(number, copied)| {
@@ -4457,6 +4457,11 @@ mod tests {
                 assert_ne!(proxy_format_for(format, colour_space), proxy_format::BGRA8, "the proxy format cannot tell this order");
             }
         }
+        // And no present outside the tests derives its order from the proxy format again (`paced_present`'s compose
+        // and meter once did, after the other paths had moved to `compose_bgr_order`).
+        let source = include_str!("capture.rs");
+        let live = &source[..source.find("#[cfg(test)]\nmod tests {").expect("the tests module")];
+        assert!(!live.contains("proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8"), "a present takes its channel order from the proxy format");
     }
 
     fn kept(parity: usize, sent: bool, dims: (u32, u32, u32)) -> DelayedRequest {
