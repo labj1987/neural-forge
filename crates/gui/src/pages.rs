@@ -84,7 +84,9 @@ fn scan_steam() -> SteamScan {
 /// source changed since.
 pub(crate) struct ProtonScan {
     root: Option<std::path::PathBuf>,
-    sources: Vec<proton_tool::Source>,
+    /// Each source with why the wrapper cannot run under it (`proton_tool::unix_pid_support`, which reads its
+    /// `ntdll.so`: read here, on the worker, never while drawing).
+    sources: Vec<(proton_tool::Source, Option<String>)>,
     tools: Vec<(proton_tool::Tool, bool)>,
     /// The copies made again (`compat_tool::stale_copies`, the check `doctor` makes): older than their source, or
     /// named without "Proton".
@@ -95,6 +97,10 @@ fn scan_protons() -> ProtonScan {
     let Some(root) = steam::roots().into_iter().find(|r| !r.flatpak).map(|r| r.path) else {
         return ProtonScan { root: None, sources: Vec::new(), tools: Vec::new(), stale: Vec::new() };
     };
+    scan_protons_in(root)
+}
+
+fn scan_protons_in(root: std::path::PathBuf) -> ProtonScan {
     let libraries = steam::libraries(&root);
     let tools: Vec<(proton_tool::Tool, bool)> = proton_tool::tools(&root).into_iter().map(|t| (t.clone(), proton_tool::outdated(&t))).collect();
     let stale = compat_tool::stale_copies(&root);
@@ -103,6 +109,10 @@ fn scan_protons() -> ProtonScan {
     let sources = proton_tool::sources(&root, &libraries)
         .into_iter()
         .filter(|s| !tools.iter().any(|(t, _)| t.name == s.tool_name()) && !stale.iter().any(|c| c.tool.source == s.dir))
+        .map(|s| {
+            let unsupported = proton_tool::unix_pid_support(&s.dir).err();
+            (s, unsupported)
+        })
         .collect();
     ProtonScan { root: Some(root), sources, tools, stale }
 }
@@ -2165,10 +2175,9 @@ impl MainView {
                         })));
                     rows.push(line.into_any_element());
                 }
-                for (i, source) in sources.iter().enumerate() {
+                for (i, (source, unsupported)) in sources.iter().enumerate() {
                     // A Proton the wrapper cannot run under (Wine older than 10) says why instead of offering a copy.
-                    let unsupported = proton_tool::unix_pid_support(&source.dir).err();
-                    let subtitle = match &unsupported {
+                    let subtitle = match unsupported {
                         Some(why) => format!("{} in {}: cannot be copied, {why}", source.version, source.dir.display()),
                         None => format!("{} in {}", source.version, source.dir.display()),
                     };
@@ -2826,6 +2835,25 @@ fn tag_text(theme: &gpui_kit::component::Theme) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether a Proton can take the wrapper is read in the scan (a worker), not on every draw of the Setup tab.
+    #[test]
+    fn the_proton_scan_says_which_sources_cannot_take_the_wrapper() {
+        let root = std::env::temp_dir().join(format!("neural-forge-gui-proton-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, wine) in [("GE-Proton9-27", "wine-9.0"), ("GE-Proton11-12", "wine-11.0")] {
+            let dir = root.join("compatibilitytools.d").join(name);
+            std::fs::create_dir_all(dir.join("files/lib/wine/x86_64-unix")).unwrap();
+            std::fs::write(dir.join("files/lib/wine/x86_64-unix/ntdll.so"), format!("\0{wine}\0")).unwrap();
+            std::fs::write(dir.join("proton"), "").unwrap();
+            std::fs::write(dir.join("version"), format!("1 {name}\n")).unwrap();
+        }
+        let scan = scan_protons_in(root.clone());
+        let found: Vec<(String, bool)> = scan.sources.iter().map(|(s, why)| (s.version.clone(), why.is_some())).collect();
+        assert_eq!(found, [("GE-Proton11-12".to_string(), false), ("GE-Proton9-27".to_string(), true)]);
+        assert!(scan.sources[1].1.as_deref().unwrap().contains("Wine 9.0"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn tag_text_uses_primary_where_it_reads_and_the_link_colour_where_it_does_not() {
