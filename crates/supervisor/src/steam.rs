@@ -218,8 +218,14 @@ pub fn find<'a>(games: &'a [Game], query: &str) -> Result<&'a Game, FindError> {
 
 use neural_forge_protocol::processes::{game_helper as helper_exe, launcher_like};
 
-fn helper_dir(name: &str) -> bool {
+/// A folder of redistributables, installers, anti-cheat or crash reporters, never the game's own: skipped at any depth.
+/// `engine` only at the top of the install folder (`top`), where Unreal keeps its own tools (`Engine/Binaries`); a
+/// game's folder further down may be named so.
+fn helper_dir(name: &str, top: bool) -> bool {
     let n = name.to_ascii_lowercase();
+    if n == "engine" {
+        return top;
+    }
     [
         "redist",
         "_commonredist",
@@ -230,7 +236,6 @@ fn helper_dir(name: &str) -> bool {
         "vcredist",
         "battleye",
         "easyanticheat",
-        "engine",
         "support",
         "crashreporter",
         "crashpad",
@@ -259,7 +264,7 @@ fn unreal_binaries(dir: &Path) -> Vec<String> {
     projects.sort();
     let mut out = Vec::new();
     for project in projects {
-        if project.file_name().and_then(|n| n.to_str()).is_some_and(helper_dir) {
+        if project.file_name().and_then(|n| n.to_str()).is_some_and(|n| helper_dir(n, true)) {
             continue;
         }
         for platform in ["Win64", "WinGDK", "Win32"] {
@@ -450,7 +455,7 @@ fn all_exes(dir: &Path) -> Vec<(String, u64)> {
             let Ok(kind) = e.file_type() else { continue };
             let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
             let path = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-            if kind.is_dir() && depth > 1 && !helper_dir(&name) {
+            if kind.is_dir() && depth > 1 && !helper_dir(&name, rel.is_empty()) {
                 walk(&e.path(), &path, depth - 1, out);
             } else if kind.is_file() && name.to_ascii_lowercase().ends_with(".exe") && !helper_exe(&name) {
                 out.push((path, e.metadata().map(|m| m.len()).unwrap_or(0)));
@@ -1445,6 +1450,18 @@ mod tests {
         assert!(std::fs::read_to_string(&lc).unwrap().contains("WINEDLLOVERRIDES=\\\"dxgi=n,b\\\""));
         apply(&home.0, "3240220", &Action::Disable, false);
         assert_eq!(options_in(&lc, "3240220").as_deref(), Some(existing));
+    }
+
+    /// Unreal's `Engine` folder at the top of the install folder holds its tools; a game folder named so further down
+    /// is searched.
+    #[test]
+    fn only_the_top_engine_folder_is_skipped() {
+        let home = Scratch::new("engine");
+        for f in ["Engine/Binaries/Win64/CrashReportClient.exe", "Game/Engine/Game.exe", "Game/Support/Tool.exe"] {
+            write(&home.0.join(f), "MZ");
+        }
+        let found: Vec<String> = all_exes(&home.0).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(found, ["Game/Engine/Game.exe"]);
     }
 
     /// Steam started while the edit waited for the files' locks: nothing is written.
