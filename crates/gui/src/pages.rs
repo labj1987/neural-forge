@@ -60,6 +60,13 @@ pub(crate) struct SteamScan {
     games: Vec<ScannedGame>,
 }
 
+impl SteamScan {
+    /// Whether Steam runs, read again since the scan (the 30 s worker): the switches are offered by it. Whether it changed.
+    fn set_running(&mut self, running: bool) -> bool {
+        std::mem::replace(&mut self.running, running) != running
+    }
+}
+
 fn scan_steam() -> SteamScan {
     let cfg = neural_forge_supervisor::Config::load();
     let roots = steam::roots();
@@ -161,6 +168,11 @@ pub(crate) struct PageState {
 }
 
 impl PageState {
+    /// [`SteamScan::set_running`] for the scan shown, if any: whether that changed.
+    pub(crate) fn set_steam_running(&mut self, running: bool) -> bool {
+        self.steam.as_mut().is_some_and(|scan| scan.set_running(running))
+    }
+
     pub(crate) fn new(window: &mut Window, cx: &mut Context<MainView>) -> Self {
         let exe_input = cx.new(|cx| InputState::new(window, cx).placeholder("Game.exe"));
         let profile_input = cx.new(|cx| InputState::new(window, cx).placeholder("Profile name"));
@@ -2835,6 +2847,15 @@ fn tag_text(theme: &gpui_kit::component::Theme) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Steam started or closed since the scan: the list says so once the 30 s worker reads it again.
+    #[test]
+    fn steam_running_is_updated_after_the_scan() {
+        let mut scan = SteamScan { roots: Vec::new(), running: false, games: Vec::new() };
+        assert!(scan.set_running(true) && scan.running);
+        assert!(!scan.set_running(true), "no change, no redraw");
+        assert!(scan.set_running(false) && !scan.running);
+    }
 
     /// Whether a Proton can take the wrapper is read in the scan (a worker), not on every draw of the Setup tab.
     #[test]

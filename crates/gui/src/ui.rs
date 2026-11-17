@@ -1030,8 +1030,8 @@ impl MainView {
                 break;
             }
         }));
-        // Every 30 s, on a worker: the desktop's HDR state (a D-Bus call or the compositor's own tool) and the Proton
-        // copies that are out of date.
+        // Every 30 s, on a worker: the desktop's HDR state (a D-Bus call or the compositor's own tool), the Proton
+        // copies that are out of date, and whether Steam runs (the Setup tab's switches wait for it to close).
         view._tasks.push(cx.spawn_in(window, async move |this, cx| loop {
             let read = cx
                 .background_executor()
@@ -1041,11 +1041,15 @@ impl MainView {
                         .find(|r| !r.flatpak)
                         .map(|r| neural_forge_supervisor::compat_tool::stale_copies(&r.path))
                         .unwrap_or_default();
-                    (neural_forge_supervisor::desktop_hdr::read(), stale)
+                    let steam = neural_forge_supervisor::steam::steam_running(std::path::Path::new("/proc"));
+                    (neural_forge_supervisor::desktop_hdr::read(), stale, steam)
                 })
                 .await;
             let updated = this.update(cx, |this, cx| {
-                let (hdr, stale) = read;
+                let (hdr, stale, steam) = read;
+                if this.pages.set_steam_running(steam) {
+                    cx.notify();
+                }
                 let stale: Vec<(String, String)> = stale.iter().map(|copy| (copy.tool.name.clone(), copy.describe())).collect();
                 if this.desktop_hdr.as_ref() != Some(&hdr) || this.pages.stale != stale {
                     this.desktop_hdr = Some(hdr);
