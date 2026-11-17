@@ -1642,7 +1642,8 @@ unsafe fn evaluate(
                                 &[],
                             );
                             device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 8));
-                            device.cmd_dispatch(cmd, (width * height).div_ceil(64), 1, 1);
+                            let (x, y) = feedback_groups(width * height);
+                            device.cmd_dispatch(cmd, x, y, 1);
                             device.cmd_pipeline_barrier(
                                 cmd,
                                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -2359,9 +2360,31 @@ fn note_flow_off(why: &str) {
     }
 }
 
+/// The pass feedback's dispatch for `texels` (groups of 64): rows of at most [`FEEDBACK_ROW`] groups, as
+/// `native_post_feedback.comp` indexes them. One row alone needs 129600 groups at 4K, past the 65535 a device has to
+/// allow in X (`maxComputeWorkGroupCount`).
+fn feedback_groups(texels: u32) -> (u32, u32) {
+    let groups = texels.div_ceil(64).max(1);
+    let x = groups.min(FEEDBACK_ROW);
+    (x, groups.div_ceil(x))
+}
+
+/// The most groups in a row of the pass feedback's dispatch ([`feedback_groups`]).
+const FEEDBACK_ROW: u32 = 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pass feedback's dispatch covers every texel and stays within the X limit every device allows, at 4K too.
+    #[test]
+    fn the_feedback_dispatch_fits_the_group_count_limit_at_4k() {
+        for (w, h) in [(1u32, 1u32), (64, 1), (1920, 1080), (3840, 2160), (7680, 4320)] {
+            let (x, y) = feedback_groups(w * h);
+            assert!(x <= 65535 && y <= 65535, "{w}x{h}: {x}x{y}");
+            assert!(u64::from(x) * u64::from(y) * 64 >= u64::from(w * h), "{w}x{h}: every texel");
+        }
+    }
     use std::cell::Cell;
 
     thread_local! {
