@@ -1829,14 +1829,33 @@ fn meter_white(frame: &[u8], width: u32, height: u32, bgr: bool) -> Option<f32> 
 /// Frame hold: the captured frame (and the proxy sent for it) that every present keeps working on
 /// while `hold_frame` is on, so a settings change is judged against the same picture.
 struct HeldFrame {
-    width: u32,
-    height: u32,
+    /// What the frame's bytes are: they are shown again only to a present of the same.
+    of: HeldOf,
     original: Vec<u8>,
     proxy: Vec<u8>,
     sent: (u32, u32),
     encoded: bool,
 }
 static HELD: std::sync::Mutex<Option<HeldFrame>> = std::sync::Mutex::new(None);
+
+/// The device and swapchain frame a held frame was captured from: its size, proxy format and channel order. A
+/// present of anything else (another swapchain's format at the same size, another device) drops the held frame
+/// rather than showing its bytes read as a different layout.
+/// Drops the held frame unless the hold is on and it is of this present's frame (`of`).
+fn drop_unfit_hold(held: &mut Option<HeldFrame>, hold_frame: bool, of: HeldOf) {
+    if !hold_frame || held.as_ref().is_some_and(|h| h.of != of) {
+        *held = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeldOf {
+    device: vk::Device,
+    width: u32,
+    height: u32,
+    proxy_format: u32,
+    bgr_order: bool,
+}
 
 /// The longest a present waits for its own frame's answer before going out untouched.
 const SYNC_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
@@ -2505,11 +2524,10 @@ pub unsafe fn run(
             let mut copy_out = std::time::Duration::ZERO;
             // The held frame is copied out under the lock and the lock let go before the capture and
             // its polling below (up to the sync budget): nothing waits on another present's frame hold.
+            let held_of = HeldOf { device: device.handle(), width, height, proxy_format, bgr_order };
             let holding = {
                 let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-                if !settings.hold_frame || held.as_ref().is_some_and(|h| (h.width, h.height) != (width, height)) {
-                    *held = None;
-                }
+                drop_unfit_hold(&mut held, settings.hold_frame, held_of);
                 if let Some(h) = held.as_ref() {
                     // Holding: the model is shown the held proxy again, no capture.
                     let t_copy = std::time::Instant::now();
@@ -2581,7 +2599,7 @@ pub unsafe fn run(
                 let t_copy = std::time::Instant::now();
                 let proxy = if from_model_scratch { model_scratch.clone() } else { original_scratch.clone() };
                 *HELD.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(HeldFrame { width, height, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h), encoded });
+                    Some(HeldFrame { of: held_of, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h), encoded });
                 copy_out += t_copy.elapsed();
             }
             let t_captured = std::time::Instant::now();
@@ -3894,6 +3912,30 @@ mod tests {
     /// Every present composes (and meters) in the run's channel order, the one the swapchain's format has --
     /// the delayed paths included. They once took `proxy_format == BGRA8`, which reads false for both
     /// `A2R10G10B10` runs (HDR10's proxy is `PQ10_BGR`, SDR's `RGBA8`): `b_low` 0, red and blue swapped.
+    /// A held frame is shown again only to a present of the same device and frame: the same size alone (another
+    /// swapchain's format, or the same format's other channel order) would read its bytes as another layout.
+    #[test]
+    fn a_held_frame_is_dropped_for_another_format_order_or_device() {
+        use neural_forge_protocol::enums::proxy_format;
+        let of = HeldOf { device: <vk::Device as vk::Handle>::from_raw(1), width: 64, height: 32, proxy_format: proxy_format::BGRA8, bgr_order: true };
+        let held = || Some(HeldFrame { of, original: vec![1], proxy: vec![2], sent: (64, 32), encoded: false });
+        let mut h = held();
+        drop_unfit_hold(&mut h, true, of);
+        assert!(h.is_some(), "the same frame keeps it");
+        drop_unfit_hold(&mut h, false, of);
+        assert!(h.is_none(), "the hold turned off drops it");
+        for other in [
+            HeldOf { proxy_format: proxy_format::RGBA8, bgr_order: false, ..of },
+            HeldOf { bgr_order: false, ..of },
+            HeldOf { device: <vk::Device as vk::Handle>::from_raw(2), ..of },
+            HeldOf { width: 65, ..of },
+        ] {
+            let mut h = held();
+            drop_unfit_hold(&mut h, true, other);
+            assert!(h.is_none(), "{other:?}");
+        }
+    }
+
     #[test]
     fn presents_compose_in_the_runs_channel_order() {
         use crate::swapchain::{is_bgr_order, proxy_format_for};
