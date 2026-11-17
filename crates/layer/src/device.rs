@@ -1482,15 +1482,39 @@ unsafe fn sharpen_frame(
             return None;
         }
     }
-    let pass = sharpen.as_mut()?;
-    if pass.family() != target.queue_family {
+    if let Some(was) = sharpen.as_ref().map(crate::sharpen::Sharpen::family).filter(|f| *f != target.queue_family) {
+        // Presents moved to another queue family: the pass is rebuilt for it once its last work finished, as the
+        // compose is (`capture::compose_for_family`).
+        let new = if sharpen.as_mut().is_some_and(|old| old.wait_idle(device)) {
+            // SAFETY: the device's own handles.
+            unsafe { crate::sharpen::Sharpen::new(device, instance, physical_device, target.queue_family) }
+        } else {
+            None
+        };
+        let Some(mut new) = new else {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!(
+                    "[sharpen] a present on queue family {} (set up for {was}), and the pass could not be rebuilt for it yet: that frame presents unsharpened",
+                    target.queue_family
+                );
+                crate::logging::flush();
+            }
+            return None;
+        };
+        let mut old = sharpen.take().expect("checked above");
+        // Presents may still wait on the old pass's semaphores: they go with the new one.
+        new.semaphores = std::mem::take(&mut old.semaphores);
+        // SAFETY: every slot of the old pass finished (waited above), and its present semaphores moved.
+        unsafe { old.destroy(device) };
+        *sharpen = Some(new);
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            crate::log!("[sharpen] a present on queue family {} (set up for {}): that frame presents unsharpened", target.queue_family, pass.family());
+            crate::log!("[sharpen] presents moved to queue family {} (set up for {was}): rebuilt for it", target.queue_family);
             crate::logging::flush();
         }
-        return None;
     }
+    let pass = sharpen.as_mut()?;
     // SAFETY: `p_wait_semaphores` is valid for `wait_semaphore_count`.
     let app_waits: &[vk::Semaphore] = unsafe { preupscale_slice(present_info.p_wait_semaphores, present_info.wait_semaphore_count) };
     if !app_waits.is_empty() && relay_semaphore.is_none() {
