@@ -374,7 +374,8 @@ fn hand_over(stream: &UnixStream, token: Option<&str>, build: Option<&str>, wait
     let pid = peer_pid(stream);
     let asked = Instant::now();
     let _ = stream.set_write_timeout(Some(waits.answer));
-    if writeln!(&*stream, "{}", request_line(token, build)).is_err() {
+    // One write, so the running copy's first read holds both lines (its reader takes the build only from that).
+    if (&*stream).write_all(request_text(token, build).as_bytes()).is_err() {
         return Err(Retry::Closed);
     }
     let mut reader = BufReader::new(stream).take(64);
@@ -427,29 +428,37 @@ pub fn not_responding_message(pid: Option<u32>) -> String {
 fn read_request(connection: UnixStream) -> Request {
     let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
     let mut line = String::new();
-    let _ = BufReader::new(&connection).take(8192).read_line(&mut line);
+    let mut reader = BufReader::new(&connection);
+    let _ = (&mut reader).take(8192).read_line(&mut line);
+    // The build line, from what the first read already brought: a launch of 4.5.x sends only the first line and
+    // waits for the answer, so nothing more is read from the connection.
+    let after = String::from_utf8_lossy(reader.buffer());
+    if let Some((build_line, _)) = after.split_once('\n') {
+        line.push_str(build_line);
+        line.push('\n');
+    }
     let (token, build) = parse_request(&line);
     Request { token, build, reply: connection }
 }
 
-/// A launch's request: `activate <token> <build>`, the token empty without one. Both are printable ASCII without
-/// spaces (`valid_token`), so the line splits at its one space after the token.
-fn request_line(token: Option<&str>, build: Option<&str>) -> String {
+/// A launch's request: `activate <token>` (the token empty without one), then `build <build>` on a line of its own.
+/// The first line is exactly what 4.5.x sends and reads: its reader takes everything after `activate ` as the token
+/// and ignores what follows the line, so a running 4.5.x copy still gets a clean token (and can raise its window on
+/// Wayland) from this launch.
+fn request_text(token: Option<&str>, build: Option<&str>) -> String {
     let token = token.filter(|t| valid_token(t)).unwrap_or("");
     match build.filter(|b| valid_token(b)) {
-        Some(build) => format!("activate {token} {build}"),
-        None => format!("activate {token}"),
+        Some(build) => format!("activate {token}\nbuild {build}\n"),
+        None => format!("activate {token}\n"),
     }
 }
 
-/// The token and the build of a request line ([`request_line`]); each `None` where absent or not clean.
-fn parse_request(line: &str) -> (Option<String>, Option<String>) {
-    let Some(rest) = line.trim_end_matches('\n').strip_prefix("activate ") else { return (None, None) };
-    let (token, build) = match rest.split_once(' ') {
-        Some((token, build)) => (token, Some(build)),
-        None => (rest, None),
-    };
-    (valid_token(token).then(|| token.to_string()), build.filter(|b| valid_token(b)).map(str::to_string))
+/// The token and the build of a request ([`request_text`]); each `None` where absent or not clean.
+fn parse_request(request: &str) -> (Option<String>, Option<String>) {
+    let mut lines = request.split('\n');
+    let Some(token) = lines.next().and_then(|line| line.strip_prefix("activate ")) else { return (None, None) };
+    let build = lines.next().and_then(|line| line.strip_prefix("build ")).filter(|b| valid_token(b));
+    (valid_token(token).then(|| token.to_string()), build.map(str::to_string))
 }
 
 /// The write end of the pipe SIGTERM's handler writes to (`terminations`); -1 before it is set up.
@@ -505,7 +514,7 @@ pub fn terminations(fallback: Option<Duration>) -> Option<UnboundedReceiver<()>>
 #[cfg(test)]
 mod tests {
     use super::{
-        build_id, claim_at, listen, nobody_listening, not_responding_message, parse_request, request_line, still_starting_message, terminations, valid_token,
+        build_id, claim_at, listen, nobody_listening, not_responding_message, parse_request, request_text, still_starting_message, terminations, valid_token,
         Activations, Claim, Listening, UiUp, Waits, MAX_TOKEN,
     };
     use std::path::Path;
@@ -929,16 +938,24 @@ mod tests {
         assert_eq!(parse_request(&long), (None, None));
     }
 
-    /// A launch names its build after its token; a launch without either still parses, and a build that is not one
+    /// A launch names its build on a second line; a launch without either still parses, and a build that is not one
     /// clean word is dropped (the window is then shown, as to a launch that did not say).
     #[test]
     fn requests_carry_the_launchs_build() {
-        let line = request_line(Some("tok"), Some("4.7.0-10-20.30"));
-        assert_eq!(line, "activate tok 4.7.0-10-20.30");
-        assert_eq!(parse_request(&format!("{line}\n")), (Some("tok".into()), Some("4.7.0-10-20.30".into())));
-        assert_eq!(parse_request(&format!("{}\n", request_line(None, Some("b")))), (None, Some("b".into())));
-        assert_eq!(parse_request(&format!("{}\n", request_line(Some("tok"), None))), (Some("tok".into()), None));
-        assert_eq!(parse_request("activate tok two words\n"), (Some("tok".into()), None));
+        let text = request_text(Some("tok"), Some("4.7.0-10-20.30"));
+        assert_eq!(text, "activate tok\nbuild 4.7.0-10-20.30\n");
+        assert_eq!(parse_request(&text), (Some("tok".into()), Some("4.7.0-10-20.30".into())));
+        assert_eq!(parse_request(&request_text(None, Some("b"))), (None, Some("b".into())));
+        assert_eq!(parse_request(&request_text(Some("tok"), None)), (Some("tok".into()), None));
+        assert_eq!(parse_request("activate tok\nbuild two words\n"), (Some("tok".into()), None));
+        // A running 4.5.x copy reads only the first line and takes all of it after `activate ` as the token.
+        let old_rule = |text: &str| {
+            let line = &text[..=text.find('\n').unwrap()];
+            line.trim_end_matches('\n').strip_prefix("activate ").filter(|t| valid_token(t)).map(str::to_string)
+        };
+        assert_eq!(old_rule(&text), Some("tok".into()), "4.5.x gets the token intact");
+        // And a 4.5.x launch's request (no build line) is read as one that did not name its build.
+        assert_eq!(parse_request("activate tok\n"), (Some("tok".into()), None));
         assert!(build_id().starts_with(env!("CARGO_PKG_VERSION")) && valid_token(build_id()), "{}", build_id());
         assert_eq!(build_id(), build_id(), "one build, one name");
     }
@@ -971,6 +988,24 @@ mod tests {
                 request.acknowledge();
             });
             assert!(matches!(claim_at(&dir.join("other.sock"), None, Some("b"), WAIT), Claim::Shown));
+        });
+        // A 4.5.x launch writes only `activate <token>` and waits: its request is read at once, token intact, as one
+        // that did not name its build (no wait for a build line that never comes).
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let request = second.recv_blocking();
+                assert_eq!(request.token.as_deref(), Some("old-token"));
+                assert!(!request.is_other_build("b"));
+                request.acknowledge();
+            });
+            use std::io::Write;
+            let stream = std::os::unix::net::UnixStream::connect(dir.join("other.sock")).unwrap();
+            let asked = Instant::now();
+            writeln!(&stream, "activate old-token").unwrap();
+            let mut answer = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&stream), &mut answer).unwrap();
+            assert_eq!(answer, "ok\n");
+            assert!(asked.elapsed() < Duration::from_secs(1), "{:?}", asked.elapsed());
         });
     }
 
