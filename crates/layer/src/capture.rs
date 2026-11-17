@@ -1838,9 +1838,6 @@ struct HeldFrame {
 }
 static HELD: std::sync::Mutex<Option<HeldFrame>> = std::sync::Mutex::new(None);
 
-/// The device and swapchain frame a held frame was captured from: its size, proxy format and channel order. A
-/// present of anything else (another swapchain's format at the same size, another device) drops the held frame
-/// rather than showing its bytes read as a different layout.
 /// Drops the held frame unless the hold is on and it is of this present's frame (`of`).
 fn drop_unfit_hold(held: &mut Option<HeldFrame>, hold_frame: bool, of: HeldOf) {
     if !hold_frame || held.as_ref().is_some_and(|h| h.of != of) {
@@ -1848,6 +1845,9 @@ fn drop_unfit_hold(held: &mut Option<HeldFrame>, hold_frame: bool, of: HeldOf) {
     }
 }
 
+/// The device and swapchain frame a held frame was captured from: its size, proxy format and channel order. A
+/// present of anything else (another swapchain's format at the same size, another device) drops the held frame
+/// rather than showing its bytes read as a different layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HeldOf {
     device: vk::Device,
@@ -3909,9 +3909,6 @@ pub(crate) unsafe fn import_host_buffer(
 #[cfg(test)]
 mod tests {
 
-    /// Every present composes (and meters) in the run's channel order, the one the swapchain's format has --
-    /// the delayed paths included. They once took `proxy_format == BGRA8`, which reads false for both
-    /// `A2R10G10B10` runs (HDR10's proxy is `PQ10_BGR`, SDR's `RGBA8`): `b_low` 0, red and blue swapped.
     /// A held frame is shown again only to a present of the same device and frame: the same size alone (another
     /// swapchain's format, or the same format's other channel order) would read its bytes as another layout.
     #[test]
@@ -3936,6 +3933,9 @@ mod tests {
         }
     }
 
+    /// Every present composes (and meters) in the run's channel order, the one the swapchain's format has --
+    /// the delayed paths included. They once took `proxy_format == BGRA8`, which reads false for both
+    /// `A2R10G10B10` runs (HDR10's proxy is `PQ10_BGR`, SDR's `RGBA8`): `b_low` 0, red and blue swapped.
     #[test]
     fn presents_compose_in_the_runs_channel_order() {
         use crate::swapchain::{is_bgr_order, proxy_format_for};
