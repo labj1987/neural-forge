@@ -34,12 +34,16 @@ pub fn state_home() -> String {
     xdg("XDG_STATE_HOME", ".local/state")
 }
 
+/// The directory of [`config_file`].
 pub fn config_dir() -> String {
-    format!("{}/neural-forge", xdg("XDG_CONFIG_HOME", ".config"))
+    let file = config_file();
+    file.strip_suffix("/config.ini").map_or(file.clone(), str::to_string)
 }
 
+/// `config.ini`, as the layer finds it: `neural_forge_protocol::persist::config_file`, the one rule for every reader
+/// (`XDG_CONFIG_HOME` trimmed, an empty one ignored).
 pub fn config_file() -> String {
-    format!("{}/config.ini", config_dir())
+    neural_forge_protocol::persist::config_file()
 }
 
 pub fn data_dir() -> String {

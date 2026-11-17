@@ -15,9 +15,10 @@ pub struct Config {
     /// The channel path `config.ini` pins, or empty for none. Read it through
     /// [`crate::channel_path`], which falls back to `NEURAL_FORGE_SHM` and then the default.
     pub shm: String,
-    /// Every other line: the `set_<name>=<value>` settings `neural_forge_protocol::persist`
-    /// round-trips (so they survive a reboot, unlike the mapping under `/tmp`), and anything else, kept
-    /// so `save()` round-trips it.
+    /// Every other `key=value` line: the `set_<name>=<value>` settings `neural_forge_protocol::persist`
+    /// round-trips (so they survive a reboot, unlike the mapping under `/tmp`), and any other key, kept
+    /// so `save()` round-trips it. Comments, blank lines and lines without `=` are not kept: `save()`
+    /// writes the file from these keys alone (sorted, a key set twice once, with its last value).
     pub settings: BTreeMap<String, String>,
     /// Why the file could not be read, when it exists but could not (permissions, an I/O error):
     /// [`Config::save`] then refuses, so the file is never replaced by one holding only this run's keys.
