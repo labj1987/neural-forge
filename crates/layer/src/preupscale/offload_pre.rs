@@ -1013,12 +1013,19 @@ fn settle_and_mark(progress: &Progress, inn: *mut u8, plan: &HoldPlan) -> bool {
         if plan.take && !went_out {
             progress.untaken.fetch_add(1, Ordering::Relaxed);
         } else if plan.take {
-            // SAFETY: IN's header, the exchange's own memory; the GPU reads it only in holds submitted after this.
-            unsafe {
-                inn.cast::<u32>().add(IN_SEQ).write_volatile(seq);
-                inn.cast::<u32>().add(IN_VALID).write_volatile(u32::from(ok));
+            // Only a complete answer is written. Its frame was taken by the worker after the hold that sent it ran
+            // (the `sent` event), so that hold's gate has read the header already. A frame abandoned at the budget
+            // (or failed) leaves the header as it is: the hold that sent it may still be queued with its gate unread,
+            // and a (seq, 0) here would make it refuse its own good answer; this hold's gate refuses the other frame's
+            // sequence number anyway.
+            if ok {
+                // SAFETY: IN's header, the exchange's own memory; no gate that still reads it is left (above).
+                unsafe {
+                    inn.cast::<u32>().add(IN_SEQ).write_volatile(seq);
+                    inn.cast::<u32>().add(IN_VALID).write_volatile(1);
+                }
+                std::sync::atomic::fence(Ordering::SeqCst);
             }
-            std::sync::atomic::fence(Ordering::SeqCst);
             taken = ok;
             if ok { &progress.taken } else { &progress.untaken }.fetch_add(1, Ordering::Relaxed);
         }
@@ -1498,11 +1505,11 @@ mod tests {
         assert!(settle_and_mark(&p, at, &first));
         assert!(!settle_and_mark(&p, at, &second));
         assert_eq!((inn[IN_VALID], inn[IN_SEQ]), (1, 1), "the header still names frame 1's complete answer");
-        // Alone in a later submit, a hold whose frame went out writes it (here: frame 3 failed, no answer).
+        // Alone in a later submit, a hold whose frame went out but failed (frame 3, no answer) writes nothing.
         p.handed();
         assert!(p.finish(3, false));
         assert!(!settle_and_mark(&p, at, &HoldPlan { settle: Some(3), take: true, send: None }));
-        assert_eq!((inn[IN_VALID], inn[IN_SEQ]), (0, 3));
+        assert_eq!((inn[IN_VALID], inn[IN_SEQ]), (1, 1), "a failed frame leaves the header: its gate refuses frame 1's number");
     }
 
     /// Two frames abandoned before the first finished: neither late answer is taken (one slot kept only the last).
