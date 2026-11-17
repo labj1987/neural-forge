@@ -623,6 +623,12 @@ fn purge_in(steam_roots: &[crate::steam::Root], steam_running: bool, leftovers: 
             std::fs::remove_dir_all(&dir)?;
             purged.removed.push(dir);
         }
+        // The lock the copies are made, removed and renamed under.
+        let lock = crate::proton_tool::tools_dir(&root.path).join(crate::proton_tool::TOOLS_LOCK);
+        if lock.is_file() {
+            std::fs::remove_file(&lock)?;
+            purged.removed.push(lock);
+        }
     }
     // Rings the NGX wrapper left where the layer never opened them, of games that are gone.
     purged.removed.extend(crate::proton_tool::sweep_dead_rings(ring_dir));
@@ -1253,6 +1259,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(config.join("localconfig.vdf")).unwrap(), text, "Steam's file is left to Steam");
         assert!(!tools.join("GE-Proton10-25-NeuralForge").exists() && purged.removed.contains(&tools.join("GE-Proton10-25-NeuralForge")));
         assert!(!tools.join(".GE-Proton10-26-NeuralForge.tmp").exists(), "what a stopped copy left goes too");
+        assert!(!tools.join(crate::proton_tool::TOOLS_LOCK).exists(), "and the copies' lock");
         assert!(tools.join("GE-Proton10-25/proton").is_file() && tools.join("Other-NeuralForge-not").is_dir(), "never a tool that is not ours");
         assert!(tools.join("Unmarked-NeuralForge/proton").is_file(), "only a marked copy is removed, whatever its name");
         assert!(tools.join("Linked-NeuralForge").is_symlink(), "a link is not a copy");
