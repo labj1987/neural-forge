@@ -962,6 +962,7 @@ struct GamesCache {
     stamp: Option<(std::time::SystemTime, u64)>,
     sections: std::collections::BTreeMap<String, neural_forge_supervisor::game_settings::Section>,
     /// How often the file was read (for the test).
+    #[cfg(test)]
     reads: u32,
 }
 
@@ -972,7 +973,10 @@ impl GamesCache {
         if stamp != self.stamp || stamp.is_none() {
             self.sections = std::fs::read(path).map(|bytes| neural_forge_protocol::games::parse(&String::from_utf8_lossy(&bytes))).unwrap_or_default();
             self.stamp = stamp;
-            self.reads += 1;
+            #[cfg(test)]
+            {
+                self.reads += 1;
+            }
         }
         &self.sections
     }
