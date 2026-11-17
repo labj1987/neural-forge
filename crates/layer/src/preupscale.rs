@@ -1700,13 +1700,11 @@ impl Tracker {
     }
 
     pub(crate) fn forget_image(&mut self, image: vk::Image) {
-        // The identifications whose colour shape no image has any more are forgotten: images of that shape made later
-        // are a new identification, not a rotation back to those.
-        if let Some(gone) = self.images.remove(&image).map(|d| ColourWatch::of(&d)) {
-            if self.seen_keys.iter().any(|k| k.0 == gone) && !self.images.values().any(|d| ColourWatch::of(d) == gone) {
-                self.seen_keys.retain(|k| k.0 != gone);
-            }
-        }
+        // `seen_keys` keeps the identifications of shapes no image has any more: a game destroying and making again its
+        // only colour image of the shape (007 First Light, every 0.4 s) while rotating its motion vectors or exposure
+        // images comes back to them, still a rotation. A switch back to an earlier colour shape is a new identification
+        // all the same ([`Self::refresh`]: only the watched colour shape's keys rotate), and the list is bounded.
+        self.images.remove(&image);
         self.keys.retain(|k| k.2 != image);
         self.registered.retain(|_, i| *i != image);
         self.kept.remove(&image);
@@ -8844,7 +8842,6 @@ mod tests {
 
     /// A DLSS mode or resolution switched and switched back (A, B, A): back on A's colour shape the identification
     /// is new (A's colour images watched again, the generation bumped), not a rotation that left B's shape watched.
-    /// The identifications of a shape whose images are all destroyed are forgotten.
     #[test]
     fn a_switch_back_to_an_earlier_colour_shape_is_a_new_identification() {
         let rg = vk::Format::R16G16_SFLOAT;
@@ -8869,12 +8866,48 @@ mod tests {
             assert_eq!(t.colour_watch.map(|c| (c.width, c.height)), Some((w, hgt)), "frame {frame}: the colour shape watched is the input's");
         }
         assert!(generations[2] > generations[1], "back on A: a new identification ({generations:?})");
-        // B's images destroyed: its identification is forgotten.
-        for i in [0x101, 0x201, 0x301] {
-            t.forget_image(img(i));
+    }
+
+    /// A game destroys its only colour image of the shape and makes a new one every frame (007 First Light, every
+    /// 0.4 s) while rotating its motion vectors between two shapes: back on a motion-vector shape seen before is still
+    /// a rotation (no generation bump, so no hold refused and no exposure reset), not a new identification.
+    #[test]
+    fn a_remade_colour_image_keeps_a_rotation_one_identification() {
+        let rg = vk::Format::R16G16_SFLOAT;
+        let colour_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let colour = |k: u64| (0x100 + 0x10 * k, desc(1488, 836, vk::Format::R16G16B16A16_SFLOAT, colour_usage));
+        let mut set = vec![colour(0), (0x200, desc(1488, 836, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT))];
+        for (k, (w, hgt)) in [(1488, 836), (744, 418)].into_iter().enumerate() {
+            set.push((0x300 + k as u64, desc(w, hgt, rg, vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)));
         }
-        assert!(t.seen_keys.iter().all(|k| (k.0.width, k.0.height) != shapes[1]), "B's shape is gone");
-        assert!(t.seen_keys.iter().any(|k| (k.0.width, k.0.height) == shapes[0]), "A's images live on");
+        let mut t = tracker_with(&set_of(&set));
+        let mut generations = Vec::new();
+        for frame in 0..8u64 {
+            let (c, d) = colour(frame);
+            if frame > 0 {
+                // The old one destroyed first: for a moment no image has the colour shape.
+                t.forget_image(img(colour(frame - 1).0));
+                let info = vk::ImageCreateInfo {
+                    image_type: vk::ImageType::TYPE_2D,
+                    extent: vk::Extent3D { width: d.width, height: d.height, depth: 1 },
+                    format: d.format,
+                    usage: d.usage,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    ..Default::default()
+                };
+                t.record_image(img(c), &info);
+                t.record_view(vk::ImageView::from_raw(c + 1), img(c));
+                t.register(vk::ImageView::from_raw(c + 1), Some(h(c)));
+            }
+            let m = 0x300 + frame % 2;
+            crate::ngx_ring::inject(vec![sr_record(frame + 1, [c, m, 0x200, 0, 0])]);
+            t.begin(cb(11));
+            t.launch(cb(11), Some(&param_block(&[h(c), h(0x200), h(m)])));
+            let _ = submit(&mut t, &[vec![cb(11)]]);
+            generations.push(t.generation);
+            assert_eq!(t.inputs.map(|i| (i.colour.0, i.mvec.0)), Some((img(c), img(m))), "frame {frame}: its own images");
+        }
+        assert!(generations[2..].iter().all(|&g| g == generations[1]), "no new identification once round: {generations:?}");
     }
 
     /// 007 First Light after a load (#49): DLSS gets a brand-new colour input and motion-vector image every 0.4 s,
