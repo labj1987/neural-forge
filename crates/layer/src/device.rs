@@ -2744,6 +2744,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let binding = crate::preupscale::restore::Binding::Sets { layout, first: first_set, sets: sets.to_vec(), dynamic: dynamic_offsets.to_vec() };
             i.restore.with(command_buffer, |s| s.bind(binding));
         }
+        // Elsewhere they invalidate the offsets kept there (`restore::State::bind_other_sets`).
+        else if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
+            i.restore.with(command_buffer, |s| s.bind_other_sets(bind_point));
+        }
         LayerResult::Unhandled
     }
 
@@ -2804,6 +2808,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let binding =
                 crate::preupscale::restore::Binding::Offsets { layout, first: first_set, indices: buffer_indices.to_vec(), offsets: offsets.to_vec() };
             i.restore.with(command_buffer, |s| s.bind(binding));
+        }
+        // Elsewhere too: the replay's buffer binding invalidates them (`restore::State::set_other_offsets`).
+        else if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
+            i.restore.with(command_buffer, |s| s.set_other_offsets(bind_point, layout, first_set, buffer_indices.to_vec(), offsets.to_vec()));
         }
         LayerResult::Unhandled
     }

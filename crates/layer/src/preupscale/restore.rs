@@ -7,7 +7,9 @@
 //! bound. Graphics state is never touched by the hold: it records no draw, binds nothing to the graphics bind
 //! point and sets no dynamic state; descriptor sets and descriptor-buffer offsets are per bind point, and
 //! the buffers bound by `vkCmdBindDescriptorBuffersEXT` are a binding point of their own that binding
-//! descriptor sets leaves alone.
+//! descriptor sets leaves alone. The replay's own `vkCmdBindDescriptorBuffersEXT` (below) is the exception:
+//! binding descriptor buffers makes every offset set before it no longer valid, whatever its bind point, so
+//! the other bind points' offsets set since the application's last such call are tracked and set again too.
 //!
 //! What is tracked per command buffer, from its `vkBeginCommandBuffer` on (each only where the application
 //! set it, so only that is restored):
@@ -21,6 +23,9 @@
 //! - the descriptor buffers `vkCmdBindDescriptorBuffersEXT` bound last: the specification keeps them bound
 //!   across `vkCmdBindDescriptorSets`, but the validation layer takes binding descriptor sets to unbind them,
 //!   so they are bound again before the offsets that use them;
+//! - the descriptor-buffer offsets of every other bind point (graphics, ray tracing) set since that call, as
+//!   the calls that made them: the replayed buffer binding invalidates them as well. Descriptor sets bound at
+//!   such a bind point drop them, as at compute;
 //! - the push constants of every push that includes the compute stage, with the layout it was made with
 //!   (values are per stage, and the hold's pushes are compute ones). A push for graphics stages only is left
 //!   alone by the hold, but one over bytes of a kept push that reached its stages too (stages ALL, then
@@ -153,6 +158,9 @@ pub(crate) struct State {
     /// push-descriptor binding (`VkDescriptorBufferBindingPushDescriptorBufferHandleEXT`).
     buffers: Option<(u64, Vec<BufferBinding>)>,
     bindings: Vec<(u64, Binding)>,
+    /// `vkCmdSetDescriptorBufferOffsetsEXT` at other bind points than compute since the last
+    /// `vkCmdBindDescriptorBuffersEXT` (always [`Binding::Offsets`]).
+    other_offsets: Vec<(u64, vk::PipelineBindPoint, Binding)>,
     pushes: Vec<(u64, Push)>,
     /// Why the state cannot be put back after a hold, if it cannot.
     unrestorable: Option<&'static str>,
@@ -195,6 +203,33 @@ impl State {
         }
     }
 
+    /// `vkCmdSetDescriptorBufferOffsetsEXT` at `point`, not compute: kept, as the replay's buffer binding
+    /// invalidates it. A call whose every set number is set again is gone.
+    pub(crate) fn set_other_offsets(
+        &mut self,
+        point: vk::PipelineBindPoint,
+        layout: vk::PipelineLayout,
+        first: u32,
+        indices: Vec<u32>,
+        offsets: Vec<vk::DeviceSize>,
+    ) {
+        let s = self.next();
+        let range = first..first + indices.len() as u32;
+        self.other_offsets.retain(|(_, p, old)| {
+            let r = old.sets();
+            *p != point || !(range.start <= r.start && r.end <= range.end)
+        });
+        self.other_offsets.push((s, point, Binding::Offsets { layout, first, indices, offsets }));
+        if self.other_offsets.len() > MAX_BINDINGS {
+            self.unrestorable.get_or_insert("more descriptor binding calls than the layer keeps");
+        }
+    }
+
+    /// Descriptor sets bound at `point`, not compute: they invalidate the offsets set there.
+    pub(crate) fn bind_other_sets(&mut self, point: vk::PipelineBindPoint) {
+        self.other_offsets.retain(|(_, p, _)| *p != point);
+    }
+
     /// `vkCmdBindDescriptorBuffersEXT`.
     ///
     /// # Safety
@@ -218,6 +253,8 @@ impl State {
         }
         let s = self.next();
         self.buffers = Some((s, out));
+        // Every offset set before is no longer valid, at every bind point; the application sets them again.
+        self.other_offsets.clear();
     }
 
     /// Whether a push for `stages` over `offset..offset + size` is kept: one reaching the compute stage, or one
@@ -270,12 +307,14 @@ impl State {
             Compute(Compute),
             Buffers(&'a [BufferBinding]),
             Binding(&'a Binding),
+            Other(vk::PipelineBindPoint, &'a Binding),
             Push(&'a Push),
         }
-        let mut items: Vec<(u64, Item)> = Vec::with_capacity(2 + self.bindings.len() + self.pushes.len());
+        let mut items: Vec<(u64, Item)> = Vec::with_capacity(2 + self.bindings.len() + self.other_offsets.len() + self.pushes.len());
         items.extend(self.compute.map(|(s, c)| (s, Item::Compute(c))));
         items.extend(self.buffers.as_ref().map(|(s, b)| (*s, Item::Buffers(b))));
         items.extend(self.bindings.iter().map(|(s, b)| (*s, Item::Binding(b))));
+        items.extend(self.other_offsets.iter().map(|(s, p, b)| (*s, Item::Other(*p, b))));
         items.extend(self.pushes.iter().map(|(s, p)| (*s, Item::Push(p))));
         items.sort_by_key(|(s, _)| *s);
         let compute = vk::PipelineBindPoint::COMPUTE;
@@ -362,6 +401,12 @@ impl State {
                             set(cb, compute, *layout, *first, indices.len() as u32, indices.as_ptr(), offsets.as_ptr());
                         }
                     }
+                    Item::Other(point, Binding::Offsets { layout, first, indices, offsets }) => {
+                        if let Some(set) = fns.set_descriptor_buffer_offsets {
+                            set(cb, point, *layout, *first, indices.len() as u32, indices.as_ptr(), offsets.as_ptr());
+                        }
+                    }
+                    Item::Other(..) => {}
                     Item::Binding(Binding::Embedded { layout, set }) => {
                         if let Some(bind) = fns.bind_descriptor_buffer_embedded_samplers {
                             bind(cb, compute, *layout, *set);
@@ -379,6 +424,7 @@ impl State {
         let shader = matches!(self.compute, Some((_, Compute::Shader(_)))) && fns.bind_shaders.is_none();
         shader
             || (self.buffers.is_some() && fns.bind_descriptor_buffers.is_none())
+            || (!self.other_offsets.is_empty() && fns.set_descriptor_buffer_offsets.is_none())
             || self.bindings.iter().any(|(_, b)| match b {
                 Binding::Sets { .. } => false,
                 Binding::Push { .. } => fns.push_descriptor_set.is_none(),
@@ -927,6 +973,21 @@ fn binds_compute_sets(i: &BindDescriptorSetsInfo) -> bool {
     i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE) && i.descriptor_set_count > 0
 }
 
+/// The bind points other than compute whose stages a `2` binding command's `stage_flags` reach.
+fn other_bind_points(stages: vk::ShaderStageFlags) -> impl Iterator<Item = vk::PipelineBindPoint> {
+    let graphics = vk::ShaderStageFlags::ALL_GRAPHICS | vk::ShaderStageFlags::TASK_EXT | vk::ShaderStageFlags::MESH_EXT;
+    let ray = vk::ShaderStageFlags::RAYGEN_KHR
+        | vk::ShaderStageFlags::ANY_HIT_KHR
+        | vk::ShaderStageFlags::CLOSEST_HIT_KHR
+        | vk::ShaderStageFlags::MISS_KHR
+        | vk::ShaderStageFlags::INTERSECTION_KHR
+        | vk::ShaderStageFlags::CALLABLE_KHR;
+    [(graphics, vk::PipelineBindPoint::GRAPHICS), (ray, vk::PipelineBindPoint::RAY_TRACING_KHR)]
+        .into_iter()
+        .filter(move |(s, _)| stages.intersects(*s))
+        .map(|(_, p)| p)
+}
+
 /// Whether a `vkCmdPushConstants2` call pushes bytes (which of them are kept: [`State::keeps`]).
 fn pushes_constants(i: &PushConstantsInfo) -> bool {
     i.size > 0
@@ -977,6 +1038,9 @@ unsafe extern "system" fn bind_descriptor_sets2(cb: vk::CommandBuffer, info: *co
                     s.bind(Binding::Sets { layout: i.layout, first: i.first_set, sets, dynamic });
                 }
             });
+        }
+        if let Some(i) = info.as_ref().filter(|i| i.descriptor_set_count > 0) {
+            w.tracker.note(cb, |s| other_bind_points(i.stage_flags).for_each(|p| s.bind_other_sets(p)));
         }
         next(cb, info);
     }
@@ -1051,6 +1115,17 @@ unsafe extern "system" fn set_descriptor_buffer_offsets2(cb: vk::CommandBuffer, 
                     let indices = slice(i.p_buffer_indices, i.set_count).to_vec();
                     let offsets = slice(i.p_offsets, i.set_count).to_vec();
                     s.bind(Binding::Offsets { layout: i.layout, first: i.first_set, indices, offsets });
+                }
+            });
+        }
+        if let Some(i) = info.as_ref().filter(|i| i.set_count > 0 && other_bind_points(i.stage_flags).next().is_some()) {
+            w.tracker.note(cb, |s| {
+                if !i.p_next.is_null() || i.layout == vk::PipelineLayout::null() {
+                    s.refuse("vkCmdSetDescriptorBufferOffsets2EXT with a chained structure");
+                } else {
+                    let indices = slice(i.p_buffer_indices, i.set_count).to_vec();
+                    let offsets = slice(i.p_offsets, i.set_count).to_vec();
+                    other_bind_points(i.stage_flags).for_each(|p| s.set_other_offsets(p, i.layout, i.first_set, indices.clone(), offsets.clone()));
                 }
             });
         }
@@ -1183,6 +1258,32 @@ mod tests {
 
     fn layout(raw: u64) -> vk::PipelineLayout {
         vk::PipelineLayout::from_raw(raw)
+    }
+
+    /// The replay binds the descriptor buffers again, which invalidates the offsets of every bind point: those set
+    /// at graphics (or ray tracing) since the application's own buffer binding are kept to be set again.
+    #[test]
+    fn offsets_at_other_bind_points_are_kept_for_the_buffer_rebinding() {
+        let g = vk::PipelineBindPoint::GRAPHICS;
+        let mut s = State::default();
+        s.set_other_offsets(g, layout(1), 0, vec![0], vec![0]);
+        // SAFETY: a binding info with no chain.
+        unsafe { s.bind_buffers(&[vk::DescriptorBufferBindingInfoEXT::default().address(0x1000)]) };
+        assert!(s.other_offsets.is_empty(), "the application's own buffer binding invalidated them");
+        s.set_other_offsets(g, layout(1), 0, vec![0, 0], vec![0, 256]);
+        s.set_other_offsets(vk::PipelineBindPoint::RAY_TRACING_KHR, layout(2), 0, vec![0], vec![512]);
+        s.set_other_offsets(g, layout(1), 1, vec![0], vec![1024]);
+        assert_eq!(s.other_offsets.len(), 3, "set 0 of the first graphics call is still set");
+        s.set_other_offsets(g, layout(1), 0, vec![0, 0], vec![0, 0]);
+        assert_eq!(s.other_offsets.len(), 2, "setting both sets again replaces both graphics calls");
+        let buffers = s.buffers.as_ref().map(|(seq, _)| *seq).unwrap();
+        assert!(s.other_offsets.iter().all(|(seq, ..)| *seq > buffers), "replayed after the buffers, in call order");
+        s.bind_other_sets(g);
+        assert!(s.other_offsets.iter().all(|(_, p, _)| *p == vk::PipelineBindPoint::RAY_TRACING_KHR), "graphics descriptor sets drop graphics offsets only");
+        assert!(s.bindings.is_empty(), "none of this touches the compute bindings");
+        let stages = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::COMPUTE;
+        assert_eq!(other_bind_points(stages).collect::<Vec<_>>(), vec![g]);
+        assert_eq!(other_bind_points(vk::ShaderStageFlags::COMPUTE).count(), 0);
     }
 
     #[test]
