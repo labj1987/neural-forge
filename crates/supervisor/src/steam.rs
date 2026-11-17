@@ -218,8 +218,14 @@ pub fn find<'a>(games: &'a [Game], query: &str) -> Result<&'a Game, FindError> {
 
 use neural_forge_protocol::processes::{game_helper as helper_exe, launcher_like};
 
-fn helper_dir(name: &str) -> bool {
+/// A folder of redistributables, installers, anti-cheat or crash reporters, never the game's own: skipped at any depth.
+/// `engine` only at the top of the install folder (`top`), where Unreal keeps its own tools (`Engine/Binaries`); a
+/// game's folder further down may be named so.
+fn helper_dir(name: &str, top: bool) -> bool {
     let n = name.to_ascii_lowercase();
+    if n == "engine" {
+        return top;
+    }
     [
         "redist",
         "_commonredist",
@@ -230,7 +236,6 @@ fn helper_dir(name: &str) -> bool {
         "vcredist",
         "battleye",
         "easyanticheat",
-        "engine",
         "support",
         "crashreporter",
         "crashpad",
@@ -259,7 +264,7 @@ fn unreal_binaries(dir: &Path) -> Vec<String> {
     projects.sort();
     let mut out = Vec::new();
     for project in projects {
-        if project.file_name().and_then(|n| n.to_str()).is_some_and(helper_dir) {
+        if project.file_name().and_then(|n| n.to_str()).is_some_and(|n| helper_dir(n, true)) {
             continue;
         }
         for platform in ["Win64", "WinGDK", "Win32"] {
@@ -450,7 +455,7 @@ fn all_exes(dir: &Path) -> Vec<(String, u64)> {
             let Ok(kind) = e.file_type() else { continue };
             let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
             let path = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-            if kind.is_dir() && depth > 1 && !helper_dir(&name) {
+            if kind.is_dir() && depth > 1 && !helper_dir(&name, rel.is_empty()) {
                 walk(&e.path(), &path, depth - 1, out);
             } else if kind.is_file() && name.to_ascii_lowercase().ends_with(".exe") && !helper_exe(&name) {
                 out.push((path, e.metadata().map(|m| m.len()).unwrap_or(0)));
@@ -674,9 +679,9 @@ pub enum Outcome {
     },
 }
 
-/// [`apply`] against the real `/proc`.
+/// [`apply`] against the real `/proc`, asked again once the files are locked.
 pub fn apply_now(root: &Path, appid: &str, action: &Action) -> Outcome {
-    apply(root, appid, action, steam_running(Path::new("/proc")))
+    apply_in(root, appid, action, &|| steam_running(Path::new("/proc")))
 }
 
 /// Sets the game's launch options in `root`'s `localconfig.vdf` files.
@@ -692,32 +697,48 @@ pub fn apply_now(root: &Path, appid: &str, action: &Action) -> Outcome {
 /// before it is read for the edit until it is replaced ([`lock_localconfigs`]): two edits at once (the GUI's
 /// switches for two games, or the CLI and the GUI) run one after the other, so neither is lost.
 pub fn apply(root: &Path, appid: &str, action: &Action, steam_running: bool) -> Outcome {
+    apply_in(root, appid, action, &|| steam_running)
+}
+
+/// [`apply`] with `steam_running` asked before the edit and again once the files are locked (Steam started while
+/// waiting for the lock writes its own copy back when it exits). An account file that cannot be read or parsed stops
+/// the edit only when it would be edited: the newest file (the account signed in last) when enabling. Others are
+/// left as they are.
+fn apply_in(root: &Path, appid: &str, action: &Action, steam_running: &dyn Fn() -> bool) -> Outcome {
     let current = launch_options(root, appid).iter().find(|a| a.has_app).and_then(|a| a.options.clone()).unwrap_or_default();
     let manual = action.apply_to(&current);
     if matches!(action, Action::Enable { target_exe } if target_exe.trim().is_empty()) {
         return Outcome::Failed { reason: "the game's executable is not known: name it (the .exe the game runs) as the target".into(), manual };
     }
-    if steam_running {
+    // `%command%` only inside a longer token (`sh -c '... %command%'`): not edited, the user puts the variables in front.
+    if matches!(action, Action::Enable { .. }) && launch_options::command_inside_token(&current) && !launch_options::is_enabled(&current) {
+        return Outcome::Failed {
+            reason: "the game's launch options have %command% only inside a quoted command: set them by hand, with Neural Forge's variables in front".into(),
+            manual,
+        };
+    }
+    if steam_running() {
         return Outcome::SteamRunning { manual };
     }
     // Read again under the lock: what another edit wrote meanwhile is kept.
     let _held = lock_localconfigs(&localconfigs(root));
+    if steam_running() {
+        return Outcome::SteamRunning { manual };
+    }
     let accounts = launch_options(root, appid);
     let files = localconfigs(root);
     if files.is_empty() {
         return Outcome::Failed { reason: format!("no Steam account found under {}", root.join("userdata").display()), manual };
     }
-    if accounts.len() != files.len() {
-        let unreadable: Vec<String> = files.iter().filter(|f| !accounts.iter().any(|a| &a.file == *f)).map(|f| f.display().to_string()).collect();
-        return Outcome::Failed { reason: format!("cannot read {}", unreadable.join(", ")), manual };
-    }
     let mut targets: Vec<&AccountOptions> = accounts.iter().filter(|a| a.has_app).collect();
     if *action != Action::Disable {
         // The account last signed in (its file written last) gets the game's block too: it is the
         // one that will start the game next, whether or not it has run it before.
-        let newest = accounts.iter().max_by_key(|a| std::fs::metadata(&a.file).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH));
-        if let Some(newest) = newest.filter(|n| !n.has_app) {
-            targets.push(newest);
+        let newest = files.iter().max_by_key(|f| std::fs::metadata(f).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH));
+        match newest.map(|f| accounts.iter().find(|a| &a.file == f)) {
+            Some(Some(newest)) if !newest.has_app => targets.push(newest),
+            Some(None) => return Outcome::Failed { reason: format!("cannot read {}", newest.map(|f| f.display().to_string()).unwrap_or_default()), manual },
+            _ => {}
         }
     } else if targets.is_empty() {
         return Outcome::Unchanged;
@@ -835,10 +856,6 @@ fn sibling(file: &Path, suffix: &str) -> PathBuf {
     file.with_file_name(name)
 }
 
-/// Holds `files` for one [`apply`]: an exclusive lock on `localconfig.vdf.neural-forge.lock` next to
-/// each (beside its backups), taken in the files' sorted order so two holders never wait on each
-/// other. A lock that cannot be taken is skipped: its directory then cannot take the edit's
-/// temporary file either, and the write reports that.
 /// Holds `file`'s Neural Forge lock (its `.neural-forge.lock` sibling) until dropped.
 pub(crate) fn lock_file(file: &Path) -> Option<std::fs::File> {
     let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(sibling(file, ".neural-forge.lock")).ok()?;
@@ -846,15 +863,12 @@ pub(crate) fn lock_file(file: &Path) -> Option<std::fs::File> {
     Some(lock)
 }
 
+/// Holds `files` for one [`apply`]: an exclusive lock on `localconfig.vdf.neural-forge.lock` next to
+/// each (beside its backups), taken in the files' sorted order so two holders never wait on each
+/// other. A lock that cannot be taken is skipped: its directory then cannot take the edit's
+/// temporary file either, and the write reports that.
 fn lock_localconfigs(files: &[PathBuf]) -> Vec<std::fs::File> {
-    files
-        .iter()
-        .filter_map(|file| {
-            let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(sibling(file, ".neural-forge.lock")).ok()?;
-            lock.lock().ok()?;
-            Some(lock)
-        })
-        .collect()
+    files.iter().filter_map(|file| lock_file(file)).collect()
 }
 
 /// The backups and the atomic replace for one file, whose bytes read as `old` a moment ago.
@@ -1438,6 +1452,58 @@ mod tests {
         assert_eq!(options_in(&lc, "3240220").as_deref(), Some(existing));
     }
 
+    /// Unreal's `Engine` folder at the top of the install folder holds its tools; a game folder named so further down
+    /// is searched.
+    #[test]
+    fn only_the_top_engine_folder_is_skipped() {
+        let home = Scratch::new("engine");
+        for f in ["Engine/Binaries/Win64/CrashReportClient.exe", "Game/Engine/Game.exe", "Game/Support/Tool.exe"] {
+            write(&home.0.join(f), "MZ");
+        }
+        let found: Vec<String> = all_exes(&home.0).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(found, ["Game/Engine/Game.exe"]);
+    }
+
+    /// Steam started while the edit waited for the files' locks: nothing is written.
+    #[test]
+    fn steam_started_while_waiting_for_the_lock_stops_the_edit() {
+        let home = Scratch::new("late-steam");
+        let lc = home.0.join("userdata/1/config/localconfig.vdf");
+        write(&lc, &localconfig(&[("3240220", Some("%command%"))]));
+        let asked = std::cell::Cell::new(0);
+        let running = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        assert!(matches!(apply_in(&home.0, "3240220", &enable(), &running), Outcome::SteamRunning { .. }));
+        assert_eq!(asked.get(), 2);
+        assert_eq!(options_in(&lc, "3240220").as_deref(), Some("%command%"));
+    }
+
+    /// `%command%` only inside a quoted command: not edited; the string to paste puts the variables in front.
+    #[test]
+    fn a_command_inside_a_quoted_command_is_left_for_the_user() {
+        let home = Scratch::new("embedded");
+        let lc = home.0.join("userdata/1/config/localconfig.vdf");
+        let existing = "sh -c 'MANGOHUD=1 %command%'";
+        write(&lc, &localconfig(&[("3240220", Some(existing))]));
+        let before = std::fs::read_to_string(&lc).unwrap();
+        match apply(&home.0, "3240220", &enable(), false) {
+            Outcome::Failed { reason, manual } => {
+                assert!(reason.contains("inside a quoted command"), "{reason}");
+                assert_eq!(manual, format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe {existing}"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&lc).unwrap(), before);
+        // Pasted by hand: seen as on, and switching off takes the variables out again.
+        write(&lc, &localconfig(&[("3240220", Some(&format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe {existing}")))]));
+        assert!(enabled(&home.0, "3240220"));
+        assert_eq!(apply(&home.0, "3240220", &enable(), false), Outcome::Unchanged);
+        apply(&home.0, "3240220", &Action::Disable, false);
+        assert_eq!(options_in(&lc, "3240220").as_deref(), Some(existing));
+    }
+
     #[test]
     fn an_unsafe_edit_is_refused_and_nothing_is_written() {
         let home = Scratch::new("refuse");
@@ -1451,11 +1517,23 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(&lc).unwrap(), text);
         assert!(!home.0.join("userdata/1/config/localconfig.vdf.neural-forge.orig").exists());
-        // A second account whose file does not parse stops the edit of the first too.
-        write(&home.0.join("userdata/2/config/localconfig.vdf"), &localconfig(&[("3240220", Some("%command%"))]));
+        // An account whose file does not parse stops the edit when it is the newest (the one signed in last, which
+        // enabling edits), and is left alone otherwise.
+        let other = home.0.join("userdata/2/config/localconfig.vdf");
+        write(&other, &localconfig(&[("3240220", Some("%command%"))]));
         write(&lc, "\"broken\" {");
-        assert!(matches!(apply(&home.0, "3240220", &enable(), false), Outcome::Failed { .. }));
-        assert_eq!(options_in(&home.0.join("userdata/2/config/localconfig.vdf"), "3240220").as_deref(), Some("%command%"));
+        let set_mtime = |p: &Path, secs: u64| {
+            std::fs::File::options().write(true).open(p).unwrap().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap()
+        };
+        set_mtime(&other, 1_000);
+        set_mtime(&lc, 2_000);
+        assert!(matches!(apply(&home.0, "3240220", &enable(), false), Outcome::Failed { reason, .. } if reason.contains("cannot read")));
+        assert_eq!(options_in(&other, "3240220").as_deref(), Some("%command%"));
+        set_mtime(&lc, 500);
+        assert!(matches!(apply(&home.0, "3240220", &enable(), false), Outcome::Changed(edits) if edits.len() == 1 && edits[0].file == other));
+        assert_eq!(std::fs::read_to_string(&lc).unwrap(), "\"broken\" {");
+        assert!(matches!(apply(&home.0, "3240220", &Action::Disable, false), Outcome::Changed(edits) if edits.len() == 1));
+        assert_eq!(options_in(&other, "3240220").as_deref(), Some(""), "a bare %command% left is no launch options");
         // No account at all.
         assert!(matches!(apply(&home.0.join("nowhere"), "3240220", &enable(), false), Outcome::Failed { .. }));
     }

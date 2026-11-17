@@ -60,6 +60,13 @@ pub(crate) struct SteamScan {
     games: Vec<ScannedGame>,
 }
 
+impl SteamScan {
+    /// Whether Steam runs, read again since the scan (the 30 s worker): the switches are offered by it. Whether it changed.
+    fn set_running(&mut self, running: bool) -> bool {
+        std::mem::replace(&mut self.running, running) != running
+    }
+}
+
 fn scan_steam() -> SteamScan {
     let cfg = neural_forge_supervisor::Config::load();
     let roots = steam::roots();
@@ -84,7 +91,9 @@ fn scan_steam() -> SteamScan {
 /// source changed since.
 pub(crate) struct ProtonScan {
     root: Option<std::path::PathBuf>,
-    sources: Vec<proton_tool::Source>,
+    /// Each source with why the wrapper cannot run under it (`proton_tool::unix_pid_support`, which reads its
+    /// `ntdll.so`: read here, on the worker, never while drawing).
+    sources: Vec<(proton_tool::Source, Option<String>)>,
     tools: Vec<(proton_tool::Tool, bool)>,
     /// The copies made again (`compat_tool::stale_copies`, the check `doctor` makes): older than their source, or
     /// named without "Proton".
@@ -95,6 +104,10 @@ fn scan_protons() -> ProtonScan {
     let Some(root) = steam::roots().into_iter().find(|r| !r.flatpak).map(|r| r.path) else {
         return ProtonScan { root: None, sources: Vec::new(), tools: Vec::new(), stale: Vec::new() };
     };
+    scan_protons_in(root)
+}
+
+fn scan_protons_in(root: std::path::PathBuf) -> ProtonScan {
     let libraries = steam::libraries(&root);
     let tools: Vec<(proton_tool::Tool, bool)> = proton_tool::tools(&root).into_iter().map(|t| (t.clone(), proton_tool::outdated(&t))).collect();
     let stale = compat_tool::stale_copies(&root);
@@ -103,6 +116,10 @@ fn scan_protons() -> ProtonScan {
     let sources = proton_tool::sources(&root, &libraries)
         .into_iter()
         .filter(|s| !tools.iter().any(|(t, _)| t.name == s.tool_name()) && !stale.iter().any(|c| c.tool.source == s.dir))
+        .map(|s| {
+            let unsupported = proton_tool::unix_pid_support(&s.dir).err();
+            (s, unsupported)
+        })
         .collect();
     ProtonScan { root: Some(root), sources, tools, stale }
 }
@@ -151,6 +168,11 @@ pub(crate) struct PageState {
 }
 
 impl PageState {
+    /// [`SteamScan::set_running`] for the scan shown, if any: whether that changed.
+    pub(crate) fn set_steam_running(&mut self, running: bool) -> bool {
+        self.steam.as_mut().is_some_and(|scan| scan.set_running(running))
+    }
+
     pub(crate) fn new(window: &mut Window, cx: &mut Context<MainView>) -> Self {
         let exe_input = cx.new(|cx| InputState::new(window, cx).placeholder("Game.exe"));
         let profile_input = cx.new(|cx| InputState::new(window, cx).placeholder("Profile name"));
@@ -159,12 +181,7 @@ impl PageState {
             // The launch option follows the executable typed.
             cx.subscribe_in(&exe_input, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
             // Leaving the toggle key's button ends the wait for a key.
-            cx.on_blur(&hotkey_focus, window, |this, _, cx| {
-                if std::mem::take(&mut this.pages.capturing_key) {
-                    this.stop_listening_for_key();
-                    cx.notify();
-                }
-            }),
+            cx.on_blur(&hotkey_focus, window, |this, _, cx| this.end_key_wait(cx)),
         ];
         Self {
             model_text: String::new(),
@@ -365,7 +382,19 @@ impl MainView {
     pub(crate) fn refresh_model(&mut self) {
         (self.pages.model_text, self.pages.model_present) = model_status();
         self.pages.network_subtitles = [network_subtitle(Network::Full), network_subtitle(Network::Small)];
-        self.pages.lut = neural_forge_supervisor::Config::load().settings.get(neural_forge_protocol::cube::CONFIG_KEY).cloned().filter(|p| !p.is_empty());
+    }
+
+    /// Reads the look-up table's name from config.ini, on a worker (no file is read on the UI thread).
+    pub(crate) fn load_lut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run(
+            window,
+            cx,
+            || neural_forge_supervisor::Config::load().settings.get(neural_forge_protocol::cube::CONFIG_KEY).cloned().filter(|p| !p.is_empty()),
+            |this, lut, _, cx| {
+                this.pages.lut = lut;
+                cx.notify();
+            },
+        );
     }
 
     /// Runs `work` on a worker thread and `done` with its result here.
@@ -543,6 +572,15 @@ impl MainView {
             tap.listen();
         }
         self.read_session_keys();
+    }
+
+    /// Ends the toggle key's wait for a key, if it waits: the focus left its button, or another tab was picked (which
+    /// need not take the focus, and leaves the button undrawn).
+    pub(crate) fn end_key_wait(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.pages.capturing_key) {
+            self.stop_listening_for_key();
+            cx.notify();
+        }
     }
 
     fn stop_listening_for_key(&mut self) {
@@ -922,7 +960,7 @@ impl MainView {
                 .child(
                     Button::new("clear").small().icon(Icon::new(IconName::Close)).tooltip("No look-up table").accessibility_label("No look-up table").on_click(
                         cx.listener(|this, _, window, cx| {
-                            this.set_lut(None, window, cx);
+                            this.set_lut(None, None, window, cx);
                         }),
                     ),
                 )
@@ -945,22 +983,35 @@ impl MainView {
         )
     }
 
-    /// Names the look-up table's file in config.ini and tells the layer to read it again. False when saving failed.
-    fn set_lut(&mut self, path: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let mut cfg = neural_forge_supervisor::Config::load();
-        match &path {
-            Some(p) => cfg.settings.insert(neural_forge_protocol::cube::CONFIG_KEY.to_string(), p.clone()),
-            None => cfg.settings.remove(neural_forge_protocol::cube::CONFIG_KEY),
-        };
-        if let Err(e) = cfg.save() {
-            toast(window, cx, &format!("Saving config.ini failed: {e}"));
-            return false;
-        }
-        self.shm.header().edit_lut_seq.fetch_add(1, Ordering::Relaxed);
-        self.shm.header().control_seq.fetch_add(1, Ordering::Relaxed);
-        self.pages.lut = path;
-        cx.notify();
-        true
+    /// Names the look-up table's file in config.ini (on a worker) and tells the layer to read it again; `saved` is
+    /// the toast once it is saved, a failed save says so instead.
+    fn set_lut(&mut self, path: Option<String>, saved: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let worker_path = path.clone();
+        self.run(
+            window,
+            cx,
+            move || {
+                let mut cfg = neural_forge_supervisor::Config::load();
+                match &worker_path {
+                    Some(p) => cfg.settings.insert(neural_forge_protocol::cube::CONFIG_KEY.to_string(), p.clone()),
+                    None => cfg.settings.remove(neural_forge_protocol::cube::CONFIG_KEY),
+                };
+                cfg.save().map_err(|e| e.to_string())
+            },
+            move |this, done, window, cx| {
+                if let Err(e) = done {
+                    toast(window, cx, &format!("Saving config.ini failed: {e}"));
+                    return;
+                }
+                this.shm.header().edit_lut_seq.fetch_add(1, Ordering::Relaxed);
+                this.shm.header().control_seq.fetch_add(1, Ordering::Relaxed);
+                this.pages.lut = path;
+                cx.notify();
+                if let Some(saved) = saved {
+                    toast(window, cx, &saved);
+                }
+            },
+        );
     }
 
     /// Asks for one file with the desktop's file dialog and hands it to `picked`. The dialog has no file-type filter
@@ -996,9 +1047,8 @@ impl MainView {
             let path = path.to_string_lossy().into_owned();
             match neural_forge_protocol::cube::load(&path) {
                 Ok(cube) => {
-                    if this.set_lut(Some(path), window, cx) {
-                        toast(window, cx, &format!("Look-up table set: {} points a side. Raise its strength to use it", cube.size));
-                    }
+                    let saved = format!("Look-up table set: {} points a side. Raise its strength to use it", cube.size);
+                    this.set_lut(Some(path), Some(saved), window, cx);
                 }
                 Err(e) => toast(window, cx, &format!("Not a usable look-up table: {e}")),
             }
@@ -1981,30 +2031,30 @@ impl MainView {
     fn target_chosen(&mut self, appid: &str, typed: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(scanned) = self.scanned(appid) else { return };
         let (game, on) = (scanned.game.clone(), scanned.enabled);
-        let mut cfg = neural_forge_supervisor::Config::load();
-        let key = steam::chosen_target_key(&game.appid);
-        match typed {
-            Some(typed) => cfg.settings.insert(key, typed),
-            None => cfg.settings.remove(&key),
-        };
-        if let Err(e) = cfg.save() {
-            toast(window, cx, &format!("Saving config.ini failed: {e}"));
-            return;
-        }
         let worker_game = game.clone();
         self.run(
             window,
             cx,
             move || {
-                let cfg = neural_forge_supervisor::Config::load();
+                let mut cfg = neural_forge_supervisor::Config::load();
+                let key = steam::chosen_target_key(&worker_game.appid);
+                match typed {
+                    Some(typed) => cfg.settings.insert(key, typed),
+                    None => cfg.settings.remove(&key),
+                };
+                cfg.save().map_err(|e| e.to_string())?;
                 let new = steam::target_for(&cfg, &worker_game);
                 let chosen = steam::chosen_target(&cfg, &worker_game.appid).is_some();
                 // A game that is on gets the new target in its launch options at once.
                 let applied = (on && !new.is_empty())
                     .then(|| steam::apply_now(&worker_game.root.path, &worker_game.appid, &steam::Action::Enable { target_exe: new.clone() }));
-                (new, chosen, applied)
+                Ok((new, chosen, applied))
             },
-            move |this, (new, chosen, applied), window, cx| {
+            move |this, done: Result<_, String>, window, cx| {
+                let (new, chosen, applied) = match done {
+                    Ok(done) => done,
+                    Err(e) => return toast(window, cx, &format!("Saving config.ini failed: {e}")),
+                };
                 // A game whose executable was just named can be switched on now, without a refresh.
                 if let Some(scanned) = this.scanned(&game.appid) {
                     scanned.target = new.clone();
@@ -2165,10 +2215,9 @@ impl MainView {
                         })));
                     rows.push(line.into_any_element());
                 }
-                for (i, source) in sources.iter().enumerate() {
+                for (i, (source, unsupported)) in sources.iter().enumerate() {
                     // A Proton the wrapper cannot run under (Wine older than 10) says why instead of offering a copy.
-                    let unsupported = proton_tool::unix_pid_support(&source.dir).err();
-                    let subtitle = match &unsupported {
+                    let subtitle = match unsupported {
                         Some(why) => format!("{} in {}: cannot be copied, {why}", source.version, source.dir.display()),
                         None => format!("{} in {}", source.version, source.dir.display()),
                     };
@@ -2223,22 +2272,29 @@ impl MainView {
 
     pub(crate) fn uninstall_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let appimage = std::env::var_os("APPIMAGE").map(std::path::PathBuf::from).filter(|p| p.is_file());
-        let steam_running = steam::steam_running(std::path::Path::new("/proc"));
         let view = cx.weak_entity();
-        ask(
-            Question {
-                id: "uninstall",
-                title: "Uninstall Neural Forge?".into(),
-                body: uninstall_body(steam_running, appimage.as_deref()).into(),
-                ok_text: "Uninstall",
-                danger: true,
-            },
-            Box::new(move |window, cx| {
-                let _ = view.update(cx, |this, cx| this.uninstall(appimage, window, cx));
-            }),
-            None,
+        // The /proc scan runs on a worker; the question opens once it is done.
+        self.run(
             window,
             cx,
+            || steam::steam_running(std::path::Path::new("/proc")),
+            move |_, steam_running, window, cx| {
+                ask(
+                    Question {
+                        id: "uninstall",
+                        title: "Uninstall Neural Forge?".into(),
+                        body: uninstall_body(steam_running, appimage.as_deref()).into(),
+                        ok_text: "Uninstall",
+                        danger: true,
+                    },
+                    Box::new(move |window, cx| {
+                        let _ = view.update(cx, |this, cx| this.uninstall(appimage, window, cx));
+                    }),
+                    None,
+                    window,
+                    cx,
+                );
+            },
         );
     }
 
@@ -2826,6 +2882,34 @@ fn tag_text(theme: &gpui_kit::component::Theme) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Steam started or closed since the scan: the list says so once the 30 s worker reads it again.
+    #[test]
+    fn steam_running_is_updated_after_the_scan() {
+        let mut scan = SteamScan { roots: Vec::new(), running: false, games: Vec::new() };
+        assert!(scan.set_running(true) && scan.running);
+        assert!(!scan.set_running(true), "no change, no redraw");
+        assert!(scan.set_running(false) && !scan.running);
+    }
+
+    /// Whether a Proton can take the wrapper is read in the scan (a worker), not on every draw of the Setup tab.
+    #[test]
+    fn the_proton_scan_says_which_sources_cannot_take_the_wrapper() {
+        let root = std::env::temp_dir().join(format!("neural-forge-gui-proton-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, wine) in [("GE-Proton9-27", "wine-9.0"), ("GE-Proton11-12", "wine-11.0")] {
+            let dir = root.join("compatibilitytools.d").join(name);
+            std::fs::create_dir_all(dir.join("files/lib/wine/x86_64-unix")).unwrap();
+            std::fs::write(dir.join("files/lib/wine/x86_64-unix/ntdll.so"), format!("\0{wine}\0")).unwrap();
+            std::fs::write(dir.join("proton"), "").unwrap();
+            std::fs::write(dir.join("version"), format!("1 {name}\n")).unwrap();
+        }
+        let scan = scan_protons_in(root.clone());
+        let found: Vec<(String, bool)> = scan.sources.iter().map(|(s, why)| (s.version.clone(), why.is_some())).collect();
+        assert_eq!(found, [("GE-Proton11-12".to_string(), false), ("GE-Proton9-27".to_string(), true)]);
+        assert!(scan.sources[1].1.as_deref().unwrap().contains("Wine 9.0"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn tag_text_uses_primary_where_it_reads_and_the_link_colour_where_it_does_not() {

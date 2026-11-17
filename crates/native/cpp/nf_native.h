@@ -167,7 +167,7 @@ uint32_t nf_native_profile_end(NfNative* n, char* out, size_t out_len);
 
 // Records slot `slot`'s graph (nf_native_build_sizes) straight into `primary`, a primary command buffer of
 // `frame_family` the caller is recording (the application's: the hold inside DLSS's command buffer), between
-// barriers as nf_native_graph_commands describes. Its descriptor sets come from hold slot `hold`'s own pool (0..15, made on first use),
+// barriers as nf_native_graph_commands describes. Its descriptor sets come from hold slot `hold`'s own pool (0..nf_native_hold_slots(), exclusive; made on first use),
 // which this call resets first: the caller guarantees that no command buffer recorded with that hold slot
 // may still be submitted or pending. The recording reads the build's activations, so the build must not be
 // dropped (a rebuild, nf_native_fall_back_to_barriers, nf_native_close) while any such buffer may still be

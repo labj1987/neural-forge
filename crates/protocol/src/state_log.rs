@@ -129,7 +129,8 @@ pub fn append(path: &Path, line: &str, rotate_at: u64) -> std::io::Result<()> {
             return Err(std::io::Error::last_os_error());
         }
         let meta = file.metadata()?;
-        let current = std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()));
+        // What `path` names now, through a symlink as the open above went (a layer.log linked elsewhere is written).
+        let current = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
         if current != Some((meta.dev(), meta.ino())) {
             continue; // rotated away between the open and the lock
         }
@@ -228,6 +229,20 @@ mod tests {
         assert_eq!(parse_line("[neural-forge-layer] [layer] VK_ERROR_DEVICE_LOST; device-lost"), None);
         assert_eq!(parse_line("x\t2\tgame\tdevice-lost\tm"), None);
         assert!(parse_line("1\t2\tgame\tdevice-lost\t").is_some());
+    }
+
+    /// A log file that is a symlink is written through, not taken for one rotated away on every try.
+    #[test]
+    fn a_symlinked_log_is_written_through() {
+        let dir = scratch("symlink");
+        let state = dir.join("neural-forge");
+        std::fs::create_dir_all(&state).unwrap();
+        let elsewhere = dir.join("elsewhere.log");
+        std::fs::write(&elsewhere, "").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, state.join(FILE_NAME)).unwrap();
+        append(&state.join(FILE_NAME), &format_line(1, 1, "a", ATTACH, "first"), 1 << 20).unwrap();
+        assert!(std::fs::read_to_string(&elsewhere).unwrap().contains("first"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

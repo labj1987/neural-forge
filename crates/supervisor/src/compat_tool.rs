@@ -32,12 +32,16 @@ pub fn current(root: &Path, appid: &str) -> Option<String> {
     proton_tool::mapped_tool(root, appid).filter(|n| !n.is_empty())
 }
 
-fn read_record(root: &Path) -> Vec<(String, String)> {
-    std::fs::read_to_string(record_path(root))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_once('\t').map(|(a, t)| (a.to_string(), t.to_string())))
-        .collect()
+/// The record of what each game had before. A missing file is an empty record; one that cannot be read is an error,
+/// never taken for empty: writing over it would lose what other games must get back.
+fn read_record(root: &Path) -> Result<Vec<(String, String)>, String> {
+    let path = record_path(root);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{} cannot be read ({e}): the Protons games had before are kept there", path.display())),
+    };
+    Ok(text.lines().filter_map(|l| l.split_once('\t').map(|(a, t)| (a.to_string(), t.to_string()))).collect())
 }
 
 fn write_record(root: &Path, entries: &[(String, String)]) -> std::io::Result<()> {
@@ -321,10 +325,16 @@ fn switch_on_core(root: &Path, libraries: &[PathBuf], appid: &str, wrapper: &Pat
         }
     };
     // The record first: an edit it does not record could never be put back.
-    let before = read_record(root);
+    let before = read_record(root)?;
     let mut record = before.clone();
-    if from_tool.is_none() && !record.iter().any(|(a, _)| a == appid) {
-        record.push((appid.to_string(), now.clone().unwrap_or_default()));
+    // Not on a Neural Forge copy now: what the game runs with is the user's latest choice (made in Steam since an earlier
+    // switch-on, if the game has a record), and that is what switching off puts back.
+    if from_tool.is_none() {
+        let previous = now.clone().unwrap_or_default();
+        match record.iter_mut().find(|(a, _)| a == appid) {
+            Some(entry) => entry.1 = previous,
+            None => record.push((appid.to_string(), previous)),
+        }
     }
     if record != before {
         write_record(root, &record).map_err(|e| e.to_string())?;
@@ -341,7 +351,7 @@ fn switch_on_core(root: &Path, libraries: &[PathBuf], appid: &str, wrapper: &Pat
 /// Puts back the Proton `appid` had before [`switch_on`] (removing the entry where it had none). Nothing to do
 /// for a game Neural Forge did not set. Refused while Steam runs.
 pub fn switch_off(root: &Path, appid: &str, steam_running: bool) -> Result<Option<String>, String> {
-    let mut record = read_record(root);
+    let mut record = read_record(root)?;
     let Some(at) = record.iter().position(|(a, _)| a == appid) else { return Ok(None) };
     if steam_running {
         return Err("Steam is running: close it to put the game's Proton back".into());
@@ -372,7 +382,7 @@ fn remove_entry(old: &[u8], path: &[&str]) -> Result<Option<Vec<u8>>, String> {
 
 /// [`switch_off`] for every game Neural Forge set (uninstall --purge).
 pub fn switch_all_off(root: &Path, steam_running: bool) -> Result<Vec<String>, String> {
-    let apps: Vec<String> = read_record(root).into_iter().map(|(a, _)| a).collect();
+    let apps: Vec<String> = read_record(root)?.into_iter().map(|(a, _)| a).collect();
     for a in &apps {
         switch_off(root, a, steam_running)?;
     }
@@ -724,7 +734,7 @@ mod tests {
         assert_eq!(on.tool, "Proton-experimental-11.0-NeuralForge");
         let text = std::fs::read_to_string(root.join("config/config.vdf")).unwrap();
         assert!(text.contains("\t\t\t\t\"SurveyDate\"\t\t\"2026-11-01\"\n\t\t\t\t\"CompatToolMapping\"\n\t\t\t\t{\n\t\t\t\t\t\"1174180\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"name\"\t\t\"Proton-experimental-11.0-NeuralForge\""), "{text}");
-        assert_eq!(read_record(&root), [("1174180".to_string(), String::new())]);
+        assert_eq!(read_record(&root).unwrap(), [("1174180".to_string(), String::new())]);
         assert_eq!(switch_off(&root, "1174180", false).unwrap().as_deref(), Some(""));
         // A config.vdf that cannot be edited: the record goes back to what it was.
         std::fs::write(root.join("config/config.vdf"), "\"InstallConfigStore\"\n{\n}\n").unwrap();
@@ -1319,6 +1329,37 @@ mod tests {
         std::fs::create_dir_all(&procs).unwrap();
         let e = update_in(&root, &copy, &root.join("missing.dll"), false, &procs).unwrap_err();
         assert!(e.contains("before that: moved") && e.contains(OLD), "{e}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Switched on, then another Proton chosen in Steam, then switched on again: switching off puts back the one chosen
+    /// last, not the first.
+    #[test]
+    fn switching_on_again_after_choosing_another_proton_records_the_new_choice() {
+        let (root, lib, w) = steam("rechoose");
+        let libs = std::slice::from_ref(&lib);
+        switch_on(&root, libs, "1091500", &w, false).unwrap().unwrap();
+        edit(&root, |old| set_name(old, "1091500", "proton_experimental")).unwrap();
+        let on = switch_on(&root, libs, "1091500", &w, false).unwrap().unwrap();
+        assert_eq!((on.tool.as_str(), on.previous.as_deref()), ("Proton-experimental-11.0-NeuralForge", Some("proton_experimental")));
+        assert_eq!(switch_off(&root, "1091500", false).unwrap().as_deref(), Some("proton_experimental"));
+        assert_eq!(current(&root, "1091500").as_deref(), Some("proton_experimental"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A record that exists but cannot be read is never taken for an empty one and written over.
+    #[test]
+    fn an_unreadable_record_refuses_the_switch() {
+        let (root, lib, w) = steam("unreadable");
+        let libs = std::slice::from_ref(&lib);
+        std::fs::create_dir_all(record_path(&root)).unwrap();
+        let before = std::fs::read(root.join("config/config.vdf")).unwrap();
+        let e = switch_on(&root, libs, "1091500", &w, false).unwrap_err();
+        assert!(e.contains("cannot be read"), "{e}");
+        assert!(switch_off(&root, "1091500", false).unwrap_err().contains("cannot be read"));
+        assert!(switch_all_off(&root, false).is_err());
+        assert_eq!(std::fs::read(root.join("config/config.vdf")).unwrap(), before);
+        assert!(record_path(&root).is_dir());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

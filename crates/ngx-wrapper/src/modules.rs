@@ -294,8 +294,9 @@ mod win {
     mod tests {
         use super::*;
 
-        /// Under Wine (`cargo test --target x86_64-pc-windows-gnu`, the runner in the cargo config): the module
-        /// listing and the version read work on a real system DLL.
+        /// Under Wine, run by hand (no cargo config names a runner, and CI runs only the host tests):
+        /// `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test --target x86_64-pc-windows-gnu` in
+        /// crates/ngx-wrapper. The module listing and the version read work on a real system DLL.
         #[test]
         fn lists_modules_and_reads_a_file_version() {
             let modules = loaded();

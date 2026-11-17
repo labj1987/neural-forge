@@ -197,7 +197,7 @@ model ran before the upscaler. `scripts/bench-report.py --self-test` checks its 
   `--fg` names a run where it did not engage and leaves it out of `--mean`. Whether frame generation
   works and how the game feels is the maintainer's check, playing.
 
-**Resolution.** Never change the desktop's display mode for a run (it stays at 3840x2160, 144 Hz, VRR,
+**Resolution.** Never change the desktop's display mode for a run (it stays at 2560x1440, 288 Hz, VRR,
 HDR); set the game's own resolution instead: `ScreenWidth` and `ScreenHeight` in GTA's `settings.xml`
 (the game sweep sets 2560x1440 and puts the file back; `gta-bench.sh` uses the file as found), checked
 afterwards with `sha256sum` against the value taken before. The layer's log names the size the game

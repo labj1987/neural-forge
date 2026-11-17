@@ -465,8 +465,8 @@ pub struct ShmHeader {
     // Appended after everything else on purpose: a new field inserted higher up would move
     // every field below it. See
     // `docs/PROTOCOL_V3_DESIGN.md` for why only these five are duplicated (not, say,
-    // `format`/`hdr_encode`/`answered_w`/`answered_h`, which are dead fields on slot 0
-    // too -- nothing in this workspace reads or writes them today).
+    // `format`/`hdr_encode`/`answered_w`/`answered_h`, which slot 0 alone carries: the layer writes the
+    // request's format and encode, the model server its answered size, for both slots' requests).
     pub seq_req_b: AtomicU32,
     pub seq_resp_b: AtomicU32,
     pub width_b: AtomicU32,
@@ -1957,27 +1957,29 @@ impl ShmHeader {
     }
 
     fn mask_settings_now(&self) -> MaskSettings {
-        let f = |a: &AtomicU32, name: &str| {
+        // A value that is not a number is the setting's default ([`MaskSettings::OFF`]'s), as the other readers do.
+        let f = |a: &AtomicU32, name: &str, default: f32| {
             let (lo, hi) = setting_bounds(name).expect("a mask setting");
             let v = f32::from_bits(a.load(Ordering::Relaxed));
             if v.is_finite() {
                 v.clamp(lo, hi)
             } else {
-                lo
+                default
             }
         };
+        let d = MaskSettings::OFF;
         let on = |a: &AtomicU32| a.load(Ordering::Relaxed) != 0;
         MaskSettings {
             sky: on(&self.mask_sky),
-            sky_margin: f(&self.mask_sky_margin_bits, "mask_sky_margin"),
+            sky_margin: f(&self.mask_sky_margin_bits, "mask_sky_margin", d.sky_margin),
             dark: on(&self.mask_dark),
-            dark_threshold: f(&self.mask_dark_threshold_bits, "mask_dark_threshold"),
-            dark_intensity: f(&self.mask_dark_intensity_bits, "mask_dark_intensity"),
-            dark_structure: f(&self.mask_dark_structure_bits, "mask_dark_structure"),
+            dark_threshold: f(&self.mask_dark_threshold_bits, "mask_dark_threshold", d.dark_threshold),
+            dark_intensity: f(&self.mask_dark_intensity_bits, "mask_dark_intensity", d.dark_intensity),
+            dark_structure: f(&self.mask_dark_structure_bits, "mask_dark_structure", d.dark_structure),
             motion: on(&self.mask_motion),
-            motion_threshold: f(&self.mask_motion_threshold_bits, "mask_motion_threshold"),
-            motion_intensity: f(&self.mask_motion_intensity_bits, "mask_motion_intensity"),
-            motion_structure: f(&self.mask_motion_structure_bits, "mask_motion_structure"),
+            motion_threshold: f(&self.mask_motion_threshold_bits, "mask_motion_threshold", d.motion_threshold),
+            motion_intensity: f(&self.mask_motion_intensity_bits, "mask_motion_intensity", d.motion_intensity),
+            motion_structure: f(&self.mask_motion_structure_bits, "mask_motion_structure", d.motion_structure),
         }
     }
 
@@ -2425,7 +2427,10 @@ pub fn store64(lo: &AtomicU32, hi: &AtomicU32, v: u64) {
 /// memory image is the same byte string it always was.
 ///
 /// There is exactly one writer per field. If a previous writer died mid-write and left
-/// the sequence odd, it is simply carried through to the next even value.
+/// the sequence odd, the next write takes the next odd value (never the dead one's, which readers may
+/// already treat as dead) and ends on the even value after it. A reader that finds the same odd value
+/// on two looks [`STUCK_FOR`] apart takes its writer for dead and reads the field as it was left
+/// ([`text_writer_dead`]), instead of an empty string until the next write.
 /// What a reason field ([`ShmHeader::layer_reason`], [`ShmHeader::preupscale_reason`]) keeps of `s`: at most
 /// `REASON_BYTES - 1` bytes, cut at a character boundary. A writer that compares its line with the field's compares
 /// this, or a line longer than the field never matches and is written again every time.
@@ -2446,7 +2451,8 @@ fn stored_len(s: &str, max: usize) -> usize {
 fn store_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W], s: &str) {
     let bytes = s.as_bytes();
     let n = stored_len(s, W * 4 - 1);
-    let odd = seq.load(Ordering::Relaxed) | 1;
+    let now = seq.load(Ordering::Relaxed);
+    let odd = if now & 1 != 0 { now.wrapping_add(2) } else { now | 1 };
     seq.store(odd, Ordering::Relaxed);
     // Keeps the odd store ordered before the data writes below, as far as a reader
     // that pairs it with an acquire fence is concerned.
@@ -2481,7 +2487,37 @@ fn load_words_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W
     None
 }
 
+/// The odd sequence values of text fields readers found, each with the field's sequence address and when it was
+/// first seen: the same value seen again [`STUCK_FOR`] later is a writer that died inside its write. A few fields' worth.
+static ODD_TEXT: std::sync::Mutex<Vec<(usize, u32, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `seq`'s odd `value` has stayed for [`STUCK_FOR`] since a read first found it (its writer died mid-write).
+/// Never waits: the first look records it and says no.
+fn text_writer_dead(seq: &AtomicU32, value: u32) -> bool {
+    let at = std::ptr::from_ref(seq) as usize;
+    let now = std::time::Instant::now();
+    let mut seen = ODD_TEXT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match seen.iter_mut().find(|e| e.0 == at) {
+        Some(e) if e.1 == value => now.duration_since(e.2) >= STUCK_FOR,
+        Some(e) => {
+            (e.1, e.2) = (value, now);
+            false
+        }
+        None => {
+            if seen.len() >= 16 {
+                seen.remove(0);
+            }
+            seen.push((at, value, now));
+            false
+        }
+    }
+}
+
 fn load_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W]) -> String {
+    let text = |snapshot: &[u8]| {
+        let end = snapshot.iter().position(|&b| b == 0).unwrap_or(snapshot.len());
+        String::from_utf8_lossy(&snapshot[..end]).into_owned()
+    };
     for _ in 0..16 {
         let before = seq.load(Ordering::Acquire);
         if before & 1 != 0 {
@@ -2495,9 +2531,14 @@ fn load_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W]) -> 
         }
         std::sync::atomic::fence(Ordering::Acquire);
         if seq.load(Ordering::Relaxed) == before {
-            let end = snapshot.iter().position(|&b| b == 0).unwrap_or(snapshot.len());
-            return String::from_utf8_lossy(&snapshot[..end]).into_owned();
+            return text(&snapshot);
         }
+    }
+    // Still odd: a writer inside its write, or one that died there and left it so.
+    let odd = seq.load(Ordering::Acquire);
+    if odd & 1 != 0 && text_writer_dead(seq, odd) {
+        let snapshot: Vec<u8> = words.iter().flat_map(|w| w.load(Ordering::Relaxed).to_le_bytes()).collect();
+        return text(&snapshot);
     }
     String::new()
 }
@@ -2533,6 +2574,33 @@ mod tests {
         }
         writer.join().unwrap();
         assert_eq!(h.layer_reason_seq.load(Ordering::Relaxed) & 1, 0);
+    }
+
+    /// A writer that died inside its write leaves the sequence odd: readers give the field as it was left once the
+    /// same odd value has stayed for STUCK_FOR, and the next write moves past that value.
+    #[test]
+    fn a_text_field_left_odd_by_a_dead_writer_is_read_again() {
+        let h = ShmHeader::default();
+        h.set_game_name("GTA5_Enhanced.exe");
+        let even = h.game_name_seq.load(Ordering::Relaxed);
+        h.game_name_seq.store(even + 1, Ordering::Release);
+        assert_eq!(h.game_name(), "", "maybe a live writer: not read yet");
+        std::thread::sleep(STUCK_FOR + std::time::Duration::from_millis(10));
+        assert_eq!(h.game_name(), "GTA5_Enhanced.exe", "the same odd value STUCK_FOR later: a dead writer");
+        h.set_game_name("RDR2.exe");
+        assert_eq!(h.game_name_seq.load(Ordering::Relaxed), even + 4, "written under the odd value after the dead one");
+        assert_eq!(h.game_name(), "RDR2.exe");
+    }
+
+    /// A mask value that is not a number reads as the setting's default, not as its lower bound.
+    #[test]
+    fn a_mask_value_that_is_not_a_number_is_its_default() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+        h.mask_dark_intensity_bits.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        h.mask_motion_threshold_bits.store(f32::INFINITY.to_bits(), Ordering::Relaxed);
+        let m = h.mask_settings();
+        assert_eq!((m.dark_intensity, m.motion_threshold), (MaskSettings::OFF.dark_intensity, MaskSettings::OFF.motion_threshold));
     }
 
     #[test]

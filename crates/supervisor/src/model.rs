@@ -788,7 +788,7 @@ fn extracted(dir: PathBuf, network: Network, version: [u16; 4], tensors: &[Tenso
     Extracted {
         dir,
         network,
-        build: format!("{}.{}.{}", version[0], version[1], version[2]),
+        build: format!("{}.{}.{}.{}", version[0], version[1], version[2], version[3]),
         verified: is_verified(network, version),
         tensors: tensors.len(),
         bytes: tensors.iter().map(|t| t.bytes.len()).sum(),
@@ -1442,7 +1442,7 @@ mod tests {
         std::fs::write(dir.join(DLL_NAME), dll_with("WEIGHTS_CC_SMALL_FP8", &blob_of(&small), [310, 9, 16, 0])).unwrap();
         let root = dir.join("model");
         let done = extract_shaped(&dir, &root, Network::Small, &table(&small)).unwrap();
-        assert_eq!((done.network, done.build.as_str(), done.verified), (Network::Small, "310.9.16", true));
+        assert_eq!((done.network, done.build.as_str(), done.verified), (Network::Small, "310.9.16.0", true));
         assert_eq!(installed_verified(&network_dir(&root, Network::Small)), Some(true));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1679,7 +1679,8 @@ mod tests {
         std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 8, 0, 3])).unwrap();
         let root = dir.join("model");
         let done = extract_shaped(&dir, &root, Network::Full, &table(&shape())).unwrap();
-        assert_eq!((done.build.as_str(), done.verified, done.tensors), ("310.8.0", true, TENSOR_COUNT));
+        assert_eq!((done.build.as_str(), done.verified, done.tensors), ("310.8.0.3", true, TENSOR_COUNT));
+        assert_eq!(installed(&network_dir(&root, Network::Full)).as_deref(), Some(done.build.as_str()), "the same four parts as the manifest");
         let out = network_dir(&root, Network::Full);
         assert_eq!(installed_network(&out), Some(Network::Full));
         assert!(out.join("manifest.json").is_file() && out.join("model/vit.e4m3").is_file());
@@ -1699,7 +1700,7 @@ mod tests {
         std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 9, 1, 0])).unwrap();
         let root = dir.join("model");
         let done = extract_shaped(&dir, &root, Network::Full, &table(&shape())).unwrap();
-        assert_eq!((done.build.as_str(), done.verified), ("310.9.1", false));
+        assert_eq!((done.build.as_str(), done.verified), ("310.9.1.0", false));
         let out = network_dir(&root, Network::Full);
         assert_eq!(installed(&out).as_deref(), Some("310.9.1.0"));
         assert_eq!(installed_verified(&out), Some(false));

@@ -109,10 +109,24 @@ fn value_of<'t>(lead: &'t [String], prefix: &str) -> Option<&'t str> {
     Some(['\'', '"'].iter().find_map(|q| raw.strip_prefix(*q).and_then(|v| v.strip_suffix(*q))).unwrap_or(raw))
 }
 
-/// The tokens before `%command%` and the ones after it; `None` without a `%command%`.
-fn around_command(tokens: &[String]) -> Option<(&[String], &[String])> {
-    let at = tokens.iter().position(|t| t == COMMAND)?;
-    Some((&tokens[..at], &tokens[at + 1..]))
+/// Whether `token` is `%command%` on its own, quoted or not.
+fn is_command(token: &str) -> bool {
+    token == COMMAND || token == "\"%command%\"" || token == "'%command%'"
+}
+
+/// The tokens before the one with `%command%`, that token, and the ones after it; `None` without a `%command%`.
+/// The token is `%command%` on its own ([`is_command`]), else the first that holds it inside other text (`sh -c
+/// 'X=1 %command%'`).
+fn around_command(tokens: &[String]) -> Option<(&[String], &str, &[String])> {
+    let at = tokens.iter().position(|t| is_command(t)).or_else(|| tokens.iter().position(|t| t.contains(COMMAND)))?;
+    Some((&tokens[..at], &tokens[at], &tokens[at + 1..]))
+}
+
+/// Whether `options` has `%command%` only inside a longer token (`sh -c '... %command%'`), never on its own. Such a
+/// string is not edited (Steam's config is left alone, `steam::apply`): the user pastes [`merge`]'s string instead.
+pub fn command_inside_token(options: &str) -> bool {
+    let tokens = split_tokens(options);
+    !tokens.iter().any(|t| is_command(t)) && tokens.iter().any(|t| t.contains(COMMAND))
 }
 
 /// Whether `before` (the tokens before `%command%`) turns Neural Forge on: the leading assignments
@@ -128,14 +142,14 @@ fn enables(before: &[String]) -> bool {
 /// Forge's variables after a wrapper.
 pub fn is_enabled(options: &str) -> bool {
     let tokens = split_tokens(options);
-    around_command(&tokens).is_some_and(|(before, _)| enables(before))
+    around_command(&tokens).is_some_and(|(before, _, _)| enables(before))
 }
 
 /// Whether `options` turns Neural Forge on ([`is_enabled`]) with a target executable
 /// (`NEURAL_FORGE_TARGET_EXE=` with a value, among the same leading variables).
 pub fn has_target(options: &str) -> bool {
     let tokens = split_tokens(options);
-    around_command(&tokens).is_some_and(|(before, _)| enables(before) && value_of(leading(before), TARGET_PREFIX).is_some_and(|v| !v.trim().is_empty()))
+    around_command(&tokens).is_some_and(|(before, _, _)| enables(before) && value_of(leading(before), TARGET_PREFIX).is_some_and(|v| !v.trim().is_empty()))
 }
 
 /// `existing` with Neural Forge turned on. Returned unchanged (byte for byte) when it already is
@@ -148,7 +162,7 @@ pub fn merge(existing: &str, target_exe: &str) -> String {
     let wanted_target = (!target_exe.is_empty()).then(|| format!("{TARGET_PREFIX}{}", shell_quote(target_exe)));
     let tokens = split_tokens(existing);
     let command = around_command(&tokens);
-    let (before, after): (&[String], &[String]) = command.unwrap_or((&[], &tokens));
+    let (before, command_token, after): (&[String], &str, &[String]) = command.unwrap_or((&[], COMMAND, &tokens));
     let lead = leading(before);
     let current_target = lead.iter().rev().find(|t| t.starts_with(TARGET_PREFIX));
     if command.is_some() && enables(before) && wanted_target.as_ref().is_none_or(|w| current_target == Some(w)) {
@@ -158,7 +172,7 @@ pub fn merge(existing: &str, target_exe: &str) -> String {
     let mut out = vec![ENABLE.to_string()];
     out.extend(wanted_target.or(kept_target));
     out.extend(before.iter().filter(|t| !ours(t)).cloned());
-    out.push(COMMAND.to_string());
+    out.push(command_token.to_string());
     out.extend(after.iter().filter(|t| command.is_some() || !ours(t)).cloned());
     out.join(" ")
 }
@@ -168,18 +182,18 @@ pub fn merge(existing: &str, target_exe: &str) -> String {
 /// a result of nothing but `%command%` becomes the empty string, Steam's "no launch options".
 pub fn strip(existing: &str) -> String {
     let tokens = split_tokens(existing);
-    let Some((before, after)) = around_command(&tokens) else {
+    let Some((before, command, after)) = around_command(&tokens) else {
         return existing.to_string();
     };
     if !before.iter().any(|t| ours(t)) {
         return existing.to_string();
     }
     let rest: Vec<String> = before.iter().filter(|t| !ours(t)).cloned().collect();
-    if rest.is_empty() && after.is_empty() {
+    if rest.is_empty() && after.is_empty() && command == COMMAND {
         return String::new();
     }
     let mut out = rest;
-    out.push(COMMAND.to_string());
+    out.push(command.to_string());
     out.extend(after.iter().cloned());
     out.join(" ")
 }
@@ -219,6 +233,24 @@ mod tests {
         assert_eq!(neural_forge_part("-login user pass"), OMITTED);
         assert_eq!(neural_forge_part("MANGOHUD=1 NEURAL_FORGE_LOG=/tmp/l %command%"), "<other options omitted> NEURAL_FORGE_LOG=/tmp/l %command%");
         assert_eq!(neural_forge_part(""), "");
+    }
+
+    /// `%command%` quoted on its own is the command; inside a longer token (`sh -c '...'`) Neural Forge's variables go
+    /// in front of the whole line (the shell's environment is the game's), and such a string is flagged.
+    #[test]
+    fn a_quoted_or_embedded_command_is_found() {
+        assert!(is_enabled("NEURAL_FORGE_ENABLE=1 \"%command%\""));
+        assert!(is_enabled("NEURAL_FORGE_ENABLE=1 '%command%' -x"));
+        assert_eq!(merge("MANGOHUD=1 \"%command%\" -x", "a.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=a.exe MANGOHUD=1 \"%command%\" -x");
+        assert_eq!(strip("NEURAL_FORGE_ENABLE=1 MANGOHUD=1 \"%command%\" -x"), "MANGOHUD=1 \"%command%\" -x");
+        let embedded = "sh -c 'MANGOHUD=1 %command%'";
+        assert!(command_inside_token(embedded));
+        assert!(!command_inside_token("MANGOHUD=1 %command% -x") && !command_inside_token("-x") && !command_inside_token("'%command%'"));
+        let merged = merge(embedded, "a.exe");
+        assert_eq!(merged, "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=a.exe sh -c 'MANGOHUD=1 %command%'");
+        assert!(is_enabled(&merged) && has_target(&merged) && !is_enabled(embedded));
+        assert_eq!(merge(&merged, "a.exe"), merged);
+        assert_eq!(strip(&merged), embedded);
     }
 
     #[test]

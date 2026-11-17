@@ -80,6 +80,8 @@ says "missing library" "these system libraries are missing: libxkbcommon-x11.so.
 says "missing library" "Install them with: sudo apt install libxkbcommon-x11-0. Then start Neural Forge again."
 if run LIBCHECK_OS_RELEASE="$tmp/fedora"; then fail "missing library (Fedora): AppRun exited 0"; fi
 says "missing library (Fedora)" "Install them with: sudo dnf install 'libxkbcommon-x11.so.0()(64bit)'."
+if run LIBCHECK_OS_RELEASE="$tmp/fedora" LIBCHECK_OSTREE_BOOTED="$tmp/fedora"; then fail "missing library (Fedora Silverblue): AppRun exited 0"; fi
+says "missing library (Fedora Silverblue)" "Install them with: rpm-ostree install 'libxkbcommon-x11.so.0()(64bit)', and restart the computer."
 if run LIBCHECK_OS_RELEASE="$tmp/gentoo"; then fail "missing library (unknown system): AppRun exited 0"; fi
 says "missing library (unknown system)" "Install the packages that provide them with your package manager, then start Neural Forge again."
 # A library the table does not know: the command that finds its package.
