@@ -77,10 +77,24 @@ pub struct PassTunings {
     pub colour: ColourSettings,
     /// Each pass's placement ([`ShmHeader::placements`]).
     pub placements: [u32; crate::MAX_PASSES],
+    /// The same passes where they run after DLSS's output or on the finished frame (the "After DLSS / finished
+    /// frame" group, #73): the group's own values in place of the Model tab's where it sets them, each pass's own
+    /// overrides still on top. The fields above are the passes before the upscaler.
+    pub after: GroupTunings,
+}
+
+/// The passes of one settings group ([`PassTunings::after`]): how many a frame runs with this group, and each
+/// pass's settings, model resolution and colour of the edit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroupTunings {
+    pub count: usize,
+    pub tunings: [Tuning; crate::MAX_PASSES],
+    pub scales: [f32; crate::MAX_PASSES],
+    pub colour: [EditColour; crate::MAX_PASSES],
 }
 
 impl PassTunings {
-    /// One pass with `tuning`, at full size.
+    /// One pass with `tuning`, at full size, the same before and after DLSS.
     pub fn single(tuning: Tuning) -> Self {
         Self {
             count: 1,
@@ -89,12 +103,43 @@ impl PassTunings {
             scales: [1.0; crate::MAX_PASSES],
             colour: ColourSettings::DEFAULT,
             placements: [crate::enums::placement::AUTO; crate::MAX_PASSES],
+            after: GroupTunings {
+                count: 1,
+                tunings: [tuning; crate::MAX_PASSES],
+                scales: [1.0; crate::MAX_PASSES],
+                colour: [EditColour::NEUTRAL; crate::MAX_PASSES],
+            },
         }
     }
 
     pub fn passes(&self) -> &[Tuning] {
         &self.tunings[..self.count]
     }
+
+    /// These passes as a frame runs them after DLSS or on the finished frame: the After DLSS group's count,
+    /// settings, model resolutions and colour in place of the ones before the upscaler (the stack's colour
+    /// controls, the feedback and the placements stay).
+    pub fn after_dlss(&self) -> Self {
+        Self {
+            count: self.after.count,
+            tunings: self.after.tunings,
+            scales: self.after.scales,
+            colour: ColourSettings { each: self.after.colour, ..self.colour },
+            ..*self
+        }
+    }
+}
+
+/// The pass counts and each pass's placement ([`ShmHeader::placements`]), read as one unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placements {
+    /// The Passes setting: how many passes a frame runs where its first pass runs before the upscaler.
+    pub before: usize,
+    /// The After DLSS group's Passes (`after_passes`; the Passes setting where that is 0, "the same"): how many
+    /// passes a frame runs where none runs before the upscaler (after DLSS's output, or on the finished frame).
+    pub after: usize,
+    /// Each pass's placement ([`crate::enums::placement`]).
+    pub each: [u32; crate::MAX_PASSES],
 }
 
 /// One pass's own values for the colour of the edit ([`ShmHeader::pass_colour`]); which of them it uses
@@ -729,6 +774,46 @@ pub struct ShmHeader {
     /// (saturating). Both 0 without a wrapper.
     pub ngx_records: AtomicU32,
     pub ngx_matched: AtomicU32,
+
+    // --- v28 -----------------------------------------------------------------------------
+    /// The second GPU shows the frame itself (`second_gpu_present`; the layer's `gpu2_present`): with the model on
+    /// a second GPU and every pass on the finished frame, that GPU presents the model's output on a swapchain of its
+    /// own and the game's GPU only copies each frame out, never waiting for an answer. 0 off (the frame comes back to
+    /// the game's GPU), 1 on. Read when the game creates its swapchain.
+    pub second_gpu_present: AtomicU32,
+    /// What the layer says about it: which GPU shows the frames, how many were shown and skipped and the copy's
+    /// time, or why the frames come back to the game's GPU. Empty while the setting is off. Sequence-guarded like
+    /// `layer_reason`.
+    pub second_gpu_present_seq: AtomicU32,
+    second_gpu_present_line: [AtomicU32; REASON_BYTES / 4],
+
+    // --- v29 -----------------------------------------------------------------------------
+    /// The presented frame's own size (the swapchain image the layer captured), written with every capture.
+    /// `layer_width`/`layer_height` are the raster the model is shown, which is smaller at a Model resolution below
+    /// Full on the finished frame; the two together say what share of the frame the model works at. 0 until a frame
+    /// was captured.
+    pub frame_width: AtomicU32,
+    pub frame_height: AtomicU32,
+
+    // --- v30 -----------------------------------------------------------------------------
+    /// The "After DLSS / finished frame" settings group (#73; docs/USER_GUIDE.md, "After DLSS and the finished
+    /// frame"): what a frame uses where the model runs after DLSS's output or on the finished frame, whether by the
+    /// Placement setting, by Auto (Ray Reconstruction on) or by a fall-back. `after_passes`: the passes of a frame none
+    /// of whose passes runs before the upscaler, 1 to [`crate::MAX_PASSES`]; 0 (the default) the Passes setting.
+    pub after_passes: AtomicU32,
+    /// f32 bits: the model resolution after DLSS's output, a scale of DLSS's output size
+    /// ([`crate::enums::model_scale`]); 0 (the default) `preupscale_scale`. A pass's own `pass<N>_scale` wins. The
+    /// finished frame keeps its own (`working_scale`).
+    pub after_scale_bits: AtomicU32,
+    /// The group's image settings (`after_overrides`, [`crate::enums::pass_override`] bits for the intensity, the
+    /// local tone and structure, the skin structure, the style, the auto mask and the colour of the edit; the
+    /// others mean nothing here): each one set replaces the Model tab's value for every pass that runs after DLSS or
+    /// on the finished frame, and a pass's own override still wins over it. Default none.
+    pub after: PassControl,
+    pub after_colour: PassColour,
+    /// Which group the current placement uses ([`crate::enums::settings_group`]), for the Status tab. Written by
+    /// the layer when it plans a frame's passes; [`crate::enums::settings_group::NONE`] when a session starts.
+    pub settings_group: AtomicU32,
 }
 
 /// The room for [`ShmHeader::hdr_verdict`]'s text, in bytes.
@@ -851,7 +936,10 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 3300, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 3560, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, after_passes) == 3508, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, after) == 3516, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, settings_group) == 3556, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_verdict_seq) == 2776, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_verdict) == 2780, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, ngx_records) == 3292, "layout changed -- bump SHM_VERSION");
@@ -915,7 +1003,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 187] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 200] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -1116,16 +1204,39 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 187] = [
     ("pass10_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
     // The HUD at present: its detection.
     ("hud_detect", 0.0, 1.0),
+    // The second GPU shows the frame itself.
+    ("second_gpu_present", 0.0, 1.0),
     // What the network sees before the upscaler: its brightness, and where the exposure comes from
     // (`enums::exposure_source`).
     ("preupscale_brightness", 0.25, 4.0),
     ("preupscale_exposure", 0.0, (crate::enums::exposure_source::COUNT - 1) as f32),
+    // The After DLSS / finished frame group: its passes (0 the Passes setting), its model resolution after DLSS
+    // (0 `preupscale_scale`), and its image overrides (`enums::pass_override` bits) with their values.
+    ("after_passes", 0.0, crate::MAX_PASSES as f32),
+    ("after_scale", 0.0, 1.0),
+    ("after_overrides", 0.0, 2047.0),
+    ("after_intensity", 0.0, 4.0),
+    ("after_local_tone", 0.0, 4.0),
+    ("after_local_structure", 0.0, 4.0),
+    ("after_skin_structure", -1.0, 4.0),
+    ("after_style", 0.0, 2.0),
+    ("after_auto_mask", 0.0, 1.0),
+    ("after_edit_saturation", 0.0, 4.0),
+    ("after_edit_contrast", 0.0, 4.0),
+    ("after_edit_detail", 0.0, 4.0),
 ];
 
 /// The persisted name of pass `pass`'s (0 is pass 1) `field` (`overrides`, `intensity`, `local_tone`,
 /// `local_structure`, `skin_structure`, `style`, `auto_mask`, `scale`): `pass<N>_<field>`.
 pub fn pass_setting(pass: usize, field: &str) -> Option<&'static str> {
     let name = format!("pass{}_{field}", pass + 1);
+    SETTING_BOUNDS.iter().map(|&(n, ..)| n).find(|n| *n == name)
+}
+
+/// The persisted name of the After DLSS group's `field` (`overrides`, `intensity`, ..., `edit_detail`, `passes`,
+/// `scale`): `after_<field>`.
+pub fn after_setting(field: &str) -> Option<&'static str> {
+    let name = format!("after_{field}");
     SETTING_BOUNDS.iter().map(|&(n, ..)| n).find(|n| *n == name)
 }
 
@@ -1205,6 +1316,11 @@ impl ShmHeader {
         for p in &self.pass {
             p.reset_to_defaults();
         }
+        // The After DLSS group: the same as before the upscaler in everything.
+        self.after_passes.store(0, Ordering::Relaxed);
+        self.after_scale_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+        self.after.reset_to_defaults();
+        self.after_colour.reset_to_defaults();
         self.network.store(crate::enums::network::FULL, Ordering::Relaxed);
         self.mask_sky.store(1, Ordering::Relaxed);
         self.mask_sky_margin_bits.store(0.00001f32.to_bits(), Ordering::Relaxed);
@@ -1246,6 +1362,7 @@ impl ShmHeader {
             p.store(crate::enums::placement::AUTO, Ordering::Relaxed);
         }
         self.hud_detect.store(1, Ordering::Relaxed);
+        self.second_gpu_present.store(0, Ordering::Relaxed);
         self.store_hud_regions(&[]);
         self.preupscale_brightness_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.preupscale_exposure.store(crate::enums::exposure_source::GAME, Ordering::Relaxed);
@@ -1263,6 +1380,9 @@ impl ShmHeader {
         self.layer_frames_hi.store(0, Ordering::Relaxed);
         self.layer_width.store(0, Ordering::Relaxed);
         self.layer_height.store(0, Ordering::Relaxed);
+        self.frame_width.store(0, Ordering::Relaxed);
+        self.frame_height.store(0, Ordering::Relaxed);
+        self.settings_group.store(crate::enums::settings_group::NONE, Ordering::Relaxed);
         self.layer_format.store(0, Ordering::Relaxed);
         self.layer_composition_up.store(0, Ordering::Relaxed);
         self.layer_ms_bits.store(0, Ordering::Relaxed);
@@ -1300,6 +1420,8 @@ impl ShmHeader {
         self.set_game_name("");
         self.set_preupscale_reason("");
         self.set_hdr_verdict("");
+        self.second_gpu_present_seq.store(0, Ordering::Relaxed);
+        self.set_second_gpu_present_line("");
         for n in [&self.ngx_records, &self.ngx_matched] {
             n.store(0, Ordering::Relaxed);
         }
@@ -1506,13 +1628,13 @@ impl ShmHeader {
     /// under `/tmp` and does not). Add to [`Self::setting_slots`] (and [`SETTING_BOUNDS`]), not just
     /// to the GUI, whenever a new tunable needs to survive a restart -- that is the one list that
     /// decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 187] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 200] {
         self.setting_slots().map(|(name, kind, field)| (name, kind == Kind::Float, field.load(Ordering::Relaxed)))
     }
 
     /// Every persisted setting's name, kind and field, in [`SETTING_BOUNDS`]'s order (a test holds
     /// the two lists to the same names at the same places). Only addresses: nothing is loaded.
-    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 187] {
+    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 200] {
         [
             ("white_point", Kind::Float, &self.white_point_bits),
             ("white_point_scale", Kind::Float, &self.white_point_scale_bits),
@@ -1701,8 +1823,21 @@ impl ShmHeader {
             ("pass9_placement", Kind::Whole, &self.pass_placement[8]),
             ("pass10_placement", Kind::Whole, &self.pass_placement[9]),
             ("hud_detect", Kind::Whole, &self.hud_detect),
+            ("second_gpu_present", Kind::Whole, &self.second_gpu_present),
             ("preupscale_brightness", Kind::Float, &self.preupscale_brightness_bits),
             ("preupscale_exposure", Kind::Whole, &self.preupscale_exposure),
+            ("after_passes", Kind::Whole, &self.after_passes),
+            ("after_scale", Kind::Float, &self.after_scale_bits),
+            ("after_overrides", Kind::Bits, &self.after.overrides),
+            ("after_intensity", Kind::Float, &self.after.intensity_bits),
+            ("after_local_tone", Kind::Float, &self.after.local_tone_bits),
+            ("after_local_structure", Kind::Float, &self.after.local_structure_bits),
+            ("after_skin_structure", Kind::Float, &self.after.skin_structure_bits),
+            ("after_style", Kind::Whole, &self.after.style),
+            ("after_auto_mask", Kind::Whole, &self.after.auto_mask),
+            ("after_edit_saturation", Kind::Float, &self.after_colour.saturation_bits),
+            ("after_edit_contrast", Kind::Float, &self.after_colour.contrast_bits),
+            ("after_edit_detail", Kind::Float, &self.after_colour.detail_bits),
         ]
     }
 
@@ -1710,7 +1845,7 @@ impl ShmHeader {
     /// clamped to the setting's range in [`SETTING_BOUNDS`] (`None` for one that is not finite), a
     /// whole number clamped to it, and an override mask with the bits that name no override cleared.
     /// `None` for a name that is no setting.
-    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 187], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
+    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 200], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
         let at = SETTING_BOUNDS.iter().position(|(n, ..)| *n == name)?;
         let (_, min, max) = SETTING_BOUNDS[at];
         let (slot_name, kind, field) = slots[at];
@@ -1765,20 +1900,84 @@ impl ShmHeader {
 
     fn pass_tunings_now(&self) -> PassTunings {
         let global = self.global_tuning_now();
+        // The After DLSS group's values in place of the Model tab's where it sets its own (#73).
+        let after_global = self.after.apply(global);
         let mut tunings = [global; crate::MAX_PASSES];
-        for (t, p) in tunings.iter_mut().zip(&self.pass) {
+        let mut after_tunings = [after_global; crate::MAX_PASSES];
+        for ((t, a), p) in tunings.iter_mut().zip(after_tunings.iter_mut()).zip(&self.pass) {
             *t = p.apply(global);
+            *a = p.apply(after_global);
         }
         let feedback = f32::from_bits(self.pass_feedback_bits.load(Ordering::Relaxed));
         let feedback = if feedback.is_finite() { feedback.clamp(0.0, 1.0) } else { 1.0 };
         let global_scale = resolved_scale(self.preupscale_scale_bits.load(Ordering::Relaxed));
+        let after_scale = self.after_scale_now().unwrap_or(global_scale);
         let mut scales = [global_scale; crate::MAX_PASSES];
-        for (k, s) in scales.iter_mut().enumerate() {
+        let mut after_scales = [after_scale; crate::MAX_PASSES];
+        for (k, (s, a)) in scales.iter_mut().zip(after_scales.iter_mut()).enumerate() {
             if self.pass[k].overrides.load(Ordering::Relaxed) & crate::enums::pass_override::SCALE != 0 {
                 *s = resolved_scale(self.pass_scale_bits[k].load(Ordering::Relaxed));
+                *a = *s;
             }
         }
-        PassTunings { count: self.resolved_passes() as usize, tunings, feedback, scales, colour: self.colour_now(), placements: self.placements_now() }
+        let colour = self.colour_now();
+        let after_colour = self.each_colour(self.after.apply_colour(&self.after_colour, self.edit_colour_now()));
+        PassTunings {
+            count: self.resolved_passes() as usize,
+            tunings,
+            feedback,
+            scales,
+            colour,
+            placements: self.placements_now(),
+            after: GroupTunings { count: self.resolved_after_passes(), tunings: after_tunings, scales: after_scales, colour: after_colour },
+        }
+    }
+
+    /// The After DLSS group's model resolution (`after_scale`), `None` where it is 0 (the default: the model
+    /// resolution before DLSS) or not a number.
+    fn after_scale_now(&self) -> Option<f32> {
+        let bits = self.after_scale_bits.load(Ordering::Relaxed);
+        let v = f32::from_bits(bits);
+        (v.is_finite() && v > 0.0).then(|| resolved_scale(bits))
+    }
+
+    /// The After DLSS group's pass count: `after_passes` clamped to 1 to [`crate::MAX_PASSES`], the Passes setting
+    /// where it is 0.
+    pub fn resolved_after_passes(&self) -> usize {
+        match self.after_passes.load(Ordering::Relaxed) {
+            0 => self.resolved_passes() as usize,
+            n => (n as usize).clamp(1, crate::MAX_PASSES),
+        }
+    }
+
+    /// The Model tab's colour of the edit, each value clamped to its range (a non-finite one is 1).
+    fn edit_colour_now(&self) -> EditColour {
+        let f = |a: &AtomicU32, name: &str| {
+            let (lo, hi) = setting_bounds(name).expect("a colour setting");
+            let v = f32::from_bits(a.load(Ordering::Relaxed));
+            if v.is_finite() {
+                v.clamp(lo, hi)
+            } else {
+                1.0
+            }
+        };
+        EditColour {
+            saturation: f(&self.edit_saturation_bits, "edit_saturation"),
+            contrast: f(&self.edit_contrast_bits, "edit_contrast"),
+            detail: f(&self.edit_detail_bits, "edit_detail"),
+        }
+    }
+
+    /// Each pass's colour of the edit from `global` (the Model tab's, or the After DLSS group's): the pass's own
+    /// overrides on top, each value within 0 to 4 (a non-finite one is 1).
+    fn each_colour(&self, global: EditColour) -> [EditColour; crate::MAX_PASSES] {
+        let mut each = [global; crate::MAX_PASSES];
+        for ((e, p), own) in each.iter_mut().zip(&self.pass).zip(&self.pass_colour) {
+            let c = p.apply_colour(own, global);
+            let g = |v: f32| if v.is_finite() { v.clamp(0.0, 4.0) } else { 1.0 };
+            *e = EditColour { saturation: g(c.saturation), contrast: g(c.contrast), detail: g(c.detail) };
+        }
+        each
     }
 
     /// The colour of the edit ([`ColourSettings`]), each value clamped to its range (a non-finite one is
@@ -1793,19 +1992,8 @@ impl ShmHeader {
                 default
             }
         };
-        let global = EditColour {
-            saturation: f(&self.edit_saturation_bits, "edit_saturation", 1.0),
-            contrast: f(&self.edit_contrast_bits, "edit_contrast", 1.0),
-            detail: f(&self.edit_detail_bits, "edit_detail", 1.0),
-        };
-        let mut each = [global; crate::MAX_PASSES];
-        for ((e, p), own) in each.iter_mut().zip(&self.pass).zip(&self.pass_colour) {
-            let c = p.apply_colour(own, global);
-            let g = |v: f32| if v.is_finite() { v.clamp(0.0, 4.0) } else { 1.0 };
-            *e = EditColour { saturation: g(c.saturation), contrast: g(c.contrast), detail: g(c.detail) };
-        }
         ColourSettings {
-            each,
+            each: self.each_colour(self.edit_colour_now()),
             gamut_guard: self.edit_gamut_guard.load(Ordering::Relaxed) != 0,
             dither: self.edit_dither.load(Ordering::Relaxed) != 0,
             lut_strength: f(&self.edit_lut_strength_bits, "edit_lut_strength", 0.0),
@@ -1921,11 +2109,11 @@ impl ShmHeader {
         (brightness, self.preupscale_exposure.load(Ordering::Relaxed) == crate::enums::exposure_source::AUTO)
     }
 
-    /// The pass count and each pass's placement ([`crate::enums::placement`]: `placement`, or the pass's own
+    /// Both pass counts ([`Placements`]) and each pass's placement ([`crate::enums::placement`]: `placement`, or the pass's own
     /// where its `overrides` has [`crate::enums::pass_override::PLACEMENT`]; a value out of range is `auto`),
     /// read as one unit like [`Self::pass_tunings`], for the game's threads (never waits for a writer).
-    pub fn placements(&self) -> (usize, [u32; crate::MAX_PASSES]) {
-        self.read_settings_for_frame(|h| (h.resolved_passes() as usize, h.placements_now()))
+    pub fn placements(&self) -> Placements {
+        self.read_settings_for_frame(|h| Placements { before: h.resolved_passes() as usize, after: h.resolved_after_passes(), each: h.placements_now() })
     }
 
     fn placements_now(&self) -> [u32; crate::MAX_PASSES] {
@@ -2145,6 +2333,14 @@ impl ShmHeader {
     /// [`ShmHeader::hdr_verdict`]'s writer (the layer).
     pub fn set_hdr_verdict(&self, s: &str) {
         store_seq_guarded(&self.hdr_verdict_seq, &self.hdr_verdict, s);
+    }
+    /// [`ShmHeader::second_gpu_present_line`]'s writer (the layer).
+    pub fn set_second_gpu_present_line(&self, s: &str) {
+        store_seq_guarded(&self.second_gpu_present_seq, &self.second_gpu_present_line, s);
+    }
+    /// What the layer says about the second GPU showing the frames, or empty.
+    pub fn second_gpu_present_line(&self) -> String {
+        load_seq_guarded(&self.second_gpu_present_seq, &self.second_gpu_present_line)
     }
     /// The HDR verdict for the game's swapchain, or empty before a game has created one.
     pub fn hdr_verdict(&self) -> String {
@@ -2765,7 +2961,7 @@ mod tests {
     }
 
     /// Every game-side read of the settings, timed.
-    fn frame_reads(h: &ShmHeader) -> (f32, MaskSettings, (usize, [u32; crate::MAX_PASSES]), HudSettings, std::time::Duration) {
+    fn frame_reads(h: &ShmHeader) -> (f32, MaskSettings, Placements, HudSettings, std::time::Duration) {
         let start = std::time::Instant::now();
         let t = h.pass_tunings();
         let read = (t.tunings[0].intensity, h.mask_settings(), h.placements(), h.hud_settings_for_frame());
@@ -2775,7 +2971,7 @@ mod tests {
     /// [`frame_reads`] until this process keeps its copy of `h` at the present sequence: a read skips
     /// keeping its copy while another thread (another test's read, in the same process) holds the
     /// copies, and a test that then counts on that copy would read an older one.
-    fn frame_reads_kept(h: &ShmHeader) -> (f32, MaskSettings, (usize, [u32; crate::MAX_PASSES]), HudSettings, std::time::Duration) {
+    fn frame_reads_kept(h: &ShmHeader) -> (f32, MaskSettings, Placements, HudSettings, std::time::Duration) {
         let me = std::ptr::from_ref(h) as usize;
         loop {
             let read = frame_reads(h);
@@ -2807,7 +3003,7 @@ mod tests {
             h.write_settings_and_hud(&[("intensity", 0.5f32.to_bits()), ("mask_motion_threshold", 32.0f32.to_bits()), ("placement", 1)], Some(&[region(0.25)]))
         );
         let (intensity, mask, placements, hud, _) = frame_reads_kept(&h);
-        assert_eq!((intensity, mask.motion_threshold, placements.1[0], hud.regions.clone()), (0.5, 32.0, 1, vec![region(0.25)]));
+        assert_eq!((intensity, mask.motion_threshold, placements.each[0], hud.regions.clone()), (0.5, 32.0, 1, vec![region(0.25)]));
 
         // Stopped half way: the sequence odd, two of its stores made.
         let seq = h.tuning_seq.load(Ordering::Relaxed);
@@ -3017,7 +3213,7 @@ mod tests {
         // v26 appends the HDR verdict: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, hdr_verdict_seq), std::mem::offset_of!(ShmHeader, preupscale_reason) + REASON_BYTES);
         assert_eq!(std::mem::offset_of!(ShmHeader, hdr_verdict) + HDR_VERDICT_BYTES, std::mem::offset_of!(ShmHeader, ngx_records));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 30);
         let h = ShmHeader::default();
         h.set_hdr_verdict("game outputs SDR");
         assert_eq!(h.hdr_verdict(), "game outputs SDR");
@@ -3034,7 +3230,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_sky), std::mem::offset_of!(ShmHeader, network) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_motion_structure_bits) + 4, std::mem::offset_of!(ShmHeader, pass_feedback_bits));
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4, std::mem::offset_of!(ShmHeader, scene_cuts));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 30);
         let h = ShmHeader::default();
         h.init_defaults();
         let m = h.mask_settings();
@@ -3058,7 +3254,7 @@ mod tests {
         // v20 appends the Network setting: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, network), std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28);
         assert_eq!(std::mem::offset_of!(ShmHeader, network) + 4, std::mem::offset_of!(ShmHeader, mask_sky));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 30);
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.network.load(Ordering::Relaxed), crate::enums::network::FULL, "the full network is the default");
@@ -3069,7 +3265,7 @@ mod tests {
         // v20's last word: every earlier field keeps its offset, and v21's fields follow it.
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts), std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts) + 4, std::mem::offset_of!(ShmHeader, preupscale_scale_bits));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 30);
         let h = ShmHeader::default();
         h.scene_cuts.store(5, Ordering::Relaxed);
         h.init_defaults();
@@ -3084,7 +3280,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<PassColour>(), 12);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour), std::mem::offset_of!(ShmHeader, edit_lut_seq) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour) + crate::MAX_PASSES * 12, std::mem::offset_of!(ShmHeader, placement));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 30);
         let h = ShmHeader::default();
         h.edit_lut_seq.store(9, Ordering::Relaxed);
         h.init_defaults();
@@ -3226,7 +3422,7 @@ mod tests {
     fn the_settings_game_is_appended_and_written_with_its_settings() {
         assert_eq!(std::mem::offset_of!(ShmHeader, settings_game), std::mem::offset_of!(ShmHeader, edit_highlight_protection_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, running_game) + 4, std::mem::offset_of!(ShmHeader, sharpen_cas_bits));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 30);
         let h = ShmHeader::default();
         h.settings_game.store(7, Ordering::Relaxed);
         h.running_game.store(7, Ordering::Relaxed);
@@ -3271,15 +3467,37 @@ mod tests {
     /// session starts them at 0.
     #[test]
     fn the_ngx_counters_are_appended_after_the_hdr_verdict() {
-        assert_eq!(crate::SHM_VERSION, 27);
         let at = std::mem::offset_of!(ShmHeader, ngx_records);
         assert_eq!(std::mem::offset_of!(ShmHeader, hdr_verdict) + HDR_VERDICT_BYTES, at);
         assert_eq!(std::mem::offset_of!(ShmHeader, ngx_matched), at + 4);
-        assert_eq!(at + 8, std::mem::size_of::<ShmHeader>());
+        assert_eq!(at + 8, std::mem::offset_of!(ShmHeader, second_gpu_present));
         let h = ShmHeader::default();
         h.ngx_matched.store(7, Ordering::Relaxed);
         h.init_defaults();
         assert_eq!(h.ngx_matched.load(Ordering::Relaxed), 0);
+    }
+
+    /// v28 appends the second GPU's present after the NGX counters: the setting is off by default, a persisted
+    /// setting, and its line is the layer's and starts empty with every session.
+    #[test]
+    fn the_second_gpus_present_is_appended_off_and_its_line_starts_empty() {
+        let at = std::mem::offset_of!(ShmHeader, second_gpu_present);
+        assert_eq!(at, 3300);
+        assert_eq!(std::mem::offset_of!(ShmHeader, second_gpu_present_seq), at + 4);
+        // v29 appends the presented frame's size after it.
+        assert_eq!(crate::SHM_VERSION, 30);
+        assert_eq!(std::mem::offset_of!(ShmHeader, frame_width), at + 8 + REASON_BYTES);
+        assert_eq!(std::mem::offset_of!(ShmHeader, frame_height), at + 12 + REASON_BYTES);
+        // v30 appends the After DLSS group after it (`the_after_dlss_group_is_appended_and_starts_as_before`).
+        assert_eq!(std::mem::offset_of!(ShmHeader, after_passes), at + 16 + REASON_BYTES);
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(h.second_gpu_present.load(Ordering::Relaxed), 0);
+        assert!(SETTING_BOUNDS.iter().any(|(name, _, _)| *name == "second_gpu_present"));
+        h.set_second_gpu_present_line("second GPU shows the frames: X; 10 shown, 1 skipped (9%), copy 1.2 ms");
+        assert!(h.second_gpu_present_line().starts_with("second GPU shows the frames: X"));
+        h.init_defaults();
+        assert_eq!(h.second_gpu_present_line(), "");
     }
 
     /// v25 appends why no hold ran while DLSS's input is identified (`preupscale_reason`), after the sharpening: every
@@ -3290,7 +3508,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_reason_seq), std::mem::offset_of!(ShmHeader, clarity_edges_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_reason), std::mem::offset_of!(ShmHeader, preupscale_reason_seq) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_reason) + REASON_BYTES, std::mem::offset_of!(ShmHeader, hdr_verdict_seq));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 30);
         assert_eq!(crate::enums::preupscale_state::IDENTIFIED, 5);
         let h = ShmHeader::default();
         h.set_preupscale_reason("the colour input lacks TRANSFER_DST");
@@ -3308,7 +3526,7 @@ mod tests {
     fn the_sharpening_is_appended_and_starts_off() {
         assert_eq!(std::mem::offset_of!(ShmHeader, clarity_strength_bits), std::mem::offset_of!(ShmHeader, sharpen_cas_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, clarity_edges_bits) + 4, std::mem::offset_of!(ShmHeader, preupscale_reason_seq));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 30);
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.sharpen_settings_for_frame(), SharpenSettings::DEFAULT);
@@ -3359,7 +3577,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, hud_region) + MAX_HUD_REGIONS * 24, std::mem::offset_of!(ShmHeader, preupscale_brightness_bits));
         let h = ShmHeader::default();
         h.init_defaults();
-        assert_eq!(h.placements(), (1, [placement::AUTO; crate::MAX_PASSES]), "auto for every pass by default");
+        assert_eq!(h.placements(), Placements { before: 1, after: 1, each: [placement::AUTO; crate::MAX_PASSES] }, "auto for every pass by default");
         assert!(h.write_settings(&[
             ("passes", 3),
             ("placement", placement::BEFORE),
@@ -3367,14 +3585,129 @@ mod tests {
             ("pass3_placement", placement::PRESENT),
             ("pass2_overrides", pass_override::PLACEMENT)
         ]));
-        let (count, p) = h.placements();
+        let Placements { before: count, after, each: p } = h.placements();
         assert_eq!((count, &p[..3]), (3, &[placement::BEFORE, placement::UPSCALED, placement::BEFORE][..]), "pass 3 does not override its placement");
+        assert_eq!(after, 3, "the After DLSS group's passes follow the Passes setting by default");
         assert_eq!(h.pass_tunings().placements, p);
         assert!(h.apply_persisted_setting("placement", 9));
         assert_eq!(h.placement.load(Ordering::Relaxed), placement::PRESENT, "clamped to the last placement");
         assert_eq!(placement::parse("upscaled"), Some(placement::UPSCALED));
         assert_eq!(placement::parse("2"), Some(placement::UPSCALED));
         assert_eq!(placement::parse("later"), None);
+    }
+
+    /// v30 appends the After DLSS / finished frame group (#73) after the presented frame's size, and which group the
+    /// current placement uses: every earlier field keeps its offset. By default the group is the same as before
+    /// the upscaler in everything: the passes, the model resolutions and every pass's settings and colour.
+    #[test]
+    fn the_after_dlss_group_is_appended_and_starts_as_before() {
+        assert_eq!(crate::SHM_VERSION, 30);
+        assert_eq!(std::mem::offset_of!(ShmHeader, after_passes), std::mem::offset_of!(ShmHeader, frame_height) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, after_scale_bits), std::mem::offset_of!(ShmHeader, after_passes) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, after), std::mem::offset_of!(ShmHeader, after_scale_bits) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, after_colour), std::mem::offset_of!(ShmHeader, after) + std::mem::size_of::<PassControl>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, settings_group), std::mem::offset_of!(ShmHeader, after_colour) + std::mem::size_of::<PassColour>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, settings_group) + 4, std::mem::size_of::<ShmHeader>());
+        let h = ShmHeader::default();
+        h.settings_group.store(crate::enums::settings_group::AFTER, Ordering::Relaxed);
+        h.init_defaults();
+        assert_eq!(h.settings_group.load(Ordering::Relaxed), crate::enums::settings_group::NONE, "a session starts with no group");
+        // Graded before the upscaler: three passes, Performance, pass 2 on its own intensity and saturation.
+        assert!(h.write_settings(&[
+            ("passes", 3),
+            ("preupscale_scale", 0.5f32.to_bits()),
+            ("intensity", 0.7f32.to_bits()),
+            ("edit_saturation", 1.5f32.to_bits()),
+            ("pass2_overrides", crate::enums::pass_override::INTENSITY | crate::enums::pass_override::EDIT_SATURATION),
+            ("pass2_intensity", 0.4f32.to_bits()),
+            ("pass2_edit_saturation", 0.5f32.to_bits()),
+        ]));
+        let t = h.pass_tunings();
+        let after = t.after_dlss();
+        assert_eq!((after.count, after.tunings, after.scales, after.colour), (t.count, t.tunings, t.scales, t.colour), "the same as before by default");
+        assert_eq!(h.placements().after, 3);
+    }
+
+    /// The group's own values replace the Model tab's for every pass after DLSS, each pass's own override still wins,
+    /// and the values before the upscaler do not move.
+    #[test]
+    fn the_after_dlss_group_replaces_the_model_tabs_values_and_a_pass_override_wins() {
+        use crate::enums::pass_override as po;
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert!(h.write_settings(&[
+            ("passes", 3),
+            ("preupscale_scale", 1.0f32.to_bits()),
+            ("intensity", 0.7f32.to_bits()),
+            ("edit_contrast", 1.2f32.to_bits()),
+            ("pass2_overrides", po::INTENSITY | po::SCALE),
+            ("pass2_intensity", 0.4f32.to_bits()),
+            ("pass2_scale", 0.667f32.to_bits()),
+            ("after_passes", 1),
+            ("after_scale", 0.5f32.to_bits()),
+            ("after_overrides", po::INTENSITY | po::LOCAL_TONE | po::STYLE | po::EDIT_CONTRAST),
+            ("after_intensity", 0.3f32.to_bits()),
+            ("after_local_tone", 0.6f32.to_bits()),
+            ("after_style", 2),
+            ("after_edit_contrast", 0.25f32.to_bits()),
+        ]));
+        let t = h.pass_tunings();
+        // Before the upscaler: as set there.
+        assert_eq!(t.count, 3);
+        assert_eq!((t.tunings[0].intensity, t.tunings[1].intensity, t.tunings[0].local_tone, t.tunings[0].style), (0.7, 0.4, 1.0, 0));
+        assert_eq!(&t.scales[..3], &[1.0, 0.667, 1.0]);
+        assert_eq!(t.colour.each[0].contrast, 1.2);
+        // After DLSS: the group's values, pass 2's own intensity and resolution over them.
+        let a = t.after_dlss();
+        assert_eq!(a.count, 1);
+        assert_eq!((a.tunings[0].intensity, a.tunings[1].intensity, a.tunings[0].local_tone, a.tunings[1].local_tone), (0.3, 0.4, 0.6, 0.6));
+        assert_eq!((a.tunings[0].style, a.tunings[0].local_structure), (2, 1.0), "what the group does not set is the Model tab's");
+        assert_eq!(&a.scales[..3], &[0.5, 0.667, 0.5]);
+        assert_eq!((a.colour.each[0].contrast, a.colour.each[0].saturation), (0.25, 1.0));
+        assert_eq!(a.colour.gamut_guard, t.colour.gamut_guard, "the stack's controls are shared");
+        assert_eq!(h.placements(), Placements { before: 3, after: 1, each: [crate::enums::placement::AUTO; crate::MAX_PASSES] });
+        // A bad value: a scale below the presets is the lowest one, one that is not a number the one before DLSS.
+        assert!(h.write_settings(&[("after_scale", 0.1f32.to_bits())]));
+        assert_eq!(h.pass_tunings().after.scales[0], 0.25);
+        h.after_scale_bits.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        assert_eq!(h.pass_tunings().after.scales[0], 1.0);
+        // The passes are clamped, and 0 follows the Passes setting again.
+        assert!(h.apply_persisted_setting("after_passes", 40));
+        assert_eq!(h.resolved_after_passes(), crate::MAX_PASSES);
+        assert!(h.write_settings(&[("after_passes", 0)]));
+        assert_eq!(h.resolved_after_passes(), 3);
+    }
+
+    /// Every setting of the group round-trips through `config.ini` like the others, under `after_<field>`.
+    #[test]
+    fn the_after_dlss_group_is_persisted() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+        for field in [
+            "passes",
+            "scale",
+            "overrides",
+            "intensity",
+            "local_tone",
+            "local_structure",
+            "skin_structure",
+            "style",
+            "auto_mask",
+            "edit_saturation",
+            "edit_contrast",
+            "edit_detail",
+        ] {
+            let name = after_setting(field).unwrap_or_else(|| panic!("after_{field} is a setting"));
+            assert!(h.persisted_settings().iter().any(|(n, ..)| *n == name), "{name} is persisted");
+        }
+        assert_eq!(after_setting("placement"), None, "the group has no placement of its own");
+        assert!(h.apply_persisted_setting("after_intensity", 2.5f32.to_bits()));
+        assert!(h.apply_persisted_setting("after_overrides", u32::MAX));
+        assert_eq!(h.after.overrides.load(Ordering::Relaxed), crate::enums::pass_override::ALL, "unknown bits dropped");
+        let defaults = ShmHeader::default();
+        defaults.init_defaults();
+        let (_, _, bits) = defaults.persisted_settings().into_iter().find(|(n, ..)| *n == "after_scale").expect("persisted");
+        assert_eq!(f32::from_bits(bits), 0.0, "the same as before DLSS by default");
     }
 
     #[test]
@@ -3405,7 +3738,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_scale_bits), std::mem::offset_of!(ShmHeader, scene_cuts) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits), std::mem::offset_of!(ShmHeader, preupscale_scale_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits) + crate::MAX_PASSES * 4, std::mem::offset_of!(ShmHeader, edit_saturation_bits));
-        assert_eq!(crate::SHM_VERSION, 27);
+        assert_eq!(crate::SHM_VERSION, 30);
         let h = ShmHeader::default();
         h.preupscale_scale_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
         h.pass_scale_bits[2].store(0.5f32.to_bits(), Ordering::Relaxed);

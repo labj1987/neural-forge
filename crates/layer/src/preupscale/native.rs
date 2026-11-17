@@ -218,6 +218,8 @@ struct LoaderState {
     /// [`Loader::lend`] decided on: the worker closes the network only while they agree.
     uses: u64,
     lend_uses: u64,
+    /// Why the network is closed on [`Self::lend`] when no other device asked for it ([`Loader::give_back_network`]).
+    lend_why: Option<&'static str>,
     /// The network is opened without counter chaining ([`Loader::start`]'s `chain` false): the holds run inside
     /// DLSS's buffer, which needs barriers between its launches, so a chained build would be built again at once.
     barriers_from_start: bool,
@@ -491,6 +493,15 @@ impl Claims {
         let quiet = |at: u64| epoch_ms().saturating_sub(at) >= PATH_SWITCH_MS;
         !self.in_flight() && quiet(self.last_local.load(SeqCst)) && quiet(self.last_post.load(SeqCst))
     }
+
+    /// [`Self::unused`] once the after-the-upscaler server has ended (its worker is gone, so no frame of that path
+    /// can come): its last frame's stamp does not count, only that none is in flight and that the holds are quiet.
+    fn unused_without_post(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        // A hold that never recorded here (0) has nothing to wait out.
+        let last_local = self.last_local.load(SeqCst);
+        !self.in_flight() && (last_local == 0 || epoch_ms().saturating_sub(last_local) >= PATH_SWITCH_MS)
+    }
 }
 
 /// [`Loader::holds_took_over`] for the last hold's and the last after-the-upscaler frame's stamps (ms since [`epoch_ms`]'s
@@ -524,6 +535,12 @@ pub(crate) fn stop_clock() {
 }
 
 /// Milliseconds since the first call in this process (a monotonic stamp for [`Loader`]'s claims).
+/// Tests: [`epoch_ms`].
+#[cfg(test)]
+pub(crate) fn epoch_ms_for_test() -> u64 {
+    epoch_ms()
+}
+
 fn epoch_ms() -> u64 {
     static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
     START.elapsed().as_millis() as u64 + 1
@@ -621,6 +638,12 @@ fn no_history() -> bool {
 /// holds were refused it for good (2026-10-23).
 static NETWORK_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `device` closed the network: it owns it no longer (unless another device opened it since).
+fn disown(device: u64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _ = NETWORK_OWNER.compare_exchange(device, 0, SeqCst, SeqCst);
+}
+
 /// The longest a build waits for the game to stop loading ([`Loader::work`]).
 const LOADING_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -630,6 +653,63 @@ const IN_FLIGHT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// How often the loader thread checks the VRAM budget for the guard ([`super::vram_guard`]) while it has no other work.
 const GUARD_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A hold's miss while the network is still being loaded and built on its device (the finished frame's trial gives
+/// such holds the build's budget, `offload_trial::is_loading`).
+pub(crate) const LOADING: &str = "the native network is still loading";
+
+/// A hold's miss while the last load or build on its device failed (it is tried again on the loader's schedule).
+pub(crate) const NOT_BUILT: &str = "the native network could not be loaded or built";
+
+/// A hold's miss while the process's one network is open on another device (which is closing it, or still using it):
+/// the loader waits for it and tries again.
+pub(crate) const OPEN_WAIT: &str = "the network is open on another device of the game, which is closing it or using it";
+
+/// A hold's miss on a device whose network is off for the session (a wait on its queue timed out: nothing is tried
+/// again there until the game restarts).
+pub(crate) const DEAD: &str = "the network is off on this device until the game restarts";
+
+/// The loader's reason once it lent the network to another device of the process ([`Loader::lend`]).
+const LENT: &str = "lent to another device of the game, which runs the model";
+
+/// Why the after-the-upscaler path of the game's device `device` has no answer now, where its loader says: its
+/// network is off for the session ([`DEAD`]), another device's ([`OPEN_WAIT`]), failed ([`NOT_BUILT`]) or not there
+/// yet ([`LOADING`]); `None` with a network open (the frame is only late) or no loader. For the finished frame's
+/// trial (`offload_trial::finished_present`).
+pub(crate) fn post_miss(device: vk::Device) -> Option<&'static str> {
+    let loader = {
+        let loaders = LOADERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loaders.iter().find(|(d, _)| *d == device.as_raw()).and_then(|(_, l)| l.upgrade())
+    }?;
+    post_miss_of(loader.dead(), loader.failed().as_deref(), loader.network_open())
+}
+
+/// [`post_miss`] for a loader that is `dead`, failed last with `failed`, and has a network `open` or not.
+fn post_miss_of(dead: bool, failed: Option<&str>, open: bool) -> Option<&'static str> {
+    match failed {
+        _ if dead => Some(DEAD),
+        _ if open => None,
+        Some(why) => Some(failed_miss(why, false)),
+        None => Some(LOADING),
+    }
+}
+
+/// The loader's reason once it gave the network back to the second GPU ([`Loader::give_back_network`]).
+const GIVEN_BACK: &str = "the model runs on the second GPU: the faster GPU keeps it";
+
+/// A hold's miss for a loader whose last load or build left the reason `why` ([`Loader::failed`]), on a device
+/// whose network is off for the session or not (`dead`): [`DEAD`]; [`OPEN_WAIT`] where the network is another
+/// device's (refused as open elsewhere, [`OPEN_ELSEWHERE`], lent, [`LENT`], or given back to the second GPU,
+/// [`GIVEN_BACK`]), which passes; else [`NOT_BUILT`].
+fn failed_miss(why: &str, dead: bool) -> &'static str {
+    if dead {
+        DEAD
+    } else if why.contains(OPEN_ELSEWHERE) || why == LENT || why == GIVEN_BACK {
+        OPEN_WAIT
+    } else {
+        NOT_BUILT
+    }
+}
 
 /// The words of `nf_native_open`'s refusal while another network is open in the process (crates/native/cpp/nf_native.cpp).
 const OPEN_ELSEWHERE: &str = "another network is open in this process";
@@ -771,6 +851,18 @@ impl Loader {
         Self::start(vk::Device::null(), setup, HoldCounts::default(), true)
     }
 
+    /// Tests: [`Self::unused`] (what [`Self::lend`] waits for).
+    #[cfg(test)]
+    pub(crate) fn unused_for_test(&self) -> bool {
+        self.unused()
+    }
+
+    /// Tests: [`Claims::unused_without_post`] (what [`Self::give_back_network`] waits for).
+    #[cfg(test)]
+    pub(crate) fn unused_without_post_for_test(&self) -> bool {
+        self.claims.unused_without_post()
+    }
+
     /// Tests: the claims' stamps (the last hold's, the after-the-upscaler path's last frame's) and whether that path runs one.
     #[cfg(test)]
     pub(crate) fn stamp_for_test(&self, last_pre: u64, last_post: u64, post_busy: bool) {
@@ -852,6 +944,36 @@ impl Loader {
     /// flag is read (that path sets its flag before it reads the stamp, [`Self::claim_post`], so one of the two
     /// sees the other); and once lent, neither path takes the network until the worker closed it.
     fn lend(&self) -> bool {
+        self.lend_for(None)
+    }
+
+    /// The finished frame's trial gave the model back to the second GPU (`offload_trial::take_back`): the network is
+    /// closed here as a lend closes it, so its video memory goes back to the game, and opened again when a path here
+    /// asks for it. Whether it will be (not while a path uses it).
+    ///
+    /// The caller's after-the-upscaler server has ended (`Session::ensure_post_server` asks only then), so that
+    /// path's last frame does not make the network wait out [`PATH_SWITCH_MS`]: in #63 that second, and the second
+    /// GPU's loader finding the network still open here and trying again a second later, were two seconds of frames
+    /// without the model at every hand-back.
+    pub(crate) fn give_back_network(&self) -> bool {
+        // Nothing open (never built here, or closed already): nothing to give back.
+        if !self.network_open() {
+            return true;
+        }
+        self.lend_with(Some(GIVEN_BACK), true)
+    }
+
+    /// Whether this device has the process's network open (or is still closing it).
+    pub(crate) fn network_open(&self) -> bool {
+        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.is_some()
+    }
+
+    fn lend_for(&self, why: Option<&'static str>) -> bool {
+        self.lend_with(why, false)
+    }
+
+    /// [`Self::lend`], with why; `post_ended`: the after-the-upscaler server is gone ([`Claims::unused_without_post`]).
+    fn lend_with(&self, why: Option<&'static str>, post_ended: bool) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         let (lock, wake) = &*self.shared;
         let uses = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).uses;
@@ -863,7 +985,7 @@ impl Loader {
             let _ = self.claims.last_pre.compare_exchange(stamp, before, SeqCst, SeqCst);
             false
         };
-        if !self.unused() {
+        if !(if post_ended { self.claims.unused_without_post() } else { self.unused() }) {
             return refuse();
         }
         let mut st = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -873,6 +995,7 @@ impl Loader {
         }
         st.lend = true;
         st.lend_uses = uses;
+        st.lend_why = why;
         drop(st);
         wake.notify_all();
         true
@@ -1004,12 +1127,17 @@ impl Loader {
                     continue;
                 }
                 if let Some(network) = state.network.take() {
+                    let why = state.lend_why.take();
                     state.built = Vec::new();
                     state.wanted = None;
-                    state.failed = Some("lent to another device of the game, which runs the model".into());
+                    state.failed = Some(why.unwrap_or(LENT).into());
                     drop(state);
                     drop(network);
-                    crate::log!("[native] the network is closed on this device: another device of the game asked for it (one network per process)");
+                    disown(device.as_raw());
+                    match why {
+                        Some(why) => crate::log!("[native] the network is closed on this device, its video memory back to the game: {why}"),
+                        None => crate::log!("[native] the network is closed on this device: another device of the game asked for it (one network per process)"),
+                    }
                     crate::logging::flush();
                     state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
@@ -1080,6 +1208,9 @@ impl Loader {
                 note_failure(&why);
                 state.failed = Some(why);
                 drop(state);
+                if n.is_some() {
+                    disown(device.as_raw());
+                }
                 drop(n);
                 crate::log!("[native] VRAM guard: the network is closed; frames go to DLSS untouched until there is room again");
                 crate::logging::flush();
@@ -1123,6 +1254,9 @@ impl Loader {
             state.built = Vec::new();
             drop(state);
             if step == Step::ReinitThenBuild && network.take().is_some() {
+                // Owned again ([`NETWORK_OWNER`]) only if the attempt after the reopen succeeds or the loader still holds
+                // a network then.
+                disown(device.as_raw());
                 crate::log!("[native] {} failed attempts in a row: closing the network and loading it again", retry.streak());
             }
             // Another network chosen: this one is closed and the chosen one opened (and built for the
@@ -1130,6 +1264,7 @@ impl Loader {
             // asks for another network only in `ready`, after the frames that used this one were drained,
             // and neither path takes the network while the other's work may run).
             if switching && network.take().is_some() {
+                disown(device.as_raw());
                 crate::log!("[native] the {} network is chosen: closing the open one and loading it", network::name(choice));
             }
             let t = Instant::now();
@@ -1466,7 +1601,9 @@ impl Drop for Loader {
     fn drop(&mut self) {
         self.stop_worker();
         // The network (closed here) must not be pending: the device's teardown waited for its work.
-        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.take();
+        if self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.take().is_some() {
+            disown(self.device);
+        }
     }
 }
 
@@ -1656,6 +1793,20 @@ pub(crate) struct Passes {
     pub scales: [f32; neural_forge_protocol::MAX_PASSES],
     /// The colour of each pass's edit, and the stack's colour controls.
     pub colour: neural_forge_protocol::ColourSettings,
+    /// The After DLSS group's pass count (#73; `placement::plan_for`): a frame none of whose passes runs before the
+    /// upscaler runs this many. `count` is the Passes setting's.
+    pub after_count: usize,
+    /// The passes' values where they run after DLSS's output, where the After DLSS group makes them differ from
+    /// the ones above ([`Passes::after_dlss`]); `None` for the same.
+    pub after: Option<AfterValues>,
+}
+
+/// Each pass's conditioning, model resolution and colour of the edit after DLSS ([`Passes::after`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AfterValues {
+    pub each: [Conditioning; neural_forge_protocol::MAX_PASSES],
+    pub scales: [f32; neural_forge_protocol::MAX_PASSES],
+    pub colour: [neural_forge_protocol::EditColour; neural_forge_protocol::MAX_PASSES],
 }
 
 impl Passes {
@@ -1667,6 +1818,19 @@ impl Passes {
             feedback: 1.0,
             scales: [1.0; neural_forge_protocol::MAX_PASSES],
             colour: neural_forge_protocol::ColourSettings::DEFAULT,
+            after_count: 1,
+            after: None,
+        }
+    }
+
+    /// These passes with the values they run with after DLSS's output (the After DLSS group's, where it sets any).
+    /// The counts stay.
+    pub(crate) fn after_dlss(&self) -> Self {
+        match self.after {
+            Some(a) => {
+                Self { each: a.each, scales: a.scales, colour: neural_forge_protocol::ColourSettings { each: a.colour, ..self.colour }, after: None, ..*self }
+            }
+            None => *self,
         }
     }
 }
@@ -1705,9 +1869,16 @@ impl Passes {
     }
 }
 
-/// The passes the hold `at` runs ([`Passes::stage`]); `None` when none of the frame's passes is at its stage.
+/// The passes the hold `at` runs ([`Passes::stage`]); `None` when none of the frame's passes is at its stage. A hold
+/// after DLSS runs them with the After DLSS group's values (#73). Before the upscaler the frame runs the Passes
+/// setting's count; after DLSS the plan's range says how many (the After DLSS group's count where no pass runs
+/// before the upscaler), and it is the frame's last stage, so its last pass is the stack's.
 pub(crate) fn stage_passes(all: &Passes, at: super::placement::Hold) -> Option<Passes> {
     let (first, end) = at.passes();
+    if at.stage == super::placement::Stage::Upscaled {
+        let end = end.min(all.count.max(all.after_count));
+        return (first < end).then(|| Passes { count: end, ..all.after_dlss() }.stage(first, end));
+    }
     let end = end.min(all.count);
     (first < end).then(|| all.stage(first, end))
 }
@@ -1746,6 +1917,14 @@ impl From<neural_forge_protocol::PassTunings> for Passes {
         for (c, &tuning) in each.iter_mut().zip(t.tunings.iter()) {
             *c = Conditioning::from(tuning);
         }
+        // The After DLSS group's values, kept only where they differ from the ones before the upscaler.
+        let after = (t.after.tunings != t.tunings || t.after.scales != t.scales || t.after.colour != t.colour.each).then(|| {
+            let mut each = [Conditioning::default(); neural_forge_protocol::MAX_PASSES];
+            for (c, &tuning) in each.iter_mut().zip(t.after.tunings.iter()) {
+                *c = Conditioning::from(tuning);
+            }
+            AfterValues { each, scales: t.after.scales, colour: t.after.colour }
+        });
         Self {
             count: t.count.clamp(1, neural_forge_protocol::MAX_PASSES),
             each,
@@ -1753,6 +1932,8 @@ impl From<neural_forge_protocol::PassTunings> for Passes {
             feedback: t.feedback,
             scales: t.scales,
             colour: t.colour,
+            after_count: t.after.count.clamp(1, neural_forge_protocol::MAX_PASSES),
+            after,
         }
     }
 }
@@ -2941,7 +3122,14 @@ impl NativePass {
     ///
     /// # Safety
     /// `device` is live; `family` is this pass's family; nothing of this pass is pending.
-    unsafe fn ensure_more(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, count: usize) -> bool {
+    pub(crate) unsafe fn ensure_more(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        family: u32,
+        count: usize,
+    ) -> bool {
         // SAFETY: forwarded.
         if !unsafe { self.ensure_more_base(device, instance, physical_device, family) } {
             return false;
@@ -3099,13 +3287,17 @@ impl NativePass {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
         let Some(m) = &self.more else { return Ok(()) };
-        let begin = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // `Y` runs before every pass from 3 on: in one submit more than once (the runner's), or submitted again while its
+        // earlier submit is pending (the split hold's). It records the same copy each time, so it is a buffer for
+        // simultaneous use (VUID-vkQueueSubmit-pCommandBuffers-00071); `X` and `R` run once a frame.
+        let once = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let again = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE);
         let fresh = m.fresh.clone();
         // SAFETY: forwarded; every handle is live.
         unsafe {
             for (i, &cmd) in m.copies.iter().enumerate() {
                 device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-                device.begin_command_buffer(cmd, &begin)?;
+                device.begin_command_buffer(cmd, if i == 1 { &again } else { &once })?;
                 self.record_copy(device, cmd, i, encoded, region, count, feedback, &fresh, i == 0 && m.timer.is_some(), i == 2 && m.timer.is_some());
                 device.end_command_buffer(cmd)?;
             }
@@ -3617,6 +3809,50 @@ impl NativePass {
         let p = plan.parity;
         let later = plan.passes.iter().skip(1).map(|r| self.more.as_ref().expect("a later pass").commands[r.index - 1][p]).collect();
         ([(!self.initialised).then_some(self.commands[2]), Some(self.commands[p])], later)
+    }
+
+    /// The buffers that run passes 2 on after pass 1's, in submission order: `X` and pass 2, `Y` and each further pass,
+    /// then `R` (`later`: [`Self::frame_graphs`]'s, of a frame whose later passes' buffers are built). Empty without them.
+    pub(crate) fn later_sequence(&self, later: &[vk::CommandBuffer]) -> Vec<vk::CommandBuffer> {
+        let Some(copies) = self.more.as_ref().map(|m| m.copies).filter(|_| !later.is_empty()) else { return Vec::new() };
+        later_order(copies, later)
+    }
+
+    /// The later passes of a network frame as the other GPU's runner submits them (`super::offload_server`): the
+    /// copies between the passes recorded for this frame over `encoded` (in `GENERAL`; [`Self::record_copies`], as
+    /// the split hold records them) and the buffers in submission order ([`Self::later_sequence`]). Empty without
+    /// later passes.
+    ///
+    /// # Safety
+    /// As [`Self::record_copies`] when `later` is not empty.
+    pub(crate) unsafe fn record_later(
+        &mut self,
+        device: &ash::Device,
+        encoded: vk::Image,
+        encoded_view: vk::ImageView,
+        region: vk::BufferImageCopy,
+        passes: &Passes,
+        later: &[vk::CommandBuffer],
+    ) -> ash::prelude::VkResult<Vec<vk::CommandBuffer>> {
+        if later.is_empty() || self.more.is_none() {
+            return Ok(Vec::new());
+        }
+        // SAFETY: forwarded.
+        unsafe { self.record_copies(device, encoded, encoded_view, region, passes.count, passes.feedback) }?;
+        Ok(self.later_sequence(later))
+    }
+
+    /// The buffers of [`Self::later_sequence`] for `later` went to the queue: `X` takes the later passes' new
+    /// histories to `GENERAL`.
+    pub(crate) fn later_submitted(&mut self, later: usize) {
+        if let Some(m) = self.more.as_mut().filter(|_| later > 0) {
+            for f in m.fresh.iter_mut().take(later) {
+                *f = false;
+            }
+            if let Some(t) = m.timer.as_mut() {
+                t.mark_submitted();
+            }
+        }
     }
 
     /// What one network frame runs, and the parameters each of its passes reads (written by the caller: on
@@ -4187,7 +4423,7 @@ fn fake_chain_timeout(frames: u64) -> Option<(u32, String)> {
 /// What the Status tab says about the native backend after a hold: running, or why not.
 pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     if result.evaluated {
-        return running_line(loader.guard_note().as_deref(), result.after_dlss_on_game_gpu);
+        return running_line(loader.guard_note().as_deref(), super::offload_trial::status_line().as_deref());
     }
     match (loader.failed(), result.miss) {
         (Some(why), _) => format!("native network not running: {why}"),
@@ -4196,15 +4432,12 @@ pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     }
 }
 
-/// The Status line of a hold whose network ran: `guard`, the VRAM guard's note; `after_dlss_on_game_gpu`, a hold after
-/// DLSS's output while the model on a second GPU is asked for, which says where the model runs and what the second
-/// GPU covers (the native line alone read as if the second GPU were not asked for).
-fn running_line(guard: Option<&str>, after_dlss_on_game_gpu: bool) -> String {
+/// The Status line of a running hold, with the VRAM guard and the second GPU's trial.
+pub(crate) fn running_line(guard: Option<&str>, trial: Option<&str>) -> String {
     let guard = guard.map(|why| format!(" ({why})")).unwrap_or_default();
-    if after_dlss_on_game_gpu {
-        format!("second GPU: not used here: the model runs on the game's GPU after DLSS{guard}; the second GPU covers only before DLSS")
-    } else {
-        format!("native network running{guard}")
+    match trial {
+        Some(trial) => format!("{trial}{guard}"),
+        None => format!("native network running{guard}"),
     }
 }
 
@@ -4339,6 +4572,41 @@ pub(crate) struct CacheAsk {
     pub interval: u32,
     /// `debug_view` asks for the cache's rejection mask.
     pub debug_mask: bool,
+    /// The hold's stage and the frame's groups of passes (whether the model on a second GPU takes it,
+    /// [`super::placement::Hold::offload_takes`]).
+    pub at: super::placement::Hold,
+}
+
+/// [`NativePass::later_sequence`]'s order: `copies` are `X`, `Y`, `R`.
+fn later_order(copies: [vk::CommandBuffer; 3], later: &[vk::CommandBuffer]) -> Vec<vk::CommandBuffer> {
+    let mut all = Vec::with_capacity(2 * later.len() + 1);
+    for (k, &cmd) in later.iter().enumerate() {
+        all.push(if k == 0 { copies[0] } else { copies[1] });
+        all.push(cmd);
+    }
+    all.push(copies[2]);
+    all
+}
+
+/// Why a hold's frame cannot be sent to the other GPU (`super::offload_pre`): the next hold could not carry its edit
+/// (`chained`: the edit cache has its buffers; `aux`: DLSS's motion vectors as the hold found them, `copied` when they
+/// are copied this hold; `jitter`: DLSS's jitter is known). `None` when it can be sent. The first reason that applies,
+/// for the log line and the Status tab when the offload gives up on a long row of them.
+pub(crate) fn unsendable(chained: bool, aux: Option<super::Aux>, copied: bool, jitter: bool) -> Option<&'static str> {
+    if !chained {
+        return Some("the edit cache has no room for its buffers");
+    }
+    if !copied {
+        return Some(match aux {
+            None => "DLSS names no motion vectors",
+            Some(a) if a.layout.is_none() => "the motion vectors' layout is unknown",
+            Some(_) => "the motion vectors cannot be copied",
+        });
+    }
+    if !jitter {
+        return Some("DLSS's jitter is unknown");
+    }
+    None
 }
 
 /// Why a hold inside DLSS's buffer records nothing while changes wait for the holds recorded before it.
@@ -4476,18 +4744,14 @@ unsafe fn native_hold(
         return result;
     }
     // The network on a second GPU (`super::offload_pre`): this hold sends its frame there and carries the edit of
-    // the frame before it, as a cached hold does. Only the hold before DLSS, with the edit cache on (it is what
+    // the frame before it, as a cached hold does: the hold before DLSS and the hold after DLSS's output (Ray
+    // Reconstruction, or passes placed there), each with a side of its own; in a frame with passes at both, both sides'
+    // runners share the other device and its one network (`offload_server::Core`). With the edit cache on (it is what
     // carries the edit), and not for a cache dump (which needs the network's answer to its own frame).
-    let before_dlss = ctx.as_ref().is_none_or(|c| c.point.hold.stage != super::placement::Stage::Upscaled);
-    if !before_dlss && super::offload_pre::wanted() {
-        result.after_dlss_on_game_gpu = true;
-        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            crate::log!("[offload] NEURAL_FORGE_OFFLOAD_GPU: the hold after DLSS's output (the placement with Ray Reconstruction) runs the model on the game's GPU; the other GPU takes the hold before DLSS and the finished frame");
-        }
-    }
+    let offload_at = super::offload_pre::Where::of(ask.at.stage);
+    let offload_takes = ask.at.offload_takes();
     let offloaded = super::offload_pre::wanted()
-        && before_dlss
+        && offload_takes
         && arm.is_none()
         && {
             let cache = ask.interval > 1;
@@ -4499,6 +4763,7 @@ unsafe fn native_hold(
             }
             cache
         };
+    result.offloaded = offloaded;
     // Every frame that ran the graph has completed (this path's: the hold waited above; the other
     // path's: `claim_pre` says none ran for a second): the chain watchdog's count is final for them.
     let fake = fake_chain_timeout(res.native.as_ref().map_or(0, |n| n.frames));
@@ -4536,12 +4801,12 @@ unsafe fn native_hold(
         }
         result.miss = Some(if loader.paused() {
             super::VRAM_PAUSED
-        } else if loader.failed().is_some() {
-            "the native network could not be loaded or built"
+        } else if let Some(why) = loader.failed() {
+            failed_miss(&why, loader.dead())
         } else if loader.waiting_for_holds(reserved) {
             WAITING
         } else {
-            "the native network is still loading"
+            LOADING
         });
         return result;
     };
@@ -4660,6 +4925,10 @@ unsafe fn native_hold(
         if let Some(e) = res.edit.as_mut() {
             e.state.drop_edit();
         }
+        // The offload's side stays: its pack's set pointed at the pass's field that just went.
+        if let Some(side) = res.offpre.as_mut() {
+            side.exchange.forget_bound();
+        }
     }
     let mut native = match res.native.take() {
         Some(n) => n,
@@ -4678,16 +4947,19 @@ unsafe fn native_hold(
             }
         }
     };
-    // More than one pass: their buffers, built once (a failure runs one pass).
-    let more = passes.count > 1 && {
-        let family = res.queue_family;
-        // SAFETY: `device` is live; `family` is the pass's; nothing of it is pending.
-        unsafe { native.ensure_more(device, instance, physical_device, family, passes.count) }
-    };
+    // More than one pass: their buffers, built once (a failure runs one pass). Offloaded, every pass of the stage runs
+    // on the other device (`offload_server::PreRunner`), which builds them there: none here.
+    let more = passes.count > 1
+        && (offloaded || {
+            let family = res.queue_family;
+            // SAFETY: `device` is live; `family` is the pass's; nothing of it is pending.
+            unsafe { native.ensure_more(device, instance, physical_device, family, passes.count) }
+        });
     let passes = runnable(passes, more);
-    // Below a model resolution of 1: the passes' resources at their extents.
+    // Below a model resolution of 1: the passes' resources at their extents (offloaded, the later passes' lanes are the
+    // other device's: pass 1's only here, as before more than one pass ran there).
     // SAFETY: as above.
-    if !unsafe { native.ensure_lanes(device, instance, physical_device, passes.count) } {
+    if !unsafe { native.ensure_lanes(device, instance, physical_device, if offloaded { 1 } else { passes.count }) } {
         res.native = Some(native);
         result.miss = Some("the model resolution's buffers could not be built");
         return result;
@@ -4747,7 +5019,9 @@ unsafe fn native_hold(
         return result;
     }
     // The offload's side of the hold: the exchange with the other device and its worker, made on the first hold.
-    if res.offpre.as_ref().is_some_and(super::offload_pre::HoldSide::released) && !others_outstanding {
+    // A side whose worker stopped serving (the trial on the game's GPU gave it up) while the offload is wanted again: the
+    // same.
+    if res.offpre.as_ref().is_some_and(|s| s.released() || (!s.serving() && super::offload_pre::wanted())) && !others_outstanding {
         // Its worker was ended for another set of hold resources while these had no hold: built again below.
         if let Some(side) = res.offpre.take() {
             // The late capture's set points at this side's kept copy: written again for the next side's.
@@ -4766,27 +5040,46 @@ unsafe fn native_hold(
             result.miss = Some("a frame on the second GPU never finished: the model is off for this session");
             return result;
         }
+        if super::offload::holder(device.handle()) == super::offload::Holder::Finished {
+            // Placement left Finished frame while the game runs: the finished frame's server still has the other GPU's
+            // device. It is asked to let it go (it ends within a frame or two and gives it back); until then the
+            // frames go to DLSS as they are, and the second GPU is not given up.
+            if super::offload::ask_back(device.handle()) {
+                crate::log!(
+                    "[offload] {}: Placement changed while the game runs; the second GPU's device is still with the finished frame's server, which is asked to let it go",
+                    offload_at.name()
+                );
+                crate::logging::flush();
+            }
+            res.native = Some(native);
+            result.miss = Some("the second GPU is changing over from the finished frame");
+            return result;
+        }
         if others_outstanding {
             // Not while holds recorded with these resources may still run (the cache's sets are written for it).
             res.native = Some(native);
             result.miss = Some(WAITING);
             return result;
         }
-        if super::offload_pre::serving_device(device.handle()) && !super::offload_pre::release_idle(device.handle(), super::offload_pre::IDLE_SIDE) {
-            // Another set of hold resources of this device has the offload device (and with it the process's one
-            // network) and holds with it: these wait until it has had no hold for a few seconds, and say so once.
+        if super::offload_pre::serving_at(device.handle(), offload_at)
+            && !super::offload_pre::release_idle(device.handle(), offload_at, super::offload_pre::IDLE_SIDE)
+        {
+            // Another set of hold resources of this device serves this hold on the offload device (another render size:
+            // the other GPU keeps one pass per hold) and holds with it: these wait until it has had no hold for a few
+            // seconds, and say so once. (The frame's other hold has its own place there.)
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 crate::log!(
-                    "[offload] before DLSS: the other GPU serves another render size of this game; frames of this one go to DLSS as they are until it is free"
+                    "[offload] {}: the other GPU serves another size of this game; frames of this one go on as they are until it is free",
+                    offload_at.name()
                 );
             }
             res.native = Some(native);
-            result.miss = Some("the second GPU is serving another render size");
+            result.miss = Some("the second GPU is serving another size of this game");
             return result;
         }
         // SAFETY: the game's live device; the offload device was made with it.
-        match unsafe { super::offload_pre::HoldSide::build(device, instance, physical_device, res.id, target.width, target.height) } {
+        match unsafe { super::offload_pre::HoldSide::build(device, instance, physical_device, res.id, offload_at, target.width, target.height) } {
             Ok(side) => res.offpre = Some(side),
             Err(why) => {
                 crate::log!("[offload] the model stays on the game's GPU: {why}");
@@ -4904,6 +5197,7 @@ unsafe fn native_hold(
             unsafe {
                 late_bound = edit.bind_late(device, side.snapshot_view(), side.snapshot_made());
                 side.exchange.bind_gate(device, edit.stats_buffer(), edit.stats_made());
+                side.exchange.bind_pack(device, native.acc.buffer, native.id());
             }
         }
         // A hold that records nothing (below) must not have taken the stored edit out of the plan.
@@ -4911,7 +5205,7 @@ unsafe fn native_hold(
             edit.state.set_offloaded(offloaded);
             if let Some(side) = res.offpre.as_mut().filter(|_| offloaded) {
                 // Its frame can be sent when the next hold can carry its edit: vectors, jitter, a chained cache.
-                off_plan = Some(side.plan(&mut edit.state, &h, chained && mvec.is_some() && jitter.is_some()));
+                off_plan = Some(side.plan(&mut edit.state, &h, unsendable(chained, target.mvec, mvec.is_some(), jitter.is_some())));
             }
             let p = edit.state.plan(&h);
             if !inline {
@@ -4945,6 +5239,7 @@ unsafe fn native_hold(
         mvec_scale: target.mvec_scale,
         passes,
         depth: depth.is_some(),
+        motion_half: res.offpre.as_ref().is_some_and(|side| side.exchange.motion_half()),
         lut: lut.cloned(),
     });
     // The motion pass while the cache runs (its prep and the accumulated field the network reads), at
@@ -5339,8 +5634,9 @@ unsafe fn native_hold(
         result.miss = Some("recording the capture failed");
         return result;
     }
-    // The copies between the passes, on a network frame with more than one.
-    if more {
+    // The copies between the passes, on a network frame with more than one (offloaded: the other device's runner records
+    // its own, `NativePass::record_later`).
+    if more && !offloaded {
         let pass = res.hdr.as_ref().expect("built above");
         // SAFETY: built above and not pending (the hold waited for the previous one's fence, which
         // comes after them); the encoded image is in GENERAL.
@@ -5453,30 +5749,18 @@ unsafe fn native_hold(
             n.submitted(cmd);
         }
     }
-    if let (false, Some(copies)) = (later.is_empty(), res.native.as_ref().and_then(|n| n.more.as_ref()).map(|m| m.copies)) {
-        // Pass 2 on: `X` (or `Y`) puts the previous answer where the network reads, then the pass;
-        // `R` puts the capture back for the write-back.
-        let mut ok = true;
-        for (k, &cmd) in later.iter().enumerate() {
-            let copy = if k == 0 { copies[0] } else { copies[1] };
-            ok = ok
-                && crate::note_vk(device.handle(), submit(super::Which::Native, copy, vk::Fence::null())).is_ok()
-                && crate::note_vk(device.handle(), submit(super::Which::Native, cmd, vk::Fence::null())).is_ok();
-        }
-        ok = ok && crate::note_vk(device.handle(), submit(super::Which::Native, copies[2], vk::Fence::null())).is_ok();
+    // Pass 2 on: `X` (or `Y`) puts the previous answer where the network reads, then the pass; `R` puts the capture
+    // back for the write-back.
+    let sequence = res.native.as_ref().map_or_else(Vec::new, |n| n.later_sequence(&later));
+    if !sequence.is_empty() {
+        let ok = sequence.iter().all(|&cmd| crate::note_vk(device.handle(), submit(super::Which::Native, cmd, vk::Fence::null())).is_ok());
         if !ok {
             failed(res, submit);
             result.miss = Some("a later pass of the network could not be submitted");
             return result;
         }
-        if let Some(m) = res.native.as_mut().and_then(|n| n.more.as_mut()) {
-            // `X` took the passes' new history to GENERAL.
-            for f in m.fresh.iter_mut().take(later.len()) {
-                *f = false;
-            }
-            if let Some(t) = m.timer.as_mut() {
-                t.mark_submitted();
-            }
+        if let Some(n) = res.native.as_mut() {
+            n.later_submitted(later.len());
         }
     }
     // SAFETY: the layer's own fence, idle (`wait_idle` above, or never submitted).
@@ -5550,23 +5834,64 @@ unsafe fn native_hold(
 
 #[cfg(test)]
 mod tests {
+    /// The later passes go in the order the local hold and the other GPU's runner submit them: `X` before pass 2,
+    /// `Y` before each further pass, `R` after the last.
     #[test]
-    fn the_running_line_says_where_the_model_runs_with_ray_reconstruction_and_a_second_gpu() {
-        assert_eq!(super::running_line(None, false), "native network running");
-        assert_eq!(super::running_line(Some("lower"), false), "native network running (lower)");
-        let rr = super::running_line(None, true);
-        assert!(rr.starts_with("second GPU: "), "doctor reports it with the second GPU's lines: {rr}");
-        assert!(rr.contains("the game's GPU after DLSS") && rr.contains("covers only before DLSS"), "{rr}");
-        assert!(super::running_line(Some("lower"), true).contains("after DLSS (lower);"));
+    fn the_later_passes_go_between_their_copies() {
+        let cb = |n: u64| <vk::CommandBuffer as ash::vk::Handle>::from_raw(n);
+        let copies = [cb(100), cb(101), cb(102)];
+        assert_eq!(later_order(copies, &[cb(2)]), vec![cb(100), cb(2), cb(102)]);
+        assert_eq!(later_order(copies, &[cb(2), cb(3), cb(4)]), vec![cb(100), cb(2), cb(101), cb(3), cb(101), cb(4), cb(102)]);
+    }
+
+    /// The reason a hold's frame cannot go to the other GPU names what is missing, the first that applies.
+    #[test]
+    fn a_frame_that_cannot_be_sent_says_why() {
+        let aux = |layout| Some(super::super::Aux { image: vk::Image::null(), format: vk::Format::R16G16_SFLOAT, layout, readable: false });
+        assert_eq!(unsendable(true, aux(Some(vk::ImageLayout::GENERAL)), true, true), None);
+        assert_eq!(unsendable(false, None, false, false), Some("the edit cache has no room for its buffers"));
+        assert_eq!(unsendable(true, None, false, true), Some("DLSS names no motion vectors"));
+        assert_eq!(unsendable(true, aux(None), false, true), Some("the motion vectors' layout is unknown"));
+        assert_eq!(unsendable(true, aux(Some(vk::ImageLayout::UNDEFINED)), false, true), Some("the motion vectors cannot be copied"));
+        assert_eq!(unsendable(true, aux(Some(vk::ImageLayout::GENERAL)), true, false), Some("DLSS's jitter is unknown"));
+    }
+
+    #[test]
+    fn the_running_line_fits_the_channel_with_every_note_of_the_vram_guard() {
+        assert_eq!(super::running_line(None, None), "native network running");
+        assert_eq!(super::running_line(Some("lower"), None), "native network running (lower)");
         // Every variant fits the channel's field whole (a cut line would read as changed at every hold).
         for guard in [None, Some(super::super::vram_guard::NOTE_SMALL), Some(super::super::vram_guard::NOTE_PAUSED)] {
-            for after in [false, true] {
-                let line = super::running_line(guard, after);
-                assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
-            }
+            let line = super::running_line(guard, None);
+            assert!(line.len() < neural_forge_protocol::REASON_BYTES, "{} bytes: {line}", line.len());
         }
     }
     use super::*;
+
+    /// A hold's miss for the loader's last failure (#63): the network being another device's, refused as open elsewhere
+    /// (the native library's own words, [`OPEN_ELSEWHERE`]) or lent to it, is a wait; a device whose network is off for
+    /// the session is that, whatever it failed with; anything else is a build that failed.
+    #[test]
+    fn the_holds_miss_says_whether_the_network_is_another_devices_dead_or_not_built() {
+        let refused = format!("the model at /x could not be loaded: {OPEN_ELSEWHERE} (one at a time: its Vulkan function table is process-wide)");
+        assert_eq!(failed_miss(&refused, false), OPEN_WAIT);
+        assert_eq!(failed_miss(LENT, false), OPEN_WAIT, "lent to another device: it is that device's now");
+        assert_eq!(failed_miss("the model at /x could not be loaded: no such file", false), NOT_BUILT);
+        assert_eq!(failed_miss(GIVEN_BACK, false), OPEN_WAIT, "given back to the second GPU: that device's until it closes it");
+        for why in [refused.as_str(), LENT, "a wait on the network's queue timed out"] {
+            assert_eq!(failed_miss(why, true), DEAD, "{why}");
+        }
+        // The finished frame's presents get the same from the game's device's loader.
+        assert_eq!(post_miss_of(true, Some(&refused), true), Some(DEAD));
+        assert_eq!(post_miss_of(false, Some(&refused), false), Some(OPEN_WAIT));
+        assert_eq!(post_miss_of(false, Some("no such file"), false), Some(NOT_BUILT));
+        assert_eq!(post_miss_of(false, None, false), Some(LOADING));
+        assert_eq!(post_miss_of(false, Some(&refused), true), None, "open again: the frame is only late");
+        assert_eq!(post_miss_of(false, None, true), None);
+        // Each is its own miss: the trial tells them apart by the constant, not by wording.
+        let all = [LOADING, NOT_BUILT, OPEN_WAIT, DEAD, WAITING];
+        assert!(all.iter().enumerate().all(|(i, a)| all.iter().skip(i + 1).all(|b| a != b)));
+    }
 
     /// Resources built untimed (inside DLSS's buffer the hold times its slot) make no GPU timer at all: a timer
     /// has no destructor, so one made and dropped left its query pool behind, past `vkDestroyDevice` (which the
@@ -6995,6 +7320,379 @@ mod tests {
         }
     }
 
+    /// The other GPU's runner (`offload_server`, [`NativePass::record_later`]) gets the same multi-pass answer as the
+    /// split hold, which records the copies between the passes itself and submits `X`, pass 2, `Y`, pass 3, `R`: with
+    /// two and three passes, at a pass feedback of 1 and of 0.5 (#63 review: the runner submitted the copies
+    /// unrecorded, so every later pass read the capture and the answer was the last pass's alone).
+    #[test]
+    fn the_other_gpus_later_passes_match_the_split_holds() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only, waited for and destroyed before it.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(pw * ph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1),
+                )
+                .unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device
+                .begin_command_buffer(
+                    graph,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance),
+                )
+                .unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let built = Built {
+                width: W,
+                height: H,
+                frame: nn::Frame {
+                    field_width: FW,
+                    field_height: FH,
+                    features: features.buffer,
+                    features_bytes: u64::from(FW * FH) * 64,
+                    head: head.buffer,
+                    head_bytes: u64::from(FW * FH) * 16,
+                    blend_scale: 0.5,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation: 1,
+                network: network::FULL,
+            };
+            let texels: Vec<u16> =
+                (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            let range =
+                vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            let region = vk::BufferImageCopy {
+                image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                buffer_row_length: pw,
+                image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                ..Default::default()
+            };
+            let h: Vec<f32> =
+                (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, 0), residual(x, y, 1, 0), residual(x, y, 2, 0), 10.0])).collect();
+            // A sequence of network frames (`count` passes at `feedback` each, with history from the second on) on a pass
+            // of its own, the split hold's way (each buffer in its own submit, as `run_native_hold` submits them) or the
+            // runner's (one submit, `record_later`'s order): each frame's answer.
+            let run = |frames: &[(usize, f32)], runner: bool| -> Vec<Vec<u16>> {
+                let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+                std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+                fx.one_shot(|cmd| {
+                    let to_general = vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(encoded.image)
+                        .subresource_range(range);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_general],
+                    );
+                    device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+                });
+                std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+                let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
+                fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+                let mut answers = Vec::new();
+                for (n, &(count, feedback)) in frames.iter().enumerate() {
+                    assert!(pass.ensure_more(device, instance, physical, family, count), "the later passes build");
+                    assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
+                    let mut passes = Passes::one(Conditioning::default());
+                    passes.count = count;
+                    passes.feedback = feedback;
+                    for (k, each) in passes.each.iter_mut().enumerate().take(count).skip(1) {
+                        each.intensity = 1.0 - 0.05 * k as f32;
+                    }
+                    if !runner {
+                        pass.record_copies(device, encoded.image, encoded.view, region, count, feedback).unwrap();
+                    }
+                    let (cmds, later) = pass.frame_passes(&built, n > 0, None, [1.0, 1.0], &passes);
+                    assert_eq!(later.len(), count - 1);
+                    let first: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().collect();
+                    let order: Vec<vk::CommandBuffer> = if runner {
+                        let sequence = pass.record_later(device, encoded.image, encoded.view, region, &passes, &later).unwrap();
+                        let all: Vec<vk::CommandBuffer> = first.iter().copied().chain(sequence).collect();
+                        device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&all)], vk::Fence::null()).unwrap();
+                        all
+                    } else {
+                        // The split hold's order, written out: `X`, pass 2, then `Y` before each further pass, `R`; each
+                        // buffer submitted on its own, `Y` again while its earlier submit may still be pending.
+                        let copies = pass.more.as_ref().unwrap().copies;
+                        let mut order = first.clone();
+                        for (k, &l) in later.iter().enumerate() {
+                            order.push(if k == 0 { copies[0] } else { copies[1] });
+                            order.push(l);
+                        }
+                        order.push(copies[2]);
+                        for &cmd in &order {
+                            device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
+                        }
+                        order
+                    };
+                    device.queue_wait_idle(gpu.4).unwrap();
+                    for cmd in order {
+                        pass.submitted(cmd);
+                    }
+                    pass.later_submitted(later.len());
+                    let m = pass.more.as_ref().unwrap();
+                    assert!(m.fresh.iter().take(count - 1).all(|f| !f), "frame {n}: the later passes' histories are out of UNDEFINED");
+                    let answer = pass.answer();
+                    fx.one_shot(|cmd| {
+                        device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }])
+                    });
+                    answers.push(std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).to_vec());
+                }
+                pass.destroy(device);
+                encoded.destroy(device);
+                answers
+            };
+            let first = run(&[(1, 1.0)], true).remove(0);
+            for (count, feedback) in [(2, 1.0), (3, 1.0), (2, 0.5), (3, 0.5), (4, 1.0), (4, 0.5), (neural_forge_protocol::MAX_PASSES, 1.0)] {
+                let split = run(&[(count, feedback)], false);
+                let runner = run(&[(count, feedback)], true);
+                assert_eq!(runner, split, "{count} passes at feedback {feedback}: the runner's answer is the split hold's");
+                assert_ne!(runner[0], first, "{count} passes at feedback {feedback}: the later passes changed the answer");
+            }
+            // Frames in a row with the pass count changing (2, 3, 2): each later pass's history is its own, read from
+            // the second frame on, and pass 3's comes out of UNDEFINED when it first runs.
+            let frames = [(2, 1.0), (3, 0.5), (2, 1.0)];
+            let split = run(&frames, false);
+            let runner = run(&frames, true);
+            assert_eq!(runner, split, "2, 3, 2 passes: the runner's answers are the split hold's, frame by frame");
+            assert_ne!(runner[0], runner[2], "the third frame reads the histories the first two left");
+            for b in [&exposure, &features, &head, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// The runner's sequence for the shared core on the other GPU (`offload_server::Core`), at the `NativePass` level
+    /// (`frame_graphs`, `record_later`, one submit, `submitted`, `later_submitted`; not `PreRunner::frame` or `Core`
+    /// themselves): a frame with passes before DLSS and after its output sends both holds' frames to the one device, one
+    /// network and one queue, each hold with its own pass (its `NativePass`, so its own later passes' buffers, lanes and
+    /// histories). Here the hold before DLSS runs 2 passes (pass
+    /// 2 at half the model resolution) and the hold after DLSS 3 (pass 2 at half, pass 3 at full, a pass feedback of
+    /// 0.5); pass 2 after DLSS runs at the render size, so it shares that size's network buffers with pass 1 before
+    /// DLSS. Run as the runners run them (one submit each, `record_later`'s copies, the two holds' frames one after the
+    /// other on the one queue) every frame of each hold is bit for bit the answer that hold gets alone on the game's GPU
+    /// (the split hold's own submits, nothing of the other hold in between).
+    #[test]
+    fn two_holds_on_one_core_run_every_pass_as_each_does_alone() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let (render, output) = ((SW, SH), (2 * SW, 2 * SH));
+        // SAFETY: a fresh device; every object below is used on its queue only, waited for and destroyed before it.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (graph_pool, graph) = empty_graph(device, family);
+            // The one network, built for every size of the frame (`frame_sizes`): render, half of it, output.
+            let stands = [
+                Stand::new(device, instance, physical, render, (FW, FH), graph, 5),
+                Stand::new(device, instance, physical, (SW / 2, SH / 2), (FW / 2, FH / 2), graph, 5),
+                Stand::new(device, instance, physical, output, (2 * FW, 2 * FH), graph, 5),
+            ];
+            let graphs = [stands[0].graph(), stands[1].graph(), stands[2].graph()];
+            let (opw, oph) = super::super::padded(output.0, output.1);
+            let staging = own_host_buffer_with(
+                device,
+                instance,
+                physical,
+                u64::from(opw * oph) * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            // The two holds' passes: (extent, count, scales, feedback, intensities, the frame's texture).
+            let stage = |count: usize, half_at: &[usize], feedback: f32, base: f32| {
+                let mut p = Passes::one(Conditioning::default());
+                p.count = count;
+                p.feedback = feedback;
+                for &k in half_at {
+                    p.scales[k] = 0.5;
+                }
+                for (k, each) in p.each.iter_mut().enumerate().take(count) {
+                    each.intensity = base - 0.1 * k as f32;
+                }
+                p
+            };
+            let holds = [(render, stage(2, &[1], 1.0, 0.9), 0u32), (output, stage(3, &[1], 0.5, 0.8), 11u32)];
+            struct HoldRun {
+                pass: NativePass,
+                encoded: OwnImage,
+                pw: u32,
+                ph: u32,
+                region: vk::BufferImageCopy,
+                texels: Vec<u16>,
+            }
+            let make = |k: usize| -> HoldRun {
+                let ((w, h), passes, shift) = holds[k];
+                let (pw, ph) = super::super::padded(w, h);
+                let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+                let extents = pass_extents(w, h, &passes.scales);
+                let mut pass = NativePass::build_at(device, instance, physical, family, w, h, extents, false, true).expect("the native pass builds");
+                assert!(pass.ensure_more(device, instance, physical, family, passes.count), "the later passes build");
+                assert!(pass.ensure_lanes(device, instance, physical, passes.count), "the passes' lanes build");
+                assert!(pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None));
+                fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+                let texels = (0..ph)
+                    .flat_map(|y| {
+                        (0..pw).flat_map(move |x| [half(proxy(x + shift, y, 0)), half(proxy(x, y + shift, 1)), half(proxy(x + shift, y + 1, 2)), half(1.0)])
+                    })
+                    .collect();
+                let region = vk::BufferImageCopy {
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    buffer_row_length: pw,
+                    image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 },
+                    ..Default::default()
+                };
+                HoldRun { pass, encoded, pw, ph, region, texels }
+            };
+            // One network frame of hold `k` (frame `n`): the network's answers for this hold and frame in the head of
+            // every size, the hold's capture uploaded, then its passes the runner's way (`runner`: one submit with
+            // `record_later`'s order) or the split hold's (each buffer submitted on its own); its answer.
+            let frame = |run: &mut HoldRun, k: usize, n: u32, runner: bool| -> Vec<u16> {
+                let passes = holds[k].1;
+                for (s, st) in stands.iter().enumerate() {
+                    st.write_head(|x, y, c| residual(x + 3 * k as u32, y + s as u32, c, n));
+                }
+                upload_encoded(&fx, &staging, &run.encoded, run.pw, run.ph, &run.texels);
+                if !runner {
+                    run.pass.record_copies(device, run.encoded.image, run.encoded.view, run.region, passes.count, passes.feedback).unwrap();
+                }
+                let (cmds, later) = run.pass.frame_graphs(&graphs, n > 0, None, [1.0, 1.0], &passes);
+                assert_eq!(later.len(), passes.count - 1, "hold {k}: every later pass is planned");
+                let first: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().collect();
+                let order: Vec<vk::CommandBuffer> = if runner {
+                    let sequence = run.pass.record_later(device, run.encoded.image, run.encoded.view, run.region, &passes, &later).unwrap();
+                    assert_eq!(sequence.len(), 2 * later.len() + 1);
+                    let all: Vec<vk::CommandBuffer> = first.iter().copied().chain(sequence).collect();
+                    device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&all)], vk::Fence::null()).unwrap();
+                    all
+                } else {
+                    let order: Vec<vk::CommandBuffer> = first.iter().copied().chain(run.pass.later_sequence(&later)).collect();
+                    for &cmd in &order {
+                        device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
+                    }
+                    order
+                };
+                device.queue_wait_idle(gpu.4).unwrap();
+                for cmd in order {
+                    run.pass.submitted(cmd);
+                }
+                run.pass.later_submitted(later.len());
+                let answer = run.pass.answer();
+                let bytes = u64::from(run.pw * run.ph) * 8;
+                fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]));
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (run.pw * run.ph * 4) as usize).to_vec()
+            };
+            const FRAMES: u32 = 4;
+            // Each hold alone, the split hold's way.
+            let mut alone = Vec::new();
+            for k in 0..2 {
+                let mut run = make(k);
+                alone.push((0..FRAMES).map(|n| frame(&mut run, k, n, false)).collect::<Vec<_>>());
+                run.pass.destroy(device);
+                run.encoded.destroy(device);
+            }
+            // Both holds through the one core: before DLSS, then after it, frame after frame.
+            let mut runs = [make(0), make(1)];
+            let mut shared = [Vec::new(), Vec::new()];
+            for n in 0..FRAMES {
+                for (k, run) in runs.iter_mut().enumerate() {
+                    shared[k].push(frame(run, k, n, true));
+                }
+            }
+            for k in 0..2 {
+                let m = runs[k].pass.more.as_ref().unwrap();
+                assert!(m.history.iter().take(holds[k].1.count - 1).all(Option::is_some), "hold {k}: every later pass has its history");
+                assert_eq!(runs[k].pass.extents[1], (holds[k].0 .0 / 2, holds[k].0 .1 / 2), "hold {k}: pass 2 at half its size");
+                for n in 0..FRAMES as usize {
+                    assert!(shared[k][n] == alone[k][n], "hold {k}, frame {n}: the shared core's answer is the hold's own alone, bit for bit");
+                }
+                assert_ne!(shared[k][0], shared[k][FRAMES as usize - 1], "hold {k}: the frames differ (their heads and histories do)");
+            }
+            // The later passes changed the answer: pass 1 alone is another picture.
+            let mut one = make(1);
+            let only = {
+                let ((_, _), mut passes, _) = holds[1];
+                passes.count = 1;
+                stands[2].write_head(|x, y, c| residual(x + 3, y + 2, c, 0));
+                upload_encoded(&fx, &staging, &one.encoded, one.pw, one.ph, &one.texels);
+                let (cmds, _) = one.pass.frame_graphs(&graphs, false, None, [1.0, 1.0], &passes);
+                fx.submit(&mut one.pass, cmds);
+                let bytes = u64::from(one.pw * one.ph) * 8;
+                let answer = one.pass.answer();
+                fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]));
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (one.pw * one.ph * 4) as usize).to_vec()
+            };
+            assert_ne!(only, shared[1][0], "the after-DLSS hold's later passes changed its answer");
+            one.pass.destroy(device);
+            one.encoded.destroy(device);
+            for run in runs {
+                run.pass.destroy(device);
+                run.encoded.destroy(device);
+            }
+            for st in &stands {
+                st.destroy(device);
+            }
+            for b in [&exposure, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
     /// Two passes, the second with its own intensity: pass 2 reads pass 1's answer as its colour input (its
     /// proxy lanes), its answer is the network's on that picture blended by its own intensity, and the
     /// encoded capture is put back after it for the write-back.
@@ -8381,6 +9079,50 @@ mod tests {
             device.destroy_command_pool(graph_pool, None);
             device.destroy_command_pool(pool, None);
         }
+    }
+
+    /// The After DLSS group (#73): a hold after DLSS runs the group's values (its intensity, model resolution and colour,
+    /// a pass's own override still first) and as many passes as the plan gives it, while a hold before the upscaler runs
+    /// the Model tab's and the Passes setting's count; with the group at its defaults nothing differs.
+    #[test]
+    fn a_hold_after_dlss_runs_the_after_dlss_groups_values() {
+        use super::super::placement::{plan_for, Frame, Hold, Stage};
+        use neural_forge_protocol::enums::pass_override as po;
+        let h = neural_forge_protocol::ShmHeader::default();
+        h.init_defaults();
+        let defaults = Passes::from(h.pass_tunings());
+        assert!(defaults.after.is_none(), "the same values after DLSS by default");
+        assert!(h.write_settings(&[
+            ("passes", 2),
+            ("intensity", 0.8f32.to_bits()),
+            ("pass2_overrides", po::INTENSITY),
+            ("pass2_intensity", 0.4f32.to_bits()),
+            ("after_passes", 3),
+            ("after_scale", 0.5f32.to_bits()),
+            ("after_overrides", po::INTENSITY | po::EDIT_DETAIL),
+            ("after_intensity", 0.3f32.to_bits()),
+            ("after_edit_detail", 2.0f32.to_bits()),
+            ("edit_lut_strength", 0.5f32.to_bits()),
+        ]));
+        let all = Passes::from(h.pass_tunings());
+        let (render, output) = ((960, 540), (1920, 1080));
+        let placements = h.placements();
+        // Ray Reconstruction: every pass after DLSS, three of them, with the group's values.
+        let plan = plan_for(&placements, Frame { rr: true, output: true, hook: false });
+        let after = stage_passes(&all, Hold::of(&plan, Stage::Upscaled, render, output)).expect("passes after DLSS");
+        assert_eq!(after.count, 3);
+        assert_eq!([after.each[0].intensity, after.each[1].intensity, after.each[2].intensity], [0.3, 0.4, 0.3], "pass 2's own intensity first");
+        assert_eq!(&after.scales[..3], &[0.5; 3]);
+        assert_eq!((after.colour.each[0].detail, after.colour.lut_strength), (2.0, 0.5), "the stack's last pass keeps the table");
+        assert_eq!(frame_sizes(&all, Hold::of(&plan, Stage::Upscaled, render, output), output), vec![(960, 540)], "the network at the group's size");
+        // Without it: before the upscaler, two passes with the Model tab's values at full size.
+        let plan = plan_for(&placements, Frame { rr: false, output: true, hook: true });
+        let before = stage_passes(&all, Hold::of(&plan, Stage::Before, render, output)).expect("passes before the upscaler");
+        assert_eq!((before.count, before.each[0].intensity, before.each[1].intensity, before.scales[0]), (2, 0.8, 0.4, 1.0));
+        assert_eq!(before.colour.each[0].detail, 1.0);
+        assert!(stage_passes(&all, Hold::of(&plan, Stage::Upscaled, render, output)).is_none());
+        // A hold that names every pass before the upscaler still runs the Passes setting's count, not the group's.
+        assert_eq!(stage_passes(&all, Hold::ALL_BEFORE).expect("passes").count, 2);
     }
 
     /// The per-pass split: two passes, one placed before the upscaler and one after DLSS. Each stage's hold

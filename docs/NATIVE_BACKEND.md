@@ -1314,6 +1314,18 @@ ranges from the moment it is recorded (`placement::Hold`, in `InlinePoint::hold`
 plan at the submit, `Tracking::split_hold`), so the two holds of one buffer always split the passes the
 same way.
 
+**The After DLSS / finished frame group** (#73; header v30: `after_passes`, `after_scale`, `after_overrides` and
+`after_<field>`). The passes after DLSS and at present take the group's values: `ShmHeader::pass_tunings` gives both
+sets (`PassTunings::after`, each pass's own overrides applied on top of the group's, as on the Model tab's), the hold
+after DLSS takes them in `native::stage_passes` (`Passes::after_dlss`; `None` while the group sets nothing, so the
+default path is the one it was), and the after-the-upscaler path in `native_post` (`PassTunings::after_dlss`). The
+pass count follows pass 1's stage (`placement::plan_for`): before the upscaler the Passes setting's, else
+`after_passes` (0: the Passes setting). Since passes never run earlier than pass 1, pass 1's stage is the same with
+either count. `after_scale` (0: `preupscale_scale`) is the model resolution after DLSS; at present `working_scale`
+stays the size. The layer writes the group of the plan it made last (`settings_group`, the current placement's) for
+the Status tab. A switch between the groups is a change of stage (or, after DLSS, of size and count), which the holds
+and the network's build already follow: nothing new is built or freed for it.
+
 **Two holds in one buffer.** A command buffer can carry the hold before the upscaler and the hold after
 DLSS's output (`inline::Slots::by_cb` holds a list): each has its own staging slot and events, the jobs
 are handed to the worker in the order recorded, and the worker runs them one after the other, waiting for
@@ -1755,6 +1767,133 @@ per summary, video memory at 11.8 of 12 GB; in 24 captured frames each composite
 and after each stall the capture's own writing caused (2.7 s) one frame went out live and was then shown once more,
 composed.
 
+## The second GPU shows the frame (#63, 2026-11-14)
+
+With the model on the finished frame, the setting `second_gpu_present` moves the present itself to the second
+device: the game gets a swapchain the layer owns (plain images on its device), the real swapchain is created on the
+second device, the game's present copies its image into one of three host-memory slots and returns, and a presenter
+thread uploads the newest slot and presents it through this same finished-frame path, run on the second device by a
+device record of its own (so the network's server is the local one there, never the round trip). Nothing comes back
+to the game's GPU and the game never waits; frames that find no slot, or are overtaken, are skipped. The design, the
+swapchain semantics and the fall-backs are in [SECOND_GPU_PRESENT_DESIGN.md](SECOND_GPU_PRESENT_DESIGN.md); the code
+is `crates/layer/src/gpu2_present.rs` and the `gpu2_*` parts of `device.rs`.
+
+## Finished-frame pacing: the relay and the wait on the GPU (4.4.0, 2026-11-13)
+
+`composition::pace`, `capture::paced_present`, `GpuCompose::send_delayed`, `native_post`'s `Export`. The delayed
+present above makes three waits on the game's thread: (a) for the capture of its frame to finish on the game's GPU
+(so the request can be posted), (b) for the compose's read of the answer region (the server writes it next), and (c),
+at the next present, for the answer. The first two are waits for work queued behind the game's whole frame: the
+game's thread cannot record the next frame while its GPU renders this one. The third puts the other GPU's time in
+series with the game's CPU time.
+
+**The relay: (a) and (b).** Once `PACE_AFTER` (30) delayed presents in a row composed their answers, the present
+hands its frames to a relay. It keeps the frame with its proxy copied off the image (`keep_delayed`,
+`proxy_from_image`: on the zero-copy path the proxy is the frame itself), composes the frame before with its answer
+as always, and copies the proxy from the kept pair into the proxy region behind that compose (`send_delayed`: the
+direct capture's import of the region; one copy fewer than the capture and its second target). The frame's number
+and that copy's fence go to the relay (`pace::Token`). Its thread waits for the fence (the game's GPU is done with
+both regions for this frame), runs the white meter, posts the request on the channel's header (`shm::HeaderPort`:
+the words `ShmClient::begin_async_request` writes) and polls for the answer within the frame's budget
+(`SYNC_BUDGET`, 250 ms), then resolves the frame: answered and fitting (`capture::answer_fits`), or not. The late
+rule and the round-trip counters are fed there. The channel's client starts no request on the slot meanwhile.
+
+**The wait on the GPU: (c).** MAKO (github.com/eugeniosegala/MAKO at 81f1604bc7a2) lets the present's submission
+wait on the GPU for a timeline semaphore its host signals. That form was built here first (a timeline on the game's
+device signalled from the host when the answer is in, the compose's dispatch size read at execution so that a
+missing answer passed the kept frame through) and the validation layer refuses it: the present waits on a binary
+semaphore, and a binary semaphore's wait may only depend on signal operations already submitted
+(VUID-vkQueueSubmit-pWaitSemaphores-03238, VUID-vkQueuePresentKHR-pWaitSemaphores-03268), which a host signal
+that has not been made is not; also through the queue's order, with the present semaphore signalled by an ungated
+submission behind the gated one. (The first before-DLSS version had the same end with a host-set event,
+VUID-vkSetEvent-event-09543.)
+
+What the rule allows is a wait on a signal that *is* submitted: the other device's own submission of the frame. It
+is opt-in and experimental, with `NEURAL_FORGE_OFFLOAD_PACING=gpu` (`pace::gpu_wait_wanted`; the releaser below says
+why it is not the default). Then, where both devices have `VK_KHR_external_semaphore_fd` with `SYNC_FD` (asked of
+the driver, `pace::sync_fd_capable`: `vkGetPhysicalDeviceExternalSemaphoreProperties` says `SYNC_FD` semaphores are
+exportable on the other GPU and importable on the game's, not just the extension's name; added to the offload device
+and to the game's device by the layer's device hook, only with the GPU wait chosen and `NEURAL_FORGE_OFFLOAD_GPU`
+set; `pace::has_semaphore_fd`), and the other device imports the regions (its frame writes the answer itself):
+
+1. the server's last submission of a frame (`native_post::evaluate`: the network frame; an HDR10 frame's conversion
+   comes before it) signals an exportable binary semaphore, and its sync fd, exported right after the submit, is
+   published with the request's number, the size the answer is for and that it is evaluated (`pace::publish`). The
+   export takes the signal, so the one semaphore serves every frame. An export may give -1 when the submission is
+   already done: nothing is published (the export is not broken), and the relay resolves the frame on its answer;
+2. the relay takes it for the request it posted (`Port::submitted`) and keeps it for the present;
+3. the next present waits only until the frame before it is submitted there or resolved (`Pacer::wait_ready`).
+   Submitted and fitting: the fd is duplicated, one is imported as a temporary payload into a semaphore of the
+   compose's async slot and the compose's submission waits on it; the other into the pair's send semaphore, and
+   this frame's copy into the proxy region waits on it (the server reads that region until then). Nothing else
+   changes: the compose is the same compose, and it still signals the present semaphore itself.
+
+Fall-backs to the wait on the game's thread: either device without the extension, staged regions on the other
+device, an fd that cannot be exported (the semaphore is then not signalled again) or duplicated (the frame before
+is composed only when the relay resolves it with a good answer, else it goes out as it was kept), an answer that
+will not fit (never gated), and the pacing not set to `gpu` (unset or `relay`: the default). An import the game's
+device refuses (`Paced::take_gate`) is said once in the log and ends the waits on the GPU for that compose
+(`can_gate` is false from then on): that present's compose (or send) waits for the relay to resolve the frame and
+composes it ungated, only with a good answer, and every later present waits on the game's thread. A submission
+that fails after its import leaves the semaphore with a payload nothing consumes: it is replaced
+(`Paced::renew`). A present that cannot keep its frame once it has the gate hands it back, and its own path waits
+for that answer before it composes.
+`NEURAL_FORGE_OFFLOAD_PACING=cpu` keeps all three waits on the game's thread. Only the zero-copy pair has any of
+this (the CPU pairs of
+`delayed_present_cpu` do not).
+
+**The releaser.** Every wait of the relay's own is bounded; a frame whose copy does not finish or whose answer does
+not come within its budget is resolved without one, the pacer is `lost`, frames already posted behind it are
+resolved without being sent, the frame goes out as it was kept (still in its turn: the wait was the other GPU's
+lateness, not a stall of the game), and the request that is still out becomes the channel client's
+(`ShmClient::adopt_request`), whose own rules end it; the present makes its own waits again until 30 answers in a
+row. The relay's end, a panic included, resolves everything posted (`ReleaseOnExit`). Leaving the delayed present
+waits for the relay first (`leave_delayed`), and the compose's teardown ends it before the sends' fences go
+(`release_paced`). A wait on the GPU cannot be released once submitted, so none is made for a signal that might not
+come: an fd exists only for a submission that was made, and such a submission finishes or its device is lost,
+which signals its fence too. What that leaves: a frame the server gives up on after its submit (a counter-chain
+timeout, a lost device) is composed once with whatever is in the answer region, and a submission that hangs on the
+other GPU holds the game's queue for as long: a hung or very slow other GPU freezes the game, where on the game's
+thread the present waits `SYNC_BUDGET` and then lets the frame through (a hitch of a quarter of a second). Not seen
+in any run, and on two different GPUs not run at all; that is why the wait on the GPU is opt-in
+(`NEURAL_FORGE_OFFLOAD_PACING=gpu`) and the default is the relay with the answer waited for on the game's thread.
+
+**What it changes.** With the relay alone the game's thread no longer waits for its own GPU at each present, and
+waits for the answer only as long as the other GPU is behind the game. With the wait on the GPU it waits only until
+the other GPU has *started* the frame before: the answer's time is no longer in series with the game's CPU time,
+and the frame rate is bounded by the slowest of the game's CPU, the game's GPU and the other GPU, where it was the
+other GPU plus the game's CPU. On one GPU (`same`) none of it shows: the second device's network takes four times
+the game's frame, the pipeline is full, and the wait only moves.
+
+**Measured (RTX 5070 alone, `same`; Cyberpunk 2077's benchmark at 2560x1440 HDR10, Placement set to Finished frame
+while it ran, frame generation on; the `[offload]` summary's time of the game's thread in each delayed present;
+2026-11-13):**
+
+| Pacing | Game's thread, per present | Presented | On the second device | Notes |
+|---|---|---|---|---|
+| `NEURAL_FORGE_OFFLOAD_PACING=cpu` (all three waits on the game's thread) | 31.6-32.2 ms | 31.4-31.7 fps | 28-30 ms a frame | 600 of 600 presents with the answer |
+| unset or `=relay`, the default (the copy's wait with the relay) | 32.3-32.9 ms (31.1-33.0 in a second run) | 29.2-30.8 fps (31.1) | 29.6-30.2 ms | 600 of 600 with the answer; 0 waited on the GPU |
+| `=gpu` (the answer waited for on the GPU, sync fd) | 32.5-33.5 ms | 29.3-30.2 fps | 30.1-31.0 ms | 600 of 600 with the answer, 600 of 600 composes waiting on the GPU; no export or import refused |
+
+One GPU cannot show the gain: the second device's network takes about 30 ms beside the game, four times the
+game's own frame, so the pipeline is full whichever way it is paced, the game's thread waits a frame's worth of the
+other device at every present (for the answer, or for the other device to take the next frame), and the three
+kinds are within what two runs of one kind differ by (about 1.5 fps). What the runs do show is that each path works
+in a game on the NVIDIA driver (the sync fd exported from one device of the GPU and imported on the other every
+frame, 600 of 600), with the frames shown one present late: in each run's recording (12 s, `vw`) the picture is
+clean, with one hitch of 120 to 230 ms at the benchmark's scene change in every kind. Not measured: two different
+GPUs, where the other GPU can be faster than the game and the wait on the GPU is the only one left.
+
+After the review fixes (the GPU wait opt-in; 2026-11-13, same benchmark and settings): the default (relay) ran 600 of
+600 presents with the answer in every summary, none waiting on the GPU and no sync fd exported, 30.9-32.7 ms of the
+game's thread a present, and its recording flags nothing (longest gap 92 ms). With `=gpu` 600 of 600 composes waited
+on the GPU, except once: one answer came later than its budget (the relay gave up; 5 frames went out without their
+edit, the presents took their waits back for 34 frames). Its recording shows that as a 242 ms stop and six frames
+tinted by up to 7 levels against their neighbours (the frames without the edit). That is what the wait on the GPU
+costs when the other GPU is late: the game's GPU holds until the other is done (on the relay the present waits up to
+`SYNC_BUDGET` on the game's thread, then lets the frame through), and why it stays opt-in.
+
+
 ## Before DLSS on a second GPU (#63, 2026-11-12)
 
 `preupscale::offload_pre` (the exchange and the hold's side), `preupscale::offload_server` (the network's frame on the
@@ -1815,13 +1954,54 @@ counter chaining), a `NativePass`, an `HdrPass` (for its encoded image and expos
 own for the frame's extent; the regions imported as host memory or staged; one frame as the split hold submits it
 (the copies in, `N[parity]`, the answer's copy out), waited for. The history's rule is the hold's
 (`NativePass::begin_frame`); what the CPU decides per frame comes in a queue keyed by the frame's sequence number
-(`FrameMeta`). One pass runs there (the stage's first). One `HoldSide` (exchange, worker, runner, loader) per hold
+(`FrameMeta`). Every pass of the stage runs there, as on the game's device: the later passes' buffers
+(`NativePass::ensure_more`) are built on the other device, the game's device builds none for an offloaded hold, and
+the runner records the copies between the passes every frame as the split hold does (`NativePass::record_later`:
+`record_copies`, with the pass feedback) and submits `X`, pass 2, `Y` and each further pass, `R` between pass 1 and
+the answer's copy out (`NativePass::later_sequence`; the test `the_other_gpus_later_passes_match_the_split_holds`
+compares its answer with the split hold's for two and three passes at a feedback of 1 and 0.5); the game's device
+builds pass 1's lanes only; the log says "all N passes of the stage run on the other GPU" once per count. Until
+4.3.0 only the stage's first pass ran there and the others were dropped (#63: three passes after DLSS took 34 ms on the
+other device, as one does). One `HoldSide` (exchange, worker, runner, loader) per hold
 resources: a change of render extent loads the network again on the other device.
+
+**The measured trial** (`offload_trial`, #63, #70). The submit waits for the answer to the frame before
+(`Progress::settle`), so a second GPU slower than the game's frame sets the frame rate, and `LateRule` never sees it:
+the frames slow down to the answers, none is late. The submits' waits are summed (`Progress::waited_us`); each
+600-hold summary logs the hold interval (the mean of the intervals with the lowest and highest tenth left out, pauses
+over 250 ms dropped: with the edit cache the local frames are two kinds, which a median would pick one of) and the mean
+wait per hold. From the second window on (the first has the network loading on the other GPU), two windows in a row of
+the same key (the hold's extent and the pass count) whose frame times agree within 10% and whose mean wait is 2 ms or
+more and a tenth of the frame start the trial (`Trial::offloaded`). Every 200 holds a short window is taken too
+(`Trial::short_window`): where 90% of its holds took the answer, the short window before it (same key) did too, and
+the mean wait is 60% of the frame or more, that window alone starts the trial (#63: Cyberpunk 2077 with Ray
+Reconstruction waited 24.1 ms of 27.5 ms frames, and the two-window rule started the trial 75 s in). Until it starts,
+a window that showed the wait adds "the game waits for it: measuring whether the game's GPU is faster" to the
+offload's Status line (`offload_trial::pending_note`). Either way the worker stops serving (its give-up callback
+sets `State::Off`, not `FellBack`: the trial is not a fall-back, and the finished-frame offload stays available) and
+`offload_pre::wanted` is false while `offload_trial::keeps_local`. Every hold while it runs goes through
+`Session::note` to `offload_trial::local_hold`: after 60 holds that ran the model here, the frame time of at least 300
+intervals, extended up to 900 while the window's halves disagree by more than 10%, is compared: 10% shorter keeps the
+model here until the game restarts; otherwise the next hold builds its side again (a side whose worker no longer serves
+counts as released). The game's GPU that cannot run the model (not built within 15 s of holds that keep coming, or 30
+misses in a row once it ran) or cannot be measured (30 frame times over 250 ms, or 1860 holds that ran without a
+window; an interval counts only between two holds that both ran the model) sends the frames back; a hold of another key aborts (a later pair of windows may try
+again, three times at most). The Status line is the native line's (`native::running_line`'s `trial`): "second GPU:
+trying the game's GPU for a few seconds: the faster one keeps the model", then "second GPU: not used: the game's GPU is
+faster (18.6 ms vs 22.8 ms a frame)". `NEURAL_FORGE_OFFLOAD_TRIAL=off` (`0`, `false`) never tries; with `same` it is off
+unless `on`; `NEURAL_FORGE_OFFLOAD_TRIAL_VERDICT=offload` (tests) forces the way back. The #63 reporter's numbers (RTX
+4090 with an RTX 5080, the frames crossing system memory at about 3.5 GB/s): Cyberpunk 2077 with Ray Reconstruction
+after DLSS at 2048x1536, 72 MB a frame, 28.6 ms a frame on the 5080 and 27-36 fps, against its 75 fps cap with the
+network on the 4090 (7.2 ms, one pass); Red Dead Redemption 2 (Vulkan) before DLSS at 1365x1024, 37 MB a frame, 15.1 ms
+and 48.5 fps.
 
 **Fall-back** as on the finished frame (`ServerRule`, `LateRule` on the answers, `State::FellBack` for the process),
 and when 30 holds in a row, over at least a second of holds that keep coming (a pause of more than 250 ms between two
-of them starts the row again), cannot send their frame (no motion vectors, no jitter, no room for the chained cache:
-nothing could carry the edit, and the model would not run at all): the worker stops running frames (every send is
+of them starts the row again), cannot send their frame (no motion vectors, motion vectors whose layout the layer never saw set, no jitter, no
+room for the chained cache, `native::unsendable`: nothing could carry the edit, and the model would not run at all;
+the log line and the Status tab name the reason, "given up (after DLSS: its frames cannot be sent: the motion
+vectors' layout is unknown)" in the #63 reporter's session, where the hold after DLSS found DLSS's motion vectors in
+no known layout with a single pass): the worker stops running frames (every send is
 finished at once without an answer) and the runner frees its frame resources and closes its loader and with it the
 network (`PreRunner::gave_up`; retiring the loader alone leaves the network open there, and the game's loader then
 finds it open elsewhere for good), so the next holds load and run the network on the game's device. The hold's side is
@@ -1893,6 +2073,137 @@ picture against local.
 GTA V note: its `settings.xml` names the CPU (`CPUDescription`); with another CPU in the machine the game resets every
 graphics setting at each launch (DLSS and frame generation off, so no DLSS evaluate and no hold). The runs above set
 that line for the run only.
+
+## After DLSS on a second GPU (Ray Reconstruction, 4.3.0, 2026-11-13)
+
+With `NEURAL_FORGE_OFFLOAD_GPU` set, the hold after DLSS's output (`Stage::Upscaled`: the placement with Ray
+Reconstruction, or every pass set there) sends its frames to the offload device too, through the before-DLSS path
+as it is: `HoldSide` (exchange, cadence, worker, the kept colour), `PreRunner`, the gate, the wait at the submit,
+the fall-back rules. `offload_pre::Where` tells the side which hold it serves (the regions' sizes, the log's and the
+Status tab's words: "second GPU: the model runs on <gpu> after DLSS, its edit applied one frame later").
+
+**What is different there, and why the design still holds.**
+
+- The hold is the same code (`native::native_hold` with the inline `Ctx`, its own `Session::res_after`); one gate
+  kept it on the game's GPU. Nothing in the path reads Ray Reconstruction: it is taken by the hold's stage and plan
+  (`placement::Hold::offload_takes`: a frame with no pass before DLSS), so any denoiser whose output is held there
+  goes the same way.
+- DLSS's output is not jittered (`Tracking::frame_after`: a jitter of zero, known), so the edit cache's rules hold
+  and the before-DLSS offload's loss on still scenes (the part of the answer that follows each frame's jitter is not
+  carried) does not exist: a one-frame-old edit of a still frame lands on the same texels.
+- The motion vectors are DLSS's own, resampled to the output size and scaled to its pixels (`after_point`), as the
+  cached holds on one GPU use them.
+- There is no depth at the output size: the cache admits by fingerprint alone, on one GPU and offloaded alike, and
+  the regions have no depth section (`Sizes::of`).
+- Delaying DLSS's output by a frame instead (the finished frame's trick) would hand the game's post-processing, HUD
+  and frame generation frame N-1's colour with frame N's depth and vectors, and add a frame of latency. Waiting in
+  the hold for the frame's own answer idles the game's GPU for the round trip. So the edit is delayed, as before
+  DLSS: no latency added, the edit one frame old on every hold.
+
+**Both holds of a frame (4.4.0).** The process has one network (`nf_native.cpp`, `g_live`) and the game's device one
+offload device. In a frame with passes before DLSS and after its output each hold has a side of its own (`HoldSide`:
+its exchange at its own size, its worker, its runner with its own regions' imports and its own pass on the other
+device), and both runners take a seat on one core there (`offload_server::Core` through `offload_pre::Seats`: the
+device, its loader with the network, the queue, the command buffers and the fence a frame is submitted with). A
+runner locks the core for the whole of a frame and waits for the frame before it lets go, so the two holds' frames
+run one after the other and nothing of the device or the network is rebuilt or freed under a frame that runs. Both
+holds ask the network for the same set of sizes (`native::frame_sizes`: the render size and the output size), so
+neither's frame rebuilds it (`frame_sizes` takes every pass's extent of both stages, so the later passes' sizes are
+built too). Every pass of each hold's stage runs there (`NativePass::record_later`, as for one hold): each runner's
+own `NativePass` holds its later passes' buffers, lanes and histories, so the two holds may run different pass counts
+at different per-pass extents and share only the network's buffers of a size, used one frame after the other (the
+test `two_holds_on_one_core_run_every_pass_as_each_does_alone`, which runs the runner's sequence at the `NativePass` level: 2 passes before DLSS and 3 after it, frames of the two
+holds alternating on one queue, every answer bit for bit the hold's own alone). Each submit waits for its own hold's
+answer (`Exchange::at_submit`, by the resources' id), 100 ms at most each.
+
+Ownership: the first runner of a game's device takes the offload device (`offload::take`) and the last to leave gives
+it back, both under the seats' lock, so a runner that asks meanwhile waits and then makes a new core from what was
+given back. A frame that never finishes marks the core: no runner submits to it again (the other hold's next frame is
+refused there, as a stall, not a fall-back), none joins it, nothing on the device is freed by either, and the device
+goes back busy (the sticky rule above). A give-up is the process's: the worker that gives up closes the network for
+both, the other's next frame is refused, and it is said once. A second set of hold resources at the *same* hold (a
+change of render size) still waits for the first to be idle for 3 seconds (`release_idle`, per hold now). A side whose
+hold stopped coming while the other hold's holds keep coming (the frame no longer has passes there) is released after
+3 seconds, measured against the other side's last hold and not against now, so a pause of both (a menu) releases
+neither (`Worker::touch`). The Status line names the holds served (`offload_pre::serving`): "before DLSS", "after
+DLSS", or "before and after DLSS, its edits applied one frame later"; each side's summary line has its own time on
+the other GPU. 4.3.0 kept such a frame on the game's GPU: with one hold there and one here, the hold here found the
+network open elsewhere on every frame and never ran.
+
+Measured (RTX 5070 alone, `same`; Cyberpunk 2077's benchmark, Super Resolution, pass 1 before the upscaler and pass 2
+set to After DLSS while it ran, 2560x1440 HDR10, frame generation on; 2026-11-13): on the game's GPU 27 rendered
+frames a second (54 holds, about 81 fps shown); with `same` 17 (34 holds, about 51 shown), 18.4 ms a frame on the
+second device for the hold before DLSS and 37.4 ms for the hold after it (39.8 ms from send to answer there: it waits
+for the other hold's frame), 600 of 600 frames answered in time and 600 of 600 holds carrying the edit at each hold in
+every summary once the network ran, no misses, video memory 10.5 of 12 GB. As everywhere on one GPU, `same` saves
+nothing; it shows that both holds are served. With every pass of each hold there (the merge of 4.3.0's fixes; same
+benchmark, 3 passes, pass 1 before the upscaler and passes 2 and 3 set to After DLSS): "after DLSS: all 2 passes of the
+stage run on the other GPU", 16.8 ms a frame there before DLSS and 54.7 ms after it (two passes at 2560x1440), 473 and
+471 of 598 frames answered in time and carried (the one GPU is saturated by the three passes and the game: the
+others go without the edit, as the budget rule says), the Status "before and after DLSS", the recording clean.
+
+**What crosses, per hold** (imported host memory on both devices): the encode and the answer at the padded output
+extent (RGBA16F) and the accumulated motion, packed to two halves a texel since 4.4.0 (below): 42.2 MB out and 28.1
+MB back at 2560x1440, about 100 MB and 66 MB at 3840x2160 (before DLSS at 1485x835: 19.0 MB and 9.5 MB). With the
+motion as 2 x f32 a texel (`NEURAL_FORGE_OFFLOAD_MOTION=float`, and 4.3.0): 56.3 MB, 133 MB and 23.7 MB out. The copies are recorded in DLSS's buffer,
+so they are the game GPU's frame time: the capture went from 2.4 ms to 6.7 ms in the run below (on one shared GPU).
+
+**The motion as packed halves (4.4.0).** The accumulated field (`preupscale_cache_motion.comp`) is f32 x and y a
+texel in the vectors' own units, NaN where the chain leaves the frame or the hold has no vectors. A hold that sends
+its frame runs the motion pass with a fresh chain, so the field is DLSS's own vectors, which are halves (the hold's
+RG16F copy), times the vectors' scale and divided by it again: one f32 rounding step from the half it came from. The
+send packs it on the game's GPU (`preupscale_offload_pack.comp`, in `Exchange::record_send`: one dispatch, 64 texels
+a group, rows of 65536 texels) into a buffer of 4 bytes a texel and copies that; the other device copies it into the
+pass's `mvec` buffer and its frame shaders read it as they read DLSS's packed vectors (`MOTION_HALF`, the path the
+edit cache being off has always used; `FrameMeta::motion_half`). A texel with a NaN in either component is written
+as `0x7e007e00` (a half NaN in both), the one pattern the pack writes that is not a number; everything else is
+clamped to the half's finite range first, as the cache's own read of DLSS's vectors is (`half_vector`).
+`the_pack_gives_dlss_s_halves_back_exactly_and_keeps_the_nan_marker` runs the pack over every finite half, through
+four scales (1, 1485, 835, 0.0006734): each texel comes back as exactly the half it started as, so what the other GPU
+reads is DLSS's vectors bit for bit, where the f32 path read them one rounding step off. That is proven on the test
+driver (lavapipe), which rounds `packHalf2x16` to nearest; Vulkan does not require round-to-nearest there, so a
+driver that rounds otherwise may give the neighbouring half for some texels (a step of 1/2048 of the value). A field
+accumulated over
+more than one hold (none is sent today) would be rounded to the half's 11 bits: 1/64 px at a motion of 16 to 32 px,
+1/16 px at 64 to 128.
+
+In the game (RTX 5070 alone, `same`, Cyberpunk 2077's benchmark at 2560x1440 HDR10, frame generation on; 2026-11-13):
+after DLSS with Ray Reconstruction, halves against floats (`NEURAL_FORGE_OFFLOAD_MOTION=float`): 42.2 MB out a hold
+against 56.3, 32.7-34.1 ms a frame on the second device against 33.4-35.0, 22.3 holds a second against 21.9, 601 of
+601 frames answered and carried in both, both runs passing the sweep with their recordings; fine detail over the
+views the two 35 s recordings share (173 pairs, the method above): halves over floats a median 1.011 and a mean
+1.018, inside what two runs of one build differ by. Before DLSS (Super Resolution): 18.9 MB out against 23.7, 16.7 ms
+on the second device (17.7-18.0 in 4.2.0's run), 33.7 holds a second, 600 of 600 answered and carried, the sweep
+passing.
+
+**The frame rate is bounded by the second GPU at the output size.** The network there takes three to four times
+what it does at DLSS's render size, and the submit waits for the answer to the frame before (100 ms at most). The
+finished-frame placement has the same bound for the same reason, and pays it on every presented frame, where this
+hold pays it once per rendered frame (frame generation's frames come after it). Lifting the bound means not waiting:
+sending when the other GPU is free and carrying the edit over more than one hold (a kept encode per sent frame and
+a second accumulated field); not built.
+
+**Measured (RTX 5070 alone, `same`; Cyberpunk 2077's benchmark, path tracing with Ray Reconstruction, 2560x1440
+HDR10, frame generation x3; the game sweep's `cyberpunk-rr` run with and without
+`env = ["NEURAL_FORGE_OFFLOAD_GPU=same"]`; 2026-11-13):**
+
+| Run | Holds per second | Shown | Network frame | On the game's GPU | Notes |
+|---|---|---|---|---|---|
+| model on the game's device | 32-33 | 95-100 fps | 17.7 ms (median), every second hold | capture 2.4 ms, write-back 1.3 ms | cache rejection 1-5%; sweep passes |
+| `same` | 21-22 | 62-67 fps | 34.0-34.3 ms on the second device, copies included; 34.3 ms from send to answer | capture 6.7 ms, write-back 2.6 ms | 600 of 600 frames answered in time and 600 of 600 holds carried the edit in every summary once the network ran; cache rejection 7-14% (more motion per hold at the lower rate); no misses; sweep passes, recording clean |
+
+The same hold without Ray Reconstruction (Super Resolution, Placement set to After DLSS while the benchmark ran,
+`same`): 21-22 holds per second, 63-65 fps shown, 37.0 ms on the second device, 600 of 600 answered and carried, cache
+rejection 4-12%, no misses. So the placement is offloaded for any game whose passes all run there, once per rendered
+frame and before frame generation, where the finished-frame placement runs the network on every presented frame.
+
+As before DLSS, `same` saves nothing (both devices share the GPU, and the second device's network takes twice the
+time beside the game); the numbers show the path works and what it adds. The picture: fine detail over the views
+two 35 s recordings share (143 pairs, the method of the section above), offloaded over local a median 0.964, inside
+what two runs of one build differ by. With 3 passes (one comparison, Cyberpunk 2077 with Ray Reconstruction, 120 pairs)
+it is a median 0.919, against 0.964 with one pass. Frames looked at where the camera moves past pillars, railings and walking
+people: no edit trailing behind an edge. Not measured: two different GPUs, 3840x2160 (the 12 GB card cannot hold a
+second network at that size beside path tracing), a still scene.
 
 ## Decided before Phase 1
 

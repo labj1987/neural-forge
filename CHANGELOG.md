@@ -4,6 +4,124 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.7.0 — 2026-11-17
+
+**The second GPU with Ray Reconstruction**
+
+- With `NEURAL_FORGE_OFFLOAD_GPU` set, the second GPU now also runs the model in games using DLSS Ray Reconstruction
+  (path tracing), where the model works on DLSS's output, and in any game with Placement set to After DLSS. Until now
+  the model stayed on the game's GPU there. With Ray Reconstruction there is nothing to change: leave Placement on
+  Auto.
+- It works as before DLSS does: each of DLSS's output frames goes to the second GPU and its edit is applied to the
+  next one, carried along the game's motion vectors. No frame is shown later; the edit is one frame old. The network
+  runs at the output resolution there, so the second GPU needs longer per frame than before DLSS, and the frame rate
+  is bounded by it. At 4K the small network or a lower Model resolution helps.
+- With more than one pass, every pass now runs on the second GPU, before or after DLSS. Until now only the first pass
+  ran there and the others were left out.
+- With passes both before and after DLSS in one frame (for example pass 1 before the upscaler and pass 2 set to After
+  DLSS), the second GPU now runs both. Until now it took only the pass before DLSS, and the passes after DLSS did not
+  run. The second GPU does all of their work for every frame, so the frame rate is bounded by the two sides together.
+- When the model goes back to the game's GPU because its frames cannot be sent to the second GPU, the Status tab and
+  the log now say what was missing (the game's motion vectors, their layout, the jitter or the edit cache's room).
+- When a game is started with Ray Reconstruction already on, the model after DLSS now gets the game's motion vectors.
+  Without them it could not run on a second GPU and ran without its history, which could show as a slight flicker
+  with one pass (#63).
+- Placement can be changed while the game runs, and the second GPU follows it. Before, switching from Finished frame
+  to Before DLSS (or back) in a running game put the model on the game's GPU for the rest of the session.
+- When building the network failed on one GPU, the second GPU could no longer take the model and gave up after 30
+  seconds. The network is now handed over.
+- Before and after DLSS on the second GPU, the motion vectors sent with each frame are half the size (about 42 MB per
+  frame instead of 56 MB at 2560x1440 after DLSS). They are DLSS's own half-precision vectors, so the picture does
+  not change. `NEURAL_FORGE_OFFLOAD_MOTION=float` sends them as before.
+- Finished frame on the second GPU: the game no longer waits at every present for its own GPU to finish copying the
+  frame out. It still waits for the second GPU's answer, and frames are still shown one frame later.
+  `NEURAL_FORGE_OFFLOAD_PACING=cpu` keeps every wait in the game, as before.
+- Experimental: `NEURAL_FORGE_OFFLOAD_PACING=gpu` lets the game's GPU wait for the answer instead of the game, where
+  both GPUs' drivers support it (NVIDIA's do). When the second GPU is late this shows as a visible hitch, and if it
+  hangs the game freezes, so it is off by default.
+
+**The second GPU: the model goes where the game runs faster**
+
+- With the model on a second GPU, the model is now also tried on the game's GPU, and the GPU with the higher frame rate
+  keeps it until the game restarts. Where the frames cross system memory slowly, the game's own GPU is often faster:
+  on an RTX 4090 with an RTX 5080 beside it, Cyberpunk 2077 with Ray Reconstruction ran at 27-36 fps with the 5080 and
+  at its 75 fps cap on the 4090.
+- Before or after DLSS, the try starts once the game has waited for the second GPU for most of several hundred frames;
+  until then the Status tab says "the game waits for it: measuring whether the game's GPU is faster". At the finished
+  frame it starts once the game is in gameplay, and if the GPU that kept the model later slows down a lot, the other
+  one is tried once more. The time the network takes to build on the game's GPU no longer counts against it.
+- Each switch shows about a second of frames without the model. The log gives both frame rates, and the Status tab
+  says which GPU runs the model. `NEURAL_FORGE_OFFLOAD_TRIAL=off` keeps the model on the second GPU.
+
+**The second GPU can show the frame itself (asked for in #63)**
+
+- New switch "Second GPU shows the frame" in the Model tab, for the model on a second GPU with Placement set to
+  Finished frame. The second GPU then runs the model and shows the frame itself. Each frame crosses to it once and
+  nothing comes back, so the game no longer waits for the second GPU: when the link or the second GPU cannot keep up,
+  frames are skipped instead of the game's frame rate dropping.
+- To use it: plug the monitor into the second GPU, set `NEURAL_FORGE_OFFLOAD_GPU`, set Placement to Finished frame,
+  switch the setting on and start the game (it takes effect when the game starts). The desktop must draw the game's
+  window on the second GPU; when it draws it on the other card, the log and the Status tab name that card, and the
+  frames come back to the game's GPU as before. On KDE Plasma, `KWIN_DRM_DEVICES` can move the desktop to the second
+  GPU; the user guide has it as an optional step, with its warning.
+- What it costs: the frame is shown later by the copy and the model's time on the second GPU. The game's V-Sync no
+  longer limits the game (use its frame limiter), and Reflex does nothing in this mode.
+- The Status tab's new "Second GPU's present" row says which GPU shows the frames, how many were shown and skipped,
+  and the copy's time, or why the mode is not used. When anything fails, the game gets its usual swapchain back.
+
+**After DLSS and the finished frame: their own passes, size and image settings (#73)**
+
+- The Model tab has a new **After DLSS / finished frame** group with its own Passes, Model resolution after DLSS and
+  image settings (intensity, local tone and structure, skin structure, style, auto mask and the colour of the edit).
+  They apply wherever the model runs after DLSS or on the finished frame, whether set by Placement, moved there by
+  Auto when Ray Reconstruction is on, or by a fall-back. The model costs far more there than before the upscaler, so
+  one pass or a lower size after DLSS can now go with two passes before it. Switching Ray Reconstruction on or off in
+  a running game switches between the two sets.
+- Each setting of the group is the same as before DLSS until changed, so existing setups look and perform as before.
+  A pass's own values in the per-pass settings still come first.
+- The Status tab's new **Settings in use** line says whether the current placement uses the settings before DLSS,
+  the After DLSS group's, or both.
+
+**Model resolution and the Status tab (#63)**
+
+- The Model tab now has both model resolutions, one under the other: "Model resolution before and after DLSS" (the
+  row that was just "Model resolution") and "Model resolution at the finished frame". With Placement Finished frame
+  only the second one counts; before, it was only in the Composition tab, and only while a game ran, so "Full" in the
+  Model tab could sit over a frame that ran at 50%. The Status tab's Model placement line says the size the model runs
+  at on the finished frame.
+- The Status tab's Model row says where the model runs: before the upscaler, after DLSS, or on the second GPU before
+  DLSS, after DLSS, both, or on the finished frame. The frame-time graph shows no model time while the second GPU
+  runs the model (that time is not spent on the game's GPU).
+- Model every Nth frame and the finished frame's resolution in the Composition tab are now shown whenever the model is
+  not running before the upscaler or after DLSS, not only when it is not running before the upscaler.
+
+**The picture**
+
+- The Reference strength preset now gives the reference look: besides the four strengths it puts the style and the
+  colour of the edit back to their defaults, in every pass. Before, a grade set earlier
+  stayed on under "Reference", and the menu showed Reference while it did. The menu now shows "Custom" until
+  everything a preset sets is in place.
+- Every strength preset now reaches every pass: a pass that had its own intensity, local tone, local structure or
+  skin structure follows the preset again. Light, Moderate, Overdrive and Remix still leave the style and the colour
+  of the edit alone. The presets set the After DLSS group's own strengths too.
+- Model every Nth frame above 1, on the finished frame: on the frames between two runs of the model, the model's
+  colour is no longer laid on what has moved since the frame it answered, which showed as pink, orange or green edges
+  on moving things, most of all with a strong edit saturation. Ghost guard 0 keeps the old behaviour.
+- With the Model resolution at the finished frame below Full, the ghost guard now compares the frame with the frame
+  the model answered at the model's own size. Before, it took the soft edges of the enlarged picture for motion on a
+  still frame, and missed small movements in texture.
+- Ray Reconstruction with the model after DLSS: opening a menu or the map no longer moves the model to the finished
+  frame a second later, which cost frames without the model when the game resumed.
+- The log now says when the effect is switched off and on (the Neural rendering switch, the toggle key, Apply model
+  edit), so frames without the model in a session are explained.
+
+**Another build replaces the open window (#73)**
+
+- Starting a different Neural Forge build (older or newer) while another build's window is open now closes that
+  window, with its settings saved, and opens the new one (once the open window is 4.7.0 or later). Before, the new copy installed its layer and then only
+  brought the other build's window forward. Starting the same build again still brings its open window forward.
+- Closing Neural Forge from outside (logging out, `kill`) now saves the settings changed in the last moments first.
+
 ## 4.5.3 — 2026-11-17
 
 **Fixes from a full read of the code**

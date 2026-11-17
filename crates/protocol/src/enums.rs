@@ -229,6 +229,22 @@ pub mod exposure_source {
     }
 }
 
+/// Which settings group the current placement uses (`ShmHeader::settings_group`, #73; written when the layer plans a
+/// frame's passes, before the model runs it): the Model tab's own
+/// values where the model runs before the upscaler, the "After DLSS / finished frame" group's where it runs after
+/// DLSS's output or on the finished frame (by Placement, by Auto, or by a fall-back).
+pub mod settings_group {
+    /// No placement planned yet (or the channel's session just started).
+    pub const NONE: u32 = 0;
+    /// Before the upscaler: the Model tab's Passes, Model resolution and image settings.
+    pub const BEFORE: u32 = 1;
+    /// After DLSS or on the finished frame: the After DLSS group's values where it sets its own.
+    pub const AFTER: u32 = 2;
+    /// Both: passes before the upscaler with the Model tab's values, later passes (placed after DLSS in the
+    /// per-pass settings) with the After DLSS group's.
+    pub const BOTH: u32 = 3;
+}
+
 /// How a HUD region (`hud_regions`) treats the edit inside it.
 pub mod hud_mode {
     /// No edit inside the region (a feathered edge outside it).

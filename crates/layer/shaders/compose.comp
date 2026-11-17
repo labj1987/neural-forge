@@ -24,6 +24,9 @@ layout(binding = 0, rgba8) uniform readonly image2D u_original;
 layout(binding = 1, rgba8) uniform readonly image2D u_proxy;
 layout(binding = 2, rgba8) uniform readonly image2D u_model_answer;
 layout(binding = 3, rgba8) uniform writeonly image2D u_output;
+// The small proxy the model was shown, at its own size, while `model_small` (else any image: not read). The ghost
+// guard compares it with the current frame reduced the same way.
+layout(binding = 4, rgba8) uniform readonly image2D u_proxy_small;
 
 // IEC 61966-2-1 sRGB EOTF/OETF -- the exact same formulas as
 // `composition::apply`'s `srgb_decode`/`srgb_encode`, which is the CPU reference this
@@ -114,6 +117,13 @@ layout(push_constant) uniform Params {
   // the model's verdict. 2 and 4 are the replace modes: in mode 2 the model's answer comes
   // straight back through the exact inverse of its curve, with no composition.
   uint reversible_mode;
+  // The small proxy's own size (the model's raster), when `model_small`: the ghost guard puts the current frame
+  // through the same reduction and enlargement the proxy input went through, to compare the two like for like.
+  uint proxy_width;
+  uint proxy_height;
+  // The capture reduced the frame in linear light (an `*_SRGB` swapchain: its blit to the small proxy decodes,
+  // filters and encodes again); 0 for a UNORM one, whose blit filters the stored values.
+  uint proxy_srgb;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -319,6 +329,31 @@ vec3 GamutCompressReversible(vec3 rgb) {
   return XYZ_TO_LINEAR_SRGB * (HPE_LMS_TO_XYZ * compressed_lms);
 }
 
+// One texel of the current frame as the small proxy would hold it, in the encoded space the proxy is compared in:
+// reduced as the capture reduces the frame (a linear blit to the proxy's size: of the stored values, or in linear
+// light for an sRGB swapchain), then encoded as `encode.comp` encodes it. On a frame that has not changed this is the
+// small proxy's own texel (to the last bit of its 8), whatever the size and whatever is in the picture; where it
+// differs, the frame has changed.
+vec3 SmallTexel(ivec2 t, ivec2 small, ivec2 size, bool bgr, float wp) {
+  vec2 u = (vec2(t) + 0.5) * vec2(size) / vec2(small) - 0.5;
+  ivec2 i0 = ivec2(floor(u));
+  vec2 a = u - vec2(i0);
+  ivec2 last = size - ivec2(1);
+  vec3 c00 = imageLoad(u_original, clamp(i0, ivec2(0), last)).rgb;
+  vec3 c10 = imageLoad(u_original, clamp(i0 + ivec2(1, 0), ivec2(0), last)).rgb;
+  vec3 c01 = imageLoad(u_original, clamp(i0 + ivec2(0, 1), ivec2(0), last)).rgb;
+  vec3 c11 = imageLoad(u_original, clamp(i0 + ivec2(1, 1), ivec2(0), last)).rgb;
+  vec3 linear;
+  if (params.proxy_srgb != 0u) {
+    // An sRGB image is filtered in linear light.
+    linear = mix(mix(SrgbDecode(c00), SrgbDecode(c10), a.x), mix(SrgbDecode(c01), SrgbDecode(c11), a.x), a.y);
+  } else {
+    linear = SrgbDecode(mix(mix(c00, c10, a.x), mix(c01, c11, a.x), a.y));
+  }
+  linear = bgr ? linear.bgr : linear;
+  return clamp(EncodeProxy(linear / wp), 0.0, 1.0);
+}
+
 void main() {
   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
   ivec2 size = imageSize(u_output);
@@ -501,9 +536,13 @@ void main() {
       // both are compared in one space; taps over highlights, where the encode compresses the
       // differences, are still ignored. The mask is soft, not a hard threshold, so a
       // pixel hovering near it does not flicker between the two ratios.
+      // How far the guard holds this pixel's answer to be stale (0 with the guard off, or nothing moved).
+      float stale = 0.0;
       if (params.ghost_guard > 0.0) {
         const int kGhostStep = 3;
         ivec2 last = size - ivec2(1);
+        ivec2 small = ivec2(int(params.proxy_width), int(params.proxy_height));
+        bool small_proxy = params.model_small != 0u && small.x > 0 && small.y > 0;
         float proxy_sum = 0.0;
         float model_sum = 0.0;
         float worst = 0.0;
@@ -512,17 +551,43 @@ void main() {
             ivec2 q = clamp(src + ivec2(i, j) * kGhostStep, ivec2(0), last);
             vec3 pq = ProxyTap(q, bgr, wp);
             vec3 mq = SrgbDecode(bgr ? imageLoad(u_model_answer, q).bgr : imageLoad(u_model_answer, q).rgb);
-            vec3 oq = clamp(EncodeProxy(SrgbDecode(bgr ? imageLoad(u_original, q).bgr : imageLoad(u_original, q).rgb) / wp), 0.0, 1.0);
             float pl = Luminance(pq);
             proxy_sum += pl;
             model_sum += Luminance(mq);
             float valid = 1.0 - smoothstep(0.5, 0.7, pl);
-            worst = max(worst, valid * abs(Luminance(oq) - pl) / (0.03 + 0.5 * pl));
+            float mismatch = 0.0;
+            if (!small_proxy) {
+              vec3 oq = clamp(EncodeProxy(SrgbDecode(bgr ? imageLoad(u_original, q).bgr : imageLoad(u_original, q).rgb) / wp), 0.0, 1.0);
+              mismatch = abs(Luminance(oq) - pl);
+            }
+            worst = max(worst, valid * mismatch / (0.03 + 0.5 * pl));
+          }
+        }
+        if (small_proxy) {
+          // The proxy input is the small proxy enlarged, softer than the frame at every edge, which is no motion.
+          // So the comparison is made where both are the same picture: the small proxy's own texels against the
+          // current frame reduced the way the capture reduced it. Two texels each way, every texel where a texel
+          // is 1.7 px of the frame or wider (a Model resolution of 58% and below), every second one up to 2.7 px
+          // and every third at the frame's own size, so the taps are 2 to 4 px of the frame apart. (The pixel's
+          // own texel and the eight around it alone left stale colour on a 2 px pan: 30 of 255 in the texture
+          // test.) The step is a floor, never a rounding of a half, which the implementations round differently.
+          ivec2 tc = clamp(ivec2((vec2(src) + 0.5) * vec2(small) / vec2(size)), ivec2(0), small - ivec2(1));
+          int tstep = max(1, int(floor(3.0 * float(small.x) / float(size.x) + 0.25)));
+          for (int j = -2; j <= 2; ++j) {
+            for (int i = -2; i <= 2; ++i) {
+              ivec2 t = clamp(tc + ivec2(i, j) * tstep, ivec2(0), small - ivec2(1));
+              vec3 was = imageLoad(u_proxy_small, t).rgb;
+              float wl = Luminance(SrgbDecode(bgr ? was.bgr : was));
+              float nl = Luminance(SmallTexel(t, small, size, bgr, wp));
+              float valid = 1.0 - smoothstep(0.5, 0.7, wl);
+              worst = max(worst, valid * abs(nl - wl) / (0.03 + 0.5 * wl));
+            }
           }
         }
         float smooth_ratio = (model_sum / 25.0 + kRatioFloor) / (proxy_sum / 25.0 + kRatioFloor);
         float moved = smoothstep(0.35, 1.2, worst);
-        edit_ratio = mix(edit_ratio, smooth_ratio, moved * clamp(params.ghost_guard, 0.0, 1.0));
+        stale = moved * clamp(params.ghost_guard, 0.0, 1.0);
+        edit_ratio = mix(edit_ratio, smooth_ratio, stale);
       }
       // Detail strength as a power on the ratio, not a blend: 0 leaves the frame as it is, 1 takes
       // the model's ratio, and above 1 amplifies it. It cannot go negative, leaves an unchanged
@@ -576,7 +641,11 @@ void main() {
         colour_allow_debug = vec3(1.0 - colour_allow, colour_allow, 0.0);
         pre_bound_debug = fully_upgraded;
         // The model's colour follows the detail strength below 1 as its light does (none at 0).
-        float colour_weight = clamp(params.colour_strength, 0.0, 1.0) * hue_trust * clamp(params.transfer_strength, 0.0, 1.0);
+        // And not where the guard found the frame moved on from the one the model answered: the hue above is the
+        // model's at this position of the old frame, and laid on what is here now it tints it with whatever was here
+        // (pink and orange edges behind anything that moves, at a model interval above 1). The light's broad ratio
+        // has a neighbourhood to fall back to; a hue has none that is this pixel's, so there the frame keeps its own.
+        float colour_weight = clamp(params.colour_strength, 0.0, 1.0) * hue_trust * clamp(params.transfer_strength, 0.0, 1.0) * (1.0 - stale);
         result = GamutCompressReversible(mix(luminance_only, bounded_colour, colour_weight));
       }
     }

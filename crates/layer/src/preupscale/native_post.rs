@@ -214,7 +214,13 @@ impl PostServer {
             // The channel first: a retry while another server holds it makes no device.
             let Some(claim) = claim_channel(view, u64::MAX, st) else { return };
             // Made with the game's device (`offload::make_for`, inside its vkCreateDevice, where the loader's lock is held).
-            let off = match super::offload::take(game_device) {
+            // The holds' runners have the device (Placement was before or after DLSS and became Finished frame while the
+            // game runs): they are ended, which gives it back, and it is taken here.
+            if super::offload::holder(game_device) == super::offload::Holder::Holds && super::offload_pre::release_for_finished(game_device) {
+                crate::log!("[offload] Placement is Finished frame now: the holds' work on the other GPU ended, the finished frame's starts there");
+                crate::logging::flush();
+            }
+            let off = match super::offload::take_for_finished(game_device) {
                 Some(Ok(off)) => {
                     crate::log!("[offload] {}", off.plan);
                     crate::log!("[offload] the present shows each frame's answer one frame later: the game's GPU renders the next frame while the other GPU runs this one");
@@ -228,6 +234,12 @@ impl PostServer {
                     }
                     drop(claim);
                     return end(Status::Unavailable);
+                }
+                None if super::offload::holder(game_device) == super::offload::Holder::Holds => {
+                    // Still with a hold's runner (it could not be ended yet): tried again on the retry schedule, the
+                    // second GPU not given up.
+                    drop(claim);
+                    return end(Status::Retry);
                 }
                 None => {
                     let why = "no device was made for it with the game's device".to_string();
@@ -260,7 +272,7 @@ impl PostServer {
             } else {
                 None
             };
-            let extra = Offloaded { standin, name: off.name.clone() };
+            let extra = Offloaded { standin, name: off.name.clone(), game: game_device };
             let ended = work(&off.device, &instance, off.physical, off.setup, off.import, &loader, view, q, st, claim, Some(extra));
             loader.retire();
             loader.stop_worker();
@@ -287,6 +299,17 @@ impl PostServer {
         Some(Self { quit, status, worker: Some(worker) })
     }
 
+    /// Asks the worker to end without waiting for it (the present must not join it): [`Self::ended`] says when it
+    /// has, and dropping it then does not wait.
+    pub(crate) fn stop_soon(&self) {
+        self.quit.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the worker has ended.
+    pub(crate) fn ended(&self) -> bool {
+        self.worker.as_ref().is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
     pub(crate) fn status(&self) -> Status {
         Status::from_u8(self.status.load(Ordering::Acquire))
     }
@@ -296,6 +319,8 @@ impl PostServer {
 struct Offloaded {
     standin: Option<super::offload::Standin>,
     name: String,
+    /// The game's device the offload device was made with (`offload::asked_back`).
+    game: vk::Device,
 }
 
 /// Takes the channel for `token` ([`Owner`]) and checks that nothing outside the process answers it (its heartbeat
@@ -356,7 +381,19 @@ fn work(
     let offload = offloaded.is_some();
     // SAFETY: the device and the queue the setup names are live for this thread's life (joined in Drop,
     // before the device's teardown frees anything).
-    let Some(mut gpu) = (unsafe { Gpu::new(device, setup) }) else {
+    let Some(mut gpu) = (unsafe { Gpu::new(device, setup) }).map(|mut gpu| {
+        // On another GPU whose device exports sync fds and imports the regions (its frames write the answer themselves).
+        if offload && import && crate::composition::pace::has_semaphore_fd(device.handle()) && crate::composition::pace::gpu_wait_wanted() {
+            // SAFETY: the live offload device, made with the extension.
+            gpu.export = unsafe { Export::new(device, instance, std::ptr::from_ref(view.header()) as usize) };
+            if gpu.export.is_some() {
+                crate::log!(
+                    "[offload] each frame's submission on the other GPU is handed to the game's presents as a sync fd: they wait for the answers on the GPU"
+                );
+            }
+        }
+        gpu
+    }) else {
         crate::log!("[native] the after-the-upscaler path's pipelines could not be built; it stays untouched for now");
         drop(claim);
         // On another GPU it would fail the same way again: the network goes back to the game's GPU.
@@ -369,6 +406,7 @@ fn work(
     let stalled_name = offloaded.as_ref().map(|o| o.name.clone());
     if let Some(o) = offloaded {
         gpu.standin = o.standin;
+        gpu.offload_game = Some(o.game);
         gpu.slow = Some(super::offload::ServerRule::default());
         crate::log!("[offload] answering the after-the-upscaler path's requests on {}", o.name);
         super::offload::note_state(super::offload::State::Active(o.name));
@@ -526,7 +564,43 @@ struct Gpu {
     /// On another GPU: the rule that gives it up (a hung frame, the network not running), and why it was given up (the
     /// server ends).
     slow: Option<super::offload::ServerRule>,
+    /// On another GPU: the game's device its device was made with (`offload::asked_back`).
+    offload_game: Option<vk::Device>,
     give_up: Option<String>,
+    /// On another GPU with sync-fd semaphores: each frame's submission signals this device's exportable semaphore,
+    /// and its sync fd is published for the game's present to wait on (`composition::pace::publish`).
+    export: Option<Export>,
+    /// The request the next frame is for (slot, number) and its size, set by the server before [`evaluate`].
+    publish_for: Option<(usize, u32, u32, u32)>,
+    /// An exportable semaphore whose export failed with its signal pending: not signalled again, kept for the teardown.
+    broken_export: Option<vk::Semaphore>,
+}
+
+/// A sync fd `vkGetSemaphoreFdKHR` gave, owned; `None` for -1 (or any negative value), which a `SYNC_FD` export may
+/// return for a signal that is already done: nothing to wait for (and an `OwnedFd` must never hold -1).
+fn owned_sync_fd(fd: std::os::fd::RawFd) -> Option<std::os::fd::OwnedFd> {
+    // SAFETY: a new fd from the export, this call's to own.
+    (fd >= 0).then(|| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+}
+
+/// What the offload server exports each frame's submission with ([`Gpu::export`]).
+struct Export {
+    api: ash::khr::external_semaphore_fd::Device,
+    /// Signalled by the frame's submission; exporting its sync fd takes the signal, so it is ready for the next frame.
+    done: vk::Semaphore,
+    /// The channel's header's address (`composition::pace::publish`'s key).
+    channel: usize,
+}
+
+impl Export {
+    /// # Safety
+    /// `device` is live with `VK_KHR_external_semaphore_fd`.
+    unsafe fn new(device: &ash::Device, instance: &ash::Instance, channel: usize) -> Option<Self> {
+        let mut export = vk::ExportSemaphoreCreateInfo::default().handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        // SAFETY: the contract.
+        let done = unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None) }.ok()?;
+        Some(Self { api: ash::khr::external_semaphore_fd::Device::new(instance, device), done, channel })
+    }
 }
 
 /// What [`Gpu::sets`] point at.
@@ -792,7 +866,11 @@ impl Gpu {
             synthetic_flow: None,
             standin: None,
             slow: None,
+            offload_game: None,
             give_up: None,
+            export: None,
+            publish_for: None,
+            broken_export: None,
         }
     }
 
@@ -804,6 +882,12 @@ impl Gpu {
         }
         // SAFETY: forwarded.
         unsafe {
+            if let Some(e) = self.export.take() {
+                device.destroy_semaphore(e.done, None);
+            }
+            if let Some(s) = self.broken_export.take() {
+                device.destroy_semaphore(s, None);
+            }
             let flow = std::mem::replace(&mut self.flow, FlowState::Off);
             for s in self.slots.iter_mut().filter_map(Option::take) {
                 s.destroy(device, flow.device());
@@ -886,6 +970,21 @@ fn serve(
         if gpu.slow.is_some() {
             if let Some(why) = super::offload::take_give_up() {
                 gpu.give_up = Some(why);
+                break;
+            }
+            // The finished frame's trial on the game's GPU (`offload_trial::finished_present`): this server ends
+            // without giving the other GPU up (its device is given back and may serve again), and the game's GPU's
+            // server answers from the next present.
+            if super::offload_trial::finished_local() {
+                crate::log!("[offload] the other GPU's server stops for the trial: the game's GPU runs the model on the finished frame");
+                crate::logging::flush();
+                break;
+            }
+            // Placement left the finished frame while the game runs, and a hold needs the other GPU's device
+            // (`offload::ask_back`): this server ends and gives it back, the second GPU not given up.
+            if gpu.offload_game.is_some_and(super::offload::asked_back) {
+                crate::log!("[offload] the other GPU's server ends: Placement left Finished frame, and the model's hold takes the second GPU");
+                crate::logging::flush();
                 break;
             }
         }
@@ -997,7 +1096,8 @@ fn process(
         // A size or format change resets the history (`post_history`).
         gpu.history[slot.index()].note_request(width, height, format);
     }
-    let tunings = hdr.pass_tunings();
+    // The finished frame is after DLSS: the After DLSS group's passes and values (#73).
+    let tunings = hdr.pass_tunings().after_dlss();
     let passes: Vec<Conditioning> = tunings.passes().iter().map(|&t| Conditioning::from(t)).collect();
     let feedback = tunings.feedback;
     // The colour of the edit, and its look-up table (read from config.ini's `edit_lut` in the background).
@@ -1035,6 +1135,8 @@ fn process(
             // was waited for (`evaluate` waits for each) and the other path is kept off by the claim.
             let ok = loader.ready(width, height, hdr.network_choice()).is_some_and(|built| {
                 generation = built.generation;
+                // The frame's submission is published for this request (`Gpu::export`).
+                gpu.publish_for = Some((slot.index(), seq, width, height));
                 // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
                 unsafe {
                     evaluate(
@@ -1067,6 +1169,10 @@ fn process(
             ok
         }
     };
+    if evaluated && hdr.settings_group.load(Ordering::Relaxed) != neural_forge_protocol::enums::settings_group::AFTER {
+        // For the Status tab: this frame used the After DLSS group.
+        hdr.settings_group.store(neural_forge_protocol::enums::settings_group::AFTER, Ordering::Relaxed);
+    }
     if evaluated && gpu.slow.is_some() {
         super::offload::STATS.server_frames.fetch_add(1, Ordering::Relaxed);
         super::offload::STATS.server_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1794,6 +1900,13 @@ unsafe fn evaluate(
     if let Some(sem) = waits.as_ref() {
         submit = submit.wait_semaphores(std::slice::from_ref(sem)).wait_dst_stage_mask(&wait_stages);
     }
+    // On another GPU: this submission, the frame's last, writes the answer region itself (imported; not when it is
+    // staged and copied after) and signals the exportable semaphore, whose sync fd goes to the game's present.
+    let publish = gpu.publish_for.take().filter(|_| !b.answer.staged && gpu.export.is_some());
+    let signals = [gpu.export.as_ref().map_or(vk::Semaphore::null(), |e| e.done)];
+    if publish.is_some() {
+        submit = submit.signal_semaphores(&signals);
+    }
     // SAFETY: the fence is the layer's own and idle; the queue is this thread's alone.
     let submitted = unsafe {
         device.reset_fences(&[gpu.fence]).and_then(|()| {
@@ -1808,6 +1921,29 @@ unsafe fn evaluate(
             gpu.flow.give_up(device, gpu.queue, gpu.shared, "the frame's submit after the flow failed");
         }
         return false;
+    }
+    let mut export_failed = false;
+    if let (Some((slot, seq, width, height)), Some(e)) = (publish, gpu.export.as_ref()) {
+        let info = vk::SemaphoreGetFdInfoKHR::default().semaphore(e.done).handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        // SAFETY: the semaphore's signal was just submitted, with everything it depends on (the flow's submits).
+        match unsafe { e.api.get_semaphore_fd(&info) }.map(owned_sync_fd) {
+            Ok(Some(fd)) => {
+                crate::composition::pace::publish(e.channel, slot, seq, crate::composition::pace::Submitted { fd, dims: (width, height), evaluated: true });
+            }
+            // -1: the submission was already done, the signal taken with it (the export is fine). Nothing to wait
+            // for on the GPU: the relay resolves the frame on its answer.
+            Ok(None) => {}
+            Err(why) => {
+                // The semaphore keeps its signal: it is not signalled again (and freed with the device's other objects).
+                crate::log!("[offload] the frame's sync fd could not be exported ({why:?}): the presents wait for the answers on the game's thread");
+                export_failed = true;
+            }
+        }
+    }
+    if export_failed {
+        if let Some(e) = gpu.export.take() {
+            gpu.broken_export = Some(e.done);
+        }
     }
     if uploaded_in_frame {
         // The frame's own upload into the session (a frame without a flow) went to the queue with it.
@@ -2394,6 +2530,17 @@ mod tests {
         }
     }
     use std::cell::Cell;
+
+    /// A `SYNC_FD` export may give -1 for a signal that is already done: nothing to publish, and never an `OwnedFd`
+    /// holding -1. A real fd is owned (closed with it).
+    #[test]
+    fn an_export_of_minus_one_publishes_nothing() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        assert!(owned_sync_fd(-1).is_none());
+        let raw = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let owned = owned_sync_fd(raw).expect("a real fd is kept");
+        assert_eq!(owned.as_raw_fd(), raw);
+    }
 
     thread_local! {
         /// Makes [`Gpu::new`] fail at this step.

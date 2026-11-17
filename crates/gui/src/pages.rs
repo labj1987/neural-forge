@@ -299,7 +299,7 @@ const FLOAT_SPINS: &[(&str, Get, f64, f64)] = &[
 ];
 
 /// The whole-number settings with a spin row.
-const INT_SPINS: &[(&str, Get)] = &[("passes", |h| &h.passes), ("model_interval", |h| &h.model_interval)];
+const INT_SPINS: &[(&str, Get)] = &[("passes", |h| &h.passes), ("after_passes", |h| &h.after_passes), ("model_interval", |h| &h.model_interval)];
 
 /// A HUD region's spin fields: the key's letter, what the field is, its range in percent and the region's value.
 type HudField = (&'static str, &'static str, (f64, f64), fn(&HudRegion) -> f32, fn(&mut HudRegion, f32));
@@ -536,14 +536,14 @@ impl MainView {
         row(name, title, subtitle, cx).children(self.mark(name, cx)).child(menu).into_any_element()
     }
 
-    /// The strength preset menu: choosing a preset writes its four values to the header as one unit (`Knobs::write`,
-    /// so the layer never sees half of a preset) and saves them. It shows the preset the header matches, else
-    /// "Custom".
+    /// The strength preset menu: choosing a preset writes its values to the header as one unit (`Preset::write`, so the
+    /// layer never sees half of a preset) and saves them. It shows the preset the header matches (`presets::matching`:
+    /// with a style or a colour of the edit on, or a pass on its own strengths, not Reference), else "Custom".
     fn preset_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        use neural_forge_supervisor::presets::{matching, Knobs, KNOBS, PRESETS};
+        use neural_forge_supervisor::presets::{matching, PRESETS};
         let mut names: Vec<SharedString> = PRESETS.iter().map(|p| p.name.into()).collect();
         names.push("Custom".into());
-        let selected = matching(&Knobs::from_header(self.shm.header())).unwrap_or(PRESETS.len());
+        let selected = matching(self.shm.header()).unwrap_or(PRESETS.len());
         let view = cx.weak_entity();
         let menu = menu_button(
             "menu",
@@ -555,13 +555,21 @@ impl MainView {
                 // "Custom" sets nothing.
                 let Some(preset) = PRESETS.get(picked) else { return };
                 let _ = view.update(cx, |this, cx| {
-                    preset.knobs.write(this.shm.header());
-                    crate::shm::persist_settings_later(&this.shm, &KNOBS);
+                    if let Some(names) = preset.write(this.shm.header()) {
+                        crate::shm::persist_settings_later(&this.shm, &names);
+                    }
                     this.changed(window, cx);
                 });
             }),
         );
-        row("preset", "Strength preset", "Sets the four values below. Reference is Neural Forge's defaults", cx).child(menu).into_any_element()
+        row(
+            "preset",
+            "Strength preset",
+            "Sets the four values below in every pass. Reference is Neural Forge's defaults and also resets the style and the colour of the edit",
+            cx,
+        )
+        .child(menu)
+        .into_any_element()
     }
 
     /// Opens the line to the display server's keyboard, once the window is up, and reads the session's keymap.
@@ -776,7 +784,7 @@ impl MainView {
 
     pub(crate) fn page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let (id, groups) = match self.tab {
-            Tab::Model => ("page-model", vec![self.model_group(cx), self.colour_group(cx), self.hud_group(cx), self.sharpen_group(cx)]),
+            Tab::Model => ("page-model", vec![self.model_group(cx), self.after_group(cx), self.colour_group(cx), self.hud_group(cx), self.sharpen_group(cx)]),
             Tab::Composition => ("page-composition", vec![self.composition_group(cx), self.white_point_group(cx)]),
             Tab::Debug => ("page-debug", vec![self.debug_group(cx), self.capture_group(cx)]),
             Tab::Status => {
@@ -829,9 +837,23 @@ impl MainView {
         rows.push(self.combo_row("placement", "Placement", PLACEMENTS.get(placement).map_or("", |&(_, d)| d), &PLACEMENT_NAMES, |h| &h.placement, true, cx));
         rows.push(self.scale_row(
             "preupscale_scale",
-            "Model resolution",
-            "The size the model runs at before the upscaler, of DLSS's input size. Full gives the most detail; the others are faster, and the model's edit is brought back to full size",
+            "Model resolution before and after DLSS",
+            "The size the model runs at with Placement Before the upscaler or After DLSS, of the picture it works on there (after DLSS unless the After DLSS / finished frame group has its own). Full gives the most detail; the others are faster. Not used at Finished frame: the next row is",
             |h| &h.preupscale_scale_bits,
+            cx,
+        ));
+        rows.push(self.scale_row(
+            "working_scale",
+            "Model resolution at the finished frame",
+            "The size the model runs at with Placement Finished frame, and wherever it runs on the finished frame because it cannot run before or after DLSS, of the frame's size. Lower is faster, softer and flickers more. The Status tab shows the size in use",
+            |h| &h.working_scale_bits,
+            cx,
+        ));
+        rows.push(self.switch_row(
+            "second_gpu_present",
+            "Second GPU shows the frame",
+            "With the model on a second GPU (NEURAL_FORGE_OFFLOAD_GPU) and Placement Finished frame: that GPU shows the frame itself, so each frame crosses once and the game never waits; frames it cannot carry are skipped. The monitor must be plugged into the second GPU. Applies when the game starts",
+            |h| &h.second_gpu_present,
             cx,
         ));
         // What the model sees before the upscaler: the picture's brightness for it alone (the game's is kept).
@@ -1189,6 +1211,69 @@ impl MainView {
         )
     }
 
+    fn after_group(&self, cx: &mut Context<Self>) -> AnyElement {
+        use neural_forge_protocol::enums::model_scale::PRESETS;
+        let mut names: Vec<SharedString> = vec!["Same as before DLSS".into()];
+        names.extend(PRESETS.iter().map(|&(name, _)| name.into()));
+        names.push("Custom".into());
+        let selected = crate::text::after_scale_index(f32::from_bits(self.shm.header().after_scale_bits.load(Ordering::Relaxed)));
+        let view = cx.weak_entity();
+        let scale = row(
+            "after_scale",
+            "Model resolution after DLSS",
+            "The size the model runs at on DLSS's output, of that output's size. Lower makes the model cheaper where it runs at the output resolution. The finished frame keeps its own row above",
+            cx,
+        )
+            .children(self.mark("after_scale", cx))
+            .child(menu_button(
+                "menu",
+                "Model resolution after DLSS",
+                names,
+                selected,
+                true,
+                Rc::new(move |picked, window, cx| {
+                    // "Custom" stores nothing: the menu goes back to what the header holds.
+                    if let Some(value) = crate::text::after_scale_value(picked) {
+                        let _ = view.update(cx, |this, cx| this.set_bits("after_scale", |h| &h.after_scale_bits, value.to_bits(), window, cx));
+                    }
+                }),
+            ))
+            .into_any_element();
+        let rows = vec![
+            self.spin_row(
+                "after_passes",
+                "Passes after DLSS",
+                "How many times the model runs over a frame where no pass runs before the upscaler. 0 is the same as before DLSS",
+                cx,
+            ),
+            scale,
+            row(
+                "after-image",
+                "Image settings after DLSS",
+                "Own intensity, local tone and structure, skin structure, style, auto mask or colour of the edit",
+                cx,
+            )
+            .child(
+                Button::new("edit")
+                    .small()
+                    .label("Edit…")
+                    .on_click(cx.listener(|this, _, window, cx| open_override_dialog(&this.shm, OverrideTarget::AfterDlss, window, cx))),
+            )
+            .into_any_element(),
+        ];
+        group(
+            "after-dlss",
+            "After DLSS / finished frame",
+            Some(
+                "Own settings for when the model runs after DLSS or on the finished frame (Placement After DLSS or Finished frame, Auto with Ray Reconstruction on, or a fall-back), where it costs more. Each is the same as before DLSS until changed"
+                    .into(),
+            ),
+            None,
+            rows,
+            cx,
+        )
+    }
+
     fn composition_group(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut rows = vec![
             self.spin_row("transfer_strength", "Detail strength", "How much of the model's edit reaches the frame; above 1 amplifies it", cx),
@@ -1198,8 +1283,8 @@ impl MainView {
         if self.live.after_upscaler {
             rows.push(self.spin_row(
                 "working_scale",
-                "Model resolution after the upscaler",
-                "Percent of the frame the model works at; lower is faster, softer and flickers more",
+                "Model resolution at the finished frame",
+                "Percent of the frame the model works at with Placement Finished frame; lower is faster, softer and flickers more",
                 cx,
             ));
         }
@@ -1530,10 +1615,11 @@ impl MainView {
         let profile_names: Vec<SharedString> =
             if profiles.is_empty() { vec!["No saved profiles".into()] } else { profiles.iter().map(|p| p.clone().into()).collect() };
         let view = cx.weak_entity();
-        let rows = vec![
+        let mut rows = vec![
             row("layer", "Layer", self.live.layer, cx).into_any_element(),
             // Where the model runs: before DLSS's upscaler or after it. Read-only; the Placement setting asks.
             row("placement", "Model placement", self.live.placement.clone(), cx).into_any_element(),
+            row("settings-in-use", "Settings in use", self.live.settings_in_use, cx).into_any_element(),
             tested_row,
             // The HDR verdict: what the game asked for and why (the layer's), and the desktop's HDR state.
             row("hdr", "HDR", self.live.hdr.clone(), cx).into_any_element(),
@@ -1563,6 +1649,9 @@ impl MainView {
                 .child(Button::new("delete").small().danger().label("Delete").on_click(cx.listener(|this, _, window, cx| this.delete_profile(window, cx))))
                 .into_any_element(),
         ];
+        if !self.live.second_present.is_empty() {
+            rows.insert(3, row("second-present", "Second GPU's present", self.live.second_present.clone(), cx).into_any_element());
+        }
         group("status", "Status", None, None, rows, cx)
     }
 
@@ -2517,6 +2606,32 @@ struct PassField {
     kind: PassFieldKind,
     /// The pass's field (pass 0 is pass 1).
     get: fn(&ShmHeader, usize) -> &std::sync::atomic::AtomicU32,
+    after: Option<Get>,
+}
+
+/// Whose overrides the per-pass dialog edits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverrideTarget {
+    /// One pass's at a time (`pass<N>_*`), picked in the dialog.
+    Passes,
+    /// The After DLSS / finished frame group's image settings (`after_*`, #73).
+    AfterDlss,
+}
+
+/// The persisted name of `field` for `target` (`pass` is the pass shown; the After DLSS group has one set).
+fn override_setting(target: OverrideTarget, pass: usize, field: &str) -> Option<&'static str> {
+    match target {
+        OverrideTarget::Passes => neural_forge_protocol::pass_setting(pass, field),
+        OverrideTarget::AfterDlss => neural_forge_protocol::after_setting(field),
+    }
+}
+
+/// The override mask `target` edits (`pass<N>_overrides` or `after_overrides`).
+fn override_mask(h: &neural_forge_protocol::ShmHeader, target: OverrideTarget, pass: usize) -> &std::sync::atomic::AtomicU32 {
+    match target {
+        OverrideTarget::Passes => &h.pass[pass].overrides,
+        OverrideTarget::AfterDlss => &h.after.overrides,
+    }
 }
 
 enum PassFieldKind {
@@ -2532,13 +2647,21 @@ enum PassFieldKind {
 use neural_forge_protocol::enums::pass_override as po;
 
 const PASS_FIELDS: &[PassField] = &[
-    PassField { title: "Intensity", field: "intensity", bit: po::INTENSITY, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass[k].intensity_bits },
+    PassField {
+        title: "Intensity",
+        field: "intensity",
+        bit: po::INTENSITY,
+        kind: PassFieldKind::Float { step: 0.05 },
+        get: |h, k| &h.pass[k].intensity_bits,
+        after: Some(|h| &h.after.intensity_bits),
+    },
     PassField {
         title: "Local tone",
         field: "local_tone",
         bit: po::LOCAL_TONE,
         kind: PassFieldKind::Float { step: 0.05 },
         get: |h, k| &h.pass[k].local_tone_bits,
+        after: Some(|h| &h.after.local_tone_bits),
     },
     PassField {
         title: "Local structure",
@@ -2546,6 +2669,7 @@ const PASS_FIELDS: &[PassField] = &[
         bit: po::LOCAL_STRUCTURE,
         kind: PassFieldKind::Float { step: 0.05 },
         get: |h, k| &h.pass[k].local_structure_bits,
+        after: Some(|h| &h.after.local_structure_bits),
     },
     PassField {
         title: "Skin structure",
@@ -2553,6 +2677,7 @@ const PASS_FIELDS: &[PassField] = &[
         bit: po::SKIN_STRUCTURE,
         kind: PassFieldKind::Float { step: 0.05 },
         get: |h, k| &h.pass[k].skin_structure_bits,
+        after: Some(|h| &h.after.skin_structure_bits),
     },
     PassField {
         title: "Style",
@@ -2560,15 +2685,25 @@ const PASS_FIELDS: &[PassField] = &[
         bit: po::STYLE,
         kind: PassFieldKind::Choice(&["Default", "Natural", "Cinematic"]),
         get: |h, k| &h.pass[k].style,
+        after: Some(|h| &h.after.style),
     },
-    PassField { title: "Auto mask", field: "auto_mask", bit: po::AUTO_MASK, kind: PassFieldKind::Toggle, get: |h, k| &h.pass[k].auto_mask },
-    PassField { title: "Model resolution", field: "scale", bit: po::SCALE, kind: PassFieldKind::Scale, get: |h, k| &h.pass_scale_bits[k] },
+    PassField {
+        title: "Auto mask",
+        field: "auto_mask",
+        bit: po::AUTO_MASK,
+        kind: PassFieldKind::Toggle,
+        get: |h, k| &h.pass[k].auto_mask,
+        after: Some(|h| &h.after.auto_mask),
+    },
+    // The After DLSS group has its model resolution in the Model tab, and no placement.
+    PassField { title: "Model resolution", field: "scale", bit: po::SCALE, kind: PassFieldKind::Scale, get: |h, k| &h.pass_scale_bits[k], after: None },
     PassField {
         title: "Edit saturation",
         field: "edit_saturation",
         bit: po::EDIT_SATURATION,
         kind: PassFieldKind::Float { step: 0.05 },
         get: |h, k| &h.pass_colour[k].saturation_bits,
+        after: Some(|h| &h.after_colour.saturation_bits),
     },
     PassField {
         title: "Edit contrast",
@@ -2576,6 +2711,7 @@ const PASS_FIELDS: &[PassField] = &[
         bit: po::EDIT_CONTRAST,
         kind: PassFieldKind::Float { step: 0.05 },
         get: |h, k| &h.pass_colour[k].contrast_bits,
+        after: Some(|h| &h.after_colour.contrast_bits),
     },
     PassField {
         title: "Edit detail",
@@ -2583,8 +2719,16 @@ const PASS_FIELDS: &[PassField] = &[
         bit: po::EDIT_DETAIL,
         kind: PassFieldKind::Float { step: 0.05 },
         get: |h, k| &h.pass_colour[k].detail_bits,
+        after: Some(|h| &h.after_colour.detail_bits),
     },
-    PassField { title: "Placement", field: "placement", bit: po::PLACEMENT, kind: PassFieldKind::Choice(&PLACEMENT_NAMES), get: |h, k| &h.pass_placement[k] },
+    PassField {
+        title: "Placement",
+        field: "placement",
+        bit: po::PLACEMENT,
+        kind: PassFieldKind::Choice(&PLACEMENT_NAMES),
+        get: |h, k| &h.pass_placement[k],
+        after: None,
+    },
 ];
 
 /// Writes settings of a pass, as one unit (so the layer never reads half of a change), and saves them.
@@ -2598,6 +2742,7 @@ fn write_pass_settings(shm: &Arc<Mapping>, settings: &[(&'static str, u32)]) {
 /// Per-pass overrides: each pass can replace any of the Model tab's values with its own; a pass that overrides
 /// nothing follows the Model tab. Saved as `set_pass<N>_*` like any other setting.
 struct PassDialog {
+    target: OverrideTarget,
     shm: Arc<Mapping>,
     /// The pass shown (0 is pass 1).
     pass: Rc<Cell<usize>>,
@@ -2609,7 +2754,7 @@ struct PassDialog {
 }
 
 impl PassDialog {
-    fn new(shm: Arc<Mapping>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(shm: Arc<Mapping>, target: OverrideTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let max = neural_forge_protocol::MAX_PASSES;
         let pass = Rc::new(Cell::new(0usize));
         let mut subs = Vec::new();
@@ -2632,13 +2777,19 @@ impl PassDialog {
             };
             let (lower, upper) = neural_forge_protocol::setting_bounds(field.field).unwrap_or_else(|| panic!("{} has no bounds", field.field));
             let (read_shm, write_shm, read_pass, write_pass) = (Arc::clone(&shm), Arc::clone(&shm), pass.clone(), pass.clone());
-            let (get, name) = (field.get, field.field);
+            let (get, after, name) = (field.get, field.after, field.field);
             let (spin, spin_subs) = Spin::new(
                 window,
                 cx,
-                Rc::new(move || f64::from(f32::from_bits(get(read_shm.header(), read_pass.get()).load(Ordering::Relaxed)))),
+                Rc::new(move || {
+                    f64::from(f32::from_bits(if target == OverrideTarget::AfterDlss {
+                        after.map_or(0, |get| get(read_shm.header()).load(Ordering::Relaxed))
+                    } else {
+                        get(read_shm.header(), read_pass.get()).load(Ordering::Relaxed)
+                    }))
+                }),
                 Rc::new(move |shown| {
-                    if let Some(setting) = neural_forge_protocol::pass_setting(write_pass.get(), name) {
+                    if let Some(setting) = override_setting(target, write_pass.get(), name) {
                         write_pass_settings(&write_shm, &[(setting, (shown as f32).to_bits())]);
                     }
                 }),
@@ -2649,7 +2800,7 @@ impl PassDialog {
             subs.extend(spin_subs);
             spins.push(Some(spin));
         }
-        Self { shm, pass, pass_spin, spins, close_focus: InitialFocus::new(cx), _subs: subs }
+        Self { shm, target, pass, pass_spin, spins, close_focus: InitialFocus::new(cx), _subs: subs }
     }
 
     /// After an edit (another pass picked, a value changed): every field shows the pass's values.
@@ -2661,7 +2812,7 @@ impl PassDialog {
     }
 
     fn write(&mut self, field: &'static str, bits: u32, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(setting) = neural_forge_protocol::pass_setting(self.pass.get(), field) {
+        if let Some(setting) = override_setting(self.target, self.pass.get(), field) {
             write_pass_settings(&self.shm, &[(setting, bits)]);
         }
         self.edited(window, cx);
@@ -2673,25 +2824,29 @@ impl Render for PassDialog {
         self.close_focus.apply(window, cx);
         let pass = self.pass.get();
         let header = self.shm.header();
-        let mask = header.pass[pass].overrides.load(Ordering::Relaxed);
+        let mask = override_mask(header, self.target, pass).load(Ordering::Relaxed);
         let mut rows = Vec::new();
-        for (i, field) in PASS_FIELDS.iter().enumerate() {
+        for (i, field) in PASS_FIELDS.iter().enumerate().filter(|(_, f)| self.target == OverrideTarget::Passes || f.after.is_some()) {
             let on = mask & field.bit != 0;
             let bit = field.bit;
             rows.push(
-                row(("field", i), field.title, "Override for this pass", cx)
-                    .child(Switch::new("override").checked(on).accessibility_label(format!("Override {} for this pass", field.title)).on_click(cx.listener(
-                        move |this, on: &bool, window, cx| {
-                            let mask = this.shm.header().pass[this.pass.get()].overrides.load(Ordering::Relaxed);
+                row(("field", i), field.title, self.target.field_subtitle(), cx)
+                    .child(Switch::new("override").checked(on).accessibility_label(format!("{}: {}", self.target.field_subtitle(), field.title)).on_click(
+                        cx.listener(move |this, on: &bool, window, cx| {
+                            let mask = override_mask(this.shm.header(), this.target, this.pass.get()).load(Ordering::Relaxed);
                             this.write("overrides", if *on { mask | bit } else { mask & !bit }, window, cx);
-                        },
-                    )))
+                        }),
+                    ))
                     .into_any_element(),
             );
             if !on {
                 continue;
             }
-            let bits = (field.get)(header, pass).load(Ordering::Relaxed);
+            let bits = if self.target == OverrideTarget::AfterDlss {
+                field.after.expect("group field")(header).load(Ordering::Relaxed)
+            } else {
+                (field.get)(header, pass).load(Ordering::Relaxed)
+            };
             let name = field.field;
             let view = cx.weak_entity();
             let value = match &field.kind {
@@ -2718,7 +2873,7 @@ impl Render for PassDialog {
                     use neural_forge_protocol::enums::model_scale::{preset_of, PRESETS};
                     let mut names: Vec<SharedString> = PRESETS.iter().map(|&(n, _)| n.into()).collect();
                     names.push("Custom".into());
-                    row(("value", i), "Value", "Of DLSS's input size; this pass works on the previous pass's full-size picture", cx).child(menu_button(
+                    row(("value", i), "Value", "Before the upscaler and after DLSS only, of the picture the pass works on (the previous pass's, at full size). At Finished frame every pass runs at \"Model resolution at the finished frame\"", cx).child(menu_button(
                         "menu",
                         field.title,
                         names,
@@ -2737,15 +2892,16 @@ impl Render for PassDialog {
         let pick = group(
             "pick",
             "",
-            Some(
-                "Each pass of the model can override any Model-tab value with its own. A pass that overrides nothing follows the Model tab. Only the passes the Passes setting runs are used. Passes run in order: a pass placed earlier in the frame than the pass before it runs where that one does."
-                    .into(),
-            ),
+            Some(self.target.description().into()),
             None,
-            vec![row("pass", "Pass", "", cx).child(self.pass_spin.field("Pass")).into_any_element()],
+            if self.target == OverrideTarget::Passes {
+                vec![row("pass", "Pass", "", cx).child(self.pass_spin.field("Pass")).into_any_element()]
+            } else {
+                vec![]
+            },
             cx,
         );
-        named_group("per-pass", PASS_TITLE)
+        named_group("per-pass", self.target.title())
             .child(v_flex().id("body").max_h(dialog_room(window)).overflow_y_scroll().gap_4().child(pick).child(group("fields", "", None, None, rows, cx)))
             .child(
                 dialog_buttons()
@@ -2756,12 +2912,45 @@ impl Render for PassDialog {
 
 const PASS_TITLE: &str = "Per-pass settings";
 
+impl OverrideTarget {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Passes => PASS_TITLE,
+            Self::AfterDlss => "After DLSS image settings",
+        }
+    }
+
+    /// The dialog's explanation above its fields.
+    fn description(self) -> &'static str {
+        match self {
+            Self::Passes => {
+                "Each pass of the model can override any Model-tab value with its own. A pass that overrides nothing follows the Model tab (after DLSS: the After DLSS group's values). Only the passes that run are used: the Passes setting's count, or Passes after DLSS where no pass runs before the upscaler. Passes run in order: a pass placed earlier in the frame than the pass before it runs where that one does."
+            }
+            Self::AfterDlss => {
+                "Where the model runs after DLSS or on the finished frame (Placement After DLSS or Finished frame, Auto with Ray Reconstruction on, or a fall-back), each value switched on here replaces the Model tab's for every pass. The rest follow the Model tab. A pass's own value in the per-pass settings still comes first."
+            }
+        }
+    }
+
+    /// What a field's switch does, under its name (and to a screen reader).
+    fn field_subtitle(self) -> &'static str {
+        match self {
+            Self::Passes => "Override for this pass",
+            Self::AfterDlss => "Own value after DLSS",
+        }
+    }
+}
+
 pub(crate) fn open_pass_dialog(shm: &Arc<Mapping>, window: &mut Window, cx: &mut App) {
+    open_override_dialog(shm, OverrideTarget::Passes, window, cx);
+}
+
+pub(crate) fn open_override_dialog(shm: &Arc<Mapping>, target: OverrideTarget, window: &mut Window, cx: &mut App) {
     let shm = Arc::clone(shm);
-    let dialog_view = cx.new(|cx| PassDialog::new(shm, window, cx));
+    let dialog_view = cx.new(|cx| PassDialog::new(shm, target, window, cx));
     window.open_dialog(cx, move |dialog, _, _| {
         // Enter belongs to the fields here (it takes a typed value): it never closes the dialog.
-        dialog.title(dialog_title(PASS_TITLE)).overlay(false).w(px(640.)).on_ok(|_, _, _| false).child(dialog_view.clone())
+        dialog.title(dialog_title(target.title())).overlay(false).w(px(640.)).on_ok(|_, _, _| false).child(dialog_view.clone())
     });
 }
 
@@ -2952,5 +3141,23 @@ mod tests {
         assert!(failed.starts_with("false failed ("), "{failed}");
         let missing = open_with_file_manager(&dir, "/nonexistent/neural-forge-opener").unwrap_err();
         assert!(missing.contains("could not be started"), "{missing}");
+    }
+
+    /// The dialog writes the After DLSS group's own settings for that target and the pass's for the passes; the group
+    /// has every field but the pass's model resolution and placement, and reads and writes its own mask.
+    #[test]
+    fn the_override_dialog_writes_the_targets_settings() {
+        assert_eq!(override_setting(OverrideTarget::AfterDlss, 3, "intensity"), Some("after_intensity"));
+        assert_eq!(override_setting(OverrideTarget::AfterDlss, 0, "overrides"), Some("after_overrides"));
+        assert_eq!(override_setting(OverrideTarget::AfterDlss, 0, "placement"), None);
+        assert_eq!(override_setting(OverrideTarget::Passes, 1, "intensity"), Some("pass2_intensity"));
+        // Every field the group shows is one it stores (its model resolution is a Model-tab row instead).
+        for field in PASS_FIELDS.iter().filter(|f| f.after.is_some()) {
+            assert!(override_setting(OverrideTarget::AfterDlss, 0, field.field).is_some(), "{}", field.field);
+        }
+        let header = ShmHeader::default();
+        header.after.overrides.store(po::INTENSITY, Ordering::Relaxed);
+        assert_eq!(override_mask(&header, OverrideTarget::AfterDlss, 2).load(Ordering::Relaxed), po::INTENSITY);
+        assert_eq!(override_mask(&header, OverrideTarget::Passes, 2).load(Ordering::Relaxed), 0);
     }
 }

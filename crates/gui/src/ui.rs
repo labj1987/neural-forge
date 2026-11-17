@@ -857,10 +857,30 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
     // Once the first frame has been drawn and presented, later launches get "ok" without being told this copy is still
     // starting. GPUI runs next-frame callbacks at the start of a frame request, before that frame is drawn: the first
     // callback only asks for the next frame, and the second one (after the first frame is up on screen) sets `up`.
+    // SIGTERM (a logout, `kill`): the settings changed in the last moments are saved and the window closes as when the
+    // user closes it. One that has not closed 5 s later is ended as SIGTERM would have ended it.
+    if let Some(terminations) = crate::instance::terminations(Some(std::time::Duration::from_secs(5))) {
+        cx.spawn(async move |cx| {
+            if terminations.recv().await.is_ok() {
+                save_pending_settings();
+                let _ = window.update(cx, |_, window, _| window.remove_window());
+            }
+        })
+        .detach();
+    }
     let up = activations.up_signal();
     let _ = window.update(cx, |_, window, _| window.on_next_frame(move |window, _| window.on_next_frame(move |_, _| up.set())));
     cx.spawn(async move |cx| {
         while let Some(request) = activations.next().await {
+            // Another build was started (an older or newer AppImage): this window saves its settings and closes for it
+            // (#73), so the window always matches the layer that launch installed. Closing releases the socket
+            // (`on_window_closed`); the requests still queued are dropped with `activations`, and their launches ask again.
+            if request.is_other_build(crate::instance::build_id()) {
+                save_pending_settings();
+                request.make_way();
+                let _ = window.update(cx, |_, window, _| window.remove_window());
+                break;
+            }
             let shown = window.update(cx, |_, window, _| {
                 let raised = request.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
                 if !raised {
@@ -933,6 +953,8 @@ pub(crate) struct Live {
     pub capture_in_game_frame: bool,
     pub layer: &'static str,
     pub placement: String,
+    pub settings_in_use: &'static str,
+    pub second_present: String,
     pub tested: (String, Option<String>),
     pub hdr: String,
     /// The "Settings for" menu: its entries, the one whose settings the header holds, and what the line below says.
@@ -992,6 +1014,8 @@ pub struct MainView {
     /// `games.ini`'s sections, read again only when the file changed.
     games_cache: GamesCache,
     liveness: Liveness,
+    /// The finished frame's sizes and setting, and for how many refreshes they stayed (`text::steady_for`).
+    finished_sizes: std::cell::Cell<Option<(crate::text::FinishedSizes, u32)>>,
     /// The installed Steam games' app ids and names, for the "Settings for" menu.
     steam_names: Vec<(String, String)>,
     banner_closed: bool,
@@ -1018,6 +1042,7 @@ impl MainView {
             spin_subs: HashMap::new(),
             live: Live::default(),
             liveness: Liveness::default(),
+            finished_sizes: std::cell::Cell::new(None),
             steam_names: Vec::new(),
             banner_closed: false,
             telemetry: Telemetry::default(),
@@ -1038,7 +1063,7 @@ impl MainView {
         if !view.pages.model_present {
             view.tab = Tab::Setup;
         }
-        // Developer aid: `NEURAL_FORGE_GUI_OPEN=<tab>` selects that tab at start (`passes` and `uninstall` open their
+        // Developer aid: `NEURAL_FORGE_GUI_OPEN=<tab>` selects that tab at start (`passes`, `after` and `uninstall` open their
         // dialogs, see `started`), so each can be screenshotted without synthetic input.
         match neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
             Some("uninstall") => view.tab = Tab::Setup,
@@ -1195,6 +1220,7 @@ impl MainView {
         }
         match neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
             Some("passes") => crate::pages::open_pass_dialog(&self.shm, window, cx),
+            Some("after") => crate::pages::open_override_dialog(&self.shm, crate::pages::OverrideTarget::AfterDlss, window, cx),
             Some("uninstall") => self.uninstall_clicked(window, cx),
             Some("about") => crate::pages::show_about_dialog(window, cx),
             _ => {}
@@ -1299,6 +1325,23 @@ impl MainView {
             hdr.preupscale_misses.load(Ordering::Relaxed),
             &hdr.preupscale_reason(),
         );
+        let sizes = (
+            (hdr.answered_w.load(Ordering::Relaxed), hdr.answered_h.load(Ordering::Relaxed)),
+            (hdr.frame_width.load(Ordering::Relaxed), hdr.frame_height.load(Ordering::Relaxed)),
+            hdr.working_scale_bits.load(Ordering::Relaxed),
+        );
+        let placement = match crate::text::finished_frame_size(
+            alive
+                && !neural_forge_protocol::enums::preupscale_state::network_runs(hdr.preupscale_state.load(Ordering::Relaxed))
+                && hdr.model_up.load(Ordering::Relaxed) != 0,
+            sizes.0,
+            sizes.1,
+            f32::from_bits(sizes.2),
+            crate::text::steady_for(&self.finished_sizes, sizes),
+        ) {
+            Some(size) => format!("{placement}: {size}"),
+            None => placement,
+        };
         // The layer's own status line: the model running, or why it is not.
         let layer_reason = if alive { hdr.layer_reason() } else { String::new() };
         let placement = if layer_reason.is_empty() { placement } else { format!("{placement} -- {layer_reason}") };
@@ -1326,10 +1369,12 @@ impl MainView {
             alive,
             cache,
             cuts,
-            after_upscaler: alive && hdr.native_running.load(Ordering::Relaxed) == 0,
+            after_upscaler: alive && !neural_forge_protocol::enums::preupscale_state::network_runs(hdr.preupscale_state.load(Ordering::Relaxed)),
             capture_in_game_frame: alive && crate::text::edits_in_game_frame(hdr.preupscale_state.load(Ordering::Relaxed)),
             layer,
             placement,
+            settings_in_use: crate::text::settings_group_label(alive, hdr.settings_group.load(Ordering::Relaxed)),
+            second_present: if alive { hdr.second_gpu_present_line() } else { String::new() },
             tested: crate::text::tested_label(hdr.game_name().as_str(), neural_forge_supervisor::compat::for_header(hdr)),
             hdr: neural_forge_supervisor::shm_status::hdr_line(hdr, self.desktop_hdr.as_deref()),
             entries,
@@ -1372,7 +1417,11 @@ impl MainView {
         let model_ms = f32::from_bits(hdr.preupscale_network_gpu_ms_bits.load(Ordering::Relaxed));
         let sample = TelemetrySample {
             frame_ms: rate.filter(|&f| active && f > 0.5).map(|f| (1000.0 / f) as f32),
-            model_ms: (active && neural_forge_protocol::enums::preupscale_state::network_runs(state) && model_ms.is_finite() && model_ms > 0.0)
+            model_ms: (active
+                && neural_forge_protocol::enums::preupscale_state::network_runs(state)
+                && !crate::text::on_second_gpu(&hdr.layer_reason())
+                && model_ms.is_finite()
+                && model_ms > 0.0)
                 .then_some(model_ms),
         };
         let ms = |v: Option<f32>| v.map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"));

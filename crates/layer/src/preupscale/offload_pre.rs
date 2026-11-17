@@ -45,6 +45,22 @@ use ash::vk;
 use super::HostBuffer;
 
 const GATE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_offload_gate.spv");
+const PACK_SPV: &[u8] = include_bytes!("../../shaders/preupscale_offload_pack.spv");
+/// `preupscale_offload_pack.comp`'s local size and the texels a row of its dispatch covers.
+const PACK_LOCAL: u64 = 64;
+const PACK_ROW: u64 = 65536;
+/// The half a texel of the packed motion holds in both components where the field is not a number (the chain left
+/// the frame, or the hold had no vectors): the one pattern the pack ever writes that is not a number.
+#[cfg(test)]
+const HALF_NAN: u32 = 0x7e00_7e00;
+
+/// `NEURAL_FORGE_OFFLOAD_MOTION`: `float` sends the accumulated motion as it is (2 x f32 a texel, as 4.3.0 did);
+/// anything else, or unset, packs it to two halves a texel (`preupscale_offload_pack.comp`), half the bytes.
+pub(crate) fn motion_packed() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_MOTION").is_none_or(|v| !v.trim().eq_ignore_ascii_case("float")));
+    *ON
+}
 
 /// Each region's header, and the alignment of every section after it (a storage buffer's offset alignment is at
 /// most this on every driver the layer runs on).
@@ -60,19 +76,74 @@ pub(crate) const IN_SEQ: usize = 1;
 /// hold goes on without the answer. The finished-frame offload's floor for a late frame.
 pub(crate) const ANSWER_BUDGET: Duration = super::offload::LATE_FLOOR;
 
+/// Which hold the other GPU serves: the one before DLSS (at DLSS's render size), or the one after DLSS's output (at
+/// the output size: the placement with Ray Reconstruction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Where {
+    Before,
+    After,
+}
+
+impl Where {
+    /// Of a hold at `stage`.
+    pub(crate) fn of(stage: super::placement::Stage) -> Self {
+        if stage == super::placement::Stage::Upscaled {
+            Self::After
+        } else {
+            Self::Before
+        }
+    }
+
+    /// Its bit in [`SERVING_HOLD`], and its place in [`SERVER_TIME`].
+    fn bit(self) -> u8 {
+        match self {
+            Self::Before => 1,
+            Self::After => 2,
+        }
+    }
+
+    /// As the log and the Status tab say it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Before => "before DLSS",
+            Self::After => "after DLSS",
+        }
+    }
+}
+
 /// The sizes of what crosses, in bytes (0 for a section the hold does not have).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Sizes {
     /// The frame as the capture encoded it.
     pub frame: u64,
-    /// The accumulated motion the network's history reads.
+    /// The accumulated motion the network's history reads: 2 x f32 a texel, or packed to two halves.
     pub motion: u64,
+    /// The texels of the motion when it crosses packed (`preupscale_offload_pack.comp`); 0 when it crosses as floats.
+    pub packed_texels: u64,
     /// DLSS's depth as the capture copied it (the control mask's sky rule).
     pub depth: u64,
     /// The small buffers the frame shaders read (the exposure, the scene cut's word), one after another.
     pub side: u64,
     /// The network's answer.
     pub answer: u64,
+}
+
+impl Sizes {
+    /// What a hold of `width` x `height` at `at` exchanges: the encode and the answer (RGBA16F at the padded
+    /// extent), the accumulated motion (two halves a texel with `packed`, else 2 x f32), the small state, and DLSS's
+    /// depth before DLSS only (the hold after DLSS's output has none at its size).
+    pub(crate) fn of(at: Where, width: u32, height: u32, packed: bool) -> Self {
+        let (pw, ph) = super::padded(width, height);
+        let (texels, padded) = (u64::from(width) * u64::from(height), u64::from(pw) * u64::from(ph));
+        Self {
+            frame: padded * 8,
+            motion: texels * if packed { 4 } else { 8 },
+            packed_texels: if packed { texels } else { 0 },
+            depth: if at == Where::Before { texels * 4 } else { 0 },
+            side: super::hdr::HdrPass::EXPOSURE_BYTES + 16,
+            answer: padded * 8,
+        }
+    }
 }
 
 /// Where each section is in its region.
@@ -205,6 +276,9 @@ pub(crate) struct Progress {
     /// Held while the host resets `sent` (the worker) and while a hold records its set: `vkResetEvent` needs the
     /// event externally synchronized, and the hold's thread records it while the worker runs.
     event: Mutex<()>,
+    /// Microseconds the submits waited for the worker ([`Self::settle`]), summed: the hold's summary reads and clears
+    /// it (`super::offload_trial`).
+    waited_us: AtomicU64,
     /// Tests: how many times a settle blocked (waited for the worker at all), whatever it then found.
     #[cfg(test)]
     blocked: AtomicU64,
@@ -234,7 +308,13 @@ impl Progress {
     /// in the submit being made: it cannot have run), nor once the worker stopped. A frame not done within the
     /// budget is abandoned.
     pub(crate) fn settle(&self, seq: u32, budget: Duration) -> bool {
-        let deadline = Instant::now() + budget;
+        let start = Instant::now();
+        let ok = self.settle_until(seq, start + budget);
+        self.waited_us.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        ok
+    }
+
+    fn settle_until(&self, seq: u32, deadline: Instant) -> bool {
         let mut p = self.lock();
         loop {
             if let Some((done, ok)) = p.finished.filter(|(done, _)| *done == seq) {
@@ -303,12 +383,13 @@ pub(crate) struct Counters {
 
 impl Counters {
     /// The summary line's text since the last call (the counters start over).
-    pub(crate) fn summary(&self) -> String {
+    pub(crate) fn summary(&self, at: Where) -> String {
         let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
         let (sent, answered, late, us) = (take(&self.sent), take(&self.answered), take(&self.late), take(&self.answer_us));
         let mean = if answered == 0 { 0.0 } else { us as f64 / answered as f64 / 1000.0 };
         format!(
-            "before DLSS: {sent} frames sent to the other GPU, {answered} answered in time (mean {mean:.1} ms from send to answer), {late} without an answer"
+            "{}: {sent} frames sent to the other GPU, {answered} answered in time (mean {mean:.1} ms from send to answer), {late} without an answer",
+            at.name()
         )
     }
 }
@@ -333,9 +414,76 @@ pub(crate) struct Exchange {
     pipeline: vk::Pipeline,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
-    /// The counters the gate's set points at: their buffer and which edit cache's they are
-    /// (`cache::CachePass::stats_made`).
-    gated: Option<(vk::Buffer, u64)>,
+    /// The counters the gate's set points at, with which edit cache's they are (`cache::CachePass::stats_made`: counted,
+    /// never the handle alone, which the driver gives the next buffer made).
+    gated: Bound,
+    /// The motion's pack (`Sizes::packed_texels`).
+    pack: Option<Pack>,
+}
+
+/// What a set of the exchange points at: the buffer, and which object's it is (counted, never the handle alone).
+type Bound = Option<(vk::Buffer, u64)>;
+
+/// The pack of the accumulated motion to halves before it is sent (`preupscale_offload_pack.comp`): its pipeline (over
+/// the gate's layout: two storage buffers and one pushed word), its set and the packed field.
+struct Pack {
+    pipeline: vk::Pipeline,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    packed: super::native::OwnBuffer,
+    texels: u64,
+    /// The field the set points at, with which native pass's it is (`native::NativePass::id`).
+    bound: Bound,
+}
+
+impl Pack {
+    /// # Safety
+    /// `device` is live; `layout` and `set_layout` are the gate's.
+    unsafe fn build(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+        layout: vk::PipelineLayout,
+        set_layout: vk::DescriptorSetLayout,
+        texels: u64,
+    ) -> Option<Self> {
+        // SAFETY: valid create infos; everything made is destroyed on a later failure.
+        unsafe {
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC;
+            let packed = super::native::OwnBuffer::new(device, instance, physical, texels * 4, usage)?;
+            let Some(pipeline) = super::hdr::compute_pipeline(device, layout, PACK_SPV) else {
+                packed.destroy(device);
+                return None;
+            };
+            let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
+            let pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).ok();
+            let set = pool.and_then(|pool| {
+                device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout])).ok()
+            });
+            match (pool, set) {
+                (Some(pool), Some(sets)) => Some(Self { pipeline, pool, set: sets[0], packed, texels, bound: None }),
+                (pool, _) => {
+                    if let Some(pool) = pool {
+                        device.destroy_descriptor_pool(pool, None);
+                    }
+                    device.destroy_pipeline(pipeline, None);
+                    packed.destroy(device);
+                    None
+                }
+            }
+        }
+    }
+
+    /// # Safety
+    /// Nothing submitted may still use it.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: the contract.
+        unsafe {
+            device.destroy_descriptor_pool(self.pool, None);
+            device.destroy_pipeline(self.pipeline, None);
+            self.packed.destroy(device);
+        }
+    }
 }
 
 /// Page-aligned zeroed memory.
@@ -492,7 +640,33 @@ impl Exchange {
                 inn.destroy(device);
                 return None;
             };
-            Some(Self { layout, out, inn, regions, shared, sent, progress: Arc::default(), set_layout, pipeline_layout, pipeline, pool, set, gated: None })
+            let pack = if sizes.packed_texels > 0 { Pack::build(device, instance, physical, pipeline_layout, set_layout, sizes.packed_texels) } else { None };
+            if sizes.packed_texels > 0 && pack.is_none() {
+                device.destroy_descriptor_pool(pool, None);
+                device.destroy_pipeline(pipeline, None);
+                device.destroy_pipeline_layout(pipeline_layout, None);
+                device.destroy_descriptor_set_layout(set_layout, None);
+                device.destroy_event(sent, None);
+                out.destroy(device);
+                inn.destroy(device);
+                return None;
+            }
+            Some(Self {
+                layout,
+                out,
+                inn,
+                regions,
+                shared,
+                sent,
+                progress: Arc::default(),
+                set_layout,
+                pipeline_layout,
+                pipeline,
+                pool,
+                set,
+                gated: None,
+                pack,
+            })
         }
     }
 
@@ -510,7 +684,10 @@ impl Exchange {
         }
     }
 
-    /// Points the gate at the edit cache's counters `stats`, when they changed.
+    /// Points the gate at the edit cache's counters `stats`, when they changed. `made` names the edit cache they
+    /// belong to (`cache::CachePass::made`): a cache destroyed and built again under this side (the VRAM guard's
+    /// pause frees it, `Resources::release_native`) often gets its counters under the old handle, and a set left as
+    /// it was then pointed at the freed buffer (the fault `CachePass::bind_late` had, #63).
     ///
     /// `made` names the edit cache `stats` belongs to (`cache::CachePass::stats_made`: counted, never a handle). The
     /// buffer's handle alone does not: an edit cache destroyed and built again while this side lives (the VRAM
@@ -535,7 +712,45 @@ impl Exchange {
     /// The counters the gate's set points at are going (their edit cache is destroyed): the set is written again
     /// before it is next used, whatever the next cache's handles are.
     pub(crate) fn forget_gate(&mut self) {
-        self.gated = None;
+        self.gated = Bound::default();
+    }
+
+    /// Points the motion's pack at the accumulated field `field` (2 x f32 a texel), when it changed and the motion
+    /// crosses packed. `made` names the native pass it belongs to (`native::NativePass::id`): a pass built again
+    /// under this side (a change of the Model resolution in a running game, `native::take_other_extents`) often gets
+    /// its field under the old handle.
+    ///
+    /// # Safety
+    /// `field` is live and holds the layout's packed texels; nothing that may run uses the set unless it is unchanged.
+    pub(crate) unsafe fn bind_pack(&mut self, device: &ash::Device, field: vk::Buffer, made: u64) {
+        let Some(pack) = self.pack.as_mut().filter(|p| p.bound != Some((field, made))) else { return };
+        let from = [vk::DescriptorBufferInfo { buffer: field, offset: 0, range: pack.texels * 8 }];
+        let to = [vk::DescriptorBufferInfo { buffer: pack.packed.buffer, offset: 0, range: vk::WHOLE_SIZE }];
+        let w =
+            |n: u32, i| vk::WriteDescriptorSet::default().dst_set(pack.set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i);
+        // SAFETY: the contract.
+        unsafe { device.update_descriptor_sets(&[w(0, &from), w(1, &to)], &[]) };
+        pack.bound = Some((field, made));
+    }
+
+    /// The edit cache or the native pass the gate's and the pack's sets point into is going: both are written again
+    /// before they are next used.
+    pub(crate) fn forget_bound(&mut self) {
+        self.gated = Bound::default();
+        if let Some(pack) = self.pack.as_mut() {
+            pack.bound = None;
+        }
+    }
+
+    /// Tests: what the gate's and the pack's sets are taken to point at.
+    #[cfg(test)]
+    pub(crate) fn bound_for_test(&self) -> (Bound, Bound) {
+        (self.gated, self.pack.as_ref().and_then(|p| p.bound))
+    }
+
+    /// Whether the motion crosses packed to halves.
+    pub(crate) fn motion_half(&self) -> bool {
+        self.pack.is_some()
     }
 
     /// Before the buffer of a hold planned as `plan` goes to the driver (in the order of the submit's buffers):
@@ -631,12 +846,14 @@ impl Exchange {
         }
     }
 
-    /// Records the hold's send of its frame as number `seq` (never 0): the copies into OUT, then `sent` set. The
-    /// hold's submit settles the send before it first ([`Self::at_submit`]).
+    /// Records the hold's send of its frame as number `seq` (never 0): the motion's pack where it crosses packed (a
+    /// compute pipeline, set and pushed word, as the gate's), the copies into OUT, then `sent` set. The hold's submit
+    /// settles the send before it first ([`Self::at_submit`]).
     ///
     /// # Safety
     /// `cmd` is recording on the game's device, outside a render pass, after the hold's capture; every source is
-    /// live, at least its section's size, and the image is in `GENERAL` with `TRANSFER_SRC` usage.
+    /// live, at least its section's size, and the image is in `GENERAL` with `TRANSFER_SRC` usage; with the motion
+    /// packed, the pack is bound to the motion's buffer ([`Self::bind_pack`]).
     pub(crate) unsafe fn record_send(&self, device: &ash::Device, cmd: vk::CommandBuffer, seq: u32, from: &Sources) {
         let l = &self.layout;
         let mut header = [0u32; 8];
@@ -652,6 +869,35 @@ impl Exchange {
                 // SAFETY: the contract.
                 unsafe { device.cmd_copy_buffer(cmd, src, self.out.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: at, size }]) };
             }
+        };
+        // The motion packed to halves first: what is copied below is the packed field.
+        let motion = match (from.motion, self.pack.as_ref()) {
+            (Some(field), Some(pack)) => {
+                debug_assert_eq!(pack.bound.map(|b| b.0), Some(field), "the pack is bound to the hold's field");
+                let field_ready = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                let rows = pack.texels.div_ceil(PACK_ROW) as u32;
+                let groups = if rows > 1 { PACK_ROW / PACK_LOCAL } else { pack.texels.div_ceil(PACK_LOCAL) } as u32;
+                // SAFETY: the contract.
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[field_ready],
+                        &[],
+                        &[],
+                    );
+                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pack.pipeline);
+                    device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, std::slice::from_ref(&pack.set), &[]);
+                    device.cmd_push_constants(cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &(pack.texels as u32).to_ne_bytes());
+                    device.cmd_dispatch(cmd, groups, rows, 1);
+                }
+                Some(pack.packed.buffer)
+            }
+            (motion, _) => motion,
         };
         // SAFETY: the contract.
         unsafe {
@@ -676,7 +922,7 @@ impl Exchange {
                     device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, self.out.buffer, &[region]);
                 }
             }
-            if let Some(m) = from.motion {
+            if let Some(m) = motion {
                 copy(m, l.motion_at, l.sizes.motion);
             }
             if let Some(d) = from.depth {
@@ -707,6 +953,9 @@ impl Exchange {
     pub(crate) unsafe fn destroy(self, device: &ash::Device) {
         // SAFETY: the contract.
         unsafe {
+            if let Some(pack) = &self.pack {
+                pack.destroy(device);
+            }
             device.destroy_descriptor_pool(self.pool, None);
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
@@ -725,15 +974,25 @@ pub(crate) struct Worker {
     mode: Arc<AtomicU8>,
     pub counters: Arc<Counters>,
     /// Why the hold's side wants the offload given up ([`Self::give_up`]), until the worker took it.
-    asked: Arc<Mutex<Option<String>>>,
+    asked: Arc<Mutex<Option<(String, Stop)>>>,
     thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     /// When its side last planned a hold ([`now_ms`]).
     touched: Arc<AtomicU64>,
+    /// The game's device and the hold it serves.
+    game: vk::Device,
+    at: Where,
 }
 
-/// The running workers by the game's device, so its destruction can end them (and with them free the other
-/// device's side) before the offload device goes ([`stop_for`]).
-type Running = (vk::Device, Arc<AtomicBool>, Arc<Mutex<Option<std::thread::JoinHandle<()>>>>, Arc<AtomicU64>);
+/// A running worker, by the game's device and the hold it serves: so the device's destruction can end them (and with
+/// them free the other device's side) before the offload device goes ([`stop_for`]), and a side can find who else
+/// serves its device ([`serving_at`], [`release_idle`]).
+struct Running {
+    game: vk::Device,
+    at: Where,
+    quit: Arc<AtomicBool>,
+    thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    touched: Arc<AtomicU64>,
+}
 
 /// A hold's side that has had no hold for this long gives the offload device up to another set of hold resources
 /// of the same game that waits for it ([`release_idle`]).
@@ -744,30 +1003,49 @@ fn now_ms() -> u64 {
     START.elapsed().as_millis() as u64 + 1
 }
 
-/// Ends the workers of the game's device `game` whose side had no hold for `idle` (their runners free the other
-/// device's side and give the device back): another set of hold resources can then take the offload. The sides they
-/// belonged to find their worker ended ([`Worker::ended`]) and are built again when they next hold. Whether any ended.
-pub(crate) fn release_idle(game: vk::Device, idle: Duration) -> bool {
+/// Ends the workers of the game's device `game` that serve the hold `at` and whose side had no hold for `idle`
+/// (their runners free their part of the other device's side, and the last one there gives the device back): another
+/// set of hold resources at that hold can then take its place. The sides they belonged to find their worker ended
+/// ([`Worker::ended`]) and are built again when they next hold. Whether any ended.
+pub(crate) fn release_idle(game: vk::Device, at: Where, idle: Duration) -> bool {
     let now = now_ms();
+    release(|r| r.game == game && r.at == at && now.saturating_sub(r.touched.load(Ordering::Relaxed)) >= idle.as_millis() as u64)
+}
+
+/// Ends every hold's worker of the game's device `game` (Placement became Finished frame while the game runs: the
+/// finished frame's server takes the other GPU's device, which the last runner gives back as it ends). Whether any
+/// ended.
+pub(crate) fn release_for_finished(game: vk::Device) -> bool {
+    release(|r| r.game == game)
+}
+
+/// Ends the workers `pick` names. A released worker's hold is no longer served: its place on the Status line goes
+/// (the side that takes its place, if one does, sets it again when it is built).
+fn release(pick: impl Fn(&Running) -> bool) -> bool {
     let ours: Vec<Running> = {
         let mut all = WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (ours, rest) = std::mem::take(&mut *all)
-            .into_iter()
-            .partition(|(d, _, _, touched)| *d == game && now.saturating_sub(touched.load(Ordering::Relaxed)) >= idle.as_millis() as u64);
+        if !all.iter().any(&pick) {
+            return false;
+        }
+        let (ours, rest) = std::mem::take(&mut *all).into_iter().partition(&pick);
         *all = rest;
         ours
     };
-    for (_, quit, thread, _) in &ours {
-        join(quit, thread);
+    for r in &ours {
+        join(&r.quit, &r.thread);
+        set_serving(r.at, false);
     }
     !ours.is_empty()
 }
 static WORKERS: Mutex<Vec<Running>> = Mutex::new(Vec::new());
 
+/// Ends a worker's thread and waits for it. The handle's lock is held across the join: a second caller (the side's
+/// own [`Worker::stop`] while another thread releases the worker, [`release`]), and [`Worker::ended`], wait here until
+/// the thread has ended, never return while it still runs with the exchange they are about to free.
 fn join(quit: &AtomicBool, thread: &Mutex<Option<std::thread::JoinHandle<()>>>) {
     quit.store(true, Ordering::Release);
-    let handle = thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-    if let Some(t) = handle {
+    let mut handle = thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(t) = handle.take() {
         let _ = t.join();
     }
 }
@@ -777,31 +1055,46 @@ fn join(quit: &AtomicBool, thread: &Mutex<Option<std::thread::JoinHandle<()>>>) 
 pub(crate) fn stop_for(game: vk::Device) {
     let ours: Vec<Running> = {
         let mut all = WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (ours, rest) = std::mem::take(&mut *all).into_iter().partition(|(d, _, _, _)| *d == game);
+        let (ours, rest) = std::mem::take(&mut *all).into_iter().partition(|r| r.game == game);
         *all = rest;
         ours
     };
-    let any = !ours.is_empty();
-    for (_, quit, thread, _) in ours {
-        join(&quit, &thread);
-    }
-    if any {
+    for r in ours {
+        join(&r.quit, &r.thread);
         // Their sides are destroyed after this and find their workers ended, as released ones do: the status goes here.
         #[cfg(target_arch = "x86_64")]
-        side_gone(true);
+        side_gone(Some(r.at));
     }
 }
 
 /// What the worker tells its owner when it stops serving (it keeps finishing the frames sent, without an answer):
 /// why the offload is given up, and whether a frame on the other GPU never finished ([`Runner::stuck`]: the network
 /// cannot be taken back, so the model is off from here on).
-pub(crate) type GiveUp = Box<dyn Fn(String, bool) + Send>;
+pub(crate) type GiveUp = Box<dyn Fn(String, Stop) + Send>;
+
+/// Why a worker stopped serving, for its owner's callback ([`GiveUp`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// A failure, or a rule given up on: back to the game's GPU for the session.
+    Failed,
+    /// A frame that never finished may still run: the network cannot be taken back.
+    Stuck,
+    /// The trial on the game's GPU (`super::offload_trial`): its side said and did what it does, at its call.
+    Trial,
+}
 
 impl Worker {
     /// Starts the worker on `link` with `runner`. `late` judges the answers against the game's frame
     /// (`offload::LateRule`, `None` in the `same` test, where the other device shares the game's GPU); `give_up`
     /// is told once when the worker stops serving.
-    pub(crate) fn start(link: Link, runner: Box<dyn Runner>, late: Option<super::offload::LateRule>, dims: (u32, u32), give_up: GiveUp) -> Option<Self> {
+    pub(crate) fn start(
+        link: Link,
+        at: Where,
+        runner: Box<dyn Runner>,
+        late: Option<super::offload::LateRule>,
+        dims: (u32, u32),
+        give_up: GiveUp,
+    ) -> Option<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let mode = Arc::new(AtomicU8::new(SERVING));
         let counters = Arc::new(Counters::default());
@@ -812,8 +1105,14 @@ impl Worker {
             std::thread::Builder::new().name("nf-offload-pre".into()).spawn(move || serve(&link, runner, late, dims, &q, &m, &a, &c, &give_up)).ok()?;
         let thread = Arc::new(Mutex::new(Some(thread)));
         let touched = Arc::new(AtomicU64::new(now_ms()));
-        WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((game, quit.clone(), thread.clone(), touched.clone()));
-        Some(Self { quit, mode, counters, asked, thread, touched })
+        WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Running {
+            game,
+            at,
+            quit: quit.clone(),
+            thread: thread.clone(),
+            touched: touched.clone(),
+        });
+        Some(Self { quit, mode, counters, asked, thread, touched, game, at })
     }
 
     /// Whether frames are run on the other GPU (else every send is finished at once, without an answer).
@@ -821,9 +1120,20 @@ impl Worker {
         self.mode.load(Ordering::Acquire) == SERVING
     }
 
-    /// Its side plans a hold now.
+    /// Its side plans a hold now. A worker of the same game device that serves the other hold, and whose side had
+    /// planned no hold for [`IDLE_SIDE`] when this side planned its last one, is ended ([`release`]): the frame no
+    /// longer has passes at that hold, and what its runner keeps on the other GPU (a pass at its size) is freed. Measured
+    /// against this side's last hold, not against now: after a pause of both holds (a menu, a loading screen)
+    /// neither is idle against the other, and both go on.
     pub(crate) fn touch(&self) {
-        self.touched.store(now_ms(), Ordering::Relaxed);
+        self.touch_at(now_ms());
+    }
+
+    /// [`Self::touch`] at `now` ([`now_ms`]).
+    fn touch_at(&self, now: u64) {
+        let last = self.touched.swap(now, Ordering::Relaxed);
+        let (game, at) = (self.game, self.at);
+        release(|r| r.game == game && r.at != at && idle_against(last, r.touched.load(Ordering::Relaxed)));
     }
 
     /// The worker's thread has ended (stopped, or released for another set of hold resources, [`release_idle`]).
@@ -834,14 +1144,20 @@ impl Worker {
     /// Gives the offload up from the hold's side (`why`): the worker stops running frames and tells its owner, as
     /// for a failure of its own.
     pub(crate) fn give_up(&self, why: String) {
-        *self.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+        *self.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((why, Stop::Failed));
+    }
+
+    /// Stops serving for the trial on the game's GPU (`super::offload_trial`): no fall-back; the hold's side logged it
+    /// and cleared the serving state itself (the worker may end before it reads this).
+    pub(crate) fn stop_for_trial(&self) {
+        *self.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((String::new(), Stop::Trial));
     }
 
     /// Stops the worker: no submit waits for it any more ([`Progress::settle`]), and the holds still recorded with
     /// the exchange take no answer.
     pub(crate) fn stop(&mut self) {
         join(&self.quit, &self.thread);
-        WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(_, q, _, _)| !Arc::ptr_eq(q, &self.quit));
+        WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|r| !Arc::ptr_eq(&r.quit, &self.quit));
     }
 }
 
@@ -849,6 +1165,12 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Whether a side whose last hold was at `other` was idle ([`IDLE_SIDE`]) when a side of the same device planned a
+/// hold at `last` (both [`now_ms`]).
+fn idle_against(last: u64, other: u64) -> bool {
+    last.saturating_sub(other) >= IDLE_SIDE.as_millis() as u64
 }
 
 /// How long the worker sleeps between two looks at `sent`: short while frames come, longer once none has for a while.
@@ -868,14 +1190,14 @@ fn serve(
     dims: (u32, u32),
     quit: &AtomicBool,
     mode: &AtomicU8,
-    asked: &Mutex<Option<String>>,
+    asked: &Mutex<Option<(String, Stop)>>,
     counters: &Counters,
     give_up: &GiveUp,
 ) {
     let device = &link.device;
-    let stop_serving = |why: String, stuck: bool| {
+    let stop_serving = |why: String, stop: Stop| {
         if mode.swap(PASSING, Ordering::AcqRel) == SERVING {
-            give_up(why, stuck);
+            give_up(why, stop);
         }
     };
     let mut idle = 0u32;
@@ -883,8 +1205,8 @@ fn serve(
     let mut retired = false;
     while !quit.load(Ordering::Acquire) {
         // Asked from the hold's side to give up ([`Worker::give_up`]).
-        if let Some(why) = asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
-            stop_serving(why, false);
+        if let Some((why, stop)) = asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            stop_serving(why, stop);
         }
         // Given up: the runner lets go of what the game's GPU needs back, once.
         if !retired && mode.load(Ordering::Acquire) != SERVING {
@@ -901,7 +1223,7 @@ fn serve(
             }
             Err(_) => {
                 // The game's device is lost: none of its holds run any more.
-                stop_serving("the game's device was lost".into(), false);
+                stop_serving("the game's device was lost".into(), Stop::Failed);
                 break;
             }
         }
@@ -923,7 +1245,7 @@ fn serve(
             match unsafe { runner.run(seq, link.out, link.inn, &link.layout) } {
                 Ran::Answered => ok = true,
                 Ran::Skipped => {}
-                Ran::Failed(why) => stop_serving(why, runner.stuck()),
+                Ran::Failed(why) => stop_serving(why, if runner.stuck() { Stop::Stuck } else { Stop::Failed }),
             }
         }
         // Another send ran while this frame did (a hold whose submit did not settle this one: two holds in one
@@ -948,7 +1270,7 @@ fn serve(
             // A frame the network was not ready for is no late answer.
             if mode.load(Ordering::Acquire) == SERVING && ok {
                 if let Some(why) = rule.note(answer, interval, dims) {
-                    stop_serving(why, false);
+                    stop_serving(why, Stop::Failed);
                 }
             }
         }
@@ -1055,23 +1377,148 @@ fn imports(device: vk::Device) -> bool {
     IMPORTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&device)
 }
 
-/// Whether a worker serves the game's device `game` already (another set of hold resources has the offload device).
-pub(crate) fn serving_device(game: vk::Device) -> bool {
-    WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(d, _, _, _)| *d == game)
+/// Whether a worker serves the hold `at` of the game's device `game` already (another set of hold resources at that
+/// hold has its place on the offload device).
+pub(crate) fn serving_at(game: vk::Device, at: Where) -> bool {
+    WORKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|r| r.game == game && r.at == at)
 }
 
-/// Whether the before-DLSS placement is asked onto another GPU and not given up (`NEURAL_FORGE_OFFLOAD_GPU`).
+/// Whether the held placements (before DLSS, after its output) are asked onto another GPU and not given up
+/// (`NEURAL_FORGE_OFFLOAD_GPU`).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn wanted() -> bool {
-    super::offload::Choice::current() != super::offload::Choice::Off && !super::offload::given_up() && !super::offload::standin()
+    super::offload::Choice::current() != super::offload::Choice::Off
+        && !super::offload::given_up()
+        && !super::offload::standin()
+        && !super::offload_trial::keeps_local()
 }
 
-/// The before-DLSS placement runs on the other GPU now (the Status tab's line, [`status_line`]).
-static SERVING_PRE: AtomicBool = AtomicBool::new(false);
+/// Which holds' models run on the other GPU now (the Status tab's line, [`status_line`]): [`Where::bit`] of the hold
+/// before DLSS and of the hold after DLSS's output (both in a frame with passes at both).
+static SERVING_HOLD: AtomicU8 = AtomicU8::new(0);
 
-pub(crate) fn serving_pre() -> bool {
-    SERVING_PRE.load(Ordering::Acquire)
+/// The hold `at` sends its frames to the other GPU from here on (`on`), or no longer.
+fn set_serving(at: Where, on: bool) {
+    if on {
+        SERVING_HOLD.fetch_or(at.bit(), Ordering::AcqRel);
+    } else {
+        SERVING_HOLD.fetch_and(!at.bit(), Ordering::AcqRel);
+    }
 }
+
+/// No hold sends its frames to the other GPU any more (the offload was given up, or a frame there never finished).
+fn clear_serving() {
+    SERVING_HOLD.store(0, Ordering::Release);
+}
+
+/// The holds whose frames the other GPU runs now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Serving {
+    pub before: bool,
+    pub after: bool,
+}
+
+pub(crate) fn serving() -> Serving {
+    let bits = SERVING_HOLD.load(Ordering::Acquire);
+    Serving { before: bits & Where::Before.bit() != 0, after: bits & Where::After.bit() != 0 }
+}
+
+/// A hold (before DLSS or after its output) sends its frames to the other GPU now.
+pub(crate) fn serving_hold() -> bool {
+    SERVING_HOLD.load(Ordering::Acquire) != 0
+}
+
+/// The network's frames on the other GPU per hold ([`Where::bit`] - 1): how many, and the sum of their times (µs,
+/// copies included), for each side's summary line.
+static SERVER_TIME: [[AtomicU64; 2]; 2] = [[AtomicU64::new(0), AtomicU64::new(0)], [AtomicU64::new(0), AtomicU64::new(0)]];
+
+/// A frame of the hold `at` took `took` on the other GPU.
+pub(crate) fn note_server_frame(at: Where, took: Duration) {
+    let [frames, us] = &SERVER_TIME[usize::from(at.bit() - 1)];
+    frames.fetch_add(1, Ordering::Relaxed);
+    us.fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// What the runners of one game device share on the other GPU (`T`: `offload_server`'s device, loader and queue),
+/// by the game's device, with how many runners have a seat.
+///
+/// The process has one network and the game's device one offload device, and a frame with passes before DLSS and
+/// after its output has two holds, each with a side of its own (its exchange, its worker, its runner). Both runners
+/// take a seat on the one `T`: the first makes it, the second joins, each locks it for the whole of a frame of its
+/// own (so nothing of `T` is used by two frames at once, and every frame is waited for before the lock goes), and the
+/// last to leave drops it, still under the registry's lock: a runner that asks for a seat meanwhile waits, and then
+/// makes a new `T` from what the old one's drop gave back.
+pub(crate) struct Seats<T> {
+    all: Mutex<Vec<Seated<T>>>,
+}
+
+/// A game's device, what its runners share, and how many of them have a seat.
+type Seated<T> = (vk::Device, Arc<Mutex<T>>, usize);
+
+/// One runner's seat ([`Seats::join`]).
+pub(crate) struct Seat<T: 'static> {
+    seats: &'static Seats<T>,
+    game: vk::Device,
+    shared: Option<Arc<Mutex<T>>>,
+}
+
+impl<T> Seats<T> {
+    pub(crate) const fn new() -> Self {
+        Self { all: Mutex::new(Vec::new()) }
+    }
+
+    /// A seat on `game`'s `T`: the one that is there when `admit` takes it (`Err` with why not: nothing is made in
+    /// its place), else a new one from `make`.
+    pub(crate) fn join(
+        &'static self,
+        game: vk::Device,
+        admit: impl FnOnce(&T) -> Result<(), String>,
+        make: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Seat<T>, String> {
+        let mut all = self.all.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, shared, seats)) = all.iter_mut().find(|(g, _, _)| *g == game) {
+            admit(&shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner))?;
+            *seats += 1;
+            return Ok(Seat { seats: self, game, shared: Some(shared.clone()) });
+        }
+        let shared = Arc::new(Mutex::new(make()?));
+        all.push((game, shared.clone(), 1));
+        Ok(Seat { seats: self, game, shared: Some(shared) })
+    }
+
+    /// How many runners have a seat on `game`'s `T`.
+    #[cfg(test)]
+    pub(crate) fn seated(&self, game: vk::Device) -> usize {
+        self.all.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(|(g, _, _)| *g == game).map_or(0, |(_, _, n)| *n)
+    }
+}
+
+impl<T> Seat<T> {
+    /// The shared `T`, for one frame (or one change of it) of this runner's.
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.shared.as_ref().expect("held until the seat is dropped").lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl<T> Drop for Seat<T> {
+    fn drop(&mut self) {
+        let mut all = self.seats.all.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // This seat's own reference first: the registry's is then the last one when the count reaches 0, and `T` is
+        // dropped right here, before the registry's lock is released.
+        drop(self.shared.take());
+        if let Some(k) = all.iter().position(|(g, _, _)| *g == self.game) {
+            all[k].2 -= 1;
+            if all[k].2 == 0 {
+                drop(all.swap_remove(k));
+            }
+        }
+    }
+}
+
+/// Holds between two `[offload]` summaries (and the two-window rule of `super::offload_trial`).
+const SUMMARY_HOLDS: u64 = 600;
+// The short windows end where the summaries do.
+const _: () = assert!(SUMMARY_HOLDS.is_multiple_of(super::offload_trial::SHORT_HOLDS));
 
 /// The hold's side of the offload, for one set of hold resources (one render extent): the exchange, the worker
 /// with the network on the other device, the sent frame's kept colour, and the cadence.
@@ -1080,6 +1527,8 @@ pub(crate) struct HoldSide {
     pub exchange: Exchange,
     cadence: Cadence,
     worker: Worker,
+    /// The hold it serves.
+    at: Where,
     metas: super::offload_server::Metas,
     /// The colour input of the frame sent last, as the game left it: what the late capture measures the edit
     /// against (the hold's write-back has written the colour input since).
@@ -1090,6 +1539,16 @@ pub(crate) struct HoldSide {
     sent: Option<(super::cache::Hold, super::cache::CachePush)>,
     resources: u64,
     holds: u64,
+    /// The hold before this one, and the times between holds since the last summary (pauses left out): the
+    /// offloaded frame time `super::offload_trial` measures.
+    last_hold: Option<Instant>,
+    intervals: Vec<Duration>,
+    /// Where the current short window's intervals begin in `intervals`, and the exchange's wait (µs), taken and
+    /// untaken counts summed over the short windows since the last summary (`super::offload_trial::SHORT_HOLDS`).
+    short_from: usize,
+    summed: [u64; 3],
+    /// The extent its frames have (the trial's key).
+    extent: (u32, u32),
     /// The hold planned last has not gone through yet: if it never does, what it planned is dropped at the next plan.
     pending: bool,
     /// Holds in a row whose frame could not be sent (no motion vectors, no jitter, no chained cache), and when the
@@ -1139,6 +1598,12 @@ pub(crate) fn unsendable_gives_up(streak: &mut Unsendable, can: bool, now: Insta
     false
 }
 
+/// Why the offload gave up on a row of holds that could not send (`why`, the last one's reason): the Status tab's
+/// words (short enough for the channel's line).
+pub(crate) fn unsendable_line(at: Where, why: &str) -> String {
+    format!("{}: its frames cannot be sent: {why}", at.name())
+}
+
 #[cfg(target_arch = "x86_64")]
 impl HoldSide {
     /// # Safety
@@ -1149,13 +1614,12 @@ impl HoldSide {
         instance: &ash::Instance,
         physical: vk::PhysicalDevice,
         resources: u64,
+        at: Where,
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
         let import = imports(device.handle());
-        let (pw, ph) = super::padded(width, height);
-        let (texels, padded) = (u64::from(width) * u64::from(height), u64::from(pw) * u64::from(ph));
-        let sizes = Sizes { frame: padded * 8, motion: texels * 8, depth: texels * 4, side: super::hdr::HdrPass::EXPOSURE_BYTES + 16, answer: padded * 8 };
+        let sizes = Sizes::of(at, width, height, motion_packed());
         // SAFETY: the contract.
         let exchange =
             unsafe { Exchange::build(device, instance, physical, import, sizes) }.ok_or("the frame's regions could not be made on the game's GPU")?;
@@ -1166,7 +1630,7 @@ impl HoldSide {
         };
         let link = exchange.link(device);
         let metas = super::offload_server::Metas::default();
-        let (runner, name) = match super::offload_server::PreRunner::start(instance.clone(), device.handle(), link.shared, link.capacity, metas.clone()) {
+        let (runner, name) = match super::offload_server::PreRunner::start(instance.clone(), device.handle(), link.shared, link.capacity, metas.clone(), at) {
             Ok(r) => r,
             Err(why) => {
                 // SAFETY: never used.
@@ -1180,20 +1644,31 @@ impl HoldSide {
         // Not judged late in the `same` test, where the other device shares the game's GPU (as the finished frame).
         let late = (super::offload::Choice::current() != super::offload::Choice::Same).then(super::offload::LateRule::default);
         let stalled = name.clone();
-        let give_up: GiveUp = Box::new(move |why, stuck| {
-            SERVING_PRE.store(false, Ordering::Release);
-            if stuck {
-                // The network is still in use by that frame: it cannot go back to the game's GPU.
-                crate::log!("[offload] {why}: the network cannot be taken back while that frame may run; the model is off for the rest of the session");
-                crate::logging::flush();
+        let give_up: GiveUp = Box::new(move |why, stop| {
+            if stop == Stop::Trial {
+                // Said and done by the hold's side ([`HoldSide::went_through`]).
+                return;
+            }
+            clear_serving();
+            if stop == Stop::Stuck {
+                // The network is still in use by that frame: it cannot go back to the game's GPU. (Said once: the
+                // other hold's worker finds the same frame stuck.)
+                if !matches!(super::offload::state(), super::offload::State::Stalled(_)) {
+                    crate::log!("[offload] {why}: the network cannot be taken back while that frame may run; the model is off for the rest of the session");
+                    crate::logging::flush();
+                }
                 super::offload::note_state(super::offload::State::Stalled(stalled.clone()));
+                return;
+            }
+            if super::offload::given_up() {
+                // The other hold's worker gave up first and said why; this one's runner found the network closed.
                 return;
             }
             crate::log!("[offload] back to the game's GPU: {why}");
             crate::logging::flush();
             super::offload::note_state(super::offload::State::FellBack(why));
         });
-        let Some(worker) = Worker::start(link, Box::new(runner), late, (width, height), give_up) else {
+        let Some(worker) = Worker::start(link, at, Box::new(runner), late, (width, height), give_up) else {
             // SAFETY: never used (the runner was dropped with the failed start and gave its device back).
             unsafe {
                 snapshot.destroy(device);
@@ -1203,9 +1678,12 @@ impl HoldSide {
         };
         SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((resources, exchange.submits()));
         super::offload::note_state(super::offload::State::Active(name.clone()));
-        SERVING_PRE.store(true, Ordering::Release);
+        set_serving(at, true);
+        super::offload_trial::side_built();
         crate::log!(
-            "[offload] before DLSS: the network's frames of {width}x{height} run on {name}; on the game's GPU the frame's regions are {}",
+            "[offload] {}: the network's frames of {width}x{height} run on {name}; the motion crosses as {}; on the game's GPU the frame's regions are {}",
+            at.name(),
+            if exchange.motion_half() { "two halves a texel" } else { "two floats a texel (NEURAL_FORGE_OFFLOAD_MOTION=float)" },
             if exchange.shared {
                 "imported host memory (no CPU copy)"
             } else if import {
@@ -1219,6 +1697,7 @@ impl HoldSide {
             exchange,
             cadence: Cadence::default(),
             worker,
+            at,
             metas,
             snapshot,
             snapshot_made: {
@@ -1228,6 +1707,11 @@ impl HoldSide {
             sent: None,
             resources,
             holds: 0,
+            last_hold: None,
+            extent: (width, height),
+            intervals: Vec::with_capacity(SUMMARY_HOLDS as usize),
+            short_from: 0,
+            summed: [0; 3],
             pending: false,
             unsendable: Unsendable::default(),
         })
@@ -1260,8 +1744,10 @@ impl HoldSide {
     }
 
     /// Plans hold `h`: what it does with the exchange, and, when it takes the answer to the frame sent before it,
-    /// that frame's refresh noted in the cache's `state` (before the hold's own plan is made there).
-    pub(crate) fn plan(&mut self, state: &mut super::cache::State, h: &super::cache::Hold, send: bool) -> HoldPlan {
+    /// that frame's refresh noted in the cache's `state` (before the hold's own plan is made there). `unsendable`:
+    /// why this hold's frame cannot be sent (`native::unsendable`), `None` when it can.
+    pub(crate) fn plan(&mut self, state: &mut super::cache::State, h: &super::cache::Hold, unsendable: Option<&'static str>) -> HoldPlan {
+        let send = unsendable.is_none();
         if std::mem::replace(&mut self.pending, true) {
             // The hold planned before this one never went through (a miss after its plan): it sent nothing.
             self.dropped();
@@ -1269,9 +1755,12 @@ impl HoldSide {
         }
         self.worker.touch();
         if self.serving() && unsendable_gives_up(&mut self.unsendable, send, Instant::now()) {
-            self.worker.give_up(format!(
-                "{UNSENDABLE_HOLDS} frames in a row and more than a second had no motion vectors, no jitter or no room for the edit cache: nothing can carry the other GPU's edit to the next frame"
-            ));
+            let why = unsendable.unwrap_or("");
+            crate::log!(
+                "[offload] {}: {UNSENDABLE_HOLDS} frames in a row and more than a second could not be sent ({why}): nothing can carry the other GPU's edit to the next frame",
+                self.at.name()
+            );
+            self.worker.give_up(unsendable_line(self.at, why));
         }
         let mut plan = self.cadence.hold(h.hold, send && self.serving());
         // At a hold the game reset, the answer to the frame before is the old scene's: not taken (it still sends).
@@ -1312,16 +1801,65 @@ impl HoldSide {
             self.queue_meta(meta);
         }
         self.holds += 1;
-        if self.holds.is_multiple_of(600) {
-            let p = &self.exchange.progress;
-            let (taken, untaken) = (p.taken.swap(0, Ordering::Relaxed), p.untaken.swap(0, Ordering::Relaxed));
-            let frames = super::offload::STATS.server_frames.swap(0, Ordering::Relaxed);
-            let us = super::offload::STATS.server_us.swap(0, Ordering::Relaxed);
+        let now = Instant::now();
+        if let Some(t) = self.last_hold.replace(now) {
+            let d = now.saturating_duration_since(t);
+            if d < super::offload_trial::FRAME_GAP {
+                self.intervals.push(d);
+            }
+        }
+        if self.holds.is_multiple_of(super::offload_trial::SHORT_HOLDS) {
+            self.windows();
+        }
+    }
+
+    /// A short window of holds ended (`super::offload_trial::SHORT_HOLDS`), and every third a summary's: the exchange's
+    /// counters are read for both, and the windows go to `super::offload_trial`, which may start its trial.
+    fn windows(&mut self) {
+        let p = &self.exchange.progress;
+        let part = [p.waited_us.swap(0, Ordering::Relaxed), p.taken.swap(0, Ordering::Relaxed), p.untaken.swap(0, Ordering::Relaxed)];
+        for (sum, v) in self.summed.iter_mut().zip(part) {
+            *sum += v;
+        }
+        let key = (self.extent, super::placement::active_count());
+        let short = std::mem::replace(&mut self.short_from, self.intervals.len());
+        let mut started = None;
+        if self.serving() {
+            let frame = super::offload_trial::trimmed_mean(&mut self.intervals[short..].to_vec());
+            let waited = Duration::from_micros(part[0] / super::offload_trial::SHORT_HOLDS);
+            started = super::offload_trial::short_window(key, frame, waited, super::offload_trial::answered(part[1], part[2]));
+        }
+        if self.holds.is_multiple_of(SUMMARY_HOLDS) {
+            let [waited_us, taken, untaken] = std::mem::take(&mut self.summed);
+            let waited = Duration::from_micros(waited_us / SUMMARY_HOLDS);
+            let [frames, us] = &SERVER_TIME[usize::from(self.at.bit() - 1)];
+            let (frames, us) = (frames.swap(0, Ordering::Relaxed), us.swap(0, Ordering::Relaxed));
+            let frame = super::offload_trial::trimmed_mean(&mut self.intervals);
+            self.intervals.clear();
+            self.short_from = 0;
             crate::log!(
-                "[offload] {}; {taken} holds carried the edit of the frame before them, {untaken} found no answer; the network's frame on the other GPU {:.2} ms (copies included)",
-                self.worker.counters.summary(),
-                if frames == 0 { 0.0 } else { us as f64 / frames as f64 / 1000.0 }
+                "[offload] {}; {taken} holds carried the edit of the frame before them, {untaken} found no answer; the network's frame on the other GPU {:.2} ms (copies included); a hold every {:.1} ms, the game waiting {:.1} ms a frame for the answer",
+                self.worker.counters.summary(self.at),
+                if frames == 0 { 0.0 } else { us as f64 / frames as f64 / 1000.0 },
+                frame.as_secs_f64() * 1000.0,
+                waited.as_secs_f64() * 1000.0
             );
+            // Not the first window: the network was still loading on the other GPU for part of it.
+            if started.is_none() && self.holds > SUMMARY_HOLDS && self.serving() {
+                started = super::offload_trial::offloaded(key, frame, waited);
+            }
+        }
+        if let Some(why) = started {
+            // The trial on the game's GPU: not a fall-back. The held placements follow `offload_trial::keeps_local`
+            // from the next hold, and the Status line is the native one's (the offload's state is off, unless
+            // something else, a stall, already took it).
+            crate::log!("[offload] {why}");
+            crate::logging::flush();
+            clear_serving();
+            if matches!(super::offload::state(), super::offload::State::Active(_)) {
+                super::offload::note_state(super::offload::State::Off);
+            }
+            self.worker.stop_for_trial();
         }
     }
 
@@ -1391,7 +1929,7 @@ impl HoldSide {
         // The worker first: its runner frees the other device's side and gives the device back.
         let owned = !self.worker.ended();
         self.worker.stop();
-        side_gone(owned);
+        side_gone(owned.then_some(self.at));
         // SAFETY: the contract.
         unsafe {
             self.snapshot.destroy(device);
@@ -1400,31 +1938,79 @@ impl HoldSide {
     }
 }
 
-/// A hold's side is destroyed. `owned`: its worker still ran, so the offload was its own; a side whose worker was
-/// ended for another set of hold resources ([`release_idle`]) leaves the status to the side that serves now.
+/// A hold's side is destroyed. `owned`: the hold it served while its worker still ran, so that hold's place on the
+/// offload was its own; a side whose worker was ended ([`release`]: for another set of hold resources at its hold,
+/// or because its hold had no passes any more) leaves the status to the sides that serve now. The offload is off
+/// once no hold is served.
 #[cfg(target_arch = "x86_64")]
-fn side_gone(owned: bool) {
-    if !owned {
-        return;
-    }
-    SERVING_PRE.store(false, Ordering::Release);
-    if matches!(super::offload::state(), super::offload::State::Active(_)) {
+fn side_gone(owned: Option<Where>) {
+    let Some(at) = owned else { return };
+    set_serving(at, false);
+    if !serving_hold() && matches!(super::offload::state(), super::offload::State::Active(_)) {
         super::offload::note_state(super::offload::State::Off);
     }
 }
 
-/// The Status tab's words while the before-DLSS placement runs on `gpu`.
-pub(crate) fn status_line(gpu: &str) -> String {
-    format!("second GPU: the model runs on {gpu} before DLSS, its edit applied one frame later")
+/// The Status tab's words while the holds `serving` send their frames to `gpu` (the hold before DLSS when neither
+/// is said).
+pub(crate) fn status_line(gpu: &str, serving: Serving) -> String {
+    match (serving.before, serving.after) {
+        (true, true) => format!("second GPU: the model runs on {gpu} before and after DLSS, its edits applied one frame later"),
+        (false, true) => format!("second GPU: the model runs on {gpu} {}, its edit applied one frame later", Where::After.name()),
+        _ => format!("second GPU: the model runs on {gpu} {}, its edit applied one frame later", Where::Before.name()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// After DLSS's output the hold has no depth at its size: nothing of it crosses, and the rest is the output size's.
+    #[test]
+    fn the_hold_after_dlss_exchanges_no_depth() {
+        let before = Sizes::of(Where::Before, 1485, 835, false);
+        let (pw, ph) = crate::preupscale::padded(1485, 835);
+        assert_eq!(before.depth, 1485 * 835 * 4);
+        assert_eq!((before.frame, before.answer, before.motion), (u64::from(pw * ph) * 8, u64::from(pw * ph) * 8, 1485 * 835 * 8));
+        let after = Sizes::of(Where::After, 2560, 1440, false);
+        assert_eq!(after.depth, 0);
+        let (pw, ph) = crate::preupscale::padded(2560, 1440);
+        assert_eq!((after.frame, after.answer, after.motion), (u64::from(pw * ph) * 8, u64::from(pw * ph) * 8, 2560 * 1440 * 8));
+        // The side section follows the motion directly, on its alignment, and the regions hold every section.
+        let l = Layout::of(after);
+        assert_eq!(l.side_at, l.depth_at);
+        assert_eq!(l.side_at % HEADER_BYTES, 0);
+        assert!(l.out_bytes >= l.side_at + after.side && l.in_bytes >= l.answer_at + after.answer);
+        // At 2560x1440: about 59 MB out and 29.5 MB back a frame.
+        assert!(l.out_bytes < 60 << 20 && l.in_bytes < 30 << 20, "{l:?}");
+    }
+
+    #[test]
+    fn the_status_line_names_the_hold_the_other_gpu_serves() {
+        let (before, after) = (Serving { before: true, after: false }, Serving { before: false, after: true });
+        assert_eq!(status_line("X", before), "second GPU: the model runs on X before DLSS, its edit applied one frame later");
+        assert_eq!(status_line("X", after), "second GPU: the model runs on X after DLSS, its edit applied one frame later");
+        let both = status_line("X", Serving { before: true, after: true });
+        assert_eq!(both, "second GPU: the model runs on X before and after DLSS, its edits applied one frame later");
+        // With a long GPU name the line still fits the channel's field whole.
+        let long = status_line("NVIDIA GeForce RTX 5080 Laptop GPU", Serving { before: true, after: true });
+        assert!(long.len() < neural_forge_protocol::REASON_BYTES, "{} bytes", long.len());
+        assert_eq!(Where::of(crate::preupscale::placement::Stage::Upscaled), Where::After);
+        assert_eq!(Where::of(crate::preupscale::placement::Stage::Before), Where::Before);
+    }
+
+    /// Given up on frames that cannot be sent, the Status tab says which hold and why, within the channel's line.
+    #[test]
+    fn the_unsendable_line_names_the_hold_and_the_reason() {
+        let line = unsendable_line(Where::After, "the motion vectors' layout is unknown");
+        assert_eq!(line, "after DLSS: its frames cannot be sent: the motion vectors' layout is unknown");
+        let status = format!("second GPU: given up ({line}); the model runs on the game's GPU");
+        assert!(status.len() < neural_forge_protocol::REASON_BYTES, "{status}");
+    }
+
     #[test]
     fn the_layout_keeps_every_section_apart_and_aligned() {
-        let l = Layout::of(Sizes { frame: 1000, motion: 300, depth: 0, side: 32, answer: 777 });
+        let l = Layout::of(Sizes { frame: 1000, motion: 300, packed_texels: 0, depth: 0, side: 32, answer: 777 });
         assert_eq!(l.frame_at, HEADER_BYTES);
         assert_eq!(l.motion_at, HEADER_BYTES + 1024);
         assert_eq!(l.depth_at, l.motion_at + 512);
@@ -1599,8 +2185,11 @@ mod tests {
         c.answered.store(8, Ordering::Relaxed);
         c.late.store(2, Ordering::Relaxed);
         c.answer_us.store(80_000, Ordering::Relaxed);
-        assert_eq!(c.summary(), "before DLSS: 10 frames sent to the other GPU, 8 answered in time (mean 10.0 ms from send to answer), 2 without an answer");
-        assert!(c.summary().starts_with("before DLSS: 0 frames sent"));
+        assert_eq!(
+            c.summary(Where::Before),
+            "before DLSS: 10 frames sent to the other GPU, 8 answered in time (mean 10.0 ms from send to answer), 2 without an answer"
+        );
+        assert!(c.summary(Where::After).starts_with("after DLSS: 0 frames sent"));
     }
 
     #[test]
@@ -1640,7 +2229,7 @@ mod tests {
     }
 
     const TEXELS: u64 = 4096;
-    const SIZES: Sizes = Sizes { frame: TEXELS * 4, motion: 1024, depth: 0, side: 16, answer: TEXELS * 4 };
+    const SIZES: Sizes = Sizes { frame: TEXELS * 4, motion: 1024, packed_texels: 0, depth: 0, side: 16, answer: TEXELS * 4 };
 
     /// The stand-in for the network on the second device: the answer is the frame, copied on that device's queue
     /// from OUT to IN (imported there where the device can, else staged through its own buffers).
@@ -1883,7 +2472,7 @@ mod tests {
         let abandoned = runner.abandoned_list();
         let gave_up = Arc::new(std::sync::Mutex::new(Vec::new()));
         let g = gave_up.clone();
-        let worker = Worker::start(link, Box::new(runner), None, (64, 64), Box::new(move |why, _| g.lock().unwrap().push(why)))?;
+        let worker = Worker::start(link, Where::Before, Box::new(runner), None, (64, 64), Box::new(move |why, _| g.lock().unwrap().push(why)))?;
         Some((game, worker, ran, gave_up, abandoned))
     }
 
@@ -2014,6 +2603,84 @@ mod tests {
         assert!(gave_up.lock().unwrap().is_empty());
         assert!(worker.serving());
         assert_eq!(worker.counters.answered.load(Ordering::Relaxed), 6);
+        game.close(worker);
+    }
+
+    /// The gate's set over an edit cache destroyed and built again under the same side (#63, review: the VRAM
+    /// guard's pause frees the cache, `Resources::release_native`): the new cache's counters are another buffer,
+    /// often under the old handle. The set is keyed on which cache they are, written again for the new one, and the
+    /// holds after it run their gate on live counters (under the validation layer a set left on the destroyed
+    /// buffer is an error at the dispatch). The pack's set is keyed the same way on the native pass.
+    #[test]
+    fn the_gate_is_written_again_for_another_caches_counters_under_the_same_handle() {
+        let Some((mut game, worker, _, gave_up, _)) = rig(Vec::new(), None) else { return };
+        let d = game.dev.device.clone();
+        let mut cadence = Cadence::default();
+        let hold = |game: &Game, cadence: &mut Cadence, hold: u64| {
+            let plan = cadence.hold(hold, true);
+            if hold > 1 {
+                wait_finished(game, hold as u32 - 1);
+            }
+            game.run(&[game.record(plan, 100 + hold as u32)]);
+        };
+        for k in 1..=3u64 {
+            hold(&game, &mut cadence, k);
+        }
+        assert_eq!(game.landed(), (Some(102), true));
+        let first = game.stats.buffer;
+        assert_eq!(game.exchange.bound_for_test().0, Some((first, 1)), "bound by the rig to the first cache's counters");
+        // SAFETY: the test's own objects; every hold recorded with the set was waited for (`run`).
+        unsafe {
+            game.exchange.bind_gate(&d, first, 1);
+            assert_eq!(game.exchange.bound_for_test().0, Some((first, 1)), "the same cache: nothing to write");
+            // Another cache's counters under the very same handle: not the same, written again.
+            game.exchange.bind_gate(&d, first, 2);
+            assert_eq!(game.exchange.bound_for_test().0, Some((first, 2)));
+            // The cache is destroyed: nothing is taken as bound, whatever comes next.
+            game.exchange.forget_bound();
+            assert_eq!(game.exchange.bound_for_test(), (None, None));
+            // And really: the counters go, new ones are made (the driver may hand out the old handle) and bound.
+            let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
+            let new = crate::preupscale::own_host_buffer_with(&d, &game.dev.instance, game.dev.physical, 64, usage).expect("new counters");
+            std::mem::replace(&mut game.stats, new).destroy(&d);
+            game.exchange.bind_gate(&d, game.stats.buffer, 3);
+            assert_eq!(game.exchange.bound_for_test().0, Some((game.stats.buffer, 3)));
+        }
+        // The holds go on over the new counters, each with the answer to the frame before it.
+        for k in 4..=6u64 {
+            hold(&game, &mut cadence, k);
+        }
+        assert_eq!(game.landed(), (Some(105), true), "the gate ran on the new counters");
+        assert!(gave_up.lock().unwrap().is_empty());
+        wait_finished(&game, 6);
+        game.close(worker);
+    }
+
+    /// Placement became Finished frame in a running game (`native_post` on its own thread): every hold's worker of
+    /// the game's device is ended for it. A side asking meanwhile whether its worker has ended is answered only
+    /// once the thread is gone (the join holds the handle's lock), never while it still runs with the exchange the
+    /// side is about to free.
+    #[test]
+    fn the_holds_workers_end_for_the_finished_frame_and_no_one_sees_them_ended_early() {
+        let Some((game, worker, _, gave_up, _)) = rig(Vec::new(), None) else { return };
+        let device = worker.game;
+        assert!(!worker.ended() && worker.serving());
+        let registered = |d: vk::Device| WORKERS.lock().unwrap().iter().filter(|r| r.game == d).count();
+        assert_eq!(registered(device), 1);
+        let thread = worker.thread.clone();
+        let releasing = std::thread::spawn(move || release_for_finished(device));
+        let t0 = Instant::now();
+        while !worker.ended() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the worker never ended");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Ended as the side sees it: the handle is gone, and whoever joined it has returned from the join (the lock is
+        // free only then).
+        assert!(thread.try_lock().is_ok_and(|h| h.is_none()), "the thread was joined before `ended` said so");
+        assert!(releasing.join().unwrap(), "ended for the finished frame");
+        assert_eq!(registered(device), 0);
+        assert!(!release_for_finished(device), "none is left to end");
+        assert!(gave_up.lock().unwrap().is_empty(), "a release is no failure of the second GPU");
         game.close(worker);
     }
 
@@ -2164,21 +2831,25 @@ mod tests {
     /// A side that had no hold for a while gives its worker up to another set of hold resources of the same device.
     #[test]
     fn an_idle_side_is_released_for_another() {
+        let _state = crate::preupscale::offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some((game, worker, _, _, _)) = rig(Vec::new(), None) else { return };
         let device = game.dev.device.handle();
-        assert!(serving_device(device));
+        assert!(serving_at(device, Where::Before) && !serving_at(device, Where::After));
         worker.touch();
-        assert!(!release_idle(device, Duration::from_secs(3600)), "it just held");
+        assert!(!release_idle(device, Where::Before, Duration::from_secs(3600)), "it just held");
+        assert!(!release_idle(device, Where::After, Duration::ZERO), "the other hold's place is not this side's");
         assert!(!worker.ended());
-        assert!(release_idle(device, Duration::ZERO));
-        assert!(worker.ended() && !serving_device(device));
+        clear_serving();
+        set_serving(Where::Before, true);
+        assert!(release_idle(device, Where::Before, Duration::ZERO));
+        assert!(worker.ended() && !serving_at(device, Where::Before));
+        assert!(!serving_hold(), "its hold is not served until the side that takes its place is built");
         // The released side's end leaves the status to the side that serves now; an owning side's end clears it.
-        let _state = crate::preupscale::offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        SERVING_PRE.store(true, Ordering::Release);
-        side_gone(!worker.ended());
-        assert!(serving_pre(), "another set's side serves: the Status tab keeps the second GPU");
-        side_gone(true);
-        assert!(!serving_pre());
+        set_serving(Where::Before, true);
+        side_gone((!worker.ended()).then_some(Where::Before));
+        assert!(serving_hold(), "another set's side serves: the Status tab keeps the second GPU");
+        side_gone(Some(Where::Before));
+        assert!(!serving_hold());
         // Its side's submits do not wait for it.
         let mut cadence = Cadence::default();
         game.run(&[game.record(cadence.hold(1, true), 801)]);
@@ -2208,5 +2879,747 @@ mod tests {
         let landed = game.landed();
         assert!(landed == (Some(602), true) || !landed.1, "{landed:?}");
         game.close(worker);
+    }
+
+    /// The Status line names both holds while both send their frames, and each alone otherwise; a hold's end leaves
+    /// the other's place.
+    #[test]
+    fn the_serving_holds_are_kept_apart() {
+        let _state = crate::preupscale::offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_serving();
+        set_serving(Where::Before, true);
+        set_serving(Where::After, true);
+        assert_eq!(serving(), Serving { before: true, after: true });
+        side_gone(None);
+        assert_eq!(serving(), Serving { before: true, after: true }, "a released side's end changes nothing");
+        side_gone(Some(Where::Before));
+        assert_eq!(serving(), Serving { before: false, after: true });
+        assert!(serving_hold());
+        side_gone(Some(Where::After));
+        assert!(!serving_hold());
+    }
+
+    /// A side is idle against another only when it had no hold for the idle time by that side's last hold.
+    #[test]
+    fn a_side_is_idle_only_against_holds_that_kept_coming() {
+        let idle = IDLE_SIDE.as_millis() as u64;
+        assert!(!idle_against(10_000, 10_000) && !idle_against(10_000, 9_990), "both hold");
+        assert!(!idle_against(10_000, 10_000 - idle + 1));
+        assert!(idle_against(10_000, 10_000 - idle));
+        assert!(!idle_against(5_000, 20_000), "the other held since");
+    }
+
+    /// What two runners share in the seats' tests: how many were made and dropped, and how many are alive.
+    #[derive(Default)]
+    struct Tally {
+        made: AtomicU64,
+        dropped: AtomicU64,
+        alive: AtomicU64,
+        most: AtomicU64,
+    }
+
+    struct Shared(Arc<Tally>);
+
+    impl Shared {
+        fn make(tally: &Arc<Tally>) -> Self {
+            tally.made.fetch_add(1, Ordering::SeqCst);
+            let alive = tally.alive.fetch_add(1, Ordering::SeqCst) + 1;
+            tally.most.fetch_max(alive, Ordering::SeqCst);
+            Self(tally.clone())
+        }
+    }
+
+    impl Drop for Shared {
+        fn drop(&mut self) {
+            self.0.dropped.fetch_add(1, Ordering::SeqCst);
+            self.0.alive.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn key(n: u64) -> vk::Device {
+        use ash::vk::Handle;
+        vk::Device::from_raw(n)
+    }
+
+    /// The second runner of a game device joins what the first made; it is dropped once, when the last leaves, and
+    /// the next runner makes a new one. Another game device has its own.
+    #[test]
+    fn two_runners_of_a_device_share_one_seat_and_the_last_to_leave_drops_it() {
+        static SEATS: Seats<Shared> = Seats::new();
+        let tally = Arc::new(Tally::default());
+        let (game, other) = (key(0x5ea7_0001), key(0x5ea7_0002));
+        let a = SEATS.join(game, |_| Ok(()), || Ok(Shared::make(&tally))).unwrap();
+        let b = SEATS.join(game, |_| Ok(()), || Err("the second runner makes nothing".into())).unwrap();
+        // One at a time: both seats lock the same thing.
+        let first = a.lock().0.clone();
+        assert!(Arc::ptr_eq(&first, &b.lock().0));
+        assert_eq!((SEATS.seated(game), tally.made.load(Ordering::SeqCst)), (2, 1));
+        let c = SEATS.join(other, |_| Ok(()), || Ok(Shared::make(&tally))).unwrap();
+        assert_eq!((SEATS.seated(other), tally.made.load(Ordering::SeqCst)), (1, 2));
+        drop(a);
+        assert_eq!((SEATS.seated(game), tally.dropped.load(Ordering::SeqCst)), (1, 0), "the other runner still has it");
+        // One that is there and not admitted: no seat, and nothing made in its place.
+        assert_eq!(SEATS.join(game, |_| Err("stuck".into()), || Ok(Shared::make(&tally))).err().as_deref(), Some("stuck"));
+        assert_eq!((SEATS.seated(game), tally.made.load(Ordering::SeqCst)), (1, 2));
+        drop(b);
+        assert_eq!((SEATS.seated(game), tally.dropped.load(Ordering::SeqCst)), (0, 1));
+        let d = SEATS.join(game, |_| Ok(()), || Ok(Shared::make(&tally))).unwrap();
+        assert_eq!(tally.made.load(Ordering::SeqCst), 3, "a new one after the last left");
+        // A failed make leaves no seat behind.
+        let third = key(0x5ea7_0003);
+        assert!(SEATS.join(third, |_| Ok(()), || Err::<Shared, _>("no device".into())).is_err());
+        assert_eq!(SEATS.seated(third), 0);
+        drop((c, d));
+        assert_eq!((tally.dropped.load(Ordering::SeqCst), tally.alive.load(Ordering::SeqCst)), (3, 0));
+    }
+
+    /// Runners that come and go on several threads: a game device never has two of what they share alive at once
+    /// (the offload device is taken once and given back before it is taken again), and every one made is dropped.
+    #[test]
+    fn runners_coming_and_going_never_make_a_second_one_beside_the_first() {
+        static SEATS: Seats<Shared> = Seats::new();
+        let tally = Arc::new(Tally::default());
+        let game = key(0x5ea7_0010);
+        let threads: Vec<_> = (0..6)
+            .map(|t| {
+                let tally = tally.clone();
+                std::thread::spawn(move || {
+                    for n in 0..400u32 {
+                        let seat = SEATS.join(game, |_| Ok(()), || Ok(Shared::make(&tally))).unwrap();
+                        {
+                            let shared = seat.lock();
+                            assert_eq!(shared.0.alive.load(Ordering::SeqCst), 1, "one alive while a runner has a seat");
+                        }
+                        if (n + t) % 3 == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(tally.most.load(Ordering::SeqCst), 1);
+        assert_eq!(tally.made.load(Ordering::SeqCst), tally.dropped.load(Ordering::SeqCst));
+        assert_eq!(SEATS.seated(game), 0);
+    }
+
+    /// A core no runner may run a frame on: a frame never finished there (which is a stall), or the offload was given
+    /// up and the network closed.
+    #[test]
+    fn a_stuck_or_closed_core_takes_no_frame() {
+        use crate::preupscale::offload_server::refused;
+        assert_eq!(refused(false, false), None);
+        assert!(refused(true, false).is_some_and(|(_, stuck)| stuck));
+        assert!(refused(true, true).is_some_and(|(_, stuck)| stuck), "a stall first: nothing may be taken back");
+        assert!(refused(false, true).is_some_and(|(_, stuck)| !stuck));
+    }
+
+    type Log = Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+    /// The second device as both holds' runners share it (the tests' `offload_server::Core`).
+    struct Other {
+        dev: Option<Dev>,
+        fence: vk::Fence,
+        /// Frames submitted to it.
+        submits: u32,
+        /// A frame of one runner is on the device now.
+        running: bool,
+        stuck: bool,
+        closed: bool,
+        log: Log,
+    }
+
+    // SAFETY: the test's own device, used under the seats' lock.
+    unsafe impl Send for Other {}
+
+    impl Drop for Other {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push("dropped");
+            let dev = self.dev.take().expect("open");
+            // SAFETY: idle; every runner freed what it made before it left its seat.
+            unsafe { dev.device.destroy_fence(self.fence, None) };
+            dev.close();
+        }
+    }
+
+    static OTHERS: Seats<Other> = Seats::new();
+
+    /// A hold's runner on the shared second device: its own imports of its exchange's regions and its own command
+    /// buffer; the device, its queue and its fence are the seat's, locked for the whole of a frame.
+    struct SeatedRunner {
+        seat: Seat<Other>,
+        device: ash::Device,
+        queue: vk::Queue,
+        out: HostBuffer,
+        inn: HostBuffer,
+        pool: vk::CommandPool,
+        cmd: vk::CommandBuffer,
+        /// This frame fails (a give-up); this one never finishes (a stall).
+        fail: Option<u32>,
+        stick: Option<u32>,
+        stuck: bool,
+        ran: Ranlist,
+    }
+
+    // SAFETY: as `CopyRunner`.
+    unsafe impl Send for SeatedRunner {}
+
+    impl SeatedRunner {
+        fn new(game: vk::Device, link: &Link, log: &Log, fail: Option<u32>, stick: Option<u32>, ran: Ranlist) -> Option<Self> {
+            use crate::preupscale::offload_server::refused;
+            let seat = OTHERS
+                .join(
+                    game,
+                    |o| refused(o.stuck, o.closed).map_or(Ok(()), |(why, _)| Err(why.to_string())),
+                    || {
+                        let dev = Dev::open().ok_or("no device")?;
+                        // SAFETY: a live device.
+                        let fence = unsafe { dev.device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| e.to_string())?;
+                        log.lock().unwrap().push("made");
+                        Ok(Other { dev: Some(dev), fence, submits: 0, running: false, stuck: false, closed: false, log: log.clone() })
+                    },
+                )
+                .ok()?;
+            let (device, instance, physical, queue, family, import) = {
+                let o = seat.lock();
+                let d = o.dev.as_ref().expect("open");
+                (d.device.clone(), d.instance.clone(), d.physical, d.queue, d.family, d.import && link.shared)
+            };
+            let l = link.layout();
+            let (out_ptr, in_ptr) = link.regions();
+            let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+            // SAFETY: the regions outlive the runner; a live device, used here under no frame (none was sent yet).
+            unsafe {
+                let out = crate::preupscale::region_buffer(&device, &instance, physical, import, out_ptr, link.capacity.0, l.out_bytes, usage)?;
+                let inn = crate::preupscale::region_buffer(&device, &instance, physical, import, in_ptr, link.capacity.1, l.in_bytes, usage)?;
+                let pool = device
+                    .create_command_pool(
+                        &vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                        None,
+                    )
+                    .ok()?;
+                let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).ok()?[0];
+                Some(Self { seat, device, queue, out, inn, pool, cmd, fail, stick, stuck: false, ran })
+            }
+        }
+    }
+
+    impl Runner for SeatedRunner {
+        unsafe fn run(&mut self, seq: u32, out: *const u8, inn: *mut u8, layout: &Layout) -> Ran {
+            let mut other = self.seat.lock();
+            if let Some((why, stuck)) = crate::preupscale::offload_server::refused(other.stuck, other.closed) {
+                self.stuck |= stuck;
+                return Ran::Failed(why.into());
+            }
+            if self.stick == Some(seq) {
+                other.stuck = true;
+                self.stuck = true;
+                return Ran::Failed("the test's frame never finished".into());
+            }
+            if self.fail == Some(seq) {
+                return Ran::Failed("the test's frame failed".into());
+            }
+            assert!(!std::mem::replace(&mut other.running, true), "one frame at a time on the shared device");
+            other.submits += 1;
+            let d = &self.device;
+            // SAFETY: the test's own objects; the regions as the contract; the device's queue and fence under the seat's lock.
+            unsafe {
+                if self.out.staged {
+                    std::ptr::copy_nonoverlapping(out, self.out.ptr, layout.out_bytes as usize);
+                }
+                d.begin_command_buffer(self.cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+                let copy = vk::BufferCopy { src_offset: layout.frame_at, dst_offset: layout.answer_at, size: layout.sizes.answer.min(layout.sizes.frame) };
+                d.cmd_copy_buffer(self.cmd, self.out.buffer, self.inn.buffer, &[copy]);
+                d.end_command_buffer(self.cmd).unwrap();
+                let cmds = [self.cmd];
+                d.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], other.fence).unwrap();
+                d.wait_for_fences(&[other.fence], true, u64::MAX).unwrap();
+                d.reset_fences(&[other.fence]).unwrap();
+                d.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty()).unwrap();
+                if self.inn.staged {
+                    std::ptr::copy_nonoverlapping(
+                        self.inn.ptr.add(layout.answer_at as usize),
+                        inn.add(layout.answer_at as usize),
+                        layout.sizes.answer as usize,
+                    );
+                }
+            }
+            other.running = false;
+            self.ran.lock().unwrap().push(seq);
+            Ran::Answered
+        }
+
+        fn gave_up(&mut self) {
+            let mut other = self.seat.lock();
+            if !other.stuck {
+                other.closed = true;
+            }
+        }
+
+        fn stuck(&self) -> bool {
+            self.stuck
+        }
+    }
+
+    impl Drop for SeatedRunner {
+        fn drop(&mut self) {
+            let _other = self.seat.lock();
+            // SAFETY: idle (every frame was waited for under the seat's lock).
+            unsafe {
+                self.device.destroy_command_pool(self.pool, None);
+                self.out.destroy(&self.device);
+                self.inn.destroy(&self.device);
+            }
+        }
+    }
+
+    /// One hold of the frame on the game's device: its exchange at its own size, the frame it sends, where its
+    /// answers land and the counters its gate writes.
+    struct HoldRig {
+        exchange: Exchange,
+        sizes: Sizes,
+        frame: HostBuffer,
+        side: HostBuffer,
+        answer: HostBuffer,
+        stats: HostBuffer,
+    }
+
+    /// The game's device with both holds of a frame: before DLSS (the smaller frame) and after its output.
+    struct Pair {
+        dev: Dev,
+        holds: [HoldRig; 2],
+        pool: vk::CommandPool,
+        fence: vk::Fence,
+    }
+
+    const SIZES_AFTER: Sizes = Sizes { frame: TEXELS * 12, motion: 2048, packed_texels: 0, depth: 0, side: 16, answer: TEXELS * 12 };
+
+    impl Pair {
+        fn new() -> Option<Self> {
+            let dev = Dev::open()?;
+            let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
+            let hold = |sizes: Sizes| {
+                let own = |bytes: u64| crate::preupscale::own_host_buffer_with(&dev.device, &dev.instance, dev.physical, bytes, usage);
+                // SAFETY: a live device.
+                unsafe {
+                    let mut exchange = Exchange::build(&dev.device, &dev.instance, dev.physical, dev.import, sizes)?;
+                    let (frame, side, answer, stats) = (own(sizes.frame)?, own(sizes.side)?, own(sizes.answer)?, own(64)?);
+                    exchange.bind_gate(&dev.device, stats.buffer, 1);
+                    Some(HoldRig { exchange, sizes, frame, side, answer, stats })
+                }
+            };
+            let holds = [hold(SIZES)?, hold(SIZES_AFTER)?];
+            // SAFETY: a live device.
+            unsafe {
+                let pool = dev.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(dev.family), None).ok()?;
+                let fence = dev.device.create_fence(&vk::FenceCreateInfo::default(), None).ok()?;
+                Some(Self { dev, holds, pool, fence })
+            }
+        }
+
+        /// Records hold `k` (0 before DLSS, 1 after) as the layer would ([`Game::record`]).
+        fn record(&self, k: usize, plan: HoldPlan, value: u32) -> (usize, vk::CommandBuffer, HoldPlan) {
+            let (d, h) = (&self.dev.device, &self.holds[k]);
+            // SAFETY: the test's own objects.
+            unsafe {
+                let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(1)).unwrap()[0];
+                d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+                d.cmd_fill_buffer(cmd, h.stats.buffer, 14 * 4, 4, u32::from(plan.take));
+                if let Some(seq) = plan.settle.filter(|_| plan.take) {
+                    let (answer, size) = (h.answer.buffer, h.sizes.answer);
+                    h.exchange.record_receive(d, cmd, &[], &|region, at| {
+                        d.cmd_copy_buffer(cmd, region, answer, &[vk::BufferCopy { src_offset: at, dst_offset: 0, size }])
+                    });
+                    h.exchange.record_gate(d, cmd, seq);
+                }
+                if let Some(seq) = plan.send {
+                    d.cmd_fill_buffer(cmd, h.frame.buffer, 0, h.sizes.frame, value);
+                    let side = [(h.side.buffer, h.sizes.side)];
+                    h.exchange.record_send(d, cmd, seq, &Sources { frame: FrameSource::Buffer(h.frame.buffer), motion: None, depth: None, side: &side });
+                }
+                d.end_command_buffer(cmd).unwrap();
+                (k, cmd, plan)
+            }
+        }
+
+        /// Submits the holds in this order in one submit, as the layer's submit hook does for a frame whose two holds
+        /// are in one submit ([`at_submit`]: each hold's exchange settles its own frame), and waits for them.
+        fn run(&self, holds: &[(usize, vk::CommandBuffer, HoldPlan)]) {
+            let d = &self.dev.device;
+            let cmds: Vec<vk::CommandBuffer> = holds.iter().map(|(_, c, _)| *c).collect();
+            for (k, _, plan) in holds {
+                self.holds[*k].exchange.at_submit(plan);
+            }
+            // SAFETY: the test's own objects.
+            unsafe {
+                d.queue_submit(self.dev.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], self.fence).unwrap();
+                for (k, _, _) in holds {
+                    self.holds[*k].exchange.handed();
+                }
+                d.wait_for_fences(&[self.fence], true, 30_000_000_000).expect("the holds finished");
+                d.reset_fences(&[self.fence]).unwrap();
+            }
+        }
+
+        fn landed(&self, k: usize) -> (Option<u32>, bool) {
+            let h = &self.holds[k];
+            // SAFETY: host-visible buffers of the sizes read; the holds were waited for.
+            unsafe {
+                let words = std::slice::from_raw_parts(h.answer.ptr.cast::<u32>(), (h.sizes.answer / 4) as usize);
+                let same = words.iter().all(|w| *w == words[0]).then_some(words[0]);
+                (same, h.stats.ptr.cast::<u32>().add(14).read_volatile() == 1)
+            }
+        }
+
+        fn wait_finished(&self, k: usize, seq: u32) {
+            let start = Instant::now();
+            while self.holds[k].exchange.progress.lock().finished.is_none_or(|(done, _)| done != seq) {
+                assert!(start.elapsed() < Duration::from_secs(20), "the worker finished frame {seq} of hold {k}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn close(self, workers: Vec<Worker>) {
+            for mut w in workers {
+                w.stop();
+            }
+            // SAFETY: every hold was waited for and the workers stopped.
+            unsafe {
+                let d = &self.dev.device;
+                d.destroy_fence(self.fence, None);
+                d.destroy_command_pool(self.pool, None);
+                for h in self.holds {
+                    for b in [&h.frame, &h.side, &h.answer, &h.stats] {
+                        b.destroy(d);
+                    }
+                    h.exchange.destroy(d);
+                }
+            }
+            self.dev.close();
+        }
+    }
+
+    type GaveUp = Arc<std::sync::Mutex<Vec<(usize, String, bool)>>>;
+
+    /// Both holds of a frame on the game's device, each with its worker; their runners share the second device.
+    /// `fail` and `stick`: (hold, frame) whose frame fails there, or never finishes.
+    #[allow(clippy::type_complexity)]
+    fn pair(fail: Option<(usize, u32)>, stick: Option<(usize, u32)>) -> Option<(Pair, Vec<Worker>, [Ranlist; 2], GaveUp, Log)> {
+        let Some(pair) = Pair::new() else {
+            assert_ne!(neural_forge_protocol::env::var("NEURAL_FORGE_REQUIRE_VULKAN").as_deref(), Some("1"), "no Vulkan device for the exchange's tests");
+            return None;
+        };
+        let game = pair.dev.device.handle();
+        let (log, gave_up) = (Log::default(), GaveUp::default());
+        let ran = [Ranlist::default(), Ranlist::default()];
+        let mut workers = Vec::new();
+        for (k, at) in [Where::Before, Where::After].into_iter().enumerate() {
+            let link = pair.holds[k].exchange.link(&pair.dev.device);
+            let only = |x: Option<(usize, u32)>| x.filter(|(hold, _)| *hold == k).map(|(_, seq)| seq);
+            let runner = SeatedRunner::new(game, &link, &log, only(fail), only(stick), ran[k].clone())?;
+            let g = gave_up.clone();
+            workers.push(Worker::start(
+                link,
+                at,
+                Box::new(runner),
+                None,
+                (64, 64),
+                Box::new(move |why, stop| g.lock().unwrap().push((k, why, stop == Stop::Stuck))),
+            )?);
+        }
+        assert_eq!(OTHERS.seated(game), 2);
+        assert_eq!(*log.lock().unwrap(), vec!["made"], "the second hold's runner joined the first's device");
+        Some((pair, workers, ran, gave_up, log))
+    }
+
+    /// A frame with passes before DLSS and after its output: both holds, recorded into one submit, each carry the
+    /// answer to their own frame before, through the one second device, at their own sizes.
+    #[test]
+    fn both_holds_of_a_frame_carry_their_answers_through_one_device() {
+        let Some((pair, workers, ran, gave_up, log)) = pair(None, None) else { return };
+        let game = pair.dev.device.handle();
+        let mut cadence = [Cadence::default(), Cadence::default()];
+        for frame in 1..=8u64 {
+            let n = frame as u32;
+            if frame > 1 {
+                // The answers are there before the holds that take them (the budget is not what this test is about).
+                pair.wait_finished(0, n - 1);
+                pair.wait_finished(1, n - 1);
+            }
+            let before = pair.record(0, cadence[0].hold(frame, true), 100 + n);
+            let after = pair.record(1, cadence[1].hold(frame, true), 200 + n);
+            pair.run(&[before, after]);
+            if frame > 1 {
+                assert_eq!(pair.landed(0), (Some(100 + n - 1), true), "frame {frame}: the hold before DLSS has its own answer");
+                assert_eq!(pair.landed(1), (Some(200 + n - 1), true), "frame {frame}: the hold after DLSS has its own answer");
+            }
+        }
+        pair.wait_finished(0, 8);
+        pair.wait_finished(1, 8);
+        for k in 0..2 {
+            assert_eq!(*ran[k].lock().unwrap(), (1..=8).collect::<Vec<u32>>());
+            assert_eq!(workers[k].counters.answered.load(Ordering::Relaxed), 8);
+            assert!(workers[k].serving());
+        }
+        assert!(gave_up.lock().unwrap().is_empty());
+        assert!(serving_at(game, Where::Before) && serving_at(game, Where::After));
+        pair.close(workers);
+        assert_eq!(OTHERS.seated(game), 0);
+        assert_eq!(*log.lock().unwrap(), vec!["made", "dropped"], "one device for both holds, given back once both left");
+    }
+
+    /// The submits of both holds wait for the one second device without waiting for each other's frames: with no
+    /// pause between frames every hold still gets its answer or goes without, and nothing is abandoned or torn.
+    #[test]
+    fn both_holds_keep_their_answers_apart_at_full_speed() {
+        let Some((pair, workers, ran, gave_up, _)) = pair(None, None) else { return };
+        let mut cadence = [Cadence::default(), Cadence::default()];
+        for frame in 1..=40u64 {
+            let n = frame as u32;
+            let before = pair.record(0, cadence[0].hold(frame, true), 1000 + n);
+            let after = pair.record(1, cadence[1].hold(frame, true), 2000 + n);
+            // Every third frame as two submits (the split hold before DLSS, then DLSS's buffer with the hold after it).
+            if frame % 3 == 0 {
+                pair.run(&[before]);
+                pair.run(&[after]);
+            } else {
+                pair.run(&[before, after]);
+            }
+            if frame > 1 {
+                for (k, base) in [(0, 1000), (1, 2000)] {
+                    let (value, stored) = pair.landed(k);
+                    // The answer of the frame before (the submit waited for it), never another frame's or the other hold's.
+                    assert!(!stored || value == Some(base + n - 1), "frame {frame}, hold {k}: {value:?}");
+                }
+            }
+        }
+        pair.wait_finished(0, 40);
+        pair.wait_finished(1, 40);
+        assert!(gave_up.lock().unwrap().is_empty());
+        for (k, list) in ran.iter().enumerate() {
+            let list = list.lock().unwrap();
+            assert!(list.windows(2).all(|w| w[0] < w[1]), "hold {k}'s frames ran in order: {list:?}");
+        }
+        pair.close(workers);
+    }
+
+    /// One hold's frame fails on the second device: its worker gives the offload up, the network is closed for
+    /// both, and the other hold's next frame is refused without being submitted. Both holds go on without an edit.
+    #[test]
+    fn a_give_up_by_one_hold_ends_the_other_s_frames_too() {
+        let Some((pair, workers, ran, gave_up, log)) = pair(Some((1, 2)), None) else { return };
+        let game = pair.dev.device.handle();
+        let mut cadence = [Cadence::default(), Cadence::default()];
+        for frame in 1..=6u64 {
+            let n = frame as u32;
+            pair.run(&[pair.record(0, cadence[0].hold(frame, true), 300 + n), pair.record(1, cadence[1].hold(frame, true), 400 + n)]);
+            pair.wait_finished(0, n);
+            pair.wait_finished(1, n);
+        }
+        assert!(!workers[0].serving() && !workers[1].serving());
+        assert!(!pair.landed(0).1 && !pair.landed(1).1, "no edit once the offload is given up");
+        assert_eq!(*ran[1].lock().unwrap(), vec![1]);
+        let said = gave_up.lock().unwrap().clone();
+        assert_eq!(said.len(), 2, "each worker tells its owner once: {said:?}");
+        assert!(said.contains(&(1, "the test's frame failed".to_string(), false)));
+        assert!(said.iter().any(|(k, why, stuck)| *k == 0 && why == "the second GPU was given up" && !stuck), "{said:?}");
+        // Nothing went to the device for the hold before DLSS after the network was closed.
+        let before_ran = ran[0].lock().unwrap().len() as u32;
+        assert_eq!(OTHERS.all.lock().unwrap().iter().find(|(g, _, _)| *g == game).map(|(_, o, _)| o.lock().unwrap().submits), Some(before_ran + 1));
+        assert!(before_ran < 6);
+        pair.close(workers);
+        assert_eq!(*log.lock().unwrap(), vec!["made", "dropped"]);
+    }
+
+    /// One hold's frame never finishes on the second device: the other hold's worker finds it stuck too (a stall,
+    /// not a fall-back), submits nothing more there, and no new runner is given a seat on that device.
+    #[test]
+    fn a_frame_that_never_finishes_stops_both_holds_and_the_device_is_not_joined_again() {
+        let Some((pair, workers, ran, gave_up, log)) = pair(None, Some((0, 3))) else { return };
+        let game = pair.dev.device.handle();
+        let mut cadence = [Cadence::default(), Cadence::default()];
+        for frame in 1..=6u64 {
+            let n = frame as u32;
+            pair.run(&[pair.record(0, cadence[0].hold(frame, true), 500 + n), pair.record(1, cadence[1].hold(frame, true), 600 + n)]);
+            pair.wait_finished(0, n);
+            pair.wait_finished(1, n);
+        }
+        let said = gave_up.lock().unwrap().clone();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said.iter().all(|(_, _, stuck)| *stuck), "both are a stall: nothing is taken back: {said:?}");
+        assert_eq!(*ran[0].lock().unwrap(), vec![1, 2]);
+        assert!(ran[1].lock().unwrap().len() <= 3, "nothing submitted for the other hold after the stall");
+        let submits = OTHERS.all.lock().unwrap().iter().find(|(g, _, _)| *g == game).map(|(_, o, _)| o.lock().unwrap().submits);
+        assert_eq!(submits, Some(2 + ran[1].lock().unwrap().len() as u32));
+        // Another set of hold resources asks for the device: refused, and nothing is made beside the stuck one.
+        let link = pair.holds[0].exchange.link(&pair.dev.device);
+        assert!(SeatedRunner::new(game, &link, &log, None, None, Ranlist::default()).is_none());
+        assert_eq!((OTHERS.seated(game), log.lock().unwrap().len()), (2, 1));
+        pair.close(workers);
+    }
+
+    /// The frame no longer has passes at one hold: once that hold's side has been idle against the holds that keep
+    /// coming at the other, its worker is ended and its runner leaves the second device, which stays with the hold that
+    /// still serves. A pause of both holds releases neither.
+    #[test]
+    fn the_hold_that_stopped_coming_leaves_the_device_to_the_other() {
+        let _state = crate::preupscale::offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((pair, workers, _, _, log)) = pair(None, None) else { return };
+        let game = pair.dev.device.handle();
+        clear_serving();
+        set_serving(Where::Before, true);
+        set_serving(Where::After, true);
+        let idle = IDLE_SIDE.as_millis() as u64;
+        let t0 = now_ms();
+        // Both hold, then both pause for longer than the idle time, then both hold again.
+        for t in [t0, t0 + 16, t0 + 4 * idle, t0 + 4 * idle + 16] {
+            workers[0].touch_at(t);
+            workers[1].touch_at(t + 1);
+        }
+        assert!(!workers[0].ended() && !workers[1].ended(), "a pause of both holds releases neither");
+        // Only the hold before DLSS keeps coming.
+        let t1 = t0 + 4 * idle + 32;
+        workers[0].touch_at(t1);
+        workers[0].touch_at(t1 + idle - 100);
+        assert!(!workers[1].ended(), "not idle for long enough yet");
+        workers[0].touch_at(t1 + idle + 16);
+        assert!(!workers[1].ended(), "measured against this side's hold before: that one was too early");
+        workers[0].touch_at(t1 + idle + 32);
+        assert!(workers[1].ended() && !workers[0].ended());
+        assert_eq!(serving(), Serving { before: true, after: false });
+        assert!(serving_at(game, Where::Before) && !serving_at(game, Where::After));
+        assert_eq!(OTHERS.seated(game), 1);
+        assert_eq!(*log.lock().unwrap(), vec!["made"], "the device stays with the hold that serves");
+        // That hold goes on getting its answers.
+        let mut cadence = Cadence::default();
+        pair.run(&[pair.record(0, cadence.hold(1, true), 901)]);
+        pair.wait_finished(0, 1);
+        pair.run(&[pair.record(0, cadence.hold(2, true), 902)]);
+        assert_eq!(pair.landed(0), (Some(901), true));
+        clear_serving();
+        pair.close(workers);
+        assert_eq!(*log.lock().unwrap(), vec!["made", "dropped"]);
+    }
+
+    /// The motion packed to halves is half the bytes: at 2560x1440 after DLSS the way out drops from 56 MB to 42 MB.
+    #[test]
+    fn the_packed_motion_is_half_the_floats() {
+        let (floats, packed) = (Sizes::of(Where::After, 2560, 1440, false), Sizes::of(Where::After, 2560, 1440, true));
+        assert_eq!((floats.motion, floats.packed_texels), (2560 * 1440 * 8, 0));
+        assert_eq!((packed.motion, packed.packed_texels), (2560 * 1440 * 4, 2560 * 1440));
+        assert_eq!(Sizes { motion: 0, packed_texels: 0, ..packed }, Sizes { motion: 0, packed_texels: 0, ..floats }, "nothing else changes");
+        let (a, b) = (Layout::of(floats), Layout::of(packed));
+        assert_eq!(a.out_bytes - b.out_bytes, 2560 * 1440 * 4);
+        assert!(b.out_bytes < 43 << 20 && a.in_bytes == b.in_bytes, "{b:?}");
+        let before = Sizes::of(Where::Before, 1485, 835, true);
+        assert_eq!((before.motion, before.depth), (1485 * 835 * 4, 1485 * 835 * 4));
+    }
+
+    fn half_to_f32(h: u16) -> f32 {
+        let (sign, exponent, fraction) = (if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }, i32::from((h >> 10) & 31), f32::from(h & 0x3ff));
+        match exponent {
+            0 => sign * fraction * 2f32.powi(-24),
+            31 => {
+                if fraction == 0.0 {
+                    sign * f32::INFINITY
+                } else {
+                    f32::NAN
+                }
+            }
+            e => sign * (1.0 + fraction / 1024.0) * 2f32.powi(e - 15),
+        }
+    }
+
+    /// The pack on the GPU, over every finite half: a field that is DLSS's vectors (halves) times the vectors' scale
+    /// and divided by it again, as the motion pass leaves it with a fresh chain, packs back to exactly those halves,
+    /// whatever the scale. A texel with a NaN in either component is the reserved pattern in both; nothing else ever
+    /// is a NaN or an infinity (values past the half's range are its largest finite value).
+    #[test]
+    fn the_pack_gives_dlss_s_halves_back_exactly_and_keeps_the_nan_marker() {
+        let Some(dev) = Dev::open() else {
+            assert_ne!(neural_forge_protocol::env::var("NEURAL_FORGE_REQUIRE_VULKAN").as_deref(), Some("1"), "no Vulkan device for the pack's test");
+            return;
+        };
+        const SCALES: [f32; 4] = [1.0, 1485.0, 835.0, 0.000_673_4];
+        // Every finite half as x (y another half), once per scale, then the special texels: more than three rows
+        // of the dispatch.
+        let finite: Vec<u16> = (0..=u16::MAX).filter(|h| (h >> 10) & 31 != 31).collect();
+        let mut field: Vec<[f32; 2]> = Vec::new();
+        let mut expected: Vec<u32> = Vec::new();
+        for scale in SCALES {
+            for (k, &h) in finite.iter().enumerate() {
+                let other = finite[(k * 7919 + 13) % finite.len()];
+                let through = |h: u16| (half_to_f32(h) * scale) / scale;
+                field.push([through(h), through(other)]);
+                expected.push(u32::from(h) | (u32::from(other) << 16));
+            }
+        }
+        let specials: [([f32; 2], u32); 8] = [
+            ([f32::NAN, f32::NAN], HALF_NAN),
+            ([f32::NAN, 1.5], HALF_NAN),
+            ([-2.25, f32::NAN], HALF_NAN),
+            ([f32::INFINITY, f32::NEG_INFINITY], 0x7bff | (0xfbff << 16)),
+            ([1.0e9, -1.0e9], 0x7bff | (0xfbff << 16)),
+            ([65504.0, -65504.0], 0x7bff | (0xfbff << 16)),
+            ([0.0, -0.0], 0x8000 << 16),
+            ([0.5, -3.25], 0x3800 | (0xc280 << 16)),
+        ];
+        for (v, bits) in specials {
+            field.push(v);
+            expected.push(bits);
+        }
+        let texels = field.len() as u64;
+        assert!(texels > 3 * PACK_ROW, "more than one row of the dispatch");
+        let sizes = Sizes { frame: 256, motion: texels * 4, packed_texels: texels, depth: 0, side: 16, answer: 256 };
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
+        let own = |bytes: u64| crate::preupscale::own_host_buffer_with(&dev.device, &dev.instance, dev.physical, bytes, usage).unwrap();
+        // SAFETY: a live device; the test's own objects, destroyed below.
+        unsafe {
+            let mut exchange = Exchange::build(&dev.device, &dev.instance, dev.physical, dev.import, sizes).expect("the exchange with a pack");
+            assert!(exchange.motion_half());
+            let (source, frame, side) = (own(texels * 8), own(sizes.frame), own(sizes.side));
+            std::ptr::copy_nonoverlapping(field.as_ptr().cast::<u8>(), source.ptr, field.len() * 8);
+            exchange.bind_pack(&dev.device, source.buffer, 1);
+            // Keyed on which native pass the field is: another pass's field under the same handle is written again,
+            // and a pass that goes leaves nothing taken as bound.
+            assert_eq!(exchange.bound_for_test().1, Some((source.buffer, 1)));
+            exchange.bind_pack(&dev.device, source.buffer, 2);
+            assert_eq!(exchange.bound_for_test().1, Some((source.buffer, 2)));
+            exchange.forget_bound();
+            assert_eq!(exchange.bound_for_test().1, None);
+            exchange.bind_pack(&dev.device, source.buffer, 2);
+            let d = &dev.device;
+            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(dev.family), None).unwrap();
+            let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+            let sides = [(side.buffer, sizes.side)];
+            exchange.record_send(d, cmd, 9, &Sources { frame: FrameSource::Buffer(frame.buffer), motion: Some(source.buffer), depth: None, side: &sides });
+            d.end_command_buffer(cmd).unwrap();
+            d.queue_submit(dev.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
+            d.wait_for_fences(&[fence], true, 60_000_000_000).expect("the send finished");
+            let sent = std::slice::from_raw_parts(exchange.out.ptr.add(exchange.layout.motion_at as usize).cast::<u32>(), texels as usize);
+            let wrong: Vec<usize> = (0..sent.len()).filter(|&k| sent[k] != expected[k]).take(5).collect();
+            assert!(
+                wrong.is_empty(),
+                "{} texels differ; the first: {:?}",
+                (0..sent.len()).filter(|&k| sent[k] != expected[k]).count(),
+                wrong.iter().map(|&k| (k, field[k], format!("{:08x} for {:08x}", sent[k], expected[k]))).collect::<Vec<_>>()
+            );
+            // The marker is the only pattern that is not a number, and no texel is an infinity.
+            let not_finite = |h: u32| (h >> 10) & 31 == 31;
+            assert_eq!(sent.iter().filter(|&&w| not_finite(w & 0xffff) || not_finite(w >> 16)).count(), 3);
+            assert!(sent.iter().all(|&w| !(not_finite(w & 0xffff) || not_finite(w >> 16)) || w == HALF_NAN));
+            assert_eq!(exchange.out.ptr.cast::<u32>().add(OUT_SEQ).read_volatile(), 9, "the frame's header went with it");
+            d.destroy_fence(fence, None);
+            d.destroy_command_pool(pool, None);
+            for b in [&source, &frame, &side] {
+                b.destroy(d);
+            }
+            exchange.destroy(d);
+        }
+        dev.close();
     }
 }

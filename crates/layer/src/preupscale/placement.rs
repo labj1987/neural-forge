@@ -17,11 +17,17 @@
 //!
 //! Each move is logged once. Each stage then runs one contiguous group of passes with their own settings and
 //! its own histories (a hold's resources per stage: `Session::res` and `Session::res_after`).
+//!
+//! The settings group (#73; [`plan_for`]): a frame whose first pass runs before the upscaler runs the Passes
+//! setting's count; one whose first pass does not (after DLSS's output or on the finished frame, by the setting, by
+//! Auto with Ray Reconstruction or by a fall-back) runs the After DLSS group's count. Passes are never placed
+//! earlier than pass 1, so pass 1's stage is the same with either count. The passes after DLSS take the group's
+//! values (`native::stage_passes`, `native_post`), each pass's own overrides first.
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use neural_forge_protocol::enums::placement;
-use neural_forge_protocol::MAX_PASSES;
+use neural_forge_protocol::enums::{placement, settings_group};
+use neural_forge_protocol::{Placements, MAX_PASSES};
 
 /// A stage of the frame the network can run at, in the frame's order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -232,6 +238,19 @@ impl Hold {
         Self { stage, before: plan.range(Stage::Before), upscaled: plan.range(Stage::Upscaled), render, output }
     }
 
+    /// Whether the model on a second GPU takes this hold (`super::offload_pre`): every hold that has passes (before
+    /// the upscaler, or after DLSS's output: Ray Reconstruction, or the placement set there). In a frame with passes at
+    /// both stages both holds are the other GPU's: the process has one network, and both holds' runners share it
+    /// there (`offload_server::Core`), where with one hold there and one here the hold here found the network open
+    /// elsewhere and never ran.
+    pub(crate) fn offload_takes(&self) -> bool {
+        let own = match self.stage {
+            Stage::Upscaled => self.upscaled,
+            _ => self.before,
+        };
+        own.0 < own.1
+    }
+
     /// This hold's passes, `first..end`.
     pub(crate) fn passes(&self) -> (usize, usize) {
         match self.stage {
@@ -250,21 +269,87 @@ pub(crate) fn watch(header: &neural_forge_protocol::ShmHeader) {
     HEADER.store(std::ptr::from_ref(header).cast_mut(), Ordering::Release);
 }
 
-/// The pass count and each pass's placement (`auto` for every pass until the channel is open).
-pub(crate) fn settings() -> (usize, [u32; MAX_PASSES]) {
+/// Both pass counts and each pass's placement (one pass, `auto`, until the channel is open).
+pub(crate) fn placements() -> Placements {
     let header = HEADER.load(Ordering::Acquire);
     if header.is_null() {
-        return (1, [placement::AUTO; MAX_PASSES]);
+        return Placements { before: 1, after: 1, each: [placement::AUTO; MAX_PASSES] };
     }
     // SAFETY: a header [`watch`] stored: mapped for the life of the process.
     unsafe { (*header).placements() }
 }
 
-/// The plan for `frame` with the channel's settings, its notes logged once.
+/// The Passes setting's count and each pass's placement ([`placements`]). Whether every pass runs at present
+/// depends on pass 1 alone (passes run in order), so this count serves for that.
+pub(crate) fn settings() -> (usize, [u32; MAX_PASSES]) {
+    let p = placements();
+    (p.before, p.each)
+}
+
+/// The pass count of the plan in force: the After DLSS group's where the last plan made ([`note_group`]) runs no pass
+/// before the upscaler, the Passes setting's otherwise (and before any plan). The second GPU's trial keys its
+/// measurement on it (`offload_trial`), so a change of the count that runs starts it again, and one of the other does not.
+pub(crate) fn active_count() -> usize {
+    let header = HEADER.load(Ordering::Acquire);
+    // SAFETY: a header [`watch`] stored: mapped for the life of the process.
+    let group = if header.is_null() { settings_group::NONE } else { unsafe { (*header).settings_group.load(Ordering::Relaxed) } };
+    count_of(&placements(), group)
+}
+
+/// [`active_count`] for the placements `p` and the settings group `group` of the plan in force ([`group_of`]).
+pub(crate) fn count_of(p: &Placements, group: u32) -> usize {
+    if group == settings_group::AFTER {
+        p.after
+    } else {
+        p.before
+    }
+}
+
+/// Whether the placements put every pass on the finished frame: pass 1's placement is Finished frame, and the passes
+/// run in order, so every later pass runs there too whatever it is pinned to ([`Plan::of`]), with either group's count.
+pub(crate) fn finished_frame_only(p: &Placements) -> bool {
+    p.each[0] == placement::PRESENT
+}
+
+/// The plan for `frame` with `p`: the Passes setting's count where pass 1 runs before the upscaler, else the After
+/// DLSS group's (module docs).
+pub(crate) fn plan_for(p: &Placements, frame: Frame) -> Plan {
+    let plan = Plan::of(p.before, &p.each, frame);
+    if plan.has(Stage::Before) || p.after == p.before {
+        plan
+    } else {
+        Plan::of(p.after, &p.each, frame)
+    }
+}
+
+/// The settings group `plan` runs with ([`settings_group`]).
+pub(crate) fn group_of(plan: &Plan) -> u32 {
+    match (plan.has(Stage::Before), plan.has(Stage::Upscaled) || plan.has(Stage::Present)) {
+        (true, true) => settings_group::BOTH,
+        (true, false) => settings_group::BEFORE,
+        _ => settings_group::AFTER,
+    }
+}
+
+/// The plan just made runs with settings group `group` (the group the current placement uses), for the Status tab and
+/// [`active_count`]: stored only when it changed.
+pub(crate) fn note_group(group: u32) {
+    let header = HEADER.load(Ordering::Acquire);
+    if header.is_null() {
+        return;
+    }
+    // SAFETY: a header [`watch`] stored: mapped for the life of the process.
+    let field = unsafe { &(*header).settings_group };
+    if field.load(Ordering::Relaxed) != group {
+        field.store(group, Ordering::Relaxed);
+    }
+}
+
+/// The plan for `frame` with the channel's settings, its notes logged once, its settings group noted.
 pub(crate) fn current(frame: Frame) -> Plan {
-    let (count, settings) = settings();
-    let plan = Plan::of(count, &settings, frame);
+    let plan = plan_for(&placements(), frame);
     plan.say();
+    note_group(group_of(&plan));
     plan
 }
 
@@ -346,6 +431,9 @@ mod tests {
         assert_eq!(plan.notes().count(), 0);
         assert_eq!((plan.range(Before), plan.range(Upscaled), plan.range(Present)), ((0, 1), (1, 2), (0, 0)));
         let hold = Hold::of(&plan, Upscaled, (1707, 960), (2560, 1440));
+        // A frame with passes at both stages: the second GPU takes both holds (they share its one network).
+        assert!(hold.offload_takes() && Hold::of(&plan, Before, (1707, 960), (2560, 1440)).offload_takes());
+        assert!(Hold::ALL_BEFORE.offload_takes());
         assert_eq!(hold.passes(), (1, 2));
         assert_eq!(Hold::of(&plan, Before, (1707, 960), (2560, 1440)).passes(), (0, 1));
         // Out of order: pass 2 before the upscaler after pass 1 after DLSS runs after DLSS too.
@@ -354,6 +442,8 @@ mod tests {
         let plan = Plan::of(2, &s, sr);
         assert_eq!(&plan.stages[..2], &[Upscaled, Upscaled]);
         assert_eq!(plan.notes().collect::<Vec<_>>(), [Note::Order { pass: 1, asked: Before, runs: Upscaled }]);
+        // Every pass after DLSS's output (as with Ray Reconstruction): that hold is the second GPU's.
+        assert!(Hold::of(&plan, Upscaled, (1707, 960), (2560, 1440)).offload_takes());
         // At present after a hold: to the hold after DLSS where the output is learnt, else before the upscaler.
         s[0] = BEFORE;
         s[1] = PRESENT;
@@ -373,5 +463,99 @@ mod tests {
         s[1] = AUTO;
         let plan = Plan::of(2, &s, Frame { rr: true, output: true, hook: false });
         assert_eq!(&plan.stages[..2], &[Present, Present]);
+    }
+
+    /// The After DLSS group's pass count (#73): a frame whose pass 1 runs before the upscaler runs the Passes setting's
+    /// count, one whose pass 1 runs after DLSS or on the finished frame the group's, whatever moved it there: the
+    /// setting, Auto with Ray Reconstruction, or the fall-back of After DLSS where the output is not learnt.
+    #[test]
+    fn the_after_dlss_group_sets_the_pass_count_where_no_pass_runs_before_the_upscaler() {
+        use Stage::*;
+        let p = Placements { before: 3, after: 1, each: [AUTO; MAX_PASSES] };
+        let sr = Frame { rr: false, output: true, hook: true };
+        let rr = Frame { rr: true, output: true, hook: false };
+        let rr_no_output = Frame { rr: true, output: false, hook: false };
+        // Auto: before the upscaler without Ray Reconstruction (three passes), after DLSS with it (one).
+        let plan = plan_for(&p, sr);
+        assert_eq!((plan.count, plan.range(Before)), (3, (0, 3)));
+        assert_eq!(group_of(&plan), settings_group::BEFORE);
+        let plan = plan_for(&p, rr);
+        assert_eq!((plan.count, plan.range(Upscaled)), (1, (0, 1)));
+        assert_eq!(group_of(&plan), settings_group::AFTER);
+        // Ray Reconstruction without a learnt output: the finished frame, with the group's count too.
+        let plan = plan_for(&p, rr_no_output);
+        assert_eq!((plan.count, plan.all_present()), (1, true));
+        assert_eq!(group_of(&plan), settings_group::AFTER);
+        // More passes after DLSS than before: the group's count there, the setting's before.
+        let more = Placements { before: 1, after: 4, ..p };
+        assert_eq!(plan_for(&more, rr).range(Upscaled), (0, 4));
+        assert_eq!(plan_for(&more, sr).range(Before), (0, 1));
+        // After DLSS where the output is not learnt yet falls back to before the upscaler: the setting's count.
+        let upscaled = Placements { each: [UPSCALED; MAX_PASSES], ..p };
+        assert_eq!(plan_for(&upscaled, Frame { output: false, ..sr }).range(Before), (0, 3));
+        assert_eq!(plan_for(&upscaled, sr).range(Upscaled), (0, 1));
+        // No DLSS at all (no hook): the finished frame, the group's count.
+        assert_eq!(plan_for(&p, Frame { rr: false, output: false, hook: false }).count, 1);
+        // Pass 2 pinned after DLSS behind pass 1 before the upscaler: the setting's count, both groups in the frame.
+        let mut each = [AUTO; MAX_PASSES];
+        each[1] = UPSCALED;
+        let mixed = Placements { before: 2, after: 5, each };
+        let plan = plan_for(&mixed, sr);
+        assert_eq!((plan.count, plan.range(Before), plan.range(Upscaled)), (2, (0, 1), (1, 2)));
+        assert_eq!(group_of(&plan), settings_group::BOTH);
+        // The same count either way: the plan is the one it always was.
+        let same = Placements { before: 2, after: 2, each };
+        assert_eq!(plan_for(&same, rr), Plan::of(2, &each, rr));
+    }
+
+    /// The second GPU's trial counts the passes of the plan in force (#73; review): the After DLSS group's where no pass
+    /// runs before the upscaler, the Passes setting's where one does, so changing the other count does not restart it.
+    #[test]
+    fn the_active_count_is_the_count_of_the_plan_in_force() {
+        let sr = Frame { rr: false, output: true, hook: true };
+        let rr = Frame { rr: true, output: true, hook: false };
+        let rr_no_output = Frame { rr: true, output: false, hook: false };
+        let no_dlss = Frame { rr: false, output: false, hook: false };
+        let mut mixed = [AUTO; MAX_PASSES];
+        mixed[1] = UPSCALED;
+        for (before, after) in [(1, 3), (3, 1), (2, 2)] {
+            for each in [[AUTO; MAX_PASSES], [PRESENT; MAX_PASSES], [UPSCALED; MAX_PASSES], mixed] {
+                let p = Placements { before, after, each };
+                for frame in [sr, rr, rr_no_output, no_dlss] {
+                    let plan = plan_for(&p, frame);
+                    assert_eq!(count_of(&p, group_of(&plan)), plan.count, "{p:?} {frame:?}");
+                }
+            }
+        }
+        let p = Placements { before: 1, after: 3, each: [AUTO; MAX_PASSES] };
+        assert_eq!(count_of(&p, settings_group::AFTER), 3, "on the finished frame or after DLSS: after_passes");
+        assert_eq!(count_of(&p, settings_group::NONE), 1, "before any plan: the Passes setting");
+    }
+
+    /// The finished frame's checks (the second GPU's present and its offload) follow the plan (#73; review): pass 1 on
+    /// the finished frame puts every pass there, whatever a later pass is pinned to, also past the Passes setting.
+    #[test]
+    fn every_pass_is_on_the_finished_frame_when_pass_1_is() {
+        let frames = [
+            Frame { rr: false, output: true, hook: true },
+            Frame { rr: true, output: true, hook: false },
+            Frame { rr: true, output: false, hook: false },
+            Frame { rr: false, output: false, hook: false },
+        ];
+        let mut stale = [PRESENT; MAX_PASSES];
+        stale[1] = UPSCALED;
+        stale[2] = BEFORE;
+        for each in [[PRESENT; MAX_PASSES], stale] {
+            let p = Placements { before: 1, after: 3, each };
+            assert!(finished_frame_only(&p), "{each:?}");
+            for frame in frames {
+                assert!(plan_for(&p, frame).all_present(), "{each:?} {frame:?}");
+            }
+        }
+        let mut later = [PRESENT; MAX_PASSES];
+        later[0] = AUTO;
+        let p = Placements { before: 1, after: 3, each: later };
+        assert!(!finished_frame_only(&p));
+        assert!(!plan_for(&p, frames[0]).all_present(), "pass 1 before the upscaler");
     }
 }

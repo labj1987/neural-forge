@@ -102,6 +102,12 @@ struct PushConstants {
     debug_scale: f32,
     /// Matches `compose.comp`'s `params.reversible_mode`: the encode's curve.
     reversible_mode: u32,
+    /// The small proxy's own size while `model_small` (0 otherwise): `compose.comp`'s ghost guard reduces and
+    /// enlarges the current frame the same way to compare it with the proxy input.
+    proxy_width: u32,
+    proxy_height: u32,
+    /// The capture's reduction ran in linear light (an `*_SRGB` swapchain, [`GpuCompose::set_capture_srgb`]).
+    proxy_srgb: u32,
 }
 
 /// `compose_hdr.comp`'s `Params` block, field for field: pushed through `compose.comp`'s pipeline layout
@@ -249,7 +255,32 @@ pub enum ComposeInputs<'a> {
     /// previous present's frame, whose proxy and full frame [`GpuCompose::keep_delayed`] kept in its pair `parity`. The
     /// composition works on that frame, not the live image, and its result replaces the live image: each frame is
     /// shown one present late, exactly as it would have been shown without the delay. Full-size answers only.
-    Delayed { parity: usize },
+    ///
+    /// `gate`: the answer is not in yet, but the other device has submitted the frame's work: the sync fd of that
+    /// submission (`super::pace::Submitted`). It is imported into a semaphore of this device and the compose's
+    /// submission waits for it on the GPU. The fd is consumed, whatever the outcome. Where the import is refused,
+    /// the compose waits for the relay to resolve the frame instead, and composes only a good answer ([`Gate`]).
+    Delayed { parity: usize, gate: Option<Gate> },
+}
+
+/// The other device's sync fd a delayed present's compose or send waits for on the GPU, and what to wait for instead
+/// when this device cannot: the relay's resolution of frame `token` (`super::pace::Pacer::wait_resolved`), until
+/// `until`.
+#[derive(Clone, Copy, Debug)]
+pub struct Gate {
+    pub fd: std::os::fd::RawFd,
+    pub token: u64,
+    pub until: std::time::Instant,
+}
+
+/// What a compose or a send does with its [`Gate`] ([`Paced::take_gate`]).
+#[cfg(target_arch = "x86_64")]
+enum Gated {
+    /// Imported: the submission waits on this semaphore.
+    Wait(vk::Semaphore),
+    /// Not imported (none can be here, or the import was refused): the relay's resolution of the frame, waited for
+    /// on this thread (`Some(true)`: the answer is in and fits).
+    Resolved(Option<bool>),
 }
 
 /// `compose_hdr.comp`'s pipeline over `layout` (compose.comp's).
@@ -364,6 +395,132 @@ struct ZeroCopy {
     last_queue: Option<vk::Queue>,
     /// The delayed present's kept frames ([`GpuCompose::keep_delayed`]).
     delayed: Option<Delayed>,
+    /// The delayed present's relay and its sends ([`GpuCompose::ensure_paced`]).
+    #[cfg(target_arch = "x86_64")]
+    paced: Option<Paced>,
+    /// The relay ended, or its resources could not be made: not tried again on this compose.
+    #[cfg(target_arch = "x86_64")]
+    paced_dead: bool,
+}
+
+/// The delayed present with the relay (`super::pace`): each pair's copy of its frame into the proxy region, and
+/// the relay that waits for those copies and lets the other GPU run the frames.
+#[cfg(target_arch = "x86_64")]
+struct Paced {
+    cmd: [vk::CommandBuffer; 2],
+    fence: [vk::Fence; 2],
+    armed: [bool; 2],
+    pacer: super::pace::Pacer,
+    /// The number of the frame sent last.
+    sent: u64,
+    /// The semaphores the other device's sync fds are imported into, on a device with
+    /// `VK_KHR_external_semaphore_fd`.
+    sync: Option<SyncFd>,
+    /// This device refused an import: no compose or send waits on the GPU again on this compose ([`Self::take_gate`]).
+    refused: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The next this many sync-fd imports on this thread are refused, as a driver may refuse one.
+    pub(crate) static REFUSE_IMPORTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Binary semaphores of this device that take the other device's sync fds as temporary payloads: one per async slot
+/// for the compose that waits for an answer on the GPU, one per pair for the send that waits for the server to be
+/// done with the proxy region. A payload is consumed by the submission that waits on it.
+#[cfg(target_arch = "x86_64")]
+struct SyncFd {
+    api: ash::khr::external_semaphore_fd::Device,
+    compose: [vk::Semaphore; ASYNC_SLOTS],
+    send: [vk::Semaphore; 2],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SyncFd {
+    /// Imports sync fd `fd` into `semaphore` as its temporary payload. The fd is consumed: by the import, or closed
+    /// here when the import is refused (`false`).
+    fn import(&self, semaphore: vk::Semaphore, fd: std::os::fd::RawFd) -> bool {
+        let info = vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(semaphore)
+            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+            .fd(fd);
+        #[cfg(test)]
+        if REFUSE_IMPORTS.with(|r| r.get() > 0 && (r.set(r.get() - 1), true).1) {
+            // SAFETY: the caller's, handed over to this function.
+            unsafe { libc::close(fd) };
+            return false;
+        }
+        // SAFETY: a semaphore of this device with no pending operation (its last wait's submission was waited for);
+        // `fd` is a sync fd the caller owns.
+        let imported = unsafe { self.api.import_semaphore_fd(&info) }.is_ok();
+        if !imported {
+            // SAFETY: still the caller's, and handed over to this function.
+            unsafe { libc::close(fd) };
+        }
+        imported
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Paced {
+    /// Imports `gate` into the semaphore `pick` names, for a submission to wait on; or, where this compose has no
+    /// semaphores or this device refused an import (the first refusal is logged and ends the gating for this compose:
+    /// [`GpuCompose::can_gate`] is false from then on), waits for the relay to resolve the frame. The fd is consumed.
+    fn take_gate(&mut self, pick: impl FnOnce(&SyncFd) -> vk::Semaphore, gate: Gate) -> Gated {
+        match self.sync.as_ref().filter(|_| !self.refused) {
+            Some(sync) => {
+                let semaphore = pick(sync);
+                if sync.import(semaphore, gate.fd) {
+                    return Gated::Wait(semaphore);
+                }
+                self.refused = true;
+                crate::log!(
+                    "[offload] this GPU refused the other GPU's sync fd: the presents wait for the answers on the game's thread from here (no more waits on the GPU)"
+                );
+            }
+            // SAFETY: the caller's fd, handed over and not imported.
+            None => unsafe {
+                libc::close(gate.fd);
+            },
+        }
+        Gated::Resolved(self.pacer.wait_resolved(gate.token, gate.until))
+    }
+
+    /// Replaces `semaphore` (one of [`SyncFd`]'s) with a new one, after a submission that was to wait on its imported
+    /// payload failed: the payload is never consumed, and the next import needs a semaphore with none. Where a new one
+    /// cannot be made, the gating ends for this compose.
+    ///
+    /// # Safety
+    /// No submission that was made waits on `semaphore` (the one that was to failed).
+    unsafe fn renew(&mut self, device: &ash::Device, semaphore: vk::Semaphore) {
+        let Some(sync) = self.sync.as_mut() else { return };
+        let Some(at) = sync.compose.iter_mut().chain(sync.send.iter_mut()).find(|s| **s == semaphore) else { return };
+        // SAFETY: the contract: nothing pending uses it.
+        unsafe { device.destroy_semaphore(*at, None) };
+        // SAFETY: a plain creation on the live device.
+        *at = unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.unwrap_or_default();
+        if *at == vk::Semaphore::null() {
+            self.refused = true;
+        }
+    }
+
+    /// # Safety
+    /// The relay has ended and every send was waited.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: the contract; the command buffers go with the compose's pool (or are freed by the caller).
+        unsafe {
+            for f in self.fence {
+                device.destroy_fence(f, None);
+            }
+            if let Some(sync) = &self.sync {
+                for s in sync.compose.iter().chain(&sync.send) {
+                    device.destroy_semaphore(*s, None);
+                }
+            }
+        }
+    }
 }
 
 /// Two presents' frames for the delayed present ([`ComposeInputs::Delayed`]): each one's full frame (read off the
@@ -721,6 +878,7 @@ impl ComposeSlot {
         // `writes`' layout (4 storage-image bindings); every image view is live for at
         // least as long as `self.sized` holds its owning `Image`.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let proxy_view = proxy.view;
 
         self.sized = Some(Sized_ {
             width,
@@ -738,7 +896,23 @@ impl ComposeSlot {
             current_buffer,
             current_memory,
         });
+        self.bind_small_proxy(device, proxy_view);
         true
+    }
+
+    /// Binding 4 (`u_proxy_small`): the small proxy's image while there is one, else `fallback` (the proxy's own
+    /// view: the binding is always valid, and not read while the model runs at the frame's size). Called whenever
+    /// either changes, with nothing of this slot pending.
+    fn bind_small_proxy(&self, device: &ash::Device, fallback: vk::ImageView) {
+        let view = self.small_proxy.as_ref().map_or(fallback, |(image, _, _)| image.view);
+        let info = vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.descriptor_set)
+            .dst_binding(4)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(std::slice::from_ref(&info));
+        // SAFETY: this slot's own set, with a live view; no submission of the slot's is pending (its callers' contract).
+        unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
     }
 
     /// `working_scale`'s compose-side counterpart to `capture::CapturePipeline`'s own
@@ -752,13 +926,22 @@ impl ComposeSlot {
                 return true;
             }
         }
+        let fallback = self.sized.as_ref().map(|s| s.proxy.view);
         if let Some((old, _, _)) = self.small_proxy.take() {
+            // The binding leaves the image before it goes.
+            if let Some(view) = fallback {
+                self.bind_small_proxy(device, view);
+            }
             // SAFETY: as in `ensure_small_answer`: only after this slot's fence was waited on.
             unsafe { old.destroy(device) };
         }
         let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
         let Some(image) = create_storage_image(device, mem_props, width, height, usage) else { return false };
         self.small_proxy = Some((image, width, height));
+        // Bound for the ghost guard, which reads it at its own size (the frame's images are sized before this).
+        if let Some(view) = fallback {
+            self.bind_small_proxy(device, view);
+        }
         true
     }
 
@@ -841,6 +1024,7 @@ impl ComposeSlot {
         update_src: (vk::Buffer, u64, vk::Buffer, u64),
         fresh_copy: Option<[(vk::Buffer, vk::Buffer); 2]>,
         timer: Option<&crate::gpu_timer::GpuTimer>,
+        capture_srgb: bool,
     ) {
         let s = self.sized.as_ref().expect("caller already ensured this");
         let cached_before = self.cached_generation != 0;
@@ -1010,6 +1194,24 @@ impl ComposeSlot {
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[blit],
                         vk::Filter::LINEAR,
+                    );
+                    // The pass reads the small proxy itself too (binding 4, the ghost guard), on this and on the
+                    // carried presents after it.
+                    let sp_to_read = image_barrier(
+                        sp.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::ImageLayout::GENERAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::AccessFlags::SHADER_READ,
+                    );
+                    device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[sp_to_read],
                     );
                 } else {
                     device.cmd_copy_buffer_to_image(
@@ -1209,6 +1411,9 @@ impl ComposeSlot {
                     debug_view: compose.debug_view,
                     debug_scale: compose.debug_scale,
                     reversible_mode: compose.reversible_mode,
+                    proxy_width: if compose.model_small { answer_width } else { 0 },
+                    proxy_height: if compose.model_small { answer_height } else { 0 },
+                    proxy_srgb: u32::from(capture_srgb),
                 };
                 let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
                 device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
@@ -1361,6 +1566,8 @@ pub struct GpuCompose {
     timers_built: bool,
     /// The latest compose GPU reading not yet taken by [`Self::take_compose_gpu_ms`].
     compose_gpu_ms: Option<f32>,
+    /// The captured swapchain is `*_SRGB` ([`Self::set_capture_srgb`]).
+    capture_srgb: bool,
 }
 
 // SAFETY: every field is either a plain Vulkan handle or (inside a slot's own
@@ -1375,7 +1582,8 @@ impl GpuCompose {
     /// that as "the GPU compose path isn't available", falling back to
     /// [`super::apply`]'s CPU path, never a reason to stop presenting frames.
     pub fn new(device: &ash::Device, queue_family: u32) -> Option<Self> {
-        let bindings: Vec<_> = (0..4)
+        // The four images of the pass, and the small proxy at its own size (`compose.comp`'s ghost guard).
+        let bindings: Vec<_> = (0..5)
             .map(|i| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(i)
@@ -1452,7 +1660,7 @@ impl GpuCompose {
         // One sync slot plus `ASYNC_SLOTS` async ones, each needing its own 4
         // storage-image descriptors.
         let total_sets = 1 + ASYNC_SLOTS as u32;
-        let pool_size = vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(4 * total_sets);
+        let pool_size = vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(5 * total_sets);
         let pool_info = vk::DescriptorPoolCreateInfo::default().max_sets(total_sets).pool_sizes(std::slice::from_ref(&pool_size));
         // SAFETY: `pool_info` is valid.
         let descriptor_pool = match unsafe { device.create_descriptor_pool(&pool_info, None) } {
@@ -1532,6 +1740,7 @@ impl GpuCompose {
             queue_family,
             timers_built: false,
             compose_gpu_ms: None,
+            capture_srgb: false,
         })
     }
 
@@ -1569,8 +1778,16 @@ impl GpuCompose {
         target_image: vk::Image,
         compose: ComposeParams,
     ) -> Option<vk::Semaphore> {
+        let srgb = self.capture_srgb;
         let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
         let answer_bytes = (u64::from(answer_width) * u64::from(answer_height) * 4) as usize;
+        // The gate's sync fd is this call's from here: closed on every way out that does not import it.
+        #[cfg(target_arch = "x86_64")]
+        let mut gate_fd = match inputs {
+            // SAFETY: the caller hands the fd over (`ComposeInputs::Delayed`).
+            ComposeInputs::Delayed { gate: Some(gate), .. } => Some((unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(gate.fd) }, gate)),
+            _ => None,
+        };
         // An HDR10 frame composes only a full-size answer (the 8-bit enlargement would blur the frame's own
         // words), and only with its own pipeline: anything else presents it untouched.
         if compose.pq10.is_some() && (self.hdr_pipeline == vk::Pipeline::null() || (answer_width, answer_height) != (width, height)) {
@@ -1600,7 +1817,7 @@ impl GpuCompose {
                 }
                 Some(sources)
             }
-            ComposeInputs::Delayed { parity } => {
+            ComposeInputs::Delayed { parity, .. } => {
                 let frames = self.zc.frames.as_ref()?;
                 let kept = self.zc.delayed.as_ref().filter(|d| d.kept_proxy[parity])?;
                 if generation == 0 || (answer_width, answer_height) != (width, height) || frames.frame_bytes != bytes as u64 || kept.frame_bytes != bytes as u64
@@ -1646,7 +1863,7 @@ impl GpuCompose {
         }
         let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let delayed_original = match inputs {
-            ComposeInputs::Delayed { parity } => self.zc.delayed.as_ref().map(|d| (d.raw[parity].buffer, 0)),
+            ComposeInputs::Delayed { parity, .. } => self.zc.delayed.as_ref().map(|d| (d.raw[parity].buffer, 0)),
             _ => None,
         };
         let mut held_at_base = false;
@@ -1732,6 +1949,7 @@ impl GpuCompose {
                 update_src,
                 fresh_copy,
                 slot.timer.as_ref(),
+                srgb,
             );
         }
         if let Some(timer) = &slot.timer {
@@ -1742,8 +1960,34 @@ impl GpuCompose {
             return None;
         }
         let cmd = slot.slot.cmd;
-        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd)).signal_semaphores(std::slice::from_ref(&semaphore));
+        let mut submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd)).signal_semaphores(std::slice::from_ref(&semaphore));
+        // Gated: the other device's submission of this answer, imported, is what this submission waits for on the GPU.
+        // That signal is submitted already (the fd exists), so the present's wait on `semaphore` depends on nothing
+        // that is not (VUID-vkQueuePresentKHR-pWaitSemaphores-03268).
+        // Refused (or nothing to import into): the frame's answer is waited for here instead, and composed ungated
+        // only when it is in and fits; otherwise nothing is submitted and the caller shows the kept frame.
+        #[cfg(target_arch = "x86_64")]
+        let gate = match gate_fd.take() {
+            Some((fd, gate)) => match self.zc.paced.as_mut()?.take_gate(|sync| sync.compose[idx], Gate { fd: std::os::fd::IntoRawFd::into_raw_fd(fd), ..gate })
+            {
+                Gated::Wait(semaphore) => Some(semaphore),
+                Gated::Resolved(Some(true)) => None,
+                Gated::Resolved(_) => return None,
+            },
+            None => None,
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let gate: Option<vk::Semaphore> = None;
+        let (waits, stages) = ([gate.unwrap_or_default()], [vk::PipelineStageFlags::ALL_COMMANDS]);
+        if gate.is_some() {
+            submit = submit.wait_semaphores(&waits).wait_dst_stage_mask(&stages);
+        }
         if !slot.slot.submit(device, queue, submit) {
+            #[cfg(target_arch = "x86_64")]
+            if let (Some(semaphore), Some(p)) = (gate, self.zc.paced.as_mut()) {
+                // SAFETY: the submission that was to wait on it failed.
+                unsafe { p.renew(device, semaphore) };
+            }
             return None;
         }
         if let Some(timer) = slot.timer.as_mut() {
@@ -1773,6 +2017,10 @@ impl GpuCompose {
         let mut fences: Vec<Option<vk::Fence>> = self.async_slots.iter().map(|s| s.slot.armed_fence()).collect();
         if let Some(d) = &self.zc.delayed {
             fences.extend((0..3).map(|k| d.armed[k].then_some(d.fence[k])));
+        }
+        #[cfg(target_arch = "x86_64")]
+        if let Some(p) = &self.zc.paced {
+            fences.extend((0..2).map(|k| p.armed[k].then_some(p.fence[k])));
         }
         fences
     }
@@ -1924,10 +2172,13 @@ impl GpuCompose {
         parity: usize,
         with_proxy: bool,
         signal: bool,
+        proxy_from_image: bool,
     ) -> Option<Option<vk::Semaphore>> {
         let bytes = u64::from(width) * u64::from(height) * 4;
         let capture_target = self.zc.frames.as_ref().filter(|f| f.frame_bytes == bytes).map(|f| f.capture_target.buffer);
-        if with_proxy && capture_target.is_none() {
+        // `proxy_from_image` (the present that hands its frame to the relay): no capture ran; the proxy is the frame
+        // itself, copied off the image here, and [`Self::send_delayed`] sends it from the pair.
+        if with_proxy && !proxy_from_image && capture_target.is_none() {
             return None;
         }
         if !self.ensure_delayed(device, instance, physical_device, bytes) {
@@ -1992,7 +2243,9 @@ impl GpuCompose {
                         &[to_src],
                     );
                     device.cmd_copy_image_to_buffer(cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, raw, &[image_copy_region(width, height, 0)]);
-                    if let Some(target) = capture_target.filter(|_| with_proxy) {
+                    if with_proxy && proxy_from_image {
+                        device.cmd_copy_image_to_buffer(cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, base, &[image_copy_region(width, height, 0)]);
+                    } else if let Some(target) = capture_target.filter(|_| with_proxy) {
                         device.cmd_copy_buffer(cmd, target, base, &[vk::BufferCopy::default().size(bytes)]);
                     }
                     let back = image_barrier(
@@ -2137,6 +2390,11 @@ impl GpuCompose {
     /// Frees the delayed present's kept frames (it is no longer used: the model came back to this GPU), once nothing
     /// may still read them. `false` if a wait failed (they are kept).
     pub fn release_delayed(&mut self, device: &ash::Device) -> bool {
+        // The relay first: it waits on the sends' fences.
+        #[cfg(target_arch = "x86_64")]
+        if !self.release_paced(device) {
+            return false;
+        }
         if self.zc.delayed.is_none() {
             return true;
         }
@@ -2203,6 +2461,214 @@ impl GpuCompose {
         }
     }
 
+    /// The delayed present's relay (`super::pace`) over `port` (the channel's request side) and each pair's send,
+    /// made on first use. `false` when they cannot be made or the relay ended: the present then makes every wait
+    /// itself, for the life of this compose.
+    #[cfg(target_arch = "x86_64")]
+    pub fn ensure_paced(&mut self, device: &ash::Device, instance: &ash::Instance, port: impl FnOnce() -> Option<Box<dyn super::pace::Port>>) -> bool {
+        if self.zc.paced_dead {
+            return false;
+        }
+        if let Some(p) = &self.zc.paced {
+            if !p.pacer.ended() {
+                return true;
+            }
+            self.zc.paced_dead = true;
+            return false;
+        }
+        // SAFETY: plain creations on the live device, each destroyed below when the set is incomplete.
+        let made = unsafe {
+            let fences: Vec<vk::Fence> = (0..2).filter_map(|_| device.create_fence(&vk::FenceCreateInfo::default(), None).ok()).collect();
+            let cmds = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(2));
+            // SAFETY: the device outlives the relay (`release_paced` and `destroy` end it first), and so do the fences.
+            let pacer = match (fences.len(), &cmds) {
+                (2, Ok(_)) => port().and_then(|port| super::pace::Pacer::start(device.clone(), port)),
+                _ => None,
+            };
+            match (pacer, cmds) {
+                (Some(pacer), Ok(cmds)) => {
+                    // The semaphores for the other device's sync fds, where this device can import them.
+                    let sync = super::pace::has_semaphore_fd(device.handle())
+                        .then(|| {
+                            let made: Vec<vk::Semaphore> =
+                                (0..ASYNC_SLOTS + 2).filter_map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()).collect();
+                            if made.len() == ASYNC_SLOTS + 2 {
+                                Some(SyncFd {
+                                    api: ash::khr::external_semaphore_fd::Device::new(instance, device),
+                                    compose: std::array::from_fn(|k| made[k]),
+                                    send: [made[ASYNC_SLOTS], made[ASYNC_SLOTS + 1]],
+                                })
+                            } else {
+                                for s in made {
+                                    device.destroy_semaphore(s, None);
+                                }
+                                None
+                            }
+                        })
+                        .flatten();
+                    Some(Paced { cmd: [cmds[0], cmds[1]], fence: [fences[0], fences[1]], armed: [false; 2], pacer, sent: 0, sync, refused: false })
+                }
+                (_, cmds) => {
+                    for f in fences {
+                        device.destroy_fence(f, None);
+                    }
+                    if let Ok(c) = cmds {
+                        device.free_command_buffers(self.pool, &c);
+                    }
+                    None
+                }
+            }
+        };
+        self.zc.paced_dead = made.is_none();
+        self.zc.paced = made;
+        self.zc.paced.is_some()
+    }
+
+    /// Whether a compose and a send can wait on the GPU for the other device's sync fd (`ComposeInputs::Delayed`'s
+    /// `gate`, [`Self::send_delayed`]'s `after`): this device has `VK_KHR_external_semaphore_fd`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn can_gate(&self) -> bool {
+        self.zc.paced.as_ref().is_some_and(|p| p.sync.is_some() && !p.refused)
+    }
+
+    /// The delayed present's relay, once [`Self::ensure_paced`] made it.
+    #[cfg(target_arch = "x86_64")]
+    pub fn pacer(&self) -> Option<&super::pace::Pacer> {
+        self.zc.paced.as_ref().map(|p| &p.pacer)
+    }
+
+    /// Sends the frame kept in pair `parity` (with its proxy, [`Self::keep_delayed`]) to the other GPU: its proxy copied
+    /// into `proxy` (the proxy region on this device, `bytes` of it) on `queue`, behind the compose of the frame before
+    /// (which reads the answer region: the server may write it again once this copy is done). Nothing is waited for
+    /// here: the frame's number and the copy's fence go to the relay ([`super::pace::Token`]), which waits for the
+    /// fence and posts the request. The server must be done with the proxy region before the copy runs: the caller
+    /// knows the frame before is resolved, or gives `after`, the sync fd of the other device's submission of that
+    /// frame (consumed, whatever the outcome), which the copy then waits for on the GPU. `None` when nothing was
+    /// submitted.
+    #[cfg(target_arch = "x86_64")]
+    pub fn send_delayed(
+        &mut self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        parity: usize,
+        proxy: vk::Buffer,
+        bytes: u64,
+        after: Option<Gate>,
+    ) -> Option<(u64, vk::Fence)> {
+        let close = |gate: Option<Gate>| {
+            if let Some(gate) = gate {
+                // SAFETY: the caller's fd, handed over to this function and not used yet.
+                unsafe { libc::close(gate.fd) };
+            }
+        };
+        let Some(base) =
+            self.zc.delayed.as_ref().filter(|d| d.kept_proxy[parity] && d.frame_bytes == bytes).and_then(|d| d.base.as_ref()).map(|b| b[parity].buffer)
+        else {
+            close(after);
+            return None;
+        };
+        let Some(p) = self.zc.paced.as_mut() else {
+            close(after);
+            return None;
+        };
+        // The pair's last send is two frames old, and the relay is done with its fence (its frame was resolved).
+        if p.armed[parity] && !wait_armed(device, &[Some(p.fence[parity])], "gpu::send_delayed reuse") {
+            close(after);
+            return None;
+        }
+        p.armed[parity] = false;
+        let cmd = p.cmd[parity];
+        // SAFETY: the pair's last send was waited; the buffers are live; nothing else writes the proxy region now.
+        let recorded = unsafe {
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).is_ok()
+                && device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).is_ok()
+                && {
+                    let before = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[before],
+                        &[],
+                        &[],
+                    );
+                    device.cmd_copy_buffer(cmd, base, proxy, &[vk::BufferCopy::default().size(bytes)]);
+                    let to_host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &[to_host],
+                        &[],
+                        &[],
+                    );
+                    device.end_command_buffer(cmd).is_ok()
+                }
+        };
+        if !recorded {
+            close(after);
+            return None;
+        }
+        let mut submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        // Nothing to import into, or refused: the copy must not run under the server's read, so the frame before is
+        // waited for here; resolved, the server is done with the region (answered or given up).
+        let gate = match after {
+            Some(after) => match p.take_gate(|sync| sync.send[parity], after) {
+                Gated::Wait(semaphore) => Some(semaphore),
+                Gated::Resolved(Some(_)) => None,
+                Gated::Resolved(None) => return None,
+            },
+            None => None,
+        };
+        let (waits, stages) = ([gate.unwrap_or_default()], [vk::PipelineStageFlags::ALL_COMMANDS]);
+        if gate.is_some() {
+            submit = submit.wait_semaphores(&waits).wait_dst_stage_mask(&stages);
+        }
+        // SAFETY: the fence was waited and is reset here; the caller holds the queue (the present's).
+        let submitted = unsafe { device.reset_fences(&[p.fence[parity]]).and_then(|()| device.queue_submit(queue, &[submit], p.fence[parity])) };
+        if crate::note_vk(device.handle(), submitted).is_err() {
+            if let Some(semaphore) = gate {
+                // SAFETY: the submission that was to wait on it failed.
+                unsafe { p.renew(device, semaphore) };
+            }
+            return None;
+        }
+        p.armed[parity] = true;
+        p.sent += 1;
+        self.zc.last_queue = Some(queue);
+        Some((p.sent, p.fence[parity]))
+    }
+
+    /// Ends the relay and frees the sends: the relay first (the frame in its hand is resolved without an answer), then
+    /// every send is waited. `false` when a wait failed: nothing is freed (drain before free), and it is not used again.
+    #[cfg(target_arch = "x86_64")]
+    pub fn release_paced(&mut self, device: &ash::Device) -> bool {
+        let Some(p) = self.zc.paced.as_ref() else { return true };
+        p.pacer.stop();
+        if !wait_armed(device, &[p.armed[0].then_some(p.fence[0]), p.armed[1].then_some(p.fence[1])], "gpu::release_paced") {
+            self.zc.paced_dead = true;
+            return false;
+        }
+        if let Some(p) = self.zc.paced.take() {
+            // SAFETY: the relay ended and both sends were just waited.
+            unsafe {
+                p.destroy(device);
+                device.free_command_buffers(self.pool, &p.cmd);
+            }
+        }
+        true
+    }
+
+    /// Whether the frames this composes come from an `*_SRGB` swapchain: the capture's blit to a small proxy then
+    /// filters in linear light, and the ghost guard reduces the current frame the same way (`compose.comp`).
+    pub fn set_capture_srgb(&mut self, srgb: bool) {
+        self.capture_srgb = srgb;
+    }
+
     /// Whether `gen_*` hold this answer generation, so a zero-copy compose can present it again
     /// (a carried frame) with no CPU copy of the answer anywhere.
     pub fn holds_generation(&self, generation: u64) -> bool {
@@ -2264,6 +2730,12 @@ impl GpuCompose {
             }
             if let Some(d) = &self.zc.delayed {
                 d.destroy(device);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(p) = &self.zc.paced {
+                // The relay ends first (its thread waits on the sends' fences).
+                p.pacer.stop();
+                p.destroy(device);
             }
             // Freeing imported memory never unmaps it: the mapping is `ShmClient`'s.
             if let Some(a) = &self.zc.answer_import {
@@ -2412,7 +2884,13 @@ pub(crate) fn test_device_with_external_memory_host() -> Option<(ash::Entry, ash
     }
     let queue_family = 0;
     let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&[1.0])];
-    let extension_names = test_device_extensions(&instance, physical_device, surface, &[crate::EXTERNAL_MEMORY_HOST_EXTENSION]);
+    // With sync-fd semaphores where the driver has them (the delayed present's wait for the answer on the GPU).
+    let semaphore_fd = ash::khr::external_semaphore_fd::NAME;
+    let has_semaphore_fd = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == semaphore_fd));
+    let wanted: &[&'static std::ffi::CStr] =
+        if has_semaphore_fd { &[crate::EXTERNAL_MEMORY_HOST_EXTENSION, semaphore_fd] } else { &[crate::EXTERNAL_MEMORY_HOST_EXTENSION] };
+    let extension_names = test_device_extensions(&instance, physical_device, surface, wanted);
     let device_create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -2466,6 +2944,12 @@ mod tests {
         compose_once_ordered(width, height, current, proxy, answer, answer_dims, proxy_small, held, params, false)
     }
 
+    thread_local! {
+        /// Tests: the next [`compose_once_ordered`] on this thread composes as for an `*_SRGB` swapchain
+        /// ([`GpuCompose::set_capture_srgb`]).
+        static COMPOSE_SRGB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     /// [`compose_once_scaled`] with the frame's channel order: `bgr_order` for a `B8G8R8A8` swapchain.
     #[allow(clippy::too_many_arguments)]
     fn compose_once_ordered(
@@ -2485,6 +2969,7 @@ mod tests {
         let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
         let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
+        gpu.set_capture_srgb(COMPOSE_SRGB.with(std::cell::Cell::get));
         let target = make_target_image(&device, &mem_props, width, height);
         let staging = build_upload_staging(&device, &mem_props, current);
         let cmd = unsafe {
@@ -3375,6 +3860,301 @@ mod tests {
         }
     }
 
+    /// The parameters of a carried answer (the model interval's presents between two runs of the model): mode 2 with
+    /// the model's colour, the ghost guard as given.
+    fn carried_params(guard: f32) -> ComposeParams {
+        ComposeParams {
+            colour_strength: 1.0,
+            transfer_strength: 1.0,
+            max_ratio: 2.0,
+            ghost_guard: guard,
+            compare: Default::default(),
+            colour_trust: 2.0,
+            ratio_smooth: 1.0,
+            transfer: 0,
+            model_small: false,
+            white_point: 1.0,
+            debug_view: 0,
+            debug_scale: 1.0,
+            proxy_encoded: true,
+            reversible_mode: 0,
+            pq10: None,
+        }
+    }
+
+    /// A carried answer's colour (#63: model interval 2 left pink and orange edges on whatever moved): the model
+    /// turned a dark stroke at x=20..22 magenta. On a frame where the stroke has moved to x=40..42, the model's hue
+    /// at the old place would tint what is there now; with the ghost guard nothing of it stays, and what did not
+    /// move keeps the model's colour whole.
+    #[test]
+    fn ghost_guard_keeps_a_stale_colour_edit_off_what_moved() {
+        let (width, height) = (64u32, 32u32);
+        // A warm grey with a 3 px darker stroke: every pixel has some colour of its own for the model's hue to turn.
+        let frame = |stroke_x: u32| -> Vec<u8> {
+            (0..width * height).flat_map(|i| if (stroke_x..stroke_x + 3).contains(&(i % width)) { [70, 50, 40, 255] } else { [150, 120, 100, 255] }).collect()
+        };
+        let proxy = frame(20);
+        let mut answer = proxy.clone();
+        for px in answer.as_chunks_mut::<4>().0.iter_mut().enumerate().filter(|(i, _)| (20..23).contains(&(*i as u32 % width))).map(|(_, px)| px) {
+            px[..3].copy_from_slice(&[90, 30, 90]);
+        }
+        let Some(still) = compose_once(width, height, &proxy, &proxy, &answer, carried_params(1.0)) else {
+            eprintln!("ghost_guard colour test: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let unguarded_still = compose_once(width, height, &proxy, &proxy, &answer, carried_params(0.0)).unwrap();
+        assert_eq!(still, unguarded_still, "nothing moved: the guard changes nothing");
+        let at = |out: &[u8], x: u32| -> [i32; 3] {
+            let o = ((height / 2 * width + x) * 4) as usize;
+            [i32::from(out[o]), i32::from(out[o + 1]), i32::from(out[o + 2])]
+        };
+        let magenta = |c: [i32; 3]| (c[0] - c[1]) + (c[2] - c[1]);
+        assert!(magenta(at(&still, 21)) > 25, "the still stroke takes the model's magenta: {:?}", at(&still, 21));
+        let moved = frame(40);
+        let guarded = compose_once(width, height, &moved, &proxy, &answer, carried_params(1.0)).unwrap();
+        let unguarded = compose_once(width, height, &moved, &proxy, &answer, carried_params(0.0)).unwrap();
+        // The frame's own colour at the stroke's old place: red over green by 30, blue under it by 20.
+        eprintln!("moved: unguarded {:?}, guarded {:?}, the frame {:?}", at(&unguarded, 21), at(&guarded, 21), at(&moved, 21));
+        assert!(
+            magenta(at(&unguarded, 21)) > magenta(at(&moved, 21)) + 20,
+            "without the guard the old stroke's magenta lies on the new frame: {:?}",
+            at(&unguarded, 21)
+        );
+        let (now, own) = (at(&guarded, 21), at(&moved, 21));
+        assert!((0..3).all(|c| (now[c] - own[c]).abs() <= 4), "the guard keeps the stale colour off: {now:?} against the frame's {own:?}");
+        // And the stroke at its new place is the frame's own, not tinted by anything.
+        let (now, own) = (at(&guarded, 41), at(&moved, 41));
+        assert!((0..3).all(|c| (now[c] - own[c]).abs() <= 6), "the moved stroke keeps its colour: {now:?} against {own:?}");
+    }
+
+    /// A carried answer at a Model resolution below Full (#63: model interval 2 at half size): the proxy the guard
+    /// compares the frame with is the enlarged small one, softer than the frame at every edge. On a frame that did
+    /// not move the guard must not read that softness as motion: the composition is the one without the guard.
+    #[test]
+    fn ghost_guard_reads_no_motion_into_an_enlarged_proxy() {
+        let (width, height) = (64u32, 32u32);
+        let (sw, sh) = (width / 2, height / 2);
+        // Bars of 9 px, dark and bright, with a colour of their own: their edges fall inside the small proxy's pixels.
+        let shade = |x: u32| if (x / 9).is_multiple_of(2) { [60u8, 45, 40] } else { [190, 160, 150] };
+        let frame: Vec<u8> = (0..width * height)
+            .flat_map(|i| {
+                let c = shade(i % width);
+                [c[0], c[1], c[2], 255]
+            })
+            .collect();
+        // The half-size proxy and the model's answer: brighter, and greener.
+        let small: Vec<u8> = (0..sw * sh)
+            .flat_map(|i| {
+                let (a, b) = (shade(i % sw * 2), shade(i % sw * 2 + 1));
+                [
+                    ((u16::from(a[0]) + u16::from(b[0])) / 2) as u8,
+                    ((u16::from(a[1]) + u16::from(b[1])) / 2) as u8,
+                    ((u16::from(a[2]) + u16::from(b[2])) / 2) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let answer: Vec<u8> = small
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [(f32::from(p[0]) * 1.1) as u8, (f32::from(p[1]) * 1.45).min(255.0) as u8, (f32::from(p[2]) * 1.1) as u8, 255])
+            .collect();
+        let run = |guard: f32| compose_once_scaled(width, height, &frame, &frame, &answer, (sw, sh), Some(&small), None, carried_params(guard));
+        let Some(guarded) = run(1.0) else {
+            eprintln!("ghost_guard small-proxy test: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let unguarded = run(0.0).unwrap();
+        let worst = guarded.iter().zip(&unguarded).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+        assert!(worst <= 2, "a still frame at half size composes as without the guard; it differs by {worst} of 255");
+        let edited = unguarded.iter().zip(&frame).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+        assert!(edited > 20, "the answer edits the frame at all ({edited})");
+        // The bars moved on by their own width (dark where it was bright): there the guard still holds the answer's
+        // green off, at half size too.
+        let moved: Vec<u8> = (0..width * height)
+            .flat_map(|i| {
+                let c = shade(i % width + 9);
+                [c[0], c[1], c[2], 255]
+            })
+            .collect();
+        let green = |out: &[u8]| {
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(moved.as_chunks::<4>().0.iter())
+                .map(|(o, f)| (i32::from(o[1]) - i32::from(o[0])) - (i32::from(f[1]) - i32::from(f[0])))
+                .max()
+                .unwrap()
+        };
+        let guarded = compose_once_scaled(width, height, &moved, &moved, &answer, (sw, sh), Some(&small), None, carried_params(1.0)).unwrap();
+        let unguarded = compose_once_scaled(width, height, &moved, &moved, &answer, (sw, sh), Some(&small), None, carried_params(0.0)).unwrap();
+        assert!(green(&unguarded) > 15, "without the guard the old answer's green lies on the moved frame ({})", green(&unguarded));
+        assert!(green(&guarded) <= 5, "the guard keeps it off ({})", green(&guarded));
+    }
+
+    /// The small proxy of `frame` as the capture makes it: the frame reduced to `small` with a linear blit of its
+    /// stored values, then encoded (`encode::reference_encode_pixel`, white point 1, the soft knee).
+    fn reduced(frame: &[u8], (w, h): (u32, u32), (sw, sh): (u32, u32), srgb: bool) -> Vec<u8> {
+        // An `*_SRGB` image is filtered in linear light and stored encoded again; a UNORM one as it is stored.
+        let decode = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        let encode = |v: f32| if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+        let at = |x: i64, y: i64, c: usize| {
+            let v = f32::from(frame[((y.clamp(0, i64::from(h) - 1) as u32 * w + x.clamp(0, i64::from(w) - 1) as u32) * 4) as usize + c]);
+            if srgb {
+                decode(v / 255.0) * 255.0
+            } else {
+                v
+            }
+        };
+        let mut out = Vec::with_capacity((sw * sh * 4) as usize);
+        for j in 0..sh {
+            for i in 0..sw {
+                let (u, v) = ((i as f32 + 0.5) * w as f32 / sw as f32 - 0.5, (j as f32 + 0.5) * h as f32 / sh as f32 - 0.5);
+                let (x0, y0) = (u.floor(), v.floor());
+                let (a, b) = (u - x0, v - y0);
+                let (x0, y0) = (x0 as i64, y0 as i64);
+                let px: [u8; 3] = std::array::from_fn(|c| {
+                    let top = at(x0, y0, c) * (1.0 - a) + at(x0 + 1, y0, c) * a;
+                    let bottom = at(x0, y0 + 1, c) * (1.0 - a) + at(x0 + 1, y0 + 1, c) * a;
+                    let v = top * (1.0 - b) + bottom * b;
+                    (if srgb { encode(v / 255.0) * 255.0 } else { v }).round() as u8
+                });
+                out.extend_from_slice(&crate::composition::encode::reference_encode_pixel([px[0], px[1], px[2], 255], false, 1.0, 0));
+            }
+        }
+        out
+    }
+
+    /// The model's stand-in for the carried-frame tests: it turns what is bright in the small proxy magenta and
+    /// leaves the rest as it is, so its edit is tied to where things were.
+    fn magenta_where_bright(small: &[u8]) -> Vec<u8> {
+        small.as_chunks::<4>().0.iter().flat_map(|p| if p[1] > 120 { [p[0].saturating_add(40), p[1] - 45, p[2].saturating_add(40), 255] } else { *p }).collect()
+    }
+
+    /// The ghost guard at every Model resolution (#63, review S1): a still frame with what an enlarged proxy
+    /// softens most (one-pixel lines along both axes and both diagonals, corners, an edge between two colours of
+    /// one brightness) composes as it does without the guard, at a half, a third and a quarter of the frame, in
+    /// every transfer mode. The guard compares the frame as the proxy would hold it, so nothing of the enlargement
+    /// is left to read as motion.
+    #[test]
+    fn ghost_guard_reads_no_motion_into_a_still_frame_at_any_model_resolution() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                COMPOSE_SRGB.with(|s| s.set(false));
+            }
+        }
+        let (w, h) = (96u32, 48u32);
+        let frame: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                let bright = [235u8, 215, 200];
+                // One-pixel diagonals, a horizontal and a vertical line; a block (four corners).
+                let lines = x < 30 && (x == y || x + y == 29) || (y == 40 && x < 60) || (x == 70 && y < 30);
+                let block = (36..52).contains(&x) && (6..22).contains(&y);
+                let c = if lines || block {
+                    bright
+                } else if x >= 76 && y >= 30 {
+                    if x < 86 {
+                        [150, 60, 60]
+                    } else {
+                        [40, 100, 60]
+                    } // red against green, about one brightness
+                } else {
+                    [18, 16, 16]
+                };
+                [c[0], c[1], c[2], 255]
+            })
+            .collect();
+        // On a UNORM swapchain and on an `*_SRGB` one, whose capture reduces the frame in linear light: there a bright
+        // line on black comes out of the reduction brighter than the mean of its stored values, and a guard that mixed
+        // the stored values read that as motion.
+        for (divisor, srgb) in [(2u32, false), (3, false), (4, false), (2, true), (3, true), (4, true)] {
+            COMPOSE_SRGB.with(|s| s.set(srgb));
+            let _reset = Reset;
+            let small_size = (w / divisor, h / divisor);
+            let small = reduced(&frame, (w, h), small_size, srgb);
+            let answer = magenta_where_bright(&small);
+            for transfer in [0u32, 1, 2] {
+                let run = |guard: f32| {
+                    let params = ComposeParams { transfer, ..carried_params(guard) };
+                    compose_once_scaled(w, h, &frame, &frame, &answer, small_size, Some(&small), None, params)
+                };
+                let Some(guarded) = run(1.0) else {
+                    eprintln!("ghost_guard still-frame test: no Vulkan loader/ICD, skipping");
+                    return;
+                };
+                let unguarded = run(0.0).unwrap();
+                let worst = guarded.iter().zip(&unguarded).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+                assert!(worst <= 2, "1/{divisor} of the frame, sRGB {srgb}, transfer {transfer}: a still frame differs by {worst} of 255 with the guard");
+                let edited = unguarded.iter().zip(&frame).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+                assert!(edited > 15, "1/{divisor}, transfer {transfer}: the answer edits the frame at all ({edited})");
+            }
+        }
+    }
+
+    /// A pan over texture at a Model resolution below Full (#63, review S2): bright and dark patches of 6 px, moved
+    /// on by 2 px since the frame the model answered (less than the old test's reach, and inside the texture's own
+    /// range of values). The answer's magenta belongs to where the bright patches were. With the guard none of it
+    /// lies on what is dark now; without it, it does. At a half and a quarter of the frame.
+    #[test]
+    fn ghost_guard_keeps_a_stale_answer_off_texture_that_moved_a_little() {
+        let (w, h) = (96u32, 48u32);
+        let patch = |x: u32, y: u32| ((x / 6).wrapping_mul(2654435761) ^ (y / 6).wrapping_mul(40503)).wrapping_mul(2246822519) >> 16 & 1 == 1;
+        let texture = |shift: u32| -> Vec<u8> {
+            (0..w * h).flat_map(|i| if patch(i % w + shift, i / w + shift) { [190u8, 165, 150, 255] } else { [105, 80, 60, 255] }).collect()
+        };
+        let (old, now) = (texture(0), texture(2));
+        for divisor in [2u32, 4] {
+            let small_size = (w / divisor, h / divisor);
+            let small = reduced(&old, (w, h), small_size, false);
+            let answer = magenta_where_bright(&small);
+            let run = |guard: f32| compose_once_scaled(w, h, &now, &now, &answer, small_size, Some(&small), None, carried_params(guard));
+            let Some(guarded) = run(1.0) else {
+                eprintln!("ghost_guard texture test: no Vulkan loader/ICD, skipping");
+                return;
+            };
+            let unguarded = run(0.0).unwrap();
+            // Magenta over the frame's own colour, on pixels that are dark now and well inside a dark patch.
+            let inside_dark = |x: u32, y: u32| (0..3).all(|d| !patch(x + 2 + d - 1, y + 2) && !patch(x + 2, y + 2 + d - 1)) && !patch(x + 2, y + 2);
+            let excess = |out: &[u8]| -> (i32, usize) {
+                let mut worst = 0;
+                let mut n = 0;
+                for y in 1..h - 1 {
+                    for x in 1..w - 1 {
+                        if !inside_dark(x, y) {
+                            continue;
+                        }
+                        let o = ((y * w + x) * 4) as usize;
+                        let m = |p: &[u8]| (i32::from(p[0]) - i32::from(p[1])) + (i32::from(p[2]) - i32::from(p[1]));
+                        let e = m(&out[o..o + 3]) - m(&now[o..o + 3]);
+                        worst = worst.max(e);
+                        n += 1;
+                    }
+                }
+                (worst, n)
+            };
+            let ((with, n), (without, _)) = (excess(&guarded), excess(&unguarded));
+            eprintln!("texture moved 2 px, 1/{divisor} of the frame: stale magenta on {n} dark pixels: {without} of 255 without the guard, {with} with it");
+            assert!(n > 100, "the texture has dark pixels to look at ({n})");
+            assert!(without >= 12, "1/{divisor}: without the guard the old patches' magenta lies on what is dark now ({without})");
+            // The guard compares the small proxy's own texels, every one of them two each way around the pixel at
+            // these sizes, so a strip two pixels wide is never between two taps.
+            assert!(with <= 4, "1/{divisor}: the guard keeps it off ({with} of 255)");
+            let total = |out: &[u8]| -> i64 {
+                let m = |p: &[u8]| (i64::from(p[0]) - i64::from(p[1])) + (i64::from(p[2]) - i64::from(p[1]));
+                (0..w * h)
+                    .filter(|i| inside_dark(i % w, i / w) && i % w > 0 && i / w > 0 && i % w < w - 1 && i / w < h - 1)
+                    .map(|i| (m(&out[(i * 4) as usize..]) - m(&now[(i * 4) as usize..])).max(0))
+                    .sum()
+            };
+            let (sum_with, sum_without) = (total(&guarded), total(&unguarded));
+            eprintln!("  summed over them: {sum_without} without the guard, {sum_with} with it");
+            assert!(sum_with * 20 <= sum_without, "1/{divisor}: nineteen twentieths of the stale colour is gone ({sum_with} against {sum_without})");
+        }
+    }
+
     /// Mode 2, on a real (lavapipe) device: the model brightened a dark stroke at x=20..22 of
     /// the frame it was shown. When the current frame has moved on (the stroke is now at
     /// x=40..42), the per-pixel ratio would lay a pale copy of the old stroke at x=21 --
@@ -3949,15 +4729,15 @@ mod tests {
         let frame_b: Vec<u8> = current.chunks(4).flat_map(|p| [p[0].wrapping_add(90), p[1].wrapping_add(60), p[2].wrapping_add(30), 255]).collect();
         upload(&base, false);
         upload(&current, true);
-        assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false).is_some());
+        assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, false).is_some());
         upload(&vec![9u8; frame_bytes as usize], false);
         upload(&frame_b, true);
         unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
-        let delayed = present(&mut gpu, ComposeInputs::Delayed { parity: 1 }, 3).expect("the delayed present composes");
+        let delayed = present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: None }, 3).expect("the delayed present composes");
         assert_eq!(delayed, expected, "the delayed present composes the kept frame and proxy, not the live ones");
         let on_b = compose_once(width, height, &frame_b, &base, &answer, params).expect("the CPU reference composes");
         assert_ne!(delayed, on_b, "the live frame must not be what the answer composes onto");
-        assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0 }, 4).is_none(), "a pair never kept is refused");
+        assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0, gate: None }, 4).is_none(), "a pair never kept is refused");
         // A kept frame with no answer is shown as it was, in its turn (the live image is frame B; the read-back above
         // left the image in TRANSFER_SRC_OPTIMAL, and the upload puts it back in PRESENT_SRC_KHR, as a present would).
         upload(&frame_b, true);
@@ -3978,9 +4758,157 @@ mod tests {
         let shown = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
         assert_eq!(shown, current, "the kept frame A replaces the live frame B, untouched");
         assert!(gpu.show_kept(&device, queue, target.image, width, height, 0).is_none(), "nothing kept in pair 0");
+
+        // With the relay (`super::pace`): the frame is kept with its proxy copied off the image, sent from the pair
+        // behind whatever the queue holds, and the relay posts its request once that copy is done. The answer then
+        // composes exactly as on the present's own waits, where the proxy is the frame.
+        {
+            use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+            use std::sync::Arc;
+            #[derive(Default)]
+            struct Fake {
+                begun: AtomicU32,
+                good: AtomicBool,
+            }
+            impl super::super::pace::Port for Arc<Fake> {
+                fn begin(&self) -> Option<u32> {
+                    Some(self.begun.fetch_add(1, Ordering::SeqCst) + 1)
+                }
+                fn answered(&self, _req: u32) -> bool {
+                    true
+                }
+                fn fits(&self, _req: u32, _proxy: (u32, u32), _pq10: bool) -> bool {
+                    self.good.load(Ordering::SeqCst)
+                }
+                fn quit(&self) -> bool {
+                    false
+                }
+                fn publish_white(&self, _reading: f32) {}
+            }
+            let fake = Arc::new(Fake::default());
+            let port = fake.clone();
+            // On a device with sync-fd semaphores the compose and the send can wait for the other device on the GPU.
+            let other = super::super::pace::test_support::OtherDevice::open();
+            super::super::pace::note_semaphore_fd(device.handle(), other.is_some());
+            assert!(gpu.ensure_paced(&device, &instance, || Some(Box::new(port))));
+            assert!(gpu.ensure_paced(&device, &instance, || None), "made once");
+            assert_eq!(gpu.can_gate(), other.is_some());
+            // The proxy region's stand-in on this device: host-visible, so the test can read what was sent.
+            let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let (sent_buffer, sent_memory, sent_ptr) = unsafe {
+                let info = vk::BufferCreateInfo::default().size(frame_bytes).usage(vk::BufferUsageFlags::TRANSFER_DST);
+                let buffer = device.create_buffer(&info, None).unwrap();
+                let reqs = device.get_buffer_memory_requirements(buffer);
+                let kind = find_memory_type(&mem_props, reqs.memory_type_bits, host).expect("host-visible memory");
+                let memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(kind), None).unwrap();
+                device.bind_buffer_memory(buffer, memory, 0).unwrap();
+                (buffer, memory, device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()).unwrap().cast::<u8>())
+            };
+            let composed = compose_once(width, height, &current, &current, &answer, params).expect("the CPU reference composes");
+            for (round, good) in [true, false].into_iter().enumerate() {
+                fake.good.store(good, Ordering::SeqCst);
+                upload(&current, true);
+                assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, true).is_some());
+                let (number, copied) = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes, None).expect("the frame is sent");
+                assert_eq!(number, round as u64 + 1);
+                let pacer = gpu.pacer().expect("made");
+                assert!(pacer.post(super::super::pace::Token {
+                    number,
+                    copied,
+                    proxy: (width, height),
+                    pq10: false,
+                    dims: (width, height),
+                    budget: std::time::Duration::from_secs(30),
+                    posted: std::time::Instant::now(),
+                    judged: false,
+                    meter: None,
+                }));
+                assert_eq!(pacer.wait_resolved(number, std::time::Instant::now() + std::time::Duration::from_secs(30)), Some(good));
+                // The request was posted after the copy: the region holds the frame.
+                assert_eq!(unsafe { std::slice::from_raw_parts(sent_ptr, frame_bytes as usize) }, &current[..], "the proxy sent is the kept frame");
+                // The next present: the live image is frame B, and A's answer composes onto A.
+                upload(&frame_b, true);
+                unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
+                let shown = present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: None }, 10 + number).expect("the delayed present composes");
+                assert_eq!(shown, composed, "the answer composes onto the kept frame, whose proxy is the frame itself");
+            }
+            assert_eq!(fake.begun.load(Ordering::SeqCst), 2, "one request a frame");
+            // The answer waited for on the GPU: the other device's submission of the frame, as a sync fd, gates the
+            // compose and the next frame's send. The compose is the same compose.
+            if let Some(other) = other {
+                use std::os::fd::IntoRawFd;
+                for round in 0..3u64 {
+                    upload(&current, true);
+                    assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, true).is_some());
+                    upload(&frame_b, true);
+                    unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
+                    let (gate, after) = (other.submit(), other.submit());
+                    let gate = Gate { fd: gate.into_raw_fd(), token: 0, until: std::time::Instant::now() };
+                    let shown = present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: Some(gate) }, 20 + round).expect("the gated compose is submitted");
+                    assert_eq!(shown, composed, "the gated compose is the same compose");
+                    let after = Gate { fd: after.into_raw_fd(), token: 0, until: std::time::Instant::now() };
+                    let sent = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes, Some(after)).expect("the gated send is submitted");
+                    unsafe { device.wait_for_fences(&[sent.1], true, 30_000_000_000) }.expect("the send ran once the other device's work was done");
+                }
+                // An import the driver refuses: the compose waits for the relay's resolution of the frame instead and
+                // composes the good answer ungated, and nothing waits on the GPU on this compose again (the send after
+                // it, and the next frame, wait here: their frame before is resolved).
+                assert!(gpu.can_gate());
+                fake.good.store(true, Ordering::SeqCst);
+                let post = |gpu: &GpuCompose, (number, copied): (u64, vk::Fence)| {
+                    assert!(gpu.pacer().expect("made").post(super::super::pace::Token {
+                        number,
+                        copied,
+                        proxy: (width, height),
+                        pq10: false,
+                        dims: (width, height),
+                        budget: std::time::Duration::from_secs(30),
+                        posted: std::time::Instant::now(),
+                        judged: false,
+                        meter: None,
+                    }));
+                    number
+                };
+                upload(&current, true);
+                assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, true).is_some());
+                let sent = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes, None).expect("the frame is sent");
+                let mut number = post(&gpu, sent);
+                for round in 0..2u64 {
+                    upload(&frame_b, true);
+                    unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
+                    REFUSE_IMPORTS.with(|r| r.set(1));
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    let gate = Gate { fd: other.submit().into_raw_fd(), token: number, until };
+                    let shown = present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: Some(gate) }, 40 + round)
+                        .expect("a refused import composes the answer once the relay has it");
+                    assert_eq!(shown, composed, "the same compose, ungated");
+                    assert!(!gpu.can_gate(), "no wait on the GPU after a refused import");
+                    assert_eq!(REFUSE_IMPORTS.with(std::cell::Cell::get), u32::from(round == 1), "the first refusal ends the imports");
+                    REFUSE_IMPORTS.with(|r| r.set(0));
+                    // The next frame, kept and sent behind that compose, ungated.
+                    upload(&current, true);
+                    assert!(gpu.keep_delayed(&device, &instance, physical_device, queue, target.image, width, height, 1, true, false, true).is_some());
+                    let after = Gate { fd: other.submit().into_raw_fd(), token: number, until };
+                    let sent = gpu.send_delayed(&device, queue, 1, sent_buffer, frame_bytes, Some(after)).expect("the send goes ungated");
+                    number = post(&gpu, sent);
+                }
+                assert_eq!(gpu.pacer().expect("made").wait_resolved(number, std::time::Instant::now() + std::time::Duration::from_secs(30)), Some(true));
+                // A pair that was never kept: the fd is consumed all the same (nothing is left open or imported).
+                let gate = Gate { fd: other.submit().into_raw_fd(), token: 0, until: std::time::Instant::now() };
+                assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 0, gate: Some(gate) }, 30).is_none());
+                assert!(gpu.wait_in_flight(&device));
+                other.close();
+            }
+            super::super::pace::note_semaphore_fd(device.handle(), false);
+            assert!(gpu.release_paced(&device) && gpu.pacer().is_none());
+            unsafe {
+                device.destroy_buffer(sent_buffer, None);
+                device.free_memory(sent_memory, None);
+            }
+        }
         assert!(gpu.wait_in_flight(&device));
         assert!(gpu.release_delayed(&device));
-        assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 1 }, 5).is_none(), "released pairs are gone");
+        assert!(present(&mut gpu, ComposeInputs::Delayed { parity: 1, gate: None }, 5).is_none(), "released pairs are gone");
 
         unsafe {
             device.device_wait_idle().unwrap();

@@ -198,11 +198,11 @@ pub(crate) fn state() -> State {
 
 /// Whether the Status tab's line is the offload's ([`status_line`]) in `state`: while it starts, stalled or was given
 /// up; and while it runs, only when the offload is what runs the model: the finished-frame server serving with every
-/// pass at the placement `present` (`finished`), or the hold before DLSS sending its frames (`before_dlss`). When the
+/// pass at the placement `present` (`finished`), or a hold (before DLSS or after its output) sending its frames (`hold`). When the
 /// placement left the finished frame and nothing is offloaded, the native backend's line has the channel.
-pub(crate) fn shows_line(state: &State, finished: bool, before_dlss: bool) -> bool {
+pub(crate) fn shows_line(state: &State, finished: bool, hold: bool) -> bool {
     match state {
-        State::Active(_) => finished || before_dlss,
+        State::Active(_) => finished || hold,
         _ => true,
     }
 }
@@ -212,11 +212,29 @@ pub(crate) fn status_line() -> Option<String> {
     match state() {
         State::Off => None,
         State::Starting(gpu) => Some(format!("second GPU: starting on {gpu}")),
-        State::Active(gpu) if super::offload_pre::serving_pre() => Some(super::offload_pre::status_line(&gpu)),
+        State::Active(gpu) if super::offload_pre::serving_hold() => {
+            let serving = super::offload_pre::serving();
+            // The game waits for the other GPU: the trial measures before it tries the game's GPU (`offload_trial`).
+            Some(match super::offload_trial::pending_note() {
+                Some(note) => line_with_note(&gpu, serving, note),
+                None => super::offload_pre::status_line(&gpu, serving),
+            })
+        }
         State::Active(gpu) => Some(format!("second GPU: the model runs on {gpu}, each frame shown one frame later")),
         State::Stalled(gpu) => Some(format!("second GPU: stalled: a frame on {gpu} did not finish; waiting for it, the frames go out without the model")),
         State::FellBack(why) => Some(format!("second GPU: given up ({why}); the model runs on the game's GPU")),
     }
+}
+
+/// The hold's line on `gpu` with the trial's pending `note` after it. The channel keeps `REASON_BYTES - 1` bytes of the
+/// line: where the GPU's full description (name, IDs, PCI address, driver) would cut the note, the GPU goes by its name.
+pub(crate) fn line_with_note(gpu: &str, serving: super::offload_pre::Serving, note: &str) -> String {
+    let full = format!("{}; {note}", super::offload_pre::status_line(gpu, serving));
+    if full.len() < neural_forge_protocol::REASON_BYTES {
+        return full;
+    }
+    let name = gpu.split_once(" [").map_or(gpu, |(name, _)| name);
+    format!("{}; {note}", super::offload_pre::status_line(name, serving))
 }
 
 /// Whether frames are offloaded now: the server on the other device is serving. The present delays every frame by
@@ -469,6 +487,13 @@ pub(crate) struct Offload {
     pub name: String,
     /// For the log when the server starts on it: which GPU, the game's, and how the frame crosses.
     pub plan: String,
+    /// The next layer's `vkGetDeviceProcAddr` for it.
+    pub gdpa: vk::PFN_vkGetDeviceProcAddr,
+    /// The queue (family, index) made for a swapchain of its own (`crate::gpu2_present`); `None` where the GPU has no
+    /// `VK_KHR_swapchain` or no graphics queue to spare.
+    pub present: Option<(u32, u32)>,
+    /// `VK_EXT_hdr_metadata` is enabled on it (with [`Self::present`]).
+    pub hdr_metadata: bool,
     destroy: PfnLayerDestroyDevice,
     _registration: crate::loader_data::Registration,
 }
@@ -480,6 +505,17 @@ fn family(families: &[vk::QueueFamilyProperties], wanted: u32) -> Option<u32> {
     let pick =
         |no_graphics: bool| (0..families.len()).find(|&i| fits(&families[i]) && (!no_graphics || !families[i].queue_flags.contains(vk::QueueFlags::GRAPHICS)));
     pick(true).or_else(|| pick(false)).map(|i| i as u32)
+}
+
+/// The queue (family, index) for a swapchain on the offload device: the first graphics family's first queue, or,
+/// where that is the network's family (`family`, which takes `taken` queues), the next one of it if it has one.
+fn present_queue(families: &[vk::QueueFamilyProperties], family: u32, taken: u32) -> Option<(u32, u32)> {
+    let g = families.iter().position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS) && f.queue_count > 0)? as u32;
+    if g != family {
+        Some((g, 0))
+    } else {
+        (families[g as usize].queue_count > taken).then_some((g, taken))
+    }
 }
 
 impl Offload {
@@ -519,13 +555,37 @@ impl Offload {
         let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
         let queues_wanted = if run_network { 2 } else { 1 };
         let family = family(&families, queues_wanted).ok_or_else(|| format!("{} has no compute family with {queues_wanted} queue(s)", described[k].name))?;
-        let priorities = [1.0f32; 2];
-        let queue = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities[..queues_wanted as usize])];
         // SAFETY: as above.
         let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
         let offers = |name: &CStr| extensions.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == name);
+        // The second GPU may show the frames itself (`crate::gpu2_present`): a queue of a graphics family for its
+        // swapchain and the finished-frame path, where the GPU has `VK_KHR_swapchain`. Whether that queue presents to
+        // the game's surface is asked when the game creates its swapchain.
+        let present = present_queue(&families, family, queues_wanted).filter(|_| offers(ash::khr::swapchain::NAME));
+        let priorities = [1.0f32; 3];
+        let mut queue = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities[..queues_wanted as usize])];
+        match present {
+            Some((f, index)) if f == family => queue[0] = queue[0].queue_priorities(&priorities[..=index as usize]),
+            Some((f, _)) => queue.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&priorities[..1])),
+            None => {}
+        }
         let host = offers(crate::EXTERNAL_MEMORY_HOST_EXTENSION);
-        let names: Vec<*const c_char> = if host { vec![crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()] } else { Vec::new() };
+        // Sync-fd semaphores, where the GPU can export them (asked of the driver) and the GPU wait is chosen
+        // (`NEURAL_FORGE_OFFLOAD_PACING=gpu`): each frame's submission is exported for the game's present to wait on
+        // (`composition::pace`).
+        // SAFETY: a physical device of this 1.3 instance.
+        let semaphore_fd = crate::composition::pace::gpu_wait_wanted() && unsafe { crate::composition::pace::sync_fd_capable(instance, physical, true) };
+        let mut names: Vec<*const c_char> = if host { vec![crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()] } else { Vec::new() };
+        if semaphore_fd {
+            names.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
+        }
+        let hdr_metadata = present.is_some() && offers(ash::ext::hdr_metadata::NAME);
+        if present.is_some() {
+            names.push(ash::khr::swapchain::NAME.as_ptr());
+        }
+        if hdr_metadata {
+            names.push(ash::ext::hdr_metadata::NAME.as_ptr());
+        }
         let base = vk::DeviceCreateInfo::default().queue_create_infos(&queue).enabled_extension_names(&names);
         // The network's extensions and features on top (they outlive the call).
         let extension = if run_network {
@@ -563,6 +623,7 @@ impl Offload {
         // loader made).
         let registration = unsafe { crate::loader_data::register(device, game_info) };
         crate::note_secondary_device(device, true);
+        crate::composition::pace::note_semaphore_fd(device, semaphore_fd);
         let setup = Setup {
             gipa: game.gipa,
             instance: game.instance,
@@ -577,7 +638,7 @@ impl Offload {
             bda_ext: false,
         };
         let name = described[k].line();
-        crate::log!("[offload] a device made on GPU {k} ({name}) for the model on the finished frame: used once Placement is Finished frame");
+        crate::log!("[offload] a device made on GPU {k} ({name}) for the model: used by the placement that runs it (the finished frame, or the holds before and after DLSS), also after Placement changes while the game runs");
         crate::logging::flush();
         let plan = format!(
             "the network runs on GPU {k}: {name}{}; the game's GPU: {}; queue family {family}; the frame crosses system memory: {} on the other GPU, host copies on the game's",
@@ -593,6 +654,9 @@ impl Offload {
             standin: !run_network,
             name,
             plan,
+            gdpa,
+            present,
+            hdr_metadata,
             destroy: callbacks.destroy,
             _registration: registration,
         })
@@ -607,7 +671,71 @@ impl Offload {
         // SAFETY: as the contract; the loader's callback with the device's own vkDestroyDevice.
         unsafe { (self.destroy)(self.device.handle(), std::ptr::null(), destroy_device) };
         crate::note_secondary_device(self.device.handle(), false);
+        crate::composition::pace::note_semaphore_fd(self.device.handle(), false);
     }
+}
+
+/// The real GPUs (not CPU renderers such as llvmpipe) of the instance the game last created a device on, and their
+/// names, kept inside that `vkCreateDevice` (the loader's lock held) with the instance's handle: `gpu2_present` asks
+/// them which may present to a window without enumerating outside that lock, and only for the same instance (a probe
+/// instance made first, by the game or DXVK/vkd3d, is gone by then; its handles must never reach another).
+static GPUS: Mutex<Vec<KnownGpus>> = Mutex::new(Vec::new());
+
+/// [`GPUS`]: an instance's handle and its real GPUs.
+pub(crate) type KnownGpus = (vk::Instance, Vec<(vk::PhysicalDevice, String)>);
+
+/// Keeps [`GPUS`] for `instance`, at every device the game creates (devices are few; the list follows the instance).
+///
+/// # Safety
+/// `instance` is the game's live instance.
+unsafe fn note_gpus(instance: &ash::Instance) {
+    // Only the second GPU's modes ask (present2 needs `NEURAL_FORGE_OFFLOAD_GPU` too).
+    if Choice::current() == Choice::Off {
+        return;
+    }
+    // SAFETY: the game's live instance and its own physical devices.
+    let Ok(physicals) = (unsafe { instance.enumerate_physical_devices() }) else { return };
+    let list = physicals
+        .into_iter()
+        .filter_map(|p| {
+            // SAFETY: as above.
+            let props = unsafe { instance.get_physical_device_properties(p) };
+            real_gpu(props.device_type).then(|| (p, props.device_name_as_c_str().map_or_else(|_| "a GPU".into(), |n| n.to_string_lossy().into_owned())))
+        })
+        .collect();
+    keep_gpus(&mut GPUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner), instance.handle(), list);
+}
+
+/// [`note_gpus`] on `known`: `instance`'s list, beside the other live instances' (a probe instance never evicts the
+/// game's).
+pub(crate) fn keep_gpus(known: &mut Vec<KnownGpus>, instance: vk::Instance, list: Vec<(vk::PhysicalDevice, String)>) {
+    known.retain(|(i, _)| *i != instance);
+    known.push((instance, list));
+}
+
+/// The real GPUs `known` holds for `instance` ([`GPUS`]); none for another instance.
+pub(crate) fn gpus_of(known: &[KnownGpus], instance: vk::Instance) -> Vec<(vk::PhysicalDevice, String)> {
+    known.iter().find(|(i, _)| *i == instance).map(|(_, l)| l.clone()).unwrap_or_default()
+}
+
+/// [`forget_gpus`] on `known`.
+pub(crate) fn drop_gpus(known: &mut Vec<KnownGpus>, instance: vk::Instance) {
+    known.retain(|(i, _)| *i != instance);
+}
+
+/// The instance is destroyed: its GPUs are forgotten (a later instance may get its handle).
+pub(crate) fn forget_gpus(instance: vk::Instance) {
+    drop_gpus(&mut GPUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner), instance);
+}
+
+/// Whether a device of this type is a GPU (a CPU renderer is not).
+pub(crate) fn real_gpu(kind: vk::PhysicalDeviceType) -> bool {
+    kind != vk::PhysicalDeviceType::CPU
+}
+
+/// The real GPUs of `instance` ([`GPUS`]).
+pub(crate) fn gpus(instance: vk::Instance) -> Vec<(vk::PhysicalDevice, String)> {
+    gpus_of(&GPUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner), instance)
 }
 
 /// The GPUs of the instance, in the log once per process (where there is more than one): the indices and IDs
@@ -616,6 +744,8 @@ impl Offload {
 /// # Safety
 /// `game` is a physical device of `instance`; `core2` only where the instance has Vulkan 1.1.
 pub(crate) unsafe fn log_gpus(instance: &ash::Instance, game: vk::PhysicalDevice, core2: bool) {
+    // SAFETY: as the contract.
+    unsafe { note_gpus(instance) };
     static SAID: AtomicBool = AtomicBool::new(false);
     if SAID.load(Ordering::Relaxed) {
         return;
@@ -647,6 +777,25 @@ struct Made {
     game: vk::Device,
     offload: Option<Result<Offload, String>>,
     busy: bool,
+    /// The finished frame's server has the device ([`take_for_finished`]), not a hold's runner.
+    finished: bool,
+    /// A hold asked the finished frame's server to let the device go ([`ask_back`]): the placement left the finished
+    /// frame while the game ran.
+    wanted: bool,
+    /// The finished frame's server gave the device back because a hold asked ([`moved_to_hold`]): its end is the
+    /// placement's change, no failure of the server's.
+    moved: bool,
+}
+
+/// Who has the offload device made with a game's device ([`holder`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Holder {
+    /// Nobody: it waits to be taken, or none was made.
+    Free,
+    /// The finished frame's server (`native_post`).
+    Finished,
+    /// The holds' runners (before DLSS, after its output: `offload_server`).
+    Holds,
 }
 
 // SAFETY: the handles and function pointers inside are plain values; the device is used by one thread at a time (the
@@ -666,6 +815,8 @@ pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk:
     let choice = Choice::current();
     // Given up for the process, or a frame on an offload device never finished (the model is off for the session):
     // no more devices for it.
+    // A trial that kept the held placements on the game's GPU (`offload_trial::keeps_local`) does not stop this on
+    // purpose: the finished-frame placement may still ask for the offload device.
     if choice == Choice::Off || given_up() || matches!(state(), State::Stalled(_)) {
         return;
     }
@@ -677,19 +828,34 @@ pub(crate) unsafe fn make_for(instance: &ash::Instance, game: Setup, device: vk:
     }
     let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     all.retain(|m| m.game != device);
-    all.push(Made { game: device, offload: Some(made), busy: false });
+    all.push(Made { game: device, offload: Some(made), busy: false, finished: false, wanted: false, moved: false });
 }
 
 /// The offload device made with `game` ([`make_for`]), for the server to run on; `None` when none was asked for, the
 /// error when it could not be made. Given back with [`give_back`].
 pub(crate) fn take(game: vk::Device) -> Option<Result<Offload, String>> {
     let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let m = all.iter_mut().find(|m| m.game == game)?;
+    take_from(all.iter_mut().find(|m| m.game == game)?, false)
+}
+
+/// [`take`] from `m`, under the registry's lock; `finished`: for the finished frame's server ([`take_for_finished`]),
+/// noted with the take. A device that could not be made stays as its error (why, for whoever asks next): only a
+/// made device leaves the entry, so [`holder`] never reads an error once taken as a device in someone's hands.
+fn take_from(m: &mut Made, finished: bool) -> Option<Result<Offload, String>> {
     if m.busy {
         // A frame on it never finished: it is not handed out again (and never destroyed).
         return Some(Err("a frame on the other GPU never finished: its device is not used again this session".into()));
     }
-    m.offload.take()
+    if let Some(Err(why)) = &m.offload {
+        return Some(Err(why.clone()));
+    }
+    let taken = m.offload.take();
+    if taken.is_some() {
+        m.finished = finished;
+        m.wanted = false;
+        m.moved = false;
+    }
+    taken
 }
 
 /// Whether a frame on the offload device made with `game` never finished ([`give_back`] with `busy`): for the life
@@ -706,9 +872,68 @@ pub(crate) fn give_back(game: vk::Device, offload: Offload, busy: bool) {
         Some(m) => {
             m.offload = Some(Ok(offload));
             m.busy |= busy;
+            // Given back by the finished frame's server because a hold asked for it: said to the present, which
+            // finds that server ended ([`moved_to_hold`]).
+            m.moved = m.finished && m.wanted;
+            m.finished = false;
+            m.wanted = false;
         }
-        None => all.push(Made { game, offload: Some(Ok(offload)), busy }),
+        None => all.push(Made { game, offload: Some(Ok(offload)), busy, finished: false, wanted: false, moved: false }),
     }
+}
+
+/// [`take`] for the finished frame's server: noted as its holder, so that a hold that needs the device after a
+/// change of Placement while the game runs can ask for it ([`ask_back`]) instead of finding nothing and giving the
+/// second GPU up for the session (#63: Finished frame to Before DLSS in a running game put the model on the game's
+/// GPU).
+pub(crate) fn take_for_finished(game: vk::Device) -> Option<Result<Offload, String>> {
+    let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    take_from(all.iter_mut().find(|m| m.game == game)?, true)
+}
+
+/// Whether the finished frame's server last gave `game`'s device back because a hold asked for it ([`ask_back`]):
+/// the present, finding that server ended, counts no failure and waits for no retry.
+pub(crate) fn moved_to_hold(game: vk::Device) -> bool {
+    MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|m| m.game == game && m.moved)
+}
+
+/// Who has the offload device made with `game`.
+pub(crate) fn holder(game: vk::Device) -> Holder {
+    let all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match all.iter().find(|m| m.game == game) {
+        Some(m) if m.offload.is_none() && m.finished => Holder::Finished,
+        Some(m) if m.offload.is_none() && !m.busy => Holder::Holds,
+        _ => Holder::Free,
+    }
+}
+
+/// A hold of `game` needs the device the finished frame's server has: that server ends at its next look
+/// ([`asked_back`]) and gives it back. Whether it was asked now (the first time).
+pub(crate) fn ask_back(game: vk::Device) -> bool {
+    let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match all.iter_mut().find(|m| m.game == game && m.offload.is_none() && m.finished) {
+        Some(m) => !std::mem::replace(&mut m.wanted, true),
+        None => false,
+    }
+}
+
+/// Whether a hold asked for the device the finished frame's server has ([`ask_back`]).
+pub(crate) fn asked_back(game: vk::Device) -> bool {
+    MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|m| m.game == game && m.finished && m.wanted)
+}
+
+/// Tests: an entry for `game` whose device could not be made (`why`), to be taken like a made one.
+#[cfg(test)]
+pub(crate) fn made_for_test(game: vk::Device, why: &str) {
+    let mut all = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    all.retain(|m| m.game != game);
+    all.push(Made { game, offload: Some(Err(why.into())), busy: false, finished: false, wanted: false, moved: false });
+}
+
+/// Tests: forgets `game`'s entry.
+#[cfg(test)]
+pub(crate) fn forget_for_test(game: vk::Device) {
+    MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|m| m.game != game);
 }
 
 /// Called inside the game's `vkDestroyDevice` for `game` (the loader's lock held), once its server was joined:
@@ -773,7 +998,7 @@ pub(crate) fn note_present() {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_multiple_of(600) {
-        crate::log!("[offload] {}", STATS.summary());
+        crate::log!("[offload] {}; {}", STATS.summary(), crate::composition::pace::WAITS.summary());
         crate::logging::flush();
     }
 }
@@ -1194,6 +1419,68 @@ pub(crate) static LATE: Mutex<Option<LateRule>> = Mutex::new(None);
 mod tests {
     use super::*;
 
+    /// A change of Placement while the game runs (#63): the device made with the game's device goes from the
+    /// finished frame's server to a hold and back, asked for, never "no device was made" and a second GPU given up.
+    #[test]
+    fn the_offload_device_changes_hands_with_the_placement() {
+        use ash::vk::Handle;
+        let _state = TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let game = vk::Device::from_raw(0x63_0001);
+        made_for_test(game, "a stand-in for the device");
+        assert_eq!(holder(game), Holder::Free);
+        assert!(!ask_back(game) && !asked_back(game), "nobody has it: nothing to ask back");
+        // A device that could not be made is nobody's: its error is there for every taker, however often.
+        for _ in 0..2 {
+            assert!(matches!(take(game), Some(Err(why)) if why == "a stand-in for the device"));
+            assert!(matches!(take_for_finished(game), Some(Err(_))));
+            assert_eq!(holder(game), Holder::Free, "an error taken is no device in anyone's hands");
+        }
+        let poke = |f: &dyn Fn(&mut Made)| f(MADE.lock().unwrap().iter_mut().find(|m| m.game == game).unwrap());
+        // A made device, taken by a hold's runner: its other hold joins it, nothing is asked.
+        poke(&|m| m.offload = None);
+        assert_eq!(holder(game), Holder::Holds);
+        assert!(!ask_back(game), "a hold's own");
+        // The finished frame's server has it; Placement becomes Before DLSS: the hold asks, once.
+        poke(&|m| m.finished = true);
+        assert_eq!(holder(game), Holder::Finished);
+        assert!(!asked_back(game) && !moved_to_hold(game));
+        assert!(ask_back(game), "asked now");
+        assert!(!ask_back(game), "and only once");
+        assert!(asked_back(game), "the server sees it at its next look and ends");
+        // It gives the device back (as `give_back` notes it): free again, and its end is the placement's change.
+        poke(&|m| {
+            m.moved = m.finished && m.wanted;
+            m.finished = false;
+            m.wanted = false;
+            m.offload = Some(Err("given back".into()));
+        });
+        assert_eq!(holder(game), Holder::Free);
+        assert!(moved_to_hold(game) && !asked_back(game));
+        // A frame that never finished: busy devices are nobody's to wait for.
+        poke(&|m| {
+            m.offload = None;
+            m.busy = true;
+        });
+        assert_eq!(holder(game), Holder::Free, "a device whose frame never finished is not waited for");
+        forget_for_test(game);
+        assert_eq!(holder(game), Holder::Free);
+    }
+
+    #[test]
+    fn the_gpu_list_belongs_to_one_instance() {
+        use ash::vk::Handle;
+        let (probe, game) = (vk::Instance::from_raw(0x10), vk::Instance::from_raw(0x20));
+        let mut known = Vec::new();
+        keep_gpus(&mut known, game, vec![(vk::PhysicalDevice::from_raw(7), "RTX 5080".into())]);
+        assert!(gpus_of(&known, probe).is_empty(), "the game's handles never reach another instance");
+        // A probe instance made later (DXVK's, vkd3d's) neither sees nor evicts the game's list.
+        keep_gpus(&mut known, probe, vec![(vk::PhysicalDevice::from_raw(1), "RTX 4090".into())]);
+        assert_eq!(gpus_of(&known, game), [(vk::PhysicalDevice::from_raw(7), "RTX 5080".to_string())]);
+        assert_eq!(gpus_of(&known, probe), [(vk::PhysicalDevice::from_raw(1), "RTX 4090".to_string())]);
+        drop_gpus(&mut known, probe);
+        assert!(gpus_of(&known, probe).is_empty() && !gpus_of(&known, game).is_empty(), "a destroyed probe goes alone");
+    }
+
     #[test]
     fn the_choice_parses_every_form_and_refuses_the_rest() {
         assert_eq!(Choice::parse(""), Ok(Choice::Off));
@@ -1311,7 +1598,7 @@ mod tests {
         let game = vk::Device::from_raw(0x5757_0001);
         assert!(!is_busy(game));
         assert!(take(game).is_none(), "no device was made with it");
-        MADE.lock().unwrap().push(Made { game, offload: None, busy: true });
+        MADE.lock().unwrap().push(Made { game, offload: None, busy: true, finished: false, wanted: false, moved: false });
         assert!(is_busy(game));
         assert!(matches!(take(game), Some(Err(_))));
         assert!(is_busy(game), "asking for it changes nothing");
@@ -1326,7 +1613,7 @@ mod tests {
     fn the_status_line_is_the_offloads_while_either_path_serves() {
         let active = State::Active("GPU".into());
         assert!(shows_line(&active, true, false), "the finished-frame server serving at `present`");
-        assert!(shows_line(&active, false, true), "the hold before DLSS sending its frames");
+        assert!(shows_line(&active, false, true), "a hold sending its frames");
         assert!(!shows_line(&active, false, false), "the placement left the offload: the native backend's line");
         for other in [State::Starting("GPU".into()), State::Stalled("GPU".into()), State::FellBack("why".into())] {
             assert!(shows_line(&other, false, false));
@@ -1348,6 +1635,18 @@ mod tests {
         assert!(given_up(), "another device's server cannot start it again");
         assert!(status_line().is_some_and(|l| l.contains("given up (too slow)")));
         *STATE.lock().unwrap() = State::Off;
+    }
+
+    #[test]
+    fn the_present_queue_is_a_graphics_one_beside_the_networks() {
+        let f = |flags, queue_count| vk::QueueFamilyProperties { queue_flags: flags, queue_count, ..Default::default() };
+        let (g, c) = (vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE, vk::QueueFlags::COMPUTE);
+        // NVIDIA: graphics family 0, the network on the compute family 2.
+        assert_eq!(present_queue(&[f(g, 16), f(vk::QueueFlags::TRANSFER, 2), f(c, 8)], 2, 2), Some((0, 0)));
+        // One family for everything: the queue after the network's, if there is one.
+        assert_eq!(present_queue(&[f(g, 3)], 0, 2), Some((0, 2)));
+        assert_eq!(present_queue(&[f(g, 2)], 0, 2), None);
+        assert_eq!(present_queue(&[f(c, 4)], 0, 2), None, "no graphics family");
     }
 
     #[test]

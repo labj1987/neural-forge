@@ -222,6 +222,55 @@ impl Channel {
     }
 }
 
+/// The request side of one slot, over the header's atomics: what the delayed present's relay (`composition::pace`)
+/// needs of [`ShmClient::begin_async_request`] and [`ShmClient::poll_async_request`] on its own thread.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct HeaderPort {
+    channel: Channel,
+    slot: Slot,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl crate::composition::pace::Port for HeaderPort {
+    fn begin(&self) -> Option<u32> {
+        let hdr = self.channel.header()?;
+        if hdr.quit.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        let req = neural_forge_protocol::next_request(hdr.seq_req_slot(self.slot).load(Ordering::Relaxed));
+        std::sync::atomic::fence(Ordering::Release);
+        hdr.seq_req_slot(self.slot).store(req, Ordering::Relaxed);
+        Some(req)
+    }
+
+    fn answered(&self, req: u32) -> bool {
+        // Equality, as `ShmClient::poll_async_request`: the counter wraps.
+        self.channel.header().is_some_and(|hdr| hdr.seq_resp_slot(self.slot).load(Ordering::Relaxed) == req)
+    }
+
+    fn fits(&self, req: u32, proxy: (u32, u32), pq10: bool) -> bool {
+        let Some(hdr) = self.channel.header() else { return false };
+        let dims = (hdr.answered_w.load(Ordering::Relaxed), hdr.answered_h.load(Ordering::Relaxed));
+        let evaluated = self.slot == Slot::Primary && req != 0 && hdr.seq_eval.load(Ordering::Acquire) == req;
+        crate::capture::answer_fits((dims != (0, 0)).then_some(dims), proxy, pq10, evaluated)
+    }
+
+    fn submitted(&self, req: u32) -> Option<crate::composition::pace::Submitted> {
+        crate::composition::pace::take_published(self.channel.header as usize, self.slot.index(), req)
+    }
+
+    fn quit(&self) -> bool {
+        self.channel.header().is_none_or(|hdr| hdr.quit.load(Ordering::Relaxed) != 0)
+    }
+
+    fn publish_white(&self, reading: f32) {
+        let Some(hdr) = self.channel.header() else { return };
+        let prev = f32::from_bits(hdr.layer_measured_white_bits.load(Ordering::Relaxed));
+        let next = if prev.is_finite() && prev > 1e-4 { prev + (reading - prev) * 0.3 } else { reading };
+        hdr.layer_measured_white_bits.store(next.to_bits(), Ordering::Relaxed);
+    }
+}
+
 /// One mapping of a channel file per path for the whole process, shared by every device's
 /// [`ShmClient`]: each used to map the whole file (about 1 GiB of address space) again and keep it to
 /// the end of the process.
@@ -388,7 +437,7 @@ impl ShmClient {
         Self { header: std::ptr::from_ref(header).cast_mut(), reserved: [REGION_CAP as u64; Slot::COUNT], ..Self::default() }
     }
 
-    fn header(&self) -> Option<&'static neural_forge_protocol::ShmHeader> {
+    pub(crate) fn header(&self) -> Option<&'static neural_forge_protocol::ShmHeader> {
         // SAFETY: non-null only after a successful `open()`, which mmaps
         // `neural_forge_protocol::shm_total_bytes()` at this address and never unmaps it for
         // the lifetime of the process. The real channel is this process's only while it holds the
@@ -599,7 +648,9 @@ impl ShmClient {
         }
     }
 
-    pub fn set_frame_info(&mut self, slot: Slot, width: u32, height: u32, proxy_format: u32) {
+    /// The raster the model is shown on `slot` (`width`, `height`: the frame's, or smaller at a Model resolution below
+    /// Full) and its format; `frame` is the presented frame's own size, published beside it (`frame_width`).
+    pub fn set_frame_info(&mut self, slot: Slot, width: u32, height: u32, proxy_format: u32, frame: (u32, u32)) {
         let bytes = u64::from(width) * u64::from(height) * neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
         self.frame_backed[slot.index()] = self.reserve(slot, bytes);
         let Some(hdr) = self.header() else { return };
@@ -612,6 +663,8 @@ impl ShmClient {
         hdr.layer_width.store(width, Ordering::Relaxed);
         hdr.layer_height.store(height, Ordering::Relaxed);
         hdr.layer_format.store(proxy_format, Ordering::Relaxed);
+        hdr.frame_width.store(frame.0, Ordering::Relaxed);
+        hdr.frame_height.store(frame.1, Ordering::Relaxed);
     }
 
     /// Publishes the layer's host-observed cost for a frame. This is deliberately a
@@ -1018,6 +1071,37 @@ impl ShmClient {
         self.pending[slot.index()].is_some()
     }
 
+    /// Whether a request could be started on `slot` now ([`Self::begin_async_request`]'s own conditions, checked
+    /// without starting one): the channel is open and alive, and the frame `set_frame_info` described last fits its
+    /// regions. The delayed present's pacing on the GPU asks before it hands a frame to its relay
+    /// ([`Self::request_port`]), which posts the request later.
+    pub fn can_request(&mut self, slot: Slot) -> bool {
+        if !self.open() || self.dead || self.pending[slot.index()].is_some() || !self.frame_backed[slot.index()] {
+            return false;
+        }
+        self.header().is_some_and(|hdr| hdr.quit.load(Ordering::Relaxed) == 0)
+    }
+
+    /// The request side of `slot` for the delayed present's relay (`composition::pace`), which posts requests and
+    /// sees their answers from its own thread while the present paces on the GPU. While it does, this client starts
+    /// no request on the slot itself; a request the relay gave up on comes back through [`Self::adopt_request`].
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn request_port(&self, slot: Slot) -> Option<HeaderPort> {
+        self.channel().map(|channel| HeaderPort { channel, slot })
+    }
+
+    /// Takes over a request the delayed present's relay posted on `slot` and gave up on (`req`, posted at `sent_at`),
+    /// when it is still out at the server: it is pending here from now on, so no new request is written over it,
+    /// and [`Self::poll_async_request`] ends it (answered late, or timed out) by the channel's own rules.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn adopt_request(&mut self, slot: Slot, req: u32, sent_at: Instant) {
+        let Some(hdr) = self.header() else { return };
+        if self.pending[slot.index()].is_none() && hdr.seq_resp_slot(slot).load(Ordering::Relaxed) != req {
+            self.pending[slot.index()] = Some((req, sent_at));
+            self.last_req[slot.index()] = req;
+        }
+    }
+
     /// Starts a round trip on the given slot without waiting for it: bumps that
     /// slot's `seq_req` and records when, exactly like the first half of
     /// [`Self::round_trip_after_open`] (which only ever uses slot 0), but returns
@@ -1362,7 +1446,7 @@ mod tests {
         assert!(a.open_at(&path) && b.open_at(&path));
         assert_eq!(a.header as usize, b.header as usize, "the second device reuses the first's mapping");
         assert_eq!(MAPPINGS.lock().unwrap().iter().filter(|m| m.path == path).count(), 1);
-        a.set_frame_info(Slot::Primary, 64, 32, neural_forge_protocol::enums::proxy_format::RGBA8);
+        a.set_frame_info(Slot::Primary, 64, 32, neural_forge_protocol::enums::proxy_format::RGBA8, (64, 32));
         assert!(a.frame_backed[0] && a.reserved[0] >= 64 * 32 * 4);
         // The file's allocated blocks now cover the proxy region's start (it was a hole before).
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1370,7 +1454,7 @@ mod tests {
         assert_eq!(unsafe { libc::stat(c.as_ptr(), &mut st) }, 0);
         assert!(st.st_blocks as u64 * 512 >= (neural_forge_protocol::HEADER_BYTES + 2 * 64 * 32 * 4) as u64, "{} blocks", st.st_blocks);
         // What another client backed is known to the next one without another call into the file.
-        b.set_frame_info(Slot::Primary, 64, 32, neural_forge_protocol::enums::proxy_format::RGBA8);
+        b.set_frame_info(Slot::Primary, 64, 32, neural_forge_protocol::enums::proxy_format::RGBA8, (64, 32));
         assert!(b.frame_backed[0]);
         // A write longer than what is backed is not made.
         let before = header_of(&a).seq_req.load(Ordering::Relaxed);
@@ -1392,16 +1476,16 @@ mod tests {
         let calls = || TEST_FALLOCATE_CALLS.with(std::cell::Cell::get);
         TEST_FALLOCATE_ERROR.with(|e| e.set(Some(libc::ENOSPC)));
         let before = calls();
-        client.set_frame_info(Slot::Secondary, 640, 480, rgba);
+        client.set_frame_info(Slot::Secondary, 640, 480, rgba, (640, 480));
         assert!(!client.frame_backed[1], "a frame the file cannot back is not sent");
         assert_eq!(calls() - before, 1, "the first attempt failed at the proxy region");
         for _ in 0..10 {
-            client.set_frame_info(Slot::Secondary, 640, 480, rgba);
-            client.set_frame_info(Slot::Secondary, 800, 600, rgba);
+            client.set_frame_info(Slot::Secondary, 640, 480, rgba, (640, 480));
+            client.set_frame_info(Slot::Secondary, 800, 600, rgba, (800, 600));
         }
         assert!(!client.frame_backed[1]);
         assert_eq!(calls() - before, 1, "neither that size nor a larger one is tried again at once");
-        client.set_frame_info(Slot::Secondary, 320, 240, rgba);
+        client.set_frame_info(Slot::Secondary, 320, 240, rgba, (320, 240));
         assert_eq!(calls() - before, 2, "a smaller frame may fit and is tried");
         // The retry interval passed: tried again, and with space back the frame is backed.
         TEST_FALLOCATE_ERROR.with(|e| e.set(None));
@@ -1411,7 +1495,7 @@ mod tests {
             let (size, at) = mapped.refused[1].unwrap();
             mapped.refused[1] = Some((size, at - RESERVE_RETRY));
         }
-        client.set_frame_info(Slot::Secondary, 640, 480, rgba);
+        client.set_frame_info(Slot::Secondary, 640, 480, rgba, (640, 480));
         assert!(client.frame_backed[1], "backed once the space is there");
         assert!(MAPPINGS.lock().unwrap().iter().find(|m| m.path == path).unwrap().refused[1].is_none());
     }

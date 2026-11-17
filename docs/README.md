@@ -27,6 +27,8 @@ disagree, the more recent measurement wins.
 - [PROTON_NGX.md](PROTON_NGX.md): the NGX wrapper for Proton (a builtin `_nvngx.dll` that forwards NVIDIA's core
   and records what the game gives DLSS), its ring, how the layer places and runs its holds from the records alone,
   the Proton copies the app makes, licences and maintenance.
+- [SECOND_GPU_PRESENT_DESIGN.md](SECOND_GPU_PRESENT_DESIGN.md): the second GPU shows the frame itself (the game gets
+  a swapchain the layer owns, the real one is on the second device; the hand-off, the semantics, the fall-backs).
 - [PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md): the 2.0 design for running the model before
   DLSS Super Resolution, and the full record of its experiments (E1-E3, hand-off latency, 4K,
   robustness, frame generation).

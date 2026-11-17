@@ -115,6 +115,8 @@ pub(crate) mod offload;
 pub(crate) mod offload_pre;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod offload_server;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod offload_trial;
 pub(crate) mod placement;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_flow;
@@ -181,6 +183,131 @@ pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
     loader.is_some()
 }
 
+/// Why a server is ending in [`Session::ensure_post_server`]'s `post_ending`.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ending {
+    /// The game's GPU's, for the other GPU's ([`PostAction::EndForSwitch`]): its network is given back after.
+    Switch,
+    /// It ended on its own ([`PostAction::Drop`]), on the other GPU (`offload`) or this one.
+    Dropped { offload: bool },
+}
+
+/// The game's GPU's network to be closed after the finished frame's trial gave the model back to the other GPU: the
+/// loader closes it once no path here uses it (`native::Loader::give_back_network`), so it is asked again at every
+/// present until it does, or until the game's GPU needs it again.
+///
+/// The other GPU's server starts only once the network is closed here ([`Self::holds_start`]): one network is open
+/// in the process at a time, and a server started before that found it still open, was refused and tried again a
+/// second later (#63: about two seconds of frames without the model at every hand-back). Not for ever: past
+/// [`Self::HOLD_MAX`] it starts anyway and waits on its own schedule, as before.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Default)]
+struct GiveBack {
+    /// Asked, and the loader has not agreed to close the network yet.
+    pending: bool,
+    /// The loader agreed; its worker has not closed the network yet.
+    closing: bool,
+    /// When it was asked ([`Self::holds_start`]'s limit).
+    since: Option<Instant>,
+    /// Presents since the loader agreed with the network still open ([`Self::REASK`]).
+    waited: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl GiveBack {
+    /// The longest the other GPU's server waits for the network to close here.
+    const HOLD_MAX: Duration = Duration::from_secs(3);
+
+    /// Presents the loader's worker has to close the network after it agreed, before it is asked again: the worker
+    /// declines when a path took the network in between, and nothing else would ask it a second time.
+    const REASK: u32 = 8;
+
+    fn ask(&mut self, now: Instant) {
+        *self = Self { pending: true, closing: false, since: Some(now), waited: 0 };
+    }
+
+    /// One present: `needed_here` (the trial runs or kept the model on the game's GPU, or its server runs) drops the
+    /// request; otherwise `give` is tried, and once it agreed `open` says whether the network is still open here.
+    /// Whether the network closed now (said once, when it has, never when the loader only agreed).
+    fn step(&mut self, needed_here: bool, give: impl FnOnce() -> bool, open: impl FnOnce() -> bool) -> bool {
+        if needed_here {
+            *self = Self::default();
+            return false;
+        }
+        let mut agreed = false;
+        if self.pending && give() {
+            self.pending = false;
+            self.closing = true;
+            agreed = true;
+        }
+        if self.closing {
+            if !open() {
+                *self = Self::default();
+                return true;
+            } else if !agreed {
+                self.waited += 1;
+                if self.waited >= Self::REASK {
+                    // The worker declined (a path took the network after the loader agreed): asked again.
+                    self.pending = true;
+                    self.closing = false;
+                    self.waited = 0;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the other GPU's server waits at this present: the network is still open here, and not for longer
+    /// than [`Self::HOLD_MAX`].
+    fn holds_start(&self, now: Instant) -> bool {
+        (self.pending || self.closing) && self.since.is_some_and(|t| now.saturating_duration_since(t) < Self::HOLD_MAX)
+    }
+}
+
+/// What the present does with the after-the-upscaler server ([`Session::ensure_post_server`]).
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostAction {
+    /// Nothing now: it starts, serves, or (on the other GPU) waits for a frame that did not finish.
+    Wait,
+    /// The finished frame's trial gave the model back to the other GPU: the game's GPU's server ends.
+    EndForSwitch,
+    /// It ended: dropped. `stalled`: nothing starts on this device again; `failed`: the next start waits for the
+    /// retry schedule; `handed`: the other GPU's server ended for the finished frame's trial.
+    Drop { stalled: bool, failed: bool, handed: bool },
+    /// None runs: one starts (here or on the other GPU).
+    Start,
+}
+
+/// [`PostAction`] for a server in `status` (`None`: none), on the other GPU (`offload`) or not, with the finished
+/// frame's trial running or keeping the model on the game's GPU (`trial_local`) and a give-back pending (`back`).
+#[cfg(target_arch = "x86_64")]
+fn post_action(status: Option<native_post::Status>, offload: bool, trial_local: bool, back: bool, moved: bool) -> PostAction {
+    use native_post::Status;
+    match status {
+        Some(Status::Starting) => PostAction::Wait,
+        Some(Status::Serving) if !offload && back && !trial_local => PostAction::EndForSwitch,
+        Some(Status::Serving) => PostAction::Wait,
+        // The server on another GPU waits for a frame that did not finish (`native_post::work`): it ends on its own,
+        // with the network back here (Unavailable) once that frame is done.
+        Some(Status::Stalled) if offload => PostAction::Wait,
+        Some(Status::Stalled) => PostAction::Drop { stalled: true, failed: false, handed: false },
+        // The second GPU could not start, stalled, was lost or was too slow (`offload`, logged there): the network runs
+        // on this device's GPU from the next present on.
+        Some(Status::Unavailable) => PostAction::Drop { stalled: false, failed: false, handed: false },
+        // Ended for a reason that may pass; or the other GPU's server ended for the finished frame's trial: no failure,
+        // the game's GPU's starts at the next present.
+        // (Or it ended because Placement left the finished frame and a hold took the second GPU, `moved`: no failure
+        // either, and nothing handed to the game's GPU.)
+        Some(Status::Retry) => {
+            let handed = offload && trial_local;
+            PostAction::Drop { stalled: false, failed: !handed && !(offload && moved), handed }
+        }
+        None => PostAction::Start,
+    }
+}
+
 /// A native hold ([`native::run_native_hold`]).
 ///
 /// # Safety
@@ -216,7 +343,7 @@ pub(crate) unsafe fn run_native(
         passes.mask = shm.mask_settings().map_or_else(native::Mask::default, native::Mask::from);
         // The edit cache's interval (its own, not `model_interval`: that is the after-the-upscaler
         // path's), and the debug view of its rejection mask.
-        let ask = native::CacheAsk { hold, interval: cache::interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW };
+        let ask = native::CacheAsk { hold, interval: cache::interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW, at };
         // Told when this hold's work is waited on (`Resources::wait_idle`): until then the
         // after-the-upscaler path keeps off the network.
         res.pre_loader = Some(loader.clone());
@@ -293,12 +420,12 @@ fn native_line_due(status: &str, last: &str, channel: &str, offload_active: bool
     !offload_active && (status != last || (!status.is_empty() && channel != neural_forge_protocol::stored_reason(status)))
 }
 
-/// The offload's Status line a hold writes (`line`, [`offload::status_line`]): while the hold before DLSS sends its
-/// frames to the other GPU (`serving_pre`, with the offload `active`) and the channel says something else. The
-/// present's writer ([`Session::ensure_post_server`]) does not run while frames are held before the upscaler, so
+/// The offload's Status line a hold writes (`line`, [`offload::status_line`]): while a hold (before DLSS or after
+/// its output) sends its frames to the other GPU (`serving_hold`, with the offload `active`) and the channel says something else. The
+/// present's writer ([`Session::ensure_post_server`]) does not run while frames are held, so
 /// without this the channel kept the native line a hold wrote before the offload started.
-fn hold_offload_line<'a>(line: Option<&'a str>, active: bool, serving_pre: bool, channel: &str) -> Option<&'a str> {
-    line.filter(|l| active && serving_pre && neural_forge_protocol::stored_reason(l) != channel)
+fn hold_offload_line<'a>(line: Option<&'a str>, active: bool, serving_hold: bool, channel: &str) -> Option<&'a str> {
+    line.filter(|l| active && serving_hold && neural_forge_protocol::stored_reason(l) != channel)
 }
 
 impl SrLaunches {
@@ -315,6 +442,11 @@ impl SrLaunches {
 fn note_sr_launch() {
     let mut run = lock(&SR_LAUNCHES);
     *run = Some(SrLaunches::after(*run, Instant::now()));
+}
+
+/// When DLSS's launches were last seen (held or not, with or without NGX's records): `offload_trial`'s gameplay.
+pub(crate) fn sr_launches_last() -> Option<Instant> {
+    sr_launches().map(|r| r.last)
 }
 
 fn sr_launches() -> Option<SrLaunches> {
@@ -704,6 +836,27 @@ impl ColourWatch {
     }
 }
 
+/// The motion vectors of DLSS's learnt output ([`Tracker::mvec_watch`]): that image, and every 2D single-sample image of
+/// its extent and format (Cyberpunk 2077 hands DLSS two in turn). Ray Reconstruction identifies nothing
+/// ([`Tracker::refresh`]), so without this nothing watched them there: vectors a game renders (not `STORAGE`, so not taken
+/// as `GENERAL`) had no layout for the hold after DLSS, which then neither copied them nor could send its frames to a
+/// second GPU (#63: Cyberpunk 2077 started with Ray Reconstruction on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MvecWatch {
+    pub image: vk::Image,
+    pub shape: Option<ColourWatch>,
+}
+
+impl MvecWatch {
+    fn of(o: &DlssOutput, images: &HashMap<vk::Image, ImageDesc>) -> Self {
+        Self { image: o.mvec, shape: images.get(&o.mvec).map(ColourWatch::of) }
+    }
+
+    fn covers(&self, image: vk::Image, d: Option<&ImageDesc>) -> bool {
+        image == self.image || self.shape.is_some_and(|w| d.is_some_and(|d| w.covers(d)))
+    }
+}
+
 /// At most one line per this long with the counts of the ordinary hold-inside refusals ([`InlineRefusal::quiet`]).
 const QUIET_REFUSALS_EVERY: Duration = Duration::from_secs(5);
 
@@ -764,6 +917,12 @@ pub(crate) struct ImageSync {
 /// copy or transition of the image is recorded from it ([`aux_copy_layout`], [`depth_copy_layout`])
 /// until a barrier on both aspects says where they are.
 pub(crate) const ASPECTS_APART: vk::ImageLayout = vk::ImageLayout::from_raw(0x7fff_0001);
+
+/// [`Tracker::layout_when_run`] of DLSS's output's motion vectors (watched for them alone, [`MvecWatch`]) where a buffer
+/// begun before they were watched runs in front, in the same submission or an earlier one, or nothing is known: their
+/// layout then may be anything, so a hold that guessed one is taken as wrong (`inline::Inline::check`), as the split
+/// refuses a buffer recorded before the identification ([`Hazard::RecordedBefore`]).
+pub(crate) const MVEC_UNSEEN: vk::ImageLayout = vk::ImageLayout::from_raw(0x7fff_0002);
 
 impl ImageSync {
     pub(crate) fn from_barrier(b: &vk::ImageMemoryBarrier, src_stage: vk::PipelineStageFlags, dst_stage: vk::PipelineStageFlags) -> Self {
@@ -1034,6 +1193,13 @@ const SEEN_KEYS: usize = 64;
 pub(crate) struct Tracker {
     /// DLSS's output as its last evaluate wrote it ([`DlssOutput`]).
     dlss_output: Option<DlssOutput>,
+    /// Its motion vectors, watched from the first output learnt on ([`MvecWatch`], [`Self::watch_mvec`]).
+    mvec_watch: Option<MvecWatch>,
+    /// Command buffers whose whole recording so far happened while [`Self::mvec_watch`] (as it is now) was watched, as
+    /// [`Self::recorded_watched`] is for the identification: only in these is the motion vectors' layout read after DLSS
+    /// (a buffer begun before may have moved them unseen), and a buffer not among them that is submitted leaves their
+    /// layout unknown ([`Self::commit_submitted`]).
+    recorded_mvec: HashSet<vk::CommandBuffer>,
     /// The launch just recorded is the last of its evaluate to write DLSS's output, and passes run after DLSS
     /// ([`placement`]): the hold goes right after it, for those passes (taken by [`Tracking::launch_with_after`]).
     after_at: Option<(vk::CommandBuffer, DlssOutput, placement::Plan)>,
@@ -1113,6 +1279,8 @@ pub(crate) struct Tracker {
     /// The newest upscaling evaluate on this device is Ray Reconstruction's ([`Self::rr_running`]), as of the last
     /// [`Self::refresh`].
     rr: bool,
+    /// The Ray Reconstruction evaluate noted last ([`Self::rr_evaluate`]): its record's sequence number.
+    rr_seq: Option<u64>,
     /// Registered images whose last registered view was destroyed. They stay registered until the image itself is
     /// destroyed: Black Myth: Wukong's benchmark with DLSS Frame Generation on destroys and re-creates the views it
     /// hands DLSS every frame (about 65 a second, the images never), and its launches still name the images.
@@ -1712,6 +1880,10 @@ impl Tracker {
         self.owners.remove(&image);
         self.launch_layouts.remove(&image);
         self.colour_barriers.remove(&image);
+        // The watched motion vectors' handle may come back for another image; their shape stays watched.
+        if let Some(m) = self.mvec_watch.as_mut().filter(|m| m.image == image) {
+            m.image = vk::Image::null();
+        }
         self.exposure_names.retain(|c, (e, _)| *c != image && *e != image);
     }
 
@@ -1756,6 +1928,13 @@ impl Tracker {
 
     pub(crate) fn forget_function(&mut self, function: vk::CuFunctionNVX) {
         self.functions.remove(&function);
+    }
+
+    /// A Ray Reconstruction record with sequence number `seq` is the newest: whether it is another evaluate than the
+    /// one noted last (Ray Reconstruction was evaluated since), which is what keeps its run going
+    /// ([`note_ray_reconstruction`]).
+    fn rr_evaluate(&mut self, seq: u64) -> bool {
+        self.rr_seq.replace(seq) != Some(seq)
     }
 
     /// Whether DLSS Ray Reconstruction runs: the newest upscaling evaluate on this device is Ray Reconstruction's (NGX's
@@ -2092,9 +2271,14 @@ impl Tracker {
 
     /// `image`'s layout when a buffer submitted right after `earlier` (the buffers in front of it in the same
     /// submission, in order) starts: what the last of them to set it left, else what the buffers submitted
-    /// before left. `None` when nothing is known (an image not watched, or never seen in a barrier).
+    /// before left. `None` when nothing is known (an image not watched, or never seen in a barrier); for DLSS's output's
+    /// motion vectors then, or behind a buffer begun before they were watched, [`MVEC_UNSEEN`].
     pub(crate) fn layout_when_run(&self, earlier: &[vk::CommandBuffer], image: vk::Image) -> Option<vk::ImageLayout> {
-        earlier
+        let mvec_only = self.watched_for_mvec_only(image);
+        if mvec_only && earlier.iter().any(|cb| !self.recorded_mvec.contains(cb)) {
+            return Some(MVEC_UNSEEN);
+        }
+        let known = earlier
             .iter()
             .rev()
             .find_map(|cb| {
@@ -2104,7 +2288,8 @@ impl Tracker {
                     .and_then(|p| p.iter().rev().filter(|s| s.image == image).find_map(ImageSync::layout_after))
                     .or_else(|| self.attached.get(cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
             })
-            .or_else(|| self.committed.get(&image).copied())
+            .or_else(|| self.committed.get(&image).copied());
+        known.or(mvec_only.then_some(MVEC_UNSEEN))
     }
 
     /// [`Self::inline_point`] refused a hold inside DLSS's buffer at a launch naming the colour input `colour`:
@@ -2318,8 +2503,10 @@ impl Tracker {
                 _ => Some(crate::ngx_ring::Rect::whole(extent)),
             }
         });
+        // Begun before the motion vectors were watched: what it recorded on them was not seen ([`Self::recorded_mvec`]).
+        let seen_whole = self.recorded_mvec.contains(&cb);
         let mvec_input = mvec.map(|d| {
-            let known = layout_of(o.mvec, &d);
+            let known = layout_of(o.mvec, &d).filter(|_| seen_whole);
             guessed.mvec = known.filter(|(_, set)| !set).map(|(l, _)| l);
             let layout = known.map(|(l, _)| l);
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
@@ -2360,14 +2547,19 @@ impl Tracker {
             || !self.rendering.is_empty()
             || !self.attached.is_empty()
             || !self.recorded_watched.is_empty()
+            || !self.recorded_mvec.is_empty()
     }
 
     /// `vkBeginCommandBuffer` (or a reset): the earlier recording is gone, and the new one is seen
-    /// whole from here on when inputs are watched ([`Self::recorded_watched`]).
+    /// whole from here on when inputs are watched ([`Self::recorded_watched`]), or DLSS's output's motion vectors
+    /// ([`Self::recorded_mvec`]).
     pub(crate) fn begin(&mut self, command_buffer: vk::CommandBuffer) {
         self.free(&[command_buffer]);
         if self.inputs.is_some() {
             self.recorded_watched.insert(command_buffer);
+        }
+        if self.mvec_watch.is_some() {
+            self.recorded_mvec.insert(command_buffer);
         }
     }
 
@@ -2381,6 +2573,7 @@ impl Tracker {
             self.rendering.remove(cb);
             self.attached.remove(cb);
             self.recorded_watched.remove(cb);
+            self.recorded_mvec.remove(cb);
             self.inline_tried.remove(cb);
         }
     }
@@ -2439,6 +2632,9 @@ impl Tracker {
             // A secondary recorded (in part) before the identification makes the primary so too.
             if !self.recorded_watched.contains(secondary) {
                 self.recorded_watched.remove(&primary);
+            }
+            if !self.recorded_mvec.contains(secondary) {
+                self.recorded_mvec.remove(&primary);
             }
             // Where the secondary's recording starts in the primary's.
             let base = Before {
@@ -2501,15 +2697,18 @@ impl Tracker {
 
     /// Whether barriers on `image` are recorded now.
     fn watched(&self, image: vk::Image) -> bool {
-        self.watched_by(self.inputs, self.colour_watch, image)
+        self.watched_by(self.inputs, self.colour_watch, self.mvec_watch, image)
     }
 
-    /// Whether barriers on `image` are recorded with `inputs` identified and `watch` the colour shape watched.
-    fn watched_by(&self, inputs: Option<Inputs>, watch: Option<ColourWatch>, image: vk::Image) -> bool {
+    /// Whether barriers on `image` are recorded with `inputs` identified, `watch` the colour shape watched and `mvec`
+    /// DLSS's output's motion vectors watched.
+    fn watched_by(&self, inputs: Option<Inputs>, watch: Option<ColourWatch>, mvec: Option<MvecWatch>, image: vk::Image) -> bool {
         let desc = self.images.get(&image);
         // Every image of the colour input's shape: an evaluate may name another one than the identified (Remnant II and
         // Expedition 33 alternate between several).
         watch.is_some_and(|w| desc.is_some_and(|d| w.covers(d)))
+            // The motion vectors of the output the hold after DLSS goes after ([`MvecWatch`]).
+            || mvec.is_some_and(|m| m.covers(image, desc))
             || inputs.is_some_and(|i| {
                 i.colour.0 == image
                     || i.depth.0 == image
@@ -2535,16 +2734,29 @@ impl Tracker {
     /// was not seen.
     fn keep_watched_across(&mut self, inputs: Option<Inputs>, watch: Option<ColourWatch>) {
         let (old, old_watch) = (self.inputs, self.colour_watch);
-        let seen: HashSet<vk::Image> = self
-            .committed
+        let seen = self.tracked_images();
+        let mvec = self.mvec_watch;
+        let keep: HashSet<vk::Image> =
+            seen.into_iter().filter(|&i| self.watched_by(old, old_watch, mvec, i) && self.watched_by(inputs, watch, mvec, i)).collect();
+        self.retain_tracked(&keep);
+        self.colour_watch = watch;
+    }
+
+    /// Every image something is recorded on: a committed layout or owner, a layout at DLSS's launch, barriers or
+    /// attachments in buffers not yet submitted.
+    fn tracked_images(&self) -> HashSet<vk::Image> {
+        self.committed
             .keys()
             .chain(self.owners.keys())
             .chain(self.launch_layouts.keys())
             .copied()
             .chain(self.pending.values().flatten().map(|s| s.image))
             .chain(self.attached.values().flatten().map(|a| a.0))
-            .collect();
-        let keep: HashSet<vk::Image> = seen.into_iter().filter(|&i| self.watched_by(old, old_watch, i) && self.watched_by(inputs, watch, i)).collect();
+            .collect()
+    }
+
+    /// Drops what was recorded on every image but `keep`'s.
+    fn retain_tracked(&mut self, keep: &HashSet<vk::Image>) {
         self.committed.retain(|i, _| keep.contains(i));
         self.owners.retain(|i, _| keep.contains(i));
         self.launch_layouts.retain(|i, _| keep.contains(i));
@@ -2556,7 +2768,30 @@ impl Tracker {
             attached.retain(|a| keep.contains(&a.0));
         }
         self.attached.retain(|_, attached| !attached.is_empty());
-        self.colour_watch = watch;
+    }
+
+    /// A new DLSS output was learnt ([`Self::observe`]): its motion vectors are watched from here on. When that changes
+    /// what is watched, it is handled as a new identification is ([`Self::keep_watched_across`]): what was recorded on
+    /// images watched both before and after is kept, everything else dropped (vectors of an earlier output watched
+    /// again later start with no layout, not with the one they had then), and only buffers begun from here on are seen
+    /// whole for them ([`Self::recorded_mvec`]).
+    fn watch_mvec(&mut self, mvec: MvecWatch) {
+        let old = self.mvec_watch;
+        // The same image, or another of the same shape (Cyberpunk 2077 alternates two): the watch is unchanged.
+        if old == Some(mvec) || old.is_some_and(|o| o.shape.is_some() && o.shape == mvec.shape) {
+            return;
+        }
+        let (inputs, watch) = (self.inputs, self.colour_watch);
+        let keep: HashSet<vk::Image> =
+            self.tracked_images().into_iter().filter(|&i| self.watched_by(inputs, watch, old, i) && self.watched_by(inputs, watch, Some(mvec), i)).collect();
+        self.retain_tracked(&keep);
+        self.mvec_watch = Some(mvec);
+        self.recorded_mvec.clear();
+    }
+
+    /// Whether `image` is watched only for DLSS's output's motion vectors, not for the identification.
+    fn watched_for_mvec_only(&self, image: vk::Image) -> bool {
+        !self.watched_by(self.inputs, self.colour_watch, None, image) && self.mvec_watch.is_some_and(|m| m.covers(image, self.images.get(&image)))
     }
 
     pub(crate) fn barrier(&mut self, command_buffer: vk::CommandBuffer, sync: ImageSync) {
@@ -2592,6 +2827,13 @@ impl Tracker {
     /// passed once it was accepted ([`submit_around`]).
     pub(crate) fn commit_submitted(&mut self, command_buffers: impl IntoIterator<Item = vk::CommandBuffer>) {
         for cb in command_buffers {
+            // Begun before DLSS's output's motion vectors were watched: it may have moved them unseen.
+            if self.mvec_watch.is_some() && !self.recorded_mvec.contains(&cb) {
+                let unseen: Vec<vk::Image> = self.committed.keys().copied().filter(|&i| self.watched_for_mvec_only(i)).collect();
+                for image in unseen {
+                    self.committed.remove(&image);
+                }
+            }
             // Attachment layouts first, then the buffer's barriers (which follow its rendering).
             if let Some(attached) = self.attached.get(&cb) {
                 for &(image, layout) in attached {
@@ -2661,8 +2903,21 @@ impl Tracker {
     pub(crate) fn refresh(&mut self) -> Option<String> {
         let record = crate::ngx_ring::newest(|i| self.images.contains_key(&i));
         let rr = record.is_some_and(|r| r.is_rr());
-        if rr {
-            note_ray_reconstruction();
+        // Ray Reconstruction runs while it is evaluated: a new record. The newest record alone says nothing once the
+        // game paused DLSS (a menu, a map): other launch-bearing submits go on (Frame Generation's), every one of them
+        // comes here, and counting them kept "Ray Reconstruction runs" true through the pause. With no hold after
+        // DLSS recorded meanwhile, auto then put every pass at present, and the after-the-upscaler path took the
+        // frames (and the process's one network) from the live hold a second after its last frame (#63).
+        //
+        // Where no hold after DLSS was recorded or tried in this run (its output cannot be learnt: the
+        // after-the-upscaler path is where the model runs with Ray Reconstruction there), the run is kept through
+        // pauses as before: ended by each, it would begin again at every resume and leave the frames without the
+        // model for [`RAY_RECONSTRUCTION_SETTLE`], with nothing to protect.
+        if let Some(r) = record.filter(|r| r.is_rr()) {
+            let evaluated = self.rr_evaluate(r.seq);
+            if keeps_rr_run(evaluated, held_in_run(*lock(&RAY_RECONSTRUCTION_RUN), after_dlss_last())) {
+                note_ray_reconstruction();
+            }
         }
         let inputs = record.filter(|r| !r.is_rr()).and_then(|r| self.inputs_of(&r));
         let key = inputs.map(|i| (ColourWatch::of(&i.colour.1), ColourWatch::of(&i.mvec.1), i.exposure_input.map(|e| ColourWatch::of(&e.1))));
@@ -2754,6 +3009,7 @@ impl Tracker {
                 lines.push(format!("DLSS's output is written in {} launches, not {}: a hold in this frame went after part of it", seen.writes, l.writes));
             }
             self.dlss_output = Some(seen);
+            self.watch_mvec(MvecWatch::of(&seen, &self.images));
             let desc = |i: vk::Image| self.images.get(&i).map_or("unregistered".to_string(), |d| format!("{}x{} {:?}", d.width, d.height, d.format));
             lines.push(format!(
                 "DLSS's output: image {} ({}), written by {} launch(es) of its evaluate on {} ({}; depth {}, motion vectors {}){}",
@@ -3027,7 +3283,8 @@ impl Tracker {
 
 /// A device's [`Tracker`] plus lock-free flags, so that on a device with NVX but no DLSS (a
 /// vkd3d-proton game without DLSS) the per-command-buffer and per-submit hooks cost one relaxed
-/// load: `watching` (an input is identified, so barriers on it are worth recording), `armed` (some
+/// load: `watching` (an input is identified, or DLSS's output's motion vectors are watched, so barriers on them are
+/// worth recording), `armed` (some
 /// command buffer carries a launch or recorded layouts, so begin/free/execute/submit have something
 /// to do) and the identified extent for the present hook.
 #[derive(Default)]
@@ -3109,7 +3366,8 @@ impl Tracking {
         lock(&self.tracker)
     }
 
-    /// Whether any input is identified (so barriers on it are worth recording).
+    /// Whether any input is identified, or DLSS's output's motion vectors are watched ([`MvecWatch`]): barriers on them
+    /// are worth recording. Without the latter, a game started with Ray Reconstruction on recorded none (#63).
     pub(crate) fn watching(&self) -> bool {
         self.watching.load(Ordering::Relaxed)
     }
@@ -3208,8 +3466,8 @@ impl Tracking {
         self.lock().forget_function(function);
     }
 
-    /// `vkBeginCommandBuffer`: forgets the buffer's earlier recording, and while inputs are watched
-    /// notes that the new one is seen whole ([`Tracker::recorded_watched`]). Nothing to do (no lock)
+    /// `vkBeginCommandBuffer`: forgets the buffer's earlier recording, and while inputs or DLSS's output's motion vectors
+    /// are watched notes that the new one is seen whole for them ([`Tracker::recorded_watched`], [`Tracker::recorded_mvec`]). Nothing to do (no lock)
     /// while nothing is armed or watched: a buffer begun then is not in that set, and none of it is.
     pub(crate) fn begin(&self, command_buffer: vk::CommandBuffer) {
         if self.armed() || self.watching() {
@@ -3287,7 +3545,7 @@ impl Tracking {
         self.rearm(&t);
     }
 
-    /// An image copy ([`Tracker::copy`]), while inputs are watched.
+    /// An image copy ([`Tracker::copy`]), while inputs or DLSS's output's motion vectors are watched.
     pub(crate) fn copy(&self, command_buffer: vk::CommandBuffer, src: vk::Image, dst: vk::Image) {
         if !self.watching.load(Ordering::Relaxed) {
             return;
@@ -3297,7 +3555,8 @@ impl Tracking {
         self.rearm(&t);
     }
 
-    /// `vkCmdBeginRendering`'s attachments ([`Tracker::attachments`]), while inputs are watched.
+    /// `vkCmdBeginRendering`'s attachments ([`Tracker::attachments`]), while inputs or DLSS's output's motion vectors are
+    /// watched.
     pub(crate) fn attachments(&self, command_buffer: vk::CommandBuffer, views: &[(vk::ImageView, vk::ImageLayout)]) {
         if !self.watching.load(Ordering::Relaxed) || views.is_empty() {
             return;
@@ -3338,7 +3597,7 @@ impl Tracking {
             let observed = t.observe(batches);
             let line = t.refresh().map(|l| format!("{l} [device {device:#x}]"));
             let identified = line.is_some().then(|| t.inputs.map(|i| i.colour.0));
-            self.watching.store(t.inputs.is_some() || t.colour_watch.is_some(), Ordering::Relaxed);
+            self.watching.store(t.inputs.is_some() || t.colour_watch.is_some() || t.mvec_watch.is_some(), Ordering::Relaxed);
             self.extent.store(t.inputs.map_or(0, |i| u64::from(i.colour.1.width) << 32 | u64::from(i.colour.1.height)), Ordering::Relaxed);
             let foreign_before = t.foreign_submits;
             let scan = t.scan(batches);
@@ -4105,7 +4364,8 @@ pub(crate) struct Resources {
     /// The edit cache's passes (`cache`), built on the first native hold.
     #[cfg(target_arch = "x86_64")]
     pub(crate) edit: Option<cache::CachePass>,
-    /// The network on a second GPU for the hold before DLSS (`offload_pre`), made on its first offloaded hold.
+    /// The network on a second GPU for these hold resources (`offload_pre`: the hold before DLSS, or the one after
+    /// its output), made on their first offloaded hold.
     #[cfg(target_arch = "x86_64")]
     pub(crate) offpre: Option<offload_pre::HoldSide>,
     /// The scene-cut detector (`scene_cut`), built on the first native hold unless it is switched off.
@@ -4454,6 +4714,11 @@ impl Resources {
     #[cfg(target_arch = "x86_64")]
     pub(crate) unsafe fn release_native(&mut self, device: &ash::Device) -> bool {
         let mut any = false;
+        // The offload's side stays: its gate's and pack's sets point into the edit cache and the native pass that go.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(side) = self.offpre.as_mut() {
+            side.exchange.forget_bound();
+        }
         // SAFETY (each destroy): nothing recorded with them may still run (this function's contract).
         if let Some(n) = self.native.take() {
             unsafe { n.destroy(device) };
@@ -4682,9 +4947,9 @@ pub(crate) struct HoldResult {
     pub timing: HoldTiming,
     /// The native backend ran this hold (`evaluated` means the network ran).
     pub native: bool,
-    /// The native backend: a hold after DLSS's output (Ray Reconstruction's placement, or the one set there) while the model on a second GPU is asked
-    /// for: the network runs on the game's GPU here, the second GPU takes only the holds before DLSS.
-    pub after_dlss_on_game_gpu: bool,
+    /// The native backend sent this hold's frame to the second GPU (`offload_pre`): what it ran or carried was the
+    /// other GPU's, not the game's.
+    pub offloaded: bool,
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
     /// network, composite), read when its fence was found signalled here.
     pub network_gpu_ms: Option<f32>,
@@ -5666,6 +5931,40 @@ fn hold_clock() -> Instant {
     Instant::now()
 }
 
+/// The network's GPU time a frame costs, for the Status tab's graph: the last time each hold of the frame reported,
+/// summed. The holds before the upscaler and after DLSS's output are told apart by their size (render and output);
+/// where the two are the same size (DLAA with passes at both holds) they share a slot and the time is one hold's. A
+/// hold that has not reported for [`Self::FRESH`] (its passes moved to the other hold, a pause) no longer counts.
+#[derive(Debug, Default)]
+pub(crate) struct NetworkMs {
+    slots: [Option<NetworkSlot>; 2],
+}
+
+/// One hold's last report: its size, the time, and when.
+#[derive(Clone, Copy, Debug)]
+struct NetworkSlot {
+    extent: (u32, u32),
+    ms: f32,
+    at: Instant,
+}
+
+impl NetworkMs {
+    const FRESH: Duration = Duration::from_secs(1);
+
+    /// The hold of `extent` reports `ms` at `now`: the frame's time.
+    pub(crate) fn note(&mut self, extent: (u32, u32), ms: f32, now: Instant) -> f32 {
+        for slot in &mut self.slots {
+            if slot.is_some_and(|s| now.saturating_duration_since(s.at) > Self::FRESH) {
+                *slot = None;
+            }
+        }
+        let own = self.slots.iter().position(|s| s.is_some_and(|s| s.extent == extent));
+        let at = own.or_else(|| self.slots.iter().position(Option::is_none)).unwrap_or(0);
+        self.slots[at] = Some(NetworkSlot { extent, ms, at: now });
+        self.slots.iter().flatten().map(|s| s.ms).sum()
+    }
+}
+
 /// One device's pre-upscaler state, kept in its `State` (so holds and presents are serialized by
 /// the same lock).
 #[derive(Default)]
@@ -5680,6 +5979,8 @@ pub(crate) struct Session {
     /// in the same frame.
     pub(crate) res_after: Option<Resources>,
     stats: Stats,
+    /// The network's GPU time of the frame's holds, for the Status tab ([`NetworkMs`]).
+    network_ms: NetworkMs,
     last_hold: Option<Instant>,
     /// The last hold ran the native backend (for `native_running`).
     last_hold_native: bool,
@@ -5729,6 +6030,13 @@ pub(crate) struct Session {
     /// The native backend's after-the-upscaler server (`native_post`), once the mapping is open.
     #[cfg(target_arch = "x86_64")]
     pub(crate) post_server: Option<native_post::PostServer>,
+    /// The game's GPU's server, ending after the finished frame's trial gave the model back to the other GPU
+    /// ([`PostAction::EndForSwitch`]): not joined in the present; the other GPU's server starts once it has ended.
+    #[cfg(target_arch = "x86_64")]
+    post_ending: Option<(native_post::PostServer, Ending)>,
+    /// The game's GPU's network to close once nothing here uses it ([`GiveBack`]).
+    #[cfg(target_arch = "x86_64")]
+    give_back: GiveBack,
     /// When to start the server again after it ended for a reason that may pass (its pipelines could not be
     /// built, another server held the channel): the native loader's schedule.
     #[cfg(target_arch = "x86_64")]
@@ -6501,6 +6809,15 @@ impl Session {
         if result.native && result.evaluated {
             self.engaged = true;
         }
+        // While the trial against the other GPU measures the game's GPU: every hold, whether the model ran on it. Not the
+        // hold whose window started the trial (`offload_pre`'s summary runs inside it): it was sent to the other GPU, and
+        // counted as the game's GPU's first run it turned the build's waits after it into misses of a running model
+        // (#63: "could not run the model" 0.3 s into the trial).
+        #[cfg(target_arch = "x86_64")]
+        if offload_trial::running() && !offload_pre::serving_hold() && !result.offloaded {
+            let ran = result.native && result.evaluated && result.wrote_back;
+            offload_trial::local_hold((extent, placement::active_count()), now, ran, result.miss);
+        }
         self.share_post_off();
         let holding = self.holding();
         let s = &mut self.stats;
@@ -6575,7 +6892,8 @@ impl Session {
             shm.publish_cache(s.refresh_holds, s.cached_holds, s.last_rejected, gpu);
             shm.publish_scene_cuts(s.scene_cuts);
             if let Some(g) = result.network_gpu_ms {
-                shm.publish_network_gpu_ms(g);
+                // A frame with holds before the upscaler and after DLSS runs the network twice: the frame's time is both.
+                shm.publish_network_gpu_ms(self.network_ms.note(extent, g, now));
             }
         }
         shm.publish_preupscale_state(hold_state(holding), self.last_hold_native, extent.0, extent.1);
@@ -6667,15 +6985,25 @@ impl Session {
     ) {
         // The model on another GPU's state, on the Status tab's line and for `doctor` (`layer_reason`).
         #[cfg(target_arch = "x86_64")]
-        // Only while the offload is what runs (serving at the finished-frame placement, or the hold before DLSS sending
+        // Only while the offload is what runs (serving at the finished-frame placement, or a hold sending
         // its frames) or not running (starting, stalled, given up): when the placement left it, the native backend's
         // line has the channel (`offload::shows_line`).
-        let at_present = shm.view().is_some_and(|v| {
-            let (count, placements) = v.header().placements();
-            placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT)
-        });
-        let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_pre());
-        if let Some(line) = offload::status_line().filter(|_| offload_line) {
+        // Pass 1 on the finished frame puts every pass there (`placement::finished_frame_only`).
+        let at_present = shm.view().is_some_and(|v| placement::finished_frame_only(&v.header().placements()));
+        let offload_line = offload::shows_line(&offload::state(), offload::active() && at_present, offload_pre::serving_hold());
+        // The finished frame's trial on the game's GPU, or its verdict for it (`offload_trial`): the offload's state
+        // still says Active there, but the game's GPU runs the model.
+        let choice_on = offload::Choice::current() != offload::Choice::Off;
+        let trial_line = if choice_on && at_present && !offload::active() && !offload::given_up() { offload_trial::finished_status_line() } else { None };
+        // present2's refusal made for the trial (`gpu2_present::TRIAL_REFUSAL`) no longer holds once the trial does not
+        // keep the model on the game's GPU, whichever way it ended.
+        #[cfg(target_arch = "x86_64")]
+        if choice_on && !offload_trial::finished_local() {
+            if let Some(v) = shm.view() {
+                crate::gpu2_present::clear_trial_refusal(v.header());
+            }
+        }
+        if let Some(line) = trial_line.or_else(|| offload::status_line().filter(|_| offload_line)) {
             // Against what the channel holds (the native backend's line shares it): written when it says something else,
             // except that once the offload was given up the native backend's own line (the network running here, or why
             // not) is the one to keep.
@@ -6688,37 +7016,92 @@ impl Session {
         if !self.post_stalled && native_on(self.native.as_ref()) {
             use native_post::Status;
             let now = Instant::now();
-            match self.post_server.as_ref().map(native_post::PostServer::status) {
-                Some(Status::Starting) => return,
-                Some(Status::Serving) => {
-                    if self.post_retry.failing() {
+            // A server that ended (`post_ending`) is dropped once its worker has, never joined in the present: the other
+            // GPU's closes its network and gives its device back after its status said so. One that stalled on this
+            // device blocks every later start here, as a stall seen while it ran does.
+            if let Some((ending, why)) = self.post_ending.take() {
+                if !ending.ended() {
+                    self.post_ending = Some((ending, why));
+                    return;
+                }
+                let stalled = ending.status() == Status::Stalled;
+                drop(ending);
+                match why {
+                    Ending::Switch if stalled => {
+                        self.post_stalled = true;
+                        return;
+                    }
+                    Ending::Switch => self.give_back.ask(now),
+                    Ending::Dropped { offload: false } if stalled => {
+                        self.post_stalled = true;
+                        return;
+                    }
+                    Ending::Dropped { .. } => {}
+                }
+            }
+            // The game's GPU's network after a give-back: closed once no path here has used it for a while (asked again at
+            // every present until then), unless the trial takes the model back here first.
+            if let Some(loader) = self.native.as_ref().filter(|_| choice_on) {
+                // Needed here: the trial runs or kept the model on the game's GPU, its server runs, or the next server
+                // to start is the game's GPU's own (the offload given up, a placement off the finished frame, the
+                // second GPU showing the frames from this device): the same decision the start below makes, taken
+                // first, so a give-back never closes the network at the present that starts a server on it.
+                let offload_next = !offload::given_up() && !offload_trial::finished_local() && !crate::device::gpu2_hosts(device.handle()) && at_present;
+                let needed_here = !offload_next || (self.post_server.is_some() && !self.post_offload);
+                if self.give_back.step(needed_here, || loader.give_back_network(), || loader.network_open()) {
+                    crate::log!("[offload] the game's GPU's network is closed: the model runs on the other GPU");
+                    crate::logging::flush();
+                }
+            }
+            let status = self.post_server.as_ref().map(native_post::PostServer::status);
+            let (trial, back) = if choice_on {
+                if offload::given_up() {
+                    offload_trial::clear_back();
+                }
+                (offload_trial::expects_handover(), offload_trial::back_pending())
+            } else {
+                (false, false)
+            };
+            let moved = choice_on && self.post_offload && offload::moved_to_hold(device.handle());
+            match post_action(status, self.post_offload, trial, back, moved) {
+                PostAction::Wait => {
+                    if status == Some(Status::Serving) && self.post_retry.failing() {
                         self.post_retry.succeeded();
                     }
                     return;
                 }
-                // The server on another GPU waits for a frame that did not finish (`native_post::work`): it ends on its
-                // own, with the network back here (Unavailable) once that frame is done.
-                Some(Status::Stalled) if self.post_offload => return,
-                Some(Status::Stalled) => {
-                    self.post_stalled = true;
-                    drop(self.post_server.take());
+                // The finished frame's trial gave the model back to the other GPU (`offload_trial::take_back`): the game's
+                // GPU's server ends without the present waiting for it, and the other GPU's starts once it has.
+                PostAction::EndForSwitch => {
+                    offload_trial::take_back();
+                    if let Some(server) = self.post_server.take() {
+                        server.stop_soon();
+                        self.post_ending = Some((server, Ending::Switch));
+                    }
                     return;
                 }
-                // The second GPU could not start, stalled, was lost or was too slow (`offload`, logged there): the
-                // network runs on this device's GPU from the next present on.
-                Some(Status::Unavailable) => {
+                PostAction::Drop { stalled, failed, handed } => {
+                    // The worker said it ended; what it does after that (the other GPU's network closed, its device given
+                    // back) is not waited for here.
+                    let offload = self.post_offload;
                     self.post_offload = false;
-                    drop(self.post_server.take());
+                    self.post_stalled |= stalled;
+                    if let Some(server) = self.post_server.take() {
+                        if server.ended() {
+                            drop(server);
+                        } else {
+                            self.post_ending = Some((server, Ending::Dropped { offload }));
+                        }
+                    }
+                    if handed {
+                        offload_trial::handed_over();
+                    }
+                    if failed {
+                        self.post_retry.failed(now);
+                    }
                     return;
                 }
-                Some(Status::Retry) => {
-                    // The worker has ended: joining it does not wait.
-                    self.post_offload = false;
-                    drop(self.post_server.take());
-                    self.post_retry.failed(now);
-                    return;
-                }
-                None => {}
+                PostAction::Start => {}
             }
             if matches!(self.post_retry.step(now), neural_forge_protocol::rebuild::Step::Wait(_)) {
                 return;
@@ -6727,10 +7110,20 @@ impl Session {
             // The model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`, `offload`): only at the finished-frame placement, and
             // until it is given up for the session.
             // Given up for the process (`offload::given_up`): every device runs the network on its own GPU from then on.
-            if offload::Choice::current() != offload::Choice::Off && !offload::given_up() {
-                let (count, placements) = view.header().placements();
-                if placements[..count.max(1)].iter().all(|&p| p == neural_forge_protocol::enums::placement::PRESENT) {
+            // (Never from the second GPU's own device while it shows the frames, `crate::gpu2_present`: the network runs on it.)
+            // Not while the finished frame's trial runs on the game's GPU or kept the model there (`offload_trial`).
+            if offload::Choice::current() != offload::Choice::Off
+                && !offload::given_up()
+                && !offload_trial::finished_local()
+                && !crate::device::gpu2_hosts(device.handle())
+            {
+                if placement::finished_frame_only(&view.header().placements()) {
+                    // After a hand-back: once the game's GPU's network is closed (one is open in the process at a time).
+                    if self.give_back.holds_start(now) {
+                        return;
+                    }
                     self.post_offload = true;
+                    offload_trial::clear_back();
                     self.post_server = native_post::PostServer::start_offload(instance.clone(), device.handle(), view);
                     return;
                 }
@@ -6752,6 +7145,9 @@ impl Session {
                 return;
             }
             self.post_server = native_post::PostServer::start(device.clone(), instance.clone(), physical_device, loader.setup(), import, loader, view);
+            // The game's GPU serves the finished frame: a trial waiting for a hand-over (the other GPU's server ended
+            // another way, or this device is new) has it now.
+            offload_trial::handed_over();
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = (device, instance, physical_device, import, shm);
@@ -6761,6 +7157,8 @@ impl Session {
     pub(crate) fn stop_native(&mut self) {
         #[cfg(target_arch = "x86_64")]
         drop(self.post_server.take());
+        #[cfg(target_arch = "x86_64")]
+        drop(self.post_ending.take());
         #[cfg(target_arch = "x86_64")]
         if let Some(loader) = &self.native {
             // First: no other device's loader can reach it once this returns.
@@ -6813,7 +7211,7 @@ impl Session {
             // Against what the channel holds too: the offload's line shares it, and while the offload serves the line is
             // its own (the hold's "native network running" would overwrite it on every frame).
             let offload_active = matches!(offload::state(), offload::State::Active(_));
-            if let Some(line) = hold_offload_line(offload::status_line().as_deref(), offload_active, offload_pre::serving_pre(), &shm.layer_reason()) {
+            if let Some(line) = hold_offload_line(offload::status_line().as_deref(), offload_active, offload_pre::serving_hold(), &shm.layer_reason()) {
                 shm.set_layer_reason(line);
             }
             if native_line_due(&status, &self.native_status, &shm.layer_reason(), offload_active) {
@@ -6997,8 +7395,23 @@ pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
 type Held = (Instant, u32, bool, (u32, u32));
 static LAST_HELD: Mutex<Option<Held>> = Mutex::new(None);
 
-/// The current run of DLSS Ray Reconstruction's launch-bearing submits a device of the process saw ([`Tracker::rr_running`]):
-/// when it began (submits less than [`RAY_RECONSTRUCTION_HAND_BACK`] apart) and the last one.
+/// Whether a launch-bearing submit whose newest record is Ray Reconstruction's keeps its run going
+/// ([`note_ray_reconstruction`]): when it carries another evaluate than the last (`evaluated`), and, in a run with no
+/// hold after DLSS (`held_after`, [`held_in_run`]), every such submit, as before the holds after DLSS.
+fn keeps_rr_run(evaluated: bool, held_after: bool) -> bool {
+    evaluated || !held_after
+}
+
+/// Whether a hold after DLSS was recorded or tried (`held`, [`after_dlss_last`]) in the Ray Reconstruction `run`: since
+/// it began. Holds of an earlier run do not count, so a game whose hold after DLSS stopped being recordable (another
+/// output, a setting changed in a menu) gets its run kept through pauses again once a run began without one.
+fn held_in_run(run: Option<SrLaunches>, held: Option<Instant>) -> bool {
+    run.zip(held).is_some_and(|(r, h)| h >= r.since)
+}
+
+/// The current run of DLSS Ray Reconstruction a device of the process saw ([`Tracker::refresh`]): when it began (its
+/// evaluates less than [`RAY_RECONSTRUCTION_HAND_BACK`] apart; where no hold after DLSS ever was, its launch-bearing
+/// submits, [`keeps_rr_run`]) and the last one.
 static RAY_RECONSTRUCTION_RUN: Mutex<Option<SrLaunches>> = Mutex::new(None);
 
 /// When a hold after DLSS's output last got as far as asking for the network ([`note_after_dlss_tried`]).
@@ -7022,12 +7435,6 @@ pub(crate) fn note_after_dlss_tried() {
     *lock(&AFTER_DLSS_TRIED_AT) = Some(Instant::now());
 }
 
-/// Whether holds after DLSS's output were recorded or tried within [`RAY_RECONSTRUCTION_HAND_BACK`] of `now`.
-fn after_dlss_lately(now: Instant) -> bool {
-    let recent = |at: Option<Instant>| at.is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK);
-    recent(*lock(&AFTER_DLSS_AT)) || recent(*lock(&AFTER_DLSS_TRIED_AT))
-}
-
 /// The header's `preupscale_state` for a device that is `holding` or not: where its holds are, from the
 /// passes' placements and whether holds after DLSS are being recorded (within
 /// [`RAY_RECONSTRUCTION_HAND_BACK`]).
@@ -7036,9 +7443,10 @@ fn hold_state(holding: bool) -> u32 {
         return neural_forge_protocol::enums::preupscale_state::WAITING;
     }
     let now = Instant::now();
-    let after = lock(&AFTER_DLSS_AT).is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK);
-    let (count, settings) = placement::settings();
-    let plan = placement::Plan::of(count, &settings, placement::Frame { rr: ray_reconstruction_running(now), output: after, hook: true });
+    // Holds after DLSS recorded lately, by [`rr_and_after`]'s clock (their own mark alone: a hold only tried is not
+    // one that holds). Ray Reconstruction here is whether it runs at all, with its hold or without.
+    let (_, after) = rr_and_after(None, *lock(&AFTER_DLSS_AT), now);
+    let plan = placement::plan_for(&placement::placements(), placement::Frame { rr: ray_reconstruction_running(now), output: after, hook: true });
     hold_state_of(plan.has(placement::Stage::Before), after && plan.has(placement::Stage::Upscaled))
 }
 
@@ -7061,7 +7469,32 @@ fn hold_state_of(before: bool, after: bool) -> u32 {
 /// first hold after DLSS can be recorded (DLSS's output is learned from them), and the post path that took them built
 /// the network at the output size and held it while the holds waited (#59).
 pub(crate) fn post_serves(now: Instant) -> bool {
-    post_serves_for(placement::settings(), ray_reconstruction_settled(*lock(&RAY_RECONSTRUCTION_RUN), now), after_dlss_lately(now))
+    let (rr, after) = rr_and_after(*lock(&RAY_RECONSTRUCTION_RUN), after_dlss_last(), now);
+    post_serves_for(placement::settings(), rr, after)
+}
+
+/// What [`post_serves`] plans with at `now`: whether Ray Reconstruction counts as running without its hold (`rr`), and
+/// whether holds after DLSS are recorded or tried lately (`after`), from the Ray Reconstruction `run` and the newest
+/// such hold's mark `held`.
+///
+/// One clock for both. The hold's marks are set when it is recorded, the run's when its buffer is submitted, a few
+/// milliseconds to a frame later, and each expires [`RAY_RECONSTRUCTION_HAND_BACK`] after its own: for the last frame
+/// before a pause there was a moment with the hold's expired and the run's not, "Ray Reconstruction runs and no hold
+/// after DLSS" for a few milliseconds, in which a present started the after-the-upscaler server under the hold (#63:
+/// last hold at 735.785, the post path at 736.786, "another network is open" at 736.862). Ray Reconstruction counts
+/// as running without its hold only once it was evaluated for [`RAY_RECONSTRUCTION_HAND_BACK`] past the newest hold's
+/// mark: it went on, and no hold came with it.
+fn rr_and_after(run: Option<SrLaunches>, held: Option<Instant>, now: Instant) -> (bool, bool) {
+    let after = held.is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK);
+    let past_hold = |r: SrLaunches| held.is_none_or(|at| r.last.saturating_duration_since(at) >= RAY_RECONSTRUCTION_HAND_BACK);
+    (ray_reconstruction_settled(run, now) && run.is_some_and(past_hold), after)
+}
+
+/// The newest mark of a hold after DLSS's output, recorded ([`note_after_dlss`]) or tried ([`note_after_dlss_tried`]);
+/// `None` while the process never had one.
+fn after_dlss_last() -> Option<Instant> {
+    let (recorded, tried) = (*lock(&AFTER_DLSS_AT), *lock(&AFTER_DLSS_TRIED_AT));
+    recorded.into_iter().chain(tried).max()
 }
 
 /// How long Ray Reconstruction runs before the post path may take its frames ([`post_serves`]).
@@ -7081,8 +7514,8 @@ fn post_serves_for((count, settings): (usize, [u32; neural_forge_protocol::MAX_P
     placement::Plan::of(count, &settings, placement::Frame { rr, output: after, hook: true }).all_present()
 }
 
-/// How long after Ray Reconstruction's last launch-bearing submit the post path keeps running in its
-/// place. Its submits come several times per real frame; a second covers a hitch.
+/// How long after Ray Reconstruction's last evaluate (or launch-bearing submit, [`keeps_rr_run`]) its run goes on, and
+/// the post path with it where it serves Ray Reconstruction's frames. A second covers a hitch.
 const RAY_RECONSTRUCTION_HAND_BACK: Duration = Duration::from_secs(1);
 
 fn note_ray_reconstruction() {
@@ -7170,6 +7603,148 @@ pub(crate) fn write_dump_async(frame: DumpFrame, capture: Option<(neural_forge_p
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_game_gpus_network_is_given_back_once_it_is_quiet() {
+        let t0 = Instant::now();
+        let mut g = GiveBack::default();
+        assert!(!g.step(false, || panic!("nothing asked"), || panic!("nothing asked")));
+        assert!(!g.holds_start(t0));
+        g.ask(t0);
+        // The loader refuses while a path uses the network: asked again at the next presents.
+        let mut tries = 0;
+        assert!(!g.step(
+            false,
+            || {
+                tries += 1;
+                false
+            },
+            || panic!("not agreed yet")
+        ));
+        assert!(!g.step(
+            false,
+            || {
+                tries += 1;
+                false
+            },
+            || panic!("not agreed yet")
+        ));
+        assert!(
+            !g.step(
+                false,
+                || {
+                    tries += 1;
+                    true
+                },
+                || true
+            ),
+            "the loader agreed: nothing is closed yet, nothing said"
+        );
+        assert_eq!(tries, 3);
+        assert!(g.step(false, || panic!("agreed already"), || false), "closed: said now, once");
+        assert!(!g.step(false, || panic!("done"), || panic!("done")));
+        // The trial takes the model back here first: dropped.
+        g.ask(t0);
+        assert!(!g.step(true, || panic!("needed here"), || panic!("needed here")));
+        assert!(!g.step(false, || panic!("dropped"), || panic!("dropped")));
+        assert!(!g.holds_start(t0), "nothing holds the other GPU's server");
+        // A loader with no network open has nothing to give back.
+        let loader = native::Loader::idle_for_test();
+        loader.stamp_for_test(0, native::epoch_ms_for_test(), false);
+        assert!(!loader.network_open());
+        assert!(loader.give_back_network(), "no network open: nothing to give back, the request is done");
+    }
+
+    /// The hand-back of #63 (the finished frame's trial gives the model back to the second GPU): the game's GPU's
+    /// server has ended and its last frame was moments ago. The network is given back at that present, not a second
+    /// later, and the second GPU's server starts only once it is closed here, so its loader never finds it open and
+    /// waits out its retry.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_hand_back_closes_the_network_before_the_other_gpus_server_starts() {
+        // The claims: a frame of the after-the-upscaler path just now, none in flight, no hold recorded here.
+        let loader = native::Loader::idle_for_test();
+        let now_ms = native::epoch_ms_for_test();
+        loader.stamp_for_test(0, now_ms, false);
+        assert!(!loader.unused_for_test(), "another device's loader would be refused: the path ran moments ago");
+        assert!(loader.unused_without_post_for_test(), "the server has ended: its last frame does not hold the network");
+        // A frame of it still running does.
+        loader.stamp_for_test(0, now_ms, true);
+        assert!(!loader.unused_without_post_for_test(), "a frame in flight keeps the network");
+        // The present's sequence: asked when the server has ended; the loader agrees at once; its worker closes the
+        // network a few milliseconds later; only then does the other GPU's server start.
+        let t0 = Instant::now();
+        let mut g = GiveBack::default();
+        g.ask(t0);
+        assert!(g.holds_start(t0), "asked: the other GPU's server waits");
+        assert!(!g.step(false, || true, || true), "the loader agreed at the first present: nothing is closed yet");
+        assert!(g.holds_start(t0 + Duration::from_millis(40)), "still open here: it waits");
+        assert!(g.step(false, || panic!("agreed already"), || false), "closed now");
+        assert!(!g.holds_start(t0 + Duration::from_millis(80)), "closed: it starts at this present");
+        // The worker declines after the loader agreed (a path took the network in between): the network stays open,
+        // and after a few presents the loader is asked again instead of the server waiting out its limit.
+        let mut g = GiveBack::default();
+        g.ask(t0);
+        assert!(!g.step(false, || true, || true), "agreed, still open");
+        let mut asked_again = 0;
+        for _ in 0..GiveBack::REASK {
+            assert!(!g.step(
+                false,
+                || {
+                    asked_again += 1;
+                    false
+                },
+                || true
+            ));
+        }
+        assert_eq!(asked_again, 0, "the worker has its presents to close it");
+        assert!(
+            !g.step(
+                false,
+                || {
+                    asked_again += 1;
+                    true
+                },
+                || true
+            ),
+            "asked again, and it agrees again (still open, nothing said twice)"
+        );
+        assert_eq!(asked_again, 1);
+        assert!(g.step(false, || panic!("agreed"), || false) && !g.holds_start(t0), "closed this time: the other GPU's server starts");
+        // A network that never closes (a hold keeps using it) does not hold the other GPU's server for ever.
+        let mut g = GiveBack::default();
+        g.ask(t0);
+        assert!(!g.step(false, || false, || panic!("not agreed")));
+        assert!(g.holds_start(t0 + GiveBack::HOLD_MAX - Duration::from_millis(1)));
+        assert!(!g.holds_start(t0 + GiveBack::HOLD_MAX), "past the limit it starts and waits on its own schedule");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_finished_frames_server_steps_for_the_trial() {
+        use native_post::Status::*;
+        let drop = |stalled, failed, handed| PostAction::Drop { stalled, failed, handed };
+        // The other GPU's server ended for the trial: handed over, no failure booked.
+        assert_eq!(post_action(Some(Retry), true, true, false, false), drop(false, false, true));
+        // Any other end that may pass waits for the retry schedule; the game's GPU's own Retry is never a hand-over.
+        assert_eq!(post_action(Some(Retry), true, false, false, false), drop(false, true, false));
+        assert_eq!(post_action(Some(Retry), false, true, false, false), drop(false, true, false));
+        // The trial gave the model back: the game's GPU's server ends, not the other GPU's, and not while the trial
+        // keeps the model here (a give-back from before a re-trial).
+        assert_eq!(post_action(Some(Serving), false, false, true, false), PostAction::EndForSwitch);
+        assert_eq!(post_action(Some(Serving), true, false, true, false), PostAction::Wait);
+        assert_eq!(post_action(Some(Serving), false, true, true, false), PostAction::Wait);
+        assert_eq!(post_action(Some(Serving), false, false, false, false), PostAction::Wait);
+        assert_eq!(post_action(Some(Stalled), true, false, false, false), PostAction::Wait);
+        assert_eq!(post_action(Some(Stalled), false, false, false, false), drop(true, false, false));
+        assert_eq!(post_action(Some(Unavailable), true, true, false, false), drop(false, false, false));
+        assert_eq!(post_action(None, false, false, false, false), PostAction::Start);
+        // Ended because Placement left the finished frame and a hold took the second GPU (`offload::moved_to_hold`):
+        // dropped without a failure, so the next start waits for no retry; the game's GPU's own retry still fails.
+        assert_eq!(post_action(Some(Retry), true, false, false, true), drop(false, false, false));
+        assert_eq!(post_action(Some(Retry), false, false, false, true), drop(false, true, false));
+    }
 
     /// `NEURAL_FORGE_TEST_REBUILD_AT`'s entries: a launch with an optional pause; what does not parse is left out.
     #[test]
@@ -7684,6 +8259,169 @@ mod tests {
         assert!(scan.is_some_and(|s| s.identified_now) && !t.frame().rr);
     }
 
+    /// #63: Ray Reconstruction identifies nothing (`Tracker::refresh`), so only the output it learns watches its motion
+    /// vectors. Cyberpunk 2077 with ray tracing and path tracing off hands DLSS vectors it renders (no `STORAGE`, so
+    /// not taken as `GENERAL`), two in turn: the hold after DLSS reads the one its evaluate names in the layout the
+    /// game's barrier left it in. Without the watch their layout was unknown, nothing was copied, and the offload
+    /// gave up on every frame ("DLSS names no motion vectors").
+    #[test]
+    fn the_hold_after_ray_reconstruction_knows_its_rendered_motion_vectors_layout() {
+        use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let rendered = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut set = gta_registered();
+        for raw in [0x300, 0x310] {
+            set.insert(raw, (img(raw), desc(1707, 960, rgba, rendered)));
+        }
+        let mut t = tracker_with(&set);
+        let rr = |seq, mvec| parse_record(&record_bytes(seq, FEATURE_RR, 1, [0x100, mvec, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        let a = rr(1, 0x300);
+        inject(vec![a]);
+        t.begin(cb(1));
+        t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        t.launch(cb(1), Some(&param_block(&[0x1400])));
+        inject(vec![a, end_of(&a, 2)]);
+        submit(&mut t, &[vec![cb(1)]]);
+        assert!(t.dlss_output.is_some_and(|o| o.rr && o.mvec == img(0x300)), "the output learnt");
+        assert!(t.inputs.is_none(), "Ray Reconstruction identifies nothing");
+        // The next frame's vectors are the other image of their shape, moved to be read in a buffer before DLSS's.
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        t.begin(cb(2));
+        t.barrier(cb(2), ImageSync::to(img(0x310), read));
+        submit(&mut t, &[vec![cb(2)]]);
+        let b = rr(3, 0x310);
+        inject(vec![a, end_of(&a, 2), b]);
+        t.begin(cb(3));
+        t.launch(cb(3), Some(&param_block(&[0x1100, 0x1200, 0x1310])));
+        t.launch(cb(3), Some(&param_block(&[0x1400])));
+        let (c, o, plan) = t.after_at.take().expect("the hold after DLSS's output");
+        let point = t.after_point_at(c, o, &plan).expect("a point on the output");
+        let mv = point.mvec_input.expect("the evaluate's motion vectors");
+        assert_eq!((mv.image, mv.layout, mv.readable), (img(0x310), Some(read), true), "{mv:?}");
+        assert_eq!(point.guessed.mvec, Some(read), "set before DLSS's buffer: checked at its submit");
+    }
+
+    /// The hold inside DLSS's buffer guessed the motion vectors' committed layout: a buffer begun before they were
+    /// watched, in front in the same submission or submitted in between, may have moved them unseen, so the check at the
+    /// submit finds the guess wrong ([`MVEC_UNSEEN`]) rather than keeping it (the same layout still committed, or none).
+    #[test]
+    fn a_buffer_begun_before_the_motion_vector_watch_makes_their_guessed_layout_wrong() {
+        use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let rendered = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut set = gta_registered();
+        set.insert(0x300, (img(0x300), desc(1707, 960, rgba, rendered)));
+        let mut t = tracker_with(&set);
+        t.begin(cb(9));
+        let a = parse_record(&record_bytes(1, FEATURE_RR, 1, [0x100, 0x300, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        inject(vec![a]);
+        t.begin(cb(1));
+        t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        t.launch(cb(1), Some(&param_block(&[0x1400])));
+        inject(vec![a, end_of(&a, 2)]);
+        submit(&mut t, &[vec![cb(1)]]);
+        assert!(t.mvec_watch.is_some());
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        t.begin(cb(2));
+        t.barrier(cb(2), ImageSync::to(img(0x300), read));
+        submit(&mut t, &[vec![cb(2)]]);
+        t.begin(cb(3));
+        assert_eq!(t.layout_when_run(&[], img(0x300)), Some(read), "what the buffers seen whole left");
+        assert_eq!(t.layout_when_run(&[cb(3)], img(0x300)), Some(read));
+        assert_eq!(t.layout_when_run(&[cb(9)], img(0x300)), Some(MVEC_UNSEEN), "behind a buffer begun before, in the same submission");
+        assert_eq!(t.layout_when_run(&[cb(9)], img(0x400)), None, "an image not watched keeps its rule");
+        submit(&mut t, &[vec![cb(9)]]);
+        assert_eq!(t.layout_when_run(&[], img(0x300)), Some(MVEC_UNSEEN), "after it was submitted");
+        assert_eq!(t.layout_when_run(&[cb(3)], img(0x300)), Some(MVEC_UNSEEN));
+    }
+
+    /// #63 through the device's hooks: a game started with Ray Reconstruction on identifies nothing, so the hooks record
+    /// barriers and attachments (gated on [`Tracking::watching`]) only because the learnt output's motion vectors are
+    /// watched. Rendered vectors' layout then comes from a render pass's attachments or a barrier; never from a buffer
+    /// begun before they were watched (its unseen commands may have moved them), and vectors of an earlier output watched
+    /// again start with no layout.
+    #[test]
+    fn rendered_motion_vectors_after_ray_reconstruction_through_the_hooks() {
+        use crate::ngx_ring::{end_of, inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let rendered = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut set = gta_registered();
+        for raw in [0x300, 0x310] {
+            set.insert(raw, (img(raw), desc(1707, 960, rgba, rendered)));
+        }
+        // Another output's vectors, of another shape.
+        set.insert(0x320, (img(0x320), desc(1280, 720, rgba, rendered)));
+        let t = Tracking::default();
+        *t.lock() = tracker_with(&set);
+        let null = vk::CuFunctionNVX::null();
+        let rr = |seq, mvec| parse_record(&record_bytes(seq, FEATURE_RR, 1, [0x100, mvec, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        let mut records = Vec::new();
+        let mut seq = 0;
+        // One evaluate in `c` naming `mvec`: its colour launch and its one write of the output, ended at the submit.
+        // Returns the hold after DLSS's output's motion vectors as that point reads them.
+        let mut evaluate = |c: vk::CommandBuffer, mvec: u64, begin: bool| -> Option<Aux> {
+            seq += 2;
+            let r = rr(seq - 1, mvec);
+            records.push(r);
+            inject(records.clone());
+            if begin {
+                t.begin(c);
+            }
+            t.launch(c, null, Some(&param_block(&[0x1100, 0x1200, mvec + 0x1000])));
+            let (_, after) = t.launch_with_after(c, null, Some(&param_block(&[0x1400])));
+            records.push(end_of(&r, seq));
+            inject(records.clone());
+            let _ = t.submit_ok(&[vec![c]]);
+            after.and_then(|p| p.mvec_input)
+        };
+        // A buffer begun before anything was watched, submitted later.
+        t.begin(cb(9));
+        assert!(evaluate(cb(1), 0x300, true).is_none(), "the first evaluate only teaches the output");
+        assert!(t.watching(), "the output's motion vectors are watched: the hooks record barriers");
+        assert!(t.lock().inputs.is_none() && t.lock().mvec_watch.is_some());
+        // Rendered under dynamic rendering in a buffer begun since: their layout is the attachment's.
+        t.begin(cb(2));
+        t.attachments(cb(2), &[(vk::ImageView::from_raw(0x311), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)]);
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        let mv = evaluate(cb(3), 0x310, true).expect("the evaluate's motion vectors");
+        assert_eq!((mv.image, mv.layout, mv.readable), (img(0x310), Some(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL), true), "{mv:?}");
+        // Moved to be read by a barrier the device's hook records (it records only while watching).
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        t.begin(cb(2));
+        if t.watching() {
+            t.barriers(cb(2), [ImageSync::to(img(0x310), read)].into_iter(), None);
+        }
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        let mv = evaluate(cb(3), 0x310, true).expect("the evaluate's motion vectors");
+        assert_eq!((mv.layout, mv.readable), (Some(read), true), "{mv:?}");
+        // The buffer begun before they were watched is submitted: what it did to them is unknown.
+        let _ = t.submit_ok(&[vec![cb(9)]]);
+        let mv = evaluate(cb(3), 0x310, true).expect("the evaluate's motion vectors");
+        assert_eq!((mv.layout, mv.readable), (None, false), "{mv:?}");
+        // DLSS's own buffer begun before they were watched: not read there either, whatever is committed.
+        t.begin(cb(2));
+        t.barriers(cb(2), [ImageSync::to(img(0x310), read)].into_iter(), None);
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        t.begin(cb(4));
+        // Another output (its vectors of another shape): what was recorded on the first one's vectors is dropped.
+        assert!(evaluate(cb(5), 0x320, true).is_none(), "learnt anew");
+        assert!(t.lock().mvec_watch.is_some_and(|m| m.image == img(0x320)));
+        assert!(!t.lock().committed.contains_key(&img(0x310)), "the earlier output's vectors are not watched now");
+        // Back to the first output: its vectors start with no layout, and cb(4), begun before, never reads them.
+        assert!(evaluate(cb(5), 0x310, true).is_none(), "learnt anew");
+        t.begin(cb(2));
+        t.barriers(cb(2), [ImageSync::to(img(0x310), read)].into_iter(), None);
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        let mv = evaluate(cb(4), 0x310, false).expect("the evaluate's motion vectors");
+        assert_eq!((mv.layout, mv.readable), (None, false), "begun before the watch: {mv:?}");
+        assert!(!t.lock().committed.contains_key(&img(0x310)), "and its submit left their layout unknown");
+        t.begin(cb(2));
+        t.barriers(cb(2), [ImageSync::to(img(0x310), read)].into_iter(), None);
+        let _ = t.submit_ok(&[vec![cb(2)]]);
+        let mv = evaluate(cb(6), 0x310, true).expect("the evaluate's motion vectors");
+        assert_eq!((mv.layout, mv.readable), (Some(read), true), "{mv:?}");
+    }
+
     /// A game handing DLSS another colour image of the same shape every frame (Remnant II, Expedition 33): every
     /// buffer is held with its own evaluate's colour input, and the identification stays the first one.
     #[test]
@@ -7708,6 +8446,42 @@ mod tests {
             assert_eq!(s.identified_now, frame == 0, "frame {frame}: identified once");
         }
         assert_eq!(t.generation, 1);
+    }
+
+    /// #63, test build 145: Ray Reconstruction with the model held after DLSS, and a pause menu. DLSS is not evaluated
+    /// there, but other launch-bearing submits go on (Frame Generation's), each of them a `refresh`. The run of Ray
+    /// Reconstruction is kept by its evaluates (a new record), never by those submits: counted as running through the
+    /// pause, with no hold recorded meanwhile, it put every pass of an auto placement at present a second after the
+    /// last hold, and the after-the-upscaler path took the frames and the process's network from the live hold.
+    #[test]
+    fn ray_reconstruction_runs_while_it_is_evaluated_not_while_other_launches_go_on() {
+        use crate::ngx_ring::{inject, parse_record, tests::record_bytes, FEATURE_RR};
+        let rr = |seq| parse_record(&record_bytes(seq, FEATURE_RR, 1, [0x100, 0x300, 0x200, 0x400, 0], [0.0; 2], [1707.0, 960.0], 1.0, 1.0, 1));
+        let mut t = tracker_with(&gta_registered());
+        inject(vec![rr(1)]);
+        t.refresh();
+        assert!(t.rr_running() && t.rr_seq == Some(1), "its first evaluate: noted");
+        // The pause: the same record is the newest at every other launch-bearing submit.
+        for _ in 0..50 {
+            t.refresh();
+            assert!(!t.rr_evaluate(1), "no new evaluate: the run is not kept going");
+        }
+        assert!(t.rr_running(), "the newest evaluate is still Ray Reconstruction's (nothing is held before it)");
+        // The game resumes: another evaluate.
+        inject(vec![rr(1), rr(3)]);
+        t.refresh();
+        assert_eq!(t.rr_seq, Some(3), "noted again");
+        // What the pause then looks like to the after-the-upscaler path: the run's last evaluate more than a second
+        // ago, no hold after DLSS lately. Auto puts the pass before the upscaler (where it waits for DLSS), not at
+        // present: the post path does not serve, and the hand-back's rules keep it off as in any pause.
+        let t0 = Instant::now();
+        let s = |secs: f32| t0 + Duration::from_secs_f32(secs);
+        let paused = Some(SrLaunches { since: s(0.0), last: s(40.0) });
+        let auto = (1, [neural_forge_protocol::enums::placement::AUTO; neural_forge_protocol::MAX_PASSES]);
+        assert!(!post_serves_for(auto, ray_reconstruction_settled(paused, s(41.2)), false), "1.2 s into the pause: the hold keeps the frames");
+        assert!(post_off(true, Some(s(40.0)), None, s(41.2)) && post_off(true, Some(s(40.0)), None, s(40.0) + PAUSE_HAND_BACK - Duration::from_secs(1)));
+        // (Kept going by the menu's submits, as before the fix, it read as running with no hold: every pass at present.)
+        assert!(post_serves_for(auto, ray_reconstruction_settled(Some(SrLaunches { since: s(0.0), last: s(41.1) }), s(41.2)), false));
     }
 
     /// The hold after DLSS goes after the last of the launches that write DLSS's output, as many as the evaluates
@@ -8227,6 +9001,86 @@ mod tests {
         assert!(shm.preupscale_reason_is(&header.preupscale_reason()));
         publish_reason(&shm, "");
         assert_eq!(header.preupscale_reason(), "");
+    }
+
+    /// The trial against the second GPU (`offload_trial`), wired as the holds drive it: two offloaded windows that
+    /// show the game waiting start it (the held placements then stay on the game's GPU, `offload_pre::wanted`), the
+    /// holds on the game's GPU go through `Session::note`, the Status line is the trial's, and a game's GPU that is
+    /// faster keeps the model, with its line reaching the channel over the native one.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_trial_runs_through_the_holds_notes_and_status() {
+        let _state = offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        offload_trial::reset_for_test();
+        let key = ((1485, 836), placement::active_count());
+        assert!(offload_trial::offloaded(key, Duration::from_millis(23), Duration::from_millis(5)).is_none());
+        assert!(offload_trial::offloaded(key, Duration::from_millis(23), Duration::from_millis(5)).is_some());
+        assert!(offload_trial::running() && offload_trial::keeps_local());
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.init_defaults();
+        let shm = ShmClient::test_over_header(&header);
+        let mut session = Session::default();
+        let held = HoldResult { wrote_back: true, waits_consumed: true, native: true, evaluated: true, ..Default::default() };
+        let trying = native::running_line(None, offload_trial::status_line().as_deref());
+        assert!(trying.starts_with("second GPU: trying the game's GPU"), "{trying}");
+        assert!(native_line_due(&trying, "native network running", "native network running", false));
+        // Holds every 2 ms on the game's GPU (much faster than 23 ms): the warm-up, the window, the verdict.
+        for _ in 0..(offload_trial::LOCAL_WARM as usize + offload_trial::LOCAL_WINDOW + 50) {
+            if !offload_trial::running() {
+                break;
+            }
+            session.note(&shm, &held, Duration::ZERO, (1485, 836));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!offload_trial::running(), "decided");
+        assert!(offload_trial::keeps_local(), "kept on the game's GPU");
+        let kept = native::running_line(None, offload_trial::status_line().as_deref());
+        assert!(kept.starts_with("second GPU: not used: the game's GPU is faster ("), "{kept}");
+        shm.set_layer_reason("native network running");
+        assert!(native_line_due(&kept, "native network running", &shm.layer_reason(), false));
+        offload_trial::reset_for_test();
+    }
+
+    /// #63: the hold whose window starts the trial was sent to the other GPU, and `Session::note` sees it after the
+    /// trial began. It is no run of the model on the game's GPU: the holds after it that wait for DLSS's buffers to be
+    /// done with the other GPU's holds, then for the build, are the build's time, and the trial measures and decides.
+    /// Counted as a run, 30 such waits read as 30 misses: "could not run the model", decided for the process.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_offloaded_hold_that_starts_the_trial_is_no_run_on_the_game_gpu() {
+        let _state = offload::TEST_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        offload_trial::reset_for_test();
+        let key = ((2048, 1536), placement::active_count());
+        assert!(offload_trial::offloaded(key, Duration::from_millis(25), Duration::from_millis(24)).is_none());
+        assert!(offload_trial::offloaded(key, Duration::from_millis(25), Duration::from_millis(24)).is_some());
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.init_defaults();
+        let shm = ShmClient::test_over_header(&header);
+        let mut session = Session::default();
+        let sent = HoldResult { wrote_back: true, waits_consumed: true, native: true, evaluated: true, offloaded: true, ..Default::default() };
+        session.note(&shm, &sent, Duration::ZERO, (2048, 1536));
+        let waiting = HoldResult { native: true, ..HoldResult::local(native::WAITING) };
+        for _ in 0..2 * offload_trial::MISSES {
+            session.note(&shm, &waiting, Duration::ZERO, (2048, 1536));
+        }
+        // Before the model first ran on the game's GPU every miss is the build's (its budget), whatever its reason;
+        // after a run, 30 in a row would be a verdict.
+        let missed = HoldResult { native: true, ..HoldResult::local("the network's sizes do not include this hold's") };
+        for _ in 0..offload_trial::MISSES {
+            session.note(&shm, &missed, Duration::ZERO, (2048, 1536));
+        }
+        assert!(offload_trial::running(), "the build's waits are no verdict");
+        let held = HoldResult { wrote_back: true, waits_consumed: true, native: true, evaluated: true, ..Default::default() };
+        for _ in 0..(offload_trial::LOCAL_WARM as usize + offload_trial::LOCAL_WINDOW + 50) {
+            if !offload_trial::running() {
+                break;
+            }
+            session.note(&shm, &held, Duration::ZERO, (2048, 1536));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!offload_trial::running(), "decided");
+        assert!(offload_trial::keeps_local(), "measured, and kept on the game's GPU");
+        offload_trial::reset_for_test();
     }
 
     /// A hold that runs and holds nothing gives the status its reason (#59): with the VRAM guard's pause in Cyberpunk 2077 at
@@ -10360,7 +11214,7 @@ mod tests {
         let mut session = Session::default();
         session.saw_dlss();
         assert!(!post_off(session.engaged, session.last_hold, None, Instant::now()), "not before the first hold ran the network");
-        let skipped = HoldResult { miss: Some("the native network is still loading"), waits_consumed: true, native: true, ..Default::default() };
+        let skipped = HoldResult { miss: Some(native::LOADING), waits_consumed: true, native: true, ..Default::default() };
         session.note(&shm, &skipped, Duration::from_millis(1), (64, 64));
         assert!(!session.engaged, "a hold that did not run the network does not engage the device");
         assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 1, "a held frame that went untouched is a miss");
@@ -10492,6 +11346,63 @@ mod tests {
 
     /// Ray Reconstruction's first frames do not hand the frames to the post path: only once it has run for
     /// RAY_RECONSTRUCTION_SETTLE (the hold after DLSS is learned from its first frames), and only while running.
+    /// #63, the last frame before a pause: its hold after DLSS is recorded at 40.000 s and its buffer, with Ray
+    /// Reconstruction's evaluate, submitted 6 ms later. A second on, the hold's mark has expired and the run's has
+    /// not. That is not "Ray Reconstruction runs without its hold": the post path must not serve in that moment (it
+    /// started its server there, under the live hold), nor in any other of the pause.
+    #[test]
+    fn the_last_frame_before_a_pause_gives_the_post_path_no_moment_to_start() {
+        let t0 = Instant::now();
+        let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
+        let run = Some(SrLaunches { since: s(0.0), last: s(40.006) });
+        let held = Some(s(40.0));
+        let auto = (1, [neural_forge_protocol::enums::placement::AUTO; neural_forge_protocol::MAX_PASSES]);
+        let serves = |now: f64| {
+            let (rr, after) = rr_and_after(run, held, s(now));
+            post_serves_for(auto, rr, after)
+        };
+        assert_eq!(rr_and_after(run, held, s(40.5)), (false, true), "in play: the hold has the frames");
+        // Each millisecond from the hold's expiry to past the run's.
+        for ms in 0..=20 {
+            let now = 41.0 + f64::from(ms) / 1000.0;
+            assert!(!rr_and_after(run, held, s(now)).0, "at {now} s Ray Reconstruction does not count as running without its hold");
+            assert!(!serves(now), "at {now} s the post path does not serve");
+        }
+        assert!(!serves(41.001) && !serves(45.0) && !serves(200.0), "nor later in the pause");
+        // Ray Reconstruction that goes on for a second past the last hold, with no hold: the post path has its frames.
+        let on = Some(SrLaunches { since: s(0.0), last: s(41.2) });
+        assert_eq!(rr_and_after(on, held, s(41.21)), (true, false));
+        assert!(post_serves_for(auto, true, false));
+        assert_eq!(rr_and_after(Some(SrLaunches { since: s(0.0), last: s(40.9) }), held, s(41.05)), (false, false), "not yet a second past it");
+        // Where no hold after DLSS ever was, Ray Reconstruction counts once settled, as before.
+        assert_eq!(rr_and_after(run, None, s(40.5)), (true, false));
+    }
+
+    /// Ray Reconstruction where the hold after DLSS cannot be recorded (never was, in this process): the
+    /// after-the-upscaler path is where the model runs, and a pause must not end the run, or every resume would go
+    /// 2 s without the model while it settles again. Its launch-bearing submits keep it going there, as before; once a
+    /// hold after DLSS was recorded or tried, only its evaluates do.
+    #[test]
+    fn a_game_never_held_after_dlss_keeps_its_ray_reconstruction_run_through_pauses() {
+        assert!(keeps_rr_run(true, false) && keeps_rr_run(true, true), "an evaluate keeps the run going either way");
+        assert!(keeps_rr_run(false, false), "never held after DLSS: the pause's other launches keep it going");
+        assert!(!keeps_rr_run(false, true), "held after DLSS: a pause ends the run");
+        // "Held" is of this run: a hold from before it began does not count (the output stopped being learnable, or
+        // the game came back from a pause into a run without one), and the run is kept through pauses again.
+        let t0 = Instant::now();
+        let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
+        let run = |since: f64, last: f64| Some(SrLaunches { since: s(since), last: s(last) });
+        assert!(held_in_run(run(10.0, 40.0), Some(s(39.9))), "a hold in this run");
+        assert!(held_in_run(run(10.0, 40.0), Some(s(10.0))));
+        assert!(!held_in_run(run(50.0, 60.0), Some(s(39.9))), "the last hold was in the run before this one");
+        assert!(!held_in_run(run(10.0, 40.0), None) && !held_in_run(None, Some(s(39.9))));
+        assert!(keeps_rr_run(false, held_in_run(run(50.0, 60.0), Some(s(39.9)))), "healed: the pause's launches keep the new run going");
+        // And such a run, a pause long, still hands the post path the frames (no hold's mark to wait past).
+        let t0 = Instant::now();
+        let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
+        assert_eq!(rr_and_after(Some(SrLaunches { since: s(0.0), last: s(99.9) }), None, s(100.0)), (true, false));
+    }
+
     #[test]
     fn ray_reconstruction_hands_the_post_path_its_frames_only_once_settled() {
         let t0 = Instant::now();
@@ -12310,6 +13221,26 @@ mod tests {
 mod native_line_tests {
     use super::{hold_offload_line, native_line_due};
 
+    /// The Status tab's model time is the frame's: both holds' in a frame with passes before the upscaler and after
+    /// DLSS, one hold's otherwise, and a hold that stopped reporting drops out.
+    #[test]
+    fn the_published_network_time_adds_the_frames_two_holds() {
+        use std::time::{Duration, Instant};
+        let mut n = super::NetworkMs::default();
+        let t = Instant::now();
+        let (render, output) = ((1485, 835), (2560, 1440));
+        assert_eq!(n.note(render, 7.5, t), 7.5);
+        assert_eq!(n.note(render, 8.0, t + Duration::from_millis(20)), 8.0, "one hold: its last time");
+        assert_eq!(n.note(output, 17.0, t + Duration::from_millis(21)), 25.0, "both holds of a frame");
+        assert_eq!(n.note(render, 7.0, t + Duration::from_millis(40)), 24.0);
+        // The passes all moved after DLSS: the hold before the upscaler reports no more.
+        assert_eq!(n.note(output, 17.5, t + Duration::from_millis(900)), 24.5);
+        assert_eq!(n.note(output, 17.5, t + Duration::from_millis(1500)), 17.5);
+        // Another size (DLSS's quality changed): the stale slot is taken, never a third added.
+        assert_eq!(n.note((1280, 720), 6.0, t + Duration::from_millis(1510)), 23.5);
+        assert_eq!(n.note((1707, 960), 9.0, t + Duration::from_millis(1520)), 26.5, "a third size replaces one");
+    }
+
     #[test]
     fn a_hold_writes_the_offloads_line_while_it_sends_its_frames() {
         let offload = "second GPU: the model runs on X before DLSS, its edit applied one frame later";
@@ -12318,10 +13249,24 @@ mod native_line_tests {
         assert_eq!(hold_offload_line(Some(offload), true, true, ""), Some(offload));
         // Already there: nothing written.
         assert_eq!(hold_offload_line(Some(offload), true, true, offload), None);
-        // Not the hold before DLSS serving (the finished frame, after DLSS, off, given up): not the hold's to write.
+        // No hold serving (the finished frame, off, given up): not the hold's to write.
         assert_eq!(hold_offload_line(Some(offload), true, false, "native network running"), None);
         assert_eq!(hold_offload_line(Some(offload), false, true, "native network running"), None);
         assert_eq!(hold_offload_line(None, false, false, ""), None);
+    }
+
+    /// A frame with passes before and after DLSS: both holds send their frames to the other GPU, and the offload's
+    /// line, which then names both, takes the channel from the line one hold alone left there, once.
+    #[test]
+    fn a_mixed_frames_line_reaches_the_channel() {
+        use super::offload_pre::{self, Serving};
+        let both = offload_pre::status_line("X", Serving { before: true, after: true });
+        let before = offload_pre::status_line("X", Serving { before: true, after: false });
+        assert!(both.contains("before and after DLSS"), "{both}");
+        for channel in ["", "native network running", before.as_str()] {
+            assert_eq!(hold_offload_line(Some(&both), true, true, channel), Some(both.as_str()), "over {channel:?}");
+        }
+        assert_eq!(hold_offload_line(Some(&both), true, true, neural_forge_protocol::stored_reason(&both)), None, "until it is there");
     }
 
     #[test]

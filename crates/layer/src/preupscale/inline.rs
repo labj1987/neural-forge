@@ -826,8 +826,13 @@ impl Inline {
             s.slots[i].sound = wrong.is_none();
             verdicts.set(i, wrong.is_none());
             if let Some((image, guess, layout)) = wrong {
+                let layout = if layout == super::MVEC_UNSEEN {
+                    "not known (a buffer recorded before it was watched runs first)".to_string()
+                } else {
+                    format!("{layout:?}")
+                };
                 self.say_once(format!(
-                    "an input of a hold inside DLSS's buffer was read as {guess:?}, its layout before this buffer was recorded, but it is {layout:?} when the buffer runs (image {}): that hold carries nothing to the next",
+                    "an input of a hold inside DLSS's buffer was read as {guess:?}, its layout before this buffer was recorded, but it is {layout} when the buffer runs (image {}): that hold carries nothing to the next",
                     super::hex(image)
                 ));
             }
@@ -1008,7 +1013,12 @@ impl Inline {
             }),
             // The copy is at the colour input's extent; the source's extent stays (the vectors' unit,
             // `InlinePoint::mvec_scale`).
-            mvec_input: mvec.map(|_| Aux { image: staging.mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
+            // Not copied: DLSS's own, unread, so a frame the offload cannot send says why (`native::unsendable`: their
+            // layout unknown, not "DLSS names no motion vectors"); everything reading them checks `readable`.
+            mvec_input: match mvec {
+                Some(_) => Some(Aux { image: staging.mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
+                None => point.mvec_input.map(|a| Aux { readable: false, ..a }),
+            },
             depth_input: None,
             // The staging images, in `GENERAL` (set by the copies in), the rectangle at their corner and its edge
             // replicated over the rest of them.
@@ -2178,7 +2188,7 @@ mod tests {
         }
 
         fn ask(hold: u64) -> CacheAsk {
-            CacheAsk { hold, interval: 2, debug_mask: false }
+            CacheAsk { hold, interval: 2, debug_mask: false, at: crate::preupscale::placement::Hold::ALL_BEFORE }
         }
 
         /// The split hold (the reference): frame `f` uploaded, held in front of the game's buffer as hold

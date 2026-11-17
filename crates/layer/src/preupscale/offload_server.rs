@@ -8,6 +8,13 @@
 //! hold submits it (`N[parity]` on the frames' queue), and the answer copied into the answer region. What the CPU
 //! decides per frame on the game's device (the history, the jitter, the passes' settings) comes in a queue keyed
 //! by the frame's sequence number ([`Metas`]).
+//!
+//! A frame with passes before DLSS and after its output has two holds and so two runners, one per hold, each with
+//! its own regions and pass resources at its own size. They share the other device, its one network (the process
+//! has one: `nf_native.cpp`'s `g_live`) and what a frame is submitted with ([`Core`], through
+//! `offload_pre::Seats`): a runner locks the core for the whole of a frame and waits for the frame before it lets
+//! go, so the two holds' frames run one after the other and nothing is freed or rebuilt under a frame that runs.
+//! Both holds ask the network for the same set of sizes (`native::frame_sizes`), so neither's frame rebuilds it.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -16,7 +23,7 @@ use std::time::Instant;
 use ash::vk;
 
 use super::native::{Graph, Loader, NativePass, Passes};
-use super::offload_pre::{Layout, Ran, Runner};
+use super::offload_pre::{Layout, Ran, Runner, Seat, Seats};
 use super::HostBuffer;
 
 /// What the hold decided for the frame it sent as `seq`.
@@ -37,6 +44,9 @@ pub(crate) struct FrameMeta {
     pub passes: Passes,
     /// The hold sent DLSS's depth (the control mask's sky rule reads it).
     pub depth: bool,
+    /// The motion came packed to two halves a texel (`offload_pre::Sizes::packed_texels`): the frame shaders read it
+    /// as they read DLSS's packed vectors (`MOTION_HALF`).
+    pub motion_half: bool,
     pub lut: Option<Arc<super::colour::Lut>>,
 }
 
@@ -48,22 +58,52 @@ struct Frame {
     width: u32,
     height: u32,
     extents: [(u32, u32); neural_forge_protocol::MAX_PASSES],
+    /// The pass reads the motion as packed halves (from its `mvec` buffer), else as floats (from `acc`).
+    motion_half: bool,
     hdr: super::hdr::HdrPass,
     native: NativePass,
-    depth: super::native::DepthCopy,
+    /// DLSS's depth as the hold sent it: only for the hold before DLSS (after DLSS's output there is none).
+    depth: Option<super::native::DepthCopy>,
 }
 
-pub(crate) struct PreRunner {
+/// What the runners of one game device share on the other GPU: the device made for the offload, its loader (the
+/// process's one network) and what a frame is submitted with. Locked by a runner for the whole of a frame.
+struct Core {
     game: vk::Device,
-    instance: ash::Instance,
     off: Option<super::offload::Offload>,
+    /// `None` once the offload was given up ([`Runner::gave_up`]): the network is closed here.
     loader: Option<Arc<Loader>>,
-    metas: Metas,
     queue: vk::Queue,
     pool: vk::CommandPool,
     /// The copies in, and the answer's copy out.
     cmds: [vk::CommandBuffer; 2],
     fence: vk::Fence,
+    /// A frame did not finish: nothing of the device is freed, and no runner submits to it again.
+    leaked: bool,
+}
+
+// SAFETY: plain handles of the offload device, used by one thread at a time (under the seats' lock of it).
+unsafe impl Send for Core {}
+
+/// The cores by the game's device.
+static CORES: Seats<Core> = Seats::new();
+
+/// Why a runner may not run a frame on a core in this state (`leaked`: a frame never finished there; `closed`: the
+/// offload was given up and the network closed), and whether that is a frame that never finished.
+pub(crate) fn refused(leaked: bool, closed: bool) -> Option<(&'static str, bool)> {
+    if leaked {
+        Some(("a frame on the other GPU did not finish", true))
+    } else if closed {
+        Some(("the second GPU was given up", false))
+    } else {
+        None
+    }
+}
+
+pub(crate) struct PreRunner {
+    instance: ash::Instance,
+    seat: Seat<Core>,
+    metas: Metas,
     /// The regions on this device (imported, or staged copies of them), made on the first frame.
     regions: Option<(HostBuffer, HostBuffer)>,
     /// Both devices can import the regions' memory, and the regions' whole sizes.
@@ -71,19 +111,47 @@ pub(crate) struct PreRunner {
     capacity: (usize, usize),
     frame: Option<Frame>,
     rule: super::offload::ServerRule,
-    /// A frame did not finish: nothing of the device is freed.
+    /// A frame did not finish (this runner's, or one of the other hold's on the same device): nothing of the device
+    /// is freed.
     leaked: bool,
     said_loading: bool,
     /// Frames asked of the runner so far.
     frames: u64,
+    /// The hold it serves (the log's words).
+    at: super::offload_pre::Where,
+    /// The pass count last said in the log (more than one pass asked).
+    said_more: Option<usize>,
+}
+
+/// The passes a frame runs on the other device: every pass of the stage the hold sent (`asked`) when the later passes'
+/// buffers are built there (`more`), else pass 1 alone (`native::runnable`, as on the game's GPU).
+fn server_passes(asked: Passes, more: bool) -> Passes {
+    super::native::runnable(asked, more)
+}
+
+/// One frame's buffers on the other device, in submission order: the copies in (`up`), pass 1 (`frame`: its first
+/// frame's buffer and its parity's), the later passes with the copies between them (`later`:
+/// `NativePass::later_sequence`), the answer's copy out (`down`).
+fn frame_submits(
+    up: vk::CommandBuffer,
+    frame: &[Option<vk::CommandBuffer>; 2],
+    later: &[vk::CommandBuffer],
+    down: vk::CommandBuffer,
+) -> Vec<vk::CommandBuffer> {
+    let mut all = vec![up];
+    all.extend(frame.iter().flatten().copied());
+    all.extend_from_slice(later);
+    all.push(down);
+    all
 }
 
 // SAFETY: plain handles of the offload device and its own mappings, used on the worker's thread only.
 unsafe impl Send for PreRunner {}
 
-/// `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (a test switch): that frame of the before-DLSS offload fails on the other
-/// GPU, so the fall-back to the game's GPU can be seen in a game.
-fn test_fail_at() -> Option<u64> {
+/// `NEURAL_FORGE_OFFLOAD_TEST_FAIL=<frame>` (a test switch): that frame of a hold's offload (before DLSS or after its output) fails on the other
+/// GPU, so the fall-back to the game's GPU can be seen in a game; where the second GPU shows the frames itself
+/// (`crate::gpu2_present`), that frame's present fails there.
+pub(crate) fn test_fail_at() -> Option<u64> {
     static AT: std::sync::LazyLock<Option<u64>> =
         std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_OFFLOAD_TEST_FAIL").and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0));
     *AT
@@ -92,7 +160,54 @@ fn test_fail_at() -> Option<u64> {
 impl PreRunner {
     /// On the offload device made with the game's device `game` (`offload::take`): its loader, queue and command
     /// buffers. `Err` with why it cannot serve (the device is given back).
-    pub(crate) fn start(instance: ash::Instance, game: vk::Device, shared: bool, capacity: (usize, usize), metas: Metas) -> Result<(Self, String), String> {
+    pub(crate) fn start(
+        instance: ash::Instance,
+        game: vk::Device,
+        shared: bool,
+        capacity: (usize, usize),
+        metas: Metas,
+        at: super::offload_pre::Where,
+    ) -> Result<(Self, String), String> {
+        let seat = CORES.join(game, |core| refused(core.leaked, core.loader.is_none()).map_or(Ok(()), |(why, _)| Err(why.to_string())), || Core::make(game))?;
+        let (name, import) = {
+            let core = seat.lock();
+            match core.off.as_ref() {
+                Some(off) => (off.name.clone(), off.import),
+                None => return Err("the other GPU's device is gone".into()),
+            }
+        };
+        crate::log!(
+            "[offload] {}: each frame's edit comes from the other GPU and is applied one frame later, carried by DLSS's motion vectors; {}",
+            at.name(),
+            if at == super::offload_pre::Where::Before { "nothing DLSS reads is delayed" } else { "DLSS's output is not delayed" }
+        );
+        crate::logging::flush();
+        let shared = shared && import;
+        Ok((
+            Self {
+                instance,
+                seat,
+                metas,
+                regions: None,
+                shared,
+                capacity,
+                frame: None,
+                rule: super::offload::ServerRule::default(),
+                leaked: false,
+                said_loading: false,
+                frames: 0,
+                at,
+                said_more: None,
+            },
+            name,
+        ))
+    }
+}
+
+impl Core {
+    /// On the offload device made with the game's device `game` (`offload::take`): its loader, queue and command
+    /// buffers. `Err` with why it cannot serve (the device is given back).
+    fn make(game: vk::Device) -> Result<Self, String> {
         let off = match super::offload::take(game) {
             Some(Ok(off)) => off,
             Some(Err(why)) => return Err(why),
@@ -103,9 +218,7 @@ impl PreRunner {
             super::offload::give_back(game, off, false);
             return Err(why);
         }
-        let name = off.name.clone();
         crate::log!("[offload] {}", off.plan);
-        crate::log!("[offload] before DLSS: each frame's edit comes from the other GPU and is applied one frame later, carried by DLSS's motion vectors; nothing DLSS reads is delayed");
         crate::logging::flush();
         let device = &off.device;
         let setup = off.setup;
@@ -141,43 +254,63 @@ impl PreRunner {
         // Barriers between the network's launches, never counter chaining (`native_post::PostServer::start_offload`).
         let loader = Arc::new(Loader::start(off.device.handle(), off.setup, super::native::HoldCounts::default(), false));
         loader.register(off.device.handle());
-        let shared = shared && off.import;
-        Ok((
-            Self {
-                game,
-                instance,
-                off: Some(off),
-                loader: Some(loader),
-                metas,
-                queue,
-                pool,
-                cmds,
-                fence,
-                regions: None,
-                shared,
-                capacity,
-                frame: None,
-                rule: super::offload::ServerRule::default(),
-                leaked: false,
-                said_loading: false,
-                frames: 0,
-            },
-            name,
-        ))
+        Ok(Self { game, off: Some(off), loader: Some(loader), queue, pool, cmds, fence, leaked: false })
     }
+}
 
-    /// One frame; `Err` with [`Ran::Skipped`] or [`Ran::Failed`].
+impl Drop for Core {
+    /// The last runner left (inside the game's `vkDestroyDevice` at the latest, `offload_pre::stop_for`): the
+    /// network is closed and the device given back, unless a frame on it never finished.
+    fn drop(&mut self) {
+        let Some(off) = self.off.take() else { return };
+        let loader = self.loader.take();
+        if let Some(l) = loader.as_ref() {
+            l.retire();
+            l.stop_worker();
+        }
+        if self.leaked {
+            crate::log!("[offload] the other GPU's last frame never finished: its network and device are left to the process's end");
+            crate::logging::flush();
+            if let Some(l) = loader {
+                std::mem::forget(l);
+            }
+            super::offload::give_back(self.game, off, true);
+            return;
+        }
+        // SAFETY: idle: every frame was waited for, and every runner freed what it made before it left.
+        unsafe {
+            off.device.destroy_fence(self.fence, None);
+            off.device.destroy_command_pool(self.pool, None);
+        }
+        drop(loader);
+        // Destroyed with the game's device (inside its vkDestroyDevice, the loader's lock held).
+        super::offload::give_back(self.game, off, false);
+    }
+}
+
+impl PreRunner {
+    /// One frame; `Err` with [`Ran::Skipped`] or [`Ran::Failed`]. The core is locked for all of it: the other hold's
+    /// runner waits for this frame to be done with the device and the network.
     ///
     /// # Safety
     /// As [`Runner::run`].
     unsafe fn frame(&mut self, meta: &FrameMeta, out: *const u8, inn: *mut u8, layout: &Layout) -> Result<(), Ran> {
         let failed = |why: &str| Ran::Failed(why.to_string());
-        let (Some(off), Some(loader)) = (self.off.as_ref(), self.loader.as_ref()) else { return Err(failed("the other GPU's device is gone")) };
+        let mut core = self.seat.lock();
+        let Core { off, loader, queue, cmds, fence, leaked, .. } = &mut *core;
+        if let Some((why, stuck)) = refused(*leaked, loader.is_none()) {
+            // The other hold's frame never finished there, or its worker gave the offload up: nothing is submitted.
+            self.leaked |= stuck;
+            return Err(failed(why));
+        }
+        let (Some(off), Some(loader)) = (off.as_ref(), loader.as_ref()) else { return Err(failed("the other GPU's device is gone")) };
+        let (queue, cmds, fence) = (*queue, *cmds, *fence);
         let (device, instance, physical, setup) = (&off.device, &self.instance, off.physical, off.setup);
         if loader.dead() {
             // A wait on the network's queue there timed out: its work may still run, so nothing it uses is freed
             // (as the finished-frame server does).
             self.leaked = true;
+            *leaked = true;
             return Err(failed("the network on the other GPU stopped responding"));
         }
         // The regions on this device.
@@ -189,7 +322,8 @@ impl PreRunner {
             match (o, i) {
                 (Some(o), Some(i)) => {
                     crate::log!(
-                        "[offload] before DLSS: the frame crosses system memory, {} on the other GPU ({:.1} MB out, {:.1} MB back per frame)",
+                        "[offload] {}: the frame crosses system memory, {} on the other GPU ({:.1} MB out, {:.1} MB back per frame)",
+                        self.at.name(),
                         if o.staged || i.staged { "copied once more there" } else { "imported there without a copy" },
                         layout.out_bytes as f64 / 1048576.0,
                         layout.in_bytes as f64 / 1048576.0
@@ -211,13 +345,15 @@ impl PreRunner {
             }
         }
         // The pass for this extent and these pass extents.
-        if self.frame.as_ref().is_some_and(|f| (f.width, f.height, f.extents) != (meta.width, meta.height, meta.extents)) {
+        if self.frame.as_ref().is_some_and(|f| (f.width, f.height, f.extents, f.motion_half) != (meta.width, meta.height, meta.extents, meta.motion_half)) {
             if let Some(f) = self.frame.take() {
                 // SAFETY: idle: every frame is waited for before `run` returns.
                 unsafe {
                     f.native.destroy(device);
                     f.hdr.destroy(device);
-                    f.depth.destroy(device);
+                    if let Some(d) = f.depth {
+                        d.destroy(device);
+                    }
                 }
             }
         }
@@ -225,10 +361,15 @@ impl PreRunner {
             // SAFETY: a live device; the frames' family is the setup's.
             let built = unsafe {
                 let hdr = super::hdr::HdrPass::build(device, instance, physical, meta.width, meta.height);
-                let native = NativePass::build_at(device, instance, physical, setup.family, meta.width, meta.height, meta.extents, false, false);
-                let depth = super::native::DepthCopy::build(device, instance, physical, setup.family, meta.width, meta.height, false);
+                let native = NativePass::build_at(device, instance, physical, setup.family, meta.width, meta.height, meta.extents, meta.motion_half, false);
+                // No depth crosses for the hold after DLSS's output: no buffer for it there.
+                let wants_depth = layout.sizes.depth > 0;
+                let depth =
+                    if wants_depth { super::native::DepthCopy::build(device, instance, physical, setup.family, meta.width, meta.height, false) } else { None };
                 match (hdr, native, depth) {
-                    (Some(hdr), Some(native), Some(depth)) => Some(Frame { width: meta.width, height: meta.height, extents: meta.extents, hdr, native, depth }),
+                    (Some(hdr), Some(native), depth) if depth.is_some() == wants_depth => {
+                        Some(Frame { width: meta.width, height: meta.height, extents: meta.extents, motion_half: meta.motion_half, hdr, native, depth })
+                    }
                     (hdr, native, depth) => {
                         if let Some(x) = hdr {
                             x.destroy(device);
@@ -252,7 +393,7 @@ impl PreRunner {
         }
         let Some(builts) = loader.ready_sizes(&meta.sizes, meta.choice, 0) else {
             if !std::mem::replace(&mut self.said_loading, true) {
-                crate::log!("[offload] before DLSS: the network is loading on the other GPU; the frames go to DLSS as they are until it runs");
+                crate::log!("[offload] {}: the network is loading on the other GPU; the frames go on as they are until it runs", self.at.name());
                 crate::logging::flush();
             }
             let why = loader.failed().or_else(|| loader.paused().then(|| "the VRAM guard paused it".to_string()));
@@ -266,9 +407,19 @@ impl PreRunner {
         let built = builts[own];
         // Its own compute family: the graph recorded for it.
         let graphs: Vec<Graph> = builts.iter().map(|&b| Graph { built: b, graph: b.graph_own }).collect();
-        // One pass there (the first of the stage).
-        let passes = super::native::runnable(meta.passes, false);
-        let depth = meta.depth.then(|| f.depth.buffer());
+        // Every pass of the stage there, as on the game's GPU: the later passes' buffers built once (a failure runs one).
+        // SAFETY: nothing of the pass is pending (every frame is waited for); the frames' family is the setup's.
+        let more = meta.passes.count > 1 && unsafe { f.native.ensure_more(device, instance, physical, setup.family, meta.passes.count) };
+        let passes = server_passes(meta.passes, more);
+        if meta.passes.count > 1 && self.said_more != Some(passes.count) {
+            if more {
+                crate::log!("[offload] {}: all {} passes of the stage run on the other GPU", self.at.name(), passes.count);
+            } else {
+                crate::log!("[offload] {}: the later passes' buffers could not be made on the other GPU: it runs pass 1 alone", self.at.name());
+            }
+        }
+        self.said_more = (meta.passes.count > 1).then_some(passes.count);
+        let depth = f.depth.as_ref().filter(|_| meta.depth && layout.sizes.depth > 0).map(super::native::DepthCopy::buffer);
         // SAFETY: nothing of the pass is pending (every frame is waited for); every handle is this device's.
         unsafe {
             if !f.native.ensure_lanes(device, instance, physical, passes.count) {
@@ -280,7 +431,16 @@ impl PreRunner {
             }
         }
         let history = f.native.begin_frame(built.network, meta.history);
-        let (frame_cmds, _) = f.native.frame_graphs(&graphs, history, meta.jitter, meta.mvec_scale, &passes);
+        let (frame_cmds, later) = f.native.frame_graphs(&graphs, history, meta.jitter, meta.mvec_scale, &passes);
+        let later = if more { later } else { Vec::new() };
+        // The copies between the passes, recorded for this frame (as the split hold does): `X` saves the capture and
+        // puts pass 1's answer (or its blend at a pass feedback below 1) where pass 2 reads, `Y` the same for each
+        // further pass, `R` puts the capture back. The encoded image is in GENERAL once `up` ran.
+        // SAFETY: built above and not pending (every frame is waited for); the encoded image is this device's.
+        let sequence = match unsafe { f.native.record_later(device, f.hdr.encoded_image(), f.hdr.encoded_view(), f.hdr.padded_region(), &passes, &later) } {
+            Ok(s) => s,
+            Err(_) => return Err(failed("recording the copies between the network's passes failed on the other GPU")),
+        };
         let (o, i) = self.regions.as_ref().expect("made above");
         let texels = u64::from(meta.width) * u64::from(meta.height);
         // SAFETY: the regions as the contract; the device's own command buffers, not pending.
@@ -291,7 +451,7 @@ impl PreRunner {
             // The exposure the encode used, and the scene cut's word.
             let side = out.add(layout.side_at as usize);
             f.hdr.set_exposure_bytes(std::slice::from_raw_parts(side, super::hdr::HdrPass::EXPOSURE_BYTES as usize));
-            let [up, down] = self.cmds;
+            let [up, down] = cmds;
             let begin = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             let recorded = (|| -> ash::prelude::VkResult<()> {
                 device.reset_command_buffer(up, vk::CommandBufferResetFlags::empty())?;
@@ -322,9 +482,14 @@ impl PreRunner {
                 let copy = |dst: vk::Buffer, at: u64, to: u64, size: u64| {
                     device.cmd_copy_buffer(up, o.buffer, dst, &[vk::BufferCopy { src_offset: at, dst_offset: to, size }])
                 };
-                copy(f.native.acc.buffer, layout.motion_at, 0, (texels * 8).min(layout.sizes.motion));
-                if meta.depth {
-                    copy(f.depth.buffer(), layout.depth_at, 0, (texels * 4).min(layout.sizes.depth));
+                // The motion: packed halves into the buffer the frame shaders read DLSS's vectors from, or the floats.
+                if f.motion_half {
+                    copy(f.native.mvec.buffer, layout.motion_at, 0, (texels * 4).min(layout.sizes.motion));
+                } else {
+                    copy(f.native.acc.buffer, layout.motion_at, 0, (texels * 8).min(layout.sizes.motion));
+                }
+                if let Some(depth) = depth {
+                    copy(depth, layout.depth_at, 0, (texels * 4).min(layout.sizes.depth));
                 }
                 // The scene cut the game's GPU decided in its capture: the state's third word.
                 copy(f.native.state_buffer(), layout.side_at + super::hdr::HdrPass::EXPOSURE_BYTES + 8, 8, 4);
@@ -374,23 +539,23 @@ impl PreRunner {
             if recorded.is_err() {
                 return Err(failed("recording the frame's copies failed on the other GPU"));
             }
-            let mut all = vec![up];
-            all.extend(frame_cmds.into_iter().flatten());
-            all.push(down);
+            let all = frame_submits(up, &frame_cmds, &sequence, down);
             let started = Instant::now();
-            if crate::note_vk(device.handle(), device.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&all)], self.fence)).is_err() {
+            if crate::note_vk(device.handle(), device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&all)], fence)).is_err() {
                 f.native.gap.skipped();
                 return Err(failed("the frame's submit failed on the other GPU"));
             }
             for cmd in frame_cmds.into_iter().flatten() {
                 f.native.submitted(cmd);
             }
-            loader.pre_submitted(device, self.fence);
-            let waited = device.wait_for_fences(&[self.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64);
+            f.native.later_submitted(later.len());
+            loader.pre_submitted(device, fence);
+            let waited = device.wait_for_fences(&[fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64);
             match waited {
                 Err(vk::Result::TIMEOUT) => {
                     // Still running: nothing it uses is freed (drain before free).
                     self.leaked = true;
+                    *leaked = true;
                     return Err(failed("a frame on the other GPU did not finish"));
                 }
                 // The device lost (or the wait failed otherwise): nothing of it runs any more, so it is freed as
@@ -398,11 +563,10 @@ impl PreRunner {
                 Err(e) => return Err(failed(&format!("waiting for a frame on the other GPU failed ({e:?}): its device was lost"))),
                 Ok(()) => {}
             }
-            loader.pre_idle(self.fence);
-            let _ = device.reset_fences(&[self.fence]);
+            loader.pre_idle(fence);
+            let _ = device.reset_fences(&[fence]);
             let took = started.elapsed();
-            super::offload::STATS.server_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            super::offload::STATS.server_us.fetch_add(took.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            super::offload_pre::note_server_frame(self.at, took);
             if i.staged {
                 std::ptr::copy_nonoverlapping(i.ptr.add(layout.answer_at as usize), inn.add(layout.answer_at as usize), layout.sizes.answer as usize);
             }
@@ -459,61 +623,81 @@ impl Runner for PreRunner {
         // The process's one network goes back to the game's device: it is closed here (the loader's own drop does
         // it; retiring alone leaves it open, and the game's loader then finds it open elsewhere for good). Not after
         // a frame that never finished: nothing it uses is freed.
-        if self.leaked {
+        // Both holds' runners: a give-up is the process's, so the first to get here closes the network for both (the
+        // other's next frame is refused, and its own give-up finds the loader gone).
+        let mut core = self.seat.lock();
+        if core.leaked {
+            self.leaked = true;
             return;
         }
-        if let (Some(off), Some(f)) = (self.off.as_ref(), self.frame.take()) {
-            // SAFETY: idle: every frame was waited for.
+        if let (Some(off), Some(f)) = (core.off.as_ref(), self.frame.take()) {
+            // SAFETY: idle: every frame was waited for (the core is locked).
             unsafe {
                 f.native.destroy(&off.device);
                 f.hdr.destroy(&off.device);
-                f.depth.destroy(&off.device);
+                if let Some(d) = f.depth {
+                    d.destroy(&off.device);
+                }
             }
         }
-        if let Some(loader) = self.loader.take() {
+        if let Some(loader) = core.loader.take() {
             loader.retire();
             loader.stop_worker();
             drop(loader);
-            crate::log!("[offload] before DLSS: the network is closed on the other GPU; the game's GPU loads it");
+            crate::log!("[offload] {}: the network is closed on the other GPU; the game's GPU loads it", self.at.name());
             crate::logging::flush();
         }
     }
 }
 
 impl Drop for PreRunner {
+    /// Frees what this runner made on the other device; its seat's drop then leaves the core, and the last runner to
+    /// leave closes the network and gives the device back ([`Core`]'s drop).
     fn drop(&mut self) {
-        let Some(off) = self.off.take() else { return };
-        let loader = self.loader.take();
-        if let Some(l) = loader.as_ref() {
-            l.retire();
-            l.stop_worker();
-        }
-        if self.leaked {
-            crate::log!("[offload] the other GPU's last frame never finished: its network and device are left to the process's end");
-            crate::logging::flush();
-            if let Some(l) = loader {
-                std::mem::forget(l);
-            }
-            super::offload::give_back(self.game, off, true);
+        let core = self.seat.lock();
+        // A frame never finished there (this runner's or the other hold's): nothing on the device is freed.
+        if core.leaked {
             return;
         }
-        // SAFETY: idle: every frame was waited for.
+        let Some(off) = core.off.as_ref() else { return };
+        // SAFETY: idle: every frame was waited for (the core is locked).
         unsafe {
             let device = &off.device;
             if let Some(f) = self.frame.take() {
                 f.native.destroy(device);
                 f.hdr.destroy(device);
-                f.depth.destroy(device);
+                if let Some(d) = f.depth {
+                    d.destroy(device);
+                }
             }
             if let Some((o, i)) = self.regions.take() {
                 o.destroy(device);
                 i.destroy(device);
             }
-            device.destroy_fence(self.fence, None);
-            device.destroy_command_pool(self.pool, None);
         }
-        drop(loader);
-        // Destroyed with the game's device (inside its vkDestroyDevice, the loader's lock held).
-        super::offload::give_back(self.game, off, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pass of the stage the hold sent runs on the other GPU once the later passes' buffers are there (#63: only
+    /// pass 1 ran there, the others were dropped); without them pass 1 alone.
+    #[test]
+    fn the_other_gpu_runs_every_pass_of_the_stage() {
+        let asked = Passes { count: 3, ..Passes::default() };
+        assert_eq!(server_passes(asked, true).count, 3);
+        assert_eq!(server_passes(asked, false).count, 1);
+        assert_eq!(server_passes(Passes::default(), false).count, 1);
+    }
+
+    /// The later passes run after pass 1 and before the answer is copied out.
+    #[test]
+    fn the_answer_is_copied_out_after_the_last_pass() {
+        let cb = |n: u64| <vk::CommandBuffer as ash::vk::Handle>::from_raw(n);
+        let (up, down) = (cb(1), cb(9));
+        assert_eq!(frame_submits(up, &[None, Some(cb(2))], &[], down), vec![up, cb(2), down]);
+        assert_eq!(frame_submits(up, &[Some(cb(3)), Some(cb(2))], &[cb(5), cb(6), cb(7)], down), vec![up, cb(3), cb(2), cb(5), cb(6), cb(7), down]);
     }
 }
