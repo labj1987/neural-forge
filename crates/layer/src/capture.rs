@@ -850,7 +850,7 @@ unsafe fn delayed_present(
             // SAFETY: the capture that wrote it was just seen complete (its fence, host-coherent memory) and no request is out.
             let frame =
                 shm.proxy_region(SLOT).map_or(&[][..], |(ptr, capacity)| unsafe { std::slice::from_raw_parts(ptr, capacity.min(frame_bytes as usize)) });
-            if let Some(white) = meter_white(frame, width, height, proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8) {
+            if let Some(white) = meter_white(frame, width, height, encode_push.bgr_order != 0) {
                 shm.publish_measured_white(white);
             }
         }
@@ -887,7 +887,7 @@ unsafe fn delayed_present(
                 height,
                 crate::composition::gpu::ComposeInputs::Delayed { parity: req.parity },
                 *raw_answer_generation,
-                proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+                encode_push.bgr_order != 0,
                 image,
                 crate::composition::gpu::ComposeParams {
                     colour_strength: settings.colour_strength,
@@ -1087,7 +1087,7 @@ unsafe fn delayed_present_cpu(
     let kept = captured.as_ref().filter(|c| original_scratch.len() >= frame_bytes as usize && (!c.from_model_scratch || !model_scratch.is_empty())).map(|c| {
         static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if METER_FRAME.fetch_add(1, Relaxed).is_multiple_of(8) {
-            if let Some(white) = meter_white(original_scratch, width, height, proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8) {
+            if let Some(white) = meter_white(original_scratch, width, height, encode_push.bgr_order != 0) {
                 shm.publish_measured_white(white);
             }
         }
@@ -1143,7 +1143,7 @@ unsafe fn delayed_present_cpu(
                     held_original: Some(&k.original),
                 },
                 *raw_answer_generation,
-                proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+                encode_push.bgr_order != 0,
                 image,
                 crate::composition::gpu::ComposeParams {
                     colour_strength: settings.colour_strength,
@@ -1185,6 +1185,7 @@ unsafe fn delayed_present_cpu(
                     width,
                     height,
                     proxy_format,
+                    encode_push.bgr_order != 0,
                     &inflight[SLOT.index()].kept_cpu[req.parity],
                     raw_answer_generation,
                     settings,
@@ -1267,6 +1268,8 @@ unsafe fn show_kept_cpu(
     width: u32,
     height: u32,
     proxy_format: u32,
+    // The run's channel order (`swapchain::is_bgr_order`), as the synchronous present's compose takes it.
+    bgr_order: bool,
     kept: &KeptCpu,
     raw_answer_generation: &mut u64,
     settings: &crate::shm::CompositionSettings,
@@ -1285,7 +1288,7 @@ unsafe fn show_kept_cpu(
         height,
         crate::composition::gpu::ComposeInputs::Cpu { base: frame, answer: frame, proxy_small: None, held_original: Some(frame) },
         *raw_answer_generation,
-        proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+        bgr_order,
         image,
         crate::composition::gpu::ComposeParams {
             colour_strength: settings.colour_strength,
