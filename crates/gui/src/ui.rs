@@ -955,6 +955,29 @@ pub(crate) struct Telemetry {
     live: Liveness,
 }
 
+/// `games.ini`'s sections, kept until the file's modified time or size changes: reading the file on every tick and
+/// every step of a held spin button is work for the UI thread that a stat call avoids.
+#[derive(Default)]
+struct GamesCache {
+    stamp: Option<(std::time::SystemTime, u64)>,
+    sections: std::collections::BTreeMap<String, neural_forge_supervisor::game_settings::Section>,
+    /// How often the file was read (for the test).
+    reads: u32,
+}
+
+impl GamesCache {
+    /// The sections of the `games.ini` at `path` (none when it is missing or cannot be read).
+    fn sections(&mut self, path: &std::path::Path) -> &std::collections::BTreeMap<String, neural_forge_supervisor::game_settings::Section> {
+        let stamp = std::fs::metadata(path).and_then(|m| Ok((m.modified()?, m.len()))).ok();
+        if stamp != self.stamp || stamp.is_none() {
+            self.sections = std::fs::read(path).map(|bytes| neural_forge_protocol::games::parse(&String::from_utf8_lossy(&bytes))).unwrap_or_default();
+            self.stamp = stamp;
+            self.reads += 1;
+        }
+        &self.sections
+    }
+}
+
 pub struct MainView {
     pub(crate) shm: Arc<Mapping>,
     pub(crate) tab: Tab,
@@ -962,6 +985,8 @@ pub struct MainView {
     pub(crate) spins: HashMap<String, Spin>,
     spin_subs: HashMap<String, [Subscription; 2]>,
     pub(crate) live: Live,
+    /// `games.ini`'s sections, read again only when the file changed.
+    games_cache: GamesCache,
     liveness: Liveness,
     /// The installed Steam games' app ids and names, for the "Settings for" menu.
     steam_names: Vec<(String, String)>,
@@ -996,6 +1021,7 @@ impl MainView {
             scroll: Default::default(),
             scroll_aid: 4,
             pages,
+            games_cache: GamesCache::default(),
             _tasks: Vec::new(),
             _subs: Vec::new(),
         };
@@ -1078,6 +1104,7 @@ impl MainView {
         }));
         view.scan_steam(window, cx);
         view.scan_protons(window, cx);
+        view.load_lut(window, cx);
 
         // A change is saved a moment after the last one (`shm::SAVE_DELAY`), so a held step button is one write.
         let saver = cx.to_async();
@@ -1274,17 +1301,17 @@ impl MainView {
 
         // The "Settings for" menu brought in line with the header: its entries (a game the header names that the menu
         // lacks is added), the entry whose settings it holds, and the summary.
-        let sections = game_settings::load_all();
+        let sections = self.games_cache.sections(std::path::Path::new(&game_settings::games_file()));
         let held = game_settings::held_game(hdr);
         // The game on the channel: by app id, or by the executable the layer names.
         let on_channel: Vec<GameKey> = GameKey::exe(&hdr.game_name()).into_iter().collect();
-        let running = neural_forge_protocol::games::key_for_scope(hdr.running_game.load(Ordering::Relaxed), &sections, &on_channel);
+        let running = neural_forge_protocol::games::key_for_scope(hdr.running_game.load(Ordering::Relaxed), sections, &on_channel);
         let extra: Vec<GameKey> = held.iter().chain(running.iter()).cloned().collect();
-        let entries = crate::text::scope_entries(&self.steam_names, &game_settings::games_with_settings(&sections), &extra);
+        let entries = crate::text::scope_entries(&self.steam_names, &game_settings::games_with_settings(sections), &extra);
         let scope = hdr.settings_game();
         let scope_at = entries.iter().position(|e| e.game.as_ref().map_or(0, GameKey::scope) == scope).unwrap_or(0);
         let game = entries.get(scope_at).and_then(|e| e.game.clone());
-        let own = game.as_ref().map(|g| game_settings::overrides(&sections, g)).unwrap_or_default();
+        let own = game.as_ref().map(|g| game_settings::overrides(sections, g)).unwrap_or_default();
         let shipped = game.as_ref().and_then(neural_forge_protocol::games::shipped).map_or(0, <[_]>::len);
         let running_now = alive && game.is_some() && game.as_ref().map_or(0, GameKey::scope) == hdr.running_game.load(Ordering::Relaxed);
         let summary = crate::text::scope_summary(game.as_ref(), own.len(), shipped, running_now);
@@ -1444,6 +1471,30 @@ impl Render for MainView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn games_cache_reads_again_only_after_the_file_changes() {
+        let dir = std::env::temp_dir().join(format!("nf-games-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("games.ini");
+        let mut cache = super::GamesCache::default();
+        assert!(cache.sections(&path).is_empty(), "a missing file reads as no sections");
+        std::fs::write(&path, "[570]\nset_style=1\n").unwrap();
+        assert_eq!(cache.sections(&path).len(), 1);
+        let reads = cache.reads;
+        for _ in 0..5 {
+            assert_eq!(cache.sections(&path).len(), 1);
+        }
+        assert_eq!(cache.reads, reads, "an unchanged file is not read again");
+        // Same size, later modified time: still a change.
+        std::fs::write(&path, "[571]\nset_style=2\n").unwrap();
+        let later = std::fs::metadata(&path).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
+        let sections = cache.sections(&path);
+        assert!(sections.contains_key("571") && !sections.contains_key("570"));
+        assert_eq!(cache.reads, reads + 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]
