@@ -277,7 +277,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
                 None,
             ));
             out.extend(check_vram(&gpus, None, false));
-            out.push(check_never_attached(roots, manifest_ok, "no channel file".to_string()));
+            out.push(check_never_started(roots, manifest_ok));
             out.extend(check_device_lost(None, session.as_deref()));
             out.extend(check_cannot_run(None, session.as_deref()));
         }
@@ -412,20 +412,30 @@ fn check_model(roots: &Roots) -> Finding {
         let why = format!("no network's manifest in {dir} (full/manifest.json or small/manifest.json)");
         return Finding::new("model", Severity::Failure, "the model is not extracted: the network has nothing to load", why, Some(extract.into()));
     }
-    for i in &installed {
-        if let Err(why) = model::check_installed(&model::network_dir(&roots.model_dir, i.network), i.network) {
-            return Finding::new(
-                "model",
-                Severity::Failure,
-                format!("the extracted {} is damaged: the network cannot load it", i.network),
-                format!("{dir}: {why}"),
-                Some(format!("Extract it again. {extract}")),
-            );
-        }
+    let cfg = crate::Config::load_from(&roots.config_file.to_string_lossy());
+    let setting = |v: &String| v.trim().parse::<u32>().ok().map(Network::from_setting);
+    let chosen = cfg.settings.get("set_network").and_then(setting).unwrap_or(Network::Full);
+    // The networks a game will load: the chosen one (all games', and each game's own in games.ini), or the other one
+    // where it is not extracted (the layer's `network_to_load`).
+    let games_ini = roots.config_file.with_file_name("games.ini");
+    let sections = std::fs::read_to_string(&games_ini).map(|t| neural_forge_protocol::games::parse(&t)).unwrap_or_default();
+    let present = |n: Network| installed.iter().any(|i| i.network == n);
+    let to_load = |n: Network| if present(n) { n } else { installed[0].network };
+    let loaded: Vec<Network> = std::iter::once(chosen).chain(sections.values().filter_map(|s| s.get("set_network").and_then(setting))).map(to_load).collect();
+    let damaged: Vec<(Network, String)> = installed
+        .iter()
+        .filter_map(|i| model::check_installed(&model::network_dir(&roots.model_dir, i.network), i.network).err().map(|why| (i.network, why.to_string())))
+        .collect();
+    // A damaged network a game loads is a failure; one no game loads fails nothing now, and would once chosen.
+    if let Some((network, why)) = damaged.iter().find(|(n, _)| loaded.contains(n)) {
+        let summary = format!("the extracted {network} is damaged: the network cannot load it");
+        return Finding::new("model", Severity::Failure, summary, format!("{dir}: {why}"), Some(format!("Extract it again. {extract}")));
+    }
+    if let Some((network, why)) = damaged.first() {
+        let summary = format!("the extracted {network} is damaged: it cannot load if chosen (the {chosen} is chosen)");
+        return Finding::new("model", Severity::Warning, summary, format!("{dir}: {why}"), Some(format!("Extract it again. {extract}")));
     }
     let text = installed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
-    let cfg = crate::Config::load_from(&roots.config_file.to_string_lossy());
-    let chosen = cfg.settings.get("set_network").and_then(|v| v.trim().parse::<u32>().ok()).map_or(Network::Full, Network::from_setting);
     if !installed.iter().any(|i| i.network == chosen) {
         let runs = installed[0].network;
         return Finding::new(
@@ -774,18 +784,27 @@ fn check_game_compat(hdr: &neural_forge_protocol::ShmHeader) -> Option<Finding> 
     let notes = (!game.notes.is_empty()).then(|| game.notes.join(" "));
     let state = hdr.preupscale_state.load(Ordering::Relaxed);
     let expected: Vec<crate::compat::Placement> = [Some(game.placement), game.placement_rr].into_iter().flatten().collect();
-    // Only a game running now, with the Placement setting on Auto, is compared: a setting that moves the model, or
-    // a closed game's last state, says nothing about the game; nor does waiting for DLSS or a pause with it (a menu, a
-    // loading screen).
+    // Only a game running now, with the Placement setting on Auto, is compared: a setting that moves the model (the
+    // passes' own placements split it before and after DLSS: holding both), or a closed game's last state, says nothing
+    // about the game; nor does waiting for DLSS or a pause with it (a menu, a loading screen), nor a game not on a
+    // Neural Forge Proton (the Proton check says that).
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING_BOTH, IDENTIFIED, NO_WRAPPER, PAUSED, WAITING};
     let comparable = layer_alive(hdr)
         && hdr.placement.load(Ordering::Relaxed) == neural_forge_protocol::enums::placement::AUTO
-        && state != neural_forge_protocol::enums::preupscale_state::WAITING
-        && state != neural_forge_protocol::enums::preupscale_state::PAUSED;
+        && ![WAITING, PAUSED, NO_WRAPPER, HOLDING_BOTH].contains(&state);
     if comparable && !expected.iter().any(|p| p.preupscale_state() == state) {
+        // Identified but not held: the layer says why.
+        let reason = hdr.preupscale_reason();
+        let why = if state == IDENTIFIED && !reason.is_empty() { format!(" (\"{reason}\")") } else { String::new() };
         return Some(Finding::new(
             CHECK,
             Severity::Warning,
-            format!("{}: the model runs {} now, but in testing it ran {}", game.name, crate::shm_status::preupscale_state_name(state), game.placement_text()),
+            format!(
+                "{}: the model runs {} now{why}, but in testing it ran {}",
+                game.name,
+                crate::shm_status::preupscale_state_name(state),
+                game.placement_text()
+            ),
             evidence,
             Some(notes.unwrap_or_else(|| "Check the game's DLSS settings (Super Resolution on), then attach Save report to a bug report.".into())),
         ));
@@ -794,6 +813,19 @@ fn check_game_compat(hdr: &neural_forge_protocol::ShmHeader) -> Option<Finding> 
 }
 
 /// No game's layer has attached: the likely causes, most likely first, and the fix for the first.
+/// No channel file yet: no game has started with the layer since the computer started (the layer creates the
+/// channel), which is no fault; the causes [`check_never_attached`] lists are the evidence, should one have.
+fn check_never_started(roots: &Roots, manifest_ok: bool) -> Finding {
+    let attached = check_never_attached(roots, manifest_ok, "no channel file".to_string());
+    Finding::new(
+        attached.check,
+        Severity::Info,
+        "no game has started with Neural Forge since the computer started",
+        attached.evidence.replace("likely causes:", "if one did, the likely causes:"),
+        attached.fix,
+    )
+}
+
 fn check_never_attached(roots: &Roots, manifest_ok: bool, evidence: String) -> Finding {
     const CHECK: &str = "layer-attached";
     let mut causes = Vec::new();
@@ -2068,6 +2100,15 @@ mod tests {
         std::fs::write(&first, [9u8; 16]).unwrap();
         let m = one(&run(&f.roots), "model").clone();
         assert_eq!((m.severity, m.summary.as_str()), (Severity::Failure, "the extracted small network is damaged: the network cannot load it"));
+        // Damaged but not chosen: a warning, until a game's own setting chooses it.
+        write(&f.roots.config_file, "set_network=0\n");
+        let m = one(&run(&f.roots), "model").clone();
+        assert_eq!(
+            (m.severity, m.summary.as_str()),
+            (Severity::Warning, "the extracted small network is damaged: it cannot load if chosen (the full network is chosen)")
+        );
+        write(&f.roots.config_file.with_file_name("games.ini"), "[1091500]\nset_network=1\n");
+        assert_eq!(one(&run(&f.roots), "model").severity, Severity::Failure, "a game's own setting loads it");
     }
 
     #[test]
@@ -2188,6 +2229,14 @@ mod tests {
             assert_eq!(check_game_compat(&hdr).unwrap().severity, Severity::Ok, "after DLSS is its Ray Reconstruction placement");
             hdr.preupscale_state.store(preupscale_state::WAITING, Ordering::Relaxed);
             assert_eq!(check_game_compat(&hdr).unwrap().severity, Severity::Ok, "waiting (a menu) is not compared");
+            hdr.preupscale_state.store(preupscale_state::NO_WRAPPER, Ordering::Relaxed);
+            assert_eq!(check_game_compat(&hdr).unwrap().severity, Severity::Ok, "no wrapper is the Proton check's");
+            hdr.preupscale_state.store(preupscale_state::HOLDING_BOTH, Ordering::Relaxed);
+            assert_eq!(check_game_compat(&hdr).unwrap().severity, Severity::Ok, "the passes' own placements are a setting");
+            hdr.preupscale_state.store(preupscale_state::IDENTIFIED, Ordering::Relaxed);
+            hdr.set_preupscale_reason("the render size changed");
+            let f = check_game_compat(&hdr).unwrap();
+            assert!(f.summary.contains("not holding now (\"the render size changed\"), but"), "{}", f.summary);
             beat.store(false, Ordering::Relaxed);
         });
     }
@@ -2470,6 +2519,10 @@ mod tests {
         let f = quiet();
         let findings = run(&f.roots);
         assert_eq!(one(&findings, "channel").severity, Severity::Info);
+        // No channel: no game started since boot, which is no fault (not "has not attached since the channel was created").
+        let attached = one(&findings, "layer-attached");
+        assert_eq!((attached.severity, attached.summary.as_str()), (Severity::Info, "no game has started with Neural Forge since the computer started"));
+        assert!(attached.evidence.contains("if one did, the likely causes:"), "{}", attached.evidence);
         assert!(!f.roots.shm_path.exists(), "the doctor created the channel");
         assert!(!f.roots.state_dir.exists() && !f.roots.binaries_dir.exists(), "the doctor created user dirs");
     }
