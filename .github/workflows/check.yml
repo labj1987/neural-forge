@@ -393,12 +393,18 @@ jobs:
           (cd crates/ngx-wrapper &&
               CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked -p neural-forge-ngx-wrapper &&
               CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked --release -p neural-forge-ngx-wrapper)
+          # scripts/build-ngx-wrapper.sh builds the DLL in its own target directory and writes the stamped copy beside it.
+          rm -rf target/ngx-wrapper-build target/ngx-wrapper
           # Only the final artifacts' own paths (target/<profile>/<file>) are checked; Cargo's intermediate layout
           # (deps/, build/, incremental/) is not an interface. No incremental data exists (CARGO_INCREMENTAL=0).
           if find target -type f -regex 'target/\(debug\|release\)/[^/]*' \
                   \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \
                   -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' \) | grep .; then
               echo "error: the checkout's own build output is still in target/" >&2
+              exit 1
+          fi
+          if [ -e target/ngx-wrapper-build ] || [ -e target/ngx-wrapper ]; then
+              echo "error: the NGX wrapper's build output is still in target/" >&2
               exit 1
           fi
 
