@@ -4,6 +4,43 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.5.3 — 2026-11-17
+
+**Fixes from a full read of the code**
+
+- With the model on a second GPU before DLSS, the model's picture is now used on a game GPU that cannot share host
+  memory. Until now the status said the second GPU ran the model, but the game showed its own frame.
+- HDR10 with the model on a second GPU: red and blue are no longer swapped in the blend on swapchains that store blue
+  in the low bits.
+- A game with two Vulkan devices keeps the model when its first network build fails once (for example short of
+  VRAM): the second device can borrow the network again instead of retrying every 30 seconds for the rest of the run.
+- Games whose DLSS exposure is a 32-bit value no longer get frames at the wrong brightness: only a 16-bit exposure is
+  read as the game's, anything else is measured from the frame. A game exposure of 0 counts as unusable, as it should.
+- Switching DLSS's mode or resolution and back again is now recognised as a new input, so the model follows the right
+  image after the switch.
+- After a black start (a fade-in or loading screen), the automatic exposure takes the first real frame's brightness at
+  once instead of adapting to it over about a second.
+- HUD detection after DLSS treats red and blue HUD elements alike on BGRA swapchains.
+- Sharpening keeps working when a game moves its presents to another queue.
+- The toggle key works with a keyboard plugged in or woken after the game started.
+- Switching Neural Forge off for a game puts back the Proton you chose last, also when you changed it in Steam and
+  switched Neural Forge on again.
+- Launch options with a quoted `%command%` are recognised; ones where `%command%` is part of a longer command are left
+  for you to edit, with the line to paste.
+- Settings saved from the window and from `neural-forge-cli` at the same moment no longer overwrite each other; the
+  same for making or removing a Neural Forge Proton.
+- Doctor no longer warns about low VRAM while the model already runs after DLSS or with Ray Reconstruction, no longer
+  calls a game on a Neural Forge Proton set as Steam's default "not on one", and says plainly that no game has started
+  since boot instead of naming a wrong cause. A damaged network you don't use is a warning, not a failure.
+- The Status page's Model row says where the model runs, after DLSS included.
+- The Setup tab no longer reads every Proton from disk each time the window redraws; other file reads moved off the
+  window too, so it stays smooth.
+- A value typed into a number field is kept even when it rounds to the shown value; the toggle-key wait ends when you
+  switch tabs; the game switches become usable once Steam is closed, without a new scan.
+- `neural-forge-cli shmctl capture --view` puts the debug view back afterwards.
+- On Bazzite, Silverblue and other image-based Fedora systems, the missing-library message suggests `rpm-ostree
+  install`.
+
 ## 4.5.2 — 2026-11-16
 
 - **The window takes your desktop's accent colour.** On GNOME, KDE Plasma and COSMIC, primary buttons, switches,
