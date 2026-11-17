@@ -409,7 +409,9 @@ impl State {
         let captures = capture::wait_in_flight(self.capture_pipeline.as_ref(), &self.direct_capture, device);
         let composes = self.gpu_compose.as_ref().is_none_or(|gpu| gpu.wait_in_flight(device));
         let sharpened = self.sharpen.as_mut().is_none_or(|s| s.wait_idle(device));
-        captures && composes && sharpened
+        // A series readback that stalled may still be reading a swapchain image.
+        let series = self.series.wait_stranded(device);
+        captures && composes && sharpened && series
     }
 
     /// Frees the retired present semaphores (the relay's and the composition's) whose last wait is
@@ -1153,6 +1155,7 @@ unsafe fn capture_untouched(
     relay_semaphore: &mut Option<vk::Semaphore>,
     series_wait: &mut Option<vk::Semaphore>,
     why: u32,
+    (swapchain, engaged_swapchains): (vk::SwapchainKHR, &mut HashSet<vk::SwapchainKHR>),
 ) {
     if !readable || !series.running() {
         return;
@@ -1170,6 +1173,8 @@ unsafe fn capture_untouched(
             }
         }
     }
+    // Its readbacks read the swapchain's image: destroying the swapchain drains them (`State::drain_layer_work`).
+    engaged_swapchains.insert(swapchain);
     // SAFETY: per this function's contract; the relay (if any) is the only submission so far.
     unsafe {
         series.before(device, instance, physical_device, queue, queue_family, image, width, height);
@@ -4261,6 +4266,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                                     &mut relay_semaphore,
                                     &mut series_wait,
                                     neural_forge_protocol::capture::reason::BEFORE_UPSCALER,
+                                    (sc, engaged_swapchains),
                                 );
                             }
                         }
@@ -4308,6 +4314,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                                 &mut relay_semaphore,
                                 &mut series_wait,
                                 neural_forge_protocol::capture::reason::MODEL_UNAVAILABLE,
+                                (sc, engaged_swapchains),
                             );
                         }
                     }
