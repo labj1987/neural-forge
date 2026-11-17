@@ -409,7 +409,9 @@ impl State {
         let captures = capture::wait_in_flight(self.capture_pipeline.as_ref(), &self.direct_capture, device);
         let composes = self.gpu_compose.as_ref().is_none_or(|gpu| gpu.wait_in_flight(device));
         let sharpened = self.sharpen.as_mut().is_none_or(|s| s.wait_idle(device));
-        captures && composes && sharpened
+        // A series readback that stalled may still be reading a swapchain image.
+        let series = self.series.wait_stranded(device);
+        captures && composes && sharpened && series
     }
 
     /// Frees the retired present semaphores (the relay's and the composition's) whose last wait is
@@ -1153,6 +1155,7 @@ unsafe fn capture_untouched(
     relay_semaphore: &mut Option<vk::Semaphore>,
     series_wait: &mut Option<vk::Semaphore>,
     why: u32,
+    (swapchain, engaged_swapchains): (vk::SwapchainKHR, &mut HashSet<vk::SwapchainKHR>),
 ) {
     if !readable || !series.running() {
         return;
@@ -1170,6 +1173,8 @@ unsafe fn capture_untouched(
             }
         }
     }
+    // Its readbacks read the swapchain's image: destroying the swapchain drains them (`State::drain_layer_work`).
+    engaged_swapchains.insert(swapchain);
     // SAFETY: per this function's contract; the relay (if any) is the only submission so far.
     unsafe {
         series.before(device, instance, physical_device, queue, queue_family, image, width, height);
@@ -1477,15 +1482,39 @@ unsafe fn sharpen_frame(
             return None;
         }
     }
-    let pass = sharpen.as_mut()?;
-    if pass.family() != target.queue_family {
+    if let Some(was) = sharpen.as_ref().map(crate::sharpen::Sharpen::family).filter(|f| *f != target.queue_family) {
+        // Presents moved to another queue family: the pass is rebuilt for it once its last work finished, as the
+        // compose is (`capture::compose_for_family`).
+        let new = if sharpen.as_mut().is_some_and(|old| old.wait_idle(device)) {
+            // SAFETY: the device's own handles.
+            unsafe { crate::sharpen::Sharpen::new(device, instance, physical_device, target.queue_family) }
+        } else {
+            None
+        };
+        let Some(mut new) = new else {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!(
+                    "[sharpen] a present on queue family {} (set up for {was}), and the pass could not be rebuilt for it yet: that frame presents unsharpened",
+                    target.queue_family
+                );
+                crate::logging::flush();
+            }
+            return None;
+        };
+        let mut old = sharpen.take().expect("checked above");
+        // Presents may still wait on the old pass's semaphores: they go with the new one.
+        new.semaphores = std::mem::take(&mut old.semaphores);
+        // SAFETY: every slot of the old pass finished (waited above), and its present semaphores moved.
+        unsafe { old.destroy(device) };
+        *sharpen = Some(new);
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            crate::log!("[sharpen] a present on queue family {} (set up for {}): that frame presents unsharpened", target.queue_family, pass.family());
+            crate::log!("[sharpen] presents moved to queue family {} (set up for {was}): rebuilt for it", target.queue_family);
             crate::logging::flush();
         }
-        return None;
     }
+    let pass = sharpen.as_mut()?;
     // SAFETY: `p_wait_semaphores` is valid for `wait_semaphore_count`.
     let app_waits: &[vk::Semaphore] = unsafe { preupscale_slice(present_info.p_wait_semaphores, present_info.wait_semaphore_count) };
     if !app_waits.is_empty() && relay_semaphore.is_none() {
@@ -2744,6 +2773,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let binding = crate::preupscale::restore::Binding::Sets { layout, first: first_set, sets: sets.to_vec(), dynamic: dynamic_offsets.to_vec() };
             i.restore.with(command_buffer, |s| s.bind(binding));
         }
+        // Elsewhere they invalidate the offsets kept there (`restore::State::bind_other_sets`).
+        else if let Some(i) = self.inline.as_ref() {
+            i.restore.note_other(command_buffer, |s| s.bind_other_sets(bind_point));
+        }
         LayerResult::Unhandled
     }
 
@@ -2805,10 +2838,17 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 crate::preupscale::restore::Binding::Offsets { layout, first: first_set, indices: buffer_indices.to_vec(), offsets: offsets.to_vec() };
             i.restore.with(command_buffer, |s| s.bind(binding));
         }
+        // Elsewhere too: the replay's buffer binding invalidates them (`restore::State::set_other_offsets`).
+        else if let Some(i) = self.inline.as_ref() {
+            i.restore.note_other(command_buffer, |s| s.set_other_offsets(bind_point, layout, first_set, buffer_indices, offsets));
+        }
         LayerResult::Unhandled
     }
 
     fn cmd_bind_descriptor_buffers_ext(&self, command_buffer: vk::CommandBuffer, infos: &[vk::DescriptorBufferBindingInfoEXT]) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref() {
+            i.restore.buffers_bound();
+        }
         if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
             // SAFETY: the application's binding infos, valid for this call.
             i.restore.with(command_buffer, |s| unsafe { s.bind_buffers(infos) });
@@ -4253,6 +4293,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                                     &mut relay_semaphore,
                                     &mut series_wait,
                                     neural_forge_protocol::capture::reason::BEFORE_UPSCALER,
+                                    (sc, engaged_swapchains),
                                 );
                             }
                         }
@@ -4300,6 +4341,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                                 &mut relay_semaphore,
                                 &mut series_wait,
                                 neural_forge_protocol::capture::reason::MODEL_UNAVAILABLE,
+                                (sc, engaged_swapchains),
                             );
                         }
                     }

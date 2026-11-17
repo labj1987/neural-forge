@@ -118,7 +118,8 @@ pub(crate) const LIFT_LO: f32 = 0.5;
 pub(crate) const LIFT_HI: f32 = 16.0;
 
 /// The exposure buffer's first word as the encode reads it (the low half) and the game's own exposure: the
-/// high half where the auto-exposure lifted the game's (relative), else the same value.
+/// high half where the auto-exposure lifted the game's (relative), else the same value. A high half of 0x0000 is
+/// "no game value"; the shader writes a game exposure of 0 as -0 (0x8000), read here as -0: unusable, as 0 is.
 pub(crate) fn exposure_word(bytes: [u8; 4]) -> (f32, f32) {
     let used = super::f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
     let game = u16::from_le_bytes([bytes[2], bytes[3]]);
@@ -206,7 +207,9 @@ pub(crate) fn auto_exposure_reference(texels: &[u8], width: u32, height: u32, pr
         let target = AUTO_KEY.log2() - mean;
         (previous.map_or(target, |p| p + AUTO_RATE * (target - p)), target, mean)
     };
-    AutoState { log2_e: log2_e.clamp(AUTO_MIN_LOG2_E, AUTO_MAX_LOG2_E), valid: true, target_log2_e: target, mean_log2: mean, samples: total }
+    // Nothing measured after a reset leaves the state invalid (the shader's resolve).
+    let valid = previous.is_some() || total != 0;
+    AutoState { log2_e: log2_e.clamp(AUTO_MIN_LOG2_E, AUTO_MAX_LOG2_E), valid, target_log2_e: target, mean_log2: mean, samples: total }
 }
 
 /// The variable that overrides the paper white (exposed units mapped to 1.0 before the shoulder).

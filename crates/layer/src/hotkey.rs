@@ -147,7 +147,8 @@ fn test_bit(bits: &[c_ulong], bit: usize) -> bool {
 }
 
 /// A keyboard, as opposed to a mouse, lid switch, power button or gamepad: nothing else on a
-/// normal system claims every key from A to Z.
+/// normal system claims every key code from `KEY_A` (30) to `KEY_Z` (44), the home row and the
+/// keys around it up to Z (evdev numbers keys by position, not alphabetically).
 fn looks_like_a_keyboard(fd: c_int) -> bool {
     let mut evbits = [0 as c_ulong; (EV_MAX + LONG_BITS) / LONG_BITS];
     let mut keybits = [0 as c_ulong; (KEY_MAX + LONG_BITS) / LONG_BITS];
@@ -828,14 +829,22 @@ pub struct Poller {
     /// when it was last opened (a broken or missing one is opened again after [`FOCUS_RETRY`]).
     focus: Option<Option<Focus>>,
     focus_opened: Option<Instant>,
+    /// When a backend was last chosen ([`Self::open`]): without one, or with X11 where evdev may become readable
+    /// (the user added to the `input` group, a keyboard plugged in), it is tried again after [`BACKEND_RETRY`].
+    opened_at: Option<Instant>,
+    /// "No way to read the keyboard" was said (once, not at every retry).
+    said_none: bool,
 }
+
+/// How often a missing or second-best keyboard backend is tried again ([`Poller::pressed`]).
+const BACKEND_RETRY: Duration = Duration::from_secs(5);
 
 // The backends hold raw descriptors/pointers used only from the layer's serialized present hook.
 unsafe impl Send for Poller {}
 
 impl Default for Poller {
     fn default() -> Self {
-        Self { backend: Backend::Unopened, pending: 0, pending_key: 0, last_poll: None, focus: None, focus_opened: None }
+        Self { backend: Backend::Unopened, pending: 0, pending_key: 0, last_poll: None, focus: None, focus_opened: None, opened_at: None, said_none: false }
     }
 }
 
@@ -845,6 +854,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 impl Poller {
     fn open(&mut self) {
+        self.opened_at = Some(Instant::now());
         let forced = neural_forge_protocol::env::var("NEURAL_FORGE_HOTKEY_BACKEND");
         let forced = forced.as_deref();
         let (want_evdev, want_x11) = (forced.is_none_or(|f| f == "evdev"), forced.is_none_or(|f| f == "x11"));
@@ -862,10 +872,13 @@ impl Poller {
                 return;
             }
         }
-        crate::log!(
-            "[hotkey] no way to read the keyboard here: /dev/input needs the 'input' group or a uaccess ACL, \
-             and without it only an X11 session can be read (never one inside gamescope)"
-        );
+        if !std::mem::replace(&mut self.said_none, true) {
+            crate::log!(
+                "[hotkey] no way to read the keyboard here: /dev/input needs the 'input' group or a uaccess ACL, \
+                 and without it only an X11 session can be read (never one inside gamescope); tried again every {} s",
+                BACKEND_RETRY.as_secs()
+            );
+        }
         self.backend = Backend::None;
     }
 
@@ -876,8 +889,19 @@ impl Poller {
         if key == 0 {
             return false;
         }
-        if matches!(self.backend, Backend::Unopened) {
+        let retry = self.opened_at.is_some_and(|t| t.elapsed() >= BACKEND_RETRY);
+        if matches!(self.backend, Backend::Unopened) || (retry && matches!(self.backend, Backend::None)) {
             self.open();
+        } else if retry && matches!(self.backend, Backend::X11(_)) {
+            // X11 sees no key inside gamescope and none while another client grabs the keyboard: evdev is preferred
+            // as soon as it can be read.
+            self.opened_at = Some(Instant::now());
+            if neural_forge_protocol::env::var("NEURAL_FORGE_HOTKEY_BACKEND").as_deref().is_none_or(|f| f == "evdev") {
+                if let Some(e) = Evdev::open() {
+                    crate::log!("[hotkey] watching {} keyboard(s) through evdev (readable now)", e.fds.len());
+                    self.backend = Backend::Evdev(e);
+                }
+            }
         }
         let now = Instant::now();
         // Drained events stay in `pending`, so throttling delays a press but never loses it.

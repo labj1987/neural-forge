@@ -12,7 +12,7 @@ HERE="$(dirname "$(readlink -f "$0")")"
 # session and a graphics loader, Vulkan's or EGL's (libcheck_runtime). A system with a loader but no working driver
 # is the GUI's own business: it says so itself. When the GUI cannot start, the reason goes to stderr and, since
 # nobody sees stderr when it was started from a menu, to a dialog (zenity, kdialog or a notification).
-# LIBCHECK_LOADER, LIBCHECK_LDCONFIG, LIBCHECK_OS_RELEASE, LIBCHECK_GLIBC_HAVE and LIBCHECK_DIALOG=none exist for
+# LIBCHECK_LOADER, LIBCHECK_LDCONFIG, LIBCHECK_OS_RELEASE, LIBCHECK_OSTREE_BOOTED, LIBCHECK_GLIBC_HAVE and LIBCHECK_DIALOG=none exist for
 # the tests. Every name here is a shell variable, never exported.
 
 # libcheck_scan BINARY [loader]: sorts what `ldd -r BINARY` reports into LIBCHECK_LIBS (libraries not found),
@@ -163,9 +163,18 @@ libcheck_install_hint() {
     done
     case "$mgr" in
         dnf|zypper)
-            cmd="sudo $mgr install"
+            # An image-based Fedora (Silverblue, Kinoite, Bazzite, ...) layers packages with rpm-ostree, not dnf.
+            if [[ "$mgr" == dnf && -e "${LIBCHECK_OSTREE_BOOTED:-/run/ostree-booted}" ]]; then
+                cmd="rpm-ostree install"
+            else
+                cmd="sudo $mgr install"
+            fi
             for lib in "$@"; do cmd+=" '$lib()(64bit)'"; done
-            echo "Install them with: $cmd."
+            if [[ "$cmd" == rpm-ostree* ]]; then
+                echo "Install them with: $cmd, and restart the computer."
+            else
+                echo "Install them with: $cmd."
+            fi
             ;;
         apt|pacman)
             for lib in "$@"; do

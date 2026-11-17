@@ -145,7 +145,6 @@ impl Guard {
         self.proposal
     }
 
-    /// Applies the decided step; returns it.
     /// A step down is decided and not applied yet.
     pub(crate) fn step_down_pending(&self) -> bool {
         match (self.level, self.proposal) {
@@ -155,6 +154,7 @@ impl Guard {
         }
     }
 
+    /// Applies the decided step; returns it.
     pub(crate) fn apply(&mut self) -> Option<Level> {
         let level = self.proposal.take()?;
         self.level = level;

@@ -548,6 +548,19 @@ pub fn create(root: &Path, source: &Source, wrapper: &Path) -> Result<Created, S
     create_in(root, source, wrapper, Path::new("/proc"))
 }
 
+/// [`lock_tools`]'s file in `compatibilitytools.d`.
+pub const TOOLS_LOCK: &str = ".neural-forge.lock";
+
+/// Holds `compatibilitytools.d`'s Neural Forge lock (`.neural-forge.lock` in it, hidden from Steam and from [`tools`])
+/// until dropped: making, removing and renaming a copy go one at a time (the GUI and the CLI, or two of the GUI's
+/// workers), never two builds in the same `.<name>.tmp`. Not taken where the file cannot be made: the edit then reports
+/// its own error there.
+fn lock_tools(dir: &Path) -> Option<std::fs::File> {
+    let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join(TOOLS_LOCK)).ok()?;
+    lock.lock().ok()?;
+    Some(lock)
+}
+
 /// [`create`], with the processes read from `proc_root`.
 pub fn create_in(root: &Path, source: &Source, wrapper: &Path, proc_root: &Path) -> Result<Created, String> {
     let dll = std::fs::read(wrapper).map_err(|e| format!("Neural Forge's NGX wrapper {}: {e}", wrapper.display()))?;
@@ -563,6 +576,7 @@ pub fn create_in(root: &Path, source: &Source, wrapper: &Path, proc_root: &Path)
     let name = source.tool_name();
     let dir = tools_dir(root);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let _held = lock_tools(&dir);
     let (final_dir, tmp, old) = (dir.join(&name), dir.join(format!(".{name}.tmp")), dir.join(format!(".{name}.old")));
     let replaced = final_dir.exists() || final_dir.is_symlink();
     if replaced {
@@ -647,6 +661,7 @@ pub fn remove(root: &Path, name: &str) -> Result<Tool, String> {
 
 /// [`remove`], with the processes read from `proc_root`.
 pub fn remove_in(root: &Path, name: &str, proc_root: &Path) -> Result<Tool, String> {
+    let _held = lock_tools(&tools_dir(root));
     let tool = tools(root).into_iter().find(|t| t.name == name).ok_or_else(|| format!("no Neural Forge Proton named {name}"))?;
     refuse_in_use(&tool.dir, proc_root, "remove it")?;
     std::fs::remove_dir_all(&tool.dir).map_err(|e| format!("{}: {e}", tool.dir.display()))?;
@@ -717,6 +732,7 @@ pub fn rename_in(tool: &Tool, proc_root: &Path) -> Result<Renamed, String> {
             Err(format!("{} already exists and is another tool or an incomplete copy: remove or rename it, then make {} again", target.display(), tool.name))
         }
         RenamePlan::Rename(name) => {
+            let _held = tool.dir.parent().and_then(lock_tools);
             refuse_in_use(&tool.dir, proc_root, "rename it")?;
             rename_dir(tool, &name).map(Renamed::To)
         }
@@ -954,6 +970,34 @@ mod tests {
         b[..2].copy_from_slice(b"MZ");
         b[0x40..0x50].copy_from_slice(b"Wine builtin DLL");
         std::fs::write(path, b).unwrap();
+    }
+
+    /// Making a copy waits for another make, remove or rename of a copy to finish (the lock in compatibilitytools.d).
+    #[test]
+    fn making_a_copy_waits_for_the_tools_lock() {
+        let root = scratch("lock");
+        let src = root.join("compatibilitytools.d/Proton-GE Latest");
+        fake_proton(&src, "GE-Proton11-12", "Proton-GE Latest");
+        let wrapper = root.join("_nvngx.dll");
+        fake_wrapper(&wrapper);
+        let source = sources(&root, &[]).remove(0);
+        let held = lock_tools(&root.join("compatibilitytools.d")).unwrap();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let maker = s.spawn(|| {
+                let made = create(&root, &source, &wrapper);
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                made
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "made while another holder had the lock");
+            assert!(!root.join("compatibilitytools.d/.GE-Proton11-12-NeuralForge.tmp").exists());
+            drop(held);
+            assert_eq!(maker.join().unwrap().unwrap().tool.name, "GE-Proton11-12-NeuralForge");
+        });
+        assert_eq!(tools(&root).len(), 1, "the lock file is not a tool");
+        assert!(leftovers(&root).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

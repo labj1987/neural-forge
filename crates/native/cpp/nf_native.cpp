@@ -152,11 +152,21 @@ struct InstanceFns {
   }
 };
 
+// The device's extensions; asked again while the list grows between the count and the fill (VK_INCOMPLETE). Throws
+// when the driver fails the query (every caller is inside a try).
 std::vector<std::string> deviceExtensions(const InstanceFns& fns, VkPhysicalDevice physical) {
-  uint32_t count = 0;
-  fns.extensions(physical, nullptr, &count, nullptr);
-  std::vector<VkExtensionProperties> props(count);
-  fns.extensions(physical, nullptr, &count, props.data());
+  std::vector<VkExtensionProperties> props;
+  VkResult result = VK_INCOMPLETE;
+  for (int tries = 0; result == VK_INCOMPLETE && tries < 8; ++tries) {
+    uint32_t count = 0;
+    result = fns.extensions(physical, nullptr, &count, nullptr);
+    if (result != VK_SUCCESS) break;
+    props.resize(count);
+    result = fns.extensions(physical, nullptr, &count, props.data());
+    props.resize(count);
+  }
+  if (result != VK_SUCCESS)
+    throw std::runtime_error("vkEnumerateDeviceExtensionProperties failed (VkResult " + std::to_string(result) + ")");
   std::vector<std::string> names;
   for (const auto& p : props) names.emplace_back(p.extensionName);
   return names;
@@ -1026,6 +1036,9 @@ uint32_t nf_native_capture(NfNative* n, uint32_t slot, const char* name, void* o
     return 1;
   } catch (const std::exception& e) {
     say(err, err_len, e.what());
+    return 0;
+  } catch (...) {
+    say(err, err_len, "an unknown C++ exception");
     return 0;
   }
 }

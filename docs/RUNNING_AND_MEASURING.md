@@ -197,7 +197,7 @@ model ran before the upscaler. `scripts/bench-report.py --self-test` checks its 
   `--fg` names a run where it did not engage and leaves it out of `--mean`. Whether frame generation
   works and how the game feels is the maintainer's check, playing.
 
-**Resolution.** Never change the desktop's display mode for a run (it stays at 3840x2160, 144 Hz, VRR,
+**Resolution.** Never change the desktop's display mode for a run (it stays at 2560x1440, 288 Hz, VRR,
 HDR); set the game's own resolution instead: `ScreenWidth` and `ScreenHeight` in GTA's `settings.xml`
 (the game sweep sets 2560x1440 and puts the file back; `gta-bench.sh` uses the file as found), checked
 afterwards with `sha256sum` against the value taken before. The layer's log names the size the game
@@ -562,7 +562,7 @@ each run the sweep shuts Steam down, writes the options, starts Steam with the s
 (`systemd-run --user`, so `environment.d`'s variables apply as at login), runs the game, then shuts Steam down
 again, puts every account's `localconfig.vdf` back byte for byte and starts it again if it was running.
 
-Each run sets the game's own resolution to 2560x1440 and leaves the desktop at 3840x2160 (since 2026-11-12: at 4K
+Each run sets the game's own resolution to 2560x1440 and leaves the desktop at 2560x1440, 288 Hz, VRR (since 2026-11-12: at 4K
 the 12 GB card ran out of video memory with Ray Reconstruction and the model after DLSS; LESSONS.md). The run's game
 settings (`edit_file`: Cyberpunk 2077's `UserSettings.json` for the resolution, HDR10 PQ and Ray Reconstruction;
 GTA's `settings.xml` for the resolution and `FrameLimit` 120, which keeps its frame generation on, see LESSONS.md)

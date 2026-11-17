@@ -261,8 +261,10 @@ jobs:
           python3 scripts/check_proton_scripts.py --self-test
           bash scripts/gta-bench.sh --self-test
           bash scripts/build-ngx-wrapper.sh --self-test
+          bash build-appimage.sh --self-test
           bash scripts/game-sweep.sh --self-test
           bash scripts/test_apprun.sh
+          bash scripts/test_game_reg.sh
           bash scripts/smoke-gui.sh --self-test
 
       - name: Shader sources match committed SPIR-V
@@ -343,7 +345,8 @@ jobs:
 
       # Install the extracted AppImage's files with its own CLI into scratch XDG directories (never
       # the runner user's real ones), then run the smoke example through the Vulkan loader against
-      # the installed release library, so the packaged layer is the one that gets exercised.
+      # the installed release library, so the packaged layer is the one that gets exercised, last through the
+      # installed implicit manifest alone.
       - name: Install the AppImage and smoke-test the installed layer
         run: |
           scratch="$(mktemp -d)"
@@ -353,7 +356,7 @@ jobs:
           so="$XDG_DATA_HOME/neural-forge/lib/neural-forge/libneural_forge_layer.so"
           test -f "$so"
           cmp "$so" squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so
-          NEURAL_FORGE_SMOKE_SO="$so" bash scripts/smoke-test.sh
+          NEURAL_FORGE_SMOKE_SO="$so" NEURAL_FORGE_SMOKE_INSTALLED_DATA="$XDG_DATA_HOME" bash scripts/smoke-test.sh
 
       - name: Upload the release files
         if: inputs.release
@@ -391,12 +394,18 @@ jobs:
           (cd crates/ngx-wrapper &&
               CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked -p neural-forge-ngx-wrapper &&
               CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked --release -p neural-forge-ngx-wrapper)
+          # scripts/build-ngx-wrapper.sh builds the DLL in its own target directory and writes the stamped copy beside it.
+          rm -rf target/ngx-wrapper-build target/ngx-wrapper
           # Only the final artifacts' own paths (target/<profile>/<file>) are checked; Cargo's intermediate layout
           # (deps/, build/, incremental/) is not an interface. No incremental data exists (CARGO_INCREMENTAL=0).
           if find target -type f -regex 'target/\(debug\|release\)/[^/]*' \
                   \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \
                   -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' \) | grep .; then
               echo "error: the checkout's own build output is still in target/" >&2
+              exit 1
+          fi
+          if [ -e target/ngx-wrapper-build ] || [ -e target/ngx-wrapper ]; then
+              echo "error: the NGX wrapper's build output is still in target/" >&2
               exit 1
           fi
 

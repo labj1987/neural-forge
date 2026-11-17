@@ -25,7 +25,7 @@ static DEVICES: LazyLock<Mutex<HashMap<vk::Device, Option<SetLoaderData>>>> = La
 pub struct Registration(vk::Device);
 impl Drop for Registration {
     fn drop(&mut self) {
-        DEVICES.lock().unwrap().remove(&self.0);
+        DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.0);
     }
 }
 
@@ -45,12 +45,12 @@ pub unsafe fn register(device: vk::Device, info: &vk::DeviceCreateInfo) -> Regis
         }
         node = base.p_next;
     }
-    DEVICES.lock().unwrap().insert(device, setter);
+    DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(device, setter);
     Registration(device)
 }
 
 unsafe fn initialize(device: vk::Device, object: *mut c_void) -> VkResult<()> {
-    let registration = DEVICES.lock().unwrap().get(&device).copied();
+    let registration = DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&device).copied();
     match registration {
         Some(Some(setter)) => unsafe { setter(device, object) }.result(),
         Some(None) => {
@@ -125,7 +125,7 @@ mod tests {
         unsafe { initialize(device, child.as_mut_ptr().cast()) }.unwrap();
         assert_eq!(child, [0x1234, 0x5678]);
         drop(registration);
-        assert!(!DEVICES.lock().unwrap().contains_key(&device));
+        assert!(!DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&device));
     }
     #[test]
     fn older_loader_fallback_initializes_only_the_dispatch_slot() {

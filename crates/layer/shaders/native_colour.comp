@@ -200,7 +200,9 @@ void main() {
     return;
   }
   vec4 a = answerAt(id);
-  vec3 input_ = clamp(imageLoad(u_encoded, ivec2(id)).rgb, vec3(0.0), vec3(1.0));
+  // A NaN in the proxy is zeroed before the clamp (as native_preprocess.comp): clamp leaves a NaN undefined.
+  vec3 input_ = imageLoad(u_encoded, ivec2(id)).rgb;
+  input_ = clamp(mix(input_, vec3(0.0), isnan(input_)), vec3(0.0), vec3(1.0));
   vec3 e = a.rgb - input_;
   vec3 r = a.rgb;
   bool changed = false;

@@ -252,6 +252,9 @@ pub struct Series {
     /// the device is idle.
     stranded: Vec<Resources>,
     stranded_semaphores: Vec<vk::Semaphore>,
+    /// The stranded readbacks' fences of copies that were submitted and not seen done: they read a swapchain
+    /// image, so destroying the swapchain waits for them first ([`Self::wait_stranded`]).
+    stranded_fences: Vec<vk::Fence>,
     /// Writers of finished captures still writing: waited for (bounded) only at device teardown.
     draining: Vec<std::thread::JoinHandle<()>>,
 }
@@ -440,11 +443,18 @@ impl Series {
         let consumed = if submitted { PresentWait::Consumed } else { PresentWait::Unchanged };
         let original_done = unsafe { wait_and_reset(device, &r.original) };
         let composited_done = submitted && unsafe { wait_and_reset(device, &r.composited) };
+        let (original_fence, composited_fence) = (r.original.fence, r.composited.fence);
         if !(original_done && composited_done) {
             crate::log!("[capture] readback failed on frame {}; capture abandoned", active.seq);
             self.finish(Close::Failed(reason::READBACK_FAILED));
             // A fence that never signalled leaves its resources in an unknown state: they are kept
             // aside rather than freed under the GPU or reused with a pending fence.
+            if !original_done {
+                self.stranded_fences.push(original_fence);
+            }
+            if submitted && !composited_done {
+                self.stranded_fences.push(composited_fence);
+            }
             self.stranded.extend(self.resources.take());
             // A copy still in flight reads the image and puts it back in `PRESENT_SRC_KHR` only when it
             // runs: the present must not go before it. With `compose_done` still unconsumed (the second
@@ -553,6 +563,21 @@ impl Series {
         !self.stranded.is_empty() || !self.stranded_semaphores.is_empty()
     }
 
+    /// Waits (bounded, [`crate::FENCE_WAIT_TIMEOUT`]) for the stranded readbacks still reading a swapchain
+    /// image: whether none is left in flight. The resources stay stranded until teardown either way.
+    pub fn wait_stranded(&mut self, device: &ash::Device) -> bool {
+        if self.stranded_fences.is_empty() {
+            return true;
+        }
+        // SAFETY: the fences are this device's and alive (their resources are kept until teardown).
+        let wait = unsafe { device.wait_for_fences(&self.stranded_fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        let done = crate::note_fence_wait(device.handle(), wait, "stranded series readback").is_ok();
+        if done {
+            self.stranded_fences.clear();
+        }
+        done
+    }
+
     /// `idle`: the device was waited idle (or is lost), so the stranded readbacks and the semaphores
     /// presents waited on in their place may go too; otherwise they are leaked.
     ///
@@ -577,6 +602,7 @@ impl Series {
         }
         self.draining.clear();
         unsafe { destroy_resources(self.resources.take(), device) };
+        self.stranded_fences.clear();
         if idle {
             for stranded in self.stranded.drain(..) {
                 // SAFETY: the device is idle: nothing of these is pending.
@@ -1108,6 +1134,9 @@ mod tests {
             assert!(!series.running(), "the capture ends");
             assert_eq!(finished(&header, 21).reason, reason::READBACK_FAILED);
             assert!(series.has_stranded());
+            assert_eq!(series.stranded_fences.len(), 2, "both copies were submitted and not seen done");
+            assert!(series.wait_stranded(&device), "a swapchain's destruction can wait for them");
+            assert!(series.stranded_fences.is_empty() && series.wait_stranded(&device));
             // The present's wait, standing in for `vkQueuePresentKHR`'s.
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
             let stage = [vk::PipelineStageFlags::ALL_COMMANDS];

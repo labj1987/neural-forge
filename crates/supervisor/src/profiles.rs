@@ -102,6 +102,7 @@ pub fn save_profile(name: &str, settings: ProfileSettings) -> std::io::Result<()
     if let Some(why) = invalid_name(name) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why));
     }
+    let _held = crate::paths::lock_beside(&profiles_file());
     let mut all = load_for_update()?;
     all.insert(name.to_string(), settings);
     save_all(&all)
@@ -109,6 +110,7 @@ pub fn save_profile(name: &str, settings: ProfileSettings) -> std::io::Result<()
 
 /// Returns `true` if `name` existed and was removed.
 pub fn delete_profile(name: &str) -> std::io::Result<bool> {
+    let _held = crate::paths::lock_beside(&profiles_file());
     let mut all = load_for_update()?;
     let existed = all.remove(name).is_some();
     if existed {
@@ -169,6 +171,26 @@ mod tests {
             }
             std::fs::remove_dir_all(&self.dir).ok();
         }
+    }
+
+    /// A save waits for another read-modify-write of profiles.ini (the GUI's and the CLI's at once) to finish.
+    #[test]
+    fn a_save_waits_for_the_files_lock() {
+        let _scratch = ScratchConfigHome::new("lock");
+        let held = crate::paths::lock_beside(&profiles_file()).unwrap();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let saver = s.spawn(|| {
+                let saved = save_profile("Night", ProfileSettings::new());
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                saved
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "saved while another holder had the lock");
+            drop(held);
+            saver.join().unwrap().unwrap();
+        });
+        assert!(load_all().contains_key("Night"));
     }
 
     #[test]

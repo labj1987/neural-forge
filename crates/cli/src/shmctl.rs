@@ -150,9 +150,8 @@ fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
 /// removes the key) and bumps `edit_lut_seq` so a running layer reads it again.
 fn cmd_lut(header: &ShmHeader, file: &str) -> bool {
     let key = neural_forge_protocol::cube::CONFIG_KEY;
-    let mut cfg = neural_forge_supervisor::Config::load();
-    if file == "none" {
-        cfg.settings.remove(key);
+    let path = if file == "none" {
+        None
     } else {
         let path = match std::fs::canonicalize(file) {
             Ok(p) => p.to_string_lossy().into_owned(),
@@ -168,12 +167,22 @@ fn cmd_lut(header: &ShmHeader, file: &str) -> bool {
                 return false;
             }
         }
-        cfg.settings.insert(key.to_string(), path);
-    }
-    if let Err(e) = cfg.save() {
-        eprintln!("shmctl lut: saving config.ini failed: {e}");
-        return false;
-    }
+        Some(path)
+    };
+    let saved = neural_forge_supervisor::Config::update(|cfg| {
+        match path {
+            Some(path) => cfg.settings.insert(key.to_string(), path),
+            None => cfg.settings.remove(key),
+        };
+        true
+    });
+    let cfg = match saved {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("shmctl lut: saving config.ini failed: {e}");
+            return false;
+        }
+    };
     header.edit_lut_seq.fetch_add(1, Ordering::Relaxed);
     header.control_seq.fetch_add(1, Ordering::Relaxed);
     println!("{key}={}", cfg.settings.get(key).map_or("", String::as_str));
@@ -300,12 +309,26 @@ fn cmd_capture(header: &ShmHeader, args: &[String]) -> bool {
         }
         CaptureArgs::Take { frames, view } => (frames, view),
     };
+    // The view is the capture's only: what was shown before is put back afterwards, so a later `set` or profile save
+    // (which saves every setting) does not keep it.
+    let previous = header.debug_view.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(view) = view {
         if !store(header, "debug_view", view) {
             eprintln!("shmctl capture: debug_view was not stored");
             return false;
         }
     }
+    let ok = take_capture(header, frames);
+    if view.is_some() && !store(header, "debug_view", previous) {
+        eprintln!("shmctl capture: debug_view could not be put back to {previous}");
+        return false;
+    }
+    ok
+}
+
+/// [`cmd_capture`]'s request and its wait.
+fn take_capture(header: &ShmHeader, frames: u32) -> bool {
+    use neural_forge_protocol::capture;
     let id = match capture::request(header, frames) {
         Ok(id) => id,
         Err(e) => {
@@ -599,6 +622,30 @@ mod tests {
         let err = wait_for_capture(&header, id, std::time::Duration::from_millis(50), std::time::Duration::from_secs(10)).unwrap_err();
         assert!(err.contains("no game took"), "{err}");
         assert_eq!(capture::pending(&header), None, "withdrawn: nothing waits to fire on the next game");
+    }
+
+    /// `--view` holds for the capture only: the view before it is back afterwards.
+    #[test]
+    fn a_captures_view_is_put_back_afterwards() {
+        use neural_forge_protocol::capture;
+        let header: &'static ShmHeader = Box::leak(Box::default());
+        header.init_defaults();
+        let layer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let request = loop {
+                if let Some(r) = capture::take(header, |_| true) {
+                    break r;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            let seen = header.debug_view.load(Ordering::Relaxed);
+            capture::publish(header, &capture::Outcome { id: request.id, state: capture::state::WRITTEN, done: 1, total: 1, ..Default::default() });
+            seen
+        });
+        assert!(cmd_capture(header, &["--view".to_string(), "1".to_string()]));
+        assert_eq!(layer.join().unwrap(), 1, "the capture ran with the view asked for");
+        assert_eq!(header.debug_view.load(Ordering::Relaxed), 0, "and the view before it is back");
     }
 
     #[test]

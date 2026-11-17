@@ -13,9 +13,9 @@
 //! after the first reading the previous pass's answer (copied into the slot's `scratch`) where the first reads
 //! the frame; each pass has its own settings (the Model tab's with that pass's overrides).
 //!
-//! There are no motion vectors after the upscaler. By default (`NEURAL_FORGE_POST_MOTION=none`) every frame
+//! There are no motion vectors after the upscaler. With `NEURAL_FORGE_POST_MOTION=none` every frame
 //! runs without history, with a fixed seed (a seed that changed every frame, with nothing blending frames,
-//! would shimmer). `zero` and `flow` give each pass a history of its own ([`super::post_history`],
+//! would shimmer). `zero` (the default) and `flow` give each pass a history of its own ([`super::post_history`],
 //! [`super::post_flow`]): its previous output at the same pixel or where the GPU's optical flow says the pixel
 //! was, blended toward as before the upscaler, rejected per pixel where the frame changed, reset as a whole
 //! on a cut and the other reset rules, with the seed counting frames since the reset. It never runs the
@@ -573,14 +573,17 @@ impl FlowState {
         }
     }
 
-    /// A submit of the flow's failed: both queues (this thread's alone) drain, so nothing of the flow is
-    /// pending, and `zero` runs from here on. Never on a queue shared with the application: no after-the-upscaler
-    /// server runs there (`Session::ensure_post_server`); if one ever does, this wait needs that queue's lock.
-    fn give_up(&mut self, device: &ash::Device, compute: vk::Queue, why: &str) {
+    /// A submit of the flow's failed: both queues drain, so nothing of the flow is pending, and `zero` runs from
+    /// here on. `shared` is set when `compute` is the application's queue (`crate::shared_queue`): its wait is made
+    /// under that queue's lock, as every use of it is.
+    fn give_up(&mut self, device: &ash::Device, compute: vk::Queue, shared: Option<&'static crate::shared_queue::SharedQueue>, why: &str) {
         if let Self::Ready(fd) = std::mem::replace(self, Self::Off) {
-            // SAFETY: both queues are this thread's alone.
+            // SAFETY: the flow's queue is this thread's alone; `compute` is too, or used under its lock.
             unsafe {
-                let _ = device.queue_wait_idle(compute);
+                {
+                    let _shared = shared.map(|q| q.guard());
+                    let _ = device.queue_wait_idle(compute);
+                }
                 let _ = device.queue_wait_idle(fd.queue);
             }
             *self = Self::unavailable(why, Some(fd));
@@ -916,6 +919,11 @@ fn serve(
         } else {
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    // Stopped: the channel no longer says this server runs (unless another process's layer owns it now).
+    if view.usable() {
+        hdr.server_state.store(neural_forge_protocol::enums::server_state::STOPPED, Ordering::Relaxed);
+        hdr.model_up.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1472,7 +1480,7 @@ unsafe fn evaluate(
             unsafe { device.update_descriptor_sets(&writes, &[]) };
             let push = HudPush {
                 dims: [width, height, 0, hud.regions.len() as u32],
-                flags: [u32::from(hud.detect), 0, 0, 0],
+                flags: [u32::from(hud.detect), u32::from(bgra), 0, 0],
                 detect: [Hud::STILL, Hud::SHARP, Hud::RISE, Hud::FALL],
                 shape: [Hud::THRESHOLD, 0.0, Hud::region_feather(height), 0.0],
             };
@@ -1642,7 +1650,8 @@ unsafe fn evaluate(
                                 &[],
                             );
                             device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 8));
-                            device.cmd_dispatch(cmd, (width * height).div_ceil(64), 1, 1);
+                            let (x, y) = feedback_groups(width * height);
+                            device.cmd_dispatch(cmd, x, y, 1);
                             device.cmd_pipeline_barrier(
                                 cmd,
                                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1773,7 +1782,7 @@ unsafe fn evaluate(
         match unsafe { flow_submits(device, gpu, s) } {
             Ok(waits) => Some(waits),
             Err(why) => {
-                gpu.flow.give_up(device, gpu.queue, &why);
+                gpu.flow.give_up(device, gpu.queue, gpu.shared, &why);
                 return false;
             }
         }
@@ -1796,7 +1805,7 @@ unsafe fn evaluate(
     if crate::note_vk(device.handle(), submitted).is_err() {
         if waits.is_some() {
             // The flow ran (or runs) with nothing waiting for it: its queue drains, and the flow is not used again.
-            gpu.flow.give_up(device, gpu.queue, "the frame's submit after the flow failed");
+            gpu.flow.give_up(device, gpu.queue, gpu.shared, "the frame's submit after the flow failed");
         }
         return false;
     }
@@ -2359,9 +2368,31 @@ fn note_flow_off(why: &str) {
     }
 }
 
+/// The pass feedback's dispatch for `texels` (groups of 64): rows of at most [`FEEDBACK_ROW`] groups, as
+/// `native_post_feedback.comp` indexes them. One row alone needs 129600 groups at 4K, past the 65535 a device has to
+/// allow in X (`maxComputeWorkGroupCount`).
+fn feedback_groups(texels: u32) -> (u32, u32) {
+    let groups = texels.div_ceil(64).max(1);
+    let x = groups.min(FEEDBACK_ROW);
+    (x, groups.div_ceil(x))
+}
+
+/// The most groups in a row of the pass feedback's dispatch ([`feedback_groups`]).
+const FEEDBACK_ROW: u32 = 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pass feedback's dispatch covers every texel and stays within the X limit every device allows, at 4K too.
+    #[test]
+    fn the_feedback_dispatch_fits_the_group_count_limit_at_4k() {
+        for (w, h) in [(1u32, 1u32), (64, 1), (1920, 1080), (3840, 2160), (7680, 4320)] {
+            let (x, y) = feedback_groups(w * h);
+            assert!(x <= 65535 && y <= 65535, "{w}x{h}: {x}x{y}");
+            assert!(u64::from(x) * u64::from(y) * 64 >= u64::from(w * h), "{w}x{h}: every texel");
+        }
+    }
     use std::cell::Cell;
 
     thread_local! {

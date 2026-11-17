@@ -2,6 +2,8 @@
 # game-reg.sh <label> <appid> <exe-pattern> <boot-s> <steps...>: one run of a Steam game with the layer
 # (its own launch options): launch, wait <boot-s>, send controller steps (a step "W<n>" waits n s),
 # measure 60 s in play, capture the presented frame, quit. Prints holds, presents, timeouts, Xid.
+# Refuses to start while a process matching <exe-pattern> already runs (a game someone is playing is never closed),
+# and puts the layer's `enabled` back as it was. NF_REG_CLI names the CLI (scripts/test_game_reg.sh uses a stand-in).
 set -euo pipefail
 if [ $# -lt 4 ]; then
     echo "usage: game-reg.sh <label> <appid> <exe-pattern> <boot-s> <steps...>" >&2
@@ -10,7 +12,7 @@ fi
 label=$1; appid=$2; pat=$3; boot=$4; shift 4
 case $label in ''|.|..|*/*) echo "error: label must be a plain name (no '/', not empty)" >&2; exit 2;; esac
 uid=$(id -u)
-out=$HOME/nf-spike/runs/$label; mkdir -p "$out"; C=$HOME/.local/share/neural-forge/bin/neural-forge-cli
+out=$HOME/nf-spike/runs/$label; mkdir -p "$out"; C=${NF_REG_CLI:-$HOME/.local/share/neural-forge/bin/neural-forge-cli}
 # Controller steps go to the pad helper (~/nf-spike/pad/nf-pad.py) through its FIFO. Never written
 # unless it is a FIFO: a redirect to a missing one would create a plain file, every step would
 # "succeed" at once with no input reaching the game, and the run would measure a menu. A step that
@@ -31,12 +33,10 @@ if [ $needs_pad = 1 ] && [ ! -p "$PAD" ]; then
     fi
     exit 1
 fi
-start=$(date "+%F %T"); echo "$start" > "$out/start"
-
-# Ends the game however this script ends (a failed step under set -e included): `pgrep -f` also
-# matches this script (and the shell running it), whose own command line holds the pattern, so this
-# process, everything above it and anything it forked itself are skipped.
-quit_game() {
+# The processes matching the pattern that are not this script's: `pgrep -f` also matches this script (and the shell
+# running it), whose own command line holds the pattern, so this process, everything above it and anything it forked
+# itself are skipped.
+game_pids() {
     local mine=" " p=$$
     while [ "$p" -gt 1 ]; do
         mine="$mine$p "
@@ -47,13 +47,42 @@ quit_game() {
         case $mine in *" $p "*) continue;; esac
         [ -e "/proc/$p" ] || continue
         [ "$(ps -o ppid= -p "$p" | tr -d ' ')" = "$$" ] && continue
-        kill -TERM "$p" 2>/dev/null || true
+        echo "$p"
     done
 }
-trap quit_game EXIT
+running=$(game_pids)
+if [ -n "$running" ]; then
+    echo "error: $pat is already running (pid $(echo "$running" | tr '\n' ' ')); not launching it again or closing it" >&2
+    exit 1
+fi
+start=$(date "+%F %T"); echo "$start" > "$out/start"
+
+# The layer's `enabled` as it was, put back however this script ends.
+was_enabled=$("$C" shmctl status 2>/dev/null | sed -n 's/^enabled=\([0-9]*\).*/\1/p' | head -1 || true)
+# Ends the game this run started however this script ends (a failed step under set -e included), and puts
+# `enabled` back.
+quit_game() {
+    local p
+    for p in $(game_pids); do kill -TERM "$p" 2>/dev/null || true; done
+}
+on_exit() {
+    quit_game
+    if [ -n "$was_enabled" ] && [ "$was_enabled" != 1 ]; then "$C" shmctl set enabled "$was_enabled" >/dev/null || true; fi
+}
+trap on_exit EXIT
 "$C" shmctl set enabled 1 >/dev/null
-XA=$(ls -t "/run/user/$uid"/.mutter-Xwaylandauth.* | head -1)
-DISPLAY=:0 XAUTHORITY=$XA timeout 10 steam -applaunch "$appid" >/dev/null 2>&1 || true
+# The X authority Steam is reached with: the session's own (XAUTHORITY), else GNOME's Xwayland's newest, else
+# ~/.Xauthority; none on a display that needs none.
+XA=${XAUTHORITY:-}
+if [ -z "$XA" ]; then
+    XA=$(find "${XDG_RUNTIME_DIR:-/run/user/$uid}" -maxdepth 1 -name '.mutter-Xwaylandauth.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+fi
+if [ -z "$XA" ] && [ -f "$HOME/.Xauthority" ]; then XA=$HOME/.Xauthority; fi
+if [ -n "$XA" ]; then
+    DISPLAY=${DISPLAY:-:0} XAUTHORITY=$XA timeout 10 steam -applaunch "$appid" >/dev/null 2>&1 || true
+else
+    DISPLAY=${DISPLAY:-:0} timeout 10 steam -applaunch "$appid" >/dev/null 2>&1 || true
+fi
 sleep "$boot"
 for s in "$@"; do case $s in W*) sleep "${s#W}";; *) pad "$s";; esac; done
 m=$(date "+%F %T"); sleep 60

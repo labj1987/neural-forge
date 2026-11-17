@@ -687,6 +687,13 @@ fn take_previous(
     (pending, previous)
 }
 
+/// The channel order a present composes and meters with: the run's own (`swapchain::is_bgr_order` of the
+/// swapchain's format), which the run's encode push carries. Never re-derived from the proxy format: an HDR10
+/// `A2R10G10B10` frame's proxy is `PQ10_BGR` and an SDR one's `RGBA8`, neither `BGRA8`, yet both put blue low.
+fn compose_bgr_order(encode_push: &crate::composition::encode_pass::EncodePush) -> bool {
+    encode_push.bgr_order != 0
+}
+
 /// The model on a second GPU (`preupscale::offload`): the present composes the answer to the frame the last present
 /// kept and posted, onto that frame as it was kept, and the result replaces this image; then it keeps and posts this
 /// frame. The game's GPU renders the next frame while the other GPU runs this one's network: every frame is shown one
@@ -850,7 +857,7 @@ unsafe fn delayed_present(
             // SAFETY: the capture that wrote it was just seen complete (its fence, host-coherent memory) and no request is out.
             let frame =
                 shm.proxy_region(SLOT).map_or(&[][..], |(ptr, capacity)| unsafe { std::slice::from_raw_parts(ptr, capacity.min(frame_bytes as usize)) });
-            if let Some(white) = meter_white(frame, width, height, proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8) {
+            if let Some(white) = meter_white(frame, width, height, compose_bgr_order(&encode_push)) {
                 shm.publish_measured_white(white);
             }
         }
@@ -887,7 +894,7 @@ unsafe fn delayed_present(
                 height,
                 crate::composition::gpu::ComposeInputs::Delayed { parity: req.parity },
                 *raw_answer_generation,
-                proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+                compose_bgr_order(&encode_push),
                 image,
                 crate::composition::gpu::ComposeParams {
                     colour_strength: settings.colour_strength,
@@ -1087,7 +1094,7 @@ unsafe fn delayed_present_cpu(
     let kept = captured.as_ref().filter(|c| original_scratch.len() >= frame_bytes as usize && (!c.from_model_scratch || !model_scratch.is_empty())).map(|c| {
         static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if METER_FRAME.fetch_add(1, Relaxed).is_multiple_of(8) {
-            if let Some(white) = meter_white(original_scratch, width, height, proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8) {
+            if let Some(white) = meter_white(original_scratch, width, height, compose_bgr_order(&encode_push)) {
                 shm.publish_measured_white(white);
             }
         }
@@ -1143,7 +1150,7 @@ unsafe fn delayed_present_cpu(
                     held_original: Some(&k.original),
                 },
                 *raw_answer_generation,
-                proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+                compose_bgr_order(&encode_push),
                 image,
                 crate::composition::gpu::ComposeParams {
                     colour_strength: settings.colour_strength,
@@ -1185,6 +1192,7 @@ unsafe fn delayed_present_cpu(
                     width,
                     height,
                     proxy_format,
+                    compose_bgr_order(&encode_push),
                     &inflight[SLOT.index()].kept_cpu[req.parity],
                     raw_answer_generation,
                     settings,
@@ -1267,6 +1275,8 @@ unsafe fn show_kept_cpu(
     width: u32,
     height: u32,
     proxy_format: u32,
+    // The run's channel order (`swapchain::is_bgr_order`), as the synchronous present's compose takes it.
+    bgr_order: bool,
     kept: &KeptCpu,
     raw_answer_generation: &mut u64,
     settings: &crate::shm::CompositionSettings,
@@ -1285,7 +1295,7 @@ unsafe fn show_kept_cpu(
         height,
         crate::composition::gpu::ComposeInputs::Cpu { base: frame, answer: frame, proxy_small: None, held_original: Some(frame) },
         *raw_answer_generation,
-        proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8,
+        bgr_order,
         image,
         crate::composition::gpu::ComposeParams {
             colour_strength: settings.colour_strength,
@@ -1819,14 +1829,33 @@ fn meter_white(frame: &[u8], width: u32, height: u32, bgr: bool) -> Option<f32> 
 /// Frame hold: the captured frame (and the proxy sent for it) that every present keeps working on
 /// while `hold_frame` is on, so a settings change is judged against the same picture.
 struct HeldFrame {
-    width: u32,
-    height: u32,
+    /// What the frame's bytes are: they are shown again only to a present of the same.
+    of: HeldOf,
     original: Vec<u8>,
     proxy: Vec<u8>,
     sent: (u32, u32),
     encoded: bool,
 }
 static HELD: std::sync::Mutex<Option<HeldFrame>> = std::sync::Mutex::new(None);
+
+/// Drops the held frame unless the hold is on and it is of this present's frame (`of`).
+fn drop_unfit_hold(held: &mut Option<HeldFrame>, hold_frame: bool, of: HeldOf) {
+    if !hold_frame || held.as_ref().is_some_and(|h| h.of != of) {
+        *held = None;
+    }
+}
+
+/// The device and swapchain frame a held frame was captured from: its size, proxy format and channel order. A
+/// present of anything else (another swapchain's format at the same size, another device) drops the held frame
+/// rather than showing its bytes read as a different layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeldOf {
+    device: vk::Device,
+    width: u32,
+    height: u32,
+    proxy_format: u32,
+    bgr_order: bool,
+}
 
 /// The longest a present waits for its own frame's answer before going out untouched.
 const SYNC_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
@@ -2195,6 +2224,8 @@ pub unsafe fn run(
             // reads `answer_dims` unless `have_answer` is `true`, at which point it was
             // always actually set from the branch just below.
             let mut answer_dims = (width, height);
+            // The answered request's frame dims/format and whether its proxy was encoded, for the same reason.
+            let mut answered = (None, false);
             if shm.has_pending_request(slot) && shm.poll_async_request(slot) == Some(true) {
                 // The answer comes back at whatever resolution *this outstanding
                 // request* was actually sent at (`inflight[slot.index()].proxy_dims`), not
@@ -2203,6 +2234,7 @@ pub unsafe fn run(
                 // swapchain's own `frame_bytes` when `proxy_dims` is `None`, the only
                 // possibility before `working_scale` existed.
                 answer_dims = inflight[slot.index()].proxy_dims.unwrap_or((width, height));
+                answered = (inflight[slot.index()].dims, inflight[slot.index()].encoded);
                 let (aw, ah) = answer_dims;
                 let answer_bytes = (u64::from(aw) * u64::from(ah) * bytes_per_pixel) as usize;
                 answer_scratch.resize(answer_bytes, 0);
@@ -2275,10 +2307,7 @@ pub unsafe fn run(
                 }
             }
 
-            if have_answer
-                && inflight[slot.index()].dims == Some((width, height, proxy_format))
-                && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format)
-            {
+            if have_answer && answered.0 == Some((width, height, proxy_format)) && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
                 // Retain the model's raw answer for continuous re-presentation below --
                 // deliberately *not* run through `composition::gpu`/`composition::apply`'s
                 // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
@@ -2295,7 +2324,7 @@ pub unsafe fn run(
                 last_answer.clear();
                 last_answer.extend_from_slice(answer_scratch);
                 *last_answer_dims = answer_dims;
-                *last_answer_encoded = inflight[slot.index()].encoded;
+                *last_answer_encoded = answered.1;
                 *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
             }
         }
@@ -2495,11 +2524,10 @@ pub unsafe fn run(
             let mut copy_out = std::time::Duration::ZERO;
             // The held frame is copied out under the lock and the lock let go before the capture and
             // its polling below (up to the sync budget): nothing waits on another present's frame hold.
+            let held_of = HeldOf { device: device.handle(), width, height, proxy_format, bgr_order };
             let holding = {
                 let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-                if !settings.hold_frame || held.as_ref().is_some_and(|h| (h.width, h.height) != (width, height)) {
-                    *held = None;
-                }
+                drop_unfit_hold(&mut held, settings.hold_frame, held_of);
                 if let Some(h) = held.as_ref() {
                     // Holding: the model is shown the held proxy again, no capture.
                     let t_copy = std::time::Instant::now();
@@ -2571,7 +2599,7 @@ pub unsafe fn run(
                 let t_copy = std::time::Instant::now();
                 let proxy = if from_model_scratch { model_scratch.clone() } else { original_scratch.clone() };
                 *HELD.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(HeldFrame { width, height, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h), encoded });
+                    Some(HeldFrame { of: held_of, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h), encoded });
                 copy_out += t_copy.elapsed();
             }
             let t_captured = std::time::Instant::now();
@@ -2593,7 +2621,7 @@ pub unsafe fn run(
                     } else {
                         original_scratch
                     };
-                    if let Some(white) = meter_white(frame, width, height, bgr_order) {
+                    if let Some(white) = meter_white(frame, width, height, compose_bgr_order(&encode_push)) {
                         shm.publish_measured_white(white);
                     }
                 }
@@ -3880,6 +3908,54 @@ pub(crate) unsafe fn import_host_buffer(
 
 #[cfg(test)]
 mod tests {
+
+    /// A held frame is shown again only to a present of the same device and frame: the same size alone (another
+    /// swapchain's format, or the same format's other channel order) would read its bytes as another layout.
+    #[test]
+    fn a_held_frame_is_dropped_for_another_format_order_or_device() {
+        use neural_forge_protocol::enums::proxy_format;
+        let of = HeldOf { device: <vk::Device as vk::Handle>::from_raw(1), width: 64, height: 32, proxy_format: proxy_format::BGRA8, bgr_order: true };
+        let held = || Some(HeldFrame { of, original: vec![1], proxy: vec![2], sent: (64, 32), encoded: false });
+        let mut h = held();
+        drop_unfit_hold(&mut h, true, of);
+        assert!(h.is_some(), "the same frame keeps it");
+        drop_unfit_hold(&mut h, false, of);
+        assert!(h.is_none(), "the hold turned off drops it");
+        for other in [
+            HeldOf { proxy_format: proxy_format::RGBA8, bgr_order: false, ..of },
+            HeldOf { bgr_order: false, ..of },
+            HeldOf { device: <vk::Device as vk::Handle>::from_raw(2), ..of },
+            HeldOf { width: 65, ..of },
+        ] {
+            let mut h = held();
+            drop_unfit_hold(&mut h, true, other);
+            assert!(h.is_none(), "{other:?}");
+        }
+    }
+
+    /// Every present composes (and meters) in the run's channel order, the one the swapchain's format has --
+    /// the delayed paths included. They once took `proxy_format == BGRA8`, which reads false for both
+    /// `A2R10G10B10` runs (HDR10's proxy is `PQ10_BGR`, SDR's `RGBA8`): `b_low` 0, red and blue swapped.
+    #[test]
+    fn presents_compose_in_the_runs_channel_order() {
+        use crate::swapchain::{is_bgr_order, proxy_format_for};
+        use ash::vk::{ColorSpaceKHR as Cs, Format as F};
+        use neural_forge_protocol::enums::proxy_format;
+        for (format, colour_space, blue_low) in [
+            (F::A2R10G10B10_UNORM_PACK32, Cs::HDR10_ST2084_EXT, true),
+            (F::A2R10G10B10_UNORM_PACK32, Cs::SRGB_NONLINEAR, true),
+            (F::A2B10G10R10_UNORM_PACK32, Cs::HDR10_ST2084_EXT, false),
+            (F::B8G8R8A8_UNORM, Cs::SRGB_NONLINEAR, true),
+            (F::R8G8B8A8_SRGB, Cs::SRGB_NONLINEAR, false),
+        ] {
+            // The push as the run builds it from the device's `is_bgr_order`.
+            let push = crate::composition::encode_pass::EncodePush { white_point: 1.0, bgr_order: u32::from(is_bgr_order(format)), reversible_mode: 0 };
+            assert_eq!(compose_bgr_order(&push), blue_low, "{format:?} {colour_space:?}");
+            if format == F::A2R10G10B10_UNORM_PACK32 {
+                assert_ne!(proxy_format_for(format, colour_space), proxy_format::BGRA8, "the proxy format cannot tell this order");
+            }
+        }
+    }
 
     fn kept(parity: usize, sent: bool, dims: (u32, u32, u32)) -> DelayedRequest {
         DelayedRequest {

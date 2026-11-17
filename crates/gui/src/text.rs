@@ -41,11 +41,11 @@ pub(crate) fn decimals(x: f64) -> u32 {
 
 /// The value a spin row keeps when its field's `text` is read back: the current `value` while the text
 /// still shows it at `digits` decimals (either decimal mark), so precision the row does not show
-/// survives a focus change; `None` for edited text, which the row then parses as a new value.
+/// survives a focus change; `None` for edited text, which the row then parses as a new value. Only the text exactly as
+/// shown counts: a typed value with more decimals that rounds to the shown one (1.004 where 1.00 shows) is new.
 pub(crate) fn kept_spin_value(text: &str, value: f64, digits: u32) -> Option<f64> {
-    let typed: f64 = text.trim().replace(',', ".").parse().ok()?;
     let d = digits as usize;
-    (format!("{typed:.d$}") == format!("{value:.d$}")).then_some(value)
+    (text.trim().replace(',', ".") == format!("{value:.d$}")).then_some(value)
 }
 
 pub(crate) fn format_key_label(code: u32, name: Option<&str>) -> String {
@@ -318,6 +318,20 @@ pub(crate) fn edits_in_game_frame(state: u32) -> bool {
     use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH, PAUSED};
     // Paused with DLSS (#49) the post path is still kept off: the layer captures the presented frame as both images.
     matches!(state, HOLDING | HOLDING_AFTER | HOLDING_BOTH | PAUSED)
+}
+
+/// The Status page's Model row: where the network runs, from the hold's state (`preupscale_state`; the layer's
+/// `native_running` covers only the hold before the upscaler) and the layer's line (`layer_reason`) for a second GPU.
+pub(crate) fn model_label(state: u32, native_running: bool, reason: &str) -> &'static str {
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING_AFTER, HOLDING_BOTH};
+    match state {
+        HOLDING_BOTH => "running before the upscaler and after DLSS",
+        HOLDING_AFTER => "running after DLSS",
+        _ if native_running => "running before the upscaler",
+        // The model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`) runs on the finished frame, not before the upscaler.
+        _ if reason.starts_with("second GPU: the model runs on") => "running on the second GPU, on the finished frame",
+        _ => "not running before the upscaler",
+    }
 }
 
 /// The Status page's one line on the pre-upscaler path, from the header's `preupscale_*` fields
@@ -765,6 +779,9 @@ mod spin_precision_tests {
         assert_eq!(kept_spin_value("1.2", 1.26, 1), None);
         assert_eq!(kept_spin_value("", 1.0, 1), None);
         assert_eq!(kept_spin_value("abc", 1.0, 1), None);
+        // More decimals than shown, rounding to the shown text: typed, so a new value.
+        assert_eq!(kept_spin_value("1.004", 1.0, 2), None);
+        assert_eq!(kept_spin_value("16.6", 16.6, 0), None, "the value itself, typed in full");
     }
 }
 
@@ -831,7 +848,19 @@ mod preupscale_label_tests {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::{capture_subtitle, edits_in_game_frame};
+    use super::{capture_subtitle, edits_in_game_frame, model_label};
+
+    /// The model running after DLSS (Ray Reconstruction, the `upscaled` placement) is running, though the layer's
+    /// `native_running` is 0 there.
+    #[test]
+    fn the_model_row_says_where_the_network_runs() {
+        use neural_forge_protocol::enums::preupscale_state::*;
+        assert_eq!(model_label(HOLDING, true, ""), "running before the upscaler");
+        assert_eq!(model_label(HOLDING_AFTER, false, ""), "running after DLSS");
+        assert_eq!(model_label(HOLDING_BOTH, false, ""), "running before the upscaler and after DLSS");
+        assert_eq!(model_label(OFF, false, "second GPU: the model runs on GPU 1"), "running on the second GPU, on the finished frame");
+        assert_eq!(model_label(WAITING, false, ""), "not running before the upscaler");
+    }
 
     #[test]
     fn the_capture_row_says_when_there_is_no_before_image() {

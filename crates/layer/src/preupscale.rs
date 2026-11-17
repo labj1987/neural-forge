@@ -33,9 +33,12 @@
 //!
 //! The game's call is submitted as: `head` (batches before the launch batch, plus the launch
 //! batch's command buffers before the launch buffer, with the launch batch's wait semaphores),
-//! then the layer's capture batch `C`, then (after the CPU waited for `C`'s fence) the layer's
-//! write-back batch `W`, then `tail` (the launch buffer onward,
-//! with the launch batch's signal semaphores, then the call's later batches, with the fence).
+//! then the layer's capture batch `C`, then the layer's write-back batch `W`, then `tail` (the launch
+//! buffer onward, with the launch batch's signal semaphores, then the call's later batches, with the
+//! fence). In the diagnostic modes (dump, identity, roundtrip) the CPU waits for `C`'s fence before
+//! `W` is submitted; in `model` mode `C` is submitted with no fence ([`native`]) and nothing on the CPU
+//! waits for it: `W` and the network's work follow it in submission order on the same queue, and the
+//! barriers below carry the chain.
 //!
 //! - Game work before the launch buffer -> `C`: every such command is earlier in submission order
 //!   on the same queue, and `C` opens with a pipeline barrier `ALL_COMMANDS/MEMORY_WRITE ->
@@ -47,10 +50,10 @@
 //!   scope also includes every command later in submission order, so `W` and `tail` stay ordered
 //!   after those signals exactly as the game asked. When the launch buffer is not first, the waits
 //!   stay on the prefix in `head`, which is earlier in submission order than `C`: same argument.
-//! - `C` -> host: `C` ends with `TRANSFER/TRANSFER_WRITE -> HOST/HOST_READ`; the CPU waits on `C`'s
-//!   fence before anyone reads the bytes.
+//! - `C` -> host (the diagnostic modes): `C` ends with `TRANSFER/TRANSFER_WRITE -> HOST/HOST_READ`; the
+//!   CPU waits on `C`'s fence before anyone reads the bytes.
 //! - `C` -> `W`: `W` opens with `ALL_COMMANDS|HOST -> TRANSFER` (write-after-read on the colour
-//!   input after `C`'s read; `C`'s fence was also waited on).
+//!   input after `C`'s read; in the diagnostic modes `C`'s fence was also waited on).
 //! - `W` -> DLSS: `W` ends with `TRANSFER/TRANSFER_WRITE -> ALL_COMMANDS/MEMORY_READ|MEMORY_WRITE`.
 //!   `tail` (the launch buffer, whose kernels read the colour input) is later in submission order,
 //!   so it is in that barrier's second scope: the write-back is visible to DLSS.
@@ -1281,8 +1284,6 @@ fn parse_game_reset(raw: Option<&str>) -> bool {
     raw.map(str::trim) != Some("off")
 }
 
-/// The layouts the hold inside DLSS's buffer copies the motion vectors from (moved to
-/// `TRANSFER_SRC_OPTIMAL` and back when not already readable there).
 /// Whether the hold inside DLSS's buffer copies the depth aspect of a `format` image found in `layout`
 /// (moved to TRANSFER_SRC_OPTIMAL and back unless it is there or in GENERAL). The separate depth
 /// layouts only for formats without stencil: with one, the stencil aspect's layout is not known.
@@ -1699,6 +1700,10 @@ impl Tracker {
     }
 
     pub(crate) fn forget_image(&mut self, image: vk::Image) {
+        // `seen_keys` keeps the identifications of shapes no image has any more: a game destroying and making again its
+        // only colour image of the shape (007 First Light, every 0.4 s) while rotating its motion vectors or exposure
+        // images comes back to them, still a rotation. A switch back to an earlier colour shape is a new identification
+        // all the same ([`Self::refresh`]: only the watched colour shape's keys rotate), and the list is bounded.
         self.images.remove(&image);
         self.keys.retain(|k| k.2 != image);
         self.registered.retain(|_, i| *i != image);
@@ -2661,8 +2666,10 @@ impl Tracker {
         }
         let inputs = record.filter(|r| !r.is_rr()).and_then(|r| self.inputs_of(&r));
         let key = inputs.map(|i| (ColourWatch::of(&i.colour.1), ColourWatch::of(&i.mvec.1), i.exposure_input.map(|e| ColourWatch::of(&e.1))));
-        // Back to images identified before (a rotation): the same identification, its tracking kept.
-        let rotation = key.is_some() && self.key.is_some() && self.seen_keys.contains(&key.expect("checked"));
+        // Back to images identified before (a rotation): the same identification, its tracking kept. Only while the
+        // colour shape watched is that key's: a switch back to an earlier shape (a DLSS mode or resolution changed and
+        // changed back) is a new identification, whose colour images are watched again.
+        let rotation = key.is_some_and(|k| self.seen_keys.contains(&k) && Some(k.0) == self.colour_watch) && self.key.is_some();
         if let Some(k) = key.filter(|k| !self.seen_keys.contains(k)) {
             if self.seen_keys.len() == SEEN_KEYS {
                 self.seen_keys.remove(0);
@@ -2851,6 +2858,12 @@ impl Tracker {
                     }
                 }
                 if found.is_none() {
+                    // Attachment layouts first, then the buffer's barriers (which follow its rendering), as the commit
+                    // ([`Self::commit_submitted`]) and [`Self::layout_when_run`] apply them.
+                    for &(image, layout) in self.attached.get(&cb).into_iter().flatten() {
+                        let owner = proposed.get(&image).and_then(|p| p.1);
+                        proposed.insert(image, (layout, owner));
+                    }
                     for sync in self.pending.get(&cb).into_iter().flatten() {
                         let owner = sync.transfers_ownership().then_some(sync.dst_queue_family).or(proposed.get(&sync.image).and_then(|p| p.1));
                         // A barrier that keeps the layout leaves the one before it (none known: none proposed).
@@ -3113,9 +3126,8 @@ impl Tracking {
         self.armed.store(t.armed(), Ordering::Relaxed);
     }
 
-    /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`, with its parameter buffer if
-    /// readable ([`launch_params`]).
-    /// A launch recorded into `command_buffer`. Returns where a hold should run inside the buffer,
+    /// A launch (`vkCmdCuLaunchKernelNVX`, with its parameter buffer if readable: [`launch_params`]) recorded into
+    /// `command_buffer`. Returns where a hold should run inside the buffer,
     /// right before this launch, when it is the buffer's first to name a colour candidate and the
     /// split in front of the buffer would be refused ([`Tracker::inline_point`]).
     #[cfg(test)]
@@ -4277,6 +4289,10 @@ impl Resources {
 
     /// The next hold's work goes to `queue` (the application's DLSS submit's).
     pub(crate) fn on_queue(&mut self, queue: vk::Queue) {
+        // The fences seen were on the queue before: their signals cover nothing submitted on another.
+        if self.queue != Some(queue) {
+            self.fences_seen = 0;
+        }
         self.queue = Some(queue);
     }
 
@@ -4428,10 +4444,6 @@ impl Resources {
         self.cache.as_ref().is_some_and(|c| c.pending.is_some())
     }
 
-    /// Frees a finished cache dump's readbacks.
-    ///
-    /// # Safety
-    /// Nothing submitted may still use them ([`Self::wait_idle`] returned true since the last hold).
     /// Frees the native hold's frame resources (the native pass, the edit cache, the depth copy, the scene-cut
     /// detector, the HDR pass) while the VRAM guard has the network paused, so the game gets all of Neural
     /// Forge's memory back; each is built again on the first hold that runs the network. Returns whether there
@@ -4472,6 +4484,10 @@ impl Resources {
         any
     }
 
+    /// Frees a finished cache dump's readbacks.
+    ///
+    /// # Safety
+    /// Nothing submitted may still use them ([`Self::wait_idle`] returned true since the last hold).
     pub(crate) unsafe fn free_cache(&mut self, device: &ash::Device) {
         if let Some(cache) = self.cache.take() {
             // SAFETY: forwarded.
@@ -4574,13 +4590,22 @@ pub(crate) enum ExposureSource {
 }
 
 impl ExposureSource {
-    /// The source for `target`: the game's image when it can be copied from, else the frame.
+    /// The source for `target`: the game's image when it can be copied from and its texel starts with the half the
+    /// pass reads ([`Self::readable_format`]), else the frame.
     pub(crate) fn of(target: &Target) -> Self {
-        if target.exposure_input.is_some_and(|a| a.readable && aux_copy_layout(a.layout).is_some()) {
+        if target.exposure_input.is_some_and(|a| a.readable && Self::readable_format(a.format) && aux_copy_layout(a.layout).is_some()) {
             Self::Game
         } else {
             Self::Auto
         }
+    }
+
+    /// Formats whose copied texel is the exposure as the pass reads it: R16F alone, as the hold inside DLSS's buffer
+    /// requires (`inline.rs`). A 32-bit float's low half is noise; RG16F's second channel would land in the word's
+    /// high half, which [`hdr::exposure_word`] reads as the game's own value; and a texel wider than 4 bytes (RGBA16F,
+    /// RG32F, RGBA32F) would write over the second word (the composite's exposure-jump word).
+    fn readable_format(format: vk::Format) -> bool {
+        format == vk::Format::R16_SFLOAT
     }
 
     /// Whether the capture measures the exposure from the frame for `target`: the source is the frame, or the
@@ -4740,6 +4765,9 @@ fn aux_copy_layout(layout: Option<vk::ImageLayout>) -> Option<(vk::ImageLayout, 
     }
 }
 
+/// The subresource of a DLSS input the hold reads: mip 0 of layer 0, every aspect of its format. Only that is copied,
+/// and its layout is all that is tracked: a barrier over every mip and layer would move the others from a layout
+/// they may not be in.
 pub(crate) fn aux_range(format: vk::Format) -> vk::ImageSubresourceRange {
     let aspect = if DEPTH_FORMATS.contains(&format) {
         if has_stencil(format) {
@@ -4750,13 +4778,7 @@ pub(crate) fn aux_range(format: vk::Format) -> vk::ImageSubresourceRange {
     } else {
         vk::ImageAspectFlags::COLOR
     };
-    vk::ImageSubresourceRange {
-        aspect_mask: aspect,
-        base_mip_level: 0,
-        level_count: vk::REMAINING_MIP_LEVELS,
-        base_array_layer: 0,
-        layer_count: vk::REMAINING_ARRAY_LAYERS,
-    }
+    vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 }
 }
 
 /// What a dump reads besides colour.
@@ -5410,7 +5432,8 @@ pub(crate) fn preview_rgba8(colour: &[u8], row_texels: u32, width: u32, height: 
 }
 
 impl DumpFrame {
-    /// Writes `colour.rgba16f` (padded), `depth.r32f` (or `depth.raw` for a non-float depth),
+    /// Writes `colour.rgba16f` (padded), `depth.r32f` (a 32-bit float depth, the `R32_SFLOAT` copy Frame
+    /// Generation games make included; `depth.raw` for any other),
     /// `mvec.rg16f`, `meta.json`, `colour-preview.png` and, with any 1x1 candidates,
     /// `exposure.json` under `dir`. Returns the files written.
     pub(crate) fn write(&self, dir: &std::path::Path) -> std::io::Result<Vec<String>> {
@@ -5419,7 +5442,8 @@ impl DumpFrame {
         let mut files = vec!["colour.rgba16f".to_string()];
         std::fs::write(dir.join("colour.rgba16f"), &self.colour)?;
         let depth_name = self.depth.as_ref().map(|(bytes, format)| {
-            let name = if matches!(*format, vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT) { "depth.r32f" } else { "depth.raw" };
+            let name =
+                if matches!(*format, vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT | vk::Format::R32_SFLOAT) { "depth.r32f" } else { "depth.raw" };
             (name, bytes, *format)
         });
         if let Some((name, bytes, _)) = &depth_name {
@@ -6233,8 +6257,6 @@ impl Session {
         }
     }
 
-    /// Logs, once per identification of DLSS's inputs (and again if it changes), where the HDR
-    /// encode's exposure comes from: the game's 1x1 R16F, or measured from the frame.
     /// Whether the game's exposure image may be used for `identification` (not after it read
     /// implausibly high, [`Self::check_exposure`]).
     pub(crate) fn game_exposure_trusted(&self, identification: u64) -> bool {
@@ -6434,6 +6456,8 @@ impl Session {
         view
     }
 
+    /// Logs, once per identification of DLSS's inputs (and again if it changes), where the HDR
+    /// encode's exposure comes from: the game's 1x1 R16F, or measured from the frame.
     pub(crate) fn note_exposure_source(&mut self, identification: u64, inputs: &Inputs, result: &HoldResult) {
         let Some(source) = result.exposure_source else { return };
         if self.exposure_said == Some((identification, source)) {
@@ -8816,6 +8840,76 @@ mod tests {
         assert!(generations[4..].iter().all(|&g| g == generations[3]), "no new identification once round: {generations:?}");
     }
 
+    /// A DLSS mode or resolution switched and switched back (A, B, A): back on A's colour shape the identification
+    /// is new (A's colour images watched again, the generation bumped), not a rotation that left B's shape watched.
+    #[test]
+    fn a_switch_back_to_an_earlier_colour_shape_is_a_new_identification() {
+        let rg = vk::Format::R16G16_SFLOAT;
+        let colour_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let shapes = [(1488, 836), (2560, 1440)];
+        let mut set = Vec::new();
+        for (k, &(w, hgt)) in shapes.iter().enumerate() {
+            let k = k as u64;
+            set.push((0x100 + k, desc(w, hgt, vk::Format::R16G16B16A16_SFLOAT, colour_usage)));
+            set.push((0x200 + k, desc(w, hgt, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)));
+            set.push((0x300 + k, desc(w, hgt, rg, vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)));
+        }
+        let mut t = tracker_with(&set_of(&set));
+        let mut generations = Vec::new();
+        for (frame, k) in [0u64, 1, 0].into_iter().enumerate() {
+            crate::ngx_ring::inject(vec![sr_record(frame as u64 + 1, [0x100 + k, 0x300 + k, 0x200 + k, 0, 0])]);
+            t.begin(cb(11));
+            t.launch(cb(11), Some(&param_block(&[h(0x100 + k), h(0x200 + k), h(0x300 + k)])));
+            let _ = submit(&mut t, &[vec![cb(11)]]);
+            generations.push(t.generation);
+            let (w, hgt) = shapes[k as usize];
+            assert_eq!(t.colour_watch.map(|c| (c.width, c.height)), Some((w, hgt)), "frame {frame}: the colour shape watched is the input's");
+        }
+        assert!(generations[2] > generations[1], "back on A: a new identification ({generations:?})");
+    }
+
+    /// A game destroys its only colour image of the shape and makes a new one every frame (007 First Light, every
+    /// 0.4 s) while rotating its motion vectors between two shapes: back on a motion-vector shape seen before is still
+    /// a rotation (no generation bump, so no hold refused and no exposure reset), not a new identification.
+    #[test]
+    fn a_remade_colour_image_keeps_a_rotation_one_identification() {
+        let rg = vk::Format::R16G16_SFLOAT;
+        let colour_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let colour = |k: u64| (0x100 + 0x10 * k, desc(1488, 836, vk::Format::R16G16B16A16_SFLOAT, colour_usage));
+        let mut set = vec![colour(0), (0x200, desc(1488, 836, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT))];
+        for (k, (w, hgt)) in [(1488, 836), (744, 418)].into_iter().enumerate() {
+            set.push((0x300 + k as u64, desc(w, hgt, rg, vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)));
+        }
+        let mut t = tracker_with(&set_of(&set));
+        let mut generations = Vec::new();
+        for frame in 0..8u64 {
+            let (c, d) = colour(frame);
+            if frame > 0 {
+                // The old one destroyed first: for a moment no image has the colour shape.
+                t.forget_image(img(colour(frame - 1).0));
+                let info = vk::ImageCreateInfo {
+                    image_type: vk::ImageType::TYPE_2D,
+                    extent: vk::Extent3D { width: d.width, height: d.height, depth: 1 },
+                    format: d.format,
+                    usage: d.usage,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    ..Default::default()
+                };
+                t.record_image(img(c), &info);
+                t.record_view(vk::ImageView::from_raw(c + 1), img(c));
+                t.register(vk::ImageView::from_raw(c + 1), Some(h(c)));
+            }
+            let m = 0x300 + frame % 2;
+            crate::ngx_ring::inject(vec![sr_record(frame + 1, [c, m, 0x200, 0, 0])]);
+            t.begin(cb(11));
+            t.launch(cb(11), Some(&param_block(&[h(c), h(0x200), h(m)])));
+            let _ = submit(&mut t, &[vec![cb(11)]]);
+            generations.push(t.generation);
+            assert_eq!(t.inputs.map(|i| (i.colour.0, i.mvec.0)), Some((img(c), img(m))), "frame {frame}: its own images");
+        }
+        assert!(generations[2..].iter().all(|&g| g == generations[1]), "no new identification once round: {generations:?}");
+    }
+
     /// 007 First Light after a load (#49): DLSS gets a brand-new colour input and motion-vector image every 0.4 s,
     /// never one seen before. Images of the same shapes are the same identification, so no hold is refused as begun
     /// before it (each new image was a new identification, and a frame or two showed the game's own picture).
@@ -9927,6 +10021,9 @@ mod tests {
         ] {
             assert!(json.contains(needle), "{needle} in {json}");
         }
+        // A colour-format float depth (Cyberpunk 2077's Frame Generation copy) is the same 32-bit floats.
+        frame.depth = Some((vec![0u8; 12], vk::Format::R32_SFLOAT));
+        assert!(frame.write(&dir).unwrap().contains(&"depth.r32f".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10167,6 +10264,23 @@ mod tests {
         session.bury(d);
         assert_eq!(session.left_behind.len(), 1, "no fence of the new ones seen yet");
         assert!(session.res.as_mut().unwrap().wait_idle(d, &mut None));
+        // The holds moved to another queue (here a handle nothing is submitted to) where the old ones were left: the
+        // fence seen on the first queue covers nothing there.
+        let other = vk::Queue::from_raw(0xdead_0000);
+        session.left_behind[0].queue = Some(other);
+        session.res.as_mut().unwrap().on_queue(other);
+        session.bury(d);
+        assert_eq!(session.left_behind.len(), 1, "a fence seen on another queue does not free them");
+        session.left_behind[0].queue = Some(gpu.queue);
+        let res = session.res.as_mut().unwrap();
+        res.on_queue(gpu.queue);
+        // SAFETY: the fence was waited for (signalled, idle).
+        unsafe {
+            d.reset_fences(&[res.capture_fence]).unwrap();
+            d.queue_submit(gpu.queue, &[], res.capture_fence).unwrap();
+        }
+        res.capture_pending = true;
+        assert!(res.wait_idle(d, &mut None));
         session.bury(d);
         assert!(session.left_behind.is_empty(), "destroyed once a later fence on their queue signalled");
         // The split holds run before the upscaler only: no fenced resources are ever built into the
@@ -10822,10 +10936,12 @@ mod tests {
         assert_eq!(gpu.read(image, w, h), original, "the frame is untouched");
         let unreadable = Some(Aux { readable: false, ..exposure_aux(zero).unwrap() });
         let unknown_layout = Some(Aux { layout: None, ..exposure_aux(zero).unwrap() });
+        // A 32-bit float exposure: its low 16 bits are no half (and a wider texel writes over the jump word).
+        let wide = Some(Aux { format: vk::Format::R32_SFLOAT, ..exposure_aux(zero).unwrap() });
         let mut plain = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
         };
-        for exposure_input in [None, unreadable, unknown_layout] {
+        for exposure_input in [None, unreadable, unknown_layout, wide] {
             let target = Target { exposure_input, ..base };
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut plain) };
             assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{exposure_input:?}: {result:?}");
@@ -11294,6 +11410,16 @@ mod tests {
         // A new identification starts over: the target at once.
         let reset = auto_hold(&gpu, &mut res, image, w, h, identification + 1).auto_exposure.unwrap();
         assert!((reset.log2_e - reset.target_log2_e).abs() < 1e-6 && (reset.log2_e - after.log2_e).abs() > 1.5, "{reset:?} after {after:?}");
+        // A new identification whose first frame has no samples (all black) measures nothing: the state stays invalid,
+        // and the next frame with samples takes its target at once (not 5% of the way from e = 1).
+        let black = frame(w, h, |_, _| grey(0.0));
+        gpu.upload(image, w, h, &black);
+        let empty = auto_hold(&gpu, &mut res, image, w, h, identification + 3).auto_exposure.unwrap();
+        assert!(!empty.valid && empty.samples == 0, "nothing measured: {empty:?}");
+        assert!(!hdr::auto_exposure_reference(&black, w, h, None).valid, "the reference: nothing measured");
+        gpu.upload(image, w, h, last);
+        let first = auto_hold(&gpu, &mut res, image, w, h, identification + 3).auto_exposure.unwrap();
+        assert!((first.log2_e - first.target_log2_e).abs() < 1e-6, "the first measured frame takes its target: {first:?}");
         // DLSS's subrect: only the rectangle at the corner is measured, never the padding around it (here far brighter).
         let (rw, rh) = (120u32, 70u32);
         let inside = frame(rw, rh, sky);
@@ -11358,7 +11484,31 @@ mod tests {
             assert!((e - want).abs() <= want * 1e-3, "{name}: e {e}, want {want} (measured {measured})");
             assert!((hdr::LIFT_LO..=hdr::LIFT_HI).contains(&e), "{name}");
         }
-        finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
+        // The game's exposure image reads 0: what comes back as the game's value is unusable (the check's counter
+        // runs), never the lifted e taken for the game's.
+        let (zero, zero_mem) = exposure_image(&gpu, 0.0);
+        let target = Target {
+            colour: image,
+            width: w,
+            height: h,
+            depth: None,
+            depth_buffer: None,
+            region: None,
+            mvec: None,
+            mvec_scale: [1.0, 1.0],
+            exposure: [None; MAX_EXPOSURE],
+            exposure_input: exposure_aux(zero),
+            paper_white: hdr::DEFAULT_PAPER_WHITE,
+            lift_exposure: true,
+            pre_exposed: false,
+            identification: 9,
+        };
+        let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
+        };
+        let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut submit) };
+        assert!(!result.game_exposure.is_some_and(|g| g > hdr::EXPOSURE_MIN), "a game exposure of 0 reads as one: {result:?}");
+        finish(&gpu, res, &[(image, memory), (exposure, exposure_mem), (zero, zero_mem)]);
     }
 
     /// #51, Clair Obscur: Expedition 33: a colour input the game already exposed (a flat 0.2 here) with the

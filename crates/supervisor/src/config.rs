@@ -15,9 +15,10 @@ pub struct Config {
     /// The channel path `config.ini` pins, or empty for none. Read it through
     /// [`crate::channel_path`], which falls back to `NEURAL_FORGE_SHM` and then the default.
     pub shm: String,
-    /// Every other line: the `set_<name>=<value>` settings `neural_forge_protocol::persist`
-    /// round-trips (so they survive a reboot, unlike the mapping under `/tmp`), and anything else, kept
-    /// so `save()` round-trips it.
+    /// Every other `key=value` line: the `set_<name>=<value>` settings `neural_forge_protocol::persist`
+    /// round-trips (so they survive a reboot, unlike the mapping under `/tmp`), and any other key, kept
+    /// so `save()` round-trips it. Comments, blank lines and lines without `=` are not kept: `save()`
+    /// writes the file from these keys alone (sorted, a key set twice once, with its last value).
     pub settings: BTreeMap<String, String>,
     /// Why the file could not be read, when it exists but could not (permissions, an I/O error):
     /// [`Config::save`] then refuses, so the file is never replaced by one holding only this run's keys.
@@ -105,6 +106,20 @@ impl Config {
             line(k, v);
         }
         out
+    }
+
+    /// Loads `config.ini`, runs `edit` on it and saves it when `edit` returns `true`, all under the file's lock
+    /// ([`paths::lock_beside`]): the GUI and the CLI changing it at once run one after the other, so neither
+    /// change is lost. Every load-modify-save of `config.ini` goes through here. Returns the config as it now
+    /// stands (saved or not).
+    pub fn update(edit: impl FnOnce(&mut Self) -> bool) -> std::io::Result<Self> {
+        let file = paths::config_file();
+        let _held = paths::lock_beside(&file);
+        let mut cfg = Self::load_from(&file);
+        if edit(&mut cfg) {
+            cfg.save_to(std::path::Path::new(&file))?;
+        }
+        Ok(cfg)
     }
 
     /// Writes `config.ini`, replacing it whole. Refused when it was there but could not be read
