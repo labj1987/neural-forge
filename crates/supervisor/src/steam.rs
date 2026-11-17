@@ -697,6 +697,13 @@ pub fn apply(root: &Path, appid: &str, action: &Action, steam_running: bool) -> 
     if matches!(action, Action::Enable { target_exe } if target_exe.trim().is_empty()) {
         return Outcome::Failed { reason: "the game's executable is not known: name it (the .exe the game runs) as the target".into(), manual };
     }
+    // `%command%` only inside a longer token (`sh -c '... %command%'`): not edited, the user puts the variables in front.
+    if matches!(action, Action::Enable { .. }) && launch_options::command_inside_token(&current) && !launch_options::is_enabled(&current) {
+        return Outcome::Failed {
+            reason: "the game's launch options have %command% only inside a quoted command: set them by hand, with Neural Forge's variables in front".into(),
+            manual,
+        };
+    }
     if steam_running {
         return Outcome::SteamRunning { manual };
     }
@@ -1434,6 +1441,30 @@ mod tests {
         let expected = format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='My Game.exe' {existing}");
         assert_eq!(options_in(&lc, "3240220").as_deref(), Some(expected.as_str()));
         assert!(std::fs::read_to_string(&lc).unwrap().contains("WINEDLLOVERRIDES=\\\"dxgi=n,b\\\""));
+        apply(&home.0, "3240220", &Action::Disable, false);
+        assert_eq!(options_in(&lc, "3240220").as_deref(), Some(existing));
+    }
+
+    /// `%command%` only inside a quoted command: not edited; the string to paste puts the variables in front.
+    #[test]
+    fn a_command_inside_a_quoted_command_is_left_for_the_user() {
+        let home = Scratch::new("embedded");
+        let lc = home.0.join("userdata/1/config/localconfig.vdf");
+        let existing = "sh -c 'MANGOHUD=1 %command%'";
+        write(&lc, &localconfig(&[("3240220", Some(existing))]));
+        let before = std::fs::read_to_string(&lc).unwrap();
+        match apply(&home.0, "3240220", &enable(), false) {
+            Outcome::Failed { reason, manual } => {
+                assert!(reason.contains("inside a quoted command"), "{reason}");
+                assert_eq!(manual, format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe {existing}"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&lc).unwrap(), before);
+        // Pasted by hand: seen as on, and switching off takes the variables out again.
+        write(&lc, &localconfig(&[("3240220", Some(&format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe {existing}")))]));
+        assert!(enabled(&home.0, "3240220"));
+        assert_eq!(apply(&home.0, "3240220", &enable(), false), Outcome::Unchanged);
         apply(&home.0, "3240220", &Action::Disable, false);
         assert_eq!(options_in(&lc, "3240220").as_deref(), Some(existing));
     }
