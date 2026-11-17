@@ -489,18 +489,16 @@ fn cmd_tested(query: Option<&str>) -> ExitCode {
 /// forgets it), else the remembered one, else the one found from Steam's data.
 fn target_for_enable(game: &neural_forge_supervisor::steam::Game, chosen: &str) -> Result<String, String> {
     use neural_forge_supervisor::steam;
-    let mut cfg = Config::load();
     let key = steam::chosen_target_key(&game.appid);
     let chosen = chosen.trim();
-    if chosen == "auto" {
-        if cfg.settings.remove(&key).is_some() {
-            cfg.save().map_err(|e| format!("saving config.ini failed: {e}"))?;
-        }
-    } else if !chosen.is_empty() {
-        if cfg.settings.get(&key).map(String::as_str) != Some(chosen) {
-            cfg.settings.insert(key, chosen.to_string());
-            cfg.save().map_err(|e| format!("saving config.ini failed: {e}"))?;
-        }
+    // Saved only when it changes.
+    let cfg = Config::update(|cfg| match chosen {
+        "auto" => cfg.settings.remove(&key).is_some(),
+        "" => false,
+        _ => cfg.settings.insert(key.clone(), chosen.to_string()).as_deref() != Some(chosen),
+    })
+    .map_err(|e| format!("saving config.ini failed: {e}"))?;
+    if !chosen.is_empty() && chosen != "auto" {
         return Ok(chosen.to_string());
     }
     match steam::target_for(&cfg, game) {

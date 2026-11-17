@@ -108,6 +108,20 @@ impl Config {
         out
     }
 
+    /// Loads `config.ini`, runs `edit` on it and saves it when `edit` returns `true`, all under the file's lock
+    /// ([`paths::lock_beside`]): the GUI and the CLI changing it at once run one after the other, so neither
+    /// change is lost. Every load-modify-save of `config.ini` goes through here. Returns the config as it now
+    /// stands (saved or not).
+    pub fn update(edit: impl FnOnce(&mut Self) -> bool) -> std::io::Result<Self> {
+        let file = paths::config_file();
+        let _held = paths::lock_beside(&file);
+        let mut cfg = Self::load_from(&file);
+        if edit(&mut cfg) {
+            cfg.save_to(std::path::Path::new(&file))?;
+        }
+        Ok(cfg)
+    }
+
     /// Writes `config.ini`, replacing it whole. Refused when it was there but could not be read
     /// ([`Config::read_error`]): the keys this run did not see would be lost.
     pub fn save(&self) -> std::io::Result<()> {

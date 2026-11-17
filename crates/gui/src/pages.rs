@@ -991,12 +991,15 @@ impl MainView {
             window,
             cx,
             move || {
-                let mut cfg = neural_forge_supervisor::Config::load();
-                match &worker_path {
-                    Some(p) => cfg.settings.insert(neural_forge_protocol::cube::CONFIG_KEY.to_string(), p.clone()),
-                    None => cfg.settings.remove(neural_forge_protocol::cube::CONFIG_KEY),
-                };
-                cfg.save().map_err(|e| e.to_string())
+                neural_forge_supervisor::Config::update(|cfg| {
+                    match &worker_path {
+                        Some(p) => cfg.settings.insert(neural_forge_protocol::cube::CONFIG_KEY.to_string(), p.clone()),
+                        None => cfg.settings.remove(neural_forge_protocol::cube::CONFIG_KEY),
+                    };
+                    true
+                })
+                .map(drop)
+                .map_err(|e| e.to_string())
             },
             move |this, done, window, cx| {
                 if let Err(e) = done {
@@ -2036,13 +2039,15 @@ impl MainView {
             window,
             cx,
             move || {
-                let mut cfg = neural_forge_supervisor::Config::load();
                 let key = steam::chosen_target_key(&worker_game.appid);
-                match typed {
-                    Some(typed) => cfg.settings.insert(key, typed),
-                    None => cfg.settings.remove(&key),
-                };
-                cfg.save().map_err(|e| e.to_string())?;
+                let cfg = neural_forge_supervisor::Config::update(|cfg| {
+                    match typed {
+                        Some(typed) => cfg.settings.insert(key, typed),
+                        None => cfg.settings.remove(&key),
+                    };
+                    true
+                })
+                .map_err(|e| e.to_string())?;
                 let new = steam::target_for(&cfg, &worker_game);
                 let chosen = steam::chosen_target(&cfg, &worker_game.appid).is_some();
                 // A game that is on gets the new target in its launch options at once.

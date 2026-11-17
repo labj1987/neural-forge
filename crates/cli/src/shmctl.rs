@@ -150,9 +150,8 @@ fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
 /// removes the key) and bumps `edit_lut_seq` so a running layer reads it again.
 fn cmd_lut(header: &ShmHeader, file: &str) -> bool {
     let key = neural_forge_protocol::cube::CONFIG_KEY;
-    let mut cfg = neural_forge_supervisor::Config::load();
-    if file == "none" {
-        cfg.settings.remove(key);
+    let path = if file == "none" {
+        None
     } else {
         let path = match std::fs::canonicalize(file) {
             Ok(p) => p.to_string_lossy().into_owned(),
@@ -168,12 +167,22 @@ fn cmd_lut(header: &ShmHeader, file: &str) -> bool {
                 return false;
             }
         }
-        cfg.settings.insert(key.to_string(), path);
-    }
-    if let Err(e) = cfg.save() {
-        eprintln!("shmctl lut: saving config.ini failed: {e}");
-        return false;
-    }
+        Some(path)
+    };
+    let saved = neural_forge_supervisor::Config::update(|cfg| {
+        match path {
+            Some(path) => cfg.settings.insert(key.to_string(), path),
+            None => cfg.settings.remove(key),
+        };
+        true
+    });
+    let cfg = match saved {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("shmctl lut: saving config.ini failed: {e}");
+            return false;
+        }
+    };
     header.edit_lut_seq.fetch_add(1, Ordering::Relaxed);
     header.control_seq.fetch_add(1, Ordering::Relaxed);
     println!("{key}={}", cfg.settings.get(key).map_or("", String::as_str));

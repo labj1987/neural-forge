@@ -157,12 +157,11 @@ impl LiveScope {
 /// `scope`'s settings: `config.ini` for all games (every other line kept), else that game's own ([`store`]).
 pub fn save_values(scope: &LiveScope, values: &BTreeMap<String, String>) -> std::io::Result<()> {
     match scope.scope {
-        0 => {
-            let _held = paths::lock_beside(&paths::config_file());
-            let mut cfg = Config::load();
+        0 => Config::update(|cfg| {
             cfg.settings.extend(values.iter().map(|(k, v)| (k.clone(), v.clone())));
-            cfg.save()
-        }
+            true
+        })
+        .map(drop),
         n => match scope.game() {
             Some(game) => store(&game, values),
             None => Err(std::io::Error::other(format!("the channel holds the settings of a game {} does not name (scope {n:#x})", games_file()))),
@@ -192,11 +191,11 @@ pub fn save_live(header: &neural_forge_protocol::ShmHeader, names: Option<&[&str
             let chosen: BTreeMap<String, String> = snapshot.into_iter().filter(|(k, _)| k.strip_prefix("set_").is_some_and(|n| names.contains(&n))).collect();
             save_values(&scope, &chosen)
         }
-        None if scope.scope == 0 => {
-            let mut cfg = Config::load();
+        None if scope.scope == 0 => Config::update(|cfg| {
             cfg.replace_tuning(snapshot);
-            cfg.save()
-        }
+            true
+        })
+        .map(drop),
         None => save_values(&scope, &snapshot),
     }
 }
@@ -249,6 +248,26 @@ mod tests {
 
     fn values(lines: &[(&str, &str)]) -> BTreeMap<String, String> {
         lines.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// `Config::update` (every load-modify-save of `config.ini`) waits for another holder of the file's lock.
+    #[test]
+    fn a_config_update_waits_for_the_files_lock() {
+        let _home = Home::new("config-lock");
+        let held = paths::lock_beside(&paths::config_file()).unwrap();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let saver = s.spawn(|| {
+                let saved = Config::update(|cfg| cfg.settings.insert("set_intensity".into(), "3".into()).is_none());
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                saved
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "saved while another holder had the lock");
+            drop(held);
+            saver.join().unwrap().unwrap();
+        });
+        assert_eq!(Config::load().settings.get("set_intensity").map(String::as_str), Some("3"));
     }
 
     #[test]
