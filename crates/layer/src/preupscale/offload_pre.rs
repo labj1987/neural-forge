@@ -961,8 +961,23 @@ fn serve(
 #[derive(Clone)]
 struct Submits {
     progress: Arc<Progress>,
-    /// Keeps IN's memory while a submit writes its header.
-    inn: Arc<Region>,
+    /// IN's header as the gate reads it: the exchange's own `inn.ptr` (the imported region, or the mapping of the
+    /// buffer made in its place when the import was refused), never the region alone.
+    inn: *mut u8,
+    /// Keeps IN's region while a submit writes its header (the buffer's own mapping lives as long as the exchange,
+    /// whose entry goes before it is destroyed).
+    _region: Arc<Region>,
+}
+
+// SAFETY: `inn` points at memory that outlives the entry (see the fields); the header is written only at submits.
+unsafe impl Send for Submits {}
+unsafe impl Sync for Submits {}
+
+impl Exchange {
+    /// The entry the global [`at_submit`] uses for this exchange: the same header [`Self::at_submit`] writes.
+    fn submits(&self) -> Submits {
+        Submits { progress: self.progress.clone(), inn: self.inn.ptr, _region: self.regions[1].clone() }
+    }
 }
 
 static SUBMITS: Mutex<Vec<(u64, Submits)>> = Mutex::new(Vec::new());
@@ -978,7 +993,7 @@ pub(crate) fn at_submit(plans: &[(u64, HoldPlan)]) {
     let mut touched: Vec<&Submits> = Vec::new();
     for (id, plan) in plans {
         let Some((_, s)) = all.iter().find(|(i, _)| i == id) else { continue };
-        settle_and_mark(&s.progress, s.inn.ptr, plan);
+        settle_and_mark(&s.progress, s.inn, plan);
         touched.push(s);
     }
     for s in touched {
@@ -1176,10 +1191,7 @@ impl HoldSide {
             }
             return Err("the offload's worker could not be started".into());
         };
-        SUBMITS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((resources, Submits { progress: exchange.progress.clone(), inn: exchange.regions[1].clone() }));
+        SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((resources, exchange.submits()));
         super::offload::note_state(super::offload::State::Active(name.clone()));
         SERVING_PRE.store(true, Ordering::Release);
         crate::log!(
@@ -1937,6 +1949,33 @@ mod tests {
         // SAFETY: idle; nothing uses it.
         unsafe { freed.destroy(&d) };
         game.free();
+    }
+
+    /// Regions not imported (no `VK_EXT_external_memory_host`, or the import refused): the gate reads the mapping of
+    /// the buffer made in their place, so the submit hook of holds recorded into DLSS's buffers writes the header
+    /// there, as [`Exchange::at_submit`] does.
+    #[test]
+    fn the_submit_hook_writes_the_header_the_gate_reads_when_the_regions_are_not_imported() {
+        let Some(dev) = Dev::open() else {
+            assert_ne!(neural_forge_protocol::env::var("NEURAL_FORGE_REQUIRE_VULKAN").as_deref(), Some("1"), "no Vulkan device for the exchange's tests");
+            return;
+        };
+        // SAFETY: a live device; `import: false` makes IN the exchange's own buffer.
+        let exchange = unsafe { Exchange::build(&dev.device, &dev.instance, dev.physical, false, SIZES) }.expect("the exchange");
+        assert!(exchange.inn.staged, "IN is the exchange's own buffer");
+        const ID: u64 = u64::MAX - 7;
+        SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((ID, exchange.submits()));
+        exchange.progress.queue(1);
+        exchange.progress.handed();
+        assert!(exchange.progress.finish(1, true));
+        at_submit(&[(ID, HoldPlan { settle: Some(1), take: true, send: None })]);
+        // SAFETY: IN's header, host-visible; nothing runs.
+        let header = unsafe { (exchange.inn.ptr.cast::<u32>().add(IN_SEQ).read_volatile(), exchange.inn.ptr.cast::<u32>().add(IN_VALID).read_volatile()) };
+        SUBMITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(id, _)| *id != ID);
+        assert_eq!(header, (1, 1), "the header the gate's set binds names frame 1's answer");
+        // SAFETY: nothing was recorded with it.
+        unsafe { exchange.destroy(&dev.device) };
+        dev.close();
     }
 
     /// Two devices: every hold gets exactly the frame the hold before it sent, through the second device.
