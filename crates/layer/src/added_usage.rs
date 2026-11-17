@@ -108,6 +108,16 @@ impl AddedUsage {
         Key::of(asked).and_then(|k| lock(&self.verdicts).get(&k).copied())
     }
 
+    /// The driver refused to create `asked` with the added usage: the verdict for its shape is `false`.
+    fn refused(&self, asked: &vk::ImageCreateInfo) {
+        if let Some(key) = Key::of(asked) {
+            let mut verdicts = lock(&self.verdicts);
+            if verdicts.len() < VERDICTS_MAX || verdicts.contains_key(&key) {
+                verdicts.insert(key, false);
+            }
+        }
+    }
+
     /// Judges `copyable` (`asked` with the added usage) by the two images' requirements, keeps the verdict and
     /// logs a difference (once per format and usage). `true`: they are the same, the image gets the usage.
     pub(crate) fn judge(
@@ -161,7 +171,10 @@ impl AddedUsage {
             Some(true) => {
                 return match create(copyable) {
                     Ok(image) => (Ok(image), true),
-                    Err(_) => (create(asked), false),
+                    Err(_) => {
+                        self.refused(asked);
+                        (create(asked), false)
+                    }
                 };
             }
             None => {}
@@ -170,7 +183,11 @@ impl AddedUsage {
             Ok(image) => image,
             Err(e) => return (Err(e), false),
         };
-        let Ok(added) = create(copyable) else { return (Ok(plain), false) };
+        let Ok(added) = create(copyable) else {
+            // The driver refuses the usage for this shape: kept as a verdict, so it is not asked again at every create.
+            self.refused(asked);
+            return (Ok(plain), false);
+        };
         if self.judge(asked, copyable, requirements(plain), requirements(added)) {
             destroy(plain);
             (Ok(added), true)
@@ -210,6 +227,30 @@ mod tests {
         let (asked, copyable) = colour(p_next);
         let flags = vk::ImageCreateFlags::MUTABLE_FORMAT;
         (vk::ImageCreateInfo { flags, ..asked }, vk::ImageCreateInfo { flags, ..copyable })
+    }
+
+    /// A driver that refuses the image with the added usage: created as asked, and the refusal kept as the verdict,
+    /// so the next one is created once, as asked (not refused again at every create).
+    #[test]
+    fn a_refused_added_usage_is_kept_as_the_verdict() {
+        let usage = AddedUsage::default();
+        let (asked, copyable) = colour(std::ptr::null());
+        let creates = RefCell::new(0);
+        let create = |info: &vk::ImageCreateInfo| {
+            *creates.borrow_mut() += 1;
+            if info.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+                Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED)
+            } else {
+                Ok(ash::vk::Handle::from_raw(0x10))
+            }
+        };
+        let destroy = |_: vk::Image| {};
+        let requirements = |_: vk::Image| vk::MemoryRequirements::default();
+        let (image, added) = usage.create(&asked, &copyable, &create, &destroy, &requirements);
+        assert_eq!((image.is_ok(), added, usage.cached(&asked)), (true, false, Some(false)));
+        *creates.borrow_mut() = 0;
+        let (_, added) = usage.create(&asked, &copyable, &create, &destroy, &requirements);
+        assert_eq!((added, *creates.borrow()), (false, 1), "the kept refusal: one create, as asked");
     }
 
     /// On a real (lavapipe) device, through real images: where the requirements with the added usage differ
