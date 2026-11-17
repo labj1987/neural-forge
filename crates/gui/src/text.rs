@@ -320,16 +320,41 @@ pub(crate) fn edits_in_game_frame(state: u32) -> bool {
     matches!(state, HOLDING | HOLDING_AFTER | HOLDING_BOTH | PAUSED)
 }
 
+/// Whether the layer's line (`layer_reason`) says the model runs on a second GPU now (`NEURAL_FORGE_OFFLOAD_GPU`):
+/// not when that GPU was given up, stalled or not used.
+pub(crate) fn on_second_gpu(reason: &str) -> bool {
+    reason.starts_with("second GPU: the model runs on")
+}
+
 /// The Status page's Model row: where the network runs, from the hold's state (`preupscale_state`; the layer's
-/// `native_running` covers only the hold before the upscaler) and the layer's line (`layer_reason`) for a second GPU.
+/// `native_running` covers only the hold before the upscaler) and the layer's line (`layer_reason`), which while a
+/// second GPU runs the model says which hold it serves (before DLSS, after DLSS, both) or neither for the finished
+/// frame. The hold wordings only while a hold runs: its side keeps its line through a pause menu.
 pub(crate) fn model_label(state: u32, native_running: bool, reason: &str) -> &'static str {
-    use neural_forge_protocol::enums::preupscale_state::{HOLDING_AFTER, HOLDING_BOTH};
+    use neural_forge_protocol::enums::preupscale_state::{network_runs, HOLDING, HOLDING_AFTER, HOLDING_BOTH};
+    if on_second_gpu(reason) {
+        let held = network_runs(state);
+        if reason.contains(" before and after DLSS, its edit") {
+            if held {
+                return "running on the second GPU, before and after DLSS";
+            }
+        } else if reason.contains(" before DLSS, its edit") {
+            if held {
+                return "running on the second GPU, before DLSS";
+            }
+        } else if reason.contains(" after DLSS, its edit") {
+            if held {
+                return "running on the second GPU, after DLSS";
+            }
+        } else {
+            return "running on the second GPU, on the finished frame";
+        }
+    }
     match state {
+        HOLDING => "running before the upscaler",
         HOLDING_BOTH => "running before the upscaler and after DLSS",
         HOLDING_AFTER => "running after DLSS",
         _ if native_running => "running before the upscaler",
-        // The model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`) runs on the finished frame, not before the upscaler.
-        _ if reason.starts_with("second GPU: the model runs on") => "running on the second GPU, on the finished frame",
         _ => "not running before the upscaler",
     }
 }
@@ -954,5 +979,181 @@ mod uninstall_tests {
         assert!(text.starts_with("Removed 2 files and folders."), "{text}");
         assert!(text.contains("Switched off in the launch options of: Some Game (1).") && text.contains("app 2: Steam is running"), "{text}");
         assert!(uninstall_result(&purged, Some(std::path::Path::new("/x.AppImage"))).contains("Delete /x.AppImage too"));
+    }
+}
+
+/// The size the model runs at on the finished frame, for the Status tab's Model placement row: the last answer's size
+/// (`model`, `answered_w`/`answered_h`) against the presented frame's (`frame`, `frame_width`/`frame_height`), with the
+/// setting that decides it (`set`: `working_scale`). `None` while the model does not run there (`running`), nothing
+/// was answered yet, or the two do not belong together: a setting just changed, whose next answer has not come, is
+/// said by a later second's line, never as a percent of the wrong frame. An answer that stays below the size set
+/// (`steady`, [`steady_for`]) is the model's pixel cap at work (`NEURAL_FORGE_MAX_MODEL_PIXELS` in the game's
+/// environment, which this app cannot read: no number is given).
+pub(crate) fn finished_frame_size(running: bool, model: (u32, u32), frame: (u32, u32), set: f32, steady: bool) -> Option<String> {
+    if !running || model.0 == 0 || model.1 == 0 || frame.0 == 0 || frame.1 == 0 || model.0 > frame.0 || model.1 > frame.1 {
+        return None;
+    }
+    // The model takes even sizes only: an odd frame runs one row or column short, which is still its full size.
+    let near = |a: u32, b: u32| a.abs_diff(b) <= 2;
+    if near(model.0, frame.0) && near(model.1, frame.1) {
+        return Some(format!("the model runs at the frame's full size, {}x{}", frame.0, frame.1));
+    }
+    let set = if set.is_finite() && set > 0.0 { f64::from(set.min(1.0)) } else { 1.0 };
+    let percent = (f64::from(model.0) / f64::from(frame.0) * 100.0).round();
+    let expected = ((f64::from(frame.0) * set).round() as u32, (f64::from(frame.1) * set).round() as u32);
+    if near(model.0, expected.0) && near(model.1, expected.1) {
+        return Some(format!(
+            "the model runs at {}x{}, {percent:.0}% of the {}x{} frame (Model resolution at the finished frame, in the Model tab)",
+            model.0, model.1, frame.0, frame.1
+        ));
+    }
+    if steady && model.0 < expected.0 && model.1 < expected.1 {
+        return Some(format!(
+            "the model runs at {}x{}, {percent:.0}% of the {}x{} frame: below the {:.0}% set, held there by the model's pixel cap (NEURAL_FORGE_MAX_MODEL_PIXELS)",
+            model.0,
+            model.1,
+            frame.0,
+            frame.1,
+            set * 100.0
+        ));
+    }
+    None
+}
+
+/// How many of the Status tab's refreshes (one a second) the finished frame's sizes and setting must stay the same
+/// before an answer below the size set counts as capped, not as a setting whose first answer is still out.
+const STEADY_REFRESHES: u32 = 3;
+
+/// Counts refreshes with the same `now` in `seen`; whether it has stayed for [`STEADY_REFRESHES`].
+pub(crate) fn steady_for<T: PartialEq + Copy>(seen: &std::cell::Cell<Option<(T, u32)>>, now: T) -> bool {
+    let count = match seen.get() {
+        Some((before, n)) if before == now => n.saturating_add(1),
+        _ => 1,
+    };
+    seen.set(Some((now, count)));
+    count >= STEADY_REFRESHES
+}
+
+/// The finished frame's sizes and setting [`steady_for`] counts: the answer's size, the frame's, `working_scale`'s bits.
+pub(crate) type FinishedSizes = ((u32, u32), (u32, u32), u32);
+
+/// The Status tab's "Settings in use" line (`settings_group`): the Model tab's before the upscaler, the After DLSS /
+/// finished frame group's after DLSS or on the finished frame, or both in one frame.
+pub(crate) fn settings_group_label(layer_active: bool, group: u32) -> &'static str {
+    use neural_forge_protocol::enums::settings_group::{AFTER, BEFORE, BOTH};
+    match group {
+        _ if !layer_active => "no game running",
+        BEFORE => "before DLSS: the Model tab's Passes, Model resolution and image settings",
+        AFTER => "after DLSS / finished frame: the After DLSS / finished frame group's (each the same as before DLSS where not set)",
+        BOTH => "both: the Model tab's before the upscaler, the After DLSS / finished frame group's for the passes after DLSS",
+        _ => "not yet: the layer has not placed the model in a frame",
+    }
+}
+
+/// The After DLSS group's model resolution menu: "Same as before DLSS" (a stored 0), the presets
+/// (`enums::model_scale::PRESETS`), then "Custom" for another value (set with `shmctl`). The row for a stored value.
+pub(crate) fn after_scale_index(value: f32) -> usize {
+    use neural_forge_protocol::enums::model_scale::{preset_of, PRESETS};
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else {
+        preset_of(value).map_or(PRESETS.len() + 1, |i| i + 1)
+    }
+}
+
+/// The value row `index` of [`after_scale_index`]'s menu stores; `None` for "Custom", which stores nothing.
+pub(crate) fn after_scale_value(index: usize) -> Option<f32> {
+    use neural_forge_protocol::enums::model_scale::PRESETS;
+    match index {
+        0 => Some(0.0),
+        i => PRESETS.get(i - 1).map(|&(_, scale)| scale),
+    }
+}
+
+#[cfg(test)]
+mod second_gpu_tests {
+    use super::{finished_frame_size, model_label, on_second_gpu, steady_for};
+    use neural_forge_protocol::enums::preupscale_state::*;
+
+    /// The Model row says which hold runs the model and on which GPU: with a second GPU the hold it serves (the
+    /// layer's line), where it used to say "on the finished frame" for every offloaded hold.
+    #[test]
+    fn the_model_row_says_which_hold_runs_the_model_and_on_which_gpu() {
+        let on = |rest: &str| format!("second GPU: the model runs on NVIDIA GeForce RTX 5080 {rest}");
+        assert_eq!(model_label(HOLDING, true, &on("before DLSS, its edit applied one frame later")), "running on the second GPU, before DLSS");
+        assert_eq!(model_label(HOLDING_AFTER, false, &on("after DLSS, its edit applied one frame later")), "running on the second GPU, after DLSS");
+        assert_eq!(model_label(OFF, false, &on("each frame shown one frame later")), "running on the second GPU, on the finished frame");
+        let both = on("before and after DLSS, its edits applied one frame later");
+        assert_eq!(model_label(HOLDING_BOTH, false, &both), "running on the second GPU, before and after DLSS");
+        // Paused or waiting (a menu, a loading screen): the hold's side keeps its line, but no hold runs the model.
+        assert_eq!(model_label(PAUSED, false, &on("after DLSS, its edit applied one frame later")), "not running before the upscaler");
+        assert_eq!(model_label(WAITING, false, &both), "not running before the upscaler");
+        // The second GPU given up or stalled: the hold's own state.
+        assert_eq!(model_label(HOLDING, true, "second GPU: given up (too slow); the model runs on the game's GPU"), "running before the upscaler");
+        // No model time on the game's GPU is shown while a second GPU runs the network; it is when that GPU is not used.
+        assert!(on_second_gpu(&both));
+        assert!(!on_second_gpu("second GPU: given up (too slow); the model runs on the game's GPU") && !on_second_gpu("native network running"));
+    }
+
+    /// The finished frame's size (#63: "Full" in the Model tab's row was the size before DLSS; the frame ran at half).
+    #[test]
+    fn the_finished_frame_size_is_said_only_when_answer_and_setting_agree() {
+        let size = finished_frame_size;
+        assert_eq!(
+            size(true, (1024, 768), (2048, 1536), 0.5, false).as_deref(),
+            Some("the model runs at 1024x768, 50% of the 2048x1536 frame (Model resolution at the finished frame, in the Model tab)")
+        );
+        assert_eq!(size(true, (2560, 1440), (2560, 1440), 1.0, false).as_deref(), Some("the model runs at the frame's full size, 2560x1440"));
+        assert_eq!(size(true, (1485, 835), (2560, 1440), 0.58, true).map(|s| s.contains("58% of the 2560x1440 frame")), Some(true));
+        // An odd frame runs a row or column short: still its full size.
+        assert_eq!(size(true, (2492, 1408), (2493, 1408), 1.0, false).as_deref(), Some("the model runs at the frame's full size, 2493x1408"));
+        // A setting just changed: nothing is said until the answer and the setting agree.
+        assert_eq!(size(true, (1024, 768), (2048, 1536), 1.0, false), None);
+        assert_eq!(size(true, (2048, 1536), (1280, 720), 1.0, true), None);
+        // The pixel cap: an answer that stays below the size set. No number of the cap is claimed.
+        for (model, frame) in [((3840, 2160), (5120, 2880)), ((1920, 1080), (2560, 1440))] {
+            let capped = size(true, model, frame, 1.0, true).expect("steady below the size set");
+            assert!(capped.contains("75% of") && capped.contains("below the 100% set") && capped.contains("pixel cap"), "{capped}");
+        }
+        assert_eq!(size(false, (1024, 768), (2048, 1536), 0.5, true), None, "held before or after DLSS, or not running");
+        assert_eq!(size(true, (0, 0), (2048, 1536), 0.5, true), None, "nothing answered yet");
+        assert_eq!(size(true, (1024, 768), (0, 0), 0.5, true), None, "no frame captured yet");
+        // Steady: the same sizes and setting at three refreshes in a row; a change starts the count again.
+        let seen = std::cell::Cell::new(None);
+        assert!(!steady_for(&seen, 1) && !steady_for(&seen, 1) && steady_for(&seen, 1) && steady_for(&seen, 1));
+        assert!(!steady_for(&seen, 2));
+    }
+}
+
+#[cfg(test)]
+mod after_dlss_tests {
+    use super::{after_scale_index, after_scale_value, settings_group_label};
+    use neural_forge_protocol::enums::{model_scale::PRESETS, settings_group};
+
+    /// The model resolution menu: "Same" stores 0 and reads back from 0 (or a value that is not a number), each preset
+    /// its scale, and a value set elsewhere shows as "Custom", which writes nothing.
+    #[test]
+    fn the_after_scale_menu_round_trips() {
+        assert_eq!((after_scale_index(0.0), after_scale_value(0)), (0, Some(0.0)));
+        assert_eq!(after_scale_index(f32::NAN), 0);
+        for (i, &(_, scale)) in PRESETS.iter().enumerate() {
+            assert_eq!(after_scale_index(scale), i + 1);
+            assert_eq!(after_scale_value(i + 1), Some(scale));
+        }
+        let custom = PRESETS.len() + 1;
+        assert_eq!(after_scale_index(0.8), custom);
+        assert_eq!(after_scale_value(custom), None);
+        // Every value the menu stores is one the setting holds.
+        let (lo, hi) = neural_forge_protocol::setting_bounds("after_scale").expect("a setting");
+        assert!((0..custom).filter_map(after_scale_value).all(|v| v == 0.0 || (lo..=hi).contains(&v)));
+    }
+
+    #[test]
+    fn the_status_line_names_the_group_in_use() {
+        assert_eq!(settings_group_label(false, settings_group::AFTER), "no game running");
+        assert!(settings_group_label(true, settings_group::BEFORE).starts_with("before DLSS"));
+        assert!(settings_group_label(true, settings_group::AFTER).starts_with("after DLSS / finished frame"));
+        assert!(settings_group_label(true, settings_group::BOTH).starts_with("both"));
+        assert!(settings_group_label(true, settings_group::NONE).starts_with("not yet"));
     }
 }
