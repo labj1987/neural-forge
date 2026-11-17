@@ -2857,6 +2857,12 @@ impl Tracker {
                     }
                 }
                 if found.is_none() {
+                    // Attachment layouts first, then the buffer's barriers (which follow its rendering), as the commit
+                    // ([`Self::commit_submitted`]) and [`Self::layout_when_run`] apply them.
+                    for &(image, layout) in self.attached.get(&cb).into_iter().flatten() {
+                        let owner = proposed.get(&image).and_then(|p| p.1);
+                        proposed.insert(image, (layout, owner));
+                    }
                     for sync in self.pending.get(&cb).into_iter().flatten() {
                         let owner = sync.transfers_ownership().then_some(sync.dst_queue_family).or(proposed.get(&sync.image).and_then(|p| p.1));
                         // A barrier that keeps the layout leaves the one before it (none known: none proposed).
