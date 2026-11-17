@@ -21,6 +21,7 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste (a proc macro, runs only in the compiler): archived by its author, no known flaw" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz (text shaping of the system's own fonts): unmaintained, no known flaw; the toolkit's text stack uses it" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser (reads the system's own fonts): unmaintained, no known flaw; the toolkit's text stack uses it" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono (dates for the toolkit's components): unmaintained, no known flaw; the toolkit (gpui-base) asks for it" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names: now developed inside zbus; the toolkit's D-Bus crates (portals, accessibility) still name the standalone crate" },
     { id = "RUSTSEC-2026-0370", reason = "zvariant: now developed inside zbus; the toolkit's D-Bus crates still name the standalone crate" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: now developed inside zbus; the toolkit's D-Bus crates still name the standalone crate" },
