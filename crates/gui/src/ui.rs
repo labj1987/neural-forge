@@ -1312,16 +1312,8 @@ impl MainView {
     fn sample_telemetry(&mut self, cx: &mut Context<Self>) {
         let hdr = self.shm.header();
         let t = &mut self.telemetry;
-        // The model on a second GPU (`NEURAL_FORGE_OFFLOAD_GPU`) runs on the finished frame, not before the upscaler:
-        // its line is the layer's (`layer_reason`).
-        let reason = hdr.layer_reason();
-        let model = if hdr.native_running.load(Ordering::Relaxed) != 0 {
-            "running before the upscaler"
-        } else if reason.starts_with("second GPU: the model runs on") {
-            "running on the second GPU, on the finished frame"
-        } else {
-            "not running before the upscaler"
-        };
+        let state = hdr.preupscale_state.load(Ordering::Relaxed);
+        let model = crate::text::model_label(state, hdr.native_running.load(Ordering::Relaxed) != 0, &hdr.layer_reason());
         // The name is only as current as the frames: a closed game leaves its name behind.
         let name = hdr.game_name();
         let active = t.live.alive(hdr);
@@ -1345,7 +1337,8 @@ impl MainView {
         let model_ms = f32::from_bits(hdr.preupscale_network_gpu_ms_bits.load(Ordering::Relaxed));
         let sample = TelemetrySample {
             frame_ms: rate.filter(|&f| active && f > 0.5).map(|f| (1000.0 / f) as f32),
-            model_ms: (active && hdr.native_running.load(Ordering::Relaxed) != 0 && model_ms.is_finite() && model_ms > 0.0).then_some(model_ms),
+            model_ms: (active && neural_forge_protocol::enums::preupscale_state::network_runs(state) && model_ms.is_finite() && model_ms > 0.0)
+                .then_some(model_ms),
         };
         let ms = |v: Option<f32>| v.map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"));
         let frame_label = format!("Frame time {}", ms(sample.frame_ms));

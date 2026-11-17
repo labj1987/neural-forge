@@ -35,6 +35,13 @@ pub mod preupscale_state {
     /// DLSS runs but the game is not on a Neural Forge Proton (NGX's wrapper hands the layer no records, 4.0): the
     /// model stays off (the finished frame only where that placement is chosen).
     pub const NO_WRAPPER: u32 = 7;
+
+    /// Whether the network runs in a hold in `state`: before the upscaler, after DLSS or both. The layer's
+    /// `native_running` is set only for [`HOLDING`] (the GUI uses it for "after the upscaler"), so a reader that asks
+    /// whether the network is running at all asks this.
+    pub const fn network_runs(state: u32) -> bool {
+        matches!(state, HOLDING | HOLDING_AFTER | HOLDING_BOTH)
+    }
 }
 
 /// Which of the networks `extract-model` writes the layer runs (`ShmHeader::network`, the Network

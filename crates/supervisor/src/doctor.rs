@@ -273,7 +273,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
         Ok(Some(mapping)) => {
             let hdr = mapping.header();
             out.push(Finding::new("channel", Severity::Ok, "the settings channel opens", roots.shm_path.display().to_string(), None));
-            let running = hdr.native_running.load(Ordering::Relaxed) != 0 && layer_alive(hdr);
+            let running = network_resident(hdr);
             out.extend(check_vram(&gpus, Some(hdr), running));
             out.push(check_attached(roots, hdr, manifest_ok));
             out.extend(check_device_lost(Some(hdr), session.as_deref()));
@@ -672,6 +672,12 @@ fn layer_alive(hdr: &neural_forge_protocol::ShmHeader) -> bool {
         }
     }
     false
+}
+
+/// Whether the network is resident in a game running now: a hold runs it (before the upscaler, after DLSS or both;
+/// `native_running` covers only the first) and the layer's heartbeat moves.
+fn network_resident(hdr: &neural_forge_protocol::ShmHeader) -> bool {
+    neural_forge_protocol::enums::preupscale_state::network_runs(hdr.preupscale_state.load(Ordering::Relaxed)) && layer_alive(hdr)
 }
 
 /// `running`: the network is resident in a game that is running now (`native_running` and [`layer_alive`]).
@@ -2188,6 +2194,30 @@ mod tests {
                 }
             });
             assert!(layer_alive(&hdr));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    /// The network runs after DLSS too (Ray Reconstruction, the `upscaled` placement), where `native_running` stays 0:
+    /// the VRAM check must not warn that the running network may fail to build.
+    #[test]
+    fn a_hold_after_dlss_is_a_running_network() {
+        use neural_forge_protocol::enums::preupscale_state::*;
+        let hdr = neural_forge_protocol::ShmHeader::default();
+        hdr.init_defaults();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    hdr.layer_heartbeat.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            for (state, runs) in [(HOLDING, true), (HOLDING_AFTER, true), (HOLDING_BOTH, true), (WAITING, false), (IDENTIFIED, false), (PAUSED, false)] {
+                hdr.preupscale_state.store(state, Ordering::Relaxed);
+                hdr.native_running.store(u32::from(state == HOLDING), Ordering::Relaxed);
+                assert_eq!(network_resident(&hdr), runs, "state {state}");
+            }
             stop.store(true, Ordering::Relaxed);
         });
     }
