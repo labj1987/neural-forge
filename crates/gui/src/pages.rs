@@ -2830,8 +2830,8 @@ impl Render for PassDialog {
             let on = mask & field.bit != 0;
             let bit = field.bit;
             rows.push(
-                row(("field", i), field.title, "Override for this pass", cx)
-                    .child(Switch::new("override").checked(on).accessibility_label(format!("{} {}", self.target.switch_label(), field.title)).on_click(
+                row(("field", i), field.title, self.target.field_subtitle(), cx)
+                    .child(Switch::new("override").checked(on).accessibility_label(format!("{}: {}", self.target.field_subtitle(), field.title)).on_click(
                         cx.listener(move |this, on: &bool, window, cx| {
                             let mask = override_mask(this.shm.header(), this.target, this.pass.get()).load(Ordering::Relaxed);
                             this.write("overrides", if *on { mask | bit } else { mask & !bit }, window, cx);
@@ -2932,11 +2932,11 @@ impl OverrideTarget {
         }
     }
 
-    /// What a field's switch is called to a screen reader.
-    fn switch_label(self) -> &'static str {
+    /// What a field's switch does, under its name (and to a screen reader).
+    fn field_subtitle(self) -> &'static str {
         match self {
-            Self::Passes => "Override for this pass:",
-            Self::AfterDlss => "Own value after DLSS:",
+            Self::Passes => "Override for this pass",
+            Self::AfterDlss => "Own value after DLSS",
         }
     }
 }

@@ -90,12 +90,12 @@ How it works, step by step: [ARCHITECTURE.md](ARCHITECTURE.md).
 | Tab | What it has |
 |---|---|
 | Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive, Remix), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, the two model resolutions (before and after DLSS, and at the finished frame), the After DLSS / finished frame group (its own passes, model resolution after DLSS and image settings) and per-pass settings, model brightness and its scale, keep the game's sky, more mask rules (dark areas, fast motion), model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither, hue, grey, shadow and highlight protection and a look-up table, the HUD group: finding the HUD and HUD regions on the finished frame, and the Sharpening group: adaptive sharpening (CAS) and Clarity on the finished frame. |
-| Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution after the upscaler (the Model tab's Model resolution at the finished frame as a percent; shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
+| Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution at the finished frame (the Model tab's row of that name as a percent; shown while the model runs there), the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point; HDR input and Colour mode are shown but not used yet. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | **Proton copies out of date** (shown only when a Neural Forge Proton copy is older than the Proton it was made from, or its name lacks "Proton" so Steam Cloud skips the saves in its prefix: the copy, both versions or the Steam Cloud problem, and the games that run with it; see [Proton with DLSS parameters](#proton-with-dlss-parameters)), Telemetry (the model, the game, the frame rate, and a graph of the time per frame and the model's GPU time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, after DLSS with its output size, both, waiting for DLSS Super Resolution, paused with the game's DLSS (a menu or loading screen), DLSS's input found but not held and why, or after the upscaler; on the finished frame, the size the model runs at and its share of the frame), **Settings in use** (before DLSS, after DLSS / finished frame, or both), **Tested game** (where the model ran in the running game in testing and the version that was, with its setup notes as the tooltip; see [Tested games](#tested-games)), **HDR** (the HDR verdict, see below), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
 | Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another (a game whose folder ships anti-cheat says which, and asks before it is switched on; a tested game says where the model runs in it), the launch option to copy by hand for a game you pick, **Proton with DLSS parameters** (below) and **Uninstall…** (see [Uninstall](#uninstall)). |
 
-![Status tab, lower half, while Cyberpunk 2077 runs with Ray Reconstruction: the layer, the model's placement after DLSS with the second GPU's verdict, the settings in use, where the model ran in the game in testing, the HDR line with the game's HDR10 output and the desktop's HDR state, the model, reset and profiles, and Diagnosis](../screenshots/status-details.png)
+![Status tab, lower half, while Cyberpunk 2077 runs: the layer and the model's placement, where the model ran in the game in testing, the HDR line with the game's HDR10 output and the desktop's HDR state, the model, reset and profiles, and Diagnosis](../screenshots/status-details.png)
 
 **The HDR verdict** (the Status tab's HDR line, `hdr_verdict=` in `neural-forge-cli shmctl status`, Save report and the
 game's log as `[layer] HDR: ...`) says in one line whether the game presents HDR and, when it does not, why:
@@ -171,7 +171,7 @@ different pictures:
   DLSS its own (**Model resolution after DLSS**, below).
 - **Model resolution at the finished frame** is the size with Placement Finished frame, and wherever the model
   runs on the finished frame because it cannot run before or after DLSS, as a share of the frame. It is for every
-  pass there, and the Composition tab's "Model resolution after the upscaler" is the same setting as a percent.
+  pass there, and the Composition tab's "Model resolution at the finished frame" is the same setting as a percent.
 
 "Full" in the first row says nothing about the second: with Placement Finished frame only the second one counts.
 The Status tab's Model placement line says the size in use on the finished frame ("the model runs at 1024x768,
@@ -278,7 +278,7 @@ model resolutions) holds the settings for those frames, so the passes and the si
 changing them before the upscaler:
 
 - **Passes after DLSS**: how many times the model runs over a frame where no pass runs before the upscaler (after
-  DLSS's output or on the finished frame). **Same as before DLSS** (the default) uses the Passes setting.
+  DLSS's output or on the finished frame). **0** (the default) is the same as before DLSS: the Passes setting.
 - **Model resolution after DLSS**: the size the model works at on DLSS's output, as a share of it, with the same
   choices as the other model resolutions. **Same as before DLSS** (the default) uses Model resolution before and
   after DLSS. On the finished frame the Model resolution at the finished frame applies, as before.
@@ -298,7 +298,7 @@ group the current placement uses. They are saved as `set_after_passes`, `set_aft
 DLSS), `set_after_overrides` and `set_after_intensity`, ... in `config.ini`, can be set per game, and
 `neural-forge-cli shmctl set after_passes 1` (or `after_scale 0.5`) does the same from a terminal.
 
-![Model tab, the After DLSS / finished frame group opened: Passes after DLSS set to 1, Model resolution after DLSS set to Performance, and Image settings after DLSS with its Edit button](../screenshots/after-dlss.png)
+![Model tab, the After DLSS / finished frame group: Passes after DLSS at 0 (the same as before DLSS), Model resolution after DLSS set to Same as before DLSS, and Image settings after DLSS with its Edit button](../screenshots/after-dlss.png)
 
 ![After DLSS image settings: an own-value switch for each of intensity, local tone, local structure, skin structure, style, auto mask, edit saturation, edit contrast and edit detail, each off](../screenshots/after-dlss-settings.png)
 
