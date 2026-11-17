@@ -1367,6 +1367,9 @@ impl MainView {
     }
 
     fn pick_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        if tab != self.tab {
+            self.end_key_wait(cx);
+        }
         self.tab = tab;
         cx.notify();
     }

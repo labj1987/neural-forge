@@ -181,12 +181,7 @@ impl PageState {
             // The launch option follows the executable typed.
             cx.subscribe_in(&exe_input, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
             // Leaving the toggle key's button ends the wait for a key.
-            cx.on_blur(&hotkey_focus, window, |this, _, cx| {
-                if std::mem::take(&mut this.pages.capturing_key) {
-                    this.stop_listening_for_key();
-                    cx.notify();
-                }
-            }),
+            cx.on_blur(&hotkey_focus, window, |this, _, cx| this.end_key_wait(cx)),
         ];
         Self {
             model_text: String::new(),
@@ -565,6 +560,15 @@ impl MainView {
             tap.listen();
         }
         self.read_session_keys();
+    }
+
+    /// Ends the toggle key's wait for a key, if it waits: the focus left its button, or another tab was picked (which
+    /// need not take the focus, and leaves the button undrawn).
+    pub(crate) fn end_key_wait(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.pages.capturing_key) {
+            self.stop_listening_for_key();
+            cx.notify();
+        }
     }
 
     fn stop_listening_for_key(&mut self) {
