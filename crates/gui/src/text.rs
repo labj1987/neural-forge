@@ -41,11 +41,11 @@ pub(crate) fn decimals(x: f64) -> u32 {
 
 /// The value a spin row keeps when its field's `text` is read back: the current `value` while the text
 /// still shows it at `digits` decimals (either decimal mark), so precision the row does not show
-/// survives a focus change; `None` for edited text, which the row then parses as a new value.
+/// survives a focus change; `None` for edited text, which the row then parses as a new value. Only the text exactly as
+/// shown counts: a typed value with more decimals that rounds to the shown one (1.004 where 1.00 shows) is new.
 pub(crate) fn kept_spin_value(text: &str, value: f64, digits: u32) -> Option<f64> {
-    let typed: f64 = text.trim().replace(',', ".").parse().ok()?;
     let d = digits as usize;
-    (format!("{typed:.d$}") == format!("{value:.d$}")).then_some(value)
+    (text.trim().replace(',', ".") == format!("{value:.d$}")).then_some(value)
 }
 
 pub(crate) fn format_key_label(code: u32, name: Option<&str>) -> String {
@@ -779,6 +779,9 @@ mod spin_precision_tests {
         assert_eq!(kept_spin_value("1.2", 1.26, 1), None);
         assert_eq!(kept_spin_value("", 1.0, 1), None);
         assert_eq!(kept_spin_value("abc", 1.0, 1), None);
+        // More decimals than shown, rounding to the shown text: typed, so a new value.
+        assert_eq!(kept_spin_value("1.004", 1.0, 2), None);
+        assert_eq!(kept_spin_value("16.6", 16.6, 0), None, "the value itself, typed in full");
     }
 }
 
