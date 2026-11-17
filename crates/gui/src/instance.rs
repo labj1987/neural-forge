@@ -8,6 +8,12 @@
 //! settings. The start-up install is not what this guards: every launch runs it before it looks for a running copy
 //! (main.rs), so a newer AppImage installs its layer even while an older window is open.
 //!
+//! A launch of another build (an older or newer AppImage, a new `cargo` build) does not present the running window:
+//! that window saves its settings and closes, and the launch takes its place (#73), so the window always matches the
+//! layer the launch installed. The request carries the launch's build (`build_id`); the running copy answers
+//! "replacing" and goes, and the launch asks again until nobody listens. SIGTERM (a logout, `kill`) closes the window
+//! the same way, its settings saved (`terminations`).
+//!
 //! Without `XDG_RUNTIME_DIR` there is no directory that is known to be the
 //! user's alone, so the app runs without the single-instance check rather
 //! than trust a socket in a shared place.
@@ -17,7 +23,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,6 +31,8 @@ use std::time::{Duration, Instant};
 pub struct Request {
     /// The activation token of that launch, when it had one (see `launch_token`).
     pub token: Option<String>,
+    /// That launch's build (`build_id`); `None` from a launch that did not say.
+    build: Option<String>,
     reply: UnixStream,
 }
 
@@ -34,6 +42,32 @@ impl Request {
     pub fn acknowledge(mut self) {
         let _ = self.reply.write_all(ACK.as_bytes());
     }
+
+    /// Whether the launch that asked is another build than `own` (this copy's `build_id`): this window then makes way
+    /// for it ([`Self::make_way`]) instead of being shown. A launch that did not name its build is shown the window.
+    pub fn is_other_build(&self, own: &str) -> bool {
+        self.build.as_deref().is_some_and(|build| build != own)
+    }
+
+    /// Tells the launch that asked that this copy is closing for it: it asks again until nobody listens and then
+    /// becomes the first copy. Answer only once the settings are saved; release the socket and close right after.
+    pub fn make_way(mut self) {
+        let _ = self.reply.write_all(REPLACING.as_bytes());
+    }
+}
+
+/// This build of the app, as a later launch names it: the version and the program file's size and change time, the
+/// same for every launch of one AppImage (its files keep their times) or one `cargo` build, different for any other.
+pub fn build_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        use std::os::unix::fs::MetadataExt;
+        let version = env!("CARGO_PKG_VERSION");
+        match std::env::current_exe().and_then(std::fs::metadata) {
+            Ok(meta) => format!("{version}-{}-{}.{}", meta.size(), meta.mtime(), meta.mtime_nsec()),
+            Err(_) => version.to_string(),
+        }
+    })
 }
 
 /// Requests from later launches to show the running window, and the word to them that the window is up.
@@ -117,6 +151,12 @@ pub fn release() {
 /// What the running copy answers once its UI has handled a request.
 const ACK: &str = "ok\n";
 
+/// What the running copy answers when the launch is another build: it is closing for that launch ([`Request::make_way`]).
+const REPLACING: &str = "replacing\n";
+
+/// How long a launch that a running copy makes way for waits for that copy to go before calling it stuck.
+const REPLACE_WAIT: Duration = Duration::from_secs(10);
+
 /// What the running copy's listener answers at once while its window is not up yet (the socket is bound before the
 /// graphics start, which can take seconds on a cold start or a software renderer).
 const STARTING: &str = "starting\n";
@@ -179,7 +219,7 @@ fn valid_token(token: &str) -> bool {
 pub fn claim() -> Claim {
     match runtime_dir() {
         Some(dir) => {
-            let claim = claim_at(&dir.join("neural-forge.sock"), launch_token(), WAITS);
+            let claim = claim_at(&dir.join("neural-forge.sock"), launch_token(), Some(build_id()), WAITS);
             if let Claim::Primary(Activations { listening: Some(listening), .. }) = &claim {
                 let _ = PRIMARY.set(listening.clone());
             }
@@ -214,35 +254,58 @@ fn nobody_listening(error: &std::io::Error) -> bool {
     matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
 }
 
-/// The running copy closed the connection without an answer (an end of file, a reset or a broken pipe).
-struct Closed;
+/// Why a launch asks again.
+enum Retry {
+    /// The running copy closed the connection without an answer (an end of file, a reset or a broken pipe).
+    Closed,
+    /// The running copy (its process id, where the socket tells) is another build and closes for this launch.
+    Replacing(Option<u32>),
+}
 
-fn claim_at(path: &Path, token: Option<String>, waits: Waits) -> Claim {
+fn claim_at(path: &Path, token: Option<String>, build: Option<&str>, waits: Waits) -> Claim {
     // A copy that exits while it is being asked closes the connection unanswered. Its listener may take a moment more
     // to go away, so it is asked again in short steps until nobody listens (this launch becomes the first copy) or a
     // copy answers; if copies keep going away unanswered for the whole answer wait, this launch ends quietly rather
     // than call one stuck. That wait counts from the first closed connection: a copy may have said "starting" for
     // seconds before it went away.
+    // A copy that makes way for this launch (another build) is given `REPLACE_WAIT` to save and go; one still there
+    // after that is reported as not responding.
     let mut deadline = None;
+    let mut replacing: Option<(Instant, Option<u32>)> = None;
     loop {
-        if let Ok(claim) = try_claim(path, token.as_deref(), waits) {
-            return claim;
-        }
-        let deadline = *deadline.get_or_insert_with(|| Instant::now() + waits.answer);
-        if Instant::now() >= deadline {
-            return Claim::Gone;
+        match try_claim(path, token.as_deref(), build, waits) {
+            Ok(claim) => return claim,
+            Err(Retry::Replacing(pid)) => {
+                let (since, _) = *replacing.get_or_insert((Instant::now(), pid));
+                if since.elapsed() >= REPLACE_WAIT {
+                    return Claim::NotResponding(pid);
+                }
+            }
+            Err(Retry::Closed) => {
+                if let Some((since, pid)) = replacing {
+                    // The replaced copy is on its way out (it no longer takes requests): its own wait still applies.
+                    if since.elapsed() >= REPLACE_WAIT {
+                        return Claim::NotResponding(pid);
+                    }
+                } else {
+                    let deadline = *deadline.get_or_insert_with(|| Instant::now() + waits.answer);
+                    if Instant::now() >= deadline {
+                        return Claim::Gone;
+                    }
+                }
+            }
         }
         std::thread::sleep(RETRY_STEP);
     }
 }
 
-fn try_claim(path: &Path, token: Option<&str>, waits: Waits) -> Result<Claim, Closed> {
+fn try_claim(path: &Path, token: Option<&str>, build: Option<&str>, waits: Waits) -> Result<Claim, Retry> {
     let lock = lock(path);
     match UnixStream::connect(path) {
         Ok(stream) => {
             // The wait for the answer needs no lock: other launches may look meanwhile.
             drop(lock);
-            return hand_over(&stream, token, waits);
+            return hand_over(&stream, token, build, waits);
         }
         Err(e) if nobody_listening(&e) => {
             let _ = std::fs::remove_file(path);
@@ -304,14 +367,15 @@ fn listen(listening: &Listening, up: &UiUp, tx: &async_channel::Sender<Request>)
 
 /// Sends the request to the running copy and waits for its answer: "ok" within `waits.answer`, or "starting" within
 /// that and then "ok" within `waits.start` of the request. A copy that said it is starting is not called stuck if its
-/// window takes longer still. `Err(Closed)` when the running copy closed the connection without answering: it has
-/// exited (or is exiting), which is not a stuck window, and the claim is worth another try.
-fn hand_over(stream: &UnixStream, token: Option<&str>, waits: Waits) -> Result<Claim, Closed> {
+/// window takes longer still. `Err(Retry::Closed)` when the running copy closed the connection without answering: it
+/// has exited (or is exiting), which is not a stuck window, and the claim is worth another try; `Err(Retry::Replacing)`
+/// when it is another build and closes for this launch (`build`, this launch's `build_id`).
+fn hand_over(stream: &UnixStream, token: Option<&str>, build: Option<&str>, waits: Waits) -> Result<Claim, Retry> {
     let pid = peer_pid(stream);
     let asked = Instant::now();
     let _ = stream.set_write_timeout(Some(waits.answer));
-    if writeln!(&*stream, "activate {}", token.unwrap_or("")).is_err() {
-        return Err(Closed);
+    if writeln!(&*stream, "{}", request_line(token, build)).is_err() {
+        return Err(Retry::Closed);
     }
     let mut reader = BufReader::new(stream).take(64);
     let mut line = String::new();
@@ -326,10 +390,11 @@ fn hand_over(stream: &UnixStream, token: Option<&str>, waits: Waits) -> Result<C
     }
     match read {
         _ if line == ACK => Ok(Claim::Shown),
+        _ if line == REPLACING => Err(Retry::Replacing(pid)),
         // The end with nothing, or a reset (it closed before reading the request): the copy went away. A timeout is
         // another error.
-        Ok(0) => Err(Closed),
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) => Err(Closed),
+        Ok(0) => Err(Retry::Closed),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) => Err(Retry::Closed),
         _ if starting => Ok(Claim::Starting(pid)),
         _ => Ok(Claim::NotResponding(pid)),
     }
@@ -363,19 +428,85 @@ fn read_request(connection: UnixStream) -> Request {
     let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
     let mut line = String::new();
     let _ = BufReader::new(&connection).take(8192).read_line(&mut line);
-    Request { token: parse_request(&line), reply: connection }
+    let (token, build) = parse_request(&line);
+    Request { token, build, reply: connection }
 }
 
-fn parse_request(line: &str) -> Option<String> {
-    let token = line.trim_end_matches('\n').strip_prefix("activate ")?;
-    valid_token(token).then(|| token.to_string())
+/// A launch's request: `activate <token> <build>`, the token empty without one. Both are printable ASCII without
+/// spaces (`valid_token`), so the line splits at its one space after the token.
+fn request_line(token: Option<&str>, build: Option<&str>) -> String {
+    let token = token.filter(|t| valid_token(t)).unwrap_or("");
+    match build.filter(|b| valid_token(b)) {
+        Some(build) => format!("activate {token} {build}"),
+        None => format!("activate {token}"),
+    }
+}
+
+/// The token and the build of a request line ([`request_line`]); each `None` where absent or not clean.
+fn parse_request(line: &str) -> (Option<String>, Option<String>) {
+    let Some(rest) = line.trim_end_matches('\n').strip_prefix("activate ") else { return (None, None) };
+    let (token, build) = match rest.split_once(' ') {
+        Some((token, build)) => (token, Some(build)),
+        None => (rest, None),
+    };
+    (valid_token(token).then(|| token.to_string()), build.filter(|b| valid_token(b)).map(str::to_string))
+}
+
+/// The write end of the pipe SIGTERM's handler writes to (`terminations`); -1 before it is set up.
+static TERM_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn on_sigterm(_: libc::c_int) {
+    let fd = TERM_PIPE.load(Ordering::Relaxed);
+    let byte = 1u8;
+    // SAFETY: write(2) is async-signal-safe; one byte from a local to the pipe this process made.
+    unsafe { libc::write(fd, std::ptr::from_ref(&byte).cast(), 1) };
+}
+
+/// SIGTERM (a logout, `kill`, an older build's way of replacing a window) as a message to the UI, which saves the
+/// settings changed in the last moments and closes the window as the user would, instead of the process ending with
+/// them unsaved. A UI that has not closed within `fallback` after the signal is ended as SIGTERM would have ended it
+/// (`None`: never, for the tests). `None` when the handler could not be set up: SIGTERM then ends the process as usual.
+pub fn terminations(fallback: Option<Duration>) -> Option<UnboundedReceiver<()>> {
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 fills the two descriptors of the array it is given; close-on-exec keeps them from programs started.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return None;
+    }
+    TERM_PIPE.store(fds[1], Ordering::Relaxed);
+    // SAFETY: a zeroed sigaction with the handler set, SA_RESTART so no read is interrupted by it; the handler only
+    // writes to the pipe. A program started later gets SIGTERM's default again (exec resets handlers).
+    let installed = unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_sigterm as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) == 0
+    };
+    if !installed {
+        return None;
+    }
+    let (tx, rx) = unbounded_channel();
+    let read_end = fds[0];
+    std::thread::spawn(move || {
+        let mut byte = 0u8;
+        // SAFETY: one byte into a local, from the read end this thread alone uses.
+        while unsafe { libc::read(read_end, std::ptr::from_mut(&mut byte).cast(), 1) } == 1 {
+            let _ = tx.send_blocking(());
+            if let Some(wait) = fallback {
+                std::thread::sleep(wait);
+                // SAFETY: ends the process as SIGTERM's default action would (128 + 15), without running anything else.
+                unsafe { libc::_exit(143) };
+            }
+        }
+    });
+    Some(rx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_at, listen, nobody_listening, not_responding_message, parse_request, still_starting_message, valid_token, Activations, Claim, Listening, UiUp,
-        Waits, MAX_TOKEN,
+        build_id, claim_at, listen, nobody_listening, not_responding_message, parse_request, request_line, still_starting_message, terminations, valid_token,
+        Activations, Claim, Listening, UiUp, Waits, MAX_TOKEN,
     };
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -414,7 +545,7 @@ mod tests {
 
     /// The first copy at `path`, with its window drawn.
     fn up_primary(path: &Path) -> Activations {
-        let first = primary(claim_at(path, None, WAIT));
+        let first = primary(claim_at(path, None, None, WAIT));
         first.up_signal().set();
         first
     }
@@ -428,14 +559,14 @@ mod tests {
                 request.acknowledge();
                 token
             });
-            let claim = claim_at(path, token.map(str::to_string), WAIT);
+            let claim = claim_at(path, token.map(str::to_string), None, WAIT);
             (claim, ui.join().unwrap())
         })
     }
 
     fn launch(path: &Path, waits: Waits) -> std::thread::JoinHandle<Claim> {
         let path = path.to_path_buf();
-        std::thread::spawn(move || claim_at(&path, None, waits))
+        std::thread::spawn(move || claim_at(&path, None, None, waits))
     }
 
     #[test]
@@ -457,7 +588,7 @@ mod tests {
         let dir = scratch("starting");
         let path = dir.join("test.sock");
         // The first copy has bound its socket but its window is not drawn yet (the graphics are still starting).
-        let first = primary(claim_at(&path, None, WAIT));
+        let first = primary(claim_at(&path, None, None, WAIT));
         let second = launch(&path, waits(300, 5000));
         let request = first.recv_blocking();
         // Its window comes up well after the answer wait, within the start-up wait: the second launch hears "ok".
@@ -479,7 +610,7 @@ mod tests {
     fn a_copy_that_stays_starting_is_reported_as_starting_after_the_long_wait() {
         let dir = scratch("starting-slow");
         let path = dir.join("test.sock");
-        let first = primary(claim_at(&path, None, WAIT));
+        let first = primary(claim_at(&path, None, None, WAIT));
         let started = Instant::now();
         let second = launch(&path, waits(200, 900));
         let request = first.recv_blocking();
@@ -508,7 +639,7 @@ mod tests {
         // copy is starting (and waits for it), not silence that would call it stuck.
         let dir = scratch("first-frame");
         let path = dir.join("test.sock");
-        let first = primary(claim_at(&path, None, WAIT));
+        let first = primary(claim_at(&path, None, None, WAIT));
         use std::future::Future as _;
         let mut next = std::pin::pin!(first.next());
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
@@ -526,7 +657,7 @@ mod tests {
         // The first copy's window was drawn, and now its UI takes no requests (a stuck window).
         let first = up_primary(&path);
         let started = Instant::now();
-        match claim_at(&path, Some("token-2".into()), waits(300, 5000)) {
+        match claim_at(&path, Some("token-2".into()), None, waits(300, 5000)) {
             Claim::NotResponding(pid) => {
                 assert_eq!(pid, Some(std::process::id()), "the running copy's process, from the socket");
                 assert_eq!(
@@ -548,7 +679,7 @@ mod tests {
             stream.write_all(b"busy\n").unwrap();
             stream
         });
-        assert!(matches!(claim_at(&path, None, waits(300, 5000)), Claim::NotResponding(_)));
+        assert!(matches!(claim_at(&path, None, None, waits(300, 5000)), Claim::NotResponding(_)));
         drop(wrong.join());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -571,7 +702,7 @@ mod tests {
                 drop(listener);
             })
         };
-        let claim = claim_at(&path, None, waits(2000, 5000));
+        let claim = claim_at(&path, None, None, waits(2000, 5000));
         exiting.join().unwrap();
         assert!(matches!(claim, Claim::Primary(_)), "the copy that exited left the place free");
         let _ = std::fs::remove_dir_all(&dir);
@@ -597,7 +728,7 @@ mod tests {
                 drop(listener);
             })
         };
-        let claim = claim_at(&path, None, waits(300, 5000));
+        let claim = claim_at(&path, None, None, waits(300, 5000));
         dying.join().unwrap();
         assert!(matches!(claim, Claim::Primary(_)), "retried after the copy went away, and became the first copy");
         let _ = std::fs::remove_dir_all(&dir);
@@ -626,7 +757,7 @@ mod tests {
             })
         };
         let started = Instant::now();
-        let claim = claim_at(&path, None, waits(500, 5000));
+        let claim = claim_at(&path, None, None, waits(500, 5000));
         let waited = started.elapsed();
         stop.store(true, std::sync::atomic::Ordering::Release);
         drop(std::os::unix::net::UnixStream::connect(&path));
@@ -642,7 +773,7 @@ mod tests {
         let dir = scratch("gives-up");
         let path = dir.join("test.sock");
         // The first copy's window never comes up (no window could be opened).
-        let first = primary(claim_at(&path, None, WAIT));
+        let first = primary(claim_at(&path, None, None, WAIT));
         let started = Instant::now();
         let second = launch(&path, waits(2000, 15000));
         // Its request is queued (told "starting"); then the copy gives up as `ui::no_window` does: release, and drop
@@ -712,14 +843,14 @@ mod tests {
     fn a_released_copy_lets_the_next_launch_start_at_once() {
         let dir = scratch("released");
         let path = dir.join("test.sock");
-        let first = primary(claim_at(&path, None, WAIT));
+        let first = primary(claim_at(&path, None, None, WAIT));
         first.close();
         assert!(!path.exists(), "the socket file is removed");
         let error = std::os::unix::net::UnixStream::connect(&path).unwrap_err();
         assert!(nobody_listening(&error), "{error}");
         first.close();
         let started = Instant::now();
-        assert!(matches!(claim_at(&path, None, waits(2000, 15000)), Claim::Primary(_)), "the next launch is the first copy");
+        assert!(matches!(claim_at(&path, None, None, waits(2000, 15000)), Claim::Primary(_)), "the next launch is the first copy");
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
         drop(first);
         let _ = std::fs::remove_dir_all(&dir);
@@ -731,7 +862,7 @@ mod tests {
         // told "starting"), so that launch looks again at once.
         let dir = scratch("released-race");
         let path = dir.join("test.sock");
-        let first = primary(claim_at(&path, None, WAIT));
+        let first = primary(claim_at(&path, None, None, WAIT));
         let listening = first.listening.clone().unwrap();
         listening.closed.store(true, std::sync::atomic::Ordering::Release);
         let mut stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
@@ -767,7 +898,7 @@ mod tests {
         let path = dir.join("test.sock");
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("keep"), b"x").unwrap();
-        let _ = claim_at(&path, None, waits(100, 100));
+        let _ = claim_at(&path, None, None, waits(100, 100));
         assert!(path.join("keep").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -785,16 +916,70 @@ mod tests {
 
     #[test]
     fn requests_and_tokens_are_one_clean_line() {
-        assert_eq!(parse_request("activate abc-123_x\n"), Some("abc-123_x".into()));
-        assert_eq!(parse_request("activate \n"), None);
-        assert_eq!(parse_request("activate\n"), None);
-        assert_eq!(parse_request(""), None);
-        assert_eq!(parse_request("something else\n"), None);
+        assert_eq!(parse_request("activate abc-123_x\n").0, Some("abc-123_x".into()));
+        assert_eq!(parse_request("activate \n"), (None, None));
+        assert_eq!(parse_request("activate\n"), (None, None));
+        assert_eq!(parse_request(""), (None, None));
+        assert_eq!(parse_request("something else\n"), (None, None));
         assert!(!valid_token("a\nb") && !valid_token("") && !valid_token("a\u{7}"));
         assert!(!valid_token("a b") && !valid_token("tok\u{e9}n"), "printable ASCII only");
         assert!(valid_token(&"x".repeat(MAX_TOKEN)));
         assert!(!valid_token(&"x".repeat(MAX_TOKEN + 1)), "an oversized token must never reach the compositor");
         let long = format!("activate {}\n", "x".repeat(MAX_TOKEN + 1));
-        assert_eq!(parse_request(&long), None);
+        assert_eq!(parse_request(&long), (None, None));
+    }
+
+    /// A launch names its build after its token; a launch without either still parses, and a build that is not one
+    /// clean word is dropped (the window is then shown, as to a launch that did not say).
+    #[test]
+    fn requests_carry_the_launchs_build() {
+        let line = request_line(Some("tok"), Some("4.7.0-10-20.30"));
+        assert_eq!(line, "activate tok 4.7.0-10-20.30");
+        assert_eq!(parse_request(&format!("{line}\n")), (Some("tok".into()), Some("4.7.0-10-20.30".into())));
+        assert_eq!(parse_request(&format!("{}\n", request_line(None, Some("b")))), (None, Some("b".into())));
+        assert_eq!(parse_request(&format!("{}\n", request_line(Some("tok"), None))), (Some("tok".into()), None));
+        assert_eq!(parse_request("activate tok two words\n"), (Some("tok".into()), None));
+        assert!(build_id().starts_with(env!("CARGO_PKG_VERSION")) && valid_token(build_id()), "{}", build_id());
+        assert_eq!(build_id(), build_id(), "one build, one name");
+    }
+
+    /// Another build's launch: the running copy answers "replacing", saves and goes; the launch waits for it and becomes
+    /// the first copy. The same build's launch, or one that does not say, is shown the window.
+    #[test]
+    fn another_builds_launch_replaces_the_running_copy() {
+        let dir = scratch("instance-replace");
+        let path = dir.join("test.sock");
+        let first = up_primary(&path);
+        let ui = std::thread::spawn(move || {
+            let request = first.recv_blocking();
+            assert!(request.is_other_build("old-build") && !request.is_other_build("new-build"));
+            request.make_way();
+            // Saving the settings and closing take a moment; the launch keeps asking meanwhile. The UI's loop then ends,
+            // which drops the requests it no longer takes.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            first.close();
+            drop(first);
+        });
+        let claim = claim_at(&path, None, Some("new-build"), WAIT);
+        assert!(matches!(claim, Claim::Primary(_)), "the launch took the running copy's place");
+        ui.join().unwrap();
+        let second = up_primary(&dir.join("other.sock"));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let request = second.recv_blocking();
+                assert!(!request.is_other_build("b"), "the same build is shown the window");
+                request.acknowledge();
+            });
+            assert!(matches!(claim_at(&dir.join("other.sock"), None, Some("b"), WAIT), Claim::Shown));
+        });
+    }
+
+    /// SIGTERM reaches the UI as a message (it saves and closes) instead of ending the process at once.
+    #[test]
+    fn sigterm_is_a_message_to_the_ui() {
+        let terms = terminations(None).expect("the handler is set up");
+        // SAFETY: raising a signal this process now handles.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        assert_eq!(terms.recv_blocking(), Ok(()));
     }
 }

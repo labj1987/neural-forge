@@ -857,10 +857,30 @@ pub fn build_ui(cx: &mut App, activations: Activations, install_error: Option<St
     // Once the first frame has been drawn and presented, later launches get "ok" without being told this copy is still
     // starting. GPUI runs next-frame callbacks at the start of a frame request, before that frame is drawn: the first
     // callback only asks for the next frame, and the second one (after the first frame is up on screen) sets `up`.
+    // SIGTERM (a logout, `kill`): the settings changed in the last moments are saved and the window closes as when the
+    // user closes it. One that has not closed 5 s later is ended as SIGTERM would have ended it.
+    if let Some(terminations) = crate::instance::terminations(Some(std::time::Duration::from_secs(5))) {
+        cx.spawn(async move |cx| {
+            if terminations.recv().await.is_ok() {
+                save_pending_settings();
+                let _ = window.update(cx, |_, window, _| window.remove_window());
+            }
+        })
+        .detach();
+    }
     let up = activations.up_signal();
     let _ = window.update(cx, |_, window, _| window.on_next_frame(move |window, _| window.on_next_frame(move |_, _| up.set())));
     cx.spawn(async move |cx| {
         while let Some(request) = activations.next().await {
+            // Another build was started (an older or newer AppImage): this window saves its settings and closes for it
+            // (#73), so the window always matches the layer that launch installed. Closing releases the socket
+            // (`on_window_closed`); the requests still queued are dropped with `activations`, and their launches ask again.
+            if request.is_other_build(crate::instance::build_id()) {
+                save_pending_settings();
+                request.make_way();
+                let _ = window.update(cx, |_, window, _| window.remove_window());
+                break;
+            }
             let shown = window.update(cx, |_, window, _| {
                 let raised = request.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
                 if !raised {
