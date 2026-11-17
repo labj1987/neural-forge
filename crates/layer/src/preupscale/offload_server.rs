@@ -175,7 +175,10 @@ impl PreRunner {
         let (Some(off), Some(loader)) = (self.off.as_ref(), self.loader.as_ref()) else { return Err(failed("the other GPU's device is gone")) };
         let (device, instance, physical, setup) = (&off.device, &self.instance, off.physical, off.setup);
         if loader.dead() {
-            return Err(failed("the other GPU's device was lost"));
+            // A wait on the network's queue there timed out: its work may still run, so nothing it uses is freed
+            // (as the finished-frame server does).
+            self.leaked = true;
+            return Err(failed("the network on the other GPU stopped responding"));
         }
         // The regions on this device.
         if self.regions.is_none() {
@@ -384,10 +387,16 @@ impl PreRunner {
             }
             loader.pre_submitted(device, self.fence);
             let waited = device.wait_for_fences(&[self.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64);
-            if waited.is_err() {
-                // Still running (or the device is lost): nothing it uses is freed (drain before free).
-                self.leaked = true;
-                return Err(failed("a frame on the other GPU did not finish"));
+            match waited {
+                Err(vk::Result::TIMEOUT) => {
+                    // Still running: nothing it uses is freed (drain before free).
+                    self.leaked = true;
+                    return Err(failed("a frame on the other GPU did not finish"));
+                }
+                // The device lost (or the wait failed otherwise): nothing of it runs any more, so it is freed as
+                // usual and the network goes back to the game's GPU.
+                Err(e) => return Err(failed(&format!("waiting for a frame on the other GPU failed ({e:?}): its device was lost"))),
+                Ok(()) => {}
             }
             loader.pre_idle(self.fence);
             let _ = device.reset_fences(&[self.fence]);
