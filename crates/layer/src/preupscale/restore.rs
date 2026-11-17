@@ -439,7 +439,7 @@ pub(crate) unsafe fn own_writes(writes: &[vk::WriteDescriptorSet]) -> Result<Vec
                     if n > 0 && w.p_image_info.is_null() {
                         return Err("a pushed image descriptor without its image infos");
                     }
-                    own.images = std::slice::from_raw_parts(w.p_image_info, n).to_vec();
+                    own.images = slice(w.p_image_info, w.descriptor_count).to_vec();
                 }
                 vk::DescriptorType::UNIFORM_BUFFER
                 | vk::DescriptorType::STORAGE_BUFFER
@@ -448,13 +448,13 @@ pub(crate) unsafe fn own_writes(writes: &[vk::WriteDescriptorSet]) -> Result<Vec
                     if n > 0 && w.p_buffer_info.is_null() {
                         return Err("a pushed buffer descriptor without its buffer infos");
                     }
-                    own.buffers = std::slice::from_raw_parts(w.p_buffer_info, n).to_vec();
+                    own.buffers = slice(w.p_buffer_info, w.descriptor_count).to_vec();
                 }
                 vk::DescriptorType::UNIFORM_TEXEL_BUFFER | vk::DescriptorType::STORAGE_TEXEL_BUFFER => {
                     if n > 0 && w.p_texel_buffer_view.is_null() {
                         return Err("a pushed texel buffer descriptor without its views");
                     }
-                    own.texel_views = std::slice::from_raw_parts(w.p_texel_buffer_view, n).to_vec();
+                    own.texel_views = slice(w.p_texel_buffer_view, w.descriptor_count).to_vec();
                 }
                 vk::DescriptorType::INLINE_UNIFORM_BLOCK | vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => {}
                 _ => return Err("a pushed descriptor of a type the layer does not copy"),
@@ -464,11 +464,11 @@ pub(crate) unsafe fn own_writes(writes: &[vk::WriteDescriptorSet]) -> Result<Vec
                 match s.s_type {
                     vk::StructureType::WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK => {
                         let b = &*next.cast::<vk::WriteDescriptorSetInlineUniformBlock>();
-                        own.inline = Some(std::slice::from_raw_parts(b.p_data.cast::<u8>(), b.data_size as usize).to_vec());
+                        own.inline = Some(slice(b.p_data.cast::<u8>(), b.data_size).to_vec());
                     }
                     vk::StructureType::WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR => {
                         let a = &*next.cast::<vk::WriteDescriptorSetAccelerationStructureKHR>();
-                        own.accel = Some(std::slice::from_raw_parts(a.p_acceleration_structures, a.acceleration_structure_count as usize).to_vec());
+                        own.accel = Some(slice(a.p_acceleration_structures, a.acceleration_structure_count).to_vec());
                     }
                     _ => return Err("a pushed descriptor write with a structure the layer does not copy"),
                 }
