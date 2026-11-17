@@ -920,6 +920,11 @@ fn serve(
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    // Stopped: the channel no longer says this server runs (unless another process's layer owns it now).
+    if view.usable() {
+        hdr.server_state.store(neural_forge_protocol::enums::server_state::STOPPED, Ordering::Relaxed);
+        hdr.model_up.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Frees this path's buffers between its requests when nothing needs them ([`serve`]), and says why. Paused by the VRAM

@@ -696,9 +696,13 @@ fn layer_alive(hdr: &neural_forge_protocol::ShmHeader) -> bool {
 }
 
 /// Whether the network is resident in a game running now: a hold runs it (before the upscaler, after DLSS or both;
-/// `native_running` covers only the first) and the layer's heartbeat moves.
+/// `native_running` covers only the first) or the model server (the `present` placement) runs with the model up,
+/// and the layer's heartbeat moves. The server's state is the running game's: a new game's session resets it
+/// (`capture::reset_session`), and a server that stops says so.
 fn network_resident(hdr: &neural_forge_protocol::ShmHeader) -> bool {
-    neural_forge_protocol::enums::preupscale_state::network_runs(hdr.preupscale_state.load(Ordering::Relaxed)) && layer_alive(hdr)
+    use neural_forge_protocol::enums::{preupscale_state::network_runs, server_state};
+    let server = hdr.server_state.load(Ordering::Relaxed) == server_state::RUNNING && hdr.model_up.load(Ordering::Relaxed) == 1;
+    (network_runs(hdr.preupscale_state.load(Ordering::Relaxed)) || server) && layer_alive(hdr)
 }
 
 /// `running`: the network is resident in a game that is running now (`native_running` and [`layer_alive`]).
@@ -2315,6 +2319,12 @@ mod tests {
                 hdr.native_running.store(u32::from(state == HOLDING), Ordering::Relaxed);
                 assert_eq!(network_resident(&hdr), runs, "state {state}");
             }
+            // The model at the present placement: the model server runs it, no hold does.
+            hdr.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, Ordering::Relaxed);
+            hdr.model_up.store(1, Ordering::Relaxed);
+            assert!(network_resident(&hdr), "a running model server with the model up");
+            hdr.model_up.store(0, Ordering::Relaxed);
+            assert!(!network_resident(&hdr), "a server whose model failed to load");
             stop.store(true, Ordering::Relaxed);
         });
     }

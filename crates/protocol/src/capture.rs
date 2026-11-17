@@ -295,8 +295,12 @@ pub fn result(hdr: &ShmHeader) -> Option<Outcome> {
 /// A new game's layer opening the channel: a request left waiting from before belongs to no game that
 /// is running now (it would fire, unasked, at this game's first frame), and an outcome left running
 /// is a game that went away mid-capture. The same holds for a cache-dump request
-/// (`shmctl dump-cache`) that no pre-upscaler hold has taken yet.
+/// (`shmctl dump-cache`) that no pre-upscaler hold has taken yet. So does the model server's state: a server
+/// of the game before that never stopped its own (the process ended) is not this game's; this game's server, if it
+/// runs, says so again on its next round.
 pub fn reset_session(hdr: &'static ShmHeader) {
+    hdr.server_state.store(crate::enums::server_state::STOPPED, Ordering::Relaxed);
+    hdr.model_up.store(0, Ordering::Relaxed);
     hdr.capture_request.store(0, Ordering::Release);
     hdr.preupscale_dump_request.store(0, Ordering::Relaxed);
     hdr.capture_cancel.store(0, Ordering::Relaxed);
@@ -349,10 +353,14 @@ mod tests {
         h.init_defaults();
         h.preupscale_dump_request.store(32, Ordering::Relaxed);
         h.capture_request.store(5, Ordering::Relaxed);
+        h.server_state.store(crate::enums::server_state::RUNNING, Ordering::Relaxed);
+        h.model_up.store(1, Ordering::Relaxed);
         reset_session(h);
         assert!(crate::deferred::settle(std::time::Duration::from_secs(2)));
         assert_eq!(h.preupscale_dump_request.load(Ordering::Relaxed), 0);
         assert_eq!(h.capture_request.load(Ordering::Relaxed), 0);
+        assert_eq!(h.server_state.load(Ordering::Relaxed), crate::enums::server_state::STOPPED, "the earlier game's server");
+        assert_eq!(h.model_up.load(Ordering::Relaxed), 0);
     }
 
     #[test]
