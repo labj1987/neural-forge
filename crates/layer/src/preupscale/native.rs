@@ -2097,7 +2097,7 @@ pub(crate) struct NativePass {
     colour: Option<ColourPass>,
     colour_wanted: bool,
     colour_recorded: bool,
-    /// The look-up table on the GPU (binding 13), the last pass's.
+    /// The look-up table on the GPU (binding 17), the last pass's.
     lut: Option<LutBuffer>,
     /// Whether this frame applies [`Self::lut`] ([`Self::prepare_colour`]): not once `colour::current` gives no
     /// table (the strength at 0, none named, or one that could not be read), though the buffer stays.
@@ -2806,7 +2806,7 @@ impl NativePass {
                 made(());
                 made(());
                 self.colour = Some(ColourPass { pipelines: [a, b], low });
-                // The sets point binding 12 at the low-pass: written and recorded again.
+                // The sets point binding 16 at the low-pass: written and recorded again.
                 self.recorded = None;
                 if let Some(m) = self.more.as_mut() {
                     m.recorded = None;

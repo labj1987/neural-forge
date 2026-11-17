@@ -13,9 +13,9 @@
 //! after the first reading the previous pass's answer (copied into the slot's `scratch`) where the first reads
 //! the frame; each pass has its own settings (the Model tab's with that pass's overrides).
 //!
-//! There are no motion vectors after the upscaler. By default (`NEURAL_FORGE_POST_MOTION=none`) every frame
+//! There are no motion vectors after the upscaler. With `NEURAL_FORGE_POST_MOTION=none` every frame
 //! runs without history, with a fixed seed (a seed that changed every frame, with nothing blending frames,
-//! would shimmer). `zero` and `flow` give each pass a history of its own ([`super::post_history`],
+//! would shimmer). `zero` (the default) and `flow` give each pass a history of its own ([`super::post_history`],
 //! [`super::post_flow`]): its previous output at the same pixel or where the GPU's optical flow says the pixel
 //! was, blended toward as before the upscaler, rejected per pixel where the frame changed, reset as a whole
 //! on a cut and the other reset rules, with the seed counting frames since the reset. It never runs the

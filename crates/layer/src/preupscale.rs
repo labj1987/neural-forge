@@ -1281,8 +1281,6 @@ fn parse_game_reset(raw: Option<&str>) -> bool {
     raw.map(str::trim) != Some("off")
 }
 
-/// The layouts the hold inside DLSS's buffer copies the motion vectors from (moved to
-/// `TRANSFER_SRC_OPTIMAL` and back when not already readable there).
 /// Whether the hold inside DLSS's buffer copies the depth aspect of a `format` image found in `layout`
 /// (moved to TRANSFER_SRC_OPTIMAL and back unless it is there or in GENERAL). The separate depth
 /// layouts only for formats without stencil: with one, the stencil aspect's layout is not known.
@@ -3121,9 +3119,8 @@ impl Tracking {
         self.armed.store(t.armed(), Ordering::Relaxed);
     }
 
-    /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`, with its parameter buffer if
-    /// readable ([`launch_params`]).
-    /// A launch recorded into `command_buffer`. Returns where a hold should run inside the buffer,
+    /// A launch (`vkCmdCuLaunchKernelNVX`, with its parameter buffer if readable: [`launch_params`]) recorded into
+    /// `command_buffer`. Returns where a hold should run inside the buffer,
     /// right before this launch, when it is the buffer's first to name a colour candidate and the
     /// split in front of the buffer would be refused ([`Tracker::inline_point`]).
     #[cfg(test)]
@@ -4440,10 +4437,6 @@ impl Resources {
         self.cache.as_ref().is_some_and(|c| c.pending.is_some())
     }
 
-    /// Frees a finished cache dump's readbacks.
-    ///
-    /// # Safety
-    /// Nothing submitted may still use them ([`Self::wait_idle`] returned true since the last hold).
     /// Frees the native hold's frame resources (the native pass, the edit cache, the depth copy, the scene-cut
     /// detector, the HDR pass) while the VRAM guard has the network paused, so the game gets all of Neural
     /// Forge's memory back; each is built again on the first hold that runs the network. Returns whether there
@@ -4484,6 +4477,10 @@ impl Resources {
         any
     }
 
+    /// Frees a finished cache dump's readbacks.
+    ///
+    /// # Safety
+    /// Nothing submitted may still use them ([`Self::wait_idle`] returned true since the last hold).
     pub(crate) unsafe fn free_cache(&mut self, device: &ash::Device) {
         if let Some(cache) = self.cache.take() {
             // SAFETY: forwarded.
