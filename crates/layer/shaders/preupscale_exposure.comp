@@ -167,7 +167,9 @@ void resolve() {
   }
   log2_e = clamp(log2_e, MIN_LOG2_E, MAX_LOG2_E);
   u_state.log2_e = log2_e;
-  u_state.valid = 1u;
+  // A frame with no samples after a reset measures nothing: the state stays invalid, so the first frame that has
+  // samples takes its target at once instead of adapting from e = 1.
+  u_state.valid = (valid || total != 0u) ? 1u : 0u;
   u_state.samples = total;
   if (p.relative == 2u) {
     return;
@@ -179,7 +181,9 @@ void resolve() {
       used = clamp(log2_e, log2(game) + LIFT_LO_LOG2, log2(game) + LIFT_HI_LOG2);
       used = clamp(used, MIN_LOG2_E, MAX_LOG2_E);
     }
-    u_exposure.bits = packHalf2x16(vec2(exp2(used), game));
+    // The high half carries the game's own value; a game exposure of 0 goes in as -0 (0x8000), since 0x0000 there
+    // means "no game value" (hdr::exposure_word) and would read as a healthy exposure.
+    u_exposure.bits = packHalf2x16(vec2(exp2(used), game == 0.0 ? uintBitsToFloat(0x80000000u) : game));
   } else {
     u_exposure.bits = packHalf2x16(vec2(exp2(log2_e), 0.0));
   }

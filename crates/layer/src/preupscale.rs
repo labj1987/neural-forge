@@ -11369,6 +11369,16 @@ mod tests {
         // A new identification starts over: the target at once.
         let reset = auto_hold(&gpu, &mut res, image, w, h, identification + 1).auto_exposure.unwrap();
         assert!((reset.log2_e - reset.target_log2_e).abs() < 1e-6 && (reset.log2_e - after.log2_e).abs() > 1.5, "{reset:?} after {after:?}");
+        // A new identification whose first frame has no samples (all black) measures nothing: the state stays invalid,
+        // and the next frame with samples takes its target at once (not 5% of the way from e = 1).
+        let black = frame(w, h, |_, _| grey(0.0));
+        gpu.upload(image, w, h, &black);
+        let empty = auto_hold(&gpu, &mut res, image, w, h, identification + 3).auto_exposure.unwrap();
+        assert!(!empty.valid && empty.samples == 0, "nothing measured: {empty:?}");
+        assert!(!hdr::auto_exposure_reference(&black, w, h, None).valid, "the reference: nothing measured");
+        gpu.upload(image, w, h, last);
+        let first = auto_hold(&gpu, &mut res, image, w, h, identification + 3).auto_exposure.unwrap();
+        assert!((first.log2_e - first.target_log2_e).abs() < 1e-6, "the first measured frame takes its target: {first:?}");
         // DLSS's subrect: only the rectangle at the corner is measured, never the padding around it (here far brighter).
         let (rw, rh) = (120u32, 70u32);
         let inside = frame(rw, rh, sky);
@@ -11433,7 +11443,31 @@ mod tests {
             assert!((e - want).abs() <= want * 1e-3, "{name}: e {e}, want {want} (measured {measured})");
             assert!((hdr::LIFT_LO..=hdr::LIFT_HI).contains(&e), "{name}");
         }
-        finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
+        // The game's exposure image reads 0: what comes back as the game's value is unusable (the check's counter
+        // runs), never the lifted e taken for the game's.
+        let (zero, zero_mem) = exposure_image(&gpu, 0.0);
+        let target = Target {
+            colour: image,
+            width: w,
+            height: h,
+            depth: None,
+            depth_buffer: None,
+            region: None,
+            mvec: None,
+            mvec_scale: [1.0, 1.0],
+            exposure: [None; MAX_EXPOSURE],
+            exposure_input: exposure_aux(zero),
+            paper_white: hdr::DEFAULT_PAPER_WHITE,
+            lift_exposure: true,
+            pre_exposed: false,
+            identification: 9,
+        };
+        let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
+        };
+        let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut submit) };
+        assert!(!result.game_exposure.is_some_and(|g| g > hdr::EXPOSURE_MIN), "a game exposure of 0 reads as one: {result:?}");
+        finish(&gpu, res, &[(image, memory), (exposure, exposure_mem), (zero, zero_mem)]);
     }
 
     /// #51, Clair Obscur: Expedition 33: a colour input the game already exposed (a flat 0.2 here) with the
