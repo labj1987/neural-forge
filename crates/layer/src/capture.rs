@@ -2205,6 +2205,8 @@ pub unsafe fn run(
             // reads `answer_dims` unless `have_answer` is `true`, at which point it was
             // always actually set from the branch just below.
             let mut answer_dims = (width, height);
+            // The answered request's frame dims/format and whether its proxy was encoded, for the same reason.
+            let mut answered = (None, false);
             if shm.has_pending_request(slot) && shm.poll_async_request(slot) == Some(true) {
                 // The answer comes back at whatever resolution *this outstanding
                 // request* was actually sent at (`inflight[slot.index()].proxy_dims`), not
@@ -2213,6 +2215,7 @@ pub unsafe fn run(
                 // swapchain's own `frame_bytes` when `proxy_dims` is `None`, the only
                 // possibility before `working_scale` existed.
                 answer_dims = inflight[slot.index()].proxy_dims.unwrap_or((width, height));
+                answered = (inflight[slot.index()].dims, inflight[slot.index()].encoded);
                 let (aw, ah) = answer_dims;
                 let answer_bytes = (u64::from(aw) * u64::from(ah) * bytes_per_pixel) as usize;
                 answer_scratch.resize(answer_bytes, 0);
@@ -2285,10 +2288,7 @@ pub unsafe fn run(
                 }
             }
 
-            if have_answer
-                && inflight[slot.index()].dims == Some((width, height, proxy_format))
-                && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format)
-            {
+            if have_answer && answered.0 == Some((width, height, proxy_format)) && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
                 // Retain the model's raw answer for continuous re-presentation below --
                 // deliberately *not* run through `composition::gpu`/`composition::apply`'s
                 // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
@@ -2305,7 +2305,7 @@ pub unsafe fn run(
                 last_answer.clear();
                 last_answer.extend_from_slice(answer_scratch);
                 *last_answer_dims = answer_dims;
-                *last_answer_encoded = inflight[slot.index()].encoded;
+                *last_answer_encoded = answered.1;
                 *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
             }
         }
