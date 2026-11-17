@@ -154,6 +154,9 @@ pub(crate) struct PageState {
     protons: Option<ProtonScan>,
     proton_busy: bool,
     uninstalling: bool,
+    /// Uninstall… was clicked and its question is not open yet (the /proc scan before it runs on a worker): another
+    /// click is ignored, so a double click opens one question, not two.
+    uninstall_pending: bool,
     /// The Proton copies out of date: name and what is wrong.
     pub(crate) stale: Vec<(String, String)>,
     profile_input: Entity<InputState>,
@@ -203,6 +206,7 @@ impl PageState {
             protons: None,
             proton_busy: false,
             uninstalling: false,
+            uninstall_pending: false,
             stale: Vec::new(),
             profile_input,
             profiles: profile_names(),
@@ -2276,6 +2280,9 @@ impl MainView {
     }
 
     pub(crate) fn uninstall_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.pages.uninstall_pending, true) {
+            return;
+        }
         let appimage = std::env::var_os("APPIMAGE").map(std::path::PathBuf::from).filter(|p| p.is_file());
         let view = cx.weak_entity();
         // The /proc scan runs on a worker; the question opens once it is done.
@@ -2283,7 +2290,9 @@ impl MainView {
             window,
             cx,
             || steam::steam_running(std::path::Path::new("/proc")),
-            move |_, steam_running, window, cx| {
+            move |this, steam_running, window, cx| {
+                // The question is modal from here on: it takes the next clicks.
+                this.pages.uninstall_pending = false;
                 ask(
                     Question {
                         id: "uninstall",
