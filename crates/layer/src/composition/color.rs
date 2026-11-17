@@ -9,8 +9,9 @@
 //!   addon actually does — not code, a description of the technique (four
 //!   paragraphs: the two-branch luminance/headroom rule, the OkLab hue correction, the
 //!   luminance-only/full blend, the reversible neutral-axis gamut compression). That
-//!   description is what [`upgrade_tone_map`] and [`gamut_compress_reversible`]
-//!   implement; the Rust below is this crate's own expression of it.
+//!   description is what `compose.comp`'s tone map and [`gamut_compress_reversible`]
+//!   implement; the Rust below is this crate's own expression of it. (Its CPU twin of the
+//!   tone map, `upgrade_tone_map`, no longer matched the shader and had no callers: removed.)
 //! - **The OkLab matrices**: Björn Ottosson's own published constants
 //!   (<https://bottosson.github.io/posts/oklab/>), cross-checked against RenoDX's own
 //!   `src/shaders/color/oklab.hlsl` (MIT) to confirm they match what RenoDX itself
@@ -83,66 +84,6 @@ fn hpe_lms_to_linear_srgb(lms: [f32; 3]) -> [f32; 3] {
     // XYZ -> linear sRGB is the matrix inverse of LINEAR_SRGB_TO_XYZ.
     const XYZ_TO_LINEAR_SRGB: [[f32; 3]; 3] = [[3.2404542, -1.5371385, -0.4985314], [-0.9692660, 1.8760108, 0.0415560], [0.0556434, -0.2040259, 1.0572252]];
     mat3_mul(&XYZ_TO_LINEAR_SRGB, mat3_mul(&HPE_LMS_TO_XYZ, lms))
-}
-
-/// The two-branch luminance/headroom rule plus the OkLab hue correction plus the
-/// luminance-only/full blend — see the module doc comment for where this comes from.
-///
-/// - `original`: the frame before any model edit.
-/// - `proxy`: what the model was actually shown (the tone-mapped/display-referred
-///   encode of `original` — may have compressed away highlights `original` had).
-/// - `model`: the model's raw answer, at the proxy's own exposure/encoding.
-/// - `colour_strength`: 0 = luminance-only result (`original`'s hue, the model's
-///   light); 1 = the fully hue-corrected result. Between: a blend of the two.
-///
-/// Returns linear-light RGB, **not yet gamut-compressed** — see
-/// [`gamut_compress_reversible`], applied separately so a caller that wants the model's
-/// raw transfer without the compression can skip it.
-pub fn upgrade_tone_map(original: [f32; 3], proxy: [f32; 3], model: [f32; 3], colour_strength: f32) -> [f32; 3] {
-    let original_luminance = luminance(original);
-    let proxy_luminance = luminance(proxy).max(1e-6);
-    let model_luminance = luminance(model).max(1e-6);
-
-    // Below the proxy's own luminance, the original is already representable and is
-    // the target outright. Above it, the proxy clipped highlights `original` actually
-    // had; treat that clipped-away difference as headroom and hand it back on top of
-    // whatever the model answered, rather than trying to make the model responsible
-    // for light it was never shown.
-    let target_luminance = if original_luminance <= proxy_luminance { original_luminance } else { model_luminance + (original_luminance - proxy_luminance) };
-
-    let ratio = target_luminance / model_luminance;
-    let rescaled = [model[0] * ratio, model[1] * ratio, model[2] * ratio];
-
-    // The luminance-only result: the original's own hue and chroma, just relit to the
-    // target luminance -- i.e. scale `original` itself by the same target/model
-    // relationship, but taken relative to its own luminance instead of the model's.
-    let original_ratio = target_luminance / original_luminance.max(1e-6);
-    let luminance_only = [original[0] * original_ratio, original[1] * original_ratio, original[2] * original_ratio];
-
-    if colour_strength <= 0.0 {
-        return luminance_only;
-    }
-
-    // The fully upgraded colour: `rescaled`'s lightness (already at the target
-    // luminance), the model's own hue and chroma *direction*, but only `rescaled`'s
-    // chroma *magnitude* -- the model answers what direction the colour should shift,
-    // the luminance-preserving rescale answers how far.
-    let model_oklab = oklab_from_linear_srgb(model);
-    let model_chroma = (model_oklab[1] * model_oklab[1] + model_oklab[2] * model_oklab[2]).sqrt();
-    let (chroma_dir_a, chroma_dir_b) = if model_chroma > 1e-6 { (model_oklab[1] / model_chroma, model_oklab[2] / model_chroma) } else { (0.0, 0.0) };
-
-    let rescaled_oklab = oklab_from_linear_srgb(rescaled);
-    let rescaled_chroma = (rescaled_oklab[1] * rescaled_oklab[1] + rescaled_oklab[2] * rescaled_oklab[2]).sqrt();
-
-    let corrected_oklab = [rescaled_oklab[0], chroma_dir_a * rescaled_chroma, chroma_dir_b * rescaled_chroma];
-    let fully_upgraded = linear_srgb_from_oklab(corrected_oklab);
-
-    let t = colour_strength.clamp(0.0, 1.0);
-    [
-        luminance_only[0] + (fully_upgraded[0] - luminance_only[0]) * t,
-        luminance_only[1] + (fully_upgraded[1] - luminance_only[1]) * t,
-        luminance_only[2] + (fully_upgraded[2] - luminance_only[2]) * t,
-    ]
 }
 
 /// The reversible neutral-axis gamut compression: scale the whole colour by one factor
@@ -226,42 +167,6 @@ mod tests {
     fn luminance_of_white_is_one_and_black_is_zero() {
         assert!((luminance([1.0, 1.0, 1.0]) - 1.0).abs() < 1e-6);
         assert!(luminance([0.0, 0.0, 0.0]).abs() < 1e-6);
-    }
-
-    #[test]
-    fn upgrade_tone_map_below_headroom_targets_original_luminance() {
-        // proxy_luminance is generous (2.0) so original (Y ~0.591 for [0.8,0.5,0.3])
-        // never exceeds it -- exercises the "no headroom" branch.
-        let original = [0.8, 0.5, 0.3];
-        let proxy = [1.6, 1.0, 0.6]; // scaled up, luminance ~1.18
-        let model = [0.4, 0.4, 0.4]; // model's raw answer, arbitrary
-        let result = upgrade_tone_map(original, proxy, model, 0.0);
-        // colour_strength = 0 => luminance-only: original's hue, target luminance.
-        assert!((luminance(result) - luminance(original)).abs() < 1e-4);
-    }
-
-    #[test]
-    fn upgrade_tone_map_above_headroom_adds_the_clipped_difference() {
-        // original's luminance exceeds the proxy's -- the proxy clipped highlights.
-        let original = [2.0, 2.0, 2.0]; // luminance 2.0
-        let proxy = [1.0, 1.0, 1.0]; // luminance 1.0 (clipped by the encode)
-        let model = [0.5, 0.5, 0.5]; // luminance 0.5
-        let result = upgrade_tone_map(original, proxy, model, 0.0);
-        // target = model_luminance + (original_luminance - proxy_luminance) = 0.5 + 1.0 = 1.5
-        assert!((luminance(result) - 1.5).abs() < 1e-4, "got luminance {}", luminance(result));
-    }
-
-    #[test]
-    fn upgrade_tone_map_colour_strength_zero_matches_original_hue() {
-        let original = [0.9, 0.2, 0.2]; // strongly red
-        let proxy = [0.9, 0.2, 0.2];
-        let model = [0.2, 0.9, 0.2]; // strongly green -- very different hue
-        let result = upgrade_tone_map(original, proxy, model, 0.0);
-        let result_oklab = oklab_from_linear_srgb(result);
-        let original_oklab = oklab_from_linear_srgb(original);
-        let result_hue = result_oklab[2].atan2(result_oklab[1]);
-        let original_hue = original_oklab[2].atan2(original_oklab[1]);
-        assert!((result_hue - original_hue).abs() < 1e-3, "expected original's hue preserved at colour_strength=0");
     }
 
     #[test]

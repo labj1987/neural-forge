@@ -1,8 +1,8 @@
 #version 450
 // The composition pass: blends the model's answer onto the frame.
 //
-// A hand-translated GLSL expression of crates/layer/src/composition/color.rs's
-// `upgrade_tone_map`/`gamut_compress_reversible`, wired into a live compute dispatch
+// First a hand-translated GLSL expression of crates/layer/src/composition/color.rs's
+// `upgrade_tone_map` (since removed: the tone map here moved on) and `gamut_compress_reversible`, wired into a live compute dispatch
 // (`composition::gpu`) as of 2026-09-10 -- kept in sync by hand with `color.rs` (GLSL
 // and Rust can't literally share source) and, for the sRGB encode/decode this file
 // adds itself below, with `composition::apply`'s `srgb_decode`/`srgb_encode`, the
@@ -714,6 +714,6 @@ void main() {
   // they must already be in that image's true B,G,R,A order when the swapchain is
   // BGR, not canonical R,G,B,A.
   // The frame's own alpha, as the encode and the model server keep it: the composition changes
-  // colour only.
-  imageStore(u_output, pixel, vec4(bgr ? encoded.bgr : encoded, imageLoad(u_original, pixel).a));
+  // colour only. Read where the colour was (`src`: the compare view's side by side moves it).
+  imageStore(u_output, pixel, vec4(bgr ? encoded.bgr : encoded, imageLoad(u_original, src).a));
 }
