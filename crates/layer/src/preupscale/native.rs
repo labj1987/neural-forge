@@ -975,7 +975,7 @@ impl Loader {
             "[native] model loaded and verified from {} in {} ms (chaining {})",
             dir.display(),
             t.elapsed().as_millis(),
-            if chain_wanted() { "on" } else { "off" }
+            if open.chain { "on" } else { "off" }
         );
         crate::log!("[native] model source: {}", model_source(&std::fs::read_to_string(dir.join("manifest.json")).unwrap_or_default()));
         Ok((network, running))
@@ -1004,8 +1004,11 @@ impl Loader {
             if std::mem::take(&mut state.lend) {
                 // A path took it after the lend was decided, or a frame that used it may still run: kept.
                 if state.uses != state.lend_uses || claims.in_flight() {
+                    // The log line with the lock let go, as everywhere here: holds take it on the game's thread.
+                    drop(state);
                     crate::log!("[native] the network stays on this device: a path here took it as it was being lent");
                     crate::logging::flush();
+                    state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     continue;
                 }
                 if let Some(network) = state.network.take() {
@@ -1052,8 +1055,10 @@ impl Loader {
                     state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
                 if let Some(level) = state.apply_idle_step(claims, Instant::now()) {
+                    drop(state);
                     crate::log!("[native] VRAM guard: no frame has used the network for {} s; the step down ({level:?}) is applied now", IDLE_STEP.as_secs());
                     crate::logging::flush();
+                    state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
                 continue;
             }
@@ -4705,6 +4710,14 @@ unsafe fn native_hold(
     // The control mask's rules for this frame: the sky rule reads the depth copy, in the convention the edit
     // cache decided.
     let mut passes = passes;
+    if !cache_on && passes.mask.rules & MASK_SKY != 0 {
+        // The sky rule reads the depth copy in the convention the edit cache decides: with the cache off neither is
+        // there, and the rule is dropped (said once).
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[native] the control mask's sky rule needs the edit cache (off: NEURAL_FORGE_EDIT_CACHE): it is not applied");
+        }
+    }
     passes.mask = passes.mask.for_frame(depth.map_or(0, super::cache::depth_kind), res.edit.as_ref().and_then(|e| e.state.reverse_z()));
     let depth_buffer = depth.and(res.depth.as_ref()).map(DepthCopy::buffer);
     // The colour of the edit: whether this frame records it, and the look-up table.
