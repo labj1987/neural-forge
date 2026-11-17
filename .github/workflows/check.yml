@@ -345,7 +345,8 @@ jobs:
 
       # Install the extracted AppImage's files with its own CLI into scratch XDG directories (never
       # the runner user's real ones), then run the smoke example through the Vulkan loader against
-      # the installed release library, so the packaged layer is the one that gets exercised.
+      # the installed release library, so the packaged layer is the one that gets exercised, last through the
+      # installed implicit manifest alone.
       - name: Install the AppImage and smoke-test the installed layer
         run: |
           scratch="$(mktemp -d)"
@@ -355,7 +356,7 @@ jobs:
           so="$XDG_DATA_HOME/neural-forge/lib/neural-forge/libneural_forge_layer.so"
           test -f "$so"
           cmp "$so" squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so
-          NEURAL_FORGE_SMOKE_SO="$so" bash scripts/smoke-test.sh
+          NEURAL_FORGE_SMOKE_SO="$so" NEURAL_FORGE_SMOKE_INSTALLED_DATA="$XDG_DATA_HOME" bash scripts/smoke-test.sh
 
       - name: Upload the release files
         if: inputs.release

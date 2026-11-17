@@ -6,8 +6,11 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 # NEURAL_FORGE_SMOKE_SO names a layer library to test instead of building the debug one (the
-# release workflow points it at the library the AppImage installed).
+# release workflow points it at the library the AppImage installed). NEURAL_FORGE_SMOKE_INSTALLED_DATA names
+# that install's XDG_DATA_HOME: a last pass then finds the layer only through the implicit manifest the install
+# wrote there, as a game does.
 SO_PATH="${NEURAL_FORGE_SMOKE_SO:-}"
+INSTALLED_DATA="${NEURAL_FORGE_SMOKE_INSTALLED_DATA:-}"
 if [[ -z "$SO_PATH" ]]; then
     cargo build --locked -p neural-forge-layer
     SO_PATH="${CARGO_TARGET_DIR:-$(pwd)/target}/debug/libneural_forge_layer.so"
@@ -134,4 +137,23 @@ fi
 if grep -q 'frame went to DLSS untouched\|resources for' "$NEURAL_FORGE_LOG" 2>/dev/null; then
     echo "FAIL: the pre-upscaler path held a submit on a device without DLSS" >&2
     exit 1
+fi
+unset NEURAL_FORGE_PREUPSCALE
+
+# The installed implicit manifest alone: no VK_LAYER_PATH, no VK_INSTANCE_LAYERS, only the manifest's
+# enable_environment (NEURAL_FORGE_ENABLE=1), as a game started with the launch option finds it.
+if [[ -n "$INSTALLED_DATA" ]]; then
+    unset VK_LAYER_PATH VK_INSTANCE_LAYERS
+    export XDG_DATA_HOME="$INSTALLED_DATA"
+    export NEURAL_FORGE_LOG="$SCRATCH/layer-implicit.log"
+    echo
+    echo "==> again through the implicit manifest in $INSTALLED_DATA/vulkan/implicit_layer.d only"
+    cargo run --locked --example smoke -p neural-forge-layer
+    echo
+    echo "==> layer log ($NEURAL_FORGE_LOG):"
+    cat "$NEURAL_FORGE_LOG" 2>/dev/null || echo "(no log written -- the layer never ran)"
+    if ! grep -q '\[layer\] hooked device' "$NEURAL_FORGE_LOG" 2>/dev/null; then
+        echo "FAIL: the installed implicit manifest did not load the layer with NEURAL_FORGE_ENABLE=1" >&2
+        exit 1
+    fi
 fi
