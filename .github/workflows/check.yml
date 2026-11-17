@@ -264,6 +264,7 @@ jobs:
           bash build-appimage.sh --self-test
           bash scripts/game-sweep.sh --self-test
           bash scripts/test_apprun.sh
+          bash scripts/test_game_reg.sh
           bash scripts/smoke-gui.sh --self-test
 
       - name: Shader sources match committed SPIR-V
