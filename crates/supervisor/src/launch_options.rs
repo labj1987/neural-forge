@@ -145,6 +145,15 @@ pub fn is_enabled(options: &str) -> bool {
     around_command(&tokens).is_some_and(|(before, _, _)| enables(before))
 }
 
+/// The value the shell gives the variable `name` (e.g. `NEURAL_FORGE_NGX_CORE`) for the game: its last assignment among
+/// the leading variables before `%command%`, outer quotes taken off; `None` when it is not set there or is empty (an
+/// assignment after a wrapper or after `%command%` is that program's argument, not the game's environment).
+pub fn value(options: &str, name: &str) -> Option<String> {
+    let tokens = split_tokens(options);
+    let (before, _, _) = around_command(&tokens)?;
+    value_of(leading(before), &format!("{name}=")).filter(|v| !v.is_empty()).map(str::to_string)
+}
+
 /// Whether `options` turns Neural Forge on ([`is_enabled`]) with a target executable
 /// (`NEURAL_FORGE_TARGET_EXE=` with a value, among the same leading variables).
 pub fn has_target(options: &str) -> bool {
@@ -219,6 +228,22 @@ pub const OMITTED: &str = "<other options omitted>";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A variable's value as the shell gives it to the game: the last leading assignment before `%command%`, quotes off;
+    /// not one after a wrapper or after `%command%`.
+    #[test]
+    fn reads_a_variables_value_as_the_shell_does() {
+        let v = |o: &str| value(o, "NEURAL_FORGE_NGX_CORE");
+        assert_eq!(v("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_NGX_CORE=/x/_nvngx_core.dll %command%").as_deref(), Some("/x/_nvngx_core.dll"));
+        assert_eq!(v(r"NEURAL_FORGE_NGX_CORE='C:\nf c\nvngx_core.dll' %command%").as_deref(), Some(r"C:\nf c\nvngx_core.dll"));
+        assert_eq!(v("A=1 NEURAL_FORGE_NGX_CORE=\"/a b/_nvngx.dll\" %command%").as_deref(), Some("/a b/_nvngx.dll"));
+        assert_eq!(v("NEURAL_FORGE_NGX_CORE=/a/_nvngx.dll NEURAL_FORGE_NGX_CORE=/b/core.dll %command%").as_deref(), Some("/b/core.dll"), "the last one");
+        assert_eq!(v("%command% NEURAL_FORGE_NGX_CORE=/x/core.dll"), None, "a game argument");
+        assert_eq!(v("gamemoderun NEURAL_FORGE_NGX_CORE=/x/core.dll %command%"), None, "a wrapper's argument");
+        assert_eq!(v("X_NEURAL_FORGE_NGX_CORE=/y %command%"), None);
+        assert_eq!(v("NEURAL_FORGE_NGX_CORE= %command%"), None);
+        assert_eq!(v("NEURAL_FORGE_NGX_CORE=/x"), None, "no %command%");
+    }
 
     #[test]
     fn the_reports_view_keeps_only_neural_forges_part() {

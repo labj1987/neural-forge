@@ -459,6 +459,13 @@ fn resolve(this: Handle) -> Result<String, String> {
         (Err(e), None) => return Err(e),
     };
     CORE.store(core, Ordering::Release);
+    let loaded = module_path(core);
+    if let Some(warning) = core_copy::name_warning(&loaded) {
+        // In the text log and the trace (`log` writes both), and in the NGX versions record `doctor` reads.
+        log(&format!("WARNING: {warning}"));
+        source = format!("{source}; WARNING: {warning}");
+    }
+    crate::modules::set_core_load(format!("{loaded} ({source})"));
     let lookup = |name: &str| -> *const c_void {
         let cname: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
         unsafe { GetProcAddress(core, cname.as_ptr()) }
@@ -529,7 +536,9 @@ fn hide_exports(this: Handle, names: &[&str]) -> usize {
 /// thread without waiting; the core's copy has a name no builtin has (and the driver's file, the fallback, is loaded
 /// by its full path, overridden native), so it cannot be this module again (checked: [`resolve`] refuses a load that
 /// returns this module); copying the core is plain file I/O; and nothing here waits on another thread.
-/// The ring is opened here too, only where the layer is on ([`rules::ring_wanted`]).
+/// The ring is opened here too, only where the layer is on ([`rules::ring_wanted`]). The NGX module record
+/// (`modules.rs`) is not listed here: a thread started at the end writes it once the loader lock is free, and only a
+/// core that failed to load is recorded from here (one small file write).
 ///
 /// # Safety
 /// Called by the Windows loader.
@@ -576,6 +585,8 @@ pub unsafe extern "system" fn DllMain(this: Handle, reason: u32, _reserved: *mut
                 env!("CARGO_PKG_VERSION"),
                 module_path(this)
             ));
+            // The NGX module record for doctor and the report, written by a thread once the loader lock is free.
+            crate::modules::note_core_loaded_later();
             trace(format_args!("load: DllMain done"));
             1
         }
@@ -583,6 +594,7 @@ pub unsafe extern "system" fn DllMain(this: Handle, reason: u32, _reserved: *mut
             // Failing the load makes NGX report itself unavailable: the game runs without DLSS rather than with a
             // half-forwarded core.
             log(&format!("Neural Forge NGX wrapper in {exe}: {e}; trace {trace_state}"));
+            crate::modules::note_core_failed(&format!("not loaded: {e}"));
             0
         }
     }

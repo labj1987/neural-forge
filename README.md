@@ -74,8 +74,8 @@ under the tabs). Every setting, the tested games, environment variables and the 
 ## Troubleshooting
 
 Start with **Diagnose** on the Status tab (or `neural-forge-cli doctor`). It checks the install, the
-GPU and driver, video memory, GPU faults, the last game's log, the NGX hook and each game's Proton, and
-says what to do.
+GPU and driver, video memory, GPU faults, the last game's log, the NGX hook, each Neural Forge Proton copy's
+NGX wrapper and each game's Proton, and says what to do.
 
 - **"off: this game uses DLSS but isn't on the Neural Forge Proton".** Close Steam, switch the game
   off and on again in the Setup tab (or **Make copy** under **Proton with DLSS parameters**), and

@@ -4,6 +4,22 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.6.2 — 2026-11-19
+
+**Diagnose shows which NGX core a game ran, even when DLSS never started, and checks each Proton copy**
+
+- The NGX versions in Diagnose, `doctor` and Save report now show what a game loaded as soon as NVIDIA's NGX core
+  is loaded, with which core the NGX wrapper loaded and why, not only after the game started DLSS. A game whose last
+  run never started DLSS is marked so, and one whose NGX core could not be loaded says why. After DLSS starts, the
+  list of DLSS files it loaded replaces it as before.
+- Diagnose and `doctor` check each Neural Forge Proton copy's NGX wrapper: that it is there and is the file Neural
+  Forge put there, that the copy's `proton` script sets the DLL overrides it needs, and that the copy's Wine version is
+  one Neural Forge was checked with. A wrapper file that was replaced is put back when Neural Forge starts.
+- A core named by `NEURAL_FORGE_NGX_CORE` whose path lacks a lower-case `nvngx.dll` is now warned about in the NGX
+  log, the trace and Diagnose: NVIDIA's DLSS files refuse calls from it, so DLSS silently never started.
+- With `XDG_STATE_HOME` set, the NGX wrapper now writes that record where Neural Forge reads it (it used to write it
+  under your home's `.local/state`, so Diagnose showed nothing).
+
 ## 4.6.1 — 2026-11-19
 
 **The NGX wrapper runs NVIDIA's core from where Proton puts it (Indiana Jones and the Great Circle)**

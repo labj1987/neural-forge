@@ -39,9 +39,18 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   (`crates/ngx-wrapper/src/core_copy.rs`), so the core runs, as under stock Proton, from a folder without DLSS feature
   DLLs and under its own name. NVIDIA's core treats the folder it runs from as a place of its own (see "Where the core
   looks for feature DLLs" below), and the driver's `nvidia/wine` folder holds NVIDIA's `nvngx_dlssg.dll` and
-  `nvngx_dlssd.dll`; Indiana Jones and the Great Circle crashed only with the core loaded from there (#51). The name
-  must stay `_nvngx.dll`: loaded as `_nvngx_core.dll` (or #51's `nvngx_core.dll`) the core answers every call the
-  same, but the game never creates a DLSS feature. Wine would hand a module of that name to the wrapper
+  `nvngx_dlssd.dll`; Indiana Jones and the Great Circle crashed only with the core loaded from there (#51). The copy
+  keeps the name `_nvngx.dll`: NVIDIA's feature DLLs (`nvngx_dlss.dll`, `nvngx_dlssd.dll`, `nvngx_dlssg.dll`; 310.4 to 310.9 and the driver's
+  copies, read in Ghidra) check who calls each of their NGX exports: `GetModuleHandleExA(FROM_ADDRESS)` on the return
+  address, `GetModuleFileNameW`, and a case-sensitive `wcsstr(path, L"nvngx.dll")`; a caller whose path lacks it gets
+  `0xBAD00002` and the log line "Error: Not called from NGX runtime". So the core's path must contain `nvngx.dll` in
+  lower case (in any folder): as `_nvngx_core.dll`, `nvngx_core.dll` or `_NVNGX.DLL` DLSS never starts. The wrapper says so in its text log, its trace and its
+  NGX versions record (so `doctor` warns) when the core it loaded breaks the rule (`core_copy::name_warning`: one
+  named by `NEURAL_FORGE_NGX_CORE`), and `doctor` warns about such a `NEURAL_FORGE_NGX_CORE` in a game's launch
+  options. Nothing else depends on the name: the game's NGX loader (in `sl.common.dll`) compares no name after the
+  load, the core uses only its folder, and no code in them calls `GetModuleHandle("_nvngx.dll")` (the same Ghidra
+  pass), so the wrapper and the core
+  sharing a base name is safe. Wine would hand a module of that name to the wrapper
   (`_nvngx=b`), so the Proton copy also sets `C:\windows\system32\neural-forge\_nvngx=n`: a full-path key is
   looked up before the base name. Each time Neural Forge renews the wrapper in its copies (`refresh_wrapper`, at start and
   after an update), it also makes a copy's `proton` script again from its source's when they differ; a copy whose source is no
@@ -72,7 +81,9 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   passthrough exports are bare jumps through the resolved pointers, so they must be set before any export can be
   called, and nothing else runs before that; Wine's loader lock is recursive, so the nested load (and the core's own
   `DllMain`) runs on the same thread without waiting; the core is loaded by its full path with a native override,
-  so it cannot be the wrapper again (checked); and the wrapper's `DllMain` waits on no other thread.
+  so it cannot be the wrapper again (checked); and the wrapper's `DllMain` waits on no other thread. It does not list
+  the process's modules for the NGX versions record (below): it starts a thread for that, which Wine runs only once the
+  loader lock is free, and only a core that did not load is recorded from `DllMain` itself (one small file write).
 - **What it records.** For D3D12 the `ID3D12Resource`s become VkImages through vkd3d-proton's
   `ID3D12DXVKInteropDevice1::GetVulkanResourceInfo1` (and the layout DLSS reads them in through
   `GetVulkanImageLayout`); for D3D11 through DXVK's `IDXGIVkInteropSurface::GetVulkanImageInfo`; Vulkan games hand
@@ -104,16 +115,29 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   NGX records any of the evaluate's launches, on the same thread; once the call returned, the wrapper writes the same
   record again with `KIND_END` (bit 16 of `api`; the API is the low 16 bits). Every launch of the evaluate lies between
   the two.
-- **The NGX versions.** After a feature is created (`modules.rs`, `note_loaded`) the wrapper lists the process's
-  modules (`K32EnumProcessModules`, which Wine serves), keeps `_nvngx.dll` and `nvngx*.dll` (itself, NVIDIA's core, the
-  snippets `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `nvngx_dlssd.dll`, `nvngx_dlssnr.dll`, ...), whatever path each was
-  loaded from, and reads each file's `VS_FIXEDFILEINFO` version through `version.dll` (loaded when needed, not
-  imported). It logs them when the text log is on and, in a game the layer is on in, writes
-  `$XDG_STATE_HOME/neural-forge/ngx-modules/<app id>-<exe>.txt` (the format is in `modules.rs`; a run replaces the
-  file, and it is rewritten only when the set of paths changes). `<app id>` is Steam's `SteamAppId` (else
+- **The NGX versions.** The wrapper lists the process's modules (`modules.rs`; `K32EnumProcessModules`, which Wine
+  serves), keeps `_nvngx.dll` and `nvngx*.dll` (itself, NVIDIA's core, the snippets `nvngx_dlss.dll`,
+  `nvngx_dlssg.dll`, `nvngx_dlssd.dll`, `nvngx_dlssnr.dll`, ...), whatever path each was loaded from, and reads each
+  file's `VS_FIXEDFILEINFO` version through `version.dll` (loaded when needed, not imported). It logs them when the
+  text log is on and, in a game the layer is on in, writes `$XDG_STATE_HOME/neural-forge/ngx-modules/<app id>-<exe>.txt`
+  (the format is in `modules.rs`), with which core it loaded and why (the text log's "NVIDIA's core" part) and when it
+  wrote it (`stage=`). It writes three times at most: once NVIDIA's core is loaded (`core-loaded`: a thread
+  `DllMain` starts, `note_core_loaded_later`, which Wine runs once the `LoadLibrary` that loaded the wrapper has
+  returned; it holds a reference to the wrapper while it runs, so a game freeing NGX meanwhile cannot unmap its code);
+  after a feature is created (`feature-created`, `note_loaded`), which replaces it with the snippets loaded by then,
+  and again only when the set of paths changes; or, instead of both, when the core did not load (`core-failed`, with
+  the reason and no modules, from `DllMain` before it fails the load). A core-loaded note that runs after a feature
+  was created writes nothing, so the later list wins; nor does one that finds the file already holding a
+  feature-created record of the same process (`process=`, the Windows process id and its creation time, since Wine gives a game the
+  same small id run after run: a game that frees NGX and loads it again, whose wrapper starts with no memory of what it
+  wrote). A run replaces the file. So a game that never creates a DLSS
+  feature (#51) still leaves a record of which core it ran, and `doctor` and the report say that its last run created
+  none. `<app id>` is Steam's `SteamAppId` (else
   `SteamGameId`), else `x` and a hash of the executable's path, so games whose executables share a name keep apart.
-  Wine does not pass `HOME` into the game's Windows environment (it gives `WINEHOMEDIR`, `\??\Z:\home\<user>`), so
-  without `XDG_STATE_HOME` the wrapper takes the home from there, the same directory the supervisor uses. It writes through `Z:` for a `Z:` home, and through the NT path (`\\?\unix\home\<user>\.local\state\...`, or the other drive's) for a `\??\unix\...` or other-drive `WINEHOMEDIR`, so it needs no `Z:` drive. `doctor`
+  Wine passes `HOME` and every `XDG_*` variable into the game's Windows environment only with `WINE_HOST_` before the
+  name (`dlls/ntdll/unix/env.c`, `is_special_env_var`), so the wrapper reads `XDG_STATE_HOME` and `HOME` under either
+  name (until 4.6.2 it missed `XDG_STATE_HOME` and wrote under the home), and without both takes the home from
+  `WINEHOMEDIR` (`\??\Z:\home\<user>`): the same directory the supervisor uses. It writes through `Z:` for a `Z:` home, and through the NT path (`\\?\unix\home\<user>\.local\state\...`, or the other drive's) for a `\??\unix\...` or other-drive `WINEHOMEDIR`, so it needs no `Z:` drive. `doctor`
   and the report (`ngx_versions.rs`) show that record with how long ago it was written, and the NGX DLLs present in each switched-on game's folder, its prefix's
   `ProgramData/NVIDIA/NGX` and `system32`, and the driver's core, with their versions read from the PE resources on
   the Linux side (`model::dll_file_version`: headers and resource section only). The record is for a bug report's
@@ -304,6 +328,19 @@ running game uses (a process whose executable or arguments lie in it) is neither
   or a `-NeuralForge` name whose folder is gone; never another tool with that suffix) off it, then removes only marked
   copies (and what a stopped copy left, `.<name>.tmp`).
 
+- **What `doctor` checks in a copy** (`proton_tool::check_chain`, finding `proton-chain`, shown with the other
+  findings in the Status tab's Diagnosis group). The trick depends on Wine's DLL load order, so each copy's chain is
+  checked statically, reading files only: its wrapper (`files/lib/wine/x86_64-windows/_nvngx.dll`) is there, is a
+  Wine builtin (the 16 bytes at 0x40) and is the file its marker records (and whether that is this Neural Forge's);
+  its `proton` script sets `_nvngx=b` (a failure without it: games get NVIDIA's core), the copy of NVIDIA's core's
+  full path native and the driver's core's full path native (warnings: the wrapper then falls back or fails); and its
+  Wine's major version is one whose `get_load_order` (`dlls/ntdll/unix/loadorder.c`) was read
+  (`VERIFIED_WINE_MAJORS`: 10 and 11, see Evidence; a newer one is a note). A wrapper file that is not the one its
+  marker records is put back when Neural Forge starts (`refresh_wrapper` compares the file too). Nothing runs: a run
+  of a test program through the copy's Wine that loads the full path and says which module it got would need a Wine
+  prefix, which took 6.6 s and 640 MB to make with GE-Proton11-12 on the test machine (0.9 s per run once made),
+  for each copy, and a prefix kept for it would go stale with the copy. The wrapper checks at run time that the core
+  it loaded is not itself, and its NGX versions record says which core each game ran.
 - **Hard links.** A copy shares most files with its source (same inode), so Steam updating the source in place changes
   the copy's files too. The marker records the shared files at the time (`linked=` and one `link_file=` line each:
   relative path, size, modification time; no device or inode numbers, no hashing); `doctor` warns when one of those
@@ -349,6 +386,14 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
 ## Evidence
 
 - Wine source: ValveSoftware/wine at `fda79a585939fb7512dc220a11249f9ffe825fcf` (GE-Proton11-12's submodule).
+- DLL load order (2026-11-19, `dlls/ntdll/unix/loadorder.c` at gitlab.winehq.org wine/wine `wine-10.0`, `wine-11.0`,
+  `wine-11.22` and master, and ValveSoftware/wine `fda79a5`): `get_load_order` takes `\??\` and `.dll` off the name;
+  a module directly in `system32` is looked up by its base name, any other (a folder below `system32` too: 10.0 and
+  11.0 strip the system folder only when no separator follows, 11.22's `is_system_dir_path` in `loader.c` returns
+  false for one) first by its full path, then by `*` and its base name, then by its base name; each in
+  `WINEDLLOVERRIDES` before the registry. 11.22 adds heuristics from the version resource (2026-03 and 04,
+  `a31ec8da`, `8cf7a53e`) after those lookups, for a module none of them names; Valve's tree adds only Easy
+  Anti-Cheat's bridge. So the copy's three keys mean the same in all of them.
 - A scratch prefix under the copy: `WinVerifyTrust(C:\windows\system32\_nvngx.dll)` = 0, `LoadLibrary` of that path
   returns the wrapper (its `EvaluateFeature` in the wrapper's module), NVIDIA's core loaded from
   `Z:\run\host\usr\lib\x86_64-linux-gnu\nvidia\wine\_nvngx.dll`, no export missing.
@@ -377,7 +422,11 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
   made the same NGX calls with the same results up to `GetCapabilityParameters` (trace and NGX log identical), and
   then never called `UpdateFeature` or `CreateFeature` (no DLSS, 2 of 2 runs); as `C:\nfc\_nvngx.dll` and as
   `system32\neural-forge\_nvngx.dll` it ran DLSS and Frame Generation as with the driver's file. That is #51's "DLSS
-  never starts" with `C:\nfcore\nvngx_core.dll`. In #51 (Indiana Jones and the Great Circle: Vulkan, Streamline with
+  never starts" with `C:\nfcore\nvngx_core.dll`. Why (Ghidra, the feature DLLs 310.4 to 310.9 and the driver's
+  copies): every NGX export of `nvngx_dlss.dll`, `nvngx_dlssd.dll` and `nvngx_dlssg.dll` looks its caller's module up
+  from the return address and refuses one whose path lacks `nvngx.dll` (case-sensitive `wcsstr`) with `0xBAD00002`,
+  "Error: Not called from NGX runtime - %S". The game-side loader (`sl.common.dll`) compares no name after the load.
+  The 20 exports `READS_CALLER` names are exactly 620.73's that read their caller. In #51 (Indiana Jones and the Great Circle: Vulkan, Streamline with
   DLSS, Ray Reconstruction and Frame Generation) the core loaded from the driver's folder reported a third feature
   supported, `UpdateFeature` ran for each feature, and the game's present timed out (`VK_TIMEOUT`) about 5 s after its
   swapchain. Whether the core's folder alone (the stock layout the wrapper now uses) avoids that is for the reporter

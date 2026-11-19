@@ -1,9 +1,13 @@
 //! Where the wrapper loads NVIDIA's core from (docs/PROTON_NGX.md, "Loading NVIDIA's core"), and the copy it loads.
 //!
-//! The core must keep its file name, `_nvngx.dll`: loaded under another name (`_nvngx_core.dll`, or #51's
-//! `nvngx_core.dll`) it initialises and answers every query the same, but the game never creates a DLSS feature
-//! (Cyberpunk 2077, 2026-11-19: no `CreateFeature`, the same as the reporter's "DLSS never starts"); named
-//! `_nvngx.dll` in a folder of its own it works (DLSS and Frame Generation). So the wrapper loads a copy of the
+//! The core's path must contain `nvngx.dll` in lower case ([`NGX_RUNTIME_MARK`]): NVIDIA's feature DLLs (`nvngx_dlss.dll`, `nvngx_dlssd.dll`, `nvngx_dlssg.dll`; 310.4 to 310.9 and the driver's
+//! copies, read in Ghidra) check who calls each of their NGX exports: `GetModuleHandleExA(FROM_ADDRESS)` on the return
+//! address, `GetModuleFileNameW`, and a case-sensitive `wcsstr(path, L"nvngx.dll")`; a caller whose path lacks it gets
+//! `0xBAD00002` and the log line "Error: Not called from NGX runtime". So the core's path must contain `nvngx.dll` in
+//! lower case (in any folder): as `_nvngx_core.dll`, `nvngx_core.dll` or `_NVNGX.DLL` DLSS never starts.
+//! (Cyberpunk 2077, 2026-11-19: as `_nvngx_core.dll` no `CreateFeature`, the same as #51's "DLSS never starts" with
+//! `nvngx_core.dll`). The wrapper warns when the core it loaded breaks that rule ([`name_warning`]: a core named by
+//! `NEURAL_FORGE_NGX_CORE`). So the wrapper loads a copy of the
 //! driver's core, `system32\neural-forge\_nvngx.dll`: a folder with nothing else in it, as stock Proton's core has no
 //! DLSS feature DLL beside it in `system32`, where the driver's `nvidia/wine` folder holds NVIDIA's `nvngx_dlssg.dll`
 //! and `nvngx_dlssd.dll` (Indiana Jones and the Great Circle crashed only with the core loaded from there, #51). Wine
@@ -22,6 +26,20 @@ pub const COPY_DIR: &str = "neural-forge";
 pub const COPY_NAME: &str = "_nvngx.dll";
 /// The environment variable that names the core to load instead (a Windows path, or a Linux one through `Z:`).
 pub const ENV_CORE: &str = "NEURAL_FORGE_NGX_CORE";
+/// What NVIDIA's feature DLLs look for, case-sensitively, in the path of the module that calls them: their caller must
+/// be NGX's runtime (the module text).
+pub const NGX_RUNTIME_MARK: &str = "nvngx.dll";
+
+/// The warning for a core loaded from `path` when NVIDIA's feature DLLs will refuse its calls (its path lacks
+/// [`NGX_RUNTIME_MARK`]): DLSS then never starts, with nothing else to say why.
+pub fn name_warning(path: &str) -> Option<String> {
+    (!path.contains(NGX_RUNTIME_MARK)).then(|| {
+        format!(
+            "NVIDIA's core {path} has no lower-case \"{NGX_RUNTIME_MARK}\" in its path: NVIDIA's DLSS DLLs refuse calls from it (0xBAD00002, \"Not called from NGX runtime\"), so DLSS never starts; name the file _nvngx.dll"
+        )
+    })
+}
+
 /// The driver folder Proton names in `NVIDIA_WINE_DLL_DIR` when it is not set (Debian and Ubuntu's layout).
 pub const DEFAULT_DRIVER_DIR: &str = "/usr/lib/x86_64-linux-gnu/nvidia/wine";
 
@@ -117,6 +135,20 @@ mod tests {
         assert_eq!(COPY_NAME, "_nvngx.dll");
         assert!(!COPY_DIR.is_empty() && !COPY_DIR.contains(['\\', '/']));
         assert!(crate::modules::is_ngx_module(COPY_NAME));
+        assert!(COPY_NAME.contains(NGX_RUNTIME_MARK), "NVIDIA's DLSS DLLs take calls only from a path with lower-case nvngx.dll");
+    }
+
+    /// NVIDIA's feature DLLs refuse a caller whose path lacks lower-case `nvngx.dll`: such a core is warned about.
+    #[test]
+    fn a_core_path_without_lower_case_nvngx_dll_is_warned_about() {
+        for ok in [r"C:\windows\system32\neural-forge\_nvngx.dll", r"Z:\usr\lib\nvidia\wine\_nvngx.dll", r"C:\NFC\nvngx.dll", r"C:\x\nvngx.dll.bak"] {
+            assert_eq!(name_warning(ok), None, "{ok}");
+        }
+        for bad in [r"C:\nfc\_nvngx_core.dll", r"C:\nfcore\nvngx_core.dll", r"C:\windows\system32\_NVNGX.DLL", r"C:\x\_Nvngx.dll"] {
+            assert!(name_warning(bad).is_some_and(|w| w.contains(bad) && w.contains("0xBAD00002")), "{bad}");
+        }
+        let Plan::Copy { to, .. } = plan(env(&[]), r"C:\windows\system32") else { panic!() };
+        assert_eq!(name_warning(&to), None, "the wrapper's own copy");
     }
 
     #[test]

@@ -891,17 +891,75 @@ fn check_ngx_versions(roots: &Roots) -> Vec<Finding> {
     let dirs: Vec<(PathBuf, PathBuf)> = on.iter().map(|g| (g.dir(), g.library.join("steamapps/compatdata").join(&g.appid).join("pfx/drive_c"))).collect();
     let files: Vec<nv::GameFiles> =
         on.iter().zip(&dirs).map(|(g, (game_dir, drive_c))| nv::GameFiles { name: &g.name, appid: &g.appid, game_dir, drive_c }).collect();
-    let summary = match records.len() {
-        0 => "NGX versions: no game has recorded its loaded DLSS files yet".to_string(),
-        n => format!("NGX versions: {n} game(s) recorded their loaded DLSS files"),
-    };
-    vec![Finding::new("ngx-versions", Severity::Info, summary, nv::render(core.as_deref(), &records, &files), None)]
+    let without = records.iter().filter(|(_, _, r)| r.no_feature()).count();
+    let mut out =
+        vec![Finding::new("ngx-versions", Severity::Info, versions_summary(records.len(), without), nv::render(core.as_deref(), &records, &files), None)];
+    // Each switched-on game's NEURAL_FORGE_NGX_CORE, as the shell gives it to the game.
+    let cores: Vec<(&str, &str, String)> = on
+        .iter()
+        .filter_map(|g| Some((g.appid.as_str(), g.name.as_str(), crate::launch_options::value(&enabled_options(g)?, "NEURAL_FORGE_NGX_CORE")?)))
+        .collect();
+    out.extend(core_name_findings(&cores, &records));
+    out
+}
+
+/// The NGX versions finding's summary: `records` games recorded, `without` of them with no DLSS feature in their last run.
+fn versions_summary(records: usize, without: usize) -> String {
+    match (records, without) {
+        (0, _) => "NGX versions: no game has recorded its loaded DLSS files yet".to_string(),
+        (n, 0) => format!("NGX versions: {n} game(s) recorded their loaded DLSS files"),
+        (n, w) => format!(
+            "NGX versions: {n} game(s) recorded their loaded DLSS files; in {w} of them the last run created no DLSS feature (or not yet, while the game still runs)"
+        ),
+    }
+}
+
+/// NVIDIA's DLSS DLLs take calls only from a module whose path holds a lower-case `nvngx.dll`
+/// ([`crate::proton_tool::NGX_RUNTIME_MARK`], docs/PROTON_NGX.md): a core named otherwise (by `NEURAL_FORGE_NGX_CORE`)
+/// gets every call refused and DLSS never starts. Warned about from a switched-on game's launch options and from the
+/// core a game's last run loaded (the wrapper's record), once per game: a game warned about from its launch options gets
+/// no second warning from its record.
+fn core_name_findings(cores: &[(&str, &str, String)], records: &[(String, Option<std::time::Duration>, crate::ngx_versions::Record)]) -> Vec<Finding> {
+    use crate::proton_tool::NGX_RUNTIME_MARK;
+    const CHECK: &str = "ngx-core-name";
+    let why = format!("NVIDIA's DLSS DLLs refuse calls from a core whose path lacks a lower-case \u{201c}{NGX_RUNTIME_MARK}\u{201d}, so DLSS never starts");
+    let mut out = Vec::new();
+    let mut warned: Vec<&str> = Vec::new();
+    for (appid, name, core) in cores {
+        if !core.contains(NGX_RUNTIME_MARK) {
+            warned.push(appid);
+            out.push(Finding::new(
+                CHECK,
+                Severity::Warning,
+                format!("{name}'s launch options load NVIDIA's NGX core from {core}: {why}"),
+                format!("{name} ({appid}): NEURAL_FORGE_NGX_CORE={core}"),
+                Some("Name the file _nvngx.dll (any folder), or take NEURAL_FORGE_NGX_CORE out of the launch options.".into()),
+            ));
+        }
+    }
+    for (file, age, r) in records {
+        // The record's file is `<app id>-<exe>.txt`.
+        if warned.iter().any(|appid| file.strip_prefix(appid).is_some_and(|rest| rest.starts_with('-'))) {
+            continue;
+        }
+        if let Some(m) = r.modules.iter().find(|m| m.role == "core" && !m.path.contains(NGX_RUNTIME_MARK)) {
+            out.push(Finding::new(
+                CHECK,
+                Severity::Warning,
+                format!("{} ran NVIDIA's NGX core from {} in its last run: {why}", r.exe, m.path),
+                format!("{file} (written {}): core {}", crate::ngx_versions::ago(*age), m.path),
+                Some("Name the file _nvngx.dll (any folder), or take NEURAL_FORGE_NGX_CORE out of the game's launch options.".into()),
+            ));
+        }
+    }
+    out
 }
 
 /// Since 4.0 the layer works only in games run with a Neural Forge Proton (`proton_tool`): the NGX wrapper must be
-/// installed and match the driver's NGX core both ways ([`compare_exports`]); each copy must be on Wine 10 or newer
-/// and hold the installed wrapper; each switched-on game (but a native Linux one) must be set to such a Proton; and a
-/// running game's ring must be of the version the layer reads.
+/// installed and match the driver's NGX core both ways ([`compare_exports`]); each copy must be on Wine 10 or newer,
+/// hold the installed wrapper and pass the static check of its wrapper chain ([`chain_findings`]); each switched-on
+/// game (but a native Linux one) must be set to such a Proton; and a running game's ring must be of the version the
+/// layer reads.
 fn check_proton(roots: &Roots) -> Vec<Finding> {
     use crate::proton_tool;
     const CHECK: &str = "proton";
@@ -944,6 +1002,7 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
                     Some("Remove it in the Setup tab (or `neural-forge-cli proton-tool remove`) and make a copy of Proton 10 or newer.".into()),
                 ));
             }
+            out.extend(chain_findings(t, digest.as_deref()));
             if digest.as_ref().is_some_and(|d| *d != t.wrapper_sha256) {
                 out.push(Finding::new(
                     CHECK,
@@ -1093,8 +1152,83 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
     out
 }
 
-fn short(digest: &str) -> &str {
-    digest.get(..12).unwrap_or(digest)
+use crate::proton_tool::short;
+
+/// The static check of a copy's wrapper chain ([`crate::proton_tool::check_chain`]), as findings: a failure when it is
+/// broken, a warning when it is degraded, a note when its Wine is newer than those whose load order was read, else one
+/// passed finding that names what was checked. Nothing runs: a run through the copy's Wine needs a prefix (about 7 s
+/// and 640 MB to make one on the test machine), more than a diagnosis should cost; the wrapper checks at run time that
+/// it got NVIDIA's core, and its record (NGX versions) says which core it loaded.
+fn chain_findings(t: &crate::proton_tool::Tool, installed: Option<&str>) -> Vec<Finding> {
+    use crate::proton_tool;
+    let source = if proton_tool::source_gone(t) {
+        Source::Gone
+    } else if proton_tool::source_changed(t) {
+        Source::Newer
+    } else {
+        Source::Same
+    };
+    chain_verdict(t, &proton_tool::check_chain(t, installed), source)
+}
+
+/// Where a copy's source Proton stands, for [`chain_verdict`]'s fix: Neural Forge makes a copy's script again from its
+/// source's only while the source is there at the version the copy was made from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Source {
+    Same,
+    Newer,
+    Gone,
+}
+
+/// [`chain_findings`] for a check already made.
+fn chain_verdict(t: &crate::proton_tool::Tool, c: &crate::proton_tool::Chain, source: Source) -> Vec<Finding> {
+    const CHECK: &str = "proton-chain";
+    let evidence = |items: &[String]| format!("{}: {}", t.dir.display(), items.join("; "));
+    let remake = match source {
+        Source::Gone => "Switch its games off, choose an installed Proton for them in Steam, and switch them on again: that makes a new copy.",
+        Source::Newer => "Close Steam, then make it again in the Setup tab (or `neural-forge-cli proton-tool update`): its source has a newer version now, and its games move to the new copy.",
+        Source::Same => "Close Steam, then make it again in the Setup tab (or `neural-forge-cli proton-tool create` for its source).",
+    };
+    let degraded_fix = match source {
+        Source::Same => "Start Neural Forge (or run `neural-forge-cli install --appdir`): it puts its wrapper in every copy and makes their scripts again from their sources'. If this stays, make the copy again.".to_string(),
+        _ => format!("Starting Neural Forge puts its wrapper back, but cannot make this copy's script again from its source. {remake}"),
+    };
+    let mut out = Vec::new();
+    if !c.broken.is_empty() {
+        out.push(Finding::new(
+            CHECK,
+            Severity::Failure,
+            format!("{}: games run with it do not get Neural Forge's NGX wrapper, so the model stays off where they use DLSS", t.name),
+            evidence(&c.broken),
+            Some(remake.to_string()),
+        ));
+    }
+    if !c.degraded.is_empty() {
+        out.push(Finding::new(
+            CHECK,
+            Severity::Warning,
+            format!("{}: its NGX wrapper chain is not as this Neural Forge sets it up", t.name),
+            evidence(&c.degraded),
+            Some(degraded_fix),
+        ));
+    }
+    if let Some(u) = &c.unverified {
+        out.push(Finding::new(
+            CHECK,
+            Severity::Info,
+            format!("{}: {u}", t.name),
+            evidence(&c.passed),
+            Some(
+                "Nothing to do unless DLSS stops working with it: the wrapper checks at run time that it got NVIDIA's core, and the NGX versions say which core each game loaded. Update Neural Forge when a newer one is out."
+                    .into(),
+            ),
+        ));
+    }
+    // On a Wine too old or unreadable, `check_proton`'s failure stands alone: the chain does not check out then.
+    if out.is_empty() && !c.wine_unsupported {
+        out.push(Finding::new(CHECK, Severity::Ok, format!("{}: its NGX wrapper chain checks out", t.name), evidence(&c.passed), None));
+    }
+    out
 }
 
 /// The wrapper's exports (`ours`, `None` when unreadable) against NVIDIA's core at `core`, both ways: a function the
@@ -1718,6 +1852,74 @@ mod tests {
     }
 
     use super::*;
+
+    /// The doctor summary of the NGX versions, with the caveat for a game still running.
+    #[test]
+    fn versions_summary_says_or_not_yet() {
+        assert!(versions_summary(0, 0).contains("no game"));
+        assert!(!versions_summary(3, 0).contains("no DLSS feature"));
+        assert!(versions_summary(3, 1).ends_with("in 1 of them the last run created no DLSS feature (or not yet, while the game still runs)"));
+    }
+
+    fn chain_tool() -> crate::proton_tool::Tool {
+        crate::proton_tool::Tool {
+            name: "GE-Proton11-12-NeuralForge".into(),
+            dir: "/c/GE-Proton11-12-NeuralForge".into(),
+            source: "/c/GE-Proton11-12".into(),
+            source_version: "GE-Proton11-12".into(),
+            wrapper_sha256: "ab".into(),
+            linked: None,
+        }
+    }
+
+    /// A copy on a Wine too old (or unreadable) gets no "checks out" beside doctor's Wine failure; one that passes does.
+    #[test]
+    fn no_passing_chain_beside_an_unsupported_wine() {
+        let t = chain_tool();
+        let passed = crate::proton_tool::Chain { passed: vec!["_nvngx=b".into()], ..Default::default() };
+        let ok = chain_verdict(&t, &passed, Source::Same);
+        assert_eq!((ok.len(), ok[0].severity), (1, Severity::Ok));
+        let old = crate::proton_tool::Chain { wine_unsupported: true, ..passed };
+        assert!(chain_verdict(&t, &old, Source::Same).is_empty());
+    }
+
+    /// The fix for a degraded chain: starting Neural Forge remakes the script only while the source is there unchanged.
+    #[test]
+    fn degraded_chain_fix_follows_the_source() {
+        let t = chain_tool();
+        let c = crate::proton_tool::Chain { degraded: vec!["its proton script does not set ...".into()], ..Default::default() };
+        let fix = |s| chain_verdict(&t, &c, s)[0].fix.clone().unwrap();
+        assert!(fix(Source::Same).starts_with("Start Neural Forge"));
+        assert!(fix(Source::Newer).contains("cannot make this copy's script again") && fix(Source::Newer).contains("proton-tool update"));
+        assert!(fix(Source::Gone).contains("switch them on again"));
+        let broken = crate::proton_tool::Chain { broken: vec!["no _nvngx=b".into()], ..Default::default() };
+        assert!(chain_verdict(&t, &broken, Source::Newer)[0].fix.as_deref().unwrap().contains("proton-tool update"));
+    }
+
+    /// A core whose path lacks lower-case nvngx.dll (NVIDIA's DLSS DLLs refuse its calls) is warned about from the record.
+    #[test]
+    fn warns_about_a_core_path_without_nvngx_dll() {
+        let record = |core: &str| {
+            crate::ngx_versions::parse_record(&format!(
+                "neural-forge-ngx-modules 1\nwrapper=4.6.2\nexe=g.exe\nstage=core-loaded\ncore\t_nvngx.dll\t1.0.0.0\t{core}\n"
+            ))
+            .unwrap()
+        };
+        let records = vec![
+            ("1-g.txt".to_string(), None, record(r"C:\windows\system32\neural-forge\_nvngx.dll")),
+            ("2-g.txt".to_string(), None, record(r"C:\nfc\_nvngx_core.dll")),
+        ];
+        let found = core_name_findings(&[], &records);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].check, found[0].severity), ("ngx-core-name", Severity::Warning));
+        assert!(found[0].summary.contains(r"C:\nfc\_nvngx_core.dll") && found[0].evidence.starts_with("2-g.txt"), "{found:?}");
+        // One warning per game: the launch option's, not the record's too; a good core in the options says nothing.
+        let cores = [("2", "Game", r"C:\nfc\_nvngx_core.dll".to_string()), ("1", "Other", r"C:\x\_nvngx.dll".to_string())];
+        let found = core_name_findings(&cores, &records);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].summary.starts_with("Game's launch options"), "{found:?}");
+        assert!(core_name_findings(&[("22", "G", "/x/core.dll".to_string())], &records).len() == 2, "another app id's record still warns");
+    }
     use std::sync::atomic::AtomicU64;
 
     /// A fixture tree: every root under one temporary directory, the commands answering `smi`/`journal`.

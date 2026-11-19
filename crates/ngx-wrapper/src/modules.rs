@@ -1,15 +1,23 @@
 //! The NGX modules a game has loaded, and their file versions, for `doctor` and the report (docs/PROTON_NGX.md).
 //!
-//! After a feature is created ([`note_loaded`]) the wrapper lists the process's loaded modules, keeps the NGX ones
-//! (NVIDIA's core, the wrapper itself, `nvngx.dll` and the DLSS snippets `nvngx_dlss.dll`, `nvngx_dlssg.dll`,
-//! `nvngx_dlssd.dll`, `nvngx_dlssnr.dll`, ...: whichever path they were loaded from, the game's folder, the NGX models
-//! folder an over-the-air update fills, the driver's folder) and writes their paths and file versions to
-//! `<state>/neural-forge/ngx-modules/<game>-<exe>.txt` (and to the text log, when it is on). Neural Forge's `doctor`
-//! and report read that file; the supervisor's `ngx_versions.rs` parses the format below. A set that did not change is
-//! not written again, so a game that creates features all the time costs one module listing each.
+//! The wrapper lists the process's loaded modules, keeps the NGX ones (NVIDIA's core, the wrapper itself, `nvngx.dll`
+//! and the DLSS snippets `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `nvngx_dlssd.dll`, `nvngx_dlssnr.dll`, ...: whichever
+//! path they were loaded from, the game's folder, the NGX models folder an over-the-air update fills, the driver's
+//! folder) and writes their paths and file versions to `<state>/neural-forge/ngx-modules/<game>-<exe>.txt` (and to the
+//! text log, when it is on), with which core it loaded and why. Neural Forge's `doctor` and report read that file; the
+//! supervisor's `ngx_versions.rs` parses the format below. It is written at three points ([`Stage`]):
 //!
-//! `<state>` is the supervisor's state directory ([`dir`]): Wine does not pass `HOME` into the Windows environment (it
-//! becomes `WINEHOMEDIR`), so the home is read from there when neither `XDG_STATE_HOME` nor `HOME` is set. `<game>` is
+//! - once NVIDIA's core is loaded ([`note_core_loaded_later`]): from a thread `DllMain` starts, which runs once the
+//!   loader lock is free (after the `LoadLibrary` that loaded the wrapper returned), so `DllMain` neither lists modules
+//!   nor waits for anything. A game that never creates a DLSS feature (#51) still leaves a record;
+//! - after a feature is created ([`note_loaded`]), which replaces it (the snippets are loaded by then). A set that did
+//!   not change is not written again, so a game that creates features all the time costs one module listing each;
+//! - when the core could not be loaded ([`note_core_failed`], from `DllMain`, which then fails the wrapper's load):
+//!   the reason, and no modules (nothing is listed under the loader lock), with one small file write.
+//!
+//! `<state>` is the supervisor's state directory ([`dir`]): Wine passes `HOME` and every `XDG_*` variable into the
+//! Windows environment only with `WINE_HOST_` before the name (`dlls/ntdll/unix/env.c`, `is_special_env_var`), so they
+//! are read under either name, and the home from `WINEHOMEDIR` when neither is set. `<game>` is
 //! the Steam app id Steam gives the game (`SteamAppId`, else `SteamGameId`), else a hash of the executable's path, so
 //! two games whose executables share a name keep apart ([`state_file_name`]).
 //!
@@ -17,13 +25,44 @@
 //!
 //! ```text
 //! neural-forge-ngx-modules 1
-//! wrapper=4.0.0
+//! wrapper=4.6.2
 //! exe=C:\...\game.exe
-//! core<TAB>_nvngx.dll<TAB>570.133.0.0<TAB>Z:\usr\lib\x86_64-linux-gnu\nvidia\wine\_nvngx.dll
+//! process=1234@134077112345678901
+//! stage=feature-created
+//! core_load=C:\windows\system32\neural-forge\_nvngx.dll (copy of Z:\usr\lib\x86_64-linux-gnu\nvidia\wine\_nvngx.dll)
+//! core<TAB>_nvngx.dll<TAB>570.133.0.0<TAB>C:\windows\system32\neural-forge\_nvngx.dll
 //! snippet<TAB>nvngx_dlss.dll<TAB>310.4.0.0<TAB>C:\...\nvngx_dlss.dll
 //! ```
 //!
-//! The role is `wrapper`, `core` or `snippet`; a version that could not be read is `-`.
+//! `process` is the Windows process id and its creation time (a `FILETIME`): Wine hands a game the same small id run
+//! after run, so the time tells two runs apart. A wrapper loaded again in the same process (a game that frees NGX and loads it
+//! again) finds its feature-created record by it and does not replace it with a core-loaded one
+//! ([`keeps_feature_record`]). `stage` is [`Stage::key`]; `core_load` says which core was loaded and why (or, for
+//! `core-failed`, why none was).
+//! A wrapper before 4.6.2 wrote neither (it wrote only after a feature was created). The role is `wrapper`, `core` or
+//! `snippet`; a version that could not be read is `-`.
+
+/// When the record was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// NVIDIA's core is loaded; no DLSS feature was created yet.
+    CoreLoaded,
+    /// A DLSS feature was created.
+    Feature,
+    /// NVIDIA's core could not be loaded: the wrapper's load fails, and NGX reports itself unavailable.
+    CoreFailed,
+}
+
+impl Stage {
+    /// The record's `stage=` value.
+    pub fn key(self) -> &'static str {
+        match self {
+            Stage::CoreLoaded => "core-loaded",
+            Stage::Feature => "feature-created",
+            Stage::CoreFailed => "core-failed",
+        }
+    }
+}
 
 /// Whether a loaded module's file name is one of NGX's: `_nvngx.dll`, or `nvngx*.dll`.
 pub fn is_ngx_module(file_name: &str) -> bool {
@@ -41,11 +80,17 @@ pub fn wanted(var: impl Fn(&str) -> Option<String>) -> bool {
     var("NEURAL_FORGE_ENABLE").is_some_and(|v| v == "1") && !var("NEURAL_FORGE_DISABLE").is_some_and(|v| v == "1")
 }
 
+/// A Unix variable as a Wine process sees it: `name`, else `WINE_HOST_<name>` (Wine renames `HOME` and `XDG_*`); unset
+/// when empty.
+fn host_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    var(name).filter(|v| !v.is_empty()).or_else(|| var(&format!("WINE_HOST_{name}")).filter(|v| !v.is_empty()))
+}
+
 /// The state directory's `neural-forge/ngx-modules` as a Unix path (the supervisor's `paths::state_dir`, the same
-/// rule: `XDG_STATE_HOME`, else `HOME`'s `.local/state`). In a Wine process `HOME` is not in the environment; Wine
-/// gives the Unix home as `WINEHOMEDIR` instead ([`unix_home_from_wine`]). `None` when none of them names a Unix path.
+/// rule: `XDG_STATE_HOME`, else `HOME`'s `.local/state`, each also as Wine passes it, [`host_var`]); without either,
+/// the Unix home Wine gives as `WINEHOMEDIR` ([`unix_home_from_wine`]). `None` when none of them names a Unix path.
 pub fn dir(var: impl Fn(&str) -> Option<String>) -> Option<String> {
-    let set = |name: &str| var(name).filter(|v| !v.is_empty());
+    let set = |name: &str| if name == "WINEHOMEDIR" { var(name).filter(|v| !v.is_empty()) } else { host_var(&var, name) };
     let home = || set("HOME").or_else(|| set("WINEHOMEDIR").and_then(|w| unix_home_from_wine(&w)));
     let state = set("XDG_STATE_HOME").or_else(|| home().map(|h| format!("{}/.local/state", h.trim_end_matches('/'))))?;
     Some(format!("{}/neural-forge/ngx-modules", state.trim_end_matches('/')))
@@ -70,15 +115,14 @@ pub fn unix_home_from_wine(nt: &str) -> Option<String> {
 }
 
 /// The Windows-form path of the state directory ([`dir`]) the wrapper creates and writes in. With `XDG_STATE_HOME` or
-/// `HOME` (Unix paths) it is `Z:` and the path, as ever. Without them it comes from `WINEHOMEDIR`: for `\??\Z:\...`
+/// `HOME` (Unix paths, under either name: [`host_var`]) it is `Z:` and the path, as ever. Without them it comes from `WINEHOMEDIR`: for `\??\Z:\...`
 /// the same `Z:` path; for `\??\unix\...` or a home on another drive it is the NT path itself, `\\?\` and the rest
 /// of `WINEHOMEDIR` and `\.local\state\neural-forge\ngx-modules`, which needs no `Z:` drive. `None` when none names a path.
 pub fn win_dir(var: impl Fn(&str) -> Option<String>) -> Option<String> {
-    let set = |name: &str| var(name).filter(|v| !v.is_empty());
-    if set("XDG_STATE_HOME").is_some() || set("HOME").is_some() {
+    if host_var(&var, "XDG_STATE_HOME").is_some() || host_var(&var, "HOME").is_some() {
         return dir(var).map(|d| format!("Z:{d}").replace('/', "\\"));
     }
-    let wine = set("WINEHOMEDIR")?;
+    let wine = var("WINEHOMEDIR").filter(|v| !v.is_empty())?;
     let rest = wine.trim_prefix(r"\??\");
     let bytes = rest.as_bytes();
     if bytes.get(..2).is_some_and(|b| b.eq_ignore_ascii_case(b"z:")) {
@@ -145,9 +189,10 @@ pub fn version_text(ms: u32, ls: u32) -> String {
     format!("{}.{}.{}.{}", ms >> 16, ms & 0xffff, ls >> 16, ls & 0xffff)
 }
 
-/// The file's text (the module docs).
-pub fn render(wrapper_version: &str, exe: &str, modules: &[Module]) -> String {
-    let mut s = format!("neural-forge-ngx-modules 1\nwrapper={wrapper_version}\nexe={exe}\n");
+/// The file's text (the module docs). `core_load` is kept to one line.
+pub fn render(wrapper_version: &str, exe: &str, process: &str, stage: Stage, core_load: &str, modules: &[Module]) -> String {
+    let core_load = core_load.replace(['\r', '\n'], " ");
+    let mut s = format!("neural-forge-ngx-modules 1\nwrapper={wrapper_version}\nexe={exe}\nprocess={process}\nstage={}\ncore_load={core_load}\n", stage.key());
     for m in modules {
         s += &format!("{}\t{}\t{}\t{}\n", m.role, file_name(&m.path), m.version.as_deref().unwrap_or("-"), m.path);
     }
@@ -159,15 +204,46 @@ pub fn log_line(m: &Module) -> String {
     format!("NGX module {}: {} {}", m.role, m.version.as_deref().unwrap_or("no version"), m.path)
 }
 
+/// Whether `existing` (the record file as it is) is a feature-created record of process `process` (`<id>@<creation time>`, [`process_key`]): a core-loaded record
+/// must not replace it. The wrapper's own memory of what it wrote ([`Written`]) starts again when the game frees NGX
+/// and loads it again, the file does not.
+pub fn keeps_feature_record(existing: &str, process: &str) -> bool {
+    let has = |line: &str| existing.lines().any(|l| l.trim_end() == line);
+    existing.starts_with("neural-forge-ngx-modules 1\n") && has(&format!("process={process}")) && has(&format!("stage={}", Stage::Feature.key()))
+}
+
+/// The record's `process=` value: the process id and its creation time, unique to one run.
+pub fn process_key(id: u32, created: u64) -> String {
+    format!("{id}@{created}")
+}
+
+/// What this process has written, for [`should_write`].
+#[derive(Debug, Default)]
+pub struct Written {
+    /// A feature was created (whether or not its record could be written).
+    pub feature_seen: bool,
+    /// The stage and module paths last written; `None` before the first write and after a failed one.
+    pub last: Option<(Stage, Vec<String>)>,
+}
+
+/// Whether a record of `stage` listing `paths` is written: not a core-loaded one once a feature was created (its
+/// thread ran late: the later list wins), else whenever it differs from the last one written.
+pub fn should_write(written: &Written, stage: Stage, paths: &[String]) -> bool {
+    if stage == Stage::CoreLoaded && written.feature_seen {
+        return false;
+    }
+    written.last.as_ref().is_none_or(|(s, p)| *s != stage || p != paths)
+}
+
 #[cfg(windows)]
-pub use win::note_loaded;
+pub use win::{note_core_failed, note_core_loaded_later, note_loaded, set_core_load};
 
 #[cfg(windows)]
 mod win {
     use super::*;
-    use crate::win::{log, logging, wide, Handle};
+    use crate::win::{log, logging, trace, wide, Handle};
     use core::ffi::c_void;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -177,6 +253,19 @@ mod win {
         fn GetModuleHandleExW(flags: u32, address: *const c_void, out: *mut Handle) -> i32;
         fn LoadLibraryW(name: *const u16) -> Handle;
         fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
+        fn CreateThread(
+            security: *mut c_void,
+            stack: usize,
+            start: unsafe extern "system" fn(*mut c_void) -> u32,
+            param: *mut c_void,
+            flags: u32,
+            id: *mut u32,
+        ) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn FreeLibrary(module: Handle) -> i32;
+        fn FreeLibraryAndExitThread(module: Handle, code: u32) -> !;
+        fn GetCurrentProcessId() -> u32;
+        fn GetProcessTimes(process: Handle, created: *mut u64, exited: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     }
 
     const FROM_ADDRESS: u32 = 4;
@@ -240,25 +329,108 @@ mod win {
         }
     }
 
-    /// The paths last written, so an unchanged set costs the listing only.
-    static LAST: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    /// What was written, so an unchanged set costs the listing only ([`should_write`]).
+    static WRITTEN: Mutex<Written> = Mutex::new(Written { feature_seen: false, last: None });
 
-    /// Lists the NGX modules the process has loaded and, when the set changed since the last call, logs them and
-    /// writes the state file (the module docs). Called after a feature was created: NGX loads the core before the
-    /// first call, and a snippet when its feature is created. Never fails the game: a file that cannot be written is
-    /// skipped.
-    pub fn note_loaded() {
-        let mut own = core::ptr::null_mut();
-        unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, note_loaded as *const c_void, &mut own) };
-        let mut found: Vec<(Handle, String)> = loaded().into_iter().filter(|(_, p)| is_ngx_module(file_name(p))).collect();
-        found.sort_by_key(|a| a.1.to_ascii_lowercase());
-        let paths: Vec<String> = found.iter().map(|(_, p)| p.clone()).collect();
-        // Held through the write, so two threads creating features at once cannot write an older set last.
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if *last == paths {
+    /// Which core was loaded and why (`win.rs`, `resolve`), for the record's `core_load=`.
+    static CORE_LOAD: OnceLock<String> = OnceLock::new();
+
+    /// Keeps `text` (which core was loaded and why) for the records. Called once, from `DllMain`.
+    pub fn set_core_load(text: String) {
+        let _ = CORE_LOAD.set(text);
+    }
+
+    fn var(name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+
+    /// This process's [`process_key`]: its id and creation time (0 when Windows cannot say).
+    fn this_process() -> String {
+        let (mut created, mut other) = (0u64, [0u64; 3]);
+        // SAFETY: four FILETIME out-parameters (8 bytes each) for the current process's pseudo-handle.
+        let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut other[0], &mut other[1], &mut other[2]) };
+        process_key(unsafe { GetCurrentProcessId() }, if ok != 0 { created } else { 0 })
+    }
+
+    /// Writes the record (only where the layer is on, [`wanted`]); false when it could not be written. A core-loaded
+    /// record leaves a feature-created one of this process in place ([`keeps_feature_record`]: the wrapper loaded again).
+    fn write_record(stage: Stage, core_load: &str, modules: &[Module]) -> bool {
+        let exe = module_path(core::ptr::null_mut());
+        let Some(dir) = win_dir(var) else { return false };
+        let path = format!("{dir}\\{}", state_file_name(&exe, var));
+        let process = this_process();
+        if stage == Stage::CoreLoaded && std::fs::read_to_string(&path).is_ok_and(|have| keeps_feature_record(&have, &process)) {
+            return true;
+        }
+        std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&path, render(env!("CARGO_PKG_VERSION"), &exe, &process, stage, core_load, modules)).is_ok()
+    }
+
+    /// Starts a thread that writes the core-loaded record ([`Stage::CoreLoaded`]), from the end of `DllMain` once
+    /// NVIDIA's core is loaded. The thread starts running only once the loader lock is free (Wine attaches a new
+    /// thread's DLLs under it), so nothing here lists modules or waits; it holds a reference to this module while it
+    /// runs and gives it back as it ends (`FreeLibraryAndExitThread`), so a game freeing NGX meanwhile cannot unmap
+    /// its code. Nothing is started where there is nothing to write (the layer off, no text log).
+    ///
+    /// # Safety
+    /// Called from `DllMain` (`DLL_PROCESS_ATTACH`).
+    pub unsafe fn note_core_loaded_later() {
+        if !wanted(var) && !logging() {
             return;
         }
-        *last = paths;
+        let mut own = core::ptr::null_mut();
+        if GetModuleHandleExW(FROM_ADDRESS, note_core_loaded_later as *const c_void, &mut own) == 0 {
+            return;
+        }
+        let thread = CreateThread(core::ptr::null_mut(), 0, core_loaded_thread, own, 0, core::ptr::null_mut());
+        if thread.is_null() {
+            trace(format_args!("load: the thread for the NGX module record did not start"));
+            FreeLibrary(own);
+            return;
+        }
+        CloseHandle(thread);
+    }
+
+    unsafe extern "system" fn core_loaded_thread(own: *mut c_void) -> u32 {
+        note(Stage::CoreLoaded);
+        FreeLibraryAndExitThread(own, 0)
+    }
+
+    /// Writes the record of a wrapper that could not load NVIDIA's core: `why`, and no modules. From `DllMain`, which
+    /// then fails the load: one small file write, nothing listed and nothing loaded.
+    pub fn note_core_failed(why: &str) {
+        if !wanted(var) {
+            return;
+        }
+        // DllMain fails the load next, so nothing in this module reads anything after this: no bookkeeping.
+        write_record(Stage::CoreFailed, why, &[]);
+    }
+
+    /// The feature-created record ([`Stage::Feature`]): called after a feature was created, when NGX has loaded the
+    /// feature's snippet.
+    pub fn note_loaded() {
+        note(Stage::Feature);
+    }
+
+    /// Lists the NGX modules the process has loaded and, when [`should_write`] says so, logs them and writes the state
+    /// file (the module docs). Never fails the game: a file that cannot be written is skipped (and tried again at the
+    /// next feature).
+    fn note(stage: Stage) {
+        let mut own = core::ptr::null_mut();
+        unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, note_loaded as *const c_void, &mut own) };
+        // NVIDIA's core whatever its name (`NEURAL_FORGE_NGX_CORE` may name it otherwise: `doctor` warns about that).
+        let core = crate::win::core_module();
+        let mut found: Vec<(Handle, String)> = loaded().into_iter().filter(|(h, p)| *h == core || is_ngx_module(file_name(p))).collect();
+        found.sort_by_key(|a| a.1.to_ascii_lowercase());
+        let paths: Vec<String> = found.iter().map(|(_, p)| p.clone()).collect();
+        // Held through the write, so two threads cannot write an older set last.
+        let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if stage == Stage::Feature {
+            written.feature_seen = true;
+        }
+        if !should_write(&written, stage, &paths) {
+            return;
+        }
+        written.last = Some((stage, paths));
         let modules: Vec<Module> = found
             .into_iter()
             .map(|(h, path)| {
@@ -273,20 +445,16 @@ mod win {
             .collect();
         if logging() {
             for m in &modules {
-                log(&log_line(m));
+                log(&format!("{} ({})", log_line(m), stage.key()));
             }
         }
-        let var = |name: &str| std::env::var(name).ok();
         if !wanted(var) {
             return;
         }
-        let exe = module_path(core::ptr::null_mut());
-        let Some(dir) = win_dir(var) else { return };
-        let written = std::fs::create_dir_all(&dir).is_ok()
-            && std::fs::write(format!("{dir}\\{}", state_file_name(&exe, var)), render(env!("CARGO_PKG_VERSION"), &exe, &modules)).is_ok();
-        if !written {
+        let core_load = CORE_LOAD.get().map_or("-", String::as_str);
+        if !write_record(stage, core_load, &modules) {
             // Tried again at the next feature.
-            last.clear();
+            written.last = None;
         }
     }
 
@@ -380,6 +548,24 @@ mod tests {
         assert_eq!(state_file_name("", env(&[("SteamAppId", "1")])), "1-game.txt");
     }
 
+    /// Wine passes `XDG_STATE_HOME` and `HOME` only as `WINE_HOST_XDG_STATE_HOME` and `WINE_HOST_HOME`: the record goes
+    /// where the supervisor reads it, `XDG_STATE_HOME` first (Neural Forge 4.6.1 and older wrote under the home then).
+    #[test]
+    fn state_directory_from_wines_renamed_variables() {
+        let wine = env(&[("WINE_HOST_XDG_STATE_HOME", "/s"), ("WINE_HOST_HOME", "/h"), ("WINEHOMEDIR", r"\??\Z:\home\alex")]);
+        assert_eq!(dir(&wine).as_deref(), Some("/s/neural-forge/ngx-modules"));
+        assert_eq!(win_dir(&wine).as_deref(), Some(r"Z:\s\neural-forge\ngx-modules"));
+        let home = env(&[("WINE_HOST_HOME", "/h"), ("WINEHOMEDIR", r"\??\Z:\home\alex")]);
+        assert_eq!(dir(&home).as_deref(), Some("/h/.local/state/neural-forge/ngx-modules"));
+        assert_eq!(win_dir(&home).as_deref(), Some(r"Z:\h\.local\state\neural-forge\ngx-modules"));
+        assert_eq!(
+            dir(env(&[("XDG_STATE_HOME", "/x"), ("WINE_HOST_XDG_STATE_HOME", "/s")])).as_deref(),
+            Some("/x/neural-forge/ngx-modules"),
+            "the plain name first"
+        );
+        assert_eq!(dir(env(&[("WINE_HOST_XDG_STATE_HOME", ""), ("WINE_HOST_HOME", "/h")])).as_deref(), Some("/h/.local/state/neural-forge/ngx-modules"));
+    }
+
     /// Wine passes no `HOME` into a game's Windows environment, only `WINEHOMEDIR`; the record must still be written.
     #[test]
     fn state_directory_from_wines_home_without_home() {
@@ -462,12 +648,53 @@ mod tests {
             Module { role: "snippet", path: r"C:\Game\nvngx_dlss.dll".into(), version: None },
         ];
         assert_eq!(
-            render("4.0.0", r"C:\Game\g.exe", &modules),
-            "neural-forge-ngx-modules 1\nwrapper=4.0.0\nexe=C:\\Game\\g.exe\n\
+            render("4.0.0", r"C:\Game\g.exe", "7@1", Stage::Feature, "C:\\nf\\_nvngx.dll (copy of Z:\\d\\_nvngx.dll)\nwritten now", &modules),
+            "neural-forge-ngx-modules 1\nwrapper=4.0.0\nexe=C:\\Game\\g.exe\nprocess=7@1\nstage=feature-created\n\
+             core_load=C:\\nf\\_nvngx.dll (copy of Z:\\d\\_nvngx.dll) written now\n\
              wrapper\t_nvngx.dll\t4.0.0\tC:\\windows\\system32\\_nvngx.dll\n\
              snippet\tnvngx_dlssg.dll\t310.1.0.0\tC:\\Game\\nvngx_dlssg.dll\n\
              snippet\tnvngx_dlss.dll\t-\tC:\\Game\\nvngx_dlss.dll\n"
         );
+        assert_eq!(
+            render("4.0.0", "g.exe", "7@1", Stage::CoreFailed, "no core", &[]),
+            "neural-forge-ngx-modules 1\nwrapper=4.0.0\nexe=g.exe\nprocess=7@1\nstage=core-failed\ncore_load=no core\n"
+        );
+        assert_eq!(Stage::CoreLoaded.key(), "core-loaded");
         assert_eq!(log_line(&modules[2]), r"NGX module snippet: no version C:\Game\nvngx_dlss.dll");
+    }
+
+    /// The core-loaded record is written once; a feature's replaces it, and a core-loaded note that comes after a
+    /// feature (its thread ran late) writes nothing: the later list wins.
+    #[test]
+    fn the_feature_record_replaces_the_core_loaded_one() {
+        let (core, more) = (vec![r"C:\w\_nvngx.dll".to_string()], vec![r"C:\w\_nvngx.dll".to_string(), r"C:\g\nvngx_dlss.dll".to_string()]);
+        let mut w = Written::default();
+        assert!(should_write(&w, Stage::CoreLoaded, &core));
+        w.last = Some((Stage::CoreLoaded, core.clone()));
+        assert!(!should_write(&w, Stage::CoreLoaded, &core), "the same record again");
+        w.feature_seen = true;
+        assert!(should_write(&w, Stage::Feature, &core), "the same modules, but now with a feature");
+        w.last = Some((Stage::Feature, core.clone()));
+        assert!(!should_write(&w, Stage::Feature, &core), "an unchanged set after another feature");
+        assert!(should_write(&w, Stage::Feature, &more), "a new snippet");
+        let late = Written { feature_seen: true, last: None };
+        assert!(!should_write(&late, Stage::CoreLoaded, &core), "the core-loaded note after a feature (even one not written)");
+        assert!(should_write(&late, Stage::Feature, &core), "a feature's record is tried again after a failed write");
+    }
+
+    /// The wrapper loaded again in the same process (its memory starts again) keeps that process's feature record; a
+    /// new run's core-loaded record replaces an older run's.
+    #[test]
+    fn a_reloaded_wrapper_keeps_its_processs_feature_record() {
+        let (run, key) = (process_key(42, 1000), |id, t| process_key(id, t));
+        assert_eq!(run, "42@1000");
+        let feature = render("4.6.2", "g.exe", &run, Stage::Feature, "c", &[]);
+        assert!(keeps_feature_record(&feature, &run));
+        assert!(!keeps_feature_record(&feature, &key(42, 2000)), "the same id in a later run (Wine reuses small ids): a new run");
+        assert!(!keeps_feature_record(&feature, &key(43, 1000)), "another process");
+        assert!(!keeps_feature_record(&feature, &key(4, 1000)) && !keeps_feature_record(&feature, &key(42, 100)), "no prefix match");
+        assert!(!keeps_feature_record(&render("4.6.2", "g.exe", &run, Stage::CoreLoaded, "c", &[]), &run));
+        assert!(!keeps_feature_record("neural-forge-ngx-modules 1\nwrapper=4.6.1\nexe=g.exe\n", &run), "an older wrapper's record");
+        assert!(!keeps_feature_record("", &run));
     }
 }
