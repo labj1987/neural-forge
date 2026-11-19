@@ -45,6 +45,28 @@ const SDK: &str = "Vulkan SDK (Vulkan-Headers = volk)";
 const USER_AGENT: &str = "neural-forge-pin-check";
 
 type Res<T> = Result<T, String>;
+
+/// Why asking upstream failed: the network or its answer (reported, the pin is left unchecked), or curl itself (the
+/// check is broken: it stops the run).
+#[derive(Debug)]
+enum Up {
+    Net(String),
+    Tool(String),
+}
+
+impl From<String> for Up {
+    fn from(m: String) -> Self {
+        Up::Net(m)
+    }
+}
+
+impl From<&str> for Up {
+    fn from(m: &str) -> Self {
+        Up::Net(m.to_string())
+    }
+}
+
+type UpRes<T> = Result<T, Up>;
 type Texts = BTreeMap<&'static str, String>;
 type Sha<'a> = &'a dyn Fn(&str) -> Res<String>;
 
@@ -95,28 +117,6 @@ fn rel_path(key: &str) -> &'static str {
     FILES.iter().find(|(k, _)| *k == key).map(|(_, rel)| *rel).unwrap_or("")
 }
 
-/// Python's repr() of a string, for the error texts that quote a pattern or a text.
-pub(crate) fn py_repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
-    let mut out = String::from(quote);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push(quote);
-    out
-}
-
 /// Python's re.escape(): the characters that can mean something in a pattern get a backslash.
 fn py_escape(s: &str) -> String {
     let mut out = String::new();
@@ -132,7 +132,7 @@ fn py_escape(s: &str) -> String {
 /// A file's text as Python's `Path.read_text()` gives it: UTF-8 with universal newlines.
 fn read(rel: &str) -> Res<String> {
     let text = std::fs::read_to_string(crate::root().join(rel)).map_err(|e| format!("{rel}: {e}"))?;
-    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
+    Ok(crate::py::universal_newlines(&text))
 }
 
 fn read_all() -> Res<Texts> {
@@ -145,7 +145,7 @@ fn one(pattern: &str, text: &str, what: &str, multiline: bool) -> Res<String> {
     let re = regex::Regex::new(&full).map_err(|e| format!("{what}: bad pattern {pattern}: {e}"))?;
     match re.captures(text) {
         Some(c) => Ok(c.get(1).map(|m| m.as_str()).unwrap_or("").to_string()),
-        None => Err(format!("{what}: pattern {} not found", py_repr(pattern))),
+        None => Err(format!("{what}: pattern {} not found", crate::py::repr_str(pattern))),
     }
 }
 
@@ -193,11 +193,19 @@ fn github_headers() -> Vec<(String, String)> {
     headers
 }
 
-fn api(path: &str) -> Res<serde_json::Value> {
+fn api(path: &str) -> UpRes<serde_json::Value> {
     let headers = github_headers();
     let refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let body = http::get(&format!("https://api.github.com/{path}"), &refs, 30).map_err(|e| e.to_string())?;
-    serde_json::from_slice(&body).map_err(|e| e.to_string())
+    let body = http::get(&format!("https://api.github.com/{path}"), &refs, 30).map_err(up)?;
+    serde_json::from_slice(&body).map_err(|e| Up::Net(e.to_string()))
+}
+
+/// A fetch error as an `Up`: only curl's own failure (not the network's) is a tool error.
+fn up(e: http::FetchError) -> Up {
+    match e {
+        http::FetchError::Tool(m) => Up::Tool(m),
+        e => Up::Net(e.to_string()),
+    }
 }
 
 fn json_list(v: serde_json::Value, what: &str) -> Res<Vec<serde_json::Value>> {
@@ -225,7 +233,7 @@ fn truthy(v: &serde_json::Value) -> bool {
 }
 
 /// Every tag of `repo` starting with `prefix` (matching-refs lists them all, unlike /tags' first page).
-fn tags(repo: &str, prefix: &str) -> Res<Vec<String>> {
+fn tags(repo: &str, prefix: &str) -> UpRes<Vec<String>> {
     let refs = json_list(api(&format!("repos/{repo}/git/matching-refs/tags/{prefix}"))?, repo)?;
     refs.iter()
         .map(|r| {
@@ -243,7 +251,7 @@ fn newest_common_sdk(per_repo: &[Vec<String>]) -> Option<String> {
     newest(&common)
 }
 
-fn latest(kind: Kind, repo: &str, cache: &mut Option<Option<String>>) -> Res<Option<String>> {
+fn latest(kind: Kind, repo: &str, cache: &mut Option<Option<String>>) -> UpRes<Option<String>> {
     match kind {
         Kind::Release => {
             let releases = json_list(api(&format!("repos/{repo}/releases?per_page=100"))?, repo)?;
@@ -257,7 +265,7 @@ fn latest(kind: Kind, repo: &str, cache: &mut Option<Option<String>>) -> Res<Opt
         }
         Kind::Sdk => {
             if cache.is_none() {
-                let per_repo = repo.split_whitespace().map(|r| tags(r, "vulkan-sdk-")).collect::<Res<Vec<_>>>()?;
+                let per_repo = repo.split_whitespace().map(|r| tags(r, "vulkan-sdk-")).collect::<UpRes<Vec<_>>>()?;
                 *cache = Some(newest_common_sdk(&per_repo));
             }
             Ok(cache.clone().flatten())
@@ -336,7 +344,7 @@ fn text_url(url: &str) -> Res<String> {
 fn replace(texts: &mut Texts, key: &'static str, old: &str, new: &str, count: usize) -> Res<()> {
     let found = texts[key].matches(old).count();
     if found != count {
-        return Err(format!("{}: expected {count} of {}, found {found}", rel_path(key), py_repr(old)));
+        return Err(format!("{}: expected {count} of {}, found {found}", rel_path(key), crate::py::repr_str(old)));
     }
     let replaced = texts[key].replace(old, new);
     texts.insert(key, replaced);
@@ -451,10 +459,12 @@ fn check() -> Res<(Vec<Row>, Vec<String>)> {
                 None
             }
             Ok(u) => u,
-            Err(e) => {
+            Err(Up::Net(e)) => {
                 failed.push(format!("{}: {e}", p.name));
                 None
             }
+            // curl itself failed (not the network): the check is broken, so the run fails instead of reporting "could not check".
+            Err(Up::Tool(e)) => return Err(format!("{}: {e}", p.name)),
         };
         let st = state(&p.pinned, upstream.as_deref());
         rows.push(Row { name: p.name, pinned: p.pinned, upstream, state: st });
@@ -703,6 +713,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn check_pins_tool_errors_are_not_the_network() {
+        assert!(matches!(up(http::FetchError::Tool("curl failed (exit status 3)".into())), Up::Tool(_)));
+        assert!(matches!(up(http::FetchError::Io("timed out".into())), Up::Net(m) if m == "timed out"));
+        assert!(
+            matches!(up(http::FetchError::Http { code: 404, reason: "Not Found".into(), headers: vec![] }), Up::Net(m) if m == "HTTP Error 404: Not Found")
+        );
+    }
+
+    #[test]
     fn check_pins_self_test() {
         if let Err(e) = self_test() {
             panic!("{e}");
@@ -711,9 +730,9 @@ mod tests {
 
     #[test]
     fn check_pins_python_text_helpers() {
-        assert_eq!(py_repr(r#"^X="([^"]+)""#), r#"'^X="([^"]+)"'"#);
-        assert_eq!(py_repr("a'b"), "\"a'b\"");
-        assert_eq!(py_repr("a\\.b\n"), "'a\\\\.b\\n'");
+        assert_eq!(crate::py::repr_str(r#"^X="([^"]+)""#), r#"'^X="([^"]+)"'"#);
+        assert_eq!(crate::py::repr_str("a'b"), "\"a'b\"");
+        assert_eq!(crate::py::repr_str("a\\.b\n"), "'a\\\\.b\\n'");
         assert_eq!(py_escape("Vulkan-Headers"), "Vulkan\\-Headers");
         assert!(regex::Regex::new(&py_escape("a b-c.d")).unwrap().is_match("a b-c.d"));
     }

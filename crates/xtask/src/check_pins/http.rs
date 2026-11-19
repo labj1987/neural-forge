@@ -4,17 +4,19 @@
 
 use std::fmt;
 use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug)]
 pub enum FetchError {
     /// The server answered with a status outside 200-299 (after redirects).
     Http { code: u16, reason: String, headers: Vec<(String, String)> },
-    /// curl could not get an answer: DNS, connection, TLS, timeout, a dropped transfer.
+    /// curl could not get an answer: DNS, connection, TLS, timeout, a dropped transfer (see `NETWORK_EXITS`).
     Io(String),
-    /// curl itself could not be started.
+    /// Anything else: curl could not be started, was killed, or exited with a code that is not a network problem
+    /// (a refused option or protocol, a malformed URL, a local write error). That is a failure of the check, not a
+    /// reason to retry later.
     Tool(String),
 }
 
@@ -51,16 +53,47 @@ pub fn parse_headers(dump: &str) -> Option<Head> {
     Some((code, reason, headers))
 }
 
-fn temp_path() -> PathBuf {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    std::env::temp_dir().join(format!("nf-xtask-curl-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)))
+/// curl's exit codes that mean the network let it down: could not resolve the proxy (5) or host (6), could not
+/// connect (7), a partial transfer (18), a timeout (28), a TLS handshake failure (35), an empty reply (52), a send or
+/// receive failure (55, 56).
+const NETWORK_EXITS: [i32; 9] = [5, 6, 7, 18, 28, 35, 52, 55, 56];
+
+/// What a failed curl run (its exit code, None when a signal ended it, and its stderr) means.
+fn classify_exit(code: Option<i32>, stderr: &str) -> FetchError {
+    let why = stderr.trim();
+    match code {
+        Some(c) if NETWORK_EXITS.contains(&c) => FetchError::Io(if why.is_empty() { format!("curl failed: exit status {c}") } else { why.to_string() }),
+        Some(c) => FetchError::Tool(if why.is_empty() { format!("curl failed: exit status {c}") } else { format!("curl failed (exit status {c}): {why}") }),
+        None => FetchError::Tool(format!("curl was killed by a signal{}", if why.is_empty() { String::new() } else { format!(": {why}") })),
+    }
+}
+
+/// A private (mode 0700) directory of this process's own, with an unguessable name, for curl's header dump.
+fn private_dir() -> std::io::Result<PathBuf> {
+    let mut random = [0u8; 16];
+    let from_system = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random));
+    if from_system.is_err() {
+        // No /dev/urandom: the clock and the process id still make the name unique, and create_dir refuses a taken one.
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        random.copy_from_slice(&(nanos ^ (u128::from(std::process::id()) << 96)).to_le_bytes());
+    }
+    let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let dir = std::env::temp_dir().join(format!("nf-xtask-curl-{name}"));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
 }
 
 /// Streams the body of `url` into `sink`. `idle_secs` bounds the connect and any stall, like a socket timeout.
 pub fn get_stream(url: &str, headers: &[(&str, &str)], idle_secs: u32, sink: &mut dyn FnMut(&[u8])) -> Result<(), FetchError> {
-    let dump = temp_path();
-    let result = stream(url, headers, idle_secs, &dump, sink);
-    let _ = std::fs::remove_file(&dump);
+    let dir = private_dir().map_err(|e| FetchError::Tool(format!("could not create a private temporary directory: {e}")))?;
+    let dump = dir.join("headers");
+    // create_new: never opens a file that is already there (or follows a link planted in its place).
+    let created = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&dump);
+    let result = match created {
+        Ok(_) => stream(url, headers, idle_secs, &dump, sink),
+        Err(e) => Err(FetchError::Tool(format!("could not create the header dump: {e}"))),
+    };
+    let _ = std::fs::remove_dir_all(&dir);
     result
 }
 
@@ -68,10 +101,16 @@ fn stream(url: &str, headers: &[(&str, &str)], idle_secs: u32, dump: &Path, sink
     // Headers (the Authorization token among them) go in on stdin: argv is visible to every process on the machine.
     let mut config = String::new();
     for (k, v) in headers {
+        // A line break would end the config line and start another option.
+        if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
+            return Err(FetchError::Tool(format!("refusing a request header with a line break in it: {k}")));
+        }
         let line = format!("{k}: {v}").replace('\\', "\\\\").replace('"', "\\\"");
         config.push_str(&format!("header = \"{line}\"\n"));
     }
     let mut child = Command::new("curl")
+        // -q first: no ~/.curlrc. https only, also after a redirect; no URL globbing.
+        .args(["-q", "--globoff", "--proto", "=https", "--proto-redir", "=https"])
         .args(["--silent", "--show-error", "--location", "--max-redirs", "10", "--http1.1"])
         .args(["--connect-timeout", &idle_secs.to_string(), "--speed-time", &idle_secs.to_string(), "--speed-limit", "1"])
         .arg("--dump-header")
@@ -100,8 +139,7 @@ fn stream(url: &str, headers: &[(&str, &str)], idle_secs: u32, dump: &Path, sink
     }
     let out = child.wait_with_output().map_err(|e| FetchError::Tool(format!("could not wait for curl: {e}")))?;
     if !out.status.success() {
-        let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(FetchError::Io(if why.is_empty() { format!("curl failed: {}", out.status) } else { why }));
+        return Err(classify_exit(out.status.code(), &String::from_utf8_lossy(&out.stderr)));
     }
     let head = std::fs::read_to_string(dump).unwrap_or_default();
     let (code, reason, headers) = parse_headers(&head).ok_or_else(|| FetchError::Io("curl returned no HTTP status".into()))?;
@@ -134,5 +172,35 @@ mod tests {
         assert_eq!(e.header("missing"), None);
         assert_eq!(e.to_string(), "HTTP Error 403: Forbidden");
         assert!(parse_headers("").is_none());
+    }
+
+    #[test]
+    fn check_pins_http_curl_exit_classes() {
+        for c in NETWORK_EXITS {
+            assert!(matches!(classify_exit(Some(c), "boom"), FetchError::Io(m) if m == "boom"), "exit {c} is the network");
+        }
+        assert!(matches!(classify_exit(Some(28), ""), FetchError::Io(m) if m == "curl failed: exit status 28"));
+        // Not the network: an unsupported protocol (1), a malformed URL (3), a bad option (2), a write error (23),
+        // too many redirects (47), an option curl does not know (49), a killed run.
+        for c in [1, 2, 3, 23, 47, 49, 84] {
+            assert!(matches!(classify_exit(Some(c), "x"), FetchError::Tool(m) if m.contains(&format!("exit status {c}"))), "exit {c} is the tool");
+        }
+        assert!(matches!(classify_exit(None, ""), FetchError::Tool(_)));
+    }
+
+    #[test]
+    fn check_pins_http_header_dump_is_private_and_unique() {
+        let (a, b) = (private_dir().unwrap(), private_dir().unwrap());
+        assert_ne!(a, b);
+        let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&a).unwrap().permissions());
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_dir_all(&a).unwrap();
+        std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn check_pins_http_refuses_a_header_with_a_line_break() {
+        let e = get("https://localhost.invalid/", &[("Authorization", "Bearer a\nheader = \"x\"")], 1).unwrap_err();
+        assert!(matches!(e, FetchError::Tool(_)), "{e}");
     }
 }

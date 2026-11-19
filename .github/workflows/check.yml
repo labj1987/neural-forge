@@ -84,13 +84,6 @@ jobs:
           CHANNEL: ${{ steps.toolchain.outputs.channel }}
         run: rustc --version | tee /dev/stderr | grep -qF "rustc $CHANNEL "
 
-      # The release page carries this version's changes in full, from CHANGELOG.md (no link to it);
-      # every build checks the section exists, so a release cannot fail on it.
-      - name: Release notes from the changelog
-        run: |
-          cargo xtask release-notes "$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" > release-notes.md
-          cat release-notes.md
-
       # The GUI toolkit's (GPUI's) build headers: libxcb, libxkbcommon and libxkbcommon-x11, which it links, and
       # fontconfig, which one of its crates probes at build time; a software Vulkan ICD (lavapipe) so the
       # layer's real-device tests run (NEURAL_FORGE_REQUIRE_VULKAN makes that an assertion) and the GUI's
@@ -142,6 +135,13 @@ jobs:
             ~/.cargo/git/db
             target
           key: ${{ steps.cargo-key.outputs.key }}
+
+      # The release page carries this version's changes in full, from CHANGELOG.md (no link to it);
+      # every build checks the section exists, so a release cannot fail on it.
+      - name: Release notes from the changelog
+        run: |
+          cargo xtask release-notes "$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" > release-notes.md
+          cat release-notes.md
 
       # The pinned tools in tools/native, cached by their pins: glslang, Vulkan-Headers and volk that
       # crates/native builds with (fetch-native-tools.sh), cargo-deny (cargo-deny.sh) and the layer
@@ -391,7 +391,7 @@ jobs:
           # (deps/, build/, incremental/) is not an interface. No incremental data exists (CARGO_INCREMENTAL=0).
           if find target -type f -regex 'target/\(debug\|release\)/[^/]*' \
                   \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \
-                  -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' \) | grep .; then
+                  -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' -o -name 'xtask*' \) | grep .; then
               echo "error: the checkout's own build output is still in target/" >&2
               exit 1
           fi

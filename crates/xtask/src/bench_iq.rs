@@ -17,7 +17,8 @@ use regex::Regex;
 pub(crate) mod pyish;
 mod selftest;
 
-use pyish::{fixed, glob_dir, is_dir, join, normpath_basename, py_int, py_repr_str, py_sum};
+use crate::py::repr_str;
+use pyish::{fixed, glob_dir, is_dir, join, normpath_basename, py_int, py_sum};
 
 const USAGE: &str = include_str!("bench_iq/usage.txt");
 
@@ -290,7 +291,7 @@ fn srgb_table() -> [f32; 256] {
 /// The frame's Rec.709 luma of the linearised 8-bit sRGB pixels (`Image.convert("RGB")`, then numpy float32).
 fn load_luma(path: &str) -> Res<Img<f32>> {
     let file = File::open(path).map_err(|e| IqError::Os(pyish::os_error(&e, path)))?;
-    let unidentified = || IqError::Os(format!("cannot identify image file {}", py_repr_str(path)));
+    let unidentified = || IqError::Os(format!("cannot identify image file {}", repr_str(path)));
     let mut decoder = png::Decoder::new(BufReader::new(file));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().map_err(|_| unidentified())?;
@@ -599,7 +600,7 @@ pub(crate) fn summary(run: &str, baseline: Option<&str>, start: Option<i64>, fra
 fn int_opt(v: &Option<String>) -> Result<i64, String> {
     match v {
         None => Err("TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'".to_string()),
-        Some(s) => py_int(s).ok_or_else(|| format!("ValueError: invalid literal for int() with base 10: {}", py_repr_str(s))),
+        Some(s) => py_int(s).ok_or_else(|| format!("ValueError: invalid literal for int() with base 10: {}", repr_str(s))),
     }
 }
 

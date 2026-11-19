@@ -19,7 +19,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::bench_iq::pyish::{glob_dir, join, os_error, py_float, py_int, py_repr_str, read_text_lossy, splitlines};
+use crate::bench_iq::pyish::{glob_dir, join, os_error, py_float, py_int, read_text_lossy};
+use crate::py::{repr_str, splitlines};
 
 /// GTA5_Enhanced.exe (2026-09-15 build): the instruction after its hang watchdog's call.
 const WATCHDOG: u64 = 0x1_4012_c6eb;
@@ -238,7 +239,7 @@ fn fg(csv: &str, cap: &str) -> Result<(), Fail> {
         .filter(|r| r.matches(',').count() > 3)
         .filter_map(|r| int_as_f64(r.rsplit(',').next().unwrap_or("")).map(|v| v / 1e9))
         .collect();
-    let cap = py_float(cap).ok_or_else(|| format!("ValueError: could not convert string to float: {}", py_repr_str(cap)))?;
+    let cap = py_float(cap).ok_or_else(|| format!("ValueError: could not convert string to float: {}", repr_str(cap)))?;
     println!("{}", fg_rule(&times, cap));
     Ok(())
 }
@@ -464,7 +465,7 @@ fn run(args: &[String]) -> Result<ExitCode, Fail> {
         "dumps" => {
             let folder = arg(1)?;
             let since = arg(2)?;
-            let since = py_float(&since).ok_or_else(|| format!("ValueError: could not convert string to float: {}", py_repr_str(&since)))?;
+            let since = py_float(&since).ok_or_else(|| format!("ValueError: could not convert string to float: {}", repr_str(&since)))?;
             dumps(&folder, since)?;
         }
         "fg" => fg(&arg(1)?, &arg(2)?)?,

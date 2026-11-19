@@ -39,10 +39,18 @@ exports() {
 nvidia=""
 for d in /usr/lib/x86_64-linux-gnu/nvidia/wine /usr/lib64/nvidia/wine /usr/lib/nvidia/wine; do [ -f "$d/_nvngx.dll" ] && nvidia="$d/_nvngx.dll" && break; done
 if [ -n "$nvidia" ] && command -v x86_64-w64-mingw32-objdump >/dev/null; then
-    if diff <(exports "$nvidia") <(exports "$out") >/dev/null; then
-        echo "exports: all $(exports "$out" | wc -l) of $nvidia, same ordinals"
+    # Both listings are captured first: a failing objdump or `wine-builtin exports` stops the script here (set -e),
+    # where inside <(...) it would only look like an empty listing.
+    nvidia_exports=$(exports "$nvidia")
+    our_exports=$(exports "$out")
+    count=$(printf '%s\n' "$our_exports" | grep -c . || true)
+    if [ "$count" -eq 0 ]; then
+        echo "error: no exports found in $out" >&2; exit 1
+    fi
+    if [ "$nvidia_exports" = "$our_exports" ]; then
+        echo "exports: all $count of $nvidia, same ordinals"
     else
-        echo "exports differ from $nvidia:"; diff <(exports "$nvidia") <(exports "$out") | head -20; exit 1
+        echo "exports differ from $nvidia:"; diff <(printf '%s\n' "$nvidia_exports") <(printf '%s\n' "$our_exports") | head -20; exit 1
     fi
 fi
 echo "$out: $(stat -c %s "$out") bytes, Wine builtin"

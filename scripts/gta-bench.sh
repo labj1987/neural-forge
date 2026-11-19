@@ -55,7 +55,8 @@ set -u
 
 # The checks that read GTA's crash dumps and MangoHud's log, and the Steam lookup for the Proton the game runs with, are
 # in crates/xtask/src/gta_bench.rs (a binary built from this repository, sent along with --host; NF_BENCH_XTASK=<path>
-# names a ready-built one instead).
+# names a ready-built one instead). --host therefore needs, on the machine it is run from, a checkout of this repository
+# with cargo, or NF_BENCH_XTASK set to a built xtask (a binary of the host's architecture); the host needs neither.
 # gta_x dumps <CrashLogs dir> <epoch>: one line per dump written since <epoch>.
 # gta_x fg <MangoHud csv> <cap fps>: "stopped <s> <shown> <best>" or "kept".
 # gta_x proton <steam root> <appid> [libraries...]: the Proton folder. gta_x self-test.
@@ -68,7 +69,7 @@ resolve_xtask() {
     local root target
     root=$(cd "$(dirname "$0")/.." && pwd) || return 1
     (cd "$root" && cargo build --locked --quiet --package xtask) || { echo "error: cannot build xtask in $root" >&2; return 1; }
-    target=${CARGO_TARGET_DIR:-$root/target}
+    target=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}
     # A relative CARGO_TARGET_DIR is relative to where cargo ran: the repository root.
     case $target in /*) ;; *) target=$root/$target;; esac
     NF_BENCH_XTASK=$target/debug/xtask
@@ -84,7 +85,9 @@ if [ "${1:-}" = "--host" ]; then
     remote_q=$(printf '%q' "$remote")
     trap 'ssh "$host" "rm -f $remote_q"' EXIT
     trap 'exit 130' INT TERM
-    ssh "$host" "NF_BENCH_XTASK=$remote_q bash -s -- $args" < "$0"
+    # The remote shell removes the binary itself when it ends (also when the connection drops: sshd hangs it up); the
+    # trap above is the backstop for a run that never got that far.
+    ssh "$host" "trap 'rm -f $remote_q' EXIT HUP INT TERM; NF_BENCH_XTASK=$remote_q bash -s -- $args" < "$0"
     exit $?
 fi
 

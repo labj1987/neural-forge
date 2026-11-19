@@ -90,7 +90,7 @@ rustup target add --toolchain "$TOOLCHAIN" x86_64-pc-windows-gnu
 bash scripts/fetch-native-tools.sh
 # ── Release build ─────────────────────────────────────────────────────
 echo "==> cargo build --release (protocol/layer/native/gui/cli)"
-cargo build --release --locked
+cargo build --release --locked --workspace --exclude xtask
 
 # The NGX wrapper for Proton (docs/PROTON_NGX.md): a Windows DLL, stamped as a Wine builtin.
 bash scripts/build-ngx-wrapper.sh "${CARGO_TARGET_DIR:-target}/ngx-wrapper/_nvngx.dll"

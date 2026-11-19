@@ -5,7 +5,8 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 
 use super::*;
-use crate::bench_iq::{pyish::py_repr_str, WINDOW};
+use crate::bench_iq::WINDOW;
+use crate::py::repr_str;
 
 macro_rules! check {
     ($cond:expr, $($msg:tt)+) => {
@@ -78,7 +79,7 @@ pub(super) fn python_behaviour() -> Result<(), String> {
     // repr, median, ms.
     check!(py_float_repr(10.2) == "10.2" && py_float_repr(1e-5) == "1e-05" && py_float_repr(1e16) == "1e+16" && py_float_repr(300.0) == "300.0", "float repr");
     check!(py_float_repr(0.0001) == "0.0001" && py_float_repr(123456789012345.6) == "123456789012345.6", "float repr positional");
-    check!(py_repr_str("a'b") == "\"a'b\"" && py_repr_str("it") == "'it'", "str repr");
+    check!(repr_str("a'b") == "\"a'b\"" && repr_str("it") == "'it'", "str repr");
     check!(median(vec![3.0, 1.0, 2.0, 10.0]) == 2.5 && median(vec![5.0]) == 5.0, "median");
     check!(ms("250us")? == Some(0.25) && ms("1.5s")? == Some(1500.0) && ms("300")?.is_none(), "ms");
     check!(ms("1.2.3").is_ok_and(|v| v.is_none()) && ms("1.2.3ms").is_err(), "ms with a bad number");

@@ -31,7 +31,6 @@
 //! .github/workflows/proton-script-check.yml runs it weekly; one issue carries the report.
 
 use crate::check_pins::http::{self, FetchError};
-use crate::check_pins::py_repr;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -106,11 +105,20 @@ fn percent_encode(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"_.-~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
+/// The first non-blank token among the environment variables, trimmed. One with a line break inside is an error (it
+/// would end the Authorization header and start another): it is never sent.
+fn token(vars: [Result<String, std::env::VarError>; 2]) -> Result<Option<String>, String> {
+    let Some(token) = vars.into_iter().filter_map(Result::ok).map(|t| t.trim().to_string()).find(|t| !t.is_empty()) else { return Ok(None) };
+    if token.contains(['\r', '\n']) {
+        return Err("GITHUB_TOKEN/GH_TOKEN contains a line break; refusing to send it".into());
+    }
+    Ok(Some(token))
+}
+
 fn api(path: &str, raw: bool) -> Result<Vec<u8>, Failure> {
     let accept = if raw { "application/vnd.github.raw" } else { "application/vnd.github+json" };
     let mut headers = vec![("Accept".to_string(), accept.to_string()), ("User-Agent".to_string(), USER_AGENT.to_string())];
-    let token = [std::env::var("GITHUB_TOKEN"), std::env::var("GH_TOKEN")].into_iter().filter_map(Result::ok).find(|t| !t.is_empty());
-    if let Some(token) = token {
+    if let Some(token) = token([std::env::var("GITHUB_TOKEN"), std::env::var("GH_TOKEN")]).map_err(Failure::Tool)? {
         headers.push(("Authorization".to_string(), format!("Bearer {token}")));
     }
     let refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -120,19 +128,6 @@ fn api(path: &str, raw: bool) -> Result<Vec<u8>, Failure> {
     })
 }
 
-/// Python's repr() of a parsed JSON value, for the error text that shows what the API answered.
-fn py_repr_json(v: &serde_json::Value) -> String {
-    use serde_json::Value::*;
-    match v {
-        Null => "None".into(),
-        Bool(b) => if *b { "True" } else { "False" }.into(),
-        Number(n) => n.to_string(),
-        String(s) => py_repr(s),
-        Array(a) => format!("[{}]", a.iter().map(py_repr_json).collect::<Vec<_>>().join(", ")),
-        Object(o) => format!("{{{}}}", o.iter().map(|(k, v)| format!("{}: {}", py_repr(k), py_repr_json(v))).collect::<Vec<_>>().join(", ")),
-    }
-}
-
 fn branches_of(repo: &str, api: Api) -> Result<Vec<String>, Failure> {
     let (mut names, mut page) = (Vec::new(), 1);
     loop {
@@ -140,7 +135,7 @@ fn branches_of(repo: &str, api: Api) -> Result<Vec<String>, Failure> {
         let chunk: serde_json::Value = serde_json::from_slice(&body).map_err(|e| Failure::Other(format!("JSONDecodeError: {e}")))?;
         let known: Option<Vec<&str>> = chunk.as_array().and_then(|a| a.iter().map(|b| b.get("name").and_then(|n| n.as_str())).collect());
         let Some(known) = known else {
-            let shown: String = py_repr_json(&chunk).chars().take(200).collect();
+            let shown: String = crate::py::repr(Some(&chunk)).chars().take(200).collect();
             return Err(Failure::Tool(format!("the branch list of {repo} has a shape this check does not know: {shown}")));
         };
         names.extend(known.iter().map(|n| n.to_string()));
@@ -207,27 +202,6 @@ fn decide(state: &str, issue_state: &str, old_body: &str, new_body: &str) -> Vec
     }
 }
 
-/// Python's str.splitlines().
-fn splitlines(s: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut cur = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if matches!(c, '\n' | '\r' | '\x0b' | '\x0c' | '\x1c' | '\x1d' | '\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}') {
-            if c == '\r' && chars.peek() == Some(&'\n') {
-                chars.next();
-            }
-            lines.push(std::mem::take(&mut cur));
-        } else {
-            cur.push(c);
-        }
-    }
-    if !cur.is_empty() {
-        lines.push(cur);
-    }
-    lines
-}
-
 /// The example's output lines for `files` (paths in). `command` replaces the cargo run (NF_CHECK_PROTON_SCRIPT).
 fn run_patch(files: &[PathBuf], command: Option<&str>) -> Result<Vec<String>, Failure> {
     let mut cmd = match command {
@@ -252,7 +226,7 @@ fn run_patch(files: &[PathBuf], command: Option<&str>) -> Result<Vec<String>, Fa
         let (stderr, stdout) = (String::from_utf8_lossy(&out.stderr).trim().to_string(), String::from_utf8_lossy(&out.stdout).trim().to_string());
         return Err(Failure::Tool(format!("the patch check could not run (exit {shown}): {}", if stderr.is_empty() { stdout } else { stderr })));
     }
-    Ok(splitlines(&String::from_utf8_lossy(&out.stdout)))
+    Ok(crate::py::splitlines(&String::from_utf8_lossy(&out.stdout)).into_iter().map(String::from).collect())
 }
 
 /// A scratch directory removed on drop, also when a step fails.
@@ -336,7 +310,7 @@ fn run_with(api: Api, patch: Patch) -> Outcome {
 /// A file as Python's `Path.read_text()` gives it: UTF-8 with universal newlines.
 fn read_text(path: &str) -> Result<String, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
+    Ok(crate::py::universal_newlines(&text))
 }
 
 pub fn main(args: &[String]) -> ExitCode {
@@ -419,6 +393,8 @@ fn exit_code_tests() -> Result<(), String> {
         (http_error(404, "not found", &[]), TOOL),
         (http_error(401, "bad credentials", &[]), TOOL),
         (Failure::Other("KeyError: 'name'".into()), TOOL),
+        // curl itself failed (not the network): the check fails, it is not "retry later".
+        (Failure::Tool("curl failed (exit status 3): URL rejected".into()), TOOL),
     ];
     let no_patch = |_: &[PathBuf]| -> Result<Vec<String>, Failure> { Err(Failure::Other("the patch must not run".into())) };
     for (failure, want) in cases {
@@ -513,9 +489,12 @@ mod tests {
     #[test]
     fn check_proton_scripts_helpers() {
         assert_eq!(percent_encode("cachyos_11.0_20261014/main"), "cachyos_11.0_20261014%2Fmain");
-        assert_eq!(splitlines("a\nb\r\nc\rd"), ["a", "b", "c", "d"]);
-        assert_eq!(splitlines("a\n"), ["a"]);
-        assert_eq!(py_repr_json(&serde_json::json!({"message": "moved", "n": [1, true, null]})), "{'message': 'moved', 'n': [1, True, None]}");
+        let ok = |t: &str| Ok::<String, std::env::VarError>(t.to_string());
+        assert_eq!(token([ok(" abc\n"), ok("other")]), Ok(Some("abc".into())));
+        assert_eq!(token([ok("  \n"), ok("other")]), Ok(Some("other".into())));
+        assert_eq!(token([Err(std::env::VarError::NotPresent), ok("")]), Ok(None));
+        assert!(token([ok("abc\r\nX-Evil: 1"), ok("")]).is_err());
+        assert!(token([ok("abc\ndef"), ok("")]).is_err());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! xtask: the repository's development tasks, one subcommand each (`cargo xtask <task> ...`, the alias in
-//! .cargo/config.toml). Each keeps the flags, output and exit codes of the script it replaced.
+//! .cargo/config.toml). Each keeps the flags, output and exit codes of the script it replaced;
+//! the dispatcher itself exits 64 (EX_USAGE) for no task or an unknown one.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,6 +20,11 @@ mod py;
 mod release_notes;
 mod sync_appdata_releases;
 mod wine_builtin;
+
+/// The exit code of an unknown task or none (sysexits' EX_USAGE). Not 1, 2 or 3: tasks use those for their own
+/// outcomes (check-proton-scripts' network failure is 2, check-pins' nothing-to-bump is 3, bench-iq's usage error is 2),
+/// and no task uses 64, so a caller can tell "no such task" from a task's own result.
+const EX_USAGE: u8 = 64;
 
 type Task = fn(&[String]) -> ExitCode;
 
@@ -50,7 +56,7 @@ fn usage() -> ExitCode {
     for (name, _, what) in TASKS {
         eprintln!("  {name:<24}{what}");
     }
-    ExitCode::from(2)
+    ExitCode::from(EX_USAGE)
 }
 
 fn main() -> ExitCode {

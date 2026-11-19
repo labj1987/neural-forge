@@ -11,8 +11,9 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::bench_iq::pyish::{exists, fixed, glob_dir, join, py_float, py_float_repr, py_sum, read_text, read_text_lossy, splitlines};
+use crate::bench_iq::pyish::{exists, fixed, glob_dir, join, py_float, py_float_repr, py_sum, read_text, read_text_lossy};
 use crate::bench_iq::{self, IqError};
+use crate::py::{repr_str, splitlines};
 
 mod pytime;
 mod selftest;
@@ -37,7 +38,7 @@ static CSV_STAMP: LazyLock<Regex> = LazyLock::new(|| re(r"([0-9]{4}-[0-9]{2}-[0-
 type Fail = String;
 
 fn float(s: &str) -> Result<f64, Fail> {
-    py_float(s).ok_or_else(|| format!("ValueError: could not convert string to float: {}", bench_iq::pyish::py_repr_str(s)))
+    py_float(s).ok_or_else(|| format!("ValueError: could not convert string to float: {}", repr_str(s)))
 }
 
 /// The value of a `[sync]` field: a duration in milliseconds, or the text as it was.
@@ -181,8 +182,7 @@ fn report(label: &str, base: &str, baseline: Option<&str>) -> Result<Option<Row>
         return Ok(None);
     };
     let ts = PASS4_STAMP.captures(p4).ok_or("AttributeError: 'NoneType' object has no attribute 'group'")?[1].to_string();
-    let end = pytime::parse_gta_stamp(&ts)
-        .ok_or_else(|| format!("ValueError: time data {} does not match format '%y-%m-%d-%H-%M-%S'", bench_iq::pyish::py_repr_str(&ts)))?;
+    let end = pytime::parse_gta_stamp(&ts).ok_or_else(|| format!("ValueError: time data {} does not match format '%y-%m-%d-%H-%M-%S'", repr_str(&ts)))?;
     let p4_text = read_text(p4)?;
     let mut ft = Vec::new();
     for line in splitlines(&p4_text).into_iter().skip(1).filter(|l| !l.trim().is_empty()) {
@@ -200,14 +200,13 @@ fn report(label: &str, base: &str, baseline: Option<&str>) -> Result<Option<Row>
         glob_dir(&d, |n| n.starts_with("GTA5_Enhanced_") && n.ends_with(".csv") && n.len() >= 19 && n[..n.len() - 4].ends_with(|c: char| c.is_ascii_digit()))
     {
         let stamp = CSV_STAMP.captures(&m).ok_or("AttributeError: 'NoneType' object has no attribute 'group'")?[1].to_string();
-        let st = pytime::parse_csv_stamp(&stamp)
-            .ok_or_else(|| format!("ValueError: time data {} does not match format '%Y-%m-%d_%H-%M-%S'", bench_iq::pyish::py_repr_str(&stamp)))?;
+        let st =
+            pytime::parse_csv_stamp(&stamp).ok_or_else(|| format!("ValueError: time data {} does not match format '%Y-%m-%d_%H-%M-%S'", repr_str(&stamp)))?;
         let content = read_text(&m)?;
         let mut n = 0_u64;
         for r in splitlines(&content).into_iter().skip(3).filter(|r| !r.trim().is_empty()) {
             let last = r.rsplit(',').next().unwrap_or("");
-            let us = bench_iq::pyish::py_int(last)
-                .ok_or_else(|| format!("ValueError: invalid literal for int() with base 10: {}", bench_iq::pyish::py_repr_str(last)))?;
+            let us = bench_iq::pyish::py_int(last).ok_or_else(|| format!("ValueError: invalid literal for int() with base 10: {}", repr_str(last)))?;
             let t = st + pytime::microseconds(us as f64 / 1000.0);
             if w0 <= t && t <= w1 {
                 n += 1;
@@ -298,13 +297,19 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The command run on the host: the executable arrives on stdin, runs with `args` (already quoted) and is removed when the
+/// remote shell ends, however it ends (exit, or the connection dropping and the shell being hung up).
+fn remote_command(args: &str) -> String {
+    format!("f=$(mktemp) || exit 1; trap 'rm -f \"$f\"' EXIT HUP INT TERM; cat > \"$f\" && chmod +x \"$f\" && \"$f\" bench-report {args}")
+}
+
 /// `--host`: this executable goes along to the host (the way the script sent bench-iq and itself to `python3 -`), runs
 /// there with the remaining arguments and is removed again.
 fn run_on_host(host: &str, rest: &[String]) -> Result<ExitCode, Fail> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let bytes = std::fs::read(&exe).map_err(|e| e.to_string())?;
     let args: Vec<String> = rest.iter().map(|a| shell_quote(a)).collect();
-    let remote = format!("f=$(mktemp) && cat > \"$f\" && chmod +x \"$f\" && \"$f\" bench-report {}; rc=$?; rm -f \"$f\"; exit $rc", args.join(" "));
+    let remote = remote_command(&args.join(" "));
     let mut child = Command::new("ssh").arg(host).arg(remote).stdin(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(&bytes);
@@ -382,5 +387,32 @@ pub fn main(args: &[String]) -> ExitCode {
             eprintln!("bench-report: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs `remote_command` in a local shell with `binary` as the "executable" on stdin; returns the exit code and
+    /// what is left in the shell's temporary directory.
+    fn run_remote(binary: &str) -> (Option<i32>, usize) {
+        let tmp = std::env::temp_dir().join(format!("nf-xtask-remote-test-{}-{}", std::process::id(), binary.len()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut child = Command::new("sh").arg("-c").arg(remote_command("'x'")).env("TMPDIR", &tmp).stdin(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(binary.as_bytes()).unwrap();
+        let status = child.wait().unwrap();
+        let left = std::fs::read_dir(&tmp).unwrap().count();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        (status.code(), left)
+    }
+
+    #[test]
+    fn bench_report_host_binary_is_removed_when_the_remote_shell_ends() {
+        assert_eq!(run_remote("#!/bin/sh\nexit 7\n"), (Some(7), 0));
+        // The shell is hung up while the binary runs (a dropped ssh connection): the copy must still go.
+        let (_, left) = run_remote("#!/bin/sh\nkill -HUP $PPID\n");
+        assert_eq!(left, 0, "the copied binary was left behind");
     }
 }

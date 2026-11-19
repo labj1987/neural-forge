@@ -46,20 +46,29 @@ pub fn render(text: &str, releases: &[(String, String)]) -> String {
 }
 
 pub fn main(args: &[String]) -> ExitCode {
-    let root = crate::root();
+    run(&crate::root(), args)
+}
+
+fn run(root: &Path, args: &[String]) -> ExitCode {
     let changelog = crate::py::universal_newlines(&std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap_or_default());
     let rel = releases(&changelog);
-    let version = cargo_version(&root);
+    let version = cargo_version(root);
     if rel.first().is_none_or(|(v, _)| v != &version) {
         let newest = rel.first().map_or("None", |(v, _)| v.as_str());
         eprintln!("newest CHANGELOG.md release ({newest}) is not the Cargo.toml version {version}: add its `## {version} — YYYY-MM-DD` heading");
         return ExitCode::FAILURE;
     }
-    let Some(path) = appdata(&root) else {
+    let Some(path) = appdata(root) else {
         eprintln!("no data/*.appdata.xml");
         return ExitCode::FAILURE;
     };
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let current = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("{}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
     let updated = render(&current, &rel);
     if args.iter().any(|a| a == "--check") {
         if updated != current {
@@ -94,5 +103,19 @@ mod tests {
         let xml = "<c>\n  <releases>\n    <release version=\"0\" date=\"x\"/>\n  </releases>\n</c>\n";
         let rel = vec![("1.0.0".to_string(), "2026-01-01".to_string())];
         assert_eq!(render(xml, &rel), "<c>\n  <releases>\n    <release version=\"1.0.0\" date=\"2026-01-01\"/>\n  </releases>\n</c>\n");
+    }
+
+    #[test]
+    fn an_unreadable_appdata_file_is_an_error() {
+        let root = std::env::temp_dir().join(format!("nf-xtask-appdata-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // A directory where the file should be: it exists (so it is found) but cannot be read as text.
+        std::fs::create_dir_all(root.join("data/io.test.appdata.xml")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "version = \"1.0.0\"\n").unwrap();
+        std::fs::write(root.join("CHANGELOG.md"), "## 1.0.0 — 2026-01-01\n").unwrap();
+        for args in [vec!["--check".to_string()], vec![]] {
+            assert_eq!(run(&root, &args), ExitCode::FAILURE, "{args:?}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

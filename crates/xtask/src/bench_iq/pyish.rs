@@ -1,5 +1,5 @@
 //! Python's behaviour where the two scripts depend on it: `sum` of floats, `float()`/`int()` parsing, `repr`, `{:.Nf}`,
-//! `os.path.join`, `str.splitlines`, text-mode newline translation. Shared by bench-iq and bench-report.
+//! `os.path.join`, text-mode newline translation. Shared by bench-iq and bench-report.
 
 use std::fs;
 
@@ -51,28 +51,6 @@ fn underscores_out(t: &str) -> Option<String> {
         }
     }
     Some(out)
-}
-
-/// `repr(str)`.
-pub(crate) fn py_repr_str(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
-    let mut out = String::from(quote);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push(quote);
-    out
 }
 
 /// `repr(float)` / `str(float)`: the shortest round-trip digits, exponent form below 1e-4 and from 1e16.
@@ -146,43 +124,16 @@ pub(crate) fn normpath_basename(p: &str) -> String {
     parts.last().map_or(if p.is_empty() || absolute { "" } else { "." }, |l| l).to_string()
 }
 
-/// `str.splitlines()`.
-pub(crate) fn splitlines(s: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut chars = s.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if matches!(c, '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{1c}' | '\u{1d}' | '\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}') {
-            out.push(&s[start..i]);
-            let mut end = i + c.len_utf8();
-            if c == '\r' && chars.peek().is_some_and(|&(_, n)| n == '\n') {
-                chars.next();
-                end += 1;
-            }
-            start = end;
-        }
-    }
-    if start < s.len() {
-        out.push(&s[start..]);
-    }
-    out
-}
-
-/// What text-mode `open().read()` does to line ends.
-pub(crate) fn universal_newlines(s: &str) -> String {
-    s.replace("\r\n", "\n").replace('\r', "\n")
-}
-
 /// `open(path).read()`: UTF-8 (strict), line ends translated. The error is Python's `OSError` text or the decode failure.
 pub(crate) fn read_text(path: &str) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| os_error(&e, path))?;
-    String::from_utf8(bytes).map(|s| universal_newlines(&s)).map_err(|e| format!("'utf-8' codec can't decode byte in {path}: {e}"))
+    String::from_utf8(bytes).map(|s| crate::py::universal_newlines(&s)).map_err(|e| format!("'utf-8' codec can't decode byte in {path}: {e}"))
 }
 
 /// `open(path, errors="replace").read()`.
 pub(crate) fn read_text_lossy(path: &str) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| os_error(&e, path))?;
-    Ok(universal_newlines(&String::from_utf8_lossy(&bytes)))
+    Ok(crate::py::universal_newlines(&String::from_utf8_lossy(&bytes)))
 }
 
 /// Python's `OSError` text: `[Errno 2] No such file or directory: 'path'`.
@@ -190,8 +141,8 @@ pub(crate) fn os_error(e: &std::io::Error, path: &str) -> String {
     let text = e.to_string();
     let text = text.split(" (os error").next().unwrap_or(&text);
     match e.raw_os_error() {
-        Some(n) => format!("[Errno {n}] {text}: {}", py_repr_str(path)),
-        None => format!("{text}: {}", py_repr_str(path)),
+        Some(n) => format!("[Errno {n}] {text}: {}", crate::py::repr_str(path)),
+        None => format!("{text}: {}", crate::py::repr_str(path)),
     }
 }
 
