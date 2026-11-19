@@ -69,10 +69,14 @@ pub fn read_core(bytes: &[u8]) -> Result<Vec<Export>, String> {
             }
         }
     }
-    // GuardCFDispatchFunctionPointer (IMAGE_LOAD_CONFIG_DIRECTORY64, offset 0x78): Control Flow Guard's calls go
-    // through it, to rax.
+    // GuardCFCheckFunctionPointer and GuardCFDispatchFunctionPointer (IMAGE_LOAD_CONFIG_DIRECTORY64, offsets 0x70
+    // and 0x78): Control Flow Guard's check before an indirect call, and its calls through rax.
     let load_config = pe.data_directories().get(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG).and_then(|d| d.data(bytes, &sections).ok());
-    if let Some(dispatch) = load_config.and_then(|c| c.get(0x78..0x80)).map(|b| u64::from_le_bytes(b.try_into().unwrap())).filter(|&va| va != 0) {
+    let pointer_at = |at: usize| load_config.and_then(|c| c.get(at..at + 8)).map(|b| u64::from_le_bytes(b.try_into().unwrap())).filter(|&va| va != 0);
+    if let Some(check) = pointer_at(0x70) {
+        image.set_cfg_check(check);
+    }
+    if let Some(dispatch) = pointer_at(0x78) {
         image.set_cfg_dispatch(dispatch);
     }
     let table = pe.export_table().map_err(|e| format!("its export table: {e}"))?.ok_or("it exports nothing")?;

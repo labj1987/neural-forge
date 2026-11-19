@@ -4,7 +4,7 @@
 //! An export reads its caller when the return address it was called with (`[rsp]` at its entry) reaches the address
 //! argument (`rdx`) of `GetModuleHandleExA`/`W`, called through the import table: in its own code, in code it jumps
 //! to (a tail call keeps the return address), or through at most [`MAX_CALL_DEPTH`] direct calls that pass it on as
-//! an argument. The scan follows registers and the stack slots of each function's frame (pushes, `sub rsp`, moves
+//! an argument (a function that deep is still scanned for its frame, its own calls are not). The scan follows registers and the stack slots of each function's frame (pushes, `sub rsp`, moves
 //! between registers and frame slots, `lea` of frame addresses, `__chkstk`'s `sub rsp, rax`), merges the states where
 //! paths meet, and forgets a value at anything it does not model; it does not follow values through the heap or
 //! through computed jumps (switch tables). Wherever the return address goes that the scan cannot see the end of, it
@@ -41,6 +41,7 @@ pub struct Image<'a> {
     regions: Vec<(u64, &'a [u8])>,
     imports: HashMap<u64, String>,
     cfg_dispatch: Option<u64>,
+    cfg_check: Option<u64>,
 }
 
 impl<'a> Image<'a> {
@@ -58,6 +59,12 @@ impl<'a> Image<'a> {
     /// it calls `rax`.
     pub fn set_cfg_dispatch(&mut self, va: u64) {
         self.cfg_dispatch = Some(va);
+    }
+
+    /// The pointer Control Flow Guard's check before an indirect call goes through (`GuardCFCheckFunctionPointer`):
+    /// it only checks `rcx`, and keeps the argument registers.
+    pub fn set_cfg_check(&mut self, va: u64) {
+        self.cfg_check = Some(va);
     }
 
     fn code_at(&self, va: u64) -> Option<&'a [u8]> {
@@ -79,13 +86,13 @@ pub struct Flow {
     /// A bit per stack argument slot (`[rsp + 8 + 8k]` at entry, the register arguments' home space included) the
     /// function writes: a caller's value there does not survive the call.
     writes_args: u32,
-    /// `rax` is unchanged on every return (a stack probe such as `__chkstk`).
-    keeps_rax: bool,
+    /// A bit per register unchanged on every return (a stack probe such as `__chkstk` keeps rax and the arguments).
+    kept: u16,
 }
 
 impl Default for Flow {
     fn default() -> Self {
-        Flow { sinks: BTreeMap::new(), incomplete: false, writes_args: 0, keeps_rax: true }
+        Flow { sinks: BTreeMap::new(), incomplete: false, writes_args: 0, kept: u16::MAX }
     }
 }
 
@@ -176,8 +183,8 @@ struct State {
     slots: BTreeMap<i64, Val>,
     /// `rax` before the stack probe just called, for its `sub rsp, rax`.
     chkstk: Option<u64>,
-    /// No path to here wrote `rax`.
-    rax_kept: bool,
+    /// A bit per register some path to here wrote.
+    written: u16,
     /// [`Flow::writes_args`] on the paths to here.
     arg_writes: u32,
 }
@@ -193,7 +200,7 @@ impl State {
         for k in 4..MAX_ARGS {
             slots.insert(8 + 8 * i64::from(k), Val::input(1 << k));
         }
-        State { regs, slots, chkstk: None, rax_kept: true, arg_writes: 0 }
+        State { regs, slots, chkstk: None, written: 0, arg_writes: 0 }
     }
 
     /// Merges `other` into `self` ([`Val::join`]). Whether `self` changed.
@@ -215,7 +222,7 @@ impl State {
         if self.chkstk != other.chkstk {
             self.chkstk = None;
         }
-        self.rax_kept &= other.rax_kept;
+        self.written |= other.written;
         self.arg_writes |= other.arg_writes;
         *self != before
     }
@@ -248,9 +255,7 @@ impl State {
     }
 
     fn set_reg(&mut self, g: usize, v: Val) {
-        if g == RAX {
-            self.rax_kept = false;
-        }
+        self.written |= 1 << g;
         self.regs[g] = v;
     }
 }
@@ -331,7 +336,9 @@ impl<'i, 'a> Scanner<'i, 'a> {
             }
         }
         flow.writes_args = states.values().fold(0, |a, s| a | s.arg_writes);
-        flow.keeps_rax &= !flow.incomplete;
+        if flow.incomplete {
+            flow.kept = 0;
+        }
         self.flows.insert((entry, depth), flow.clone());
         flow
     }
@@ -366,15 +373,19 @@ impl<'i, 'a> Scanner<'i, 'a> {
     }
 
     /// A write of `size` bytes (0: unknown) through a memory operand with this base, index and displacement: the
-    /// frame slots it may overwrite are forgotten. With an index, that is every slot of the frame from the base up
-    /// (not the return address and the arguments above it, which no frame array reaches).
+    /// frame slots it may overwrite are forgotten. With an index, that is every slot from the base up: below the entry
+    /// `rsp`, up to it (no frame array reaches the return address and the arguments above it); at or above it, all.
     fn forget_written(st: &mut State, base: Register, index: Register, disp: u64, size: usize) {
         let Some(Known::Stack(d)) = gpr(base).map(|g| st.regs[g].known) else { return };
         let off = d.wrapping_add(disp as i64);
         if index == Register::None {
             st.forget_slots(off, if size == 0 { 8 } else { size as i64 });
-        } else {
+        } else if off < 0 {
             st.forget_slots(off, -off);
+        } else {
+            // An array in the home or argument area: everything above it.
+            let top = st.slots.keys().next_back().map_or(off + 8, |k| k + 8).max(off + 8 * i64::from(MAX_ARGS) + 8);
+            st.forget_slots(off, top - off);
         }
     }
 
@@ -453,19 +464,24 @@ impl<'i, 'a> Scanner<'i, 'a> {
         }
     }
 
-    /// A direct call: what the callee does with its parameters and stack arguments, seen from here. Whether the
-    /// callee keeps `rax`.
-    fn call_direct(&mut self, st: &mut State, target: u64, depth: u32, flow: &mut Flow) -> bool {
-        if depth >= MAX_CALL_DEPTH {
+    /// A direct call: what the callee does with its parameters and stack arguments, seen from here. The registers it
+    /// keeps. A callee [`MAX_CALL_DEPTH`] calls deep is scanned for its frame effects only (a stack probe there still
+    /// counts), and what it passes on is recorded as [`DEPTH_LIMIT`]; its own calls are not scanned.
+    fn call_direct(&mut self, st: &mut State, target: u64, depth: u32, flow: &mut Flow) -> u16 {
+        if depth > MAX_CALL_DEPTH {
             flow.record_register_args(DEPTH_LIMIT, st);
-            return false;
+            return 0;
         }
         let callee = self.flow(target, depth + 1);
         flow.incomplete |= callee.incomplete;
         for ((name, arg), reached) in &callee.sinks {
             for k in 0..MAX_ARGS {
                 if reached.params & (1 << k) != 0 {
-                    flow.record((name, *arg), st.arg(k));
+                    if depth < MAX_CALL_DEPTH {
+                        flow.record((name, *arg), st.arg(k));
+                    } else {
+                        flow.record((DEPTH_LIMIT, k), st.arg(k));
+                    }
                 }
             }
         }
@@ -477,7 +493,7 @@ impl<'i, 'a> Scanner<'i, 'a> {
                 }
             }
         }
-        callee.keeps_rax
+        callee.kept
     }
 
     /// Where a call or jump through operand 0 goes: the import (by its table slot), or `None` for anything else.
@@ -496,19 +512,30 @@ impl<'i, 'a> Scanner<'i, 'a> {
         }
     }
 
-    /// A call or tail jump through operand 0: records what reaches the import's (or the unknown callee's) register
-    /// arguments (the scan cannot tell how many arguments it takes, so its stack ones are not looked at), and for a
-    /// jump that is not to an import, what its target finds at `[rsp]`.
-    fn call_indirect(&self, st: &State, i: &Instruction, flow: &mut Flow) {
-        match self.indirect_import(st, i).and_then(|slot| self.image.imports.get(&slot)) {
-            Some(name) => flow.record_register_args(name, st),
-            None => {
-                flow.record_register_args(INDIRECT_CALL, st);
-                if let (FlowControl::IndirectBranch, Known::Stack(d)) = (i.flow_control(), st.regs[RSP].known) {
-                    flow.record((INDIRECT_JUMP, 0), st.slots.get(&d).copied().unwrap_or(Val::UNKNOWN));
+    /// A call or jump through operand 0: records what reaches the import's (or the unknown callee's) register
+    /// arguments (the scan cannot tell how many arguments it takes, so its stack ones are not looked at). A jump that
+    /// is not to an import is a tail call only with the frame gone (`rsp` back at its entry): then what its target
+    /// finds at `[rsp]` is recorded too; a jump within a frame is a computed jump (a switch) and records nothing. The
+    /// registers the callee keeps: Control Flow Guard's check keeps all but rax, r10 and r11, anything else none.
+    fn call_indirect(&self, st: &State, i: &Instruction, flow: &mut Flow) -> u16 {
+        if i.op0_kind() == OpKind::Memory {
+            if let (Some(Addr::Abs(va)), Some(check)) = (Self::mem_addr(st, i), self.image.cfg_check) {
+                if va == check {
+                    return !((1 << RAX) | (1 << 10) | (1 << 11));
                 }
             }
         }
+        let tail = i.flow_control() == FlowControl::IndirectBranch;
+        match self.indirect_import(st, i).and_then(|slot| self.image.imports.get(&slot)) {
+            Some(name) => flow.record_register_args(name, st),
+            None if !tail => flow.record_register_args(INDIRECT_CALL, st),
+            None if st.regs[RSP].known == Known::Stack(0) => {
+                flow.record_register_args(INDIRECT_CALL, st);
+                flow.record((INDIRECT_JUMP, 0), st.slots.get(&0).copied().unwrap_or(Val::UNKNOWN));
+            }
+            None => {}
+        }
+        0
     }
 
     /// Runs one instruction on `st`; the addresses that follow it.
@@ -517,30 +544,31 @@ impl<'i, 'a> Scanner<'i, 'a> {
         let next = i.next_ip();
         match i.flow_control() {
             FlowControl::Return => {
-                flow.keeps_rax &= st.rax_kept;
+                flow.kept &= !st.written;
                 return vec![];
             }
             FlowControl::Interrupt | FlowControl::Exception | FlowControl::XbeginXabortXend => return vec![],
             FlowControl::UnconditionalBranch => return vec![i.near_branch_target()],
             FlowControl::ConditionalBranch => return vec![i.near_branch_target(), next],
             FlowControl::IndirectBranch => {
-                // A tail call through a pointer; a computed jump within the function (a switch table) is not
-                // followed, and counts as an indirect call.
+                // A tail call through a pointer, or a computed jump within the function (a switch table): neither
+                // is followed.
                 self.call_indirect(st, i, flow);
-                flow.keeps_rax = false;
+                flow.kept = 0;
                 return vec![];
             }
             FlowControl::Call | FlowControl::IndirectCall => {
                 // The callee sees rsp - 8, so its stack arguments are this frame's [rsp + 8k], as State::arg reads them.
                 let rax = st.regs[RAX];
-                let keeps_rax = if i.flow_control() == FlowControl::Call {
+                let kept = if i.flow_control() == FlowControl::Call {
                     self.call_direct(st, i.near_branch_target(), depth, flow)
                 } else {
-                    self.call_indirect(st, i, flow);
-                    false
+                    self.call_indirect(st, i, flow)
                 };
                 for r in VOLATILE {
-                    st.set_reg(r, Val::UNKNOWN);
+                    if kept & (1 << r) == 0 {
+                        st.set_reg(r, Val::UNKNOWN);
+                    }
                 }
                 // The callee's home space for the register arguments, within this function's own frame (a call
                 // made before the frame is set up, as `__chkstk`'s, does not write it).
@@ -548,7 +576,7 @@ impl<'i, 'a> Scanner<'i, 'a> {
                     st.forget_slots(d, (0x20).min(-d));
                 }
                 // A stack probe (`__chkstk`) keeps rax, the frame's size, for the `sub rsp, rax` after it.
-                if let (true, Known::Const(c)) = (keeps_rax, rax.known) {
+                if let (true, Known::Const(c)) = (kept & (1 << RAX) != 0, rax.known) {
                     st.chkstk = Some(c);
                 }
                 return vec![next];
@@ -660,14 +688,23 @@ mod tests {
         other: CodeLabel,
         /// Control Flow Guard's dispatch pointer (not an import).
         cfg: CodeLabel,
+        /// Control Flow Guard's check pointer.
+        check: CodeLabel,
     }
 
     /// Assembles `build`'s code at [`BASE`] and scans the function at the label it returns.
     fn scan(build: impl FnOnce(&mut CodeAssembler, Iat) -> Result<CodeLabel, IcedError>) -> Flow {
         let mut a = CodeAssembler::new(64).unwrap();
-        let iat = Iat { gmhe_a: a.create_label(), gmfn_w: a.create_label(), gmhe_w: a.create_label(), other: a.create_label(), cfg: a.create_label() };
+        let iat = Iat {
+            gmhe_a: a.create_label(),
+            gmfn_w: a.create_label(),
+            gmhe_w: a.create_label(),
+            other: a.create_label(),
+            cfg: a.create_label(),
+            check: a.create_label(),
+        };
         let entry = build(&mut a, iat).unwrap();
-        let mut slots = [iat.gmhe_a, iat.gmfn_w, iat.gmhe_w, iat.other, iat.cfg];
+        let mut slots = [iat.gmhe_a, iat.gmfn_w, iat.gmhe_w, iat.other, iat.cfg, iat.check];
         for slot in &mut slots {
             a.set_label(slot).unwrap();
             a.dq(&[0]).unwrap();
@@ -679,6 +716,7 @@ mod tests {
             image.add_import(result.label_ip(slot).unwrap(), name);
         }
         image.set_cfg_dispatch(result.label_ip(&slots[4]).unwrap());
+        image.set_cfg_check(result.label_ip(&slots[5]).unwrap());
         let code = result.inner.code_buffer;
         image.add_code(BASE, &code);
         Scanner::new(&image).function(entry_va)
@@ -900,6 +938,40 @@ mod tests {
         assert!(!beyond.reads_caller());
         // Not silently: the return address is reported as passed to a call the scan did not follow.
         assert_eq!(beyond.return_address_sinks(), BTreeSet::from([(DEPTH_LIMIT.to_string(), 0)]));
+        // The deepest function followed keeps its frame through a stack probe it calls.
+        let probed = |n: u32| {
+            scan(move |a, iat| {
+                let mut chk = a.create_label();
+                a.set_label(&mut chk)?;
+                a.ret()?;
+                let mut labels: Vec<CodeLabel> = (0..=n).map(|_| a.create_label()).collect();
+                a.set_label(&mut labels[0])?;
+                a.mov(qword_ptr(rsp + 8), rcx)?;
+                a.mov(eax, 0x2010)?;
+                a.call(chk)?;
+                a.sub(rsp, rax)?;
+                a.mov(rdx, qword_ptr(rsp + 0x2018))?;
+                a.call(qword_ptr(iat.gmhe_a))?;
+                a.add(rsp, 0x2010)?;
+                a.ret()?;
+                for k in 1..=n as usize {
+                    let callee = labels[k - 1];
+                    a.set_label(&mut labels[k])?;
+                    a.sub(rsp, 0x28)?;
+                    if k == n as usize {
+                        a.mov(rcx, qword_ptr(rsp + 0x28))?;
+                    }
+                    a.call(callee)?;
+                    a.add(rsp, 0x28)?;
+                    a.ret()?;
+                }
+                Ok(labels[n as usize])
+            })
+        };
+        for n in 1..=MAX_CALL_DEPTH {
+            let f = probed(n);
+            assert!(f.reads_caller() && !f.return_address_sinks().iter().any(|(name, _)| name == DEPTH_LIMIT), "{n}: {f:?}");
+        }
     }
 
     #[test]
@@ -1107,5 +1179,75 @@ mod tests {
         });
         assert!(f.reads_caller(), "{f:?}");
         assert!(f.return_address_sinks().contains(&("VirtualQuery".to_string(), 0)), "{f:?}");
+    }
+
+    #[test]
+    fn a_stack_probe_keeps_the_argument_registers() {
+        let f = scan(|a, iat| {
+            let mut entry = a.create_label();
+            let mut chk = a.create_label();
+            a.set_label(&mut chk)?;
+            a.ret()?;
+            a.set_label(&mut entry)?;
+            a.mov(rcx, qword_ptr(rsp))?;
+            a.mov(eax, 0x2000)?;
+            a.call(chk)?;
+            a.sub(rsp, rax)?;
+            a.mov(rdx, rcx)?;
+            a.call(qword_ptr(iat.gmhe_a))?;
+            a.add(rsp, 0x2000)?;
+            a.ret()?;
+            Ok(entry)
+        });
+        assert!(f.reads_caller(), "{f:?}");
+    }
+
+    #[test]
+    fn a_switch_and_the_guard_check_hand_nothing_on() {
+        // A computed jump within the frame with the return address in rcx: not a tail call.
+        let f = scan(|a, _iat| {
+            let mut entry = a.create_label();
+            a.set_label(&mut entry)?;
+            a.sub(rsp, 0x28)?;
+            a.mov(rcx, qword_ptr(rsp + 0x28))?;
+            a.jmp(rax)?;
+            Ok(entry)
+        });
+        assert!(f.return_address_sinks().is_empty(), "{f:?}");
+        // Control Flow Guard's check (rcx = the target) keeps rdx for the call that follows it.
+        let f = scan(|a, iat| {
+            let mut entry = a.create_label();
+            a.set_label(&mut entry)?;
+            a.sub(rsp, 0x28)?;
+            a.mov(rdx, qword_ptr(rsp + 0x28))?;
+            a.mov(rcx, qword_ptr(iat.gmhe_a))?;
+            a.mov(rbx, rcx)?;
+            a.call(qword_ptr(iat.check))?;
+            a.call(rbx)?;
+            a.add(rsp, 0x28)?;
+            a.ret()?;
+            Ok(entry)
+        });
+        assert!(f.reads_caller(), "{f:?}");
+        assert_eq!(f.return_address_sinks().len(), 1, "{f:?}");
+    }
+
+    #[test]
+    fn an_indexed_write_above_the_entry_forgets_what_is_there() {
+        // The return address kept in the home space, then an array write into the home space.
+        let f = scan(|a, iat| {
+            let mut entry = a.create_label();
+            a.set_label(&mut entry)?;
+            a.mov(rax, qword_ptr(rsp))?;
+            a.mov(qword_ptr(rsp + 0x10), rax)?;
+            a.mov(qword_ptr(rsp + rcx * 8 + 8), 0)?;
+            a.sub(rsp, 0x28)?;
+            a.mov(rdx, qword_ptr(rsp + 0x38))?;
+            a.call(qword_ptr(iat.gmhe_a))?;
+            a.add(rsp, 0x28)?;
+            a.ret()?;
+            Ok(entry)
+        });
+        assert!(!f.reads_caller(), "{f:?}");
     }
 }
