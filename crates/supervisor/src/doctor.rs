@@ -998,6 +998,18 @@ fn check_proton(roots: &Roots) -> Vec<Finding> {
                     t.dir.display().to_string(),
                     Some("Close Steam, then make it again in the Setup tab (or `neural-forge-cli proton-tool update`): its games move to the new copy.".into()),
                 ));
+            } else if proton_tool::source_gone(t) && std::fs::read_to_string(t.dir.join("proton")).is_ok_and(|s| !proton_tool::has_current_overrides(&s)) {
+                out.push(Finding::new(
+                    CHECK,
+                    Severity::Warning,
+                    format!(
+                        "{} was made by an older Neural Forge from {}, which is no longer installed: its script cannot be made again, so its NGX wrapper loads NVIDIA's core from the driver's folder",
+                        t.name,
+                        t.source.display()
+                    ),
+                    t.dir.display().to_string(),
+                    Some("Switch its games off, choose an installed Proton for them in Steam, and switch them on again: that makes a new copy.".into()),
+                ));
             } else if proton_tool::source_gone(t) && !proton_tool::steam_cloud_blind(t) {
                 // (Named without "Proton", it is renamed: the Steam Cloud finding above says so.)
                 out.push(Finding::new(
