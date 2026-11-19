@@ -897,7 +897,44 @@ fn check_ngx_versions(roots: &Roots) -> Vec<Finding> {
         (n, 0) => format!("NGX versions: {n} game(s) recorded their loaded DLSS files"),
         (n, w) => format!("NGX versions: {n} game(s) recorded their loaded DLSS files; in {w} of them the last run created no DLSS feature"),
     };
-    vec![Finding::new("ngx-versions", Severity::Info, summary, nv::render(core.as_deref(), &records, &files), None)]
+    let mut out = vec![Finding::new("ngx-versions", Severity::Info, summary, nv::render(core.as_deref(), &records, &files), None)];
+    out.extend(core_name_findings(&on, &records));
+    out
+}
+
+/// NVIDIA's DLSS DLLs take calls only from a module whose path holds a lower-case `nvngx.dll`
+/// ([`crate::proton_tool::NGX_RUNTIME_MARK`], docs/PROTON_NGX.md): a core named otherwise (by `NEURAL_FORGE_NGX_CORE`)
+/// gets every call refused and DLSS never starts. Warned about from a switched-on game's launch options and from the
+/// core a game's last run loaded (the wrapper's record).
+fn core_name_findings(on: &[&crate::steam::Game], records: &[(String, Option<std::time::Duration>, crate::ngx_versions::Record)]) -> Vec<Finding> {
+    use crate::proton_tool::{ngx_core_option, NGX_RUNTIME_MARK};
+    const CHECK: &str = "ngx-core-name";
+    let why = format!("NVIDIA's DLSS DLLs refuse calls from a core whose path lacks a lower-case \u{201c}{NGX_RUNTIME_MARK}\u{201d}, so DLSS never starts");
+    let mut out = Vec::new();
+    for g in on {
+        let Some(core) = enabled_options(g).as_deref().and_then(ngx_core_option) else { continue };
+        if !core.contains(NGX_RUNTIME_MARK) {
+            out.push(Finding::new(
+                CHECK,
+                Severity::Warning,
+                format!("{}'s launch options load NVIDIA's NGX core from {core}: {why}", g.name),
+                format!("{} ({}): NEURAL_FORGE_NGX_CORE={core}", g.name, g.appid),
+                Some("Name the file _nvngx.dll (any folder), or take NEURAL_FORGE_NGX_CORE out of the launch options.".into()),
+            ));
+        }
+    }
+    for (file, _, r) in records {
+        if let Some(m) = r.modules.iter().find(|m| m.role == "core" && !m.path.contains(NGX_RUNTIME_MARK)) {
+            out.push(Finding::new(
+                CHECK,
+                Severity::Warning,
+                format!("{} ran NVIDIA's NGX core from {} in its last run: {why}", r.exe, m.path),
+                format!("{file}: core {}", m.path),
+                Some("Name the file _nvngx.dll (any folder), or take NEURAL_FORGE_NGX_CORE out of the game's launch options.".into()),
+            ));
+        }
+    }
+    out
 }
 
 /// Since 4.0 the layer works only in games run with a Neural Forge Proton (`proton_tool`): the NGX wrapper must be
@@ -1775,6 +1812,25 @@ mod tests {
     }
 
     use super::*;
+
+    /// A core whose path lacks lower-case nvngx.dll (NVIDIA's DLSS DLLs refuse its calls) is warned about from the record.
+    #[test]
+    fn warns_about_a_core_path_without_nvngx_dll() {
+        let record = |core: &str| {
+            crate::ngx_versions::parse_record(&format!(
+                "neural-forge-ngx-modules 1\nwrapper=4.6.2\nexe=g.exe\nstage=core-loaded\ncore\t_nvngx.dll\t1.0.0.0\t{core}\n"
+            ))
+            .unwrap()
+        };
+        let records = vec![
+            ("1-g.txt".to_string(), None, record(r"C:\windows\system32\neural-forge\_nvngx.dll")),
+            ("2-g.txt".to_string(), None, record(r"C:\nfc\_nvngx_core.dll")),
+        ];
+        let found = core_name_findings(&[], &records);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].check, found[0].severity), ("ngx-core-name", Severity::Warning));
+        assert!(found[0].summary.contains(r"C:\nfc\_nvngx_core.dll") && found[0].evidence.starts_with("2-g.txt"), "{found:?}");
+    }
     use std::sync::atomic::AtomicU64;
 
     /// A fixture tree: every root under one temporary directory, the commands answering `smi`/`journal`.

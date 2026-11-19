@@ -459,7 +459,13 @@ fn resolve(this: Handle) -> Result<String, String> {
         (Err(e), None) => return Err(e),
     };
     CORE.store(core, Ordering::Release);
-    crate::modules::set_core_load(format!("{} ({source})", module_path(core)));
+    let loaded = module_path(core);
+    if let Some(warning) = core_copy::name_warning(&loaded) {
+        // In the text log and the trace (`log` writes both), and in the NGX versions record `doctor` reads.
+        log(&format!("WARNING: {warning}"));
+        source = format!("{source}; WARNING: {warning}");
+    }
+    crate::modules::set_core_load(format!("{loaded} ({source})"));
     let lookup = |name: &str| -> *const c_void {
         let cname: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
         unsafe { GetProcAddress(core, cname.as_ptr()) }

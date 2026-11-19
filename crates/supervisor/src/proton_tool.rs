@@ -978,6 +978,21 @@ fn rings(dir: &Path) -> Vec<(PathBuf, u32)> {
 /// (`crates/ngx-wrapper/src/core_copy.rs`, `COPY_DIR` and `COPY_NAME`).
 pub const CORE_COPY_DIR: &str = "neural-forge";
 pub const CORE_COPY_NAME: &str = "_nvngx.dll";
+/// What NVIDIA's DLSS DLLs look for, case-sensitively, in the path of the module that calls them (the wrapper's
+/// `core_copy::NGX_RUNTIME_MARK`): a core loaded from a path without it gets every call refused, and DLSS never starts.
+pub const NGX_RUNTIME_MARK: &str = "nvngx.dll";
+
+/// The value of `NEURAL_FORGE_NGX_CORE=` in a game's launch options (quoted or not), if set.
+pub fn ngx_core_option(options: &str) -> Option<String> {
+    const KEY: &str = "NEURAL_FORGE_NGX_CORE=";
+    let at = options.match_indices(KEY).map(|(i, _)| i).find(|&i| i == 0 || options.as_bytes()[i - 1].is_ascii_whitespace())?;
+    let rest = &options[at + KEY.len()..];
+    let value = match rest.chars().next() {
+        Some(q @ ('\'' | '"')) => rest[1..].split(q).next().unwrap_or_default(),
+        _ => rest.split(char::is_whitespace).next().unwrap_or_default(),
+    };
+    Some(value.to_string()).filter(|v| !v.is_empty())
+}
 
 /// The NGX wrapper's core folders in the prefixes of the Steam library `library` (`steamapps/compatdata/<app
 /// id>/pfx/drive_c/windows/system32/neural-forge`) that hold nothing but its copy (and temporary copies it left): a
@@ -1112,6 +1127,18 @@ mod tests {
         let src = include_str!("../../ngx-wrapper/src/core_copy.rs");
         assert!(src.contains(&format!("pub const COPY_DIR: &str = \"{CORE_COPY_DIR}\";")), "COPY_DIR");
         assert!(src.contains(&format!("pub const COPY_NAME: &str = \"{CORE_COPY_NAME}\";")), "COPY_NAME");
+        assert!(src.contains(&format!("pub const NGX_RUNTIME_MARK: &str = \"{NGX_RUNTIME_MARK}\";")), "NGX_RUNTIME_MARK");
+        assert!(CORE_COPY_NAME.contains(NGX_RUNTIME_MARK));
+    }
+
+    #[test]
+    fn reads_the_ngx_core_launch_option() {
+        assert_eq!(ngx_core_option("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_NGX_CORE=/x/_nvngx_core.dll %command%").as_deref(), Some("/x/_nvngx_core.dll"));
+        assert_eq!(ngx_core_option("NEURAL_FORGE_NGX_CORE='C:\\nf c\\nvngx_core.dll' %command%").as_deref(), Some("C:\\nf c\\nvngx_core.dll"));
+        assert_eq!(ngx_core_option("A=1 NEURAL_FORGE_NGX_CORE=\"/a b/_nvngx.dll\" %command%").as_deref(), Some("/a b/_nvngx.dll"));
+        assert_eq!(ngx_core_option("X_NEURAL_FORGE_NGX_CORE=/y %command%"), None);
+        assert_eq!(ngx_core_option("NEURAL_FORGE_NGX_CORE= %command%"), None);
+        assert_eq!(ngx_core_option("%command%"), None);
     }
 
     /// `doctor` reports a ring of another version than the layer reads: the same number.

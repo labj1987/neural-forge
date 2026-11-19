@@ -15,6 +15,8 @@ first shipped them; their phase is kept as a subheading.
 - Diagnose and `doctor` check each Neural Forge Proton copy's NGX wrapper: that it is there and is the file Neural
   Forge put there, that the copy's `proton` script sets the DLL overrides it needs, and that the copy's Wine version is
   one Neural Forge was checked with. A wrapper file that was replaced is put back when Neural Forge starts.
+- A core named by `NEURAL_FORGE_NGX_CORE` whose path lacks a lower-case `nvngx.dll` is now warned about in the NGX
+  log, the trace and Diagnose: NVIDIA's DLSS files refuse calls from it, so DLSS silently never started.
 - With `XDG_STATE_HOME` set, the NGX wrapper now writes that record where Neural Forge reads it (it used to write it
   under your home's `.local/state`, so Diagnose showed nothing).
 

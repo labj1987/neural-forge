@@ -39,9 +39,17 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   (`crates/ngx-wrapper/src/core_copy.rs`), so the core runs, as under stock Proton, from a folder without DLSS feature
   DLLs and under its own name. NVIDIA's core treats the folder it runs from as a place of its own (see "Where the core
   looks for feature DLLs" below), and the driver's `nvidia/wine` folder holds NVIDIA's `nvngx_dlssg.dll` and
-  `nvngx_dlssd.dll`; Indiana Jones and the Great Circle crashed only with the core loaded from there (#51). The name
-  must stay `_nvngx.dll`: loaded as `_nvngx_core.dll` (or #51's `nvngx_core.dll`) the core answers every call the
-  same, but the game never creates a DLSS feature. Wine would hand a module of that name to the wrapper
+  `nvngx_dlssd.dll`; Indiana Jones and the Great Circle crashed only with the core loaded from there (#51). The copy
+  keeps the name `_nvngx.dll`: NVIDIA's feature DLLs (`nvngx_dlss.dll`, `nvngx_dlssd.dll`, `nvngx_dlssg.dll`; 310.4 to 310.9 and the driver's
+  copies, read in Ghidra) check who calls each of their NGX exports: `GetModuleHandleExA(FROM_ADDRESS)` on the return
+  address, `GetModuleFileNameW`, and a case-sensitive `wcsstr(path, L"nvngx.dll")`; a caller whose path lacks it gets
+  `0xBAD00002` and the log line "Error: Not called from NGX runtime". So the core's path must contain `nvngx.dll` in
+  lower case (in any folder): as `_nvngx_core.dll`, `nvngx_core.dll` or `_NVNGX.DLL` DLSS never starts. The wrapper says so in its text log, its trace and its
+  NGX versions record (so `doctor` warns) when the core it loaded breaks the rule (`core_copy::name_warning`: one
+  named by `NEURAL_FORGE_NGX_CORE`), and `doctor` warns about such a `NEURAL_FORGE_NGX_CORE` in a game's launch
+  options. Nothing else depends on the name: the game's NGX loader (in `sl.common.dll`) compares no name after the
+  load, the core uses only its folder, and nothing calls `GetModuleHandle("_nvngx.dll")`, so the wrapper and the core
+  sharing a base name is safe. Wine would hand a module of that name to the wrapper
   (`_nvngx=b`), so the Proton copy also sets `C:\windows\system32\neural-forge\_nvngx=n`: a full-path key is
   looked up before the base name. Each time Neural Forge renews the wrapper in its copies (`refresh_wrapper`, at start and
   after an update), it also makes a copy's `proton` script again from its source's when they differ; a copy whose source is no
@@ -410,7 +418,11 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
   made the same NGX calls with the same results up to `GetCapabilityParameters` (trace and NGX log identical), and
   then never called `UpdateFeature` or `CreateFeature` (no DLSS, 2 of 2 runs); as `C:\nfc\_nvngx.dll` and as
   `system32\neural-forge\_nvngx.dll` it ran DLSS and Frame Generation as with the driver's file. That is #51's "DLSS
-  never starts" with `C:\nfcore\nvngx_core.dll`. In #51 (Indiana Jones and the Great Circle: Vulkan, Streamline with
+  never starts" with `C:\nfcore\nvngx_core.dll`. Why (Ghidra, the feature DLLs 310.4 to 310.9 and the driver's
+  copies): every NGX export of `nvngx_dlss.dll`, `nvngx_dlssd.dll` and `nvngx_dlssg.dll` looks its caller's module up
+  from the return address and refuses one whose path lacks `nvngx.dll` (case-sensitive `wcsstr`) with `0xBAD00002`,
+  "Error: Not called from NGX runtime - %S". The game-side loader (`sl.common.dll`) compares no name after the load.
+  The 20 exports `READS_CALLER` names are exactly 620.73's that read their caller. In #51 (Indiana Jones and the Great Circle: Vulkan, Streamline with
   DLSS, Ray Reconstruction and Frame Generation) the core loaded from the driver's folder reported a third feature
   supported, `UpdateFeature` ran for each feature, and the game's present timed out (`VK_TIMEOUT`) about 5 s after its
   swapchain. Whether the core's folder alone (the stock layout the wrapper now uses) avoids that is for the reporter

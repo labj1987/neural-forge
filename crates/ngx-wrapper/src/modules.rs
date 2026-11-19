@@ -384,7 +384,9 @@ mod win {
     fn note(stage: Stage) {
         let mut own = core::ptr::null_mut();
         unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, note_loaded as *const c_void, &mut own) };
-        let mut found: Vec<(Handle, String)> = loaded().into_iter().filter(|(_, p)| is_ngx_module(file_name(p))).collect();
+        // NVIDIA's core whatever its name (`NEURAL_FORGE_NGX_CORE` may name it otherwise: `doctor` warns about that).
+        let core = crate::win::core_module();
+        let mut found: Vec<(Handle, String)> = loaded().into_iter().filter(|(h, p)| *h == core || is_ngx_module(file_name(p))).collect();
         found.sort_by_key(|a| a.1.to_ascii_lowercase());
         let paths: Vec<String> = found.iter().map(|(_, p)| p.clone()).collect();
         // Held through the write, so two threads cannot write an older set last.
