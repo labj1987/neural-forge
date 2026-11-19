@@ -704,6 +704,8 @@ pub struct Chain {
     pub unverified: Option<String>,
     /// What passed.
     pub passed: Vec<String>,
+    /// Its Wine is older than [`MIN_WINE_MAJOR`] or unreadable: `doctor`'s own failure, so the chain is not said to check out.
+    pub wine_unsupported: bool,
 }
 
 /// The static check of `tool`'s wrapper chain, without running anything: its wrapper is there, is a Wine builtin
@@ -770,7 +772,7 @@ pub fn check_chain(tool: &Tool, installed: Option<&str>) -> Chain {
             ))
         }
         // Older than Neural Forge supports, or unreadable: `doctor`'s Wine version finding.
-        _ => {}
+        _ => c.wine_unsupported = true,
     }
     c
 }
@@ -982,18 +984,6 @@ pub const CORE_COPY_NAME: &str = "_nvngx.dll";
 /// `core_copy::NGX_RUNTIME_MARK`): a core loaded from a path without it gets every call refused, and DLSS never starts.
 pub const NGX_RUNTIME_MARK: &str = "nvngx.dll";
 
-/// The value of `NEURAL_FORGE_NGX_CORE=` in a game's launch options (quoted or not), if set.
-pub fn ngx_core_option(options: &str) -> Option<String> {
-    const KEY: &str = "NEURAL_FORGE_NGX_CORE=";
-    let at = options.match_indices(KEY).map(|(i, _)| i).find(|&i| i == 0 || options.as_bytes()[i - 1].is_ascii_whitespace())?;
-    let rest = &options[at + KEY.len()..];
-    let value = match rest.chars().next() {
-        Some(q @ ('\'' | '"')) => rest[1..].split(q).next().unwrap_or_default(),
-        _ => rest.split(char::is_whitespace).next().unwrap_or_default(),
-    };
-    Some(value.to_string()).filter(|v| !v.is_empty())
-}
-
 /// The NGX wrapper's core folders in the prefixes of the Steam library `library` (`steamapps/compatdata/<app
 /// id>/pfx/drive_c/windows/system32/neural-forge`) that hold nothing but its copy (and temporary copies it left): a
 /// folder with anything else in it, or a link, is not listed.
@@ -1129,16 +1119,6 @@ mod tests {
         assert!(src.contains(&format!("pub const COPY_NAME: &str = \"{CORE_COPY_NAME}\";")), "COPY_NAME");
         assert!(src.contains(&format!("pub const NGX_RUNTIME_MARK: &str = \"{NGX_RUNTIME_MARK}\";")), "NGX_RUNTIME_MARK");
         assert!(CORE_COPY_NAME.contains(NGX_RUNTIME_MARK));
-    }
-
-    #[test]
-    fn reads_the_ngx_core_launch_option() {
-        assert_eq!(ngx_core_option("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_NGX_CORE=/x/_nvngx_core.dll %command%").as_deref(), Some("/x/_nvngx_core.dll"));
-        assert_eq!(ngx_core_option("NEURAL_FORGE_NGX_CORE='C:\\nf c\\nvngx_core.dll' %command%").as_deref(), Some("C:\\nf c\\nvngx_core.dll"));
-        assert_eq!(ngx_core_option("A=1 NEURAL_FORGE_NGX_CORE=\"/a b/_nvngx.dll\" %command%").as_deref(), Some("/a b/_nvngx.dll"));
-        assert_eq!(ngx_core_option("X_NEURAL_FORGE_NGX_CORE=/y %command%"), None);
-        assert_eq!(ngx_core_option("NEURAL_FORGE_NGX_CORE= %command%"), None);
-        assert_eq!(ngx_core_option("%command%"), None);
     }
 
     /// `doctor` reports a ring of another version than the layer reads: the same number.
@@ -1545,7 +1525,7 @@ mod tests {
         let installed = crate::install::digest(&std::fs::read(&wrapper).unwrap());
         let t = create(&root, &sources(&root, &[]).remove(0), &wrapper).unwrap().tool;
         let good = check_chain(&t, Some(&installed));
-        assert!(good.broken.is_empty() && good.degraded.is_empty() && good.unverified.is_none(), "{good:?}");
+        assert!(good.broken.is_empty() && good.degraded.is_empty() && good.unverified.is_none() && !good.wine_unsupported, "{good:?}");
         assert_eq!(good.passed.len(), 5, "{good:?}");
         assert!(good.passed[0].contains("this Neural Forge's") && good.passed[4].contains("Wine 11.0"), "{good:?}");
         // The overrides the script must carry are the ones `added_lines` writes.
@@ -1599,6 +1579,9 @@ mod tests {
         fake_ntdll(&t.dir, "lib", "9.0");
         let old = check_chain(&t, None);
         assert!(old.unverified.is_none() && !old.passed.iter().any(|p| p.contains("load order")), "older Wine is doctor's own failure");
+        assert!(old.wine_unsupported && !check_chain(&t, None).passed.is_empty());
+        std::fs::remove_file(t.dir.join("files/lib/wine/x86_64-unix/ntdll.so")).unwrap();
+        assert!(check_chain(&t, None).wine_unsupported, "an unreadable Wine version");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

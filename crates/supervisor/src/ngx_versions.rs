@@ -161,7 +161,7 @@ pub fn read_records(state_dir: &Path, now: SystemTime) -> Vec<(String, Option<Du
         .collect()
 }
 
-fn ago(age: Option<Duration>) -> String {
+pub(crate) fn ago(age: Option<Duration>) -> String {
     match age.map(|a| a.as_secs()) {
         None => "at an unknown time".into(),
         Some(s) if s < 120 => "just now".into(),
