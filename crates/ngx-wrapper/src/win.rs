@@ -29,6 +29,7 @@ extern "system" {
     fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
     fn GetModuleFileNameW(module: Handle, buf: *mut u16, len: u32) -> u32;
     fn GetSystemDirectoryW(buf: *mut u16, len: u32) -> u32;
+    fn FreeLibrary(module: Handle) -> i32;
 }
 
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -421,6 +422,8 @@ fn load_core(this: Handle, path: &str) -> Result<Handle, String> {
         return Err(format!("NVIDIA's NGX core {path} did not load"));
     }
     if core == this {
+        // The reference this load took on the wrapper goes back (the loader holds others while its DllMain runs).
+        unsafe { FreeLibrary(core) };
         return Err(format!("{path} resolved to this wrapper (the full-path native override is missing)"));
     }
     Ok(core)
