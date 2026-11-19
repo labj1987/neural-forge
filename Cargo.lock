@@ -2894,6 +2894,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "iced-x86"
+version = "1.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c23ad4d19dca41180e835ef6fbd2c1ee655777eca086ad80dd517e0513322879"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3848,9 +3857,11 @@ dependencies = [
 name = "neural-forge-supervisor"
 version = "4.6.2"
 dependencies = [
+ "iced-x86",
  "libc",
  "miniz_oxide 0.9.1",
  "neural-forge-protocol",
+ "object",
  "serde_json",
  "sha2 0.11.1",
 ]

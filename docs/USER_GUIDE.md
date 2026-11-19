@@ -519,7 +519,8 @@ The CLI is installed as `~/.local/share/neural-forge/bin/neural-forge-cli`; add 
 `neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID] [--trace FILE]`, `games [--tested [GAME]]`,
 `enable GAME [--target-exe EXE[,EXE...]|auto] [--anti-cheat-ok]`, `disable GAME`, `config`, `import-binaries DIR`,
 `extract-model DIR [--network full|small]`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`,
-`proton-tool [list|create SOURCE|update|remove NAME]` for the Proton copies (above),
+`proton-tool [list|create SOURCE|update|remove NAME]` for the Proton copies (above), `ngx-audit [CORE] [--driver-dir DIR]`
+(after an NVIDIA driver update: whether Neural Forge's NGX wrapper still fits the driver's NGX core),
 `game-settings list|show GAME|set GAME NAME VALUE|clear GAME [NAME]` for a game's own settings, and
 `shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--view V]|capture --cancel|dump-cache [--holds K]|reset|lut FILE|none`
 for the live settings. `doctor`, `report` and `shmctl status` only look: they create and change nothing.

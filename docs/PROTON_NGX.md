@@ -64,7 +64,7 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   or a Linux one through `Z:`), for diagnosis. `uninstall --purge` removes the copies from the prefixes of every
   Steam library.
 - **Exports the core lacks.** The wrapper hooks ten exports: `NVSDK_NGX_{D3D11,D3D12,VULKAN}_{CreateFeature,
-  EvaluateFeature,ReleaseFeature}` and `NVSDK_NGX_VULKAN_CreateFeature1` (`exports.rs`, `HOOKED`). It calls NVIDIA's
+  EvaluateFeature,ReleaseFeature}` and `NVSDK_NGX_VULKAN_CreateFeature1` (`core_exports.rs`, `HOOKED`). It calls NVIDIA's
   function of each, so a core without one of them fails the wrapper's load, and NGX reports itself unavailable: the
   game runs without DLSS rather than with a half-forwarded core. Every other export is a jump through the pointer
   resolved at load; one the core lacks (an older driver) jumps to a stub that returns `NVSDK_NGX_Result_Fail`
@@ -191,7 +191,7 @@ it in file order: `tail -c +129 FILE | tr -d '\0'` (the ring after the 128-byte 
 and once wrapped from `next` on: `{ tail -c +$((129 + NEXT)) FILE; tail -c +129 FILE | head -c NEXT; } | tr -d '\0'`.
 The game's pid is in the file's name (`indy-trace.txt` is written as `indy-trace-<pid>.txt`).
 NVIDIA's core reads the module that called some of its exports from their return address (every `*_Init*` and
-`*_GetFeatureRequirements`, and `NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements`: `exports.rs`,
+`*_GetFeatureRequirements`, and `NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements`: `core_exports.rs`,
 `READS_CALLER`) and searches that module's folder for feature DLLs. For those the trace logs the entry only (`[exit
 not traced: the core reads its caller]`) and leaves the return address alone: with `trace_return` in its place, the
 core would take the wrapper in `system32` for the caller and miss a feature DLL in the game's folder, so the trace
@@ -367,6 +367,47 @@ LGPL code. Publishing ready-made GE-Proton tarballs would make Neural Forge a di
 and the rest, owing their complete corresponding source (LGPL-2.1 section 6; GE's "Source code" archives lack the
 submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in the copy.
 
+## After a driver update (`neural-forge-cli ngx-audit`, `crates/supervisor/src/ngx_audit.rs`)
+
+The wrapper is built for one driver's core. `crates/ngx-wrapper/src/core_exports.rs` holds what it assumes of it: the
+75 exported names in ordinal order (`CORE_EXPORTS`: NVIDIA numbers them alphabetically from 1, and so does the
+linker), the ten the wrapper hooks (`HOOKED`), the 20 whose code reads its caller (`READS_CALLER`), and the driver
+and core file they were checked on (`CHECKED_DRIVER`, `CHECKED_CORE_SHA256`). The Linux crates compile the same file
+(`neural_forge_supervisor::ngx_core_exports`, a `#[path]` module), so `doctor`, the Proton copies and the audit read
+the wrapper's own lists; the wrapper's test checks that its `passthrough!` names and `HOOKED` together are
+`CORE_EXPORTS`.
+
+`neural-forge-cli ngx-audit [CORE] [--driver-dir DIR]` checks a core (by default the driver's
+`nvidia/wine/_nvngx.dll`) against those lists, prints one `OK` or `FAIL` line per check and exits 1 on any `FAIL`.
+Run it after every driver update; the maintainer's daily machine check runs the installed one against the installed
+driver. It checks:
+
+- **The exports**: a name the core has and the wrapper does not export (a game that looks it up does not find it), one
+  the core no longer has (hooked: the wrapper refuses to load; passthrough: answered with NGX's failure code), and an
+  ordinal that moved.
+- **Which exports read their caller**, from the core's code (`ngx_audit/scan.rs`). An export reads its caller when the
+  return address it was called with (`[rsp]` at its entry) reaches the address argument (`rdx`) of
+  `GetModuleHandleExA` or `GetModuleHandleExW`, called through the import table: in the export's own code, in code it
+  jumps to, or through up to four direct calls that pass it on as an argument (the `*_GetFeatureRequirements` exports
+  hand it to a helper). The scan decodes the code with iced-x86 and follows registers and the function's frame slots
+  (pushes, `sub rsp`, `__chkstk`'s `sub rsp, rax`, moves, `lea` of frame addresses) along every path, keeping a
+  value's origin where paths meet; it forgets a value at any instruction it does not model and follows nothing
+  through the heap or a computed jump. A hooked export that now reads its caller, a passthrough one that newly does,
+  and a listed one that no longer does are all failures, and so is the return address reaching any other import's
+  argument: that would be a new way of finding the caller. On 620.73.04 it finds exactly Ghidra's 20, at any call
+  depth from 1 to 8 (at 0 it misses the five `GetFeatureRequirements`); its test repeats that wherever the file with
+  `CHECKED_CORE_SHA256` is installed, and the other tests run it on small assembled functions and a hand-made PE.
+- **The feature DLLs' caller check**: `nvngx_dlssg.dll` and `nvngx_dlssd.dll` (in DIR, by default the core's folder)
+  still hold "Not called from NGX runtime", the message with which they refuse a caller whose path lacks lower-case
+  `nvngx.dll` (see Evidence). Gone, their check changed, and what the wrapper does about the core's name needs
+  another look.
+
+A failure means the wrapper needs updating before games run on that driver: open the core (or the feature DLL) in
+Ghidra at the exports the report names, confirm what changed, update `core_exports.rs` (and the `passthrough!` list
+in `exports.rs` for an added or removed export), set `CHECKED_DRIVER` and `CHECKED_CORE_SHA256` to the new core, and
+run the audit again. A path the scan cannot follow shows as "no longer reads its caller": confirm it in Ghidra
+before changing the list.
+
 ## Maintenance
 
 - GE-Proton releases about three times a month (GE-Proton11-1 2026-06-24 to 11-12 2026-11-03: twelve). A copy is made
@@ -377,7 +418,8 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
   the wrapper lacks it and NGX's loader may refuse the core, so the game runs without DLSS. NVIDIA's core lacks one of
   the wrapper's exports (an older driver): a passthrough one answers `NVSDK_NGX_Result_Fail`, a hooked one fails the
   wrapper's load, so the game runs without DLSS (see "Exports the core lacks"). `build-ngx-wrapper.sh` compares the
-  wrapper's exports (names and ordinals) with the driver's DLL wherever one is installed, and `doctor` compares them
+  wrapper's exports (names and ordinals) with the driver's DLL wherever one is installed, `ngx-audit` checks a new
+  driver's core against every assumption the wrapper makes of it (below), and `doctor` compares the exports
   with the user's driver both ways: a core export the wrapper does not forward, or one the wrapper hooks that the core
   lacks, is a failure; a forwarded export the core lacks is a warning. NGX starts verifying the loaded image instead of the file: the
   wrapper approach stops working (the fallback would be the in-memory export patch spike 1 used, from a builtin every
@@ -426,7 +468,8 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
   copies): every NGX export of `nvngx_dlss.dll`, `nvngx_dlssd.dll` and `nvngx_dlssg.dll` looks its caller's module up
   from the return address and refuses one whose path lacks `nvngx.dll` (case-sensitive `wcsstr`) with `0xBAD00002`,
   "Error: Not called from NGX runtime - %S". The game-side loader (`sl.common.dll`) compares no name after the load.
-  The 20 exports `READS_CALLER` names are exactly 620.73's that read their caller. In #51 (Indiana Jones and the Great Circle: Vulkan, Streamline with
+  The 20 exports `READS_CALLER` names are exactly 620.73's that read their caller (Ghidra; `ngx-audit`'s scan finds the
+  same 20 from the core's code). In #51 (Indiana Jones and the Great Circle: Vulkan, Streamline with
   DLSS, Ray Reconstruction and Frame Generation) the core loaded from the driver's folder reported a third feature
   supported, `UpdateFeature` ran for each feature, and the game's present timed out (`VK_TIMEOUT`) about 5 s after its
   swapchain. Whether the core's folder alone (the stock layout the wrapper now uses) avoids that is for the reporter

@@ -19,6 +19,10 @@ first shipped them; their phase is kept as a subheading.
   log, the trace and Diagnose: NVIDIA's DLSS files refuse calls from it, so DLSS silently never started.
 - With `XDG_STATE_HOME` set, the NGX wrapper now writes that record where Neural Forge reads it (it used to write it
   under your home's `.local/state`, so Diagnose showed nothing).
+- New `neural-forge-cli ngx-audit` checks the NVIDIA driver's NGX core for Proton against what the NGX wrapper was
+  built for: its functions and their numbers, the ones the wrapper hooks, which ones find their caller's folder from
+  their return address (read from the core's code), and that DLSS's own files still refuse callers outside
+  `nvngx.dll`. Run it after a driver update: any difference is listed and it exits 1.
 
 ## 4.6.1 — 2026-11-19
 

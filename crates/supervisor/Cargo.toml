@@ -24,6 +24,14 @@ serde_json = "1"
 miniz_oxide = "0.9"
 # The doctor's writability check (access) and the report's local time (localtime_r).
 libc = "0.2"
+# `ngx_audit`: the NGX core's export and import tables (already linked through `backtrace`), and the decoder its
+# scan of the core's code runs on.
+object = { version = "0.40", default-features = false, features = ["read_core", "pe", "std"] }
+iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "instr_info"] }
+
+[dev-dependencies]
+# The scan's tests assemble their x86-64 code.
+iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 
 # The pre-release game sweep (scripts/game-sweep.sh): its unit tests run with `cargo test`.
 [[example]]
