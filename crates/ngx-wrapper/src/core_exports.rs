@@ -129,3 +129,13 @@ pub const READS_CALLER: &[&str] = &[
     "NVSDK_NGX_VULKAN_Init_ProjectID",
     "NVSDK_NGX_VULKAN_Init_ProjectID_Ext",
 ];
+
+/// Exports whose code ends in a jump through a pointer the audit's scan cannot follow, handing the target their
+/// return address: the four `*_GetScratchBufferSize` jump to the DLSS feature's own function, from a table the core
+/// fills at run time (`[table + 0x98 * feature + 0x2538]`, driver 620.73). The audit expects exactly these.
+pub const UNFOLLOWED_TAIL_JUMPS: &[&str] = &[
+    "NVSDK_NGX_CUDA_GetScratchBufferSize",
+    "NVSDK_NGX_D3D11_GetScratchBufferSize",
+    "NVSDK_NGX_D3D12_GetScratchBufferSize",
+    "NVSDK_NGX_VULKAN_GetScratchBufferSize",
+];

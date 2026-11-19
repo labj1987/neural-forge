@@ -383,30 +383,36 @@ Run it after every driver update; the maintainer's daily machine check runs the 
 driver. It checks:
 
 - **The exports**: a name the core has and the wrapper does not export (a game that looks it up does not find it), one
-  the core no longer has (hooked: the wrapper refuses to load; passthrough: answered with NGX's failure code), and an
-  ordinal that moved.
+  the core no longer has (hooked: the wrapper refuses to load; passthrough: the wrapper hides it, so a game that looks
+  it up does not find it), an ordinal that moved, and an export forwarded to another DLL (its code is not in the
+  core, so whether it reads its caller cannot be seen).
 - **Which exports read their caller**, from the core's code (`ngx_audit/scan.rs`). An export reads its caller when the
   return address it was called with (`[rsp]` at its entry) reaches the address argument (`rdx`) of
-  `GetModuleHandleExA` or `GetModuleHandleExW`, called through the import table: in the export's own code, in code it
-  jumps to, or through up to four direct calls that pass it on as an argument (the `*_GetFeatureRequirements` exports
-  hand it to a helper). The scan decodes the code with iced-x86 and follows registers and the function's frame slots
-  (pushes, `sub rsp`, `__chkstk`'s `sub rsp, rax`, moves, `lea` of frame addresses) along every path, keeping a
-  value's origin where paths meet; it forgets a value at any instruction it does not model and follows nothing
-  through the heap or a computed jump. A hooked export that now reads its caller, a passthrough one that newly does,
-  and a listed one that no longer does are all failures, and so is the return address reaching any other import's
-  argument: that would be a new way of finding the caller. On 620.73.04 it finds exactly Ghidra's 20, at any call
-  depth from 1 to 8 (at 0 it misses the five `GetFeatureRequirements`); its test repeats that wherever the file with
-  `CHECKED_CORE_SHA256` is installed, and the other tests run it on small assembled functions and a hand-made PE.
+  `GetModuleHandleExA` or `GetModuleHandleExW`, called through the import table (directly, through a register or
+  frame slot that holds the import, or through Control Flow Guard's dispatch pointer): in the export's own code, in
+  code it jumps to, or through up to four direct calls that pass it on as an argument (the four
+  `*_GetFeatureRequirements` exports and `NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements` hand it to a
+  helper). The scan decodes the code with iced-x86 and follows registers and the function's frame slots (pushes,
+  `sub rsp`, a stack probe's `sub rsp, rax`, moves, conditional moves, exchanges, `lea` of frame addresses, a
+  callee's writes to its stack arguments) along every path it can see, keeping a value's origin where paths meet; it
+  forgets a value at any instruction it does not model, and follows nothing through the heap. Where the return
+  address goes and the scan cannot see the end of it, the audit says so instead of passing: a hooked export that now
+  reads its caller, a passthrough one that newly does, a listed one that no longer does, the return address reaching
+  another imported function, a call deeper than four or a call through an unknown pointer, and a tail jump through
+  a pointer by any export but the four `*_GetScratchBufferSize` (`UNFOLLOWED_TAIL_JUMPS`: they jump to the DLSS
+  feature's own function, from a table the core fills at run time) are all failures. On 620.73.04 it finds exactly
+  Ghidra's 20 and nothing else, at any call depth from 1 to 8 (at 0 it misses the five that use the helper); its test
+  repeats that wherever the file with `CHECKED_CORE_SHA256` is installed, and the other tests run it on small
+  assembled functions and a hand-made PE.
 - **The feature DLLs' caller check**: `nvngx_dlssg.dll` and `nvngx_dlssd.dll` (in DIR, by default the core's folder)
   still hold "Not called from NGX runtime", the message with which they refuse a caller whose path lacks lower-case
-  `nvngx.dll` (see Evidence). Gone, their check changed, and what the wrapper does about the core's name needs
-  another look.
+  `nvngx.dll` (see Evidence). This is a marker only: the check's code is not read. Gone, the check changed, and what
+  the wrapper does about the core's name needs another look.
 
 A failure means the wrapper needs updating before games run on that driver: open the core (or the feature DLL) in
 Ghidra at the exports the report names, confirm what changed, update `core_exports.rs` (and the `passthrough!` list
 in `exports.rs` for an added or removed export), set `CHECKED_DRIVER` and `CHECKED_CORE_SHA256` to the new core, and
-run the audit again. A path the scan cannot follow shows as "no longer reads its caller": confirm it in Ghidra
-before changing the list.
+run the audit again. A core that cannot be read is reported as "could not audit", not as a change in the driver.
 
 ## Maintenance
 

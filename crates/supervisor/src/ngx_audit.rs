@@ -9,11 +9,11 @@ pub mod scan;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use object::pe::{ImageNtHeaders64, IMAGE_SCN_MEM_EXECUTE};
+use object::pe::{ImageNtHeaders64, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, IMAGE_SCN_MEM_EXECUTE};
 use object::read::pe::{ExportTarget, ImageNtHeaders as _, ImageOptionalHeader as _, Import, PeFile64};
 use object::LittleEndian as LE;
 
-use crate::ngx_core_exports::{CHECKED_DRIVER, CORE_EXPORTS, HOOKED, READS_CALLER};
+use crate::ngx_core_exports::{CHECKED_DRIVER, CORE_EXPORTS, HOOKED, READS_CALLER, UNFOLLOWED_TAIL_JUMPS};
 
 /// The feature DLLs whose caller check the audit looks for, and the message of that check.
 pub const FEATURE_DLLS: [&str; 2] = ["nvngx_dlssg.dll", "nvngx_dlssd.dll"];
@@ -22,10 +22,13 @@ pub const NOT_FROM_NGX: &str = "Not called from NGX runtime";
 /// One export of the core.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Export {
+    /// Its name; `#ordinal` for one exported by ordinal only.
     pub name: String,
     pub ordinal: u32,
-    /// What its code does with its return address.
+    /// What its code does with its return address (nothing, for a forwarded export).
     pub flow: scan::Flow,
+    /// The DLL and function a forwarded export stands for (`DLL.Name`), whose code is not in the core.
+    pub forward: Option<String>,
 }
 
 impl Export {
@@ -66,12 +69,24 @@ pub fn read_core(bytes: &[u8]) -> Result<Vec<Export>, String> {
             }
         }
     }
+    // GuardCFDispatchFunctionPointer (IMAGE_LOAD_CONFIG_DIRECTORY64, offset 0x78): Control Flow Guard's calls go
+    // through it, to rax.
+    let load_config = pe.data_directories().get(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG).and_then(|d| d.data(bytes, &sections).ok());
+    if let Some(dispatch) = load_config.and_then(|c| c.get(0x78..0x80)).map(|b| u64::from_le_bytes(b.try_into().unwrap())).filter(|&va| va != 0) {
+        image.set_cfg_dispatch(dispatch);
+    }
     let table = pe.export_table().map_err(|e| format!("its export table: {e}"))?.ok_or("it exports nothing")?;
     let mut scanner = scan::Scanner::new(&image);
     let mut out = Vec::new();
     for e in table.exports().map_err(|e| format!("its export table: {e}"))? {
-        let (Some(name), ExportTarget::Address(rva)) = (e.name, e.target) else { continue };
-        out.push(Export { name: String::from_utf8_lossy(name).into_owned(), ordinal: u32::from(e.ordinal.0), flow: scanner.function(base + u64::from(rva)) });
+        let ordinal = u32::from(e.ordinal.0);
+        let name = e.name.map_or_else(|| format!("#{ordinal}"), |n| String::from_utf8_lossy(n).into_owned());
+        let (flow, forward) = match e.target {
+            ExportTarget::Address(rva) => (scanner.function(base + u64::from(rva)), None),
+            ExportTarget::ForwardByName(dll, f) => (scan::Flow::default(), Some(format!("{}.{}", String::from_utf8_lossy(dll), String::from_utf8_lossy(f)))),
+            ExportTarget::ForwardByOrdinal(dll, o) => (scan::Flow::default(), Some(format!("{}.#{o}", String::from_utf8_lossy(dll)))),
+        };
+        out.push(Export { name, ordinal, flow, forward });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
@@ -129,7 +144,11 @@ pub fn compare(core: &[Export]) -> Vec<Line> {
         )));
     }
     if !stub_gone.is_empty() {
-        out.push(fail(format!("exports: {} gone from the core (the wrapper answers them with NGX's failure code): {}", stub_gone.len(), names(stub_gone))));
+        out.push(fail(format!(
+            "exports: {} gone from the core (the wrapper hides them, so a game that looks one up does not find it): {}",
+            stub_gone.len(),
+            names(stub_gone)
+        )));
     }
     if !moved.is_empty() {
         out.push(fail(format!(
@@ -143,6 +162,14 @@ pub fn compare(core: &[Export]) -> Vec<Line> {
     }
     if !hooked_gone_any {
         out.push(ok(format!("hooked exports: all {} there", HOOKED.len())));
+    }
+    let forwarded: Vec<String> = core.iter().filter_map(|e| e.forward.as_ref().map(|f| format!("{} to {f}", e.name))).collect();
+    if !forwarded.is_empty() {
+        out.push(fail(format!(
+            "exports: {} forwarded to another DLL, whose code the scan does not read (whether they read their caller is unknown): {}",
+            forwarded.len(),
+            forwarded.join(", ")
+        )));
     }
 
     let incomplete: Vec<&str> = core.iter().filter(|e| e.flow.incomplete).map(|e| e.name.as_str()).collect();
@@ -174,19 +201,49 @@ pub fn compare(core: &[Export]) -> Vec<Line> {
     if newly.is_empty() && no_longer.is_empty() {
         out.push(ok(format!("reads its caller: exactly the {} exports READS_CALLER names", READS_CALLER.len())));
     }
-    // The return address handed to any other import: another way of finding the caller, not yet accounted for.
+    // Tail jumps the scan cannot follow, whose target gets the export's return address: only the known ones.
+    let jumps: Vec<&str> =
+        core.iter().filter(|e| e.flow.return_address_sinks().contains(&(scan::INDIRECT_JUMP.to_string(), 0))).map(|e| e.name.as_str()).collect();
+    let new_jumps: Vec<&str> = jumps.iter().copied().filter(|n| !UNFOLLOWED_TAIL_JUMPS.contains(n)).collect();
+    let jumps_gone: Vec<&str> = UNFOLLOWED_TAIL_JUMPS.iter().copied().filter(|n| has(n) && !jumps.contains(n)).collect();
+    if !new_jumps.is_empty() {
+        out.push(fail(format!(
+            "tail jumps: {} export(s) now jump on through a pointer the scan cannot follow, handing their return address to code that may read it: {}",
+            new_jumps.len(),
+            names(new_jumps.iter().copied())
+        )));
+    }
+    if !jumps_gone.is_empty() {
+        out.push(fail(format!(
+            "tail jumps: {} export(s) UNFOLLOWED_TAIL_JUMPS names no longer jump through a pointer: {}",
+            jumps_gone.len(),
+            names(jumps_gone.iter().copied())
+        )));
+    }
+    if new_jumps.is_empty() && jumps_gone.is_empty() {
+        out.push(ok(format!(
+            "tail jumps the scan cannot follow: only the {} UNFOLLOWED_TAIL_JUMPS names (to the DLSS feature's own function)",
+            UNFOLLOWED_TAIL_JUMPS.len()
+        )));
+    }
+    // Anywhere else the return address goes that the scan cannot see the end of: another imported function (another
+    // way of finding the caller), a call deeper than it follows, an indirect call.
     let other: Vec<String> = core
         .iter()
         .flat_map(|e| {
             e.flow
                 .return_address_sinks()
                 .into_iter()
-                .filter(|(name, arg)| !(scan::is_module_from_address(name) && *arg == 1))
-                .map(move |(name, arg)| format!("{} to {name} (argument {})", e.name, arg + 1))
+                .filter(|(name, arg)| !(scan::is_module_from_address(name) && *arg == 1) && name != scan::INDIRECT_JUMP)
+                .map(move |(name, arg)| match name.as_str() {
+                    scan::DEPTH_LIMIT => format!("{} to a call more than {} calls deep (argument {})", e.name, scan::MAX_CALL_DEPTH, arg + 1),
+                    scan::INDIRECT_CALL => format!("{} to a call through a pointer (argument {})", e.name, arg + 1),
+                    _ => format!("{} to the imported {name} (argument {})", e.name, arg + 1),
+                })
         })
         .collect();
     if !other.is_empty() {
-        out.push(fail(format!("return address: {} export(s) hand it to another function of Windows: {}", other.len(), other.join(", "))));
+        out.push(fail(format!("return address: {} export(s) hand it where the scan cannot see what is done with it: {}", other.len(), other.join(", "))));
     }
     if !incomplete.is_empty() {
         out.push(fail(format!("scan: could not follow every path of {}", names(incomplete))));
@@ -194,14 +251,15 @@ pub fn compare(core: &[Export]) -> Vec<Line> {
     out
 }
 
-/// That each DLSS feature DLL in `dir` still refuses callers outside `nvngx.dll` (its message for that is there).
+/// That each DLSS feature DLL in `dir` still has the message with which it refuses callers outside `nvngx.dll`: a
+/// marker only (the check's code is not read), whose loss says the check changed.
 pub fn feature_dlls(dir: &Path) -> Vec<Line> {
     FEATURE_DLLS
         .iter()
         .map(|dll| match std::fs::read(dir.join(dll)) {
             Err(e) => fail(format!("{dll}: cannot be read in {} ({e})", dir.display())),
             Ok(b) if b.windows(NOT_FROM_NGX.len()).any(|w| w == NOT_FROM_NGX.as_bytes()) => {
-                ok(format!("{dll}: refuses callers outside nvngx.dll (\"{NOT_FROM_NGX}\")"))
+                ok(format!("{dll}: still has its message for callers outside nvngx.dll (\"{NOT_FROM_NGX}\")"))
             }
             Ok(_) => fail(format!(
                 "{dll}: \"{NOT_FROM_NGX}\" is gone: how it checks its caller changed, and the core's name (lower-case nvngx.dll) may no longer matter or be checked differently"
@@ -215,6 +273,8 @@ pub fn feature_dlls(dir: &Path) -> Vec<Line> {
 pub struct Report {
     pub core: PathBuf,
     pub lines: Vec<Line>,
+    /// The core could be read and scanned (a failure otherwise says nothing about the driver).
+    pub audited: bool,
 }
 
 impl Report {
@@ -228,7 +288,9 @@ impl Report {
             let _ = writeln!(s, "{} {}", if l.ok { "OK  " } else { "FAIL" }, l.text);
         }
         let failed = self.lines.iter().filter(|l| !l.ok).count();
-        if failed == 0 {
+        if !self.audited {
+            s.push_str("ngx-audit: could not audit this core\n");
+        } else if failed == 0 {
             s.push_str("ngx-audit: the NGX wrapper fits this driver\n");
         } else {
             let _ = writeln!(
@@ -242,13 +304,15 @@ impl Report {
 
 /// Audits the core at `core`, and the feature DLLs in `driver_dir` (the core's folder when `None`).
 pub fn audit(core: &Path, driver_dir: Option<&Path>) -> Report {
-    let mut lines = match std::fs::read(core).map_err(|e| e.to_string()).and_then(|b| read_core(&b)) {
-        Ok(exports) => compare(&exports),
-        Err(e) => vec![fail(format!("the core cannot be read: {e}"))],
+    let (mut lines, audited) = match std::fs::read(core).map_err(|e| e.to_string()).and_then(|b| read_core(&b)) {
+        Ok(exports) => (compare(&exports), true),
+        Err(e) => (vec![fail(format!("the core cannot be read: {e}"))], false),
     };
-    let dir = driver_dir.map(Path::to_path_buf).or_else(|| core.parent().map(Path::to_path_buf)).unwrap_or_default();
-    lines.extend(feature_dlls(&dir));
-    Report { core: core.to_path_buf(), lines }
+    if audited || driver_dir.is_some() {
+        let dir = driver_dir.map(Path::to_path_buf).or_else(|| core.parent().map(Path::to_path_buf)).unwrap_or_default();
+        lines.extend(feature_dlls(&dir));
+    }
+    Report { core: core.to_path_buf(), lines, audited }
 }
 
 #[cfg(test)]
@@ -260,7 +324,10 @@ mod tests {
         if reads {
             flow.sinks.insert(("GetModuleHandleExA".into(), 1), scan::Reached { ret: true, params: 0 });
         }
-        Export { name: name.into(), ordinal, flow }
+        if UNFOLLOWED_TAIL_JUMPS.contains(&name) {
+            flow.sinks.insert((scan::INDIRECT_JUMP.into(), 0), scan::Reached { ret: true, params: 0 });
+        }
+        Export { name: name.into(), ordinal, flow, forward: None }
     }
 
     /// The core the lists describe.
@@ -276,7 +343,7 @@ mod tests {
     fn the_core_the_lists_describe_passes() {
         let lines = compare(&expected());
         assert!(failures(&lines).is_empty(), "{lines:?}");
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
     }
 
     #[test]
@@ -285,13 +352,15 @@ mod tests {
         core.retain(|e| e.name != "NVSDK_NGX_UpdateFeature" && e.name != "NVSDK_NGX_VULKAN_CreateFeature1");
         core.push(export("NVSDK_NGX_VULKAN_Init_Ext3", 76, false));
         core.iter_mut().find(|e| e.name == "NVSDK_NGX_CUDA_Init").unwrap().ordinal = 99;
+        core.iter_mut().find(|e| e.name == "NVSDK_NGX_D3D11_Shutdown").unwrap().forward = Some("nvngx_core.NVSDK_NGX_D3D11_Shutdown".into());
         let lines = compare(&core);
         let f = failures(&lines);
-        assert_eq!(f.len(), 4, "{lines:?}");
+        assert_eq!(f.len(), 5, "{lines:?}");
         assert!(f[0].contains("1 new") && f[0].contains("NVSDK_NGX_VULKAN_Init_Ext3"), "{f:?}");
         assert!(f[1].starts_with("hooked exports: 1 gone") && f[1].contains("VULKAN_CreateFeature1"), "{f:?}");
         assert!(f[2].contains("1 gone") && f[2].contains("NVSDK_NGX_UpdateFeature"), "{f:?}");
         assert!(f[3].contains("NVSDK_NGX_CUDA_Init 99 (the wrapper's 11)"), "{f:?}");
+        assert!(f[4].contains("1 forwarded") && f[4].ends_with("NVSDK_NGX_D3D11_Shutdown to nvngx_core.NVSDK_NGX_D3D11_Shutdown"), "{f:?}");
     }
 
     #[test]
@@ -305,16 +374,24 @@ mod tests {
                     e.flow.sinks.insert(("VirtualQuery".into(), 0), scan::Reached { ret: true, params: 0 });
                 }
                 "NVSDK_NGX_D3D11_Shutdown" => e.flow.incomplete = true,
+                "NVSDK_NGX_D3D12_Shutdown" => {
+                    e.flow.sinks.insert((scan::INDIRECT_JUMP.into(), 0), scan::Reached { ret: true, params: 0 });
+                    e.flow.sinks.insert((scan::DEPTH_LIMIT.into(), 0), scan::Reached { ret: true, params: 0 });
+                }
+                "NVSDK_NGX_CUDA_GetScratchBufferSize" => e.flow.sinks.clear(),
                 _ => {}
             }
         }
         let f: Vec<String> = failures(&compare(&core)).into_iter().map(String::from).collect();
-        assert_eq!(f.len(), 5, "{f:?}");
+        assert_eq!(f.len(), 7, "{f:?}");
         assert!(f[0].contains("hooked export(s) now read") && f[0].ends_with("NVSDK_NGX_D3D12_CreateFeature"), "{f:?}");
         assert!(f[1].contains("more export(s)") && f[1].ends_with("NVSDK_NGX_CUDA_Shutdown"), "{f:?}");
         assert!(f[2].contains("no longer") && f[2].ends_with("NVSDK_NGX_VULKAN_Init"), "{f:?}");
-        assert!(f[3].ends_with("NVSDK_NGX_D3D11_Init to VirtualQuery (argument 1)"), "{f:?}");
-        assert!(f[4].ends_with("NVSDK_NGX_D3D11_Shutdown"), "{f:?}");
+        assert!(f[3].contains("now jump on") && f[3].ends_with("NVSDK_NGX_D3D12_Shutdown"), "{f:?}");
+        assert!(f[4].contains("no longer jump") && f[4].ends_with("NVSDK_NGX_CUDA_GetScratchBufferSize"), "{f:?}");
+        assert!(f[5].contains("NVSDK_NGX_D3D11_Init to the imported VirtualQuery (argument 1)"), "{f:?}");
+        assert!(f[5].contains("NVSDK_NGX_D3D12_Shutdown to a call more than 4 calls deep (argument 1)"), "{f:?}");
+        assert!(f[6].ends_with("NVSDK_NGX_D3D11_Shutdown"), "{f:?}");
     }
 
     #[test]
@@ -336,10 +413,15 @@ mod tests {
         let r = audit(Path::new("/nonexistent/_nvngx.dll"), None);
         assert!(!r.passed());
         assert!(r.text().contains("FAIL the core cannot be read"), "{}", r.text());
+        assert!(r.text().ends_with("ngx-audit: could not audit this core\n"), "{}", r.text());
+        assert_eq!(r.lines.len(), 1, "no feature DLLs looked for beside a core that is not there");
     }
+
+    pub(super) const FORWARD: u32 = u32::MAX;
 
     /// A minimal PE32+ file: one code section holding `code` at RVA 0x1000, exporting `exports` (name, offset of
     /// its code), importing `imports` from KERNEL32.dll. The IAT's slots follow the code in the same section.
+    /// An export at offset [`FORWARD`] is forwarded to `KERNEL32.Sleep`.
     pub(super) fn pe(code: &[u8], exports: &[(&str, u32)], imports: &[&str]) -> Vec<u8> {
         const SEC: u32 = 0x1000;
         let mut sec = code.to_vec();
@@ -381,11 +463,13 @@ mod tests {
         let names_at = functions + 4 * n;
         let ordinals = names_at + 4 * n;
         let mut strings = ordinals + 2 * n;
+        let forwarder = strings + exports.iter().map(|(name, _)| name.len() as u32 + 1).sum::<u32>();
         for v in [0, 0, 0, 0, 1, n, n, functions, names_at, ordinals] {
             sec.extend_from_slice(&v.to_le_bytes());
         }
         for (_, off) in exports {
-            sec.extend_from_slice(&(SEC + off).to_le_bytes());
+            let rva = if *off == FORWARD { forwarder } else { SEC + off };
+            sec.extend_from_slice(&rva.to_le_bytes());
         }
         for (_, (name, _)) in &sorted {
             sec.extend_from_slice(&strings.to_le_bytes());
@@ -398,6 +482,7 @@ mod tests {
             sec.extend_from_slice(name.as_bytes());
             sec.push(0);
         }
+        sec.extend_from_slice(b"KERNEL32.Sleep\0");
         let export_size = SEC + sec.len() as u32 - export_dir;
         sec.resize(sec.len().next_multiple_of(0x200), 0);
 
@@ -468,9 +553,12 @@ mod tests {
         let j = jmp_at(&code, 1);
         code.extend_from_slice(&j);
         code.resize(0x40, 0xcc);
-        let file = pe(&code, &[("Reads", 0), ("Own", second)], &imports);
+        let file = pe(&code, &[("Reads", 0), ("Own", second), ("Fwd", FORWARD)], &imports);
         let core = read_core(&file).unwrap();
-        assert_eq!(core.iter().map(|e| (e.name.as_str(), e.ordinal, e.reads_caller())).collect::<Vec<_>>(), [("Own", 2, false), ("Reads", 1, true)]);
+        assert_eq!(
+            core.iter().map(|e| (e.name.as_str(), e.ordinal, e.reads_caller(), e.forward.as_deref())).collect::<Vec<_>>(),
+            [("Fwd", 3, false, Some("KERNEL32.Sleep")), ("Own", 2, false, None), ("Reads", 1, true, None)]
+        );
         assert!(read_core(b"MZ").is_err());
     }
 
