@@ -312,7 +312,7 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
 - GE-Proton releases about three times a month (GE-Proton11-1 2026-06-24 to 11-12 2026-11-03: twelve). A copy is made
   again in seconds. The wrapper needs Wine 10 or newer (`ProcessWineUnixPid`), nothing else of the Wine version.
 - What can break: Valve rewrites the `NVIDIA_WINE_DLL_DIR` block (its TODO says the copies into `system32` go once
-  NGXCore's `NGXPath` is set): the patch then refuses, and the anchor needs updating. `scripts/check_proton_scripts.py` (weekly, `proton-script-check.yml`) runs
+  NGXCore's `NGXPath` is set): the patch then refuses, and the anchor needs updating. `cargo xtask check-proton-scripts` (weekly, `proton-script-check.yml`) runs
   the patch on the newest Proton Experimental and proton-cachyos scripts and keeps one standing issue open while it does not apply. NVIDIA adds an export to its core:
   the wrapper lacks it and NGX's loader may refuse the core, so the game runs without DLSS. NVIDIA's core lacks one of
   the wrapper's exports (an older driver): a passthrough one answers `NVSDK_NGX_Result_Fail`, a hooked one fails the

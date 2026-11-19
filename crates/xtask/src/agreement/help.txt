@@ -1,0 +1,20 @@
+usage: xtask agreement [-h] [--runs REF:TEST [REF:TEST ...]] [--by-seq]
+                       [--per-frame] [--self-test]
+                       [ref] [test]
+
+How well the model's edit lands, compared between two capture runs of the same
+frames.
+
+positional arguments:
+  ref                   reference capture directory (synchronous path)
+  test                  test capture directory (path under test)
+
+options:
+  -h, --help            show this help message and exit
+  --runs REF:TEST [REF:TEST ...]
+                        several run pairs to average
+  --by-seq              match frames by capture file number instead of the
+                        pan.rs stamp
+  --per-frame           print every frame's numbers (and include them in the
+                        JSON)
+  --self-test           run the synthetic self-test

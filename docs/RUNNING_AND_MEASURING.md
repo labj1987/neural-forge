@@ -37,13 +37,13 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
 ```bash
-for t in release_notes.py bench-iq.py bench-report.py agreement.py gen_third_party_crates.py check_pins.py; do
-    python3 scripts/$t --self-test
+for task in release-notes bench-iq bench-report agreement gen-third-party-crates check-pins check-proton-scripts; do
+    cargo xtask $task --self-test
 done
-python3 scripts/hdr_encode.py selftest
+cargo xtask hdr-encode selftest
 bash scripts/gta-bench.sh --self-test
-python3 scripts/check_shaders.py && python3 scripts/sync_appdata_releases.py --check
-python3 scripts/gen_third_party_crates.py --check && python3 scripts/check_namespace.py
+cargo xtask check-shaders && cargo xtask sync-appdata-releases --check
+cargo xtask gen-third-party-crates --check && cargo xtask check-namespace
 cargo fmt --all --check && (cd third_party/vk-layer-for-rust && cargo fmt --all --check)
 bash scripts/cargo-deny.sh
 bash scripts/vk-layer-codegen.sh --check
@@ -52,8 +52,9 @@ bash scripts/smoke-test.sh
 
 Then the AppImage (`bash build-appimage.sh`), its glibc baseline, and its layer installed with its
 own CLI into scratch XDG directories and run through the Vulkan loader
-(`NEURAL_FORGE_SMOKE_SO=<installed .so> bash scripts/smoke-test.sh`). The self-tests need
-`python3-numpy` and `python3-pil` (Pillow 10.2 or newer); the shader check needs `spirv-val`.
+(`NEURAL_FORGE_SMOKE_SO=<installed .so> bash scripts/smoke-test.sh`). The shader check needs `spirv-val`.
+`cargo xtask` (the alias in `.cargo/config.toml`) runs the repository's development tasks, `crates/xtask`;
+`cargo xtask` alone lists them.
 
 - `scripts/smoke-test.sh` runs `crates/layer/examples/smoke.rs` through the real Vulkan loader
   with the layer enabled, in a debug build. Run it after any change near device creation: it
@@ -149,7 +150,7 @@ scripts/gta-bench.sh --host <host> --set placement=present post-1 VK_LAYER_neura
 Summarise, and average three runs of one configuration:
 
 ```bash
-scripts/bench-report.py --host <host> --mean nron-1 nron-2 nron-3
+cargo xtask bench-report --host <host> --mean nron-1 nron-2 nron-3
 ```
 
 **What the numbers are.** The long free-roam pass is GTA's fifth, about 117 s; GTA numbers its
@@ -159,7 +160,7 @@ MangoHud's per-frame log counted over pass 4's wall-clock window; MangoHud is al
 layer, so it sits below any frame generator and counts generated frames. GPU utilisation and
 power come from `nvidia-smi` over the same window. The report also gives the median of every
 field of the layer's `[sync]` lines, and "held before upscaler/s" (from `holds_per_s`) when the
-model ran before the upscaler. `scripts/bench-report.py --self-test` checks its parsing.
+model ran before the upscaler. `cargo xtask bench-report --self-test` checks its parsing.
 
 **Rules that matter for the numbers:**
 
@@ -192,7 +193,7 @@ model ran before the upscaler. `scripts/bench-report.py --self-test` checks its 
   with and without Neural Forge, and in launches through Steam with the maintainer's own launch options
   as much as through this runner (docs/LESSONS.md, October 20), so a run is never repeated for it. The
   runner prints "frame generation stopped at about N s" when it sees the displayed rate fall to a third
-  of its best for 20 s (written to `<label>/fg`); `bench-report.py` gives each run's multiplier, and
+  of its best for 20 s (written to `<label>/fg`); `cargo xtask bench-report` gives each run's multiplier, and
   `--fg` names a run where it did not engage and leaves it out of `--mean`. Whether frame generation
   works and how the game feels is the maintainer's check, playing.
 
@@ -206,8 +207,8 @@ renders at (`DLSS's output: image ... (2560x1440 ...)`); check it after a change
 capture `<frames>` consecutive presented frames as a series, `<ms>` after the `<resume>`-th time
 DLSS's frames resumed after a pause (a loading screen, the start of a benchmark pass), so every run
 captures the same moment; gta-bench.sh moves the series into the run's directory.
-`scripts/bench-iq.py RUN_DIR [--baseline MODEL_OFF_RUN_DIR] [--fg N]` measures it, and
-`bench-report.py` prints the same beside the fps (`--baseline LABEL`), passing the run's measured
+`cargo xtask bench-iq RUN_DIR [--baseline MODEL_OFF_RUN_DIR] [--fg N]` measures it, and
+`cargo xtask bench-report` prints the same beside the fps (`--baseline LABEL`), passing the run's measured
 frame generation multiplier:
 
 - *Flicker*: the mean frame-to-frame change of log luma (`log2(Y + 0.05 x geomean)`) over the
@@ -221,10 +222,10 @@ above) at about 70.5 s: a cut from a
 crane shot over the pavement to people standing beside a parked car, the camera still for about a
 second (median motion 0.001 px a frame; at least 0.16 px at every other moment sampled every 2 to
 3 s). The camera starts a pass up to about a second earlier or later from run to run, so the series
-is captured across the cut and bench-iq.py takes the window from the new shot's 31st rendered frame
+is captured across the cut and `cargo xtask bench-iq` takes the window from the new shot's 31st rendered frame
 (the first frames after a cut are DLSS's history converging; their change decays over about 30
 rendered frames). The series holds presented frames, so with frame generation the 30 rendered
-frames are 30 x the multiplier presented ones (`--fg N`; bench-report.py passes the run's measured
+frames are 30 x the multiplier presented ones (`--fg N`; `cargo xtask bench-report` passes the run's measured
 ratio). A series without a cut is measured from its first frame, and the output says "no cut".
 Until 2026-10-11 the window started on the 41st frame: in the slower runs GTA's camera starts
 moving again 47-56 frames after the cut, inside that window (interval 1 read x1.133 and x1.172
@@ -243,7 +244,7 @@ apart), 0.325 / 0.310 / 0.320% over 5 frames (5%) and 0.318 / 0.306 / 0.329% ove
 frame generation on, the window must cover whole cycles: the default is 9 frames (8 pairs, two cycles;
 the handoff that introduced this metric asked for 6); in general the window's pair count is the
 smallest multiple of the multiplier that is at least 8 (9 frames at 1x, 2x and 4x, 10 at 3x). A
-flicker difference under 10% is noise. Added detail between two model-off runs: x0.97 and x0.98. `bench-iq.py --scan RUN_DIR` lists the change of every pair of a longer
+flicker difference under 10% is noise. Added detail between two model-off runs: x0.97 and x0.98. `cargo xtask bench-iq --scan RUN_DIR` lists the change of every pair of a longer
 series and its stillest window, for choosing another moment.
 
 Results land in `$NF_BENCH_DIR/<label>` on the host (default `~/nf-spike/gta`): GTA's Benchmark
@@ -275,17 +276,17 @@ Other flags: `--contrast C`, `--present-mode fifo|immediate|mailbox`, `--frames 
 closed), `--save DIR` (every frame as a PNG). `--capture-at`/`--capture-frames` make pan request a
 capture series right before a given frame, so every run captures the same frames.
 
-`scripts/agreement.py` (needs Pillow) matches two runs' frames by their stamped number and reports
+`cargo xtask agreement` matches two runs' frames by their stamped number and reports
 the correlation of the two edit fields (`composited - original`; 1.0 means the same edit in the
 same place) and the test run's edit strength on the original's sharpest 10% of pixels, as a
 percentage of the reference's:
 
 ```bash
-python3 scripts/agreement.py REF_SERIES_DIR TEST_SERIES_DIR
+cargo xtask agreement REF_SERIES_DIR TEST_SERIES_DIR
 ```
 
 ```bash
-python3 scripts/agreement.py --runs ref1:test1 ref2:test2 ref3:test3
+cargo xtask agreement --runs ref1:test1 ref2:test2 ref3:test3
 ```
 
 Two synchronous runs may not score exactly 1.0 if the model's answer to the same frame varies.
@@ -356,7 +357,7 @@ scripts/gta-bench.sh --host <host> cache-off-1 VK_LAYER_neuralforge_neural NEURA
 
 ### Offline tools
 
-`scripts/hdr_encode.py` (numpy, Pillow) encodes a `dump` for the model and judges an answer
+`cargo xtask hdr-encode` encodes a `dump` for the model and judges an answer
 (`info`, `encode`, `judge`, `montage`); it is how E1b chose the encode. `crates/native/tests/rig.rs`
 runs the network on a dumped frame on the real device (`NEURAL_FORGE_NATIVE_RIG=<dump dir>`,
 `NEURAL_FORGE_NATIVE_MODEL` for another model directory) and compares the head with a reference.
@@ -484,12 +485,12 @@ of play at DLSS Frame Generation 4x, "everything is working beautifully" (HARDWA
 1. Bump `version` in the workspace `Cargo.toml` (`[workspace.package]`); `Cargo.lock` follows on
    the next build.
 2. Add a `## X.Y.Z — YYYY-MM-DD` heading to `CHANGELOG.md`, with an em dash (`—`), not a hyphen:
-   `scripts/sync_appdata_releases.py` only recognises that form. Move the release's entries out of
+   `cargo xtask sync-appdata-releases` only recognises that form. Move the release's entries out of
    "Unreleased".
 3. Regenerate the AppStream releases list from the changelog, and check it:
 
    ```bash
-   python3 scripts/sync_appdata_releases.py && python3 scripts/sync_appdata_releases.py --check
+   cargo xtask sync-appdata-releases && cargo xtask sync-appdata-releases --check
    ```
 
 4. Run the checks in section 1.

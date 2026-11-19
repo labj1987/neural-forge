@@ -1,0 +1,33 @@
+Flicker and added detail of gta-bench.sh runs, from their presented-frame series.
+
+usage: cargo xtask bench-iq [--baseline MODEL_OFF_RUN_DIR] [--fg N] [--frames N] [--start K] [--scan] RUN_DIR...
+       cargo xtask bench-iq --self-test
+
+A run's series is the `series-<ms>/` directory gta-bench.sh moves into the run directory: N
+consecutive presented frames taken with NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<frames> (the
+layer's frame-series capture, docs/RUNNING_AND_MEASURING.md). The camera must be still there; what
+moves anyway (people walking, particles) is what the exclusions below are for. Every number is
+taken on the frames as presented (8-bit sRGB PNGs, linearised), with Y the Rec.709 luma.
+
+Flicker: per pixel d = |log2(Y_t + f) - log2(Y_t-1 + f)| between consecutive frames, f = 0.05 x the
+geometric mean of the first frame's Y; the mean of the smallest 95% of d (the 5% that change most
+are moving objects), averaged over the pairs of the window, shown as 100 x (2^mean - 1) %. The same
+measure as the reference's live benchmark. The window covers whole frame-generation cycles: its
+pair count is the smallest multiple of the multiplier (--fg N, the presented frames per rendered
+frame; 1 without frame generation) that is at least 8, so 9 frames at 1x, 2x and 4x and 10 at 3x.
+
+Added detail (with --baseline, a run with the layer loaded and the model off, captured at the same
+moment): the mean energy of the 4-neighbour Laplacian of log2(Y + f) over the static pixels of the
+window, with the model divided by without it (x1.15 = 15% more local contrast). Static: the pixel's
+and its four neighbours' largest frame-to-frame change within the window is under STATIC_STOPS in
+both runs. f is the
+baseline's for both, so the two logs are on one scale.
+
+The window starts SETTLE rendered frames (SETTLE x the multiplier presented frames: the series
+holds presented frames) after the series' first cut (`anchor`); a series without a cut is measured
+from its first frame, and the output says so. GTA's camera starts a pass up to about a second
+earlier or later from run to run, so the series is captured across the cut and the cut fixes the
+moment. --start K / --frames N choose the window by hand.
+--scan prints the mean frame-to-frame change of every pair and the stillest N-frame window, for
+choosing the capture moment. With several RUN_DIRs the spread of their flicker (max / min - 1) is
+printed too: the stability gate for repeated model-off runs is a spread of 10% or less.

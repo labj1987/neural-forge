@@ -1040,7 +1040,7 @@ never reaches it), so no generated frame is made. Either it never starts, or it 
 - Reflex: `DXVK_NVAPI_LOG_LEVEL=info` shows the same `SetSleepMode` sequence (disabled on each
   loading screen, `Enabled/2000us` after) in engaged and non-engaged runs.
 
-The cause inside GTA is not known. `scripts/bench-report.py --fg` now names a run where frame
+The cause inside GTA is not known. `cargo xtask bench-report --fg` now names a run where frame
 generation did not engage and leaves it out, so a frame-generation number is always an engaged one.
 
 **Update 2026-10-20:** Streamline's log names it: `eDLSSGStatusFailReflexNotDetectedAtRuntime` at a

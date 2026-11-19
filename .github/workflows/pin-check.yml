@@ -2,7 +2,7 @@ name: Pin check
 
 # Weekly: are the pins Dependabot cannot see (the native toolchain, cargo-deny, appimagetool, the
 # AppImage runtime, the Rust toolchain) behind upstream? Every pin that is behind is bumped by
-# scripts/check_pins.py --bump on the branch pin-bump, the full build and check (check.yml, what every
+# `cargo xtask check-pins --bump` on the branch pin-bump, the full build and check (check.yml, what every
 # change and release gets) runs on that commit, and only when it passes is the branch the run started
 # from (main, for the schedule) fast-forwarded to it. A bump commit is pins only: no version, no release;
 # the next release carries it.
@@ -51,6 +51,23 @@ jobs:
         with:
           persist-credentials: false
 
+      # The check is `cargo xtask check-pins` (crates/xtask), built with the toolchain rust-toolchain.toml names,
+      # in a step of its own so a build failure fails the run instead of reading as an unreachable upstream.
+      - name: Rust toolchain from rust-toolchain.toml
+        id: toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\([0-9][0-9.]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - name: Build the pin check
+        run: cargo build --locked --quiet --package xtask
+
       # A network or API failure, or an upstream that names no version to compare with, is retried,
       # then reported in the run's summary and ends the run without failing it (a failed scheduled
       # run emails) and without touching the issue: a pin that could not be checked is not current.
@@ -62,7 +79,7 @@ jobs:
           state=unknown
           for attempt in 1 2 3; do
             set +e
-            python3 scripts/check_pins.py > report.md
+            cargo xtask check-pins > report.md
             status=$?
             set -e
             case $status in
@@ -93,13 +110,30 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The check is `cargo xtask check-pins` (crates/xtask), built with the toolchain rust-toolchain.toml names,
+      # in a step of its own so a build failure fails the run instead of reading as an unreachable upstream.
+      - name: Rust toolchain from rust-toolchain.toml
+        id: toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\([0-9][0-9.]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - name: Build the pin check
+        run: cargo build --locked --quiet --package xtask
+
       - name: Bump the pins that are behind
         id: bump
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set +e
-          python3 scripts/check_pins.py --bump > bump.txt
+          cargo xtask check-pins --bump > bump.txt
           status=$?
           set -e
           cat bump.txt
@@ -116,7 +150,7 @@ jobs:
           git commit -a -q -F - <<EOF
           Pins: $(paste -sd';' bump.txt | sed 's/;/; /g')
 
-          Bumped by the weekly pin check (scripts/check_pins.py --bump); landed only after the full build
+          Bumped by the weekly pin check (cargo xtask check-pins --bump); landed only after the full build
           and check passed on this commit.
           EOF
           git push --force origin "HEAD:refs/heads/$branch"
@@ -193,6 +227,23 @@ jobs:
           ref: ${{ github.ref_name }}
           persist-credentials: false
 
+      # The check is `cargo xtask check-pins` (crates/xtask), built with the toolchain rust-toolchain.toml names,
+      # in a step of its own so a build failure fails the run instead of reading as an unreachable upstream.
+      - name: Rust toolchain from rust-toolchain.toml
+        id: toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\([0-9][0-9.]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - name: Build the pin check
+        run: cargo build --locked --quiet --package xtask
+
       - name: The report after the bump
         id: report
         env:
@@ -212,7 +263,7 @@ jobs:
             state=unknown
             for attempt in 1 2 3; do
               set +e
-              python3 scripts/check_pins.py > report.md
+              cargo xtask check-pins > report.md
               status=$?
               set -e
               case $status in

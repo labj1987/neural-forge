@@ -10,7 +10,7 @@
 # Benchmark/FrameTimes files, MangoHud's per-frame CSV (MangoHud is always the last
 # layer, i.e. below any frame generator, so it counts displayed frames), nvidia-smi
 # samples, and the launch log, which holds the layer's [sync] and [present] lines.
-# Summarise with scripts/bench-report.py.
+# Summarise with cargo xtask bench-report.
 #
 # Why not a Steam launch (steam://rungameid, as the game sweep does): a benchmark needs exactly
 # the environment given here for each A/B side (no launch options or session variables mixed
@@ -37,7 +37,7 @@
 # eDLSSGStatusFailReflexNotDetectedAtRuntime at a benchmark scene change, with or without Neural Forge,
 # launched by Steam or by this script; docs/LESSONS.md). With frame generation on in settings.xml the
 # runner says when the displayed rate fell to a third of its best for 20 s ("frame generation
-# stopped"), writes it to <label>/fg, and bench-report.py gives the measured multiplier.
+# stopped"), writes it to <label>/fg, and cargo xtask bench-report gives the measured multiplier.
 #
 # Examples (NR off, then NR on at model interval 2, both with GTA's script mods off):
 #   gta-bench.sh --host rig p0-nroff-1 '' 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
@@ -50,7 +50,7 @@
 # neural-forge-cli --set uses; the installed one by default, a development build's when the
 # layer under test has a newer shared-memory version than the installed CLI can open).
 # A frame series the layer captured during the run (NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<frames>,
-# for scripts/bench-iq.py) is moved into the run's directory.
+# for cargo xtask bench-iq) is moved into the run's directory.
 set -u
 
 # The checks that read GTA's crash dumps and MangoHud's log, in one Python program (sent along

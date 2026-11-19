@@ -1,7 +1,7 @@
 //! Captures (`neural_forge_protocol::capture`): the one-shot pair the GUI's capture button and
 //! `shmctl capture` ask for, and frame series (`shmctl capture --frames N`,
 //! `NEURAL_FORGE_CAPTURE_AT`) of the next N presented frames as matched original/composited PNG
-//! pairs, for measuring how well the model's edit lands frame by frame (`scripts/agreement.py`,
+//! pairs, for measuring how well the model's edit lands frame by frame (`cargo xtask agreement`,
 //! `crates/layer/examples/pan.rs`).
 //!
 //! Both read the swapchain image back just before `capture::run` (the game's frame) and again just

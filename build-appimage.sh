@@ -119,7 +119,7 @@ cp data/io.github.labj1987.NeuralForge.desktop                               "$A
 cp data/icon.svg                                   "$APPDIR/usr/share/icons/hicolor/scalable/apps/$NAME.svg"
 # The <releases> list is generated from CHANGELOG.md's version headings, and fails the
 # build if the newest one is not this workspace version.
-python3 scripts/sync_appdata_releases.py
+cargo xtask sync-appdata-releases
 cp data/io.github.labj1987.NeuralForge.appdata.xml       "$APPDIR/usr/share/metainfo/"
 
 # Licence notices that must ship with any build: this project's own AGPL text, the GPL-3.0 text
@@ -131,8 +131,8 @@ cp data/io.github.labj1987.NeuralForge.appdata.xml       "$APPDIR/usr/share/meta
 # and the Vulkan-Headers compiled into the layer, collected from their sources.
 DOCDIR="$APPDIR/usr/share/doc/$NAME"
 mkdir -p "$DOCDIR"
-python3 scripts/gen_third_party_crates.py
-python3 scripts/gen_third_party_crates.py --licences "$DOCDIR/THIRD_PARTY_LICENSES.txt"
+cargo xtask gen-third-party-crates
+cargo xtask gen-third-party-crates --licences "$DOCDIR/THIRD_PARTY_LICENSES.txt"
 cp LICENSE ATTRIBUTION.md THIRD_PARTY_CRATES.md "$DOCDIR/"
 mkdir -p "$DOCDIR/third_party/opendlss-nr" "$DOCDIR/third_party/vk-layer-for-rust"
 cp -r third_party/optiscaler "$DOCDIR/third_party/"
@@ -159,7 +159,7 @@ chmod 755 "$APPDIR/AppRun"
 # ── appimagetool ──────────────────────────────────────────────────────
 # Pinned to a released version and verified by checksum (the `continuous` tag moves
 # under us, so two builds of the same commit could use different tools). The weekly pin
-# check (scripts/check_pins.py --bump) moves the version and its sha256 to each new release.
+# check (cargo xtask check-pins --bump) moves the version and its sha256 to each new release.
 APPIMAGETOOL_VERSION="1.9.1"
 APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
 # Kept in .cache/, outside the build directory this script wipes, so a second build reuses it.
@@ -180,7 +180,7 @@ fi
 
 # The runtime appimagetool puts in front of the squashfs. Without --runtime-file it downloads
 # the moving `continuous` build at pack time, so it is pinned and checked the same way.
-# The weekly pin check (scripts/check_pins.py --bump) moves the version and the sha256 of the
+# The weekly pin check (cargo xtask check-pins --bump) moves the version and the sha256 of the
 # runtime-x86_64 asset to each new release.
 RUNTIME_VERSION="20251108"
 RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"

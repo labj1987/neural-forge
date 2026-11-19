@@ -11,7 +11,7 @@
 //
 // The descriptor set layout and Params are shared with native_composite.comp and
 // `preupscale::native::Params` (field for field, append only). The common functions are duplicated
-// there (no include: scripts/check_shaders.py hashes .comp files only).
+// there (no include: cargo xtask check-shaders hashes .comp files only).
 layout(local_size_x = 8, local_size_y = 8) in;
 
 // The encoded proxy (padded extent), GENERAL.

@@ -1,0 +1,25 @@
+How well the model's edit lands, compared between two capture runs of the same frames.
+
+Each run is a directory of matched ``<key>-original.png`` / ``<key>-composited.png`` pairs,
+as a frame series writes them (``neural-forge-cli shmctl capture --frames N``, see
+``crates/layer/src/series.rs``). The reference run is the synchronous present; the test run
+is the path under test (e.g. a pipelined present). Both should come from
+``crates/layer/examples/pan.rs``, which stamps its frame counter into the top-left corner:
+frames are matched across runs by that decoded counter, never by capture order, so the two
+runs need not start on the same frame.
+
+Per matched frame, ``edit = composited - original`` (per channel, signed). Reported:
+
+* ``ncc``: zero-mean normalised cross-correlation of the reference and test edit fields
+  (per-channel means removed, channels pooled). 1.0 = the test path puts the same edit in
+  the same place; ~0 = unrelated. Frames whose reference or test edit is zero everywhere
+  (the frame went out untouched) have no defined ncc and are counted as ``flat``.
+* ``detail %``: mean |edit| on high-gradient pixels (top 10% of the original's luma
+  gradient magnitude), test as a percentage of reference, summed over the run's frames.
+  Below 100 means the test path's edit is weaker (or misplaced) where the detail is.
+
+The 16-pixel band holding the frame stamp and a 1-pixel border are excluded.
+
+    cargo xtask agreement REF_DIR TEST_DIR
+    cargo xtask agreement --runs REF1:TEST1 REF2:TEST2 REF3:TEST3
+    cargo xtask agreement --self-test

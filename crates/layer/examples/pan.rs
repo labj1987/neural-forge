@@ -9,7 +9,7 @@
 //! fractional speeds are real sub-pixel motion. Everything is a function of the frame counter
 //! alone: frame N is the same picture in every run, whatever the timing. The counter is also
 //! stamped into the top-left corner (37 black/white 8x8 blocks: the magic bits 1011, the 32-bit
-//! frame number most significant bit first, an even-parity bit), which `scripts/agreement.py`
+//! frame number most significant bit first, an even-parity bit), which `cargo xtask agreement`
 //! decodes from captured originals.
 //!
 //! ```text
@@ -24,7 +24,7 @@
 //! FRAME is presented, through the same shared memory the layer opens (`NEURAL_FORGE_SHM`, else
 //! the default path). The layer takes the request on that very present when it is engaged by
 //! then, so every run captures the same frames; pan prints the frame the series really started
-//! on. Compare the runs with `scripts/agreement.py`.
+//! on. Compare the runs with `cargo xtask agreement`.
 //!
 //! `--frames 0` runs until the window is closed (or Esc). The achieved frame rate goes to
 //! stderr once a second. The picture is generated on the CPU into a host-visible staging
@@ -133,7 +133,7 @@ const TW: usize = 4096;
 const TH: usize = 2048;
 const CELL: usize = 256;
 
-/// Frame stamp geometry (see the module doc comment); `scripts/agreement.py` mirrors it.
+/// Frame stamp geometry (see the module doc comment); `cargo xtask agreement` mirrors it.
 const BLOCK: u32 = 8;
 const MAGIC: [bool; 4] = [true, false, true, true];
 const STAMP_BLOCKS: u32 = 4 + 32 + 1;

@@ -1,0 +1,7 @@
+usage: xtask hdr-encode info [-h] dump
+
+positional arguments:
+  dump
+
+options:
+  -h, --help  show this help message and exit

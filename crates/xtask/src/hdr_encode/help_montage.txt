@@ -1,0 +1,12 @@
+usage: xtask hdr-encode montage [-h] [--crop CROP] [--scale SCALE]
+                                outdir out tags [tags ...]
+
+positional arguments:
+  outdir
+  out
+  tags
+
+options:
+  -h, --help     show this help message and exit
+  --crop CROP    x,y,w,h before scaling
+  --scale SCALE

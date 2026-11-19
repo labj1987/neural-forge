@@ -1,0 +1,25 @@
+usage: xtask hdr-encode encode [-h] [--convention {mul,div}]
+                               [--exposure-image EXPOSURE_IMAGE]
+                               [--exposure EXPOSURE] [--white WHITE]
+                               [--no-keep-clamped]
+                               dump
+                               {opendlss,opendlss-linear,lumaknee,reinhard,sdr8,raw}
+                               out
+
+positional arguments:
+  dump
+  {opendlss,opendlss-linear,lumaknee,reinhard,sdr8,raw}
+  out
+
+options:
+  -h, --help            show this help message and exit
+  --convention {mul,div}
+                        scene * e (mul) or scene / e (div)
+  --exposure-image EXPOSURE_IMAGE
+                        which read exposure.json image (default 0)
+  --exposure EXPOSURE   override: the exposure value (still divided by
+                        --white; --convention is ignored)
+  --white WHITE         paper white in exposed units: the scale is divided by
+                        it (default 3, the layer's)
+  --no-keep-clamped     decode every pixel, also where the encoded input
+                        clamped (the layer keeps those)
