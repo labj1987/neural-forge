@@ -1254,9 +1254,9 @@ mod tests {
         let (copy, foreign) = (sys32("1091500").join("neural-forge"), sys32("271590").join("neural-forge"));
         for dir in [&copy, &foreign] {
             std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(dir.join("_nvngx_core.dll"), "MZ").unwrap();
+            std::fs::write(dir.join("_nvngx.dll"), "MZ").unwrap();
         }
-        std::fs::write(copy.join("_nvngx_core.dll.4242.tmp"), "MZ").unwrap();
+        std::fs::write(copy.join("_nvngx.dll.4242.tmp"), "MZ").unwrap();
         std::fs::write(foreign.join("notes.txt"), "mine").unwrap();
         std::fs::write(sys32("1091500").join("_nvngx.dll"), "MZ").unwrap();
         // The wrapper's rings: a running process's stays, a gone one's goes.
@@ -1285,7 +1285,7 @@ mod tests {
         assert!(tools.join("Linked-NeuralForge").is_symlink(), "a link is not a copy");
         assert!(live.is_file() && !dead.exists() && purged.removed.contains(&dead));
         assert!(!copy.exists() && purged.removed.contains(&copy), "{purged:?}");
-        assert!(foreign.join("notes.txt").is_file() && foreign.join("_nvngx_core.dll").is_file(), "a folder with anything else stays");
+        assert!(foreign.join("notes.txt").is_file() && foreign.join("_nvngx.dll").is_file(), "a folder with anything else stays");
         assert!(sys32("1091500").join("_nvngx.dll").is_file(), "Proton's own files stay");
         assert!(!PathBuf::from(paths::data_dir()).exists() && !manifest_path().exists());
     }
