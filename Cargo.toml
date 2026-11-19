@@ -8,6 +8,7 @@ members = [
     "crates/cli",
     "crates/native",
     "crates/cache-replay",
+    "third_party/opendlss-nr/ptx",
 ]
 # The layer framework (crates/layer's vulkan-layer dependency) is its own workspace, tested with its
 # own lockfile: third_party/vk-layer-for-rust/UPSTREAM.md.
@@ -33,6 +34,11 @@ unused_dependencies = "warn"
 # catch_unwind), so there's no reason to fight this into a per-crate setting.
 [profile.dev]
 panic = "abort"
+
+# The fast_divmod test (third_party/opendlss-nr/ptx) interprets the emitted PTX for every n < 2^24 and 32 divisors:
+# unoptimised that is minutes of CPU time.
+[profile.dev.package.opendlss-nr-ptx]
+opt-level = 3
 
 [profile.release]
 panic = "abort"
