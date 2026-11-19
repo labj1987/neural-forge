@@ -25,11 +25,10 @@
 //!
 //! The role is `wrapper`, `core` or `snippet`; a version that could not be read is `-`.
 
-/// Whether a loaded module's file name is one of NGX's: `_nvngx.dll` (and the wrapper's copy of the core,
-/// `_nvngx_core.dll`), or `nvngx*.dll`.
+/// Whether a loaded module's file name is one of NGX's: `_nvngx.dll`, or `nvngx*.dll`.
 pub fn is_ngx_module(file_name: &str) -> bool {
     let name = file_name.to_ascii_lowercase();
-    name == "_nvngx.dll" || name == crate::core_copy::COPY_NAME || (name.starts_with("nvngx") && name.ends_with(".dll"))
+    name == "_nvngx.dll" || (name.starts_with("nvngx") && name.ends_with(".dll"))
 }
 
 /// The last component of a Windows or Unix path.

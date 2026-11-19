@@ -8,12 +8,12 @@ first shipped them; their phase is kept as a subheading.
 
 **The NGX wrapper runs NVIDIA's core from where Proton puts it (Indiana Jones and the Great Circle)**
 
-- Neural Forge's Proton copies now load NVIDIA's NGX core from a copy in the game's prefix
-  (`system32\neural-forge`), as Proton's own setup does, instead of straight from the driver's folder. NGX treats
-  the folder its core runs from as its own, and the driver's folder holds NVIDIA's own Frame Generation and Ray
-  Reconstruction files; Indiana Jones and the Great Circle crashed about 5 seconds in only when the core ran from
-  there. The copy is made on the game's first start and refreshed after a driver update; `uninstall --purge`
-  removes it.
+- Neural Forge's Proton copies now run NVIDIA's NGX core from a copy in the game's prefix
+  (`system32\neural-forge\_nvngx.dll`), as Proton's own setup does, instead of straight from the driver's folder.
+  NGX treats the folder its core runs from as its own, and the driver's folder holds NVIDIA's own Frame Generation
+  and Ray Reconstruction files; Indiana Jones and the Great Circle crashed about 5 seconds in only when the core ran
+  from there. The copy is made on the game's first start and refreshed after a driver update, Neural Forge adds what
+  your existing Proton copies need when it starts, and `uninstall --purge` removes the copies.
 - `NEURAL_FORGE_NGX_TRACE` no longer changes what NGX finds: the calls in which NGX looks at which game module
   called it are now traced on entry only, so a traced run behaves like an untraced one.
 - `NEURAL_FORGE_NGX_CORE` takes a normal Linux path too. The user guide also shows how to turn on NVIDIA's own NGX

@@ -1,14 +1,15 @@
 //! Where the wrapper loads NVIDIA's core from (docs/PROTON_NGX.md, "Loading NVIDIA's core"), and the copy it loads.
 //!
-//! NVIDIA's core treats the folder it was loaded from as a place of its own: when the game's NGX library asks for it
-//! (a flag in the `InternalData` it passes), `NGXInitContext` adds that folder to where it loads DLSS's feature DLLs
-//! from ("generic snippets"; driver 620.73's `_nvngx.dll`). Under stock Proton the core runs from `system32`, which
-//! holds no feature DLLs; the driver's `nvidia/wine` folder holds NVIDIA's `nvngx_dlssg.dll` and `nvngx_dlssd.dll` next
-//! to it. Indiana Jones and the Great Circle (#51) crashed only with the core loaded from the driver's folder: there a
-//! feature reported itself supported that a byte-identical copy elsewhere reported unsupported. So the wrapper loads a
-//! copy of the core from a folder of its own in the prefix's `system32`, which holds nothing else, as stock Proton's
-//! core has no feature DLL beside it. The copy has another name than `_nvngx.dll`, which Wine would hand to the
-//! wrapper again (`_nvngx=b`); the core reads only its folder, not its name.
+//! The core must keep its file name, `_nvngx.dll`: loaded under another name (`_nvngx_core.dll`, or #51's
+//! `nvngx_core.dll`) it initialises and answers every query the same, but the game never creates a DLSS feature
+//! (Cyberpunk 2077, 2026-11-19: no `CreateFeature`, the same as the reporter's "DLSS never starts"); named
+//! `_nvngx.dll` in a folder of its own it works (DLSS and Frame Generation). So the wrapper loads a copy of the
+//! driver's core, `system32\neural-forge\_nvngx.dll`: a folder with nothing else in it, as stock Proton's core has no
+//! DLSS feature DLL beside it in `system32`, where the driver's `nvidia/wine` folder holds NVIDIA's `nvngx_dlssg.dll`
+//! and `nvngx_dlssd.dll` (Indiana Jones and the Great Circle crashed only with the core loaded from there, #51). Wine
+//! would hand a module of that name to the wrapper (`_nvngx=b`), so the Neural Forge Proton copy also sets that full
+//! path native (`proton_tool.rs`, `added_lines`); where it does not yet (a copy not patched again), loading the copy
+//! returns the wrapper itself, and the wrapper loads the driver's file instead.
 //!
 //! The part here needs no Windows (tested on Linux); `win.rs` asks Windows for the system folder and loads the core.
 
@@ -17,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 /// The folder in the prefix's `system32` that holds the copy.
 pub const COPY_DIR: &str = "neural-forge";
-/// The copy's file name: not `_nvngx.dll`, which `_nvngx=b` would load as the wrapper.
-pub const COPY_NAME: &str = "_nvngx_core.dll";
+/// The copy's file name: the core's own (see the module text).
+pub const COPY_NAME: &str = "_nvngx.dll";
 /// The environment variable that names the core to load instead (a Windows path, or a Linux one through `Z:`).
 pub const ENV_CORE: &str = "NEURAL_FORGE_NGX_CORE";
 /// The driver folder Proton names in `NVIDIA_WINE_DLL_DIR` when it is not set (Debian and Ubuntu's layout).
@@ -105,17 +106,17 @@ mod tests {
     #[test]
     fn the_copy_goes_into_its_own_folder_in_system32() {
         let p = plan(env(&[("NVIDIA_WINE_DLL_DIR", "/usr/lib64/nvidia/wine")]), r"C:\windows\system32");
-        assert_eq!(p, Plan::Copy { from: r"Z:\usr\lib64\nvidia\wine\_nvngx.dll".into(), to: r"C:\windows\system32\neural-forge\_nvngx_core.dll".into() });
+        assert_eq!(p, Plan::Copy { from: r"Z:\usr\lib64\nvidia\wine\_nvngx.dll".into(), to: r"C:\windows\system32\neural-forge\_nvngx.dll".into() });
         let Plan::Copy { to, .. } = plan(env(&[]), "C:\\windows\\system32\\") else { panic!() };
-        assert_eq!(to, r"C:\windows\system32\neural-forge\_nvngx_core.dll");
+        assert_eq!(to, r"C:\windows\system32\neural-forge\_nvngx.dll");
     }
 
-    /// The copy's name is not one Wine's `_nvngx=b` applies to, nor one the core takes for a feature (`nvngx_<name>`).
+    /// The copy keeps the core's name, in a folder below `system32` (where Wine looks overrides up by the full path).
     #[test]
-    fn the_copy_is_not_named_like_the_wrapper_or_a_feature() {
-        assert!(!COPY_NAME.eq_ignore_ascii_case("_nvngx.dll"));
-        assert!(!COPY_NAME.to_ascii_lowercase().starts_with("nvngx_"));
-        assert!(crate::modules::is_ngx_module(COPY_NAME), "listed with NGX's modules");
+    fn the_copy_keeps_the_cores_name_in_a_folder_of_its_own() {
+        assert_eq!(COPY_NAME, "_nvngx.dll");
+        assert!(!COPY_DIR.is_empty() && !COPY_DIR.contains(['\\', '/']));
+        assert!(crate::modules::is_ngx_module(COPY_NAME));
     }
 
     #[test]

@@ -391,21 +391,39 @@ fn system_dir() -> String {
     String::from_utf16_lossy(&buf[..n])
 }
 
-/// NVIDIA's core to load (`core_copy.rs`), and what was done to get it, for the log: `%NEURAL_FORGE_NGX_CORE%`, else
-/// the copy of the driver's core in `system32\neural-forge`, made or refreshed here; the driver's core itself when
-/// the copy cannot be written.
-fn core_path() -> (String, String) {
+/// NVIDIA's core to load (`core_copy.rs`), what was done to get it (for the log), and the driver's file to load
+/// instead if that one does not load as NVIDIA's core: `%NEURAL_FORGE_NGX_CORE%` (no fallback), else the copy of the
+/// driver's core in `system32\\neural-forge`, made or refreshed here; the driver's core itself when the copy cannot
+/// be written.
+fn core_path() -> (String, String, Option<String>) {
     match core_copy::plan(|name| std::env::var(name).ok(), &system_dir()) {
-        Plan::Given(path) => (path, format!("named by {}", core_copy::ENV_CORE)),
+        Plan::Given(path) => (path, format!("named by {}", core_copy::ENV_CORE), None),
         Plan::Copy { from, to } => {
             let tag = unix_pid().unwrap_or(0).to_string();
             match core_copy::place(std::path::Path::new(&from), std::path::Path::new(&to), &tag) {
-                Ok(Placed::Unchanged) => (to, format!("copy of {from}")),
-                Ok(Placed::Written) => (to, format!("copy of {from}, written now")),
-                Err(e) => (from, format!("the driver's own: the copy {to} could not be written ({e})")),
+                Ok(Placed::Unchanged) => (to, format!("copy of {from}"), Some(from)),
+                Ok(Placed::Written) => (to, format!("copy of {from}, written now"), Some(from)),
+                Err(e) => (from, format!("the driver's own: the copy {to} could not be written ({e})"), None),
             }
         }
     }
+}
+
+/// Loads `path`: the module, or null when it did not load or Wine handed back this wrapper (no full-path native
+/// override for it), which is then not counted as a load.
+fn load_core(this: Handle, path: &str) -> Result<Handle, String> {
+    let wpath = wide(path);
+    let t = now_ms();
+    trace(format_args!("load: LoadLibraryW({path}) ..."));
+    let core = unsafe { LoadLibraryW(wpath.as_ptr()) };
+    trace(format_args!("load: LoadLibraryW returned {core:p} after {:.3} ms", now_ms() - t));
+    if core.is_null() {
+        return Err(format!("NVIDIA's NGX core {path} did not load"));
+    }
+    if core == this {
+        return Err(format!("{path} resolved to this wrapper (the full-path native override is missing)"));
+    }
+    Ok(core)
 }
 
 /// NVIDIA's core module, once loaded (`modules.rs` names it in the module list).
@@ -426,19 +444,17 @@ pub(crate) fn target(name: &str) -> *const c_void {
 /// a passthrough export it lacks jumps to [`missing_export`] (named in the returned text, for the log).
 fn resolve(this: Handle) -> Result<String, String> {
     let t = now_ms();
-    let (path, source) = core_path();
+    let (mut path, mut source, fallback) = core_path();
     trace(format_args!("load: NVIDIA's core {path} ({source}) after {:.3} ms", now_ms() - t));
-    let wpath = wide(&path);
-    let t = now_ms();
-    trace(format_args!("load: LoadLibraryW({path}) ..."));
-    let core = unsafe { LoadLibraryW(wpath.as_ptr()) };
-    trace(format_args!("load: LoadLibraryW returned {core:p} after {:.3} ms", now_ms() - t));
-    if core.is_null() {
-        return Err(format!("NVIDIA's NGX core {path} did not load"));
-    }
-    if core == this {
-        return Err(format!("{path} resolved to this wrapper (the full-path native override is missing)"));
-    }
+    let core = match (load_core(this, &path), fallback) {
+        (Ok(core), _) => core,
+        (Err(e), Some(driver)) => {
+            source = format!("the driver's own: {e}");
+            path = driver;
+            load_core(this, &path)?
+        }
+        (Err(e), None) => return Err(e),
+    };
     CORE.store(core, Ordering::Release);
     let lookup = |name: &str| -> *const c_void {
         let cname: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
