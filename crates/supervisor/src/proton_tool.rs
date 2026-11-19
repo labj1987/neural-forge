@@ -804,6 +804,31 @@ fn rings(dir: &Path) -> Vec<(PathBuf, u32)> {
     out
 }
 
+/// The folder in a prefix's `system32` that the NGX wrapper copies NVIDIA's core into, and the copy's name
+/// (`crates/ngx-wrapper/src/core_copy.rs`, `COPY_DIR` and `COPY_NAME`).
+pub const CORE_COPY_DIR: &str = "neural-forge";
+pub const CORE_COPY_NAME: &str = "_nvngx_core.dll";
+
+/// The NGX wrapper's core folders in the prefixes of the Steam library `library` (`steamapps/compatdata/<app
+/// id>/pfx/drive_c/windows/system32/neural-forge`) that hold nothing but its copy (and temporary copies it left): a
+/// folder with anything else in it, or a link, is not listed.
+pub fn core_copy_dirs(library: &Path) -> Vec<PathBuf> {
+    let Ok(prefixes) = std::fs::read_dir(library.join("steamapps/compatdata")) else { return Vec::new() };
+    let ours = |name: &str| name == CORE_COPY_NAME || (name.starts_with(&format!("{CORE_COPY_NAME}.")) && name.ends_with(".tmp"));
+    let mut out: Vec<PathBuf> = prefixes
+        .flatten()
+        .map(|p| p.path().join("pfx/drive_c/windows/system32").join(CORE_COPY_DIR))
+        .filter(|dir| {
+            let real_dir = std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir());
+            real_dir
+                && std::fs::read_dir(dir)
+                    .is_ok_and(|entries| entries.flatten().all(|e| e.file_type().is_ok_and(|t| t.is_file()) && e.file_name().to_str().is_some_and(ours)))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// Removes this user's rings in `dir` whose game is gone (a ring the layer never opened stays after its game
 /// exits): never one of a running process. What was removed. Run when Neural Forge starts and by
 /// `uninstall --purge`.
@@ -910,6 +935,14 @@ pub fn installed_wrapper() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The names the wrapper uses for its core copy (a separate workspace, so compared as text).
+    #[test]
+    fn the_core_copy_names_match_the_wrappers() {
+        let src = include_str!("../../ngx-wrapper/src/core_copy.rs");
+        assert!(src.contains(&format!("pub const COPY_DIR: &str = \"{CORE_COPY_DIR}\";")), "COPY_DIR");
+        assert!(src.contains(&format!("pub const COPY_NAME: &str = \"{CORE_COPY_NAME}\";")), "COPY_NAME");
+    }
 
     /// `doctor` reports a ring of another version than the layer reads: the same number.
     #[test]
