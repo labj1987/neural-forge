@@ -404,25 +404,36 @@ mod tests {
 
     #[test]
     fn crashed_process_releases_lease() {
-        let _serial = LEASE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
+        // The other process: this test binary run again for this test alone, which then only takes the kernel lock on
+        // the file it is given and holds it until it is killed.
+        const HOLDER: &str = "NEURAL_FORGE_TEST_LOCK_HOLDER";
+        if let Some(path) = std::env::var_os(HOLDER) {
+            let file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+            assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0, "{}", std::io::Error::last_os_error());
+            println!("lock holder ready");
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        let _serial = LEASE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = std::env::temp_dir().join(format!("neural-forge-crash-test-{}", std::process::id()));
         // Create with the same private permissions as production, then let an
         // independent process acquire the actual kernel lock.
         drop(acquire(path.to_str().unwrap()).unwrap());
-        let mut child = Command::new("python3")
-            .args(["-c", "import fcntl,sys,time; f=open(sys.argv[1], 'r+'); fcntl.flock(f, fcntl.LOCK_EX); print('ready', flush=True); time.sleep(30)"])
-            .arg(&path)
+        let name = concat!(module_path!(), "::crashed_process_releases_lease").split_once("::").unwrap().1;
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(HOLDER, &path)
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut ready = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        // The test harness prints its own lines first, and the test's name on the line the holder's output starts.
+        let ready = BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok).any(|line| line.ends_with("lock holder ready"));
         let excluded = acquire(path.to_str().unwrap()).is_err();
         child.kill().unwrap();
         child.wait().unwrap();
-        assert_eq!(ready.trim(), "ready");
+        assert!(ready, "the holder never took the lock");
         assert!(excluded);
         assert!(acquire(path.to_str().unwrap()).is_ok());
         std::fs::remove_file(path).unwrap();

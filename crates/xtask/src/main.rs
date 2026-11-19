@@ -13,10 +13,12 @@ mod check_proton_scripts;
 mod check_shaders;
 mod gen_model_shape;
 mod gen_third_party_crates;
+mod gta_bench;
 mod hdr_encode;
 mod py;
 mod release_notes;
 mod sync_appdata_releases;
+mod wine_builtin;
 
 type Task = fn(&[String]) -> ExitCode;
 
@@ -30,9 +32,11 @@ const TASKS: &[(&str, Task, &str)] = &[
     ("check-shaders", check_shaders::main, "the committed SPIR-V against the shaders (--update rebuilds it)"),
     ("gen-model-shape", gen_model_shape::main, "crates/supervisor/src/model_shape.rs from a weights listing"),
     ("gen-third-party-crates", gen_third_party_crates::main, "THIRD_PARTY_CRATES.md and the licence texts"),
+    ("gta-bench", gta_bench::main, "scripts/gta-bench.sh's crash-dump, frame-generation and Proton checks"),
     ("hdr-encode", hdr_encode::main, "the HDR encode's reference"),
     ("release-notes", release_notes::main, "a version's CHANGELOG section, for its release page"),
     ("sync-appdata-releases", sync_appdata_releases::main, "the appdata <releases> list from CHANGELOG.md"),
+    ("wine-builtin", wine_builtin::main, "stamp a PE file as a Wine builtin DLL, or check the stamp"),
 ];
 
 /// The repository root (this crate is crates/xtask).

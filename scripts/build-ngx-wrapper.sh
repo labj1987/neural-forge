@@ -9,31 +9,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The stamp, its check and the export listing are `cargo xtask wine-builtin` (crates/xtask/src/wine_builtin.rs).
 stamp() {
-    python3 -I - "$1" <<'PY'
-import struct, sys
-path = sys.argv[1]
-b = bytearray(open(path, 'rb').read())
-if b[:2] != b'MZ':
-    sys.exit(f'{path}: not a PE file')
-lfanew = struct.unpack_from('<I', b, 0x3c)[0]
-if lfanew < 0x60:
-    sys.exit(f'{path}: no room for the Wine builtin signature (e_lfanew {lfanew:#x})')
-b[0x40:0x60] = b'Wine builtin DLL'.ljust(32, b'\0')
-open(path, 'wb').write(b)
-PY
+    cargo xtask wine-builtin stamp "$1"
 }
 
 check_stamp() {
-    python3 -I -c 'import sys; b = open(sys.argv[1], "rb").read(0x60); sys.exit(0 if b[0x40:0x50] == b"Wine builtin DLL" and b[0x50:0x60] == bytes(16) else 1)' "$1"
+    cargo xtask wine-builtin check "$1"
 }
 
 if [ "${1:-}" = "--self-test" ]; then
-    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-    python3 -I -c 'import struct, sys; b = bytearray(0x100); b[:2] = b"MZ"; struct.pack_into("<I", b, 0x3c, 0x80); open(sys.argv[1], "wb").write(b)' "$tmp/pe.dll"
-    stamp "$tmp/pe.dll"; check_stamp "$tmp/pe.dll" || { echo "self-test: stamp not found"; exit 1; }
-    python3 -I -c 'import struct, sys; b = bytearray(0x100); b[:2] = b"MZ"; struct.pack_into("<I", b, 0x3c, 0x40); open(sys.argv[1], "wb").write(b)' "$tmp/small.dll"
-    if (stamp "$tmp/small.dll") 2>/dev/null; then echo "self-test: a header without room was stamped"; exit 1; fi
+    cargo xtask wine-builtin --self-test || { echo "self-test: the Wine builtin stamp failed"; exit 1; }
     echo "build-ngx-wrapper.sh self-test: ok"
     exit 0
 fi
@@ -48,9 +34,7 @@ check_stamp "$out.tmp"
 mv -f "$out.tmp" "$out"
 
 exports() {
-    x86_64-w64-mingw32-objdump -p "$1" | python3 -I -c '
-import re, sys
-for m in re.finditer(r"\+base\[\s*(\d+)\]\s+[0-9a-f]{4}\s+(NVSDK\S+)", sys.stdin.read()): print(m.group(2), m.group(1))'
+    x86_64-w64-mingw32-objdump -p "$1" | cargo xtask wine-builtin exports
 }
 nvidia=""
 for d in /usr/lib/x86_64-linux-gnu/nvidia/wine /usr/lib64/nvidia/wine /usr/lib/nvidia/wine; do [ -f "$d/_nvngx.dll" ] && nvidia="$d/_nvngx.dll" && break; done

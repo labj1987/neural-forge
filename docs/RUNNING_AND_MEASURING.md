@@ -52,7 +52,7 @@ bash scripts/smoke-test.sh
 
 Then the AppImage (`bash build-appimage.sh`), its glibc baseline, and its layer installed with its
 own CLI into scratch XDG directories and run through the Vulkan loader
-(`NEURAL_FORGE_SMOKE_SO=<installed .so> bash scripts/smoke-test.sh`). The shader check needs `spirv-val`.
+(`NEURAL_FORGE_SMOKE_SO=<installed .so> bash scripts/smoke-test.sh`). The shader check needs `spirv-val`, the smoke test `jq`.
 `cargo xtask` (the alias in `.cargo/config.toml`) runs the repository's development tasks, `crates/xtask`;
 `cargo xtask` alone lists them.
 
