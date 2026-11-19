@@ -719,6 +719,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "cache-replay"
+version = "4.6.0"
+dependencies = [
+ "half",
+ "serde_json",
+]
+
+[[package]]
 name = "calloop"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3819,6 +3827,7 @@ name = "neural-forge-layer"
 version = "4.6.0"
 dependencies = [
  "ash",
+ "cache-replay",
  "libc",
  "neural-forge-native",
  "neural-forge-protocol",

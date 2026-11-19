@@ -7,7 +7,7 @@
 // (FreshEdit, ClampEdit). Upstream is GPL-3.0; this port is distributed under this project's
 // AGPL-3.0-or-later (see ATTRIBUTION.md).
 //
-// The numbers are those of scripts/cache_common.py, the numpy reference this shader mirrors step
+// The numbers are those of crates/cache-replay/src/common.rs, the reference this shader mirrors step
 // for step (each function names its counterpart there); keep the two in step. Pixel units: a pixel
 // centre is i + 0.5. Every buffer is at the render extent, row-major.
 //

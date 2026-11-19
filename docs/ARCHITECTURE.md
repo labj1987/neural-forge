@@ -36,6 +36,7 @@ flowchart LR
 | CLI | `crates/cli` | `neural-forge-cli`: install, model extraction, `doctor`, profiles, and `shmctl` for live settings. |
 | Supervisor | `crates/supervisor` | Library shared by GUI and CLI: paths, config, the channel's path, the model's extraction, installs the layer. |
 | Protocol | `crates/protocol` | The shared-memory contract: header layout, regions, version, paths, saved settings, environment variable access. |
+| Edit cache reference | `crates/cache-replay` | Developer tool, not shipped: the edit cache's reference (the algorithm its shaders mirror, 4.10) and `cache-replay`, its offline replay on a cache dump (4.9). The layer's tests compare the shaders with it. |
 
 **One process.** NVIDIA ships the DLSS 5 Neural Rendering model only inside a Windows DLL
 (`nvngx_dlssnr.dll`), and no Linux build of NGX's Feature 18 exists
@@ -559,7 +560,7 @@ image is created as asked, which the log says once per format and usage with bot
 memory-requirements queries by create info are answered for the create info the image is made with.
 
 **The cache dump** (`preupscale::cache_dump`) writes K consecutive model-mode holds for the offline
-replay of the edit cache (`scripts/cache_replay.py`). Requests: `neural-forge-cli shmctl dump-cache
+replay of the edit cache (`cargo run --release -p cache-replay -- DUMP`, crates/cache-replay). Requests: `neural-forge-cli shmctl dump-cache
 [--holds K]` (the header's `preupscale_dump_request`, v17; the layer zeroes it when it takes it), a
 file `dump-cache` next to the channel (`/tmp/neural-forge-$UID/dump-cache`, holding K or nothing for
 16; looked for at most once a second, removed when taken), or
@@ -609,9 +610,9 @@ and `depth.r32f` (device depth as f32: D16/D24 divided by their maximum; only fo
 
 ### 4.10 The edit cache (model every Nth frame before the upscaler)
 
-`crates/layer/src/preupscale/cache.rs`, `shaders/preupscale_cache_*.comp`; the numpy reference they
-mirror step for step is `scripts/cache_common.py` (`scripts/cache_replay.py` measures it offline on a
-4.9 dump). Ported from optiscaler-dlss5's `dlssnr_cache.hlsl` (ATTRIBUTION.md).
+`crates/layer/src/preupscale/cache.rs`, `shaders/preupscale_cache_*.comp`; the reference they
+mirror step for step is `crates/cache-replay` (its `common` module; the `cache-replay` tool measures it
+offline on a 4.9 dump, and the layer's shader tests compare with its exports). Ported from optiscaler-dlss5's `dlssnr_cache.hlsl` (ATTRIBUTION.md).
 
 The cache is on by default and sets its own cadence (below): while the camera moves the network runs
 on every second hold (a **refresh**: C, N, W as in 4.5) and the hold between is **cached**: C as
@@ -653,7 +654,7 @@ directly as 3.2.0's did; the picture is bit for bit 3.2.0's (the test
   (v + eps) * 2^edit - eps` back to scene with the decode's rules: original kept where the encode
   clamped, alpha kept, nothing written with an unusable exposure). Debug view 6 writes the rejection
   mask instead (red rejected, green the high band's confidence, blue off the chain).
-- **Adaptive cadence** (`cache::Regime`, mirrored by `cache_replay.py --adaptive`): the motion pass
+- **Adaptive cadence** (`cache::Regime`, mirrored by `cache-replay --adaptive`): the motion pass
   counts the texels whose vector (the nearest surface's) is shorter than a quarter of the pace,
   max(0.1% of the render width, 0.5 px) / 3 a hold (0.124 px at 1440p Balanced), and how many it
   counted (`STAT_STILL`, `STAT_MOTION_N`, read when the hold's fence was waited on). A hold reads

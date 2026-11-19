@@ -432,7 +432,8 @@ completes ("October 20", below).
 ### 3.3 edit cache: what was tried
 
 The edit cache (ARCHITECTURE.md 4.10) was ported from optiscaler-dlss5 with all of its anti-ghosting
-parts. Each part was then measured offline with `scripts/cache_replay.py` on three GTA V dumps (16
+parts. Each part was then measured offline with the replay tool (then `scripts/cache_replay.py`, now the
+`cache-replay` crate with the same command line) on three GTA V dumps (16
 holds each at 1485x836, the model on every hold: `gta-pan`, `gta-drive`, `gta-still`), the cache
 mode carried 2, 3 and 4 holds, each part switched off in turn. Cells are err / p99.5 / worse% /
 kept%: mean error and the per-hold 99.5th percentile (the strongest trails) in stops against the
@@ -480,7 +481,7 @@ how much of the model's effect is kept (100% = the model on every hold).
 - With both removed the shader still matches the tool (the shader-against-tool test, within 1e-3
   stop) and interval 1 is unchanged bit for bit.
 
-**Refresh crossfade and soft refresh: tried offline, removed after the live A/B below.** `cache_replay.py --cadence` runs the cache as the layer
+**Refresh crossfade and soft refresh: tried offline, removed after the live A/B below.** `cache-replay --cadence` runs the cache as the layer
 does, the model on one hold in N and the cached holds between, and measures over time: the numbers
 above for every hold after the first refresh (refresh holds included), p99.5 on the cached holds alone,
 upstream's pulse probe (`measure_pulse.py`: the regional light, a 12-pixel Gaussian of the shown
@@ -759,7 +760,7 @@ direction is the other way round, and of the rest only the regime itself stayed.
   more (the trails above), 3.6-6.3 ms gives 2 on every hold, a still view included, and more gives
   1 everywhere. It cannot meet the trail gate and the still gate at once; the regime does both.
 
-Offline, `cache_replay.py --cadence N --adaptive` (`--still-interval` for upstream's direction),
+Offline, `cache-replay --cadence N --adaptive` (`--still-interval` for upstream's direction),
 err / p99.5 / worse% / kept% and the share of holds the model ran on:
 
 | dump | fixed 2 | fixed 3 | adaptive, 2 in motion (shipped) | upstream's direction (8 still, 2 moving) |
@@ -852,7 +853,7 @@ multiplied onto what the decode or the cached write-back wrote; the grid (28 byt
 texel) kept what was shown. The step was the rate times the smoothed hold time (0.9 / 0.1, each
 clamped to 1/500..1/10 s). The shaders matched the replay tool's shift within 1.2e-5 stop.
 
-Offline, `cache_replay.py --cadence 2 --adaptive` (the shipped cadence) and `--cadence 1` (the model
+Offline, `cache-replay --cadence 2 --adaptive` (the shipped cadence) and `--cadence 1` (the model
 on every hold), the hold times the dumps' own (22-59 ms: dumping slows the game, and the game's
 clock runs on). Jump: the regional light's step from the hold before along the motion (the pulse
 probe's 12-pixel Gaussian of the shown picture's log luma ratio to the untouched frame), mean / p99

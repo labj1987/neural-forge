@@ -41,7 +41,7 @@ cargo build --locked -p neural-forge-cli && python3 scripts/test_install.py
 for t in release_notes.py bench-iq.py bench-report.py agreement.py gen_third_party_crates.py check_pins.py; do
     python3 scripts/$t --self-test
 done
-python3 scripts/hdr_encode.py selftest && python3 scripts/test_cache_replay.py
+python3 scripts/hdr_encode.py selftest
 bash scripts/gta-bench.sh --self-test
 python3 scripts/check_shaders.py && python3 scripts/sync_appdata_releases.py --check
 python3 scripts/gen_third_party_crates.py --check && python3 scripts/check_namespace.py
