@@ -398,27 +398,6 @@ fn added_lines(indent: &str) -> String {
     )
 }
 
-/// The first line of the lines [`added_lines`] puts in, and the end of their last line in every version so far.
-const ADDED_FIRST: &str = "# Neural Forge (docs/PROTON_NGX.md):";
-const ADDED_LAST: &str = "_nvngx\"] = \"n\"\n";
-
-/// A patched `proton` script with an older version of the added lines brought up to [`added_lines`] (4.6.1 added
-/// the override for the core's copy): `None` when it already has them, or has none to replace.
-pub fn upgrade_proton_script(text: &str) -> Option<String> {
-    let start = text.find(ADDED_FIRST)?;
-    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
-    let indent = &text[line_start..start];
-    let added = added_lines(indent);
-    if text.contains(&added) {
-        return None;
-    }
-    // The block ends at the last override line that follows its first line without a blank line in between.
-    let block = &text[line_start..];
-    let block_len = block.find("\n\n").map_or(block.len(), |i| i + 1);
-    let end = block[..block_len].rfind(ADDED_LAST)? + ADDED_LAST.len();
-    Some(format!("{}{added}{}", &text[..line_start], &block[end..]))
-}
-
 /// `proton`'s text with the DLL overrides added after the block that sets `NVIDIA_WINE_DLL_DIR` (Valve's code,
 /// in every Proton since 9); refused unless that block is there exactly once.
 pub fn patch_proton_script(text: &str) -> Result<String, String> {
@@ -652,20 +631,24 @@ pub fn create_in(root: &Path, source: &Source, wrapper: &Path, proc_root: &Path)
 }
 
 /// Puts `dll` (the installed wrapper) into `tool` when its marker names another one: its `_nvngx.dll` written new
-/// (a running game keeps the file it loaded), then the marker. Whether it changed anything.
+/// (a running game keeps the file it loaded), then the marker; and makes its `proton` script again from its source's
+/// when that differs (a Neural Forge with other overrides made it). Whether it changed anything.
 pub fn refresh_wrapper(tool: &Tool, dll: &[u8]) -> Result<bool, String> {
-    // A copy made before the current overrides gets them (a running game keeps the script it started with).
+    // The copy's script made again from its source's, as `create` makes it, while the source is the version the copy
+    // was made from (a newer one is a remake: `source_changed`); a running game keeps the script it started with.
     let script_path = tool.dir.join("proton");
-    let upgraded = match std::fs::read_to_string(&script_path).ok().as_deref().and_then(upgrade_proton_script) {
-        Some(text) => {
+    let script =
+        (!source_changed(tool)).then(|| std::fs::read_to_string(tool.source.join("proton")).ok()).flatten().and_then(|text| patch_proton_script(&text).ok());
+    let rescripted = match script {
+        Some(text) if std::fs::read_to_string(&script_path).ok().as_deref() != Some(text.as_str()) => {
             write_new(&script_path, text.as_bytes(), 0o755).map_err(|e| format!("{}: {e}", script_path.display()))?;
             true
         }
-        None => false,
+        _ => false,
     };
     let digest = crate::install::digest(dll);
     if tool.wrapper_sha256 == digest {
-        return Ok(upgraded);
+        return Ok(rescripted);
     }
     let marker_path = tool.dir.join(MARKER);
     let text = std::fs::read_to_string(&marker_path).map_err(|e| format!("{}: {e}", marker_path.display()))?;
@@ -1002,23 +985,6 @@ mod tests {
         assert!(out.contains(r#"            self.dlloverrides["C:\\windows\\system32\\neural-forge\\_nvngx"] = "n""#), "{out}");
         assert!(out.ends_with("\n        if \"PROTON_LOG\" in self.env:\n"), "the rest follows unchanged");
         assert!(patch_proton_script(&out).unwrap_err().contains("already"), "never twice");
-        assert_eq!(upgrade_proton_script(&out), None, "already the current lines");
-    }
-
-    /// A copy patched by 4.6.0 or older (no override for the core's copy) gets the current lines in place of its own.
-    #[test]
-    fn an_older_patch_is_brought_up_to_date() {
-        let current = patch_proton_script(VALVE).unwrap();
-        let copy_line = "            self.dlloverrides[\"C:\\\\windows\\\\system32\\\\neural-forge\\\\_nvngx\"] = \"n\"\n";
-        assert!(current.contains(copy_line), "{current}");
-        let old = current.replace(copy_line, "").replace(
-            "which loads its copy of NVIDIA's\n        # core from system32\\neural-forge (else the driver's from NVIDIA_WINE_DLL_DIR; both paths forced native) and\n        # forwards every export.",
-            "which loads NVIDIA's core\n        # from NVIDIA_WINE_DLL_DIR (that path forced native) and forwards every export.",
-        );
-        assert_ne!(old, current);
-        assert!(!old.contains("neural-forge"), "{old}");
-        assert_eq!(upgrade_proton_script(&old).as_deref(), Some(current.as_str()));
-        assert_eq!(upgrade_proton_script(VALVE), None, "an unpatched script is not touched");
     }
 
     #[test]
@@ -1359,6 +1325,14 @@ mod tests {
         assert!(!wrapper_changed(&t, &wrapper));
         assert_eq!(refresh_wrappers(&root, &wrapper), [(t.name.clone(), Ok(false))]);
         assert!(std::fs::read_to_string(t.dir.join(MARKER)).unwrap().contains("source_version=GE-Proton11-12\n"), "the rest of the marker stays");
+        // A copy whose script another Neural Forge made (older overrides) gets it made again from the source's.
+        let script = std::fs::read_to_string(t.dir.join("proton")).unwrap();
+        let stale = script.replace("neural-forge\\\\_nvngx", "old");
+        assert_ne!(stale, script);
+        std::fs::write(t.dir.join("proton"), &stale).unwrap();
+        assert_eq!(refresh_wrappers(&root, &wrapper), [(t.name.clone(), Ok(true))]);
+        assert_eq!(std::fs::read_to_string(t.dir.join("proton")).unwrap(), script);
+        assert_eq!(refresh_wrappers(&root, &wrapper), [(t.name.clone(), Ok(false))], "then nothing to do");
         // What a stopped create left is found for purge.
         std::fs::create_dir_all(root.join("compatibilitytools.d/.GE-Proton11-13-NeuralForge.tmp")).unwrap();
         std::fs::create_dir_all(root.join("compatibilitytools.d/.hidden")).unwrap();

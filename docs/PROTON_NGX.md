@@ -43,8 +43,8 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   must stay `_nvngx.dll`: loaded as `_nvngx_core.dll` (or #51's `nvngx_core.dll`) the core answers every call the
   same, but the game never creates a DLSS feature. Wine would hand a module of that name to the wrapper
   (`_nvngx=b`), so the Proton copy also sets `C:\windows\system32\neural-forge\_nvngx=n`: a full-path key is
-  looked up before the base name. A copy made by an older Neural Forge gets that line when the wrapper in it is
-  renewed (`proton_tool::upgrade_proton_script`, run by `refresh_wrapper`). The copy is compared with the driver's
+  looked up before the base name. Each time Neural Forge renews the wrapper in its copies (`refresh_wrapper`, at start and
+  after an update), it also makes a copy's `proton` script again from its source's when they differ. The copy is compared with the driver's
   file on every load (about 2 ms) and rewritten, through a temporary file renamed over it, only when they differ (a
   new driver); a copy another process of the game put in place first is taken as it is. If the copy cannot be
   written, or loading it returns the wrapper (a Proton copy without the new line), the wrapper loads the driver's
