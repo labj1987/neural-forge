@@ -8,7 +8,7 @@
 //! DLSS feature DLL beside it in `system32`, where the driver's `nvidia/wine` folder holds NVIDIA's `nvngx_dlssg.dll`
 //! and `nvngx_dlssd.dll` (Indiana Jones and the Great Circle crashed only with the core loaded from there, #51). Wine
 //! would hand a module of that name to the wrapper (`_nvngx=b`), so the Neural Forge Proton copy also sets that full
-//! path native (`proton_tool.rs`, `added_lines`); where it does not yet (a copy not patched again), loading the copy
+//! path native (`proton_tool.rs`, `added_lines`); where it does not yet (a copy whose script is not made again yet), loading the copy
 //! returns the wrapper itself, and the wrapper loads the driver's file instead.
 //!
 //! The part here needs no Windows (tested on Linux); `win.rs` asks Windows for the system folder and loads the core.
