@@ -3,8 +3,8 @@
 //! [`kernels`] and embeds the result.
 //!
 //! One module per generator, each with the `generate` function that emits the kernel and a `cli` that takes the
-//! generator's arguments as strings (the same order and defaults as its command-line form in upstream's
-//! `scripts/ptx/*.py`, without the output path). `ptxgen` is the emitter, `swin` the shared fragment-level
+//! generator's arguments as strings (the same order and defaults as its command-line form in
+//! upstream's `scripts/ptx/*.py`, without the output path). `ptxgen` is the emitter, `swin` the shared fragment-level
 //! building blocks. `cargo run -p opendlss-nr-ptx --example write_ptx DIR` writes every kernel to DIR, to diff the
 //! generated PTX before and after a change.
 //!
@@ -57,6 +57,21 @@ impl Kernel {
 /// A generator argument as a number (the command-line forms' `int(...)`).
 pub(crate) fn int(arg: &str) -> usize {
     arg.parse().unwrap_or_else(|_| panic!("PTX generator argument {arg:?} is not a non-negative integer"))
+}
+
+/// A required generator argument as a number: a clear error when it is missing.
+pub(crate) fn req(args: &[&str], index: usize) -> usize {
+    int(req_str(args, index))
+}
+
+/// A required generator argument as text: a clear error when it is missing.
+pub(crate) fn req_str<'a>(args: &[&'a str], index: usize) -> &'a str {
+    args.get(index).copied().unwrap_or_else(|| panic!("PTX generator needs argument {} (got {} arguments)", index + 1, args.len()))
+}
+
+/// A register cap: a `u32`, an error when it does not fit.
+pub(crate) fn reg(arg: &str) -> u32 {
+    arg.parse().unwrap_or_else(|_| panic!("PTX generator register cap {arg:?} is not a 32-bit non-negative integer"))
 }
 
 /// Every kernel the native backend embeds. The same generator invocations, in the same order, as upstream's

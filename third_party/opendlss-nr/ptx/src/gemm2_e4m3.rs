@@ -401,10 +401,10 @@ pub fn generate(k: usize, flags: usize, max_regs: Option<u32>, stages_wanted: us
 
 /// `<K> <flags> [maxregs] [stages] [ksub] [ws]`
 pub fn cli(args: &[&str]) -> String {
-    let (k, flags) = (crate::int(args[0]), crate::int(args[1]));
-    let max_regs = if args.len() > 2 { Some(crate::int(args[2]) as u32) } else { None };
-    let stages_wanted = if args.len() > 3 { crate::int(args[3]) } else { STAGES };
-    let ksub = if args.len() > 4 { crate::int(args[4]) } else { 1 };
-    let ws = args.len() > 5 && crate::int(args[5]) != 0;
+    let (k, flags) = (crate::req(args, 0), crate::req(args, 1));
+    let max_regs = if args.len() > 2 { Some(crate::reg(args[2])) } else { None };
+    let stages_wanted = if args.len() > 3 { crate::req(args, 3) } else { STAGES };
+    let ksub = if args.len() > 4 { crate::req(args, 4) } else { 1 };
+    let ws = args.len() > 5 && crate::req(args, 5) != 0;
     generate(k, flags, max_regs, stages_wanted, ksub, ws).1
 }

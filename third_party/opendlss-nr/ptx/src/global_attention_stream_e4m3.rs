@@ -318,5 +318,5 @@ pub fn generate_attention(stages: usize) -> (String, String, usize) {
 /// `normalize|attention [stages]`
 pub fn cli(args: &[&str]) -> String {
     let stages = args.get(1).map_or(4, |s| crate::int(s));
-    if args[0] == "normalize" { generate_normalize() } else { generate_attention(stages) }.1
+    if crate::req_str(args, 0) == "normalize" { generate_normalize() } else { generate_attention(stages) }.1
 }

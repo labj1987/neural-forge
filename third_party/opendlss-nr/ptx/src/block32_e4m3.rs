@@ -682,7 +682,7 @@ pub fn generate(flags: usize, max_regs: Option<u32>) -> (String, String) {
 
 /// `<flags> [maxRegs]`
 pub fn cli(args: &[&str]) -> String {
-    let flags = crate::int(args[0]);
-    let max_regs = if args.len() > 1 { Some(crate::int(args[1]) as u32) } else { None };
+    let flags = crate::req(args, 0);
+    let max_regs = if args.len() > 1 { Some(crate::reg(args[1])) } else { None };
     generate(flags, max_regs).1
 }

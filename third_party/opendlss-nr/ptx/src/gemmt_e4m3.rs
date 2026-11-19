@@ -282,8 +282,8 @@ pub fn generate(
 
 /// `<K> <flags> <partitionSteps> <splits> [maxregs] [stages] [prefetch]`
 pub fn cli(args: &[&str]) -> String {
-    let (k_dim, flags, part_steps, splits) = (crate::int(args[0]), crate::int(args[1]), crate::int(args[2]), crate::int(args[3]));
-    let max_regs = args.get(4).map(|a| crate::int(a) as u32);
+    let (k_dim, flags, part_steps, splits) = (crate::req(args, 0), crate::req(args, 1), crate::req(args, 2), crate::req(args, 3));
+    let max_regs = args.get(4).map(|a| crate::reg(a));
     let stages_wanted = args.get(5).map_or(STAGES, |a| crate::int(a));
     let prefetch = args.get(6).map_or(PREFETCH, |a| crate::int(a));
     generate(k_dim, flags, part_steps, splits, max_regs, stages_wanted, prefetch).1

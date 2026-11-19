@@ -1,5 +1,5 @@
 //! QKV projection + cosine normalization + 8x8 window attention for (window, head) items in PTX
-//! (the qkv_attention.comp dataflow at the fragment level; see block32_e4m3.py for the block-level version).
+//! (the qkv_attention.comp dataflow at the fragment level; see block32_e4m3.rs for the block-level version).
 //!
 //! Workgroup = 4 warps, persistent over items (item = head * windowCount + window, stride = grid); warp q owns the
 //! window's tokens 16q .. 16q+15.
@@ -394,7 +394,7 @@ pub fn generate(c: usize, max_regs: Option<u32>) -> (String, String) {
 
 /// `<C> [maxregs]`
 pub fn cli(args: &[&str]) -> String {
-    let c = crate::int(args[0]);
-    let max_regs = args.get(1).map(|a| crate::int(a) as u32);
+    let c = crate::req(args, 0);
+    let max_regs = args.get(1).map(|a| crate::reg(a));
     generate(c, max_regs).1
 }

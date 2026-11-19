@@ -489,12 +489,12 @@ pub fn generate(
 
 /// `<K> <flags> <splits> [stages] [bstages] [prefetch] [maxregs] [prefetch0] [BM]`
 pub fn cli(args: &[&str]) -> String {
-    let (k, flags, splits) = (crate::int(args[0]), crate::int(args[1]), crate::int(args[2]));
-    let stages = if args.len() > 3 { crate::int(args[3]) } else { STAGES };
-    let bstages = if args.len() > 4 { crate::int(args[4]) } else { BSTAGES };
-    let prefetch = if args.len() > 5 { crate::int(args[5]) } else { PREFETCH };
-    let max_regs = if args.len() > 6 && crate::int(args[6]) != 0 { Some(crate::int(args[6]) as u32) } else { None };
-    let prefetch0 = if args.len() > 7 { crate::int(args[7]) } else { PREFETCH0 };
-    let bm = if args.len() > 8 { crate::int(args[8]) } else { 192 };
+    let (k, flags, splits) = (crate::req(args, 0), crate::req(args, 1), crate::req(args, 2));
+    let stages = if args.len() > 3 { crate::req(args, 3) } else { STAGES };
+    let bstages = if args.len() > 4 { crate::req(args, 4) } else { BSTAGES };
+    let prefetch = if args.len() > 5 { crate::req(args, 5) } else { PREFETCH };
+    let max_regs = if args.len() > 6 && crate::req(args, 6) != 0 { Some(crate::reg(args[6])) } else { None };
+    let prefetch0 = if args.len() > 7 { crate::req(args, 7) } else { PREFETCH0 };
+    let bm = if args.len() > 8 { crate::req(args, 8) } else { 192 };
     generate(k, flags, splits, stages, bstages, prefetch, max_regs, prefetch0, bm).1
 }

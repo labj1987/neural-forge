@@ -9,3 +9,6 @@ description = "OpenDLSS-NR's PTX kernel generators: the native backend's PTX ker
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+sha2 = "0.11"

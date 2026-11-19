@@ -243,5 +243,5 @@ pub fn generate(padded: usize) -> (String, String, usize) {
 
 /// `<paddedTokens>`
 pub fn cli(args: &[&str]) -> String {
-    generate(crate::int(args[0])).1
+    generate(crate::req(args, 0)).1
 }

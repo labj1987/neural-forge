@@ -1,5 +1,5 @@
 // Compute kernel wrappers: pipeline specialization cache plus dispatch helpers with the exact operand contracts
-// of the network (GLSL cooperative-matrix reference kernels and the PTX kernels of scripts/ptx/).
+// of the network (GLSL cooperative-matrix reference kernels and the PTX kernels of ptx/src/).
 #pragma once
 #include <map>
 #include <string>
@@ -133,7 +133,7 @@ class Kernels {
     VkDeviceAddress chainSignal = 0; bool chained = false;
   };
   void fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& args);
-  // PTX (VK_NV_cuda_kernel_launch) version of the fused 32-channel block (scripts/ptx/block32_e4m3.py).
+  // PTX (VK_NV_cuda_kernel_launch) version of the fused 32-channel block (ptx/src/block32_e4m3.rs).
   static bool ptxBlock32Enabled();
   // Whether these arguments take the PTX route (only PTX launches take part in counter chaining): the f16 skip and
   // raw-output variants of the block are GLSL only.
@@ -148,7 +148,7 @@ class Kernels {
   vk::Buffer splitScratch_{};
   VkDeviceSize splitScratchBytes_ = 0;
 
-  // Fused two-layer MLP (gemm_mlp.comp / mlp_e4m3.py): E4(E4(SiLU(A W1)) W2) per batch, hidden on chip.
+  // Fused two-layer MLP (gemm_mlp.comp / mlp_e4m3.rs): E4(E4(SiLU(A W1)) W2) per batch, hidden on chip.
   struct MlpArgs {
     const Activation* input = nullptr;
     uint32_t inputColumnBase = 0;
@@ -160,7 +160,7 @@ class Kernels {
     uint32_t rows = 0, K = 0, hidden = 0, nout = 0, batches = 1;
   };
   void gemmMlp(VkCommandBuffer commands, const MlpArgs& args);
-  // PTX (VK_NV_cuda_kernel_launch) version of the expert MLP: mlp_e4m3.py. W1 columns permuted with
+  // PTX (VK_NV_cuda_kernel_launch) version of the expert MLP: mlp_e4m3.rs. W1 columns permuted with
   // mlpHiddenPermutation() (register-resident hidden layer), W2 tile-major per expert.
   void mlpPtx(VkCommandBuffer commands, const MlpArgs& args);
   static std::vector<uint32_t> mlpHiddenPermutation(uint32_t hidden = 128);
@@ -170,7 +170,7 @@ class Kernels {
   std::string ptxDirectory_;
 
   // Barrier-free chaining of consecutive PTX launches: producers increment per-frame dependency counters after their
-  // stores, consumers spin on them (see swin.py sync_wait / sync_signal). Counter slots per block in syncBuffer_:
+  // stores, consumers spin on them (see swin.rs sync_wait / sync_signal). Counter slots per block in syncBuffer_:
   // row bands of the FFN output (kSyncBands), window rows of the attention output (kSyncRows), row bands of the
   // projection output = the next block's state (kSyncState). A launch marked `chained` omits the compute barrier.
   static bool chainEnabled();
@@ -209,7 +209,7 @@ class Kernels {
     Activation* stateOut = nullptr;        // optional: also write the computed block state (parity captures)
     uint32_t width = 0;                    // tokens per pixel row (chaining row-band math)
   };
-  // Expert FFN + W3 in one PTX kernel (scripts/ptx/ffn_e4m3.py): w1 permuted tile-major [e][K/32][128][32],
+  // Expert FFN + W3 in one PTX kernel (ptx/src/ffn_e4m3.rs): w1 permuted tile-major [e][K/32][128][32],
   // w2 tile-major [e][4][32][32], w3 tile-major [K/32][K][32].
   static bool ptxFfnEnabled();
   static uint32_t ffnRowTiles(uint32_t channels);          // PTX expert FFN: 16-row tiles per workgroup (its chaining signals cover 16 * tiles rows)
@@ -231,7 +231,7 @@ class Kernels {
                        const Activation* normalized = nullptr, const Chain* chain = nullptr);   // normalized: E4 q/k/v from globalNormalize (large token counts)
   static bool ptxGlobalAttentionEnabled();
   bool globalAttentionPtx(uint32_t paddedTokens, const Activation* normalized) const;   // the PTX route applies
-  // Streamed PTX route for any token count (global_attention_stream_e4m3.py): normalize once per (token, head)
+  // Streamed PTX route for any token count (global_attention_stream_e4m3.rs): normalize once per (token, head)
   // into the per-head E4 layout, then attention with the key blocks streamed through shared memory.
   bool globalAttentionStreamPtx(uint32_t paddedTokens) const;
   void globalNormalizePtx(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor, uint32_t scaleByteOffset,

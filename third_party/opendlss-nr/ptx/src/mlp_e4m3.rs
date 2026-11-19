@@ -343,11 +343,11 @@ pub fn generate(k: usize, stages: usize, ksub: usize, mt: usize, max_regs: Optio
 
 /// `<K> [stages] [ksub] [mt] [maxregs] [hidden] [nout]`
 pub fn cli(args: &[&str]) -> String {
-    let k = crate::int(args[0]);
+    let k = crate::req(args, 0);
     let stages = args.get(1).map_or(STAGES, |a| crate::int(a));
     let ksub = args.get(2).map_or(KSUB, |a| crate::int(a));
     let mt = args.get(3).map_or(MT, |a| crate::int(a));
-    let max_regs = args.get(4).map(|a| crate::int(a) as u32);
+    let max_regs = args.get(4).map(|a| crate::reg(a));
     let hidden = args.get(5).map_or(HIDDEN, |a| crate::int(a));
     let nout = args.get(6).map_or(NOUT, |a| crate::int(a));
     generate(k, stages, ksub, mt, max_regs, hidden, nout).1

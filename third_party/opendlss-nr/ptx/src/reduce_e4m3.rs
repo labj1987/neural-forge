@@ -75,6 +75,6 @@ pub fn generate(splits: usize, flags: usize) -> (String, String) {
 
 /// `<splits> <flags>`
 pub fn cli(args: &[&str]) -> String {
-    let (splits, flags) = (crate::int(args[0]), crate::int(args[1]));
+    let (splits, flags) = (crate::req(args, 0), crate::req(args, 1));
     generate(splits, flags).1
 }

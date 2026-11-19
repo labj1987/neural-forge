@@ -485,8 +485,8 @@ pub fn generate(chan: usize, rowt: usize, max_regs: Option<u32>, proj: bool) -> 
 
 /// `<C> <ROWT> [maxregs] [proj]`
 pub fn cli(args: &[&str]) -> String {
-    let (chan, rowt) = (crate::int(args[0]), crate::int(args[1]));
-    let max_regs = args.get(2).map(|a| crate::int(a) as u32);
+    let (chan, rowt) = (crate::req(args, 0), crate::req(args, 1));
+    let max_regs = args.get(2).map(|a| crate::reg(a));
     let proj = args.get(3).is_some_and(|a| crate::int(a) != 0);
     generate(chan, rowt, max_regs, proj).1
 }

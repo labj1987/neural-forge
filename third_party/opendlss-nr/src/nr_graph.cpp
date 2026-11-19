@@ -387,7 +387,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
     const uint32_t w3Base = w2Base + experts * 128 * 32;
     const vk::Buffer& w1Weights = model_.fp8Matrix(tensor, layout.expand, experts * channels, 128, true, channels);
     if (options_.fusedBlocks && !options_.captureIntermediates && Kernels::ptxFfnEnabled() && channels <= 256) {
-      // PTX expert FFN + W3 in one kernel (ffn_e4m3.py): every expert of a row group in one workgroup.
+      // PTX expert FFN + W3 in one kernel (ffn_e4m3.rs): every expert of a row group in one workgroup.
       if (ffnSkipOverride) throw std::runtime_error("PTX expert FFN assumes the block state is the FFN skip");
       static const std::vector<uint32_t> hiddenPerm = Kernels::mlpHiddenPermutation();
       Kernels::ExpertFfnArgs ffn;
