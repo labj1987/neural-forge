@@ -500,3 +500,40 @@ fn guided_filter_keeps_a_linear_edit() {
         .fold(0.0f32, f32::max);
     assert!(worst < 1e-2, "max deviation {worst}");
 }
+
+#[test]
+fn an_extra_manifest_entry_replaces_the_key_it_names() {
+    // Python's manifest.update(extra): one "mvec_scale", the extra's value, in the key's own place.
+    let (mut holds, white, _) = cr::synthetic_holds("still").unwrap();
+    holds.truncate(1);
+    let s = Scratch::new("manifest-update");
+    let scale = crate::pyfmt::J::List(vec![crate::pyfmt::J::Float(2.0), crate::pyfmt::J::Float(3.0)]);
+    cc::write_dump(&s.0, &holds, white, "synthetic", vec![("mvec_scale".into(), scale), ("extra".into(), crate::pyfmt::J::Int(7))]).unwrap();
+    let text = std::fs::read_to_string(s.join("manifest.json")).unwrap();
+    assert_eq!(text.matches("\"mvec_scale\"").count(), 1);
+    let m: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(m["mvec_scale"], serde_json::json!([2.0, 3.0]));
+    assert_eq!(m["extra"], 7);
+}
+
+#[test]
+fn a_nan_difference_fails_the_self_checks_maximum() {
+    assert!(cr::max_nan([0.0, f64::NAN, 1.0].into_iter()).is_nan());
+    assert!(cr::max_nan([f64::NAN, 1.0].into_iter()).is_nan());
+    assert_eq!(cr::max_nan([0.5, 2.0, 1.0].into_iter()), 2.0);
+    assert!(cr::max_nan([f64::NAN].into_iter()).partial_cmp(&1e-5).is_none(), "NaN is no number below the check's limit");
+}
+
+#[test]
+fn a_nan_in_the_depth_makes_the_median_and_the_depth_convention_nan() {
+    assert!(cc::median_f32(vec![1.0, f32::NAN, 3.0]).is_nan());
+    assert_eq!(cc::median_f32(vec![3.0, 1.0, 2.0, 4.0]), 2.5);
+    // A frame of drawn depth, growing toward the bottom, with one NaN in the top quarter: numpy's median
+    // is NaN there, so the result is (false, "median depth top quarter nan, bottom quarter ...").
+    let (h, w) = (8, 8);
+    let mut d: Vec<f32> = (0..h * w).map(|i| 0.2 + 0.5 * (i / w) as f32 / h as f32).collect();
+    d[3] = f32::NAN;
+    let (rz, why) = cc::infer_reverse_z(&[Img { h, w, c: 1, d }]);
+    assert_eq!(rz, Some(false));
+    assert!(why.starts_with("median depth top quarter nan, bottom quarter 0."), "{why}");
+}

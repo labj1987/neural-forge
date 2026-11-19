@@ -2,6 +2,9 @@
 //! steps are listed in the crate's header). Every step is computed in f32 as numpy computes it on
 //! float32 arrays, and the means the metrics take are f64 with numpy's summation order, so the
 //! numbers are those of the numpy reference this replaced.
+//!
+//! Ports upstream's `nrcache_common.py` (and the shader it mirrors); origin and licence: the notice in
+//! src/lib.rs.
 
 use std::path::{Path, PathBuf};
 
@@ -334,7 +337,13 @@ pub fn write_dump(path: &Path, holds: &[Hold], paper_white: f64, game: &str, ext
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect::<Vec<_>>();
-    manifest.extend(extra);
+    // Python's `manifest.update(extra)`: a key already there keeps its place and takes the new value.
+    for (k, v) in extra {
+        match manifest.iter_mut().find(|(have, _)| *have == k) {
+            Some(slot) => slot.1 = v,
+            None => manifest.push((k, v)),
+        }
+    }
     std::fs::write(path.join("manifest.json"), crate::pyfmt::dumps(&J::Obj(manifest), Some(1)))
 }
 
@@ -350,8 +359,11 @@ fn nan_to(x: f32, nan: f32, pos: f32, neg: f32) -> f32 {
     }
 }
 
-/// numpy's median of f32 values (the mean of the two middle ones, in f32).
-fn median_f32(mut v: Vec<f32>) -> f32 {
+/// numpy's median of f32 values (the mean of the two middle ones, in f32); NaN if any value is NaN.
+pub(crate) fn median_f32(mut v: Vec<f32>) -> f32 {
+    if v.iter().any(|x| x.is_nan()) {
+        return f32::NAN;
+    }
     v.sort_by(f32::total_cmp);
     let n = v.len();
     if n % 2 == 1 {

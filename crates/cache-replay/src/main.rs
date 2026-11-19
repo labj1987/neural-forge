@@ -1,6 +1,7 @@
 //! cache-replay: replays the pre-upscaler edit cache offline on a K-hold dump, and measures what
 //! it keeps; writes the synthetic dumps and the exports the layer's shader tests compare with. The
-//! algorithm and its origin are the library's (src/lib.rs).
+//! algorithm and its origin (the
+//! upstream tools it ports, and the licence) are the library's: see the notice in src/lib.rs.
 
 use cache_replay::{common, pyfmt, replay};
 
@@ -20,6 +21,51 @@ const USAGE: &str = "usage: cache-replay [DUMP] [--lags N ...] [--modes M ...] [
                     --colour-floor --high-decay --no-fingerprint --print-tol --no-surface-fill --no-bilateral --sigma-depth
                     --sigma-luma --no-nearest-surface --no-jitter --chain recurrence|walk --chain-sample bilinear|nearest
                     --low-gain --high-gain]";
+
+/// Printed after the usage on `--help`: what the modes and metrics are, and the ways to run it.
+const HELP: &str = "Replays the pre-upscaler edit cache offline on a K-hold dump, and measures what it keeps.
+
+A cache dump (lead format v1: manifest.json plus raw colour/answer/mvec/depth per hold, written by
+the layer with the model running on every hold) has the model's real answer for every hold. For
+each lag L (1, 2, 3, 4, 8 by default) and every hold t >= L, the cache is refreshed at t-L (the edit
+from that hold's colour and answer), carried to t along the motion chained through the holds
+between (--chain recurrence, the default: the layer's accumulated motion field; --chain walk: each
+older hold's vectors re-read at the running position), validated against hold t's colour and depth, and compared with the model's real answer
+for t. The algorithm is the library's (crates/cache-replay/src/common.rs), the reference the layer's
+preupscale_cache*.comp shaders mirror.
+
+Modes (all on the same holds):
+
+  none    no edit at all: the frame without the model. The floor.
+  naive   the whole edit reprojected (bilinear), no validation: what a simple cache would do.
+  low     the cache's low band only (validated pyramid, same-surface fill), no high band.
+  cache   the full algorithm: validated history, band split, high band by confidence.
+
+Metrics (as upstream's measure_ghosting.py / measure_reprojection.py define them):
+
+  err     mean |luma(shown edit) - luma(true edit)| in stops, per hold, averaged. Lower is better.
+  p99.5   the per-hold 99.5th percentile of that, averaged: the strongest trails.
+  worse   share of the area where the shown edit is worse than no edit by over 0.15 stop.
+  kept    1 - mean|display(shown) - display(model)| / mean|display(original) - display(model)|,
+          display = Reinhard on luma, then gamma 1/2.2. 100% = the model on every hold.
+
+\"true\" is the model's edit for that hold, clamped as the cache clamps every edit; \"display(model)\"
+is the model's real answer, so kept is below 100% where the clamp binds (the self-check reports
+that ceiling).
+
+Usage:
+  cargo run --release -p cache-replay -- DUMP [--lags 1 2 3 4 8] [--json OUT] [--oracle] [parameters]
+  cargo run --release -p cache-replay -- DUMP --cadence 2 3 4 [--adaptive] [--phase K] [--aging] [--no-guided] [--json OUT]
+  cargo run --release -p cache-replay -- DUMP --cadence N --export-cadence DIR
+  cargo run --release -p cache-replay -- DUMP --self-check
+  cargo run --release -p cache-replay -- --make-synthetic DIR --kind still|pan|depth-edge|regrade|jitter
+  cargo run --release -p cache-replay -- DUMP --export-carry DIR [--reverse-z yes|no]
+
+Ported in part from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5),
+commit 6bfc4389c25054ef6747df6e6b1b470e9541c4da: tools/dlssnr_cache/measure_reprojection.py,
+measure_ghosting.py (the strategies and the metrics), measure_pulse.py (the regional light step)
+and flicker_lab.py (the motion-compensated flicker). Upstream is GPL-3.0; this port is
+distributed under this project's AGPL-3.0-or-later (see ATTRIBUTION.md).";
 
 #[derive(Default)]
 struct Args {
@@ -295,7 +341,7 @@ fn run(mut a: Args) -> Result<ExitCode, String> {
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.iter().any(|s| s == "-h" || s == "--help") {
-        println!("{USAGE}");
+        println!("{USAGE}\n\n{HELP}");
         return ExitCode::SUCCESS;
     }
     match parse(&argv) {

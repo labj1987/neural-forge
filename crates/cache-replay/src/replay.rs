@@ -1,5 +1,8 @@
 //! The offline replay: the lag replay and its metrics, the cadence run,
 //! the shader tests' exports, the self-check and the synthetic dumps.
+//!
+//! Ports upstream's `measure_ghosting.py`, `measure_reprojection.py`, `measure_pulse.py` and
+//! `flicker_lab.py`; origin and licence: the notice in src/lib.rs.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -223,6 +226,19 @@ pub fn print_table(results: &[(usize, Vec<(String, ModeResult)>)]) {
 // Cadence
 // ------------------------------------------------------------------------------------------------
 
+/// How a run at a fixed interval shows its edits. The defaults are the layer's (the shaders mirror
+/// `run_cadence` with them): each refresh shows the model's answer at once, the guided filter on.
+/// Aging is an experiment, measured and not in the shaders; so was the walk to each refresh's answer
+/// (upstream's keyframe crossfade with soft refresh), removed after the live runs (docs/LESSONS.md,
+/// "3.3 edit cache: what was tried").
+///
+/// * `adaptive`: the layer's cadence: `interval` while the camera moves, `still_interval` while it is
+///   still ([`Regime`]);
+/// * `aging`: the high band's confidence times 2^(-staleness / half_life), staleness = one per
+///   `stale_px` of motion since the refresh;
+/// * `guided`: a fast guided filter (He et al.) of the cached edit on this hold's log luma, blended in
+///   by `guided_strength` x sat(staleness / 2) (staleness: as for aging; the motion pass accumulates it
+///   on the GPU).
 #[derive(Clone, Debug)]
 pub struct Cadence {
     pub interval: usize,
@@ -287,7 +303,11 @@ impl Cadence {
     }
 }
 
-/// The layer's adaptive cadence (`cache::Regime`).
+/// The layer's adaptive cadence (`cache::Regime`, which mirrors this): a hold reads as still when its
+/// median pixel moves less than a quarter of the pace, max(0.1% of the render width, 0.5 px) / 3 a hold
+/// (upstream's speed reference at motion priority 0.5). A regime change waits for consecutive holds that
+/// want it: 3 toward the shorter interval, 20 toward the longer, so the cadence never hops. The motion
+/// pass counts the pixels ([`still_counts`]) and a hold's counts decide the holds after it.
 pub(crate) struct Regime {
     pub(crate) cad: Cadence,
     pub(crate) still: bool,
@@ -324,7 +344,8 @@ impl Regime {
     }
 }
 
-/// The motion pass's STAT_STILL and STAT_MOTION_N.
+/// The motion pass's STAT_STILL and STAT_MOTION_N: the pixels whose vector (the nearest surface's, render
+/// pixels) is shorter than a quarter of the pace, and all of them.
 pub fn still_counts(mv: &Img) -> (usize, usize) {
     let pace = ((0.001 * mv.w as f64).max(0.5) / 3.0) as f32;
     let lim = 0.25f32 * pace;
@@ -397,7 +418,11 @@ pub(crate) fn guided_fast(i_img: &Img, p_img: &Img, eps: f64) -> Img {
     out
 }
 
-/// One cadence hold: (t, since, refresh, shown, dst, step).
+/// One cadence hold: `t`, the hold's index in the dump; `since`, the holds since the last refresh (0 on a
+/// refresh); `refresh`, whether the model ran on it (true) or the cache carried the edit (false); `shown`,
+/// the edit shown, H x W x 3; `dst`, the hold's frame; and `step`, where each of its pixels was on the
+/// hold before ([`step_position`], pixel units, H x W x 2; `None` when the previous usable hold is not the
+/// one just before).
 pub struct CadenceHold {
     pub t: usize,
     pub since: usize,
@@ -407,7 +432,9 @@ pub struct CadenceHold {
     pub step: Option<Img>,
 }
 
-/// The cache as it runs, one refresh every N holds; `f` returns false to stop.
+/// The cache as it runs: holds `phase..` with the model on every `interval`-th (adaptive: the regime's
+/// interval, decided by the holds before). Calls `f` with each [`CadenceHold`]; `f` returns false to stop.
+/// A hold without a usable exposure restarts the run (the next hold refreshes) and is not passed on.
 pub fn run_cadence(
     dump: &Dump,
     frames: &mut Frames,
@@ -497,7 +524,12 @@ pub fn run_cadence(
     Ok(())
 }
 
-/// The refresh at hold 0 carried to every later hold by the recurrence (the layer's shader test).
+/// For the layer's shader test: the refresh at hold 0 carried to every later hold by the recurrence, as
+/// long as that carry lasts (the first hold the run refreshes on, or leaves out for an unusable exposure,
+/// ends it). Writes per hold t >= 1 carried to `cache-TT.f32` (H x W x 3, the shown edit: mode "cache"
+/// with the guided filter, as `run_cadence` shows it), `acc-TT.f32` (H x W x 2, the accumulated motion,
+/// NaN off the chain) and `weight-TT.f32` (H x W, valid x validity), and `holds.txt` (per hold: jitter x,
+/// jitter y, exposure), all f32 little-endian. Returns the number of holds carried to.
 pub fn export_carry(dump: &Dump, p: &Params, reverse_z: bool, out: &Path) -> Result<usize, String> {
     let io = |e: std::io::Error| e.to_string();
     std::fs::create_dir_all(out).map_err(io)?;
@@ -535,7 +567,9 @@ pub fn export_carry(dump: &Dump, p: &Params, reverse_z: bool, out: &Path) -> Res
     Ok(carried)
 }
 
-/// Every hold's shown edit of a cadence run (the layer's shader test).
+/// For the layer's shader test: every hold's shown edit of a cadence run, `shown-TT.f32` (H x W x 3 f32
+/// little-endian), and `holds.txt` (per hold: jitter x, jitter y, and the motion pass's `still_counts`).
+/// Returns the holds written.
 pub fn export_cadence(dump: &Dump, cad: &Cadence, p: &Params, reverse_z: bool, out: &Path) -> Result<usize, String> {
     let io = |e: std::io::Error| e.to_string();
     std::fs::create_dir_all(out).map_err(io)?;
@@ -645,6 +679,15 @@ pub struct CadenceRow {
 }
 
 /// One cadence run's numbers.
+///
+/// err/p99.5/worse/kept: as the lag replay, against the model's answer on every hold after the first
+/// refresh (the refresh holds included); `*_cached` on the cached holds only.
+/// pulse: measure_pulse.py's mean |regional light step| (stops) by holds since the refresh (0 = the
+/// refresh hold), the model's own (its answer on every hold) beside it; pulse_excess = the refresh
+/// holds' mean minus the cached holds'.
+/// flicker: flicker_lab.py's motion-compensated |picture_t - picture_t-1| (display values) on pixels
+/// that stayed on their surface, minus the model's own, x1000.
+/// refresh_share: the holds the model ran on, % of all.
 pub fn cadence_metrics(dump: &Dump, cad: &Cadence, p: &Params, reverse_z: bool) -> Result<CadenceRow, String> {
     let mut frames = Frames::new(dump, reverse_z, p, 3);
     let (mut all, mut cached) = (Series::default(), Series::default());
@@ -762,6 +805,13 @@ fn max_abs_diff(a: &[f32], b: impl Fn(usize) -> f32) -> f64 {
     m as f64
 }
 
+/// The largest of the values, NaN if any is NaN (`f64::max` would drop it; a NaN difference must fail a check).
+pub(crate) fn max_nan(xs: impl Iterator<Item = f64>) -> f64 {
+    xs.fold(f64::NEG_INFINITY, |m, x| if m.is_nan() || x.is_nan() { f64::NAN } else { m.max(x) })
+}
+
+/// Lag 0 is the identity for every mode's carry, and a lag-1 replay refreshed at the hold itself
+/// (`--oracle`, clamp off) keeps 100% of the effect with zero error.
 pub fn self_check(dump: &Dump, p: &Params, reverse_z: bool) -> Result<bool, String> {
     let mut ok = true;
     let mut check = |name: String, cond: bool, detail: String| {
@@ -785,7 +835,7 @@ pub fn self_check(dump: &Dump, p: &Params, reverse_z: bool) -> Result<bool, Stri
     for &k in usable.iter().take(3) {
         let f = frames.get(k)?;
         let (shown, d) = shown_edits(&f, &f, &centres, &on, p);
-        let dev = [&d.valid, &d.validity, &d.v_colour, &d.conf].iter().map(|x| max_abs_diff(x, |_| 1.0)).fold(f64::NEG_INFINITY, f64::max);
+        let dev = max_nan([&d.valid, &d.validity, &d.v_colour, &d.conf].iter().map(|x| max_abs_diff(x, |_| 1.0)));
         check(format!("lag 0 hold {k}: carry admits everything"), dev < 1e-5, format!("max |weight - 1| {}", fmt_e(dev, 2)));
         let dh = max_abs_diff(&d.history.d, |i| f.edit.d[i]);
         check(format!("lag 0 hold {k}: history read is the edit"), dh < 1e-5, format!("max diff {} stop", fmt_e(dh, 2)));
@@ -840,10 +890,20 @@ fn scene(x: f64, y: f64, obj: bool) -> ([f64; 3], [f64; 3]) {
     ([base[0] * g, base[1] * g, base[2] * g], [el + chroma[0] - cl, el + chroma[1] - cl, el + chroma[2] - cl])
 }
 
-/// Holds with known motion and a known "model" edit, as synthetic_holds writes them.
 /// The holds, the paper white and the manifest's `synthetic` entry.
 type Synthetic = (Vec<cc::Hold>, f64, Vec<(String, J)>);
 
+/// Holds with known motion and a known "model" edit. Returns (holds, paper_white, info).
+///
+/// * `still`: nothing moves.
+/// * `pan`: the camera pans 2.5 px right and 1 px down per hold, jitter +-0.25 px: with the jitter change
+///   the motion is a whole number of pixels, so a correct carry is exact.
+/// * `depth-edge`: a near box moves 5 px right per hold over a still far background (sky on top); where it
+///   uncovers the background the carried high band must be rejected.
+/// * `regrade`: the pan, with the model re-grading the whole picture 0.15 stop brighter each hold: every
+///   refresh's answer differs from the last.
+/// * `jitter`: nothing moves but the jitter (sub-pixel, a different offset each hold), and the edit has a
+///   near-pixel-scale term: the history read must carry it whole.
 pub fn synthetic_holds(kind: &str) -> Result<Synthetic, String> {
     let (w, h, n) = (96usize, 64usize, 6usize);
     let (paper_white, exposure) = (3.0, 1.5);
@@ -928,6 +988,7 @@ pub fn synthetic_holds(kind: &str) -> Result<Synthetic, String> {
     Ok((holds, paper_white, info))
 }
 
+/// Writes `synthetic_holds(kind)` as a dump at `path`; returns the manifest's `synthetic` entry.
 pub fn make_synthetic(path: &Path, kind: &str) -> Result<J, String> {
     let (holds, white, info) = synthetic_holds(kind)?;
     let info = J::Obj(info);
