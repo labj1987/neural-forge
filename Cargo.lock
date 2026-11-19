@@ -3842,6 +3842,7 @@ dependencies = [
  "ash",
  "cc",
  "neural-forge-protocol",
+ "opendlss-nr-ptx",
  "serde_json",
  "sha2 0.11.1",
 ]

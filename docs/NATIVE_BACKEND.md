@@ -283,7 +283,8 @@ section.
 
 ### 1.1 Vendoring and the build
 
-- OpenDLSS-NR: upstream `src/` (minus `main.cpp` and `verify.cpp`), `shaders/`, `scripts/ptx/`,
+- OpenDLSS-NR: upstream `src/` (minus `main.cpp` and `verify.cpp`), `shaders/`, `scripts/ptx/` (the PTX generators, ported
+  from Python to Rust after 4.6.0: `ptx/`, the `opendlss-nr-ptx` crate, with byte-identical output),
   `LICENSE`, `NOTICE`, at `9d08f41`. Vendored in `third_party/opendlss-nr/` until 3.4.0; from 3.4.0 to
   3.8.6 `scripts/fetch-native-tools.sh` fetched the commit (SHA-256 pinned) into `tools/native/OpenDLSS-NR`
   and applied the patches kept in `third_party/opendlss-nr/patches/`. After 3.8.6 the source was taken
@@ -294,7 +295,8 @@ section.
   waits, no `vkDeviceWaitIdle` on an adopted device, a dispatchable-init hook, `CONCURRENT` buffers
   over two queue families). ATTRIBUTION.md has the row.
 - `crates/native` (`neural-forge-native`): `build.rs` compiles the 13 GLSL kernels with the pinned
-  glslang and runs the 78 PTX generator invocations of upstream's `build_shaders.ps1` at build time,
+  glslang and generates the PTX kernels at build time (the `opendlss-nr-ptx` build-dependency: upstream
+  `build_shaders.ps1`'s 78 generator invocations, less the two FFN kernels nothing launches),
   embeds both (`.incbin`), and compiles the network's C++ with the glue (`cpp/nf_native.cpp`) into the
   rlib. Nothing prebuilt is committed. `scripts/fetch-native-tools.sh` fetches glslang,
   Vulkan-Headers and volk (the versions and SHA-256 pinned there) into `tools/native/`

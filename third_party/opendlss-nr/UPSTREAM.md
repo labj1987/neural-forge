@@ -28,6 +28,10 @@ both are generated at build time and embedded into the library.
   read and checked by `crates/native/src/model_file.rs`, and `nr::Model` takes the tensor records it read.
 - `shaders/`: every GLSL compute shader (`*.comp`) and include (`*.glsl`).
 - `scripts/ptx/`: the PTX generators (`ptxgen.py`, `swin.py`, the `*_e4m3.py` kernels, `test_fast_divmod.py`).
+  Since then ported to Rust: `ptx/` (the `opendlss-nr-ptx` crate), one module per script (`ptxgen.rs`, `swin.rs`,
+  the `*_e4m3.rs` kernels; `tests/fast_divmod.rs`), with output byte-identical to the Python's for every kernel
+  the build generates. Building no longer needs Python. `cargo run -p opendlss-nr-ptx --example write_ptx DIR`
+  writes every kernel, to diff the PTX before and after a change.
 - `NOTICE`, `LICENSE`.
 
 ## Left out when it was taken in
@@ -35,9 +39,10 @@ both are generated at build time and embedded into the library.
 - `src/main.cpp` (the `dlss5vk` command-line tool) and `src/verify.cpp`, which only that tool uses
   (`runVerify`). `src/reference.*` stays: `ref::siluTable()` feeds `Kernels::setSiluTable`.
 - `demo/`, `ports/`, `docs/`, `third_party/` (Filament patch), and the PowerShell/Node build scripts
-  (`scripts/*.ps1`, `scripts/*.mjs`, `scripts/*.py` outside `scripts/ptx/`). `build.rs` reproduces
-  `scripts/build_shaders.ps1`: the same glslang flags and the same PTX generator invocations, except that the
-  128-channel FFN kernels (`ffn_e4m3_C128_R4`, `_proj`) are generated with a 64-register cap (`build.rs` says why).
+  (`scripts/*.ps1`, `scripts/*.mjs`, `scripts/*.py` outside `scripts/ptx/`). `build.rs` (with
+  `kernels()` in `ptx/src/lib.rs`) reproduces `scripts/build_shaders.ps1`: the same glslang flags and the same PTX
+  generator invocations, except that the
+  128-channel FFN kernels (`ffn_e4m3_C128_R4`, `_proj`) are generated with a 64-register cap (`kernels()` says why), and the two 256-channel FFN kernels at 3 row tiles are left out.
 
 ## Changes made before it was taken in
 

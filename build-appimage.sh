@@ -26,8 +26,8 @@ APPDIR="$BUILD_DIR/AppDir"
 # ── Build dependencies ────────────────────────────────────────────────
 SUDO=""
 if [[ "$(id -u)" -ne 0 ]]; then SUDO="sudo"; fi
-# Every tool the build runs (here, in scripts/fetch-native-tools.sh, the crates' build scripts and the
-# Python generators), so a missing one is installed before the long release build, not found after it.
+# Every tool the build runs (here, in scripts/fetch-native-tools.sh and the crates' build scripts), so a missing
+# one is installed before the long release build, not found after it.
 missing_deps() {
     local tool
     # x86_64-w64-mingw32-gcc: the NGX wrapper's linker (scripts/build-ngx-wrapper.sh); its package also brings the
@@ -61,8 +61,8 @@ if missing="$(missing_deps)"; then
     # for that repo and still refreshes everything else; only `apt-get install`
     # failing on a package we actually need should be fatal.
     $SUDO apt-get update -qq || true
-    # g++ brings the static libstdc++ that crates/native links; curl, patch and python3 are what
-    # scripts/fetch-native-tools.sh and the crate's build script run; the -dev packages are the GUI toolkit's.
+    # g++ brings the static libstdc++ that crates/native links; curl and patch are what scripts/fetch-native-tools.sh
+    # runs, python3 what this script runs; the -dev packages are the GUI toolkit's.
     # gcc-mingw-w64-x86-64 links the NGX wrapper (a Windows DLL) and brings mingw-w64-common and gcc-mingw-w64-base,
     # whose copyright files ship as its runtime notices.
     $SUDO apt-get install -y -qq g++ curl patch python3 pkg-config desktop-file-utils zsync \

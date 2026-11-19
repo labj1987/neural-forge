@@ -1,11 +1,10 @@
 //! Builds the native backend: compiles OpenDLSS-NR's GLSL kernels (glslang) and generates its PTX kernels
-//! (its Python generators, `scripts/ptx`), embeds both into a generated C++ source, and compiles that with the
+//! (its generators: the `opendlss-nr-ptx` crate, `third_party/opendlss-nr/ptx`), embeds both into a generated C++ source, and compiles that with the
 //! OpenDLSS-NR host code, volk (as C++, in namespace volk) and `cpp/*.cpp` into a static library. libstdc++ is linked statically so the
 //! layer does not depend on the C++ runtime of whatever container a game runs in.
 //!
 //! The network's source (from OpenDLSS-NR, now kept here) is `third_party/opendlss-nr`. The tools come from
-//! `NEURAL_FORGE_NATIVE_TOOLS` or `<workspace>/tools/native` (`scripts/fetch-native-tools.sh`);
-//! Python (3.10 or later) from `NEURAL_FORGE_PYTHON` or `python3` on PATH. The Vulkan-Headers' registry also
+//! `NEURAL_FORGE_NATIVE_TOOLS` or `<workspace>/tools/native` (`scripts/fetch-native-tools.sh`). The Vulkan-Headers' registry also
 //! gives the size of every structure a device create info may chain (`nf_native_device_extend` copies the
 //! application's chain).
 
@@ -16,60 +15,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-
-/// The oldest Python the PTX generators are run with (Ubuntu 24.04, the release baseline, has 3.12).
-const MIN_PYTHON: (u32, u32) = (3, 10);
-
-/// One PTX generator run: the script in `scripts/ptx`, its arguments, and the output's file stem, which takes
-/// the place of `@` in the arguments. Same invocations, in the same order, as upstream's build_shaders.ps1, except
-/// one register cap: the 128-channel FFN kernels are capped at 64 registers (upstream: none), so two of their
-/// 512-thread workgroups fit on an SM instead of one (88 and 84 registers); bit-exact, and 0.20 ms (full
-/// network) and 0.06 ms (small) faster at 1486x836 on the RTX 5070 (docs/DLSS_KERNEL_CATALOGUE.md,
-/// "Register caps"); and the 256-channel FFN kernels at 3 row tiles left out: they run at 4 since 4 is faster
-/// ("Row tiles").
-fn ptx_invocations() -> Vec<(&'static str, String, Vec<String>)> {
-    let mut v = Vec::new();
-    let mut add = |script: &'static str, stem: String, args: &[&str]| {
-        v.push((script, stem, args.iter().map(|a| a.to_string()).collect::<Vec<_>>()));
-    };
-    for k in ["64", "128", "256"] {
-        add("mlp_e4m3.py", format!("mlp_e4m3_K{k}"), &[k, "@", "3", "1", "1"]);
-    }
-    for c in ["64", "128", "256", "512"] {
-        add("qkv_e4m3.py", format!("qkv_e4m3_K{c}"), &[c, "@", "80"]);
-    }
-    for k in ["32", "64", "128", "256", "512", "1024"] {
-        for f in ["5", "13", "4", "8", "6"] {
-            add("gemm2_e4m3.py", format!("gemm2_e4m3_K{k}_f{f}"), &[k, f, "@"]);
-        }
-    }
-    for [c, r, x] in [["64", "4", "0"], ["128", "4", "64"], ["256", "4", "64"]] {
-        add("ffn_e4m3.py", format!("ffn_e4m3_C{c}_R{r}"), &[c, r, "@", x]);
-        add("ffn_e4m3.py", format!("ffn_e4m3_C{c}_R{r}_proj"), &[c, r, "@", x, "1"]);
-    }
-    for [k, f, p, s] in [["4096", "1", "32", "4"], ["1024", "0", "16", "2"], ["1024", "1", "8", "4"], ["1024", "0", "8", "4"]] {
-        add("gemmt_e4m3.py", format!("gemmt_e4m3_K{k}_f{f}_p{p}_s{s}"), &[k, f, p, s, "@"]);
-    }
-    for [s, f] in [["4", "4"], ["2", "8"], ["4", "8"]] {
-        add("reduce_e4m3.py", format!("reduce_e4m3_s{s}_f{f}"), &[s, f, "@"]);
-    }
-    for [k, f, s] in [["1024", "6", "1"], ["4096", "5", "4"], ["1024", "8", "2"], ["1024", "5", "4"]] {
-        add("gemmv_e4m3.py", format!("gemmv_e4m3_K{k}_f{f}_s{s}"), &[k, f, s, "@"]);
-        add("gemmv_e4m3.py", format!("gemmv_e4m3_K{k}_f{f}_s{s}_m96"), &[k, f, s, "@", "4", "6", "0", "0", "0", "96"]);
-    }
-    for padded in ["64", "128", "192", "256"] {
-        add("global_attention_e4m3.py", format!("global_attention_e4m3_p{padded}"), &[padded, "@"]);
-    }
-    add("global_attention_stream_e4m3.py", "global_normalize_e4m3".into(), &["normalize", "@"]);
-    add("global_attention_stream_e4m3.py", "global_attention_stream_e4m3".into(), &["attention", "@", "4"]);
-    for [k, f] in [["512", "4"], ["512", "5"], ["512", "13"], ["256", "5"], ["4096", "5"], ["1024", "8"], ["1024", "5"]] {
-        add("gemmv_e4m3.py", format!("gemmv_e4m3_K{k}_f{f}_s1_m96"), &[k, f, "1", "@", "4", "6", "0", "0", "0", "96"]);
-    }
-    for f in ["2", "66", "74", "130", "48"] {
-        add("block32_e4m3.py", format!("block32_e4m3_f{f}"), &[f, "@"]);
-    }
-    v
-}
 
 fn files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
@@ -165,11 +110,9 @@ fn main() {
     let root = manifest.parent().and_then(Path::parent).expect("crates/native is two levels below the workspace").to_path_buf();
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-env-changed=NEURAL_FORGE_NATIVE_TOOLS");
-    println!("cargo:rerun-if-env-changed=NEURAL_FORGE_PYTHON");
     let tools = env::var_os("NEURAL_FORGE_NATIVE_TOOLS").map(PathBuf::from).unwrap_or_else(|| root.join("tools/native"));
     let vendor = root.join("third_party/opendlss-nr");
     let shaders = vendor.join("shaders");
-    let ptx_scripts = vendor.join("scripts/ptx");
     let cpp = manifest.join("cpp");
     let glslang = tools.join("glslang/bin/glslang");
     let headers = tools.join("Vulkan-Headers/include");
@@ -188,34 +131,13 @@ fn main() {
         let fetched = tools.join(stamp).join(".fetched-sha256");
         rerun_if_changed(if fetched.exists() { &fetched } else { file });
     }
-    let python = env::var_os("NEURAL_FORGE_PYTHON").unwrap_or_else(|| "python3".into());
-    // The PTX generators are run by whatever Python this is: at least the version they are known to run on.
-    let version = Command::new(&python)
-        .args(["-I", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_else(|| panic!("neural-forge-native: cannot run {} (set NEURAL_FORGE_PYTHON to a Python 3)", python.to_string_lossy()));
-    let parsed: Vec<u32> = version.trim().split('.').filter_map(|v| v.parse().ok()).collect();
-    if parsed.len() != 2 || (parsed[0], parsed[1]) < MIN_PYTHON {
-        panic!(
-            "neural-forge-native: {} is Python {}; the PTX generators need {}.{} or later",
-            python.to_string_lossy(),
-            version.trim(),
-            MIN_PYTHON.0,
-            MIN_PYTHON.1
-        );
-    }
-
-    // Kernels: SPIR-V with the same glslang flags as upstream, PTX with the same generator invocations.
+    // Kernels: SPIR-V with the same glslang flags as upstream; PTX from the generator crate (a build-dependency, so a
+    // change there reruns this script).
     let spv_dir = out.join("spv");
     let ptx_dir = out.join("ptx");
     fs::create_dir_all(&spv_dir).unwrap();
     fs::create_dir_all(&ptx_dir).unwrap();
     rerun_if_changed(&shaders);
-    rerun_if_changed(&ptx_scripts);
-    rerun_if_changed(&manifest.join("run_ptx.py"));
     let mut assets: Vec<(&str, String, PathBuf)> = Vec::new();
     let mut jobs = Vec::new();
     for file in files_with_extension(&shaders, "glsl") {
@@ -230,22 +152,10 @@ fn main() {
         jobs.push((format!("glslang {name}.comp"), cmd));
         assets.push(("spv", name, spv));
     }
-    for script in files_with_extension(&ptx_scripts, "py") {
-        rerun_if_changed(&script);
-    }
-    for (script, stem, args) in ptx_invocations() {
-        let ptx = ptx_dir.join(format!("{stem}.ptx"));
-        let mut cmd = Command::new(&python);
-        cmd.arg("-I").arg(manifest.join("run_ptx.py")).arg(ptx_scripts.join(script));
-        for a in &args {
-            if a == "@" {
-                cmd.arg(&ptx);
-            } else {
-                cmd.arg(a);
-            }
-        }
-        jobs.push((format!("{script} {}", args.join(" ")), cmd));
-        assets.push(("ptx", stem, ptx));
+    for kernel in opendlss_nr_ptx::kernels() {
+        let ptx = ptx_dir.join(format!("{}.ptx", kernel.stem));
+        fs::write(&ptx, kernel.generate()).unwrap_or_else(|e| panic!("writing {}: {e}", ptx.display()));
+        assets.push(("ptx", kernel.stem, ptx));
     }
     run_all(jobs);
 
