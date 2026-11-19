@@ -461,9 +461,15 @@ run the audit again. A core that cannot be read is reported as "could not audit"
   the return address through `GetModuleHandleExA(FROM_ADDRESS)` and `GetModuleFileNameW` in every `*_Init*` and
   `*_GetFeatureRequirements` export), the "driver store", which under Wine is `NVIDIA_WINE_DLL_DIR` as Linux gives it
   (`/run/host/usr/lib/x86_64-linux-gnu/nvidia/wine`, read in `NGXGetPathUsingQAI` after the adapter query fails;
-  Wine opens the Linux path, and NGX loaded the driver's `nvngx_dlssg.dll` and `nvngx_dlssd.dll` from it besides the
-  game's), and `ngx-builtins` under that. So the driver's feature DLLs are offered whichever folder the core runs
-  from. One more place depends on that folder: when the game's NGX library sets a flag in the `InternalData` it
+  Wine opens the Linux path), and `ngx-builtins` under that. So the driver's feature DLLs are offered whichever folder
+  the core runs from. They are only candidates: `NGXSecureLoadFeature` loads each candidate to validate it, ranks
+  the update cache's override and copy first, then the game's own copy, then `ngx-builtins`, then the driver's
+  fallback folder, takes a lower-ranked one only when nothing above it validates, and frees the others before the
+  feature is created. Cyberpunk 2077 and GTA V Enhanced run their own `nvngx_dlssg.dll` (310.9.16), and the
+  module record after feature creation lists only that copy; a game that ships none runs the driver's (310.2.1 with
+  driver 620.73). Streamline's two Frame Generation version checks (`sl.common`'s Vulkan `CreateFeature1` skip
+  reads the plugin folder's file on disk; `sl.dlss_g` asks NGX for `DLSSG.ModelVersion`, or looks the module up by
+  name after the feature exists) therefore see the same file NGX runs, in this layout and under stock Proton. One more place depends on that folder: when the game's NGX library sets a flag in the `InternalData` it
   passes, `NGXInitContext` adds the core's own folder (its error: "Failed to get NGX core path. Cannot load generic
   snippet from here."). Cyberpunk's library does not set it; which games do, and what NGX takes from there, is not
   read out. The core's file name matters too: Cyberpunk with the core loaded as `system32\neural-forge\_nvngx_core.dll`
