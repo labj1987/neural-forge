@@ -12,7 +12,7 @@
 //
 // The descriptor set layout and the push constants are shared with preupscale_decode.comp and must
 // stay identical in both shaders and in `preupscale::hdr::HdrPush` (field for field, append only).
-// The curve functions are duplicated in preupscale_decode.comp (no include: scripts/check_shaders.py
+// The curve functions are duplicated in preupscale_decode.comp (no include: cargo xtask check-shaders
 // hashes .comp files only) and must stay the same functions as the CPU reference in
 // `preupscale::tests::hdr_ref`.
 layout(local_size_x = 8, local_size_y = 8) in;

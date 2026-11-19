@@ -27,7 +27,7 @@ clear, with the installed helper and `nvngx_dlssnr.dll` from the CLI's `binaries
 
 **The frame.** A GTA V Enhanced pre-upscaler dump: a city street with people, signs, palms and
 buildings, 1485x836, DLSS's exposure 0.180 (`~/nf-spike/presets/dump-street`, kept with its depth
-and motion vectors). Encoded as the layer does (`hdr_encode.py encode --convention mul --white 3`,
+and motion vectors). Encoded as the layer does (`cargo xtask hdr-encode encode --convention mul --white 3`,
 `opendlss`), SHA-256 `aa05d7635f6f4324...`. GTA only dumps with its frame generation off: with it on,
 GTA copies depth and motion vectors inside DLSS's buffer behind same-layout barriers, which stops a
 dump (but not a model hold). `FrameGenType` was set to 0 for the dump run and the original

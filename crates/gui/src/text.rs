@@ -545,7 +545,8 @@ mod no_window_tests {
             // Notify(app_name s, replaces_id u, app_icon s, summary s, body s, actions as, hints a{sv}, expire_timeout i)
             let types = ["s", "u", "s", "s", "s", "as", "a{sv}", "i"];
             assert_eq!(notify.len(), types.len(), "{notify:?}");
-            // GLib's own parser where python3-gi is there; the exact text otherwise.
+            // GLib's own parser where python3-gi is there (an independent implementation of the format, which is the
+            // point: a Rust parser would test this code against itself); the exact text otherwise.
             let script = "import sys\nfrom gi.repository import GLib\nfor t, a in zip(sys.argv[1::2], sys.argv[2::2]):\n    print(GLib.Variant.parse(GLib.VariantType(t), a).print_(True))\n";
             let mut command = std::process::Command::new("python3");
             command.args(["-I", "-c", script]);

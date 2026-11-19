@@ -6,7 +6,7 @@
 # The network's own source is in the repository (third_party/opendlss-nr). Every archive is checked against
 # the SHA-256 pinned below before it is unpacked. Re-running skips a tool whose unpacked copy carries the
 # stamp of the same pinned archive, so it is safe to run on every build, and a filled tools/native/ builds
-# offline. scripts/check_pins.py reads the pins below, and its weekly run (.github/workflows/pin-check.yml)
+# offline. cargo xtask check-pins reads the pins below, and its weekly run (.github/workflows/pin-check.yml)
 # rewrites them when upstream moves on.
 #   bash scripts/fetch-native-tools.sh            (NEURAL_FORGE_NATIVE_TOOLS=<dir> to unpack elsewhere)
 set -euo pipefail

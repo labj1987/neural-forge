@@ -201,7 +201,7 @@ SOFTWARE.
 OpenDLSS-NR host code (above), that is the list below. The licence and notice texts of each (volk's
 copyright and permission notice, the Vulkan-Headers' Apache-2.0 and MIT texts) and of every linked
 Rust crate ship in the AppImage as `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`, collected
-from their sources at build time (`scripts/gen_third_party_crates.py --licences`).
+from their sources at build time (`cargo xtask gen-third-party-crates --licences`).
 
 | Component | Version | License | Use |
 |---|---|---|---|

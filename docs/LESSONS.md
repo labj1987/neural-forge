@@ -337,7 +337,7 @@ The full record is [PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md); the probe i
   per-channel shoulder above 0.75, sRGB. Statistically indistinguishable from the 8-bit
   reference. Paper white 1 blew out a third of the pixels and lost 20-23% of mean luminance on
   write-back; `x/(1+x)` lost 6-10% and turned hazy.
-- **Evidence:** PRE_UPSCALER_DESIGN.md, "E1b"; `scripts/hdr_encode.py`.
+- **Evidence:** PRE_UPSCALER_DESIGN.md, "E1b"; `cargo xtask hdr-encode`.
 
 ### E2 and E3: the hold is cheap, but the gate failed at first
 
@@ -1104,7 +1104,7 @@ as a setting with per-pass overrides, before and after the upscaler.
   and the edit cache compare the last answer with the game's own frame. After the upscaler the shared
   proxy is never overwritten (later passes read a scratch copy), so the composition compares the whole
   chain with the original. `pan` after the upscaler: the edit is 191% of one pass's at 2 passes and 273%
-  at 3 (agreement.py, ncc 0.96 / 0.93), so it grows instead of fading.
+  at 3 (`cargo xtask agreement`, ncc 0.96 / 0.93), so it grows instead of fading.
 - **Each pass needs its own history** (an idea from y4my4my4m/OptiScaler_DLSSNR_Multipass_MFG's notes,
   GPL-3.0, ideas only). With one shared history pass 1 blends toward the previous frame's multi-pass
   picture, which compounds frame after frame. Each later pass has its own pair of history images, built
@@ -1181,11 +1181,11 @@ pass feedback. Measured in GTA V Enhanced at 1440p, FG 4x, Preset C, mods off, p
   needs a change to OpenDLSS-NR's graph. Measured network times from this table; the per-launch profile
   (October 16, above) puts the encoder and the ViT together at 3.35 of the full network's 6.11 ms at
   1486x836.
-- **bench-iq.py's settle lands after the still shot when the capture slows the game.** The series capture
+- **bench-iq's settle lands after the still shot when the capture slows the game.** The series capture
   reads every presented frame back, which slows the game, so GTA's still shot (about a second) holds fewer
   rendered frames than the 30 the default settle skips at FG 4x, and the window measured the camera moving
   again (20% "flicker"). The numbers above put a 9-frame window 40 presented frames (settled) and 8 frames
-  (just after) after each series' own cut instead, with bench-iq.py's flicker and detail functions.
+  (just after) after each series' own cut instead, with bench-iq's flicker and detail functions.
 
 ## October 19: placement, model resolution and history after the upscaler (3.8.0)
 
@@ -1305,7 +1305,7 @@ logs, Streamline's own log and the game's memory read while it ran.
 - **What the runner does:** frame generation is not retried (Alex, 2026-10-19). With frame generation on in
   `settings.xml` the runner prints "frame generation stopped at about N s" when the displayed rate falls to a
   third of its best for 20 s, about 125 s into the launch (the rule matched bench-report on all 26 runs
-  checked), and `bench-report.py --fg` flags the run.
+  checked), and `cargo xtask bench-report --fg` flags the run.
 
 ### The 20-minute wait
 

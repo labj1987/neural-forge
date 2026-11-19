@@ -9,6 +9,7 @@ members = [
     "crates/native",
     "crates/cache-replay",
     "third_party/opendlss-nr/ptx",
+    "crates/xtask",
 ]
 # The layer framework (crates/layer's vulkan-layer dependency) is its own workspace, tested with its
 # own lockfile: third_party/vk-layer-for-rust/UPSTREAM.md.
@@ -38,6 +39,19 @@ panic = "abort"
 # The fast_divmod test (third_party/opendlss-nr/ptx) interprets the emitted PTX for every n < 2^24 and 32 divisors:
 # unoptimised that is minutes of CPU time.
 [profile.dev.package.opendlss-nr-ptx]
+opt-level = 3
+
+# The development tasks (crates/xtask) decode and measure full-size frames: unoptimised, `cargo xtask agreement` and
+# `bench-iq` take minutes on a benchmark's captures. Their own code and the PNG decoder are built optimised.
+[profile.dev.package.xtask]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.crc32fast]
 opt-level = 3
 
 [profile.release]
