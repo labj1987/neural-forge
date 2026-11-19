@@ -48,7 +48,7 @@ layout(set = 0, binding = 5, std430) readonly buffer Regions { vec4 r[]; } u_reg
 
 layout(push_constant) uniform Params {
   uvec4 dims;     // width, height, phase, region count
-  uvec4 flags;    // x: bit 0 blue first, bit 1 ten bits a channel; y: CAS on; z: Clarity on; w: unused
+  uvec4 flags;    // x: bit 0 blue first, bit 1 ten bits a channel, bit 2 BT.2020 primaries; y: CAS on; z: Clarity on; w: unused
   vec4 cas;       // peak weight (negative), unused x3
   vec4 clarity;   // strength, radius in half-size pixels (taps each side), midtones, edge stop (1 / (2 sigma^2), 0 off)
   vec4 misc;      // region feather (pixels), spatial 1 / (2 sigma^2) in half-size pixels, unused x2
@@ -56,9 +56,9 @@ layout(push_constant) uniform Params {
 
 bool tenBit() { return (p.flags.x & 2u) != 0u; }
 
-// The luma weights in the words' channel order: BT.709 for 8-bit frames, BT.2020 for HDR10.
+// The luma weights in the words' channel order: BT.2020 for HDR10, BT.709 for SDR (8-bit or 10-bit).
 vec3 lumaWeights() {
-  vec3 w = tenBit() ? vec3(0.2627, 0.6780, 0.0593) : vec3(0.2126, 0.7152, 0.0722);
+  vec3 w = (p.flags.x & 4u) != 0u ? vec3(0.2627, 0.6780, 0.0593) : vec3(0.2126, 0.7152, 0.0722);
   return (p.flags.x & 1u) != 0u ? w.bgr : w;
 }
 

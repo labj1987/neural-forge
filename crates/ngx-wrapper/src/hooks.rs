@@ -4,13 +4,17 @@
 //! returned (`ring::KIND_END`).
 
 use core::ffi::{c_char, c_void};
-use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::ring::{Record, API_D3D11, API_D3D12, API_VULKAN, KIND_END};
 use crate::rules;
-use crate::win::{log, logging, publish, target};
+use crate::win::{log, logging, publish, target, trace_in, trace_out, tracing};
+
+/// Whether the per-evaluate detail is put together: for the text log or the trace (the trace takes the log's lines).
+fn detail() -> bool {
+    logging() || tracing()
+}
 
 /// NGX's `NVSDK_NGX_Parameter` (an MSVC C++ object): its getters' vtable slots. MSVC groups overloads and lays
 /// them out in reverse declaration order (measured: docs/PROTON_NGX.md).
@@ -362,14 +366,14 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
     let mut line = String::new();
     let mut take = |key: &str, follow: bool| -> Option<Image> {
         if !follow {
-            if logging() {
-                let _ = write!(line, " {key}={:p}", raw(api, p, key));
+            if detail() {
+                line.push_str(&rules::pointer_text(key, raw(api, p, key) as usize));
             }
             return None;
         }
         let img = image(api, p, key)?;
-        if logging() {
-            let _ = write!(line, " {key}=vk:{:#x}({}x{} fmt={} lay={})", img.vk, img.width, img.height, img.format, img.layout);
+        if detail() {
+            line.push_str(&rules::image_text(key, img.vk, img.width, img.height, img.format, img.layout));
         }
         Some(img)
     };
@@ -385,7 +389,7 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
         rec.output_extent = [i.width, i.height];
     }
     rec.exposure = take("ExposureTexture", images && rules::reads_exposure_texture(rec.create_flags)).map_or(0, |i| i.vk);
-    if logging() {
+    if detail() {
         for key in LOGGED_IMAGES {
             take(key, false);
         }
@@ -404,33 +408,8 @@ unsafe fn evaluate(api: Api, handle: *const NgxHandle, p: *mut Parameter) -> Rec
     rec.depth_base = pair("DLSS.Input.Depth.Subrect.Base.X", "DLSS.Input.Depth.Subrect.Base.Y");
     rec.output_base = pair("DLSS.Output.Subrect.Base.X", "DLSS.Output.Subrect.Base.Y");
     publish(rec);
-    if logging() {
-        log(&format!(
-            "EVAL {} h={}@{handle:p} feat={}{line} jitter={},{} mv_scale={},{} pre_exposure={} exposure_scale={} reset={} render={}x{} bases=colour:{},{} mv:{},{} depth:{},{} output:{},{} out={}x{} flags={:#x}",
-            api.name(),
-            rec.handle,
-            feature_name(rec.feature),
-            rec.jitter[0],
-            rec.jitter[1],
-            rec.mv_scale[0],
-            rec.mv_scale[1],
-            rec.pre_exposure,
-            rec.exposure_scale,
-            rec.reset,
-            rec.render[0],
-            rec.render[1],
-            rec.colour_base[0],
-            rec.colour_base[1],
-            rec.mvec_base[0],
-            rec.mvec_base[1],
-            rec.depth_base[0],
-            rec.depth_base[1],
-            rec.output_base[0],
-            rec.output_base[1],
-            rec.output_size[0],
-            rec.output_size[1],
-            rec.create_flags
-        ));
+    if detail() {
+        log(&rules::eval_line(api.name(), handle as usize, feature_name(rec.feature), &line, &rec));
     }
     rec
 }
@@ -473,7 +452,9 @@ macro_rules! hooks {
         /// NGX's contract.
         #[no_mangle]
         pub unsafe extern "C" fn $create(cmd: *mut c_void, feature: i32, p: *mut Parameter, out: *mut *mut NgxHandle) -> u32 {
+            let t = trace_in(stringify!($create), &[cmd as usize, feature as usize, p as usize, out as usize]);
             let r = real::<CreateFn>(stringify!($create))(cmd, feature, p, out);
+            trace_out(stringify!($create), t, r);
             create($api, feature, p, out, r);
             r
         }
@@ -481,8 +462,10 @@ macro_rules! hooks {
         /// NGX's contract.
         #[no_mangle]
         pub unsafe extern "C" fn $evaluate(cmd: *mut c_void, handle: *const NgxHandle, p: *mut Parameter, callback: *mut c_void) -> u32 {
+            let t = trace_in(stringify!($evaluate), &[cmd as usize, handle as usize, p as usize, callback as usize]);
             let rec = evaluate($api, handle, p);
             let r = real::<EvaluateFn>(stringify!($evaluate))(cmd, handle, p, callback);
+            trace_out(stringify!($evaluate), t, r);
             evaluated(rec);
             r
         }
@@ -490,8 +473,11 @@ macro_rules! hooks {
         /// NGX's contract.
         #[no_mangle]
         pub unsafe extern "C" fn $release(handle: *mut NgxHandle) -> u32 {
+            let t = trace_in(stringify!($release), &[handle as usize]);
             release($api, handle);
-            real::<ReleaseFn>(stringify!($release))(handle)
+            let r = real::<ReleaseFn>(stringify!($release))(handle);
+            trace_out(stringify!($release), t, r);
+            r
         }
     };
 }
@@ -510,7 +496,9 @@ pub unsafe extern "C" fn NVSDK_NGX_VULKAN_CreateFeature1(
     p: *mut Parameter,
     out: *mut *mut NgxHandle,
 ) -> u32 {
+    let t = trace_in("NVSDK_NGX_VULKAN_CreateFeature1", &[device as usize, cmd as usize, feature as usize, p as usize, out as usize]);
     let r = real::<Create1Fn>("NVSDK_NGX_VULKAN_CreateFeature1")(device, cmd, feature, p, out);
+    trace_out("NVSDK_NGX_VULKAN_CreateFeature1", t, r);
     create(Api::Vulkan, feature, p, out, r);
     r
 }

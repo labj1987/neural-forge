@@ -2699,9 +2699,9 @@ dependencies = [
 
 [[package]]
 name = "heapless"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
+checksum = "411fdef4df93751117bd9ef8caa0e7f99c65dafec5bd84313eb8e2fdd75e32f2"
 dependencies = [
  "hash32",
  "stable_deref_trait",
@@ -3788,7 +3788,7 @@ dependencies = [
 
 [[package]]
 name = "neural-forge"
-version = "4.5.3"
+version = "4.6.0"
 dependencies = [
  "ashpd",
  "async-channel",
@@ -3808,7 +3808,7 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-cli"
-version = "4.5.3"
+version = "4.6.0"
 dependencies = [
  "neural-forge-protocol",
  "neural-forge-supervisor",
@@ -3816,7 +3816,7 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-layer"
-version = "4.5.3"
+version = "4.6.0"
 dependencies = [
  "ash",
  "libc",
@@ -3828,7 +3828,7 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-native"
-version = "4.5.3"
+version = "4.6.0"
 dependencies = [
  "ash",
  "cc",
@@ -3839,14 +3839,14 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-protocol"
-version = "4.5.3"
+version = "4.6.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "neural-forge-supervisor"
-version = "4.5.3"
+version = "4.6.0"
 dependencies = [
  "libc",
  "miniz_oxide 0.9.1",

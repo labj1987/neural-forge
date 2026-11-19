@@ -25,6 +25,7 @@
 #                (Cyberpunk 2077's UserSettings.json option names) or "xml-value" (<Name value="..."/>), NAME=VALUE
 #   env          more variables for the game's launch options, NAME=VALUE (a setting only a variable switches, as
 #                NEURAL_FORGE_OFFLOAD_GPU=same)
+#   prefix       a command the game runs inside, right before %command% (e.g. "gamescope ... --")
 #
 # Every run sets the game's own resolution to 2560x1440 (the desktop stays at 3840x2160; at 4K the 12 GB card ran out
 # of video memory with Ray Reconstruction); games with HDR run with it on.
@@ -75,3 +76,17 @@ edit_kind = "xml-value"
 # FrameLimit 120 keeps frame generation on through the loading screens (docs/LESSONS.md, "Frame generation in the
 # benchmark"); gameplay renders under 120, so pass 4 is untouched.
 edits = ["ScreenWidth=2560", "ScreenHeight=1440", "FrameLimit=120"]
+
+# Crimson Desert has no benchmark or launch argument that reaches gameplay: unattended, the first launch after a layer
+# update stays on its "Compiling Shaders" splash (DLSS with Ray Reconstruction already runs there, so the hold after
+# DLSS is reached, HDR10, but the picture and the frame generation are the splash's). The run shows the layer hooks
+# and holds in it; a release still needs it checked in gameplay. Ray Reconstruction is on in its settings as found.
+# (Red Dead Redemption 2 has no run: its benchmark is menu-only.)
+[[run]]
+label = "crimson-rr"
+appid = 3321460
+args = ""
+seconds = 60
+timeout = 420
+hdr = true
+ray_reconstruction = true
