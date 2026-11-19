@@ -128,8 +128,9 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   and again only when the set of paths changes; or, instead of both, when the core did not load (`core-failed`, with
   the reason and no modules, from `DllMain` before it fails the load). A core-loaded note that runs after a feature
   was created writes nothing, so the later list wins; nor does one that finds the file already holding a
-  feature-created record of the same process (`process=`, the Windows process id: a game that frees NGX and loads it
-  again, whose wrapper starts with no memory of what it wrote). A run replaces the file. So a game that never creates a DLSS
+  feature-created record of the same process (`process=`, the Windows process id and its creation time, since Wine gives a game the
+  same small id run after run: a game that frees NGX and loads it again, whose wrapper starts with no memory of what it
+  wrote). A run replaces the file. So a game that never creates a DLSS
   feature (#51) still leaves a record of which core it ran, and `doctor` and the report say that its last run created
   none. `<app id>` is Steam's `SteamAppId` (else
   `SteamGameId`), else `x` and a hash of the executable's path, so games whose executables share a name keep apart.

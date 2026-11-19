@@ -27,14 +27,15 @@
 //! neural-forge-ngx-modules 1
 //! wrapper=4.6.2
 //! exe=C:\...\game.exe
-//! process=1234
+//! process=1234@134077112345678901
 //! stage=feature-created
 //! core_load=C:\windows\system32\neural-forge\_nvngx.dll (copy of Z:\usr\lib\x86_64-linux-gnu\nvidia\wine\_nvngx.dll)
 //! core<TAB>_nvngx.dll<TAB>570.133.0.0<TAB>C:\windows\system32\neural-forge\_nvngx.dll
 //! snippet<TAB>nvngx_dlss.dll<TAB>310.4.0.0<TAB>C:\...\nvngx_dlss.dll
 //! ```
 //!
-//! `process` is the Windows process id: a wrapper loaded again in the same process (a game that frees NGX and loads it
+//! `process` is the Windows process id and its creation time (a `FILETIME`): Wine hands a game the same small id run
+//! after run, so the time tells two runs apart. A wrapper loaded again in the same process (a game that frees NGX and loads it
 //! again) finds its feature-created record by it and does not replace it with a core-loaded one
 //! ([`keeps_feature_record`]). `stage` is [`Stage::key`]; `core_load` says which core was loaded and why (or, for
 //! `core-failed`, why none was).
@@ -189,7 +190,7 @@ pub fn version_text(ms: u32, ls: u32) -> String {
 }
 
 /// The file's text (the module docs). `core_load` is kept to one line.
-pub fn render(wrapper_version: &str, exe: &str, process: u32, stage: Stage, core_load: &str, modules: &[Module]) -> String {
+pub fn render(wrapper_version: &str, exe: &str, process: &str, stage: Stage, core_load: &str, modules: &[Module]) -> String {
     let core_load = core_load.replace(['\r', '\n'], " ");
     let mut s = format!("neural-forge-ngx-modules 1\nwrapper={wrapper_version}\nexe={exe}\nprocess={process}\nstage={}\ncore_load={core_load}\n", stage.key());
     for m in modules {
@@ -203,12 +204,17 @@ pub fn log_line(m: &Module) -> String {
     format!("NGX module {}: {} {}", m.role, m.version.as_deref().unwrap_or("no version"), m.path)
 }
 
-/// Whether `existing` (the record file as it is) is a feature-created record of process `process`: a core-loaded record
+/// Whether `existing` (the record file as it is) is a feature-created record of process `process` (`<id>@<creation time>`, [`process_key`]): a core-loaded record
 /// must not replace it. The wrapper's own memory of what it wrote ([`Written`]) starts again when the game frees NGX
 /// and loads it again, the file does not.
-pub fn keeps_feature_record(existing: &str, process: u32) -> bool {
+pub fn keeps_feature_record(existing: &str, process: &str) -> bool {
     let has = |line: &str| existing.lines().any(|l| l.trim_end() == line);
     existing.starts_with("neural-forge-ngx-modules 1\n") && has(&format!("process={process}")) && has(&format!("stage={}", Stage::Feature.key()))
+}
+
+/// The record's `process=` value: the process id and its creation time, unique to one run.
+pub fn process_key(id: u32, created: u64) -> String {
+    format!("{id}@{created}")
 }
 
 /// What this process has written, for [`should_write`].
@@ -259,6 +265,7 @@ mod win {
         fn FreeLibrary(module: Handle) -> i32;
         fn FreeLibraryAndExitThread(module: Handle, code: u32) -> !;
         fn GetCurrentProcessId() -> u32;
+        fn GetProcessTimes(process: Handle, created: *mut u64, exited: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     }
 
     const FROM_ADDRESS: u32 = 4;
@@ -337,17 +344,25 @@ mod win {
         std::env::var(name).ok()
     }
 
+    /// This process's [`process_key`]: its id and creation time (0 when Windows cannot say).
+    fn this_process() -> String {
+        let (mut created, mut other) = (0u64, [0u64; 3]);
+        // SAFETY: four FILETIME out-parameters (8 bytes each) for the current process's pseudo-handle.
+        let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut other[0], &mut other[1], &mut other[2]) };
+        process_key(unsafe { GetCurrentProcessId() }, if ok != 0 { created } else { 0 })
+    }
+
     /// Writes the record (only where the layer is on, [`wanted`]); false when it could not be written. A core-loaded
     /// record leaves a feature-created one of this process in place ([`keeps_feature_record`]: the wrapper loaded again).
     fn write_record(stage: Stage, core_load: &str, modules: &[Module]) -> bool {
         let exe = module_path(core::ptr::null_mut());
         let Some(dir) = win_dir(var) else { return false };
         let path = format!("{dir}\\{}", state_file_name(&exe, var));
-        let process = unsafe { GetCurrentProcessId() };
-        if stage == Stage::CoreLoaded && std::fs::read_to_string(&path).is_ok_and(|have| keeps_feature_record(&have, process)) {
+        let process = this_process();
+        if stage == Stage::CoreLoaded && std::fs::read_to_string(&path).is_ok_and(|have| keeps_feature_record(&have, &process)) {
             return true;
         }
-        std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&path, render(env!("CARGO_PKG_VERSION"), &exe, process, stage, core_load, modules)).is_ok()
+        std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&path, render(env!("CARGO_PKG_VERSION"), &exe, &process, stage, core_load, modules)).is_ok()
     }
 
     /// Starts a thread that writes the core-loaded record ([`Stage::CoreLoaded`]), from the end of `DllMain` once
@@ -633,16 +648,16 @@ mod tests {
             Module { role: "snippet", path: r"C:\Game\nvngx_dlss.dll".into(), version: None },
         ];
         assert_eq!(
-            render("4.0.0", r"C:\Game\g.exe", 7, Stage::Feature, "C:\\nf\\_nvngx.dll (copy of Z:\\d\\_nvngx.dll)\nwritten now", &modules),
-            "neural-forge-ngx-modules 1\nwrapper=4.0.0\nexe=C:\\Game\\g.exe\nprocess=7\nstage=feature-created\n\
+            render("4.0.0", r"C:\Game\g.exe", "7@1", Stage::Feature, "C:\\nf\\_nvngx.dll (copy of Z:\\d\\_nvngx.dll)\nwritten now", &modules),
+            "neural-forge-ngx-modules 1\nwrapper=4.0.0\nexe=C:\\Game\\g.exe\nprocess=7@1\nstage=feature-created\n\
              core_load=C:\\nf\\_nvngx.dll (copy of Z:\\d\\_nvngx.dll) written now\n\
              wrapper\t_nvngx.dll\t4.0.0\tC:\\windows\\system32\\_nvngx.dll\n\
              snippet\tnvngx_dlssg.dll\t310.1.0.0\tC:\\Game\\nvngx_dlssg.dll\n\
              snippet\tnvngx_dlss.dll\t-\tC:\\Game\\nvngx_dlss.dll\n"
         );
         assert_eq!(
-            render("4.0.0", "g.exe", 7, Stage::CoreFailed, "no core", &[]),
-            "neural-forge-ngx-modules 1\nwrapper=4.0.0\nexe=g.exe\nprocess=7\nstage=core-failed\ncore_load=no core\n"
+            render("4.0.0", "g.exe", "7@1", Stage::CoreFailed, "no core", &[]),
+            "neural-forge-ngx-modules 1\nwrapper=4.0.0\nexe=g.exe\nprocess=7@1\nstage=core-failed\ncore_load=no core\n"
         );
         assert_eq!(Stage::CoreLoaded.key(), "core-loaded");
         assert_eq!(log_line(&modules[2]), r"NGX module snippet: no version C:\Game\nvngx_dlss.dll");
@@ -671,12 +686,15 @@ mod tests {
     /// new run's core-loaded record replaces an older run's.
     #[test]
     fn a_reloaded_wrapper_keeps_its_processs_feature_record() {
-        let feature = render("4.6.2", "g.exe", 42, Stage::Feature, "c", &[]);
-        assert!(keeps_feature_record(&feature, 42));
-        assert!(!keeps_feature_record(&feature, 43), "another process: a new run");
-        assert!(!keeps_feature_record(&render("4.6.2", "g.exe", 42, Stage::CoreLoaded, "c", &[]), 42));
-        assert!(!keeps_feature_record(&feature.replace("process=42", "process=420"), 42));
-        assert!(!keeps_feature_record("neural-forge-ngx-modules 1\nwrapper=4.6.1\nexe=g.exe\n", 42), "an older wrapper's record");
-        assert!(!keeps_feature_record("", 42));
+        let (run, key) = (process_key(42, 1000), |id, t| process_key(id, t));
+        assert_eq!(run, "42@1000");
+        let feature = render("4.6.2", "g.exe", &run, Stage::Feature, "c", &[]);
+        assert!(keeps_feature_record(&feature, &run));
+        assert!(!keeps_feature_record(&feature, &key(42, 2000)), "the same id in a later run (Wine reuses small ids): a new run");
+        assert!(!keeps_feature_record(&feature, &key(43, 1000)), "another process");
+        assert!(!keeps_feature_record(&feature, &key(4, 1000)) && !keeps_feature_record(&feature, &key(42, 100)), "no prefix match");
+        assert!(!keeps_feature_record(&render("4.6.2", "g.exe", &run, Stage::CoreLoaded, "c", &[]), &run));
+        assert!(!keeps_feature_record("neural-forge-ngx-modules 1\nwrapper=4.6.1\nexe=g.exe\n", &run), "an older wrapper's record");
+        assert!(!keeps_feature_record("", &run));
     }
 }
