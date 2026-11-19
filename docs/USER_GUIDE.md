@@ -445,7 +445,8 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_NGX_RING=off\|/path` | layer | `off`: the layer reads no NGX records, so nothing is held before or after DLSS (as without the wrapper). A path: read that ring file (left in place) instead of this process's. |
 | `NEURAL_FORGE_NGX_LOG=/path/ngx.log` | NGX wrapper | One line per DLSS creation, evaluate (every named image, the jitter, motion vector scale, exposure and reset) and release. Off by default. A Linux path is used through Wine's `Z:` drive; a Windows path works too, but in Steam's launch options quote it, or the backslashes are lost: `NEURAL_FORGE_NGX_LOG='Z:\home\you\ngx.log' %command%`. |
 | `NEURAL_FORGE_NGX_TRACE=/path/ngx-trace-{pid}.txt` | NGX wrapper | For a game that stalls or crashes with the NGX wrapper in: every call into it (each NGX function, its thread, its first arguments, its result and how long NVIDIA's function took) and each step of its loading, in a 64 MB file of text lines. The game's process id goes into the name (in place of `{pid}`, else before the extension; a path ending in `/` names a folder, and the file in it is `ngx-trace-<pid>.txt`), so every process writes its own file. Writing a line costs about a microsecond and no file I/O, and the lines up to a crash are kept. Read it in the order it was written, not sorted by its time column (a line's time is read before the line gets its place in the file, so lines from several threads are not in time order): `tail -c +129 FILE \| tr -d '\0'` (the first 128 bytes are a header line naming `written=` and `next=`; the rest of the file stays zero until written). The file is a ring: once the header says `wrapped`, the oldest lines were overwritten and the oldest one left starts at byte `next` of the ring, so read `{ tail -c +$((129 + NEXT)) FILE; tail -c +129 FILE \| head -c NEXT; } \| tr -d '\0'`. The header can lag the newest line or two. A path as for `NEURAL_FORGE_NGX_LOG`. Off by default. While it is on, a crash dump's or debugger's stack of an NGX call is not reliable (the trace changes the return addresses), so take crash dumps with it off. |
-| `NEURAL_FORGE_NGX_CORE=C:\path\_nvngx.dll` | NGX wrapper | Load NVIDIA's core from here instead of `NVIDIA_WINE_DLL_DIR`. |
+| `NEURAL_FORGE_NGX_CORE=/path/_nvngx.dll` | NGX wrapper | For diagnosis: load NVIDIA's core from this file. By default the wrapper loads its own copy of the driver's core, `C:\windows\system32\neural-forge\_nvngx.dll` in the game's prefix (made and kept up to date on every start), so NGX finds the same DLSS files as with Proton's own setup. A path as for `NEURAL_FORGE_NGX_LOG`. |
+| `__NGX_LOG_LEVEL=2` | NVIDIA's NGX | NVIDIA's own NGX log, in the game's prefix: `pfx/drive_c/ProgramData/NVIDIA/NGX/models/nvngx_update.log` (rewritten each start). It says where NGX looked for DLSS's files, which it loaded, and why a feature is not supported. Works with or without Neural Forge. |
 
 ## The model on a second GPU
 
@@ -575,8 +576,9 @@ that: while it runs, or while a game's options cannot be changed safely, the pur
 names each game with the launch options to set by hand instead. Then it removes Neural Forge's Proton builds
 (`compatibilitytools.d/*-NeuralForge`), the config,
 everything under `~/.local/share/neural-forge` (the model, an imported DLL, captures),
-`~/.local/state/neural-forge`, `/tmp/neural-forge-$UID` and the Proton copies it made (choose another Proton for
-the games that used one).
+`~/.local/state/neural-forge`, `/tmp/neural-forge-$UID`, the Proton copies it made (choose another Proton for
+the games that used one) and the NGX wrapper's copy of NVIDIA's core in each game's prefix
+(`system32/neural-forge`).
 
 ## More known issues
 

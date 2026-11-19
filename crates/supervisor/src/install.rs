@@ -632,6 +632,15 @@ fn purge_in(steam_roots: &[crate::steam::Root], steam_running: bool, leftovers: 
     }
     // Rings the NGX wrapper left where the layer never opened them, of games that are gone.
     purged.removed.extend(crate::proton_tool::sweep_dead_rings(ring_dir));
+    // The NGX wrapper's copies of NVIDIA's core in the games' prefixes (Proton sets a prefix up again by itself).
+    for root in steam_roots {
+        for library in steam::libraries(&root.path) {
+            for dir in crate::proton_tool::core_copy_dirs(&library) {
+                std::fs::remove_dir_all(&dir)?;
+                purged.removed.push(dir);
+            }
+        }
+    }
 
     let preserved = uninstall()?;
     for path in &preserved {
@@ -1239,6 +1248,17 @@ mod tests {
         std::fs::write(tools.join("GE-Proton10-25-NeuralForge").join(crate::proton_tool::MARKER), "source=x\n").unwrap();
         std::os::unix::fs::symlink(tools.join("GE-Proton10-25-NeuralForge"), tools.join("Linked-NeuralForge")).unwrap();
         let roots = [crate::steam::Root { path: steam.clone(), flatpak: false }];
+        // The wrapper's copies of NVIDIA's core in the prefixes: a folder of only its files goes, one with anything
+        // else in it stays.
+        let sys32 = |appid: &str| steam.join("steamapps/compatdata").join(appid).join("pfx/drive_c/windows/system32");
+        let (copy, foreign) = (sys32("1091500").join("neural-forge"), sys32("271590").join("neural-forge"));
+        for dir in [&copy, &foreign] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("_nvngx.dll"), "MZ").unwrap();
+        }
+        std::fs::write(copy.join("_nvngx.dll.4242.tmp"), "MZ").unwrap();
+        std::fs::write(foreign.join("notes.txt"), "mine").unwrap();
+        std::fs::write(sys32("1091500").join("_nvngx.dll"), "MZ").unwrap();
         // The wrapper's rings: a running process's stays, a gone one's goes.
         let shm = scratch.dir.join("shm");
         std::fs::create_dir_all(&shm).unwrap();
@@ -1264,6 +1284,9 @@ mod tests {
         assert!(tools.join("Unmarked-NeuralForge/proton").is_file(), "only a marked copy is removed, whatever its name");
         assert!(tools.join("Linked-NeuralForge").is_symlink(), "a link is not a copy");
         assert!(live.is_file() && !dead.exists() && purged.removed.contains(&dead));
+        assert!(!copy.exists() && purged.removed.contains(&copy), "{purged:?}");
+        assert!(foreign.join("notes.txt").is_file() && foreign.join("_nvngx.dll").is_file(), "a folder with anything else stays");
+        assert!(sys32("1091500").join("_nvngx.dll").is_file(), "Proton's own files stay");
         assert!(!PathBuf::from(paths::data_dir()).exists() && !manifest_path().exists());
     }
 

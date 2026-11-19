@@ -5,7 +5,8 @@ use std::io::Write;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::exports::{missing_export, HOOKED, PASSTHROUGH, PASSTHROUGH_TARGETS, PASSTHROUGH_TRACED};
+use crate::core_copy::{self, Placed, Plan};
+use crate::exports::{missing_export, reads_caller, HOOKED, PASSTHROUGH, PASSTHROUGH_TARGETS, PASSTHROUGH_TRACED};
 use crate::ring::{self, Header, Record};
 use crate::rules::{self, Resolution};
 use crate::trace;
@@ -27,6 +28,8 @@ extern "system" {
     fn DisableThreadLibraryCalls(module: Handle) -> i32;
     fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
     fn GetModuleFileNameW(module: Handle, buf: *mut u16, len: u32) -> u32;
+    fn GetSystemDirectoryW(buf: *mut u16, len: u32) -> u32;
+    fn FreeLibrary(module: Handle) -> i32;
 }
 
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -240,6 +243,11 @@ extern "C" fn trace_enter(export: usize, ret_slot: *mut usize, regs: *const usiz
     let name = PASSTHROUGH.get(export).copied().unwrap_or("?");
     // SAFETY: the thunk passes its own stack slots; REAL_TARGETS is written once, before any export can be called.
     let (real, args) = unsafe { ((*core::ptr::addr_of!(REAL_TARGETS))[export], [*regs.add(3), *regs.add(2), *regs.add(1), *regs]) };
+    if reads_caller(name) {
+        // NVIDIA's function looks its caller up by the return address: it must stay the caller's.
+        trace(format_args!("> {name}({:#x}, {:#x}, {:#x}, {:#x}) [exit not traced: the core reads its caller]", args[0], args[1], args[2], args[3]));
+        return real;
+    }
     let t_ms = now_ms();
     let pushed = STACK.with(|s| {
         let Ok(mut s) = s.try_borrow_mut() else { return false };
@@ -374,15 +382,58 @@ pub(crate) fn publish(mut record: Record) {
     }
 }
 
-/// NVIDIA's core: `%NEURAL_FORGE_NGX_CORE%`, else `_nvngx.dll` in `NVIDIA_WINE_DLL_DIR` (a Linux path, through `Z:`).
-fn core_path() -> String {
-    if let Ok(p) = std::env::var("NEURAL_FORGE_NGX_CORE") {
-        if !p.is_empty() {
-            return p;
+/// The prefix's system folder (`C:\windows\system32`).
+fn system_dir() -> String {
+    let mut buf = [0u16; 512];
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return r"C:\windows\system32".into();
+    }
+    String::from_utf16_lossy(&buf[..n])
+}
+
+/// NVIDIA's core to load (`core_copy.rs`), what was done to get it (for the log), and the driver's file to load
+/// instead if that one does not load as NVIDIA's core: `%NEURAL_FORGE_NGX_CORE%` (no fallback), else the copy of the
+/// driver's core in `system32\\neural-forge`, made or refreshed here; the driver's core itself when the copy cannot
+/// be written.
+fn core_path() -> (String, String, Option<String>) {
+    match core_copy::plan(|name| std::env::var(name).ok(), &system_dir()) {
+        Plan::Given(path) => (path, format!("named by {}", core_copy::ENV_CORE), None),
+        Plan::Copy { from, to } => {
+            let tag = unix_pid().unwrap_or(0).to_string();
+            match core_copy::place(std::path::Path::new(&from), std::path::Path::new(&to), &tag) {
+                Ok(Placed::Unchanged) => (to, format!("copy of {from}"), Some(from)),
+                Ok(Placed::Written) => (to, format!("copy of {from}, written now"), Some(from)),
+                Err(e) => (from, format!("the driver's own: the copy {to} could not be written ({e})"), None),
+            }
         }
     }
-    let dir = std::env::var("NVIDIA_WINE_DLL_DIR").unwrap_or_else(|_| "/usr/lib/x86_64-linux-gnu/nvidia/wine".into());
-    format!("Z:{}/_nvngx.dll", dir.trim_end_matches('/')).replace('/', "\\")
+}
+
+/// Loads `path`: the module, or null when it did not load or Wine handed back this wrapper (no full-path native
+/// override for it), which is then not counted as a load.
+fn load_core(this: Handle, path: &str) -> Result<Handle, String> {
+    let wpath = wide(path);
+    let t = now_ms();
+    trace(format_args!("load: LoadLibraryW({path}) ..."));
+    let core = unsafe { LoadLibraryW(wpath.as_ptr()) };
+    trace(format_args!("load: LoadLibraryW returned {core:p} after {:.3} ms", now_ms() - t));
+    if core.is_null() {
+        return Err(format!("NVIDIA's NGX core {path} did not load"));
+    }
+    if core == this {
+        // The reference this load took on the wrapper goes back (the loader holds others while its DllMain runs).
+        unsafe { FreeLibrary(core) };
+        return Err(format!("{path} resolved to this wrapper (the full-path native override is missing)"));
+    }
+    Ok(core)
+}
+
+/// NVIDIA's core module, once loaded (`modules.rs` names it in the module list).
+static CORE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+
+pub(crate) fn core_module() -> Handle {
+    CORE.load(Ordering::Acquire)
 }
 
 /// The hooked exports' targets in NVIDIA's core, in [`HOOKED`]'s order.
@@ -395,18 +446,19 @@ pub(crate) fn target(name: &str) -> *const c_void {
 /// Loads NVIDIA's core and resolves every export: `Err` if it cannot be loaded or lacks an export the wrapper hooks;
 /// a passthrough export it lacks jumps to [`missing_export`] (named in the returned text, for the log).
 fn resolve(this: Handle) -> Result<String, String> {
-    let path = core_path();
-    let wpath = wide(&path);
     let t = now_ms();
-    trace(format_args!("load: LoadLibraryW({path}) ..."));
-    let core = unsafe { LoadLibraryW(wpath.as_ptr()) };
-    trace(format_args!("load: LoadLibraryW returned {core:p} after {:.3} ms", now_ms() - t));
-    if core.is_null() {
-        return Err(format!("NVIDIA's NGX core {path} did not load"));
-    }
-    if core == this {
-        return Err(format!("{path} resolved to this wrapper (the full-path native override is missing)"));
-    }
+    let (mut path, mut source, fallback) = core_path();
+    trace(format_args!("load: NVIDIA's core {path} ({source}) after {:.3} ms", now_ms() - t));
+    let core = match (load_core(this, &path), fallback) {
+        (Ok(core), _) => core,
+        (Err(e), Some(driver)) => {
+            source = format!("the driver's own: {e}");
+            path = driver;
+            load_core(this, &path)?
+        }
+        (Err(e), None) => return Err(e),
+    };
+    CORE.store(core, Ordering::Release);
     let lookup = |name: &str| -> *const c_void {
         let cname: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
         unsafe { GetProcAddress(core, cname.as_ptr()) }
@@ -430,7 +482,7 @@ fn resolve(this: Handle) -> Result<String, String> {
         HOOK_TARGETS[i].store(lookup(name) as *mut c_void, Ordering::Release);
         trace(format_args!("load: {name} -> {:p} (hooked)", lookup(name)));
     }
-    let mut text = format!("{} at {core:p}", module_path(core));
+    let mut text = format!("{} at {core:p} ({source})", module_path(core));
     if !stubbed.is_empty() {
         let hidden = hide_exports(this, &stubbed);
         text += &format!(
@@ -474,8 +526,9 @@ fn hide_exports(this: Handle, names: &[&str]) -> usize {
 /// advises against (`LoadLibrary` from `DllMain`). It is sound here: the passthrough exports are bare jumps through
 /// the resolved pointers, so they must be set before any export can be called, and no other point comes before
 /// that; Wine's loader lock is recursive, so the nested load of NVIDIA's core (and its own `DllMain`) runs on this
-/// thread without waiting; the core is loaded by its full path, overridden native, so it cannot be this module again
-/// (checked: [`resolve`] refuses a load that returns this module); and nothing here waits on another thread.
+/// thread without waiting; the core's copy has a name no builtin has (and the driver's file, the fallback, is loaded
+/// by its full path, overridden native), so it cannot be this module again (checked: [`resolve`] refuses a load that
+/// returns this module); copying the core is plain file I/O; and nothing here waits on another thread.
 /// The ring is opened here too, only where the layer is on ([`rules::ring_wanted`]).
 ///
 /// # Safety

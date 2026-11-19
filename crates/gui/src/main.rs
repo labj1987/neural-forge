@@ -115,8 +115,11 @@ fn auto_install() -> Option<String> {
             for root in steam::roots().into_iter().filter(|r| !r.flatpak) {
                 for (name, done) in proton_tool::refresh_wrappers(&root.path, &proton_tool::installed_wrapper()) {
                     match done {
-                        Ok(true) => eprintln!("neural-forge: {name} has the new NGX wrapper"),
-                        Ok(false) => {}
+                        Ok(done) => {
+                            if let Some(line) = done.message(&name) {
+                                eprintln!("neural-forge: {line}");
+                            }
+                        }
                         Err(e) => eprintln!("neural-forge: {name}: the new NGX wrapper could not be put in: {e}"),
                     }
                 }

@@ -264,7 +264,7 @@ mod win {
             .map(|(h, path)| {
                 if h == own {
                     Module { role: "wrapper", version: Some(env!("CARGO_PKG_VERSION").to_string()), path }
-                } else if file_name(&path).eq_ignore_ascii_case("_nvngx.dll") {
+                } else if h == crate::win::core_module() || file_name(&path).eq_ignore_ascii_case("_nvngx.dll") {
                     Module { role: "core", version: file_version(&path), path }
                 } else {
                     Module { role: "snippet", version: file_version(&path), path }

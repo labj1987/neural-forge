@@ -387,12 +387,14 @@ fn added_lines(indent: &str) -> String {
     let i = indent;
     format!(
         "{i}# Neural Forge (docs/PROTON_NGX.md): NGX loads NVIDIA's signed system32 _nvngx.dll after checking its signature;\n\
-         {i}# \"_nvngx=b\" hands it Neural Forge's builtin wrapper ({BUILTIN_DIR}/_nvngx.dll), which loads NVIDIA's core\n\
-         {i}# from NVIDIA_WINE_DLL_DIR (that path forced native) and forwards every export. {OFF_ENV}=1 turns it off.\n\
+         {i}# \"_nvngx=b\" hands it Neural Forge's builtin wrapper ({BUILTIN_DIR}/_nvngx.dll), which loads its copy of NVIDIA's\n\
+         {i}# core from system32\\{CORE_COPY_DIR} (else the driver's from NVIDIA_WINE_DLL_DIR; both paths forced native) and\n\
+         {i}# forwards every export. {OFF_ENV}=1 turns it off.\n\
          {i}if self.nvidia_wine_dll_dir and self.env.get(\"{OFF_ENV}\", \"0\") in (\"\", \"0\") and \\\n\
          {i}        os.path.exists(g_proton.lib_dir + \"wine/x86_64-windows/_nvngx.dll\"):\n\
          {i}    self.dlloverrides[\"_nvngx\"] = \"b\"\n\
-         {i}    self.dlloverrides[\"Z:\" + self.nvidia_wine_dll_dir.replace(\"/\", \"\\\\\") + \"\\\\_nvngx\"] = \"n\"\n"
+         {i}    self.dlloverrides[\"Z:\" + self.nvidia_wine_dll_dir.replace(\"/\", \"\\\\\") + \"\\\\_nvngx\"] = \"n\"\n\
+         {i}    self.dlloverrides[\"C:\\\\windows\\\\system32\\\\{CORE_COPY_DIR}\\\\_nvngx\"] = \"n\"\n"
     )
 }
 
@@ -628,12 +630,69 @@ pub fn create_in(root: &Path, source: &Source, wrapper: &Path, proc_root: &Path)
     Ok(Created { tool, copied, replaced })
 }
 
+/// What [`refresh_wrapper`] did to a copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Refreshed {
+    /// The installed wrapper was put in.
+    pub wrapper: bool,
+    /// Its `proton` script was made again from its source's.
+    pub script: bool,
+    /// Its script lacks the overrides this Neural Forge sets ([`has_current_overrides`]) and cannot be made again,
+    /// because its source is no longer installed: the wrapper then loads NVIDIA's core from the driver's folder.
+    pub script_stale: bool,
+}
+
+impl Refreshed {
+    pub fn changed(&self) -> bool {
+        self.wrapper || self.script
+    }
+
+    /// One line for the user about it, or `None` when there is nothing to say.
+    pub fn message(&self, name: &str) -> Option<String> {
+        let stale = || {
+            format!(
+                "{name}: its source Proton is no longer installed, so its script cannot be made again; make the copy again from a Proton you have (until then the NGX wrapper loads NVIDIA's core from the driver's folder)"
+            )
+        };
+        match (self.wrapper, self.script, self.script_stale) {
+            (_, _, true) if !self.wrapper => Some(stale()),
+            (true, _, true) => Some(format!("{name}: has the new NGX wrapper. {}", stale())),
+            (true, true, _) => Some(format!("{name}: has the new NGX wrapper and its script was made again from its source's")),
+            (true, false, _) => Some(format!("{name}: has the new NGX wrapper")),
+            (false, true, _) => Some(format!("{name}: its script was made again from its source's")),
+            (false, false, _) => None,
+        }
+    }
+}
+
+/// Whether a copy's `proton` script sets the overrides this Neural Forge's wrapper needs: the full path of its copy of
+/// NVIDIA's core forced native ([`added_lines`]).
+pub fn has_current_overrides(script: &str) -> bool {
+    script.contains(&format!("\\\\{CORE_COPY_DIR}\\\\_nvngx\"] = \"n\""))
+}
+
 /// Puts `dll` (the installed wrapper) into `tool` when its marker names another one: its `_nvngx.dll` written new
-/// (a running game keeps the file it loaded), then the marker. Whether it changed anything.
-pub fn refresh_wrapper(tool: &Tool, dll: &[u8]) -> Result<bool, String> {
+/// (a running game keeps the file it loaded), then the marker; and makes its `proton` script again from its source's
+/// when that differs (a Neural Forge with other overrides made it). What it did.
+pub fn refresh_wrapper(tool: &Tool, dll: &[u8]) -> Result<Refreshed, String> {
+    let mut done = Refreshed::default();
+    // The copy's script made again from its source's, as `create` makes it, while the source is the version the copy
+    // was made from (a newer one is a remake: `source_changed`); a running game keeps the script it started with.
+    let script_path = tool.dir.join("proton");
+    let have = std::fs::read_to_string(&script_path).ok();
+    let script =
+        (!source_changed(tool)).then(|| std::fs::read_to_string(tool.source.join("proton")).ok()).flatten().and_then(|text| patch_proton_script(&text).ok());
+    match script {
+        Some(text) if have.as_deref() != Some(text.as_str()) => {
+            write_new(&script_path, text.as_bytes(), 0o755).map_err(|e| format!("{}: {e}", script_path.display()))?;
+            done.script = true;
+        }
+        Some(_) => {}
+        None => done.script_stale = source_gone(tool) && have.as_deref().is_some_and(|s| !has_current_overrides(s)),
+    }
     let digest = crate::install::digest(dll);
     if tool.wrapper_sha256 == digest {
-        return Ok(false);
+        return Ok(done);
     }
     let marker_path = tool.dir.join(MARKER);
     let text = std::fs::read_to_string(&marker_path).map_err(|e| format!("{}: {e}", marker_path.display()))?;
@@ -643,12 +702,13 @@ pub fn refresh_wrapper(tool: &Tool, dll: &[u8]) -> Result<bool, String> {
     let target = tool.dir.join(BUILTIN_DIR).join("_nvngx.dll");
     write_new(&target, dll, 0o644).map_err(|e| format!("{}: {e}", target.display()))?;
     write_new(&marker_path, marker.as_bytes(), 0o644).map_err(|e| format!("{}: {e}", marker_path.display()))?;
-    Ok(true)
+    done.wrapper = true;
+    Ok(done)
 }
 
 /// [`refresh_wrapper`] for every copy in `root` with the wrapper at `wrapper` (after Neural Forge is installed or
 /// updated): each copy's name and what happened. Nothing when the wrapper cannot be read.
-pub fn refresh_wrappers(root: &Path, wrapper: &Path) -> Vec<(String, Result<bool, String>)> {
+pub fn refresh_wrappers(root: &Path, wrapper: &Path) -> Vec<(String, Result<Refreshed, String>)> {
     let Ok(dll) = std::fs::read(wrapper) else { return Vec::new() };
     tools(root).into_iter().map(|t| (t.name.clone(), refresh_wrapper(&t, &dll))).collect()
 }
@@ -804,6 +864,31 @@ fn rings(dir: &Path) -> Vec<(PathBuf, u32)> {
     out
 }
 
+/// The folder in a prefix's `system32` that the NGX wrapper copies NVIDIA's core into, and the copy's name
+/// (`crates/ngx-wrapper/src/core_copy.rs`, `COPY_DIR` and `COPY_NAME`).
+pub const CORE_COPY_DIR: &str = "neural-forge";
+pub const CORE_COPY_NAME: &str = "_nvngx.dll";
+
+/// The NGX wrapper's core folders in the prefixes of the Steam library `library` (`steamapps/compatdata/<app
+/// id>/pfx/drive_c/windows/system32/neural-forge`) that hold nothing but its copy (and temporary copies it left): a
+/// folder with anything else in it, or a link, is not listed.
+pub fn core_copy_dirs(library: &Path) -> Vec<PathBuf> {
+    let Ok(prefixes) = std::fs::read_dir(library.join("steamapps/compatdata")) else { return Vec::new() };
+    let ours = |name: &str| name == CORE_COPY_NAME || (name.starts_with(&format!("{CORE_COPY_NAME}.")) && name.ends_with(".tmp"));
+    let mut out: Vec<PathBuf> = prefixes
+        .flatten()
+        .map(|p| p.path().join("pfx/drive_c/windows/system32").join(CORE_COPY_DIR))
+        .filter(|dir| {
+            let real_dir = std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir());
+            real_dir
+                && std::fs::read_dir(dir)
+                    .is_ok_and(|entries| entries.flatten().all(|e| e.file_type().is_ok_and(|t| t.is_file()) && e.file_name().to_str().is_some_and(ours)))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// Removes this user's rings in `dir` whose game is gone (a ring the layer never opened stays after its game
 /// exits): never one of a running process. What was removed. Run when Neural Forge starts and by
 /// `uninstall --purge`.
@@ -911,6 +996,14 @@ pub fn installed_wrapper() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The names the wrapper uses for its core copy (a separate workspace, so compared as text).
+    #[test]
+    fn the_core_copy_names_match_the_wrappers() {
+        let src = include_str!("../../ngx-wrapper/src/core_copy.rs");
+        assert!(src.contains(&format!("pub const COPY_DIR: &str = \"{CORE_COPY_DIR}\";")), "COPY_DIR");
+        assert!(src.contains(&format!("pub const COPY_NAME: &str = \"{CORE_COPY_NAME}\";")), "COPY_NAME");
+    }
+
     /// `doctor` reports a ring of another version than the layer reads: the same number.
     #[test]
     fn the_ring_version_is_the_layers() {
@@ -934,6 +1027,7 @@ mod tests {
         assert!(out.contains(want), "{out}");
         assert!(out.contains("\n            self.dlloverrides[\"_nvngx\"] = \"b\"\n"));
         assert!(out.contains(r#"self.dlloverrides["Z:" + self.nvidia_wine_dll_dir.replace("/", "\\") + "\\_nvngx"] = "n""#), "{out}");
+        assert!(out.contains(r#"            self.dlloverrides["C:\\windows\\system32\\neural-forge\\_nvngx"] = "n""#), "{out}");
         assert!(out.ends_with("\n        if \"PROTON_LOG\" in self.env:\n"), "the rest follows unchanged");
         assert!(patch_proton_script(&out).unwrap_err().contains("already"), "never twice");
     }
@@ -1270,12 +1364,32 @@ mod tests {
         std::fs::write(&wrapper, &newer).unwrap();
         let t = tools(&root).remove(0);
         assert!(wrapper_changed(&t, &wrapper) && !source_changed(&t));
-        assert_eq!(refresh_wrappers(&root, &wrapper), [(t.name.clone(), Ok(true))]);
+        assert_eq!(refresh_wrappers(&root, &wrapper), [(t.name.clone(), Ok(Refreshed { wrapper: true, ..Default::default() }))]);
         assert_eq!(std::fs::read(t.dir.join("files/lib/wine/x86_64-windows/_nvngx.dll")).unwrap(), newer);
         let t = tools(&root).remove(0);
         assert!(!wrapper_changed(&t, &wrapper));
-        assert_eq!(refresh_wrappers(&root, &wrapper), [(t.name.clone(), Ok(false))]);
+        assert_eq!(refresh_wrappers(&root, &wrapper), [(t.name.clone(), Ok(Refreshed::default()))]);
         assert!(std::fs::read_to_string(t.dir.join(MARKER)).unwrap().contains("source_version=GE-Proton11-12\n"), "the rest of the marker stays");
+        // A copy whose script another Neural Forge made (older overrides) gets it made again from the source's.
+        let script = std::fs::read_to_string(t.dir.join("proton")).unwrap();
+        let stale = script.replace("neural-forge\\\\_nvngx", "old");
+        assert_ne!(stale, script);
+        std::fs::write(t.dir.join("proton"), &stale).unwrap();
+        let script_only = Refreshed { script: true, ..Default::default() };
+        assert_eq!(refresh_wrappers(&root, &wrapper), [(t.name.clone(), Ok(script_only))]);
+        assert_eq!(script_only.message("X").unwrap(), "X: its script was made again from its source's");
+        assert_eq!(std::fs::read_to_string(t.dir.join("proton")).unwrap(), script);
+        assert!(has_current_overrides(&script) && !has_current_overrides(&stale));
+        assert_eq!(refresh_wrappers(&root, &wrapper), [(t.name.clone(), Ok(Refreshed::default()))], "then nothing to do");
+        assert_eq!(Refreshed::default().message("X"), None);
+        // Its source gone: the stale script is left, and said so.
+        std::fs::write(t.dir.join("proton"), &stale).unwrap();
+        std::fs::rename(&src, root.join("moved-away")).unwrap();
+        let gone = refresh_wrappers(&root, &wrapper).remove(0).1.unwrap();
+        assert_eq!(gone, Refreshed { script_stale: true, ..Default::default() });
+        assert!(gone.message("X").unwrap().contains("make the copy again"), "{gone:?}");
+        assert_eq!(std::fs::read_to_string(t.dir.join("proton")).unwrap(), stale, "not touched");
+        std::fs::rename(root.join("moved-away"), &src).unwrap();
         // What a stopped create left is found for purge.
         std::fs::create_dir_all(root.join("compatibilitytools.d/.GE-Proton11-13-NeuralForge.tmp")).unwrap();
         std::fs::create_dir_all(root.join("compatibilitytools.d/.hidden")).unwrap();
