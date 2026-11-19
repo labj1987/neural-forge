@@ -6,8 +6,8 @@
 //! The file is a fixed-size memory-mapped ring of text lines: writing a line is a copy into shared memory, with no
 //! system call and no lock, and the kernel keeps the pages when the process dies, so the last lines before a crash
 //! are there. A fixed-width header line names about where the next line goes (a hint: writers on several threads
-//! rewrite it without ordering, so it can lag a line). Every line starts with its time, so `tr -d '\0' < FILE | sort
-//! -n` is the way to put them in order, wrapped or not. Neither a line nor the header allocates or takes a lock.
+//! rewrite it without ordering, so it can lag a line). The file's order is the write order: a line's time is read
+//! before its place is reserved, so sorting by time reorders lines of different threads; read the ring from `next` on. Neither a line nor the header allocates or takes a lock.
 //!
 //! This module is the part that needs no Windows (tested on Linux); `win.rs` maps the file and `exports.rs` holds the
 //! thunks that send passthrough calls through [`crate::win`]'s tracer.

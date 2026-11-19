@@ -144,7 +144,11 @@ flush (a test counts allocations); the hooked calls' detail lines (creation, eva
 first, as for the text log, and a line holds up to 2 KB, so the longest evaluate line is kept whole. The kernel
 keeps the mapping's pages when the process dies, so the lines up to a crash are in the file. When the ring is full it
 wraps; the header says `wrapped` and about where the next line goes, but writers on several threads rewrite it
-without ordering, so it is a hint, not authoritative: `tr -d '\0' < FILE | sort -n` is what orders the lines by time.
+without ordering, so it is a hint, not authoritative. The file's order is the write order (the atomic add); a line's
+time is read before its place is reserved, so sorting by the time column reorders lines of different threads. Read
+it in file order: `tail -c +129 FILE | tr -d '\0'` (the ring after the 128-byte header; unwritten bytes are zero),
+and once wrapped from `next` on: `{ tail -c +$((129 + NEXT)) FILE; tail -c +129 FILE | head -c NEXT; } | tr -d '\0'`.
+The game's pid is in the file's name (`indy-trace.txt` is written as `indy-trace-<pid>.txt`).
 While tracing, the return addresses of passthrough calls point at `trace_return`, so a crash dump's or a debugger's
 stack walk through an NGX call is not reliable; the wrapper's text log line says whether the trace file opened (its
 path, or why not). A call that never returned shows
