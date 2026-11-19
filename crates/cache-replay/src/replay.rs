@@ -1,4 +1,4 @@
-//! The offline replay of scripts/cache_replay.py: the lag replay and its metrics, the cadence run,
+//! The offline replay: the lag replay and its metrics, the cadence run,
 //! the shader tests' exports, the self-check and the synthetic dumps.
 
 use std::collections::{BTreeMap, HashMap};
@@ -60,7 +60,7 @@ pub fn resolve_reverse_z(dump: &Dump, choice: &str) -> Result<(bool, String), St
     })
 }
 
-fn shown_edits(src: &Frame, dst: &Frame, pos: &Img, on: &[bool], p: &Params) -> (BTreeMap<&'static str, Img>, cc::Carried) {
+pub(crate) fn shown_edits(src: &Frame, dst: &Frame, pos: &Img, on: &[bool], p: &Params) -> (BTreeMap<&'static str, Img>, cc::Carried) {
     let out = cc::carry(src, dst, pos, on, p);
     let mut shown = BTreeMap::new();
     shown.insert("none", Img::new(dst.edit.h, dst.edit.w, 3, 0.0));
@@ -99,7 +99,7 @@ pub struct ReplayOut {
 }
 
 /// The recurrence from a refresh at t - lag up to hold t: (pos, on).
-fn carried_position(frames: &mut Frames, t: usize, lag: usize, p: &Params) -> Result<(Img, Vec<bool>), String> {
+pub(crate) fn carried_position(frames: &mut Frames, t: usize, lag: usize, p: &Params) -> Result<(Img, Vec<bool>), String> {
     let mut acc: Option<Img> = None;
     for k in t + 1 - lag..=t {
         let (cur, prev) = (frames.get(k)?, frames.get(k - 1)?);
@@ -288,17 +288,17 @@ impl Cadence {
 }
 
 /// The layer's adaptive cadence (`cache::Regime`).
-struct Regime {
-    cad: Cadence,
-    still: bool,
-    against: usize,
+pub(crate) struct Regime {
+    pub(crate) cad: Cadence,
+    pub(crate) still: bool,
+    pub(crate) against: usize,
 }
 
 impl Regime {
     const TO_SHORTER: usize = 3;
     const TO_LONGER: usize = 20;
 
-    fn interval(&self) -> usize {
+    pub(crate) fn interval(&self) -> usize {
         if self.still {
             self.cad.still_interval
         } else {
@@ -306,7 +306,7 @@ impl Regime {
         }
     }
 
-    fn observe(&mut self, (still, n): (usize, usize)) {
+    pub(crate) fn observe(&mut self, (still, n): (usize, usize)) {
         if n == 0 {
             return;
         }
@@ -370,7 +370,7 @@ fn tent(x: &Img) -> Img {
 }
 
 /// Upstream's fast guided filter of P (3 channels) on I.
-fn guided_fast(i_img: &Img, p_img: &Img, eps: f64) -> Img {
+pub(crate) fn guided_fast(i_img: &Img, p_img: &Img, eps: f64) -> Img {
     let (h, w) = (i_img.h, i_img.w);
     let (hh, ww) = (h.div_ceil(2), w.div_ceil(2));
     let m_i = cc::box3(&half(i_img));
@@ -637,7 +637,7 @@ pub struct CadenceRow {
     label: String,
     all: J,
     cached: J,
-    pulse: Vec<(usize, f64)>,
+    pub(crate) pulse: Vec<(usize, f64)>,
     pulse_model: f64,
     pulse_excess: f64,
     flicker: f64,

@@ -33,3 +33,8 @@ png = "0.18"
 # The native backend (vendored OpenDLSS-NR, C++ and embedded kernels) is x86_64-only.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 neural-forge-native = { path = "../native" }
+
+# The edit cache's reference (crates/cache-replay): the shader tests compare with its carry and
+# cadence, and the dump writer's test loads its dump with it.
+[dev-dependencies]
+cache-replay = { path = "../cache-replay" }

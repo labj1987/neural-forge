@@ -1,12 +1,8 @@
-//! cache-replay: the Rust port of scripts/cache_replay.py (and scripts/cache_common.py), with the
-//! same command line, printed tables, JSON and exported files.
-//!
-//! Replays the pre-upscaler edit cache offline on a K-hold dump, and measures what it keeps; writes
-//! the synthetic dumps and the exports the layer's shader tests compare with.
+//! cache-replay: replays the pre-upscaler edit cache offline on a K-hold dump, and measures what
+//! it keeps; writes the synthetic dumps and the exports the layer's shader tests compare with. The
+//! algorithm and its origin are the library's (src/lib.rs).
 
-mod common;
-mod pyfmt;
-mod replay;
+use cache_replay::{common, pyfmt, replay};
 
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;

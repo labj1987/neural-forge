@@ -1,6 +1,6 @@
 #version 450
 // The pre-upscaler edit cache (docs/ARCHITECTURE.md 4.10), preupscale_cache_motion.comp: The
-// accumulated motion (cache_common.py acc_step), in the capture after the prep pass: this hold's
+// accumulated motion (crates/cache-replay's acc_step), in the capture after the prep pass: this hold's
 // motion vector from the nearest surface of the 3x3 (NearestSurfaceMotion), plus the previous hold's
 // accumulated field read where it leads, NaN where the chain leaves the frame. The network reads the
 // field for its history (native_preprocess.comp, binding 2) and the cache for where each pixel was on
@@ -13,7 +13,7 @@
 // (NearestSurfaceMotion, mode 5). Upstream is GPL-3.0; this port is distributed under this project's
 // AGPL-3.0-or-later (see ATTRIBUTION.md).
 //
-// The numbers are those of scripts/cache_common.py, the numpy reference this shader mirrors step
+// The numbers are those of crates/cache-replay/src/common.rs, the reference this shader mirrors step
 // for step (each function names its counterpart there); keep the two in step. Pixel units: a pixel
 // centre is i + 0.5. Every buffer is at the render extent, row-major.
 //

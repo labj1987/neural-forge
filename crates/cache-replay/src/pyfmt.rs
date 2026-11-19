@@ -1,5 +1,5 @@
 //! Python's text output: float `repr`, `%e`/`%f`/`%g` formatting and `json.dump(indent=1)`, so the
-//! port prints and writes what cache_replay.py does.
+//! tool prints and writes what the Python tool it replaced did (and earlier results compare).
 
 use std::fmt::Write as _;
 

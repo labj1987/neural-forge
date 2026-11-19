@@ -5,7 +5,7 @@
 //! and is not read here; `NEURAL_FORGE_EDIT_CACHE=off` ([`interval`]) makes every hold a refresh.
 //!
 //! The GPU side is seven compute passes (`shaders/preupscale_cache_*.comp`), the step-for-step mirror
-//! of `scripts/cache_common.py` (the numpy reference the offline replay measures with):
+//! of `crates/cache-replay`'s `common` (the reference the offline replay, `cache-replay`, measures with):
 //!
 //! - in the capture (`C`) of every hold: `prep` (this hold's pseudo-linear depth, the depth's
 //!   reversed-Z counts) and `motion` (the accumulated motion
@@ -163,7 +163,7 @@ pub(crate) struct CachePush {
     pub paper_white: f32,
     /// `uint level`: the level the reduce pass builds.
     pub level: u32,
-    /// The carry's parameters (`cache_common.Params`, [`Tuning`]).
+    /// The carry's parameters (`cache_replay::common::Params`, [`Tuning`]).
     pub eps_v: f32,
     pub max_luma_edit: f32,
     pub chroma_stops: f32,
@@ -177,8 +177,8 @@ pub(crate) struct CachePush {
     pub guided_eps: f32,
 }
 
-/// The carry's parameters: `scripts/cache_common.py`'s `Params` defaults (the replay's numbers are
-/// for these).
+/// The carry's parameters: `cache_replay::common::Params`'s defaults (the replay's numbers are for
+/// these).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Tuning {
     pub eps_v: f32,
@@ -363,7 +363,7 @@ pub(crate) struct Outcome {
     pub rejected: Option<f32>,
 }
 
-/// The adaptive cadence (`scripts/cache_replay.py`'s `Regime`, which this mirrors): while the camera
+/// The adaptive cadence (`cache_replay::replay::Regime`, which this mirrors): while the camera
 /// is still the network runs on every hold, so the view a player looks at closest keeps all of the
 /// model's detail (a cached hold cannot carry the part of the answer that follows each hold's
 /// jitter); while it moves, on one hold in [`MOVING_INTERVAL`]. A hold reads as still when its median
@@ -603,7 +603,7 @@ impl State {
 pub(crate) const REVERSE_Z_HOLDS: u32 = 3;
 
 /// The share of depth texels that must be neither 0 nor 1 (drawn geometry) for a hold's counts to
-/// count (`cache_common.DEPTH_GEOMETRY_MIN`): a frame of cleared depth alone, or depth never written,
+/// count (`cache_replay::common::DEPTH_GEOMETRY_MIN`): a frame of cleared depth alone, or depth never written,
 /// tells nothing about which way it runs.
 pub(crate) const DEPTH_GEOMETRY_MIN: f64 = 0.05;
 
@@ -2085,18 +2085,25 @@ mod tests {
         dir
     }
 
-    /// Runs `scripts/cache_replay.py` with `args`; `false` (the test skips) without python3 and numpy.
-    fn replay_tool(args: &[&str]) -> bool {
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("scripts/cache_replay.py");
-        match std::process::Command::new("python3").arg(&script).args(args).output() {
-            Ok(out) if out.status.success() => true,
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                assert!(err.contains("No module named 'numpy'"), "cache_replay.py {args:?} failed: {err}");
-                false
-            }
-            Err(_) => false,
+    /// The replay tool's (crates/cache-replay) synthetic `kind` dump, written to `dir` and loaded.
+    fn synthetic_dump(dir: &std::path::Path, kind: &str) -> cache_replay::common::Dump {
+        cache_replay::replay::make_synthetic(dir, kind).unwrap_or_else(|e| panic!("the replay tool's {kind} dump: {e}"));
+        cache_replay::common::load_dump(dir).unwrap_or_else(|e| panic!("the replay tool's {kind} dump: {e}"))
+    }
+
+    /// The layer's parameters are the replay tool's defaults, so the shader tests and the replay's
+    /// numbers stand for what ships.
+    #[test]
+    fn the_tuning_is_the_replay_tools_defaults() {
+        let p = cache_replay::common::Params::default();
+        let t = Tuning::default();
+        let want = [p.eps_v, p.max_luma_edit, p.chroma_stops, p.depth_tol, p.colour_tol, p.colour_floor, p.print_tol, p.sigma_depth, p.sigma_luma];
+        let got = [t.eps_v, t.max_luma_edit, t.chroma_stops, t.depth_tol, t.colour_tol, t.colour_floor, t.print_tol, t.sigma_depth, t.sigma_luma];
+        for (g, w) in got.iter().zip(want) {
+            assert_eq!(*g, w as f32);
         }
+        assert_eq!(t.guided_eps, cache_replay::replay::Cadence::new(2).guided_eps as f32);
+        assert_eq!(DEPTH_GEOMETRY_MIN, cache_replay::common::DEPTH_GEOMETRY_MIN);
     }
 
     /// One synthetic kind through the shaders: hold 0 refreshes (its edit captured from the dump's
@@ -2110,12 +2117,9 @@ mod tests {
         let dir = scratch(&format!("{kind}-{depth_image}"));
         let dump = dir.join("dump");
         let out = dir.join("carry");
-        if !replay_tool(&["--make-synthetic", dump.to_str()?, "--kind", kind])
-            || !replay_tool(&[dump.to_str()?, "--export-carry", out.to_str()?, "--reverse-z", "yes"])
-        {
-            eprintln!("python3 with numpy is not available: the shader-against-tool test is skipped");
-            return None;
-        }
+        // As `cache-replay DUMP --export-carry OUT --reverse-z yes`.
+        cache_replay::replay::export_carry(&synthetic_dump(&dump, kind), &cache_replay::common::Params::default(), true, &out)
+            .unwrap_or_else(|e| panic!("the replay tool's {kind} carry: {e}"));
         let holds: Vec<[f32; 3]> = std::fs::read_to_string(out.join("holds.txt"))
             .unwrap()
             .lines()
@@ -2193,7 +2197,7 @@ mod tests {
         a.iter().zip(b).map(|(x, y)| if x.is_nan() && y.is_nan() { 0.0 } else { (x - y).abs() }).fold(0.0, f32::max)
     }
 
-    /// The shaders give the replay tool's numbers (cache_common.py, `--chain recurrence`) on its
+    /// The shaders give the replay tool's numbers (crates/cache-replay, `--chain recurrence`) on its
     /// synthetic dumps, within 1e-3 stop: the shown edit, the accumulated motion and the weight. And
     /// on each kind what it is for: a still scene reproduces the refresh's edit; a pan keeps it
     /// aligned, its field the composed motion; a moving box's uncovered background rejects the
@@ -2250,7 +2254,7 @@ mod tests {
                 }
                 "jitter" => {
                     // Nothing moves: the refresh's texel nearest to where this hold's pixel samples
-                    // (the jitters of cache_replay.py's synthetic_holds).
+                    // (the jitters of the replay tool's `synthetic_holds`).
                     const JITTER: [[f32; 2]; 6] = [[0.0, 0.0], [0.3, -0.2], [-0.35, 0.15], [0.1, 0.4], [-0.2, -0.3], [0.45, 0.05]];
                     let refresh = JITTER[0];
                     for (t, .., history) in &results {
@@ -2297,12 +2301,10 @@ mod tests {
             let dir = scratch(&format!("cadence-{kind}"));
             let dump = dir.join("dump");
             let out = dir.join("cadence");
-            if !replay_tool(&["--make-synthetic", dump.to_str().unwrap(), "--kind", kind])
-                || !replay_tool(&[dump.to_str().unwrap(), "--cadence", "3", "--export-cadence", out.to_str().unwrap(), "--reverse-z", "yes"])
-            {
-                eprintln!("python3 with numpy is not available: the shader-against-tool test is skipped");
-                return;
-            }
+            // As `cache-replay DUMP --cadence 3 --export-cadence OUT --reverse-z yes`.
+            let cadence = cache_replay::replay::Cadence::new(INTERVAL);
+            cache_replay::replay::export_cadence(&synthetic_dump(&dump, kind), &cadence, &cache_replay::common::Params::default(), true, &out)
+                .unwrap_or_else(|e| panic!("the replay tool's {kind} cadence: {e}"));
             let lines: Vec<Vec<f64>> =
                 std::fs::read_to_string(out.join("holds.txt")).unwrap().lines().map(|l| l.split_whitespace().map(|x| x.parse().unwrap()).collect()).collect();
             let holds: Vec<[f32; 2]> = lines.iter().map(|v| [v[0] as f32, v[1] as f32]).collect();

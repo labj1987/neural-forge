@@ -255,7 +255,6 @@ jobs:
           python3 scripts/bench-report.py --self-test
           python3 scripts/agreement.py --self-test
           python3 scripts/hdr_encode.py selftest
-          python3 scripts/test_cache_replay.py
           python3 scripts/gen_third_party_crates.py --self-test
           python3 scripts/check_pins.py --self-test
           python3 scripts/check_proton_scripts.py --self-test

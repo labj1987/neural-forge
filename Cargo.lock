@@ -3827,6 +3827,7 @@ name = "neural-forge-layer"
 version = "4.6.0"
 dependencies = [
  "ash",
+ "cache-replay",
  "libc",
  "neural-forge-native",
  "neural-forge-protocol",

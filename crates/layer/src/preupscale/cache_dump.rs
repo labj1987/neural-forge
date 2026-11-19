@@ -1,5 +1,5 @@
 //! The K-hold pre-upscaler cache dump: K consecutive model-mode holds written out for the edit
-//! cache's offline replay (`scripts/cache_replay.py`; the format is docs/ARCHITECTURE.md,
+//! cache's offline replay (`cache-replay`, crates/cache-replay; the format is docs/ARCHITECTURE.md,
 //! 4.9). The model runs on every hold as always; an armed hold only adds
 //! copies: the colour input before the model (in `C`), and after the write-back the colour input
 //! with the answer in it, the motion vectors and the depth the hold copied (in `W`). They land in
@@ -525,8 +525,8 @@ mod tests {
         assert_eq!(d32, 0.375f32.to_le_bytes());
     }
 
-    /// The writer's files and manifest are what `scripts/cache_common.py` reads: the sizes and fields
-    /// here, and, where python3 with numpy is installed, the loader itself.
+    /// The writer's files and manifest are what the replay tool (crates/cache-replay) reads: the sizes
+    /// and fields here, and its loader itself.
     #[test]
     fn the_writer_writes_what_the_replay_tool_reads() {
         let dir = scratch("writer");
@@ -554,23 +554,15 @@ mod tests {
         assert_eq!(size("hold-02/mvec.rg16f"), 6 * 4 * 4);
         assert_eq!(size("hold-02/depth.r32f"), 6 * 4 * 4);
         assert!(!dir.join("manifest.json.tmp").exists());
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap();
-        let check = format!(
-            "import sys; sys.path.insert(0, {:?}); import cache_common as cc; d = cc.load_dump({:?}); \
-             assert len(d) == 3 and d.has_depth and (d.width, d.height) == (6, 4); h = d.hold(2); \
-             assert abs(float(h.colour[0, 0, 0]) - 0.5) < 1e-3 and abs(float(h.answer[3, 5, 1]) - 1.0) < 1e-3; \
-             assert abs(float(h.mvec[1, 1, 0]) - 1.0) < 1e-3 and abs(float(h.mvec[1, 1, 1]) + 0.5) < 1e-3; \
-             assert abs(float(h.depth[2, 2]) - 0.25) < 1e-6 and list(h.jitter) == [0.25, -0.125]; print('ok')",
-            root.join("scripts").display().to_string(),
-            dir.display().to_string()
-        );
-        match std::process::Command::new("python3").args(["-I", "-c", "import numpy"]).status() {
-            Ok(s) if s.success() => {
-                let out = std::process::Command::new("python3").args(["-I", "-B", "-c", &check]).output().unwrap();
-                assert!(out.status.success(), "the replay tool's loader refused the dump: {}", String::from_utf8_lossy(&out.stderr));
-            }
-            _ => eprintln!("python3 with numpy not found: the loader check is skipped"),
-        }
+        // The replay tool's loader (crates/cache-replay) takes it.
+        let d = cache_replay::common::load_dump(&dir).unwrap_or_else(|e| panic!("the replay tool's loader refused the dump: {e}"));
+        assert!(d.len() == 3 && d.has_depth && (d.width, d.height) == (6, 4));
+        let hold = d.hold(2).unwrap();
+        // Row-major, channels innermost (the loader keeps RGB of the RGBA files).
+        let at = |img: &cache_replay::common::Img, y: usize, x: usize, k: usize| img.d[(y * img.w + x) * img.c + k];
+        assert!((at(&hold.colour, 0, 0, 0) - 0.5).abs() < 1e-3 && (at(&hold.answer, 3, 5, 1) - 1.0).abs() < 1e-3);
+        assert!((at(&hold.mvec, 1, 1, 0) - 1.0).abs() < 1e-3 && (at(&hold.mvec, 1, 1, 1) + 0.5).abs() < 1e-3);
+        assert!((at(hold.depth.as_ref().unwrap(), 2, 2, 0) - 0.25).abs() < 1e-6 && hold.jitter == [0.25, -0.125]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,6 +1,7 @@
-//! The pre-upscaler edit cache: the port of scripts/cache_common.py (the reference the layer's
-//! preupscale_cache*.comp shaders mirror). Every step is computed in f32 as numpy computes it on
-//! float32 arrays, and the means the metrics take are f64, as the Python's are.
+//! The pre-upscaler edit cache: the reference the layer's preupscale_cache*.comp shaders mirror (the
+//! steps are listed in the crate's header). Every step is computed in f32 as numpy computes it on
+//! float32 arrays, and the means the metrics take are f64 with numpy's summation order, so the
+//! numbers are those of the numpy reference this replaced.
 
 use std::path::{Path, PathBuf};
 
@@ -190,6 +191,10 @@ impl Dump {
         self.frames.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
     fn read(&self, name: &str, half: bool, channels: usize) -> Result<Img, String> {
         let path = self.path.join(name);
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -278,7 +283,7 @@ pub fn load_dump(path: &Path) -> Result<Dump, String> {
     })
 }
 
-/// Writes holds as a v1 dump (scripts/cache_common.py's write_dump), the manifest as json.dump(indent=1).
+/// Writes holds as a v1 dump, the manifest as Python's json.dump(indent=1) lays it out.
 pub fn write_dump(path: &Path, holds: &[Hold], paper_white: f64, game: &str, extra: Vec<(String, crate::pyfmt::J)>) -> std::io::Result<()> {
     use crate::pyfmt::J;
     std::fs::create_dir_all(path)?;
