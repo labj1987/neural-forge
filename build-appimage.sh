@@ -32,7 +32,7 @@ missing_deps() {
     local tool
     # x86_64-w64-mingw32-gcc: the NGX wrapper's linker (scripts/build-ngx-wrapper.sh); its package also brings the
     # mingw-w64 runtime notices copied into the AppImage below.
-    for tool in g++ curl patch python3 pkg-config desktop-file-validate zsyncmake x86_64-w64-mingw32-gcc; do
+    for tool in g++ curl patch pkg-config desktop-file-validate zsyncmake x86_64-w64-mingw32-gcc; do
         command -v "$tool" >/dev/null 2>&1 || { echo "$tool"; return 0; }
     done
     # The GUI's toolkit (GPUI) links libxcb, libxkbcommon and libxkbcommon-x11, and one of its crates probes
@@ -43,7 +43,7 @@ missing_deps() {
 if [ "${1:-}" = "--self-test" ]; then
     stubs="$(mktemp -d)"
     trap 'rm -rf "$stubs"' EXIT
-    for tool in g++ curl patch python3 pkg-config desktop-file-validate zsyncmake; do
+    for tool in g++ curl patch pkg-config desktop-file-validate zsyncmake; do
         printf '#!/bin/sh\nexit 0\n' > "$stubs/$tool"
         chmod +x "$stubs/$tool"
     done
@@ -62,10 +62,10 @@ if missing="$(missing_deps)"; then
     # failing on a package we actually need should be fatal.
     $SUDO apt-get update -qq || true
     # g++ brings the static libstdc++ that crates/native links; curl and patch are what scripts/fetch-native-tools.sh
-    # runs, python3 what this script runs; the -dev packages are the GUI toolkit's.
+    # runs; the -dev packages are the GUI toolkit's.
     # gcc-mingw-w64-x86-64 links the NGX wrapper (a Windows DLL) and brings mingw-w64-common and gcc-mingw-w64-base,
     # whose copyright files ship as its runtime notices.
-    $SUDO apt-get install -y -qq g++ curl patch python3 pkg-config desktop-file-utils zsync \
+    $SUDO apt-get install -y -qq g++ curl patch pkg-config desktop-file-utils zsync \
         libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev gcc-mingw-w64-x86-64
     if missing="$(missing_deps)"; then
         echo "error: $missing is still missing after installing the build dependencies" >&2
