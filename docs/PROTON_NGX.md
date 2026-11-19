@@ -48,7 +48,8 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   NGX versions record (so `doctor` warns) when the core it loaded breaks the rule (`core_copy::name_warning`: one
   named by `NEURAL_FORGE_NGX_CORE`), and `doctor` warns about such a `NEURAL_FORGE_NGX_CORE` in a game's launch
   options. Nothing else depends on the name: the game's NGX loader (in `sl.common.dll`) compares no name after the
-  load, the core uses only its folder, and nothing calls `GetModuleHandle("_nvngx.dll")`, so the wrapper and the core
+  load, the core uses only its folder, and no code in them calls `GetModuleHandle("_nvngx.dll")` (the same Ghidra
+  pass), so the wrapper and the core
   sharing a base name is safe. Wine would hand a module of that name to the wrapper
   (`_nvngx=b`), so the Proton copy also sets `C:\windows\system32\neural-forge\_nvngx=n`: a full-path key is
   looked up before the base name. Each time Neural Forge renews the wrapper in its copies (`refresh_wrapper`, at start and
