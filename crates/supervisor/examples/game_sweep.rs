@@ -281,6 +281,15 @@ fn parse_status(text: &str, secs: u64) -> Option<Sample> {
     seen.then_some(s)
 }
 
+/// The channel outlives the game: after a run ends it keeps that run's last status (frames, placement, holds) until the
+/// next layer attaches. A sample counts for a run only once the run's own game process has been seen and the layer's
+/// frame count differs from the one the channel stood at before the launch (`baseline`); a frozen leftover has exactly
+/// that count. Without this, "holding before the upscaler" from the previous run passed the placement check at once and
+/// the recording landed on the loading screen.
+fn is_stale(baseline: Option<u64>, game_seen: bool, s: &Sample) -> bool {
+    !game_seen || baseline == Some(s.layer_frames)
+}
+
 fn state_name(state: u32) -> &'static str {
     neural_forge_supervisor::shm_status::preupscale_state_name(state)
 }
@@ -1158,7 +1167,7 @@ struct Watched {
 
 /// Watches a run: status every 5 s until it has held its placement for the run's seconds, the game exits, or the
 /// timeout passes without the placement.
-fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bool) -> Watched {
+fn watch(o: &Options, p: &Prepared, start: Instant, baseline: Option<u64>, mut done: impl FnMut() -> bool) -> Watched {
     let mut samples = Vec::new();
     let mut window = None;
     let mut exited_while_recording = false;
@@ -1173,7 +1182,8 @@ fn watch(o: &Options, p: &Prepared, start: Instant, mut done: impl FnMut() -> bo
             break;
         }
         let secs = start.elapsed().as_secs();
-        if let Some(s) = status(&o.cli, secs) {
+        seen |= game_running(&p.facts.exe);
+        if let Some(s) = status(&o.cli, secs).filter(|s| !is_stale(baseline, seen, s)) {
             if reached.is_none() && s.state == want {
                 reached = Some(Instant::now());
                 println!("  {}: {} after {secs} s", p.run.label, state_name(want));
@@ -1363,13 +1373,15 @@ fn vw_flags(summary: &str) -> Option<Vec<String>> {
 
 fn run_steam(o: &Options, p: &Prepared, env: &[(String, String)]) -> Watched {
     let _ = std::fs::remove_file(&p.log);
+    // What the channel still holds from the previous run: ignored until this run's layer replaces it.
+    let baseline = status(&o.cli, 0).map(|s| s.layer_frames);
     let start = Instant::now();
     let launched = session_command("steam", env).arg(format!("steam://rungameid/{}", p.run.appid)).stdout(Stdio::null()).stderr(Stdio::null()).status();
     if let Err(e) = launched {
         println!("  steam: {e}");
         return Watched::default();
     }
-    let watched = watch(o, p, start, || false);
+    let watched = watch(o, p, start, baseline, || false);
     end_game(p.run.appid);
     nap(Duration::from_secs(10));
     watched
@@ -1432,6 +1444,16 @@ mod tests {
         assert_eq!((s.layer_frames, s.state, s.misses, s.holds), (4535, 2, 0, 59));
         assert!(s.hdr.starts_with("game outputs HDR10"));
         assert!(parse_status("no channel at /tmp/x\n", 0).is_none());
+    }
+
+    /// A leftover status from the previous run is ignored until this run's game is up and its frame count moves.
+    #[test]
+    fn the_previous_runs_status_is_stale() {
+        let s = |frames| Sample { layer_frames: frames, ..Sample::default() };
+        assert!(is_stale(Some(4535), true, &s(4535)), "frozen leftover");
+        assert!(is_stale(Some(4535), false, &s(10)), "game not started yet");
+        assert!(!is_stale(Some(4535), true, &s(120)), "new session");
+        assert!(!is_stale(None, true, &s(4535)), "nothing before the launch");
     }
 
     /// vw's verdict: its flags, none for a clean picture, and nothing from a summary without them.
