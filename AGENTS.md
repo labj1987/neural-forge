@@ -98,7 +98,7 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   defaults (also under GPU-assisted validation), and each Mesa passes the setting the other crashes with.
 - Tests must not depend on how fast the machine runs them: the hold's history gap
   (`HistoryGap::MAX_GAP`, 500 ms) reads `native::hold_now`, which the inline test rig stops.
-- Run `python3 scripts/check_namespace.py`, `python3 scripts/test_install.py`,
+- Run `python3 scripts/check_namespace.py`, `cargo test -p neural-forge-cli --test install`
   and `bash scripts/smoke-test.sh` for namespace, installation and Vulkan checks.
 - Shaders: `python3 scripts/check_shaders.py --update` rebuilds the committed SPIR-V with the pinned
   glslang only (never one on PATH) and needs `spirv-val`.

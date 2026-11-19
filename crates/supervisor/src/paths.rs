@@ -17,8 +17,7 @@ fn xdg(var: &str, fallback_under_home: &str) -> String {
 }
 
 /// The raw `XDG_DATA_HOME` itself (not the `neural-forge` subdirectory [`data_dir`]
-/// returns) -- `install.rs` needs it as-is, matching `scripts/install.py`'s own
-/// `data` variable: the installed Vulkan manifests live under the shared per-user data
+/// returns) -- `install.rs` needs it as-is: the installed Vulkan manifests live under the shared per-user data
 /// hierarchy's own well-known subdirectory, a sibling of `neural-forge/` rather than inside it.
 pub fn data_home() -> String {
     xdg("XDG_DATA_HOME", ".local/share")
@@ -85,8 +84,7 @@ pub fn ensure_dirs() -> std::io::Result<()> {
 
 /// Writes `content` to `path`, replacing any existing file by renaming a same-directory
 /// staged file over it -- never truncates the destination in place, so an
-/// already-running process that has the old inode mapped (a GUI, a game) keeps reading the old content until it reopens the path, exactly like
-/// `install.py`'s own `os.replace` step. A crash part-way leaves the old file whole, never an
+/// already-running process that has the old inode mapped (a GUI, a game) keeps reading the old content until it reopens the path. A crash part-way leaves the old file whole, never an
 /// empty one: `config.ini` and `profiles.ini` are written through this too.
 ///
 /// A `path` that is a symlink is written through: its target is replaced (a symlinked

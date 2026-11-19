@@ -241,13 +241,6 @@ jobs:
       - name: Layer framework's generated code matches its generator
         run: bash scripts/vk-layer-codegen.sh --check
 
-      # scripts/install.py delegates install/uninstall to neural-forge-cli (the single
-      # implementation), so this exercises the same code the GUI's Setup tab runs.
-      - name: Installation coexistence tests
-        run: |
-          cargo build --locked -p neural-forge-cli
-          python3 scripts/test_install.py
-
       - name: Script self-tests
         run: |
           python3 scripts/release_notes.py --self-test

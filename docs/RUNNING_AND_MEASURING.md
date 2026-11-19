@@ -34,7 +34,6 @@ and again for a release tag):
 bash scripts/fetch-native-tools.sh
 VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | paste -sd:) cargo test --locked
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo build --locked -p neural-forge-cli && python3 scripts/test_install.py
 ```
 
 ```bash
