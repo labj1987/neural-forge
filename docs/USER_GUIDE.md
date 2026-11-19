@@ -527,8 +527,12 @@ for the live settings. `doctor`, `report` and `shmctl status` only look: they cr
 from the driver, of every NGX file a game loaded in its last run with the folder it was loaded from (the game's own,
 the NGX models folder an over-the-air update fills, the driver's), and of the NGX files present in each switched-on
 game's folder and Proton prefix. A DLSS update by the game or NVIDIA, or a DLSS file you replaced yourself, shows there.
-The loaded files are recorded by the wrapper once a game has created a DLSS feature, so a game that has not run with
-Neural Forge on and created a DLSS feature has none yet.
+The loaded files are recorded by the wrapper once NVIDIA's NGX core is loaded in a game with Neural Forge on (with
+which core it loaded and why), and again after the game creates a DLSS feature; a game whose last run created none
+(DLSS never started) is marked so, and one whose NGX core could not be loaded says why.
+For each Neural Forge Proton copy, `doctor` also checks the wrapper chain without running anything: the copy's NGX
+wrapper is there, is a Wine builtin and is the file Neural Forge put there, its `proton` script sets the three DLL
+overrides the wrapper needs, and its Wine version is one whose DLL load order Neural Forge was checked against.
 `neural-forge-cli help [COMMAND]` (or `COMMAND --help`) has the details; an unknown or misspelt
 argument prints the usage and exits with status 2.
 

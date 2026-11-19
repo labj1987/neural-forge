@@ -4,9 +4,10 @@
 //! a DLL the user replaced all show in a bug report:
 //!
 //! - what the game loaded in its last run: the NGX wrapper (`crates/ngx-wrapper/src/modules.rs`, which has the file
-//!   format) writes `<state_dir>/ngx-modules/<app id>-<exe>.txt` (a path hash for `<app id>` outside Steam) after a
-//!   feature is created, with every loaded NGX module's path and file version, wherever it was loaded from;
-//!   [`parse_record`] reads it;
+//!   format) writes `<state_dir>/ngx-modules/<app id>-<exe>.txt` (a path hash for `<app id>` outside Steam) once
+//!   NVIDIA's core is loaded and again after a feature is created (or why the core did not load), with every loaded
+//!   NGX module's path and file version, wherever it was loaded from, and which core it loaded and why;
+//!   [`parse_record`] reads it, and the section says when a run created no DLSS feature;
 //! - the files present: every `nvngx*.dll` in each switched-on game's folder and in its prefix's NGX folder
 //!   (`ProgramData/NVIDIA/NGX`, where over-the-air updates land) and `system32`, and the driver's core, each with its
 //!   version read from the PE resources ([`crate::model::dll_file_version`]; no code of the DLL runs).
@@ -80,12 +81,33 @@ pub struct Recorded {
     pub path: String,
 }
 
+/// When the wrapper wrote its record (its `stage=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// NVIDIA's core was loaded and no DLSS feature was created (yet, if the game still runs).
+    CoreLoaded,
+    /// A DLSS feature was created; also a record without `stage=` (a wrapper before 4.6.2 wrote only then).
+    Feature,
+    /// NVIDIA's core did not load: NGX reported itself unavailable, and the game ran without DLSS.
+    CoreFailed,
+}
+
 /// What the wrapper wrote for one game's last run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub wrapper: String,
     pub exe: String,
+    pub stage: Stage,
+    /// Which core the wrapper loaded and why, or why none (`core_load=`); `None` from a wrapper before 4.6.2.
+    pub core_load: Option<String>,
     pub modules: Vec<Recorded>,
+}
+
+impl Record {
+    /// Whether the run this record is of created no DLSS feature (so far).
+    pub fn no_feature(&self) -> bool {
+        self.stage != Stage::Feature
+    }
 }
 
 /// The wrapper's file; `None` for text of another format.
@@ -94,12 +116,20 @@ pub fn parse_record(text: &str) -> Option<Record> {
     if lines.next()?.trim() != "neural-forge-ngx-modules 1" {
         return None;
     }
-    let (mut wrapper, mut exe, mut modules) = (String::new(), String::new(), Vec::new());
+    let (mut wrapper, mut exe, mut modules, mut stage, mut core_load) = (String::new(), String::new(), Vec::new(), Stage::Feature, None);
     for line in lines {
         if let Some(v) = line.strip_prefix("wrapper=") {
             wrapper = v.trim().to_string();
         } else if let Some(v) = line.strip_prefix("exe=") {
             exe = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("stage=") {
+            stage = match v.trim() {
+                "core-loaded" => Stage::CoreLoaded,
+                "core-failed" => Stage::CoreFailed,
+                _ => Stage::Feature,
+            };
+        } else if let Some(v) = line.strip_prefix("core_load=") {
+            core_load = Some(v.trim().to_string()).filter(|v| !v.is_empty() && v != "-");
         } else {
             let f: Vec<&str> = line.splitn(4, '\t').collect();
             if let [role, file, version, path] = f[..] {
@@ -112,7 +142,7 @@ pub fn parse_record(text: &str) -> Option<Record> {
             }
         }
     }
-    Some(Record { wrapper, exe, modules })
+    Some(Record { wrapper, exe, stage, core_load, modules })
 }
 
 /// The records in `<state_dir>/ngx-modules`, by file name, with how long ago each was written.
@@ -182,10 +212,20 @@ pub fn render(driver_core: Option<&Path>, records: &[(String, Option<Duration>, 
         None => out.push_str("driver core: not found\n"),
     }
     if records.is_empty() {
-        out.push_str("loaded in a game: nothing recorded yet (the wrapper writes it after a game creates a DLSS feature with Neural Forge on)\n");
+        out.push_str(
+            "loaded in a game: nothing recorded yet (the wrapper writes it once NGX's core is loaded in a game with Neural Forge on, and again after the game creates a DLSS feature)\n",
+        );
     }
     for (file, age, record) in records {
-        out.push_str(&format!("loaded by {} ({}), {}, wrapper {}\n", record.exe, file, ago(*age), record.wrapper));
+        let stage = match record.stage {
+            Stage::Feature => "",
+            Stage::CoreLoaded => ": NVIDIA's core loaded, but no DLSS feature was created in that run (or not yet, while the game still runs)",
+            Stage::CoreFailed => ": NVIDIA's core did not load, so NGX was unavailable and the game ran without DLSS",
+        };
+        out.push_str(&format!("loaded by {} ({}), {}, wrapper {}{stage}\n", record.exe, file, ago(*age), record.wrapper));
+        if let Some(core) = &record.core_load {
+            out.push_str(&format!("  NVIDIA's core: {core}\n"));
+        }
         for m in &record.modules {
             out.push_str(&format!("  {:<8} {:<18} {}  {}\n", m.role, m.file, m.version.as_deref().unwrap_or("no version"), m.path));
         }
@@ -225,6 +265,7 @@ mod tests {
     fn parses_the_wrappers_record() {
         let r = parse_record(RECORD).unwrap();
         assert_eq!((r.wrapper.as_str(), r.exe.as_str(), r.modules.len()), ("4.0.0", "C:\\Game\\g.exe", 4));
+        assert_eq!((r.stage, r.core_load.as_deref()), (Stage::Feature, None), "an older wrapper's record: written after a feature");
         assert_eq!(
             r.modules[2],
             Recorded { role: "snippet".into(), file: "nvngx_dlssg.dll".into(), version: Some("310.1.0.0".into()), path: "C:\\Game\\nvngx_dlssg.dll".into() }
@@ -285,6 +326,37 @@ mod tests {
              \x20 prefix system32: _nvngx.dll  version unreadable (not a readable DLL: truncated DOS header)\n"
         );
         assert!(render(None, &[], &[]).contains("nothing recorded yet"));
+    }
+
+    /// The wrapper's record from the moment the core loaded (no DLSS feature in that run, #51), and from a core
+    /// that did not load.
+    #[test]
+    fn says_when_a_run_created_no_feature() {
+        let loaded = "neural-forge-ngx-modules 1\nwrapper=4.6.2\nexe=C:\\G\\indy.exe\nstage=core-loaded\n\
+            core_load=C:\\windows\\system32\\neural-forge\\_nvngx.dll (copy of Z:\\d\\_nvngx.dll, written now)\n\
+            wrapper\t_nvngx.dll\t4.6.2\tC:\\windows\\system32\\_nvngx.dll\n\
+            core\t_nvngx.dll\t32.0.16.2124\tC:\\windows\\system32\\neural-forge\\_nvngx.dll\n";
+        let r = parse_record(loaded).unwrap();
+        assert_eq!(r.stage, Stage::CoreLoaded);
+        assert!(r.no_feature());
+        assert_eq!(r.modules.len(), 2);
+        let failed = parse_record("neural-forge-ngx-modules 1\nwrapper=4.6.2\nexe=g.exe\nstage=core-failed\ncore_load=not loaded: no core\n").unwrap();
+        assert_eq!((failed.stage, failed.core_load.as_deref(), failed.modules.len()), (Stage::CoreFailed, Some("not loaded: no core"), 0));
+        let feature = parse_record("neural-forge-ngx-modules 1\nwrapper=4.6.2\nexe=g.exe\nstage=feature-created\ncore_load=-\n").unwrap();
+        assert_eq!((feature.stage, feature.core_load.as_deref()), (Stage::Feature, None));
+        assert!(!feature.no_feature());
+        let records = vec![("1-indy.txt".to_string(), Some(Duration::from_secs(60)), r), ("2-g.txt".to_string(), None, failed)];
+        let text = render(None, &records, &[]);
+        assert_eq!(
+            text,
+            "driver core: not found\n\
+             loaded by C:\\G\\indy.exe (1-indy.txt), just now, wrapper 4.6.2: NVIDIA's core loaded, but no DLSS feature was created in that run (or not yet, while the game still runs)\n\
+             \x20 NVIDIA's core: C:\\windows\\system32\\neural-forge\\_nvngx.dll (copy of Z:\\d\\_nvngx.dll, written now)\n\
+             \x20 wrapper  _nvngx.dll         4.6.2  C:\\windows\\system32\\_nvngx.dll\n\
+             \x20 core     _nvngx.dll         32.0.16.2124  C:\\windows\\system32\\neural-forge\\_nvngx.dll\n\
+             loaded by g.exe (2-g.txt), at an unknown time, wrapper 4.6.2: NVIDIA's core did not load, so NGX was unavailable and the game ran without DLSS\n\
+             \x20 NVIDIA's core: not loaded: no core\n"
+        );
     }
 
     #[test]

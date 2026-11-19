@@ -671,7 +671,116 @@ pub fn has_current_overrides(script: &str) -> bool {
     script.contains(&format!("\\\\{CORE_COPY_DIR}\\\\_nvngx\"] = \"n\""))
 }
 
-/// Puts `dll` (the installed wrapper) into `tool` when its marker names another one: its `_nvngx.dll` written new
+/// The NGX wrapper in `tool` (`files/lib/wine/x86_64-windows/_nvngx.dll`).
+pub fn wrapper_in(tool: &Tool) -> PathBuf {
+    tool.dir.join(BUILTIN_DIR).join("_nvngx.dll")
+}
+
+/// The Wine major versions whose DLL load order the overrides were read against (docs/PROTON_NGX.md, "What `doctor`
+/// checks in a copy"): `get_load_order` in `dlls/ntdll/unix/loadorder.c` of wine-10.0, wine-11.0 and wine-11.22 (2026-11-13)
+/// and of ValveSoftware/wine `fda79a5` (GE-Proton11-12). In all of them a module in `system32` itself is looked up by its
+/// base name, and one in a folder below it or elsewhere by its full path first (the `\??\` prefix taken off, `.dll`
+/// too), then by `*` and its base name, then by its base name; the environment's `WINEDLLOVERRIDES` before the
+/// registry. So `_nvngx=b` serves `system32\_nvngx.dll`, and the two full-path `=n` keys serve NVIDIA's core in
+/// `system32\neural-forge` and in the driver's folder. Wine 11.22's newer version-resource heuristics come after those
+/// lookups and never apply to them.
+pub const VERIFIED_WINE_MAJORS: [u32; 2] = [10, 11];
+
+/// The override lines the copy's `proton` script must carry (the start of each, as [`added_lines`] writes them): the
+/// base name builtin (the wrapper in place of `system32\_nvngx.dll`), the copy of NVIDIA's core native, the driver's
+/// core native.
+const BASE_OVERRIDE: &str = "self.dlloverrides[\"_nvngx\"] = \"b\"";
+const DRIVER_OVERRIDE: &str = "self.dlloverrides[\"Z:\" + self.nvidia_wine_dll_dir.replace(\"/\", \"\\\\\") + \"\\\\_nvngx\"] = \"n\"";
+
+/// What `doctor`'s static check of a copy's wrapper chain found ([`check_chain`]). Each text says what is wrong or
+/// what passed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Chain {
+    /// The chain is broken: games run with it get NVIDIA's core without the wrapper, or no DLSS.
+    pub broken: Vec<String>,
+    /// It works, but not as this Neural Forge set it up.
+    pub degraded: Vec<String>,
+    /// The copy's Wine is newer than those whose load order was read ([`VERIFIED_WINE_MAJORS`]).
+    pub unverified: Option<String>,
+    /// What passed.
+    pub passed: Vec<String>,
+}
+
+/// The static check of `tool`'s wrapper chain, without running anything: its wrapper is there, is a Wine builtin
+/// (the 16 bytes at 0x40) and is the file its marker names (and `installed`, the digest of this Neural Forge's
+/// wrapper, when given); its `proton` script carries the three overrides ([`added_lines`]); and its Wine's major
+/// version is one whose DLL load order was read ([`VERIFIED_WINE_MAJORS`]; a Wine older than [`MIN_WINE_MAJOR`] is
+/// `doctor`'s own failure). The override for the copy of NVIDIA's core is not checked when the copy's source is gone:
+/// `doctor` says that one already. Reads the wrapper (about 1 MB), the script and `ntdll.so`.
+pub fn check_chain(tool: &Tool, installed: Option<&str>) -> Chain {
+    let mut c = Chain::default();
+    match std::fs::read(wrapper_in(tool)) {
+        Err(e) => c.broken.push(format!(
+            "its NGX wrapper {BUILTIN_DIR}/_nvngx.dll cannot be read ({e}): its script then sets no override, and its games run with NVIDIA's core alone"
+        )),
+        Ok(b) if b.get(0x40..0x50) != Some(b"Wine builtin DLL".as_slice()) => c.broken.push(format!(
+            "its NGX wrapper {BUILTIN_DIR}/_nvngx.dll is not marked as a Wine builtin (at 0x40): Wine does not hand it to games in place of NVIDIA's signed core"
+        )),
+        Ok(b) => {
+            let digest = crate::install::digest(&b);
+            if digest != tool.wrapper_sha256 {
+                c.degraded.push(format!(
+                    "its NGX wrapper file ({}) is not the one its marker records ({}): something replaced it after Neural Forge put it there",
+                    short(&digest),
+                    short(&tool.wrapper_sha256)
+                ));
+            } else if installed.is_some_and(|i| i == digest) {
+                c.passed.push(format!("the NGX wrapper is a Wine builtin and this Neural Forge's ({})", short(&digest)));
+            } else {
+                c.passed.push(format!("the NGX wrapper is a Wine builtin and the one its marker records ({})", short(&digest)));
+            }
+        }
+    }
+    match std::fs::read_to_string(tool.dir.join("proton")) {
+        Err(e) => c.broken.push(format!("its proton script cannot be read ({e})")),
+        Ok(script) => {
+            let has = |line: &str| script.lines().any(|l| l.trim_start().starts_with(line));
+            if !has(BASE_OVERRIDE) {
+                c.broken.push("its proton script does not set _nvngx=b: Wine gives games NVIDIA's core, not the wrapper".into());
+            } else {
+                c.passed.push("_nvngx=b (the wrapper in place of system32\\_nvngx.dll)".into());
+            }
+            if has_current_overrides(&script) {
+                c.passed.push(format!("system32\\{CORE_COPY_DIR}\\_nvngx=n (the wrapper's copy of NVIDIA's core)"));
+            } else if !source_gone(tool) {
+                c.degraded.push(format!(
+                    "its proton script does not set system32\\{CORE_COPY_DIR}\\_nvngx=n: the wrapper gets itself back for its copy of NVIDIA's core and loads the driver's file instead"
+                ));
+            }
+            if has(DRIVER_OVERRIDE) {
+                c.passed.push("the driver's _nvngx=n (the wrapper's fallback)".into());
+            } else {
+                c.degraded.push(
+                    "its proton script does not set the driver's _nvngx=n: if the wrapper's copy of NVIDIA's core cannot be written, it gets itself back and NGX reports itself unavailable".into(),
+                );
+            }
+        }
+    }
+    match wine_version(&tool.dir) {
+        Some((major, minor)) if VERIFIED_WINE_MAJORS.contains(&major) => c.passed.push(format!("Wine {major}.{minor}, whose DLL load order was checked")),
+        Some((major, minor)) if major >= MIN_WINE_MAJOR => {
+            c.unverified = Some(format!(
+                "Wine {major}.{minor} is newer than the Wine versions whose DLL load order this Neural Forge was checked against ({})",
+                VERIFIED_WINE_MAJORS.map(|m| m.to_string()).join(", ")
+            ))
+        }
+        // Older than Neural Forge supports, or unreadable: `doctor`'s Wine version finding.
+        _ => {}
+    }
+    c
+}
+
+/// The first 12 characters of a digest, for messages.
+pub fn short(digest: &str) -> &str {
+    digest.get(..12).unwrap_or(digest)
+}
+
+/// Puts `dll` (the installed wrapper) into `tool` when its marker names another one, or its file is not that one: its `_nvngx.dll` written new
 /// (a running game keeps the file it loaded), then the marker; and makes its `proton` script again from its source's
 /// when that differs (a Neural Forge with other overrides made it). What it did.
 pub fn refresh_wrapper(tool: &Tool, dll: &[u8]) -> Result<Refreshed, String> {
@@ -691,7 +800,8 @@ pub fn refresh_wrapper(tool: &Tool, dll: &[u8]) -> Result<Refreshed, String> {
         None => done.script_stale = source_gone(tool) && have.as_deref().is_some_and(|s| !has_current_overrides(s)),
     }
     let digest = crate::install::digest(dll);
-    if tool.wrapper_sha256 == digest {
+    // The file itself too: one that is not the wrapper its marker names (`doctor`'s chain check) is put in again.
+    if tool.wrapper_sha256 == digest && std::fs::read(wrapper_in(tool)).is_ok_and(|have| have == dll) {
         return Ok(done);
     }
     let marker_path = tool.dir.join(MARKER);
@@ -1394,6 +1504,74 @@ mod tests {
         std::fs::create_dir_all(root.join("compatibilitytools.d/.GE-Proton11-13-NeuralForge.tmp")).unwrap();
         std::fs::create_dir_all(root.join("compatibilitytools.d/.hidden")).unwrap();
         assert_eq!(leftovers(&root), [root.join("compatibilitytools.d/.GE-Proton11-13-NeuralForge.tmp")]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The static check of a copy's wrapper chain: what passes on a fresh copy, and each way it breaks.
+    #[test]
+    fn the_wrapper_chain_of_a_copy() {
+        let root = scratch("chain");
+        let src = root.join("compatibilitytools.d/GE-Proton11-12");
+        fake_proton(&src, "GE-Proton11-12", "GE-Proton11-12");
+        let wrapper = root.join("_nvngx.dll");
+        fake_wrapper(&wrapper);
+        let installed = crate::install::digest(&std::fs::read(&wrapper).unwrap());
+        let t = create(&root, &sources(&root, &[]).remove(0), &wrapper).unwrap().tool;
+        let good = check_chain(&t, Some(&installed));
+        assert!(good.broken.is_empty() && good.degraded.is_empty() && good.unverified.is_none(), "{good:?}");
+        assert_eq!(good.passed.len(), 5, "{good:?}");
+        assert!(good.passed[0].contains("this Neural Forge's") && good.passed[4].contains("Wine 11.0"), "{good:?}");
+        // The overrides the script must carry are the ones `added_lines` writes.
+        let lines = added_lines("");
+        assert!(
+            lines.lines().any(|l| l.trim_start().starts_with(BASE_OVERRIDE)) && lines.lines().any(|l| l.trim_start().starts_with(DRIVER_OVERRIDE)),
+            "{lines}"
+        );
+
+        // Another Neural Forge's wrapper: still a pass, as the marker's.
+        assert!(check_chain(&t, Some("other")).passed[0].contains("its marker records"));
+        // The wrapper file replaced behind the marker's back: degraded, and the next refresh puts it back.
+        let dll = wrapper_in(&t);
+        let mut other = std::fs::read(&dll).unwrap();
+        other.push(7);
+        std::fs::write(&dll, &other).unwrap();
+        assert!(check_chain(&t, Some(&installed)).degraded[0].contains("not the one its marker records"));
+        assert_eq!(refresh_wrapper(&t, &std::fs::read(&wrapper).unwrap()).unwrap(), Refreshed { wrapper: true, ..Default::default() });
+        assert!(check_chain(&t, Some(&installed)).degraded.is_empty());
+        // Not a builtin, or gone: broken.
+        let mut native = std::fs::read(&dll).unwrap();
+        native[0x40] = b'X';
+        std::fs::write(&dll, &native).unwrap();
+        assert!(check_chain(&t, None).broken[0].contains("not marked as a Wine builtin"));
+        std::fs::remove_file(&dll).unwrap();
+        assert!(check_chain(&t, None).broken[0].contains("cannot be read"));
+        std::fs::copy(&wrapper, &dll).unwrap();
+
+        // The script without each override.
+        let script = std::fs::read_to_string(t.dir.join("proton")).unwrap();
+        let without = |needle: &str| script.lines().filter(|l| !l.contains(needle)).map(|l| format!("{l}\n")).collect::<String>();
+        std::fs::write(t.dir.join("proton"), without("[\"_nvngx\"] = \"b\"")).unwrap();
+        assert!(check_chain(&t, None).broken[0].contains("_nvngx=b"));
+        std::fs::write(t.dir.join("proton"), without("neural-forge\\\\_nvngx")).unwrap();
+        assert!(check_chain(&t, None).degraded[0].contains("loads the driver's file instead"));
+        std::fs::write(t.dir.join("proton"), without("nvidia_wine_dll_dir.replace")).unwrap();
+        assert!(check_chain(&t, None).degraded[0].contains("the driver's _nvngx=n"));
+        // Its source gone: the missing core-copy override is doctor's own finding, not repeated here.
+        std::fs::write(t.dir.join("proton"), without("neural-forge\\\\_nvngx")).unwrap();
+        std::fs::rename(&src, root.join("moved-away")).unwrap();
+        assert!(check_chain(&t, None).degraded.is_empty());
+        std::fs::rename(root.join("moved-away"), &src).unwrap();
+        std::fs::write(t.dir.join("proton"), &script).unwrap();
+
+        // A Wine newer than those read: a note; Wine 10: a pass.
+        fake_ntdll(&t.dir, "lib", "12.0");
+        let newer = check_chain(&t, None);
+        assert!(newer.unverified.as_deref().is_some_and(|u| u.contains("Wine 12.0 is newer") && u.contains("10, 11")), "{newer:?}");
+        fake_ntdll(&t.dir, "lib", "10.0");
+        assert!(check_chain(&t, None).passed.iter().any(|p| p.contains("Wine 10.0")));
+        fake_ntdll(&t.dir, "lib", "9.0");
+        let old = check_chain(&t, None);
+        assert!(old.unverified.is_none() && !old.passed.iter().any(|p| p.contains("load order")), "older Wine is doctor's own failure");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
