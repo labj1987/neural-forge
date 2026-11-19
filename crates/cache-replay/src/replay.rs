@@ -528,8 +528,8 @@ pub fn run_cadence(
 /// long as that carry lasts (the first hold the run refreshes on, or leaves out for an unusable exposure,
 /// ends it). Writes per hold t >= 1 carried to `cache-TT.f32` (H x W x 3, the shown edit: mode "cache"
 /// with the guided filter, as `run_cadence` shows it), `acc-TT.f32` (H x W x 2, the accumulated motion,
-/// NaN off the chain) and `weight-TT.f32` (H x W, valid x validity), and `holds.txt` (per hold: jitter x,
-/// jitter y, exposure), all f32 little-endian. Returns the number of holds carried to.
+/// NaN off the chain), `weight-TT.f32` (H x W, valid x validity), all f32 little-endian, and the text
+/// file `holds.txt` (per hold: jitter x, jitter y, exposure). Returns the number of holds carried to.
 pub fn export_carry(dump: &Dump, p: &Params, reverse_z: bool, out: &Path) -> Result<usize, String> {
     let io = |e: std::io::Error| e.to_string();
     std::fs::create_dir_all(out).map_err(io)?;

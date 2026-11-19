@@ -1,7 +1,7 @@
 //! cache-replay: replays the pre-upscaler edit cache offline on a K-hold dump, and measures what
 //! it keeps; writes the synthetic dumps and the exports the layer's shader tests compare with. The
-//! algorithm and its origin (the
-//! upstream tools it ports, and the licence) are the library's: see the notice in src/lib.rs.
+//! algorithm and its origin (the upstream tools it ports, and the licence) are the library's: see
+//! the notice in src/lib.rs.
 
 use cache_replay::{common, pyfmt, replay};
 
@@ -65,7 +65,15 @@ Ported in part from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/opti
 commit 6bfc4389c25054ef6747df6e6b1b470e9541c4da: tools/dlssnr_cache/measure_reprojection.py,
 measure_ghosting.py (the strategies and the metrics), measure_pulse.py (the regional light step)
 and flicker_lab.py (the motion-compensated flicker). Upstream is GPL-3.0; this port is
-distributed under this project's AGPL-3.0-or-later (see ATTRIBUTION.md).";
+distributed under this project's AGPL-3.0-or-later (see ATTRIBUTION.md).
+
+Option notes:
+  cadence options (--cadence, --phase, --adaptive, --still-interval, --aging, --half-life,
+  --no-guided, --guided-strength, --guided-eps): the cache run at a fixed interval (pulse,
+  flicker); experiments not in the shaders. --still-interval: the layer uses 1.
+  --guided-strength: the shaders use 1.
+  cache parameters (defaults are the shader's): --max-luma-edit 0 = no edit clamp;
+  --chain-sample applies to --chain walk only.";
 
 #[derive(Default)]
 struct Args {
