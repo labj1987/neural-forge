@@ -197,7 +197,13 @@ fn write_json(path: &str, doc: &J) -> Result<(), String> {
     std::fs::write(path, pyfmt::dumps(doc, Some(1))).map_err(|e| format!("{path}: {e}"))
 }
 
-fn run(a: Args) -> Result<ExitCode, String> {
+fn run(mut a: Args) -> Result<ExitCode, String> {
+    // argparse values are tested for truth: an empty path is the same as none.
+    for v in [&mut a.dump, &mut a.json, &mut a.make_synthetic, &mut a.export_carry, &mut a.export_cadence] {
+        if v.as_deref() == Some("") {
+            *v = None;
+        }
+    }
     if let Some(dir) = &a.make_synthetic {
         let info = replay::make_synthetic(Path::new(dir), &a.kind)?;
         println!("wrote a synthetic {} dump to {dir} ({})", a.kind, pyfmt::dumps(&info, None));
