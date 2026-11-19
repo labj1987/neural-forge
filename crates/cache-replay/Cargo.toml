@@ -1,0 +1,16 @@
+[package]
+name = "cache-replay"
+description = "The pre-upscaler edit cache's offline replay (Rust port of scripts/cache_replay.py)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+half = "2.7"
+serde_json = "1"
+
+[lints]
+workspace = true
