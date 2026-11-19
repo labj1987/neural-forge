@@ -1079,21 +1079,10 @@ pub fn driver_core(sys_lib_dirs: &[&Path]) -> Option<PathBuf> {
 /// The library folders the driver's `nvidia/wine` may be in (Debian/Ubuntu, Fedora/openSUSE, Arch).
 pub const DRIVER_LIB_DIRS: [&str; 3] = ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib"];
 
-/// The exports the NGX wrapper implements itself (`crates/ngx-wrapper/src/hooks.rs`; `exports.rs`'s `HOOKED`): it
-/// refuses to load when NVIDIA's core lacks one of them. Every other export it forwards to the core, and answers
-/// with `0xBAD00000` (NGX's generic failure) where the core lacks it. Keep in step with hooks.rs.
-pub const HOOKED: [&str; 10] = [
-    "NVSDK_NGX_D3D11_CreateFeature",
-    "NVSDK_NGX_D3D11_EvaluateFeature",
-    "NVSDK_NGX_D3D11_ReleaseFeature",
-    "NVSDK_NGX_D3D12_CreateFeature",
-    "NVSDK_NGX_D3D12_EvaluateFeature",
-    "NVSDK_NGX_D3D12_ReleaseFeature",
-    "NVSDK_NGX_VULKAN_CreateFeature",
-    "NVSDK_NGX_VULKAN_CreateFeature1",
-    "NVSDK_NGX_VULKAN_EvaluateFeature",
-    "NVSDK_NGX_VULKAN_ReleaseFeature",
-];
+/// The exports the NGX wrapper implements itself (`crates/ngx-wrapper/src/hooks.rs`): it refuses to load when NVIDIA's
+/// core lacks one of them. Every other export it forwards to the core, and answers with `0xBAD00000` (NGX's generic
+/// failure) where the core lacks it.
+pub use crate::ngx_core_exports::HOOKED;
 
 /// Which Proton Steam runs `appid` with (`config.vdf`'s `CompatToolMapping`), if one is chosen for it.
 pub fn mapped_tool(root: &Path, appid: &str) -> Option<String> {

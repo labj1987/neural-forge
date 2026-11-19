@@ -1,6 +1,5 @@
-//! NVIDIA's `_nvngx.dll` exports (driver 620.70, 75 names; the ordinals are their alphabetical order, which the
-//! linker gives these too: `scripts/build-ngx-wrapper.sh` checks both against the driver's DLL when it is installed).
-//! The ones Neural Forge watches are in `hooks.rs`; every other one is a jump through the pointer resolved from
+//! NVIDIA's `_nvngx.dll` exports ([`crate::core_exports`] lists them, with their ordinals, the hooked ones and the
+//! ones that read their caller). The ones Neural Forge watches are in `hooks.rs`; every other one is a jump through the pointer resolved from
 //! NVIDIA's core at load (`win.rs`, `resolve`), or to [`missing_export`] when the core lacks it
 //! ([`crate::rules::resolution`]).
 
@@ -75,46 +74,7 @@ passthrough! {
     NVSDK_NGX_VULKAN_Shutdown NVSDK_NGX_VULKAN_Shutdown1
 }
 
-/// Exports with a hook (`hooks.rs`).
-pub(crate) const HOOKED: &[&str] = &[
-    "NVSDK_NGX_D3D11_CreateFeature",
-    "NVSDK_NGX_D3D11_EvaluateFeature",
-    "NVSDK_NGX_D3D11_ReleaseFeature",
-    "NVSDK_NGX_D3D12_CreateFeature",
-    "NVSDK_NGX_D3D12_EvaluateFeature",
-    "NVSDK_NGX_D3D12_ReleaseFeature",
-    "NVSDK_NGX_VULKAN_CreateFeature",
-    "NVSDK_NGX_VULKAN_CreateFeature1",
-    "NVSDK_NGX_VULKAN_EvaluateFeature",
-    "NVSDK_NGX_VULKAN_ReleaseFeature",
-];
-
-/// Passthrough exports whose code in NVIDIA's core finds the module that called it, from its return address
-/// (`GetModuleHandleExA(FROM_ADDRESS)` and `GetModuleFileNameW`, driver 620.73), and searches that module's folder for
-/// DLSS's feature DLLs. The call trace leaves their return address alone (it logs their entry only): replaced by its
-/// own, the core would take the wrapper in `system32` for the caller and miss the game's feature DLLs.
-pub const READS_CALLER: &[&str] = &[
-    "NVSDK_NGX_CUDA_GetFeatureRequirements",
-    "NVSDK_NGX_CUDA_Init",
-    "NVSDK_NGX_CUDA_Init_Ext",
-    "NVSDK_NGX_CUDA_Init_Ext1",
-    "NVSDK_NGX_CUDA_Init_ProjectID",
-    "NVSDK_NGX_D3D11_GetFeatureRequirements",
-    "NVSDK_NGX_D3D11_Init",
-    "NVSDK_NGX_D3D11_Init_Ext",
-    "NVSDK_NGX_D3D11_Init_ProjectID",
-    "NVSDK_NGX_D3D12_GetFeatureRequirements",
-    "NVSDK_NGX_D3D12_Init",
-    "NVSDK_NGX_D3D12_Init_Ext",
-    "NVSDK_NGX_D3D12_Init_ProjectID",
-    "NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements",
-    "NVSDK_NGX_VULKAN_GetFeatureRequirements",
-    "NVSDK_NGX_VULKAN_Init",
-    "NVSDK_NGX_VULKAN_Init_Ext",
-    "NVSDK_NGX_VULKAN_Init_Ext2",
-    "NVSDK_NGX_VULKAN_Init_ProjectID",
-    "NVSDK_NGX_VULKAN_Init_ProjectID_Ext",
-];
+pub use crate::core_exports::{HOOKED, READS_CALLER};
 
 /// Whether the export's code reads its caller's module ([`READS_CALLER`]).
 pub fn reads_caller(name: &str) -> bool {
@@ -156,12 +116,13 @@ mod tests {
         assert!(!reads_caller("NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements"));
     }
 
+    /// The macro's names and the hooked ones are the core's, each once: the linker numbers the exports in that
+    /// order, so the wrapper's ordinals are the core's.
     #[test]
     fn every_export_once() {
         let mut all: Vec<&str> = PASSTHROUGH.iter().chain(HOOKED).copied().collect();
-        assert_eq!(all.len(), 75, "NVIDIA's core exports 75 names");
         all.sort_unstable();
-        all.dedup();
-        assert_eq!(all.len(), 75, "a name twice");
+        assert_eq!(all, crate::core_exports::CORE_EXPORTS, "PASSTHROUGH and HOOKED are not CORE_EXPORTS");
+        assert!(crate::core_exports::CORE_EXPORTS.windows(2).all(|w| w[0] < w[1]), "CORE_EXPORTS is not sorted, or names one twice");
     }
 }

@@ -10,6 +10,7 @@
 //! (`ring.rs`). It never changes a call's arguments or result.
 
 pub mod core_copy;
+pub mod core_exports;
 pub mod exports;
 pub mod modules;
 pub mod pe;

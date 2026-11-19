@@ -62,6 +62,9 @@ fn usage_text() -> &'static str {
          \x20                     games and their library folders); ID: the game's Steam\n\
          \x20                     app id, for its Proton version; FILE: a trace the layer\n\
          \x20                     recorded (NEURAL_FORGE_TRACE)\n\
+         \x20 ngx-audit [CORE] [--driver-dir DIR]\n\
+         \x20                     check the driver's NGX core for Proton against what the\n\
+         \x20                     NGX wrapper was built for (after a driver update)\n\
          \x20 proton-tool [list|create SOURCE|update|remove NAME]\n\
          \x20                     make a copy of an installed Proton that hands Neural\n\
          \x20                     Forge DLSS's own parameters (see `proton-tool --help`)"
@@ -263,6 +266,33 @@ fn cmd_doctor() -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+fn cmd_ngx_audit(core: Option<&str>, driver_dir: Option<&str>) -> ExitCode {
+    use neural_forge_supervisor::proton_tool;
+    let core = match core {
+        Some(c) => std::path::PathBuf::from(c),
+        None => {
+            let dirs: Vec<&std::path::Path> = proton_tool::DRIVER_LIB_DIRS.iter().map(std::path::Path::new).collect();
+            match proton_tool::driver_core(&dirs) {
+                Some(c) => c,
+                None => {
+                    eprintln!(
+                        "ngx-audit: NVIDIA's NGX core for Proton (nvidia/wine/_nvngx.dll) is not installed in {}",
+                        proton_tool::DRIVER_LIB_DIRS.join(", ")
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+    let report = neural_forge_supervisor::ngx_audit::audit(&core, driver_dir.map(std::path::Path::new));
+    print!("{}", report.text());
+    if report.passed() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -679,6 +709,12 @@ enum Command {
         trace: Option<String>,
     },
     ProtonTool(ProtonToolCmd),
+    /// `ngx-audit`: the core to check (the driver's when `None`) and the folder of its DLSS feature DLLs (the core's
+    /// when `None`).
+    NgxAudit {
+        core: Option<String>,
+        driver_dir: Option<String>,
+    },
     /// `--help`/`-h`: the whole usage (`None`) or one command's.
     Help(Option<String>),
 }
@@ -839,6 +875,23 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
             }
             Ok(Command::Report { appid, trace })
         }
+        "ngx-audit" => {
+            let (mut core, mut driver_dir) = (None, None);
+            let mut words = rest.iter();
+            while let Some(word) = words.next() {
+                match *word {
+                    "--driver-dir" if driver_dir.is_none() => match words.next() {
+                        Some(dir) if !dir.is_empty() && !dir.starts_with('-') => driver_dir = Some((*dir).to_string()),
+                        _ => return Err(err("--driver-dir takes the folder of NVIDIA's DLSS DLLs (nvidia/wine)".into())),
+                    },
+                    "--driver-dir" => return Err(err("--driver-dir is given twice".into())),
+                    other if other.starts_with('-') => return Err(err(format!("unknown option {other:?}"))),
+                    other if core.is_none() => core = Some(other.to_string()),
+                    other => return Err(err(format!("unexpected argument {other:?}"))),
+                }
+            }
+            Ok(Command::NgxAudit { core, driver_dir })
+        }
         "proton-tool" => match rest.as_slice() {
             [] | ["list"] => Ok(Command::ProtonTool(ProtonToolCmd::List)),
             ["update"] => Ok(Command::ProtonTool(ProtonToolCmd::Update)),
@@ -871,6 +924,15 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "disable" => "usage: neural-forge-cli disable GAME\n  take Neural Forge back out of GAME's Steam launch options (see `enable --help`)",
         "report" => {
             "usage: neural-forge-cli report [--appid ID] [--trace FILE]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game and its Proton -- found from the game the channel names, or\n  from ID, its Steam app id -- whether it is a tested game, the HDR verdict with the\n  desktop's HDR state, and the doctor's findings, which list your installed Steam\n  games and their library folders, and of a game's launch options only Neural Forge's\n  part), config.ini, the model's manifest, the layer's logs,\n  this boot's GPU fault (Xid) lines, the channel's status, the game's entry in the\n  tested games and the newest capture pair. --trace adds a trace file the layer\n  recorded (NEURAL_FORGE_TRACE's; also taken from that variable when it is set here).\n  The home directory, user name and host name are replaced with ~, <user> and <host>;\n  nothing is uploaded"
+        }
+        "ngx-audit" => {
+            "usage: neural-forge-cli ngx-audit [CORE] [--driver-dir DIR]\n  \
+             check NVIDIA's NGX core for Proton (CORE, by default the driver's nvidia/wine/_nvngx.dll) against\n  \
+             what Neural Forge's NGX wrapper was built for: the functions it exports and their numbers, the ones\n  \
+             the wrapper hooks, which ones find their caller's folder from their return address (read from the\n  \
+             core's code), and that the DLSS DLLs in DIR (by default CORE's folder) still refuse callers outside\n  \
+             nvngx.dll. Prints one OK or FAIL line per check; exits 1 on any FAIL. Run it after a driver update:\n  \
+             a FAIL means the wrapper needs updating before games under a Neural Forge Proton run on this driver"
         }
         "proton-tool" => {
             "usage: neural-forge-cli proton-tool [list | create SOURCE | update | remove NAME]\n  \
@@ -1070,6 +1132,7 @@ fn main() -> ExitCode {
         Command::Disable(game) => cmd_set_game(&game, neural_forge_supervisor::steam::Action::Disable, false),
         Command::Report { appid, trace } => cmd_report(appid.as_deref(), trace.as_deref()),
         Command::ProtonTool(sub) => cmd_proton_tool(sub),
+        Command::NgxAudit { core, driver_dir } => cmd_ngx_audit(core.as_deref(), driver_dir.as_deref()),
         Command::Help(command) => {
             print_help(command.as_deref());
             ExitCode::SUCCESS
@@ -1174,6 +1237,21 @@ mod tests {
         assert!(parse_str("report --appid 1 --appid 2").is_err());
         assert_eq!(parse_str("report --help"), Ok(Command::Help(Some("report".into()))));
         assert_eq!(parse_str("shmctl capture --frames 3"), Ok(Command::Shmctl(vec!["capture".into(), "--frames".into(), "3".into()])));
+    }
+
+    #[test]
+    fn ngx_audit_takes_a_core_and_a_driver_dir() {
+        assert_eq!(parse_str("ngx-audit"), Ok(Command::NgxAudit { core: None, driver_dir: None }));
+        assert_eq!(parse_str("ngx-audit /x/_nvngx.dll"), Ok(Command::NgxAudit { core: Some("/x/_nvngx.dll".into()), driver_dir: None }));
+        assert_eq!(
+            parse_str("ngx-audit --driver-dir /d /x/_nvngx.dll"),
+            Ok(Command::NgxAudit { core: Some("/x/_nvngx.dll".into()), driver_dir: Some("/d".into()) })
+        );
+        assert!(parse_str("ngx-audit --driver-dir").is_err());
+        assert!(parse_str("ngx-audit --driver-dir /d --driver-dir /e").is_err());
+        assert!(parse_str("ngx-audit a b").is_err());
+        assert!(parse_str("ngx-audit --core a").is_err());
+        assert_eq!(parse_str("ngx-audit --help"), Ok(Command::Help(Some("ngx-audit".into()))));
     }
 
     #[test]

@@ -14,6 +14,10 @@ pub mod install;
 pub mod launch_options;
 pub mod model;
 pub mod model_shape;
+pub mod ngx_audit;
+/// The NGX wrapper's lists of NVIDIA's core exports (crates/ngx-wrapper), shared with it.
+#[path = "../../ngx-wrapper/src/core_exports.rs"]
+pub mod ngx_core_exports;
 pub mod ngx_versions;
 pub mod paths;
 pub mod presets;
