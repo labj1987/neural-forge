@@ -13,7 +13,8 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
                                               │ Wine's load order: _nvngx=b
                                               ▼
                         Neural Forge's builtin _nvngx.dll (crates/ngx-wrapper)
-                              │ forwards all 75 exports to NVIDIA's core, loaded from NVIDIA_WINE_DLL_DIR
+                              │ forwards all 75 exports to NVIDIA's core: its copy of the driver's (NVIDIA_WINE_DLL_DIR)
+                              │   in C:\windows\system32\neural-forge\_nvngx_core.dll
                               │ a record per CreateFeature, two per EvaluateFeature (before and after NVIDIA's call)
                               │   (only with NEURAL_FORGE_ENABLE=1) ──► /dev/shm/neural-forge-ngx-<pid>.ring
                               ▼
@@ -33,10 +34,21 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   keeps the requested path. So `WinVerifyTrust` reads NVIDIA's unchanged signed file, and `LoadLibrary` of that path
   returns the wrapper. A PE is a builtin when the 32 bytes at file offset 0x40 read `Wine builtin DLL`
   (`server/mapping.c`), which `scripts/build-ngx-wrapper.sh` writes after the build, as `winebuild --builtin` does.
-- **Loading NVIDIA's core.** The wrapper loads `Z:<NVIDIA_WINE_DLL_DIR>/_nvngx.dll` by its full path. A full-path key
-  is looked up before the base name, so the override `Z:\...\nvidia\wine\_nvngx=n` keeps that one native; without it
-  Wine hands the wrapper back to itself (the wrapper checks: a load that returns its own module refuses the load).
-  NVIDIA's snippets (`nvngx_dlss.dll` and the others) load as before.
+- **Loading NVIDIA's core.** NVIDIA's core treats the folder it was loaded from as a place of its own (see "Where the
+  core looks for feature DLLs" below): under stock Proton that is `system32`, which holds no DLSS feature DLLs, while
+  the driver's `nvidia/wine` folder holds NVIDIA's `nvngx_dlssg.dll` and `nvngx_dlssd.dll` next to `_nvngx.dll`, and
+  Indiana Jones and the Great Circle crashed only with the core loaded from there (#51). So the wrapper does not load
+  the driver's file where it lies: it copies `Z:<NVIDIA_WINE_DLL_DIR>/_nvngx.dll` to
+  `C:\windows\system32\neural-forge\_nvngx_core.dll` (a folder that holds only that file) and loads the copy
+  (`crates/ngx-wrapper/src/core_copy.rs`). The copy is compared with the driver's file on every load (about 2 ms) and
+  rewritten, through a temporary file renamed over it, only when they differ (a new driver); a copy another process
+  of the game put in place first is taken as it is. Its name is not `_nvngx.dll`, which `_nvngx=b` would turn into the
+  wrapper again; the core reads only its folder, not its name. If the copy cannot be written, the wrapper loads the
+  driver's file by its full path as before (the text log and the trace say which it loaded and why): a full-path key
+  is looked up before the base name, so the override `Z:\...\nvidia\wine\_nvngx=n` keeps that one native; without
+  it Wine hands the wrapper back to itself (the wrapper checks: a load that returns its own module refuses the load).
+  `NEURAL_FORGE_NGX_CORE` names another core to load instead (a Windows path, or a Linux one through `Z:`), for
+  diagnosis. `uninstall --purge` removes the copies from the prefixes of every Steam library.
 - **Exports the core lacks.** The wrapper hooks ten exports: `NVSDK_NGX_{D3D11,D3D12,VULKAN}_{CreateFeature,
   EvaluateFeature,ReleaseFeature}` and `NVSDK_NGX_VULKAN_CreateFeature1` (`exports.rs`, `HOOKED`). It calls NVIDIA's
   function of each, so a core without one of them fails the wrapper's load, and NGX reports itself unavailable: the
@@ -149,8 +161,14 @@ time is read before its place is reserved, so sorting by the time column reorder
 it in file order: `tail -c +129 FILE | tr -d '\0'` (the ring after the 128-byte header; unwritten bytes are zero),
 and once wrapped from `next` on: `{ tail -c +$((129 + NEXT)) FILE; tail -c +129 FILE | head -c NEXT; } | tr -d '\0'`.
 The game's pid is in the file's name (`indy-trace.txt` is written as `indy-trace-<pid>.txt`).
-While tracing, the return addresses of passthrough calls point at `trace_return`, so a crash dump's or a debugger's
-stack walk through an NGX call is not reliable; the wrapper's text log line says whether the trace file opened (its
+NVIDIA's core reads the module that called some of its exports from their return address (every `*_Init*` and
+`*_GetFeatureRequirements`, and `NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements`: `exports.rs`,
+`READS_CALLER`) and searches that module's folder for feature DLLs. For those the trace logs the entry only (`[exit
+not traced: the core reads its caller]`) and leaves the return address alone: with `trace_return` in its place, the
+core would take the wrapper in `system32` for the caller and miss a feature DLL in the game's folder, so the trace
+would change what NGX finds (#51's first traces were taken that way). While tracing, the return addresses of the other passthrough calls point at `trace_return`, so a crash
+dump's or a debugger's stack walk through an NGX call is not reliable; the wrapper's text log line says whether the
+trace file opened (its
 path, or why not). A call that never returned shows
 as an entry line without its exit: in a stalled present, that names the NGX call the game's thread is in.
 
@@ -338,9 +356,26 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
   Proton and put it back on `disable`) held before the upscaler, 71 fps; GTA San Andreas - The Definitive Edition
   (D3D11 through DXVK) held before the upscaler, ~50 fps. Crimson Desert with DLSS off in its own settings: the model on
   the finished frame (13.5 fps, as before); with DLSS on and no wrapper: the model off, 104 fps, the log says why.
-- Where NVIDIA's core loads from does not change which DLSS files it picks (2026-11-12, driver 620.70's
-  `_nvngx.dll`, Ghidra): its "driver store" path under Wine is `NVIDIA_WINE_DLL_DIR` read from the environment
-  (`NGXGetPathUsingQAI`, after the adapter query fails), not its own module's folder, so the driver's
-  `nvngx_dlssg.dll`/`nvngx_dlssd.dll` are found the same way with and without the wrapper; and its over-the-air updater
-  is decided by `__NGX_DISABLE_UPDATER` and `PROTON_ENABLE_NGX_UPDATER` (`NGXIsUpdaterEnabledBase`), not by its path.
-  The Indiana Jones stall in #51 is therefore not the core's load path; the call trace is there to find what it is.
+- <a id="where-the-core-looks-for-feature-dlls"></a>**Where the core looks for feature DLLs** (2026-11-19, driver
+  620.73.04's `_nvngx.dll`, sha256 `637a9390…892a`, Ghidra through REA, and NGX's own log of Cyberpunk 2077 with the
+  4.6.1 wrapper). The folders NGX searched, in order: the path the game's NGX library hands in, the folder of the
+  module that called the export (`sl.common.dll`'s: the core finds it from the return address through
+  `GetModuleHandleExA(FROM_ADDRESS)` and `GetModuleFileNameW` in every `*_Init*` and `*_GetFeatureRequirements`
+  export), the "driver store", which under Wine is `NVIDIA_WINE_DLL_DIR` as Linux gives it
+  (`/run/host/usr/lib/x86_64-linux-gnu/nvidia/wine`, read in `NGXGetPathUsingQAI` after the adapter query fails;
+  Wine opens the Linux path, and NGX loaded the driver's `nvngx_dlssg.dll` and `nvngx_dlssd.dll` from it besides the
+  game's), and `ngx-builtins` under that. So the driver's feature DLLs are offered with and without the wrapper. One
+  more place depends on where the core itself was loaded from: when the game's NGX library sets a flag in the
+  `InternalData` it passes, `NGXInitContext` adds the core's own folder (the same lookup on its own code; its error
+  is "Failed to get NGX core path. Cannot load generic snippet from here."). Cyberpunk's library does not set it (the
+  core's folder is not in its list); which games do, and what NGX takes from that folder, is not read out. In #51
+  (Indiana Jones and the Great Circle: Vulkan, Streamline with DLSS, Ray Reconstruction and Frame Generation) the
+  core loaded from the driver's folder reported the third feature supported, `UpdateFeature` ran for each feature,
+  and the game's present timed out (`VK_TIMEOUT`) about 5 s after its swapchain; a byte-identical copy in a folder
+  without feature DLLs reported that feature unsupported (`0xBAD00002`) and the game ran (both runs traced, so the
+  caller's folder was the wrapper's in both). The over-the-air updater does not depend on the path: it is decided by
+  `__NGX_DISABLE_UPDATER` and `PROTON_ENABLE_NGX_UPDATER` (`NGXIsUpdaterEnabledBase`). NGX's own log: with
+  `__NGX_LOG_LEVEL=2` in the launch options the core logs to `C:\ProgramData\NVIDIA\NGX\models\nvngx_update.log`
+  in the game's prefix (rewritten each start: the folders searched, each DLL loaded and why a feature is refused);
+  `__NGX_ENABLE_OVERRIDE_LOG_PATH=1 __NGX_LOG_PATH_OVERRIDE=<folder>` moves only the game-side library's
+  `nvsdk_ngx.log`.

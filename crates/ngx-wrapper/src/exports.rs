@@ -89,6 +89,38 @@ pub(crate) const HOOKED: &[&str] = &[
     "NVSDK_NGX_VULKAN_ReleaseFeature",
 ];
 
+/// Passthrough exports whose code in NVIDIA's core finds the module that called it, from its return address
+/// (`GetModuleHandleExA(FROM_ADDRESS)` and `GetModuleFileNameW`, driver 620.73), and searches that module's folder for
+/// DLSS's feature DLLs. The call trace leaves their return address alone (it logs their entry only): replaced by its
+/// own, the core would take the wrapper in `system32` for the caller and miss the game's feature DLLs.
+pub const READS_CALLER: &[&str] = &[
+    "NVSDK_NGX_CUDA_GetFeatureRequirements",
+    "NVSDK_NGX_CUDA_Init",
+    "NVSDK_NGX_CUDA_Init_Ext",
+    "NVSDK_NGX_CUDA_Init_Ext1",
+    "NVSDK_NGX_CUDA_Init_ProjectID",
+    "NVSDK_NGX_D3D11_GetFeatureRequirements",
+    "NVSDK_NGX_D3D11_Init",
+    "NVSDK_NGX_D3D11_Init_Ext",
+    "NVSDK_NGX_D3D11_Init_ProjectID",
+    "NVSDK_NGX_D3D12_GetFeatureRequirements",
+    "NVSDK_NGX_D3D12_Init",
+    "NVSDK_NGX_D3D12_Init_Ext",
+    "NVSDK_NGX_D3D12_Init_ProjectID",
+    "NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements",
+    "NVSDK_NGX_VULKAN_GetFeatureRequirements",
+    "NVSDK_NGX_VULKAN_Init",
+    "NVSDK_NGX_VULKAN_Init_Ext",
+    "NVSDK_NGX_VULKAN_Init_Ext2",
+    "NVSDK_NGX_VULKAN_Init_ProjectID",
+    "NVSDK_NGX_VULKAN_Init_ProjectID_Ext",
+];
+
+/// Whether the export's code reads its caller's module ([`READS_CALLER`]).
+pub fn reads_caller(name: &str) -> bool {
+    READS_CALLER.contains(&name)
+}
+
 /// What a passthrough export NVIDIA's core lacks jumps to: `NVSDK_NGX_Result_Fail`, as NGX answers a call it cannot
 /// serve. (The export is also taken out of the export table at load, `win::hide_exports`, so only a caller that bound
 /// it before could reach this.) It takes no arguments, which is safe for every export's signature: on x64 Windows the caller passes
@@ -105,6 +137,23 @@ mod tests {
     fn a_missing_export_fails() {
         assert_eq!(missing_export(), 0xBAD0_0000);
         assert!(!crate::rules::ngx_succeeded(missing_export()));
+    }
+
+    /// Every export that reads its caller is a passthrough one (a hook calls NVIDIA's function from the wrapper, so
+    /// the core would see the wrapper as its caller: none of the hooked ones reads it), and each is named once.
+    #[test]
+    fn the_caller_readers_are_passthrough_exports() {
+        for name in READS_CALLER {
+            assert!(PASSTHROUGH.contains(name), "{name}");
+            assert!(!HOOKED.contains(name), "{name}");
+        }
+        let mut names = READS_CALLER.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), READS_CALLER.len());
+        assert!(reads_caller("NVSDK_NGX_VULKAN_GetFeatureRequirements"));
+        assert!(!reads_caller("NVSDK_NGX_UpdateFeature"));
+        assert!(!reads_caller("NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements"));
     }
 
     #[test]

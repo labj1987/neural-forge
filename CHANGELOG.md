@@ -4,6 +4,21 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 4.6.1 — 2026-11-19
+
+**The NGX wrapper runs NVIDIA's core from where Proton puts it (Indiana Jones and the Great Circle)**
+
+- Neural Forge's Proton copies now load NVIDIA's NGX core from a copy in the game's prefix
+  (`system32\neural-forge`), as Proton's own setup does, instead of straight from the driver's folder. NGX treats
+  the folder its core runs from as its own, and the driver's folder holds NVIDIA's own Frame Generation and Ray
+  Reconstruction files; Indiana Jones and the Great Circle crashed about 5 seconds in only when the core ran from
+  there. The copy is made on the game's first start and refreshed after a driver update; `uninstall --purge`
+  removes it.
+- `NEURAL_FORGE_NGX_TRACE` no longer changes what NGX finds: the calls in which NGX looks at which game module
+  called it are now traced on entry only, so a traced run behaves like an untraced one.
+- `NEURAL_FORGE_NGX_CORE` takes a normal Linux path too. The user guide also shows how to turn on NVIDIA's own NGX
+  log (`__NGX_LOG_LEVEL=2`), which says which DLSS files NGX loaded and why a feature is not supported.
+
 ## 4.6.0 — 2026-11-19
 
 **10-bit SDR games get the model, and a trace for games that stall with the NGX wrapper**
