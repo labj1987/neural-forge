@@ -87,7 +87,7 @@ if [ "${1:-}" = "--host" ]; then
     trap 'exit 130' INT TERM
     # The remote shell removes the binary itself when it ends (also when the connection drops: sshd hangs it up); the
     # trap above is the backstop for a run that never got that far.
-    ssh "$host" "trap 'rm -f $remote_q' EXIT HUP INT TERM; NF_BENCH_XTASK=$remote_q bash -s -- $args" < "$0"
+    ssh "$host" "f=$remote_q; trap 'rm -f \"\$f\"' EXIT HUP INT TERM; NF_BENCH_XTASK=\"\$f\" bash -s -- $args" < "$0"
     exit $?
 fi
 

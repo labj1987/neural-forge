@@ -21,8 +21,9 @@ mod release_notes;
 mod sync_appdata_releases;
 mod wine_builtin;
 
-/// The exit code of an unknown task or none (sysexits' EX_USAGE). Not 1, 2 or 3: tasks use those for their own
-/// outcomes (check-proton-scripts' network failure is 2, check-pins' nothing-to-bump is 3, bench-iq's usage error is 2),
+/// The exit code of an unknown task or none (sysexits' EX_USAGE). Not 1 to 4: tasks use those for their own
+/// outcomes (check-proton-scripts' network failure is 2, check-pins' nothing-to-bump is 3 and broken check 4, bench-iq's
+/// usage error is 2),
 /// and no task uses 64, so a caller can tell "no such task" from a task's own result.
 const EX_USAGE: u8 = 64;
 

@@ -32,6 +32,9 @@ use std::process::ExitCode;
 
 const BEHIND: u8 = 10;
 const NOTHING_TO_BUMP: u8 = 3;
+/// The check itself failed (curl or a local fault, not the network): pin-check.yml fails the run on it instead of
+/// retrying as for an unreachable upstream (exit 1).
+const BROKEN: u8 = 4;
 
 /// Every file a pin is named in, by the short name the rewrites use.
 const FILES: [(&str, &str); 5] = [
@@ -496,7 +499,7 @@ pub fn main(args: &[String]) -> ExitCode {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(BROKEN);
         }
     };
     let status = exit_status(&rows, &failed);

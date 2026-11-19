@@ -85,6 +85,7 @@ jobs:
             case $status in
               0) state=current; break ;;
               10) state=behind; break ;;
+              4) echo "the pin check itself failed (not the network)" >&2; exit 1 ;;
               *) echo "attempt $attempt: upstream could not be checked" >&2; sleep 60 ;;
             esac
           done
@@ -269,6 +270,7 @@ jobs:
               case $status in
                 0) state=current; break ;;
                 10) state=behind; break ;;
+                4) echo "the pin check itself failed (not the network)" >&2; exit 1 ;;
                 *) echo "attempt $attempt: upstream could not be checked" >&2; sleep 60 ;;
               esac
             done

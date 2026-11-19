@@ -12,7 +12,8 @@ use std::process::{Command, Stdio};
 pub enum FetchError {
     /// The server answered with a status outside 200-299 (after redirects).
     Http { code: u16, reason: String, headers: Vec<(String, String)> },
-    /// curl could not get an answer: DNS, connection, TLS, timeout, a dropped transfer (see `NETWORK_EXITS`).
+    /// curl could not get an answer: DNS, connection, TLS or certificate, proxy, timeout, a garbled or dropped reply,
+    /// a redirect loop (see `NETWORK_EXITS`).
     Io(String),
     /// Anything else: curl could not be started, was killed, or exited with a code that is not a network problem
     /// (a refused option or protocol, a malformed URL, a local write error). That is a failure of the check, not a
@@ -56,7 +57,7 @@ pub fn parse_headers(dump: &str) -> Option<Head> {
 /// curl's exit codes that mean the network let it down: could not resolve the proxy (5) or host (6), could not
 /// connect (7), a partial transfer (18), a timeout (28), a TLS handshake failure (35), an empty reply (52), a send or
 /// receive failure (55, 56).
-const NETWORK_EXITS: [i32; 9] = [5, 6, 7, 18, 28, 35, 52, 55, 56];
+const NETWORK_EXITS: [i32; 13] = [5, 6, 7, 8, 18, 28, 35, 47, 52, 55, 56, 60, 97];
 
 /// What a failed curl run (its exit code, None when a signal ended it, and its stderr) means.
 fn classify_exit(code: Option<i32>, stderr: &str) -> FetchError {
@@ -181,8 +182,8 @@ mod tests {
         }
         assert!(matches!(classify_exit(Some(28), ""), FetchError::Io(m) if m == "curl failed: exit status 28"));
         // Not the network: an unsupported protocol (1), a malformed URL (3), a bad option (2), a write error (23),
-        // too many redirects (47), an option curl does not know (49), a killed run.
-        for c in [1, 2, 3, 23, 47, 49, 84] {
+        // an option curl does not know (49), a killed run. (A redirect loop, 47, is the server's: the network.)
+        for c in [1, 2, 3, 23, 49, 84] {
             assert!(matches!(classify_exit(Some(c), "x"), FetchError::Tool(m) if m.contains(&format!("exit status {c}"))), "exit {c} is the tool");
         }
         assert!(matches!(classify_exit(None, ""), FetchError::Tool(_)));
