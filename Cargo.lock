@@ -3842,6 +3842,7 @@ dependencies = [
  "ash",
  "cc",
  "neural-forge-protocol",
+ "opendlss-nr-ptx",
  "serde_json",
  "sha2 0.11.1",
 ]
@@ -4494,6 +4495,13 @@ checksum = "8d8c8b8e725ad26404d6896eb2f064294a0a7b4f1d9120210d85544684c4ca95"
 dependencies = [
  "is-wsl",
  "libc",
+]
+
+[[package]]
+name = "opendlss-nr-ptx"
+version = "0.0.0"
+dependencies = [
+ "sha2 0.11.1",
 ]
 
 [[package]]

@@ -277,10 +277,10 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& args) {
       ((a.rows + 63) / 64) * std::max(1u, a.N / 64) < 2 * context_.smCount() && splitEnv != 0 && (splitEnv <= 0 || (uint32_t)splitEnv == a.K) &&
       (VkDeviceSize)(a.K / a.partition) * alignRows(a.rows) * a.N * 2 <= (16u << 20))
     splits = a.K / a.partition;
-  // PTX GEMM (scripts/ptx/gemm2_e4m3.py): the expert-stage shapes (single batch, N % 64 == 0, no partition,
+  // PTX GEMM (ptx/src/gemm2_e4m3.rs): the expert-stage shapes (single batch, N % 64 == 0, no partition,
   // residual seeded from an E4 tensor with a scale, E4 / f16 / dual outputs, optional SiLU).
   const bool ptxGemm = ptxGemmEnabled();
-  // ViT PTX GEMM (gemmv_e4m3.py: 192 x 128 tiles of eight 48 x 64 warps, one chain per workgroup = the whole K or
+  // ViT PTX GEMM (gemmv_e4m3.rs: 192 x 128 tiles of eight 48 x 64 warps, one chain per workgroup = the whole K or
   // one partition per split-K workgroup, the reduce folded into the last-arriving workgroup, counter chaining).
   const bool ptxGemmV = ptxGemmVEnabled();
   if (ptxGemmV && ptxGemm && a.batches == 1 && !a.broadcastInput && a.N % 128 == 0 &&
@@ -328,7 +328,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& args) {
       return;
     }
   }
-  // Tall-tile PTX GEMM (gemmt_e4m3.py, 192-row tiles, partitions in the workgroup or one partition per split-K
+  // Tall-tile PTX GEMM (gemmt_e4m3.rs, 192-row tiles, partitions in the workgroup or one partition per split-K
   // workgroup + a PTX reduce): the few-row stages (ViT / transitions), when the variant was generated.
   static const bool ptxGemmT = env::flag("NEURAL_FORGE_NR_PTX_GEMMT", true);
   if (ptxGemmT && ptxGemm && a.batches == 1 && !a.broadcastInput && a.N % 64 == 0 &&
@@ -363,7 +363,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& args) {
                outputColumnOffset = tsplits > 1 ? 0u : a.outputColumnOffset, auxHalfOffset = a.auxByteOffset / 2, sStride = splitStride;
       const void* params[] = {&pA, &pW, &pRes, &pAux, &pOut, &pOut16, &rows, &inputStride, &inputColumnBase, &Nmatrix,
                               &weightColumnOffset, &outputStride, &outputColumnOffset, &auxHalfOffset, &sStride};
-      // = gemmt_e4m3.py shared_bytes: a 3-stage ring (8 KB per stage) or the f16 tile, then the E4 tile only next to an f16 tile.
+      // = gemmt_e4m3.rs shared_bytes: a 3-stage ring (8 KB per stage) or the f16 tile, then the E4 tile only next to an f16 tile.
       const bool hasF16 = tsplits > 1 || !a.quantize, hasE4 = tsplits == 1 && (a.quantize || a.dualOutput);
       const uint32_t sharedBytes = std::max(std::min(3u, a.K / 32 / tsplits) * 8192u, hasF16 ? 192u * 128u : 0u) + (hasE4 && hasF16 ? 192u * 64u : 0u);
       dispatchLabel_ = "gemmt_ptx " + std::to_string(a.rows) + "x" + std::to_string(a.K) + "->" + std::to_string(a.N) + " f" +
@@ -767,7 +767,7 @@ Kernels::PtxKernel& Kernels::ptxKernel(const std::string& file, const std::strin
 }
 
 std::vector<uint32_t> Kernels::mlpHiddenPermutation(uint32_t hidden) {
-  // W1' column c holds hidden unit u(c) (mlp_e4m3.py hidden_permutation): per 32-block and 16-half,
+  // W1' column c holds hidden unit u(c) (mlp_e4m3.rs hidden_permutation): per 32-block and 16-half,
   // columns 2t + i -> units 4t + i, columns 8 + 2t + i -> units 4t + 2 + i.
   std::vector<uint32_t> perm(hidden);
   for (uint32_t block = 0; block < hidden / 32; ++block)
@@ -850,7 +850,7 @@ void Kernels::expertFfnPtx(VkCommandBuffer commands, const ExpertFfnArgs& a, con
   const uint32_t E = a.channels / 32;
   const uint32_t rowTiles = ffnRowTiles(a.channels);
   check(rowTiles >= 1 && rowTiles <= 4, "PTX FFN row tiles (the A tile covers 64 rows)");
-  const uint32_t sharedBytes = 2u * (E * 4096u + 2048u) + 16u * rowTiles * (a.channels + 16u);   // = ffn_e4m3.py sharedBytes
+  const uint32_t sharedBytes = 2u * (E * 4096u + 2048u) + 16u * rowTiles * (a.channels + 16u);   // = ffn_e4m3.rs sharedBytes
   const bool proj = a.attended != nullptr;
   check(!proj || (a.ffnPrev && a.wproj && a.auxTensorPrev && a.attended->format == Format::E4 && a.ffnPrev->format == Format::E4 &&
                   a.attended->channels == a.channels && a.ffnPrev->channels == a.channels), "PTX FFN proj inputs");
@@ -891,7 +891,7 @@ void Kernels::qkvAttention(VkCommandBuffer commands, const Activation& input, co
   uint32_t windowsX = (width + shiftX + 7) / 8, windowsY = (height + shiftY + 7) / 8;
   uint32_t windows = windowsX * windowsY;
   if (ptxQkvEnabled()) {
-    // PTX kernel (scripts/ptx/qkv_e4m3.py): grid (heads, windows), 128 threads per (window, head).
+    // PTX kernel (ptx/src/qkv_e4m3.rs): grid (heads, windows), 128 threads per (window, head).
     const std::string entry = "qkv_e4m3_K" + std::to_string(heads * 32);
     PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
     VkDeviceAddress pState = context_.deviceAddress(input.buffer), pW = context_.deviceAddress(weights),
@@ -1022,7 +1022,7 @@ void Kernels::globalAttention(VkCommandBuffer commands, const Activation& qkv, c
             attended.channels == heads * 32, "global attention formats");
   check(paddedTokens % 64 == 0 && paddedTokens >= tokens && qkv.allocRows >= tokens, "global attention tokens");
   check(scaleByteOffset % 4 == 0, "global attention scale offset");
-  // PTX route (scripts/ptx/global_attention_e4m3.py): one workgroup per (head, 64-query block), counter chaining.
+  // PTX route (ptx/src/global_attention_e4m3.rs): one workgroup per (head, 64-query block), counter chaining.
   if (globalAttentionPtx(paddedTokens, normalized)) {
     const std::string entry = "global_attention_e4m3_p" + std::to_string(paddedTokens);
     PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);

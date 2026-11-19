@@ -130,7 +130,7 @@ jobs:
           sys="$( { echo "${ImageOS:-} ${ImageVersion:-}"; rustc -vV
                     dpkg-query -W -f '${Package}=${Version}\n' gcc g++ binutils libc6-dev pkg-config \
                       libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libvulkan1; } | sha256sum | cut -c1-16)"
-          echo "key=cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'rust-toolchain.toml', 'third_party/vk-layer-for-rust/Cargo.lock', 'third_party/vk-layer-for-rust/Cargo.toml', 'third_party/vk-layer-for-rust/*/Cargo.toml') }}-$sys" >> "$GITHUB_OUTPUT"
+          echo "key=cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'rust-toolchain.toml', 'third_party/vk-layer-for-rust/Cargo.lock', 'third_party/vk-layer-for-rust/Cargo.toml', 'third_party/vk-layer-for-rust/*/Cargo.toml', 'third_party/opendlss-nr/ptx/Cargo.toml') }}-$sys" >> "$GITHUB_OUTPUT"
 
       - name: Restore the Cargo cache
         if: ${{ !inputs.release }}

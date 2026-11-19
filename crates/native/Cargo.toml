@@ -19,6 +19,8 @@ crate-type = ["rlib"]
 
 [build-dependencies]
 cc = { version = "1.2", features = ["parallel"] }
+# The PTX kernel generators (third_party/opendlss-nr/ptx).
+opendlss-nr-ptx = { path = "../../third_party/opendlss-nr/ptx" }
 
 [dependencies]
 # The same ash as the layer (its handles cross this crate's API).

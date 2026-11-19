@@ -120,7 +120,7 @@ grep -F '[probe-ngx] layout' launch.log
 The sections above are DLSS Super Resolution's kernels seen from Vulkan. This one is DLSS-NR's network
 kernels, read from the PTX text `nvngx_dlssnr.dll` carries, to see what NVIDIA changed in 310.9.16 (its
 release notes claim half the GPU overhead of the September build and 20% less memory at 4K) and whether
-OpenDLSS-NR's generators (`scripts/ptx/`, `third_party/opendlss-nr/UPSTREAM.md`) lack any of it.
+OpenDLSS-NR's generators (now `third_party/opendlss-nr/ptx`, `third_party/opendlss-nr/UPSTREAM.md`) lack any of it.
 
 **The DLLs.** 310.9.16.0 (266,424,944 bytes, SHA-256 `2BC19BC0…E28789F`, the build `extract-model` reads
 both networks from) and 310.8.0.0 (165,840,496 bytes, SHA-256 `E16BCF15…6E1FC8E`, the build the 2.x
@@ -171,7 +171,7 @@ notes were not read here, so which build and which test that count used is not k
 
 | Change in 310.9.16 | Entries | OpenDLSS-NR's counterpart | Here |
 |---|---|---|---|
-| **Acquire after a chained wait, a full fence before publishing.** In 310.8 thread 0 spins on the producer's counter with `ld.relaxed.gpu`, then `bar.sync`, and the workgroup reads the producer's rows: nothing orders those reads after the producer's release. 310.9.16 adds `fence.acquire.gpu` after that `bar.sync` on every waiting path, and `membar.gl` before the `bar.sync` that precedes the publishing `st.release.gpu`. | 10: `cc_vit_1d_{qkv,projection,ffn_contract}_*`, `cc_vit_1d_ffn_expand_{chained,publish}_fp8`, `cc_vit_1d_attention_chained_fp8` | `swin.py` `sync_wait` / `sync_signal`, used by every chained kernel: warp 0 polls with `ld.acquire.gpu` then `bar.sync`; producers `fence.acq_rel.gpu`, `bar.sync`, then `red.release.gpu` | Already so, on both sides |
+| **Acquire after a chained wait, a full fence before publishing.** In 310.8 thread 0 spins on the producer's counter with `ld.relaxed.gpu`, then `bar.sync`, and the workgroup reads the producer's rows: nothing orders those reads after the producer's release. 310.9.16 adds `fence.acquire.gpu` after that `bar.sync` on every waiting path, and `membar.gl` before the `bar.sync` that precedes the publishing `st.release.gpu`. | 10: `cc_vit_1d_{qkv,projection,ffn_contract}_*`, `cc_vit_1d_ffn_expand_{chained,publish}_fp8`, `cc_vit_1d_attention_chained_fp8` | `swin.rs` `sync_wait` / `sync_signal`, used by every chained kernel: warp 0 polls with `ld.acquire.gpu` then `bar.sync`; producers `fence.acq_rel.gpu`, `bar.sync`, then `red.release.gpu` | Already so, on both sides |
 | **A padding store loop halved.** The downsampling kernels zero their output's 16-byte channel groups at pixels outside the image. 310.8 looped over twice as many groups as the output has (bounds 128, 256, 512, 1024 for the 64-, 128-, 256-, 512-channel outputs, 64 in the block-0 kernel; for 128 channels the index split `/16`, `/64` where 310.9.16 splits `/8`, `/32`): it wrote zeros past the output's own groups (where that lands depends on the strides NVIDIA's host passes; not followed). 310.9.16's bounds are half: 64, 128, 256, 512, and 32. | 9: `cc_tinlayout_fused_swin_{1h_32_1,2h_64_2,4h_128_4,8h_256_8}_ds{,_wait}_fp8`, `cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8` | None: the field is computed whole from reflection-padded features, activations are zeroed once when allocated (`nr_graph.cpp`), and the pools (`block32_e4m3` POOL) write only their own output | Not applicable |
 | **The ViT attention's tail, without a barrier.** The 1D attention zeroes the padded tokens of its output (tokens rounded up to 32). 310.8: after a `bar.sync`, the workgroup with `ctaid.y == ceil(ceil(tokens / 128) / 2) - 1`. 310.9.16: no barrier, every workgroup with `2 ctaid.y + 2 >= ceil(tokens / 128)` (the `ceil(tokens / 128)` bound the third-party notes report), and `.maxnreg` 168 to 255. On a grid of `ceil(ceil(tokens / 128) / 2)` workgroups in y both tests pick the last one at every token count: the change removes a barrier. | 2: `cc_vit_1d_attention{,_chained}_fp8` | `global_normalize_e4m3` writes zero codes for the padded tokens and the attention kernels correct for the padding in their sums; no workgroup stores the tail or waits for it | Already so (no barrier to remove) |
 | **The control mask against the auto mask** (block 0, the input lanes 11-15 it builds from launch parameters). 310.8: with a mask bound, lanes 13 and 14 (NVIDIA's skin and structure) are dropped and lane 12 is structure x mask.b. 310.9.16: a new integer parameter combines structure x mask.b with lanes 13 and 14 while the auto mask is on: 2 min, 3 max, any other non-zero value the mean, 0 not at all. A second new integer, above 15, moves lanes 13 and 14 up one (13 becomes 0). Lane 11 is tone x mask.g in both. | 2: `cc_tinlayout_fused_pre_block_swin_1h_32_1{,_ds}_fp8` | Not OpenDLSS-NR's: Neural Forge's own preprocess (`native_preprocess.comp`) builds these lanes | Mode 2 only, by choice (NATIVE_BACKEND.md, "The control mask"). The lane move is not reproduced: it is off at NGX's defaults (both networks are bit-exact against NGX at presets 0 and 1, NATIVE_BACKEND.md "Against NGX (3.5.2)"), and what turns it on is not in the PTX |
@@ -241,11 +241,11 @@ dispatches (`NEURAL_FORGE_NATIVE_CHAIN=0`), so each kernel is timed alone; chain
 | 2.8% | 0.164 ms | 8 | `qkv_ptx 28w x16 K512` |
 
 **The PTX target.** NVIDIA's modules are `.target sm_120`, OpenDLSS-NR's `sm_89`; the driver compiles either for
-the GPU it runs on. Generated for `sm_120` (PTX 8.7, `ptxgen.py`), the full network took 5.383-5.387 ms median
+the GPU it runs on. Generated for `sm_120` (PTX 8.7, `ptxgen.rs`), the full network took 5.383-5.387 ms median
 against 5.386-5.408 (three rounds each, alternated, bit-exact): no difference, so it stays at `sm_89`. Both
 accumulate in f16 already (`mma.sync.m16n8k32...f16.e4m3.e4m3.f16`), GeForce's full-rate FP8 form.
 
-**Row tiles.** The FFN kernels' workgroup covers 16 rows per row tile (`ffnRowTiles`, `ffn_e4m3.py`). Timed back
+**Row tiles.** The FFN kernels' workgroup covers 16 rows per row tile (`ffnRowTiles`, `ffn_e4m3.rs`). Timed back
 to back (two rounds each, alternated, all bit-exact against dlss5vk), full network:
 
 | 256 channels | 128 channels | Median |

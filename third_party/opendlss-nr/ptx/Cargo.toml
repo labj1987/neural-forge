@@ -1,0 +1,14 @@
+[package]
+name = "opendlss-nr-ptx"
+version = "0.0.0"
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "OpenDLSS-NR's PTX kernel generators: the native backend's PTX kernels as text, generated at build time"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+sha2 = "0.11"

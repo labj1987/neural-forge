@@ -42,7 +42,10 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   after that. The network's source (C++, GLSL, PTX generators) is this project's own, in
   `third_party/opendlss-nr`: edit it there directly. That directory stays MIT (keep its `LICENSE` and
   `NOTICE`); record notable changes in CHANGELOG.md, and credit anything ported from a later upstream
-  OpenDLSS-NR commit by that commit. `UPSTREAM.md` there says where it came from.
+  OpenDLSS-NR commit by that commit. `UPSTREAM.md` there says where it came from. Its PTX generators are Rust (the
+  `opendlss-nr-ptx` crate in `third_party/opendlss-nr/ptx`, a build-dependency of `crates/native`; `kernels()` lists
+  every kernel the backend embeds): after a kernel change, diff the generated PTX against the previous code's
+  (`cargo run -p opendlss-nr-ptx --example write_ptx DIR`).
 - The layer framework (`vulkan-layer`, Google's vk-layer-for-rust, Apache-2.0) is this project's own too, in
   `third_party/vk-layer-for-rust`: its own workspace, excluded from the root one. Edit it there directly and
   mark each file changed for the first time with a "Modified for Neural Forge" note (Apache-2.0 asks for one);
