@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): the pinned toolchain's rustfmt, a fixed copyright year, imara-diff 0.2
-// (UPSTREAM.md).
+// Modified for Neural Forge (2026): the pinned toolchain's rustfmt, a fixed copyright year, imara-diff 0.2;
+// the vk.xml generators in Rust (genvk/, was Python) (UPSTREAM.md).
+
+mod genvk;
 
 use imara_diff::{Algorithm, BasicLineDiffPrinter, Diff, InternedInput, UnifiedDiffConfig};
 use log::{debug, info};
 use std::{
     env,
-    ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -227,73 +228,29 @@ pub use windows::*;
     tasks
 }
 
-fn guess_python_command() -> Option<&'static str> {
-    ["python3", "python", "py"].into_iter().find(|cmd| {
-        let output = match Command::new(cmd).arg("--version").output() {
-            Ok(output) => output,
-            Err(_) => return false,
-        };
-        output.status.success()
-    })
-}
-
-struct GenvkArgs {
-    working_directory: PathBuf,
-    module: String,
-    target: OsString,
-    registry: PathBuf,
-    out_dir: PathBuf,
-}
-
-fn run_vulkan_layer_genvk(
-    GenvkArgs {
-        working_directory,
-        module,
-        target,
-        registry,
-        out_dir,
-    }: &GenvkArgs,
-) {
-    let target = PathBuf::from(target);
-    let mut output_file_path = out_dir.clone();
-    output_file_path.push(target.clone());
+/// Generates `target` from the registry `vk_xml` into `out_dir`, formatted with the pinned
+/// toolchain's rustfmt.
+fn run_vulkan_layer_genvk(target: genvk::Target, vk_xml: &Path, out_dir: &Path) {
+    let output_file_path = out_dir.join(target.path());
     info!("Generating {}...", output_file_path.display());
-    if let Some(parent) = output_file_path.parent() {
-        fs::create_dir_all(parent).unwrap_or_else(|e| {
-            panic!(
-                "Failed to create the directory {} for genvk.py output {}: {e}",
-                parent.display(),
-                output_file_path.display()
-            )
-        });
-    }
-    let python_command = guess_python_command().expect("Failed to find installed python.");
-    let mut command = Command::new(python_command);
-    command.args([
-        OsStr::new("-m"),
-        OsStr::new(module),
-        target.as_ref(),
-        OsStr::new("-registry"),
-        registry.as_os_str(),
-        OsStr::new("-o"),
-        out_dir.as_os_str(),
-    ]);
-    command.current_dir(working_directory);
+    let registry = fs::read_to_string(vk_xml)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", vk_xml.display()));
+    let generated = genvk::generate(&registry, target);
 
-    let status = command.spawn().unwrap().wait().unwrap();
-    assert!(status.success());
-
-    let output_file = File::open(&output_file_path).unwrap();
-    let output = Command::new("rustup")
+    let mut rustfmt = Command::new("rustup")
         .args(["run", &toolchain(), "rustfmt", "--emit=stdout", "--quiet"])
-        .stdin(output_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .output()
-        .unwrap();
+        .spawn()
+        .expect("Could not spawn rustfmt");
+    let mut stdin = rustfmt.stdin.take().expect("rustfmt has no stdin");
+    let writer = thread::spawn(move || stdin.write_all(generated.as_bytes()));
+    let output = rustfmt.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
     assert!(output.status.success(), "Format failed.");
-    let formatted_content = output.stdout;
     let mut output_file = create_file_all(&output_file_path).unwrap();
-    output_file.write_all(&formatted_content).unwrap();
+    output_file.write_all(&output.stdout).unwrap();
     info!("{} completes generation.", output_file_path.display());
 }
 
@@ -344,60 +301,23 @@ fn main() -> ExitCode {
         completed_files_tx.clone(),
     ));
 
-    let vulkan_layer_genvk_module = "scripts.vulkan_layer_genvk";
-
     let mut vk_xml_path = vulkan_headers_dir.clone();
     vk_xml_path.push("registry");
     vk_xml_path.push("vk.xml");
 
-    tasks.push({
-        let target = OsString::from("layer_trait/generated.rs");
-        let target_relative_path = PathBuf::from(target.clone());
-        let genvk_args = GenvkArgs {
-            working_directory: project_root_dir.clone(),
-            module: vulkan_layer_genvk_module.to_string(),
-            target: target.clone(),
-            registry: vk_xml_path.clone(),
-            out_dir: vulkan_layer_src_dir.clone(),
-        };
+    for target in genvk::Target::ALL {
+        let vk_xml_path = vk_xml_path.clone();
+        let out_dir = vulkan_layer_src_dir.clone();
         let completed_files_tx = completed_files_tx.clone();
-        Box::new(move || {
-            run_vulkan_layer_genvk(&genvk_args);
+        tasks.push(Box::new(move || {
+            run_vulkan_layer_genvk(target, &vk_xml_path, &out_dir);
             completed_files_tx
-                .send(target_relative_path)
+                .send(PathBuf::from(target.path()))
                 .unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to send completed file for {}: {}",
-                        target.to_string_lossy().as_ref(),
-                        e
-                    )
+                    panic!("Failed to send completed file for {}: {}", target.path(), e)
                 });
-        })
-    });
-    tasks.push({
-        let target = OsString::from("global_simple_intercept/generated.rs");
-        let target_relative_path = PathBuf::from(target.clone());
-        let genvk_args = GenvkArgs {
-            working_directory: project_root_dir.clone(),
-            module: vulkan_layer_genvk_module.to_string(),
-            target: target.clone(),
-            registry: vk_xml_path.clone(),
-            out_dir: vulkan_layer_src_dir.clone(),
-        };
-        let completed_files_tx = completed_files_tx.clone();
-        Box::new(move || {
-            run_vulkan_layer_genvk(&genvk_args);
-            completed_files_tx
-                .send(target_relative_path)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to send completed file for {}: {}",
-                        target.to_string_lossy().as_ref(),
-                        e
-                    )
-                });
-        })
-    });
+        }));
+    }
     drop(completed_files_tx);
     let threads = tasks.into_iter().map(thread::spawn).collect::<Vec<_>>();
     let exit_code = if cli.check {
