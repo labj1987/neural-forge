@@ -44,7 +44,7 @@ inherits that AppImage's `APPDIR` and installs nothing. From a
 source build, install the extracted AppDir the same way:
 
 ```sh
-python3 scripts/install.py install --appdir build-appimage/AppDir
+build-appimage/AppDir/usr/bin/neural-forge-cli install --appdir build-appimage/AppDir
 ```
 
 The installer places the binaries under `$XDG_DATA_HOME/neural-forge/bin` and the layer under
@@ -54,7 +54,7 @@ integration belongs to whatever integrated the AppImage. It refuses unknown or m
 destinations (naming the file and what to do: move it aside, or uninstall first when the install
 record is missing), replaces files atomically (running processes keep their mapped copies), and removes
 files a previous version installed that this one no longer ships, if they are unchanged.
-`python3 scripts/install.py uninstall` removes only unchanged, hash-recorded files; it keeps
+`neural-forge-cli uninstall` removes only unchanged, hash-recorded files; it keeps
 config, the extracted model, an imported DLL and runtime data (`neural-forge-cli uninstall --purge`
 removes those too, after taking Neural Forge's variables out of every game's Steam launch options and
 removing its `localconfig.vdf.neural-forge.*` files; it refuses, removing nothing, while Steam runs). It

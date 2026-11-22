@@ -6790,7 +6790,7 @@ impl Session {
     /// `<resume>`-th time DLSS frames resumed after a gap of [`CAPTURE_GAP`] or more (1 is the first
     /// frames). A scripted benchmark restarts its camera with every pass, so the same values capture the
     /// same moment in every run, whatever the loading took (the A/B captures of docs/NATIVE_BACKEND.md,
-    /// Phase 3; the flicker and added-detail series of `scripts/bench-iq.py`). Several entries cover a
+    /// Phase 3; the flicker and added-detail series of `cargo xtask bench-iq`). Several entries cover a
     /// pass whose resume number moves: GTA sometimes pauses once more while it starts.
     pub(crate) fn capture_at_due(&mut self) -> Option<u32> {
         static AT: LazyLock<Vec<CaptureAt>> =

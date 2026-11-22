@@ -18,7 +18,7 @@
 // centre is i + 0.5. Every buffer is at the render extent, row-major.
 //
 // The descriptor set layout, the push constants and the shared functions below are identical in
-// every preupscale_cache_*.comp (no include: scripts/check_shaders.py hashes .comp files only) and
+// every preupscale_cache_*.comp (no include: cargo xtask check-shaders hashes .comp files only) and
 // in `preupscale::cache::CachePush` (field for field, append only).
 layout(local_size_x = 8, local_size_y = 8) in;
 

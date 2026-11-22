@@ -1,5 +1,5 @@
 # The compiler every build uses: local, CI and release (.github/workflows/check.yml reads the version
-# from here). The weekly pin check (scripts/check_pins.py, .github/workflows/pin-check.yml) moves it to
+# from here). The weekly pin check (cargo xtask check-pins, .github/workflows/pin-check.yml) moves it to
 # each new stable release once the full build and check passes with it.
 [toolchain]
 channel = "1.100.0"

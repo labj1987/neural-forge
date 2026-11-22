@@ -1,0 +1,43 @@
+Encodes a dumped scene-linear DLSS input for the model, and judges the model's answer.
+
+The pre-upscaler experiment E1b (docs/PRE_UPSCALER_DESIGN.md, "E1b: the HDR encode"). The
+layer's dump mode (NEURAL_FORGE_PREUPSCALE=dump) writes colour.rgba16f (padded size,
+little-endian halves, scene-linear, pre-exposure), meta.json and exposure.json (every
+registered 1x1 float image at the DLSS submit). This script:
+
+  info   DUMP                       exposure values and the colour's statistics under each
+                                    exposure convention
+  encode DUMP ENC OUT               writes the frame to send (RGBA16F, or RGBA8 for `sdr8`),
+                                    unpadded
+  judge  DUMP ENC ANSWER OUTDIR     applies ENC's inverse to the answer, writes
+                                    <tag>-input.png, <tag>-answer.png and <tag>-diff.png and
+                                    prints the statistics (one JSON line, also <tag>.json)
+  montage OUTDIR OUT TAG...         side by side: input | answer | diff, one row per tag
+
+Encodes (E = the exposure scale: the exposure value under --convention, divided by --white):
+
+  opendlss         v = scene * E; per channel, above 0.75: 0.75 + 0.25 (1 - exp(-5.770780 (v - 0.75)));
+                   then the sRGB OETF. Inverse: sRGB EOTF; for y in [0.75, 1): v = 0.75 -
+                   ln(1 - (y - 0.75) / 0.25) / 5.770780 (y clamped below 1 - 1e-4); / E. As the
+                   layer's decode (preupscale_decode.comp), the original pixel is kept, all three
+                   channels, where the encoded input's peak channel was >= 0.999 (--no-keep-clamped:
+                   the inverse everywhere).
+  opendlss-linear  the same without the sRGB step.
+  lumaknee         v = scene * E; on luminance (Rec.709 weights), above 0.75: L' = 0.75 + 0.25
+                   (1 - exp(-(L - 0.75) / 0.25)), rgb *= L' / L, then the peak channel brought to 1
+                   by one scalar if above (the layer's encode.comp SoftKnee); then sRGB. The inverse
+                   undoes the luminance knee; the peak divide is lossy and not undone.
+  reinhard         v = scene * E; per channel v / (1 + v), linear. Inverse y / (1 - y) / E.
+  sdr8             opendlss quantised to RGBA8 (round to nearest): the 8-bit reference, sent as an
+                   RGBA8 proxy (Hdr=0, SDR=1).
+  raw              the scene-linear frame as dumped (no encode; display as opendlss).
+
+The display mapping for both pictures is the encode's own forward curve after the exposure, then
+sRGB (so a perfect identity answer gives identical PNGs); `ref_*` statistics use one display for
+every encode (opendlss's shoulder at --ref-white, then sRGB), so edit magnitudes compare across
+encodes and paper whites.
+
+The exposure value (E before the divide) must be one the layer would use: finite, above 1e-6 and
+below 65504 (preupscale::hdr::exposure_ok); the layer writes nothing back with another.
+
+  selftest                          checks the curves, the clamped-keep rule and the exposure check

@@ -62,13 +62,6 @@ jobs:
               exit 1
           fi
 
-      # The release page carries this version's changes in full, from CHANGELOG.md (no link to it);
-      # every build checks the section exists, so a release cannot fail on it.
-      - name: Release notes from the changelog
-        run: |
-          python3 scripts/release_notes.py "$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" > release-notes.md
-          cat release-notes.md
-
       # The version in rust-toolchain.toml, read from it, so the weekly pin check's bump of that one file
       # is all a toolchain update needs (a workflow's own token cannot change files in .github/workflows).
       - name: Rust toolchain from rust-toolchain.toml
@@ -95,15 +88,14 @@ jobs:
       # fontconfig, which one of its crates probes at build time; a software Vulkan ICD (lavapipe) so the
       # layer's real-device tests run (NEURAL_FORGE_REQUIRE_VULKAN makes that an assertion) and the GUI's
       # smoke test draws its window; vulkan-validationlayers (Ubuntu's Khronos validation layer) to run them
-      # under it; spirv-tools for check_shaders.py's validation; zsync and desktop-file-utils for the
-      # AppImage; xvfb, xdotool and dbus-daemon for the GUI's smoke test; numpy and Pillow for the scripts'
-      # self-tests.
+      # under it; spirv-tools for `cargo xtask check-shaders`'s validation; zsync and desktop-file-utils for the
+      # AppImage; xvfb, xdotool and dbus-daemon for the GUI's smoke test.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
             libvulkan1 mesa-vulkan-drivers vulkan-tools vulkan-validationlayers spirv-tools \
-            zsync desktop-file-utils patch python3-numpy python3-pil libclang-dev gcc-mingw-w64-x86-64 \
+            zsync desktop-file-utils patch libclang-dev gcc-mingw-w64-x86-64 \
             xvfb xdotool dbus-daemon
 
       # Only lavapipe, never whatever other ICD the runner image happens to carry.
@@ -143,6 +135,13 @@ jobs:
             ~/.cargo/git/db
             target
           key: ${{ steps.cargo-key.outputs.key }}
+
+      # The release page carries this version's changes in full, from CHANGELOG.md (no link to it);
+      # every build checks the section exists, so a release cannot fail on it.
+      - name: Release notes from the changelog
+        run: |
+          cargo xtask release-notes "$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" > release-notes.md
+          cat release-notes.md
 
       # The pinned tools in tools/native, cached by their pins: glslang, Vulkan-Headers and volk that
       # crates/native builds with (fetch-native-tools.sh), cargo-deny (cargo-deny.sh) and the layer
@@ -241,23 +240,16 @@ jobs:
       - name: Layer framework's generated code matches its generator
         run: bash scripts/vk-layer-codegen.sh --check
 
-      # scripts/install.py delegates install/uninstall to neural-forge-cli (the single
-      # implementation), so this exercises the same code the GUI's Setup tab runs.
-      - name: Installation coexistence tests
-        run: |
-          cargo build --locked -p neural-forge-cli
-          python3 scripts/test_install.py
-
       - name: Script self-tests
         run: |
-          python3 scripts/release_notes.py --self-test
-          python3 scripts/bench-iq.py --self-test
-          python3 scripts/bench-report.py --self-test
-          python3 scripts/agreement.py --self-test
-          python3 scripts/hdr_encode.py selftest
-          python3 scripts/gen_third_party_crates.py --self-test
-          python3 scripts/check_pins.py --self-test
-          python3 scripts/check_proton_scripts.py --self-test
+          cargo xtask release-notes --self-test
+          cargo xtask bench-iq --self-test
+          cargo xtask bench-report --self-test
+          cargo xtask agreement --self-test
+          cargo xtask hdr-encode selftest
+          cargo xtask gen-third-party-crates --self-test
+          cargo xtask check-pins --self-test
+          cargo xtask check-proton-scripts --self-test
           bash scripts/gta-bench.sh --self-test
           bash scripts/build-ngx-wrapper.sh --self-test
           bash build-appimage.sh --self-test
@@ -267,20 +259,20 @@ jobs:
           bash scripts/smoke-gui.sh --self-test
 
       - name: Shader sources match committed SPIR-V
-        run: python3 scripts/check_shaders.py
+        run: cargo xtask check-shaders
 
       - name: AppStream releases match the changelog
-        run: python3 scripts/sync_appdata_releases.py --check
+        run: cargo xtask sync-appdata-releases --check
 
       # RustSec advisories (the database fetched fresh), licences and sources: deny.toml.
       - name: Dependency advisories, licences and sources
         run: bash scripts/cargo-deny.sh
 
       - name: Third-party crate listing is current
-        run: python3 scripts/gen_third_party_crates.py --check
+        run: cargo xtask gen-third-party-crates --check
 
       - name: Namespace contract
-        run: python3 scripts/check_namespace.py
+        run: cargo xtask check-namespace
 
       - name: Vulkan loader smoke test
         run: bash scripts/smoke-test.sh
@@ -376,9 +368,9 @@ jobs:
       - name: Drop the checkout's own build output from the Cargo cache
         if: success() && !inputs.release && steps.cargo-cache.outputs.cache-hit != 'true'
         run: |
-          names='import json, sys; print(" ".join(p["name"] for p in json.load(sys.stdin)["packages"]))'
-          packages="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c "$names")"
-          framework="$(cd third_party/vk-layer-for-rust && cargo metadata --locked --no-deps --format-version 1 | python3 -c "$names")"
+          names='[.packages[].name] | join(" ")'
+          packages="$(cargo metadata --locked --no-deps --format-version 1 | jq -r "$names")"
+          framework="$(cd third_party/vk-layer-for-rust && cargo metadata --locked --no-deps --format-version 1 | jq -r "$names")"
           test -n "$packages" && test -n "$framework"
           for package in $packages; do
               cargo clean --locked -p "$package"
@@ -399,7 +391,7 @@ jobs:
           # (deps/, build/, incremental/) is not an interface. No incremental data exists (CARGO_INCREMENTAL=0).
           if find target -type f -regex 'target/\(debug\|release\)/[^/]*' \
                   \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \
-                  -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' \) | grep .; then
+                  -o -name 'libvulkan_layer*' -o -name 'vulkan-layer*' -o -name 'vulkan_layer*' -o -name 'codegen*' -o -name 'xtask*' \) | grep .; then
               echo "error: the checkout's own build output is still in target/" >&2
               exit 1
           fi

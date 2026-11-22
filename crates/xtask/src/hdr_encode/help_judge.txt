@@ -1,0 +1,33 @@
+usage: xtask hdr-encode judge [-h] [--tag TAG] [--gain GAIN] [--top TOP]
+                              [--ref-white REF_WHITE] [--convention {mul,div}]
+                              [--exposure-image EXPOSURE_IMAGE]
+                              [--exposure EXPOSURE] [--white WHITE]
+                              [--no-keep-clamped]
+                              dump
+                              {opendlss,opendlss-linear,lumaknee,reinhard,sdr8,raw}
+                              answer outdir
+
+positional arguments:
+  dump
+  {opendlss,opendlss-linear,lumaknee,reinhard,sdr8,raw}
+  answer
+  outdir
+
+options:
+  -h, --help            show this help message and exit
+  --tag TAG
+  --gain GAIN           diff amplification (default 8)
+  --top TOP             high-gradient pixels: the top N% (default 10)
+  --ref-white REF_WHITE
+                        paper white of the common reference display behind the
+                        ref_* statistics (default 3)
+  --convention {mul,div}
+                        scene * e (mul) or scene / e (div)
+  --exposure-image EXPOSURE_IMAGE
+                        which read exposure.json image (default 0)
+  --exposure EXPOSURE   override: the exposure value (still divided by
+                        --white; --convention is ignored)
+  --white WHITE         paper white in exposed units: the scale is divided by
+                        it (default 3, the layer's)
+  --no-keep-clamped     decode every pixel, also where the encoded input
+                        clamped (the layer keeps those)

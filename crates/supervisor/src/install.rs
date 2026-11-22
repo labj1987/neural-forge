@@ -1,11 +1,9 @@
 //! Installing an extracted AppImage AppDir into persistent user storage, and
-//! uninstalling it again -- the same operation, the same `installation.json`
-//! provenance record format (a flat `path -> sha256` map, refusing to touch any file
-//! that record doesn't say this installer itself last wrote), and the same
-//! atomic-replace-never-truncate file writes as `scripts/install.py`. Reimplemented
-//! in Rust so the GUI can run it on every launch from an AppImage (a no-op when the
-//! installed copy is already current) without a `python3` dependency; both tools
-//! read/write the exact same record on purpose, so either can pick up after the other.
+//! uninstalling it again: the `installation.json` provenance record (a flat
+//! `path -> sha256` map, refusing to touch any file that record doesn't say this
+//! installer itself last wrote) and atomic-replace-never-truncate file writes. The one
+//! implementation: the GUI runs it on every launch from an AppImage (a no-op when the
+//! installed copy is already current), and `neural-forge-cli install`/`uninstall` reach it.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -249,8 +247,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), InstallError>
 /// Installs `appdir` (an extracted AppImage's `AppDir`) into persistent user storage.
 /// Refuses (writing nothing at all) if any destination is a symlink, or already
 /// exists with content this installer's own record doesn't recognize as what it last
-/// wrote there -- the same "never touch a file this didn't put there" guarantee
-/// `install.py` makes.
+/// wrote there: never touch a file this didn't put there.
 pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     let root = PathBuf::from(paths::data_dir());
     let (old, foreign) = owned_record(load_record()?);
@@ -290,8 +287,7 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     // (Gear Lever, AppImageLauncher, ...). Installing a second entry here gave users two
     // "Neural Forge" launchers.
 
-    // Validate every destination before writing any of them, exactly like
-    // `install.py`: a failure partway through must leave nothing changed, not a
+    // Validate every destination before writing any of them: a failure partway through must leave nothing changed, not a
     // half-installed mix of old and new files. A file already holding exactly what is about to
     // be written is adopted: an install interrupted between writing a file and recording it
     // left it there, and refusing it would block every later install.
@@ -723,8 +719,8 @@ mod tests {
         }
     }
 
-    /// Builds the same minimal fixture `scripts/test_install.py` uses, so both
-    /// implementations are exercised against the same shape of AppDir.
+    /// Builds the same minimal fixture the CLI's install tests use (crates/cli/tests/install.rs), so the
+    /// library and the command are exercised against the same shape of AppDir.
     fn write_fixture_appdir(appdir: &Path) {
         let files = [
             ("usr/bin/neural-forge", "gui"),

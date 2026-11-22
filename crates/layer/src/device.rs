@@ -4387,7 +4387,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 // (a submit of the layer's own) is skipped too and the frame presents with the
                 // application's own waits.
                 // `NEURAL_FORGE_CAPTURE_AT` starts its series before the idle check, so the model-off
-                // runs of a flicker or added-detail comparison (`scripts/bench-iq.py`) capture too.
+                // runs of a flicker or added-detail comparison (`cargo xtask bench-iq`) capture too.
                 if let Some(frames) = readable.then(|| preupscale.capture_at_due()).flatten() {
                     series.start(neural_forge_protocol::capture::Request { id: 0, frames }, &crate::dump::captures_dir(), shm.channel(), false);
                 }

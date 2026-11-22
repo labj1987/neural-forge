@@ -1,7 +1,7 @@
 //! Runs Neural Forge's patch of Proton's `proton` script (`proton_tool::patch_proton_script`) on each file named
 //! on the command line and prints one line per file: `ok <file>` or `fail <file>: <why>`. Exit 0 when every
 //! file patched, 10 when one did not (the `NVIDIA_WINE_DLL_DIR` block it anchors on is missing or matched not
-//! exactly once), 2 when a file could not be read. `scripts/check_proton_scripts.py` runs it weekly on the newest
+//! exactly once), 2 when a file could not be read. `cargo xtask check-proton-scripts` runs it weekly on the newest
 //! upstream scripts (.github/workflows/proton-script-check.yml).
 
 fn main() {

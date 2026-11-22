@@ -29,8 +29,7 @@ fn usage_text() -> &'static str {
          \x20                     (DIR holds it, or is the DLL) into the user data dir:\n\
          \x20                     every network the DLL carries, or only the one named\n\
          \x20 install --appdir DIR install an extracted AppImage AppDir into\n\
-         \x20                     persistent user storage (see scripts/install.py --\n\
-         \x20                     same operation, same record, either tool works)\n\
+         \x20                     persistent user storage\n\
          \x20 uninstall [--purge]  remove unchanged tracked installed files; --purge also\n\
          \x20                     takes Neural Forge out of every game's Steam launch\n\
          \x20                     options (not while Steam runs) and removes its copies\n\

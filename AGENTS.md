@@ -52,15 +52,15 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   never edit its generated files by hand (`bash scripts/vk-layer-codegen.sh`). Its `UPSTREAM.md` has the checks.
 - CI (`.github/workflows/check.yml`, run by ci.yml on every push and pull request and by release.yml
   on a tag) runs the tests, the layer's tests again under the Khronos validation layer (which must
-  report nothing, with nothing filtered), clippy, `cargo fmt --check`, every script's
-  self-test, the shader check, the dependency check, the AppImage build and its installed-layer smoke test. A new script with a self-test is added there.
+  report nothing, with nothing filtered), clippy, `cargo fmt --check`, every
+  development task's and script's self-test, the shader check, the dependency check, the AppImage build and its installed-layer smoke test. A new task or script with a self-test is added there.
 - Formatting: `cargo fmt --all` before committing (rustfmt.toml: 160 columns), and in
   `third_party/vk-layer-for-rust` too, which keeps its own 100-column config.
 - Dependencies: `bash scripts/cargo-deny.sh` (deny.toml) checks RustSec advisories, licences and sources. A
   new advisory fails CI: update the crate, or add an `ignore` entry in deny.toml with the reason it does not
   apply. A new licence must be added to the allow-list on purpose, after checking it is AGPL-compatible. The weekly pin check
-  (`scripts/check_pins.py`, pin-check.yml) bumps every pin Dependabot cannot see that is behind upstream
-  (`check_pins.py --bump`, which rewrites every place the pin is named: add a new place to its rewrite rules
+  (`cargo xtask check-pins`, pin-check.yml) bumps every pin Dependabot cannot see that is behind upstream
+  (`cargo xtask check-pins --bump`, which rewrites every place the pin is named: add a new place to its rewrite rules
   and self-test), runs check.yml on the bump and fast-forwards main to it only if that passes (pins only:
   no version bump, no release). main is branch-protected and requires the status "check / build" on the
   commit: a workflow's own check runs are filed under the commit it started from, so the land job records
@@ -98,12 +98,12 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   defaults (also under GPU-assisted validation), and each Mesa passes the setting the other crashes with.
 - Tests must not depend on how fast the machine runs them: the hold's history gap
   (`HistoryGap::MAX_GAP`, 500 ms) reads `native::hold_now`, which the inline test rig stops.
-- Run `python3 scripts/check_namespace.py`, `python3 scripts/test_install.py`,
+- Run `cargo xtask check-namespace`, `cargo test -p neural-forge-cli --test install`
   and `bash scripts/smoke-test.sh` for namespace, installation and Vulkan checks.
-- Shaders: `python3 scripts/check_shaders.py --update` rebuilds the committed SPIR-V with the pinned
+- Shaders: `cargo xtask check-shaders --update` rebuilds the committed SPIR-V with the pinned
   glslang only (never one on PATH) and needs `spirv-val`.
 - Every component compiled or linked into the shipped binaries must have its licence text in the
-  AppImage: `scripts/gen_third_party_crates.py --licences` collects them from the crates' and the
+  AppImage: `cargo xtask gen-third-party-crates --licences` collects them from the crates' and the
   native sources at build time and fails on one without.
 - Toggle key: a press is ignored only while another X client is known to have the focus
   (`hotkey.rs`); where the focus cannot be told (gamescope's nested Xwayland holds only the game, a
@@ -117,13 +117,17 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   (`EXPECTED`, 71 blocks), `WEIGHTS_CC_SMALL_FP8` for the small one (`EXPECTED_SMALL`, 31 blocks,
   `--network small`). The graph picks its block ranges from the model's block count
   (`nr::Topology` in `third_party/opendlss-nr/src/nr_graph.*`); a third network needs a new `Topology` and stage table. That table
-  changes together with the graph: regenerate it with `scripts/gen_model_shape.py` when the graph takes a new network. `VERIFIED` only marks the networks and builds compared with
+  changes together with the graph: regenerate it with `cargo xtask gen-model-shape` when the graph takes a new network. `VERIFIED` only marks the networks and builds compared with
   NVIDIA's runtime; it gates nothing.
 
 ## Rust
 
 - Toolchain: Rust 1.100 or newer. `rust-toolchain.toml` pins the exact release that local, CI and release builds use; `rust-version = "1.100"` in Cargo.toml is the minimum.
 - Dependency cooldown: `.cargo/config.toml` sets `[registry] global-min-publish-age = "3 days"`, so resolution only takes crate versions at least 3 days old (Dependabot's cargo `cooldown` matches). To take a newer version early for a security advisory: `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`. Until that version is 3 days old, a plain `cargo update` moves it back down, so run that round's `cargo update` with the same variable set (or update the other crates with `-p`).
+- Development tasks (release notes, the appdata and licence listings, the pin, Proton-script, shader and namespace checks,
+  the model-shape table, the benchmark and image-quality reports) are Rust, in `crates/xtask`: `cargo xtask <task>` (the
+  alias in `.cargo/config.toml`; `cargo xtask` alone lists them). A new one is a subcommand there, not a Python script.
+  Its own dependencies ship in nothing: `gen-third-party-crates` leaves them out of the listing.
 - Never compare tool versions as text or floats ("1.100" sorts before "1.99" as text): split into integers, or use `sort -V`.
 - Never read Cargo's intermediate layout under `target/` (`build/`, `deps/`, `incremental/`, `.fingerprint/`): it is not a stable interface and changed in Cargo 1.100. Use the final artifact paths, `OUT_DIR` inside build.rs, or `cargo build --message-format=json`.
 - Cargo's own lints are on (`[lints.cargo]`, `unused_dependencies = "warn"`) and CI sets `CARGO_BUILD_WARNINGS=deny`, so a lint warning fails CI. A direct dependency kept only to turn on a feature of a crate already in the graph stays in `[dependencies]` with a comment saying why: the lint does not flag it, and moving it to a `cfg(false)` table would turn the feature off. (`[target.'cfg(false)'.dependencies]` is only for a dependency listed just to pin a transitive crate's version.)
@@ -282,10 +286,10 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Write each entry for the people using the app: what changed for them and anything they need to
   do. Leave out implementation detail (file paths, flags, internal names, CI and packaging changes)
   unless a user needs it to act.
-- The release page is the version's section written out in full (`scripts/release_notes.py`), never
+- The release page is the version's section written out in full (`cargo xtask release-notes`), never
   a link to the changelog. The release fails if the section is missing.
 - The AppStream `<releases>` list is generated from the headings
-  (`scripts/sync_appdata_releases.py`, run by `build-appimage.sh` and checked in CI). Don't edit it
+  (`cargo xtask sync-appdata-releases`, run by `build-appimage.sh` and checked in CI). Don't edit it
   by hand.
 
 ## Runtime constraints

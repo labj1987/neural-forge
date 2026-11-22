@@ -23,15 +23,10 @@ SO_PATH="$(realpath "$SO_PATH")"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
-# Written as JSON, so any character the path holds stays the path.
-python3 - "$SO_PATH" data/neural_forge_layer.json "$SCRATCH/neural_forge_layer.json" <<'PY'
-import json, sys
-so, src, dst = sys.argv[1:]
-manifest = json.load(open(src))
-assert manifest["layer"]["library_path"] == "./libneural_forge_layer.so", manifest["layer"]["library_path"]
-manifest["layer"]["library_path"] = so
-json.dump(manifest, open(dst, "w"), indent=2)
-PY
+# Written as JSON (jq), so any character the path holds stays the path.
+jq --arg so "$SO_PATH" '
+    if .layer.library_path != "./libneural_forge_layer.so" then error("library_path is \(.layer.library_path)")
+    else .layer.library_path = $so end' data/neural_forge_layer.json > "$SCRATCH/neural_forge_layer.json"
 
 # VK_LAYER_PATH only makes the loader consider a manifest for *explicit* enabling --
 # it does not add it to the implicit_layer.d search path, so an implicit-type layer

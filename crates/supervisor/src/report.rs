@@ -874,7 +874,8 @@ mod tests {
         assert_eq!(png.as_slice(), b"\x89PNG orig /home/alex", "a PNG is never rewritten");
         assert!(!names.iter().any(|n| n.contains("e4m3")), "never the weights");
 
-        // python3's zipfile agrees, when there is one (CI has it).
+        // python3's zipfile agrees, when there is one (CI has it): an independent reader, which is the point; a Rust
+        // one written here would test the writer against itself.
         let check = "import sys, zipfile\nz = zipfile.ZipFile(sys.argv[1])\nassert z.testzip() is None\nprint(len(z.namelist()))";
         match std::process::Command::new("python3").args(["-I", "-c", check]).arg(&path).output() {
             Ok(out) => {

@@ -895,7 +895,7 @@ inverse for the write-back.
   `NEURAL_FORGE_HDR_FLAGS=sdr neural-forge-cli restart` is enough; a plain restart undoes it.
 - **`trigger_helper_roundtrip --rgba8 FILE`**: sends a raw 8-bit frame as an RGBA8 proxy (the
   8-bit reference).
-- **`scripts/hdr_encode.py`** (numpy + Pillow; run on the rig): `info`, `encode`, `judge`
+- **`cargo xtask hdr-encode`** (run on the rig): `info`, `encode`, `judge`
   (inverse, display PNGs of input and answer through the same display mapping, an x8 diff, and
   the statistics below), `montage`.
 
@@ -1003,7 +1003,7 @@ Balanced 1485x836 unless noted, frame generation off, script mods off via
 `WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), main at 840fc80 deployed with `scripts/deploy-rig.sh`,
 helper restarted (`helper_state=4`). No remote-desktop session during any run. One benchmark
 iteration per run with `scripts/gta-bench.sh`; numbers are pass 4 (117 s) from
-`scripts/bench-report.py`. Hold columns are the median over the `[preupscale] mode=...` lines that
+`cargo xtask bench-report`. Hold columns are the median over the `[preupscale] mode=...` lines that
 cover pass 4 (one line per 300 holds). Three runs exited early at Game Init (roundtrip, model 3,
 Quality; no preupscale activity yet, no Xid) and were rerun after 5 minutes. No Xid/NVRM line in the
 kernel log for the whole session.
@@ -1021,7 +1021,7 @@ kernel log for the whole session.
 | **model, Balanced, mean of 3** | **50.5** | 50.6 | 68 | 150 W | 14.7 | 0.68 / 0.52 | |
 | `pu-model-q-1`: model, Quality (1707x960, padded 1708x960) | 43.5 | 43.6 | 66 | 150 W | 17.42 | 0.79 / 0.64 | ~14 around the pass 3/4 boundary (91 total) |
 
-(Model mode's `composited/s 62.9` in `bench-report.py` comes from the loading screens between
+(Model mode's `composited/s 62.9` in `cargo xtask bench-report` comes from the loading screens between
 passes, where no hold happens for 500 ms and the post path runs; it is not the pass-4 rate.)
 
 ### What the layer did
@@ -1091,7 +1091,7 @@ the dev machine's scratchpad `pu3/` (`model-xgrab-{1,2}.png`, `plain-xgrab-{1,2}
 Run 2026-10-02 14:40-15:55 on the test machine, same settings as E2-E3 (2560x1440@288 HDR bt2100, GTA V
 Enhanced DLSS Balanced 1485x836 padded 1486x836, frame generation off, script mods off, model
 every frame, `NEURAL_FORGE_PREUPSCALE=model`), `scripts/gta-bench.sh` pass 4 via
-`scripts/bench-report.py`. No remote-desktop session during any run; one early exit at Game Init
+`cargo xtask bench-report`. No remote-desktop session during any run; one early exit at Game Init
 (`ho-before-1`, rerun after 5 minutes).
 
 ### Instrumentation (kept)
@@ -1233,7 +1233,7 @@ that:
   outcome says both images are the presented frame. With `NEURAL_FORGE_PREUPSCALE=dump` the one-shot
   is the dump's instead (it writes DLSS's input), never both.
 - **Logs.** The paper-white line only prints in model and roundtrip. Each 300-hold summary ends with
-  `holds_per_s=` (the window's rate), which `scripts/bench-report.py` reports as "held before
+  `holds_per_s=` (the window's rate), which `cargo xtask bench-report` reports as "held before
   upscaler/s" instead of the post path's "composited/s" (which then only counts loading screens).
 - **GUI.** The Status page's "Model placement" line: before the upscaler (holding WxH, misses), waiting
   for DLSS Super Resolution, or after the upscaler.
@@ -1248,7 +1248,7 @@ Run 2026-10-02 15:59-17:10 on the test machine, main at 346e280 (the build alrea
 `shmctl status` showed `helper_busy_ms`, so no redeploy). GTA V Enhanced, DLSS Balanced, frame
 generation off, script mods off (`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), `model_interval=2`,
 `working_scale=1`, `mvec_enabled=1`. No remote-desktop session during any run. One benchmark
-iteration per run with `scripts/gta-bench.sh`; numbers are pass 4 from `scripts/bench-report.py`.
+iteration per run with `scripts/gta-bench.sh`; numbers are pass 4 from `cargo xtask bench-report`.
 Hold columns are the medians over the `[preupscale]` lines covering pass 4. Two runs exited early
 at Game Init (`a4k-model-1`, `b-hdr-model-1`, both at about 90 s), and both reruns after 5 minutes
 worked. No Xid at any point. The kernel log's only NVRM lines are 95 `NV_ERR_NO_MEMORY`, all at
@@ -1670,7 +1670,7 @@ the first DLSS frame, then `... forwarded untouched`, and the tally in `fg-model
 the colour input, 3 held undecided (before identification), 15000 forwarded, exactly two FG submits
 per SR submit. `holds_per_s` equals real fps.
 
-### Results (pass 4, `scripts/bench-report.py`)
+### Results (pass 4, `cargo xtask bench-report`)
 
 | Run | Build | Real fps | Displayed | Holds/s | Hold ms | GPU % | Power |
 |---|---|---|---|---|---|---|---|

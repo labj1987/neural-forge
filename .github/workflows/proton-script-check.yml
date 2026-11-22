@@ -4,13 +4,13 @@ name: Proton script check
 # (Valve's Proton Experimental, proton-cachyos)? The patch anchors on the `NVIDIA_WINE_DLL_DIR` block and is
 # refused unless it is there exactly once; Valve's script has a TODO to replace that block with an NGXCore\NGXPath
 # registry key, and when it lands no copy can be made from that Proton until the anchor moves
-# (scripts/check_proton_scripts.py, docs/PROTON_NGX.md).
+# (`cargo xtask check-proton-scripts`, docs/PROTON_NGX.md).
 #
 # The answer lives in one standing issue (label proton-script-check), as in pin-check.yml, so this sends as few
 # notifications as possible: it is opened the first time the patch stops applying and reopened (never a second
 # issue) when it breaks again, its body is edited in place (an edit notifies nobody) only when the report changed,
 # and it is closed once the patch applies again. An issue closed by hand is not reopened while the report is the one
-# it was closed with (the body keeps the report's hash; `check_proton_scripts.py --decide`). Never a comment. A failed
+# it was closed with (the body keeps the report's hash; `cargo xtask check-proton-scripts --decide`). Never a comment. A failed
 # scheduled run emails, so a run that cannot reach upstream (exit 2, tried three times) does not fail: it says so in
 # its summary and leaves the issue alone. A failure of the check itself (exit 1: the patch example does not build or
 # run, the API answers in a shape the script does not know) fails the run at once.
@@ -68,7 +68,7 @@ jobs:
           state=unknown
           for attempt in 1 2 3; do
             set +e
-            python3 scripts/check_proton_scripts.py > report.md
+            cargo xtask check-proton-scripts > report.md
             status=$?
             set -e
             case $status in
@@ -112,7 +112,7 @@ jobs:
           if [ -n "$number" ]; then
             gh issue view "$number" --repo "$repo" --json body --jq .body > old-body.md
           fi
-          actions="$(python3 scripts/check_proton_scripts.py --decide "$STATE" "${state:-none}" old-body.md report.md)"
+          actions="$(cargo xtask check-proton-scripts --decide "$STATE" "${state:-none}" old-body.md report.md)"
           echo "state $STATE, issue ${number:-none} ${state:-}: ${actions:-nothing to do}"
           for action in $actions; do
             case $action in

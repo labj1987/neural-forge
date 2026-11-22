@@ -1349,7 +1349,7 @@ fn to_general(image: vk::Image, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier<
         })
 }
 
-/// A compute pipeline from embedded SPIR-V (`scripts/check_shaders.py` ties it to its source).
+/// A compute pipeline from embedded SPIR-V (`cargo xtask check-shaders` ties it to its source).
 ///
 /// # Safety
 /// `device` is live; `layout` matches the shader's interface.

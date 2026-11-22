@@ -1,0 +1,4 @@
+usage: xtask hdr-encode selftest [-h]
+
+options:
+  -h, --help  show this help message and exit

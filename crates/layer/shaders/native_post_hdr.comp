@@ -25,7 +25,7 @@ layout(push_constant) uniform Params {
 } p;
 
 // ---- HDR10 maths, the same functions in native_post_hdr.comp and compose_hdr.comp (no include:
-// scripts/check_shaders.py hashes .comp files only) and in `hdr_present::reference` (the CPU reference). ----
+// cargo xtask check-shaders hashes .comp files only) and in `hdr_present::reference` (the CPU reference). ----
 
 // SMPTE ST 2084.
 const float M1 = 2610.0 / 16384.0;
