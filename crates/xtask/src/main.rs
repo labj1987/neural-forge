@@ -8,17 +8,31 @@ use std::process::ExitCode;
 mod agreement;
 mod bench_iq;
 mod bench_report;
+mod build_ngx_wrapper;
+mod cargo_deny;
 mod check_namespace;
 mod check_pins;
 mod check_proton_scripts;
 mod check_shaders;
+mod check_stalls;
+mod deploy_rig;
+mod fetch;
+mod fetch_native_tools;
+mod game_reg;
+mod game_sweep;
 mod gen_model_shape;
 mod gen_third_party_crates;
 mod gta_bench;
 mod hdr_encode;
+mod proc;
 mod py;
 mod release_notes;
+mod sh;
+mod smoke_gui;
+mod smoke_test;
 mod sync_appdata_releases;
+mod test_apprun;
+mod vk_layer_codegen;
 mod wine_builtin;
 
 /// The exit code of an unknown task or none (sysexits' EX_USAGE). Not 1 to 4: tasks use those for their own
@@ -32,17 +46,29 @@ type Task = fn(&[String]) -> ExitCode;
 const TASKS: &[(&str, Task, &str)] = &[
     ("agreement", agreement::main, "how far the pre-upscaler's answer agrees with the model run on the finished frame"),
     ("bench-iq", bench_iq::main, "image-quality numbers of a benchmark's captured frames"),
-    ("bench-report", bench_report::main, "summarise scripts/gta-bench.sh runs"),
+    ("bench-report", bench_report::main, "summarise gta-bench runs"),
+    ("build-ngx-wrapper", build_ngx_wrapper::main, "the NGX wrapper for Proton, stamped as a Wine builtin DLL"),
+    ("cargo-deny", cargo_deny::main, "RustSec advisories, licences and sources (deny.toml), with the pinned cargo-deny"),
     ("check-namespace", check_namespace::main, "the Neural Forge namespace in the shipped files"),
     ("check-pins", check_pins::main, "pins Dependabot cannot see, against upstream (--bump rewrites them)"),
     ("check-proton-scripts", check_proton_scripts::main, "the Proton scripts the NGX wrapper patches, against upstream"),
     ("check-shaders", check_shaders::main, "the committed SPIR-V against the shaders (--update rebuilds it)"),
+    ("check-stalls", check_stalls::main, "a layer log's fence-wait timeouts, breadcrumb dumps and presented frame rate"),
+    ("deploy-rig", deploy_rig::main, "the working tree's AppImage, built, installed on a rig over ssh and verified there"),
+    ("fetch-native-tools", fetch_native_tools::main, "the pinned glslang, Vulkan-Headers and volk into tools/native"),
+    ("game-reg", game_reg::main, "one run of a Steam game with the layer: launch, controller steps, measure, quit"),
+    ("game-sweep", game_sweep::main, "the pre-release game sweep (--help)"),
     ("gen-model-shape", gen_model_shape::main, "crates/supervisor/src/model_shape.rs from a weights listing"),
     ("gen-third-party-crates", gen_third_party_crates::main, "THIRD_PARTY_CRATES.md and the licence texts"),
-    ("gta-bench", gta_bench::main, "scripts/gta-bench.sh's crash-dump, frame-generation and Proton checks"),
+    ("gta-bench", gta_bench::main, "the unattended GTA V Enhanced benchmark (on this machine, or --host)"),
     ("hdr-encode", hdr_encode::main, "the HDR encode's reference"),
     ("release-notes", release_notes::main, "a version's CHANGELOG section, for its release page"),
+    ("smoke-gui", smoke_gui::main, "the extracted AppImage's GUI starts on a virtual display"),
+    ("smoke-test", smoke_test::main, "the layer through the real Vulkan loader"),
     ("sync-appdata-releases", sync_appdata_releases::main, "the appdata <releases> list from CHANGELOG.md"),
+    ("test-apprun", test_apprun::main, "data/AppRun's system checks and messages, with stand-ins"),
+    ("test-game-reg", game_reg::test::main, "game-reg with stand-ins for the CLI, steam and journalctl"),
+    ("vk-layer-codegen", vk_layer_codegen::main, "the layer framework's generated sources (--check compares them)"),
     ("wine-builtin", wine_builtin::main, "stamp a PE file as a Wine builtin DLL, or check the stamp"),
 ];
 

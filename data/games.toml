@@ -1,6 +1,6 @@
 # Neural Forge's per-game compatibility facts: what each tested game uses, where the model runs in it and
 # what to know first. Built into the app (the Status tab, `neural-forge-cli games`, `doctor` and Save report
-# read it) and used by the pre-release sweep (`scripts/game-sweep.sh`, scripts/game-sweep.toml) as what to
+# read it) and used by the pre-release sweep (`cargo xtask game-sweep`, scripts/game-sweep.toml) as what to
 # expect. docs/USER_GUIDE.md's "Tested games" table says the same in prose.
 #
 # One [[game]] table per game:

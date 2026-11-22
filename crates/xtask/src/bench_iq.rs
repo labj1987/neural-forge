@@ -39,7 +39,7 @@ const REC709: (f32, f32, f32) = (0.2126, 0.7152, 0.0722);
 /// The darkest non-black 8-bit sRGB code, linear: black pixels count as this in the geometric mean.
 const DARKEST: f64 = 1.0 / 255.0 / 12.92;
 
-/// The layer's line for a series capture (crates/layer/src/series.rs; gta-bench.sh reads the same). The directory is the
+/// The layer's line for a series capture (crates/layer/src/series.rs; cargo xtask gta-bench reads the same). The directory is the
 /// rest of the line, spaces included.
 static SERIES_LOG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)\[capture\] capturing the next \d+ presents into (.+?)[ \t\r]*$").expect("static regex"));

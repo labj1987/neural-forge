@@ -2,7 +2,7 @@
 //! API, the DLSS features it was run with, where the model runs in it (with Ray Reconstruction off and on), how its
 //! HDR reaches the screen, its known issues and the version it was last seen working in. The Status tab, the Setup
 //! tab's games list, `neural-forge-cli games`, `doctor` and Save report show them; the pre-release sweep
-//! (`scripts/game-sweep.sh`) reads what to expect from them.
+//! (`cargo xtask game-sweep`) reads what to expect from them.
 //!
 //! The file is a small subset of TOML ([`tables`]): `[[name]]` array-of-tables headers, `key = value` lines with
 //! basic or literal strings, integers, booleans and arrays of those (over several lines too), and `#` comments.

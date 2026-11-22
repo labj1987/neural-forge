@@ -1,4 +1,4 @@
-Summarise gta-bench.sh runs.
+Summarise cargo xtask gta-bench runs.
 
 usage: cargo xtask bench-report [--host HOST] [--mean] [--fg] [--baseline LABEL] <label>...
        cargo xtask bench-report --self-test
@@ -21,7 +21,7 @@ flicker beside the fps, and its added detail against --baseline, a model-off run
 Each run also gets its pass-4 frame-generation multiplier (displayed / real). In about half of
 benchmark launches GTA turns DLSS Frame Generation off at a scene change in passes 1-3 and leaves it
 off for pass 4: Streamline reports eDLSSGStatusFailReflexNotDetectedAtRuntime, with or without
-Neural Forge, launched by Steam or by gta-bench.sh (docs/LESSONS.md, October 20). --fg is for runs
+Neural Forge, launched by Steam or by cargo xtask gta-bench (docs/LESSONS.md, October 20). --fg is for runs
 with frame generation on in GTA's settings: a run under FG_ENGAGED is reported as "frame generation
 did not engage", is left out of --mean, and the exit status is 1. Such a run is kept and compared
 only with other runs without frame generation, not repeated.

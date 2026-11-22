@@ -3,7 +3,7 @@ name: Build and check
 # The one build and check every change gets: ci.yml runs it on pushes and pull requests to main,
 # release.yml on a version tag (and then publishes what it built). Everything a release ships is
 # exercised before it is tagged: the tests (GPU ones on lavapipe, and again under the Vulkan
-# validation layer), clippy, every script's self-test,
+# validation layer), clippy, every task's self-test,
 # the AppImage itself, its glibc baseline, and its installed layer through the Vulkan loader.
 on:
   workflow_call:
@@ -144,9 +144,9 @@ jobs:
           cat release-notes.md
 
       # The pinned tools in tools/native, cached by their pins: glslang, Vulkan-Headers and volk that
-      # crates/native builds with (fetch-native-tools.sh), cargo-deny (cargo-deny.sh) and the layer
-      # framework's generator headers (vk-layer-codegen.sh). The key covers every script that fetches
-      # into the tree (the pins are in them), and each re-checks its tools' stamps (the archives'
+      # crates/native builds with (cargo xtask fetch-native-tools), cargo-deny (cargo xtask cargo-deny) and
+      # the layer framework's generator headers (cargo xtask vk-layer-codegen). The key covers the source of
+      # every task that fetches into the tree (the pins are in them), and each re-checks its tools' stamps (the archives'
       # SHA-256) and fetches again on a mismatch. A release fetches everything fresh, as it builds
       # everything from nothing.
       - name: Cache the pinned tools
@@ -154,10 +154,10 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tools/native
-          key: native-tools-${{ hashFiles('scripts/fetch-native-tools.sh', 'scripts/cargo-deny.sh', 'scripts/vk-layer-codegen.sh') }}
+          key: native-tools-${{ hashFiles('crates/xtask/src/fetch.rs', 'crates/xtask/src/fetch_native_tools.rs', 'crates/xtask/src/cargo_deny.rs', 'crates/xtask/src/vk_layer_codegen.rs') }}
 
       - name: Fetch the native backend's tools
-        run: bash scripts/fetch-native-tools.sh
+        run: cargo xtask fetch-native-tools
 
       - name: cargo test
         run: |
@@ -227,20 +227,20 @@ jobs:
           cargo test --locked --workspace --all-features -- --test-threads=1
 
       # The NGX wrapper for Proton is its own workspace too (docs/PROTON_NGX.md): its record layout's tests on Linux,
-      # clippy for its Windows target, and the stamped DLL the AppImage ships (build-ngx-wrapper.sh).
+      # clippy for its Windows target, and the stamped DLL the AppImage ships (cargo xtask build-ngx-wrapper).
       - name: NGX wrapper clippy, tests and build
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           (cd crates/ngx-wrapper && cargo fmt --check && cargo test --locked \
             && cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings)
-          bash scripts/build-ngx-wrapper.sh
+          cargo xtask build-ngx-wrapper
 
       # The framework's generated sources are what its generator gives from the pinned headers.
       - name: Layer framework's generated code matches its generator
-        run: bash scripts/vk-layer-codegen.sh --check
+        run: cargo xtask vk-layer-codegen --check
 
-      - name: Script self-tests
+      - name: Task self-tests
         run: |
           cargo xtask release-notes --self-test
           cargo xtask bench-iq --self-test
@@ -250,13 +250,13 @@ jobs:
           cargo xtask gen-third-party-crates --self-test
           cargo xtask check-pins --self-test
           cargo xtask check-proton-scripts --self-test
-          bash scripts/gta-bench.sh --self-test
-          bash scripts/build-ngx-wrapper.sh --self-test
+          cargo xtask gta-bench --self-test
+          cargo xtask build-ngx-wrapper --self-test
           bash build-appimage.sh --self-test
-          bash scripts/game-sweep.sh --self-test
-          bash scripts/test_apprun.sh
-          bash scripts/test_game_reg.sh
-          bash scripts/smoke-gui.sh --self-test
+          cargo xtask game-sweep --self-test
+          cargo xtask test-apprun
+          cargo xtask test-game-reg
+          cargo xtask smoke-gui --self-test
 
       - name: Shader sources match committed SPIR-V
         run: cargo xtask check-shaders
@@ -266,7 +266,7 @@ jobs:
 
       # RustSec advisories (the database fetched fresh), licences and sources: deny.toml.
       - name: Dependency advisories, licences and sources
-        run: bash scripts/cargo-deny.sh
+        run: cargo xtask cargo-deny
 
       - name: Third-party crate listing is current
         run: cargo xtask gen-third-party-crates --check
@@ -275,7 +275,7 @@ jobs:
         run: cargo xtask check-namespace
 
       - name: Vulkan loader smoke test
-        run: bash scripts/smoke-test.sh
+        run: cargo xtask smoke-test
 
       # Runs as the runner user: the script writes only inside the checkout and its own build
       # directory.
@@ -332,7 +332,7 @@ jobs:
       # The GUI starts through AppRun and reaches its main loop on a virtual display (drawn on lavapipe), under
       # scratch HOME and XDG dirs, with nothing at WARN or ERROR level on stderr.
       - name: The GUI starts
-        run: bash scripts/smoke-gui.sh squashfs-root
+        run: cargo xtask smoke-gui squashfs-root
 
       # Install the extracted AppImage's files with its own CLI into scratch XDG directories (never
       # the runner user's real ones), then run the smoke example through the Vulkan loader against
@@ -347,7 +347,7 @@ jobs:
           so="$XDG_DATA_HOME/neural-forge/lib/neural-forge/libneural_forge_layer.so"
           test -f "$so"
           cmp "$so" squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so
-          NEURAL_FORGE_SMOKE_SO="$so" NEURAL_FORGE_SMOKE_INSTALLED_DATA="$XDG_DATA_HOME" bash scripts/smoke-test.sh
+          NEURAL_FORGE_SMOKE_SO="$so" NEURAL_FORGE_SMOKE_INSTALLED_DATA="$XDG_DATA_HOME" cargo xtask smoke-test
 
       - name: Upload the release files
         if: inputs.release
@@ -385,7 +385,7 @@ jobs:
           (cd crates/ngx-wrapper &&
               CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked -p neural-forge-ngx-wrapper &&
               CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --locked --release -p neural-forge-ngx-wrapper)
-          # scripts/build-ngx-wrapper.sh builds the DLL in its own target directory and writes the stamped copy beside it.
+          # cargo xtask build-ngx-wrapper builds the DLL in its own target directory and writes the stamped copy beside it.
           rm -rf target/ngx-wrapper-build target/ngx-wrapper
           # Only the final artifacts' own paths (target/<profile>/<file>) are checked; Cargo's intermediate layout
           # (deps/, build/, incremental/) is not an interface. No incremental data exists (CARGO_INCREMENTAL=0).

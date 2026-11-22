@@ -1,0 +1,53 @@
+Unattended GTA V Enhanced built-in benchmark with a chosen layer environment.
+
+Runs on the rig itself, or from another machine with --host, which copies this program (the xtask
+binary; NF_BENCH_XTASK=<path> names another one of the rig's architecture) to the rig over ssh, runs
+it there and removes it again: the rig needs neither the repository nor cargo. Steam must be running
+on the rig. The game is launched through the same Steam Linux Runtime entry point and Proton that Steam uses (the one Steam has for GTA in
+config.vdf's CompatToolMapping, e.g. a Neural Forge Proton copy), with only the environment
+given here (Steam's launch options are bypassed), and exits by itself after one
+benchmark iteration. Results land in $NF_BENCH_DIR/<label> on the rig: GTA's
+Benchmark/FrameTimes files, MangoHud's per-frame CSV (MangoHud is always the last
+layer, i.e. below any frame generator, so it counts displayed frames), nvidia-smi
+samples, and the launch log, which holds the layer's [sync] and [present] lines.
+Summarise with cargo xtask bench-report.
+
+Why not a Steam launch (steam://rungameid, as the game sweep does): a benchmark needs exactly
+the environment given here for each A/B side (no launch options or session variables mixed
+in), MangoHud as the last layer, and its own process group to classify and relaunch a failed
+attempt, none of which a Steam launch gives. Steam's own Proton choice is still what runs.
+
+usage: cargo xtask gta-bench [--host HOST] [--tries N] [--set key=value]... <label> <VK layers above MangoHud> [env...]
+       cargo xtask gta-bench --self-test
+
+  --set key=value  set a live Neural Forge setting with `neural-forge-cli shmctl set`
+                   before the launch (e.g. --set working_scale=0.66 --set model_interval=2)
+                   and put the previous value back after the run, confirmed with
+                   `shmctl status`. The model resolution must never be left below 1.0.
+  --tries N        launches allowed for one result (default 3). A launch that does not end in a
+                   result is classified, its evidence kept in <label>/attempt-K/, and the game is
+                   launched again: an early exit (GTA's crash dump read: its hang watchdog, which
+                   kills the game after its main loop has stalled for 60 s, or another fault; an
+                   Xid in the kernel log names a GPU hang), a launch where the game never started,
+                   a game that stopped presenting (thread states saved), and a stuck launch (the
+                   game presenting with no result after NF_BENCH_STUCK_S, default 480 s; a normal
+                   run takes 260-280 s). Every attempt is listed in <label>/attempts.
+
+Frame generation is not retried. GTA turns it off by itself in some launches (Streamline reports
+eDLSSGStatusFailReflexNotDetectedAtRuntime at a benchmark scene change, with or without Neural Forge,
+launched by Steam or by this runner; docs/LESSONS.md). With frame generation on in settings.xml the
+runner says when the displayed rate fell to a third of its best for 20 s ("frame generation
+stopped"), writes it to <label>/fg, and cargo xtask bench-report gives the measured multiplier.
+
+Examples (NR off, then NR on at model interval 2, both with GTA's script mods off):
+  cargo xtask gta-bench --host rig p0-nroff-1 '' 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+  cargo xtask gta-bench --host rig --set model_interval=2 p0-nron-1 VK_LAYER_neuralforge_neural \
+      NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+
+Rig paths can be overridden with NF_BENCH_STEAM_LIBRARY (the library holding GTA),
+NF_BENCH_STEAM_ROOT (the Steam client), NF_BENCH_PROTON (a Proton folder instead of Steam's
+choice for GTA), NF_BENCH_DIR, and NF_BENCH_CLI (the
+neural-forge-cli --set uses; the installed one by default, a development build's when the
+layer under test has a newer shared-memory version than the installed CLI can open).
+A frame series the layer captured during the run (NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<frames>,
+for cargo xtask bench-iq) is moved into the run's directory.

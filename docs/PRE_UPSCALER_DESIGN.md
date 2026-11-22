@@ -237,7 +237,7 @@ for input and answer, and the mean |answer - input| per channel, and writes the 
 format and size) to `--out`. Odd sizes are padded by repeating the last column/row and cropped
 back. Exit status 1 when the last answer was an echo.
 
-The helper on the rig must be this build (`scripts/deploy-rig.sh`), started by the CLI with no
+The helper on the rig must be this build (`cargo xtask deploy-rig`), started by the CLI with no
 game running (the layer would drive slot 0 too), with the effect on:
 
 ```bash
@@ -754,19 +754,19 @@ screens included, and an open circuit breaker forwards DLSS submits untouched.)
 Select DLSS at Quality or Balanced (not DLAA) with frame generation off, then:
 
 ```bash
-scripts/gta-bench.sh --host <host> preupscale-dump VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=dump 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+cargo xtask gta-bench --host <host> preupscale-dump VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=dump 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ```bash
-scripts/gta-bench.sh --host <host> preupscale-identity VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=identity 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+cargo xtask gta-bench --host <host> preupscale-identity VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=identity 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ```bash
-scripts/gta-bench.sh --host <host> preupscale-model VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=model 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+cargo xtask gta-bench --host <host> preupscale-model VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=model 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ```bash
-scripts/gta-bench.sh --host <host> preupscale-roundtrip VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=roundtrip 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+cargo xtask gta-bench --host <host> preupscale-roundtrip VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=roundtrip 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 Add `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=2.5` (or 4) to any of the model/roundtrip runs to try
@@ -819,7 +819,7 @@ at 1486x836, and how NVIDIA rounds float-to-half stores (the tests' drivers trun
 ## Rig results (E1-E3)
 
 Run 2026-10-02 on the test machine (RTX, 2560x1440@288 HDR bt2100, GTA V Enhanced DLSS Balanced, frame
-generation off, script mods off), main at 2aa02bf deployed with `scripts/deploy-rig.sh`
+generation off, script mods off), main at 2aa02bf deployed with `cargo xtask deploy-rig`
 (protocol 9; the old v8 `shm.bin` had to be removed, nothing had it open). **E1 failed on the raw
 scene-linear input, so E2 and E3 were not run**, as the plan says.
 
@@ -1000,9 +1000,9 @@ DLSS runs and was in `GENERAL` (the first dump had not seen a barrier on it yet,
 
 Run 2026-10-02 13:12-14:25 on the test machine (2560x1440@288 HDR bt2100, scale 1.0; GTA V Enhanced, DLSS
 Balanced 1485x836 unless noted, frame generation off, script mods off via
-`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), main at 840fc80 deployed with `scripts/deploy-rig.sh`,
+`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), main at 840fc80 deployed with `cargo xtask deploy-rig`,
 helper restarted (`helper_state=4`). No remote-desktop session during any run. One benchmark
-iteration per run with `scripts/gta-bench.sh`; numbers are pass 4 (117 s) from
+iteration per run with `cargo xtask gta-bench`; numbers are pass 4 (117 s) from
 `cargo xtask bench-report`. Hold columns are the median over the `[preupscale] mode=...` lines that
 cover pass 4 (one line per 300 holds). Three runs exited early at Game Init (roundtrip, model 3,
 Quality; no preupscale activity yet, no Xid) and were rerun after 5 minutes. No Xid/NVRM line in the
@@ -1090,7 +1090,7 @@ the dev machine's scratchpad `pu3/` (`model-xgrab-{1,2}.png`, `plain-xgrab-{1,2}
 
 Run 2026-10-02 14:40-15:55 on the test machine, same settings as E2-E3 (2560x1440@288 HDR bt2100, GTA V
 Enhanced DLSS Balanced 1485x836 padded 1486x836, frame generation off, script mods off, model
-every frame, `NEURAL_FORGE_PREUPSCALE=model`), `scripts/gta-bench.sh` pass 4 via
+every frame, `NEURAL_FORGE_PREUPSCALE=model`), `cargo xtask gta-bench` pass 4 via
 `cargo xtask bench-report`. No remote-desktop session during any run; one early exit at Game Init
 (`ho-before-1`, rerun after 5 minutes).
 
@@ -1248,7 +1248,7 @@ Run 2026-10-02 15:59-17:10 on the test machine, main at 346e280 (the build alrea
 `shmctl status` showed `helper_busy_ms`, so no redeploy). GTA V Enhanced, DLSS Balanced, frame
 generation off, script mods off (`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), `model_interval=2`,
 `working_scale=1`, `mvec_enabled=1`. No remote-desktop session during any run. One benchmark
-iteration per run with `scripts/gta-bench.sh`; numbers are pass 4 from `cargo xtask bench-report`.
+iteration per run with `cargo xtask gta-bench`; numbers are pass 4 from `cargo xtask bench-report`.
 Hold columns are the medians over the `[preupscale]` lines covering pass 4. Two runs exited early
 at Game Init (`a4k-model-1`, `b-hdr-model-1`, both at about 90 s), and both reruns after 5 minutes
 worked. No Xid at any point. The kernel log's only NVRM lines are 95 `NV_ERR_NO_MEMORY`, all at
@@ -1474,7 +1474,7 @@ HDR again. That is two creations per loading screen, each near full VRAM.
 
 Run 2026-10-02 17:40-18:24 on the test machine.
 
-- This build was deployed with `scripts/deploy-rig.sh` (layer `eedf88b2c8f8`, helper
+- This build was deployed with `cargo xtask deploy-rig` (layer `eedf88b2c8f8`, helper
   `43c398d24fd8`). The stale protocol-10 `shm.bin` and `.owner` were removed first; nothing had
   them mapped. The committed build differs only in two log/reason strings (layer `74a4f101b7fc`,
   helper `78d5658dcee9`, deployed afterwards and left running).
@@ -1726,7 +1726,7 @@ that is for the maintainer's eyes.
   this test was removed. (The game rewrites its own `pc_settings.bin` and caches at every launch, as
   in every earlier benchmark.)
 - Desktop 2560x1440@288.001, scale 1.0, bt2100 (unchanged).
-- This fix's build is deployed on the rig (`scripts/deploy-rig.sh` from the worktree; layer
+- This fix's build is deployed on the rig (`cargo xtask deploy-rig` from the worktree; layer
   `0e3e0331f773`), helper restarted and running (`helper_state=4`, `model_up=1`), live settings
   `enabled=1`, `working_scale=1`, `model_interval=2`, `mvec_enabled=1`.
 

@@ -963,7 +963,7 @@ impl NeuralForgeInstanceHooks {
         // this) -- `slice::from_raw_parts` requires a non-null pointer even for a
         // zero-length slice, unlike C's own more permissive "null + 0 means empty"
         // convention, so this has to be checked before it's ever dereferenced. Found
-        // via `scripts/smoke-test.sh`'s debug-mode UB check aborting the process --
+        // via `cargo xtask smoke-test`'s debug-mode UB check aborting the process --
         // real, live UB in every release-mode run before this fix too, just silent.
         let requested: &[*const std::ffi::c_char] = if create_info.enabled_extension_count == 0 {
             &[]

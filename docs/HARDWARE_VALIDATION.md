@@ -192,7 +192,7 @@ a real GTA session, or against `vkcube` run through Xwayland specifically, befor
 concluding this needs a fork of the pinned framework -- patching a third-party git
 dependency is a real undertaking and should not be started on an unreproduced report.
 
-Also added `bench.sh` (since replaced by `scripts/gta-bench.sh`) for Phase 1 item 1 (the repeatable native/upstream/
+Also added `bench.sh` (since replaced by `cargo xtask gta-bench`) for Phase 1 item 1 (the repeatable native/upstream/
 neuralforge benchmark script). It restarts Steam under each mode's environment (an
 already-running Steam client does not pick up a new shell's exported vars -- confirmed
 the hard way in the 2026-09-14 session above), waits for `GTA5_Enhanced.exe`, and then
@@ -343,7 +343,7 @@ See `EXTERNAL_MEMORY_HOST_DESIGN.md` for the full account. Summary:
      `enabled_extension_count == 0` first, which `vkcube` on this exact machine hits
      live (a null pointer is a legal C convention for "zero extensions" that Rust's
      `from_raw_parts` does not tolerate even at length zero). Caught by
-     `scripts/smoke-test.sh`'s debug-mode UB checker aborting the process -- every
+     `cargo xtask smoke-test`'s debug-mode UB checker aborting the process -- every
      earlier *release*-mode `vkcube` validation run this whole session had the
      identical UB and simply never visibly crashed, which is a worse outcome than a
      visible one, not a better one.
@@ -353,7 +353,7 @@ See `EXTERNAL_MEMORY_HOST_DESIGN.md` for the full account. Summary:
      at creation. Fixed in both the layer and the helper by resolving
      `vkGetMemoryHostPointerPropertiesEXT` by hand via `get_device_proc_addr` (a real
      `Option`, checked explicitly) instead of the panicking `::load()` helper.
-- Re-validated everything after both fixes: `scripts/smoke-test.sh`, the full
+- Re-validated everything after both fixes: `cargo xtask smoke-test`, the full
   `cargo test` workspace suite, and `vkcube` at 1280x720/2560x1440 under
   `VK_LAYER_KHRONOS_validation` + `VK_LAYER_VALIDATE_SYNC=1` (including one run with a
   real helper attached) -- all clean, no crash, zero validation errors or hazards.
@@ -367,7 +367,7 @@ See `EXTERNAL_MEMORY_HOST_DESIGN.md` for the full account. Summary:
 validated clean on real hardware multiple times" was true at the time and still missed
 two real bugs, because neither Rust panics from a third-party crate's own internal
 `::load()` helper nor a plain null-pointer UB gap are things Vulkan validation layers
-or `cargo test` check for. Re-run `scripts/smoke-test.sh` specifically after touching
+or `cargo test` check for. Re-run `cargo xtask smoke-test` specifically after touching
 device-creation-adjacent code, not just a validated `vkcube` session -- it is the one
 check in this project that catches this exact class of bug.
 
@@ -384,7 +384,7 @@ this dev machine's own software ICD):
   `capture::` tests: the same pre-existing cosmetic `VUID-VkImageMemoryBarrier-*`
   warning as the pre-v3 commit (confirmed identical via a second `git worktree` at the
   parent commit) -- not a regression, zero new validation errors or sync hazards.
-- `scripts/smoke-test.sh`: clean, `external_memory_host: true`, no abort.
+- `cargo xtask smoke-test`: clean, `external_memory_host: true`, no abort.
 - `crates/protocol/examples/trigger_helper_roundtrip.rs` (extended with a slot
   argument) against a real running helper (Proton-CachyOS, the real
   `nvngx_dlssnr.dll`): both slots answered correctly when triggered *concurrently* --
@@ -763,7 +763,7 @@ The comparator for every 2.0 performance change. Neural Forge 1.0.1 as installed
 RTX 5070, driver 615.71.09. Desktop 2560x1440 at 288.001 Hz, scale 1.0, HDR on (bt2100).
 GTA settings.xml: 2560x1440, RefreshRate 288, Windowed 0, VSync 0, FrameLimit 0, ReflexMode 2,
 FrameGenType 0. GTA's script mods off (`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), no remote
-desktop session, MangoHud as the last layer, `scripts/gta-bench.sh`. NR off = Neural Forge's
+desktop session, MangoHud as the last layer, `cargo xtask gta-bench`. NR off = Neural Forge's
 layer not loaded. NR on = model every 2nd frame unless stated, working scale 1.0, motion vectors on.
 
 One run per configuration: the existing no-mods runs already gave every number the 2.0 gates
@@ -830,7 +830,7 @@ gpu (queue drain after run()): mean=1.713983ms p50=1.673638ms p95=1.849431ms max
 
 The model runs before DLSS Super Resolution by default (`docs/PRE_UPSCALER_DESIGN.md` has every
 experiment). GTA V Enhanced, the test machine, RTX 5070, driver 615.71.09, 2560x1440 at 288 Hz, HDR desktop,
-DLSS Balanced (render 1485x836), `scripts/gta-bench.sh`, script mods off, pass 4:
+DLSS Balanced (render 1485x836), `cargo xtask gta-bench`, script mods off, pass 4:
 
 | Build / config | Real fps | Shown fps | GPU |
 |---|---|---|---|
@@ -869,7 +869,7 @@ layer but never loads `libVkLayer_NV_dlssnr.so` unless `VKLayer_DLSS5=1` is set.
 Upstream ran at its defaults: model every frame, after the upscaler, at 2560x1440, motion vectors on.
 Only one model helper ran at a time.
 
-**GTA V Enhanced: upstream still cannot run it.** `scripts/gta-bench.sh`, layers
+**GTA V Enhanced: upstream still cannot run it.** `cargo xtask gta-bench`, layers
 `VK_LAYER_NV_dlssnr`, `VKLayer_DLSS5=1`, mods off, the maintainer's settings (DLSS Balanced, FrameGenType 1):
 
 - Helper running from the start: 3 of 3 launches crashed at Game Init, about 95 s in, with the known
@@ -943,11 +943,11 @@ below had `FrameGenType` 0. With the maintainer's settings as they are (`FrameGe
 `the DLSS launch buffer has a same-layout barrier on a DLSS input before its launch; not holding`,
 and the model ran after the upscaler on every shown frame (91 composited/s). Fixed in 2.0.3 (below).
 
-2.0.2 (0720dfd, deployed with `scripts/deploy-rig.sh`) against 2.0.1's code (d79c82a, the build
+2.0.2 (0720dfd, deployed with `cargo xtask deploy-rig`) against 2.0.1's code (d79c82a, the build
 installed on 2026-10-03; 2.0.1 only bumped the version after it), same day. The test machine, RTX 5070,
 driver 615.71.09, 2560x1440 at 288 Hz, HDR desktop, DLSS Balanced (render 1485x836), GTA settings.xml
 as the maintainer has it except `FrameGenType` 0 for the runs (restored afterwards, sha256 identical),
-`scripts/gta-bench.sh`, script mods off, no remote-desktop session, pass 4. Settings as found:
+`cargo xtask gta-bench`, script mods off, no remote-desktop session, pass 4. Settings as found:
 enabled=1, passes=1, working_scale=1, mvec_enabled=1.
 
 | Config | 2.0.1 (1 run) | 2.0.2 (3 runs) | 2.0.2 mean | GPU |
@@ -1218,7 +1218,7 @@ Resident Evil Requiem (ray tracing High, FG 4x) is held through DLSS Super Resol
 
 The game's frame-rate cap: San Andreas DE resets it to 60 at every launch whatever its
 GameUserSettings.ini say (both copies at `FrameRatePC=0`, also read-only, also with `FrameRate=0`:
-the menu still shows 60). `scripts/game-reg.sh` sets Frame Rate to Unlocked in the menu on every run.
+the menu still shows 60). `cargo xtask game-reg` sets Frame Rate to Unlocked in the menu on every run.
 
 One run each on the final branch build (settings as found, frame generation on where the game has
 it, no frame-rate cap):
@@ -1291,7 +1291,7 @@ frame. No fence timeout, no Xid.
 
 ## 2026-10-10 -- 3.3 edit cache: baseline (3.2.0)
 
-GTA V Enhanced built-in benchmark (`scripts/gta-bench.sh`), installed 3.2.0, RTX 5070 12 GB, driver 615.78.08,
+GTA V Enhanced built-in benchmark (`cargo xtask gta-bench`), installed 3.2.0, RTX 5070 12 GB, driver 615.78.08,
 DLSS Balanced, ray tracing on, mods off. One run per configuration; real fps and 1% low over GTA's passes 1-3 (its own
 frame times, rendered frames); shown fps = real x the frame-generation factor MangoHud measured over pass 4; N and W
 are the layer's median network and write-back GPU ms. Model off = no Neural Forge layer.
@@ -1535,7 +1535,7 @@ time, against a build with the graphics-push tracking off.
 ## 2026-10-28: 3.9.3, the README's measurements again
 
 RTX 5070, 2560x1440@288 VRR, desktop HDR as set, the installed 3.9.3 layer (`eed5dc82…`), GTA V Enhanced's
-built-in benchmark through `scripts/gta-bench.sh` with DLSS Balanced, Frame Generation 4x with Preset C (the
+built-in benchmark through `cargo xtask gta-bench` with DLSS Balanced, Frame Generation 4x with Preset C (the
 two `DXVK_NVAPI_DRS_NGX_DLSS_FG_OVERRIDE*` variables passed), ray tracing on, script mods off, Neural Forge's
 settings as found, pass 4. One run per configuration; a run where GTA turned frame generation off (at about
 120-125 s, its own Reflex quirk) is kept as a frame-generation-off run and not repeated. Another session ran

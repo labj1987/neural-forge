@@ -32,7 +32,7 @@ this project's own code: upstream is no longer tracked.
   upstream commit by that commit.
 - Check: `cargo clippy --locked --workspace --all-targets [--all-features] -- -D warnings` and
   `cargo test --locked --workspace --all-features -- --test-threads=1`, in this directory. CI runs both.
-- The generated files are never edited by hand: change the generator and run `bash scripts/vk-layer-codegen.sh`
+- The generated files are never edited by hand: change the generator and run `cargo xtask vk-layer-codegen`
   from the repository root (`--check` compares instead of writing; CI runs that). It fetches Vulkan-Headers at
   commit `38899bf6` (1.3.281, the headers ash 0.38.0 was generated from; SHA-256 pinned) once into `tools/native/`,
   and needs libclang and the pinned toolchain's rustfmt. The generated code is written against ash 0.38.0: newer

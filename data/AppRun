@@ -2,7 +2,7 @@
 # The AppImage's entry point: build-appimage.sh copies it to the AppDir's root. It checks that the system has the
 # libraries the GUI takes from it, then starts the GUI (usr/bin/neural-forge) with its arguments. It changes no
 # environment variable: the GUI, and every program it starts, sees the environment the AppImage was started with.
-# scripts/test_apprun.sh tests it.
+# cargo xtask test-apprun tests it.
 HERE="$(dirname "$(readlink -f "$0")")"
 
 # >>> libcheck: before anything else, make sure the GUI can start. Neural Forge brings no libraries of its own. The

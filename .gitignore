@@ -13,7 +13,7 @@
 /model/
 *.e4m3
 
-# Native backend toolchain (scripts/fetch-native-tools.sh)
+# Native backend toolchain (cargo xtask fetch-native-tools)
 /tools
 
 # Benchmark and test output
@@ -22,7 +22,7 @@ test-native.log
 test-validation.log
 release-notes.md
 
-# The layer framework's own build output, and the headers scripts/vk-layer-codegen.sh links in
+# The layer framework's own build output, and the headers cargo xtask vk-layer-codegen links in
 /third_party/vk-layer-for-rust/target/
 /third_party/vk-layer-for-rust/third_party/
 

@@ -4,7 +4,7 @@
 //! layer does not depend on the C++ runtime of whatever container a game runs in.
 //!
 //! The network's source (from OpenDLSS-NR, now kept here) is `third_party/opendlss-nr`. The tools come from
-//! `NEURAL_FORGE_NATIVE_TOOLS` or `<workspace>/tools/native` (`scripts/fetch-native-tools.sh`). The Vulkan-Headers' registry also
+//! `NEURAL_FORGE_NATIVE_TOOLS` or `<workspace>/tools/native` (`cargo xtask fetch-native-tools`). The Vulkan-Headers' registry also
 //! gives the size of every structure a device create info may chain (`nf_native_device_extend` copies the
 //! application's chain).
 
@@ -120,7 +120,7 @@ fn main() {
     for need in [&glslang, &headers.join("vulkan/vulkan_core.h"), &volk.join("volk.c")] {
         if !need.exists() {
             panic!(
-                "\n\nneural-forge-native: {} is missing.\nRun `bash scripts/fetch-native-tools.sh` once in the workspace root \
+                "\n\nneural-forge-native: {} is missing.\nRun `cargo xtask fetch-native-tools` once in the workspace root \
                  (or point NEURAL_FORGE_NATIVE_TOOLS at a directory it filled).\n\n",
                 need.display()
             );

@@ -1,4 +1,4 @@
-//! The Wine builtin stamp of the NGX wrapper (scripts/build-ngx-wrapper.sh): the 32 bytes at file offset 0x40 read
+//! The Wine builtin stamp of the NGX wrapper (cargo xtask build-ngx-wrapper): the 32 bytes at file offset 0x40 read
 //! "Wine builtin DLL", what `winebuild --builtin` writes and what Wine's loader checks before it serves a DLL from its
 //! builtin directories (docs/PROTON_NGX.md).
 //!

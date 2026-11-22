@@ -1,6 +1,6 @@
 # cargo-deny (CI's "Dependency advisories, licences and sources" step): what the shipped binaries link,
 # checked against the RustSec advisory database, an allow-list of licences compatible with this project's
-# AGPL-3.0-or-later, and crates.io as the only source. `bash scripts/cargo-deny.sh` runs the pinned cargo-deny.
+# AGPL-3.0-or-later, and crates.io as the only source. `cargo xtask cargo-deny` runs the pinned cargo-deny.
 
 [graph]
 targets = ["x86_64-unknown-linux-gnu"]

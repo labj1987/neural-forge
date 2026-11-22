@@ -3,7 +3,7 @@
 //! (`data/games.toml`, `neural_forge_supervisor::compat`): the placement reached, frames held (the model ran),
 //! the placement kept, frame generation on where expected, no missed frames, no device lost or `[panic]`, no Xid, the
 //! HDR verdict expected, and a clean recording. Prints a table.
-//! `scripts/game-sweep.sh` builds and runs it; docs/RUNNING_AND_MEASURING.md, "The pre-release game sweep".
+//! `cargo xtask game-sweep` builds and runs it; docs/RUNNING_AND_MEASURING.md, "The pre-release game sweep".
 //!
 //! Every run (`scripts/game-sweep.toml`, one `[[run]]` per run) is started by Steam
 //! (`steam steam://rungameid/<appid>`), on the Proton Steam has for the game, with Neural Forge's variables, the run's

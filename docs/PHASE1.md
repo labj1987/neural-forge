@@ -3,7 +3,7 @@
 > **Note (2026-10-07, 3.0.0):** the namespace, installation and target-ownership sections are
 > current for 3.0, which has no Windows helper, Wine prefix or runner. The Phase 1 benchmark plan
 > moved to [history/phase1-benchmark-plan.md](history/phase1-benchmark-plan.md); benchmarks now run
-> unattended with `scripts/gta-bench.sh` ([RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md)), and
+> unattended with `cargo xtask gta-bench` ([RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md)), and
 > the matched comparator is 2.0.10 against the native backend ([NATIVE_BACKEND.md](NATIVE_BACKEND.md),
 > Phase 3).
 
@@ -36,7 +36,7 @@ External `nvngx_dlssnr.dll`, other NVIDIA DLL names, exported NGX functions,
 
 ## Installation
 
-Build with `bash build-appimage.sh` (after `bash scripts/fetch-native-tools.sh` once). The
+Build with `bash build-appimage.sh` (after `cargo xtask fetch-native-tools` once). The
 AppImage launches the GUI directly and, each time it starts, installs its layer into persistent
 user storage, since Steam games launched later cannot see inside an AppImage mount. It installs from
 `APPDIR` only when the running GUI is inside it: the installed GUI started from another AppImage

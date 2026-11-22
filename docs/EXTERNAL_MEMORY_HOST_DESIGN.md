@@ -150,7 +150,7 @@ Both survived a clean `cargo test` and multiple validated `vkcube` runs on the t
 separately here as their own lesson, not folded into the list above.
 
 **Real, live undefined behavior in `NeuralForgeInstanceHooks::create_device`**, present
-in every run (including every "successful" one) until `scripts/smoke-test.sh` happened
+in every run (including every "successful" one) until `cargo xtask smoke-test` happened
 to be run again after the two bugs above: `std::slice::from_raw_parts(create_info.pp_enabled_extension_names,
 create_info.enabled_extension_count as usize)` when `enabled_extension_count == 0` --
 `vkcube` on this exact machine legitimately leaves `pp_enabled_extension_names` null in
@@ -186,7 +186,7 @@ worth the same fix if `VK_NV_optical_flow` is ever seen behaving the same way li
 hardware multiple times" was true and still missed two bugs that only a *different*
 kind of exercise (a debug-mode UB check; a code path validation layers don't cover at
 all, since neither VUID nor SYNC-HAZARD checking has anything to say about a Rust
-panic) caught. Re-run `scripts/smoke-test.sh` specifically (not just `cargo test` or a
+panic) caught. Re-run `cargo xtask smoke-test` specifically (not just `cargo test` or a
 validated `vkcube` run) after touching anything in this file going forward.
 
 ## Zero-copy compose: the synchronous present without CPU frame copies
@@ -261,7 +261,7 @@ Direct capture imports the whole proxy region, which a driver may back with real
 (about 250 MB of tmpfs per shm file on Intel ANV). The tests therefore share one shm file
 per test and delete it afterwards.
 
-**Not yet validated on hardware.** Before trusting it, run `scripts/smoke-test.sh`, `vkcube`
+**Not yet validated on hardware.** Before trusting it, run `cargo xtask smoke-test`, `vkcube`
 under `VK_LAYER_KHRONOS_validation` with sync validation, and GTA, where the `[sync]` line
 should show `zc=true`.
 
@@ -272,7 +272,7 @@ dedicated tests copied to and run directly against the real driver -- all of the
 following are *after* the two real-hardware VUID fixes and the two crash fixes above,
 not before:
 
-- `scripts/smoke-test.sh` (the one that caught the null-pointer UB) and the full
+- `cargo xtask smoke-test` (the one that caught the null-pointer UB) and the full
   `cargo test` workspace suite: clean.
 - `vkcube` at 1280x720 and 2560x1440 (GTA's real render resolution) under
   `VK_LAYER_KHRONOS_validation:VK_LAYER_neuralforge_neural` with `VK_LAYER_VALIDATE_SYNC=1`:

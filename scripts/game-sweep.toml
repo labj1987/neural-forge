@@ -1,4 +1,4 @@
-# The pre-release game sweep's runs (scripts/game-sweep.sh; docs/RUNNING_AND_MEASURING.md, "The pre-release game
+# The pre-release game sweep's runs (cargo xtask game-sweep; docs/RUNNING_AND_MEASURING.md, "The pre-release game
 # sweep"). What each run expects comes from data/games.toml: the game's placement (placement_rr with
 # ray_reconstruction = true) and HDR10 with hdr = true, SDR otherwise.
 #

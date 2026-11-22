@@ -23,7 +23,7 @@ miniz_oxide = "0.9"
 # The doctor's writability check (access) and the report's local time (localtime_r).
 libc = "0.2"
 
-# The pre-release game sweep (scripts/game-sweep.sh): its unit tests run with `cargo test`.
+# The pre-release game sweep (cargo xtask game-sweep): its unit tests run with `cargo test`.
 [[example]]
 name = "game-sweep"
 path = "examples/game_sweep.rs"

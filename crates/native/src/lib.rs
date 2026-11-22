@@ -1,7 +1,7 @@
 //! Native backend: the network's host code (from OpenDLSS-NR, in `third_party/opendlss-nr`), with its SPIR-V and
 //! PTX kernels embedded at build time, behind a small C API (`cpp/nf_native.h`).
 //!
-//! `build.rs` compiles the kernels with the pinned toolchain from `scripts/fetch-native-tools.sh`, embeds
+//! `build.rs` compiles the kernels with the pinned toolchain from `cargo xtask fetch-native-tools`, embeds
 //! them, and links the C++ (libstdc++ included, statically) into this rlib. x86_64 Linux only.
 //!
 //! The model directory is read and checked on this side ([`ModelFile`]); the C++ gets its tensor table.

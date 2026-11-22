@@ -118,7 +118,7 @@ In the scratch clone (`~/scratch/OpenDLSS-NR/linux/`, not in this repo): `CMakeL
 `build.sh`, `run_ptx.py`, `linux-port.patch` and `load_check.cpp`.
 
 - Pins from upstream's `scripts/fetch_tools.ps1`: glslang (official Linux release binary),
-  Vulkan-Headers and volk (this repository's current pins: `scripts/fetch-native-tools.sh`). CMake 3.31.12 portable (the machine has
+  Vulkan-Headers and volk (this repository's current pins: `cargo xtask fetch-native-tools`). CMake 3.31.12 portable (the machine has
   no system cmake), Ninja 1.13.2 and GCC 15.2 from the system.
 - Shaders: `glslang -V --target-env vulkan1.3 -I shaders`, one `.spv` per `.comp` (13). PTX: the
   generator invocations of `build_shaders.ps1` (78 files) under Python with `-I`, through
@@ -286,7 +286,7 @@ section.
 - OpenDLSS-NR: upstream `src/` (minus `main.cpp` and `verify.cpp`), `shaders/`, `scripts/ptx/` (the PTX generators, ported
   from Python to Rust after 4.6.0: `ptx/`, the `opendlss-nr-ptx` crate, with byte-identical output),
   `LICENSE`, `NOTICE`, at `9d08f41`. Vendored in `third_party/opendlss-nr/` until 3.4.0; from 3.4.0 to
-  3.8.6 `scripts/fetch-native-tools.sh` fetched the commit (SHA-256 pinned) into `tools/native/OpenDLSS-NR`
+  3.8.6 `cargo xtask fetch-native-tools` fetched the commit (SHA-256 pinned) into `tools/native/OpenDLSS-NR`
   and applied the patches kept in `third_party/opendlss-nr/patches/`. After 3.8.6 the source was taken
   back into `third_party/opendlss-nr/` with the ten patches applied, and is this project's to change:
   upstream (unchanged since 2026-09-21) is no longer tracked, and `UPSTREAM.md` there lists the ten
@@ -298,7 +298,7 @@ section.
   glslang and generates the PTX kernels at build time (the `opendlss-nr-ptx` build-dependency: upstream
   `build_shaders.ps1`'s 78 generator invocations, less the two FFN kernels nothing launches),
   embeds both (`.incbin`), and compiles the network's C++ with the glue (`cpp/nf_native.cpp`) into the
-  rlib. Nothing prebuilt is committed. `scripts/fetch-native-tools.sh` fetches glslang,
+  rlib. Nothing prebuilt is committed. `cargo xtask fetch-native-tools` fetches glslang,
   Vulkan-Headers and volk (the versions and SHA-256 pinned there) into `tools/native/`
   (ignored); CI runs it. A clean native build takes 3.5 s.
 - libstdc++ is linked statically and nothing of the C++ is exported: the layer's `NEEDED` list is
@@ -856,7 +856,7 @@ re-initialisation), and the first frame of the new network starts the history af
   dispatches, small 3.81 ms over 125.
 - Against NVIDIA's runtime: see "Against NGX (3.5.2)" below.
 
-**In GTA V Enhanced** (3.5.0 on the test machine, `gta-bench.sh`, 1440p, the maintainer's settings with
+**In GTA V Enhanced** (3.5.0 on the test machine, `cargo xtask gta-bench`, 1440p, the maintainer's settings with
 frame generation 4x, one run each, pass 4):
 
 | Model | Real fps | Shown fps | Network (`server`, median) | Weights on the GPU |
@@ -887,7 +887,7 @@ computes it identically (the window phases of patch 0009 included). 3.5.2 marks 
 networks of 310.9.16 verified and makes the small one the default extraction where the DLL has it.
 Presets 2 and 4 give different answers from 0 over a run with history; not followed further.
 
-GTA V Enhanced on the helper with that model (2.0.10 installed, preset 0, `gta-bench.sh`, the maintainer's
+GTA V Enhanced on the helper with that model (2.0.10 installed, preset 0, `cargo xtask gta-bench`, the maintainer's
 settings with frame generation 4x and FG Preset C, one run, pass 4): 63.5 real fps, the model held
 before the upscaler at 1486x836, 61 holds/s, 0 misses, helper busy 4.2 ms.
 

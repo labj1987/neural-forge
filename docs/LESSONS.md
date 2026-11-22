@@ -126,7 +126,7 @@ otherwise. "History" means [history/development-before-neuralforge.md](history/d
   layer adds the extension at `vkCreateDevice`.
 - **Result:** worked, but two real bugs were found only after everything had "validated clean": a
   null-pointer slice in device creation (undefined behaviour) and a panicking `ash` loader helper.
-  Both were caught by `scripts/smoke-test.sh`'s debug build, not by validation layers or `cargo test`.
+  Both were caught by `cargo xtask smoke-test`'s debug build, not by validation layers or `cargo test`.
 - **Evidence:** [EXTERNAL_MEMORY_HOST_DESIGN.md](EXTERNAL_MEMORY_HOST_DESIGN.md);
   HARDWARE_VALIDATION.md, Phase 3 entries.
 
@@ -611,7 +611,7 @@ replay with and without the walk:
 | still | i4-xf-soft-guided | 0.0759/0.460/1.48/64.2 | 0.479 | 0.0046 / 0.0057 (0.0087) | -2.283 |
 
 **Live (GTA V Enhanced, 1440p, frame generation off, 2026-10-11).** The release build with all of the
-above, `gta-bench.sh`, against the gate's runs of the cache as first ported (context and Catmull-Rom
+above, `cargo xtask gta-bench`, against the gate's runs of the cache as first ported (context and Catmull-Rom
 in, no walk, no guided filter):
 
 | run | real fps (pass 4) | passes 1-5 | cache_gpu_ms median | rejected |
@@ -777,7 +777,7 @@ The 64-hold dumps (`~/nf-spike/cache-dumps/gta-*-64` on the rig) are the bench's
 and pass 5 at 67.5 s and 70 s. Upstream's direction on `gta-still-64` ran with the still hold
 (below); the shipped column without it.
 
-Live, GTA V Enhanced (`gta-bench.sh`, `model_interval` 2, the other two builds by temporary
+Live, GTA V Enhanced (`cargo xtask gta-bench`, `model_interval` 2, the other two builds by temporary
 patches never committed). Real fps: GTA's pass 4 (the long free-roam pass, where the still shot
 is) and passes 1-3; p99 frame time over passes 1-3; the share of holds the network ran on and of
 holds in the still regime from the layer's summaries. Still moment: bench-iq's flicker and added
@@ -1208,7 +1208,7 @@ pass feedback. Measured in GTA V Enhanced at 1440p, FG 4x, Preset C, mods off, p
 
 ## October 20: why the unattended GTA benchmark was unreliable
 
-Over 2026-10-19 and the morning of 2026-10-20 the agents' `gta-bench.sh` launches (120 of them, counted from
+Over 2026-10-19 and the morning of 2026-10-20 the agents' `cargo xtask gta-bench` launches (120 of them, counted from
 Steam's own "Adding process / Removing process" journal lines, which every launch produces) gave 108
 results, 8 early exits, 2 launches stuck for the runner's full 20 minutes, and 2 launches that lasted under
 70 s with no dump; and frame generation often missing. Each was traced on the rig (3.8.5, 1440p, frame
@@ -1323,7 +1323,7 @@ n-1 before overwriting the input, copy its result home, then hand frame n over) 
 60% to 98%. The 2.x helper was that shape (its own device under Wine, 5.9-6.1 ms of round trip per hold,
 PRE_UPSCALER_DESIGN.md, "Hand-off latency"), so the question was whether 3.x still is.
 
-It is not: since 3.0 there is one device. Measured with `scripts/gta-bench.sh`, 2560x1440, GTA V
+It is not: since 3.0 there is one device. Measured with `cargo xtask gta-bench`, 2560x1440, GTA V
 Enhanced, DLSS Balanced, settings as found (frame generation 4x, Preset C), script mods off, pass 4, one
 run each; GTA turned frame generation off by itself in the first three (1.0x), so those three compare
 directly. GPU from nvidia-smi each second, CPU per thread from `top -H` each second (100 = one core).
@@ -2093,11 +2093,11 @@ the fix (none reached a release):
 - **Run with script mods off**, no remote-desktop session connected (it costs about 8 fps,
   according to the runner's own warning), and MangoHud as the last layer so it counts shown frames.
 - **Check what is deployed**, not what was built: compare hashes of the installed layer and helper
-  (`scripts/deploy-rig.sh` does this). Several early "the fix did nothing" results were stale
+  (`cargo xtask deploy-rig` does this). Several early "the fix did nothing" results were stale
   copies or a stale git clone on the rig.
 - **Restart Steam to change its environment.** A running Steam client keeps the environment it
   started with, and a game's saved launch options apply regardless.
-- **Run `scripts/smoke-test.sh` after touching device-creation code**; it caught what validation
+- **Run `cargo xtask smoke-test` after touching device-creation code**; it caught what validation
   layers and unit tests did not.
 - **Validation layers before any synchronization change**, and never reapply the reverted fence
   changes of 0.1.33-0.1.34.

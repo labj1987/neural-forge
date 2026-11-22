@@ -11,7 +11,7 @@ comes from reading NVIDIA's code, except the last section, which reads the PTX t
 
 | Game (engine) | DLSS SR on disk | DLSS DLL family | How it was reached | Log |
 |---|---|---|---|---|
-| GTA V Enhanced (RAGE) | 310.4 | `hiluma_*` | `gta-bench.sh`, frame generation on | `~/nf-spike/gta/layout-gta-1` |
+| GTA V Enhanced (RAGE) | 310.4 | `hiluma_*` | `cargo xtask gta-bench`, frame generation on | `~/nf-spike/gta/layout-gta-1` |
 | Shadow Warrior 3 (UE4) | 2.2.11 | `cuda_engine_*` (no suffix) | main menu | `~/nf-spike/runs/layout-sw3` |
 | God of War (own) | 2.3.4 | `cuda_engine_*` (no suffix) | main menu | `~/nf-spike/runs/layout-gow` |
 | GTA San Andreas DE (UE4) | 2.3.4 | `cuda_engine_*` (no suffix) | main menu | `~/nf-spike/runs/layout-gtasa` |
@@ -106,7 +106,7 @@ Candidates only; nothing in the layer was changed for this catalogue.
 
 ## Repeating it
 
-Install the layer, then either run `gta-bench.sh` with `NEURAL_FORGE_PROBE_NGX=1`, or restart
+Install the layer, then either run `cargo xtask gta-bench` with `NEURAL_FORGE_PROBE_NGX=1`, or restart
 Steam's `steam-relaunch` unit with that variable in its environment so every game launched through
 Steam carries it (the layer still only runs where the game's launch options set
 `NEURAL_FORGE_ENABLE=1`). Restart Steam without it afterwards.

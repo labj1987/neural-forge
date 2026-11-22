@@ -7,7 +7,7 @@
 //!   cargo xtask check-shaders            verify: every source hash and binary hash matches the manifest, no .spv is
 //!                                        left without its source, and each binary passes spirv-val (required:
 //!                                        install spirv-tools).
-//!   cargo xtask check-shaders --update   recompile every .comp with the pinned glslang (scripts/fetch-native-tools.sh;
+//!   cargo xtask check-shaders --update   recompile every .comp with the pinned glslang (cargo xtask fetch-native-tools;
 //!                                        never one on PATH), validate with spirv-val, remove .spv files whose source
 //!                                        is gone, and rewrite the manifest.
 //!
@@ -44,7 +44,7 @@ fn name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// The glslang fetch-native-tools.sh pins: the committed binaries are its output, and another release writes
+/// The glslang cargo xtask fetch-native-tools pins: the committed binaries are its output, and another release writes
 /// different bytes.
 fn pinned_glslang() -> PathBuf {
     let tools = std::env::var("NEURAL_FORGE_NATIVE_TOOLS").unwrap_or_default();
@@ -80,7 +80,7 @@ impl Drop for TempDir {
 fn update(shaders: &Path) -> u8 {
     let glslang = pinned_glslang();
     if !glslang.is_file() {
-        eprintln!("{} is missing: run scripts/fetch-native-tools.sh (--update uses only the pinned glslang)", glslang.display());
+        eprintln!("{} is missing: run cargo xtask fetch-native-tools (--update uses only the pinned glslang)", glslang.display());
         return 2;
     }
     spirv_val();

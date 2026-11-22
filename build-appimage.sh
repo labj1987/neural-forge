@@ -26,11 +26,11 @@ APPDIR="$BUILD_DIR/AppDir"
 # ── Build dependencies ────────────────────────────────────────────────
 SUDO=""
 if [[ "$(id -u)" -ne 0 ]]; then SUDO="sudo"; fi
-# Every tool the build runs (here, in scripts/fetch-native-tools.sh and the crates' build scripts), so a missing
+# Every tool the build runs (here, in cargo xtask fetch-native-tools and the crates' build scripts), so a missing
 # one is installed before the long release build, not found after it.
 missing_deps() {
     local tool
-    # x86_64-w64-mingw32-gcc: the NGX wrapper's linker (scripts/build-ngx-wrapper.sh); its package also brings the
+    # x86_64-w64-mingw32-gcc: the NGX wrapper's linker (cargo xtask build-ngx-wrapper); its package also brings the
     # mingw-w64 runtime notices copied into the AppImage below.
     for tool in g++ curl patch pkg-config desktop-file-validate zsyncmake x86_64-w64-mingw32-gcc; do
         command -v "$tool" >/dev/null 2>&1 || { echo "$tool"; return 0; }
@@ -61,7 +61,7 @@ if missing="$(missing_deps)"; then
     # for that repo and still refreshes everything else; only `apt-get install`
     # failing on a package we actually need should be fatal.
     $SUDO apt-get update -qq || true
-    # g++ brings the static libstdc++ that crates/native links; curl and patch are what scripts/fetch-native-tools.sh
+    # g++ brings the static libstdc++ that crates/native links; curl and patch are what cargo xtask fetch-native-tools
     # runs; the -dev packages are the GUI toolkit's.
     # gcc-mingw-w64-x86-64 links the NGX wrapper (a Windows DLL) and brings mingw-w64-common and gcc-mingw-w64-base,
     # whose copyright files ship as its runtime notices.
@@ -87,13 +87,13 @@ rustup run "$TOOLCHAIN" rustc --version >/dev/null 2>&1 || rustup toolchain inst
 rustup target add --toolchain "$TOOLCHAIN" x86_64-pc-windows-gnu
 # The pinned glslang, Vulkan-Headers and volk that crates/native builds with (SHA-256-checked,
 # skipped when already in tools/native/).
-bash scripts/fetch-native-tools.sh
+cargo xtask fetch-native-tools
 # ── Release build ─────────────────────────────────────────────────────
 echo "==> cargo build --release (protocol/layer/native/gui/cli)"
 cargo build --release --locked --workspace --exclude xtask
 
 # The NGX wrapper for Proton (docs/PROTON_NGX.md): a Windows DLL, stamped as a Wine builtin.
-bash scripts/build-ngx-wrapper.sh "${CARGO_TARGET_DIR:-target}/ngx-wrapper/_nvngx.dll"
+cargo xtask build-ngx-wrapper "${CARGO_TARGET_DIR:-target}/ngx-wrapper/_nvngx.dll"
 
 # ── AppDir layout ─────────────────────────────────────────────────────
 rm -rf "$BUILD_DIR"
@@ -152,7 +152,7 @@ cp data/icon.svg "$APPDIR/$NAME.svg"
 
 # ── AppRun ────────────────────────────────────────────────────────────
 # data/AppRun: checks that the system has the libraries the GUI takes from it (a dialog says which are missing),
-# then starts the GUI with the environment unchanged (scripts/test_apprun.sh).
+# then starts the GUI with the environment unchanged (cargo xtask test-apprun).
 cp data/AppRun "$APPDIR/AppRun"
 chmod 755 "$APPDIR/AppRun"
 
