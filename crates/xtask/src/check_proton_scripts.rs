@@ -54,10 +54,9 @@ enum Failure {
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Failure::Fetch(e @ FetchError::Http { .. }) => write!(f, "HTTPError: {e}"),
+            Failure::Fetch(e @ FetchError::Http { .. }) => write!(f, "HTTP error: {e}"),
             Failure::Fetch(e) => write!(f, "{e}"),
-            Failure::Tool(m) => write!(f, "ToolError: {m}"),
-            Failure::Other(m) => f.write_str(m),
+            Failure::Tool(m) | Failure::Other(m) => f.write_str(m),
         }
     }
 }
@@ -132,7 +131,7 @@ fn branches_of(repo: &str, api: Api) -> Result<Vec<String>, Failure> {
     let (mut names, mut page) = (Vec::new(), 1);
     loop {
         let body = api(&format!("repos/{repo}/branches?per_page=100&page={page}"), false)?;
-        let chunk: serde_json::Value = serde_json::from_slice(&body).map_err(|e| Failure::Other(format!("JSONDecodeError: {e}")))?;
+        let chunk: serde_json::Value = serde_json::from_slice(&body).map_err(|e| Failure::Other(format!("the branch list is not JSON: {e}")))?;
         let known: Option<Vec<&str>> = chunk.as_array().and_then(|a| a.iter().map(|b| b.get("name").and_then(|n| n.as_str())).collect());
         let Some(known) = known else {
             let shown: String = crate::py::repr(Some(&chunk)).chars().take(200).collect();
@@ -266,7 +265,7 @@ fn check(api: Api, patch: Patch) -> Result<(String, u8), Failure> {
     let lines = patch(&paths)?;
     let mut by_path: HashMap<String, &String> = HashMap::new();
     for l in &lines {
-        let key = l.split(' ').nth(1).ok_or_else(|| Failure::Other("IndexError: list index out of range".into()))?;
+        let key = l.split(' ').nth(1).ok_or_else(|| Failure::Other("a patch-check line has no second field".into()))?;
         by_path.insert(key.trim_end_matches(':').to_string(), l);
     }
     for (repo, git_ref, path) in &files {
@@ -391,7 +390,7 @@ fn exit_code_tests() -> Result<(), String> {
         (http_error(403, "forbidden", &[]), TOOL),
         (http_error(404, "not found", &[]), TOOL),
         (http_error(401, "bad credentials", &[]), TOOL),
-        (Failure::Other("KeyError: 'name'".into()), TOOL),
+        (Failure::Other("a branch has no name".into()), TOOL),
         // curl itself failed (not the network): the check fails, it is not "retry later".
         (Failure::Tool("curl failed (exit status 3): URL rejected".into()), TOOL),
     ];
