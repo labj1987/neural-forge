@@ -44,8 +44,8 @@ const DARKEST: f64 = 1.0 / 255.0 / 12.92;
 static SERIES_LOG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)\[capture\] capturing the next \d+ presents into (.+?)[ \t\r]*$").expect("static regex"));
 
-/// What went wrong, split the way bench-report needs it: Python's `OSError`s (a missing or unreadable frame) are caught
-/// there and printed, anything else ends the script with a traceback.
+/// What went wrong, split the way bench-report needs it: a missing or unreadable frame (`Os`) is caught there and printed on
+/// stdout, anything else ends the program with the message on stderr.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum IqError {
     Os(String),
@@ -329,7 +329,7 @@ fn log_frames<T: Fl>(lumas: &[Img<T>], floor: f64) -> Vec<Img<T>> {
 
 fn pair_diff<T: Fl>(a: &Img<T>, b: &Img<T>) -> Res<Img<T>> {
     if (a.h, a.w) != (b.h, b.w) {
-        return other("ValueError: operands could not be broadcast together");
+        return other("the frames differ in size");
     }
     Ok(a.like(a.d.iter().zip(&b.d).map(|(&x, &y)| (y - x).abs()).collect()))
 }
@@ -355,11 +355,11 @@ pub(crate) fn percent(stops: f64) -> f64 {
 
 /// Flicker of consecutive frames' luma, in stops (`percent` converts).
 pub(crate) fn flicker<T: Fl>(lumas: &[Img<T>]) -> Res<f64> {
-    let Some(first) = lumas.first() else { return other("IndexError: list index out of range") };
+    let Some(first) = lumas.first() else { return other("no frames to compare") };
     let logs = log_frames(lumas, floor_of(first));
     let pairs = pair_changes(&logs)?;
     if pairs.is_empty() {
-        return other("ZeroDivisionError: division by zero");
+        return other("division by zero");
     }
     let each: Vec<f64> = pairs.iter().map(|d| trimmed_mean(&d.d)).collect();
     Ok(py_sum(&each) / pairs.len() as f64)
@@ -382,7 +382,7 @@ fn laplacian<T: Fl>(l: &Img<T>) -> Vec<T> {
 /// reads them), the border left out.
 fn static_mask<T: Fl>(logs: &[Img<T>]) -> Res<Vec<bool>> {
     let pairs = pair_changes(logs)?;
-    let Some(first) = pairs.first() else { return other("ValueError: need at least one array to stack") };
+    let Some(first) = pairs.first() else { return other("no frames to stack") };
     let (h, w) = (first.h, first.w);
     let limit = T::from_f64(STATIC_STOPS);
     let mut still = vec![true; h * w];
@@ -409,9 +409,9 @@ fn static_mask<T: Fl>(logs: &[Img<T>]) -> Res<Vec<bool>> {
 /// Added detail: Laplacian energy of log luma with the model over without it, on the pixels static in both windows. None
 /// when no pixel is static in both.
 pub(crate) fn detail<T: Fl>(lumas: &[Img<T>], base_lumas: &[Img<T>]) -> Res<Option<f64>> {
-    let (Some(first), Some(base_first)) = (lumas.first(), base_lumas.first()) else { return other("IndexError: list index out of range") };
+    let (Some(first), Some(base_first)) = (lumas.first(), base_lumas.first()) else { return other("no frames to compare") };
     if (first.h, first.w) != (base_first.h, base_first.w) {
-        return other("ValueError: operands could not be broadcast together");
+        return other("the frames differ in size");
     }
     let floor = floor_of(base_first);
     let (logs, base) = (log_frames(lumas, floor), log_frames(base_lumas, floor));
@@ -432,7 +432,7 @@ pub(crate) fn detail<T: Fl>(lumas: &[Img<T>], base_lumas: &[Img<T>]) -> Res<Opti
     };
     let (e, b) = (energy(&logs), energy(&base));
     if b == 0.0 {
-        return other("ZeroDivisionError: float division by zero");
+        return other("division by zero");
     }
     Ok(Some(e / b))
 }
@@ -543,7 +543,7 @@ fn scan(run: &str, frames: i64, fg: i64) -> Res<String> {
     }
     let k = frames - 1;
     if k < 1 {
-        return other("ZeroDivisionError: division by zero");
+        return other("division by zero");
     }
     if trimmed.len() as i64 >= k {
         let ku = k as usize;
@@ -599,8 +599,8 @@ pub(crate) fn summary(run: &str, baseline: Option<&str>, start: Option<i64>, fra
 /// The argument of an option that takes one, from `it`.
 fn int_opt(v: &Option<String>) -> Result<i64, String> {
     match v {
-        None => Err("TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'".to_string()),
-        Some(s) => py_int(s).ok_or_else(|| format!("ValueError: invalid literal for int() with base 10: {}", repr_str(s))),
+        None => Err("an integer is missing".to_string()),
+        Some(s) => py_int(s).ok_or_else(|| format!("not an integer: {}", repr_str(s))),
     }
 }
 

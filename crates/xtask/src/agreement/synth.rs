@@ -273,7 +273,7 @@ pub fn self_test() -> Result<u8, Fail> {
         let _ = planes;
         let cmp = |i: usize| compare_runs(dirs[0].to_str().unwrap_or(""), dirs[i].to_str().unwrap_or(""), false, false);
         let (same, shifted1, shifted, noise, partial) = (cmp(1)?, cmp(2)?, cmp(3)?, cmp(4)?, cmp(5)?);
-        let get = |v: Option<f64>| v.ok_or_else(|| "TypeError: unsupported format string passed to NoneType.__format__".to_string());
+        let get = |v: Option<f64>| v.ok_or_else(|| "a measurement is missing".to_string());
         let (sn, s1n, s2n, nn) = (get(same.ncc_mean)?, get(shifted1.ncc_mean)?, get(shifted.ncc_mean)?, get(noise.ncc_mean)?);
         println!("identical runs:         ncc {}  detail {}%  matched {}", fmt_f(sn, 4), fmt_f(get(same.detail_pct)?, 1), same.matched);
         println!("edit shifted by (1,0):  ncc {}  detail {}%", fmt_f(s1n, 4), fmt_f(get(shifted1.detail_pct)?, 1));

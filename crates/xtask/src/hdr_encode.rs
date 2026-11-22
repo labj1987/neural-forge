@@ -30,7 +30,7 @@ const HELP_JUDGE: &str = include_str!("hdr_encode/help_judge.txt");
 const HELP_MONTAGE: &str = include_str!("hdr_encode/help_montage.txt");
 const COMMANDS: &[&str] = &["info", "encode", "judge", "selftest", "montage"];
 
-/// What an uncaught Python exception or `sys.exit(message)` becomes: the message on stderr, status 1.
+/// The message of a failure that ends the program (on stderr, exit status 1).
 type Fail = String;
 
 /// preupscale::hdr::exposure_ok: a value the layer divides by.
@@ -165,7 +165,7 @@ fn read_json(path: &Path) -> Result<Value, Fail> {
 }
 
 fn meta_dim(meta: &Value, key: &str) -> Result<usize, Fail> {
-    meta.get(key).and_then(Value::as_u64).map(|v| v as usize).ok_or_else(|| format!("KeyError or bad value: {}", str_repr(key)))
+    meta.get(key).and_then(Value::as_u64).map(|v| v as usize).ok_or_else(|| format!("missing or bad value for {}", str_repr(key)))
 }
 
 fn load_dump(dump: &str) -> Result<Dump, Fail> {
@@ -176,7 +176,7 @@ fn load_dump(dump: &str) -> Result<Dump, Fail> {
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let count = bytes.len() / 2;
     if count != ph * pw * 4 {
-        return Err(format!("ValueError: cannot reshape array of size {count} into shape ({ph},{pw},4)"));
+        return Err(format!("cannot reshape {count} values into ({ph},{pw},4)"));
     }
     let (eh, ew) = (h.min(ph), w.min(pw));
     let mut colour = Vec::with_capacity(eh * ew * 4);
@@ -221,8 +221,8 @@ fn json_to_float(v: &Value) -> Result<f64, Fail> {
     match v {
         Value::Number(n) => Ok(n.as_f64().unwrap_or(f64::NAN)),
         Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
-        Value::String(s) => pyfmt::parse_float(s).ok_or_else(|| format!("ValueError: could not convert string to float: {}", str_repr(s))),
-        other => Err(format!("TypeError: float() argument must be a string or a real number, not {}", json_value_repr(other))),
+        Value::String(s) => pyfmt::parse_float(s).ok_or_else(|| format!("not a number: {}", str_repr(s))),
+        other => Err(format!("expected a number, got {}", json_value_repr(other))),
     }
 }
 
@@ -240,7 +240,7 @@ fn exposure_scale(exposure: Option<&Value>, a: &ExposureArgs) -> Result<f64, Fai
             Some(v) if !is_falsy(v) => v,
             _ => return Err("no exposure.json in the dump; pass --exposure".into()),
         };
-        let images = exposure.get("images").and_then(Value::as_array).ok_or("KeyError: 'images'")?;
+        let images = exposure.get("images").and_then(Value::as_array).ok_or("no \"images\" in the exposure data")?;
         let images: Vec<&Value> = images.iter().filter(|i| i.get("values").is_some_and(|v| !is_falsy(v))).collect();
         if images.is_empty() {
             return Err("exposure.json has no read values; pass --exposure".into());
@@ -251,9 +251,9 @@ fn exposure_scale(exposure: Option<&Value>, a: &ExposureArgs) -> Result<f64, Fai
             idx += n;
         }
         if idx < 0 {
-            return Err("IndexError: list index out of range".into());
+            return Err("image index out of range".into());
         }
-        let first = images[idx as usize].get("values").and_then(|v| v.get(0)).ok_or("IndexError or TypeError reading values[0]")?;
+        let first = images[idx as usize].get("values").and_then(|v| v.get(0)).ok_or("an image has no values")?;
         let e = json_to_float(first)?;
         if a.div {
             if e != 0.0 {
@@ -384,7 +384,7 @@ fn cmd_info(dump: &str) -> Result<(), Fail> {
     let d = load_dump(dump)?;
     let scene = clean_rgb(&d.colour);
     let l = luma_of(&scene);
-    let get = |k: &str| d.meta.get(k).map(json_value_str).ok_or_else(|| format!("KeyError: {}", str_repr(k)));
+    let get = |k: &str| d.meta.get(k).map(json_value_str).ok_or_else(|| format!("missing key {}", str_repr(k)));
     println!("{dump}: {}x{} frame {}", get("width")?, get("height")?, get("frame")?);
     let g = |x: f64| fmt_g(x, 4);
     println!("  scene luma p1={} p50={} p90={} p99={} max={}", g(pct(&l, 1.0)), g(pct(&l, 50.0)), g(pct(&l, 90.0)), g(pct(&l, 99.0)), g(np_max(&l)));
@@ -397,9 +397,9 @@ fn cmd_info(dump: &str) -> Result<(), Fail> {
             return Ok(());
         }
     };
-    let images = exposure.get("images").and_then(Value::as_array).ok_or("KeyError: 'images'")?;
+    let images = exposure.get("images").and_then(Value::as_array).ok_or("no \"images\" in the exposure data")?;
     for (i, img) in images.iter().enumerate() {
-        let f = |k: &str| img.get(k).map(json_value_str).ok_or_else(|| format!("KeyError: {}", str_repr(k)));
+        let f = |k: &str| img.get(k).map(json_value_str).ok_or_else(|| format!("missing key {}", str_repr(k)));
         println!(
             "  exposure[{i}] {} {} layout={} assumed={} raw={} values={}",
             f("image")?,
@@ -410,7 +410,7 @@ fn cmd_info(dump: &str) -> Result<(), Fail> {
             f("values")?
         );
         if let Some(values) = img.get("values").filter(|v| !is_falsy(v)) {
-            let v = json_to_float(values.get(0).ok_or("IndexError or TypeError reading values[0]")?)?;
+            let v = json_to_float(values.get(0).ok_or("an image has no values")?)?;
             if v > 0.0 && v.is_finite() {
                 for (name, s) in [("scene * e", v), ("scene / e", 1.0 / v)] {
                     let el: Vec<f64> = l.iter().map(|x| x * s).collect();
@@ -487,7 +487,7 @@ fn gradient_mask(disp: &[f64], w: usize, h: usize, top: f64) -> Result<Vec<bool>
     }
     let q = 100.0 - top;
     if !(0.0..=100.0).contains(&q) {
-        return Err("ValueError: Percentiles must be in the range [0, 100]".into());
+        return Err("percentiles must be in the range [0, 100]".into());
     }
     let t = pct(&g, q);
     Ok(g.iter().map(|&v| v >= t).collect())
@@ -542,7 +542,7 @@ fn cmd_judge(a: &Parsed, ex: &ExposureArgs, ja: &JudgeArgs) -> Result<(), Fail> 
     let bytes = std::fs::read(answer_path).map_err(|e| format!("{answer_path}: {e}"))?;
     let (answer_raw, sent): (Vec<f64>, Vec<f64>) = if enc == "sdr8" {
         if bytes.len() != h * w * 4 {
-            return Err(format!("ValueError: cannot reshape array of size {} into shape ({h},{w},4)", bytes.len()));
+            return Err(format!("cannot reshape {} values into ({h},{w},4)", bytes.len()));
         }
         let ans = bytes.chunks_exact(4).flat_map(|p| p[..3].iter().map(|&b| b as f64 / 255.0)).collect();
         let sent = encode("opendlss", &scene, e).iter().map(|&c| (c * 255.0).round_ties_even() / 255.0).collect();
@@ -550,7 +550,7 @@ fn cmd_judge(a: &Parsed, ex: &ExposureArgs, ja: &JudgeArgs) -> Result<(), Fail> 
     } else {
         let count = bytes.len() / 2;
         if count != h * w * 4 {
-            return Err(format!("ValueError: cannot reshape array of size {count} into shape ({h},{w},4)"));
+            return Err(format!("cannot reshape {count} values into ({h},{w},4)"));
         }
         let ans = bytes.chunks_exact(8).flat_map(|p| (0..3).map(|c| f16_to_f64(u16::from_le_bytes([p[2 * c], p[2 * c + 1]])))).collect();
         let sent = encode(enc, &scene, e).iter().map(|&c| f16_to_f64(f64_to_f16(c.clamp(0.0, 65504.0)))).collect();
@@ -575,7 +575,7 @@ fn cmd_judge(a: &Parsed, ex: &ExposureArgs, ja: &JudgeArgs) -> Result<(), Fail> 
     let din = display(enc, &back_sent, e);
     let dout = display(enc, &back, e);
     if ja.ref_white == 0.0 {
-        return Err("ZeroDivisionError: float division by zero".into());
+        return Err("division by zero".into());
     }
     let rf = e * ex.white / ja.ref_white;
     let rin = ref_display(&back_sent, rf);
@@ -626,33 +626,33 @@ fn selftest() -> Result<(), Fail> {
     let ok: Vec<bool> = sent.chunks_exact(3).map(|p| np_max(p) < CLAMPED).collect();
     let pick = |a: &[f64], want: bool| -> Vec<f64> { a.chunks_exact(3).zip(&ok).filter(|(_, &o)| o == want).flat_map(|(p, _)| p.iter().copied()).collect() };
     if !allclose(&pick(&back, true), &pick(&scene, true), 1e-6) {
-        return Err(format!("AssertionError: {back:?} {scene:?}"));
+        return Err(format!("self-test failed: {back:?} {scene:?}"));
     }
     // A pixel whose peak channel clamped keeps all three channels of the original, whatever the answer.
     let answer: Vec<f64> = sent.iter().map(|x| x * 0.9).collect();
     let kept = decode("opendlss", &answer, e, Some((&sent, &scene)));
     let (kc, sc) = (pick(&kept, false), pick(&scene, false));
     if kc.is_empty() || kc != sc {
-        return Err(format!("AssertionError: {kept:?}"));
+        return Err(format!("self-test failed: {kept:?}"));
     }
     if !allclose(&pick(&kept, true), &pick(&decode("opendlss", &answer, e, None), true), 1e-5) {
-        return Err("AssertionError".into());
+        return Err("self-test failed".into());
     }
     for bad in [0.0, -1.0, f64::INFINITY, f64::NAN, 70000.0] {
         if exposure_ok(bad) {
-            return Err(format!("AssertionError: {}", pyfmt::float_repr(bad)));
+            return Err(format!("self-test failed: {}", pyfmt::float_repr(bad)));
         }
     }
     if !(exposure_ok(1.0) && exposure_ok(2f64.powi(-14))) {
-        return Err("AssertionError".into());
+        return Err("self-test failed".into());
     }
     let mut a = ExposureArgs { white: DEFAULT_PAPER_WHITE, exposure: Some(0.0), div: false, exposure_image: 0, keep_clamped: true };
     if exposure_scale(None, &a).is_ok() {
-        return Err("AssertionError: an exposure of 0 was taken".into());
+        return Err("self-test failed: an exposure of 0 was taken".into());
     }
     a.exposure = Some(1.5);
     if exposure_scale(None, &a) != Ok(0.5) {
-        return Err("AssertionError".into());
+        return Err("self-test failed".into());
     }
     println!("hdr_encode self-test: ok");
     Ok(())
@@ -669,16 +669,10 @@ fn cmd_montage(a: &Parsed, crop: Option<&str>, scale: f64) -> Result<(), Fail> {
         }
         if let Some(c) = crop {
             let parts: Vec<&str> = c.split(',').collect();
-            let nums: Vec<i64> = parts
-                .iter()
-                .map(|p| pyfmt::parse_int(p).ok_or_else(|| format!("ValueError: invalid literal for int() with base 10: {}", str_repr(p))))
-                .collect::<Result<_, _>>()?;
+            let nums: Vec<i64> =
+                parts.iter().map(|p| pyfmt::parse_int(p).ok_or_else(|| format!("not an integer: {}", str_repr(p)))).collect::<Result<_, _>>()?;
             let [x, y, cw, ch] = nums[..] else {
-                return Err(if nums.len() > 4 {
-                    "ValueError: too many values to unpack (expected 4)".into()
-                } else {
-                    format!("ValueError: not enough values to unpack (expected 4, got {})", nums.len())
-                });
+                return Err(if nums.len() > 4 { "too many values (expected 4)".into() } else { format!("not enough values (expected 4, got {})", nums.len()) });
             };
             imgs = imgs.iter().map(|i| i.crop(x, y, x + cw, y + ch)).collect::<Result<_, _>>()?;
         }

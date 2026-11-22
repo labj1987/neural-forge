@@ -34,11 +34,11 @@ static COMPOSITED: LazyLock<Regex> = LazyLock::new(|| re(r"\[present\] [0-9.]+ f
 static PASS4_STAMP: LazyLock<Regex> = LazyLock::new(|| re(r"Pass4-(.+)\.txt"));
 static CSV_STAMP: LazyLock<Regex> = LazyLock::new(|| re(r"([0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2})"));
 
-/// A Python exception that ends the script (the message is its last traceback line).
+/// The message of a failure that ends the program (on stderr, exit status 1).
 type Fail = String;
 
 fn float(s: &str) -> Result<f64, Fail> {
-    py_float(s).ok_or_else(|| format!("ValueError: could not convert string to float: {}", repr_str(s)))
+    py_float(s).ok_or_else(|| format!("not a number: {}", repr_str(s)))
 }
 
 /// The value of a `[sync]` field: a duration in milliseconds, or the text as it was.
@@ -164,7 +164,7 @@ fn iq_text(d: &str, baseline: Option<&str>, fg: Option<f64>) -> Result<String, F
 type Row = (f64, Option<f64>, Option<f64>, Option<f64>);
 
 fn line_field(line: &str, i: usize) -> Result<f64, Fail> {
-    float(line.split(',').nth(i).ok_or("IndexError: list index out of range")?)
+    float(line.split(',').nth(i).ok_or("a line has too few fields")?)
 }
 
 fn report(label: &str, base: &str, baseline: Option<&str>) -> Result<Option<Row>, Fail> {
@@ -181,16 +181,16 @@ fn report(label: &str, base: &str, baseline: Option<&str>) -> Result<Option<Row>
         println!("{label}: no Pass4 frame-time file");
         return Ok(None);
     };
-    let ts = PASS4_STAMP.captures(p4).ok_or("AttributeError: 'NoneType' object has no attribute 'group'")?[1].to_string();
-    let end = pytime::parse_gta_stamp(&ts).ok_or_else(|| format!("ValueError: time data {} does not match format '%y-%m-%d-%H-%M-%S'", repr_str(&ts)))?;
+    let ts = PASS4_STAMP.captures(p4).ok_or("no timestamp in the Pass 4 file name")?[1].to_string();
+    let end = pytime::parse_gta_stamp(&ts).ok_or_else(|| format!("bad timestamp {}, expected YY-MM-DD-HH-MM-SS", repr_str(&ts)))?;
     let p4_text = read_text(p4)?;
     let mut ft = Vec::new();
     for line in splitlines(&p4_text).into_iter().skip(1).filter(|l| !l.trim().is_empty()) {
-        ft.push(float(line.split_whitespace().nth(1).ok_or("IndexError: list index out of range")?)?);
+        ft.push(float(line.split_whitespace().nth(1).ok_or("a line has too few fields")?)?);
     }
     let dur = py_sum(&ft) / 1000.0;
     if dur == 0.0 {
-        return Err("ZeroDivisionError: division by zero".into());
+        return Err("division by zero".into());
     }
     let real4 = ft.len() as f64 / dur;
     let w0 = end - pytime::seconds(dur - 5.0);
@@ -199,14 +199,13 @@ fn report(label: &str, base: &str, baseline: Option<&str>) -> Result<Option<Row>
     for m in
         glob_dir(&d, |n| n.starts_with("GTA5_Enhanced_") && n.ends_with(".csv") && n.len() >= 19 && n[..n.len() - 4].ends_with(|c: char| c.is_ascii_digit()))
     {
-        let stamp = CSV_STAMP.captures(&m).ok_or("AttributeError: 'NoneType' object has no attribute 'group'")?[1].to_string();
-        let st =
-            pytime::parse_csv_stamp(&stamp).ok_or_else(|| format!("ValueError: time data {} does not match format '%Y-%m-%d_%H-%M-%S'", repr_str(&stamp)))?;
+        let stamp = CSV_STAMP.captures(&m).ok_or("no timestamp in the sync file")?[1].to_string();
+        let st = pytime::parse_csv_stamp(&stamp).ok_or_else(|| format!("bad timestamp {}, expected YYYY-MM-DD_HH-MM-SS", repr_str(&stamp)))?;
         let content = read_text(&m)?;
         let mut n = 0_u64;
         for r in splitlines(&content).into_iter().skip(3).filter(|r| !r.trim().is_empty()) {
             let last = r.rsplit(',').next().unwrap_or("");
-            let us = bench_iq::pyish::py_int(last).ok_or_else(|| format!("ValueError: invalid literal for int() with base 10: {}", repr_str(last)))?;
+            let us = bench_iq::pyish::py_int(last).ok_or_else(|| format!("not an integer: {}", repr_str(last)))?;
             let t = st + pytime::microseconds(us as f64 / 1000.0);
             if w0 <= t && t <= w1 {
                 n += 1;
@@ -215,7 +214,7 @@ fn report(label: &str, base: &str, baseline: Option<&str>) -> Result<Option<Row>
         if n > 0 {
             let secs = pytime::total_seconds(w1 - w0);
             if secs == 0.0 {
-                return Err("ZeroDivisionError: float division by zero".into());
+                return Err("division by zero".into());
             }
             disp = Some(n as f64 / secs);
         }
@@ -234,7 +233,7 @@ fn report(label: &str, base: &str, baseline: Option<&str>) -> Result<Option<Row>
             let stamp: String = p[0].chars().take(19).collect();
             let Some(t) = pytime::parse_gpu_stamp(&stamp) else { continue };
             if w0 <= t && t <= w1 {
-                let (a, b) = (p.get(1).ok_or("IndexError: list index out of range")?, p.get(2).ok_or("IndexError: list index out of range")?);
+                let (a, b) = (p.get(1).ok_or("a line has too few fields")?, p.get(2).ok_or("a line has too few fields")?);
                 u.push((float(a)?, float(b)?));
             }
         }

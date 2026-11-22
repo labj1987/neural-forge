@@ -143,10 +143,10 @@ impl Rgb {
     /// `img.crop((x0, y0, x1, y1))`; the part outside the image is black.
     pub fn crop(&self, x0: i64, y0: i64, x1: i64, y1: i64) -> Result<Rgb, Fail> {
         if x1 < x0 {
-            return Err("ValueError: Coordinate 'right' is less than 'left'".into());
+            return Err("right is less than left".into());
         }
         if y1 < y0 {
-            return Err("ValueError: Coordinate 'lower' is less than 'upper'".into());
+            return Err("lower is less than upper".into());
         }
         let (nw, nh) = ((x1 - x0) as usize, (y1 - y0) as usize);
         let mut out = Rgb::filled(nw, nh, [0, 0, 0]);
@@ -169,7 +169,7 @@ impl Rgb {
 
     pub fn resize(&self, ow: i64, oh: i64, filter: Filter) -> Result<Rgb, Fail> {
         if ow <= 0 || oh <= 0 {
-            return Err("ValueError: height and width must be > 0".into());
+            return Err("height and width must be > 0".into());
         }
         let (ow, oh) = (ow as usize, oh as usize);
         if (ow, oh) == (self.w, self.h) {

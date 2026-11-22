@@ -21,7 +21,7 @@ const DETAIL_FRACTION: f64 = 0.10;
 const ORIGINAL_TOLERANCE: f64 = 0.5;
 const HELP: &str = include_str!("agreement/help.txt");
 
-/// What an uncaught Python exception becomes: the message on stderr, status 1.
+/// The message of a failure that ends the program (on stderr, exit status 1).
 type Fail = String;
 
 /// The pan.rs frame counter in the top-left corner, or None when there is no stamp.
@@ -110,7 +110,7 @@ fn mean_f(a: &[f32]) -> f64 {
 /// The cropped region (1, EXCLUDE_TOP, w - 1, h - 1) of a plane.
 fn crop(p: &[f32], w: usize, h: usize) -> Result<Plane, Fail> {
     if w < 2 || h < EXCLUDE_TOP + 2 {
-        return Err("ValueError: the image is too small for the stamp band and border".into());
+        return Err("the image is too small for the stamp band and border".into());
     }
     let mut out = Vec::with_capacity((w - 2) * (h - 1 - EXCLUDE_TOP));
     for y in EXCLUDE_TOP..h - 1 {
@@ -127,7 +127,7 @@ fn zip_map(a: &[f32], b: &[f32], f: impl Fn(f32, f32) -> f32) -> Plane {
 fn detail_mask(original: &Rgb) -> Result<Plane, Fail> {
     let (w, h) = (original.w, original.h);
     if w < 2 || h < EXCLUDE_TOP + 2 {
-        return Err("ValueError: the image is too small for the stamp band and border".into());
+        return Err("the image is too small for the stamp band and border".into());
     }
     let luma: Plane = (0..w * h).map(|i| original.luma_at(i % w, i / w) as f32).collect();
     let mut g2 = Vec::with_capacity((w - 2) * (h - 1 - EXCLUDE_TOP));

@@ -124,19 +124,20 @@ pub(crate) fn normpath_basename(p: &str) -> String {
     parts.last().map_or(if p.is_empty() || absolute { "" } else { "." }, |l| l).to_string()
 }
 
-/// `open(path).read()`: UTF-8 (strict), line ends translated. The error is Python's `OSError` text or the decode failure.
+/// `open(path).read()`: UTF-8 (strict), line ends translated. The error is a plain message naming the path.
 pub(crate) fn read_text(path: &str) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| os_error(&e, path))?;
-    String::from_utf8(bytes).map(|s| crate::py::universal_newlines(&s)).map_err(|e| format!("'utf-8' codec can't decode byte in {path}: {e}"))
+    let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    String::from_utf8(bytes).map(|s| crate::py::universal_newlines(&s)).map_err(|e| format!("{path} is not valid UTF-8: {e}"))
 }
 
 /// `open(path, errors="replace").read()`.
 pub(crate) fn read_text_lossy(path: &str) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| os_error(&e, path))?;
+    let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     Ok(crate::py::universal_newlines(&String::from_utf8_lossy(&bytes)))
 }
 
-/// Python's `OSError` text: `[Errno 2] No such file or directory: 'path'`.
+/// An `OSError`-style text, `[Errno 2] No such file or directory: 'path'`: bench-report prints it on stdout for a frame it
+/// cannot read, so it stays as it was.
 pub(crate) fn os_error(e: &std::io::Error, path: &str) -> String {
     let text = e.to_string();
     let text = text.split(" (os error").next().unwrap_or(&text);
