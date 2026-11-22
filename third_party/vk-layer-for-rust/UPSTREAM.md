@@ -132,3 +132,5 @@ this project's own code: upstream is no longer tracked.
    1.3.250, 1.3.296, 1.4.304, 1.4.313 and 1.4.321 (1.4.335 and newer stop both at the same point: a type ash 0.38
    does not have). The Python unit tests are `genvk`'s tests, on a fixture taken from 1.3.281's `vk.xml`.
    Regenerating needs no Python.
+   The registry logic follows Khronos `reg.py` 1.3.281 and was checked identical up to vk.xml 1.4.321; a header bump past
+   that may need `registry.rs` updated (1.4.335 and 1.4.368 already stop with errors).

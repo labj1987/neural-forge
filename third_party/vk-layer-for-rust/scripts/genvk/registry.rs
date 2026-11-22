@@ -97,10 +97,18 @@ pub fn et_tail(node: Node) -> Option<String> {
 
 /// ElementTree's `"".join(elem.itertext())`: all the text inside the element.
 pub fn itertext(node: Node) -> String {
-    node.descendants()
-        .filter(|descendant| descendant.is_text())
-        .filter_map(|descendant| descendant.text())
-        .collect()
+    fn walk(node: Node, text: &mut String) {
+        for child in node.children() {
+            if let Some(part) = child.is_text().then(|| child.text()).flatten() {
+                text.push_str(part);
+            } else if child.is_element() && kept(&child) {
+                walk(child, text);
+            }
+        }
+    }
+    let mut text = String::new();
+    walk(node, &mut text);
+    text
 }
 
 /// A `<feature>` (a core version) or an `<extension>` (reg.py's `FeatureInfo`).
@@ -363,7 +371,7 @@ impl<'a, 'i> Registry<'a, 'i> {
         let mut seen = HashSet::new();
         for node in children(root, "feature") {
             let feature = Feature::new(node);
-            if seen.insert(feature.name.clone()) && api_name_match(node.attribute("api")) {
+            if seen.insert(feature.name.clone()) {
                 features.push(feature);
             }
         }

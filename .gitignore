@@ -15,7 +15,6 @@
 
 # Native backend toolchain (scripts/fetch-native-tools.sh)
 /tools
-__pycache__/
 
 # Benchmark and test output
 /bench-out/
