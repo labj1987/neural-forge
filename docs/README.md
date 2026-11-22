@@ -90,7 +90,7 @@ disagree, the more recent measurement wins.
   unattended GTA benchmark, the pan reproducer and agreement metric, the diagnostic modes and
   probe, reading the logs and `shmctl status`, validation
   layers, checking the picture by eye, the release checklist, the reverse-engineering toolkit, and the
-  pre-release game sweep (`scripts/game-sweep.sh`, the games in `data/games.toml`)
+  pre-release game sweep (`cargo xtask game-sweep`, the games in `data/games.toml`)
   installed on the test machine.
 - [RE_TOOLKIT.md](RE_TOOLKIT.md): agent-driven reverse-engineering tools surveyed (what each attaches
   to, headless or GUI, licence) and why each was or was not installed.

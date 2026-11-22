@@ -4,7 +4,7 @@
 //! wiring, and `NeuralForgeDeviceInfo::new`'s function-pointer resolution -- against a real
 //! loader and ICD (lavapipe is enough; nothing here needs a GPU).
 //!
-//! Run via `scripts/smoke-test.sh`, which builds the layer, writes a manifest pointing
+//! Run via `cargo xtask smoke-test`, which builds the layer, writes a manifest pointing
 //! at the just-built `.so`, and sets the env vars this needs
 //! (`VK_LAYER_PATH`/`NEURAL_FORGE_ENABLE`/`NEURAL_FORGE_LOG`) before running it. Running this
 //! directly without that setup will simply not find the layer -- which is a fine
@@ -50,7 +50,7 @@ fn main() {
     println!("smoke: device created -- if the layer is enabled, NeuralForgeDeviceInfo::new ran without panicking");
 
     // The image, view and submit paths the `NEURAL_FORGE_PROBE_NGX` probe hooks (it is off
-    // unless smoke-test.sh's second pass sets it). Neither NVX extension is enabled here, so
+    // unless cargo xtask smoke-test's second pass sets it). Neither NVX extension is enabled here, so
     // their entry points must come back null, probe or not, and nothing may crash.
     // SAFETY: plain object creation on the device above, destroyed again below.
     unsafe {

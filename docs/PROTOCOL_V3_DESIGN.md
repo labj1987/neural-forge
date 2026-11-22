@@ -108,7 +108,7 @@ commit, not just this dev machine's own software ICD:
   `PRESENT_SRC_KHR` barrier layouts trip `VUID-VkImageMemoryBarrier-*-parameter` --
   confirmed identical on the pre-v3 commit via a second worktree, so this is not a
   regression). Zero new validation errors or sync hazards.
-- `scripts/smoke-test.sh` (the debug-mode UB checker that has caught real bugs this
+- `cargo xtask smoke-test` (the debug-mode UB checker that has caught real bugs this
   project's own validation layers couldn't -- see `EXTERNAL_MEMORY_HOST_DESIGN.md`):
   clean, `external_memory_host: true`, no abort, clean teardown.
 - `crates/protocol/examples/trigger_helper_roundtrip.rs`, extended with the slot

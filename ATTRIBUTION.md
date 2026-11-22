@@ -205,7 +205,7 @@ from their sources at build time (`cargo xtask gen-third-party-crates --licences
 
 | Component | Version | License | Use |
 |---|---|---|---|
-| [volk](https://github.com/zeux/volk) | vulkan-sdk-1.4.363.0 | MIT | Vulkan function loader, compiled into the native backend. Fetched at build time by `scripts/fetch-native-tools.sh` (SHA-256 pinned). |
+| [volk](https://github.com/zeux/volk) | vulkan-sdk-1.4.363.0 | MIT | Vulkan function loader, compiled into the native backend. Fetched at build time by `cargo xtask fetch-native-tools` (SHA-256 pinned). |
 | [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | vulkan-sdk-1.4.363.0 | Apache-2.0 / MIT | The Vulkan declarations the C++ is compiled against. Fetched the same way. |
 | libstdc++ (GCC) | the build compiler's | GPL-3.0 with the GCC Runtime Library Exception | Linked statically into the layer so it does not depend on the host's C++ runtime. The exception permits distributing the result under this project's license. |
 

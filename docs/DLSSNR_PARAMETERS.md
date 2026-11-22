@@ -229,7 +229,7 @@ section 5).
 
 The maintainer's bar: a change ships only if it raises fps or improves image quality.
 
-| Candidate | Small | Risk-free | Measurable with `gta-bench.sh` | Raises fps or improves the picture | Shipped |
+| Candidate | Small | Risk-free | Measurable with `cargo xtask gta-bench` | Raises fps or improves the picture | Shipped |
 |---|---|---|---|---|---|
 | Correct `Feature_Flags` bits | yes | yes | no difference to measure | no: byte-identical answers | committed, unreleased |
 | Remove the 18 unread writes | yes | yes | no | no | no |

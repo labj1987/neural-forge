@@ -1,5 +1,5 @@
 //! NVIDIA's `_nvngx.dll` exports (driver 620.70, 75 names; the ordinals are their alphabetical order, which the
-//! linker gives these too: `scripts/build-ngx-wrapper.sh` checks both against the driver's DLL when it is installed).
+//! linker gives these too: `cargo xtask build-ngx-wrapper` checks both against the driver's DLL when it is installed).
 //! The ones Neural Forge watches are in `hooks.rs`; every other one is a jump through the pointer resolved from
 //! NVIDIA's core at load (`win.rs`, `resolve`), or to [`missing_export`] when the core lacks it
 //! ([`crate::rules::resolution`]).

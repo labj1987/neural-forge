@@ -32,7 +32,7 @@ game / sl.dlss.dll ──NGX's static loader──► C:\windows\system32\_nvngx
   order says builtin, maps the builtin of that name instead (`dlls/ntdll/unix/loader.c`, `load_builtin`). The module
   keeps the requested path. So `WinVerifyTrust` reads NVIDIA's unchanged signed file, and `LoadLibrary` of that path
   returns the wrapper. A PE is a builtin when the 32 bytes at file offset 0x40 read `Wine builtin DLL`
-  (`server/mapping.c`), which `scripts/build-ngx-wrapper.sh` writes after the build, as `winebuild --builtin` does.
+  (`server/mapping.c`), which `cargo xtask build-ngx-wrapper` writes after the build, as `winebuild --builtin` does.
 - **Loading NVIDIA's core.** The wrapper loads `Z:<NVIDIA_WINE_DLL_DIR>/_nvngx.dll` by its full path. A full-path key
   is looked up before the base name, so the override `Z:\...\nvidia\wine\_nvngx=n` keeps that one native; without it
   Wine hands the wrapper back to itself (the wrapper checks: a load that returns its own module refuses the load).
@@ -316,7 +316,7 @@ submodules). The `proton` script is BSD-3-Clause (Valve); its notice stays in th
   the patch on the newest Proton Experimental and proton-cachyos scripts and keeps one standing issue open while it does not apply. NVIDIA adds an export to its core:
   the wrapper lacks it and NGX's loader may refuse the core, so the game runs without DLSS. NVIDIA's core lacks one of
   the wrapper's exports (an older driver): a passthrough one answers `NVSDK_NGX_Result_Fail`, a hooked one fails the
-  wrapper's load, so the game runs without DLSS (see "Exports the core lacks"). `build-ngx-wrapper.sh` compares the
+  wrapper's load, so the game runs without DLSS (see "Exports the core lacks"). `cargo xtask build-ngx-wrapper` compares the
   wrapper's exports (names and ordinals) with the driver's DLL wherever one is installed, and `doctor` compares them
   with the user's driver both ways: a core export the wrapper does not forward, or one the wrapper hooks that the core
   lacks, is a failure; a forwarded export the core lacks is a warning. NGX starts verifying the loaded image instead of the file: the

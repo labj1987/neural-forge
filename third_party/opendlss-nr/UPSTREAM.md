@@ -7,7 +7,7 @@ The network Neural Forge runs is the implementation from OpenDLSS-NR by maan, MI
   taken in on 2026-10-22).
 - License: MIT (`LICENSE`, `NOTICE` here; both ship in the AppImage).
 
-Until 3.8.6, `scripts/fetch-native-tools.sh` downloaded that commit at build time, trimmed it to what is
+Until 3.8.6, `cargo xtask fetch-native-tools` downloaded that commit at build time, trimmed it to what is
 listed under "Included" and applied ten patches. Since then this directory holds that result (the commit,
 trimmed, with the ten changes below) and is this project's own code: upstream is no longer tracked.
 `crates/native/build.rs` (neural-forge-native) builds from here. No compiled SPIR-V or PTX is committed:

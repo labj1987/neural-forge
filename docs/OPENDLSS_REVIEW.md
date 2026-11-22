@@ -68,7 +68,7 @@ that doesn't exist yet.
 ## Measurements
 
 GTA V Enhanced built-in benchmark, pass 4 (the long free-roam pass), 2560x1440, frame generation
-off, model every 2nd frame, motion vectors on. Runner: `gta-bench.sh` (unattended), real fps from
+off, model every 2nd frame, motion vectors on. Runner: `cargo xtask gta-bench` (unattended), real fps from
 GTA's own frame-time file.
 
 **Correction (later the same day): these runs had GTA's script mods loaded.** One of them, the
