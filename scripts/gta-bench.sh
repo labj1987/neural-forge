@@ -69,9 +69,8 @@ resolve_xtask() {
     local root target
     root=$(cd "$(dirname "$0")/.." && pwd) || return 1
     (cd "$root" && cargo build --locked --quiet --package xtask) || { echo "error: cannot build xtask in $root" >&2; return 1; }
-    target=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}
-    # A relative CARGO_TARGET_DIR is relative to where cargo ran: the repository root.
-    case $target in /*) ;; *) target=$root/$target;; esac
+    # Cargo itself says where it built (CARGO_TARGET_DIR, build.target-dir in any config, or the default); jq is needed anyway.
+    target=$(cd "$root" && cargo metadata --format-version 1 --no-deps | jq -r .target_directory) && [ -n "$target" ] || { echo "error: cannot read cargo's target directory" >&2; return 1; }
     NF_BENCH_XTASK=$target/debug/xtask
     [ -x "$NF_BENCH_XTASK" ] || { echo "error: $NF_BENCH_XTASK was not built" >&2; NF_BENCH_XTASK=; return 1; }
 }

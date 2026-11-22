@@ -234,9 +234,8 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Result<Self, Failure> {
-        let dir = std::env::temp_dir().join(format!("nf-check-proton-scripts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).map_err(|e| Failure::Other(format!("OSError: {e}")))?;
+        let dir = crate::check_pins::http::private_dir("check-proton-scripts")
+            .map_err(|e| Failure::Other(format!("could not create a private temporary directory: {e}")))?;
         Ok(TempDir(dir))
     }
 }

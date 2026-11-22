@@ -55,8 +55,9 @@ pub fn parse_headers(dump: &str) -> Option<Head> {
 }
 
 /// curl's exit codes that mean the network let it down: could not resolve the proxy (5) or host (6), could not
-/// connect (7), a partial transfer (18), a timeout (28), a TLS handshake failure (35), an empty reply (52), a send or
-/// receive failure (55, 56).
+/// connect (7), a weird server reply (8), a partial transfer (18), a timeout (28), a TLS handshake failure (35), too many
+/// redirects (47), an empty reply (52), a send or receive failure (55, 56), a peer certificate that did not verify (60),
+/// a proxy handshake failure (97).
 const NETWORK_EXITS: [i32; 13] = [5, 6, 7, 8, 18, 28, 35, 47, 52, 55, 56, 60, 97];
 
 /// What a failed curl run (its exit code, None when a signal ended it, and its stderr) means.
@@ -69,8 +70,9 @@ fn classify_exit(code: Option<i32>, stderr: &str) -> FetchError {
     }
 }
 
-/// A private (mode 0700) directory of this process's own, with an unguessable name, for curl's header dump.
-fn private_dir() -> std::io::Result<PathBuf> {
+/// A private (mode 0700) directory of this process's own, with an unguessable name `nf-xtask-<label>-<random>`, that
+/// create_dir refuses when it is already taken (a header dump for curl, a scratch dir for a check).
+pub(crate) fn private_dir(label: &str) -> std::io::Result<PathBuf> {
     let mut random = [0u8; 16];
     let from_system = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random));
     if from_system.is_err() {
@@ -79,14 +81,14 @@ fn private_dir() -> std::io::Result<PathBuf> {
         random.copy_from_slice(&(nanos ^ (u128::from(std::process::id()) << 96)).to_le_bytes());
     }
     let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
-    let dir = std::env::temp_dir().join(format!("nf-xtask-curl-{name}"));
+    let dir = std::env::temp_dir().join(format!("nf-xtask-{label}-{name}"));
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     Ok(dir)
 }
 
 /// Streams the body of `url` into `sink`. `idle_secs` bounds the connect and any stall, like a socket timeout.
 pub fn get_stream(url: &str, headers: &[(&str, &str)], idle_secs: u32, sink: &mut dyn FnMut(&[u8])) -> Result<(), FetchError> {
-    let dir = private_dir().map_err(|e| FetchError::Tool(format!("could not create a private temporary directory: {e}")))?;
+    let dir = private_dir("curl").map_err(|e| FetchError::Tool(format!("could not create a private temporary directory: {e}")))?;
     let dump = dir.join("headers");
     // create_new: never opens a file that is already there (or follows a link planted in its place).
     let created = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&dump);
@@ -191,7 +193,7 @@ mod tests {
 
     #[test]
     fn check_pins_http_header_dump_is_private_and_unique() {
-        let (a, b) = (private_dir().unwrap(), private_dir().unwrap());
+        let (a, b) = (private_dir("curl").unwrap(), private_dir("curl").unwrap());
         assert_ne!(a, b);
         let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&a).unwrap().permissions());
         assert_eq!(mode & 0o777, 0o700);

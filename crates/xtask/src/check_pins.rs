@@ -493,7 +493,7 @@ pub fn main(args: &[String]) -> ExitCode {
     let bumping = args == ["--bump"];
     if !args.is_empty() && !bumping {
         eprintln!("usage: cargo xtask check-pins [--bump | --self-test]");
-        return ExitCode::FAILURE;
+        return ExitCode::from(BROKEN);
     }
     let (rows, failed) = match check() {
         Ok(r) => r,

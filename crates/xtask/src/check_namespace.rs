@@ -23,7 +23,7 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `glob('*.[ch]*')`: a name with a dot followed by c or h, not hidden.
+/// `glob('*.[ch]*')`: a name with a dot followed by c or h (a dotfile counts).
 fn c_sources(dir: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|e| e.flatten().map(|e| e.path()).collect::<Vec<PathBuf>>())
@@ -31,7 +31,7 @@ fn c_sources(dir: &Path) -> Vec<PathBuf> {
         .into_iter()
         .filter(|p: &PathBuf| {
             let n = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            !n.starts_with('.') && n.as_bytes().windows(2).any(|w| w[0] == b'.' && (w[1] == b'c' || w[1] == b'h'))
+            n.as_bytes().windows(2).any(|w| w[0] == b'.' && (w[1] == b'c' || w[1] == b'h'))
         })
         .collect();
     found.sort();

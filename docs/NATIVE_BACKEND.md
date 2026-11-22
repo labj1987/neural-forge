@@ -798,7 +798,8 @@ helper and everything associated with it". Done on `release-3.0`:
   held inside DLSS's buffer at 109.4/s, R11G11B10 input at 1488x836, network 6.19 ms, 0 misses. No Xid,
   no fence timeout in any run.
 - **Checks:** every crate builds without warnings, `cargo test` (layer on lavapipe) passes, as do
-  `test_install.py`, `check_shaders.py` and `check_namespace.py`.
+  `test_install.py`, `check_shaders.py` and `check_namespace.py` (that release's Python scripts, long gone: the
+  shader and namespace checks are now `cargo xtask check-shaders` and `cargo xtask check-namespace`).
 
 ## The small network (3.5.0, 2026-10-16)
 

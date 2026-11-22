@@ -34,7 +34,7 @@ fn fail(message: &str) -> ! {
 
 fn with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == ext) && !name(p).starts_with('.')).collect())
+        .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == ext)).collect())
         .unwrap_or_default();
     found.sort();
     found
@@ -88,9 +88,7 @@ fn update(shaders: &Path) -> u8 {
     let sources = with_extension(shaders, "comp");
     for comp in &sources {
         let spv = comp.with_extension("spv");
-        let tmp = TempDir(std::env::temp_dir().join(format!("check-shaders-{}-{}", std::process::id(), name(comp))));
-        let _ = std::fs::remove_dir_all(&tmp.0);
-        std::fs::create_dir_all(&tmp.0).unwrap_or_else(|e| fail(&format!("{}: {e}", tmp.0.display())));
+        let tmp = TempDir(crate::check_pins::http::private_dir("check-shaders").unwrap_or_else(|e| fail(&format!("temporary directory: {e}"))));
         let out = tmp.0.join(name(&spv));
         let result = Command::new(&glslang).arg("-V").arg(comp).arg("-o").arg(&out).output().unwrap_or_else(|e| fail(&format!("{}: {e}", glslang.display())));
         if !result.status.success() {

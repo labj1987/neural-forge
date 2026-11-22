@@ -6,8 +6,8 @@
 //! gta-bench proton <steam root> <appid> [libraries...]: the Proton folder Steam runs the app with.
 //! gta-bench self-test.
 //!
-//! Python stopped on an unexpected failure with a traceback and exit 1; here the last traceback line (`Class: message`) goes to
-//! stderr and the exit code is 1 as well. Directory listings are in name order (Python's glob gives the OS order, which only
+//! An unexpected failure puts one plain message on stderr and exits 1 (scripts/gta-bench.sh reads only the exit status and
+//! stdout). Directory listings are in name order (Python's glob gives the OS order, which only
 //! shows with equal modification times), and `glob` metacharacters in a directory name are plain text here.
 
 use std::collections::HashSet;
@@ -19,8 +19,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::bench_iq::pyish::{glob_dir, join, os_error, py_float, py_int, read_text_lossy};
-use crate::py::{repr_str, splitlines};
+use crate::bench_iq::pyish::{glob_dir, join, py_float, py_int, read_text_lossy};
+use crate::py::splitlines;
 
 /// GTA5_Enhanced.exe (2026-09-15 build): the instruction after its hang watchdog's call.
 const WATCHDOG: u64 = 0x1_4012_c6eb;
@@ -40,53 +40,16 @@ const VALVE_TOOLS: [(&str, &str); 9] = [
     ("proton_513", "1420170"),
 ];
 
-/// A Python exception that ends the program (its `Class: message` line).
+/// The message of a failure that ends the program.
 type Fail = String;
 
-fn io_fail(e: &std::io::Error, path: &str) -> Fail {
-    let class = match e.raw_os_error() {
-        Some(2) => "FileNotFoundError",
-        Some(13) => "PermissionError",
-        Some(17) => "FileExistsError",
-        Some(20) => "NotADirectoryError",
-        Some(21) => "IsADirectoryError",
-        _ => "OSError",
-    };
-    format!("{class}: {}", os_error(e, path))
-}
-
-/// `open(path, errors="replace").read()` as a failure line.
-fn read_lossy(path: &str) -> Result<String, Fail> {
-    read_text_lossy(path).map_err(|e| {
-        // read_text_lossy gives the OSError text without its class; the class follows from the errno in the text.
-        let class = match e.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty()) {
-            Some("2") => "FileNotFoundError",
-            Some("13") => "PermissionError",
-            Some("20") => "NotADirectoryError",
-            Some("21") => "IsADirectoryError",
-            _ => "OSError",
-        };
-        format!("{class}: {e}")
-    })
-}
-
-/// `struct.unpack_from(fmt, data, offset)` for a format of `size` bytes: the bytes, or struct's own error message (it names
-/// the whole format's size, so a multi-field format is read in one go here too).
-fn unpack(data: &[u8], off: i128, size: usize) -> Result<&[u8], Fail> {
-    if off > i64::MAX as i128 {
-        return Err("OverflowError: Python int too large to convert to C ssize_t".to_string());
+/// `size` bytes of `data` at `off`, or an error naming the range that is missing.
+fn unpack(data: &[u8], off: u64, size: usize) -> Result<&[u8], Fail> {
+    let end = off.checked_add(size as u64);
+    match end {
+        Some(end) if end <= data.len() as u64 => Ok(&data[off as usize..end as usize]),
+        _ => Err(format!("truncated minidump: {size} bytes wanted at offset {off}, the file has {}", data.len())),
     }
-    if off < 0 {
-        return Err(format!("struct.error: offset {off} out of range for {}-byte buffer", data.len()));
-    }
-    if off + size as i128 > data.len() as i128 {
-        return Err(format!(
-            "struct.error: unpack_from requires a buffer of at least {} bytes for unpacking {size} bytes at offset {off} (actual buffer size is {})",
-            off + size as i128,
-            data.len()
-        ));
-    }
-    Ok(&data[off as usize..off as usize + size])
 }
 
 /// The little-endian integer in `b`.
@@ -96,11 +59,11 @@ fn le(b: &[u8]) -> u64 {
     u64::from_le_bytes(w)
 }
 
-fn u32_at(data: &[u8], off: i128) -> Result<u64, Fail> {
+fn u32_at(data: &[u8], off: u64) -> Result<u64, Fail> {
     unpack(data, off, 4).map(le)
 }
 
-fn u64_at(data: &[u8], off: i128) -> Result<u64, Fail> {
+fn u64_at(data: &[u8], off: u64) -> Result<u64, Fail> {
     unpack(data, off, 8).map(le)
 }
 
@@ -110,48 +73,48 @@ fn dump_cause(data: &[u8]) -> Result<String, Fail> {
         return Ok("empty dump (the game died while writing it)".to_string());
     }
     let head = unpack(data, 0, 16)?;
-    let (nstreams, rva_dir) = (le(&head[8..12]), le(&head[12..]) as i128);
-    let mut streams: Vec<(u64, i128)> = Vec::new();
+    let (nstreams, rva_dir) = (le(&head[8..12]), le(&head[12..]));
+    let mut streams: Vec<(u64, u64)> = Vec::new();
     for i in 0..nstreams {
-        let at = rva_dir + 12 * i as i128;
+        let at = rva_dir.saturating_add(12 * i);
         let entry = unpack(data, at, 12)?;
-        streams.push((le(&entry[..4]), le(&entry[8..]) as i128));
+        streams.push((le(&entry[..4]), le(&entry[8..])));
     }
     // A later entry of the same kind replaces an earlier one.
     let stream = |kind: u64| streams.iter().rev().find(|(k, _)| *k == kind).map(|(_, r)| *r);
     let Some(rva) = stream(6) else {
         return Ok("dump without an exception record".to_string());
     };
-    let code = u32_at(data, rva + 8)?;
-    let addr = u64_at(data, rva + 24)?;
-    let ctx = u32_at(data, rva + 8 + 156)? as i128;
-    let rsp = u64_at(data, ctx + 0x98)? as i128;
+    let code = u32_at(data, rva.saturating_add(8))?;
+    let addr = u64_at(data, rva.saturating_add(24))?;
+    let ctx = u32_at(data, rva.saturating_add(8 + 156))?;
+    let rsp = u64_at(data, ctx.saturating_add(0x98))?;
     let mut ret: Option<u64> = None;
     // The memory lists: the word at rsp is the return address of a call.
     for kind in [5u64, 9] {
         let Some(r) = stream(kind) else { continue };
-        let mut ranges: Vec<(i128, i128, i128)> = Vec::new();
+        let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
         if kind == 5 {
             let n = u32_at(data, r)?;
             for i in 0..n {
-                let at = r + 4 + 16 * i as i128;
+                let at = r.saturating_add(4 + 16 * i);
                 let e = unpack(data, at, 16)?;
-                ranges.push((le(&e[..8]) as i128, le(&e[8..12]) as i128, le(&e[12..]) as i128));
+                ranges.push((le(&e[..8]), le(&e[8..12]), le(&e[12..])));
             }
         } else {
             let head = unpack(data, r, 16)?;
-            let (n, mut off) = (le(&head[..8]), le(&head[8..]) as i128);
+            let (n, mut off) = (le(&head[..8]), le(&head[8..]));
             for i in 0..n {
-                let at = r + 16 + 16 * i as i128;
+                let at = r.saturating_add(16 + 16 * i);
                 let e = unpack(data, at, 16)?;
-                let (start, size) = (le(&e[..8]) as i128, le(&e[8..]) as i128);
+                let (start, size) = (le(&e[..8]), le(&e[8..]));
                 ranges.push((start, size, off));
-                off += size;
+                off = off.saturating_add(size);
             }
         }
         for (start, size, at) in ranges {
-            if start <= rsp && rsp < start + size - 8 {
-                ret = Some(u64_at(data, at + rsp - start)?);
+            if start <= rsp && (rsp - start).saturating_add(8) < size {
+                ret = Some(u64_at(data, at.saturating_add(rsp - start))?);
             }
         }
     }
@@ -165,9 +128,9 @@ fn dump_cause(data: &[u8]) -> Result<String, Fail> {
     Ok(format!("exception {code:#010x} at {site}"))
 }
 
-/// A file's modification time the way Python's `os.path.getmtime` reports it.
+/// A file's modification time in seconds.
 fn mtime(path: &str) -> Result<f64, Fail> {
-    let m = fs::metadata(path).map_err(|e| io_fail(&e, path))?;
+    let m = fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
     Ok(m.mtime() as f64 + m.mtime_nsec() as f64 * 1e-9)
 }
 
@@ -179,7 +142,7 @@ fn dumps(folder: &str, since: f64) -> Result<(), Fail> {
     found.sort_by(|a, b| a.0.total_cmp(&b.0));
     for (_, path) in found {
         if mtime(&path)? >= since {
-            let data = fs::read(&path).map_err(|e| io_fail(&e, &path))?;
+            let data = fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
             let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             println!("{name}: {}", dump_cause(&data)?);
         }
@@ -232,14 +195,14 @@ fn int_as_f64(s: &str) -> Option<f64> {
 }
 
 fn fg(csv: &str, cap: &str) -> Result<(), Fail> {
-    let text = read_lossy(csv)?;
+    let text = read_text_lossy(csv).map_err(|e| format!("{csv}: {e}"))?;
     let times: Vec<f64> = splitlines(&text)
         .into_iter()
         .skip(3)
         .filter(|r| r.matches(',').count() > 3)
         .filter_map(|r| int_as_f64(r.rsplit(',').next().unwrap_or("")).map(|v| v / 1e9))
         .collect();
-    let cap = py_float(cap).ok_or_else(|| format!("ValueError: could not convert string to float: {}", repr_str(cap)))?;
+    let cap = py_float(cap).ok_or_else(|| format!("the frame-rate cap is not a number: {cap:?}"))?;
     println!("{}", fg_rule(&times, cap));
     Ok(())
 }
@@ -440,11 +403,7 @@ fn mapped_proton(root: &str, libraries: &[String], appid: &str) -> Result<String
 
 fn proton(args: &[String]) -> Result<ExitCode, Fail> {
     if args.len() < 2 {
-        return Err(format!(
-            "TypeError: proton() missing {} required positional argument{}",
-            2 - args.len(),
-            if args.is_empty() { "s: 'root' and 'appid'" } else { ": 'appid'" }
-        ));
+        return Err(String::from("usage: gta-bench proton <steam root> <appid> [libraries...]"));
     }
     let libraries: Vec<String> = if args.len() > 2 { args[2..].to_vec() } else { vec![args[0].clone()] };
     match mapped_proton(&args[0], &libraries, &args[1]) {
@@ -460,12 +419,16 @@ fn proton(args: &[String]) -> Result<ExitCode, Fail> {
 }
 
 fn run(args: &[String]) -> Result<ExitCode, Fail> {
-    let arg = |i: usize| args.get(i).cloned().ok_or_else(|| "IndexError: list index out of range".to_string());
+    let arg = |i: usize| {
+        args.get(i).cloned().ok_or_else(|| {
+            format!("missing argument {i}: usage: gta-bench dumps <dir> <epoch> | fg <csv> <cap> | proton <root> <appid> [libraries...] | self-test")
+        })
+    };
     match arg(0)?.as_str() {
         "dumps" => {
             let folder = arg(1)?;
             let since = arg(2)?;
-            let since = py_float(&since).ok_or_else(|| format!("ValueError: could not convert string to float: {}", repr_str(&since)))?;
+            let since = py_float(&since).ok_or_else(|| format!("the epoch is not a number: {since:?}"))?;
             dumps(&folder, since)?;
         }
         "fg" => fg(&arg(1)?, &arg(2)?)?,
@@ -487,7 +450,7 @@ fn check(ok: bool, what: &str) -> Result<(), Fail> {
     if ok {
         Ok(())
     } else {
-        Err(format!("AssertionError: {what}"))
+        Err(format!("self-test failed: {what}"))
     }
 }
 
@@ -608,12 +571,12 @@ mod tests {
     }
 
     #[test]
-    fn truncated_dump_is_a_struct_error() {
+    fn truncated_dump_is_an_error() {
         let mut b = vec![0u8; 40];
         b[..4].copy_from_slice(b"MDMP");
         b[8] = 1;
         b[12] = 32;
-        assert!(super::dump_cause(&b).is_err_and(|e| e.starts_with("struct.error: unpack_from requires a buffer of at least 44 bytes")));
+        assert!(super::dump_cause(&b).is_err_and(|e| e.starts_with("truncated minidump: 12 bytes wanted at offset 32, the file has 40")));
     }
 
     #[test]

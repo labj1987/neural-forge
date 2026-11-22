@@ -1,5 +1,5 @@
 //! The dispatcher's own exit code: an unknown or missing task is EX_USAGE (64), which no task uses for its own outcome
-//! (they use 0, 1, 2, 3 and 10).
+//! (they use 0, 1, 2, 3, 4 and 10).
 
 use std::process::Command;
 
