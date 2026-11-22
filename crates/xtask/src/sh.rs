@@ -44,7 +44,7 @@ pub type Res<T> = Result<T, Fail>;
 pub fn finish(result: Res<ExitCode>) -> ExitCode {
     result.unwrap_or_else(|fail| {
         if let Some(message) = fail.message {
-            eprintln!("{message}");
+            warn(&message);
         }
         ExitCode::from(fail.code)
     })
@@ -111,14 +111,9 @@ impl Drop for TempDir {
 pub fn mktemp_d(prefix: &Path) -> std::io::Result<TempDir> {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut last = None;
-    for attempt in 0..100u32 {
+    for _ in 0..100u32 {
         let mut random = [0u8; 6];
-        if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random)).is_err() {
-            // No /dev/urandom: the clock and the process id still make a new name, and create refuses a taken one.
-            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-            let mixed = nanos ^ (u128::from(std::process::id()) << 64) ^ u128::from(attempt);
-            random.copy_from_slice(&mixed.to_le_bytes()[..6]);
-        }
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random))?;
         let suffix: String = random.iter().map(|b| CHARS[usize::from(*b) % CHARS.len()] as char).collect();
         let mut name = prefix.as_os_str().to_os_string();
         name.push(suffix);
@@ -161,6 +156,32 @@ pub fn interrupted() -> Res<()> {
     }
 }
 
+/// Takes the trapped signal, if any: what follows (putting things back) runs as if none had come.
+pub fn take_interruption() -> Option<i32> {
+    match SIGNAL.swap(0, Ordering::SeqCst) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+/// A line to stdout that cannot end the program: a write that fails (the reader is gone: a closed pipe, a dropped
+/// ssh connection) is recorded as SIGPIPE, the signal a shell's `echo` died of there, so the task ends through its own
+/// clean-up at the next `interrupted`. (Rust ignores SIGPIPE, and `println!` panics on the failed write, which aborts in
+/// this workspace's profile: nothing would be put back.)
+pub fn say(line: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+        SIGNAL.store(libc::SIGPIPE, Ordering::SeqCst);
+    }
+}
+
+/// A line to stderr that cannot end the program (a failed write is ignored, as a shell's `echo >&2` goes on).
+pub fn warn(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
 /// `sleep SECONDS`, ended early by a trapped signal.
 pub fn sleep(seconds: f64) -> Res<()> {
     let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds.max(0.0));
@@ -174,8 +195,8 @@ pub fn sleep(seconds: f64) -> Res<()> {
     }
 }
 
-/// `timeout SECONDS command`: the command in its own process group, ended (SIGTERM to the group) when it runs longer.
-/// Its exit status, 124 when it was ended.
+/// `timeout SECONDS command`: the command in its own process group, ended (SIGTERM to the group) when it runs longer
+/// or when a trapped signal comes. Its exit status, 124 when its time ran out.
 pub fn timeout(seconds: u64, cmd: &mut Command) -> std::io::Result<u8> {
     use std::os::unix::process::CommandExt;
     let mut child = cmd.process_group(0).spawn()?;
@@ -188,6 +209,11 @@ pub fn timeout(seconds: u64, cmd: &mut Command) -> std::io::Result<u8> {
             kill(-(child.id() as i32), libc::SIGTERM);
             let _ = child.wait();
             return Ok(124);
+        }
+        // A trapped signal ends the command too, as timeout(1) passes on the one it gets.
+        if interrupted().is_err() {
+            kill(-(child.id() as i32), libc::SIGTERM);
+            return Ok(child.wait().map_or(124, code));
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -215,6 +241,10 @@ pub fn timeout_output(seconds: u64, cmd: &mut Command) -> std::io::Result<(u8, S
             kill(-(child.id() as i32), libc::SIGTERM);
             let _ = child.wait();
             break 124;
+        }
+        if interrupted().is_err() {
+            kill(-(child.id() as i32), libc::SIGTERM);
+            break child.wait().map_or(124, code);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };

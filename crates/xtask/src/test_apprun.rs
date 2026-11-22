@@ -431,14 +431,3 @@ fn run() -> Res<ExitCode> {
 pub fn main(_args: &[String]) -> ExitCode {
     sh::finish(run())
 }
-
-#[cfg(test)]
-mod tests {
-    /// The whole test, so `cargo test` runs it too.
-    #[test]
-    fn apprun() {
-        if let Err(fail) = super::run() {
-            panic!("{}", fail.message.unwrap_or_default());
-        }
-    }
-}

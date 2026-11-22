@@ -154,7 +154,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tools/native
-          key: native-tools-${{ hashFiles('crates/xtask/src/fetch_native_tools.rs', 'crates/xtask/src/cargo_deny.rs', 'crates/xtask/src/vk_layer_codegen.rs') }}
+          key: native-tools-${{ hashFiles('crates/xtask/src/fetch.rs', 'crates/xtask/src/fetch_native_tools.rs', 'crates/xtask/src/cargo_deny.rs', 'crates/xtask/src/vk_layer_codegen.rs') }}
 
       - name: Fetch the native backend's tools
         run: cargo xtask fetch-native-tools

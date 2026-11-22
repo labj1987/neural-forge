@@ -17,6 +17,15 @@ use regex::Regex;
 use crate::proc;
 use crate::sh::{self, Fail, Res};
 
+/// The runner's lines: written so that an output that has gone away cannot end the run before the settings are put
+/// back (sh::say).
+macro_rules! say {
+    ($($arg:tt)*) => { sh::say(&format!($($arg)*)) };
+}
+macro_rules! warn {
+    ($($arg:tt)*) => { sh::warn(&format!($($arg)*)) };
+}
+
 const APP: &str = "3240220";
 const GAME: &str = "GTA5_Enhanced.e";
 const NEURAL_FORGE: &str = "VK_LAYER_neuralforge_neural";
@@ -119,6 +128,14 @@ impl Rig {
         std::fs::write(self.file(name), text).map_err(|e| Fail::new(1, format!("{}: {e}", self.file(name).display())))
     }
 
+    /// A file of the run's evidence: one that cannot be written is reported and the run goes on (the script went on
+    /// past a failed redirect too), so a launch is always ended.
+    fn put(&self, name: &str, text: &str) {
+        if let Err(fail) = self.write(name, text) {
+            warn!("{}", fail.message.unwrap_or_default());
+        }
+    }
+
     fn append(&self, name: &str, text: &str) {
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(self.file(name)) {
             let _ = file.write_all(text.as_bytes());
@@ -127,7 +144,7 @@ impl Rig {
 
     /// Prints the line and adds it to a file of the run (`| tee -a`).
     fn tee(&self, name: &str, line: &str) {
-        println!("{line}");
+        say!("{line}");
         self.append(name, &format!("{line}\n"));
     }
 
@@ -219,6 +236,16 @@ struct Launch {
     start: i64,
 }
 
+impl Drop for Launch {
+    /// nvidia-smi's sampling ends with the launch's record, however the launch is left.
+    fn drop(&mut self) {
+        if let Some(mut smi) = self.smi.take() {
+            sh::kill(smi.id() as i32, libc::SIGTERM);
+            let _ = smi.wait();
+        }
+    }
+}
+
 impl Rig {
     /// Kills what one launch left: the game, the launch's process group, and the Wine processes of
     /// GTA's prefix started since the launch (winedevice.exe spins a core each when left behind).
@@ -264,7 +291,7 @@ impl Rig {
         authorities.sort();
         let authority = authorities.pop().map_or_else(String::new, |(_, n)| format!("{run_dir}/{n}"));
         if authority.is_empty() {
-            eprintln!("no {run_dir}/.mutter-Xwaylandauth.* (GNOME's Xwayland authority)");
+            warn!("no {run_dir}/.mutter-Xwaylandauth.* (GNOME's Xwayland authority)");
         }
         let layers =
             if self.mid.is_empty() { "VK_LAYER_MANGOHUD_overlay_x86_64".to_string() } else { format!("{}:VK_LAYER_MANGOHUD_overlay_x86_64", self.mid) };
@@ -297,7 +324,7 @@ impl Rig {
             })
         };
         let start = sh::epoch();
-        self.write("start", &format!("{}\n", sh::local_time(start)))?;
+        self.put("start", &format!("{}\n", sh::local_time(start)));
         let child = game.spawn().map_err(|e| sh::not_started(&game, e))?;
         let smi = std::fs::File::create(self.file("gpu.csv")).ok().and_then(|samples| {
             Command::new("nvidia-smi")
@@ -309,12 +336,14 @@ impl Rig {
                 .ok()
         });
         let group = child.id() as i32;
-        println!("launched pgid={group}");
+        say!("launched pgid={group}");
         Ok(Launch { child, group, smi, start })
     }
 
     /// One launch: "result", or what went wrong.
     fn launch_once(&self) -> Res<String> {
+        // A run that was told to end (or whose output is gone) starts no game.
+        sh::interrupted()?;
         let before = self.newest_benchmark();
         let mut launch = self.spawn()?;
         let start = launch.start;
@@ -326,7 +355,7 @@ impl Rig {
             let now = sh::epoch();
             let new = self.newest_benchmark();
             if !new.is_empty() && new != before {
-                println!("result {new} after {}s", now - start);
+                say!("result {new} after {}s", now - start);
                 why = "result".to_string();
                 result = new;
                 sh::sleep(5.0)?;
@@ -360,13 +389,13 @@ impl Rig {
             let age = now - std::fs::metadata(&csv).map_or(now, |m| m.mtime());
             if age >= 15 && stalled_at.is_none() {
                 stalled_at = Some(now - start - age);
-                println!("  the game stopped presenting at {}s; GTA's own watchdog ends it 60 s later", stalled(stalled_at));
-                self.write("stalled-threads.txt", &thread_states(game))?;
+                say!("  the game stopped presenting at {}s; GTA's own watchdog ends it 60 s later", stalled(stalled_at));
+                self.put("stalled-threads.txt", &thread_states(game));
             } else if age >= 90 {
                 why = format!("the game stopped presenting at {}s and was still stalled after {}s", stalled(stalled_at), now - start);
                 break;
             } else if age < 15 && stalled_at.is_some() {
-                println!("  presenting again after {}s", now - start);
+                say!("  presenting again after {}s", now - start);
                 stalled_at = None;
             }
             if self.fg_on && !note_fg && i % 2 == 0 {
@@ -376,13 +405,13 @@ impl Rig {
                     let (at, shown) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
                     let best = words.collect::<Vec<_>>().join(" ");
                     let note = format!("  frame generation stopped at about {at}s (displayed {shown} fps, {best} before); GTA's own, not retried");
-                    println!("{note}");
-                    self.write("fg", &format!("{note}\n"))?;
+                    say!("{note}");
+                    self.put("fg", &format!("{note}\n"));
                     note_fg = true;
                 }
             }
             if i % 12 == 0 {
-                println!("  waiting {}s: game={}", now - start, proc::named(GAME).len());
+                say!("  waiting {}s: game={}", now - start, proc::named(GAME).len());
             }
         }
         if why.is_empty() {
@@ -400,7 +429,7 @@ impl Rig {
             }
         }
         sh::sleep(3.0)?;
-        self.write("end", &format!("{}\n", sh::now()))?;
+        self.put("end", &format!("{}\n", sh::now()));
         self.end_launch(&mut launch)?;
         if why != "result" {
             let new = self.newest_benchmark();
@@ -414,17 +443,19 @@ impl Rig {
             let name = new.rsplit('/').next().unwrap_or("");
             let stamp = name.strip_prefix("Benchmark-").unwrap_or(name);
             let stamp = stamp.strip_suffix(".txt").unwrap_or(stamp);
-            std::fs::copy(&new, self.file("benchmark.txt")).map_err(|e| Fail::new(1, format!("{new}: {e}")))?;
+            if let Err(e) = std::fs::copy(&new, self.file("benchmark.txt")) {
+                warn!("{new}: {e}");
+            }
             let (prefix, suffix) = ("FrameTimes-Pass", format!("-{stamp}.txt"));
             let mut passes: Vec<String> = names(&self.docs).into_iter().filter(|n| n.starts_with(prefix) && n.ends_with(&suffix)).collect();
             passes.sort();
             if passes.is_empty() {
-                eprintln!("no {}/{prefix}*{suffix}", self.docs);
+                warn!("no {}/{prefix}*{suffix}", self.docs);
             }
             for pass in passes {
                 let to = self.file(pass.strip_prefix("FrameTimes-").unwrap_or(&pass));
                 if let Err(e) = std::fs::copy(format!("{}/{pass}", self.docs), &to) {
-                    eprintln!("{}/{pass}: {e}", self.docs);
+                    warn!("{}/{pass}: {e}", self.docs);
                 }
             }
             return Ok(why);
@@ -435,12 +466,12 @@ impl Rig {
         let journal = journal.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
         let faults = Regex::new("Xid|NVRM|segfault|Out of memory|oom-kill").unwrap();
         let kernel: String = journal.lines().filter(|l| faults.is_match(l)).map(|l| format!("{l}\n")).collect();
-        self.write("kernel.txt", &kernel)?;
+        self.put("kernel.txt", &kernel);
         let crash = match super::dump_lines(&self.crash_logs, start as f64) {
             Ok(lines) => lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
             Err(e) => format!("{e}\n"),
         };
-        self.write("crash.txt", &crash)?;
+        self.put("crash.txt", &crash);
         if !crash.is_empty() {
             why = format!("{why}; {}", crash.lines().collect::<Vec<_>>().join(";"));
         }
@@ -459,9 +490,9 @@ fn put_back(rig: &Rig, restore: &[(String, String)]) -> bool {
         let _ = sh::timeout(30, rig.shmctl(&["set", key, want]).stdout(Stdio::null()).stderr(Stdio::null()));
         let got = rig.status_of(key);
         if got == *want {
-            println!("restored {key}={got}");
+            say!("restored {key}={got}");
         } else {
-            eprintln!("error: {key} is {} after the run, not the previous {want}: set it back by hand", if got.is_empty() { "unreadable" } else { &got });
+            warn!("error: {key} is {} after the run, not the previous {want}: set it back by hand", if got.is_empty() { "unreadable" } else { &got });
             ok = false;
         }
     }
@@ -495,7 +526,7 @@ fn bench(rig: &Rig, args: &Args, restore: &mut Vec<(String, String)>) -> Res<Exi
         if why == "result" {
             break why;
         }
-        println!("attempt {attempt}: {why}");
+        say!("attempt {attempt}: {why}");
         let kept = rig.file(&format!("attempt-{attempt}"));
         std::fs::create_dir_all(&kept).map_err(|e| Fail::new(1, format!("{}: {e}", kept.display())))?;
         for name in names(&rig.out) {
@@ -504,7 +535,7 @@ fn bench(rig: &Rig, args: &Args, restore: &mut Vec<(String, String)>) -> Res<Exi
             }
         }
         if attempt >= args.tries {
-            println!("no result after {attempt} launches");
+            say!("no result after {attempt} launches");
             break why;
         }
         sh::sleep(15.0)?;
@@ -537,7 +568,7 @@ fn local(args: &[String]) -> Res<ExitCode> {
         Some(proton) => proton,
         None => super::mapped_proton(&client, &[library.clone(), client.clone()], APP).map_err(|e| Fail::new(1, e))?,
     };
-    println!("Proton: {proton}");
+    say!("Proton: {proton}");
     let prefix = format!("{library}/steamapps/compatdata/{APP}");
     let user = format!("{prefix}/pfx/drive_c/users/steamuser");
     let settings = format!("{user}/Documents/Rockstar Games/GTAV Enhanced/settings.xml");
@@ -579,13 +610,19 @@ fn local(args: &[String]) -> Res<ExitCode> {
     // Whatever happens from here on, the settings --set changed are put back.
     let mut restore = Vec::new();
     let result = bench(&rig, &args, &mut restore);
+    // The signal that ended the run (a lost output counts as one) is taken first: putting back runs its commands to
+    // their end.
+    let signal = sh::take_interruption();
     if !put_back(&rig, &restore) {
         if let Err(Fail { message: Some(message), .. }) = &result {
-            eprintln!("{message}");
+            warn!("{message}");
         }
         return Ok(ExitCode::FAILURE);
     }
-    result
+    match signal {
+        Some(signal) => Err(Fail::silent((128 + signal) as u8)),
+        None => result,
+    }
 }
 
 /// `--host HOST ...`: this program (or NF_BENCH_XTASK) copied to the rig, run there with the rest of the arguments, and
@@ -630,7 +667,7 @@ pub fn self_test() -> Result<(), String> {
             _ => return Err(format!("label '{bad}' accepted")),
         }
     }
-    println!("gta-bench label checks ok");
+    say!("gta-bench label checks ok");
     Ok(())
 }
 

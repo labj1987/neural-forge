@@ -333,12 +333,4 @@ mod tests {
         }
         assert_eq!(run(&["only".to_string()], &env, &mut Vec::new(), &mut Vec::new()).unwrap_err().code, 2);
     }
-
-    /// The whole test, so `cargo test` runs it too.
-    #[test]
-    fn game_reg() {
-        if let Err(fail) = test::run() {
-            panic!("{}", fail.message.unwrap_or_default());
-        }
-    }
 }
