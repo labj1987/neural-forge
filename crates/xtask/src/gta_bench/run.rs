@@ -487,7 +487,11 @@ impl Rig {
 fn put_back(rig: &Rig, restore: &[(String, String)]) -> bool {
     let mut ok = true;
     for (key, want) in restore {
+        // Nothing interrupts this: a signal, or the "restored" line of the setting before written to an output that is
+        // gone, would otherwise end this setting's commands as they start (sh::timeout), and it would stay changed.
+        sh::take_interruption();
         let _ = sh::timeout(30, rig.shmctl(&["set", key, want]).stdout(Stdio::null()).stderr(Stdio::null()));
+        sh::take_interruption();
         let got = rig.status_of(key);
         if got == *want {
             say!("restored {key}={got}");
