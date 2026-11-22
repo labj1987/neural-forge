@@ -14,5 +14,5 @@
 
 # Modified for Neural Forge: only the stable option is kept. Formatting uses the pinned stable rustfmt,
 # which ignores the nightly-only options upstream set (comment wrapping, string formatting); the generator
-# wraps its own comments (scripts/vulkan_layer_genvk/vk_xml_util.py).
+# wraps its own comments (scripts/genvk/vk_xml.rs).
 max_width = 100

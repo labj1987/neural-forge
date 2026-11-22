@@ -18,8 +18,8 @@ this project's own code: upstream is no longer tracked.
 - `vulkan-layer/`: the framework. `src/bindings/vk_layer/generated*`, `src/layer_trait/generated.rs` and
   `src/global_simple_intercept/generated.rs` are generated; everything else is written by hand.
 - `vulkan-layer-macros/`: its procedural macros (`auto_deviceinfo_impl` and the others).
-- `scripts/`: the generator: `codegen.rs` (bindgen for `vk_layer.h`, then the Python generators in
-  `vulkan_layer_genvk/` over `vk.xml`, then rustfmt).
+- `scripts/`: the generator: `codegen.rs` (bindgen for `vk_layer.h`, then the generators in `genvk/` over
+  `vk.xml`, then rustfmt). All Rust; it needs no Python.
 - `Cargo.toml`, `Cargo.lock`: their own workspace, apart from Neural Forge's (the root workspace excludes this
   directory and depends on `vulkan-layer` by path). Its tests need their own build settings (they unwind; the
   root workspace aborts on panic) and run one at a time: several share mock expectations held in statics.
@@ -96,7 +96,8 @@ this project's own code: upstream is no longer tracked.
 5. **Fixes from the 2026-10-30 review.** The hooks for a `VkBool32` array (`cmd_set_color_write_enable_ext`,
    `cmd_set_color_blend_enable_ext`) took their iterator as `T: Iterator<Item = bool> + 'static`, though it reads
    the application's array, valid only for the call: a hook could keep it and read freed memory from safe code.
-   The bound is gone (`vk_xml_util.py`), and a `compile_fail` doctest in `layer_trait.rs` holds it. And
+   The bound is gone (the generator's `vk_xml_util.py`, now `genvk/vk_xml.rs`), and a `compile_fail` doctest in
+   `layer_trait.rs` holds it. And
    `vkGetInstanceProcAddr` gated a physical-device command of a device extension
    (`vkGetPhysicalDeviceFragmentShadingRatesKHR`, `vkGetPhysicalDeviceToolPropertiesEXT` below 1.3) on the
    instance's enabled extensions, which never hold a device extension, so a hook on one was never returned. It is
@@ -120,3 +121,16 @@ this project's own code: upstream is no longer tracked.
    tests of both. A hook's `VkResult<T>` cannot carry a success code other than `VK_SUCCESS` together with the
    output (`VK_SUBOPTIMAL_KHR` with an image index, `VK_PIPELINE_COMPILE_REQUIRED` with pipelines): the generator
    documents that on each such hook method instead of changing the trait.
+8. **The generator in Rust** (2026-11-21). The vk.xml generators were Python (`vulkan_layer_genvk/`, run by
+   `codegen.rs`) on Khronos's registry framework (`registry/reg.py` and `generator.py` from the fetched
+   Vulkan-Headers). They are Rust now, in `scripts/genvk/` (`roxmltree` reads `vk.xml`): `registry.rs` does what
+   the framework did for them (drop what is not for the `vulkan` API, pick the versions and the extensions whose
+   `supported` names it, sort them as `regSortFeatures` does, tag what each requires, then hand each feature's
+   new commands over in order, an alias after the command it aliases, with the success codes of what was
+   required), and `vk_xml.rs`, `layer_trait.rs` and `global_simple_intercept.rs` are the generators line for
+   line. The generated files are byte-identical before rustfmt, and so is the output for Vulkan-Headers 1.3.231,
+   1.3.250, 1.3.296, 1.4.304, 1.4.313 and 1.4.321 (1.4.335 and newer stop both at the same point: a type ash 0.38
+   does not have). The Python unit tests are `genvk`'s tests, on a fixture taken from 1.3.281's `vk.xml`.
+   Regenerating needs no Python.
+   The registry logic follows Khronos `reg.py` 1.3.281 and was checked identical up to vk.xml 1.4.321; a header bump past
+   that may need `registry.rs` updated (1.4.335 and 1.4.368 already stop with errors).
