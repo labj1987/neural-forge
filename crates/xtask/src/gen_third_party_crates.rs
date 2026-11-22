@@ -4,7 +4,7 @@
 //! walking normal (non-dev, non-build) dependencies only and leaving out proc-macro crates (they run in the
 //! compiler and are not linked), nor anything reached only through one, nor what only this development tool
 //! (xtask, never shipped) links. The C and C++ code compiled into the layer: the network from OpenDLSS-NR
-//! (third_party/opendlss-nr), and volk and the Vulkan-Headers from tools/native (scripts/fetch-native-tools.sh). A
+//! (third_party/opendlss-nr), and volk and the Vulkan-Headers from tools/native (cargo xtask fetch-native-tools). A
 //! crate that ships no licence text of its own gets the standard text of each licence its SPDX expression names,
 //! from scripts/spdx/ (for MIT, the copyright line of another crate from the same repository when one has it); one
 //! naming a licence scripts/spdx/ lacks fails: add the text there.
@@ -259,7 +259,7 @@ fn licences(meta: &Value, out_path: &str) -> Result<(), String> {
         let files: Vec<PathBuf> = rel.iter().map(|r| if *base == "repo" { root.join(r) } else { tools.join(r) }).collect();
         let absent: Vec<String> = files.iter().filter(|f| !f.is_file()).map(|f| f.display().to_string()).collect();
         if !absent.is_empty() {
-            let hint = if *base == "repo" { "" } else { " (run scripts/fetch-native-tools.sh)" };
+            let hint = if *base == "repo" { "" } else { " (run cargo xtask fetch-native-tools)" };
             missing.push(format!("{name}: {}{hint}", absent.join(", ")));
             continue;
         }

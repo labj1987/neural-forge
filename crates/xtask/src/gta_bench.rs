@@ -1,14 +1,15 @@
-//! `cargo xtask gta-bench` (it replaced the Python program inside scripts/gta-bench.sh, command for command): the checks that
-//! read GTA's crash dumps and MangoHud's log, and the Steam lookups that find the Proton the game runs with.
+//! `cargo xtask gta-bench`: the unattended GTA V Enhanced benchmark (gta_bench/usage.txt; gta_bench/run.rs is the runner,
+//! which replaced scripts/gta-bench.sh). This file has what the runner reads: GTA's crash dumps, MangoHud's log (did
+//! frame generation stop) and the Steam lookups that find the Proton the game runs with. They replaced the Python program
+//! that was inside the script, command for command.
 //!
-//! gta-bench dumps <CrashLogs dir> <epoch>: one line per dump written since <epoch>.
-//! gta-bench fg <MangoHud csv> <cap fps>: "stopped <s> <shown> <best>" or "kept".
-//! gta-bench proton <steam root> <appid> [libraries...]: the Proton folder Steam runs the app with.
-//! gta-bench self-test.
+//!   cargo xtask gta-bench [--host HOST] [--tries N] [--set key=value]... <label> <VK layers above MangoHud> [env...]
+//!   cargo xtask gta-bench --self-test
 //!
-//! An unexpected failure puts one plain message on stderr and exits 1 (scripts/gta-bench.sh reads only the exit status and
-//! stdout). Directory listings are in name order (Python's glob gives the OS order, which only
+//! Directory listings are in name order (Python's glob gives the OS order, which only
 //! shows with equal modification times), and `glob` metacharacters in a directory name are plain text here.
+
+mod run;
 
 use std::collections::HashSet;
 use std::fs;
@@ -134,7 +135,9 @@ fn mtime(path: &str) -> Result<f64, Fail> {
     Ok(m.mtime() as f64 + m.mtime_nsec() as f64 * 1e-9)
 }
 
-fn dumps(folder: &str, since: f64) -> Result<(), Fail> {
+/// One line per crash dump written since `since`: its name and what ended the game.
+fn dump_lines(folder: &str, since: f64) -> Result<Vec<String>, Fail> {
+    let mut lines = Vec::new();
     let mut found = Vec::new();
     for path in glob_dir(folder, |n| n.ends_with(".dmp")) {
         found.push((mtime(&path)?, path));
@@ -144,10 +147,10 @@ fn dumps(folder: &str, since: f64) -> Result<(), Fail> {
         if mtime(&path)? >= since {
             let data = fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
             let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            println!("{name}: {}", dump_cause(&data)?);
+            lines.push(format!("{name}: {}", dump_cause(&data)?));
         }
     }
-    Ok(())
+    Ok(lines)
 }
 
 /// Frame generation stopped: the displayed rate over 10 s windows (every 5 s) under a third of the best window (ignoring
@@ -194,7 +197,8 @@ fn int_as_f64(s: &str) -> Option<f64> {
     }
 }
 
-fn fg(csv: &str, cap: &str) -> Result<(), Fail> {
+/// "stopped <s> <shown> <best>" or "kept" for a MangoHud log and the frame-rate cap.
+fn fg_line(csv: &str, cap: &str) -> Result<String, Fail> {
     let text = read_text_lossy(csv).map_err(|e| format!("{csv}: {e}"))?;
     let times: Vec<f64> = splitlines(&text)
         .into_iter()
@@ -203,8 +207,7 @@ fn fg(csv: &str, cap: &str) -> Result<(), Fail> {
         .filter_map(|r| int_as_f64(r.rsplit(',').next().unwrap_or("")).map(|v| v / 1e9))
         .collect();
     let cap = py_float(cap).ok_or_else(|| format!("the frame-rate cap is not a number: {cap:?}"))?;
-    println!("{}", fg_rule(&times, cap));
-    Ok(())
+    Ok(fg_rule(&times, cap))
 }
 
 static VDF_TOKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""((?:[^"\\]|\\.)*)"|(//[^\n]*)|([{}])"#).expect("static regex"));
@@ -401,49 +404,17 @@ fn mapped_proton(root: &str, libraries: &[String], appid: &str) -> Result<String
     Err(format!("Steam runs {appid} with {name}, which is not in {tools}"))
 }
 
-fn proton(args: &[String]) -> Result<ExitCode, Fail> {
-    if args.len() < 2 {
-        return Err(String::from("usage: gta-bench proton <steam root> <appid> [libraries...]"));
-    }
-    let libraries: Vec<String> = if args.len() > 2 { args[2..].to_vec() } else { vec![args[0].clone()] };
-    match mapped_proton(&args[0], &libraries, &args[1]) {
-        Ok(d) => {
-            println!("{d}");
-            Ok(ExitCode::SUCCESS)
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            Ok(ExitCode::FAILURE)
-        }
-    }
-}
-
-fn run(args: &[String]) -> Result<ExitCode, Fail> {
-    let arg = |i: usize| {
-        args.get(i).cloned().ok_or_else(|| {
-            format!("missing argument {i}: usage: gta-bench dumps <dir> <epoch> | fg <csv> <cap> | proton <root> <appid> [libraries...] | self-test")
-        })
-    };
-    match arg(0)?.as_str() {
-        "dumps" => {
-            let folder = arg(1)?;
-            let since = arg(2)?;
-            let since = py_float(&since).ok_or_else(|| format!("the epoch is not a number: {since:?}"))?;
-            dumps(&folder, since)?;
-        }
-        "fg" => fg(&arg(1)?, &arg(2)?)?,
-        "proton" => return proton(&args[1..]),
-        "self-test" => self_test()?,
-        _ => {}
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
 pub fn main(args: &[String]) -> ExitCode {
-    run(args).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        ExitCode::FAILURE
-    })
+    if args.first().is_some_and(|a| a == "--self-test") {
+        return match self_test().and_then(|()| run::self_test()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    crate::sh::finish(run::main(args))
 }
 
 fn check(ok: bool, what: &str) -> Result<(), Fail> {
@@ -454,7 +425,7 @@ fn check(ok: bool, what: &str) -> Result<(), Fail> {
     }
 }
 
-/// The same checks as the Python's self-test, shared by `gta-bench self-test` and the unit tests.
+/// The same checks as the Python's self-test, shared by `gta-bench --self-test` and the unit tests.
 fn self_test() -> Result<(), Fail> {
     fn put32(b: &mut [u8], at: usize, v: u32) {
         b[at..at + 4].copy_from_slice(&v.to_le_bytes());

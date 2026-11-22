@@ -3,11 +3,11 @@
 Repository: https://github.com/labj1987/neural-forge
 
 Read [docs/PHASE1.md](docs/PHASE1.md) for the current namespace, installation contract and
-target-ownership rules. Benchmarks run with `scripts/gta-bench.sh`
+target-ownership rules. Benchmarks run with `cargo xtask gta-bench`
 ([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)) on the maintainer's desktop, which stays at
 2560x1440, 288 Hz, VRR with HDR on: never change the display mode for a test, set the game's own resolution. The
 game sweep sets it to 2560x1440 (since 2026-11-12: at 4K the 12 GB card runs out of video memory with Ray
-Reconstruction and the model after DLSS); `gta-bench.sh` sets none and uses GTA's `settings.xml` as found. Games that have HDR are tested with their HDR on; video memory is sampled. Every release is
+Reconstruction and the model after DLSS); `cargo xtask gta-bench` sets none and uses GTA's `settings.xml` as found. Games that have HDR are tested with their HDR on; video memory is sampled. Every release is
 checked in Cyberpunk 2077, GTA V Enhanced, Red Dead Redemption 2 and Crimson Desert; the old Phase 1 plan is in
 [docs/history/phase1-benchmark-plan.md](docs/history/phase1-benchmark-plan.md). The former app name was dlssnr; upstream DLSS5VKLayer remains a
 separate application and must not be modified or uninstalled by this project.
@@ -37,7 +37,7 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 
 ## Build and test
 
-- Run `bash scripts/fetch-native-tools.sh` once before building: it fetches the pinned glslang,
+- Run `cargo xtask fetch-native-tools` once before building: it fetches the pinned glslang,
   Vulkan-Headers and volk that `crates/native` builds with into `tools/native/`; the build is offline
   after that. The network's source (C++, GLSL, PTX generators) is this project's own, in
   `third_party/opendlss-nr`: edit it there directly. That directory stays MIT (keep its `LICENSE` and
@@ -49,14 +49,14 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - The layer framework (`vulkan-layer`, Google's vk-layer-for-rust, Apache-2.0) is this project's own too, in
   `third_party/vk-layer-for-rust`: its own workspace, excluded from the root one. Edit it there directly and
   mark each file changed for the first time with a "Modified for Neural Forge" note (Apache-2.0 asks for one);
-  never edit its generated files by hand (`bash scripts/vk-layer-codegen.sh`). Its `UPSTREAM.md` has the checks.
+  never edit its generated files by hand (`cargo xtask vk-layer-codegen`). Its `UPSTREAM.md` has the checks.
 - CI (`.github/workflows/check.yml`, run by ci.yml on every push and pull request and by release.yml
   on a tag) runs the tests, the layer's tests again under the Khronos validation layer (which must
   report nothing, with nothing filtered), clippy, `cargo fmt --check`, every
-  development task's and script's self-test, the shader check, the dependency check, the AppImage build and its installed-layer smoke test. A new task or script with a self-test is added there.
+  development task's self-test (and `build-appimage.sh`'s), the shader check, the dependency check, the AppImage build and its installed-layer smoke test. A new task with a self-test is added there.
 - Formatting: `cargo fmt --all` before committing (rustfmt.toml: 160 columns), and in
   `third_party/vk-layer-for-rust` too, which keeps its own 100-column config.
-- Dependencies: `bash scripts/cargo-deny.sh` (deny.toml) checks RustSec advisories, licences and sources. A
+- Dependencies: `cargo xtask cargo-deny` (deny.toml) checks RustSec advisories, licences and sources. A
   new advisory fails CI: update the crate, or add an `ignore` entry in deny.toml with the reason it does not
   apply. A new licence must be added to the allow-list on purpose, after checking it is AGPL-compatible. The weekly pin check
   (`cargo xtask check-pins`, pin-check.yml) bumps every pin Dependabot cannot see that is behind upstream
@@ -82,8 +82,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   kdialog, else notify-send) that names the distribution's install command, when `ldd -r` reports a missing library,
   a missing symbol version (a glibc older than the build's) or an undefined symbol of the GUI, or when the run-time
   libraries are missing (`ldconfig -p` or `LD_LIBRARY_PATH`: libwayland-client on a Wayland session, one of the
-  Vulkan and EGL loaders); without ldd it asks the dynamic loader. `scripts/test_apprun.sh` tests it with stand-ins;
-  `scripts/smoke-gui.sh APPDIR` starts the extracted AppImage's GUI on Xvfb (drawn on lavapipe) and fails on an
+  Vulkan and EGL loaders); without ldd it asks the dynamic loader. `cargo xtask test-apprun` tests it with stand-ins;
+  `cargo xtask smoke-gui APPDIR` starts the extracted AppImage's GUI on Xvfb (drawn on lavapipe) and fails on an
   unmapped window, a loader error, a panic or a WARN/ERROR log line.
 - The layer's GPU tests run on lavapipe: set `VK_DRIVER_FILES` to the `lvp_icd*.json` manifests, as
   CI does. On a machine with an NVIDIA GPU, never run them without it. Under validation:
@@ -99,7 +99,7 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Tests must not depend on how fast the machine runs them: the hold's history gap
   (`HistoryGap::MAX_GAP`, 500 ms) reads `native::hold_now`, which the inline test rig stops.
 - Run `cargo xtask check-namespace`, `cargo test -p neural-forge-cli --test install`
-  and `bash scripts/smoke-test.sh` for namespace, installation and Vulkan checks.
+  and `cargo xtask smoke-test` for namespace, installation and Vulkan checks.
 - Shaders: `cargo xtask check-shaders --update` rebuilds the committed SPIR-V with the pinned
   glslang only (never one on PATH) and needs `spirv-val`.
 - Every component compiled or linked into the shipped binaries must have its licence text in the
@@ -125,8 +125,13 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Toolchain: Rust 1.100 or newer. `rust-toolchain.toml` pins the exact release that local, CI and release builds use; `rust-version = "1.100"` in Cargo.toml is the minimum.
 - Dependency cooldown: `.cargo/config.toml` sets `[registry] global-min-publish-age = "3 days"`, so resolution only takes crate versions at least 3 days old (Dependabot's cargo `cooldown` matches). To take a newer version early for a security advisory: `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`. Until that version is 3 days old, a plain `cargo update` moves it back down, so run that round's `cargo update` with the same variable set (or update the other crates with `-p`).
 - Development tasks (release notes, the appdata and licence listings, the pin, Proton-script, shader and namespace checks,
-  the model-shape table, the benchmark and image-quality reports) are Rust, in `crates/xtask`: `cargo xtask <task>` (the
-  alias in `.cargo/config.toml`; `cargo xtask` alone lists them). A new one is a subcommand there, not a Python script.
+  the model-shape table, the benchmark and image-quality reports, the tool fetches, the smoke tests, the benchmark and
+  game runners, the deploy to a rig) are Rust, in `crates/xtask`: `cargo xtask <task>` (the
+  alias in `.cargo/config.toml`; `cargo xtask` alone lists them). A new one is a subcommand there, not a Python or shell script.
+  Shell is kept only where nothing else can run: `data/AppRun` (it runs first on a user's system), `build-appimage.sh`
+  and the part of `cargo xtask deploy-rig` that runs on the rig (`crates/xtask/src/deploy_rig/remote.sh`).
+  A task that replaced a script keeps that script's output, files and exit codes (`crates/xtask/src/sh.rs` has what
+  they share: a command's exit status passed on, temporary directories removed on the way out, also after Ctrl-C).
   Its own dependencies ship in nothing: `gen-third-party-crates` leaves them out of the listing.
 - Never compare tool versions as text or floats ("1.100" sorts before "1.99" as text): split into integers, or use `sort -V`.
 - Never read Cargo's intermediate layout under `target/` (`build/`, `deps/`, `incremental/`, `.fingerprint/`): it is not a stable interface and changed in Cargo 1.100. Use the final artifact paths, `OUT_DIR` inside build.rs, or `cargo build --message-format=json`.
@@ -201,7 +206,7 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Fonts: `ui::init` names installed families for the UI and fixed-width fonts before the toolkit starts; without that
   GPUI warns about ".SystemUIFont" on every Linux system. Nothing may log at warn level on a normal start
   (`NEURAL_FORGE_GUI_LOG=info` shows the renderer picked). On Xvfb GPUI logs "Found no xinput mouse pointers" at error
-  level, which `scripts/smoke-gui.sh` lets through (the D-Bus crate's warning that a service is unknown in a bare
+  level, which `cargo xtask smoke-gui` lets through (the D-Bus crate's warning that a service is unknown in a bare
   session is no longer shown: the logger caps zbus at error).
 - The file dialog (portal) has no file-type filter in GPUI: what was picked is checked afterwards
   (`cube::load`, `extract_all`). A menu is a button with a popup menu (`menu_button`), not a searchable list.
@@ -262,7 +267,7 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   `doctor`, Save report and the game sweep read it. A newly tested game gets an entry (and a row in the user guide's
   "Tested games"); a change that moves the model elsewhere in a game updates its entry in the same commit.
 - Before a release that touches the layer (above all `preupscale`), run the game sweep on the test machine with
-  the release build: `scripts/game-sweep.sh --layer <build>/libneural_forge_layer.so --cli <build>/neural-forge-cli`
+  the release build: `cargo xtask game-sweep --layer <build>/libneural_forge_layer.so --cli <build>/neural-forge-cli`
   (docs/RUNNING_AND_MEASURING.md, section 11), in tmux; it takes the GPU lock and puts back what it changes. Every
   run must pass (each run holds the GPU lock only while it runs), and each is recorded (`vw`, `--vw`): a run passes
   only when the recording flags nothing and its contact sheet looks right against the model off; log numbers alone never pass; record the passing games' `verified`/`verified_on` in `data/games.toml`. Runs set the game's own
@@ -317,7 +322,7 @@ kernels.
 Do not reapply the reverted capture/composition fence changes. Validate actual GPU
 operations and measure before and after every performance change. The matched comparator
 is the released 2.0.10 against the native backend (docs/NATIVE_BACKEND.md, Phase 3), taken with
-`scripts/gta-bench.sh` and mods off. Keep the Rust implementation independent;
+`cargo xtask gta-bench` and mods off. Keep the Rust implementation independent;
 review licenses before source reuse.
 
 Current target-machine evidence and unresolved Vulkan errors are in

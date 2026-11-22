@@ -1,6 +1,6 @@
 //! Reports, and updates, the pinned versions Dependabot cannot see.
 //!
-//! The pins: the native toolchain in scripts/fetch-native-tools.sh, cargo-deny in scripts/cargo-deny.sh,
+//! The pins: the native toolchain in crates/xtask/src/fetch_native_tools.rs, cargo-deny in crates/xtask/src/cargo_deny.rs,
 //! appimagetool and the AppImage runtime in build-appimage.sh, and the Rust toolchain in
 //! rust-toolchain.toml. (GitHub Actions are pinned by SHA and updated by Dependabot; Cargo crates by
 //! Dependabot.) Each is compared with upstream's newest release or tag through the GitHub API
@@ -38,10 +38,10 @@ const BROKEN: u8 = 4;
 
 /// Every file a pin is named in, by the short name the rewrites use.
 const FILES: [(&str, &str); 5] = [
-    ("fetch", "scripts/fetch-native-tools.sh"),
+    ("fetch", "crates/xtask/src/fetch_native_tools.rs"),
     ("build", "build-appimage.sh"),
     ("toolchain", "rust-toolchain.toml"),
-    ("deny", "scripts/cargo-deny.sh"),
+    ("deny", "crates/xtask/src/cargo_deny.rs"),
     ("attribution", "ATTRIBUTION.md"),
 ];
 const SDK: &str = "Vulkan SDK (Vulkan-Headers = volk)";
@@ -160,7 +160,7 @@ fn pins(texts: &Texts) -> Res<Vec<Pin>> {
         mk("glslang", one(r"glslang/releases/download/([^/]+)/", fetch, "glslang", false)?, Kind::Release, "KhronosGroup/glslang"),
         mk("Vulkan-Headers", one(r"Vulkan-Headers/archive/refs/tags/(vulkan-sdk-[0-9.]+)\.tar", fetch, "Vulkan-Headers", false)?, Kind::Sdk, sdk_repos),
         mk("volk", one(r"volk/archive/refs/tags/(vulkan-sdk-[0-9.]+)\.tar", fetch, "volk", false)?, Kind::Sdk, sdk_repos),
-        mk("cargo-deny", one(r#"^CARGO_DENY_VERSION="([^"]+)""#, deny, "cargo-deny", true)?, Kind::Release, "EmbarkStudios/cargo-deny"),
+        mk("cargo-deny", one(r#"^const CARGO_DENY_VERSION: &str = "([^"]+)""#, deny, "cargo-deny", true)?, Kind::Release, "EmbarkStudios/cargo-deny"),
         mk("appimagetool", one(r#"^APPIMAGETOOL_VERSION="([^"]+)""#, build, "appimagetool", true)?, Kind::Release, "AppImage/appimagetool"),
         mk("AppImage type2-runtime", one(r#"^RUNTIME_VERSION="([^"]+)""#, build, "type2-runtime", true)?, Kind::Release, "AppImage/type2-runtime"),
         mk("Rust toolchain", one(r#"^channel = "([^"]+)""#, toolchain, "Rust toolchain", true)?, Kind::Release, "rust-lang/rust"),
@@ -366,7 +366,7 @@ fn deny_url(v: &str) -> String {
     format!("https://github.com/EmbarkStudios/cargo-deny/releases/download/{v}/cargo-deny-{v}-x86_64-unknown-linux-musl.tar.gz")
 }
 
-/// The `name|url|sha256|check` entry in fetch-native-tools.sh's PINS.
+/// The `name|url|sha256|check` entry in fetch_native_tools.rs's PINS.
 fn fetch_line(texts: &Texts, name: &str) -> Res<Vec<String>> {
     let pattern = format!(r#"^\s*"({}\|[^"]+)""#, py_escape(name));
     let parts: Vec<String> = one(&pattern, &texts["fetch"], name, true)?.split('|').map(String::from).collect();
@@ -404,9 +404,9 @@ fn bump(texts: &mut Texts, name: &str, old: &str, new: &str, sha_of: Sha, sha_fi
             if published != sha {
                 return Err(format!("cargo-deny {new}: downloaded SHA-256 {sha} is not the published {published}"));
             }
-            let old_sha = one(r#"^SHA="([0-9a-f]{64})""#, &texts["deny"], "cargo-deny SHA", true)?;
-            replace(texts, "deny", &format!("CARGO_DENY_VERSION=\"{old}\""), &format!("CARGO_DENY_VERSION=\"{new}\""), 1)?;
-            replace(texts, "deny", &format!("SHA=\"{old_sha}\""), &format!("SHA=\"{sha}\""), 1)
+            let old_sha = one(r#"^const SHA: &str = "([0-9a-f]{64})""#, &texts["deny"], "cargo-deny SHA", true)?;
+            replace(texts, "deny", &format!("const CARGO_DENY_VERSION: &str = \"{old}\""), &format!("const CARGO_DENY_VERSION: &str = \"{new}\""), 1)?;
+            replace(texts, "deny", &format!("const SHA: &str = \"{old_sha}\""), &format!("const SHA: &str = \"{sha}\""), 1)
         }
         "appimagetool" | "AppImage type2-runtime" => {
             let (var, repo, asset) = if name == "appimagetool" {
@@ -559,10 +559,10 @@ fn fixture() -> Texts {
     t.insert(
         "fetch",
         format!(
-            "#   glslang 16.5.0 (Linux x86_64 release binary), Vulkan-Headers vulkan-sdk-1.4.357.0 and volk vulkan-sdk-1.4.357.0.\nPINS=(\n  \
-             \"glslang|https://github.com/KhronosGroup/glslang/releases/download/16.5.0/glslang-16.5.0-linux-x86_64-release.tar.gz|{}|bin/glslang\"\n  \
-             \"Vulkan-Headers|https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz|{}|include/vulkan/vulkan_core.h\"\n  \
-             \"volk|https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz|{}|volk.c\"\n)\n",
+            "//!   glslang 16.5.0 (Linux x86_64 release binary), Vulkan-Headers vulkan-sdk-1.4.357.0 and volk vulkan-sdk-1.4.357.0.\nconst PINS: &[&str] = &[\n  \
+             \"glslang|https://github.com/KhronosGroup/glslang/releases/download/16.5.0/glslang-16.5.0-linux-x86_64-release.tar.gz|{}|bin/glslang\",\n  \
+             \"Vulkan-Headers|https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz|{}|include/vulkan/vulkan_core.h\",\n  \
+             \"volk|https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz|{}|volk.c\",\n];\n",
             hex("a"),
             hex("b"),
             hex("c")
@@ -573,7 +573,7 @@ fn fixture() -> Texts {
         format!("APPIMAGETOOL_VERSION=\"1.9.0\"\nAPPIMAGETOOL_SHA256=\"{}\"\nRUNTIME_VERSION=\"20251108\"\nRUNTIME_SHA256=\"{}\"\n", hex("d"), hex("e")),
     );
     t.insert("toolchain", "[toolchain]\nchannel = \"1.98.0\"\n".to_string());
-    t.insert("deny", format!("CARGO_DENY_VERSION=\"0.19.9\"\nSHA=\"{}\"\n", hex("f")));
+    t.insert("deny", format!("const CARGO_DENY_VERSION: &str = \"0.19.9\";\nconst SHA: &str = \"{}\";\n", hex("f")));
     t.insert(
         "attribution",
         "| [volk](https://github.com/zeux/volk) | vulkan-sdk-1.4.357.0 | MIT | x |\n| [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | vulkan-sdk-1.4.357.0 | Apache-2.0 / MIT | x |\n"
@@ -668,7 +668,7 @@ fn self_test() -> Res<()> {
     ensure!(pins(&texts)?.iter().all(|p| p.pinned == upstream_of(&p.name)));
     ensure!(texts["fetch"].contains(&format!("download/16.6.0/glslang-16.6.0-linux-x86_64-release.tar.gz|{}|bin/glslang", fake_sha(&glslang_url("16.6.0")))));
     ensure!(texts["fetch"].contains("glslang 16.6.0 (") && texts["fetch"].contains("Vulkan-Headers vulkan-sdk-1.4.363.0 and volk vulkan-sdk-1.4.363.0."));
-    ensure!(texts["deny"].contains(&format!("SHA=\"{}\"", fake_sha(&deny_url("0.20.2")))));
+    ensure!(texts["deny"].contains(&format!("const SHA: &str = \"{}\";", fake_sha(&deny_url("0.20.2")))));
     ensure!(texts["build"].contains(&format!(
         "APPIMAGETOOL_SHA256=\"{}\"",
         fake_sha("https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage")

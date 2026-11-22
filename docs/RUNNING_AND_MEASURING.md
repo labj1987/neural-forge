@@ -12,7 +12,7 @@ that measured it say so.
 Once, the pinned tools the native backend (`crates/native`) builds with:
 
 ```bash
-bash scripts/fetch-native-tools.sh
+cargo xtask fetch-native-tools
 ```
 
 Every crate (protocol, layer, native, GUI, CLI, supervisor):
@@ -31,7 +31,7 @@ Checks, in the order CI runs them (`.github/workflows/check.yml`, on every push 
 and again for a release tag):
 
 ```bash
-bash scripts/fetch-native-tools.sh
+cargo xtask fetch-native-tools
 VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | paste -sd:) cargo test --locked
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
@@ -41,22 +41,24 @@ for task in release-notes bench-iq bench-report agreement gen-third-party-crates
     cargo xtask $task --self-test
 done
 cargo xtask hdr-encode selftest
-bash scripts/gta-bench.sh --self-test
+cargo xtask gta-bench --self-test
+cargo xtask build-ngx-wrapper --self-test && cargo xtask game-sweep --self-test && cargo xtask smoke-gui --self-test
+cargo xtask test-apprun && cargo xtask test-game-reg
 cargo xtask check-shaders && cargo xtask sync-appdata-releases --check
 cargo xtask gen-third-party-crates --check && cargo xtask check-namespace
 cargo fmt --all --check && (cd third_party/vk-layer-for-rust && cargo fmt --all --check)
-bash scripts/cargo-deny.sh
-bash scripts/vk-layer-codegen.sh --check
-bash scripts/smoke-test.sh
+cargo xtask cargo-deny
+cargo xtask vk-layer-codegen --check
+cargo xtask smoke-test
 ```
 
 Then the AppImage (`bash build-appimage.sh`), its glibc baseline, and its layer installed with its
 own CLI into scratch XDG directories and run through the Vulkan loader
-(`NEURAL_FORGE_SMOKE_SO=<installed .so> bash scripts/smoke-test.sh`). The shader check needs `spirv-val`, the smoke test `jq`.
+(`NEURAL_FORGE_SMOKE_SO=<installed .so> cargo xtask smoke-test`). The shader check needs `spirv-val`.
 `cargo xtask` (the alias in `.cargo/config.toml`) runs the repository's development tasks, `crates/xtask`;
 `cargo xtask` alone lists them.
 
-- `scripts/smoke-test.sh` runs `crates/layer/examples/smoke.rs` through the real Vulkan loader
+- `cargo xtask smoke-test` runs `crates/layer/examples/smoke.rs` through the real Vulkan loader
   with the layer enabled, in a debug build. Run it after any change near device creation: it
   caught a null-pointer slice and a panicking loader helper that validation layers and unit tests
   missed (EXTERNAL_MEMORY_HOST_DESIGN.md). It also checks that `NEURAL_FORGE_PREUPSCALE=off` logs
@@ -78,7 +80,7 @@ own CLI into scratch XDG directories and run through the Vulkan loader
 ## 2. Deploy to a test machine
 
 ```bash
-scripts/deploy-rig.sh <host>
+cargo xtask deploy-rig <host>
 ```
 
 It builds the AppImage from the working tree, copies it to `~/AppImages/neural-forge.appimage` on
@@ -98,8 +100,9 @@ commands below assumes that directory is on the PATH.)
 
 ## 3. The unattended GTA benchmark
 
-`scripts/gta-bench.sh` runs GTA V Enhanced's built-in benchmark with a chosen layer environment,
-with no one at the machine. It runs on the host, or from the dev machine with `--host`. Steam must
+`cargo xtask gta-bench` runs GTA V Enhanced's built-in benchmark with a chosen layer environment,
+with no one at the machine. It runs on the host, or from the dev machine with `--host` (which copies the
+xtask binary to the host over ssh, runs it there and removes it: the host needs no checkout and no cargo). Steam must
 be running on the host. The game is launched through the same Steam Linux Runtime entry point and
 the Proton Steam has for it (`config.vdf`'s `CompatToolMapping`: a Neural Forge Proton copy when the game is
 switched on in Neural Forge; `NF_BENCH_PROTON` overrides it), with only the environment given (Steam's launch
@@ -109,8 +112,8 @@ the last layer and its own process group to classify and relaunch a failed attem
 launches through Steam.
 
 ```text
-gta-bench.sh [--host HOST] [--tries N] [--set key=value]... <label> <VK layers above MangoHud> [env...]
-gta-bench.sh --self-test
+cargo xtask gta-bench [--host HOST] [--tries N] [--set key=value]... <label> <VK layers above MangoHud> [env...]
+cargo xtask gta-bench --self-test
 ```
 
 A launch that ends without a result is classified and launched again, up to `--tries` launches
@@ -133,18 +136,18 @@ processes of GTA's prefix that the launch started.
 Effect off (no Neural Forge layer), then on, both with GTA's script mods off:
 
 ```bash
-scripts/gta-bench.sh --host <host> nroff-1 '' 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+cargo xtask gta-bench --host <host> nroff-1 '' 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ```bash
-scripts/gta-bench.sh --host <host> nron-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+cargo xtask gta-bench --host <host> nron-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 The 1.x path (the model on the finished frame, placement `present`) for comparison.
 `NEURAL_FORGE_PREUPSCALE=off` is not this: it loads no network, so it measures the layer with the model off.
 
 ```bash
-scripts/gta-bench.sh --host <host> --set placement=present post-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+cargo xtask gta-bench --host <host> --set placement=present post-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 Summarise, and average three runs of one configuration:
@@ -199,14 +202,14 @@ model ran before the upscaler. `cargo xtask bench-report --self-test` checks its
 
 **Resolution.** Never change the desktop's display mode for a run (it stays at 2560x1440, 288 Hz, VRR,
 HDR); set the game's own resolution instead: `ScreenWidth` and `ScreenHeight` in GTA's `settings.xml`
-(the game sweep sets 2560x1440 and puts the file back; `gta-bench.sh` uses the file as found), checked
+(the game sweep sets 2560x1440 and puts the file back; `cargo xtask gta-bench` uses the file as found), checked
 afterwards with `sha256sum` against the value taken before. The layer's log names the size the game
 renders at (`DLSS's output: image ... (2560x1440 ...)`); check it after a change.
 
 **Flicker and added detail.** `NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<frames>` makes the layer
 capture `<frames>` consecutive presented frames as a series, `<ms>` after the `<resume>`-th time
 DLSS's frames resumed after a pause (a loading screen, the start of a benchmark pass), so every run
-captures the same moment; gta-bench.sh moves the series into the run's directory.
+captures the same moment; cargo xtask gta-bench moves the series into the run's directory.
 `cargo xtask bench-iq RUN_DIR [--baseline MODEL_OFF_RUN_DIR] [--fg N]` measures it, and
 `cargo xtask bench-report` prints the same beside the fps (`--baseline LABEL`), passing the run's measured
 frame generation multiplier:
@@ -313,7 +316,7 @@ inside the launch-bearing buffer. Set GTA to DLSS Quality or Balanced (not DLAA)
 generation off:
 
 ```bash
-scripts/gta-bench.sh --host <host> probe-ngx-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+cargo xtask gta-bench --host <host> probe-ngx-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ```bash
@@ -336,7 +339,7 @@ once on any new game before claiming the model before the upscaler works there.
 | `roundtrip` | The HDR encode and decode with the encoded frame as the answer; no network. | That the transform alone leaves the picture unchanged. |
 
 ```bash
-scripts/gta-bench.sh --host <host> pu-identity-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=identity 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+cargo xtask gta-bench --host <host> pu-identity-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=identity 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=2.5` (or 4) tries another paper white in `model` or
@@ -352,7 +355,7 @@ The layer logs `edit cache off` when it is set, and the `[preupscale]` summaries
 (`cached=0` with it off).
 
 ```bash
-scripts/gta-bench.sh --host <host> cache-off-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_EDIT_CACHE=off 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+cargo xtask gta-bench --host <host> cache-off-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_EDIT_CACHE=off 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ### Offline tools
@@ -364,7 +367,7 @@ runs the network on a dumped frame on the real device (`NEURAL_FORGE_NATIVE_RIG=
 
 ### Fault injection
 
-Set in the game's launch environment (for `gta-bench.sh`, as extra arguments):
+Set in the game's launch environment (for `cargo xtask gta-bench`, as extra arguments):
 
 - `NEURAL_FORGE_FAIL_CREATE=N[@K]`: let K network builds through, then fail the next N. Exercises
   the retry schedule and the network's re-initialisation; frames go to DLSS untouched meanwhile.
@@ -391,9 +394,9 @@ its compute state cannot be put back ...`, once). `NEURAL_FORGE_INLINE=off` turn
 ## 6. Reading the logs
 
 **Where they are.** Transitions and errors only (never per-frame lines) also go to the state log, `$XDG_STATE_HOME/neural-forge/layer.log`, which `neural-forge-cli doctor` reads. The full log goes to `NEURAL_FORGE_LOG` if set, otherwise to the game's stderr
-(the Proton log; in `gta-bench.sh` runs, `launch.log`). `NEURAL_FORGE_LOG_TIME=1` puts a Unix
+(the Proton log; in `cargo xtask gta-bench` runs, `launch.log`). `NEURAL_FORGE_LOG_TIME=1` puts a Unix
 timestamp on every line (to match them with `journalctl -k`).
-`scripts/check-stalls.sh [LOG]` checks a layer log for fence-wait timeouts and breadcrumb dumps
+`cargo xtask check-stalls [LOG]` checks a layer log for fence-wait timeouts and breadcrumb dumps
 and summarises engage/disengage transitions and the frame rate.
 
 ### Layer lines
@@ -537,22 +540,22 @@ Notes:
 
 ## 11. The pre-release game sweep
 
-`scripts/game-sweep.sh` runs the tested games installed on the test machine, one after another, each through
+`cargo xtask game-sweep` runs the tested games installed on the test machine, one after another, each through
 its built-in benchmark, and prints a pass/fail table. What it runs is `scripts/game-sweep.toml` (one `[[run]]` per
 run: the game's app id, its arguments, its recording window and recorder, frame generation, how long to watch, HDR and Ray Reconstruction, and the game
 settings the run sets); what each run must show comes from the game's entry in `data/games.toml` (its placement,
 or `placement_rr` with Ray Reconstruction on; HDR10 for a run with `hdr = true`, SDR otherwise). The work is
-done by `crates/supervisor/examples/game_sweep.rs`, which the script builds; its unit tests run in `cargo test`.
+done by `crates/supervisor/examples/game_sweep.rs`, which the task builds; its unit tests run in `cargo test`.
 
 ```bash
 # on the test machine, in tmux; the release build under test in place of the installed layer:
-scripts/game-sweep.sh --layer target/release/libneural_forge_layer.so --cli target/release/neural-forge-cli
-scripts/game-sweep.sh --dry-run            # each run's launch options, settings edits and expectations
-scripts/game-sweep.sh --only cyberpunk,gta # some runs
+cargo xtask game-sweep --layer target/release/libneural_forge_layer.so --cli target/release/neural-forge-cli
+cargo xtask game-sweep --dry-run            # each run's launch options, settings edits and expectations
+cargo xtask game-sweep --only cyberpunk,gta # some runs
 ```
 
 Every run is started by Steam (`steam steam://rungameid/<appid>`), on the Proton Steam has for the game; a game is
-never launched around Steam (a direct launch through `scripts/gta-bench.sh` once ran GTA on that script's default
+never launched around Steam (a direct launch through `cargo xtask gta-bench` once ran GTA on that script's default
 Proton, without Neural Forge's NGX wrapper). The launch options carry Neural Forge (`NEURAL_FORGE_ENABLE=1`, the
 game's executables), the run's log (`NEURAL_FORGE_LOG`), `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1` for an HDR
 run, and the run's arguments after `%command%`, each switch with its values as one unit (Cyberpunk 2077:

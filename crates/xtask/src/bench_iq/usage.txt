@@ -1,9 +1,9 @@
-Flicker and added detail of gta-bench.sh runs, from their presented-frame series.
+Flicker and added detail of cargo xtask gta-bench runs, from their presented-frame series.
 
 usage: cargo xtask bench-iq [--baseline MODEL_OFF_RUN_DIR] [--fg N] [--frames N] [--start K] [--scan] RUN_DIR...
        cargo xtask bench-iq --self-test
 
-A run's series is the `series-<ms>/` directory gta-bench.sh moves into the run directory: N
+A run's series is the `series-<ms>/` directory cargo xtask gta-bench moves into the run directory: N
 consecutive presented frames taken with NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<frames> (the
 layer's frame-series capture, docs/RUNNING_AND_MEASURING.md). The camera must be still there; what
 moves anyway (people walking, particles) is what the exclusions below are for. Every number is

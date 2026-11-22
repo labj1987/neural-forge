@@ -1,29 +1,3 @@
-#!/usr/bin/env bash
-# Builds the AppImage from the working tree and puts exactly that build where the rig runs it:
-# the launcher copy (~/AppImages/neural-forge.appimage) and the installed layers, then
-# proves the installed files are byte-identical to the ones inside the AppImage. Leaves nothing
-# behind: no backup of the previous AppImage (releases are the rollback) and no temp files.
-#
-# Usage: scripts/deploy-rig.sh <host>      (or NF_DEPLOY_HOST=<host> scripts/deploy-rig.sh)
-set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
-HOST="${1:-${NF_DEPLOY_HOST:-}}"
-if [ -z "$HOST" ]; then
-    echo "usage: scripts/deploy-rig.sh <host>  (or set NF_DEPLOY_HOST)" >&2
-    exit 2
-fi
-VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-APPIMAGE="neural-forge-$VERSION-x86_64.AppImage"
-
-echo "==> building $APPIMAGE"
-BUILD_LOG="$(mktemp)"
-# The local build only exists to be copied; releases come from CI, so it is removed however this ends.
-trap 'rm -rf "$BUILD_LOG" "$APPIMAGE" "$APPIMAGE.zsync" build-appimage' EXIT
-bash build-appimage.sh >"$BUILD_LOG" 2>&1 || { tail -20 "$BUILD_LOG"; exit 1; }
-
-echo "==> copying to $HOST"
-scp -q "$APPIMAGE" "$HOST:/tmp/nf-deploy.AppImage"
-ssh "$HOST" "VERSION=$VERSION bash -s" <<'REMOTE'
 set -eo pipefail
   # A version-specific extraction directory, so nothing else's squashfs-root in /tmp is
   # touched or reused. Removed with the copied AppImage however the script ends.
@@ -51,5 +25,3 @@ set -eo pipefail
   [ -f "$E" ] && sed -i "s/^X-AppImage-Version=.*/X-AppImage-Version=$VERSION/" "$E"
   update-desktop-database "$D/applications" 2>/dev/null || true
   [ $ok = 1 ]
-REMOTE
-echo "==> deployed and verified"
