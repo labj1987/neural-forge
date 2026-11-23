@@ -206,8 +206,15 @@ jobs:
         env:
           SHA: ${{ needs.bump.outputs.sha }}
           BRANCH: ${{ needs.bump.outputs.branch }}
+        # Branch protection can lag a few seconds behind the check run recorded above (2026-11-23: refused as
+        # "expected" 2 s after it was recorded), so a refused push is retried with growing waits.
         run: |
-          git push origin "$SHA:refs/heads/$GITHUB_REF_NAME"
+          for wait in 5 10 20 40 0; do
+            git push origin "$SHA:refs/heads/$GITHUB_REF_NAME" && break
+            [ "$wait" -gt 0 ] || exit 1
+            echo "push refused; retrying in ${wait}s"
+            sleep "$wait"
+          done
           git push origin --delete "$BRANCH"
 
   # One issue, labelled pin-check, for good: reopened when a pin falls behind again rather than a new one
