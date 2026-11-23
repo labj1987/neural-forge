@@ -221,8 +221,8 @@ same from a terminal.
 
 What the placement trades: before the upscaler the model works on DLSS's smaller render frame, so it costs much less,
 but on a smaller frame NVIDIA's network draws a different change from the one it draws on the full output. In GTA V
-Enhanced at 1440p, the network takes about 7 ms before the upscaler at DLSS Balanced against about 22 ms on the full
-output, and a change made at the render size agrees with the full-size change at a correlation of about 0.95 (DLSS
+Enhanced at 1440p, the network took about 7 ms a frame before the upscaler at DLSS Balanced (with the edit cache
+running it on about half the frames) against about 22 ms an evaluation on the full output, and a change made at the render size agrees with the full-size change at a correlation of about 0.95 (DLSS
 Quality), 0.92 (Balanced) and 0.90 (Performance), a third to a half of it different, mostly in fine detail
 ([LESSONS.md](LESSONS.md), November 23). After DLSS or on the finished frame at Model resolution Full is the closest
 to the network's full-size picture, and the slowest.
