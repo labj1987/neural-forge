@@ -2076,8 +2076,9 @@ moving), each frame through the present pass on the RTX 5070 (NVIDIA ICD, median
   off with more grain in the pavement and on the car's paint, and Neural 2 turns the asphalt and paint grainy. It
   sharpens the noise the frame carries (the model's and DLSS's own fine texture) more than its edges. It was trained
   for ReShade on a plain game frame; on this one there is nothing it does that CAS does not do better.
-- **Cost.** 0.44 ms a presented frame at 1440p against CAS's 0.29 (both include the 0.25 ms copy out and back), so
-  0.15 ms more than CAS and over the 0.3 ms budget, paid four times a rendered frame with frame generation 4x.
+- **Cost.** 0.44 ms a presented frame at 1440p against CAS's 0.29, both including the same 0.25 ms copy out and
+  back: the pass itself about 0.19 ms against CAS's 0.04, within the 0.3 ms budget but paid four times a rendered
+  frame with frame generation 4x. The decision rests on the picture, not the cost.
 - **Not built.** No motion-vector control was tried: the present pass has no motion vectors (the frame there is the
   finished one, frame generation's included). The port itself (shader, CPU reference, settings) is about 500 lines
   and would be a small job to redo if a better-trained network turns up.
