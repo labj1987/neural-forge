@@ -2114,26 +2114,28 @@ From the week's survey of uzbekunknown/dlss-nr-on-intel (Apache-2.0; its notes `
   small network (NVIDIA's, through the same helper; Neural Forge's computes it identically) on the frame at full size is
   the reference; at each smaller size the frame is taken down with an area mean, run, and its change enlarged
   bilinearly. Correlation of the change, residual (mean |x - reference| over the reference's mean change), and the
-  change split by a 3 px Gaussian into coarse and fine; medians of the three, range in brackets:
+  change split by a 3 px Gaussian into coarse and fine; medians of the three, range in brackets. The in-game
+  timings are separate runs with Neural Forge's default full network, per evaluation: `server_eval_ms` is
+  finished-frame server wall time, while `network_gpu_ms` is GPU time before the upscaler, excluding cached frames.
 
-  | Size of the model's frame | As in Neural Forge | Correlation | Residual | Coarse | Fine | Network ms in game |
+  | Size of the model's frame | Equivalent size in Neural Forge | Correlation | Residual | Coarse | Fine | Full network ms in game |
   |---|---|---|---|---|---|---|
-  | 2560x1440 (100%) | after DLSS or on the finished frame, Model resolution Full | 1 | 0 | 1 | 1 | 22.5 (`server_eval_ms`, median of 97 samples) |
-  | 1920x1080 (75%) | after the upscaler at 75% | 0.942 [0.928-0.942] | 43% [40-44] | 0.956 | 0.793 | 14.0 (7 samples) |
+  | 2560x1440 (100%) | finished frame, Composition tab Model resolution after the upscaler 100% | 1 | 0 | 1 | 1 | 22.5 (`server_eval_ms`, median of 97 samples) |
+  | 1920x1080 (75%) | finished frame, same setting at 75% | 0.942 [0.928-0.942] | 43% [40-44] | 0.956 | 0.793 | 14.0 (`server_eval_ms`, 7 samples) |
   | 1708x960 (66.7%) | before the upscaler at DLSS Quality | 0.950 [0.938-0.951] | 33% [32-34] | 0.970 | 0.764 | not measured |
-  | 1486x836 (58%) | before the upscaler at DLSS Balanced | 0.921 [0.898-0.926] | 44% [41-45] | 0.940 | 0.712 | 7.0 (`network_gpu_ms`, the edit cache running it on about half the frames) |
-  | 1280x720 (50%) | before the upscaler at DLSS Performance, or after it at 50% | 0.898 [0.871-0.899] | 47% [46-47] | 0.922 | 0.651 | 7.2 after the upscaler (7 samples) |
+  | 1486x836 (58%) | before the upscaler at DLSS Balanced | 0.921 [0.898-0.926] | 44% [41-45] | 0.940 | 0.712 | 7.0 (`network_gpu_ms`, per evaluation on about half the frames) |
+  | 1280x720 (50%) | before the upscaler at DLSS Performance, or finished frame at 50% | 0.898 [0.871-0.899] | 47% [46-47] | 0.922 | 0.651 | 7.2 (`server_eval_ms`, finished frame, 7 samples) |
 
   The same picture as phase76 found on NVIDIA's own runs: a smaller frame gets a different change, mostly in its fine
-  detail, and no upscale brings it back. Before the upscaler is cheaper by a factor of about three and its change
-  correlates 0.90-0.95 with the full-size one, with a third to a half of it different. What this does not cover: the
-  real before-the-upscaler input is DLSS's jittered, aliased render frame in HDR, not an area-reduced DLSS output, and
+  detail, and no upscale brings it back. The small network's change at render sizes correlates 0.90-0.95 with
+  its full-size one, with a third to a half different. What this does not cover: the real before-the-upscaler input is DLSS's jittered, aliased render frame in HDR, not an area-reduced DLSS output, and
   DLSS then upscales the edited frame; a `NEURAL_FORGE_PREUPSCALE=dump` run at the same moment would give it, but in
   GTA dump mode refuses to hold (a same-layout barrier on DLSS's input) and with `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore`
   the game stopped rendering at its first scene and exited after 125 s; that was not tried again. 75% scoring below
   66.7% on residual was the same on all three frames and is not explained. Flicker (`cargo xtask bench-iq`, frame
   generation 4x, DLSS Balanced, 9 frames at two fixed windows of pass 4): 1.4% and 6.5% with the model before the
-  upscaler, 6.0% and 22.0% with it on the finished frame (no history there).
+  upscaler, 6.0% and 22.0% with it on the finished frame (default zero-motion history, no motion reprojection;
+  no `NEURAL_FORGE_POST_MOTION` override).
 - **The game's own sharpening.** AMDLSS5's changelog (2.5) recommends the game's upscaler sharpening at 0 when the model
   runs after the upscaler, because the model amplifies the noise sharpening adds. GTA V Enhanced has a DLSS sharpness
   setting (`dlssSharpen`, 1.0 as found): with the model on the finished frame, 1.0 against 0 gave flicker 6.0% against

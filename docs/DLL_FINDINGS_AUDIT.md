@@ -201,7 +201,7 @@ untested here; see section 4.
 | Control | DLL fallback | Helper sends | When |
 |---|---|---|---|
 | Style | 0 | 0 by default | creation only (`main:crates/helper/src/ngx.rs:183,157`) |
-| Intensity | 1.0 | 1.0, clamped 0-4 (the DLL itself stops at 1: LESSONS.md, November 23) | creation only (`ngx.rs:184,165`) |
+| Intensity | 1.0 | 1.0, clamped 0-4 (NGX 310.9.16 stops at 1: LESSONS.md, November 23) | creation only (`ngx.rs:184,165`) |
 | LocalToneStrength | 1.0 | 1.0, clamped 0-4 | creation only (`ngx.rs:185,166`) |
 | LocalStructureStrength | 1.0 | 1.0, clamped 0-4 | creation only (`ngx.rs:186,167`) |
 | SkinStructureStrength | -1.0 | -1.0, clamped -1..4 | creation only (`ngx.rs:187,168`) |

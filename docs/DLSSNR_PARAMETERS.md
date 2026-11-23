@@ -77,7 +77,7 @@ The consumers' column gives where they agree or differ.
 | `DLSSNR.Intensity` | f32 | 1.0, clamped 0-4 | C | default 1. NVIDIA's runtime stops at 1: 310.9.16 gives 1.0's bytes for 1.001, 1.3 and 1.5 (both networks; LESSONS.md, November 23). Neural Forge's own range is 0-4, and above 1 it extrapolates |
 | `DLSSNR.LocalToneStrength` | f32 | 1.0, clamped 0-4 | C | default 1 |
 | `DLSSNR.LocalStructureStrength` | f32 | 1.0, clamped 0-4 | C | default 1 |
-| `DLSSNR.SkinStructureStrength` | f32 | -1, clamped -1..4 | C | -1 = follow local structure; read only with `DLSSNR.UseAutoMask` on (with it off, 0 and 2 give -1's bytes on 310.9.16) |
+| `DLSSNR.SkinStructureStrength` | f32 | -1, clamped -1..4 | C | -1 = follow local structure; used only with `DLSSNR.UseAutoMask` on (with it off, 0, 2 and -1 all give the same auto-mask-off bytes on 310.9.16) |
 | `DLSSNR.UseAutoMask` | i32 | 1 (setting `auto_mask`) | C | DLSS5VKLayer and OptiScaler on, RenoDX off |
 | `CreationNodeMask`, `VisibilityNodeMask` | u32 | 1 | C | 1 |
 | `DLSSNR.Color`, `DLSSNR.Output`, `DLSSNR.MVec`, `DLSSNR.Depth` | pointer | the frame's images | E | all |

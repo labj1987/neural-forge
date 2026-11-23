@@ -171,9 +171,11 @@ Before the upscaler the frame is already small (2228x1253 in GTA V at 4K with DL
 1440p) and the smaller sizes keep little of the model's detail; after DLSS, on the full output (with Ray
 Reconstruction), Performance keeps most of it for about a fifth more frames (Crimson Desert at 4K: 84 against
 70 fps shown; see [MEASURED_RESULTS.md](MEASURED_RESULTS.md)). A smaller size does not give a softer copy of the
-full-size change but a different one: in GTA V Enhanced at 1440p the change at 75% agrees with the one at Full at a
-correlation of 0.94 and at 50% at 0.90, with 43% and 47% of it different, mostly in fine detail, for about 14 and 7
-ms of network time against 22 ms at Full ([LESSONS.md](LESSONS.md), November 23). Full is the frame exactly as
+full-size change but a different one: on area-reduced GTA V Enhanced frames at 2560x1440, the small network's
+change enlarged bilinearly at 75% and 50% correlates 0.94 and 0.90 with its full-size change, with 43% and 47%
+different, mostly in fine detail. Separate game runs with the default full network on the finished frame took
+22.5, 14.0 and 7.2 ms of server wall time per evaluation (`server_eval_ms`) at 100%, 75% and 50% on the Composition
+tab's **Model resolution after the upscaler** ([LESSONS.md](LESSONS.md), November 23). Full is the frame exactly as
 without the setting. Each pass can have its own model resolution in the per-pass settings: a pass works
 on the previous pass's full-size picture at its own size. Changing it starts the model's history afresh
 and shows a moment of untouched frames while the model is prepared for the new size.
@@ -221,11 +223,14 @@ same from a terminal.
 
 What the placement trades: before the upscaler the model works on DLSS's smaller render frame, so it costs much less,
 but on a smaller frame NVIDIA's network draws a different change from the one it draws on the full output. In GTA V
-Enhanced at 1440p, the network took about 7 ms a frame before the upscaler at DLSS Balanced (with the edit cache
-running it on about half the frames) against about 22 ms an evaluation on the full output, and a change made at the render size agrees with the full-size change at a correlation of about 0.95 (DLSS
-Quality), 0.92 (Balanced) and 0.90 (Performance), a third to a half of it different, mostly in fine detail
-([LESSONS.md](LESSONS.md), November 23). After DLSS or on the finished frame at Model resolution Full is the closest
-to the network's full-size picture, and the slowest.
+Enhanced at 2560x1440, the default full network took 7.0 ms of GPU time per evaluation before the upscaler at DLSS
+Balanced, with the edit cache skipping about half the frames. On the finished frame at 100% working scale it took
+22.5 ms of server wall time per evaluation; these are different timing metrics. In a separate small-network test,
+area-reduced frames with bilinearly enlarged changes correlate about 0.95 (DLSS Quality size), 0.92 (Balanced)
+and 0.90 (Performance) with the full-size change, a third to a half different, mostly in fine detail
+([LESSONS.md](LESSONS.md), November 23). After DLSS at **Model resolution Full**, or on the finished frame at
+**Model resolution after the upscaler 100%** (Composition tab), is closest to the network's full-size picture,
+and slowest.
 
 **The game's own sharpening.** With the model after DLSS or on the finished frame, set the game's own
 upscaler sharpening (its DLSS, FSR or XeSS sharpness slider) to 0: the model takes the grain that sharpening adds
