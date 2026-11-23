@@ -2106,7 +2106,8 @@ From the week's survey of uzbekunknown/dlss-nr-on-intel (Apache-2.0; its notes `
   The Neural Forge column is the composite's blend (`native_composite.comp`: `proxy + intensity x (answer -
   proxy)`, no clamp above 1) applied to the network's answer at intensity 1, which is NGX's byte for byte (NATIVE_BACKEND.md,
   "Against NGX (3.5.2)"). So Overdrive's 1.30, and any intensity above 1, is a Neural Forge extra NVIDIA's runtime
-  never shows. Not changed: whether to keep it or clamp at 1 is the maintainer's decision. The docs now say it
+  never shows. Decision (2026-11-23): keep it as a Neural Forge extra rather than clamp at 1; the default stays 1.0
+  and the docs say plainly that anything above 1 goes beyond NVIDIA's runtime. The docs now say it
   (DLSSNR_PARAMETERS.md, USER_GUIDE.md's strength presets, NATIVE_BACKEND.md 2.2, DLL_FINDINGS_AUDIT.md).
 - **The model's size against its full-size picture, on GTA V Enhanced.** phase76's method on three DLSS outputs from
   the GTA benchmark at 2560x1440 with no model on them (Performance, and Balanced at two moments of pass 4): the
