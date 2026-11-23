@@ -129,8 +129,13 @@ path. The Model tab's tuning and the switch apply to both.
 | Light | 0.45 | 0.55 | 0.25 | 0.15 | A light touch. |
 | Moderate | 0.70 | 0.80 | 0.55 | 0.40 | In between. |
 | Reference | 1.00 | 1.00 | 1.00 | follows local structure | NVIDIA's own defaults for the network; Neural Forge's default. |
-| Overdrive | 1.30 | 1.25 | 1.45 | 1.20 | Stronger than NVIDIA's defaults. |
+| Overdrive | 1.30 | 1.25 | 1.45 | 1.20 | Stronger than NVIDIA's defaults, and stronger than NVIDIA's own runtime can go: it stops intensity at 1, so its intensity of 1.30 is Neural Forge's alone. |
 | Remix | 1.00 | 0.30 | 0.70 | 0.50 | RTX Remix's defaults for its DLSS neural rendering. |
+
+NVIDIA's own runtime stops intensity at 1: anything above it gives exactly the picture of 1. Neural Forge allows 0
+to 4, and above 1 it pushes the model's change further than NVIDIA's runtime ever shows it (1.5 changes the frame
+one and a half times as much). Local tone and local structure above 1 are NVIDIA's too: its runtime does not stop
+them at 1. Skin structure acts only with the auto mask on, in NVIDIA's runtime and here.
 
 **Keep the game's sky** (on by default) leaves the sky untouched before the upscaler: no edit where the
 game's depth is at the far plane, fading in over the distance just in front of it. **More mask rules** can
@@ -165,7 +170,12 @@ so the frame keeps its own detail; the model costs less GPU time and memory but 
 Before the upscaler the frame is already small (2228x1253 in GTA V at 4K with DLSS Balanced, 1486x836 at
 1440p) and the smaller sizes keep little of the model's detail; after DLSS, on the full output (with Ray
 Reconstruction), Performance keeps most of it for about a fifth more frames (Crimson Desert at 4K: 84 against
-70 fps shown; see [MEASURED_RESULTS.md](MEASURED_RESULTS.md)). Full is the frame exactly as
+70 fps shown; see [MEASURED_RESULTS.md](MEASURED_RESULTS.md)). A smaller size does not give a softer copy of the
+full-size change but a different one: on area-reduced GTA V Enhanced frames at 2560x1440, the small network's
+change enlarged bilinearly at 75% and 50% correlates 0.94 and 0.90 with its full-size change, with 43% and 47%
+different, mostly in fine detail. Separate game runs with the default full network on the finished frame took
+22.5, 14.0 and 7.2 ms of server wall time per evaluation (`server_eval_ms`) at 100%, 75% and 50% on the Composition
+tab's **Model resolution after the upscaler** ([LESSONS.md](LESSONS.md), November 23). Full is the frame exactly as
 without the setting. Each pass can have its own model resolution in the per-pass settings: a pass works
 on the previous pass's full-size picture at its own size. Changing it starts the model's history afresh
 and shows a moment of untouched frames while the model is prepared for the new size.
@@ -210,6 +220,23 @@ before it runs where that one does, and passes on the finished frame after passe
 run after DLSS instead (the model serves one of the two at a time); the log says when a placement is moved.
 `neural-forge-cli shmctl set placement auto|before|upscaled|present` (and `pass2_placement`, ...) does the
 same from a terminal.
+
+What the placement trades: before the upscaler the model works on DLSS's smaller render frame, so it costs much less,
+but on a smaller frame NVIDIA's network draws a different change from the one it draws on the full output. In GTA V
+Enhanced at 2560x1440, the default full network took 7.0 ms of GPU time per evaluation before the upscaler at DLSS
+Balanced, with the edit cache skipping about half the frames. On the finished frame at 100% working scale it took
+22.5 ms of server wall time per evaluation; these are different timing metrics. In a separate small-network test,
+area-reduced frames with bilinearly enlarged changes correlate about 0.95 (DLSS Quality size), 0.92 (Balanced)
+and 0.90 (Performance) with the full-size change, a third to a half different, mostly in fine detail
+([LESSONS.md](LESSONS.md), November 23). After DLSS at **Model resolution Full**, or on the finished frame at
+**Model resolution after the upscaler 100%** (Composition tab), is closest to the network's full-size picture,
+and slowest.
+
+**The game's own sharpening.** With the model after DLSS or on the finished frame, set the game's own
+upscaler sharpening (its DLSS, FSR or XeSS sharpness slider) to 0: the model takes the grain that sharpening adds
+for detail and strengthens it. This is a community observation from AMDLSS5, not a measurement of Neural Forge's; in
+GTA V Enhanced, whose DLSS sharpness slider made no measurable difference to flicker on the finished frame, it
+changes nothing. Before the upscaler it does not apply: the model runs before DLSS sharpens.
 
 **HUD on the finished frame** (Model tab): where the model runs on the finished frame, the game's HUD is in
 the picture. **Find the HUD** (on) keeps the model's change off what stays still and sharp while the

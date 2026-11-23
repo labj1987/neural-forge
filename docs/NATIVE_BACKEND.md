@@ -516,7 +516,7 @@ setting: bit-exact, or within one half-float step where the native side applies 
 | Control | With NGX (helper) | Native | Checked |
 |---|---|---|---|
 | Style (Default, Natural, Cinematic) | `DLSSNR.Style` | lane 10 (`style / 128`) **and** the Natural/Cinematic operator after the network (exposure, contrast, saturation in HSL, scaled by local tone; OpenDLSS-NR's `nrStyle`), in `native_composite.comp` | style 1 and 2: NGX = network + operator, within one half step; the network alone differs (max 0.12) |
-| Intensity | `DLSSNR.Intensity` | `proxy + intensity * (styled - proxy)`, truncated to half, in the composite | 0.5: within one half step; the network alone differs (max 0.13) |
+| Intensity | `DLSSNR.Intensity` | `proxy + intensity * (styled - proxy)`, truncated to half, in the composite | 0.5: within one half step; the network alone differs (max 0.13). Above 1 the two part: NGX 310.9.16 gives 1.0's bytes for 1.001, 1.3 and 1.5, while the native blend extrapolates (1.3 and 1.5 change the frame 1.30 and 1.50 times as much; LESSONS.md, November 23) |
 | Local tone | `DLSSNR.LocalToneStrength` | lane 11 (and the style operator's strength) | 0.5: bit-exact |
 | Local structure | `DLSSNR.LocalStructureStrength` | lanes 12-14 | 0.5 with skin 2: bit-exact |
 | Skin structure (-1 follows structure) | `DLSSNR.SkinStructureStrength` | lane 13 | as above |

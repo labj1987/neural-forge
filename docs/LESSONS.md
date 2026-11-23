@@ -2083,6 +2083,65 @@ moving), each frame through the present pass on the RTX 5070 (NVIDIA ICD, median
   finished one, frame generation's included). The port itself (shader, CPU reference, settings) is about 500 lines
   and would be a small job to redo if a better-trained network turns up.
 
+## November 23: NVIDIA's intensity clamp, and the model's size against the full-size picture
+
+From the week's survey of uzbekunknown/dlss-nr-on-intel (Apache-2.0; its notes `phase74-vendor-parity.md` and
+`phase76-render-scale-against-nvidia.md` were read for the method, no code taken), checked here on the test machine.
+
+- **NVIDIA's runtime stops intensity at 1; Neural Forge does not.** NGX with build 310.9.16 of the DLL (the 2.0.10
+  helper in its own XDG directories and channel, GE-Proton 11-6, no game running; `trigger_helper_roundtrip`
+  32 times, 2 s, once more, so each answer is the first after a reset), three 2560x1440 finished-frame captures
+  from games (RGBA8), both networks (preset 0 = small, 1 = full), one creation per setting, every answer a real
+  evaluation:
+
+  | Setting | NGX, small | NGX, full | Neural Forge |
+  |---|---|---|---|
+  | Intensity 0.99 | differs from 1.0 (change 0.99x) | the same | 0.99x |
+  | Intensity 1.001, 1.3, 1.5 | **1.0's bytes, all three frames** | **1.0's bytes, all three frames** | 1.001 within 8-bit rounding of 1.0; 1.3 and 1.5 change the frame 1.30x and 1.50x |
+  | Local tone 2 against 1.5 | differs (mean 0.7-2.0 levels) | differs (0.7-1.7) | not clamped either |
+  | Local structure 2 against 1.5 | differs (0.7-4.6 levels) | differs (0.6-3.4) | not clamped either |
+  | Skin structure 0 or 2, auto mask off | **the auto-mask-off bytes** | **the same** | ignored too (lanes 12-14 are structure, -1, -1) |
+  | Skin structure 2, auto mask on | differs (0.4-1.3 levels) | differs (0.9-1.2) | acts |
+
+  The Neural Forge column is the composite's blend (`native_composite.comp`: `proxy + intensity x (answer -
+  proxy)`, no clamp above 1) applied to the network's answer at intensity 1, which is NGX's byte for byte (NATIVE_BACKEND.md,
+  "Against NGX (3.5.2)"). So Overdrive's 1.30, and any intensity above 1, is a Neural Forge extra NVIDIA's runtime
+  never shows. Decision (2026-11-23): keep it as a Neural Forge extra rather than clamp at 1; the default stays 1.0
+  and the docs say plainly that anything above 1 goes beyond NVIDIA's runtime. The docs now say it
+  (DLSSNR_PARAMETERS.md, USER_GUIDE.md's strength presets, NATIVE_BACKEND.md 2.2, DLL_FINDINGS_AUDIT.md).
+- **The model's size against its full-size picture, on GTA V Enhanced.** phase76's method on three DLSS outputs from
+  the GTA benchmark at 2560x1440 with no model on them (Performance, and Balanced at two moments of pass 4): the
+  small network (NVIDIA's, through the same helper; Neural Forge's computes it identically) on the frame at full size is
+  the reference; at each smaller size the frame is taken down with an area mean, run, and its change enlarged
+  bilinearly. Correlation of the change, residual (mean |x - reference| over the reference's mean change), and the
+  change split by a 3 px Gaussian into coarse and fine; medians of the three, range in brackets. The in-game
+  timings are separate runs with Neural Forge's default full network, per evaluation: `server_eval_ms` is
+  finished-frame server wall time, while `network_gpu_ms` is GPU time before the upscaler, excluding cached frames.
+
+  | Size of the model's frame | Equivalent size in Neural Forge | Correlation | Residual | Coarse | Fine | Full network ms in game |
+  |---|---|---|---|---|---|---|
+  | 2560x1440 (100%) | finished frame, Composition tab Model resolution after the upscaler 100% | 1 | 0 | 1 | 1 | 22.5 (`server_eval_ms`, median of 97 samples) |
+  | 1920x1080 (75%) | finished frame, same setting at 75% | 0.942 [0.928-0.942] | 43% [40-44] | 0.956 | 0.793 | 14.0 (`server_eval_ms`, 7 samples) |
+  | 1708x960 (66.7%) | before the upscaler at DLSS Quality | 0.950 [0.938-0.951] | 33% [32-34] | 0.970 | 0.764 | not measured |
+  | 1486x836 (58%) | before the upscaler at DLSS Balanced | 0.921 [0.898-0.926] | 44% [41-45] | 0.940 | 0.712 | 7.0 (`network_gpu_ms`, per evaluation on about half the frames) |
+  | 1280x720 (50%) | before the upscaler at DLSS Performance, or finished frame at 50% | 0.898 [0.871-0.899] | 47% [46-47] | 0.922 | 0.651 | 7.2 (`server_eval_ms`, finished frame, 7 samples) |
+
+  The same picture as phase76 found on NVIDIA's own runs: a smaller frame gets a different change, mostly in its fine
+  detail, and no upscale brings it back. The small network's change at render sizes correlates 0.90-0.95 with
+  its full-size one, with a third to a half different. What this does not cover: the real before-the-upscaler input is DLSS's jittered, aliased render frame in HDR, not an area-reduced DLSS output, and
+  DLSS then upscales the edited frame; a `NEURAL_FORGE_PREUPSCALE=dump` run at the same moment would give it, but in
+  GTA dump mode refuses to hold (a same-layout barrier on DLSS's input) and with `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore`
+  the game stopped rendering at its first scene and exited after 125 s; that was not tried again. 75% scoring below
+  66.7% on residual was the same on all three frames and is not explained. Flicker (`cargo xtask bench-iq`, frame
+  generation 4x, DLSS Balanced, 9 frames at two fixed windows of pass 4): 1.4% and 6.5% with the model before the
+  upscaler, 6.0% and 22.0% with it on the finished frame (default zero-motion history, no motion reprojection;
+  no `NEURAL_FORGE_POST_MOTION` override).
+- **The game's own sharpening.** AMDLSS5's changelog (2.5) recommends the game's upscaler sharpening at 0 when the model
+  runs after the upscaler, because the model amplifies the noise sharpening adds. GTA V Enhanced has a DLSS sharpness
+  setting (`dlssSharpen`, 1.0 as found): with the model on the finished frame, 1.0 against 0 gave flicker 6.0% against
+  5.7% and 22.0% against 22.5% at the two windows, within the run-to-run spread: GTA's DLSS 310.4 shows no effect of
+  it. The user guide carries the tip as AMDLSS5's observation.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
