@@ -2042,6 +2042,46 @@ the fix (none reached a release):
 - **Decision:** no change; Neural Forge keeps leaving the SR preset to the game. Look at this again only with a game
   whose DLSS DLL has L and M, and with NGX's log confirming the override.
 
+## November 23: Barbatos Neural Sharpening on the finished frame (tried, not built)
+
+From the weekly survey: OptiScaler added "BaBa" neural sharpening, a port of Barbatos Neural Sharpening 2.1 (ReShade,
+`BaBa_Sharpen_Neural.fx`, network 2.8, MIT per its header; https://github.com/BarbatosAWLS/Reshade-Shaders, commit
+`1adf127`). Ported from the MIT original as a third filter beside CAS and Clarity: a 3x3 convolution of BT.601 luma
+to 12 channels, PReLU, 12 to 12, PReLU, 12 to 1 (Model A's weights unchanged), the residual clamped to +-0.5 and
+scaled by 0.22, the edge response and the cut on aliased edges and fireflies as the source, added to the three
+channels; with the network's answer for a flat patch at the mean subtracted (OptiScaler's idea, commit 71a71830: it
+answers about +0.007 on any flat area). The sharpen tests passed on lavapipe against a CPU reference.
+
+Measured offline on a GTA V Enhanced benchmark capture at 2560x1440 (presented frames, model before the upscaler,
+frame generation 4x): the still shot after the pass-4 cut (9 frames) and the crane shot before it (9 frames, camera
+moving), each frame through the present pass on the RTX 5070 (NVIDIA ICD, median of 200), then `cargo xtask bench-iq
+--start 0 --frames 9 --fg 4` against the pass off.
+
+| setting | GPU ms | still: flicker / added detail | moving: flicker / added detail |
+|---|---|---|---|
+| off | - | 0.306% / x1.000 | 6.61% / x1.000 |
+| CAS 0.25 | 0.287 | 0.340% / x1.135 | 6.72% / x1.100 |
+| CAS 0.5 | 0.289 | 0.406% / x1.356 | 6.97% / x1.252 |
+| CAS 0.75 | 0.287 | 0.538% / x1.742 | 7.59% / x1.599 |
+| Neural 0.5 | 0.443 | 0.424% / x1.165 | 7.15% / x1.035 |
+| Neural 1 (its default) | 0.442 | 0.554% / x1.319 | 7.81% / x1.078 |
+| Neural 1, edge response 1 | 0.441 | 0.653% / x1.379 | 8.18% / x1.088 |
+| Neural 2 | 0.441-0.454 | 0.811% / x1.498 | 9.34% / x1.120 |
+
+- **Worse than CAS at matched strength.** Neural 1 adds what CAS 0.5 adds on the still shot (x1.32 against x1.36)
+  with a third more flicker (0.554% against 0.406%); in motion it adds less than CAS 0.25 (x1.08 against x1.10) and
+  flickers more (7.81% against 6.72%). It also changes the frame more for its contrast: 3.91/255 mean change for
+  x1.31 fine local contrast against CAS 0.5's 2.14/255 for x1.19 (`sharpen::tests::cost_at_1440p_and_effect_on_a_still_frame`).
+- **What it looks like.** In crops at 2x, CAS 0.5 crisps outlines (shirts, tyres, the kerb); Neural 1 looks close to
+  off with more grain in the pavement and on the car's paint, and Neural 2 turns the asphalt and paint grainy. It
+  sharpens the noise the frame carries (the model's and DLSS's own fine texture) more than its edges. It was trained
+  for ReShade on a plain game frame; on this one there is nothing it does that CAS does not do better.
+- **Cost.** 0.44 ms a presented frame at 1440p against CAS's 0.29 (both include the 0.25 ms copy out and back), so
+  0.15 ms more than CAS and over the 0.3 ms budget, paid four times a rendered frame with frame generation 4x.
+- **Not built.** No motion-vector control was tried: the present pass has no motion vectors (the frame there is the
+  finished one, frame generation's included). The port itself (shader, CPU reference, settings) is about 500 lines
+  and would be a small job to redo if a better-trained network turns up.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
