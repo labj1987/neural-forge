@@ -11,8 +11,8 @@ use std::process::{Command, ExitCode};
 use crate::fetch;
 use crate::sh::{self, Res};
 
-const CARGO_DENY_VERSION: &str = "0.21.0";
-const SHA: &str = "a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903";
+const CARGO_DENY_VERSION: &str = "0.22.0";
+const SHA: &str = "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786";
 
 fn run(args: &[String]) -> Res<ExitCode> {
     sh::trap_signals();
