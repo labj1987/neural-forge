@@ -61,11 +61,11 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | block-buffer | 0.12.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
 | block-padding | 0.3.3 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
 | blocking | 1.7.0 | Apache-2.0 OR MIT | https://github.com/smol-rs/blocking |
-| bstr | 1.13.1 | MIT OR Apache-2.0 | https://github.com/BurntSushi/bstr |
+| bstr | 1.14.0 | MIT OR Apache-2.0 | https://github.com/BurntSushi/bstr |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/bytemuck |
 | byteorder | 1.5.0 | Unlicense OR MIT | https://github.com/BurntSushi/byteorder |
 | byteorder-lite | 0.1.0 | Unlicense OR MIT | https://github.com/image-rs/byteorder-lite |
-| bytes | 1.12.1 | MIT | https://github.com/tokio-rs/bytes |
+| bytes | 1.12.2 | MIT | https://github.com/tokio-rs/bytes |
 | calloop | 0.14.5 | MIT | https://github.com/Smithay/calloop |
 | calloop-wayland-source | 0.4.1 | MIT | https://github.com/smithay/calloop-wayland-source |
 | cbc | 0.1.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/block-modes |
@@ -75,7 +75,7 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | codespan-reporting | 0.13.1 | Apache-2.0 | https://github.com/brendanzab/codespan |
 | color_quant | 1.1.0 | MIT | https://github.com/image-rs/color_quant.git |
 | concurrent-queue | 2.5.0 | Apache-2.0 OR MIT | https://github.com/smol-rs/concurrent-queue |
-| const-oid | 0.10.2 | Apache-2.0 OR MIT | https://github.com/RustCrypto/formats |
+| const-oid | 0.10.3 | Apache-2.0 OR MIT | https://github.com/RustCrypto/formats |
 | const-random | 0.1.18 | MIT OR Apache-2.0 | https://github.com/tkaitchuck/constrandom |
 | core_detect | 1.0.0 | MIT/Apache-2.0 | https://github.com/thomcc/core_detect |
 | core_maths | 0.1.1 | MIT | https://github.com/robertbastian/core_maths |
@@ -240,7 +240,7 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | memmap2 | 0.9.12 | MIT OR Apache-2.0 | https://github.com/RazrFalcon/memmap2-rs |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
-| mio | 1.2.4 | MIT | https://github.com/tokio-rs/mio |
+| mio | 1.2.5 | MIT | https://github.com/tokio-rs/mio |
 | moxcms | 0.8.1 | BSD-3-Clause OR Apache-2.0 | https://github.com/awxkee/moxcms.git |
 | multiversion | 0.8.1 | MIT OR Apache-2.0 | https://github.com/calebzulawski/multiversion |
 | naga | 30.0.2 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu |
@@ -252,7 +252,7 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | normpath | 1.5.2 | MIT OR Apache-2.0 | https://github.com/dylni/normpath |
 | notify | 8.2.2 | CC0-1.0 | https://github.com/notify-rs/notify.git |
 | notify-rust | 4.19.0 | MIT OR Apache-2.0 | https://github.com/hoodie/notify-rust |
-| notify-types | 2.3.0 | MIT OR Apache-2.0 | https://github.com/notify-rs/notify.git |
+| notify-types | 2.3.1 | MIT OR Apache-2.0 | https://github.com/notify-rs/notify.git |
 | num | 0.4.3 | MIT OR Apache-2.0 | https://github.com/rust-num/num |
 | num-bigint | 0.4.8 | MIT OR Apache-2.0 | https://github.com/rust-num/num-bigint |
 | num-bigint-dig | 0.9.1 | MIT/Apache-2.0 | https://github.com/dignifiedquire/num-bigint |
@@ -281,8 +281,8 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | phf_shared | 0.11.3 | MIT | https://github.com/rust-phf/rust-phf |
 | phf_shared | 0.13.1 | MIT | https://github.com/rust-phf/rust-phf |
 | pico-args | 0.5.0 | MIT | https://github.com/RazrFalcon/pico-args |
-| pin-project | 1.1.13 | Apache-2.0 OR MIT | https://github.com/taiki-e/pin-project |
-| pin-project-lite | 0.2.17 | Apache-2.0 OR MIT | https://github.com/taiki-e/pin-project-lite |
+| pin-project | 1.2.0 | Apache-2.0 OR MIT | https://github.com/taiki-e/pin-project |
+| pin-project-lite | 0.2.18 | Apache-2.0 OR MIT | https://github.com/taiki-e/pin-project-lite |
 | piper | 0.2.5 | MIT OR Apache-2.0 | https://github.com/smol-rs/piper |
 | png | 0.17.16 | MIT OR Apache-2.0 | https://github.com/image-rs/image-png |
 | png | 0.18.1 | MIT OR Apache-2.0 | https://github.com/image-rs/image-png |
@@ -315,9 +315,9 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | read-fonts | 0.37.0 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations |
 | read-fonts | 0.41.0 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations |
 | ref-cast | 1.0.27 | MIT OR Apache-2.0 | https://github.com/dtolnay/ref-cast |
-| regex | 1.13.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
-| regex-automata | 0.4.18 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
-| regex-syntax | 0.8.11 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
+| regex | 1.13.2 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
+| regex-automata | 0.4.19 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
+| regex-syntax | 0.8.12 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | renderdoc-sys | 1.1.0 | MIT OR Apache-2.0 | https://github.com/ebkalderon/renderdoc-rs |
 | resvg | 0.46.0 | Apache-2.0 OR MIT | https://github.com/linebender/resvg |
 | rgb | 0.8.53 | MIT | https://github.com/kornelski/rust-rgb |
@@ -360,7 +360,7 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | skrifa | 0.44.0 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations |
 | slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab |
 | slotmap | 1.1.1 | Zlib | https://github.com/orlp/slotmap |
-| smallvec | 1.16.5 | MIT OR Apache-2.0 | https://github.com/servo/rust-smallvec |
+| smallvec | 1.16.6 | MIT OR Apache-2.0 | https://github.com/smallvec/smallvec |
 | smol | 2.0.2 | Apache-2.0 OR MIT | https://github.com/smol-rs/smol |
 | smol_str | 0.3.7 | MIT OR Apache-2.0 | https://github.com/rust-lang/rust-analyzer/tree/master/lib/smol_str |
 | socket2 | 0.6.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/socket2 |
@@ -416,11 +416,11 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | utf-8 | 0.7.6 | MIT OR Apache-2.0 | https://github.com/SimonSapin/rust-utf8 |
 | utf8_iter | 1.1.0 | Apache-2.0 OR MIT | https://github.com/hsivonen/utf8_iter |
 | utf_types | 1.0.0 | Apache-2.0 OR MIT | https://github.com/hsivonen/utf_types |
-| uuid | 1.29.2 | Apache-2.0 OR MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.29.3 | Apache-2.0 OR MIT | https://github.com/uuid-rs/uuid |
 | v_frame | 0.3.9 | BSD-2-Clause | https://github.com/rust-av/v_frame |
 | vulkan-layer | 0.1.0 | Apache-2.0 | https://github.com/google/vk-layer-for-rust |
 | waker-fn | 1.2.0 | Apache-2.0 OR MIT | https://github.com/smol-rs/waker-fn |
-| walkdir | 2.5.0 | Unlicense/MIT | https://github.com/BurntSushi/walkdir |
+| walkdir | 2.5.1 | Unlicense/MIT | https://github.com/BurntSushi/walkdir |
 | wasm-bindgen | 0.2.130 | MIT OR Apache-2.0 | https://github.com/wasm-bindgen/wasm-bindgen |
 | wasm-bindgen-shared | 0.2.130 | MIT OR Apache-2.0 | https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared |
 | wayland-backend | 0.3.17 | MIT | https://github.com/smithay/wayland-rs |
@@ -443,12 +443,15 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | writeable | 0.6.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | x11 | 2.21.0 | MIT | https://github.com/AltF02/x11-rs.git |
 | x11rb | 0.13.2 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb |
+| x11rb | 0.14.0 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb |
 | x11rb-protocol | 0.13.2 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb |
+| x11rb-protocol | 0.14.0 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb |
 | xcb | 1.7.1 | MIT | https://github.com/rust-x-bindings/rust-xcb |
 | xcursor | 0.3.11 | MIT | https://github.com/esposm03/xcursor-rs |
 | xim-ctext | 0.3.0 | MIT | https://github.com/Riey/xim-rs |
 | xim-parser | 0.2.2 | MIT | https://github.com/Riey/xim-rs |
 | xkbcommon | 0.8.0 | MIT | https://github.com/rust-x-bindings/xkbcommon-rs |
+| xkbcommon | 0.9.0 | MIT | https://github.com/rust-x-bindings/xkbcommon-rs |
 | xkeysym | 0.2.1 | MIT OR Apache-2.0 OR Zlib | https://github.com/notgull/xkeysym |
 | xml5ever | 0.18.1 | MIT OR Apache-2.0 | https://github.com/servo/html5ever |
 | xmlwriter | 0.1.0 | MIT | https://github.com/RazrFalcon/xmlwriter |
@@ -457,24 +460,24 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | yeslogic-fontconfig-sys | 6.0.1 | MIT | https://github.com/yeslogic/fontconfig-rs |
 | yoke | 0.8.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zbus | 5.19.0 | MIT | https://github.com/z-galaxy/zbus/ |
-| zbus | 6.2.1 | MIT | https://github.com/z-galaxy/zbus/ |
+| zbus | 6.5.0 | MIT | https://github.com/z-galaxy/zbus/ |
 | zbus-lockstep | 0.5.2 | MIT | https://github.com/luukvanderduim/zbus-lockstep |
 | zbus_names | 4.3.5 | MIT | https://github.com/z-galaxy/zbus/ |
 | zbus_utils | 6.1.0 | MIT | https://github.com/z-galaxy/zbus/ |
 | zbus_xml | 5.2.1 | MIT | https://github.com/z-galaxy/zbus/ |
-| zcheapstr | 1.2.0 | MIT | https://github.com/z-galaxy/zcheapstr/ |
+| zcheapstr | 1.4.0 | MIT | https://github.com/z-galaxy/zcheapstr/ |
 | zed-font-kit | 0.14.1-zed | MIT OR Apache-2.0 | https://github.com/servo/font-kit |
 | zed-scap | 0.0.8-zed | MIT | https://github.com/helmerapp/scap |
 | zed-xim | 0.4.0-zed | MIT | https://github.com/Riey/xim-rs |
 | zeno | 0.3.3 | Apache-2.0 OR MIT | https://github.com/dfrg/zeno |
-| zerocopy | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy |
+| zerocopy | 0.8.64 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy |
 | zerofrom | 0.1.8 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| zeroize | 1.9.1 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
+| zeroize | 1.9.2 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
 | zerotrie | 0.2.5 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerovec | 0.11.9 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zlib-rs | 0.6.8 | Zlib | https://github.com/trifectatechfoundation/zlib-rs |
 | zmij | 1.0.23 | MIT | https://github.com/dtolnay/zmij |
-| zruntime | 0.2.3 | MIT | https://github.com/z-galaxy/zruntime |
+| zruntime | 0.2.4 | MIT | https://github.com/z-galaxy/zruntime |
 | zune-core | 0.5.3 | MIT OR Apache-2.0 OR Zlib | https://github.com/etemesi254/zune-image |
 | zune-inflate | 0.2.54 | MIT OR Apache-2.0 OR Zlib | https://github.com/etemesi254/zune-image/tree/main/zune-inflate |
 | zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg |
