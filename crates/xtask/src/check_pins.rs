@@ -335,7 +335,7 @@ fn exit_status(rows: &[Row], failed: &[String]) -> u8 {
 fn sha256_url(url: &str) -> Res<String> {
     let mut hash = Sha256::new();
     http::get_stream(url, &[("User-Agent", USER_AGENT)], 300, &mut |chunk| hash.update(chunk)).map_err(|e| e.to_string())?;
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(hex(&hash.finalize()))
 }
 
 fn text_url(url: &str) -> Res<String> {
@@ -583,7 +583,7 @@ fn fixture() -> Texts {
 }
 
 fn fake_sha(url: &str) -> String {
-    format!("{:x}", Sha256::digest(url.as_bytes()))
+    hex(&Sha256::digest(url.as_bytes()))
 }
 
 fn strings(v: &[&str]) -> Vec<String> {
@@ -709,6 +709,11 @@ fn self_test() -> Res<()> {
         Ok(_) => return Err("a bump with a missing site was accepted".into()),
     }
     Ok(())
+}
+
+/// Lower-case hex of a digest.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

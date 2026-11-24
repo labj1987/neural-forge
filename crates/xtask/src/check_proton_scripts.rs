@@ -174,7 +174,7 @@ fn report(results: &[ResultLine]) -> (String, bool) {
     // same failure is the same report and must not reopen an issue closed by hand.
     let mut failures: Vec<String> = bad.iter().map(|(repo, _, outcome)| format!("{repo}: {outcome}")).collect();
     failures.sort();
-    let hash = format!("{:x}", Sha256::digest(failures.join("\n").as_bytes()));
+    let hash = crate::check_pins::hex(&Sha256::digest(failures.join("\n").as_bytes()));
     (format!("{text}\n<!-- report-sha256: {hash} -->\n"), bad.is_empty())
 }
 
